@@ -101,7 +101,7 @@ The broader module inventory remains distinct from this regression:
 | Ambiguous coordinator commit | Same-ID retry, bounded unresolved retry, and one absolute recovery deadline tests; no new transaction ID or opposite decision after uncertainty. | Process loss between status, retry, durable participant resolution, and acknowledgement; real leader replacement. |
 | Partial participant fanout | Bounded concurrency, attempted-participant contact mask, durable abort before acknowledgement of untouched participants. Submitted tasks are joined before their arenas and slot arrays are released, including I/O cancellation. | Inflight cancellation/shutdown in each fanout phase, delayed replies during cleanup, and native ownership transfer under resource exhaustion. |
 | Post-commit visibility and acknowledgement | `distributed txn coordinator never aborts after durable commit decision` covers pending visibility, terminal repair, propagation and acknowledgement errors. | Retained coordinator/participant records across actual restart and all new protected record kinds. |
-| End-to-end caller deadline | Hosted begin/prepare each preserve one deadline across replica attempts; ambiguous-decision recovery uses a separate bounded deadline and deliberately ignores client cancellation. | `ExecuteOptions` has no transaction-wide original deadline. Later participant waves receive fresh operation budgets; abort/ack cleanup lacks one shared absolute deadline. This slice does not claim whole-request deadline propagation. |
+| End-to-end caller deadline | The follow-up below adds an ingress context to commit callbacks, `ExecuteOptions`, participant waves and replica attempts. Ambiguous-decision recovery still has a separate bounded deadline and ignores client cancellation. | Owning validation of the follow-up, production DATA routed callback, legacy catalog preemption, and one shared abort/ack cleanup budget remain separate requirements. |
 
 The source inventory above is not a claim that all existing tests were rerun.
 Most transaction tests are not in the curated `antfly-api-test` compile inventory;
@@ -128,3 +128,90 @@ runtime reproduction. The separate runtime owner's subsequent DATA gate also
 passed 6/6, including the retained-owner shutdown ordering regression
 (`/tmp/workload-completion-capsule-data1.log`); that evidence remains narrower
 than the multi-peer shutdown schedules listed above.
+
+
+## Original transaction admission deadline (follow-up)
+
+The API now carries `PreDecisionContext` through appended transaction, batch and
+stable-ID commit callbacks. API ABI advances from 33 to 34. A supplied absolute
+deadline retains its originating clock and cancellation token across participant
+waves and replica rediscovery; each operation/attempt can shorten its remaining
+budget but cannot restart the caller's budget. A bounded caller cannot fall back
+to a callback that lacks this capability. Null-deadline in-process calls retain
+the legacy contract explicitly.
+
+Public POST batch and transaction-commit routes establish one **20-second total
+admission deadline at ingress when none exists**, before body decoding and
+admission/lifecycle waits. This changes the previous per-operation 20-second
+behavior. The value shares the existing participant default in
+`distributed_txn_contract`; no configurable public mutation timeout was found in
+the API/common configuration. Any existing shorter or longer deadline and its
+clock remain unchanged. The deadline bounds new work before a decision; it is
+not a promise to cancel a transaction that has already committed.
+
+Single-group atomic batches retain their existing execution path. Their routed
+Raft callback gains an explicit pre-decision context rather than converting the
+deadline into postcommit cancellation. Missing support fails before proposal.
+The DATA runtime owner is implementing that callback separately. Stateless retry
+loops retain the same context, bound backoff by its remaining time, and preserve
+unknown outcomes even if the deadline expires during the attempt. Abort cleanup,
+known-committed propagation and ambiguous decision recovery do not inherit this
+caller deadline.
+
+Focused regressions cover expiry/cancellation between participant waves with
+both begun participants aborted, no callback dispatch for expired requests,
+foreign callback dispatch with exact context and no legacy downgrade, accepted
+atomic completion after expiry, stateless definite-abort retry expiry versus
+unknown outcome, and public ingress default/preservation. Existing real loopback
+batch and stable-session handoff fixtures now assert that their commit hooks
+receive the ingress deadline and clock.
+
+The first owning API gate compiled and ran all ten selected tests: 9 passed,
+1 failed, 0 skipped, 0 leaks, actual exit 1
+(`/tmp/workload-transaction-original-deadline1.log`). The failure was a new
+clock-fixture expectation that offered only one second despite the existing
+response reserve requiring more; the fixture now supplies two seconds and
+asserts the one-second server budget. Production policy was unchanged. The
+corrected owning gate passed **10/10, 0 skipped, 0 failed, 0 leaks, actual exit 0**
+(`/tmp/workload-transaction-original-deadline2.log`). That receipt retains the
+exact ten-filter command and complete tool output. These changes do not qualify
+strict preemption inside legacy `CatalogSource.adminSnapshot` callbacks: checks
+bracket those calls, but their existing interface has no deadline parameter.
+Synchronous native atomic work may finish after its admission deadline; it is
+not interrupted or reported uncommitted afterward. One shared absolute
+abort/ack budget, transport cancellation during every remote attempt, and the
+multi-peer process-loss/shutdown schedules above remain open under item 8.
+
+
+A further first-decision admission gap remains: the coordinator commit has a
+final original-deadline checkpoint before dispatch, but its existing resolution
+callback can route/wait before proposal using its separate transport/recovery
+contract. A distinct first-decision context and definite-not-proposed evidence
+are required before an expired initial decision can safely authorize abort.
+Unknown or known-committed resolution must keep the independent recovery budget.
+This is the next bounded follow-up, not a guarantee established by the ten tests.
+
+Reproduce the validated API stage from `zig/` (loopback access required):
+
+```sh
+zig build antfly-api-test -j1 --cache-dir /tmp/zig-local-cache \
+  --global-cache-dir /tmp/zig-global-cache -- \
+  --test-filter 'distributed txn preserves original deadline across participant waves and cleanup' \
+  --test-filter 'transaction attempt budgets follow the borrowed transport clock' \
+  --test-filter 'transaction commit boundary preserves ingress context and never downgrades deadlines' \
+  --test-filter 'routed atomic batch preserves deadline without changing accepted outcome' \
+  --test-filter 'public transaction ingress establishes one original deadline before dispatch' \
+  --test-filter 'shared stateless batch retries borrow IO and preserve unknown outcomes' \
+  --test-filter 'stable distributed transaction retry resumes a durable commit decision' \
+  --test-filter 'compiled table write boundary transports cancellation and committed failure identity' \
+  --test-filter 'httpx multi batch route uses the batch commit hook and public response contract' \
+  --test-filter 'workload admission stable transaction commit durably hands off recovery before acknowledgement'
+```
+
+The appended callback inventory also required a field-count-scaled compile-time
+branch quota in the checked dispatcher, and an explicit error set in the
+existing owner-forwarding batch wrapper. The first DATA dependency compile found
+these before execution; both were corrected before this successful API gate.
+The target was invoked with `-j1`; its internal test/library children were seen
+compiling concurrently, so the target still needs scheduling review if strict
+single-compiler peak memory is required.

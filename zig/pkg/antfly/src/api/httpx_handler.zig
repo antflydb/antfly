@@ -890,12 +890,13 @@ pub const AntflyApiHandler = struct {
 
     fn recordRequest(self: *AntflyApiHandler, ctx: *httpx.Context, next: *httpx.Next) !httpx.Response {
         self.api_server.recordHandledRequest();
-        try self.api_server.reachRequestLifecycle(.ingress, null);
         establishInternalRoutedBatchDeadline(ctx);
         establishInternalTxnPreDecisionDeadline(ctx);
         establishInternalTxnStatusDeadline(ctx);
         establishInternalBackupDeadline(ctx);
         establishCatalogRouteFenceDeadline(ctx);
+        establishPublicMutationDeadline(ctx);
+        try self.api_server.reachRequestLifecycle(.ingress, null);
         var response = next.call(ctx) catch |err| try mapIngressError(ctx, err);
         errdefer response.deinit();
         try self.api_server.reachRequestLifecycle(.response_ready, null);
@@ -923,6 +924,18 @@ pub const AntflyApiHandler = struct {
         try ctx.request.replaceOwnedBodyAllocation(decoded.body, decoded.allocation);
         _ = ctx.request.headers.remove("content-encoding");
         return next.call(ctx);
+    }
+
+    fn establishPublicMutationDeadline(ctx: *httpx.Context) void {
+        if (ctx.application_deadline_ns != null or ctx.application_deadline_invalid) return;
+        if (ctx.request.method != .POST) return;
+        const path = http_server_mod.stripApiPrefix(ctx.request.uri.path);
+        if (!std.mem.eql(u8, path, "/batch") and !std.mem.eql(u8, path, routes.transactions_commit) and
+            routes.matchTableBatch(path) == null and routes.matchTransactionSessionCommit(path) == null) return;
+        // Begin once at ingress, before body decoding or admission waits.
+        // Existing incoming deadlines (including their clock) are untouched.
+        ctx.application_deadline_io = ctx.io;
+        ctx.application_deadline_ns = @as(u64, @intCast(@max(0, std.Io.Clock.now(.awake, ctx.io).nanoseconds))) +| @as(u64, distributed_txn_contract.default_transaction_admission_timeout_ms) * std.time.ns_per_ms;
     }
 
     fn establishInternalRoutedBatchDeadline(ctx: *httpx.Context) void {
@@ -1238,7 +1251,8 @@ pub const AntflyApiHandler = struct {
         const execution_status: ?u16 = switch (err) {
             error.AdmissionFull, error.AdmissionQueueFull, error.AdmissionBytesExhausted, error.AdmissionRequestTooLarge, error.AdmissionWaitTimeout => 429,
             error.AdmissionClosed => 503,
-            error.DeadlineExceeded => 504,
+            error.DeadlineExceeded, error.PreDecisionDeadlineExceeded => 504,
+            error.PreDecisionNotProposed => 503,
             else => null,
         };
         if (execution_status) |status| return httpx.Response.fromJson(emergencyAllocator(ctx), status, .{
@@ -4264,8 +4278,8 @@ pub const AntflyApiHandler = struct {
 
         const commit_request = operationContext(ctx, authenticated_identity);
         const outcome = ((switch (response_mode) {
-            .transaction => source.commitTransactionWithCancellation(alloc, distributed_tables, commit_req.sync_level, commit_request.cancellation),
-            .multi_batch => source.commitBatchWithCancellation(alloc, distributed_tables, commit_req.sync_level, commit_request.cancellation),
+            .transaction => source.commitTransactionWithContext(alloc, distributed_tables, commit_req.sync_level, .{ .deadline_ns = commit_request.deadline_ns, .deadline_io = commit_request.deadline_io, .cancellation = commit_request.cancellation }),
+            .multi_batch => source.commitBatchWithContext(alloc, distributed_tables, commit_req.sync_level, .{ .deadline_ns = commit_request.deadline_ns, .deadline_io = commit_request.deadline_io, .cancellation = commit_request.cancellation }),
         }) catch |err| switch (err) {
             error.TransactionTooLarge => return textResponse(ctx, 413, "transaction exceeds preparation capacity; reduce the write set or split it into smaller transactions"),
             error.InvalidBatchRequest,
@@ -5018,13 +5032,13 @@ pub const AntflyApiHandler = struct {
         };
 
         const commit_request = operationContext(ctx, null);
-        const outcome = (source.commitTransactionWithIdAndCancellation(
+        const outcome = (source.commitTransactionWithIdWithContext(
             alloc,
             txn_id,
             session.begin_timestamp,
             distributed_tables,
             session.sync_level,
-            commit_request.cancellation,
+            .{ .deadline_ns = commit_request.deadline_ns, .deadline_io = commit_request.deadline_io, .cancellation = commit_request.cancellation },
         ) catch |err| switch (err) {
             error.TransactionTooLarge,
             error.InvalidBatchRequest,
@@ -8822,6 +8836,37 @@ test "internal transaction HTTP responses prove not-proposed only before decisio
     }
 }
 
+test "public transaction ingress establishes one original deadline before dispatch" {
+    var clock = try @import("vopr").vopr_io.VoprIo.init(.{ .monotonic_ns = std.time.ns_per_s });
+    defer clock.deinit();
+    for ([_][]const u8{ "/batch", "/tables/docs/batch", "/transactions/commit", "/transactions/abc/commit", "/db/v1/batch", "/db/v1/tables/docs/batch", "/db/v1/transactions/commit", "/db/v1/transactions/abc/commit" }) |path| {
+        const uri = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1{s}", .{path});
+        defer std.testing.allocator.free(uri);
+        var request = try httpx.Request.init(std.testing.allocator, .POST, uri);
+        defer request.deinit();
+        var ctx = httpx.Context.init(std.testing.allocator, clock.io(), &request);
+        defer ctx.deinit();
+        AntflyApiHandler.establishPublicMutationDeadline(&ctx);
+        const original = ctx.application_deadline_ns orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(clock.monotonic_ns + 20 * std.time.ns_per_s, original);
+        clock.monotonic_ns += std.time.ns_per_s;
+        AntflyApiHandler.establishPublicMutationDeadline(&ctx);
+        try std.testing.expectEqual(original, ctx.application_deadline_ns.?);
+        const operation = AntflyApiHandler.operationContext(&ctx, null);
+        try std.testing.expectEqual(original, operation.deadline_ns.?);
+        try std.testing.expect(operation.deadline_io != null);
+        ctx.application_deadline_ns = original + 100 * std.time.ns_per_s;
+        AntflyApiHandler.establishPublicMutationDeadline(&ctx);
+        try std.testing.expectEqual(original + 100 * std.time.ns_per_s, ctx.application_deadline_ns.?);
+        // An earlier upstream deadline and its clock are never rebased.
+        ctx.application_deadline_ns = 10;
+        ctx.application_deadline_io = null;
+        AntflyApiHandler.establishPublicMutationDeadline(&ctx);
+        try std.testing.expectEqual(@as(?u64, 10), ctx.application_deadline_ns);
+        try std.testing.expect(ctx.application_deadline_io == null);
+    }
+}
+
 test "internal transaction ingress establishes and validates pre-decision deadline" {
     // Routed reads use the transport's clock even when the host epoch is
     // unrelated. Transaction-only ingress retains its native contract.
@@ -8962,8 +9007,10 @@ test "httpx multi batch route uses the batch commit hook and public response con
                     .batch = batch,
                     .commit_transaction = commitTransaction,
                     .commit_transaction_with_cancellation = commitTransactionWithCancellation,
+                    .commit_transaction_with_context = commitTransactionWithContext,
                     .commit_batch = commitBatch,
                     .commit_batch_with_cancellation = commitBatchWithCancellation,
+                    .commit_batch_with_context = commitBatchWithContext,
                 },
             };
         }
@@ -8993,6 +9040,13 @@ test "httpx multi batch route uses the batch commit hook and public response con
                 .visibility_retry_pending = true,
             } };
             return error.TestUnexpectedResult;
+        }
+
+        fn commitTransactionWithContext(ptr: *anyopaque, alloc_: std.mem.Allocator, tables: []const distributed_txn.TableCommitRequest, sync_level: db_mod.types.SyncLevel, context: distributed_txn.PreDecisionContext) anyerror!?distributed_txn.CommitOutcome {
+            try std.testing.expect(context.deadline_ns != null);
+            try std.testing.expect(context.deadline_io != null);
+            try distributed_txn.ensurePreDecisionContextActive(context);
+            return commitTransactionWithCancellation(ptr, alloc_, tables, sync_level, context.cancellation);
         }
 
         fn commitTransactionWithCancellation(
@@ -9030,6 +9084,13 @@ test "httpx multi batch route uses the batch commit hook and public response con
             try std.testing.expectEqual(@as(usize, 1), tables[1].deletes.len);
             try std.testing.expectEqual(db_mod.types.SyncLevel.write, sync_level);
             return .{ .committed = .{ .participant_count = 2 } };
+        }
+
+        fn commitBatchWithContext(ptr: *anyopaque, alloc_: std.mem.Allocator, tables: []const distributed_txn.TableCommitRequest, sync_level: db_mod.types.SyncLevel, context: distributed_txn.PreDecisionContext) anyerror!?distributed_txn.CommitOutcome {
+            try std.testing.expect(context.deadline_ns != null);
+            try std.testing.expect(context.deadline_io != null);
+            try distributed_txn.ensurePreDecisionContextActive(context);
+            return commitBatchWithCancellation(ptr, alloc_, tables, sync_level, context.cancellation);
         }
 
         fn commitBatchWithCancellation(
@@ -9284,6 +9345,7 @@ test "workload admission stable transaction commit durably hands off recovery be
                 .batch = batch,
                 .commit_transaction_with_id = commitTransactionWithId,
                 .commit_transaction_with_id_with_cancellation = commitTransactionWithIdAndCancellation,
+                .commit_transaction_with_id_with_context = commitWithContext,
                 .acknowledge_transaction_commit = acknowledgeTransactionCommit,
             } };
         }
@@ -9316,6 +9378,13 @@ test "workload admission stable transaction commit durably hands off recovery be
                 .coordinator_table_name = "docs",
                 .propagation_pending = self.commit_calls == 1,
             } };
+        }
+
+        fn commitWithContext(ptr: *anyopaque, alloc_: std.mem.Allocator, txn_id: db_mod.types.TxnId, begin_timestamp: u64, tables: []const distributed_txn.TableCommitRequest, sync_level: db_mod.types.SyncLevel, context: distributed_txn.PreDecisionContext) anyerror!?distributed_txn.CommitOutcome {
+            try std.testing.expect(context.deadline_ns != null);
+            try std.testing.expect(context.deadline_io != null);
+            try distributed_txn.ensurePreDecisionContextActive(context);
+            return commitTransactionWithIdAndCancellation(ptr, alloc_, txn_id, begin_timestamp, tables, sync_level, context.cancellation);
         }
 
         fn commitTransactionWithIdAndCancellation(

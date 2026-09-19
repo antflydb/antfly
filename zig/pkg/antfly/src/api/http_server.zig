@@ -11546,10 +11546,13 @@ pub const ApiHttpServer = struct {
         // the transaction protocol, preserve its typed outcome instead of
         // reporting cancellation for a write that may already be durable.
         try ensureTableOperationActive(request);
-        const outcome = (source.commitBatchWithCancellation(alloc, &tables, req.sync_level, request.cancellation) catch |err| switch (err) {
+        const outcome = (source.commitBatchWithContext(alloc, &tables, req.sync_level, .{ .deadline_ns = request.deadline_ns, .deadline_io = request.deadline_io, .cancellation = request.cancellation }) catch |err| switch (err) {
             // The HTTP owner distinguishes configured pressure from backing
             // OOM, and conservatively marks this failure as execution started.
             error.OutOfMemory => return error.OutOfMemory,
+            error.PreDecisionDeadlineExceeded => return error.DeadlineExceeded,
+            error.Canceled => return error.Canceled,
+            error.PreDecisionNotProposed => return error.WriteUnavailable,
             error.InvalidBatchRequest,
             error.InvalidArgument,
             error.InvalidGraphEdges,

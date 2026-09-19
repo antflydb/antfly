@@ -28,13 +28,28 @@ pub const max_status_server_budget_ms: u32 = 5_000;
 /// response encoding, scheduling, and transport back to the coordinator.
 pub const status_server_response_reserve_ms: u32 = 50;
 
-/// Process-local execution context established by the receiving node. This is
-/// never serialized directly across the wire.
+/// Public mutation ingress supplies this total admission budget only when
+/// no earlier application deadline exists. Cleanup/decision recovery use
+/// independent bounded budgets after a participant has been contacted.
+pub const default_transaction_admission_timeout_ms: u32 = 20_000;
+
+/// Process-local execution context; never serialized across the wire.
 pub const PreDecisionContext = struct {
     deadline_ns: ?u64 = null,
     deadline_io: ?@import("../runtime_io_abi.zig").Borrow = null,
     cancellation: db_types.CancellationToken = .none,
 };
+
+pub fn ensurePreDecisionContextActive(context: PreDecisionContext) !void {
+    try context.cancellation.check();
+    if (context.deadline_ns) |deadline| {
+        const now_ns: u64 = if (context.deadline_io) |borrow| blk: {
+            var receiver = try borrow.receive();
+            break :blk @intCast(@max(0, @import("std").Io.Clock.now(.awake, receiver.io()).nanoseconds));
+        } else @import("antfly_platform").time.monotonicNs();
+        if (now_ns >= deadline) return error.PreDecisionDeadlineExceeded;
+    }
+}
 
 pub const TableCommitRequest = struct {
     table_name: []const u8,
