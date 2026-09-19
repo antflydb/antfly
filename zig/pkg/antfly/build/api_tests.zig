@@ -1410,6 +1410,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "single embeddings index encoder scopes isolated enrichment failure to one index",
             "published embeddings snapshot remains queryable after isolated source failure",
             "multi-source embedding enrichments receive a shared semantic producer identity",
+            "transcriber enrichment shorthand expands into a document extraction producer",
             "source readiness isolates terminal enrichment failures",
             "source readiness distinguishes durable repair debt from runtime enrichment failure",
             "managed embeddings skipped terminal sources complete backfill without fabricating replay debt",

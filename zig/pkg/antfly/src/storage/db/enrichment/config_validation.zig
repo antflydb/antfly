@@ -66,6 +66,44 @@ pub fn validateAssetProducerConfig(alloc: Allocator, raw: []const u8) !void {
     defer extraction.deinit(alloc);
 }
 
+/// Expands the public `transcriber` enrichment shorthand into the
+/// document-extraction producer it stands for: every recording the source
+/// field points at takes the audio route and is transcribed with the given
+/// speech-to-text provider. The provider object is passed through as-is so
+/// the same validation that guards `producer_json` applies to it.
+pub fn transcriberShorthandProducerJsonAlloc(alloc: Allocator, transcriber: std.json.Value) ![]u8 {
+    if (transcriber != .object) return error.InvalidAssetProducerConfig;
+    const provider = transcriber.object.get("provider") orelse return error.InvalidAssetProducerConfig;
+    if (provider != .string or provider.string.len == 0) return error.InvalidAssetProducerConfig;
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        .type = "document_extraction",
+        .config = .{
+            .transcription = .{ .enabled = true, .config = transcriber },
+        },
+    }, .{});
+}
+
+test "transcriber shorthand expands to a document extraction producer" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"provider":"antfly","model":"openai/whisper-base","language_code":"en","timestamps":true}
+    , .{});
+    defer parsed.deinit();
+    const producer_json = try transcriberShorthandProducerJsonAlloc(alloc, parsed.value);
+    defer alloc.free(producer_json);
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"document_extraction\",\"config\":{\"transcription\":{\"enabled\":true,\"config\":{\"provider\":\"antfly\",\"model\":\"openai/whisper-base\",\"language_code\":\"en\",\"timestamps\":true}}}}",
+        producer_json,
+    );
+    // The expansion is accepted by the same admission check as a hand-written producer.
+    try validateAssetProducerConfig(alloc, producer_json);
+
+    var missing_provider = try std.json.parseFromSlice(std.json.Value, alloc, "{\"model\":\"whisper-1\"}", .{});
+    defer missing_provider.deinit();
+    try std.testing.expectError(error.InvalidAssetProducerConfig, transcriberShorthandProducerJsonAlloc(alloc, missing_provider.value));
+    try std.testing.expectError(error.InvalidAssetProducerConfig, transcriberShorthandProducerJsonAlloc(alloc, .{ .string = "antfly" }));
+}
+
 test "public enrichment validation rejects invalid execution and producer config" {
     try std.testing.expectError(error.InvalidEnrichmentExecutionConfig, validatePublicConfig(std.testing.allocator, .{
         .name = "chunks",

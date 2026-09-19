@@ -1098,6 +1098,7 @@ from .storage_runtime_status import StorageRuntimeStatus
 from .storage_runtime_status_engine import StorageRuntimeStatusEngine
 from .storage_status import StorageStatus
 from .stream_transcription_audio_format import StreamTranscriptionAudioFormat
+from .stt_provider import STTProvider
 from .success_message import SuccessMessage
 from .sync_level import SyncLevel
 from .table import Table
@@ -1179,6 +1180,7 @@ from .transaction_stage_read_snapshot import TransactionStageReadSnapshot
 from .transaction_stage_write_request import TransactionStageWriteRequest
 from .transaction_stage_write_request_document import TransactionStageWriteRequestDocument
 from .transaction_status_response import TransactionStatusResponse
+from .transcriber_enrichment_config import TranscriberEnrichmentConfig
 from .transform import Transform
 from .transform_op import TransformOp
 from .transform_op_type import TransformOpType
@@ -2307,6 +2309,7 @@ __all__ = (
     "StorageRuntimeStatusEngine",
     "StorageStatus",
     "StreamTranscriptionAudioFormat",
+    "STTProvider",
     "SuccessMessage",
     "SyncLevel",
     "Table",
@@ -2388,6 +2391,7 @@ __all__ = (
     "TransactionStageWriteRequest",
     "TransactionStageWriteRequestDocument",
     "TransactionStatusResponse",
+    "TranscriberEnrichmentConfig",
     "Transform",
     "TransformOp",
     "TransformOpType",

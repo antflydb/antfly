@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING, Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..types import UNSET, Unset
+
 if TYPE_CHECKING:
     from ..models.inference_dictation_word import InferenceDictationWord
 
@@ -23,12 +25,15 @@ class InferenceDictationSegment:
         end_ms (int): Phrase end offset in the clip, in milliseconds.
         words (list[InferenceDictationWord]): Word spans estimated inside the phrase by distributing its duration over
             word lengths.
+        speaker (str | Unset): Speaker label from diarization (`SPEAKER_00`, ...). Absent without diarization or when
+            the phrase had no usable audio.
     """
 
     text: str
     start_ms: int
     end_ms: int
     words: list[InferenceDictationWord]
+    speaker: str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -43,6 +48,8 @@ class InferenceDictationSegment:
             words_item = words_item_data.to_dict()
             words.append(words_item)
 
+        speaker = self.speaker
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -53,6 +60,8 @@ class InferenceDictationSegment:
                 "words": words,
             }
         )
+        if speaker is not UNSET:
+            field_dict["speaker"] = speaker
 
         return field_dict
 
@@ -74,11 +83,14 @@ class InferenceDictationSegment:
 
             words.append(words_item)
 
+        speaker = d.pop("speaker", UNSET)
+
         inference_dictation_segment = cls(
             text=text,
             start_ms=start_ms,
             end_ms=end_ms,
             words=words,
+            speaker=speaker,
         )
 
         inference_dictation_segment.additional_properties = d

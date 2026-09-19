@@ -21878,6 +21878,100 @@ components:
           minimum: 1
           format: uint32
           description: Maximum PDF pages admitted for one request-atomic document operation.
+    STTProvider:
+      type: string
+      enum:
+        - openai
+        - vertex
+        - antfly
+      description: The STT provider to use.
+    TranscriberEnrichmentConfig:
+      description: >-
+        Speech-to-text provider for the `transcriber` enrichment shorthand.
+
+
+        Carries the provider's STT configuration (`provider`, `model`, `api_url`, `api_key`, ...) plus
+        the transcription options below. The fields are declared inline rather than composed from `STTConfig`
+        so that a generated client can leave an option out: a composed schema makes a typed client serialize
+        every field, and a `max_download_bytes` of zero would reject every recording.
+
+
+        **Example:**
+
+        ```yaml
+
+        name: call_transcripts
+
+        kind: asset
+
+        field: recording_url
+
+        transcriber:
+          provider: antfly
+          model: openai/whisper-base
+          language_code: en
+          timestamps: true
+        ```
+      type: object
+      required:
+        - provider
+      properties:
+        provider:
+          $ref: '#/components/schemas/STTProvider'
+        model:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Model name, as the provider names it (e.g. 'openai/whisper-base' for antfly, 'whisper-1'
+            for openai).
+        api_url:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          format: uri
+          description: Antfly inference API URL. Falls back to ANTFLY_INFERENCE_URL.
+        base_url:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          format: uri
+          description: OpenAI API base URL. Falls back to OPENAI_BASE_URL.
+        api_key:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Provider API key. Falls back to the provider's environment variable.
+        project_id:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Google Cloud project ID for the vertex provider. Falls back to GOOGLE_CLOUD_PROJECT.
+        location:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Google Cloud location for the vertex provider.
+        credentials_path:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Path to an ADC credential JSON file for the vertex provider. Falls back to the
+            default ADC chain.
+        language_code:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Spoken language hint (ISO 639-1, e.g. 'en'). Omit for automatic detection where
+            the provider supports it.
+        timestamps:
+          x-go-type-skip-optional-pointer: false
+          type: boolean
+          default: true
+          description: Request timestamped transcript segments so chunks carry recording offsets. Providers
+            without segment timing return plain text.
+        diarization:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          default: false
+          description: Request speaker labels on transcript segments where the provider supports them.
+        max_download_bytes:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          minimum: 1
+          description: Largest recording fetched from a URL, in bytes. Defaults to 128 MiB, which covers
+            a one hour voice memo or podcast.
     EnrichmentConfig:
       type: object
       description: Inline managed enrichment definition. Enrichments materialize generated artifacts before
@@ -21952,6 +22046,15 @@ components:
           $ref: '#/components/schemas/ExecutionPolicy'
           description: Non-semantic execution policy for this enrichment producer. This does not participate
             in generated artifact identity.
+        transcriber:
+          $ref: '#/components/schemas/TranscriberEnrichmentConfig'
+          description: 'Typed shorthand for a transcription asset enrichment. Only valid with kind=asset
+            and without producer_json; Antfly expands it into a document_extraction producer whose audio
+            route transcribes each recording with this speech-to-text provider. The produced units carry
+            the transcript text, provider confidence, and per-phrase time offsets, and chunk enrichments
+            that consume them emit _start_time_ms/_end_time_ms on every chunk. With diarization: true
+            the phrases also carry who spoke them, and a chunk that does not straddle a turn emits _speaker.
+            content_type defaults to application/json.'
     FullTextArtifactIndexSource:
       type: object
       additionalProperties: false
@@ -30841,12 +30944,18 @@ components:
         audio:
           type: string
           format: byte
-          description: Base64-encoded audio data (WAV, MP3, FLAC, etc.). Clips longer than 30 s are transcribed
-            in windows cut at pauses; silent clips return an empty transcript.
+          description: Base64-encoded audio data (WAV, MP3, AAC/M4A, MP4/MOV audio, Ogg/Opus, WebM/Matroska,
+            FLAC, etc.). Clips longer than 30 s are transcribed in windows cut at pauses; silent clips
+            return an empty transcript.
         language:
           type: string
           description: Force specific language for transcription (optional, model-dependent)
           example: en
+        diarization:
+          type: boolean
+          description: Label each segment with a speaker. Runs a local speaker-embedding model (pull `csukuangfj/speaker-embedding-models:3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx`)
+            and clusters phrases by voice; labels are `SPEAKER_00`, `SPEAKER_01`, ... in order of first
+            appearance.
     InferenceTranscribeResponse:
       type: object
       required:
@@ -30892,6 +31001,22 @@ components:
           type: string
           description: Detected or forced language
           example: en
+        duration_ms:
+          type: integer
+          description: Decoded clip duration in milliseconds.
+        segments:
+          type: array
+          items:
+            $ref: '#/components/schemas/InferenceDictationSegment'
+          description: Timestamped phrases in clip order, so a transcript can be indexed and linked back
+            to a moment in the recording. Clips longer than 30 s are transcribed in windows; segment offsets
+            are relative to the whole clip.
+        speakers:
+          type: array
+          items:
+            type: string
+          description: Speaker labels found by diarization, in order of first appearance. Present only
+            when `diarization` was requested.
     InferenceDictationStyle:
       type: string
       description: >
@@ -31001,6 +31126,10 @@ components:
           items:
             $ref: '#/components/schemas/InferenceDictationWord'
           description: Word spans estimated inside the phrase by distributing its duration over word lengths.
+        speaker:
+          type: string
+          description: Speaker label from diarization (`SPEAKER_00`, ...). Absent without diarization
+            or when the phrase had no usable audio.
     InferenceDictationTranscript:
       type: object
       required:

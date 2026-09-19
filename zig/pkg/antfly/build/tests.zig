@@ -1037,6 +1037,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "table contract rejects unknown fields in closed nested index objects",
         "table contract treats nullable nested index fields as omitted",
         "table contract preserves artifact-backed public full text indexes",
+        "table contract accepts the transcriber enrichment shorthand",
         "table contract rejects invalid inline artifact enrichments before admission",
         "table contract normalizes public artifact enrichment request",
         "restore admission rejects an embedding artifact catalog without an executable producer",
@@ -4293,7 +4294,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const docstore_test_step = b.step("docstore-test", "Run storage/docstore unit tests");
     docstore_test_step.dependOn(&run_docstore_unit_tests.step);
 
-    const vector_payload_bench_mod = makeLmdbModule(b, "pkg/antfly/src/vector_payload_bench.zig", target, .ReleaseFast, build_options, lmdb_engine_mod, platform_mod, hash_mod);
+    const vector_payload_bench_mod = makeLmdbModule(b, "pkg/antfly/src/vector_payload_bench.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
     vector_payload_bench_mod.addImport("bloom", bloom_mod);
     vector_payload_bench_mod.addImport("antfly_vectorindex", vectorindex_mod);
     vector_payload_bench_mod.addImport("antfly-json", json_mod);

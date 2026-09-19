@@ -968,6 +968,9 @@ jobs:
             "$patched_runner"
           echo "build_runner=$patched_runner" >> "$GITHUB_OUTPUT"
 
+      - name: Prepare bounded correctness-fixture workspace
+        run: python3 zig/tools/fixture_workspace.py prepare
+
       - name: Run library, Antfly, and inference unit tests
         env:
           ANTFLY_TEST_TIMINGS: "1"
@@ -986,6 +989,15 @@ jobs:
             echo "::endgroup::"
           fi
           exit "$status"
+
+      - name: Release correctness-fixture workspace
+        if: always() && env.ANTFLY_TEST_WORKSPACE != ''
+        run: |
+          df -h "$ANTFLY_TEST_WORKSPACE"
+          python3 zig/tools/fixture_workspace.py cleanup
+          # Later scale and qualification phases keep their disk-backed paths.
+          echo 'ANTFLY_TEST_WORKSPACE=' >> "$GITHUB_ENV"
+          echo 'ANTFLY_TEST_WORKSPACE_MOUNTED=' >> "$GITHUB_ENV"
 
       - name: Release completed phase compiler cache
         run: |
