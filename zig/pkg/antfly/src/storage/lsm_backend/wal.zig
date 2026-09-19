@@ -595,6 +595,24 @@ fn normalizedReplayPendingRetainedCap(retained_cap_bytes: usize) usize {
 }
 
 pub fn reset(storage: storage_io.Storage, allocator: Allocator, root_dir: []const u8) !void {
+    return resetInternal(storage, allocator, root_dir, false);
+}
+
+/// Completion owns a durable manifest and recovery guard. Exclude every old
+/// segment durably before resetting numbering, so an interrupted reset cannot
+/// replay an older prefix over the newer manifested transaction decision.
+pub const ProtectedResetBoundary = enum { excluded_old_segments, emptied_first_segment, reset_current_index, reset_checkpoint };
+pub var test_protected_reset_hook: ?*const fn (ProtectedResetBoundary) bool = null;
+
+fn protectedResetBoundary(boundary: ProtectedResetBoundary) !void {
+    if (builtin.is_test) if (test_protected_reset_hook) |hook| if (hook(boundary)) return error.InjectedProtectedResetCrash;
+}
+
+pub fn protectedReset(storage: storage_io.Storage, allocator: Allocator, root_dir: []const u8) !void {
+    return resetInternal(storage, allocator, root_dir, true);
+}
+
+fn resetInternal(storage: storage_io.Storage, allocator: Allocator, root_dir: []const u8, protected: bool) !void {
     const wal_dir = try walDirPathAlloc(allocator, root_dir);
     defer allocator.free(wal_dir);
     try storage.createDirPath(wal_dir);
@@ -604,14 +622,37 @@ pub fn reset(storage: storage_io.Storage, allocator: Allocator, root_dir: []cons
         error.FileNotFound => CurrentSegment{ .segment = 1, .size = 0, .index_exists = false },
         else => return err,
     }).segment;
+    const first_segment = try segmentPathAlloc(allocator, root_dir, 1);
+    defer allocator.free(first_segment);
+    if (protected) {
+        const after_last = std.math.add(u64, current_segment, 1) catch return error.CorruptLsmWalIndex;
+        // Legacy replay ignores the checkpoint; retire it before establishing
+        // this cut. All its data is already in the durable manifest.
+        const legacy = try legacyPathAlloc(allocator, root_dir);
+        defer allocator.free(legacy);
+        storage.deleteFileAbsolute(legacy) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+        try storage.syncParentAbsolute(legacy);
+        try writeCheckpointIndex(storage, allocator, root_dir, .{
+            .oldest_retained_segment = after_last,
+            .covered_through_segment = current_segment,
+        });
+        try protectedResetBoundary(.excluded_old_segments);
+        try storage.writeFileAbsolute(first_segment, "");
+        try storage.syncFileContentsAbsolute(first_segment);
+        try storage.syncParentAbsolute(first_segment);
+        try protectedResetBoundary(.emptied_first_segment);
+    }
     try writeCurrentSegment(storage, allocator, root_dir, 1, 0);
+    if (protected) try protectedResetBoundary(.reset_current_index);
     try writeCheckpointIndex(storage, allocator, root_dir, .{
         .oldest_retained_segment = 1,
         .covered_through_segment = 0,
     });
-    const first_segment = try segmentPathAlloc(allocator, root_dir, 1);
-    defer allocator.free(first_segment);
-    try storage.writeFileAbsolute(first_segment, "");
+    if (protected) try protectedResetBoundary(.reset_checkpoint);
+    if (!protected) try storage.writeFileAbsolute(first_segment, "");
     try writeReplayIndex(storage, allocator, root_dir, .{
         .current_segment = 1,
         .next_sequence = 1,
@@ -2396,6 +2437,45 @@ test "lsm wal retention snapshot counts replayed segment debt and reset clears i
     try std.testing.expectEqual(@as(u64, 0), after_reset.segments);
     try std.testing.expectEqual(@as(u64, 0), after_reset.bytes);
     try std.testing.expectEqual(@as(u64, 0), after_reset.current_segment_bytes);
+}
+
+test "lsm protected WAL reset never replays an older prefix after any durable cut" {
+    const Hook = struct {
+        var target: ProtectedResetBoundary = undefined;
+        fn stop(boundary: ProtectedResetBoundary) bool {
+            return boundary == target;
+        }
+    };
+    const alloc = std.testing.allocator;
+    for (std.enums.values(ProtectedResetBoundary)) |boundary| {
+        var storage = storage_io.MemoryStorage.init(alloc);
+        defer storage.deinit();
+        const root = "/protected-reset-cuts";
+        try storage.storage().createDirPath(root);
+        var state: State = .{};
+        defer state.deinit(alloc);
+        try state.upsert(alloc, .{}, "decision", "pending", false);
+        _ = try appendStateWithOptions(storage.storage(), alloc, root, &state, true, .{ .segment_bytes = 1 });
+        try state.upsert(alloc, .{}, "decision", "committed", false);
+        _ = try appendStateWithOptions(storage.storage(), alloc, root, &state, true, .{ .segment_bytes = 1 });
+        Hook.target = boundary;
+        test_protected_reset_hook = Hook.stop;
+        defer test_protected_reset_hook = null;
+        try std.testing.expectError(error.InjectedProtectedResetCrash, protectedReset(storage.storage(), alloc, root));
+        test_protected_reset_hook = null;
+        var replayed: State = .{};
+        defer replayed.deinit(alloc);
+        const stats = try replayIntoMutable(storage.storage(), alloc, root, &replayed);
+        try std.testing.expectEqual(@as(u64, 0), stats.records);
+        try std.testing.expectEqual(@as(usize, 0), replayed.entryCount());
+        // Repeating cleanup after restart is safe and enables subsequent WAL.
+        try protectedReset(storage.storage(), alloc, root);
+        try state.upsert(alloc, .{}, "decision", "newer", false);
+        _ = try appendStateWithOptions(storage.storage(), alloc, root, &state, true, .{ .segment_bytes = 1 });
+        const after = try replayIntoMutable(storage.storage(), alloc, root, &replayed);
+        try std.testing.expectEqual(@as(u64, 1), after.records);
+        try std.testing.expectEqualStrings("newer", try replayed.get(.{}, "decision"));
+    }
 }
 
 test "lsm wal checkpoint retires covered segments and replay starts at retained floor" {
