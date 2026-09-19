@@ -1,0 +1,1548 @@
+{
+ "schemaVersion": 1,
+ "id": "gliner25",
+ "family": "gliner",
+ "displayName": "GLiNER2.5 Base",
+ "tagline": "GLiNER2's successor. Instead of scoring every possible span, it proposes span boundaries and lets each field in the schema score one shared pool of candidates — classifying, relating and building records in the same pass. It runs and trains in the runtime today, but is not yet cleared for serving.",
+ "stats": {
+  "layers": 12,
+  "hidden": 768,
+  "vocab": 128011,
+  "relBuckets": 256,
+  "maxBodyWords": 4096,
+  "boundaryDim": 128,
+  "poolSize": 192,
+  "poolProposals": "top-32 starts × ends",
+  "promptMarkers": 10,
+  "variants": "small 74M · base 194M · multi 287M",
+  "quant": "FP32 heads; encoder FP16/Q8_0/Q4_K",
+  "tokenizer": "SentencePiece Unigram + strict normalizer",
+  "scope": "Architecture is recognized and runnable, but serving is withheld: no published runtime qualification profiles. Diagrams are schematic, not qualification evidence."
+ },
+ "stages": [
+  {
+   "kind": "embedding",
+   "id": "embed",
+   "title": "Prompt + text embedding",
+   "spine": "graph",
+   "summary": "The serialized schema prompt — ten marker types, group headers, descriptions, few-shot examples and synthetic enum-prefix words — is embedded in the same pass as the text. No absolute position embeddings.",
+   "source": {
+    "path": "zig/pkg/inference/src/pipelines/gliner_boundary_processor.zig",
+    "anchor": "fn addGroup(",
+    "line": 439
+   }
+  },
+  {
+   "kind": "encoder",
+   "id": "encoder",
+   "title": "DeBERTa encoder layer",
+   "spine": "graph",
+   "summary": "The same DeBERTa-v3 disentangled relative attention as GLiNER2, with hard-pinned geometry. On Metal it runs as a single simdgroup dispatch of the boundary mega-kernel (Kind.deberta_attention); a native FP32 path is the reference.",
+   "source": {
+    "path": "zig/pkg/inference/src/architectures/gliner/boundary_engine_device.zig",
+    "anchor": "fn encoderLayer(",
+    "line": 170
+   },
+   "repeat": {
+    "count": 12,
+    "note": "12 layers with the same structure and distinct learned weights; diagram shows one layer"
+   },
+   "attention": "disentangled_relative"
+  },
+  {
+   "kind": "head",
+   "id": "boundary",
+   "title": "Boundary encoder + proposer",
+   "spine": "graph",
+   "summary": "Word states project into a 128-d boundary space over W+1 positions (learned BOS/EOS states), refined by windowed self-attention and a gated FFN; the query-union of start/end marginals proposes the document's top-32 boundary starts and ends.",
+   "source": {
+    "path": "zig/pkg/inference/src/architectures/gliner/boundary_head.zig",
+    "anchor": "fn encodeBoundaries(",
+    "line": 327
+   },
+   "headType": "span"
+  },
+  {
+   "kind": "pooling",
+   "id": "pool",
+   "title": "Shared candidate pool",
+   "spine": "graph",
+   "summary": "Proposals from every query merge into one document-level pool of 192 candidate spans (at least 8 per query). Each query scores the same pool through its own FiLM conditioning — adding labels reuses the pool instead of re-enumerating spans.",
+   "source": {
+    "path": "zig/pkg/inference/src/architectures/gliner/boundary_head.zig",
+    "anchor": "fn scoreSharedPool(",
+    "line": 490
+   },
+   "method": "shared candidate pool (192 slots), FiLM-conditioned per query"
+  },
+  {
+   "kind": "head",
+   "id": "scorer",
+   "title": "Pair scorer + abstention + count",
+   "spine": "graph",
+   "summary": "Shared-pool logits from the FiLM scorer drive entity and field decoding. A separate explicit-span scorer — rotary endpoints, an 8-head compatibility mix, endpoint differences, inside evidence — scores attributes and constrained/enum fields. A null projection lets each query abstain; a count head predicts expected counts.",
+   "source": {
+    "path": "zig/pkg/inference/src/architectures/gliner/boundary_head.zig",
+    "anchor": "pub fn forwardNative(",
+    "line": 246
+   },
+   "headType": "span"
+  },
+  {
+   "kind": "head",
+   "id": "tasks",
+   "title": "Classification / relations / records",
+   "spine": "graph",
+   "summary": "Three more heads read the same encoded sequence: an MLP on each [L] choice-marker state for classification, a biaffine-content relation scorer, and a record decoder that seeds instances from anchor candidates (or 32 learned queries in anchorless mode).",
+   "source": {
+    "path": "zig/pkg/inference/src/architectures/gliner/boundary_tasks.zig",
+    "anchor": "pub fn classifyNative(",
+    "line": 97
+   },
+   "headType": "classifier"
+  }
+ ],
+ "graphs": {
+  "decode": {
+   "nodes": [
+    {
+     "id": "embed.tokens",
+     "opKind": "embedding_lookup",
+     "label": "embed + LayerNorm + mask",
+     "stageId": "embed",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "B·T"
+        ],
+        "dtype": "i64"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "B·T",
+         768
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "note": "T covers the schema header (markers, descriptions, examples, enum-prefix words) plus up to 4,096 body words in one encoder pass, admitted against a 16,384-token sequence budget. No absolute position embeddings — position lives entirely inside attention."
+     },
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "both",
+     "fusedOps": [
+      "embedding_lookup",
+      "layer_norm",
+      "embedding_mask"
+     ]
+    },
+    {
+     "id": "enc.qkv",
+     "opKind": "linear",
+     "label": "Q/K/V projections ×3",
+     "stageId": "encoder",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "B·T",
+         768
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "B·T",
+         768
+        ],
+        "dtype": "f32"
+       },
+       {
+        "dims": [
+         "B·T",
+         768
+        ],
+        "dtype": "f32"
+       },
+       {
+        "dims": [
+         "B·T",
+         768
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "note": "Three separate MPS GEMMs (query/key/value projections), drawn as one node; bias epilogues dispatch the mega-kernel (Kind.bias). share_att_key: the same query/key projections serve the relative Q_r/K_r.",
+      "weightFormat": "per-tensor policy: encoder matrices may be reduced (FP16/Q8_0/Q4_K by variant); everything else is pinned FP32"
+     },
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [
+      "TERMITE_METAL_DISABLE_DOT_GENERAL_2D_MPS"
+     ],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "enc.rel",
+     "opKind": "gather",
+     "label": "resident relative Q_r/K_r",
+     "stageId": "encoder",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         512,
+         768
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         512,
+         768
+        ],
+        "dtype": "f32"
+       },
+       {
+        "dims": [
+         512,
+         768
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "note": "Per-layer relative Q/K projections of the 512-row shared position table. On the optimized resident path they are computed once per session and kept on the device; the reference path recomputes them per request."
+     },
+     "source": {
+      "path": "zig/pkg/inference/src/architectures/gliner/boundary_engine_device.zig",
+      "anchor": "pub fn prepareResidentConstants(",
+      "line": 214
+     },
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "enc.attn",
+     "opKind": "disentangled_relative_attention",
+     "label": "disentangled attention",
+     "stageId": "encoder",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "3·B·T",
+         768
+        ],
+        "dtype": "f32"
+       },
+       {
+        "dims": [
+         "2·512",
+         768
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "B·T",
+         768
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "scale": "1/√(3·head_dim)",
+      "note": "One dispatch of the boundary mega-kernel (Kind.deberta_attention) — a simdgroup streaming-softmax kernel, not GLiNER2's fused attention kernel and not routed through its MPS/threadgroup/scalar variants. Scores combine c2c, c2p and p2c with no causal mask."
+     },
+     "source": {
+      "path": "zig/pkg/inference/src/architectures/gliner/boundary_engine_device.zig",
+      "anchor": "const attended = try math.kernel(.deberta_attention,",
+      "line": 186
+     },
+     "kernelRouteIds": [],
+     "kernels": [
+      "termite_gliner_boundary_f32"
+     ],
+     "envFlagNames": [],
+     "backend": "both",
+     "fusedOps": [
+      "c2c",
+      "c2p",
+      "p2c",
+      "softmax",
+      "context"
+     ]
+    },
+    {
+     "id": "enc.oproj",
+     "opKind": "linear",
+     "label": "output project",
+     "stageId": "encoder",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "B·T",
+         768
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "B·T",
+         768
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "note": "MPS GEMM via the device request stream; no named kernel.",
+      "weightFormat": "per-tensor policy: encoder matrices may be FP16/Q8_0/Q4_K; everything else is pinned FP32"
+     },
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "enc.norm1",
+     "opKind": "layer_norm",
+     "label": "add + LayerNorm",
+     "stageId": "encoder",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "B·T",
+         768
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "B·T",
+         768
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {},
+     "kernelRouteIds": [],
+     "kernels": [
+      "termite_gliner_boundary_f32"
+     ],
+     "envFlagNames": [],
+     "backend": "both",
+     "fusedOps": []
+    },
+    {
+     "id": "enc.ffn_up",
+     "opKind": "linear",
+     "label": "FFN up + exact GELU",
+     "stageId": "encoder",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "B·T",
+         768
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "B·T",
+         3072
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "note": "GEMM on MPS, then an exact-GELU mega-kernel dispatch (Kind.gelu); drawn fused for the diagram."
+     },
+     "kernelRouteIds": [],
+     "kernels": [
+      "termite_gliner_boundary_f32"
+     ],
+     "envFlagNames": [],
+     "backend": "both",
+     "fusedOps": [
+      "linear",
+      "gelu"
+     ]
+    },
+    {
+     "id": "enc.ffn_down",
+     "opKind": "linear",
+     "label": "FFN down",
+     "stageId": "encoder",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "B·T",
+         3072
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "B·T",
+         768
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "note": "MPS GEMM via the device request stream; no named kernel."
+     },
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "enc.norm2",
+     "opKind": "layer_norm",
+     "label": "add + LayerNorm",
+     "stageId": "encoder",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "B·T",
+         768
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "B·T",
+         768
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {},
+     "kernelRouteIds": [],
+     "kernels": [
+      "termite_gliner_boundary_f32"
+     ],
+     "envFlagNames": [],
+     "backend": "both",
+     "fusedOps": []
+    },
+    {
+     "id": "bnd.route",
+     "opKind": "gather",
+     "label": "route word / query states",
+     "stageId": "boundary",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "B·T",
+         768
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "W",
+         768
+        ],
+        "dtype": "f32"
+       },
+       {
+        "dims": [
+         "Q",
+         768
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "note": "token_pooling \"first\": the first sub-token per word becomes the word state (Kind.gather_i32). Entity, structure-field and relation markers ([E]/[C]/[R]) become the Q query states; classification [L] choice states route separately to the classifier."
+     },
+     "source": {
+      "path": "zig/pkg/inference/src/architectures/gliner/boundary_engine_device.zig",
+      "anchor": "fn route(",
+      "line": 158
+     },
+     "kernelRouteIds": [],
+     "kernels": [
+      "termite_gliner_boundary_f32"
+     ],
+     "envFlagNames": [],
+     "backend": "both",
+     "fusedOps": []
+    },
+    {
+     "id": "bnd.split",
+     "opKind": "linear",
+     "label": "boundary states: left ∥ right → 128",
+     "stageId": "boundary",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "W",
+         768
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "W+1",
+         128
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "note": "Each boundary between words sees the word to its left and right through separate 768→128 projections (Kind.boundary_side); learned BOS/EOS states cover the document edges."
+     },
+     "source": {
+      "path": "zig/pkg/inference/src/architectures/gliner/boundary_head.zig",
+      "anchor": "fn encodeBoundaries(",
+      "line": 327
+     },
+     "kernelRouteIds": [],
+     "kernels": [
+      "termite_gliner_boundary_f32"
+     ],
+     "envFlagNames": [],
+     "backend": "both",
+     "fusedOps": []
+    },
+    {
+     "id": "bnd.wattn",
+     "opKind": "windowed_self_attention",
+     "label": "windowed boundary attention ×2",
+     "stageId": "boundary",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "W+1",
+         128
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "W+1",
+         128
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "window": 128,
+      "heads": 4,
+      "note": "Two banded self-attention blocks over boundary positions (Kind.banded_attention); drawn once."
+     },
+     "kernelRouteIds": [],
+     "kernels": [
+      "termite_gliner_boundary_f32"
+     ],
+     "envFlagNames": [],
+     "backend": "both",
+     "fusedOps": []
+    },
+    {
+     "id": "bnd.refine",
+     "opKind": "silu",
+     "label": "gated FFN refinement (SwiGLU)",
+     "stageId": "boundary",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "W+1",
+         128
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "W+1",
+         128
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "note": "One gated-FFN refinement block (Kind.swiglu): 128 → 2×256 gate/value → 128."
+     },
+     "kernelRouteIds": [],
+     "kernels": [
+      "termite_gliner_boundary_f32"
+     ],
+     "envFlagNames": [],
+     "backend": "both",
+     "fusedOps": [
+      "linear",
+      "swiglu",
+      "linear"
+     ]
+    },
+    {
+     "id": "bnd.marginals",
+     "opKind": "linear",
+     "label": "start / end / inside marginals",
+     "stageId": "boundary",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "W+1",
+         128
+        ],
+        "dtype": "f32"
+       },
+       {
+        "dims": [
+         "Q",
+         768
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "Q",
+         "W+1"
+        ],
+        "dtype": "f32"
+       },
+       {
+        "dims": [
+         "Q",
+         "W+1"
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "note": "Per-query boundary marginals (Kind.marginals): start/end/inside query and boundary projections, all at 128-d, score every boundary position for every query, scaled 1/√128."
+     },
+     "source": {
+      "path": "zig/pkg/inference/src/architectures/gliner/boundary_head.zig",
+      "anchor": "fn computeMarginals(",
+      "line": 406
+     },
+     "kernelRouteIds": [],
+     "kernels": [
+      "termite_gliner_boundary_f32"
+     ],
+     "envFlagNames": [],
+     "backend": "both",
+     "fusedOps": []
+    },
+    {
+     "id": "bnd.topk",
+     "opKind": "gather",
+     "label": "union top-32 starts × ends",
+     "stageId": "boundary",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "Q",
+         "W+1"
+        ],
+        "dtype": "f32"
+       },
+       {
+        "dims": [
+         "Q",
+         "W+1"
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "≤1024"
+        ],
+        "dtype": "i32"
+       }
+      ]
+     },
+     "attrs": {
+      "note": "Schematic index-select. The host takes the query-union max of start/end marginals, keeps the top-32 boundary starts and ends (pool_boundary_top_k), and scores all 32×32 pairs by compatibility plus union marginals. The config's start/end_top_k (24) and bidirectional-pairing knobs are parsed but not consumed by this runtime's inference path."
+     },
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "native",
+     "fusedOps": []
+    },
+    {
+     "id": "pool.assemble",
+     "opKind": "concat",
+     "label": "shared pool (192 slots, ≥8/query)",
+     "stageId": "pool",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "≤1024"
+        ],
+        "dtype": "i32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         192,
+         128
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "note": "Scored boundary pairs fill one document-level candidate pool (candidate_pool \"shared\", pool_size 192); every query is guaranteed at least its top 8 (min_pool_per_query), then pairs dedupe — released-bundle values, not the code defaults."
+     },
+     "kernelRouteIds": [],
+     "kernels": [
+      "termite_gliner_boundary_f32"
+     ],
+     "envFlagNames": [],
+     "backend": "both",
+     "fusedOps": []
+    },
+    {
+     "id": "pool.film",
+     "opKind": "linear",
+     "label": "FiLM condition + pool scorer",
+     "stageId": "pool",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         192,
+         128
+        ],
+        "dtype": "f32"
+       },
+       {
+        "dims": [
+         "Q",
+         768
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "Q",
+         192
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "note": "Length and prior features join the candidate features, each query modulates them with FiLM (1+γ)·x+β (Kind.film), and the slot logit sums the scorer MLP with a feature·query dot, the start/end marginals and inside evidence. These are the pair logits entity and field decoding consume."
+     },
+     "source": {
+      "path": "zig/pkg/inference/src/architectures/gliner/boundary_head.zig",
+      "anchor": "fn scoreSharedPool(",
+      "line": 490
+     },
+     "kernelRouteIds": [],
+     "kernels": [
+      "termite_gliner_boundary_f32"
+     ],
+     "envFlagNames": [],
+     "backend": "both",
+     "fusedOps": [
+      "linear",
+      "mul",
+      "add",
+      "gelu"
+     ]
+    },
+    {
+     "id": "sc.endpoints",
+     "opKind": "gather",
+     "label": "gather start/end boundary states",
+     "stageId": "scorer",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "W+1",
+         128
+        ],
+        "dtype": "f32"
+       },
+       {
+        "dims": [
+         "S"
+        ],
+        "dtype": "i32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "S",
+         128
+        ],
+        "dtype": "f32"
+       },
+       {
+        "dims": [
+         "S",
+         128
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "note": "Explicit-span scorer, used for attributes and constrained/enum fields — the shared pool's own logits already cover entities. S = explicit (query, span) pairs; endpoint projections lift each span's start and end boundary states (Kind.endpoints)."
+     },
+     "kernelRouteIds": [],
+     "kernels": [
+      "termite_gliner_boundary_f32"
+     ],
+     "envFlagNames": [],
+     "backend": "both",
+     "fusedOps": []
+    },
+    {
+     "id": "sc.rope",
+     "opKind": "rope",
+     "label": "rotary endpoint encoding",
+     "stageId": "scorer",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "S",
+         256
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "S",
+         256
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "theta": 10000,
+      "note": "enable_rotary_endpoints: start/end representations are rotated by their positions before pairing (Kind.rotary)."
+     },
+     "source": {
+      "path": "zig/pkg/inference/src/architectures/gliner/boundary_head.zig",
+      "anchor": "fn rotateEndpoints(",
+      "line": 718
+     },
+     "kernelRouteIds": [],
+     "kernels": [
+      "termite_gliner_boundary_f32"
+     ],
+     "envFlagNames": [],
+     "backend": "both",
+     "fusedOps": []
+    },
+    {
+     "id": "sc.compat",
+     "opKind": "dot_general",
+     "label": "8-head compatibility mix",
+     "stageId": "scorer",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "S",
+         256
+        ],
+        "dtype": "f32"
+       },
+       {
+        "dims": [
+         "Q",
+         768
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "S",
+         8
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "note": "multihead_pair_compat_heads 8: per-head query–endpoint dots mixed by a learned 8→1 weight (Kind.explicit_compat)."
+     },
+     "kernelRouteIds": [],
+     "kernels": [
+      "termite_gliner_boundary_f32"
+     ],
+     "envFlagNames": [],
+     "backend": "both",
+     "fusedOps": []
+    },
+    {
+     "id": "sc.inside",
+     "opKind": "reduce_mean",
+     "label": "inside evidence + length features",
+     "stageId": "scorer",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "W",
+         768
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "S",
+         4
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "note": "Prefix sums make span means O(1) per candidate (Kind.inside_prefix / explicit_range_mean): a query-conditioned inside weight, span-content pooling and 3 length features."
+     },
+     "kernelRouteIds": [],
+     "kernels": [
+      "termite_gliner_boundary_f32"
+     ],
+     "envFlagNames": [],
+     "backend": "both",
+     "fusedOps": []
+    },
+    {
+     "id": "sc.pair",
+     "opKind": "linear",
+     "label": "pair logit assembly",
+     "stageId": "scorer",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "S",
+         8
+        ],
+        "dtype": "f32"
+       },
+       {
+        "dims": [
+         "S",
+         4
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "S"
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "note": "Compat mix, endpoint-difference features, inside evidence, length and content bias sum into one explicit-span logit (Kind.explicit_finish) — the attributes/constrained-fields path, not the shared-pool logits."
+     },
+     "kernelRouteIds": [],
+     "kernels": [
+      "termite_gliner_boundary_f32"
+     ],
+     "envFlagNames": [],
+     "backend": "both",
+     "fusedOps": []
+    },
+    {
+     "id": "sc.null",
+     "opKind": "linear",
+     "label": "null projection (abstention)",
+     "stageId": "scorer",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "Q",
+         768
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "Q",
+         1
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "note": "Per-query no-answer logit. If sigmoid(null) is strictly above abstention_threshold 0.5, the query emits nothing."
+     },
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "both",
+     "fusedOps": []
+    },
+    {
+     "id": "sc.count",
+     "opKind": "linear",
+     "label": "count head (log-rate)",
+     "stageId": "scorer",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "Q",
+         768
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "Q",
+         1
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "note": "Predicts the expected number of spans per query; with adaptive_threshold enabled, decode rescues top-ranked candidates up to round(exp(rate)) — adding only, never removing threshold hits. Released bundles ship adaptive_threshold=false, so the rescue is dormant."
+     },
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "both",
+     "fusedOps": []
+    },
+    {
+     "id": "sc.sigmoid",
+     "opKind": "sigmoid",
+     "label": "temperature sigmoid → probabilities",
+     "stageId": "scorer",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "S"
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "S"
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "note": "sigmoid(logit / pair_temperature). Thresholding, count rescue, overlap resolution (flat = exact weighted interval scheduling) and offset conversion run on the host."
+     },
+     "source": {
+      "path": "zig/pkg/inference/src/pipelines/gliner_boundary_decode.zig",
+      "anchor": "pub fn decodeQuery(",
+      "line": 180
+     },
+     "kernelRouteIds": [],
+     "kernels": [
+      "termite_gliner_boundary_f32"
+     ],
+     "envFlagNames": [],
+     "backend": "both",
+     "fusedOps": []
+    },
+    {
+     "id": "task.cls",
+     "opKind": "linear",
+     "label": "classifier MLP on [L] choice states",
+     "stageId": "tasks",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "C",
+         768
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "C",
+         1
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "note": "768 → 1536 → ReLU → 1 on each [L] classification choice-marker state; single/multi/ordinal modes and the logical-constraint solver run downstream on the host."
+     },
+     "source": {
+      "path": "zig/pkg/inference/src/architectures/gliner/boundary_tasks.zig",
+      "anchor": "pub fn classifyNative(",
+      "line": 97
+     },
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "both",
+     "fusedOps": [
+      "linear",
+      "relu",
+      "linear"
+     ]
+    },
+    {
+     "id": "task.rel",
+     "opKind": "dot_general",
+     "label": "relation scorer (biaffine content)",
+     "stageId": "tasks",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "pairs",
+         4610
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "pairs"
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "note": "Directional head/tail role states + a biaffine content gate score typed (head, tail) pairs (Kind.relation_gated_score); relation_pair_cap 64 per type."
+     },
+     "source": {
+      "path": "zig/pkg/inference/src/architectures/gliner/boundary_tasks.zig",
+      "anchor": "pub fn scoreRelationsNative(",
+      "line": 157
+     },
+     "kernelRouteIds": [],
+     "kernels": [
+      "termite_gliner_boundary_f32"
+     ],
+     "envFlagNames": [],
+     "backend": "both",
+     "fusedOps": []
+    },
+    {
+     "id": "task.rec",
+     "opKind": "cross_attention",
+     "label": "record decoder",
+     "stageId": "tasks",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "inst",
+         768
+        ],
+        "dtype": "f32"
+       },
+       {
+        "dims": [
+         "cands",
+         768
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "inst",
+         "fields"
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "note": "Instances seed from the anchor field's candidates (natural mode), all candidates (latent), or 32 learned instance queries (anchorless); cross-attention over candidate states — encoded back to hidden 768 — assigns fields per instance (Kind.record_attention / record_assign)."
+     },
+     "source": {
+      "path": "zig/pkg/inference/src/architectures/gliner/boundary_tasks.zig",
+      "anchor": "pub fn scoreRecordNative(",
+      "line": 291
+     },
+     "kernelRouteIds": [],
+     "kernels": [
+      "termite_gliner_boundary_f32"
+     ],
+     "envFlagNames": [],
+     "backend": "both",
+     "fusedOps": []
+    }
+   ],
+   "edges": [
+    {
+     "id": "e.embed.qkv",
+     "from": "embed.tokens",
+     "to": "enc.qkv",
+     "kind": "data"
+    },
+    {
+     "id": "e.embed.norm1",
+     "from": "embed.tokens",
+     "to": "enc.norm1",
+     "kind": "residual"
+    },
+    {
+     "id": "e.qkv.attn",
+     "from": "enc.qkv",
+     "to": "enc.attn",
+     "kind": "data"
+    },
+    {
+     "id": "e.rel.attn",
+     "from": "enc.rel",
+     "to": "enc.attn",
+     "kind": "routing"
+    },
+    {
+     "id": "e.attn.oproj",
+     "from": "enc.attn",
+     "to": "enc.oproj",
+     "kind": "data"
+    },
+    {
+     "id": "e.oproj.norm1",
+     "from": "enc.oproj",
+     "to": "enc.norm1",
+     "kind": "data"
+    },
+    {
+     "id": "e.norm1.up",
+     "from": "enc.norm1",
+     "to": "enc.ffn_up",
+     "kind": "data"
+    },
+    {
+     "id": "e.norm1.norm2",
+     "from": "enc.norm1",
+     "to": "enc.norm2",
+     "kind": "residual"
+    },
+    {
+     "id": "e.up.down",
+     "from": "enc.ffn_up",
+     "to": "enc.ffn_down",
+     "kind": "data"
+    },
+    {
+     "id": "e.down.norm2",
+     "from": "enc.ffn_down",
+     "to": "enc.norm2",
+     "kind": "data"
+    },
+    {
+     "id": "e.norm2.route",
+     "from": "enc.norm2",
+     "to": "bnd.route",
+     "kind": "data"
+    },
+    {
+     "id": "e.route.split",
+     "from": "bnd.route",
+     "to": "bnd.split",
+     "kind": "data"
+    },
+    {
+     "id": "e.split.wattn",
+     "from": "bnd.split",
+     "to": "bnd.wattn",
+     "kind": "data"
+    },
+    {
+     "id": "e.wattn.refine",
+     "from": "bnd.wattn",
+     "to": "bnd.refine",
+     "kind": "data"
+    },
+    {
+     "id": "e.refine.marginals",
+     "from": "bnd.refine",
+     "to": "bnd.marginals",
+     "kind": "data"
+    },
+    {
+     "id": "e.route.marginals",
+     "from": "bnd.route",
+     "to": "bnd.marginals",
+     "kind": "routing"
+    },
+    {
+     "id": "e.marginals.topk",
+     "from": "bnd.marginals",
+     "to": "bnd.topk",
+     "kind": "data"
+    },
+    {
+     "id": "e.topk.pool",
+     "from": "bnd.topk",
+     "to": "pool.assemble",
+     "kind": "data"
+    },
+    {
+     "id": "e.pool.film",
+     "from": "pool.assemble",
+     "to": "pool.film",
+     "kind": "data"
+    },
+    {
+     "id": "e.route.film",
+     "from": "bnd.route",
+     "to": "pool.film",
+     "kind": "routing"
+    },
+    {
+     "id": "e.film.sigmoid",
+     "from": "pool.film",
+     "to": "sc.sigmoid",
+     "kind": "data"
+    },
+    {
+     "id": "e.refine.endpoints",
+     "from": "bnd.refine",
+     "to": "sc.endpoints",
+     "kind": "routing"
+    },
+    {
+     "id": "e.endpoints.rope",
+     "from": "sc.endpoints",
+     "to": "sc.rope",
+     "kind": "data"
+    },
+    {
+     "id": "e.rope.compat",
+     "from": "sc.rope",
+     "to": "sc.compat",
+     "kind": "data"
+    },
+    {
+     "id": "e.compat.pair",
+     "from": "sc.compat",
+     "to": "sc.pair",
+     "kind": "data"
+    },
+    {
+     "id": "e.marginals.inside",
+     "from": "bnd.marginals",
+     "to": "sc.inside",
+     "kind": "routing"
+    },
+    {
+     "id": "e.inside.pair",
+     "from": "sc.inside",
+     "to": "sc.pair",
+     "kind": "data"
+    },
+    {
+     "id": "e.pair.sigmoid",
+     "from": "sc.pair",
+     "to": "sc.sigmoid",
+     "kind": "data"
+    },
+    {
+     "id": "e.route.null",
+     "from": "bnd.route",
+     "to": "sc.null",
+     "kind": "routing"
+    },
+    {
+     "id": "e.route.count",
+     "from": "bnd.route",
+     "to": "sc.count",
+     "kind": "routing"
+    },
+    {
+     "id": "e.null.sigmoid",
+     "from": "sc.null",
+     "to": "sc.sigmoid",
+     "kind": "routing"
+    },
+    {
+     "id": "e.count.sigmoid",
+     "from": "sc.count",
+     "to": "sc.sigmoid",
+     "kind": "routing"
+    },
+    {
+     "id": "e.norm2.cls",
+     "from": "enc.norm2",
+     "to": "task.cls",
+     "kind": "routing"
+    },
+    {
+     "id": "e.norm2.rel",
+     "from": "enc.norm2",
+     "to": "task.rel",
+     "kind": "routing"
+    },
+    {
+     "id": "e.film.rec",
+     "from": "pool.film",
+     "to": "task.rec",
+     "kind": "routing"
+    }
+   ]
+  }
+ },
+ "sources": {
+  "gitCommit": "497d957522ae809ebd322960cac8c7943851d841",
+  "generatedAt": "2026-09-18T23:10:04.315Z"
+ }
+}

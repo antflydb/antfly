@@ -1,0 +1,20 @@
+{
+ "schemaVersion": 1,
+ "gitCommit": "497d957522ae809ebd322960cac8c7943851d841",
+ "generatedAt": "2026-09-18T23:10:04.315Z",
+ "permalinkBase": "https://github.com/antflydb/antfly/blob",
+ "models": [
+  "gemma4-e2b",
+  "gemma4-e4b",
+  "gliner2",
+  "gliner25",
+  "qwen3-embedding",
+  "qwen3-vl"
+ ],
+ "counts": {
+  "opKinds": 72,
+  "kernels": 445,
+  "routes": 25,
+  "snippets": 209
+ }
+}

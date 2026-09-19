@@ -1,0 +1,2157 @@
+{
+ "schemaVersion": 1,
+ "id": "qwen3-vl",
+ "family": "qwen3",
+ "displayName": "Qwen3-VL 2B Instruct",
+ "tagline": "Reads images and text together: a 24-block vision tower turns pixels into tokens that feed the same Qwen3 decoder, with every position tracked on three axes at once (m-RoPE).",
+ "stats": {
+  "layers": 28,
+  "hidden": 2048,
+  "queryHeads": 16,
+  "kvHeads": 8,
+  "headDim": 128,
+  "vocab": 151936,
+  "context": 262144,
+  "visionBlocks": 24,
+  "visionHidden": 1024,
+  "patch": "16×16 ×2 frames",
+  "merge": "2×2",
+  "deepstackTaps": "vision blocks 5 / 11 / 17",
+  "quant": "Q4_K_M + Q8_0 mmproj",
+  "ropeTheta": "5e6 (m-RoPE)",
+  "scope": "2B Instruct example; context is architectural, not a serving guarantee"
+ },
+ "stages": [
+  {
+   "kind": "vision",
+   "id": "vision",
+   "title": "Vision tower",
+   "spine": "vision",
+   "summary": "Temporal-split Conv3D patch embed, learned-position interpolation, two-axis vision RoPE, 24 bidirectional attention blocks — with DeepStack feature taps exiting at blocks 5, 11, and 17. Antfly accepts still images and rejects video; frame duplication fills the temporal patch.",
+   "source": {
+    "path": "zig/pkg/inference/src/architectures/qwen3vl_projector.zig",
+    "anchor": "pub fn encodeProjectedImages(",
+    "line": 604
+   },
+   "repeat": {
+    "count": 24,
+    "note": "24 vision blocks; DeepStack taps after blocks 5, 11, 17"
+   },
+   "patch": [
+    16,
+    16
+   ]
+  },
+  {
+   "kind": "projector",
+   "id": "projector",
+   "title": "2×2 merger + DeepStack heads",
+   "spine": "vision",
+   "summary": "Four neighboring patch vectors zip into one token (concat → MLP → text hidden 2048). Each DeepStack tap has its own merger head; their outputs ride into early decoder layers instead of becoming tokens."
+  },
+  {
+   "kind": "embedding",
+   "id": "embed",
+   "title": "Token embedding + splice",
+   "spine": "graph",
+   "summary": "Text ids gather embedding rows; merged visual tokens are spliced in at the <|image_pad|> markers. From here on the decoder sees one interleaved sequence.",
+   "source": {
+    "path": "zig/pkg/inference/src/architectures/qwen3vl_projector.zig",
+    "anchor": "pub fn prepareExpandedPromptEmbeddings(",
+    "line": 792
+   }
+  },
+  {
+   "kind": "decoder",
+   "id": "layers",
+   "title": "Decoder layer",
+   "spine": "graph",
+   "summary": "Shared GPT execution with Qwen3-VL contracts: Q/K head norm, interleaved M-RoPE and prefill-only DeepStack additions after decoder layers 0/1/2. The diagram expands one representative layer.",
+   "source": {
+    "path": "zig/pkg/inference/src/models/gpt.zig",
+    "anchor": "return self.family == .qwen3_vl;",
+    "line": 296
+   },
+   "repeat": {
+    "count": 28
+   },
+   "attention": "gqa_paged"
+  },
+  {
+   "kind": "kvcache",
+   "id": "kv",
+   "title": "Paged KV cache",
+   "spine": "kv",
+   "summary": "Text and visual tokens use the same decoder KV geometry. Vision preprocessing, the tower, projector and DeepStack add costs beyond those KV bytes."
+  },
+  {
+   "kind": "head",
+   "id": "head",
+   "title": "LM head",
+   "spine": "graph",
+   "summary": "Project the final hidden row to vocabulary logits. The separate reranker bundle uses a two-row yes/no semantic head and does not sample.",
+   "headType": "lm"
+  },
+  {
+   "kind": "head",
+   "id": "sample",
+   "title": "Sampling",
+   "spine": "sample",
+   "summary": "Greedy/sampled next-token selection; decode positions advance by mrope_position_delta past the visual grid.",
+   "headType": "lm"
+  }
+ ],
+ "graphs": {
+  "decode": {
+   "nodes": [
+    {
+     "id": "embed.tokens",
+     "opKind": "embedding_lookup",
+     "label": "embed text tokens",
+     "stageId": "embed",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         1
+        ],
+        "dtype": "i64"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         1,
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {},
+     "kernelRouteIds": [],
+     "kernels": [
+      "termite_embedding_lookup"
+     ],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "l.norm1",
+     "opKind": "rms_norm",
+     "label": "pre-attn norm",
+     "stageId": "layers",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         1,
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         1,
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {},
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "l.qkv",
+     "opKind": "linear_no_bias",
+     "label": "QKV project",
+     "stageId": "layers",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         1,
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         1,
+         2048
+        ],
+        "dtype": "f32"
+       },
+       {
+        "dims": [
+         1,
+         1024
+        ],
+        "dtype": "f32"
+       },
+       {
+        "dims": [
+         1,
+         1024
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "weightFormat": "q4_k weights; activations use the displayed dtype",
+      "routeScope": "illustrative compatible route; actual dispatch depends on token rows, tensor format and hardware",
+      "note": "Q=16×128=2048 channels; K and V each 8×128=1024. Q4_K_M is a mixed weight-quantization profile, not a promise that every linear uses Q4_K."
+     },
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "l.qknorm",
+     "opKind": "rms_norm",
+     "label": "Q/K head RMS norm",
+     "stageId": "layers",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         1,
+         16,
+         128
+        ],
+        "dtype": "f32"
+       },
+       {
+        "dims": [
+         1,
+         8,
+         128
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         1,
+         16,
+         128
+        ],
+        "dtype": "f32"
+       },
+       {
+        "dims": [
+         1,
+         8,
+         128
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {},
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "l.mrope",
+     "opKind": "rope_per_item",
+     "label": "m-RoPE (3 axes: t / h / w)",
+     "stageId": "layers",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         1,
+         16,
+         128
+        ],
+        "dtype": "f32"
+       },
+       {
+        "dims": [
+         1,
+         8,
+         128
+        ],
+        "dtype": "f32"
+       },
+       {
+        "dims": [
+         3,
+         1
+        ],
+        "dtype": "i32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         1,
+         16,
+         128
+        ],
+        "dtype": "f32"
+       },
+       {
+        "dims": [
+         1,
+         8,
+         128
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "note": "interleaved m-RoPE: head-dim sections rotate on text-time, image-height, and image-width position streams (θ = 5e6)"
+     },
+     "source": {
+      "path": "zig/pkg/inference/src/architectures/qwen3vl_plan.zig",
+      "anchor": "pub fn buildRequestPlan(",
+      "line": 97
+     },
+     "kernelRouteIds": [],
+     "kernels": [
+      "termite_apply_mrope"
+     ],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "l.attn",
+     "opKind": "gqa_paged_attention",
+     "label": "GQA paged attention",
+     "stageId": "layers",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         1,
+         16,
+         128
+        ],
+        "dtype": "f32"
+       },
+       {
+        "dims": [
+         "P",
+         "page_size",
+         8,
+         128
+        ],
+        "dtype": "f16"
+       },
+       {
+        "dims": [
+         "P",
+         "page_size",
+         8,
+         128
+        ],
+        "dtype": "f16"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         1,
+         16,
+         128
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "gqa": "16 query / 8 KV heads",
+      "note": "Causal over the interleaved sequence: each text or visual token attends only to positions up to itself. Page shapes are logical; physical backend layouts may differ."
+     },
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [
+      "TERMITE_METAL_DISABLE_QWEN3VL_DECODE_FRAME",
+      "TERMITE_METAL_DISABLE_QWEN3VL_PREFILL_SG_ATTENTION"
+     ],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "l.oproj",
+     "opKind": "linear_no_bias",
+     "label": "output project",
+     "stageId": "layers",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         1,
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         1,
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "weightFormat": "q4_k weights; activations use the displayed dtype",
+      "routeScope": "illustrative compatible route; actual dispatch depends on token rows, tensor format and hardware"
+     },
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "l.norm2",
+     "opKind": "rms_norm",
+     "label": "pre-FFN RMS norm",
+     "stageId": "layers",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         1,
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         1,
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {},
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "l.gateup",
+     "opKind": "linear_no_bias_pair",
+     "label": "gated FFN expansion + SiLU × up",
+     "stageId": "layers",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         1,
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         1,
+         6144
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "weightFormat": "q4_k weights; activations use the displayed dtype"
+     },
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [
+      "TERMITE_METAL_DISABLE_QWEN3VL_PREPARED_FFN"
+     ],
+     "backend": "metal",
+     "fusedOps": [
+      "gate",
+      "up",
+      "silu"
+     ]
+    },
+    {
+     "id": "l.down",
+     "opKind": "linear_no_bias",
+     "label": "down project",
+     "stageId": "layers",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         1,
+         6144
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         1,
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "weightFormat": "q4_k weights; activations use the displayed dtype",
+      "routeScope": "illustrative compatible route; actual dispatch depends on token rows, tensor format and hardware"
+     },
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "kv.pages",
+     "opKind": "scatter_add",
+     "label": "append K/V to paged blocks",
+     "stageId": "kv",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         1,
+         8,
+         128
+        ],
+        "dtype": "f16"
+       },
+       {
+        "dims": [
+         1,
+         8,
+         128
+        ],
+        "dtype": "f16"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "P",
+         "page_size",
+         8,
+         128
+        ],
+        "dtype": "f16"
+       },
+       {
+        "dims": [
+         "P",
+         "page_size",
+         8,
+         128
+        ],
+        "dtype": "f16"
+       }
+      ]
+     },
+     "attrs": {},
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "h.norm",
+     "opKind": "rms_norm",
+     "label": "final norm",
+     "stageId": "head",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         1,
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         1,
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {},
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "h.lmhead",
+     "opKind": "linear_no_bias",
+     "label": "LM head [2048 × 151936]",
+     "stageId": "head",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         1,
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         1,
+         151936
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "note": "Generation vocabulary head. The separate reranker uses an F16 two-row semantic head with score=sigmoid(logit_yes−logit_no)."
+     },
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "s.sample",
+     "opKind": "argmax",
+     "label": "next token",
+     "stageId": "sample",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         1,
+         151936
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         1
+        ],
+        "dtype": "i32"
+       }
+      ]
+     },
+     "attrs": {
+      "note": "decode positions continue at tokenCount + mrope_position_delta — all three m-RoPE axes tick together in text"
+     },
+     "source": {
+      "path": "zig/pkg/inference/src/architectures/qwen3vl_plan.zig",
+      "anchor": "pub fn nextDecodePosition(self: RequestPlan) !u32 {",
+      "line": 82
+     },
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "l.attnadd",
+     "opKind": "add",
+     "label": "attention residual add",
+     "stageId": "layers",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         1,
+         2048
+        ],
+        "dtype": "f32"
+       },
+       {
+        "dims": [
+         1,
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         1,
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {},
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "l.ffnadd",
+     "opKind": "add",
+     "label": "FFN residual add",
+     "stageId": "layers",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         1,
+         2048
+        ],
+        "dtype": "f32"
+       },
+       {
+        "dims": [
+         1,
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         1,
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {},
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    }
+   ],
+   "edges": [
+    {
+     "id": "e.norm1.qkv",
+     "from": "l.norm1",
+     "to": "l.qkv",
+     "kind": "data"
+    },
+    {
+     "id": "e.qkv.qknorm",
+     "from": "l.qkv",
+     "to": "l.qknorm",
+     "kind": "data"
+    },
+    {
+     "id": "e.qknorm.mrope",
+     "from": "l.qknorm",
+     "to": "l.mrope",
+     "kind": "data"
+    },
+    {
+     "id": "e.mrope.attn",
+     "from": "l.mrope",
+     "to": "l.attn",
+     "kind": "data"
+    },
+    {
+     "id": "e.mrope.kv",
+     "from": "l.mrope",
+     "to": "kv.pages",
+     "kind": "kv"
+    },
+    {
+     "id": "e.kv.attn",
+     "from": "kv.pages",
+     "to": "l.attn",
+     "kind": "kv"
+    },
+    {
+     "id": "e.attn.oproj",
+     "from": "l.attn",
+     "to": "l.oproj",
+     "kind": "data"
+    },
+    {
+     "id": "e.norm2.gateup",
+     "from": "l.norm2",
+     "to": "l.gateup",
+     "kind": "data"
+    },
+    {
+     "id": "e.gateup.down",
+     "from": "l.gateup",
+     "to": "l.down",
+     "kind": "data"
+    },
+    {
+     "id": "e.hnorm.lm",
+     "from": "h.norm",
+     "to": "h.lmhead",
+     "kind": "data"
+    },
+    {
+     "id": "e.lm.sample",
+     "from": "h.lmhead",
+     "to": "s.sample",
+     "kind": "data"
+    },
+    {
+     "id": "e.l.oproj.l.attnadd",
+     "from": "l.oproj",
+     "to": "l.attnadd",
+     "kind": "data"
+    },
+    {
+     "id": "e.l.attnadd.l.norm2",
+     "from": "l.attnadd",
+     "to": "l.norm2",
+     "kind": "data"
+    },
+    {
+     "id": "e.l.attnadd.l.ffnadd",
+     "from": "l.attnadd",
+     "to": "l.ffnadd",
+     "kind": "residual"
+    },
+    {
+     "id": "e.l.down.l.ffnadd",
+     "from": "l.down",
+     "to": "l.ffnadd",
+     "kind": "data"
+    },
+    {
+     "id": "e.l.ffnadd.h.norm",
+     "from": "l.ffnadd",
+     "to": "h.norm",
+     "kind": "data"
+    },
+    {
+     "id": "e.embed.tokens.l.norm1",
+     "from": "embed.tokens",
+     "to": "l.norm1",
+     "kind": "data"
+    },
+    {
+     "id": "e.embed.tokens.l.attnadd",
+     "from": "embed.tokens",
+     "to": "l.attnadd",
+     "kind": "residual"
+    }
+   ]
+  },
+  "prefill": {
+   "nodes": [
+    {
+     "id": "v.patch",
+     "opKind": "token_grid_conv2d",
+     "label": "Conv3D patch embed (temporal split)",
+     "stageId": "vision",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         3,
+         2,
+         "H",
+         "W"
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "patches",
+         1024
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "patch": "16×16",
+      "temporalPatch": 2,
+      "note": "still images duplicate their frame to fill the 2-frame temporal patch"
+     },
+     "source": {
+      "path": "zig/pkg/inference/src/architectures/qwen3vl_projector.zig",
+      "anchor": "fn extractPatchesMergeMajor(",
+      "line": 1394
+     },
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "v.pos",
+     "opKind": "gather",
+     "label": "learned-pos interpolation",
+     "stageId": "vision",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         2304,
+         1024
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "patches",
+         1024
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "grid": "48×48 learned table (2,304 positions), bilinearly interpolated to the actual patch grid"
+     },
+     "source": {
+      "path": "zig/pkg/inference/src/architectures/qwen3vl_projector.zig",
+      "anchor": "fn addInterpolatedPositions(",
+      "line": 1471
+     },
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "v.attn",
+     "opKind": "scaled_dot_product_attention",
+     "label": "vision attention + two-axis RoPE",
+     "stageId": "vision",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "patches",
+         16,
+         64
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "patches",
+         16,
+         64
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "note": "bidirectional (no causal mask); Q/K rotate on two axes — patch row and patch column — before SDPA"
+     },
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "v.ffn",
+     "opKind": "linear",
+     "label": "vision FFN (GELU)",
+     "stageId": "vision",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "patches",
+         1024
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "patches",
+         1024
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "weightFormat": "q8_0 weights; activations use the displayed dtype",
+      "note": "Vision FFN hidden width 4096; GELU between two projections, with residual connections omitted in the schematic tower block."
+     },
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "p.merge",
+     "opKind": "concat",
+     "label": "2×2 merger (4-into-1)",
+     "stageId": "projector",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "patches",
+         1024
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "patches/4",
+         4096
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "note": "Four neighboring 1024-wide patch vectors are grouped into 4096 channels. The following node includes the merger normalization/MLP, not a second token merge."
+     },
+     "source": {
+      "path": "zig/pkg/inference/src/architectures/qwen3vl_projector.zig",
+      "anchor": "fn mergeProjected(",
+      "line": 1273
+     },
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "p.proj",
+     "opKind": "linear",
+     "label": "merger MLP → text hidden",
+     "stageId": "projector",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "patches/4",
+         4096
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "V",
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {},
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "p.deepstack",
+     "opKind": "linear",
+     "label": "DeepStack heads (taps @ 5/11/17)",
+     "stageId": "projector",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "patches",
+         1024
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         3,
+         "V",
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "note": "Zero-based vision taps 5/11/17 each merge to V×2048. Their outputs add after complete decoder layers 0/1/2 at visual positions during prefill only."
+     },
+     "source": {
+      "path": "zig/pkg/inference/src/architectures/qwen3vl_projector.zig",
+      "anchor": "if (next_tap < cfg.deepstack_len and cfg.deepstack_layers[next_tap] == layer) {",
+      "line": 1057
+     },
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "embed.tokens",
+     "opKind": "embedding_lookup",
+     "label": "embed text tokens",
+     "stageId": "embed",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "T_exp"
+        ],
+        "dtype": "i64"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "T_exp",
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {},
+     "kernelRouteIds": [],
+     "kernels": [
+      "termite_embedding_lookup"
+     ],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "embed.splice",
+     "opKind": "where_select",
+     "label": "splice visual tokens at <|image_pad|>",
+     "stageId": "embed",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "T_exp",
+         2048
+        ],
+        "dtype": "f32"
+       },
+       {
+        "dims": [
+         "V",
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "T_exp",
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "note": "T_exp includes expanded visual placeholder rows already. Replace those V rows with visual embeddings; do not append V a second time."
+     },
+     "source": {
+      "path": "zig/pkg/inference/src/architectures/qwen3vl_projector.zig",
+      "anchor": "pub fn prepareExpandedPromptEmbeddings(",
+      "line": 792
+     },
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "l.norm1",
+     "opKind": "rms_norm",
+     "label": "pre-attn norm",
+     "stageId": "layers",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "T_exp",
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "T_exp",
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {},
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "l.qkv",
+     "opKind": "linear_no_bias",
+     "label": "QKV project",
+     "stageId": "layers",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "T_exp",
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "T_exp",
+         2048
+        ],
+        "dtype": "f32"
+       },
+       {
+        "dims": [
+         "T_exp",
+         1024
+        ],
+        "dtype": "f32"
+       },
+       {
+        "dims": [
+         "T_exp",
+         1024
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "weightFormat": "q4_k weights; activations use the displayed dtype",
+      "routeScope": "illustrative compatible route; actual dispatch depends on token rows, tensor format and hardware",
+      "note": "Q=16×128=2048 channels; K and V each 8×128=1024. Q4_K_M is a mixed weight-quantization profile, not a promise that every linear uses Q4_K."
+     },
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "l.qknorm",
+     "opKind": "rms_norm",
+     "label": "Q/K head RMS norm",
+     "stageId": "layers",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "T_exp",
+         16,
+         128
+        ],
+        "dtype": "f32"
+       },
+       {
+        "dims": [
+         "T_exp",
+         8,
+         128
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "T_exp",
+         16,
+         128
+        ],
+        "dtype": "f32"
+       },
+       {
+        "dims": [
+         "T_exp",
+         8,
+         128
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {},
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "l.mrope",
+     "opKind": "rope_per_item",
+     "label": "m-RoPE (3 axes: t / h / w)",
+     "stageId": "layers",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "T_exp",
+         16,
+         128
+        ],
+        "dtype": "f32"
+       },
+       {
+        "dims": [
+         "T_exp",
+         8,
+         128
+        ],
+        "dtype": "f32"
+       },
+       {
+        "dims": [
+         3,
+         "T_exp"
+        ],
+        "dtype": "i32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "T_exp",
+         16,
+         128
+        ],
+        "dtype": "f32"
+       },
+       {
+        "dims": [
+         "T_exp",
+         8,
+         128
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "note": "interleaved m-RoPE: head-dim sections rotate on text-time, image-height, and image-width position streams (θ = 5e6)"
+     },
+     "source": {
+      "path": "zig/pkg/inference/src/architectures/qwen3vl_plan.zig",
+      "anchor": "pub fn buildRequestPlan(",
+      "line": 97
+     },
+     "kernelRouteIds": [],
+     "kernels": [
+      "termite_apply_mrope"
+     ],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "l.attn",
+     "opKind": "gqa_paged_attention",
+     "label": "causal GQA prefill attention",
+     "stageId": "layers",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "T_exp",
+         16,
+         128
+        ],
+        "dtype": "f32"
+       },
+       {
+        "dims": [
+         "P",
+         "page_size",
+         8,
+         128
+        ],
+        "dtype": "f16"
+       },
+       {
+        "dims": [
+         "P",
+         "page_size",
+         8,
+         128
+        ],
+        "dtype": "f16"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "T_exp",
+         16,
+         128
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "gqa": "16 query / 8 KV heads",
+      "note": "Causal over the interleaved sequence: each text or visual token attends only to positions up to itself. Page shapes are logical; physical backend layouts may differ."
+     },
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [
+      "TERMITE_METAL_DISABLE_QWEN3VL_DECODE_FRAME",
+      "TERMITE_METAL_DISABLE_QWEN3VL_PREFILL_SG_ATTENTION"
+     ],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "l.oproj",
+     "opKind": "linear_no_bias",
+     "label": "output project",
+     "stageId": "layers",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "T_exp",
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "T_exp",
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "weightFormat": "q4_k weights; activations use the displayed dtype",
+      "routeScope": "illustrative compatible route; actual dispatch depends on token rows, tensor format and hardware"
+     },
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "l.norm2",
+     "opKind": "rms_norm",
+     "label": "pre-FFN RMS norm",
+     "stageId": "layers",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "T_exp",
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "T_exp",
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {},
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "l.gateup",
+     "opKind": "linear_no_bias_pair",
+     "label": "gated FFN expansion + SiLU × up",
+     "stageId": "layers",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "T_exp",
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "T_exp",
+         6144
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "weightFormat": "q4_k weights; activations use the displayed dtype"
+     },
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [
+      "TERMITE_METAL_DISABLE_QWEN3VL_PREPARED_FFN"
+     ],
+     "backend": "metal",
+     "fusedOps": [
+      "gate",
+      "up",
+      "silu"
+     ]
+    },
+    {
+     "id": "l.down",
+     "opKind": "linear_no_bias",
+     "label": "down project",
+     "stageId": "layers",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "T_exp",
+         6144
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "T_exp",
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "weightFormat": "q4_k weights; activations use the displayed dtype",
+      "routeScope": "illustrative compatible route; actual dispatch depends on token rows, tensor format and hardware"
+     },
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "kv.pages",
+     "opKind": "scatter_add",
+     "label": "append K/V to paged blocks",
+     "stageId": "kv",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "T_exp",
+         8,
+         128
+        ],
+        "dtype": "f16"
+       },
+       {
+        "dims": [
+         "T_exp",
+         8,
+         128
+        ],
+        "dtype": "f16"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "P",
+         "page_size",
+         8,
+         128
+        ],
+        "dtype": "f16"
+       },
+       {
+        "dims": [
+         "P",
+         "page_size",
+         8,
+         128
+        ],
+        "dtype": "f16"
+       }
+      ]
+     },
+     "attrs": {},
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "h.norm",
+     "opKind": "rms_norm",
+     "label": "final norm",
+     "stageId": "head",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "T_exp",
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "T_exp",
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {},
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "h.lmhead",
+     "opKind": "linear_no_bias",
+     "label": "LM head [2048 × 151936]",
+     "stageId": "head",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         1,
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         1,
+         151936
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "note": "Generation vocabulary head. The separate reranker uses an F16 two-row semantic head with score=sigmoid(logit_yes−logit_no)."
+     },
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "l.attnadd",
+     "opKind": "add",
+     "label": "attention residual add",
+     "stageId": "layers",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "T_exp",
+         2048
+        ],
+        "dtype": "f32"
+       },
+       {
+        "dims": [
+         "T_exp",
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "T_exp",
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {},
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "l.ffnadd",
+     "opKind": "add",
+     "label": "FFN residual add",
+     "stageId": "layers",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "T_exp",
+         2048
+        ],
+        "dtype": "f32"
+       },
+       {
+        "dims": [
+         "T_exp",
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "T_exp",
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "note": "Representative layer output. Repeat the decoder block 28 times; each layer has distinct weights."
+     },
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "l.deepstack",
+     "opKind": "add",
+     "label": "DeepStack add after layer (0/1/2 only)",
+     "stageId": "layers",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "T_exp",
+         2048
+        ],
+        "dtype": "f32"
+       },
+       {
+        "dims": [
+         "V",
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         "T_exp",
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {
+      "note": "Only visual rows receive the matching tap after the full layer. Later layers omit this addition."
+     },
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    },
+    {
+     "id": "h.last",
+     "opKind": "take_rows",
+     "label": "select final prompt row",
+     "stageId": "head",
+     "inputs": [],
+     "outputs": [],
+     "shapes": {
+      "in": [
+       {
+        "dims": [
+         "T_exp",
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ],
+      "out": [
+       {
+        "dims": [
+         1,
+         2048
+        ],
+        "dtype": "f32"
+       }
+      ]
+     },
+     "attrs": {},
+     "kernelRouteIds": [],
+     "kernels": [],
+     "envFlagNames": [],
+     "backend": "metal",
+     "fusedOps": []
+    }
+   ],
+   "edges": [
+    {
+     "id": "e.patch.pos",
+     "from": "v.patch",
+     "to": "v.pos",
+     "kind": "data"
+    },
+    {
+     "id": "e.pos.vattn",
+     "from": "v.pos",
+     "to": "v.attn",
+     "kind": "data"
+    },
+    {
+     "id": "e.vattn.vffn",
+     "from": "v.attn",
+     "to": "v.ffn",
+     "kind": "data"
+    },
+    {
+     "id": "e.vffn.merge",
+     "from": "v.ffn",
+     "to": "p.merge",
+     "kind": "data"
+    },
+    {
+     "id": "e.vattn.deepstack",
+     "from": "v.ffn",
+     "to": "p.deepstack",
+     "kind": "routing"
+    },
+    {
+     "id": "e.merge.proj",
+     "from": "p.merge",
+     "to": "p.proj",
+     "kind": "data"
+    },
+    {
+     "id": "e.proj.splice",
+     "from": "p.proj",
+     "to": "embed.splice",
+     "kind": "data"
+    },
+    {
+     "id": "e.tok.splice",
+     "from": "embed.tokens",
+     "to": "embed.splice",
+     "kind": "data"
+    },
+    {
+     "id": "e.splice.norm1",
+     "from": "embed.splice",
+     "to": "l.norm1",
+     "kind": "residual"
+    },
+    {
+     "id": "e.norm1.qkv",
+     "from": "l.norm1",
+     "to": "l.qkv",
+     "kind": "data"
+    },
+    {
+     "id": "e.qkv.qknorm",
+     "from": "l.qkv",
+     "to": "l.qknorm",
+     "kind": "data"
+    },
+    {
+     "id": "e.qknorm.mrope",
+     "from": "l.qknorm",
+     "to": "l.mrope",
+     "kind": "data"
+    },
+    {
+     "id": "e.mrope.attn",
+     "from": "l.mrope",
+     "to": "l.attn",
+     "kind": "data"
+    },
+    {
+     "id": "e.mrope.kv",
+     "from": "l.mrope",
+     "to": "kv.pages",
+     "kind": "kv"
+    },
+    {
+     "id": "e.kv.attn",
+     "from": "kv.pages",
+     "to": "l.attn",
+     "kind": "kv"
+    },
+    {
+     "id": "e.attn.oproj",
+     "from": "l.attn",
+     "to": "l.oproj",
+     "kind": "data"
+    },
+    {
+     "id": "e.norm2.gateup",
+     "from": "l.norm2",
+     "to": "l.gateup",
+     "kind": "data"
+    },
+    {
+     "id": "e.gateup.down",
+     "from": "l.gateup",
+     "to": "l.down",
+     "kind": "data"
+    },
+    {
+     "id": "e.embed.splice.l.attnadd",
+     "from": "embed.splice",
+     "to": "l.attnadd",
+     "kind": "residual"
+    },
+    {
+     "id": "e.l.oproj.l.attnadd",
+     "from": "l.oproj",
+     "to": "l.attnadd",
+     "kind": "data"
+    },
+    {
+     "id": "e.l.attnadd.l.norm2",
+     "from": "l.attnadd",
+     "to": "l.norm2",
+     "kind": "data"
+    },
+    {
+     "id": "e.l.attnadd.l.ffnadd",
+     "from": "l.attnadd",
+     "to": "l.ffnadd",
+     "kind": "residual"
+    },
+    {
+     "id": "e.l.down.l.ffnadd",
+     "from": "l.down",
+     "to": "l.ffnadd",
+     "kind": "data"
+    },
+    {
+     "id": "e.p.deepstack.l.deepstack",
+     "from": "p.deepstack",
+     "to": "l.deepstack",
+     "kind": "routing"
+    },
+    {
+     "id": "e.l.ffnadd.l.deepstack",
+     "from": "l.ffnadd",
+     "to": "l.deepstack",
+     "kind": "data"
+    },
+    {
+     "id": "e.l.deepstack.h.norm",
+     "from": "l.deepstack",
+     "to": "h.norm",
+     "kind": "data"
+    },
+    {
+     "id": "e.h.norm.h.last",
+     "from": "h.norm",
+     "to": "h.last",
+     "kind": "data"
+    },
+    {
+     "id": "e.h.last.h.lmhead",
+     "from": "h.last",
+     "to": "h.lmhead",
+     "kind": "data"
+    }
+   ]
+  }
+ },
+ "sources": {
+  "gitCommit": "497d957522ae809ebd322960cac8c7943851d841",
+  "generatedAt": "2026-09-18T23:10:04.315Z"
+ }
+}
