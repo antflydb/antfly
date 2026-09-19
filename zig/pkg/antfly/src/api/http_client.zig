@@ -3274,6 +3274,72 @@ pub const ApiHttpClient = struct {
         }
     }
 
+    pub fn fetchGroupTxnDecideWithContext(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        delivery_tracker: ?*http_common.RequestDeliveryTracker,
+        timeout_ms: ?u32,
+        server_budget_ms: ?u32,
+        cancellation: ?*const http_common.RequestCancellation,
+    ) !TxnPreDecisionOutcome {
+        // Establish the strongest safe default before URI construction,
+        // request signing, or any other client-local allocation can fail.
+        // The executor advances this state at its actual send boundary.
+        if (delivery_tracker) |tracker| tracker.markNotSent();
+        const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
+            routes.Routes.tables_prefix,
+            table_name,
+            routes.Routes.txn_decide_suffix,
+        });
+        defer self.alloc.free(suffix);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
+        defer self.alloc.free(path);
+        const uri = try self.joinRoute(base_uri, path);
+        defer self.alloc.free(uri);
+
+        var budget_buf: [10]u8 = undefined;
+        const headers: []const http_common.RequestHeader = if (server_budget_ms) |budget| blk: {
+            if (budget == 0 or budget > txn_contract.max_pre_decision_server_budget_ms)
+                return error.InvalidArgument;
+            const value = try std.fmt.bufPrint(&budget_buf, "{d}", .{budget});
+            break :blk &.{.{
+                .name = txn_contract.pre_decision_remaining_ms_header,
+                .value = value,
+            }};
+        } else &.{};
+        var resp = try self.executeRequest(.{
+            .method = .POST,
+            .uri = uri,
+            .content_type = "application/json",
+            .body = body,
+            .headers = headers,
+            .delivery_tracker = delivery_tracker,
+            .timeout_ms = timeout_ms,
+            .cancellation = cancellation,
+        });
+        defer resp.deinit(self.alloc);
+        // Receiving any response proves that the request crossed the send
+        // boundary, even when a custom executor does not update the tracker.
+        if (delivery_tracker) |tracker| tracker.markMayHaveBeenSent();
+        // Only the versioned first-decision contract proves non-submission.
+        // Missing endpoints, legacy proof values and generic timeouts remain unknown.
+        if ((resp.status == 503 or resp.status == 504) and
+            std.mem.eql(u8, resp.header(txn_contract.pre_decision_outcome_header) orelse "", txn_contract.first_decision_not_proposed_v1)) return .not_proposed;
+        switch (resp.status) {
+            200 => return .applied,
+            202 => {
+                if (std.mem.eql(u8, resp.body, "committed_repair_required")) return error.EnrichmentWorkerFailed;
+                if (std.mem.eql(u8, resp.body, "committed_visibility_pending")) return error.CommitVisibilityNotSatisfied;
+                return error.UnexpectedHttpStatus;
+            },
+            409 => return remoteGroupTxnResolveConflictError(resp.body),
+            else => return error.UnexpectedHttpStatus,
+        }
+    }
+
     pub fn fetchGroupTxnPrepare(
         self: *ApiHttpClient,
         base_uri: []const u8,
@@ -5178,6 +5244,58 @@ fn consumerTests() type {
                 null,
             ));
             try std.testing.expectEqual(@as(usize, 1), executor.attempts);
+        }
+
+        test "first decision transport never downgrades endpoint or ambiguous delivery" {
+            const Fake = struct {
+                const Mode = enum { unsupported, legacy_proof, rejected, accepted, lost, cancelled, before_send };
+                mode: Mode,
+                calls: usize = 0,
+                fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.calls += 1;
+                    try std.testing.expect(std.mem.endsWith(u8, req.uri, "/txn-decide-v1"));
+                    try std.testing.expectEqual(@as(?u32, 2000), req.timeout_ms);
+                    try std.testing.expect(req.cancellation != null);
+                    var found = false;
+                    for (req.headers) |header| if (std.ascii.eqlIgnoreCase(header.name, txn_contract.pre_decision_remaining_ms_header)) {
+                        try std.testing.expectEqualStrings("1000", header.value);
+                        found = true;
+                    };
+                    try std.testing.expect(found);
+                    const tracker = req.delivery_tracker.?;
+                    if (self.mode == .before_send) {
+                        tracker.markNotSent();
+                        return error.Canceled;
+                    }
+                    tracker.markMayHaveBeenSent();
+                    return switch (self.mode) {
+                        .unsupported => http_route_helpers.textResponse(alloc, 404, "old peer"),
+                        .legacy_proof => http_route_helpers.textResponseWithHeaders(alloc, 503, "legacy", &.{.{ .name = txn_contract.pre_decision_outcome_header, .value = txn_contract.pre_decision_not_proposed_v1 }}),
+                        .rejected => http_route_helpers.textResponseWithHeaders(alloc, 503, "not proposed", &.{.{ .name = txn_contract.pre_decision_outcome_header, .value = txn_contract.first_decision_not_proposed_v1 }}),
+                        .accepted => http_route_helpers.textResponse(alloc, 200, "{}"),
+                        .lost => error.Timeout,
+                        .cancelled => error.Canceled,
+                        .before_send => unreachable,
+                    };
+                }
+            };
+            inline for (std.meta.tags(Fake.Mode)) |mode| {
+                var fake = Fake{ .mode = mode };
+                var client = ApiHttpClient.init(std.testing.allocator, .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } });
+                var tracker: http_common.RequestDeliveryTracker = .{};
+                var cancellation: http_common.RequestCancellation = .{};
+                const result = client.fetchGroupTxnDecideWithContext("http://127.0.0.1:1", 7, "docs", "{}", &tracker, 2000, 1000, &cancellation);
+                switch (mode) {
+                    .unsupported, .legacy_proof => try std.testing.expectError(error.UnexpectedHttpStatus, result),
+                    .rejected => try std.testing.expectEqual(TxnPreDecisionOutcome.not_proposed, try result),
+                    .accepted => try std.testing.expectEqual(TxnPreDecisionOutcome.applied, try result),
+                    .lost => try std.testing.expectError(error.Timeout, result),
+                    .cancelled, .before_send => try std.testing.expectError(error.Canceled, result),
+                }
+                try std.testing.expectEqual(@as(usize, 1), fake.calls);
+                try std.testing.expectEqual(if (mode == .before_send) http_common.RequestDeliveryTracker.State.not_sent else http_common.RequestDeliveryTracker.State.may_have_been_sent, tracker.load());
+            }
         }
 
         test "api http client requires explicit not-proposed marker and tracks delivery phase" {

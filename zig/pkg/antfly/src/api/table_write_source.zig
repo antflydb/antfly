@@ -643,8 +643,22 @@ pub const TableWriteSource = struct {
             sync_level: db_mod.types.SyncLevel,
             context: distributed_txn.PreDecisionContext,
         ) anyerror!?distributed_txn.CommitOutcome = null,
+        /// First decision only. PreDecisionNotProposed certifies that no
+        /// proposal/local mutation was submitted; all other errors may be ambiguous.
+        txn_decide_group_local_with_pre_decision_context: ?*const fn (*anyopaque, std.mem.Allocator, u64, []const u8, db_mod.types.TxnId, db_mod.types.TxnStatus, u64, u64, db_mod.types.SyncLevel, distributed_txn.PreDecisionContext) anyerror!?void = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
+
+    pub fn txnDecideGroupLocalWithPreDecisionContext(self: TableWriteSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, status: db_mod.types.TxnStatus, commit_version: u64, topology_epoch: u64, sync_level: db_mod.types.SyncLevel, context: distributed_txn.PreDecisionContext) !?void {
+        if (status != .committed) return error.PreDecisionNotProposed;
+        distributed_txn.ensurePreDecisionContextActive(context) catch return error.PreDecisionNotProposed;
+        const callback = self.vtable.txn_decide_group_local_with_pre_decision_context orelse return error.PreDecisionNotProposed;
+        return BoundaryAbi.call("txn_decide_group_local_with_pre_decision_context", self.boundary_dispatch, callback, .{ self.ptr, alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level, context }) catch |err| switch (err) {
+            // This capability reserves this identity for preaccept checks only.
+            error.PreDecisionDeadlineExceeded => error.PreDecisionNotProposed,
+            else => err,
+        };
+    }
 
     pub fn batch(
         self: TableWriteSource,
@@ -1574,6 +1588,37 @@ fn consumerTests() type {
     const test_owner_root = @import("antfly_source_root");
     if (@hasDecl(test_owner_root, "implementation_tests_only") and test_owner_root.implementation_tests_only) return struct {};
     const Suite = struct {
+        test "first decision boundary preserves rejection identity and never calls legacy resolve" {
+            const Fake = struct {
+                calls: usize = 0,
+                outcome: anyerror = error.PreDecisionNotProposed,
+                fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
+                    return null;
+                }
+                fn legacy(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: db_mod.types.TxnStatus, _: u64, _: u64, _: db_mod.types.SyncLevel) !?void {
+                    return error.LegacyMustNotRun;
+                }
+                fn decide(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: db_mod.types.TxnStatus, _: u64, _: u64, _: db_mod.types.SyncLevel, _: distributed_txn.PreDecisionContext) !?void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.calls += 1;
+                    return self.outcome;
+                }
+                fn dispatch(contract: *const runtime_native_abi.CallContract, callback: *const anyopaque, args: *const anyopaque, output: ?*anyopaque) callconv(.c) runtime_error_abi.Status {
+                    return TableWriteSource.BoundaryAbi.local_dispatch(contract, callback, args, output);
+                }
+            };
+            var fake: Fake = .{};
+            const source: TableWriteSource = .{ .ptr = &fake, .boundary_dispatch = Fake.dispatch, .vtable = &.{ .batch = Fake.batch, .txn_decide_group_local_with_pre_decision_context = Fake.decide } };
+            const legacy: TableWriteSource = .{ .ptr = &fake, .vtable = &.{ .batch = Fake.batch, .txn_resolve_group_local = Fake.legacy } };
+            try std.testing.expectError(error.PreDecisionNotProposed, legacy.txnDecideGroupLocalWithPreDecisionContext(std.testing.allocator, 7, "docs", [_]u8{1} ** 16, .committed, 42, 0, .write, .{}));
+            try std.testing.expectEqual(@as(usize, 0), fake.calls);
+            inline for (.{ error.PreDecisionNotProposed, error.Canceled, error.RaftBatchWriteOutcomeUnknown, error.CommitVisibilityNotSatisfied }) |outcome| {
+                fake.outcome = outcome;
+                try std.testing.expectError(outcome, source.txnDecideGroupLocalWithPreDecisionContext(std.testing.allocator, 7, "docs", [_]u8{1} ** 16, .committed, 42, 0, .write, .{}));
+            }
+            try std.testing.expectEqual(@as(usize, 4), fake.calls);
+        }
+
         test "transaction commit boundary preserves ingress context and never downgrades deadlines" {
             const Fake = struct {
                 expected: distributed_txn.PreDecisionContext,

@@ -727,7 +727,7 @@ pub const AntflyApiHandler = struct {
         if (control) return .control;
         if (config.recovery_requests == 0 or !std.mem.eql(u8, request.method, "POST")) return .general;
         if (!std.mem.eql(u8, request.path, routes.workload_attempt_control) and
-            routes.matchGroupTxnResolve(request.path) == null and routes.matchGroupTxnStatus(request.path) == null and
+            routes.matchGroupTxnResolve(request.path) == null and routes.matchGroupTxnDecide(request.path) == null and routes.matchGroupTxnStatus(request.path) == null and
             routes.matchGroupTxnAcknowledge(request.path) == null) return .general;
         if (request.transfer_encoding != null or request.content_encoding != null or
             request.body_received_bytes > 8192 or content_length > 8192 or
@@ -971,7 +971,7 @@ pub const AntflyApiHandler = struct {
     fn establishInternalTxnPreDecisionDeadline(ctx: *httpx.Context) void {
         if (ctx.application_deadline_ns != null or ctx.application_deadline_invalid) return;
         const path = ctx.request.uri.path;
-        if (routes.matchGroupTxnBegin(path) == null and routes.matchGroupTxnPrepare(path) == null) return;
+        if (routes.matchGroupTxnBegin(path) == null and routes.matchGroupTxnPrepare(path) == null and routes.matchGroupTxnDecide(path) == null) return;
         const raw = ctx.header(distributed_txn_contract.pre_decision_remaining_ms_header) orelse return;
         const budget_ms = std.fmt.parseUnsigned(u32, raw, 10) catch {
             ctx.application_deadline_invalid = true;
@@ -1430,6 +1430,7 @@ pub const AntflyApiHandler = struct {
         try server.post(table_prefix ++ routes.txn_begin_suffix, httpx.Handler.bind(self, internalTxnBegin));
         try server.post(table_prefix ++ routes.txn_prepare_suffix, httpx.Handler.bind(self, internalTxnPrepare));
         try server.post(table_prefix ++ routes.txn_resolve_suffix, httpx.Handler.bind(self, internalTxnResolve));
+        try server.post(table_prefix ++ routes.txn_decide_suffix, httpx.Handler.bind(self, internalTxnDecide));
         try server.post(table_prefix ++ routes.txn_status_suffix, httpx.Handler.bind(self, internalTxnStatus));
         try server.post(table_prefix ++ routes.txn_acknowledge_suffix, httpx.Handler.bind(self, internalTxnAcknowledge));
         try server.post(table_prefix ++ routes.artifact_repair_suffix, httpx.Handler.bind(self, internalArtifactRepairList));
@@ -3651,6 +3652,7 @@ pub const AntflyApiHandler = struct {
     }
 
     const InternalTxnPhase = enum {
+        first_decision,
         begin,
         prepare,
         resolve,
@@ -3668,7 +3670,7 @@ pub const AntflyApiHandler = struct {
         phase: InternalTxnPhase,
     ) !httpx.Response {
         if (txnErrorProvesNotProposed(err, phase))
-            try ctx.setHeader(distributed_txn_contract.pre_decision_outcome_header, distributed_txn_contract.pre_decision_not_proposed_v1);
+            try ctx.setHeader(distributed_txn_contract.pre_decision_outcome_header, if (phase == .first_decision) distributed_txn_contract.first_decision_not_proposed_v1 else distributed_txn_contract.pre_decision_not_proposed_v1);
         return switch (err) {
             error.InvalidArgument => textResponse(ctx, 400, "invalid transaction request"),
             error.TransactionRecoveryCapacityExhausted => textResponse(ctx, 503, "transaction recovery capacity exhausted"),
@@ -3683,6 +3685,7 @@ pub const AntflyApiHandler = struct {
             error.Canceled => textResponse(ctx, 408, "request canceled"),
             error.DeadlineExceeded => textResponse(ctx, 504, "request deadline exceeded"),
             error.PreDecisionDeadlineExceeded => textResponse(ctx, 504, "request deadline exceeded"),
+            error.PreDecisionNotProposed => textResponse(ctx, 503, "first decision not proposed"),
             error.TransactionPreDecisionOutcomeUnknown => textResponse(ctx, 504, "transaction outcome unknown"),
             error.EnrichmentWaitCanceled,
             error.EnrichmentWaitTimeout,
@@ -3696,6 +3699,7 @@ pub const AntflyApiHandler = struct {
     }
 
     fn txnErrorProvesNotProposed(err: internal_group_operations.Error, phase: InternalTxnPhase) bool {
+        if (phase == .first_decision) return err == error.PreDecisionNotProposed;
         if (!phase.isPreDecision()) return false;
         return err == error.GroupLeaderUnavailable or
             err == error.PreDecisionDeadlineExceeded or
@@ -3731,6 +3735,16 @@ pub const AntflyApiHandler = struct {
         const input = distributed_txn.parseTxnResolveRequest(ctx.allocator, body) catch return textResponse(ctx, 400, "invalid transaction request");
         self.internalGroupOperations().txnResolve(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, input) catch |err|
             return internalTxnErrorResponse(ctx, err, .resolve);
+        return ctx.json(struct {}{});
+    }
+
+    fn internalTxnDecide(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid transaction request");
+        const input = distributed_txn.parseTxnResolveRequest(ctx.allocator, body) catch return textResponse(ctx, 400, "invalid transaction request");
+        self.internalGroupOperations().txnDecide(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, input) catch |err|
+            return internalTxnErrorResponse(ctx, err, .first_decision);
         return ctx.json(struct {}{});
     }
 
@@ -8694,6 +8708,61 @@ test "internal transaction HTTP size rejection is actionable without claiming no
     // The rejection can originate from an applied Raft command; do not claim
     // that no proposal was sent just because no prepare vote was written.
     try std.testing.expect(response.headers.get(distributed_txn_contract.pre_decision_outcome_header) == null);
+}
+
+test "first decision endpoint emits proof only for precise preaccept rejection" {
+    const Fake = struct {
+        outcome: ?anyerror = null,
+        calls: usize = 0,
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
+            return null;
+        }
+        fn decide(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: db_mod.types.TxnStatus, _: u64, _: u64, _: db_mod.types.SyncLevel, context: distributed_txn_contract.PreDecisionContext) anyerror!?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(context.deadline_ns != null);
+            self.calls += 1;
+            if (self.outcome) |err| return err;
+            return {};
+        }
+    };
+    var fake: Fake = .{};
+    var status_source = AuthStatusSource{};
+    var api_server = ApiHttpServer.init(std.testing.allocator, .{}, status_source.iface(), null, .{ .ptr = &fake, .vtable = &.{ .batch = Fake.batch, .txn_decide_group_local_with_pre_decision_context = Fake.decide } });
+    defer api_server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &api_server };
+    const body = try distributed_txn.encodeTxnResolveRequest(std.testing.allocator, .{ .txn_id = [_]u8{1} ** 16, .status = .committed, .commit_version = 42 });
+    defer std.testing.allocator.free(body);
+    inline for ([_]?anyerror{ null, error.PreDecisionNotProposed, error.PreDecisionDeadlineExceeded, error.Timeout, error.Canceled, error.LeaderUnavailable, error.RaftBatchWriteOutcomeUnknown }) |outcome| {
+        fake.outcome = outcome;
+        var request = try httpx.Request.init(std.testing.allocator, .POST, "http://127.0.0.1/internal/v1/groups/7/tables/docs/txn-decide-v1");
+        defer request.deinit();
+        request.body = body;
+        try request.setHeader(distributed_txn_contract.pre_decision_remaining_ms_header, "1000");
+        var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+        defer ctx.deinit();
+        ctx.params = &.{ .{ .name = "group_id", .value = "7" }, .{ .name = "table_name", .value = "docs" } };
+        AntflyApiHandler.establishInternalTxnPreDecisionDeadline(&ctx);
+        try std.testing.expect(ctx.application_deadline_ns != null);
+        var response = try handler.internalTxnDecide(&ctx);
+        defer response.deinit();
+        const rejected = if (outcome) |err| err == error.PreDecisionNotProposed or err == error.PreDecisionDeadlineExceeded else false;
+        try std.testing.expectEqual(@as(u16, if (outcome == null) 200 else if (rejected) 503 else 504), response.status.code);
+        const proof = response.headers.get(distributed_txn_contract.pre_decision_outcome_header);
+        if (rejected) try std.testing.expectEqualStrings(distributed_txn_contract.first_decision_not_proposed_v1, proof.?) else try std.testing.expect(proof == null);
+    }
+    try std.testing.expectEqual(@as(usize, 7), fake.calls);
+    var request = try httpx.Request.init(std.testing.allocator, .POST, "http://127.0.0.1/internal/v1/groups/7/tables/docs/txn-decide-v1");
+    defer request.deinit();
+    request.body = body;
+    var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    defer ctx.deinit();
+    ctx.params = &.{ .{ .name = "group_id", .value = "7" }, .{ .name = "table_name", .value = "docs" } };
+    AntflyApiHandler.establishInternalTxnPreDecisionDeadline(&ctx);
+    var response = try handler.internalTxnDecide(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 503), response.status.code);
+    try std.testing.expectEqualStrings(distributed_txn_contract.first_decision_not_proposed_v1, response.headers.get(distributed_txn_contract.pre_decision_outcome_header).?);
+    try std.testing.expectEqual(@as(usize, 7), fake.calls);
 }
 
 test "internal transaction HTTP responses prove not-proposed only before decision" {

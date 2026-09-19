@@ -5914,7 +5914,15 @@ pub const RaftBatcher = struct {
             req: db_mod.types.BatchRequest,
             context: distributed_txn.PreDecisionContext,
         ) anyerror!void = null,
+        /// Local leader only: no forwarding or legacy fallback is permitted.
+        decide_group_local_with_pre_decision_context: ?*const fn (*anyopaque, std.mem.Allocator, u64, []const u8, db_mod.types.BatchRequest, distributed_txn.PreDecisionContext) anyerror!void = null,
     };
+
+    pub fn decideGroupLocalWithPreDecisionContext(self: RaftBatcher, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_mod.types.BatchRequest, context: distributed_txn.PreDecisionContext) !void {
+        distributed_txn.ensurePreDecisionContextActive(context) catch return error.PreDecisionNotProposed;
+        const callback = self.vtable.decide_group_local_with_pre_decision_context orelse return error.PreDecisionNotProposed;
+        try callback(self.ptr, alloc, group_id, table_name, req, context);
+    }
 
     pub fn batchGroup(
         self: RaftBatcher,
@@ -6123,6 +6131,7 @@ pub const BoundTableWriteSource = struct {
                 .txn_prepare_group_local_with_pre_decision_context = txnPrepareGroupLocalWithPreDecisionContext,
                 .txn_resolve_group_local = txnResolveGroupLocal,
                 .txn_resolve_group_local_with_cancellation = txnResolveGroupLocalWithCancellation,
+                .txn_decide_group_local_with_pre_decision_context = txnDecideGroupLocalWithPreDecisionContext,
                 .txn_status_group_local = txnStatusGroupLocal,
                 .txn_acknowledge_group_local = txnAcknowledgeGroupLocal,
                 .corrupt_embedding_artifact = corruptEmbeddingArtifact,
@@ -7160,7 +7169,17 @@ pub const BoundTableWriteSource = struct {
         return try txnResolveGroupLocalWithCancellation(ptr, alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level, .none);
     }
 
-    fn txnResolveGroupLocalWithCancellation(
+    fn txnDecideGroupLocalWithPreDecisionContext(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, status: db_mod.types.TxnStatus, commit_version: u64, topology_epoch: u64, sync_level: db_mod.types.SyncLevel, context: distributed_txn.PreDecisionContext) anyerror!?void {
+        if (status != .committed) return error.PreDecisionNotProposed;
+        ensurePreDecisionContextActive(context) catch return error.PreDecisionNotProposed;
+        return try txnResolveGroupLocalImpl(ptr, alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level, context.cancellation, context);
+    }
+
+    fn txnResolveGroupLocalWithCancellation(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, status: db_mod.types.TxnStatus, commit_version: u64, topology_epoch: u64, sync_level: db_mod.types.SyncLevel, cancellation: db_mod.types.CancellationToken) anyerror!?void {
+        return try txnResolveGroupLocalImpl(ptr, alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level, cancellation, null);
+    }
+
+    fn txnResolveGroupLocalImpl(
         ptr: *anyopaque,
         _: std.mem.Allocator,
         group_id: u64,
@@ -7171,10 +7190,12 @@ pub const BoundTableWriteSource = struct {
         _: u64,
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
+        first_context: ?distributed_txn.PreDecisionContext,
     ) !?void {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
         const db = try self.activeDb();
+        if (first_context) |context| ensurePreDecisionContextActive(context) catch return error.PreDecisionNotProposed;
         try db.resolveTransactionIntentsWithSyncLevelAndCancellation(txn_id, status, commit_version, sync_level, cancellation);
         const participant = try distributed_txn.participantIdForGroup(db.alloc, table_name, group_id);
         defer db.alloc.free(participant);
@@ -20734,6 +20755,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .txn_prepare_group_local_with_pre_decision_context = txnPrepareGroupLocalWithPreDecisionContext,
                 .txn_resolve_group_local = txnResolveGroupLocal,
                 .txn_resolve_group_local_with_cancellation = txnResolveGroupLocalWithCancellation,
+                .txn_decide_group_local_with_pre_decision_context = txnDecideGroupLocalWithPreDecisionContext,
                 .txn_status_group_local = txnStatusGroupLocal,
                 .txn_status_group_linearizable = txnStatusGroupLinearizable,
                 .txn_status_group_linearizable_until = txnStatusGroupLinearizableUntil,
@@ -23885,7 +23907,17 @@ pub const ProvisionedTableWriteSource = struct {
         return try txnResolveGroupLocalWithCancellation(ptr, alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level, .none);
     }
 
-    fn txnResolveGroupLocalWithCancellation(
+    fn txnDecideGroupLocalWithPreDecisionContext(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, status: db_mod.types.TxnStatus, commit_version: u64, topology_epoch: u64, sync_level: db_mod.types.SyncLevel, context: distributed_txn.PreDecisionContext) anyerror!?void {
+        if (status != .committed) return error.PreDecisionNotProposed;
+        ensurePreDecisionContextActive(context) catch return error.PreDecisionNotProposed;
+        return try txnResolveGroupLocalImpl(ptr, alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level, context.cancellation, context);
+    }
+
+    fn txnResolveGroupLocalWithCancellation(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, status: db_mod.types.TxnStatus, commit_version: u64, topology_epoch: u64, sync_level: db_mod.types.SyncLevel, cancellation: db_mod.types.CancellationToken) anyerror!?void {
+        return try txnResolveGroupLocalImpl(ptr, alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level, cancellation, null);
+    }
+
+    fn txnResolveGroupLocalImpl(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         group_id: u64,
@@ -23896,6 +23928,7 @@ pub const ProvisionedTableWriteSource = struct {
         topology_epoch: u64,
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
+        first_context: ?distributed_txn.PreDecisionContext,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         try enforceHAWriteGateOptional(self.ha_write_gate);
@@ -23913,14 +23946,18 @@ pub const ProvisionedTableWriteSource = struct {
             // dispatcher as begin/prepare; the transaction ID and replicated
             // decision make retries safe, while the forwarded batch hop remains
             // cache-only and bounded inside the data runtime.
-            try batcher.batchGroupWithCancellation(alloc, group_id, table_name, .{
+            const decision_request: db_mod.types.BatchRequest = .{
                 .sync_level = sync_level,
                 .transaction = .{ .resolve = .{
                     .txn_id = txn_id,
                     .status = status,
                     .commit_version = commit_version,
                 } },
-            }, cancellation);
+            };
+            if (first_context) |context|
+                try batcher.decideGroupLocalWithPreDecisionContext(alloc, group_id, table_name, decision_request, context)
+            else
+                try batcher.batchGroupWithCancellation(alloc, group_id, table_name, decision_request, cancellation);
             return {};
         }
         if (status == .committed) {
@@ -23936,16 +23973,11 @@ pub const ProvisionedTableWriteSource = struct {
             }
         }
         if (self.groupLocalWriteSource()) |owner| {
-            if ((try owner.txnResolveGroupLocal(
-                alloc,
-                group_id,
-                table_name,
-                txn_id,
-                status,
-                commit_version,
-                topology_epoch,
-                sync_level,
-            )) == null) return null;
+            const result = if (first_context) |context|
+                try owner.txnDecideGroupLocalWithPreDecisionContext(alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level, context)
+            else
+                try owner.txnResolveGroupLocal(alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level);
+            if (result == null) return null;
             if (status == .committed) {
                 lockAtomic(&self.local_db_mutex);
                 self.markWriteCacheDirty(table_name);
@@ -23963,6 +23995,7 @@ pub const ProvisionedTableWriteSource = struct {
         if (self.write_cache) |cache| {
             var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default_async, null, null);
             defer cached.deinit(alloc);
+            if (first_context) |context| ensurePreDecisionContextActive(context) catch return error.PreDecisionNotProposed;
             try applyReplicatedTransactionMutationWithCancellation(alloc, cached.db, table_name, group_id, .{
                 .sync_level = sync_level,
                 .transaction = .{ .resolve = .{ .txn_id = txn_id, .status = status, .commit_version = commit_version } },
@@ -23978,6 +24011,7 @@ pub const ProvisionedTableWriteSource = struct {
             var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
+            if (first_context) |context| ensurePreDecisionContextActive(context) catch return error.PreDecisionNotProposed;
             try applyReplicatedTransactionMutationWithCancellation(alloc, &db, table_name, group_id, .{
                 .sync_level = sync_level,
                 .transaction = .{ .resolve = .{ .txn_id = txn_id, .status = status, .commit_version = commit_version } },
@@ -25966,6 +26000,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .txn_prepare_group_local_with_pre_decision_context = txnPrepareGroupLocalWithPreDecisionContext,
                 .txn_resolve_group_local = txnResolveGroupLocal,
                 .txn_resolve_group_local_with_cancellation = txnResolveGroupLocalWithCancellation,
+                .txn_decide_group_local_with_pre_decision_context = txnDecideGroupLocalWithPreDecisionContext,
                 .txn_status_group_local = txnStatusGroupLocal,
                 .txn_acknowledge_group_local = txnAcknowledgeGroupLocal,
                 .corrupt_embedding_artifact = corruptEmbeddingArtifact,
@@ -27047,6 +27082,23 @@ pub const HostedProvisionedTableWriteSource = struct {
             .transforms = req.transforms,
             .predicates = req.predicates,
             .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = topology_epoch } },
+        }, topology_epoch, context);
+    }
+
+    fn txnDecideGroupLocalWithPreDecisionContext(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, status: db_mod.types.TxnStatus, commit_version: u64, topology_epoch: u64, sync_level: db_mod.types.SyncLevel, context: distributed_txn.PreDecisionContext) anyerror!?void {
+        if (status != .committed) return error.PreDecisionNotProposed;
+        ensurePreDecisionContextActive(context) catch return error.PreDecisionNotProposed;
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (comptime control_only_storage_sources) {
+            if (topology_epoch != 0) try table_catalog.validateTransactionTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
+            const local_source = self.groupLocalWriteSource() orelse return error.PreDecisionNotProposed;
+            return try local_source.txnDecideGroupLocalWithPreDecisionContext(alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level, context);
+        }
+        // The helper checks the same original context after opening and just
+        // before native mutation. It never checks the deadline after mutation.
+        return batchGroupLocalFencedWithPreDecisionContext(ptr, alloc, group_id, table_name, .{
+            .sync_level = sync_level,
+            .transaction = .{ .resolve = .{ .txn_id = txn_id, .status = status, .commit_version = commit_version } },
         }, topology_epoch, context);
     }
 

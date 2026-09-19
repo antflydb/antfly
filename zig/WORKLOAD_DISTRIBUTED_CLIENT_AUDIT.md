@@ -183,13 +183,44 @@ abort/ack budget, transport cancellation during every remote attempt, and the
 multi-peer process-loss/shutdown schedules above remain open under item 8.
 
 
-A further first-decision admission gap remains: the coordinator commit has a
-final original-deadline checkpoint before dispatch, but its existing resolution
-callback can route/wait before proposal using its separate transport/recovery
-contract. A distinct first-decision context and definite-not-proposed evidence
-are required before an expired initial decision can safely authorize abort.
-Unknown or known-committed resolution must keep the independent recovery budget.
-This is the next bounded follow-up, not a guarantee established by the ten tests.
+The follow-up first-decision path now carries the original context through a
+separate participant callback, checked local-source callback, and local-only
+Raft admission callback. The new `/txn-decide-v1` RPC does not dispatch to the
+legacy resolution endpoint when the peer lacks that capability. Only an exact
+`PreDecisionNotProposed` result (or transport proof that no request was sent)
+permits durable abort. A generic cancellation, timeout, missing endpoint, or
+post-acceptance failure remains uncertain and enters same-decision recovery.
+Recovery, resumed committed transactions and later participant propagation still
+use the independent resolution path; no caller deadline is checked after a
+successful accepted decision. The HTTP transport borrows a cancellation scope
+that observes both the original clock/deadline and caller cancellation.
+
+API ABI35 appends the new capabilities. Failure ABI60 appends the exact
+`PreDecisionNotProposed` identity, and the checked API error transport preserves
+it separately from generic unavailable/cancellation statuses. New regression
+source covers first-submission rejection, response loss, accepted completion
+after expiry, resumed committed evidence, missing capability, versioned response
+proof and precise HTTP error classification. The owning API gate passed
+**15/15, 0 skipped, 0 failed, 0 leaks, actual exit 0**
+(`/tmp/workload-first-decision-api3.log`): the previous ten filters plus
+`--test-filter 'first decision'` select five new tests. Two earlier attempts
+failed solely on the new fixture's optional-error comparison; unwrapping the
+optional before comparing fixed the test, with no production change. A separate
+canonical failure-identity root passed **1/1, actual exit 0**
+(`/tmp/workload-first-decision-identity.log`):
+
+```sh
+zig test --dep runtime_failure_abi \
+  -Mroot=pkg/antfly/src/runtime_failure_identity.zig \
+  -Mruntime_failure_abi=pkg/antfly/src/runtime_failure_abi.zig \
+  --test-filter 'first decision rejection' \
+  --cache-dir /tmp/zig-local-cache --global-cache-dir /tmp/zig-global-cache
+```
+
+The matching DATA local-leader/user-receipt and SourceOwner acquisition hooks
+have their own pending integration gate. These API results do not qualify the
+remaining aggregate abort/ack deadline or multi-peer process-loss/shutdown
+schedules listed above.
 
 Reproduce the validated API stage from `zig/` (loopback access required):
 

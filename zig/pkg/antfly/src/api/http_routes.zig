@@ -109,6 +109,7 @@ pub const Routes = struct {
     pub const txn_begin_suffix = "/txn-begin";
     pub const txn_prepare_suffix = "/txn-prepare";
     pub const txn_resolve_suffix = "/txn-resolve";
+    pub const txn_decide_suffix = "/txn-decide-v1";
     pub const txn_status_suffix = "/txn-status";
     pub const txn_acknowledge_suffix = "/txn-acknowledge";
     pub const corrupt_embedding_artifact_suffix = "/corrupt-embedding-artifact";
@@ -1353,6 +1354,17 @@ pub const Routes = struct {
         return .{ .group_id = group.group_id, .table_name = table_name };
     }
 
+    pub fn matchGroupTxnDecide(path: []const u8) ?GroupTxnResolve {
+        const group = parseGroupPrefix(path) orelse return null;
+        const rest = group.rest;
+        if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
+        if (!std.mem.endsWith(u8, rest, txn_decide_suffix)) return null;
+        if (rest.len <= tables_prefix.len + txn_decide_suffix.len) return null;
+        const table_name = rest[tables_prefix.len .. rest.len - txn_decide_suffix.len];
+        if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
+        return .{ .group_id = group.group_id, .table_name = table_name };
+    }
+
     pub fn matchGroupTxnStatus(path: []const u8) ?GroupTxnStatus {
         const group = parseGroupPrefix(path) orelse return null;
         const rest = group.rest;
@@ -1737,6 +1749,7 @@ test "workload admission group routes reject overlapping and empty table names" 
         .{ Routes.matchGroupTxnBegin, Routes.txn_begin_suffix },
         .{ Routes.matchGroupTxnPrepare, Routes.txn_prepare_suffix },
         .{ Routes.matchGroupTxnResolve, Routes.txn_resolve_suffix },
+        .{ Routes.matchGroupTxnDecide, Routes.txn_decide_suffix },
         .{ Routes.matchGroupTxnStatus, Routes.txn_status_suffix },
         .{ Routes.matchGroupTxnAcknowledge, Routes.txn_acknowledge_suffix },
     }) |case| {

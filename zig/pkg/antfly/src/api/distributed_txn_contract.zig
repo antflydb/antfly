@@ -14,6 +14,7 @@ const db_types = @import("../storage/db/types.zig");
 /// and lets clients fail closed across proxies and rolling upgrades.
 pub const pre_decision_outcome_header = "X-Antfly-Txn-Pre-Decision-Outcome";
 pub const pre_decision_not_proposed_v1 = "not-proposed-v1";
+pub const first_decision_not_proposed_v1 = "first-decision-not-proposed-v1";
 /// Relative server-side budget. Monotonic clocks are process-local, so the
 /// coordinator sends a duration and ingress establishes the absolute deadline
 /// before authentication and request dispatch consume it.

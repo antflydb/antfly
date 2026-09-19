@@ -478,6 +478,7 @@ pub const Detail = enum(c_int) {
     completion_admission_policy_changed,
     missing_completion_admission_guard,
     invalid_completion_catalog,
+    pre_decision_not_proposed,
 };
 
 pub const Status = extern struct {
@@ -674,6 +675,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.Timeout => status(.timeout, .timeout),
         error.ReadIndexTimeout => status(.timeout, .read_index_timeout),
         error.DeadlineExceeded => status(.timeout, .deadline_exceeded),
+        error.PreDecisionNotProposed => status(.unavailable, .pre_decision_not_proposed),
         error.PreDecisionDeadlineExceeded => status(.timeout, .pre_decision_deadline_exceeded),
         error.ConnectionTimeout => status(.timeout, .connection_timeout),
         error.ConnectionTimedOut => status(.timeout, .connection_timed_out),
@@ -1351,6 +1353,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .ha_sync_commit_wait_missing_context => "HASyncCommitWaitMissingContext",
         .ha_sync_commit_wait_standby_not_in_policy => "HASyncCommitWaitStandbyNotInPolicy",
         .deadline_exceeded => "DeadlineExceeded",
+        .pre_decision_not_proposed => "PreDecisionNotProposed",
         .pre_decision_deadline_exceeded => "PreDecisionDeadlineExceeded",
         .graph_metric_action_partial_outcome => "GraphMetricActionPartialOutcome",
         .graph_distinct_budget_exceeded => "GraphDistinctBudgetExceeded",
@@ -1653,4 +1656,9 @@ test "workload admission invalid completion catalog preserves checked boundary i
     const result = statusFromError(error.InvalidCompletionCatalog);
     try std.testing.expectEqual(@intFromEnum(Code.corrupt), result.code);
     try std.testing.expectEqual(error.InvalidCompletionCatalog, errorFromStatus(result));
+}
+
+test "first decision rejection preserves checked status identity" {
+    try std.testing.expectEqual(error.PreDecisionNotProposed, errorFromStatus(statusFromError(error.PreDecisionNotProposed)));
+    try std.testing.expectEqual(@intFromEnum(Detail.pre_decision_not_proposed), statusFromError(error.PreDecisionNotProposed).detail);
 }

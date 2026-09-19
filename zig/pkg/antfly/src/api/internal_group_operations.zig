@@ -47,6 +47,7 @@ pub const Error = operation.ApiError || error{
     GraphExploredEdgeBytesBudgetExceeded,
     GroupLeaderUnavailable,
     PreDecisionDeadlineExceeded,
+    PreDecisionNotProposed,
     TransactionPreDecisionOutcomeUnknown,
     RaftBatchWriteOutcomeUnknown,
     DecisionConflict,
@@ -581,6 +582,28 @@ pub const Operations = struct {
             => return error.GroupLeaderUnavailable,
             else => return error.Internal,
         }) orelse return error.NotFound;
+    }
+
+    /// Fresh coordinator commit only; recovery uses txnResolve unchanged.
+    pub fn txnDecide(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: distributed_txn.TxnResolveRequest) Error!void {
+        if (input.status != .committed or request.deadline_ns == null) return error.PreDecisionNotProposed;
+        request.ensureActive() catch return error.PreDecisionNotProposed;
+        const writes = self.writes orelse return error.PreDecisionNotProposed;
+        _ = (writes.txnDecideGroupLocalWithPreDecisionContext(alloc, group_id, table_name, input.txn_id, input.status, input.commit_version, input.topology_epoch, input.sync_level, .{
+            .deadline_ns = request.deadline_ns,
+            .deadline_io = request.deadline_io,
+            .cancellation = request.cancellation,
+        }) catch |err| switch (err) {
+            error.PreDecisionNotProposed, error.PreDecisionDeadlineExceeded => return error.PreDecisionNotProposed,
+            error.DecisionConflict => return error.DecisionConflict,
+            error.TopologyChanged => return error.TopologyChanged,
+            error.EnrichmentWaitCanceled => return error.EnrichmentWaitCanceled,
+            error.EnrichmentWaitTimeout, error.CommitVisibilityNotSatisfied => return error.EnrichmentWaitTimeout,
+            error.EnrichmentRetryInProgress => return error.EnrichmentRetryInProgress,
+            error.EnrichmentWorkerFailed => return error.EnrichmentWorkerFailed,
+            // No arbitrary callback/transport error authorizes an opposite decision.
+            else => return error.TransactionPreDecisionOutcomeUnknown,
+        }) orelse return error.PreDecisionNotProposed;
     }
 
     pub fn txnResolve(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: distributed_txn.TxnResolveRequest) Error!void {
