@@ -405,6 +405,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "packed dense response exposes public ids not doc ordinals",
         "dense response identity generation footer",
         "capi aggregate hits rejects stale identity generation before aggregation materialization",
+        "capi get edges json does not double free a non-empty edge slice",
     };
     const capi_tests = b.addTest(.{
         .root_module = capi_mod,

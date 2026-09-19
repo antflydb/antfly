@@ -1,16 +1,77 @@
 # Copyright 2026 Antfly, Inc.
 # SPDX-License-Identifier: Apache-2.0
 import os
-from pathlib import Path
+import platform
+import subprocess
 import tempfile
-from types import SimpleNamespace
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from tools import fixture_workspace as workspace
 
 
 class FixtureWorkspaceTests(unittest.TestCase):
+    def test_zig_fixtures_survive_workspace_cleanup_and_empty_environment(self):
+        zig_root = Path(__file__).resolve().parents[1]
+        # Match the production build's explicit Linux target: native libc
+        # discovery can select host CRT objects unsupported by Zig's linker.
+        target_flags = (
+            ["-target", f"{platform.machine()}-linux-gnu"]
+            if platform.system() == "Linux"
+            else []
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary = Path(temporary)
+            binary = temporary / "fixture-tests"
+            build = subprocess.run(
+                [
+                    "zig",
+                    "test",
+                    "-lc",
+                    *target_flags,
+                    "--test-no-exec",
+                    "--test-filter",
+                    "test directory",
+                    f"-femit-bin={binary}",
+                    "--dep",
+                    "antfly_platform",
+                    f"-Mroot={zig_root / 'pkg/antfly/src/common/test_directory.zig'}",
+                    f"-Mantfly_platform={zig_root / 'lib/platform/src/root.zig'}",
+                ],
+                cwd=temporary,
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=120,
+            )
+            self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
+            root = temporary / "workspace"
+            root.mkdir()
+            # Exercise actual Zig fixtures before and after CI removes its
+            # private workspace and exports an empty value for later phases.
+            for value in (None, str(root), ""):
+                with self.subTest(workspace=value):
+                    env = dict(os.environ)
+                    env.pop("ANTFLY_TEST_WORKSPACE", None)
+                    if value is not None:
+                        env["ANTFLY_TEST_WORKSPACE"] = value
+                    result = subprocess.run(
+                        [str(binary)],
+                        cwd=temporary,
+                        env=env,
+                        capture_output=True,
+                        check=False,
+                        text=True,
+                        timeout=30,
+                    )
+                    self.assertEqual(
+                        result.returncode, 0, result.stdout + result.stderr
+                    )
+                    if value == str(root):
+                        root.rmdir()
+
     def test_rejects_disk_small_full_and_unbounded_filesystems(self):
         with tempfile.TemporaryDirectory() as root:
             for kind, total, free in [
@@ -31,9 +92,9 @@ class FixtureWorkspaceTests(unittest.TestCase):
                             f_blocks=total, f_bavail=free, f_frsize=1
                         ),
                     ),
+                    self.assertRaises(ValueError),
                 ):
-                    with self.assertRaises(ValueError):
-                        workspace.validate_root(root)
+                    workspace.validate_root(root)
 
     def test_preprovisioned_volume_is_private_and_never_unmounted(self):
         with (
