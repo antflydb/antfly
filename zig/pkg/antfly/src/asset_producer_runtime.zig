@@ -268,6 +268,52 @@ test "asset producer runtime floors the local extractor allocator ceiling at the
     try plan.validate();
 }
 
+// Regression for the dogfood ingest's six terminal failures: planning a tiny
+// section (150-560 bytes) with the ordinary GLiNER extractor config parses
+// that config into a JSON value tree whose allocations exceed a budget scaled
+// only from the request's own bytes. Resolution must reach the provider (which
+// here fails with a sentinel) rather than failing closed with
+// InferenceInvocationMemoryExceeded before the invocation.
+test "asset producer runtime resolves a plan for a tiny local extractor request" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    var client = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
+    defer client.deinit();
+
+    const Local = struct {
+        fn extract(_: *anyopaque, _: Allocator, _: []const u8, _: extracting.Request) !extracting.Response {
+            return error.TestUnexpectedResult;
+        }
+        fn embedDense(_: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8) ![][]f32 {
+            return error.TestUnexpectedResult;
+        }
+        fn embedSparse(_: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8) ![]@import("storage/db/enrichment/embedder.zig").SparseEmbedding {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var context: u8 = 0;
+    const provider = managed_embedder.AntflyProvider{
+        .ptr = &context,
+        .owns_invocation_admission = true,
+        .embed_dense_texts = Local.embedDense,
+        .embed_sparse_texts = Local.embedSparse,
+        .extract = Local.extract,
+    };
+    var runtime = Runtime.initWithOptions(alloc, &client, .{ .antfly_provider = provider });
+    defer runtime.deinit();
+
+    const request = asset_producer.Request{
+        .producer_type = .extractor,
+        .config_json =
+        \\{"model":"fastino/gliner2.5-base-v1","options":{"include_confidence":true,"include_spans":true,"long_document":{"mode":"window"}},"provider":"antfly","schema":{"entities":["component","subsystem","file","test","invariant","decision","person","model","backend","format","protocol"],"relations":[{"type":"depends_on"},{"type":"owns"},{"type":"implements"},{"type":"supersedes"},{"type":"tested_by"},{"type":"documented_in"}]}}
+        ,
+        .source_text = "This document tracks reader and OCR parity between the Zig server in this repo and the reference.",
+        .content_type = "application/json",
+    };
+    try std.testing.expectError(error.TestUnexpectedResult, runtime.producer().produce(alloc, request));
+}
+
 /// Two in-flight local transcriptions keep the model busy while the other
 /// recording is decoded and windowed; more only adds memory pressure.
 pub const default_local_transcriber_width: usize = 2;
