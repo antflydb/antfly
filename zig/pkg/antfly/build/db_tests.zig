@@ -380,6 +380,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "db blocked dense embedding lane does not force the independent asset lane to redo checkpointed work",
         "cross-quantum lane pipelining publishes a fast dense quantum while a slower asset quantum is still in flight",
         "cross-quantum dispatch clones queued requests so later caller reuse cannot corrupt an in-flight asset quantum",
+        "synchronous window checkpoints never advance the asset cursor past queued or in-flight extractor work",
         "combined replay cursor gate requires every execution lane to cover a group",
         "each execution lane persists and clears its own replay cursor scope",
         "asset producer runtime accepts an unrequested boundary-model schema_version upgrade",

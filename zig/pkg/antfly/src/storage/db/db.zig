@@ -89936,6 +89936,127 @@ test "cross-quantum lane pipelining publishes a fast dense quantum while a slowe
     try std.testing.expectEqual(@as(usize, 1), slow_asset.calls.load(.acquire));
 }
 
+test "synchronous window checkpoints never advance the asset cursor past queued or in-flight extractor work" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    const c = struct {
+        extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+        extern fn unsetenv(name: [*:0]const u8) c_int;
+    };
+    // A preparation quantum wide enough to hold every document's extractor
+    // request (so the asset lane is dispatched only once, at the end of the
+    // scan, with the earlier documents' requests queued behind the scan the
+    // whole time) and a one-item synchronous replay window (so each
+    // document's copy asset takes the scanner's mid-scan flush-and-checkpoint
+    // path while those extractor requests are still queued).
+    const preparation_env = "ANTFLY_ENRICHMENT_PREPARATION_WINDOW_ITEMS";
+    const window_env = "ANTFLY_ENRICHMENT_WINDOW_ITEMS";
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(preparation_env, "8", 1));
+    defer _ = c.unsetenv(preparation_env);
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(window_env, "1", 1));
+    defer _ = c.unsetenv(window_env);
+
+    var slow_asset = SlowGatedAssetProducer{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .asset_producer = slow_asset.interface(),
+            .inline_retry_max_attempts = 1,
+        },
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    defer slow_asset.allow();
+
+    try db.addEnrichment(.{
+        .name = "summary_v1",
+        .kind = .asset,
+        .field = "body",
+        .content_type = "text/plain",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}",
+    });
+    // A copy asset is synchronous scanner work planned after the extractor:
+    // it publishes through the shared window, never through an execution
+    // lane, so it is what fills the window at the end of each group.
+    try db.addEnrichment(.{
+        .name = "title_copy_v1",
+        .kind = .asset,
+        .field = "title",
+        .content_type = "text/plain",
+        .producer_json = "{\"type\":\"copy\"}",
+    });
+
+    // Every document queues an extractor request (deferred to the lane) and
+    // a copy request (published synchronously by the scanner).
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"first title\",\"body\":\"alpha summary source\"}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"second title\",\"body\":\"beta summary source\"}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"third title\",\"body\":\"gamma summary source\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    // The scan reaches the end and dispatches the asset lane, which parks in
+    // the producer on its first call.
+    var attempts: usize = 0;
+    var parked = false;
+    while (attempts < slow_test_wait_attempts) : (attempts += 1) {
+        if (slow_asset.started.load(.acquire) and !slow_asset.finished.load(.acquire)) {
+            parked = true;
+            break;
+        }
+        sleepPollInterval();
+    }
+    try std.testing.expect(parked);
+
+    // The copy work was published and checkpointed mid-scan: the dense
+    // stream had nothing outstanding, so its cursor advanced...
+    for ([_][]const u8{ "doc:a", "doc:b", "doc:c" }) |doc_key| {
+        const copy_key = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "asset", "title_copy_v1");
+        defer alloc.free(copy_key);
+        const copied = try db.core.store.get(alloc, copy_key);
+        alloc.free(copied);
+    }
+    const dense_cursor = try enrichment_state.loadReplayCursor(alloc, db.enrichment_runtime.?.store, "generated.dense");
+    try std.testing.expect(dense_cursor != null);
+    var owned_dense_cursor = dense_cursor.?;
+    owned_dense_cursor.deinit(alloc);
+    try std.testing.expect(!slow_asset.finished.load(.acquire));
+    // ...but the asset stream's cursor must not exist yet: at each of those
+    // checkpoints the documents' asset requests were still queued for the
+    // lane, and now the lane's quantum is in flight. A cursor at doc:c would
+    // tell a restart that all three extractions are durable, and the
+    // historical mid-scan checkpoint wrote exactly that for both streams.
+    if (try enrichment_state.loadReplayCursor(alloc, db.enrichment_runtime.?.store, "generated.assets")) |cursor| {
+        var owned = cursor;
+        defer owned.deinit(alloc);
+        std.debug.print("unexpected asset cursor while extraction is outstanding: sequence={d} doc_key={s}\n", .{ owned.sequence, owned.doc_key });
+        return error.TestUnexpectedResult;
+    }
+
+    slow_asset.allow();
+    try db.runUntilIdle();
+
+    // The completed pass advanced the applied sequence and retired both
+    // stream cursors; every extraction is durable.
+    try std.testing.expect((try enrichment_state.loadReplayCursor(alloc, db.enrichment_runtime.?.store, "generated.assets")) == null);
+    try std.testing.expect((try enrichment_state.loadReplayCursor(alloc, db.enrichment_runtime.?.store, "generated.dense")) == null);
+    for ([_][]const u8{ "doc:a", "doc:b", "doc:c" }) |doc_key| {
+        const artifact_key = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "asset", "summary_v1");
+        defer alloc.free(artifact_key);
+        const artifact_value = try db.core.store.get(alloc, artifact_key);
+        defer alloc.free(artifact_value);
+        try std.testing.expect(std.mem.startsWith(u8, artifact_value, "asset:"));
+    }
+}
+
 test "cross-quantum dispatch clones queued requests so later caller reuse cannot corrupt an in-flight asset quantum" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
     const alloc = std.testing.allocator;

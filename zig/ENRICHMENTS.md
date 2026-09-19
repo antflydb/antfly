@@ -213,6 +213,43 @@ lane's quantum is still running. The final `applied_sequence` watermark
 still only advances after that drain completes for every quantum in the
 pass, preserving the durability contract below.
 
+A stream's cursor is a claim that every request of that stream up to the
+checkpointed group is durably published, so only the party that made the
+work durable may write it. The lanes checkpoint their own scope after their
+own publish. The scanner also publishes a synchronous window mid-scan
+(chunk text, sparse embeddings, copy/document-extraction assets) when it
+fills, and at that point it checkpoints a stream only if that stream has
+nothing outstanding: no requests queued for the lane's next dispatch and no
+quantum still in flight in `LanePipeline` (`saveReplayCursorForIdleStreams`).
+The historical mid-scan checkpoint advanced both streams unconditionally,
+which let a restart skip documents whose extraction was still queued or
+still running in a parked asset lane.
+
+Failure identity is per operation, never global, once lanes run
+concurrently. The runtime's `active_failure_fingerprint` (which
+`shouldYieldRequestError`, `requestAttemptNumber` and the supervisor
+boundary consult) belongs to the scanner thread alone. Each lane quantum
+carries a `FailureScope` -- the request or provider batch it is attempting
+and the first retryable error it deferred with that error's identity -- and
+every lane-side helper takes the identity from the scope
+(`shouldYieldRequestErrorFor`, `requestAttemptNumberFor`,
+`recordIsolatedRequestErrorFor`, `flushGeneratedReplayWindowWithIdentity`,
+`noteEmbedBatchStartedFor`). A successful publish credits durable retry
+progress to the scope's request, unless that request is the one that
+deferred a retry, so a sibling's success cannot clear another request's
+debt. When a lane's quantum ends with its deferred retryable error, the
+error and the identity travel together in a `LaneOutcome`; `LanePipeline`
+installs that identity as the runtime's active retry identity on the scanner
+thread, and only for the outcome whose error is actually returned to the
+supervisor (a scan-time error keeps the scanner's own identity untouched).
+
+Shared runtime sets touched from both lanes and the scanner
+(`published_generated_artifacts`, `isolated_failed_indexes`,
+`isolated_failed_sources`) are accessed only through helpers that hold
+`shared_sets_mutex`; the rest of the retry-episode state
+(`retry_failure_fingerprint`, attempt counts, embedding activity) was
+already behind the runtime mutex.
+
 Replay skip-ahead on the next pass still requires *both* per-stream cursors
 to cover a document group before that group is skipped
 (`replayCursorsCoverGroup`); a group covered by only one lane's cursor is
