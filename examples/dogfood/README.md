@@ -162,33 +162,48 @@ index's configured embedder (in-process or the index's `api_url`).
 ## Known limitations
 
 Measured on an Apple Silicon laptop against this repository's corpus
-(1,206 markdown sections), in-process on Metal, 2026-09-18, with GLiNER2.5
-base and windowed long documents:
+(1,230 markdown sections), in-process on Metal, 2026-09-19, with GLiNER2.5
+base and windowed long documents. The machine was also running other Zig
+builds during this run, and the embedded inference node refused admission
+52 times under that memory pressure (each refusal is retried), so the wall
+time is an upper bound:
 
 | Step | Result |
 |---|---|
-| Ingest wall time | 14.1 min (drain 846 s) |
-| Chunks embedded | 5,024 in 174 batches, 17.1 chunks/s |
-| Sections extracted | 1,231 items in 176 batches, 1.8 sections/s (5 sections lost) |
-| `query "how does VOPR fence strong reads"` | 8 RRF-merged hits, 44 entities, 51 edges |
+| Ingest wall time | 12.6 min (drain 757 s), no sections lost |
+| Chunks embedded | 5,119 in 180 batches, 15.3 chunks/s |
+| Sections extracted | 1,230 sections (1,277 attempts incl. admission retries) in 161 lane batches, 1.7 sections/s |
+| `query "how does VOPR fence strong reads"` | 8 RRF-merged hits, 87 entities, 115 edges |
 | `entity "Raft"` | 4 edges (`implements`, `supersedes`, ...) |
 
-The previous run with GLiNER2 base and inline chunking took 9.4 min; the
-fp32 GLiNER2.5 checkpoint with windowed long documents is heavier per
-section, and extraction is now the bottleneck.
+The two enrichment lanes now overlap fully: extraction (732 s) is the
+whole drain, and the 335 s of embedding runs inside it. The previous run
+with GLiNER2 base and inline chunking took 9.4 min; the fp32 GLiNER2.5
+checkpoint with windowed long documents is heavier per section, and
+extraction is the bottleneck.
+
+Three defects this ingest exposed are fixed on the way (details in
+`zig/pkg/inference/models/gliner2/GLINER25.md`, section 14): the
+safetensors GLiNER2.5 checkpoint advertised a 128-item serial batch
+contract, so the asset-producer batcher grouped sections into requests the
+one-document boundary executor rejected (the "five lost sections" of
+earlier runs); sections under about 600 bytes failed during invocation
+planning because the planning budget scaled only with the request; and the
+smallest real section (`zig/SCHEMA.md`'s "Related Docs", 20 bytes after
+link stripping) was below the qualification rows' 26-byte floor, which is
+now measured down to one byte.
 
 What remains:
 
-- **Extraction throughput.** The asset lane runs at ~1.8 sections/s
-  in-process versus ~4.5 sections/s measured through the standalone server
-  on the same sections; the two enrichment lanes also do not overlap fully
-  (wall 846 s versus 678 s of extraction and 293 s of embedding). An fp16
-  encoder for GLiNER2.5 matched fp32 on every fixture but is not yet
-  qualified as a production row.
-- **Five sections are still lost**: the enrichment runtime occasionally
-  groups two documents into one extraction request, which the boundary
-  model's contract (one document per request) rejects, and the resulting
-  deterministic rejections are retried five times before giving up.
+- **Extraction throughput.** The asset lane runs at ~1.7 sections/s
+  in-process. Measured in isolation, the in-process provider entry runs at
+  the same rate as the standalone HTTP server on a 40-section sample of
+  this corpus, so the remaining gap to the ~4.5 sections/s seen through the
+  server is GPU contention with the concurrent embedding lane, not the call
+  path. An fp16 encoder for GLiNER2.5 converts deterministically and
+  matches fp32 on 61 of 62 pinned confidence values, but one value misses
+  the 5e-4 tolerance by about 18% on both backends, so it stays
+  unqualified.
 - Entity node names are the extractor's surface strings (for example
   `Raft`, `Full-cluster v42`), so `dogfood entity` needs the exact extracted
   text; there is no entity resolution step in this example.
