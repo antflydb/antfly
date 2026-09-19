@@ -19,6 +19,7 @@ const abi = @import("kernel_owner_abi").completion_pool;
 const wal = @import("wal.zig");
 const Allocator = std.mem.Allocator;
 pub const maintenance = @import("completion_maintenance.zig");
+const capacity = @import("completion_capacity.zig");
 
 pub const max_slots = completion.max_slots;
 pub const accepted_filenames = [_][]const u8{
@@ -286,6 +287,23 @@ fn validateEntryRecordSizes(entry: *const entry_codec.OwnedEntry, limit: usize) 
     try validateRecordSize(descriptor.namespace, &@import("../internal_keys.zig").raft_document_applied_entry_key, 16, limit);
 }
 
+fn entryCapacity(entry: *const entry_codec.OwnedEntry) !capacity.Cost {
+    const descriptor = entry.decoded_descriptor.descriptor;
+    const ns = if (descriptor.namespace) |name| name.len else 0;
+    var result: capacity.Cost = .{};
+    for ([_][]const slot_codec.Operation{ entry.entry.prepare_operations, descriptor.commit, descriptor.abort }) |operations|
+        for (operations) |op| {
+            result = try result.plus(try capacity.Cost.record(ns, op.key.len, op.value.len));
+        };
+    for (completion.storage_keys) |key| result = try result.plus(try capacity.Cost.record(ns, key.len, entry.entry.descriptor.len));
+    for (completion.applied_keys) |key| result = try result.plus(try capacity.Cost.record(ns, key.len, 16));
+    const receipt = entry_codec.receiptKey(descriptor.txn_id);
+    result = try result.plus(try (try capacity.Cost.record(ns, receipt.len, 48)).repeated(2));
+    result = try result.plus(try (try capacity.Cost.record(ns, entry_codec.group_progress_key.len, 112)).repeated(2));
+    result = try result.plus(try (try capacity.Cost.record(ns, @import("../internal_keys.zig").raft_document_applied_entry_key.len, 16)).repeated(2));
+    return result;
+}
+
 pub fn Pool(comptime Backend: type) type {
     return struct {
         const Self = @This();
@@ -310,6 +328,11 @@ pub fn Pool(comptime Backend: type) type {
         control: *domains.RecyclingScratch,
         maintenance_active: bool = false,
         maintenance_pending: bool = false,
+        capacity_cost: capacity.Cost = .{},
+        capacity_growth: capacity.Cost = .{},
+        capacity_baseline_frontier: u64 = 0,
+        capacity_certified: bool = false,
+        capacity_max_credit_bytes: u64 = 0,
         legacy_obsolete_imported: bool = false,
         retired: [2]@import("completion_maintenance_cycle.zig").Retired = .{ .{}, .{} },
         publication: *domains.RecyclingScratch,
@@ -563,6 +586,7 @@ pub fn Pool(comptime Backend: type) type {
             for (0..incoming.entryCount()) |i| {
                 const item = incoming.entryAt(i);
                 try validateRecordSize(item.namespace_name, item.key, item.value.len, self.config.shape.max_record_bytes);
+                if (!item.tombstone) try self.counterValueHeadroom(item.key, item.value, self.capacity_max_credit_bytes);
                 const key = item.key;
                 if (std.mem.eql(u8, key, entry_codec.group_progress_key) or
                     std.mem.startsWith(u8, key, entry_codec.receipt_prefix) or
@@ -570,6 +594,68 @@ pub fn Pool(comptime Backend: type) type {
                     std.mem.startsWith(u8, key, completion.applied_key)) return error.PreparedCompletionActive;
             }
             try self.checkAcceptedFootprint(incoming);
+            if (self.capacity_certified) {
+                var growth: capacity.Cost = .{};
+                for (0..incoming.entryCount()) |i| {
+                    const item = incoming.entryAt(i);
+                    growth = try growth.plus(try capacity.Cost.record(if (item.namespace_name) |ns| ns.len else 0, item.key.len, item.value.len));
+                }
+                try self.checkCapacity(growth);
+                // Preflight can precede a failed write. Retain the conservative
+                // charge until maintenance rather than refund uncertain I/O.
+                self.chargeCapacity(growth);
+            }
+        }
+
+        fn checkCapacity(self: *const Self, growth: capacity.Cost) !void {
+            if (!self.capacity_certified) return error.CompletionReservationBusy;
+            const total = try self.capacity_cost.plus(growth);
+            _ = try capacity.certify(total, .{ .metadata_bytes = self.config.shape.max_metadata_bytes, .additional_runs = self.cell_count });
+            const future = try self.capacity_growth.plus(growth);
+            const added = try capacity.certify(future, .{ .metadata_bytes = self.config.shape.max_metadata_bytes, .additional_runs = self.cell_count });
+            // Existing immutable cursors remain live while the newly generated
+            // protected runs are merged. Certifying only the replacement run
+            // layout would omit this first maintenance frontier.
+            if (self.capacity_baseline_frontier +| added.frontier_bytes > 16 * 1024 * 1024)
+                return error.UnsupportedCompletionProfile;
+        }
+
+        fn chargeCapacity(self: *Self, growth: capacity.Cost) void {
+            self.capacity_cost = self.capacity_cost.plus(growth) catch unreachable;
+            self.capacity_growth = self.capacity_growth.plus(growth) catch unreachable;
+        }
+
+        fn counterValueHeadroom(self: *const Self, key: []const u8, value: []const u8, max_credit: u64) !void {
+            if (std.mem.eql(u8, key, &@import("../internal_keys.zig").replay_meta_next_sequence_key)) {
+                if (value.len != 8) return error.InvalidCompletionSlot;
+                try capacity.sharedCounterHeadroom(std.mem.readInt(u64, value[0..8], .little), 1, self.cell_count);
+            } else if (std.mem.eql(u8, key, "\x00\x00__metadata__:txn_completion_v1")) {
+                if (value.len != 16) return error.InvalidCompletionSlot;
+                try capacity.sharedCounterHeadroom(std.mem.readInt(u64, value[0..8], .little), 1, self.cell_count);
+                try capacity.sharedCounterHeadroom(std.mem.readInt(u64, value[8..16], .little), max_credit, self.cell_count);
+            }
+        }
+
+        fn checkCounterHeadroom(self: *Self, backend: *Backend, alloc: Allocator, entry: *const entry_codec.OwnedEntry) !u64 {
+            try capacity.nativeCounterHeadroom(backend.manifest_journal.sequence orelse return error.RecoveryRequired, backend.next_run_id, if (backend.wal_retention.primary) |primary| primary.current_segment else 1, self.cell_count);
+            var maximum_credit = self.capacity_max_credit_bytes;
+            const credit_prefix = "\x00\x00__txn_completion_v1__:";
+            for (entry.entry.prepare_operations) |op| {
+                if (op.kind != .put or op.key.len != credit_prefix.len + 16 or !std.mem.startsWith(u8, op.key, credit_prefix)) continue;
+                if (op.value.len != 16) return error.InvalidCompletionSlot;
+                const bytes = std.math.add(u64, std.mem.readInt(u64, op.value[0..8], .little), std.mem.readInt(u64, op.value[8..16], .little)) catch
+                    return error.UnsupportedCompletionProfile;
+                maximum_credit = @max(maximum_credit, bytes);
+            }
+            const ns = entry.decoded_descriptor.descriptor.namespace;
+            for ([_][]const u8{ &@import("../internal_keys.zig").replay_meta_next_sequence_key, "\x00\x00__metadata__:txn_completion_v1" }) |key| {
+                const current = try self.point(backend, alloc, ns, key);
+                defer current.deinit(alloc);
+                if (current.value) |value| try self.counterValueHeadroom(key, value, maximum_credit);
+            }
+            for (entry.entry.prepare_operations) |op| if (op.kind == .put)
+                try self.counterValueHeadroom(op.key, op.value, maximum_credit);
+            return maximum_credit;
         }
 
         pub fn checkAcceptedFootprint(self: *Self, incoming: anytype) !void {
@@ -630,6 +716,9 @@ pub fn Pool(comptime Backend: type) type {
                 (index > 1 and previous_term == 0)) return error.CompletionProfileChanged;
             try Slot.validateFootprint(backend, checked.decoded_descriptor.descriptor);
             try self.validateBaseline(backend, scratch, &checked);
+            const growth = try entryCapacity(&checked);
+            try self.checkCapacity(growth);
+            const maximum_credit = try self.checkCounterHeadroom(backend, scratch, &checked);
             const free_index = for (self.cells[0..self.cell_count], 0..) |cell, i| {
                 if (cell.phase == .free) break i;
             } else return error.CompletionReservationBusy;
@@ -655,6 +744,8 @@ pub fn Pool(comptime Backend: type) type {
             cell.term = term;
             cell.index = index;
             cell.phase = .accepted;
+            self.chargeCapacity(growth);
+            self.capacity_max_credit_bytes = maximum_credit;
             transferred = true;
             self.writeAccepted(free_index) catch |err| {
                 self.failed = true;
@@ -772,13 +863,19 @@ pub fn Pool(comptime Backend: type) type {
             const alloc = try borrow.allocator();
             var paths: [68][]const u8 = undefined;
             for (0..backend.runs.count()) |i| paths[i] = backend.runs.at(i).path orelse return error.UnsupportedCompletionProfile;
-            try maintenance.qualify(alloc, self.io.storage(), paths[0..backend.runs.count()], .{
+            const measured = try maintenance.measure(alloc, self.io.storage(), paths[0..backend.runs.count()], .{
                 .max_inputs = self.config.shape.max_runs,
                 .max_metadata_bytes = self.config.shape.max_metadata_bytes,
                 .max_block_bytes = self.config.shape.max_block_bytes,
                 .max_record_bytes = self.config.shape.max_record_bytes,
             });
+            _ = try capacity.certify(measured.cost, .{ .metadata_bytes = self.config.shape.max_metadata_bytes, .additional_runs = self.cell_count });
             try self.restoreProgress(backend, alloc);
+            self.capacity_cost = measured.cost;
+            self.capacity_growth = .{};
+            self.capacity_max_credit_bytes = 0;
+            self.capacity_baseline_frontier = measured.frontier_bytes;
+            self.capacity_certified = true;
             self.ready = true;
         }
 
@@ -1288,6 +1385,18 @@ test "workload admission physical completion pool accepts through native prepaid
     try std.testing.expectEqual(Pool(Backend).Phase.free, pool.cells[0].phase);
     try std.testing.expectError(error.FileNotFound, pool.io.storage().fileSize(pool.accepted_paths[0]));
     pool.config.shape.max_record_bytes = (Shape{}).max_record_bytes;
+    const saved_sequence = backend.manifest_journal.sequence;
+    backend.manifest_journal.sequence = std.math.maxInt(u64) - 5;
+    try std.testing.expectError(error.UnsupportedCompletionProfile, pool.accept(&backend, 3, 9, 3, 8, envelope));
+    backend.manifest_journal.sequence = saved_sequence;
+    try std.testing.expectEqual(Pool(Backend).Phase.free, pool.cells[0].phase);
+    try std.testing.expectError(error.FileNotFound, pool.io.storage().fileSize(pool.accepted_paths[0]));
+    const saved_cost = pool.capacity_cost;
+    pool.capacity_cost = try (try capacity.Cost.record(0, 8, 1)).repeated(1_000_000);
+    try std.testing.expectError(error.UnsupportedCompletionProfile, pool.accept(&backend, 3, 9, 3, 8, envelope));
+    pool.capacity_cost = saved_cost;
+    try std.testing.expectEqual(Pool(Backend).Phase.free, pool.cells[0].phase);
+    try std.testing.expectError(error.FileNotFound, pool.io.storage().fileSize(pool.accepted_paths[0]));
     Backend.rejectNewRunSnapshotRefsForTest(true);
     defer Backend.rejectNewRunSnapshotRefsForTest(false);
     var unreserved_run: repository.Run = undefined;

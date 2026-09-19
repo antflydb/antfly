@@ -64,6 +64,7 @@ pub fn run(comptime Backend: type, pool: anytype, backend: *Backend) !void {
         return error.CompletionReservationBusy;
     for (pool.cells[0..pool.cell_count]) |cell| if (cell.phase == .accepted or cell.phase == .prepared) return error.CompletionReservationBusy;
     pool.ready = false;
+    pool.capacity_certified = false;
     // Rebinding removes old planned paths. A failed attempt must never let
     // qualifyFresh reopen admission against that obsolete path plan.
     pool.maintenance_pending = true;
@@ -72,7 +73,12 @@ pub fn run(comptime Backend: type, pool: anytype, backend: *Backend) !void {
     backend.retainReaderKind(.other);
     defer backend.releaseReaderKind(.other);
     const control = pool.control.allocator();
-    const scratch = pool.scratch.allocator();
+    // Replay/old readers may retain nodes in pool.scratch. The compiler domain
+    // is exclusively borrowed and empty at entry, so those nodes cannot steal
+    // the maintenance working frontier or fragment its starting span.
+    var workspace = try pool.compiler.tryBorrow();
+    defer workspace.release() catch unreachable;
+    const scratch = try workspace.allocator();
     const root = backend.root_dir.?;
     // Paths are an explicitly bounded part of the retained control domain.
     if (root.len > 512) return error.UnsupportedCompletionProfile;

@@ -388,19 +388,25 @@ The following gates remain:
   Total free bytes in the shared recycling allocator are insufficient evidence.
   Tighter boundary-key profiles or separately reserved domains are design
   alternatives, not implemented proofs.
-- **Output-count and future-frontier certificate.** At most 68 input runs and
-  1 MiB metadata per input do not imply at most 64 rewritten outputs. Admission
-  must certify the resulting stream, including all accepted plans. After exact
-  record validation, four protected SSTs add at most 2,525,696 bytes to the
-  current 64-bit sequential cursor bound: each has at most 3,348 entries/blocks,
-  a 32-byte block descriptor, and at most two 256 KiB block buffers. A baseline
-  frontier of at most 12 MiB would leave sufficient room within the current
-  16 MiB cursor gate; this does not certify the other allocations above and is
-  not yet an enforced admission bound.
-- **Counter headroom.** Reserve checked manifest sequence increments for every
-  outstanding drain and the subsequent checkpoint/segment transition. Validate
-  replay-next-sequence and shared-credit arithmetic before accepting resolution,
-  rather than discovering overflow after starting a durable attempt.
+- **Output-count and future-frontier certificate (implemented).** Qualification
+  scans CRC-checked physical records and keeps additive encoded-data, metadata,
+  and block costs. Admission adds canonical operations, both possible outcomes,
+  and private records without refunding overwritten/deleted data or retired
+  cells. The v11 encoder's greedy splitting cost proves at most 64 outputs;
+  adjacent-block packing bounds sequential-index memory and live block buffers.
+  Both the current-input-plus-growth frontier and future replacement frontier
+  must fit 16 MiB. This is a format-cost limit, not a fixed database byte ceiling.
+  Maintenance starts from the separate empty compiler workspace, so retained
+  replay nodes cannot consume its initial span. This does not yet prove all
+  allocator/transient/publication costs in the preceding aggregate-memory gate.
+- **Counter headroom (implemented).** Before acceptance, checked native bounds
+  cover cohort manifest increments, the next checkpoint/output identifiers,
+  and bounded WAL rotations. Authoritative and proposed replay-next/summary
+  values retain cohort headroom, including the largest actual admitted credit
+  size. Ordinary counter puts receive the same check. The owning Debug gate
+  passed 10/10 with zero leaks: arithmetic boundaries, actual SST encoder
+  comparisons, pre-sidecar rejection, restart/crash/reader regressions, and
+  maintenance under denied ordinary memory/FD admission.
 - **Actual I/O fault coverage.** Maintenance crash hooks verify the selected
   publication boundaries. Partial writes, fsync failures, and failures after
   pointer rename still need direct injected-I/O coverage, including durable

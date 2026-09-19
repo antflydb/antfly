@@ -9,7 +9,16 @@ const table = @import("../lsm/table_file.zig");
 const repository = @import("repository.zig");
 const state = @import("state.zig");
 const domains = @import("completion_allocator.zig");
+pub const capacity = @import("completion_capacity.zig");
 const Allocator = std.mem.Allocator;
+
+comptime {
+    // The certificate documents v11 packed offsets, 14-bit block filters,
+    // fixed run filter and prefix-none output. Format changes need a new proof.
+    if (table.version != 11 or table.default_block_size != capacity.block_bytes or
+        @sizeOf(table.SequentialTableIndex.Block) != 32)
+        @compileError("update completion format-cost certificate for the SST format");
+}
 
 pub const Limits = struct {
     max_inputs: usize = 68,
@@ -112,8 +121,17 @@ fn stateEntry(entry: anytype) table.Entry {
 /// Qualify immutable input format and aggregate live cursor memory. This is a
 /// frontier limit, not a limit on the number of records streamed through it.
 pub fn qualify(allocator: Allocator, io: io_mod.Storage, paths: []const []const u8, limits: Limits) !void {
+    _ = try measure(allocator, io, paths, limits);
+}
+
+pub const Measurement = struct { cost: capacity.Cost, frontier_bytes: usize };
+
+/// Counting all input versions (including overwritten records) is conservative:
+/// a merge emits a subset. No data-sized vector or set is needed for the proof.
+pub fn measure(allocator: Allocator, io: io_mod.Storage, paths: []const []const u8, limits: Limits) !Measurement {
     if (paths.len > limits.max_inputs) return error.UnsupportedCompletionProfile;
     var frontier: usize = 0;
+    var cost: capacity.Cost = .{};
     for (paths) |path| {
         var cursor = try Cursor.init(allocator, io, path, limits);
         defer cursor.deinit();
@@ -121,8 +139,12 @@ pub fn qualify(allocator: Allocator, io: io_mod.Storage, paths: []const []const 
         if (frontier > limits.max_frontier_bytes) return error.UnsupportedCompletionProfile;
         // Block bounds alone do not constrain one unusually large record.
         // Activation performs this read-only scan before issuing readiness.
-        while (try cursor.current()) |_| try cursor.advance();
+        while (try cursor.current()) |entry| {
+            cost = try cost.plus(try capacity.Cost.record(if (entry.namespace_name) |ns| ns.len else 0, entry.key.len, entry.value.len));
+            try cursor.advance();
+        }
     }
+    return .{ .cost = cost, .frontier_bytes = frontier };
 }
 
 const Output = struct {
@@ -241,6 +263,62 @@ pub fn build(allocator: Allocator, io: io_mod.Storage, root: []const u8, paths: 
         active = false;
     }
     return results;
+}
+
+test "workload admission completion capacity certificate bounds actual SST metadata and greedy splits" {
+    const alloc = std.testing.allocator;
+    // Different binary-key shapes exercise both packed multi-entry blocks and
+    // oversized individual records. The proof must cover the actual encoder,
+    // including power-of-two block Bloom rounding and namespace bounds.
+    for ([_]usize{ 8, 1400, 40 * 1024 }) |key_len| {
+        var key: [40 * 1024]u8 = @splat(0xa5);
+        const count: usize = if (key_len > 1400) 12 else 200;
+        const metadata_limit: u64 = if (key_len > 1400) 256 * 1024 else 64 * 1024;
+        var total: capacity.Cost = .{};
+        var current: capacity.Cost = .{};
+        var sink_impl = table.MemoryTableSink.init(alloc);
+        defer sink_impl.deinit();
+        var sink = sink_impl.sink();
+        const options: table.StreamingEncoderOptions = .{ .bloom_config = .{ .bits_per_key = 1, .min_bits = 64, .max_hash_count = 1 }, .block_compression = .snappy_adaptive, .prefix_extractor = .none };
+        var encoder = try table.StreamingEncoder.init(alloc, &sink, 1, options);
+        defer encoder.deinit();
+        var outputs: u64 = 1;
+        var blocks: u64 = 0;
+        for (0..count) |i| {
+            std.mem.writeInt(u64, key[0..8], i, .big);
+            const entry: table.Entry = .{ .namespace_name = "binary\x00namespace", .key = key[0..key_len], .value = "payload", .tombstone = i % 7 == 0 };
+            const cost = try capacity.Cost.record(entry.namespace_name.?.len, entry.key.len, entry.value.len);
+            total = try total.plus(cost);
+            var projected = try encoder.encodedSizeUpperBoundAfterEntry(entry);
+            var data = sink.len() + encoder.block_bytes.items.len + encodedEntryLen(entry) + table.footer_len;
+            if (projected - data > metadata_limit and current.records != 0) {
+                var result = try encoder.finish();
+                result.filter.deinit(alloc);
+                blocks += encoder.blocks.items.len;
+                const footer = try table.decodeFooterBytes(sink_impl.out.items[sink_impl.out.items.len - table.footer_len ..]);
+                try std.testing.expect(footer.metadata_len <= current.metadata_bytes + capacity.fixed_file_bytes);
+                encoder.deinit();
+                sink_impl.out.clearRetainingCapacity();
+                encoder = try table.StreamingEncoder.init(alloc, &sink, 1, options);
+                current = .{};
+                outputs += 1;
+                projected = try encoder.encodedSizeUpperBoundAfterEntry(entry);
+                data = sink.len() + encoder.block_bytes.items.len + encodedEntryLen(entry) + table.footer_len;
+            }
+            current = try current.plus(cost);
+            try std.testing.expect(projected - data <= current.metadata_bytes + capacity.fixed_file_bytes);
+            try std.testing.expect(projected - data <= metadata_limit);
+            try encoder.appendEntry(entry);
+        }
+        var result = try encoder.finish();
+        result.filter.deinit(alloc);
+        blocks += encoder.blocks.items.len;
+        const proof = try capacity.certify(total, .{ .metadata_bytes = metadata_limit });
+        try std.testing.expect(outputs <= proof.outputs);
+        try std.testing.expect(blocks <= proof.blocks);
+        const footer = try table.decodeFooterBytes(sink_impl.out.items[sink_impl.out.items.len - table.footer_len ..]);
+        try std.testing.expect(footer.metadata_len <= current.metadata_bytes + capacity.fixed_file_bytes);
+    }
 }
 
 test "workload admission completion maintenance streams bounded blocks with exhausted heap and descriptors" {
