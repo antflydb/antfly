@@ -1191,6 +1191,13 @@ pub const DBCore = struct {
         try self.index_manager.loadForRestore(self.store);
     }
 
+    /// Called only before publication/workers, after restoring native slots and
+    /// their primary eligibility fence. Opens persisted runtime handles without
+    /// primary catalog writes, backfill, quarantine, or maintenance callbacks.
+    pub fn loadIndexesForCompletionRestore(self: *DBCore, scratch: Allocator) !void {
+        try self.index_manager.initializeCompletionCatalog(scratch, self.store);
+    }
+
     pub fn loadIndexesNoBackfill(self: *DBCore) !void {
         try self.index_manager.loadNoBackfill(self.store);
     }

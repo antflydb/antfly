@@ -7850,7 +7850,7 @@ pub const IndexManager = struct {
             };
             self.catalog_mutex.unlockExclusive();
 
-            var opened = self.openConfiguredIndexDetached(store, task.cfg, true, false, false) catch |err| {
+            var opened = self.openConfiguredIndexDetached(store, task.cfg, true, false, false, false) catch |err| {
                 self.catalog_mutex.lockExclusive();
                 defer self.catalog_mutex.unlockExclusive();
                 self.completeIndexLoadNoLock(task.name);
@@ -10954,6 +10954,180 @@ pub const IndexManager = struct {
         self.storeGeneratedEnrichmentTargetCache(false);
     }
 
+    fn validateCompletionBackendKind(self: *const IndexManager, kind: types.IndexKind) !void {
+        const supported = switch (kind) {
+            .full_text => self.text_main_backend == .lsm,
+            .dense_vector => self.dense_storage_backend == .lsm,
+            .sparse_vector => self.sparse_backend == .lsm,
+            .graph => self.graph_reverse_backend == .lsm,
+            .algebraic => true,
+        };
+        if (!supported) return error.UnsupportedCompletionBackend;
+    }
+
+    /// Validate only configured kinds, before native prepare is published.
+    /// Legacy ordinary opens continue to accept their historical backends.
+    pub fn validateCompletionBackends(self: *const IndexManager) !void {
+        if (self.failed_index_loads.count() != 0 or self.status_only_index_configs.len != 0)
+            return error.UnsupportedCompletionProfile;
+        inline for (.{ "text_indexes", "dense_indexes", "sparse_indexes", "graph_indexes", "algebraic_indexes" }) |field| {
+            for (@field(self, field).items) |entry| try self.validateCompletionBackendKind(entry.config.kind);
+        }
+    }
+
+    /// Admission-only physical checkpoint. The DB holds apply serialization
+    /// and its structural fence before calling; each derived owner is also
+    /// serialized against replay while its existing generation is manifested.
+    /// All allocations/I/O occur before native prepare can vote yes.
+    pub fn prepareCompletionBackends(self: *IndexManager) !void {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        try self.validateCompletionBackends();
+        for (self.text_indexes.items) |*entry| {
+            if (!entry.apply_mutex.tryLock()) return error.CompletionTransitionInProgress;
+            defer entry.apply_mutex.unlock();
+            var checkpoint = try entry.persistent.pinNativeCheckpoints();
+            checkpoint.deinit();
+        }
+        for (self.dense_indexes.items) |*entry| {
+            if (!entry.apply_mutex.tryLock()) return error.CompletionTransitionInProgress;
+            defer entry.apply_mutex.unlock();
+            if (entry.native_physical_v2) {
+                if (!try self.activeIndexRootPointerUsesNativeV2(entry.config.name)) return error.InvalidIndexRootPointer;
+                const path = try self.activeIndexPathForConfig(entry.config);
+                self.alloc.free(path);
+            } else {
+                var checkpoint = try entry.index.pinNativeCheckpoint();
+                checkpoint.deinit();
+            }
+        }
+        for (self.sparse_indexes.items) |*entry| {
+            if (!entry.apply_mutex.tryLock()) return error.CompletionTransitionInProgress;
+            defer entry.apply_mutex.unlock();
+            var checkpoint = try entry.index.pinNativeCheckpoint();
+            checkpoint.deinit();
+        }
+        for (self.graph_indexes.items) |*entry| {
+            if (!entry.apply_mutex.tryLock()) return error.CompletionTransitionInProgress;
+            defer entry.apply_mutex.unlock();
+            var checkpoint = try entry.index.pinNativeCheckpoints();
+            checkpoint.deinit();
+        }
+    }
+
+    fn requireCompletionManifest(self: *IndexManager, storage: ?lsm_backend_mod.Storage, options: lsm_backend_mod.Options, root: []const u8) !void {
+        const path = try std.fs.path.join(self.alloc, &.{ root, "manifest.bin" });
+        defer self.alloc.free(path);
+        if (storage orelse options.storage) |source| {
+            _ = try source.fileSize(path);
+        } else {
+            var native = try lsm_backend_mod.NativeStorage.initWithPool(self.alloc, options.io_runtime, options.native_storage_pool);
+            defer native.deinit();
+            _ = try native.storage().fileSize(path);
+        }
+    }
+
+    fn validateCompletionPhysicalRoots(self: *IndexManager, cfg: types.IndexConfig) !void {
+        if (cfg.kind == .algebraic) return;
+        const root = try self.activeIndexPathForConfig(cfg);
+        defer self.alloc.free(root);
+        switch (cfg.kind) {
+            .full_text => {
+                const main = try std.fs.path.join(self.alloc, &.{ root, "index" });
+                defer self.alloc.free(main);
+                // Auxiliary text WAL can be empty; only the canonical data
+                // generation must already exist. Opening it validates content.
+                try self.requireCompletionManifest(self.text_lsm_storage, self.text_main_lsm_options, main);
+            },
+            .dense_vector => if (!try self.activeIndexRootPointerUsesNativeV2(cfg.name)) {
+                try self.requireCompletionManifest(self.dense_lsm_storage, self.dense_lsm_options, root);
+            },
+            .sparse_vector => try self.requireCompletionManifest(self.sparse_lsm_storage, self.sparse_lsm_options, root),
+            .graph => {
+                inline for (.{ "forward", "reverse" }) |suffix| {
+                    const path = try std.fs.path.join(self.alloc, &.{ root, suffix });
+                    defer self.alloc.free(path);
+                    try self.requireCompletionManifest(self.graph_lsm_storage, self.graph_reverse_lsm_options, path);
+                }
+            },
+            .algebraic => unreachable,
+        }
+    }
+
+    fn completionOpenOptions(options: lsm_backend_mod.Options, existing_only: bool) lsm_backend_mod.Options {
+        var result = options;
+        if (existing_only) result.backend.create_if_missing = false;
+        return result;
+    }
+
+    /// Restore existing runtime handles before DB publication while the native
+    /// primary completion fence remains installed. The caller holds exclusive
+    /// startup ownership and supplies bounded catalog scratch. This never
+    /// changes the primary catalog, publishes registries, or launches backfill
+    /// or maintenance; index-owned physical WAL recovery remains permitted.
+    pub fn initializeCompletionCatalog(self: *IndexManager, alloc: Allocator, store: anytype) !void {
+        const fence = self.completion_eligibility orelse return error.InvalidState;
+        const has_owner = blk: {
+            fence.checkTransition() catch break :blk true;
+            break :blk false;
+        };
+        if (!has_owner or self.text_indexes.items.len != 0 or self.dense_indexes.items.len != 0 or
+            self.sparse_indexes.items.len != 0 or self.graph_indexes.items.len != 0 or
+            self.algebraic_indexes.items.len != 0 or self.enrichments.items.len != 0 or
+            self.resolvers.items.len != 0 or self.status_only_index_configs.len != 0)
+            return error.InvalidState;
+        errdefer self.resetRestoreLoadAttempt();
+        if (comptime @TypeOf(store) == *docstore_mod.DocStore) self.primary_store = store;
+        try self.loadVectorBlockGenerationIfPresent(false);
+        var runtime_store = try initRuntimeStore(alloc, store);
+        defer runtime_store.deinit();
+        var txn = try runtime_store.store.beginProbe();
+        defer txn.abort();
+        inline for (.{ enrichment_catalog_key, resolver_catalog_key }) |key| {
+            const data = txn.get(key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            if (data) |encoded| {
+                if (encoded.len > 1024 * 1024) return error.UnsupportedCompletionProfile;
+                const is_enrichment = comptime std.mem.eql(u8, key, enrichment_catalog_key);
+                const configs = if (is_enrichment) try enrichment_catalog.deserializeCatalog(alloc, encoded) else try resolver_catalog.deserializeCatalog(alloc, encoded);
+                defer {
+                    for (configs) |*cfg| cfg.deinit(alloc);
+                    alloc.free(configs);
+                }
+                for (configs) |cfg| {
+                    var cloned = try @TypeOf(cfg).clone(self.alloc, cfg);
+                    errdefer cloned.deinit(self.alloc);
+                    if (is_enrichment) try self.enrichments.append(self.alloc, cloned) else try self.resolvers.append(self.alloc, cloned);
+                }
+            }
+        }
+        const data = txn.get(index_catalog_key) catch |err| switch (err) {
+            error.NotFound => {
+                try self.refreshGeneratedEnrichmentTargetCache();
+                return;
+            },
+            else => return err,
+        };
+        if (data.len > 1024 * 1024) return error.UnsupportedCompletionProfile;
+        const configs = try deserializeCatalog(alloc, data);
+        defer {
+            for (configs) |*cfg| cfg.deinit(alloc);
+            alloc.free(configs);
+        }
+        for (configs) |cfg| {
+            try self.validateCompletionBackendKind(cfg.kind);
+            try self.validateCompletionPhysicalRoots(cfg);
+        }
+        for (configs) |cfg| {
+            var opened = try self.openConfiguredIndexDetached(store, cfg, false, false, false, true);
+            errdefer opened.deinit(self);
+            try self.appendOpenedIndex(opened);
+        }
+        try self.refreshGeneratedEnrichmentTargetCache();
+    }
+
     fn loadWithBackfill(self: *IndexManager, store: anytype, allow_backfill: bool, read_only: bool) !void {
         var completion_transition = try self.beginCompletionTransition();
         defer if (completion_transition) |*transition| transition.deinit();
@@ -11105,7 +11279,7 @@ pub const IndexManager = struct {
                 while (true) {
                     const index = state.next_index.fetchAdd(1, .monotonic);
                     if (index >= state.configs.len) return;
-                    const opened = state.manager.openConfiguredIndexDetached(state.store, state.configs[index], false, true, false) catch |err| {
+                    const opened = state.manager.openConfiguredIndexDetached(state.store, state.configs[index], false, true, false, false) catch |err| {
                         std.log.warn("load configured index failed name={s} kind={s} err={s}", .{
                             state.configs[index].name,
                             @tagName(state.configs[index].kind),
@@ -20095,6 +20269,7 @@ pub const IndexManager = struct {
             allow_backfill,
             read_only,
             authorize_dense_native_candidate,
+            false,
         );
         errdefer opened.deinit(self);
         try self.appendOpenedIndex(opened);
@@ -20117,6 +20292,7 @@ pub const IndexManager = struct {
         allow_backfill: bool,
         read_only: bool,
         authorize_dense_native_candidate: bool,
+        completion_restore: bool,
     ) !OpenedIndex {
         if (test_inject_index_open_error) |err| return err;
         var cfg = cfg_input;
@@ -20143,8 +20319,8 @@ pub const IndexManager = struct {
                     .main_backend = self.text_main_backend,
                     .main_lsm_storage = self.text_lsm_storage,
                     .wal_storage = self.text_lsm_storage,
-                    .main_lsm_options = self.text_main_lsm_options,
-                    .wal_lsm_options = self.text_wal_lsm_options,
+                    .main_lsm_options = completionOpenOptions(self.text_main_lsm_options, completion_restore),
+                    .wal_lsm_options = completionOpenOptions(self.text_wal_lsm_options, completion_restore),
                     .lsm_cache = self.lsm_cache,
                     .lsm_root_generation = self.lsm_root_generation,
                     .read_only = read_only,
@@ -20204,7 +20380,7 @@ pub const IndexManager = struct {
                 var observed_field_analyzers_moved = false;
                 errdefer if (!observed_field_analyzers_moved) freeObservedTextFieldAnalyzers(self.alloc, observed_field_analyzers);
                 try appendObservedFieldAnalyzers(self.alloc, &text_analysis, observed_field_analyzers);
-                if (!read_only) try publishFullTextDictionaryRegistry(store, self.alloc, cfg.name, text_analysis);
+                if (!read_only and !completion_restore) try publishFullTextDictionaryRegistry(store, self.alloc, cfg.name, text_analysis);
                 const apply_mutex = try self.allocIndexApplyMutex();
                 var apply_mutex_owned = true;
                 errdefer if (apply_mutex_owned) self.destroyIndexApplyMutex(apply_mutex);
@@ -20392,7 +20568,7 @@ pub const IndexManager = struct {
                     .no_sync = self.relaxed_split_durability,
                     .no_meta_sync = self.relaxed_split_durability,
                 }, .{
-                    .backend_options = self.dense_lsm_options,
+                    .backend_options = completionOpenOptions(self.dense_lsm_options, completion_restore),
                     .storage = self.dense_lsm_storage,
                     .cache = self.lsm_cache,
                     .root_generation = self.lsm_root_generation,
@@ -20482,11 +20658,13 @@ pub const IndexManager = struct {
                         posting_sequence = applied_sequence;
                         index.activateExperimentalPostingReads(applied_sequence) catch |err| switch (err) {
                             error.MissingPostingCheckpoint, error.PostingCheckpointSequenceMismatch => {
+                                if (completion_restore) return err;
                                 if (!read_only) index.invalidateExperimentalPostingSidecar() catch |invalidate_err| {
                                     std.log.warn("dense posting sidecar startup invalidation failed index={s} err={s}", .{ cfg.name, @errorName(invalidate_err) });
                                 };
                             },
                             else => {
+                                if (completion_restore) return err;
                                 std.log.warn("dense posting sidecar startup validation failed index={s} err={s}", .{ cfg.name, @errorName(err) });
                                 if (!read_only) index.invalidateExperimentalPostingSidecar() catch |invalidate_err| {
                                     std.log.warn("dense posting sidecar startup invalidation failed index={s} err={s}", .{ cfg.name, @errorName(invalidate_err) });
@@ -20637,7 +20815,7 @@ pub const IndexManager = struct {
                     .backend = self.sparse_backend,
                     .lsm_storage = self.sparse_lsm_storage,
                     .lsm_cache = self.lsm_cache,
-                    .lsm_options = self.sparse_lsm_options,
+                    .lsm_options = completionOpenOptions(self.sparse_lsm_options, completion_restore),
                     .lsm_root_generation = self.lsm_root_generation,
                 });
                 var index_moved = false;
@@ -20759,7 +20937,7 @@ pub const IndexManager = struct {
                     .reverse_backend = self.graph_reverse_backend,
                     .reverse_lsm_storage = self.graph_lsm_storage,
                     .reverse_lsm_cache = self.lsm_cache,
-                    .reverse_lsm_options = self.graph_reverse_lsm_options,
+                    .reverse_lsm_options = completionOpenOptions(self.graph_reverse_lsm_options, completion_restore),
                     .reverse_lsm_root_generation = self.lsm_root_generation,
                     .edge_type_configs = graph_cfg.edge_type_configs,
                     .metric_configs = graph_cfg.metric_configs,
@@ -29440,6 +29618,105 @@ test "index catalog rejects impossible entry count before allocation" {
     std.mem.writeInt(u32, encoded[8..12], std.math.maxInt(u32), .little);
 
     try std.testing.expectError(error.InvalidIndexCatalog, validateSerializedCatalog(std.testing.allocator, &encoded));
+}
+
+test "workload admission completion catalog restores live handles without primary mutations or quarantine" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = indexManagerTmpPathWithSuffix(&path_buf, "completion-catalog-restore");
+    defer cleanupIndexManagerDir(path);
+    var store = try docstore_mod.DocStore.open(alloc, path, .{});
+    defer store.close();
+    {
+        var original = try IndexManager.init(alloc, std.mem.span(path));
+        defer original.deinit();
+        try original.add(&store, .{ .name = "text", .kind = .full_text, .config_json = "{\"field\":\"title\"}" });
+        try original.add(&store, .{ .name = "aggregate", .kind = .algebraic, .config_json =
+            \\{"table":"docs","schema_version":1,"capability_fingerprint":"test","group_fields":[{"name":"customer","path":"customer","type":"string"}],"measure_fields":[{"name":"amount","path":"amount","type":"number"}],"materializations":[]}
+        });
+        try original.add(&store, .{ .name = "sparse", .kind = .sparse_vector, .config_json = "{\"field\":\"terms\",\"external\":true}" });
+        try original.add(&store, .{ .name = "dense", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}" });
+        try original.add(&store, .{ .name = "graph", .kind = .graph, .config_json = "{}" });
+        const busy = original.textIndexEntry("text").?.apply_mutex;
+        try std.testing.expect(busy.tryLock());
+        {
+            defer busy.unlock();
+            try std.testing.expectError(error.CompletionTransitionInProgress, original.prepareCompletionBackends());
+        }
+        try original.prepareCompletionBackends();
+    }
+    // A document written after index creation must not trigger startup backfill.
+    try store.put("doc", "{\"title\":\"pending replay\"}");
+    const Snapshot = struct {
+        fn hash(primary: *docstore_mod.DocStore) !u64 {
+            var hasher = std.hash.Wyhash.init(0);
+            var runtime_store = try initRuntimeStore(std.testing.allocator, primary);
+            defer runtime_store.deinit();
+            var txn = try runtime_store.store.beginCurrentScan();
+            defer txn.abort();
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            var next = try cursor.seekAtOrAfter("");
+            while (next) |entry| : (next = try cursor.next()) {
+                hasher.update(std.mem.asBytes(&entry.key.len));
+                hasher.update(entry.key);
+                hasher.update(std.mem.asBytes(&entry.value.len));
+                hasher.update(entry.value);
+            }
+            return hasher.final();
+        }
+    };
+    const before = try Snapshot.hash(&store);
+    var fence: @import("../completion_eligibility.zig").Fence = .{};
+    try fence.restore(@splat(77));
+    defer fence.retire(@splat(77)) catch unreachable;
+    var scratch: [1024 * 1024]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&scratch);
+    {
+        var restored = try IndexManager.init(alloc, std.mem.span(path));
+        defer restored.deinit();
+        restored.completion_eligibility = &fence;
+        try restored.initializeCompletionCatalog(fixed.allocator(), &store);
+        try std.testing.expect(restored.textIndexEntry("text") != null);
+        try std.testing.expect(restored.algebraicIndex("aggregate") != null);
+        try std.testing.expectEqual(@as(usize, 0), restored.status_only_index_configs.len);
+        try std.testing.expectEqual(@as(u64, 0), restored.textIndexEntry("text").?.persistent.snapshot().liveDocCount());
+        try std.testing.expectEqual(before, try Snapshot.hash(&store));
+        try restored.validateCompletionBackends();
+        restored.text_main_backend = .lmdb;
+        try std.testing.expectError(error.UnsupportedCompletionBackend, restored.validateCompletionBackends());
+        restored.text_main_backend = .lsm;
+        try std.testing.expect(restored.sparseIndex("sparse") != null);
+        try std.testing.expect(restored.denseIndex("dense") != null);
+        try std.testing.expect(restored.graphIndex("graph") != null);
+        try std.testing.expectError(error.PreparedCompletionActive, restored.remove(&store, "text"));
+        try std.testing.expectError(error.PreparedCompletionActive, fence.checkTransition());
+    }
+    // Ordinary loading quarantines an index open failure; restoration must fail
+    // with the original error and destroy any partially constructed handles.
+    var failed = try IndexManager.init(alloc, std.mem.span(path));
+    defer failed.deinit();
+    // An unused incompatible backend option is not an actual dependency.
+    failed.sparse_backend = .mem;
+    try failed.validateCompletionBackends();
+    failed.sparse_backend = .lsm;
+    failed.completion_eligibility = &fence;
+    fixed.reset();
+    test_inject_index_open_error = error.InvalidIndexConfig;
+    defer test_inject_index_open_error = null;
+    try std.testing.expectError(error.InvalidIndexConfig, failed.initializeCompletionCatalog(fixed.allocator(), &store));
+    try std.testing.expectEqual(@as(usize, 0), failed.text_indexes.items.len);
+    try std.testing.expectEqual(@as(usize, 0), failed.algebraic_indexes.items.len);
+    try std.testing.expect(failed.loadFailure("text") == null);
+    try std.testing.expectEqual(before, try Snapshot.hash(&store));
+    test_inject_index_open_error = null;
+    const text_root = try failed.activeIndexPathForConfig(.{ .name = "text", .kind = .full_text, .config_json = "{\"field\":\"title\"}" });
+    defer alloc.free(text_root);
+    try std.Io.Dir.cwd().deleteTree(std.testing.io, text_root);
+    fixed.reset();
+    try std.testing.expectError(error.FileNotFound, failed.initializeCompletionCatalog(fixed.allocator(), &store));
+    try std.testing.expect(failed.textIndexEntry("text") == null);
+    try std.testing.expectEqual(before, try Snapshot.hash(&store));
 }
 
 test "workload admission completion empty catalog validates persisted definitions and pending admissions" {
