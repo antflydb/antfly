@@ -560,6 +560,9 @@ pub fn diarizeSegmentsAlloc(
         // The transcript comes back unattributed rather than guessed at.
         for (segments) |segment| {
             const copy = try dupeSegment(allocator, segment, segment.words, segment.start_ms, segment.end_ms);
+            // The list owns the copy only once the append succeeds; until
+            // then this scope does.
+            errdefer freeSegment(allocator, copy);
             try out.append(allocator, copy);
         }
         return out.toOwnedSlice(allocator);
@@ -594,6 +597,7 @@ pub fn diarizeSegmentsAlloc(
         if (segment.words.len == 0) {
             const centre = (msToSamples(segment.start_ms) + msToSamples(segment.end_ms)) / 2;
             var copy = try dupeSegment(allocator, segment, segment.words, segment.start_ms, segment.end_ms);
+            errdefer freeSegment(allocator, copy);
             copy.speaker_index = nearestWindowLabel(windows, centre);
             try out.append(allocator, copy);
             continue;
@@ -619,6 +623,7 @@ pub fn diarizeSegmentsAlloc(
             const start_ms = if (run_start == 0) segment.start_ms else words[0].start_ms;
             const end_ms = if (run_end == wl.len) segment.end_ms else words[words.len - 1].end_ms;
             var piece = try dupeSegment(allocator, segment, words, start_ms, end_ms);
+            errdefer freeSegment(allocator, piece);
             piece.speaker_index = wl[run_start];
             try out.append(allocator, piece);
             run_start = run_end;
@@ -816,6 +821,76 @@ test "a phrase clamped to the clip's end leaves the transcript unattributed" {
     try std.testing.expectEqual(@as(?u8, null), labelled[0].speaker_index);
     try std.testing.expectEqualStrings("thanks", labelled[0].text);
     try std.testing.expectEqual(@as(u64, 4000), labelled[0].start_ms);
+}
+
+test "diarization frees every copy when an allocation fails" {
+    // Each phrase is copied before it joins the result, and until the
+    // append succeeds nothing else owns that copy. Running the whole path
+    // under every failing allocation is what proves it is never dropped.
+    const Case = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const clip_samples = 7 * @as(usize, sample_rate) / 2;
+            const samples = try allocator.alloc(f32, clip_samples);
+            defer allocator.free(samples);
+            for (samples, 0..) |*sample, i| {
+                sample.* = @floatCast(@sin(@as(f64, @floatFromInt(i)) * 0.01));
+            }
+
+            var first_words = [_]long_transcription.Word{
+                .{ .word = @constCast("hello"), .start_ms = 0, .end_ms = 500 },
+                .{ .word = @constCast("there"), .start_ms = 500, .end_ms = 1000 },
+            };
+            var segments = [_]long_transcription.Segment{
+                .{ .text = @constCast("hello there"), .start_ms = 0, .end_ms = 1000, .words = &first_words },
+                // A phrase with no words takes the other copy path.
+                .{ .text = @constCast("bye"), .start_ms = 2000, .end_ms = 3000, .words = &.{} },
+            };
+
+            var embedder = Embedder{ .allocator = allocator, .session = constantEmbeddingSession() };
+            const labelled = try diarizeSegmentsAlloc(allocator, &embedder, samples, &segments, .{}, null);
+            long_transcription.freeSegments(allocator, labelled);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+/// A session standing in for the speaker model: every window embeds to the
+/// same vector, so clustering finds one speaker and the copy paths all run.
+fn constantEmbeddingSession() Session {
+    const Stub = struct {
+        fn run(_: *anyopaque, _: []const backends.Tensor, allocator: std.mem.Allocator) anyerror![]backends.Tensor {
+            const values = try allocator.alloc(f32, embedding_dim);
+            defer allocator.free(values);
+            for (values, 0..) |*value, i| value.* = if (i % 2 == 0) 0.25 else -0.125;
+            const outputs = try allocator.alloc(backends.Tensor, 1);
+            errdefer allocator.free(outputs);
+            outputs[0] = try backends.Tensor.initFloat32(allocator, "embedding", &.{ 1, embedding_dim }, values);
+            return outputs;
+        }
+        fn runWithControl(ptr: *anyopaque, inputs: []const backends.Tensor, allocator: std.mem.Allocator, _: InferenceExecutionControl) anyerror![]backends.Tensor {
+            return run(ptr, inputs, allocator);
+        }
+        fn inputInfo(_: *anyopaque) []const backends.TensorInfo {
+            return &.{};
+        }
+        fn outputInfo(_: *anyopaque) []const backends.TensorInfo {
+            return &.{};
+        }
+        fn backend(_: *anyopaque) backends.BackendType {
+            return .native;
+        }
+        fn close(_: *anyopaque) void {}
+        const vtable = Session.VTable{
+            .run = run,
+            .runWithControl = runWithControl,
+            .inputInfo = inputInfo,
+            .outputInfo = outputInfo,
+            .backend = backend,
+            .close = close,
+        };
+    };
+    var nothing: u8 = 0;
+    return .{ .ptr = @ptrCast(&nothing), .vtable = &Stub.vtable };
 }
 
 /// A session that fails any call. Diarization must not reach the model when
