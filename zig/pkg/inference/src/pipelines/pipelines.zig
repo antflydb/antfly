@@ -124,6 +124,7 @@ test {
     _ = @import("whisper_timestamps.zig");
     _ = @import("silero_vad.zig");
     _ = @import("long_transcription.zig");
+    _ = @import("speaker_embedding.zig");
     _ = @import("streaming_transcription.zig");
     _ = @import("dictation.zig");
     _ = @import("image.zig");

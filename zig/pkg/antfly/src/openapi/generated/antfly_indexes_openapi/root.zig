@@ -195,6 +195,7 @@ pub const SortDirection = types.SortDirection;
 pub const SortField = types.SortField;
 pub const StatefulGraphQueryResults = types.StatefulGraphQueryResults;
 pub const StatefulGraphResult = types.StatefulGraphResult;
+pub const TranscriberEnrichmentConfig = types.TranscriberEnrichmentConfig;
 pub const TraversalResult = types.TraversalResult;
 pub const TraversalRules = types.TraversalRules;
 pub const AlgebraicIndexStatsIndexType = types.AlgebraicIndexStatsIndexType;

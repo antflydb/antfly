@@ -54,7 +54,12 @@ pub fn bestAlignmentMetrics(reference: []const f32, candidate: []const f32, max_
 
         const correlation: f32 = @floatCast(dot / @sqrt(ref_energy * candidate_energy));
         const mean_abs_error: f32 = @floatCast(abs_diff_sum / @as(f64, @floatFromInt(compared)));
-        if (correlation > best.correlation) {
+        // A periodic signal correlates equally well at every multiple of its
+        // period; among near-ties keep the smallest shift so the comparison
+        // covers as many samples as possible.
+        const tie = @abs(correlation - best.correlation) <= 1e-4;
+        const closer = @abs(offset) < @abs(@as(isize, best.offset));
+        if (correlation > best.correlation + 1e-4 or (tie and closer)) {
             best = .{
                 .offset = @intCast(offset),
                 .compared = compared,
