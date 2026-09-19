@@ -1897,6 +1897,84 @@ pub fn isDocumentUnitArtifactRecordKey(key: []const u8) bool {
     return unit_term + 2 == key.len;
 }
 
+/// Logical, document-owned cached producer results that can cross a restore
+/// namespace unchanged. Projection ownership, coverage counters, temporary
+/// producer attempts, and store/identity metadata must be rebuilt, not copied.
+/// Match complete encodings so a valid prefix never authorizes arbitrary state.
+pub fn isRestoreArtifactKey(key: []const u8) bool {
+    if (!isInternalUserKey(key)) return false;
+    const doc_term = findComponentTerminator(key, 1) orelse return false;
+    const kind_pos = doc_term + 2;
+    if (kind_pos >= key.len) return false;
+    const name_pos = kind_pos + 1;
+    switch (key[kind_pos]) {
+        asset_state_kind, document_unit_navigation_summary_kind => {
+            const name_term = findComponentTerminator(key, name_pos) orelse return false;
+            return name_term + 2 == key.len;
+        },
+        document_unit_navigation_block_kind => {
+            const name_term = findComponentTerminator(key, name_pos) orelse return false;
+            return key.len - (name_term + 2) == @sizeOf(u32);
+        },
+        artifact_kind => {
+            if (componentEquals(key, name_pos, "embedding")) return isEmbeddingArtifactKey(key);
+            if (componentEquals(key, name_pos, "chunk")) {
+                if (isChunkArtifactRecordKey(key)) return true;
+                if (!isDerivedEmbeddingArtifactKey(key)) return false;
+                const type_term = findComponentTerminator(key, name_pos).?;
+                const artifact_term = findComponentTerminator(key, type_term + 2) orelse return false;
+                var pos = artifact_term + 2;
+                if (pos < key.len and key[pos] == document_unit_record_kind) {
+                    pos = (findComponentTerminator(key, pos + 1) orelse return false) + 2;
+                }
+                return pos < key.len and key[pos] == chunk_record_kind;
+            }
+            if (componentEquals(key, name_pos, "asset")) {
+                if (isAssetArtifactKey(key) or isDocumentUnitArtifactRecordKey(key)) return true;
+                if (!isDerivedEmbeddingArtifactKey(key)) return false;
+                const type_term = findComponentTerminator(key, name_pos).?;
+                const artifact_term = findComponentTerminator(key, type_term + 2) orelse return false;
+                var pos = artifact_term + 2;
+                if (pos < key.len and key[pos] == document_unit_record_kind) {
+                    pos = (findComponentTerminator(key, pos + 1) orelse return false) + 2;
+                }
+                return pos < key.len and key[pos] == derived_embedding_kind;
+            }
+            return false;
+        },
+        else => return false,
+    }
+}
+
+test "restore artifacts admit only complete logical producer cache records" {
+    const accepted = [_][]const u8{
+        "\x01doc\x00\x00\x20embedding\x00\x00vec\x00\x00",
+        "\x01doc\x00\x00\x20chunk\x00\x00body\x00\x00\x30\x00\x00\x00\x03",
+        "\x01doc\x00\x00\x20chunk\x00\x00body\x00\x00\x30\x00\x00\x00\x03\x31vec\x00\x00",
+        "\x01doc\x00\x00\x20asset\x00\x00pages\x00\x00",
+        "\x01doc\x00\x00\x20asset\x00\x00pages\x00\x00\x35page1\x00\x00",
+        "\x01doc\x00\x00\x20asset\x00\x00pages\x00\x00\x35page1\x00\x00\x31vec\x00\x00",
+        "\x01doc\x00\x00\x33pages\x00\x00",
+        "\x01doc\x00\x00\x37pages\x00\x00",
+        "\x01doc\x00\x00\x38pages\x00\x00\x00\x00\x00\x03",
+        "\x01doc\x00\xffid\x00\x00\x20asset\x00\x00pages\x00\xffname\x00\x00",
+    };
+    for (accepted) |key| {
+        try std.testing.expect(isRestoreArtifactKey(key));
+        const extended = try std.mem.concat(std.testing.allocator, u8, &.{ key, "\x00" });
+        defer std.testing.allocator.free(extended);
+        try std.testing.expect(!isRestoreArtifactKey(extended));
+        try std.testing.expect(!isRestoreArtifactKey(key[0 .. key.len - 1]));
+    }
+    const rejected = [_][]const u8{
+        "",                                                               "doc",                                                         "\x01doc",                                                                          "\x01doc\x00\x00",                               "\x01doc\x00\x00\x10",
+        "\x01doc\x00\x00\x12",                                            "\x01doc\x00\x00\x13index\x00\x00",                            "\x01doc\x00\x00\x34graph\x00\x00asset\x00\x00",                                    "\x01doc\x00\x00\x36index\x00\x00",              "\x01doc\x00\x00\x39graph\x00\x00",
+        "\x01doc\x00\x00\x3fgraph\x00\x00",                               "\x01doc\x00\x00\x40pages\x00\x00",                            "\x01doc\x00\x00\x41pages\x00\x00",                                                 "\x01doc\x00\x00\x20graph\x00\x00edges\x00\x00", "\x01doc\x00\x00\x20resolution\x00\x00entities\x00\x00",
+        "\x01doc\x00\x00\x20unknown\x00\x00asset\x00\x00\x31vec\x00\x00", "\x01doc\x00\x00\x20chunk\x00\x00body\x00\x00\x31vec\x00\x00", "\x01doc\x00\x00\x20asset\x00\x00pages\x00\x00\x30\x00\x00\x00\x03\x31vec\x00\x00", &replay_meta_init_key,                           &identity_namespace_key,
+    };
+    for (rejected) |key| try std.testing.expect(!isRestoreArtifactKey(key));
+}
+
 /// Parent-owned compact hierarchy summary. Keeping navigation metadata outside
 /// the unit payload namespace lets sequential browsing seek without loading
 /// every page body or reparsing the complete extraction state.

@@ -78,12 +78,20 @@ pub const Digest = [32]u8;
 pub const Phase = enum { reserved, importing, imported, validated, published, canceled };
 
 pub const Timestamp = struct { key: []const u8, timestamp: u64 };
+pub const Artifact = struct { key: []const u8, value: []const u8 };
 
 pub const ImportPage = struct {
     expected: Digest,
     next: []const u8,
     scope: Digest,
     timestamps: []const Timestamp,
+    /// Native artifact materialization precedes logical row import. These are
+    /// logical document-scoped records, never source ordinals or control keys.
+    artifact_page: bool = false,
+    /// Replay explicit vectors/edges only after all target primary identities
+    /// exist. Reuses the ordinary artifact journal and projection consumers.
+    projection_page: bool = false,
+    artifacts: []const Artifact = &.{},
     /// Rewrite tails consume source integrity effects without copying their
     /// generations. Target claims are rebuilt by shared cohort activation.
     source_effects: u32 = 0,
@@ -109,6 +117,7 @@ pub const Scope = struct {
     source_namespace: identity.Namespace,
     target_namespace: identity.Namespace,
     target_schema_digest: Digest,
+    preserve_artifacts: bool = false,
     rewrite: ?@import("relational_rewrite_contract.zig").Binding = null,
 
     pub fn validateReservation(self: Scope) !void {
@@ -123,6 +132,7 @@ pub const Scope = struct {
     }
 
     pub fn validate(self: Scope) !void {
+        if (self.preserve_artifacts and self.rewrite != null) return error.InvalidRestoreStagingCommand;
         if (self.rewrite) |rewrite| {
             try rewrite.validate();
             if (rewrite.source_scope) |source| if (!source.fence.namespace.eql(self.source_namespace) or !source.receiver_namespace.eql(self.target_namespace)) return error.InvalidRestoreStagingCommand;
@@ -148,6 +158,7 @@ pub const Scope = struct {
             }
         }
         hash.update(&self.target_schema_digest);
+        if (self.preserve_artifacts) hash.update("native-artifact-preservation-v1");
         if (self.rewrite) |rewrite| {
             hash.update("relational-rewrite-v1");
             hash.update(&rewrite.program_digest);
@@ -171,6 +182,10 @@ pub const Progress = struct {
     rows: u64 = 0,
     cursor: []const u8 = "",
     logical_digest: Digest = @splat(0),
+    artifact_cursor: []const u8 = "",
+    artifacts_complete: bool = false,
+    rows_complete: bool = false,
+    projection_cursor: []const u8 = "",
     rewrite: ?@import("relational_rewrite_contract.zig").Progress = null,
     pub fn jsonStringify(self: @This(), jw: anytype) @TypeOf(jw.*).Error!void {
         try @import("relational_integrity_json.zig").write(self, jw);
@@ -178,7 +193,7 @@ pub const Progress = struct {
     pub fn encode(self: Progress, alloc: Allocator) ![]u8 {
         try self.validateRewrite();
         if (self.phase == .reserved or (self.phase == .canceled and self.scope.source_namespace.table_id == 0 and self.rows == 0 and self.cursor.len == 0)) try self.scope.validateReservation() else try self.scope.validate();
-        if (self.cursor.len > 1024 * 1024) return error.InvalidRestoreStagingCommand;
+        if (self.cursor.len > 1024 * 1024 or self.artifact_cursor.len > 1024 * 1024 or self.projection_cursor.len > 1024 * 1024) return error.InvalidRestoreStagingCommand;
         const body = try std.json.Stringify.valueAlloc(alloc, self, .{});
         defer alloc.free(body);
         const out = try alloc.alloc(u8, body.len + 36);
@@ -195,7 +210,7 @@ pub const Progress = struct {
         if (parsed.value.phase == .reserved or (parsed.value.phase == .canceled and parsed.value.scope.source_namespace.table_id == 0 and parsed.value.rows == 0 and parsed.value.cursor.len == 0)) {
             parsed.value.scope.validateReservation() catch return error.InvalidRestoreStagingRecord;
         } else parsed.value.scope.validate() catch return error.InvalidRestoreStagingRecord;
-        if (parsed.value.cursor.len > 1024 * 1024) return error.InvalidRestoreStagingRecord;
+        if (parsed.value.cursor.len > 1024 * 1024 or parsed.value.artifact_cursor.len > 1024 * 1024 or parsed.value.projection_cursor.len > 1024 * 1024) return error.InvalidRestoreStagingRecord;
         parsed.value.validateRewrite() catch return error.InvalidRestoreStagingRecord;
         return parsed;
     }

@@ -2761,7 +2761,10 @@ def _cluster_restore_modes(backup_api, *, concurrent_observers=False):
         assert restored_docs[table_b]["title"] == "Original Beta"
 
 
-def test_partial_cluster_backup_is_not_published_and_can_retry(backup_api):
+@pytest.mark.parametrize("backup_format", ["native", "portable"])
+def test_partial_cluster_backup_is_not_published_and_can_retry(
+    backup_api, backup_format
+):
     table_name = f"cluster_partial_{time.time_ns()}"
     missing_table = f"cluster_partial_missing_{time.time_ns()}"
     backup_id = f"cluster-partial-{time.time_ns()}"
@@ -2786,10 +2789,23 @@ def test_partial_cluster_backup_is_not_published_and_can_retry(backup_api):
     with tempfile.TemporaryDirectory(prefix="antfly-cluster-partial-") as backup_dir:
         location = _file_location(backup_dir)
 
+        # No existing owner returns per-table failures, not an invalid empty
+        # cohort. Its reservation must be released before reusing the ID.
+        missing = backup_api.cluster_backup(
+            backup_id=backup_id,
+            location=location,
+            table_names=[missing_table],
+            backup_format=backup_format,
+        )
+        assert missing["status"] == "failed"
+        assert missing["tables"][0]["status"] == "failed"
+        assert "not found" in missing["tables"][0]["error"]
+
         backup = backup_api.cluster_backup(
             backup_id=backup_id,
             location=location,
             table_names=[table_name, missing_table],
+            backup_format=backup_format,
         )
         assert backup["status"] == "partial"
         by_name = {table["name"]: table for table in backup["tables"]}
@@ -2827,6 +2843,7 @@ def test_partial_cluster_backup_is_not_published_and_can_retry(backup_api):
             backup_id=backup_id,
             location=location,
             table_names=[table_name, missing_table],
+            backup_format=backup_format,
         )
         assert retried["status"] == "completed"
         assert {table["name"] for table in retried["tables"]} == {

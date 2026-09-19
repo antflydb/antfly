@@ -2712,6 +2712,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const vopr_cli = b.addTest(.{
         .name = "vopr",
         .root_module = vopr_cli_mod,
+        // The custom runner dispatches only this entrypoint. Do not compile
+        // and optimize the imported unit-test inventory into the campaign
+        // executable; scenario code remains reachable from the CLI itself.
+        .filters = &.{"VOPR command entrypoint"},
+        // The campaign still links the production storage/runtime graph.
+        // Reserve its measured ReleaseSafe compile peak (about 18 GB) so the
+        // bounded runner does not schedule another large compile alongside it.
+        .max_rss = 20 * 1024 * 1024 * 1024,
         .test_runner = .{
             .path = b.path("pkg/antfly/src/vopr/cli_runner.zig"),
             .mode = .simple,

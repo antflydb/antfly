@@ -3018,6 +3018,7 @@ fn prepareRelationalRows(
 
 const BatchExecutionOptions = struct {
     restore_staging: ?@import("restore_staging.zig").BatchAdmission = null,
+    restore_artifacts: []const @import("restore_staging.zig").Artifact = &.{},
     restore_timestamps: ?*const std.StringHashMapUnmanaged(u64) = null,
     preserve_logical_values: bool = false,
     restore_ha_request: ?types.BatchRequest = null,
@@ -10039,9 +10040,23 @@ pub const DB = struct {
                 },
                 .import_page, .rewrite_page => |page| {
                     if (req.writes.len +| req.deletes.len > 128 or page.timestamps.len != req.writes.len or page.next.len > 8 * 1024 * 1024) return error.InvalidRestoreStagingCommand;
+                    if (page.artifacts.len > 128 or (page.artifact_page and page.projection_page) or
+                        ((page.artifact_page or page.projection_page) and (control != .import_page or req.writes.len != 0 or req.deletes.len != 0)) or
+                        (!page.artifact_page and !page.projection_page and page.artifacts.len != 0)) return error.InvalidRestoreStagingCommand;
                     var timestamps: std.StringHashMapUnmanaged(u64) = .empty;
                     defer timestamps.deinit(self.alloc);
                     var input_bytes: usize = 0;
+                    var previous_artifact: ?[]const u8 = null;
+                    for (page.artifacts) |artifact| {
+                        if (!(if (page.projection_page) isMergeArtifactKey(artifact.key) else isRestoreArtifactKey(artifact.key))) return error.InvalidRestoreStagingCommand;
+                        if (previous_artifact) |previous| if (std.mem.order(u8, previous, artifact.key) != .lt) return error.InvalidRestoreStagingCommand;
+                        previous_artifact = artifact.key;
+                        const owner = (try internal_keys.decodeDocumentComponentAlloc(self.alloc, artifact.key)) orelse return error.InvalidRestoreStagingCommand;
+                        defer self.alloc.free(owner);
+                        if (!self.core.byteRange().contains(owner)) return error.KeyOutOfRange;
+                        input_bytes = std.math.add(usize, input_bytes, artifact.key.len +| artifact.value.len) catch return error.TransactionTooLarge;
+                        if (input_bytes > 16 * 1024 * 1024) return error.TransactionTooLarge;
+                    }
                     for (page.timestamps, req.writes) |timestamp, row| {
                         if (timestamp.timestamp == 0 or !std.mem.eql(u8, timestamp.key, row.key)) return error.InvalidRestoreStagingCommand;
                         input_bytes = std.math.add(usize, input_bytes, row.key.len +| row.value.len) catch return error.TransactionTooLarge;
@@ -10059,16 +10074,21 @@ pub const DB = struct {
                     }
                     var apply_req = req;
                     apply_req.restore_staging = null;
-                    apply_req.sync_level = .full_index;
+                    apply_req.sync_level = if (page.artifact_page) .write else .full_index;
                     var apply_opts = opts;
-                    apply_opts.wait_for_sync_level = true;
-                    apply_opts.restore_staging = .{ .expected = page.expected, .next = page.next, .scope = page.scope, .rewrite = control == .rewrite_page, .source_effects = page.source_effects };
+                    apply_opts.wait_for_sync_level = !page.artifact_page;
+                    apply_opts.restore_staging = .{ .expected = page.expected, .next = page.next, .scope = page.scope, .rewrite = control == .rewrite_page, .source_effects = page.source_effects, .artifact_page = page.artifact_page, .projection_page = page.projection_page };
                     apply_opts.restore_timestamps = &timestamps;
                     apply_opts.restore_ha_request = req;
-                    const extra = try self.alloc.alloc(docstore_mod.KVPair, opts.extra_store_writes.len + 1);
+                    apply_opts.restore_artifacts = page.artifacts;
+                    const extra = try self.alloc.alloc(docstore_mod.KVPair, opts.extra_store_writes.len + 1 + @intFromBool(page.artifacts.len != 0));
                     defer self.alloc.free(extra);
                     @memcpy(extra[0..opts.extra_store_writes.len], opts.extra_store_writes);
                     extra[opts.extra_store_writes.len] = .{ .key = @import("restore_staging.zig").key, .value = page.next };
+                    if (page.artifacts.len != 0) {
+                        self.core.artifact_cleanup_maybe.store(true, .release);
+                        extra[extra.len - 1] = .{ .key = internal_keys.artifact_presence_key[0..], .value = "1" };
+                    }
                     apply_opts.extra_store_writes = extra;
                     return self.batchInternal(apply_req, profile, apply_opts);
                 },
@@ -10131,6 +10151,9 @@ pub const DB = struct {
         // data. Keep them across optimistic publication retries so catalog
         // churn cannot multiply expensive external work.
         var generated_memo = GeneratedEmbeddingMemo.init(allocator_guard.allocator());
+        // Cache restoration is an internal preservation operation. Ordinary
+        // writes and explicit regeneration retain their provider semantics.
+        generated_memo.reuse_stored_artifacts = if (opts.restore_staging) |admission| !admission.rewrite else false;
         defer generated_memo.deinit();
         while (true) {
             self.batchInternalPrepared(req, profile, opts, &generated_memo, allocator_guard) catch |err| switch (err) {
@@ -11304,6 +11327,11 @@ pub const DB = struct {
         }
         var changed_graph_artifact_key_set = std.StringHashMapUnmanaged(void).empty;
         defer changed_graph_artifact_key_set.deinit(self.alloc);
+        if (opts.restore_staging) |admission| if (admission.projection_page) {
+            for (opts.restore_artifacts) |write| if (isMergeArtifactKey(write.key)) {
+                try appendUniqueOwnedKeyIndexed(self.alloc, &changed_graph_artifact_keys, &changed_graph_artifact_key_set, write.key);
+            };
+        };
         var explicit_graph_write_key_set = std.StringHashMapUnmanaged(void).empty;
         defer explicit_graph_write_key_set.deinit(self.alloc);
         try explicit_graph_write_key_set.ensureTotalCapacity(
@@ -11334,6 +11362,12 @@ pub const DB = struct {
         }
 
         try store_writes.appendSlice(self.alloc, timestamp_writes.items);
+        // Scoped restore artifacts share the normal presence, source-index,
+        // target-cardinality and journal transaction; extra control writes are
+        // appended too late in the pipeline for those derived invariants.
+        for (opts.restore_artifacts) |artifact| {
+            try store_writes.append(self.alloc, .{ .key = artifact.key, .value = artifact.value });
+        }
         for (req.merge_artifacts) |row| {
             try store_writes.append(self.alloc, .{ .key = row.key, .value = row.value });
             try appendUniqueOwnedKeyIndexed(self.alloc, &changed_graph_artifact_keys, &changed_graph_artifact_key_set, row.key);
@@ -37078,6 +37112,20 @@ pub const DB = struct {
         const schema_bytes = try schema_mod.serializeSchema(alloc, self.core.schema orelse .{});
         defer alloc.free(schema_bytes);
         if (!std.mem.eql(u8, &staging.digest(schema_bytes), &scope.target_schema_digest)) return error.RestoreStagingScopeChanged;
+        var initial_identity_summary: ?doc_identity.VisibilitySummary = null;
+        if (scope.preserve_artifacts) {
+            // Native cache pages precede primary rows. Bind a proven-pristine
+            // identity root and exact zero cardinality before those artifacts
+            // make an absent visibility summary ambiguous. Keep these facts
+            // atomic with scope admission, Raft/standby markers, and outbox.
+            initial_identity_summary = (try doc_identity.initializePristineVisibilitySummaryTxn(&txn, scope.target_namespace)) orelse return error.RestoreStagingTargetNotEmpty;
+            if (try range_cardinality.loadFromTxn(&txn)) |count| {
+                if (count != 0) return error.RestoreStagingTargetNotEmpty;
+            } else {
+                const zero = [_]u8{0} ** 8;
+                try txn.put(&internal_keys.range_document_count_key, &zero);
+            }
+        }
         const raw_catalog = txn.get(@import("relational_integrity_catalog.zig").key) catch |err| switch (err) {
             error.NotFound => null,
             else => return err,
@@ -37106,6 +37154,7 @@ pub const DB = struct {
         }
         try txn.commit();
         txn_open = false;
+        if (initial_identity_summary) |summary| self.core.identity_visibility.summary = summary;
         self.restore_staging_required.store(true, .release);
         try self.core.store.sync(true);
     }
@@ -37147,10 +37196,101 @@ pub const DB = struct {
         if (next.phase == .reserved) return error.RestoreStagingInProgress;
         if (next.phase != .importing) return .{ .arena = arena, .phase = next.phase, .batch = null };
         if (next.rewrite) |rewrite| if (rewrite.snapshot_complete) return .{ .arena = arena, .phase = next.phase, .batch = null };
+        if (scope.preserve_artifacts and (!next.artifacts_complete or next.rows_complete)) {
+            // Import immutable generated inputs before primary rows. Normal
+            // row preparation can then rebuild target-local index identities
+            // using cached provider results, without issuing remote requests.
+            var read = try source.core.store.beginReadTxn();
+            defer read.abort();
+            var artifacts_cursor = try read.openCursor();
+            defer artifacts_cursor.close();
+            const projections = next.rows_complete;
+            const continuation = if (projections) &next.projection_cursor else &next.artifact_cursor;
+            // Skipped records retain only one continuation and one record's
+            // scratch data, never one allocation per scan step in the page.
+            var continuation_buffer: std.ArrayList(u8) = .empty;
+            defer continuation_buffer.deinit(alloc);
+            var record_arena = std.heap.ArenaAllocator.init(alloc);
+            defer record_arena.deinit();
+            var artifact_entry = try artifacts_cursor.seekAtOrAfter(if (continuation.*.len == 0) &.{internal_keys.user_namespace} else continuation.*);
+            if (artifact_entry) |row| if (std.mem.eql(u8, row.key, continuation.*)) {
+                artifact_entry = try artifacts_cursor.next();
+            };
+            var artifacts: std.ArrayList(staging.Artifact) = .empty;
+            var artifact_bytes: usize = 0;
+            var examined_artifacts: usize = 0;
+            const artifact_deadline = monotonicTimeNs() +| 5 * std.time.ns_per_ms;
+            while (artifact_entry) |row| : (artifact_entry = try artifacts_cursor.next()) {
+                _ = record_arena.reset(.retain_capacity);
+                const scratch = record_arena.allocator();
+                if (cancellation.isCancelled()) return error.Canceled;
+                if (row.key.len == 0 or row.key[0] != internal_keys.user_namespace) {
+                    artifact_entry = null;
+                    break;
+                }
+                if (artifacts.items.len == max_rows or examined_artifacts == 1024 or
+                    (examined_artifacts != 0 and monotonicTimeNs() >= artifact_deadline)) break;
+                if (if (projections) isMergeArtifactKey(row.key) else isRestoreArtifactKey(row.key)) {
+                    const size = std.math.add(usize, row.key.len, row.value.len) catch return error.TransactionTooLarge;
+                    if (size > 16 * 1024 * 1024) return error.TransactionTooLarge;
+                    if (artifacts.items.len != 0 and artifact_bytes + size > 16 * 1024 * 1024) break;
+                    const owner = (try internal_keys.decodeDocumentComponentAlloc(scratch, row.key)) orelse return error.InvalidRestoreStagingCommand;
+                    if (!self.core.byteRange().contains(owner)) return error.RestoreStagingScopeChanged;
+                    const value = if (internal_keys.isGraphEdgeArtifactKey(row.key)) graph: {
+                        const edge = (try internal_keys.parseGraphEdgeArtifactKeyAlloc(scratch, row.key)) orelse return error.InvalidRestoreStagingCommand;
+                        const index = self.core.index_manager.graphIndex(edge.index_name);
+                        if (index == null or enrichment_artifact_codec.isLegacyUnboundGraphEdge(row.value)) {
+                            continuation_buffer.clearRetainingCapacity();
+                            try continuation_buffer.appendSlice(alloc, row.key);
+                            continuation.* = continuation_buffer.items;
+                            examined_artifacts += 1;
+                            continue;
+                        }
+                        const decoded = try enrichment_artifact_codec.decodeGraphEdgeAlloc(scratch, row.value);
+                        if (decoded.generation != index.?.config.coverage_generation and !enrichment_artifact_codec.isPortableUnboundGraphEdge(row.value)) {
+                            continuation_buffer.clearRetainingCapacity();
+                            try continuation_buffer.appendSlice(alloc, row.key);
+                            continuation.* = continuation_buffer.items;
+                            examined_artifacts += 1;
+                            continue;
+                        }
+                        break :graph try enrichment_artifact_codec.encodePortableUnboundGraphEdgeAlloc(owned, decoded.weight, decoded.created_at, decoded.updated_at, decoded.metadata_json);
+                    } else try owned.dupe(u8, row.value);
+                    try artifacts.append(owned, .{ .key = try owned.dupe(u8, row.key), .value = value });
+                    artifact_bytes += size;
+                }
+                continuation_buffer.clearRetainingCapacity();
+                try continuation_buffer.appendSlice(alloc, row.key);
+                continuation.* = continuation_buffer.items;
+                examined_artifacts += 1;
+            }
+            if (artifact_entry == null) {
+                // Only the active phase retains a physical continuation. This
+                // keeps the existing bounded record size even for maximum-size
+                // binary document keys, and commits phase + cursor atomically.
+                continuation.* = "";
+                if (projections) next.phase = .imported else next.artifacts_complete = true;
+            } else continuation.* = try owned.dupe(u8, continuation.*);
+            // Finish every arena allocation before copying its ownership into
+            // PreparedPage; allocating while evaluating a later field would
+            // update only the old ArenaAllocator state and leak its new block.
+            const encoded_progress = try next.encode(owned);
+            return .{ .arena = arena, .phase = next.phase, .batch = .{ .sync_level = .write, .restore_staging = .{ .import_page = .{
+                .expected = staging.digest(raw),
+                .next = encoded_progress,
+                .scope = scope.digest(),
+                .timestamps = &.{},
+                .artifact_page = !projections,
+                .projection_page = projections,
+                .artifacts = artifacts.items,
+            } } } };
+        }
         var source_read = try source.core.store.beginReadTxn();
         defer source_read.abort();
         var cursor = try source_read.openCursor();
         defer cursor.close();
+        var continuation_buffer: std.ArrayList(u8) = .empty;
+        defer continuation_buffer.deinit(alloc);
         var entry = try cursor.seekAtOrAfter(if (next.cursor.len == 0) &.{internal_keys.user_namespace} else next.cursor);
         if (entry) |row| if (std.mem.eql(u8, row.key, next.cursor)) {
             entry = try cursor.next();
@@ -37170,7 +37310,9 @@ pub const DB = struct {
             }
             if (writes.items.len == max_rows or examined == 1024 or (examined != 0 and monotonicTimeNs() >= deadline)) break;
             const document_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(owned, row.key)) orelse {
-                next.cursor = try owned.dupe(u8, row.key);
+                continuation_buffer.clearRetainingCapacity();
+                try continuation_buffer.appendSlice(alloc, row.key);
+                next.cursor = continuation_buffer.items;
                 examined += 1;
                 continue;
             };
@@ -37215,12 +37357,18 @@ pub const DB = struct {
             hash.update(json);
             hash.final(&next.logical_digest);
             next.rows = std.math.add(u64, next.rows, 1) catch return error.InvalidRestoreStagingCommand;
-            next.cursor = try owned.dupe(u8, row.key);
+            continuation_buffer.clearRetainingCapacity();
+            try continuation_buffer.appendSlice(alloc, row.key);
+            next.cursor = continuation_buffer.items;
             examined += 1;
         }
         if (entry == null) {
-            if (next.rewrite) |*rewrite| rewrite.snapshot_complete = true else next.phase = .imported;
+            if (next.rewrite) |*rewrite| rewrite.snapshot_complete = true else if (scope.preserve_artifacts) {
+                next.rows_complete = true;
+                next.cursor = "";
+            } else next.phase = .imported;
         }
+        next.cursor = try owned.dupe(u8, next.cursor);
         const encoded = try next.encode(owned);
         const page: staging.ImportPage = .{ .expected = staging.digest(raw), .next = encoded, .scope = scope.digest(), .timestamps = timestamps.items };
         return .{
@@ -44623,6 +44771,13 @@ fn isMergeArtifactKey(key: []const u8) bool {
         internal_keys.isDerivedEmbeddingArtifactKey(key);
 }
 
+/// Only persisted, logical document artifacts cross native restore scopes.
+/// Runtime identities, graph projection fences, replay and transaction state
+/// belong to the fresh target generation and are deliberately excluded.
+fn isRestoreArtifactKey(key: []const u8) bool {
+    return internal_keys.isRestoreArtifactKey(key);
+}
+
 fn isPrimaryDocumentStoreKey(key: []const u8) bool {
     return internal_keys.isStoredDocumentRowKey(key);
 }
@@ -50026,7 +50181,7 @@ const GraphArtifactClear = struct {
 
 const ChunkEmbeddingSource = struct {
     key: []u8,
-    text: []u8,
+    text: []const u8,
 };
 
 fn freeChunkEmbeddingSources(alloc: Allocator, sources: []const ChunkEmbeddingSource) void {
@@ -50510,6 +50665,65 @@ fn computeDenseMaterializedChunkRequestImpl(
     }
 }
 
+/// Native preservation has already imported immutable producer results. Their
+/// metadata is sufficient to prepare target-local projections and terminal
+/// coverage; neither an enrichment worker nor a provider object is required.
+/// Validate the complete input set before appending so a cache miss cannot
+/// leave half a request mixed with freshly generated results.
+fn preparePreservedEmbeddingSources(
+    alloc: Allocator,
+    db: *DB,
+    doc_value: []const u8,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    artifact_writes: []const types.BatchWrite,
+    cache: *std.ArrayListUnmanaged(ChunkCacheEntry),
+) !?[]ChunkEmbeddingSource {
+    var sources = std.ArrayListUnmanaged(ChunkEmbeddingSource).empty;
+    var keep = false;
+    defer if (!keep) {
+        clearChunkEmbeddingSourceList(alloc, &sources);
+        sources.deinit(alloc);
+    };
+    if (requestUsesChunkSource(request)) {
+        if (requestUsesPinnedMaterializedChunkArtifact(request)) {
+            try collectChunkEmbeddingSourcesFromWrites(alloc, &sources, artifact_writes, request.doc_key, requestArtifactName(request), request.source_field);
+            try collectChunkEmbeddingSourcesFromStore(alloc, db, &sources, request.doc_key, requestArtifactName(request), request.source_field);
+        } else {
+            var chunks_created: usize = 0;
+            sources = .fromOwnedSlice(try chunkEmbeddingSourcesForRequest(alloc, db, doc_value, request, artifact_writes, cache, &chunks_created));
+        }
+    } else {
+        const text = if (request.source_template.len != 0)
+            try renderSourceTemplateText(alloc, db, request.source_template, doc_value)
+        else
+            try extractStringField(alloc, doc_value, request.source_field);
+        if (text) |value| {
+            var owned = true;
+            defer if (owned) alloc.free(value);
+            if (value.len != 0) {
+                const key = try alloc.dupe(u8, request.doc_key);
+                errdefer alloc.free(key);
+                try sources.append(alloc, .{ .key = key, .text = value });
+                owned = false;
+            }
+        }
+    }
+    for (sources.items) |source| {
+        const artifact_key = try embeddingArtifactKeyForBaseAlloc(alloc, source.key, requestEmbeddingName(request));
+        defer alloc.free(artifact_key);
+        const metadata = db.core.store.getArtifactMetadata(artifact_key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        const expected_kind: enrichment_artifact_codec.Kind = if (request.kind == .dense_embedding) .dense_embedding else .sparse_embedding;
+        if (metadata.header.kind != expected_kind or metadata.sourceHash() != enrichment_artifact_codec.hashEmbeddingSource(source.text, request.producer_json) or
+            (request.kind == .dense_embedding and metadata.dense_dimensions != request.expected_dims)) return null;
+    }
+    const result = try sources.toOwnedSlice(alloc);
+    keep = true;
+    return result;
+}
+
 fn computeDenseRequestImpl(
     alloc: Allocator,
     db: *DB,
@@ -50522,6 +50736,17 @@ fn computeDenseRequestImpl(
     memo: ?*GeneratedEmbeddingMemo,
     comptime appendForConsumers: anytype,
 ) !void {
+    if (memo) |preservation| if (preservation.reuse_stored_artifacts) {
+        if (try preparePreservedEmbeddingSources(alloc, db, doc_value, request, artifact_writes.items, cache)) |sources| {
+            defer freeChunkEmbeddingSources(alloc, sources);
+            for (sources) |source| {
+                const artifact_key = try embeddingArtifactKeyForBaseAlloc(alloc, source.key, requestEmbeddingName(request));
+                defer alloc.free(artifact_key);
+                try appendForConsumers(alloc, dense_embeddings, source.key, if (requestUsesChunkSource(request)) request.doc_key else null, artifact_key, &.{}, request.consumer_indexes);
+            }
+            return;
+        }
+    };
     const runtime = db.enrichment_runtime orelse return error.MissingDenseEmbedder;
     const dense_embedder = runtime.config.dense_embedder orelse return error.MissingDenseEmbedder;
 
@@ -50634,6 +50859,12 @@ fn computeDenseRequestImpl(
         request.expected_dims,
         source_text.?,
     );
+    // Document tables build their generated plan under apply rather than in
+    // relational prewarm. Use the same persisted-cache admission in either
+    // path before falling back to the external provider.
+    if (memo) |cache_memo| if (!cache_memo.dense.contains(memo_key)) {
+        _ = try prewarmGeneratedMemoFromArtifact(db, cache_memo, request, source_text.?, memo_key);
+    };
     var uncached_vector: ?[]f32 = null;
     defer if (uncached_vector) |owned| alloc.free(owned);
     const vector: []const f32 = if (memo) |cache_memo|
@@ -50744,6 +50975,17 @@ fn computeSparseRequestDerived(
     cache: *std.ArrayListUnmanaged(ChunkCacheEntry),
     memo: ?*GeneratedEmbeddingMemo,
 ) !void {
+    if (memo) |preservation| if (preservation.reuse_stored_artifacts) {
+        if (try preparePreservedEmbeddingSources(alloc, db, doc_value, request, artifact_writes.items, cache)) |sources| {
+            defer freeChunkEmbeddingSources(alloc, sources);
+            for (sources) |source| {
+                const artifact_key = try embeddingArtifactKeyForBaseAlloc(alloc, source.key, requestEmbeddingName(request));
+                defer alloc.free(artifact_key);
+                try appendDerivedSparseEmbeddingForConsumers(alloc, sparse_embeddings, source.key, artifact_key, &.{}, &.{}, request.consumer_indexes);
+            }
+            return;
+        }
+    };
     const runtime = db.enrichment_runtime orelse return error.MissingSparseEmbedder;
     const sparse_embedder = runtime.config.sparse_embedder orelse return error.MissingSparseEmbedder;
 
@@ -50820,6 +51062,9 @@ fn computeSparseRequestDerived(
         0,
         source_text.?,
     );
+    if (memo) |cache_memo| if (!cache_memo.sparse.contains(memo_key)) {
+        _ = try prewarmGeneratedMemoFromArtifact(db, cache_memo, request, source_text.?, memo_key);
+    };
     var uncached_sparse: ?embedder_mod.SparseEmbedding = null;
     defer if (uncached_sparse) |*owned| owned.deinit(alloc);
     const sparse = if (memo) |cache_memo|
@@ -51110,6 +51355,56 @@ fn flushGeneratedDenseMemoJobs(
     for (jobs.items, vectors) |job, vector| try memo.putDenseCopy(job.key, vector);
 }
 
+/// Seed precommit work from an immutable logical artifact, never from source
+/// namespace/ordinal state. Native restore and unchanged source writes can
+/// reuse provider results while rebuilding fresh projection identities.
+fn prewarmGeneratedMemoFromArtifact(
+    self: *DB,
+    memo: *GeneratedEmbeddingMemo,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    text: []const u8,
+    key_value: GeneratedEmbeddingMemo.Key,
+) !bool {
+    if (!memo.reuse_stored_artifacts) return false;
+    const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(memo.alloc, request.doc_key, requestEmbeddingName(request));
+    defer memo.alloc.free(artifact_key);
+    const raw = self.core.store.get(memo.alloc, artifact_key) catch |err| switch (err) {
+        error.NotFound => return false,
+        else => return err,
+    };
+    defer memo.alloc.free(raw);
+    const source_hash = enrichment_artifact_codec.sourceHash(raw) catch return false;
+    if (source_hash == null or source_hash.? != enrichment_artifact_codec.hashEmbeddingSource(text, request.producer_json)) return false;
+    switch (request.kind) {
+        .dense_embedding => {
+            const dims = enrichment_artifact_codec.decodeDenseEmbeddingDims(raw) catch return false;
+            if (dims != request.expected_dims) return false;
+            const vector = enrichment_artifact_codec.decodeDenseEmbeddingAlloc(memo.alloc, raw) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return false,
+            };
+            var owned = true;
+            defer if (owned) memo.alloc.free(vector);
+            for (vector) |value| if (!std.math.isFinite(value)) return false;
+            _ = try memo.adoptDense(key_value, vector);
+            owned = false;
+        },
+        .sparse_embedding => {
+            var vector = enrichment_artifact_codec.decodeSparseEmbeddingAlloc(memo.alloc, raw) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return false,
+            };
+            var owned = true;
+            defer if (owned) vector.deinit(memo.alloc);
+            for (vector.values) |value| if (!std.math.isFinite(value)) return false;
+            _ = try memo.adoptSparse(key_value, .{ .indices = vector.indices, .values = vector.values });
+            owned = false;
+        },
+        else => return false,
+    }
+    return true;
+}
+
 /// Collapse document-level generated embeddings across all rows into bounded
 /// provider batches. Chunk requests already use their own bounded batch path;
 /// multipart requests retain their media-aware provider ABI.
@@ -51163,6 +51458,11 @@ fn prewarmGeneratedDenseMemo(
                 text,
             );
             if (memo.dense.contains(key_value) or pending.contains(key_value)) {
+                memo.alloc.free(text);
+                text_owned = false;
+                continue;
+            }
+            if (try prewarmGeneratedMemoFromArtifact(self, memo, request, text, key_value)) {
                 memo.alloc.free(text);
                 text_owned = false;
                 continue;
@@ -51284,6 +51584,11 @@ fn prewarmGeneratedSparseMemo(
                 text_owned = false;
                 continue;
             }
+            if (try prewarmGeneratedMemoFromArtifact(self, memo, request, text, key_value)) {
+                memo.alloc.free(text);
+                text_owned = false;
+                continue;
+            }
             const incompatible = if (jobs.items.len == 0) false else blk: {
                 const first = jobs.items[0].request;
                 break :blk !std.mem.eql(u8, requestEmbeddingName(first), requestEmbeddingName(request)) or
@@ -51310,6 +51615,57 @@ fn prewarmGeneratedSparseMemo(
         }
     }
     try flushGeneratedSparseMemoJobs(self, memo, &jobs);
+}
+
+test "generated memo reuses only source matched typed embedding artifacts" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("memo-artifacts");
+    defer directory.cleanup();
+    const path = directory.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    var memo = GeneratedEmbeddingMemo.init(alloc);
+    defer memo.deinit();
+    var request: enrichment_types.GeneratedEnrichmentRequest = .{
+        .kind = .dense_embedding,
+        .index_name = "dense",
+        .embedding_name = "model",
+        .doc_key = "doc:a",
+        .source_field = "body",
+        .expected_dims = 3,
+        .producer_json = "producer-v1",
+    };
+    const key_value = GeneratedEmbeddingMemo.key(.dense_embedding, "model", request.producer_json, "", 3, "alpha");
+    const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, request.doc_key, "model");
+    defer alloc.free(artifact_key);
+    try std.testing.expect(!try prewarmGeneratedMemoFromArtifact(&db, &memo, request, "alpha", key_value));
+    const hash = enrichment_artifact_codec.hashEmbeddingSource("alpha", request.producer_json);
+    const dense = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, hash, &.{ 1, 2, 3 });
+    defer alloc.free(dense);
+    try db.core.store.put(artifact_key, dense);
+    // Ordinary/forced generation must not silently become cache reuse.
+    try std.testing.expect(!try prewarmGeneratedMemoFromArtifact(&db, &memo, request, "alpha", key_value));
+    memo.reuse_stored_artifacts = true;
+    try std.testing.expect(!try prewarmGeneratedMemoFromArtifact(&db, &memo, request, "changed", key_value));
+    request.expected_dims = 2;
+    try std.testing.expect(!try prewarmGeneratedMemoFromArtifact(&db, &memo, request, "alpha", key_value));
+    request.expected_dims = 3;
+    request.producer_json = "producer-v2";
+    try std.testing.expect(!try prewarmGeneratedMemoFromArtifact(&db, &memo, request, "alpha", key_value));
+    request.producer_json = "producer-v1";
+    try std.testing.expect(try prewarmGeneratedMemoFromArtifact(&db, &memo, request, "alpha", key_value));
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3 }, memo.dense.get(key_value).?);
+    request.kind = .sparse_embedding;
+    try std.testing.expect(!try prewarmGeneratedMemoFromArtifact(&db, &memo, request, "alpha", key_value));
+    const sparse = try enrichment_artifact_codec.encodeSparseEmbeddingAlloc(alloc, hash, &.{ 2, 9 }, &.{ 0.25, 1.5 });
+    defer alloc.free(sparse);
+    try db.core.store.put(artifact_key, sparse);
+    try std.testing.expect(try prewarmGeneratedMemoFromArtifact(&db, &memo, request, "alpha", key_value));
+    try std.testing.expectEqualSlices(u32, &.{ 2, 9 }, memo.sparse.get(key_value).?.indices);
+    try std.testing.expectEqualSlices(f32, &.{ 0.25, 1.5 }, memo.sparse.get(key_value).?.values);
+    try db.core.store.put(artifact_key, "corrupt");
+    try std.testing.expect(!try prewarmGeneratedMemoFromArtifact(&db, &memo, request, "alpha", key_value));
 }
 
 fn prepareGeneratedEnrichments(
@@ -51622,6 +51978,7 @@ const GeneratedEmbeddingMemo = struct {
     const SparseValue = struct { indices: []u32, values: []f32 };
 
     alloc: Allocator,
+    reuse_stored_artifacts: bool = false,
     dense: std.AutoHashMapUnmanaged(Key, []f32) = .empty,
     sparse: std.AutoHashMapUnmanaged(Key, SparseValue) = .empty,
 
@@ -132785,6 +133142,187 @@ test "db snapshot exports logical store only for durable lsm primary backend" {
     defer io_impl.deinit();
     try std.Io.Dir.accessAbsolute(io_impl.io(), store_snapshot_path, .{});
     try std.Io.Dir.accessAbsolute(io_impl.io(), snapshot_manifest_path, .{});
+}
+
+test "db scoped native restore imports cached artifacts before rows across restart" {
+    try testScopedNativeArtifactRestore(false);
+    try testScopedNativeArtifactRestore(true);
+}
+
+fn testScopedNativeArtifactRestore(standby: bool) !void {
+    const alloc = std.testing.allocator;
+    const staging = @import("restore_staging.zig");
+    var source_tmp = try TestDirectory.init("native-artifact-source");
+    defer source_tmp.cleanup();
+    var target_tmp = try TestDirectory.init("native-artifact-target");
+    defer target_tmp.cleanup();
+    const source_path = std.mem.span(source_tmp.path().ptr);
+    const target_path = std.mem.span(target_tmp.path().ptr);
+    var counting = CountingDenseEmbedder{};
+    var preserved_indexes: []types.IndexConfig = &.{};
+    defer types.freeIndexConfigs(alloc, preserved_indexes);
+    var source_graph_generation: u64 = 0;
+    const source_options: OpenOptions = .{
+        .identity_namespace = .{ .table_id = 101, .shard_id = 102, .range_id = 102 },
+        .primary_backend = .{ .lsm = .{} },
+        .start_index_workers = false,
+        .enrichment = .{ .owner_id = "artifact-source", .dense_embedder = counting.interface() },
+    };
+    const index: types.IndexConfig = .{
+        .name = "semantic",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"chunks\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"vectors\"}}",
+    };
+    const whole_index: types.IndexConfig = .{
+        .name = "whole_document",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"whole_vector\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"whole_vector\"}}",
+    };
+    const explicit_index: types.IndexConfig = .{ .name = "explicit", .kind = .dense_vector, .config_json = "{\"field\":\"explicit_vector\",\"dims\":3}" };
+    const graph_index: types.IndexConfig = .{ .name = "links", .kind = .graph, .config_json = "{}" };
+    const text_index: types.IndexConfig = .{ .name = "full_text", .kind = .full_text, .config_json = "{}" };
+    {
+        var source = try DB.open(alloc, source_path, source_options);
+        defer source.close();
+        try source.addIndex(index);
+        try source.addIndex(whole_index);
+        try source.addIndex(explicit_index);
+        try source.addIndex(graph_index);
+        try source.addIndex(text_index);
+        try source.batch(.{
+            .writes = &.{
+                .{ .key = "doc", .value = "{\"body\":\"abcdefghijklmno\",\"_embeddings\":{\"explicit\":[1,0,0]}}" },
+                .{ .key = "other", .value = "{\"body\":\"abcdefghijklmno\"}" },
+            },
+            .graph_writes = &.{.{ .index_name = "links", .source = "doc", .target = "other", .edge_type = "related", .weight = 1.0 }},
+            .sync_level = .full_index,
+        });
+        try source.runUntilIdle();
+        // Native manifests retain each committed index incarnation, not its
+        // original zero-generation creation request.
+        preserved_indexes = try source.listIndexes(alloc);
+        source_graph_generation = source.core.index_manager.graphIndex("links").?.config.coverage_generation;
+    }
+    const source_calls = counting.calls;
+    try std.testing.expect(source_calls > 0);
+    var read_options = source_options;
+    read_options.open_mode = .query_readonly;
+    read_options.primary_only_readonly = true;
+    var source = try DB.open(alloc, source_path, read_options);
+    defer source.close();
+    const target_options: OpenOptions = .{
+        .identity_namespace = .{ .table_id = 201, .shard_id = 202, .range_id = 202 },
+        .primary_backend = .{ .lsm = .{} },
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .enrichment = .{ .owner_id = "artifact-target", .dense_embedder = counting.interface() },
+    };
+    var target = try DB.open(alloc, target_path, target_options);
+    defer target.close();
+    for (preserved_indexes) |config| try target.addIndex(config);
+    try std.testing.expectEqual(source_graph_generation, target.core.index_manager.graphIndex("links").?.config.coverage_generation);
+    // Real hidden owners persist their namespace during lifecycle admission,
+    // before any source rows or generated artifacts arrive.
+    try doc_identity.writeNamespaceToStore(target.core.store, target_options.identity_namespace.?);
+    const schema = try schema_mod.serializeSchema(alloc, target.core.schema orelse .{});
+    defer alloc.free(schema);
+    const scope: staging.Scope = .{
+        .plan_id = @splat(1),
+        .plan_digest = @splat(2),
+        .source_artifact_digest = @splat(3),
+        .source_namespace = source_options.identity_namespace.?,
+        .target_namespace = target_options.identity_namespace.?,
+        .target_schema_digest = staging.digest(schema),
+        .preserve_artifacts = true,
+    };
+    var invalid_count: [8]u8 = undefined;
+    std.mem.writeInt(u64, &invalid_count, 1, .little);
+    try target.core.store.putBatch(&.{.{ .key = &internal_keys.range_document_count_key, .value = &invalid_count }}, &.{});
+    try std.testing.expectError(error.RestoreStagingTargetNotEmpty, target.beginRestoreStaging(alloc, scope));
+    try std.testing.expect(try doc_identity.visibilitySummaryFromStore(target.core.store) == null);
+    try std.testing.expectError(error.NotFound, target.core.store.get(alloc, staging.key));
+    try target.core.store.putBatch(&.{}, &.{&internal_keys.range_document_count_key});
+    try target.beginRestoreStaging(alloc, scope);
+    try std.testing.expectEqual(@as(u64, 0), (try doc_identity.visibilitySummaryFromStore(target.core.store)).?.live_ordinals);
+    try std.testing.expectEqual(@as(?u64, 0), try range_cardinality.load(alloc, target.core.store));
+    var index_number: u64 = 1;
+    var artifact_pages: usize = 0;
+    while (true) : (index_number += 1) {
+        var page = try target.prepareRestoreStagingPage(alloc, scope, &source, if (standby) 1 else 128, .none);
+        defer page.deinit();
+        const batch = page.batch orelse break;
+        if (standby) {
+            const payload = try ha_effects_mod.encodeBatchMutationRequestAlloc(alloc, batch);
+            defer alloc.free(payload);
+            const record: ha_replication_record_mod.RecordView = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = index_number, .previous_lsn = index_number - 1, .payload = payload };
+            try target.applyHAReplicationRecord(record);
+            try target.applyHAReplicationRecord(record);
+        } else {
+            try target.batchRaftReplicatedApply(batch, .{ .term = 1, .index = index_number });
+            // Lost acknowledgements replay without mutating the next page.
+            try target.batchRaftReplicatedApply(batch, .{ .term = 1, .index = index_number });
+        }
+        if (batch.restore_staging.?.import_page.artifact_page) {
+            artifact_pages += 1;
+            try std.testing.expectEqual(@as(u64, 0), target.core.table_catalog.row_count);
+            if (artifact_pages == 1) {
+                target.close();
+                target = try DB.open(alloc, target_path, target_options);
+            }
+        }
+        if (page.phase == .imported) break;
+        try std.testing.expect(index_number < 100);
+    }
+    try std.testing.expect(artifact_pages >= 1);
+    try std.testing.expectEqual(source_calls, counting.calls);
+    try std.testing.expectEqual(@as(u64, 6), target.core.index_manager.denseIndex("semantic").?.index.stats().active_count);
+    try std.testing.expectEqual(@as(u64, 2), target.core.index_manager.denseIndex("whole_document").?.index.stats().active_count);
+    try std.testing.expectEqual(@as(u64, 1), target.core.index_manager.denseIndex("explicit").?.index.stats().active_count);
+    const stats = try target.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expectEqual(@as(?u64, 2), try range_cardinality.load(alloc, target.core.store));
+    try std.testing.expectEqual(@as(u64, 2), stats.source_doc_count);
+    try std.testing.expectEqual(@as(u64, 2), stats.doc_identity.live_ordinals);
+    var covered: usize = 0;
+    for (stats.indexes) |item| {
+        if (!std.mem.eql(u8, item.name, "semantic") and !std.mem.eql(u8, item.name, "whole_document")) continue;
+        covered += 1;
+        try std.testing.expect(item.coverage_summary_ready);
+        try std.testing.expectEqual(@as(u64, 2), item.coverage_produced_count);
+        try std.testing.expectEqual(@as(u64, 0), item.coverage_skipped_count);
+        try std.testing.expectEqual(@as(u64, 0), item.coverage_terminal_failed_count);
+        try std.testing.expect(item.publication_target_ready);
+        try std.testing.expectEqual(@as(u64, if (std.mem.eql(u8, item.name, "semantic")) 6 else 2), item.publication_target_count);
+    }
+    try std.testing.expectEqual(@as(usize, 2), covered);
+    try std.testing.expect(target.core.artifact_cleanup_maybe.load(.acquire));
+    try std.testing.expect(target.core.identity_namespace.eql(target_options.identity_namespace.?));
+    var quanta: usize = 0;
+    while (!try target.prepareRestoreStagingIndexesStep(alloc, scope.digest())) : (quanta += 1) {
+        try std.testing.expect(quanta < 1000);
+    }
+    _ = try target.finishRestoreStaging(alloc, scope.digest(), .validated);
+    _ = try target.finishRestoreStaging(alloc, scope.digest(), .published);
+    target.close();
+    target = try DB.open(alloc, target_path, target_options);
+    const reopened_stats = try target.stats(alloc);
+    defer types.freeDBStats(alloc, reopened_stats);
+    try std.testing.expectEqual(@as(?u64, 2), try range_cardinality.load(alloc, target.core.store));
+    try std.testing.expectEqual(@as(u64, 2), reopened_stats.source_doc_count);
+    try std.testing.expectEqual(@as(u64, 2), reopened_stats.doc_identity.live_ordinals);
+    for (reopened_stats.indexes) |item| {
+        if (!std.mem.eql(u8, item.name, "semantic") and !std.mem.eql(u8, item.name, "whole_document")) continue;
+        try std.testing.expect(item.coverage_summary_ready);
+        try std.testing.expectEqual(reopened_stats.source_doc_count, item.coverage_produced_count);
+    }
+    var result = try target.search(alloc, .{ .index_name = "explicit", .dense = .{ .vector = &.{ 1, 0, 0 }, .k = 1 } });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("doc", result.hits[0].id);
+    const edges = try target.getEdges(alloc, "links", "other", "related", .in);
+    defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
+    try std.testing.expectEqualStrings("doc", edges[0].source);
 }
 
 test "db native deferred restore preserves generated dense generation without embedder" {

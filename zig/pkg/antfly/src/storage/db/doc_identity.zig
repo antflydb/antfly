@@ -557,14 +557,41 @@ fn initialVisibilitySummaryTxn(store: *docstore_mod.DocStore) !?VisibilitySummar
     // missing-summary proof; callers retain the mutation/apply fence.
     var txn = try store.beginReadTxnWithBlockCacheAdmission(.transient);
     defer txn.abort();
-    if (try readNextOrdinalTxn(&txn) != 1) return null;
-    var cursor = try txn.openCursor();
+    return try pristineVisibilitySummaryTxn(&txn);
+}
+
+fn pristineVisibilitySummaryTxn(txn: *docstore_mod.DocStore.Txn) !?VisibilitySummary {
+    if (try readNextOrdinalTxn(txn) != 1) return null;
+    // This is a key-only emptiness proof, not an artifact payload read.
+    var cursor = try txn.openPhysicalCursorAdapter();
     defer cursor.close();
     if (try cursor.seekAtOrAfter(&.{internal_keys.user_namespace})) |entry|
         if (internal_keys.isInternalUserKey(entry.key)) return null;
     if (try cursor.seekAtOrAfter(&.{internal_keys.identity_namespace})) |entry|
-        if (entry.key.len > 1 and entry.key[0] == internal_keys.identity_namespace and entry.key[1] != 0xff) return null;
+        if (entry.key.len > 0 and entry.key[0] == internal_keys.identity_namespace and
+            (entry.key.len < 2 or entry.key[1] != 0xff)) return null;
     return VisibilitySummary{};
+}
+
+/// Bootstrap a fresh owner before importing non-primary artifacts. Once those
+/// artifacts exist, the generic missing-summary proof correctly cannot infer
+/// an empty corpus. The caller commits this proof with its owner scope and
+/// range counter; aborting that transaction exposes no partial bootstrap.
+pub fn initializePristineVisibilitySummaryTxn(txn: *docstore_mod.DocStore.Txn, namespace: Namespace) !?VisibilitySummary {
+    const stored_namespace = try loadNamespaceTxn(txn);
+    if (stored_namespace) |stored| if (!stored.eql(namespace)) return error.IdentityNamespaceMismatch;
+    const empty = (try pristineVisibilitySummaryTxn(txn)) orelse return null;
+    if (try readVisibilitySummaryTxn(txn)) |existing| {
+        if (!std.meta.eql(empty, existing)) return null;
+    } else {
+        try writeVisibilitySummaryTxn(txn, empty);
+    }
+    if (stored_namespace == null) {
+        var encoded: [24]u8 = undefined;
+        encodeNamespace(&encoded, namespace);
+        try txn.put(&internal_keys.identity_namespace_key, &encoded);
+    }
+    return empty;
 }
 
 pub fn lookupOrdinalTxn(alloc: Allocator, txn: anytype, doc_id: []const u8) !?DocOrdinal {
@@ -2484,6 +2511,57 @@ test "identity unchanged batch proves live state and canonical mappings with thr
     const wrong = [_]u8{ 0, 0, 0, 99 };
     try store.putBatchWithReplay(null, &.{.{ .key = &canonical_key, .value = &wrong }}, &.{}, null);
     try std.testing.expectError(error.InvalidDocIdentity, appendBatchIdentityMetadataForNamespaceAlloc(alloc, &store, default_namespace, 22, &unchanged, &.{ "doc:m", "doc:z", "doc:a" }, &.{}));
+}
+
+test "restore staging pristine identity bootstrap is atomic and fail closed" {
+    const mem_backend = @import("../mem_backend.zig");
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try docstore_mod.DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    const namespace: Namespace = .{ .table_id = 7, .shard_id = 8, .range_id = 9 };
+    try writeNamespaceToStore(&store, namespace);
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.IdentityNamespaceMismatch, initializePristineVisibilitySummaryTxn(&txn, .{ .table_id = 10, .shard_id = 8, .range_id = 9 }));
+        try std.testing.expect(try initializePristineVisibilitySummaryTxn(&txn, namespace) != null);
+    }
+    try std.testing.expect(try visibilitySummaryFromStore(&store) == null);
+    const artifact = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "vector");
+    defer alloc.free(artifact);
+    const nonzero = encodeVisibilitySummary(.{ .live_ordinals = 1 });
+    const rejected = [_]docstore_mod.KVPair{
+        .{ .key = artifact, .value = "opaque-artifact" },
+        .{ .key = &.{internal_keys.identity_namespace}, .value = "malformed-identity-prefix" },
+        .{ .key = &internal_keys.identity_visibility_summary_key, .value = &nonzero },
+    };
+    for (rejected) |record| {
+        try store.putBatch(&.{record}, &.{});
+        {
+            var txn = try store.beginWriteTxn();
+            defer txn.abort();
+            try std.testing.expect(try initializePristineVisibilitySummaryTxn(&txn, namespace) == null);
+        }
+        const unchanged = try store.get(alloc, record.key);
+        defer alloc.free(unchanged);
+        try std.testing.expectEqualSlices(u8, record.value, unchanged);
+        try store.putBatch(&.{}, &.{record.key});
+        try std.testing.expect(try visibilitySummaryFromStore(&store) == null);
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try std.testing.expect(try initializePristineVisibilitySummaryTxn(&txn, namespace) != null);
+        try txn.commit();
+    }
+    try std.testing.expectEqual(@as(u64, 0), (try visibilitySummaryFromStore(&store)).?.live_ordinals);
+    try store.putBatch(&.{.{ .key = artifact, .value = "opaque-artifact" }}, &.{});
+    var txn = try store.beginWriteTxn();
+    defer txn.abort();
+    // A preexisting zero summary cannot authorize a non-pristine root either.
+    try std.testing.expect(try initializePristineVisibilitySummaryTxn(&txn, namespace) == null);
 }
 
 test "relational index system namespace preinitialization seeds first visibility summary only with bounded empty proof" {

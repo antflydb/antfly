@@ -1269,6 +1269,90 @@ def test_idle_worker_waits_while_session_owner_rotates_to_release_slot(
     assert waiter.sent == [[0]]
 
 
+@pytest.mark.parametrize("final_complete", [False, True])
+def test_exhausted_session_releases_lane_while_another_worker_makes_progress(
+    tmp_path: Path,
+    final_complete: bool,
+) -> None:
+    scheduler = IsolationAwareScheduling.__new__(IsolationAwareScheduling)
+    scheduler.process_slots = 2
+    scheduler.duration_history = DurationHistory(tmp_path / "durations.json")
+    owner = FakeWorker(exitstatus=0)
+    active = FakeWorker()
+    waiter = FakeWorker()
+    owner_scope = f"{PERSISTENT_PROCESS_GROUP_PREFIX}serverless_runtime--module--done"
+    active_scope = f"{PROCESS_GROUP_PREFIX}module--active"
+    waiting_scope = f"{PROCESS_GROUP_PREFIX}module--waiting"
+    waiting_nodeids = [f"test_waiting.py::test_{index}" for index in range(3)]
+    scheduler._retiring_nodes = set()
+    scheduler._persistent_processes = {owner: {"serverless_runtime"}}
+    scheduler.assigned_work = {
+        owner: {owner_scope: {"test_serverless.py::test_done": final_complete}},
+        active: {
+            active_scope: {f"test_active.py::test_{index}": False for index in range(3)}
+        },
+        waiter: {},
+    }
+    scheduler.workqueue = OrderedDict(
+        {waiting_scope: dict.fromkeys(waiting_nodeids, False)}
+    )
+    scheduler.registered_collections = {
+        owner: waiting_nodeids,
+        active: waiting_nodeids,
+        waiter: waiting_nodeids,
+    }
+
+    assert scheduler._another_worker_will_make_progress(owner)
+    scheduler._reschedule(owner)
+
+    assert owner.shutting_down
+    assert owner in scheduler._retiring_nodes
+    # Shutdown is asynchronous: do not reuse its slot until fixture teardown
+    # and worker exit have actually completed.
+    assert scheduler._reserved_process_slots() == 2
+    scheduler._reschedule(waiter)
+    assert waiter.sent == []
+
+    # Shutdown allows the final queued test to run, then pytest tears down
+    # its session fixture before reporting the clean worker exit.
+    scheduler.assigned_work[owner][owner_scope]["test_serverless.py::test_done"] = True
+    assert scheduler.remove_node(owner) is None
+
+    assert waiter.sent == [[0, 1, 2]]
+    assert scheduler._reserved_process_slots() == 2
+
+
+def test_idle_session_owner_is_retained_for_queued_mixed_work(
+    tmp_path: Path,
+) -> None:
+    scheduler = IsolationAwareScheduling.__new__(IsolationAwareScheduling)
+    scheduler.process_slots = 2
+    scheduler.duration_history = DurationHistory(tmp_path / "durations.json")
+    owner = FakeWorker()
+    active = FakeWorker()
+    mixed_scope = f"{MIXED_PROCESS_GROUP_PREFIX}serverless_runtime--module--waiting"
+    scheduler._retiring_nodes = set()
+    scheduler._persistent_processes = {owner: {"serverless_runtime"}}
+    scheduler.assigned_work = {
+        owner: {},
+        active: {
+            f"{PROCESS_GROUP_PREFIX}module--active": {
+                f"test_active.py::test_{index}": False for index in range(3)
+            }
+        },
+    }
+    scheduler.workqueue = OrderedDict(
+        {mixed_scope: {"test_mixed.py::test_waiting": False}}
+    )
+    scheduler.registered_collections = {owner: [], active: []}
+
+    scheduler._reschedule(owner)
+
+    assert not owner.shutting_down
+    assert scheduler._retiring_nodes == set()
+    assert scheduler._reserved_process_slots() == 2
+
+
 def test_lightweight_runway_preserves_successor_for_session_rotation(
     tmp_path: Path,
 ) -> None:

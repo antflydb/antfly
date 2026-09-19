@@ -214,6 +214,27 @@ def test_owner_link_failed_response_diagnostics_survive_heal_and_stay_bounded():
     assert not fault.transaction_observations
 
 
+def set_command_option(command, option, value):
+    """Override explicit fixture options, or add options left at CLI defaults."""
+    try:
+        index = command.index(option)
+    except ValueError:
+        command.extend([option, value])
+    else:
+        command[index + 1] = value
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_fault_proxy_tick_override_handles_cli_defaults(explicit):
+    command = ["antfly", "data"]
+    if explicit:
+        command.extend(["--raft-tick-ms", "5", "--control-tick-ms", "5"])
+    for option in ("--raft-tick-ms", "--control-tick-ms"):
+        set_command_option(command, option, "50")
+        assert command.count(option) == 1
+        assert command[command.index(option) + 1] == "50"
+
+
 @pytest.fixture
 def owner_link_fault(request, monkeypatch):
     fault = OwnerLinkFault(request.param)
@@ -342,8 +363,8 @@ def owner_link_fault(request, monkeypatch):
                 result.extend(["--raft-advertise-url", urls[index + 3]])
                 # Use a realistic heartbeat interval through the Python test
                 # proxy; 5ms stress ticks swamp scheduling and port budgets.
-                result[result.index("--raft-tick-ms") + 1] = "50"
-                result[result.index("--control-tick-ms") + 1] = "50"
+                set_command_option(result, "--raft-tick-ms", "50")
+                set_command_option(result, "--control-tick-ms", "50")
             return result
 
         monkeypatch.setattr(backups.ThreeByThreeBackupCluster, "_data_command", command)

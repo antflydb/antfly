@@ -29343,8 +29343,11 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
             // remains exactly idempotent through the routed adapter.
             self.stage = 6;
             try self.restartNode(1);
+            self.stage = 55;
             try self.waitForSplitFinalizedEverywhere();
+            self.stage = 56;
             try self.transferAndWait(self.split_record.source_group_id, 2);
+            self.stage = 57;
             try self.transferAndWait(self.split_record.destination_group_id, 2);
             self.stage = 59;
             var restarted_ops = self.servers[1].localShardOperationAdapter();
@@ -29646,10 +29649,13 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
         }
 
         fn waitForLeader(self: *@This(), group_id: u64, expected: u64) !void {
-            for (0..20_000) |_| {
+            // Match the progress driver's cadence. Polling every virtual
+            // millisecond burns scheduler choices while waiting for an
+            // ordinary production election, without advancing Raft sooner.
+            for (0..2_000) |_| {
                 if (self.leader(group_id) == expected) return;
                 if (self.driver_failure) |err| return err;
-                try self.io.sleep(.fromMilliseconds(1), .awake);
+                try self.io.sleep(.fromMilliseconds(10), .awake);
             }
             for (self.servers, 0..) |*server, i| {
                 if (!self.nodeIsRunning(i)) continue;
@@ -29664,7 +29670,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
         }
 
         fn transferAndWait(self: *@This(), group_id: u64, target: u64) !void {
-            for (0..20_000) |_| {
+            for (0..2_000) |_| {
                 if (self.leader(group_id)) |current| {
                     if (current == target) return;
                     const raft = self.servers[current - 1].data_raft orelse
@@ -29673,7 +29679,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
                     return try self.waitForLeader(group_id, target);
                 }
                 if (self.driver_failure) |err| return err;
-                try self.io.sleep(.fromMilliseconds(1), .awake);
+                try self.io.sleep(.fromMilliseconds(10), .awake);
             }
             return error.VoprDataServerLeaderTimeout;
         }
@@ -30200,7 +30206,12 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
         };
         try vopr_io.scheduler().executeReady(selected.id, &events, alloc);
         transitions += 1;
-        if (transitions > 8_000) {
+        // The integrity history includes quiescence and owner projections,
+        // then restarts the current leader. Budget the complete recovery:
+        // bounded 10 ms leader polling takes about 8,700 choices, versus
+        // 3,500 for the document-only history. Keep the latter's bound intact.
+        const transition_budget: usize = if (coordinated) 10_000 else 8_000;
+        if (transitions > transition_budget) {
             std.log.err(
                 "multi-owner DataServer VOPR transition budget stage={} donor_leader={?} receiver_leader={?} now_ns={} rounds={any}",
                 .{
@@ -30279,7 +30290,8 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
     if (replay_failure) |err| return err;
     // Work contracts cover record and replay without a wall-clock timeout.
     // The 1 ms polling regression exceeded 1,200 rounds per node; the 10 ms
-    // cadence needs about 190 while retaining the complete transition history.
+    // cadence needs about 190 for documents and 345 with UNIQUE/FK ownership,
+    // while retaining the complete transition history in both cases.
     for (shared.driver_rounds) |rounds| try std.testing.expect(rounds <= 400);
     const observation = shared.observation orelse return error.MissingMergeObservation;
     try std.testing.expectEqual(.finalized, observation.donor.phase);

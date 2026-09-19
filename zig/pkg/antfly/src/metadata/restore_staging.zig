@@ -382,6 +382,7 @@ pub fn ownerScope(alloc: std.mem.Allocator, plan: Plan, plan_digest: Digest, tar
         .source_namespace = artifact.source_namespace,
         .target_namespace = .{ .table_id = target.table.table_id, .shard_id = tables.rangeDocIdentityShardId(range), .range_id = tables.rangeDocIdentityRangeId(range) },
         .target_schema_digest = @import("../storage/db/restore_staging_contract.zig").digest(encoded),
+        .preserve_artifacts = artifact.format == .native,
         .rewrite = artifact.rewrite,
     };
 }

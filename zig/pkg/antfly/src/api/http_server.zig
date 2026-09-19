@@ -15540,11 +15540,24 @@ pub const ApiHttpServer = struct {
         // only drain + durable immutable pin sealing, never object uploads.
         var cohort_session: ?BackupCohortSession = null;
         defer if (cohort_session) |*session| session.deinit();
-        if (req.format == .native or self.source.vtable.compare_and_set_backup_cohort != null) {
+        // Missing selections have per-table failure semantics. Keep them in
+        // the immutable attempt journal and final status list, but do not ask
+        // the common-cut protocol to fence owners that do not exist. The same
+        // authoritative snapshot binds this selection and cohort admission.
+        // An incomplete selection still cannot publish an aggregate below.
+        var cohort_tables = std.ArrayListUnmanaged(backups_api.ClusterBackupAttemptTable).empty;
+        defer cohort_tables.deinit(op_alloc);
+        for (attempt_tables) |table| {
+            if (tables_api.findTableByName(&authoritative_snapshot, table.name) != null)
+                cohort_tables.append(op_alloc, table) catch |err| return trace.internal(err);
+        }
+        if (cohort_tables.items.len != 0 and (req.format == .native or self.source.vtable.compare_and_set_backup_cohort != null)) {
             trace.enter(.cohort_admission);
             var fallback_router = table_router.CatalogBackedGroupRouter.init(self.catalogSource(), self.localSessionNodeId());
             const router = self.cfg.session_router orelse fallback_router.router();
-            cohort_session = BackupCohortSession.admit(op_alloc, self.source, self.table_reads orelse return error.MetadataCapabilityUnavailable, self.table_writes orelse return error.MetadataCapabilityUnavailable, operation_request, router, self.catalogSource(), &authoritative_snapshot, attempt_marker, req.location, connection) catch |err| switch (err) {
+            var cohort_marker = attempt_marker;
+            cohort_marker.tables = cohort_tables.items;
+            cohort_session = BackupCohortSession.admit(op_alloc, self.source, self.table_reads orelse return error.MetadataCapabilityUnavailable, self.table_writes orelse return error.MetadataCapabilityUnavailable, operation_request, router, self.catalogSource(), &authoritative_snapshot, cohort_marker, req.location, connection) catch |err| switch (err) {
                 error.TableTopologyProtocolUpgradeRequired => return error.MetadataCapabilityUnavailable,
                 else => return trace.internal(err),
             };

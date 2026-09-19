@@ -12,9 +12,9 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-//! Durable authority for an unpublished restore owner. Only logical primary
-//! rows cross the source/target boundary; target identities and constraint
-//! generations are allocated by the ordinary target schema/row pipeline.
+//! Durable authority for an unpublished restore owner. Logical primary rows
+//! and native generated-artifact caches cross the source/target boundary;
+//! identities and constraints are allocated by the target schema/row pipeline.
 const std = @import("std");
 const identity = @import("doc_identity.zig");
 const activation = @import("relational_integrity_activation.zig");
@@ -26,6 +26,7 @@ pub const OwnerBootstrap = @import("restore_staging_contract.zig").OwnerBootstra
 pub const Digest = @import("restore_staging_contract.zig").Digest;
 pub const Phase = @import("restore_staging_contract.zig").Phase;
 pub const Timestamp = @import("restore_staging_contract.zig").Timestamp;
+pub const Artifact = @import("restore_staging_contract.zig").Artifact;
 pub const ImportPage = @import("restore_staging_contract.zig").ImportPage;
 pub const Control = @import("restore_staging_contract.zig").Control;
 pub const PreparedPage = struct {
@@ -76,7 +77,7 @@ pub fn requireMutableScope(alloc: Allocator, txn: anytype, expected: ?Digest) !v
 }
 
 /// Internal PreparedRow import admission, consumed under the DB apply fence.
-pub const BatchAdmission = struct { expected: Digest, next: []const u8, scope: Digest, rewrite: bool = false, source_effects: u32 = 0 };
+pub const BatchAdmission = struct { expected: Digest, next: []const u8, scope: Digest, rewrite: bool = false, source_effects: u32 = 0, artifact_page: bool = false, projection_page: bool = false };
 pub fn validateImport(alloc: Allocator, txn: anytype, admission: BatchAdmission, row_count: usize, delete_count: usize) !void {
     const raw = (try optional(txn)) orelse return error.RestoreStagingScopeChanged;
     if (!std.mem.eql(u8, &digest(raw), &admission.expected)) return error.RestoreStagingProgressChanged;
@@ -92,8 +93,38 @@ pub fn validateImport(alloc: Allocator, txn: anytype, admission: BatchAdmission,
         after.value.rows != std.math.add(u64, before.value.rows, row_count +| delete_count) catch return error.InvalidRestoreStagingCommand)
         return error.InvalidRestoreStagingCommand;
     if (admission.rewrite != (before.value.scope.rewrite != null)) return error.InvalidRestoreStagingCommand;
+    if (admission.projection_page) {
+        if (admission.artifact_page or admission.rewrite or !before.value.scope.preserve_artifacts or !before.value.artifacts_complete or
+            !before.value.rows_complete or !after.value.rows_complete or !after.value.artifacts_complete or
+            row_count != 0 or delete_count != 0 or admission.source_effects != 0 or
+            !std.mem.eql(u8, before.value.cursor, after.value.cursor) or
+            !std.mem.eql(u8, before.value.artifact_cursor, after.value.artifact_cursor) or
+            !std.mem.eql(u8, &before.value.logical_digest, &after.value.logical_digest) or
+            (after.value.phase == .imported and after.value.projection_cursor.len != 0) or
+            (after.value.phase != .imported and std.mem.order(u8, after.value.projection_cursor, before.value.projection_cursor) != .gt)) return error.InvalidRestoreStagingCommand;
+        return;
+    }
+    if (!std.mem.eql(u8, before.value.projection_cursor, after.value.projection_cursor)) return error.InvalidRestoreStagingCommand;
+    if (admission.artifact_page) {
+        if (admission.rewrite or !before.value.scope.preserve_artifacts or before.value.artifacts_complete or
+            before.value.rows_complete or after.value.rows_complete or
+            row_count != 0 or delete_count != 0 or admission.source_effects != 0 or after.value.phase != .importing or
+            !std.mem.eql(u8, before.value.cursor, after.value.cursor) or
+            !std.mem.eql(u8, &before.value.logical_digest, &after.value.logical_digest) or
+            (after.value.artifacts_complete and after.value.artifact_cursor.len != 0) or
+            (!after.value.artifacts_complete and std.mem.order(u8, after.value.artifact_cursor, before.value.artifact_cursor) != .gt))
+            return error.InvalidRestoreStagingCommand;
+        return;
+    }
+    if (before.value.artifacts_complete != after.value.artifacts_complete or
+        !std.mem.eql(u8, before.value.artifact_cursor, after.value.artifact_cursor) or
+        (before.value.scope.preserve_artifacts and !before.value.artifacts_complete)) return error.InvalidRestoreStagingCommand;
+    if (before.value.scope.preserve_artifacts) {
+        if (before.value.rows_complete or after.value.phase != .importing or
+            (after.value.rows_complete and after.value.cursor.len != 0)) return error.InvalidRestoreStagingCommand;
+    } else if (before.value.rows_complete or after.value.rows_complete) return error.InvalidRestoreStagingCommand;
     if (!admission.rewrite) {
-        if (delete_count != 0 or admission.source_effects != 0 or (after.value.phase == .importing and std.mem.order(u8, after.value.cursor, before.value.cursor) != .gt)) return error.InvalidRestoreStagingCommand;
+        if (delete_count != 0 or admission.source_effects != 0 or (after.value.phase == .importing and !after.value.rows_complete and std.mem.order(u8, after.value.cursor, before.value.cursor) != .gt)) return error.InvalidRestoreStagingCommand;
         return;
     }
     const previous = before.value.rewrite orelse return error.InvalidRestoreStagingCommand;
@@ -141,6 +172,49 @@ test "restore staging owner scope and checksummed continuation exclude source id
     try std.testing.expectEqualSlices(u8, &scope.digest(), &decoded.value.scope.digest());
     bytes[5] ^= 1;
     try std.testing.expectError(error.InvalidRestoreStagingRecord, Progress.decode(alloc, bytes));
+}
+
+test "native restore artifact phase cannot skip row fencing or mutate logical progress" {
+    const alloc = std.testing.allocator;
+    const scope: Scope = .{
+        .plan_id = @splat(1),
+        .plan_digest = @splat(2),
+        .source_artifact_digest = @splat(3),
+        .source_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 },
+        .target_namespace = .{ .table_id = 3, .shard_id = 4, .range_id = 4 },
+        .target_schema_digest = @splat(5),
+        .preserve_artifacts = true,
+    };
+    const before: Progress = .{ .scope = scope };
+    const raw = try before.encode(alloc);
+    defer alloc.free(raw);
+    const Read = struct {
+        value: []const u8,
+        fn get(self: *@This(), requested: []const u8) anyerror![]const u8 {
+            if (!std.mem.eql(u8, requested, key)) return error.NotFound;
+            return self.value;
+        }
+    };
+    var read: Read = .{ .value = raw };
+    var next = before;
+    next.artifact_cursor = "artifact";
+    const encoded = try next.encode(alloc);
+    defer alloc.free(encoded);
+    var admission: BatchAdmission = .{ .expected = digest(raw), .next = encoded, .scope = scope.digest(), .artifact_page = true };
+    try validateImport(alloc, &read, admission, 0, 0);
+    try std.testing.expectError(error.InvalidRestoreStagingCommand, validateImport(alloc, &read, admission, 1, 0));
+    admission.artifact_page = false;
+    try std.testing.expectError(error.InvalidRestoreStagingCommand, validateImport(alloc, &read, admission, 0, 0));
+    next.artifacts_complete = true;
+    next.artifact_cursor = "";
+    const completed = try next.encode(alloc);
+    defer alloc.free(completed);
+    admission.next = completed;
+    admission.artifact_page = true;
+    try validateImport(alloc, &read, admission, 0, 0);
+    read.value = completed;
+    admission.expected = digest(completed);
+    try std.testing.expectError(error.InvalidRestoreStagingCommand, validateImport(alloc, &read, admission, 0, 0));
 }
 
 fn applyTestPage(alloc: Allocator, db: *@import("db.zig").DB, req: @import("types.zig").BatchRequest, index: u64, ha: bool) !void {
