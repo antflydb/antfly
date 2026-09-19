@@ -4165,33 +4165,27 @@ fn trimSelectedTreeBranches(alloc: std.mem.Allocator, selected: []QueryHit, all:
         const branch = treeMetaString(original, "branch_path_text") orelse continue;
         var total: usize = 0;
         var kept: usize = 0;
-        var last_id: ?[]const u8 = null;
+        var last_node: ?QueryHit = null;
         for (all) |node| {
             if (std.mem.eql(u8, treeMetaString(node, "branch_path_text") orelse "", branch)) total += 1;
         }
         for (originals) |node| {
             if (std.mem.eql(u8, treeMetaString(node, "branch_path_text") orelse "", branch)) {
                 kept += 1;
-                last_id = node._id;
+                last_node = node;
             }
         }
         if (kept >= total) continue;
-        // Preserve ancestors present in the canonical path, up to the final
-        // selected node, even when an ancestor has no separate document hit.
-        var end: usize = 0;
-        var component_count: i64 = 0;
-        var components = std.mem.splitSequence(u8, branch, " > ");
-        while (components.next()) |component| {
-            component_count += 1;
-            end += component.len;
-            if (std.mem.eql(u8, component, last_id orelse continue)) break;
-            end += 3;
-        }
-        if (end > branch.len) continue;
+        // These fields were built from the final retained node's canonical
+        // path. Reuse them intact: keys can contain the display separator, and
+        // ancestors need not have separate hydrated document hits.
+        const endpoint = last_node orelse continue;
+        const path = treeMetaString(endpoint, "path_text") orelse continue;
+        const path_length = treeMetaInteger(endpoint, "path_length") orelse continue;
         var source = try original._source.?.map.clone(alloc);
         var meta = try source.get("_tree").?.object.clone(alloc);
-        try meta.put(alloc, "branch_path_text", .{ .string = branch[0..end] });
-        try meta.put(alloc, "branch_path_length", .{ .integer = component_count });
+        try meta.put(alloc, "branch_path_text", .{ .string = path });
+        try meta.put(alloc, "branch_path_length", .{ .integer = path_length });
         try source.put(alloc, "_tree", .{ .object = meta });
         hit._source = .{ .map = source };
     }
@@ -8181,19 +8175,8 @@ test "generation messages trim branch context after ancestor-first limit" {
 
     for (ids, depths) |id, depth| {
         var tree = std.json.ObjectMap.empty;
-        try tree.put(alloc, "root", .{ .string = try alloc.dupe(u8, "doc:root") });
-        try tree.put(alloc, "path_text", .{ .string = try alloc.dupe(u8, id) });
-        try tree.put(alloc, "branch_path_text", .{ .string = try alloc.dupe(u8, "doc:root > doc:child > doc:grandchild > doc:leaf") });
+        try putTreePathMetadata(alloc, &tree, ids[0 .. @as(usize, @intCast(depth)) + 1], &ids, id);
         try tree.put(alloc, "depth", .{ .integer = depth });
-        try tree.put(alloc, "leaf", .{ .bool = std.mem.eql(u8, id, "doc:leaf") });
-        if (depth > 0) {
-            const parent = switch (depth) {
-                1 => "doc:root",
-                2 => "doc:child",
-                else => "doc:grandchild",
-            };
-            try tree.put(alloc, "parent", .{ .string = try alloc.dupe(u8, parent) });
-        }
         var source = std.json.ObjectMap.empty;
         try source.put(alloc, "title", .{ .string = try alloc.dupe(u8, id) });
         try source.put(alloc, "_tree", .{ .object = tree });
@@ -8236,19 +8219,8 @@ test "generation messages expand branch when deeper node is query-relevant" {
 
     for (ids, titles, depths) |id, title, depth| {
         var tree = std.json.ObjectMap.empty;
-        try tree.put(alloc, "root", .{ .string = try alloc.dupe(u8, "doc:root") });
-        try tree.put(alloc, "path_text", .{ .string = try alloc.dupe(u8, id) });
-        try tree.put(alloc, "branch_path_text", .{ .string = try alloc.dupe(u8, "doc:root > doc:child > doc:grandchild > doc:leaf") });
+        try putTreePathMetadata(alloc, &tree, ids[0 .. @as(usize, @intCast(depth)) + 1], &ids, id);
         try tree.put(alloc, "depth", .{ .integer = depth });
-        try tree.put(alloc, "leaf", .{ .bool = std.mem.eql(u8, id, "doc:leaf") });
-        if (depth > 0) {
-            const parent = switch (depth) {
-                1 => "doc:root",
-                2 => "doc:child",
-                else => "doc:grandchild",
-            };
-            try tree.put(alloc, "parent", .{ .string = try alloc.dupe(u8, parent) });
-        }
         var source = std.json.ObjectMap.empty;
         try source.put(alloc, "title", .{ .string = try alloc.dupe(u8, title) });
         try source.put(alloc, "_tree", .{ .object = tree });
@@ -8303,21 +8275,8 @@ test "generation messages can expand to a deeply relevant descendant" {
 
     for (ids, titles, depths) |id, title, depth| {
         var tree = std.json.ObjectMap.empty;
-        try tree.put(alloc, "root", .{ .string = try alloc.dupe(u8, "doc:root") });
-        try tree.put(alloc, "path_text", .{ .string = try alloc.dupe(u8, id) });
-        try tree.put(alloc, "branch_path_text", .{ .string = try alloc.dupe(u8, "doc:root > doc:child > doc:grandchild > doc:section > doc:topic > doc:leaf") });
+        try putTreePathMetadata(alloc, &tree, ids[0 .. @as(usize, @intCast(depth)) + 1], &ids, id);
         try tree.put(alloc, "depth", .{ .integer = depth });
-        try tree.put(alloc, "leaf", .{ .bool = std.mem.eql(u8, id, "doc:leaf") });
-        if (depth > 0) {
-            const parent = switch (depth) {
-                1 => "doc:root",
-                2 => "doc:child",
-                3 => "doc:grandchild",
-                4 => "doc:section",
-                else => "doc:topic",
-            };
-            try tree.put(alloc, "parent", .{ .string = try alloc.dupe(u8, parent) });
-        }
         var source = std.json.ObjectMap.empty;
         try source.put(alloc, "title", .{ .string = try alloc.dupe(u8, title) });
         try source.put(alloc, "_tree", .{ .object = tree });
@@ -8341,6 +8300,47 @@ test "generation messages can expand to a deeply relevant descendant" {
     });
 
     try std.testing.expect(std.mem.indexOf(u8, messages[1].content.?.text, "id=doc:leaf") != null);
+}
+
+test "generation pruning preserves literal path keys and unhydrated ancestors" {
+    for ([_]bool{ true, false }) |hydrate_root| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const ids = [_][]const u8{ "root > literal", "chapter", "part > one", "section > two", "DISCARDED_CANARY" };
+        var hits = std.ArrayListUnmanaged(QueryHit).empty;
+        const offset: usize = if (hydrate_root) 0 else 1;
+        for (ids, 0..) |id, i| {
+            if (i < offset) continue;
+            var meta = std.json.ObjectMap.empty;
+            try putTreePathMetadata(a, &meta, ids[0 .. i + 1], &ids, id);
+            try meta.put(a, "depth", .{ .integer = @intCast(i) });
+            var source = std.json.ObjectMap.empty;
+            try source.put(a, "title", .{ .string = if (i < offset + 3) "topic" else "irrelevant" });
+            try source.put(a, "_tree", .{ .object = meta });
+            try hits.append(a, .{ ._id = id, ._score = 1, ._source = .{ .map = source } });
+        }
+        const selected = try selectHitsForGenerationContext(a, "topic", hits.items);
+        try std.testing.expectEqual(@as(usize, 3), selected.len);
+        try trimSelectedTreeBranches(a, selected, hits.items);
+        const retained_path = try treePathTextAlloc(a, ids[0 .. offset + 3]);
+        for (selected) |hit| {
+            try std.testing.expectEqualStrings(retained_path, treeMetaString(hit, "branch_path_text").?);
+            try std.testing.expectEqual(@as(i64, @intCast(offset + 3)), treeMetaInteger(hit, "branch_path_length").?);
+        }
+        // Generation context is pruned without changing the returned evidence.
+        const original_path = try treePathTextAlloc(a, &ids);
+        for (hits.items) |hit| {
+            try std.testing.expectEqualStrings(original_path, treeMetaString(hit, "branch_path_text").?);
+            try std.testing.expectEqual(@as(i64, 5), treeMetaInteger(hit, "branch_path_length").?);
+        }
+        const messages = try buildGenerationMessages(a, "topic", hits.items, .{ .chain = &.{}, .system_prompt = null, .generation_context = null });
+        const prompt = messages[1].content.?.text;
+        try std.testing.expect(std.mem.indexOf(u8, prompt, retained_path) != null);
+        try std.testing.expect(std.mem.indexOf(u8, prompt, "part > one") != null);
+        try std.testing.expect(std.mem.indexOf(u8, prompt, "DISCARDED_CANARY") == null);
+        if (hydrate_root) try std.testing.expect(std.mem.indexOf(u8, prompt, "section > two") == null);
+    }
 }
 
 test "generation ordering prefers tree ancestors before leaves" {
