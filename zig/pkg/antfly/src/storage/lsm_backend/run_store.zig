@@ -20,6 +20,7 @@ const std = @import("std");
 const Run = @import("repository.zig").Run;
 const Directory = @import("run_directory.zig").Directory;
 const Account = @import("memory_account.zig").Account;
+const completion_allocation = @import("completion_allocator.zig");
 const DestroyRun = *const fn (*Run, std.mem.Allocator) void;
 
 /// Slice-backed planner fixtures remain an independent oracle. Production
@@ -73,6 +74,7 @@ pub fn get(runs: anytype, rank: usize) Run {
 }
 
 const Payload = struct {
+    allocation_allocator: std.mem.Allocator,
     owner: @import("repository.zig").RunOwner,
     parent: ?*@import("repository.zig").RunOwner = null,
     run: Run,
@@ -93,7 +95,7 @@ const Payload = struct {
             if (payload.destroy_run) |destroy_run| destroy_run(&payload.run, allocator) else payload.run.deinit(allocator);
         }
         payload.account.discharge(payload.bytes);
-        allocator.destroy(payload);
+        payload.allocation_allocator.destroy(payload);
     }
 };
 
@@ -261,7 +263,8 @@ pub const Store = struct {
         }
     };
     pub fn memoryBytes(self: *const Store, pass: u64) u64 {
-        return self.tree.spare.capacity * @sizeOf(*Tree.Node) +
+        const prepaid_spares = if (self.tree.spare_allocator) |allocator| completion_allocation.isPrepaid(allocator) else false;
+        return (if (prepaid_spares) @as(u64, 0) else self.tree.spare.capacity * @sizeOf(*Tree.Node)) +
             (if (self.tree.account) |account| account.chargeOnce(pass) else 0);
     }
     pub const Cursor = struct {
@@ -309,14 +312,15 @@ pub const Store = struct {
         if (!overwrite and Tree.find(self.tree.root, .{ .run = &probe }) != null) return error.DuplicateRun;
         try self.tree.prepare(allocator);
         const payload = try allocator.create(Payload);
-        const bytes = @sizeOf(Payload) + if (run.owner != null) @as(usize, 0) else run.smallest_key.len + run.largest_key.len +
+        const header_bytes: usize = if (completion_allocation.isPrepaid(allocator)) 0 else @sizeOf(Payload);
+        const bytes = header_bytes + if (run.owner != null or completion_allocation.isPrepaid(run.metadata_allocator orelse allocator)) @as(usize, 0) else run.smallest_key.len + run.largest_key.len +
             (if (run.path) |path| path.len else 0) +
             (if (run.smallest_namespace_name) |name| name.len else 0) +
             (if (run.largest_namespace_name) |name| name.len else 0) +
             (if (run.state) |present| present.estimatedMemoryBytes() else 0);
         self.tree.account.?.charge(bytes);
         const parent = if (run.owner) |owner| owner.raw.owner.?.retain() else null;
-        payload.* = .{ .owner = .{ .raw = if (parent) |owner| owner.raw else &payload.run, .destroy = Payload.destroy }, .parent = parent, .run = run, .destroy_run = self.destroy_run, .account = self.tree.account.?, .bytes = bytes };
+        payload.* = .{ .allocation_allocator = allocator, .owner = .{ .raw = if (parent) |owner| owner.raw else &payload.run, .destroy = Payload.destroy }, .parent = parent, .run = run, .destroy_run = self.destroy_run, .account = self.tree.account.?, .bytes = bytes };
         payload.run.owner = &payload.owner;
         if (parent != null) {
             payload.run.bloom_filter = null;
@@ -414,4 +418,111 @@ test "writer owner narrow publication scaling benchmark" {
         }
         std.debug.print("writer-owner runs={d} changed=5 array_mean_ns={d} tree_mean_ns={d} retained_bytes={d}\n", .{ count_runs, array_ns / 31, tree_ns / 31, live.memoryBytes(@import("memory_account.zig").nextPass()) });
     }
+}
+
+test "writer run store preserves prepaid metadata allocator through ordinary revisions and reader pins" {
+    var prepaid = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var ordinary = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const reserved_alloc = prepaid.allocator();
+    const ordinary_alloc = ordinary.allocator();
+    var run: Run = .{
+        .id = 1,
+        .level = 0,
+        .size_bytes = 1,
+        .path = try reserved_alloc.dupe(u8, "reserved.sst"),
+        .smallest_namespace_name = try reserved_alloc.dupe(u8, "docs"),
+        .smallest_key = try reserved_alloc.dupe(u8, "a"),
+        .largest_namespace_name = try reserved_alloc.dupe(u8, "docs"),
+        .largest_key = try reserved_alloc.dupe(u8, "z"),
+        .entry_count = 1,
+        .bloom_filter = null,
+        .state = null,
+        .metadata_allocator = reserved_alloc,
+    };
+    var live: Store = .{};
+    try live.append(reserved_alloc, run);
+    var pinned = live.fork();
+    // Mutable cache data is created later by ordinary reads. It must not be
+    // retired through the allocator which owns the immutable run metadata.
+    live.at(0).state = .{};
+    try live.at(0).state.?.upsert(ordinary_alloc, .{}, "cache", "value", false);
+    var metadata = live.at(0).*;
+    metadata.level = 1;
+    const changed = Store.revision(live.at(0), metadata);
+    try live.remove(ordinary_alloc, live.at(0));
+    try live.stageRevision(ordinary_alloc, changed);
+    try std.testing.expectEqualStrings("reserved.sst", live.at(0).path.?);
+    live.deinit(ordinary_alloc);
+    try std.testing.expect(prepaid.freed_bytes < prepaid.allocated_bytes);
+    try std.testing.expectEqualStrings("a", pinned.at(0).smallest_key);
+    pinned.deinit(ordinary_alloc);
+    try std.testing.expectEqual(prepaid.allocated_bytes, prepaid.freed_bytes);
+    try std.testing.expectEqual(ordinary.allocated_bytes, ordinary.freed_bytes);
+    // Ownership transferred to the payload; never retire this borrowed copy.
+    run = undefined;
+}
+
+test "writer run store prepaid arena remains singly charged through directory and reader retention" {
+    const resources = @import("../resource_manager.zig");
+    const accounting = @import("memory_account.zig");
+    const Fixture = struct {
+        allocator: std.mem.Allocator,
+        pub fn retainRunSnapshotRef(_: *@This(), _: *Run) !void {}
+        pub fn releaseRunSnapshotRef(_: *@This(), _: *Run) void {}
+    };
+    const ordinary = std.testing.allocator;
+    var manager = resources.ResourceManager.init(.{ .identity_allocator = ordinary });
+    defer manager.deinit(ordinary);
+    const arena = try completion_allocation.Arena.create(ordinary, &manager, 256 * 1024);
+    const allocation = arena.allocator();
+    const slab_charge = manager.snapshot().memory.used_bytes;
+    try std.testing.expect(slab_charge >= 256 * 1024);
+    var live: Store = .{};
+    const run: Run = .{
+        .id = 1,
+        .level = 0,
+        .size_bytes = 1,
+        .path = try allocation.dupe(u8, "reserved.sst"),
+        .smallest_namespace_name = null,
+        .smallest_key = try allocation.dupe(u8, "a"),
+        .largest_namespace_name = null,
+        .largest_key = try allocation.dupe(u8, "z"),
+        .entry_count = 1,
+        .bloom_filter = null,
+        .state = null,
+        .metadata_allocator = allocation,
+    };
+    try live.append(allocation, run);
+    const directory = try Directory.create(allocation);
+    var fixture: Fixture = .{ .allocator = allocation };
+    try directory.put(&fixture, live.at(0).*);
+    const pinned = directory.at(0).retain();
+    var tracked: u64 = 0;
+    const pass = accounting.nextPass();
+    const extra = live.memoryBytes(pass) + directory.accountedMemoryBytes(pass);
+    try std.testing.expectEqual(@as(u64, 0), extra);
+    manager.observeUsage(.lsm_in_memory_state, &tracked, extra);
+    try std.testing.expectEqual(slab_charge, manager.snapshot().memory.used_bytes);
+    // Ordinary edits coexist with the prepaid generation; only their fresh
+    // allocations enter the aggregate observer, never the prepaid slab again.
+    var metadata = live.at(0).*;
+    metadata.level = 1;
+    const replacement = Store.revision(live.at(0), metadata);
+    var old = live.fork();
+    try live.remove(ordinary, live.at(0));
+    try live.stageRevision(ordinary, replacement);
+    const next_pass = accounting.nextPass();
+    const ordinary_bytes = live.memoryBytes(next_pass) + old.memoryBytes(next_pass) + directory.accountedMemoryBytes(next_pass);
+    try std.testing.expect(ordinary_bytes > 0);
+    manager.observeUsage(.lsm_in_memory_state, &tracked, ordinary_bytes);
+    try std.testing.expectEqual(slab_charge + ordinary_bytes, manager.snapshot().memory.used_bytes);
+    arena.release();
+    live.deinit(ordinary);
+    old.deinit(ordinary);
+    directory.destroy(ordinary);
+    manager.observeUsage(.lsm_in_memory_state, &tracked, 0);
+    try std.testing.expectEqual(slab_charge, manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqualStrings("z", pinned.run.largest_key);
+    pinned.release(ordinary);
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
 }
