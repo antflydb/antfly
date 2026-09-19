@@ -68,7 +68,7 @@ pub const Cost = struct {
 
 pub const Limits = struct {
     metadata_bytes: u64 = 1024 * 1024,
-    file_bytes: u64 = std.math.maxInt(u32),
+    file_bytes: u64 = 512 * 1024 * 1024,
     outputs: u64 = 64,
     additional_runs: u64 = 4,
     frontier_bytes: u64 = 16 * 1024 * 1024,

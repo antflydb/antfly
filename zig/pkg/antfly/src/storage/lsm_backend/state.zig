@@ -711,6 +711,14 @@ pub const ActiveMemTable = struct {
         return candidate;
     }
 
+    /// Publication from bounded canonical point operations; includes record
+    /// clones even when shared incoming ownership avoids those copies today.
+    pub fn publicationAllocationBound(max_entries: usize, edits: usize, record_bytes: usize) !usize {
+        const footprint = @import("completion_allocator.zig").RecyclingScratch.allocationFootprint;
+        const records = try std.math.add(usize, record_bytes, try std.math.mul(usize, edits, try footprint(@sizeOf(SharedEntry), @alignOf(SharedEntry))));
+        return std.math.add(usize, records, try OrderedIndex.insertionAllocationBound(max_entries, edits));
+    }
+
     /// No allocation, validation, or fallible work may follow the WAL boundary
     /// before this swap. The caller retires the previous root after publication.
     pub fn publishPrepared(self: *ActiveMemTable, candidate: *ActiveMemTable) void {

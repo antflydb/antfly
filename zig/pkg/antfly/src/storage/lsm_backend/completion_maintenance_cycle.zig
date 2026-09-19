@@ -210,13 +210,20 @@ pub fn run(comptime Backend: type, pool: anytype, backend: *Backend) !void {
         built.deinit(scratch);
     }
     if (backend.closing.load(.acquire)) return error.LsmBackendClosed;
-    const pub_alloc = pool.publication.allocator();
-    var new_reservations: [completion.max_slots]?*domains.PublicationReservation = @splat(null);
-    defer for (new_reservations) |reservation| if (reservation) |held| held.finish();
-    for (pool.cells[0..pool.cell_count], 0..) |cell, i| if (cell.publication == null) {
-        new_reservations[i] = try domains.PublicationReservation.create(pool.publication, @import("completion_pool.zig").publication_per_cell);
+    try pool.checkMaintenanceMetadata(built.items);
+    // A completed cohort relinquishes every unused reservation. Published
+    // children retain their exact old generation; empty-domain selection does
+    // not mistake fragmented reader-held bytes for the next contiguous span.
+    for (pool.cells[0..pool.cell_count]) |*cell| if (cell.publication) |reservation| {
+        reservation.finish();
+        cell.publication = null;
     };
-    var candidate = backend.runs.emptyLike();
+    var new_reservations = try pool.generations.reserveCells();
+    defer new_reservations.deinit();
+    const pub_alloc = (try pool.generations.emptyMetadata()).allocator();
+    // A full replacement must not retain the prior tree's Account header:
+    // that allocator-owned header alone would pin an old generation forever.
+    var candidate: @TypeOf(backend.runs) = .{ .destroy_run = backend.runs.destroy_run };
     defer candidate.deinit(backend.allocator);
     const Directory = @import("run_directory.zig").Directory;
     var directory: ?*Directory = try Directory.create(pub_alloc);
@@ -335,9 +342,9 @@ pub fn run(comptime Backend: type, pool: anytype, backend: *Backend) !void {
     next_journal = null;
     pool.cohort = .{ .base_run_id = cohort_base, .initial_runs = @intCast(backend.runs.count()), .cohort_id = pool.config.identity.incarnation };
     for (pool.cells[0..pool.cell_count], 0..) |*cell, i| {
-        if (new_reservations[i]) |reservation| {
+        if (new_reservations.items[i]) |reservation| {
             cell.publication = reservation;
-            new_reservations[i] = null;
+            new_reservations.items[i] = null;
         }
         cell.phase = .free;
         cell.baseline = .{};

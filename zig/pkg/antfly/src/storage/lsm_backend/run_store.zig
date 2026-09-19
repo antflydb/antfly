@@ -168,6 +168,19 @@ fn compare(a: Entry, b: Entry) std.math.Order {
 pub const Store = struct {
     pub const Tree = @import("ordered_index.zig").Index(Entry, compare);
     pub const empty: Store = .{};
+
+    /// Empty output tree, owned payload headers and immutable path/bounds.
+    /// Includes every allocation prefix, even for empty namespace slices.
+    pub fn freshAllocationBound(count_: usize, bound_bytes: usize, path_bytes: usize) !usize {
+        const footprint = completion_allocation.RecyclingScratch.allocationFootprint;
+        const bounds = try std.math.mul(usize, 2, try std.math.add(usize, try footprint(bound_bytes, 1), try footprint(0, 1)));
+        const per_run = try std.math.add(usize, try footprint(@sizeOf(Payload), @alignOf(Payload)), try std.math.add(usize, bounds, try footprint(path_bytes, 1)));
+        return std.math.add(usize, try Tree.sequentialAllocationBound(count_, count_), try std.math.mul(usize, count_, per_run));
+    }
+
+    pub fn singleInsertAllocationBound(max_count: usize, bound_bytes: usize, path_bytes: usize) !usize {
+        return std.math.add(usize, try freshAllocationBound(1, bound_bytes, path_bytes), try Tree.sequentialAllocationBound(max_count, 1));
+    }
     tree: Tree = .{},
     destroy_run: ?DestroyRun = null,
     retired_next: ?*Store = null,

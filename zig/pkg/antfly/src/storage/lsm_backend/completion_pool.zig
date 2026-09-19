@@ -20,6 +20,7 @@ const wal = @import("wal.zig");
 const Allocator = std.mem.Allocator;
 pub const maintenance = @import("completion_maintenance.zig");
 const capacity = @import("completion_capacity.zig");
+const generations_mod = @import("completion_generations.zig");
 
 pub const max_slots = completion.max_slots;
 pub const accepted_filenames = [_][]const u8{
@@ -304,6 +305,46 @@ fn entryCapacity(entry: *const entry_codec.OwnedEntry) !capacity.Cost {
     return result;
 }
 
+fn metadataCapacity(outputs: u64, key_bytes: u64) !void {
+    // Root <=512 bytes, slash + runs/ + maximum 20-digit u64 + .tbl.
+    const path_bytes = 512 + 1 + 5 + 20 + 4;
+    const count = std.math.cast(usize, outputs) orelse return error.UnsupportedCompletionProfile;
+    const bound = std.math.cast(usize, key_bytes) orelse return error.UnsupportedCompletionProfile;
+    const writer = try @import("run_store.zig").Store.freshAllocationBound(count, bound, path_bytes);
+    const readers = try @import("run_directory.zig").Directory.freshAllocationBound(count, bound, path_bytes);
+    const total = std.math.add(usize, writer, readers) catch return error.UnsupportedCompletionProfile;
+    if (total > generations_mod.metadata_bytes) return error.UnsupportedCompletionProfile;
+}
+
+fn nativePublicationCapacity(entry: *const entry_codec.OwnedEntry, record_limit: usize) !usize {
+    const footprint = domains.RecyclingScratch.allocationFootprint;
+    const descriptor = entry.decoded_descriptor.descriptor;
+    var bindings: usize = 0;
+    for ([_][]const slot_codec.Operation{ descriptor.commit, descriptor.abort }) |ops| {
+        for (ops) |op| bindings += op.bindings.len;
+    }
+    const decoded_bytes = entry.entry.descriptor.len + (descriptor.commit.len + descriptor.abort.len) * @sizeOf(slot_codec.Operation) + bindings * @sizeOf(slot_codec.Binding);
+    var bytes = try footprint(decoded_bytes, @alignOf(slot_codec.Operation));
+    bytes = try std.math.add(usize, bytes, try footprint(entry.entry.descriptor.len, 1));
+    bytes = try std.math.add(usize, bytes, try footprint(entry.entry.descriptor.len + completion.guard.header_bytes, 1));
+    // Guard, journal and all four reserved run paths copied by createFromPool.
+    bytes = try std.math.add(usize, bytes, try std.math.mul(usize, 2 + max_slots, try footprint(512 + 64, 1)));
+    if (entry.entry.kind == .prepare) {
+        const ns = if (descriptor.namespace) |name| name.len else 0;
+        var records: usize = entry.entry.descriptor.len + 48 + 112 + 16;
+        for (entry.entry.prepare_operations) |op| records = try std.math.add(usize, records, ns + op.key.len + op.value.len);
+        // Four private records: their keys/ns are bounded independently of
+        // incoming operations. Using the record cap also covers their framing.
+        records = try std.math.add(usize, records, 4 * @as(usize, 256));
+        bytes = try std.math.add(usize, bytes, try @import("state.zig").ActiveMemTable.publicationAllocationBound(completion.foreground_entries + max_slots * (256 + 8), entry.entry.prepare_operations.len + 4, records));
+    }
+    // One protected SST publication can include sibling foreground keys, so
+    // reserve the configured maximum bound rather than this entry's keys.
+    bytes = try std.math.add(usize, bytes, try @import("run_store.zig").Store.singleInsertAllocationBound(68, record_limit, 512 + 64));
+    bytes = try std.math.add(usize, bytes, try @import("run_directory.zig").Directory.singleInsertAllocationBound(68, record_limit, 512 + 64));
+    return bytes;
+}
+
 pub fn Pool(comptime Backend: type) type {
     return struct {
         const Self = @This();
@@ -335,7 +376,7 @@ pub fn Pool(comptime Backend: type) type {
         capacity_max_credit_bytes: u64 = 0,
         legacy_obsolete_imported: bool = false,
         retired: [2]@import("completion_maintenance_cycle.zig").Retired = .{ .{}, .{} },
-        publication: *domains.RecyclingScratch,
+        generations: generations_mod.Generations,
         scratch: *domains.RecyclingScratch,
         compiler: domains.CompilerWorkspace,
         io: *storage_io.NativeCompletionIo,
@@ -388,8 +429,8 @@ pub fn Pool(comptime Backend: type) type {
             const alloc = control.allocator();
             const self = try alloc.create(Self);
             errdefer alloc.destroy(self);
-            const publication = try domains.RecyclingScratch.create(backend.allocator, manager, 64 * 1024 * 1024);
-            errdefer publication.retire();
+            var generations = try generations_mod.Generations.create(backend.allocator, manager, config.identity.capacity, publication_per_cell);
+            errdefer generations.retire();
             const scratch = try domains.RecyclingScratch.create(backend.allocator, manager, completion.scratch_bytes);
             errdefer scratch.destroy() catch unreachable;
             var compiler = try domains.CompilerWorkspace.init(backend.allocator, manager, completion.scratch_bytes);
@@ -462,7 +503,7 @@ pub fn Pool(comptime Backend: type) type {
             self.* = .{
                 .config = config,
                 .control = control,
-                .publication = publication,
+                .generations = generations,
                 .scratch = scratch,
                 .compiler = compiler,
                 .io = io,
@@ -479,6 +520,8 @@ pub fn Pool(comptime Backend: type) type {
                 .cohort = cohort,
             };
             errdefer self.releaseCells();
+            var initial_reservations = try self.generations.reserveCells();
+            defer initial_reservations.deinit();
             for (0..config.identity.capacity) |i| {
                 const cell_slot = try alloc.create(Slot);
                 errdefer alloc.destroy(cell_slot);
@@ -487,8 +530,9 @@ pub fn Pool(comptime Backend: type) type {
                 errdefer credit_pin.release() catch unreachable;
                 try manager.adjustUsage(.lsm_wal_retention, &cell_slot.wal_credit, completion.limits.wal_bytes);
                 errdefer manager.observeUsage(.lsm_wal_retention, &cell_slot.wal_credit, 0);
-                const reservation = try domains.PublicationReservation.create(publication, publication_per_cell);
+                const reservation = initial_reservations.items[i].?;
                 self.cells[i] = .{ .slot = cell_slot, .credit_pin = credit_pin, .publication = reservation };
+                initial_reservations.items[i] = null;
                 self.cell_count += 1;
             }
             backend.next_run_id = @max(backend.next_run_id, next_id);
@@ -527,7 +571,7 @@ pub fn Pool(comptime Backend: type) type {
             }
             self.control.allocator().free(self.journal_path);
             for (&self.retired) |*generation| generation.deinit(self.control.allocator());
-            self.publication.retire();
+            self.generations.retire();
             const control = self.control;
             control.allocator().destroy(self);
             control.retire();
@@ -607,7 +651,8 @@ pub fn Pool(comptime Backend: type) type {
         fn checkCapacity(self: *const Self, growth: capacity.Cost) !void {
             if (!self.capacity_certified) return error.CompletionReservationBusy;
             const total = try self.capacity_cost.plus(growth);
-            _ = try capacity.certify(total, .{ .metadata_bytes = self.config.shape.max_metadata_bytes, .additional_runs = self.cell_count });
+            const proof = try capacity.certify(total, .{ .metadata_bytes = self.config.shape.max_metadata_bytes, .additional_runs = self.cell_count });
+            try metadataCapacity(proof.outputs, total.max_key_bytes);
             const future = try self.capacity_growth.plus(growth);
             const added = try capacity.certify(future, .{ .metadata_bytes = self.config.shape.max_metadata_bytes, .additional_runs = self.cell_count });
             // Existing immutable cursors remain live while the newly generated
@@ -723,8 +768,17 @@ pub fn Pool(comptime Backend: type) type {
             } else return error.CompletionReservationBusy;
             const cell = &self.cells[free_index];
             const alloc = cell.publication.?.allocator();
-            var owned = try entry_codec.decode(alloc, envelope);
             var transferred = false;
+            // This private span is monotonic. An allocation-stage rejection
+            // spends it; maintenance replaces it before another admission.
+            // Earlier pure validation failures leave the untouched cell free.
+            errdefer if (!transferred) {
+                cell.publication.?.finish();
+                cell.publication = null;
+                cell.phase = .spent;
+                self.ready = false;
+            };
+            var owned = try entry_codec.decode(alloc, envelope);
             errdefer if (!transferred) owned.deinit();
             var cohort = self.cohort;
             cohort.index = @intCast(free_index);
@@ -735,6 +789,8 @@ pub fn Pool(comptime Backend: type) type {
             const baseline = try self.captureBaseline(backend, scratch, &baseline_cell, free_index);
             const token = if (self.publication_owner) |owner| try owner.prepare(owner.context, alloc, &owned) else null;
             errdefer if (!transferred) if (token) |value| self.publication_owner.?.cancel(self.publication_owner.?.context, value);
+            if (cell.publication.?.remainingBytes() < try nativePublicationCapacity(&owned, self.config.shape.max_record_bytes))
+                return error.CompletionPlanCapacityExceeded;
             // Complete all fallible allocation before durable I/O starts.
             cell.baseline = baseline;
             cell.publication_token = token;
@@ -868,7 +924,8 @@ pub fn Pool(comptime Backend: type) type {
                 .max_block_bytes = self.config.shape.max_block_bytes,
                 .max_record_bytes = self.config.shape.max_record_bytes,
             });
-            _ = try capacity.certify(measured.cost, .{ .metadata_bytes = self.config.shape.max_metadata_bytes, .additional_runs = self.cell_count });
+            const proof = try capacity.certify(measured.cost, .{ .metadata_bytes = self.config.shape.max_metadata_bytes, .additional_runs = self.cell_count });
+            try metadataCapacity(proof.outputs, measured.cost.max_key_bytes);
             try self.restoreProgress(backend, alloc);
             self.capacity_cost = measured.cost;
             self.capacity_growth = .{};
@@ -883,6 +940,15 @@ pub fn Pool(comptime Backend: type) type {
         /// every ordinary mutation are fenced until the handoff completes.
         pub fn maintainLocked(self: *Self, backend: *Backend) !void {
             try @import("completion_maintenance_cycle.zig").run(Backend, self, backend);
+        }
+
+        pub fn checkMaintenanceMetadata(_: *Self, outputs: []const repository.Run) !void {
+            var largest: usize = 0;
+            for (outputs) |run| {
+                largest = @max(largest, run.smallest_key.len + (if (run.smallest_namespace_name) |name| name.len else @as(usize, 0)));
+                largest = @max(largest, run.largest_key.len + (if (run.largest_namespace_name) |name| name.len else @as(usize, 0)));
+            }
+            try metadataCapacity(outputs.len, largest);
         }
 
         /// Adoption transfers the concrete publication span into the native
@@ -1478,6 +1544,108 @@ test "workload admission physical completion pool accepts through native prepaid
     defer maintained.deinit(alloc);
     try std.testing.expectEqualStrings("complete", maintained.value.?);
     try std.testing.expectEqual(@as(u64, 10), (try pool.durableProgress()).index);
+    try std.testing.expect(!failing.has_induced_failure);
+}
+
+test "workload admission completion generations carry four maximum point plans with a retained mutable reader" {
+    const Backend = @import("../lsm_backend.zig").Backend;
+    const runtime = @import("runtime.zig");
+    const alloc = std.testing.allocator;
+    var failing = std.testing.FailingAllocator.init(alloc, .{});
+    var fd_pool = storage_io.NativeStoragePool.initWithCapacityForTest(alloc, 32);
+    defer fd_pool.deinit();
+    var manager = resources.ResourceManager.init(.{ .identity_allocator = alloc, .memory_budget = .{ .hard_limit_bytes = 256 * 1024 * 1024 } });
+    defer manager.deinit(alloc);
+    var path_buffer: [256]u8 = undefined;
+    const path = repository.tmpPath(&path_buffer, "completion-four-max-plans");
+    defer repository.cleanupTmp(path);
+    var backend: Backend = undefined;
+    try backend.openInto(failing.allocator(), std.mem.span(path), .{ .resource_manager = &manager, .native_storage_pool = &fd_pool, .flush_threshold = 10000 });
+    defer backend.abandonAfterCrash();
+    {
+        var batch = try backend.beginWrite();
+        errdefer batch.abort();
+        try batch.put(.{}, "baseline", "preserved");
+        try batch.commit();
+    }
+    try backend.checkpointWalAfterDurableBoundary();
+    const identity: abi.Identity = .{ .capacity = 4, .group_id = 23, .node_id = 7, .incarnation = @splat(11), .policy_digest = @splat(12), .generation = 19 };
+    const locked = runtime.lockBackend(Backend, &backend);
+    defer runtime.unlockBackend(Backend, &backend, locked);
+    try backend.installCompletionPoolLocked(.{ .identity = identity, .schema_catalog_digest = @splat(13), .namespace = .root });
+    const pool = backend.completion_pool.?;
+    try pool.qualifyFresh(&backend);
+    var envelopes: [4]?[]u8 = @splat(null);
+    defer for (envelopes) |wire| if (wire) |bytes| alloc.free(bytes);
+    var ids: [4][16]u8 = undefined;
+    var key_storage: [512][8]u8 = undefined;
+    var keys: [512][]const u8 = undefined;
+    var prepare_ops: [256]slot_codec.Operation = undefined;
+    var commit_ops: [256]slot_codec.Operation = undefined;
+    const value: [512]u8 = @splat(0x9c);
+    for (&envelopes, 0..) |*envelope, i| {
+        ids[i] = @splat(@intCast(40 + i));
+        var hash = entry_codec.BaselineHasher.init();
+        for (&key_storage, &keys, 0..) |*key, *slice, j| {
+            std.mem.writeInt(u64, key, i * 1024 + j, .big);
+            slice.* = key;
+            try hash.add(key, null);
+            if (j < 256) prepare_ops[j] = .{ .kind = .put, .key = key, .value = &value } else commit_ops[j - 256] = .{ .kind = .put, .key = key, .value = &value };
+        }
+        const descriptor = try slot_codec.encode(alloc, .{ .txn_id = ids[i], .intent_revision = 1, .limits = completion.limits, .profile_fence = "replicated-profile", .commit = &commit_ops, .abort = &.{} }, .{});
+        defer alloc.free(descriptor);
+        envelope.* = try entry_codec.encode(alloc, .{
+            .group_id = identity.group_id,
+            .group_incarnation = identity.incarnation,
+            .policy_digest = identity.policy_digest,
+            .schema_catalog_digest = @splat(13),
+            .txn_id = ids[i],
+            .original_input_digest = @splat(14),
+            .baseline_digest = hash.finish(),
+            .previous_term = if (i == 0) 0 else 3,
+            .previous_index = i,
+            .baseline_keys = &keys,
+            .descriptor = descriptor,
+            .prepare_operations = &prepare_ops,
+        });
+    }
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    fd_pool.fd_cache.capacity = 1;
+    manager.memory.budget.hard_limit_bytes = 1;
+    Backend.rejectNewRunSnapshotRefsForTest(true);
+    defer Backend.rejectNewRunSnapshotRefsForTest(false);
+    var reader: ?@import("state.zig").State = null;
+    defer if (reader) |*snapshot| snapshot.deinit(alloc);
+    for (envelopes, 0..) |wire, i| {
+        try std.testing.expectEqual(i, try pool.accept(&backend, 3, i + 1, if (i == 0) 0 else 3, i, wire.?));
+        const slot = try pool.adopt(&backend, i);
+        backend.durable_completion_members[i] = slot;
+        if (backend.durable_completion == null) backend.durable_completion = slot;
+        try slot.applyCanonicalPrepare(&backend, pool.cells[i].entry.?.entry.prepare_operations);
+        pool.notifyApplied(i);
+        if (i == 1) reader = try backend.mutable.snapshot(alloc);
+    }
+    for (ids, 0..) |id, i| {
+        const progress = completion.AcceptedIdentity{ .term = 3, .index = 5 + i, .digest = @splat(@intCast(70 + i)) };
+        const commit = i % 2 == 0;
+        try pool.reserveResolution(id, progress, commit, progress.index - 1);
+        const slot = pool.cells[i].slot;
+        try slot.complete(&backend, commit, .{ .commit_timestamp = 200, .replay_sequence = 1, .shared_ledger_count = 0, .shared_ledger_bytes = 0, .raft_term = 3, .raft_index = progress.index, .canonical_payload_digest = progress.digest });
+        slot.retired = true;
+    }
+    try backend.retireDurableCompletionCohort();
+    try pool.maintainLocked(&backend);
+    try pool.qualifyFresh(&backend);
+    for (0..4) |i| {
+        var key: [8]u8 = undefined;
+        std.mem.writeInt(u64, &key, i * 1024 + 256, .big);
+        const found = try pool.point(&backend, alloc, null, &key);
+        defer found.deinit(alloc);
+        if (i % 2 == 0) try std.testing.expectEqualSlices(u8, &value, found.value.?) else try std.testing.expect(found.value == null);
+    }
+    const first = [_]u8{0} ** 8;
+    try std.testing.expect(reader.?.findIndex(.{}, &first) != null);
     try std.testing.expect(!failing.has_induced_failure);
 }
 

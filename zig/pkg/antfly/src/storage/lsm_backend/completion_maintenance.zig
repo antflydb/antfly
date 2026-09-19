@@ -16,7 +16,7 @@ comptime {
     // The certificate documents v11 packed offsets, 14-bit block filters,
     // fixed run filter and prefix-none output. Format changes need a new proof.
     if (table.version != 11 or table.default_block_size != capacity.block_bytes or
-        @sizeOf(table.SequentialTableIndex.Block) != 32)
+        @sizeOf(table.SequentialTableIndex.Block) != 32 or repository.maxRunFileReadBytes() != (capacity.Limits{}).file_bytes)
         @compileError("update completion format-cost certificate for the SST format");
 }
 
@@ -28,6 +28,7 @@ pub const Limits = struct {
     max_block_bytes: usize = 1024 * 1024,
     max_record_bytes: usize = 256 * 1024,
     max_frontier_bytes: usize = 16 * 1024 * 1024,
+    max_output_file_bytes: usize = repository.maxRunFileReadBytes(),
 };
 
 const Cursor = struct {
@@ -151,12 +152,12 @@ const Output = struct {
     allocator: Allocator,
     writer: repository.StreamingRunFileWriter = undefined,
     run: repository.Run,
-    fn init(self: *Output, allocator: Allocator, io: io_mod.Storage, root: []const u8, id: u64) !void {
+    fn init(self: *Output, allocator: Allocator, io: io_mod.Storage, root: []const u8, id: u64, file_bytes: usize) !void {
         self.* = .{ .allocator = allocator, .run = .{ .id = id, .level = 1, .size_bytes = 0, .path = null, .smallest_namespace_name = null, .smallest_key = &.{}, .largest_namespace_name = null, .largest_key = &.{}, .entry_count = 0, .bloom_filter = null, .state = null, .tombstone_count = 0 } };
         // A fixed small run filter may saturate (extra false positives), but
         // never rejects an inserted key. Block filters remain bounded by the
         // encoder block size; no allocation is sized from the whole store.
-        try self.writer.initInPlace(io, allocator, root, id, 1, std.math.maxInt(u32), .{ .bits_per_key = 1, .min_bits = 64, .max_hash_count = 1 }, .snappy_adaptive, .none, null, .cold_sequential);
+        try self.writer.initInPlace(io, allocator, root, id, 1, @min(file_bytes, repository.maxRunFileReadBytes()), .{ .bits_per_key = 1, .min_bits = 64, .max_hash_count = 1 }, .snappy_adaptive, .none, null, .cold_sequential);
     }
     fn deinit(self: *Output) void {
         self.writer.deinit();
@@ -245,7 +246,7 @@ pub fn build(allocator: Allocator, io: io_mod.Storage, root: []const u8, paths: 
         }
         if (!active) {
             if (results.items.len == limits.max_outputs) return error.UnsupportedCompletionProfile;
-            try output.init(allocator, io, root, try std.math.add(u64, output_base, results.items.len));
+            try output.init(allocator, io, root, try std.math.add(u64, output_base, results.items.len), limits.max_output_file_bytes);
             active = true;
         }
         if (!output.fits(winner, limits)) return error.UnsupportedCompletionProfile;
@@ -413,4 +414,16 @@ test "workload admission completion maintenance streams bounded blocks with exha
     try scope.storage().deleteFileAbsolute(paths[17]);
     // A failed bounded build leaves immutable inputs valid and usable.
     try qualify(scratch.allocator(), scope.storage(), paths[0..2], limits);
+    // A smaller allowance exercises the same physical split used for the
+    // native 512MiB cap without constructing a half-gigabyte fixture.
+    var physical = try build(scratch.allocator(), scope.storage(), root, paths[0..2], &mutable, 3, .{
+        .max_outputs = 16,
+        .max_output_file_bytes = 8192,
+    });
+    defer {
+        for (physical.items) |*run| run.deinit(scratch.allocator());
+        physical.deinit(scratch.allocator());
+    }
+    try std.testing.expect(physical.items.len > 1);
+    for (physical.items) |run| try std.testing.expect(run.size_bytes <= 8192);
 }

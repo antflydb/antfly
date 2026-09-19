@@ -263,6 +263,25 @@ pub const Directory = struct {
         self.* = .{ .allocation_allocator = allocator };
         return self;
     }
+
+    /// Maintenance emits level-one disk runs, so generation indexing stays
+    /// empty. The durable fork shares payloads and allocates only its header.
+    pub fn freshAllocationBound(count_: usize, bound_bytes: usize, path_bytes: usize) !usize {
+        const footprint = completion_allocation.RecyclingScratch.allocationFootprint;
+        var bytes = try std.math.mul(usize, 2, try footprint(@sizeOf(Directory), @alignOf(Directory)));
+        inline for (.{ Tree, IdTree, BoundsTree, EndsTree, LevelTree }) |Index|
+            bytes = try std.math.add(usize, bytes, try Index.sequentialAllocationBound(count_, count_));
+        const bounds = try std.math.mul(usize, 2, try std.math.add(usize, try footprint(bound_bytes, 1), try footprint(0, 1)));
+        const per_run = try std.math.add(usize, try footprint(@sizeOf(Payload), @alignOf(Payload)), try std.math.add(usize, bounds, try footprint(path_bytes, 1)));
+        return std.math.add(usize, bytes, try std.math.mul(usize, count_, per_run));
+    }
+
+    pub fn singleInsertAllocationBound(max_count: usize, bound_bytes: usize, path_bytes: usize) !usize {
+        var bytes = try freshAllocationBound(1, bound_bytes, path_bytes);
+        inline for (.{ Tree, IdTree, BoundsTree, EndsTree, LevelTree, generation_index.Tree }) |Index|
+            bytes = try std.math.add(usize, bytes, try Index.sequentialAllocationBound(max_count, 1));
+        return bytes;
+    }
     pub fn fork(self: *const Directory, allocator: std.mem.Allocator) !*Directory {
         const out = try create(allocator);
         out.tree = self.tree.fork();

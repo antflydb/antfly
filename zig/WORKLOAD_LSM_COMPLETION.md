@@ -377,17 +377,31 @@ The following gates remain:
   descriptor alone does not fit a 256 KiB SST-record limit. The exact admission
   check and boundary tests passed the owning Debug gate (7/7 total, including
   pool and generation-guard regressions; no failures or leaks).
-- **Aggregate scratch and publication headroom.** A 16 MiB input cursor frontier
-  is not the full working set. At 64 output runs, two 256 KiB boundary keys per
-  run alone consume 32 MiB while the builder retains its results. Publication
-  copies those bounds into both writer metadata and the reader directory; its
-  durable directory fork shares payloads. Candidate/current/reader-retained
-  generations coexist with four concrete 8 MiB cell spans. Admission needs an
-  aggregate bound covering these bytes, decoder/encoder transients, allocator
-  overhead and retained replay state, together with actual contiguous spans.
-  Total free bytes in the shared recycling allocator are insufficient evidence.
-  Tighter boundary-key profiles or separately reserved domains are design
-  alternatives, not implemented proofs.
+- **Publication generations and remaining spans (implemented).**
+  Installation physically acquires three disjoint cell generations, each with
+  one contiguous 8 MiB span per configured cell, and four separate 8 MiB
+  metadata generations. Rearm selects an entirely empty generation; reader
+  references retain their original allocation domain. Admission bounds actual
+  writer/directory payloads, persistent tree edits, namespace/key/path copies,
+  allocator headers and alignment before accepting a future output shape.
+  It also checks each cell's remaining private span after envelope and owner
+  preparation against the remaining native prepare/completion allocations.
+  A failed partial preparation spends that cell until maintenance rearms it.
+  These domains charge about 104 MiB fixed memory plus 24 MiB per cell, with
+  exact allocator/domain overhead added, and a separate 8 MiB WAL credit per
+  cell. Capacity four therefore needs about 200 MiB physical memory and 32 MiB
+  WAL credit before installation; global resource admission may reject it.
+  This covers four prepare/outcome cells, not the separate decision/ack control
+  reservations. Aggregate decoder/encoder/result scratch and contiguous reuse
+  remain outstanding: the 16 MiB input frontier alone is not a working-set
+  certificate, and free bytes in a recycling allocator do not prove a suitably
+  sized span exists after arbitrary streaming allocation history. The owning
+  Debug gate passed 14/14 with zero skips, failures, or leaks, including four
+  256-operation prepare/outcome plans under denied ordinary memory/FD admission,
+  retained mutable readers, actual 64-run binary-bound metadata publication,
+  generation exhaustion/reuse, low-budget installation rejection, restart and
+  physical output-file splitting. Output limits use the native 512 MiB file
+  allowance, rather than the larger generic encoder format maximum.
 - **Output-count and future-frontier certificate (implemented).** Qualification
   scans CRC-checked physical records and keeps additive encoded-data, metadata,
   and block costs. Admission adds canonical operations, both possible outcomes,

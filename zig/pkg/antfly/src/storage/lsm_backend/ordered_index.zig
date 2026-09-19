@@ -252,6 +252,38 @@ pub fn SummarizedIndex(comptime Entry: type, comptime compare: fn (Entry, Entry)
             return std.math.add(u64, @sizeOf(Account), try std.math.mul(u64, needed, @sizeOf(Node) + 2 * @sizeOf(*Node)));
         }
 
+        /// Cumulative allocation bound for sequential single-entry edits. It
+        /// deliberately counts every prepare pool as newly allocated, so it
+        /// also bounds a monotonic publication reservation and allocator
+        /// fragmentation. AVL height is less than twice the key-count bit size.
+        pub fn sequentialAllocationBound(max_count: usize, edits: usize) !usize {
+            if (edits == 0) return 0;
+            const footprint = @import("completion_allocator.zig").RecyclingScratch.allocationFootprint;
+            const height = 2 * (@as(usize, std.math.log2_int(usize, @max(max_count, 1))) + 1);
+            const nodes: usize = 3 * height + 4;
+            const node_bytes = try std.math.mul(usize, nodes, try footprint(@sizeOf(Node), @alignOf(Node)));
+            // Geometric vector growth, including initial-capacity rounding.
+            const pointers = try std.math.mul(usize, 3 * (nodes + 8), @sizeOf(*Node));
+            const per_edit = try std.math.add(usize, node_bytes, try std.math.add(usize, try footprint(pointers, @alignOf(*Node)), try footprint(@sizeOf(Account), @alignOf(Account))));
+            return std.math.mul(usize, edits, per_edit);
+        }
+
+        /// Tighter insert-only bound for a retained root. An AVL insertion
+        /// copies at most the search path, one leaf and two rotation pivots.
+        /// The spare pool is replenished, not recreated, between insertions.
+        pub fn insertionAllocationBound(max_count: usize, edits: usize) !usize {
+            if (edits == 0) return 0;
+            const footprint = @import("completion_allocator.zig").RecyclingScratch.allocationFootprint;
+            const height = 2 * (@as(usize, std.math.log2_int(usize, @max(max_count, 1))) + 1);
+            const spare_nodes = 3 * height + 4;
+            const nodes = try std.math.add(usize, spare_nodes, try std.math.mul(usize, edits, height + 3));
+            const node_bytes = try std.math.mul(usize, nodes, try footprint(@sizeOf(Node), @alignOf(Node)));
+            // Count one maximum pointer-vector/account allocation per edit;
+            // this also covers all geometric growth without assuming reuse.
+            const per_edit = try std.math.add(usize, try footprint(3 * (spare_nodes + 8) * @sizeOf(*Node), @alignOf(*Node)), try footprint(@sizeOf(Account), @alignOf(Account)));
+            return std.math.add(usize, node_bytes, try std.math.mul(usize, edits, per_edit));
+        }
+
         pub fn prepareEdits(self: *Self, allocator: std.mem.Allocator, edits: usize) !void {
             if (edits == 0) return;
             if (self.account == null) self.account = try Account.create(allocator);

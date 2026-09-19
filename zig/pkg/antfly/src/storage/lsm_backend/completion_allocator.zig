@@ -299,6 +299,25 @@ pub const RecyclingScratch = struct {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
+    /// Only the owner may introduce allocations; readers only free them. A
+    /// serialized owner can therefore reuse an empty physical generation
+    /// without treating unrelated free fragments as a contiguous reservation.
+    pub fn isEmpty(self: *RecyclingScratch) bool {
+        self.lock();
+        defer self.mutex.unlock();
+        return !self.retired and self.live == 0;
+    }
+
+    /// Physical span consumed by one allocation, including prefix, alignment
+    /// and the largest unsplittable tail. Used by bounded publication proofs.
+    pub fn allocationFootprint(bytes: usize, alignment: usize) !usize {
+        if (alignment == 0 or !std.math.isPowerOfTwo(alignment)) return error.ResourceBudgetExceeded;
+        var size = try std.math.add(usize, @sizeOf(Block) + @sizeOf(usize), alignment - 1);
+        size = try std.math.add(usize, size, @max(bytes, 1));
+        size = try std.math.add(usize, size, block_alignment - 1 + minimum_block - 1);
+        return size;
+    }
+
     pub fn destroy(self: *RecyclingScratch) !void {
         self.lock();
         if (self.live != 0) {
@@ -613,6 +632,21 @@ pub const PublicationReservation = struct {
     children: usize = 0,
     finished: bool = false,
     mutex: std.atomic.Mutex = .unlocked,
+
+    pub fn backingFootprint(bytes: usize) !usize {
+        return std.math.add(usize, try RecyclingScratch.allocationFootprint(@sizeOf(PublicationReservation), @alignOf(PublicationReservation)), try RecyclingScratch.allocationFootprint(bytes, 1));
+    }
+
+    /// Conservative usable bytes still in this reservation's private tail.
+    /// Free child allocations do not replenish this monotonic allowance.
+    pub fn remainingBytes(self: *PublicationReservation) usize {
+        self.lock();
+        defer self.mutex.unlock();
+        if (self.finished or self.remaining == RecyclingScratch.none) return 0;
+        self.domain.lock();
+        defer self.domain.mutex.unlock();
+        return self.domain.block(self.remaining).size -| (RecyclingScratch.allocationFootprint(0, 1) catch unreachable);
+    }
 
     pub fn create(domain: *RecyclingScratch, bytes: usize) !*PublicationReservation {
         if (bytes == 0) return error.ResourceBudgetExceeded;
