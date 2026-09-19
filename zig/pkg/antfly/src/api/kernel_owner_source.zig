@@ -98,6 +98,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         table_storage: ?@import("../common/table_storage.zig").Settings = null,
         generation: u64,
         identity: descriptor_contract.Identity,
+        restore: ?@import("../storage/restore_identity.zig").Identity = null,
 
         pub fn view(self: *const LoadedDescriptor) descriptor_contract.Descriptor {
             return .{
@@ -106,6 +107,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .schema_json = self.schema_json,
                 .indexes_json = self.indexes_json,
                 .table_storage = self.table_storage,
+                .restore = self.restore,
             };
         }
 
@@ -113,6 +115,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             alloc.free(self.path);
             alloc.free(self.schema_json);
             alloc.free(self.indexes_json);
+            if (self.restore) |*identity| identity.deinit(alloc);
             self.* = undefined;
         }
     };
@@ -127,6 +130,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         schema_json: []u8,
         indexes_json: []u8,
         table_storage: ?@import("../common/table_storage.zig").Settings = null,
+        restore: ?@import("../storage/restore_identity.zig").Identity = null,
         owner: client.Owner,
         // Exact descriptor/target proof, owned by this physical generation.
         // Shared repair steps may reuse it until a structural follow-up is due.
@@ -1589,6 +1593,8 @@ pub const ProvisionedKernelOwnerSource = struct {
         self.alloc.free(entry.table_name);
         self.alloc.free(entry.schema_json);
         self.alloc.free(entry.indexes_json);
+        if (entry.restore) |*identity| identity.deinit(self.alloc);
+
         if (entry.repair_target) |target| self.alloc.free(target);
         self.alloc.destroy(entry);
     }
@@ -1854,6 +1860,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .schema_json = projection.schema_json,
             .indexes_json = projection.indexes_json,
             .table_storage = projection.table_storage,
+            .restore = projection.restore,
             .generation = self.visibleRootGeneration(group_id),
             .identity = .{
                 .table_id = projection.table_id,
@@ -2337,7 +2344,13 @@ pub const ProvisionedKernelOwnerSource = struct {
         for (self.entries.items, 0..) |entry, index| {
             if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name)) continue;
             if (entry.closing) return error.StorageKernelOwnerTransitionRequired;
-            if (entry.retired or entry.generation != descriptor.lsm_root_generation or !entry.identity.eql(descriptor.identity)) {
+            // A cached owner opened before restore intent must drain as well.
+            // Compare the admitted binding in memory; warm hits need no marker I/O.
+            const restore_matches = if (descriptor.restore) |expected|
+                if (entry.restore) |admitted| admitted.eql(expected) else false
+            else
+                true;
+            if (entry.retired or entry.generation != descriptor.lsm_root_generation or !entry.identity.eql(descriptor.identity) or !restore_matches) {
                 entry.retired = true;
                 if (entry.active_users == 0) {
                     stale_index = index;
@@ -2383,6 +2396,8 @@ pub const ProvisionedKernelOwnerSource = struct {
         errdefer self.alloc.free(owned_schema_json);
         const owned_indexes_json = try self.alloc.dupe(u8, descriptor.indexes_json);
         errdefer self.alloc.free(owned_indexes_json);
+        var owned_restore = if (descriptor.restore) |identity| try identity.clone(self.alloc) else null;
+        errdefer if (owned_restore) |*identity| identity.deinit(self.alloc);
         const entry = try self.alloc.create(Entry);
         errdefer self.alloc.destroy(entry);
         try self.ensureContextConfigured();
@@ -2408,6 +2423,15 @@ pub const ProvisionedKernelOwnerSource = struct {
             } else .{},
             .transaction_recovery = self.transactionRecoveryConfig(),
             .runtime_hooks = self.runtimeHooksConfig(),
+            .restore = if (descriptor.restore) |identity| .{
+                .required = 1,
+                .backup_id = .fromSlice(identity.backup_id),
+                .location = .fromSlice(identity.location),
+                .snapshot_path = .fromSlice(identity.snapshot_path),
+                .artifact_sha256 = .fromSlice(identity.artifact_sha256),
+                .native_manifest_size_bytes = identity.native_manifest_size_bytes,
+                .native_manifest_sha256 = .fromSlice(identity.native_manifest_sha256),
+            } else .{},
         });
         errdefer owner.deinit();
         entry.* = .{
@@ -2418,6 +2442,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .schema_json = owned_schema_json,
             .indexes_json = owned_indexes_json,
             .table_storage = descriptor.table_storage,
+            .restore = owned_restore,
             .owner = owner,
             .active_users = 1,
             .resident = residency == .resident,
@@ -2501,6 +2526,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         table_name: []const u8,
         req: db_types.SearchRequest,
         consistency: read_gate.ReadConsistency,
+        raw_search_result: bool,
     ) !client.QueryResponse {
         try table_reads.checkQueryDeadline(req);
         try self.prepareQueryRead(group_id, req, consistency);
@@ -2510,11 +2536,13 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer lease.deinit();
         try table_reads.checkQueryDeadline(req);
         var cancellation = req.cancellation;
+        var execution = @import("../storage/local_query_controls.zig").executionOptions(req);
+        execution.raw_search_result = @intFromBool(raw_search_result);
         var response = try lease.owner().queryJsonWithOptions(table_name, request_json, .{
             .execution_deadline_ns = req.execution_deadline_ns,
             .cancellation_ctx = if (cancellation != null) @ptrCast(&cancellation.?) else null,
             .cancellation_fn = if (cancellation != null) cancellationTokenRequested else null,
-            .execution = @import("../storage/local_query_controls.zig").executionOptions(req),
+            .execution = execution,
         });
         errdefer response.deinit();
         try table_reads.checkQueryDeadline(req);
@@ -4045,7 +4073,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         consistency: read_gate.ReadConsistency,
     ) !?query_response.QueryResponse {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
-        var response = try self.executeQuery(alloc, group_id, table_name, req, consistency);
+        var response = try self.executeQuery(alloc, group_id, table_name, req, consistency, false);
         defer response.deinit();
         return .{
             .json = try alloc.dupe(u8, response.bytes()),
@@ -4062,7 +4090,9 @@ pub const ProvisionedKernelOwnerSource = struct {
         consistency: read_gate.ReadConsistency,
     ) !?db_types.SearchResult {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
-        var response = try self.executeQuery(alloc, group_id, table_name, req, consistency);
+        // This is a raw shard phase. The coordinator owns its aggregation;
+        // queryGroupLocal instead requests a complete local response.
+        var response = try self.executeQuery(alloc, group_id, table_name, req, consistency, true);
         defer response.deinit();
         var result = try table_reads.parseStorageKernelSearchResult(alloc, response.bytes());
         errdefer result.deinit();

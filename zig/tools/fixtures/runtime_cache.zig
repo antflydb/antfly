@@ -34,6 +34,10 @@ pub fn build(b: *std.Build) void {
     var steps = std.AutoHashMap(*std.Build.Step, void).init(b.allocator);
     var modules = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
     for (b.top_level_steps.values()) |top| collectSteps(&top.step, &steps, &modules);
+    // Individual commands are intentionally absent from the consolidated gate.
+    // Inspect the owner's registry without making every CLI a gate dependency.
+    for (artifacts.inference_steps.finetune_commands) |command| collectSteps(&command.executable.step, &steps, &modules);
+    for (artifacts.inference_steps.finetune_workflows) |command| collectSteps(&command.executable.step, &steps, &modules);
     const host_tools = b.step("cache-host-tools", "Compile the actual host generators");
     const openapi = b.step("cache-openapi", "Exercise the actual schema joins and their discovered inputs");
     const unit_tests = b.step("cache-unit-tests", "Exercise actual test imports with stable metadata");

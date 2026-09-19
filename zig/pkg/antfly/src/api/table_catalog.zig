@@ -1965,10 +1965,12 @@ pub const TableGroupDescriptorProjection = struct {
     schema_json: []u8,
     indexes_json: []u8,
     table_storage: ?@import("../common/table_storage.zig").Settings,
+    restore: ?@import("../storage/restore_identity.zig").Identity = null,
 
     pub fn deinit(self: *TableGroupDescriptorProjection, alloc: std.mem.Allocator) void {
         alloc.free(self.schema_json);
         alloc.free(self.indexes_json);
+        if (self.restore) |*identity| identity.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -2035,6 +2037,7 @@ pub fn tableGroupDescriptorProjection(
                 table.schema_json,
                 table.indexes_json,
                 table.storage,
+                restoreIdentityFromRange(range),
             );
         }
     }
@@ -2054,6 +2057,7 @@ pub fn tableGroupDescriptorProjection(
             transition.table_contract.schema_json,
             transition.table_contract.indexes_json,
             null,
+            null,
         );
     }
     for (admin.merge_transitions) |transition| {
@@ -2071,6 +2075,7 @@ pub fn tableGroupDescriptorProjection(
             identity.range_id,
             transition.table_contract.schema_json,
             transition.table_contract.indexes_json,
+            null,
             null,
         );
     }
@@ -2094,6 +2099,7 @@ fn descriptorProjectionFromRoutingSnapshot(
             table.schema_json,
             table.indexes_json,
             table.storage,
+            restoreIdentityFromRange(range),
         );
     }
     return null;
@@ -2107,16 +2113,32 @@ fn descriptorProjectionFromValues(
     schema_json: []const u8,
     indexes_json: []const u8,
     table_storage: ?@import("../common/table_storage.zig").Settings,
+    restore: ?@import("../storage/restore_identity.zig").Identity,
 ) !TableGroupDescriptorProjection {
     const owned_schema_json = try alloc.dupe(u8, schema_json);
     errdefer alloc.free(owned_schema_json);
+    const owned_indexes_json = try alloc.dupe(u8, indexes_json);
+    errdefer alloc.free(owned_indexes_json);
     return .{
         .table_id = table_id,
         .table_storage = table_storage,
         .doc_identity_shard_id = doc_identity_shard_id,
         .doc_identity_range_id = doc_identity_range_id,
         .schema_json = owned_schema_json,
-        .indexes_json = try alloc.dupe(u8, indexes_json),
+        .indexes_json = owned_indexes_json,
+        .restore = if (restore) |identity| try identity.clone(alloc) else null,
+    };
+}
+
+fn restoreIdentityFromRange(range: metadata_table_manager.RangeRecord) ?@import("../storage/restore_identity.zig").Identity {
+    if (range.restore_backup_id.len == 0) return null;
+    return .{
+        .backup_id = range.restore_backup_id,
+        .location = range.restore_location,
+        .snapshot_path = range.restore_snapshot_path,
+        .artifact_sha256 = range.restore_artifact_sha256,
+        .native_manifest_size_bytes = range.restore_native_manifest_size_bytes,
+        .native_manifest_sha256 = range.restore_native_manifest_sha256,
     };
 }
 

@@ -94,6 +94,7 @@ pub const specs = [_]common.CommandSpec{
     },
     .{
         .name = "eval-gliner2-autodiff-adapter-dataset",
+        .shared_check = false,
         .root_source_file = "src/finetune/tools/eval_gliner2_autodiff_adapter_dataset.zig",
         .description = "Evaluate a saved GLiNER2 autodiff PEFT adapter across structured full-task JSONL data",
         .imports = &.{ .build_options, .ml, .inference_internal, .inference_hf_tokenizer, .inference_linalg },
@@ -175,6 +176,9 @@ pub const specs = [_]common.CommandSpec{
     },
     .{
         .name = "eval-fused-chunker",
+        // Training and evaluation both import native_compute by relative path.
+        // They cannot give that source file two distinct module owners.
+        .shared_check = false,
         .root_source_file = "src/finetune_eval_fused_chunker.zig",
         .description = "Evaluate a fused chunker-embedder boundary head checkpoint",
         .imports = &.{ .build_options, .ml, .antfly_platform, .inference_linalg },

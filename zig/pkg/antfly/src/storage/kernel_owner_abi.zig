@@ -18,7 +18,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 60;
+pub const abi_version: u32 = 61;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -255,7 +255,10 @@ pub const LocalQueryReturnMode = enum(u32) {
 pub const LocalQueryExecutionOptions = extern struct {
     enabled: u8 = 0,
     include_stored: u8 = 1,
-    _reserved0: [2]u8 = @splat(0),
+    /// Return a raw shard result for coordinator finalization. Keep aggregation
+    /// specifications during search: they also govern exact candidate totals.
+    raw_search_result: u8 = 0,
+    _reserved0: u8 = 0,
     return_mode: LocalQueryReturnMode = .parent,
     max_chunks_per_parent: u32 = 0,
     /// Presentation only; never used for storage lookup or authorization.
@@ -948,6 +951,17 @@ pub const TargetObserver = extern struct {
     notify: ?TargetAdvanceFn = null,
 };
 
+pub const RestoreAdmission = extern struct {
+    required: u8 = 0,
+    _reserved: [7]u8 = @splat(0),
+    backup_id: BorrowedBytes = .{},
+    location: BorrowedBytes = .{},
+    snapshot_path: BorrowedBytes = .{},
+    artifact_sha256: BorrowedBytes = .{},
+    native_manifest_size_bytes: u64 = 0,
+    native_manifest_sha256: BorrowedBytes = .{},
+};
+
 pub const OpenRequest = extern struct {
     version: u32 = abi_version,
     _reserved0: u32 = 0,
@@ -967,6 +981,7 @@ pub const OpenRequest = extern struct {
     target_observer: TargetObserver = .{},
     transaction_recovery: TransactionRecoveryConfig = .{},
     runtime_hooks: RuntimeHooksConfig = .{},
+    restore: RestoreAdmission = .{},
 };
 
 pub const JsonOperationRequest = extern struct {

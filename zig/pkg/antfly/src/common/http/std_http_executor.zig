@@ -364,16 +364,7 @@ pub const StdHttpExecutor = struct {
         });
         defer request.deinit();
         if (req.delivery_tracker) |tracker| tracker.markMayHaveBeenSent();
-        if (req.body.len > 0 or method.requestHasBody()) {
-            request.transfer_encoding = .{ .content_length = req.body.len };
-            var body_buffer: [16 * 1024]u8 = undefined;
-            var body_writer = try request.sendBodyUnflushed(&body_buffer);
-            if (req.body.len > 0) try body_writer.writer.writeAll(req.body);
-            try body_writer.end();
-            try request.connection.?.flush();
-        } else {
-            try request.sendBodiless();
-        }
+        try sendDirectRequest(&request, req.body);
 
         var response = try request.receiveHead(&.{});
         var header_count: usize = 0;
@@ -742,18 +733,7 @@ pub const StdHttpExecutor = struct {
         // connection establishment. From the first send operation onward, an
         // error cannot prove that the peer did not receive the request.
         if (req.delivery_tracker) |tracker| tracker.markMayHaveBeenSent();
-        if (req.body.len > 0 or method.requestHasBody()) {
-            request.transfer_encoding = .{ .content_length = req.body.len };
-            var body_buffer: [16 * 1024]u8 = undefined;
-            var body_writer = try request.sendBodyUnflushed(&body_buffer);
-            if (req.body.len > 0) {
-                try body_writer.writer.writeAll(req.body);
-            }
-            try body_writer.end();
-            try request.connection.?.flush();
-        } else {
-            try request.sendBodiless();
-        }
+        try sendDirectRequest(&request, req.body);
 
         var response = try request.receiveHead(&.{});
         const content_type = if (response.head.content_type) |value|
@@ -799,6 +779,34 @@ pub const StdHttpExecutor = struct {
             .headers = headers,
             .body = body,
         };
+    }
+
+    fn sendDirectRequest(request: *std.http.Client.Request, body: []const u8) !void {
+        sendDirectRequestBytes(request, body) catch |err| {
+            if (request.connection) |connection| {
+                // A partial request cannot return to the keep-alive pool.
+                connection.closing = true;
+                // std.Io.Writer erases socket errors as WriteFailed. Restore
+                // transport identity here, where it cannot be confused with
+                // a storage or JSON writer failure. Delivery remains uncertain;
+                // the executor never replays the mutation.
+                if (err == error.WriteFailed) if (connection.stream_writer.err) |cause| return cause;
+            }
+            return err;
+        };
+    }
+
+    fn sendDirectRequestBytes(request: *std.http.Client.Request, body: []const u8) std.Io.Writer.Error!void {
+        if (body.len > 0 or request.method.requestHasBody()) {
+            request.transfer_encoding = .{ .content_length = body.len };
+            var body_buffer: [16 * 1024]u8 = undefined;
+            var body_writer = try request.sendBodyUnflushed(&body_buffer);
+            if (body.len > 0) try body_writer.writer.writeAll(body);
+            try body_writer.end();
+            try request.connection.?.flush();
+        } else {
+            try request.sendBodiless();
+        }
     }
 
     fn beginRequest(self: *StdHttpExecutor) !void {
@@ -885,6 +893,37 @@ fn shouldForwardRequestHeader(headers: []const common.RequestHeader, name: []con
         }
     }
     return true;
+}
+
+test "std http executor retains socket write failures and uncertain delivery" {
+    const Inject = struct {
+        var writes: std.atomic.Value(usize) = .init(0);
+        fn netWrite(_: ?*anyopaque, _: std.Io.net.Socket.Handle, _: []const u8, _: []const []const u8, _: usize) std.Io.net.Stream.Writer.Error!usize {
+            _ = writes.fetchAdd(1, .monotonic);
+            return error.ConnectionResetByPeer;
+        }
+    };
+    const address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try address.listen(std.testing.io, .{});
+    defer server.deinit(std.testing.io);
+    const uri = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/", .{server.socket.address.getPort()});
+    defer std.testing.allocator.free(uri);
+    for ([_]common.Method{ .GET, .POST }) |method| {
+        var executor = StdHttpExecutor.init(std.testing.allocator, .{ .keep_alive = true });
+        defer executor.deinit();
+        executor.io_vtable.netWrite = Inject.netWrite;
+        Inject.writes.store(0, .monotonic);
+        var delivery: common.RequestDeliveryTracker = .{};
+        try std.testing.expectError(error.ConnectionResetByPeer, executor.executor().execute(std.testing.allocator, .{
+            .method = method,
+            .uri = uri,
+            .body = if (method == .POST) "body" else "",
+            .delivery_tracker = &delivery,
+        }));
+        try std.testing.expectEqual(@as(usize, 1), Inject.writes.load(.monotonic));
+        try std.testing.expectEqual(@as(usize, 0), executor.client.connection_pool.free_len);
+        try std.testing.expectEqual(common.RequestDeliveryTracker.State.may_have_been_sent, delivery.load());
+    }
 }
 
 test "std http executor module compiles" {

@@ -43,7 +43,7 @@ pub fn admission(elements: usize, limits: Limits) !Receipt {
 /// leave the mirror uncertified and retry before any host consumer can run.
 pub fn readInto(backend: *const ops.ComputeBackend, tensor: ops.CT, destination: []f32, limits: Limits, control: ?Control) !Receipt {
     const result = try admission(destination.len, limits);
-    if (backend.kind() != .metal) return error.UnsupportedSeededTrainingBackend;
+    if ((backend.kind() != .metal and backend.kind() != .cuda)) return error.UnsupportedSeededTrainingBackend;
     var combined = CombinedControl{ .original = backend.execution_control, .request = control };
     const active = Control{ .ptr = &combined, .check_fn = CombinedControl.check };
     var cb = backend.*;

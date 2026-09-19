@@ -20,6 +20,10 @@ const tests = @import("tests.zig");
 const finetune = @import("finetune/common.zig");
 
 pub const Steps = struct {
+    // Retain individual command identities for graph consumers without adding
+    // their compilations back to the consolidated test gate.
+    finetune_commands: []const finetune.Command,
+    finetune_workflows: []const finetune.Command,
     inference_test: *std.Build.Step,
     inference_finetune_test: *std.Build.Step,
 };
@@ -40,15 +44,14 @@ pub fn add(ctx: Context, wasm_jinja: *std.Build.Module, wasm_platform: *std.Buil
     const finetune_step = @import("finetune/tests.zig").addTests(finetune_ctx, "inference-finetune-test");
     const commands = @import("finetune/tools.zig").register(finetune_ctx);
     const workflows = @import("finetune/workflows.zig").register(finetune_ctx);
+    finetune_step.dependOn(finetune.addCommandChecks(finetune_ctx, &(@import("finetune/tools.zig").specs ++ @import("finetune/workflows.zig").specs)));
     for (commands) |command| {
-        finetune_step.dependOn(&command.executable.step);
         if (std.mem.eql(u8, command.executable.name, "train-gliner25"))
             ctx.step("train-gliner25", "Run a bounded GLiNER2.5 native training job").dependOn(&command.run.step);
         if (std.mem.eql(u8, command.executable.name, "materialize-gliner25-adapter"))
             ctx.step("materialize-gliner25-adapter", "Materialize a GLiNER2.5 adapter into an atomic FP32 bundle").dependOn(&command.run.step);
     }
     for (workflows) |command| {
-        finetune_step.dependOn(&command.executable.step);
         if (std.mem.eql(u8, command.executable.name, "gliner2-entity-training-readiness"))
             ctx.step("gliner2-entity-training-readiness", "Run GLiNER2 entity training readiness").dependOn(&command.run.step);
     }
@@ -62,5 +65,5 @@ pub fn add(ctx: Context, wasm_jinja: *std.Build.Module, wasm_platform: *std.Buil
         .bge_benchmark = ctx.addRunArtifact(bge_tests),
     });
     _ = @import("wasm.zig").addWasm(ctx, wasm_jinja, wasm_platform);
-    return .{ .inference_test = test_step, .inference_finetune_test = finetune_step };
+    return .{ .inference_test = test_step, .inference_finetune_test = finetune_step, .finetune_commands = commands, .finetune_workflows = workflows };
 }

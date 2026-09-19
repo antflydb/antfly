@@ -84,7 +84,7 @@ request distributions because traffic is closed-loop.
 
 ```sh
 zig build antfly-system-catalog-bench
-zig build antfly-system-catalog-routing-bench
+zig build antfly-system-catalog-routing-bench -Doptimize=ReleaseFast
 ```
 
 `antfly-system-catalog-bench` builds its own ReleaseFast executable. It reports five-sample medians

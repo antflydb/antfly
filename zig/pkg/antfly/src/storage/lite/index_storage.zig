@@ -21,9 +21,9 @@
 //! native catalog-page layout; this adapter is not a user-visible file format.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Crc32 = @import("antfly_hash").Crc32;
 const platform_sync = @import("antfly_platform").sync;
-const byte_copy = @import("../../common/byte_copy.zig");
 const docstore = @import("docstore.zig");
 const native = @import("native.zig");
 const storage_io = @import("../lsm_backend/storage_io.zig");
@@ -215,26 +215,37 @@ fn deleteFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
 
 fn deleteTree(ptr: *anyopaque, path: []const u8) !void {
     const self: *Store = @ptrCast(@alignCast(ptr));
-    try validateIndexPath(self, path);
+    const directory = if (std.mem.eql(u8, path, "/")) path else std.mem.trimEnd(u8, path, "/");
+    try validateIndexPath(self, directory);
     lockStore(self.docs);
     defer self.docs.mutex.unlock();
-
-    const index_records = try self.docs.file.snapshotIndexCatalogKeysAlloc(self.allocator);
-    defer native.NativeFile.freeSnapshotCatalogKeys(self.allocator, index_records);
 
     var mutations = std.ArrayListUnmanaged(native.CatalogMutation).empty;
     defer {
         for (mutations.items) |mutation| self.allocator.free(mutation.key);
         mutations.deinit(self.allocator);
     }
-
-    for (index_records) |record| {
-        if (!pathContains(path, record.key)) continue;
+    // A subtree includes the exact logical file, but never a neighboring name
+    // such as /a-other. Seek descendants using the slash boundary separately.
+    if (try self.docs.file.getIndexCatalogRecordSize(directory) != null) {
+        const key = try self.allocator.dupe(u8, directory);
+        errdefer self.allocator.free(key);
+        try mutations.append(self.allocator, .{ .key = key, .is_delete = true });
+    }
+    const prefix = if (std.mem.eql(u8, directory, "/"))
+        try self.allocator.dupe(u8, "/")
+    else
+        try std.fmt.allocPrint(self.allocator, "{s}/", .{directory});
+    defer self.allocator.free(prefix);
+    var cursor = try self.docs.file.indexCatalogCursor(self.docs.file.activeCheckpoint(), prefix);
+    defer cursor.deinit();
+    while (try cursor.next()) |record| {
+        defer self.docs.file.allocator.free(record.key);
+        if (std.mem.eql(u8, record.key, directory)) continue;
         const key = try self.allocator.dupe(u8, record.key);
         errdefer self.allocator.free(key);
         try mutations.append(self.allocator, .{ .key = key, .is_delete = true });
     }
-
     try self.docs.file.putIndexCatalogBatch(mutations.items);
 }
 
@@ -242,19 +253,31 @@ fn listFileNamesAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8) !
     const self: *Store = @ptrCast(@alignCast(ptr));
     const directory = if (std.mem.eql(u8, path, "/")) path else std.mem.trimEnd(u8, path, "/");
     try validateIndexPath(self, directory);
-    lockStore(self.docs);
-    defer self.docs.mutex.unlock();
-
-    // Enumerate current keys without reading file payloads. The snapshot
-    // resolves overwrites and tombstones under the same checkpoint lock.
-    const keys = try self.docs.file.snapshotIndexCatalogKeysAlloc(allocator);
-    defer native.NativeFile.freeSnapshotCatalogKeys(allocator, keys);
+    const io = self.docs.file.runtime();
+    self.docs.generation_lock.lockSharedUncancelable(io);
+    defer self.docs.generation_lock.unlockShared(io);
+    const checkpoint = pinCheckpoint(self.docs);
+    const prefix = if (std.mem.eql(u8, directory, "/"))
+        try allocator.dupe(u8, "/")
+    else
+        try std.fmt.allocPrint(allocator, "{s}/", .{directory});
+    defer allocator.free(prefix);
+    // Only scoped stores validate every path component. The unscoped adapter
+    // also accepts repeated/trailing separators, whose dirname semantics can
+    // make a raw descendant key an immediate file. Preserve those keys through
+    // the general prefix cursor rather than skipping their byte ranges.
+    var cursor = if (self.namespace_prefix.len != 0)
+        try self.docs.file.indexCatalogDirectoryCursor(checkpoint, prefix)
+    else
+        try self.docs.file.indexCatalogCursor(checkpoint, prefix);
+    defer cursor.deinit();
     var names = std.ArrayListUnmanaged([]u8).empty;
     errdefer {
         for (names.items) |name| allocator.free(name);
         names.deinit(allocator);
     }
-    for (keys) |record| {
+    while (try cursor.next()) |record| {
+        defer self.docs.file.allocator.free(record.key);
         const parent = std.fs.path.dirname(record.key) orelse continue;
         if (!std.mem.eql(u8, parent, directory)) continue;
         const name = try allocator.dupe(u8, std.fs.path.basename(record.key));
@@ -304,11 +327,22 @@ fn rootIdentityAlloc(
     );
 }
 
+/// A fixed write buffer backed by a private staging file. Builders may patch
+/// headers and checksum any range without keeping their output in memory.
+/// Staging never reserves the document writer slot or pins a file generation;
+/// finish imports it into the current generation under the publication mutex.
 const NativeAtomicWriteSink = struct {
+    const buffer_size = 64 * 1024;
     allocator: Allocator,
     storage: *Store,
     path: []u8,
-    out: std.ArrayListUnmanaged(u8) = .empty,
+    file: ?std.Io.File = null,
+    tmp_path: ?[]u8 = null,
+    persisted: usize = 0,
+    buffered: usize = 0,
+    buffer: [buffer_size]u8 = undefined,
+    failure: ?anyerror = null,
+    write_options: native.WriteOptions = .{},
 
     const vtable: AtomicWriteSink.VTable = .{
         .len = len,
@@ -318,60 +352,135 @@ const NativeAtomicWriteSink = struct {
         .crc32_range = crc32Range,
         .finish = finish,
         .abort = abort,
+        .set_cache_intent = setCacheIntent,
     };
 
     fn create(allocator: Allocator, storage: *Store, path: []const u8) !AtomicWriteSink {
         const self = try allocator.create(NativeAtomicWriteSink);
         errdefer allocator.destroy(self);
-        self.* = .{
-            .allocator = allocator,
-            .storage = storage,
-            .path = try allocator.dupe(u8, path),
-        };
-        return .{
-            .ptr = self,
-            .vtable = &vtable,
-        };
+        self.* = .{ .allocator = allocator, .storage = storage, .path = try allocator.dupe(u8, path) };
+        return .{ .ptr = self, .vtable = &vtable };
     }
 
     fn deinit(self: *NativeAtomicWriteSink) void {
-        self.out.deinit(self.allocator);
+        const io = self.storage.docs.file.runtime();
+        if (self.file) |file| file.close(io);
+        if (self.tmp_path) |path| {
+            std.Io.Dir.cwd().deleteFile(io, path) catch {};
+            self.allocator.free(path);
+        }
         self.allocator.free(self.path);
         self.allocator.destroy(self);
     }
 
+    fn ensureFile(self: *NativeAtomicWriteSink) !std.Io.File {
+        if (self.file) |file| return file;
+        const io = self.storage.docs.file.runtime();
+        var random: [16]u8 = undefined;
+        try io.randomSecure(&random);
+        // Keep the basename independent of the database name so every valid
+        // database basename can spill. Retain sibling placement and exclusive
+        // creation; the random name is private to this writer.
+        const basename = try std.fmt.allocPrint(self.allocator, ".aflite-write-{x}", .{random});
+        defer self.allocator.free(basename);
+        const parent = std.fs.path.dirname(self.storage.docs.file.path) orelse ".";
+        const path = try std.fs.path.join(self.allocator, &.{ parent, basename });
+        errdefer self.allocator.free(path);
+        const file = try std.Io.Dir.cwd().createFile(io, path, .{ .read = true, .exclusive = true, .permissions = .fromMode(0o600) });
+        self.file = file;
+        self.tmp_path = path;
+        // On POSIX the descriptor owns the staging file after unlink. Abort,
+        // cancellation, and process death then reclaim it without a scavenger.
+        if (comptime builtin.os.tag != .windows) {
+            std.Io.Dir.cwd().deleteFile(io, path) catch return file;
+            self.allocator.free(path);
+            self.tmp_path = null;
+        }
+        return file;
+    }
+
+    fn flush(self: *NativeAtomicWriteSink) !void {
+        if (self.buffered == 0) return;
+        const file = try self.ensureFile();
+        try file.writePositionalAll(self.storage.docs.file.runtime(), self.buffer[0..self.buffered], self.persisted);
+        self.persisted += self.buffered;
+        self.buffered = 0;
+    }
+
     fn len(ptr: *anyopaque) usize {
         const self: *NativeAtomicWriteSink = @ptrCast(@alignCast(ptr));
-        return self.out.items.len;
+        return self.persisted + self.buffered;
     }
 
     fn appendSlice(ptr: *anyopaque, bytes: []const u8) !void {
         const self: *NativeAtomicWriteSink = @ptrCast(@alignCast(ptr));
-        try byte_copy.appendSlicePossiblyAliased(&self.out, self.allocator, bytes);
+        if (self.failure) |err| return err;
+        if (bytes.len > std.math.maxInt(u32) - len(ptr)) return error.RecordTooLarge;
+        errdefer |err| self.failure = err;
+        var offset: usize = 0;
+        while (offset < bytes.len) {
+            const n = @min(self.buffer.len - self.buffered, bytes.len - offset);
+            @memcpy(self.buffer[self.buffered..][0..n], bytes[offset..][0..n]);
+            self.buffered += n;
+            offset += n;
+            if (self.buffered == self.buffer.len) try self.flush();
+        }
     }
 
     fn writeAt(ptr: *anyopaque, offset: usize, bytes: []const u8) !void {
         const self: *NativeAtomicWriteSink = @ptrCast(@alignCast(ptr));
-        if (offset > self.out.items.len or bytes.len > self.out.items.len - offset) return error.InvalidAtomicWriteOffset;
-        byte_copy.copyPossiblyAliased(self.out.items[offset..][0..bytes.len], bytes);
+        if (self.failure) |err| return err;
+        if (offset > len(ptr) or bytes.len > len(ptr) - offset) return error.InvalidAtomicWriteOffset;
+        errdefer |err| self.failure = err;
+        const on_disk = if (offset < self.persisted) @min(bytes.len, self.persisted - offset) else 0;
+        if (on_disk > 0) try self.file.?.writePositionalAll(self.storage.docs.file.runtime(), bytes[0..on_disk], offset);
+        if (on_disk < bytes.len) @memcpy(self.buffer[offset + on_disk - self.persisted ..][0 .. bytes.len - on_disk], bytes[on_disk..]);
     }
 
     fn crc32Prefix(ptr: *anyopaque, len_prefix: usize) !u32 {
-        const self: *NativeAtomicWriteSink = @ptrCast(@alignCast(ptr));
-        if (len_prefix > self.out.items.len) return error.InvalidAtomicWriteOffset;
-        return Crc32.hash(self.out.items[0..len_prefix]);
+        return try crc32Range(ptr, 0, len_prefix);
     }
 
     fn crc32Range(ptr: *anyopaque, offset: usize, range_len: usize) !u32 {
         const self: *NativeAtomicWriteSink = @ptrCast(@alignCast(ptr));
-        if (offset > self.out.items.len or range_len > self.out.items.len - offset) return error.InvalidAtomicWriteOffset;
-        return Crc32.hash(self.out.items[offset..][0..range_len]);
+        if (self.failure) |err| return err;
+        if (offset > len(ptr) or range_len > len(ptr) - offset) return error.InvalidAtomicWriteOffset;
+        errdefer |err| self.failure = err;
+        var crc = Crc32.init();
+        var scratch: [buffer_size]u8 = undefined;
+        var pos = offset;
+        const end = offset + range_len;
+        while (pos < @min(end, self.persisted)) {
+            const n = @min(scratch.len, @min(end, self.persisted) - pos);
+            if (try self.file.?.readPositionalAll(self.storage.docs.file.runtime(), scratch[0..n], pos) != n)
+                return error.EndOfStream;
+            crc.update(scratch[0..n]);
+            pos += n;
+        }
+        if (pos < end) crc.update(self.buffer[pos - self.persisted .. end - self.persisted]);
+        return crc.final();
+    }
+
+    fn setCacheIntent(ptr: *anyopaque, intent: storage_io.AtomicWriteCacheIntent) void {
+        const self: *NativeAtomicWriteSink = @ptrCast(@alignCast(ptr));
+        self.write_options.payload_cache = switch (intent) {
+            .normal => .normal,
+            .cold_sequential => .cold_sequential,
+        };
     }
 
     fn finish(ptr: *anyopaque) !void {
         const self: *NativeAtomicWriteSink = @ptrCast(@alignCast(ptr));
         defer self.deinit();
-        try writeFileReserved(self.storage, self.path, self.out.items);
+        if (self.failure) |err| return err;
+        if (self.file != null) try self.flush();
+        lockStore(self.storage.docs);
+        defer self.storage.docs.mutex.unlock();
+        if (self.file) |file| {
+            try self.storage.docs.file.putIndexCatalogRecordFromFile(self.path, file, self.persisted, self.write_options);
+        } else {
+            try self.storage.docs.file.putIndexCatalogRecordWithOptions(self.path, self.buffer[0..self.buffered], self.write_options);
+        }
     }
 
     fn abort(ptr: *anyopaque) void {
@@ -382,6 +491,39 @@ const NativeAtomicWriteSink = struct {
 
 fn testPath(allocator: Allocator, tmp: std.testing.TmpDir, name: []const u8) ![]u8 {
     return try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, name });
+}
+
+test "lite native repeated WAL reset does not publish unchanged control records" {
+    const wal = @import("../lsm_backend/wal.zig");
+    const State = @import("../lsm_backend/state.zig").State;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "native-wal-reset.aflite");
+    defer allocator.free(path);
+    var docs = try docstore.Store.create(allocator, path, true);
+    defer docs.close();
+    var indexes = Store.init(allocator, &docs);
+    const storage = indexes.storage();
+    const root = "/indexes/test";
+    try wal.reset(storage, allocator, root);
+    const empty = docs.file.activeCheckpoint();
+    for (0..3) |_| try wal.reset(storage, allocator, root);
+    try std.testing.expectEqualDeep(empty, docs.file.activeCheckpoint());
+
+    var state: State = .{};
+    defer state.deinit(allocator);
+    try state.upsert(allocator, .{ .name = "docs" }, "a", "A", false);
+    _ = try wal.appendStateWithOptions(storage, allocator, root, &state, false, .{ .segment_bytes = 32 });
+    const retained = try wal.snapshotRetention(storage, allocator, root);
+    try std.testing.expect(retained.bytes > 0);
+    try wal.reset(storage, allocator, root);
+    const after = try wal.snapshotRetention(storage, allocator, root);
+    try std.testing.expectEqual(@as(u64, 0), after.bytes);
+    const reset = docs.file.activeCheckpoint();
+    try std.testing.expect(reset.commit_sequence > empty.commit_sequence);
+    try wal.reset(storage, allocator, root);
+    try std.testing.expectEqualDeep(reset, docs.file.activeCheckpoint());
 }
 
 test "lite native index storage persists logical files across reopen" {
@@ -587,12 +729,13 @@ test "lite native index storage handles large files rename and delete tree" {
     const append_suffix = " native append keeps old pages streaming";
     const before_append_page_count = docs.file.activeCheckpoint().page_count;
     try storage.appendFileAbsolute(allocator, "/dense/a/blob", append_suffix, true);
-    try std.testing.expectEqual(before_append_page_count + 7, docs.file.activeCheckpoint().page_count);
+    try std.testing.expectEqual(before_append_page_count + 6, docs.file.activeCheckpoint().page_count);
     try std.testing.expectEqual(@as(u64, @intCast(large.len + append_suffix.len)), try storage.fileSize("/dense/a/blob"));
 
     const before_rename_page_count = docs.file.activeCheckpoint().page_count;
     try storage.renameAbsolute("/dense/a/blob", "/dense/a/blob2");
-    try std.testing.expectEqual(before_rename_page_count + 3, docs.file.activeCheckpoint().page_count);
+    // Two records, one final tree node, descriptor and free map.
+    try std.testing.expectEqual(before_rename_page_count + 5, docs.file.activeCheckpoint().page_count);
     try std.testing.expectError(error.FileNotFound, storage.readFileAlloc(allocator, "/dense/a/blob", 8));
     const after_rename_check = try docs.file.check();
     try std.testing.expect(after_rename_check.valid);
@@ -777,4 +920,468 @@ test "lite native index storage serializes physical writes without taking docume
     try storage.writeFileAbsolute("/indexes/ft/b.tbl", "released");
 
     try std.testing.expectError(error.FileBusy, docs.beginWrite());
+}
+
+test "lite native directory operations seek bounded prefixes independent of catalog history" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "catalog-directory-seek.aflite");
+    defer alloc.free(path);
+    var docs = try docstore.Store.create(alloc, path, true);
+    defer docs.close();
+    var indexes = Store.init(alloc, &docs);
+    const storage = indexes.storage();
+    for (0..1000) |i| {
+        var key: [32]u8 = undefined;
+        try storage.writeFileAbsolute(try std.fmt.bufPrint(&key, "/unrelated/{d:0>8}", .{i}), "x");
+        try storage.writeFileAbsolute("/unrelated/repeated", try std.fmt.bufPrint(&key, "{d}", .{i}));
+    }
+    try storage.writeFileAbsolute("/a", "exact");
+    try storage.writeFileAbsolute("/a/one", "child");
+    try storage.writeFileAbsolute("/a/sub/two", "nested");
+    try storage.writeFileAbsolute("/a/deleted", "old");
+    try storage.deleteFileAbsolute("/a/deleted");
+    try storage.writeFileAbsolute("/a-other/keep", "neighbor");
+    const before = docs.file.test_page_reads.load(.monotonic);
+    const names = try storage.listFileNamesAlloc(alloc, "/a/");
+    defer StorageIo.freeFileNames(alloc, names);
+    try std.testing.expectEqual(@as(usize, 1), names.len);
+    try std.testing.expectEqualStrings("one", names[0]);
+    try std.testing.expect(docs.file.test_page_reads.load(.monotonic) - before <= 12);
+    const before_missing = docs.file.test_page_reads.load(.monotonic);
+    const missing = try storage.listFileNamesAlloc(alloc, "/absent");
+    defer StorageIo.freeFileNames(alloc, missing);
+    try std.testing.expectEqual(@as(usize, 0), missing.len);
+    try std.testing.expect(docs.file.test_page_reads.load(.monotonic) - before_missing <= 6);
+    const before_delete = docs.file.test_page_reads.load(.monotonic);
+    try storage.deleteTree("/a/");
+    try std.testing.expect(docs.file.test_page_reads.load(.monotonic) - before_delete <= 40);
+    try std.testing.expectError(error.FileNotFound, storage.fileSize("/a"));
+    try std.testing.expectError(error.FileNotFound, storage.fileSize("/a/one"));
+    try std.testing.expectError(error.FileNotFound, storage.fileSize("/a/sub/two"));
+    try std.testing.expectEqual(@as(u64, 8), try storage.fileSize("/a-other/keep"));
+    try std.testing.expectEqual(@as(u64, 1), try storage.fileSize("/unrelated/00000000"));
+    try std.testing.expect((try docs.file.check()).valid);
+}
+
+test "lite native staged atomic writes bound heap and survive concurrent commits and vacuum" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "staged-atomic.aflite");
+    defer alloc.free(path);
+    const expected = try alloc.alloc(u8, 8 * 1024 * 1024 + 137);
+    defer alloc.free(expected);
+    for (expected, 0..) |*byte, i| byte.* = @intCast(i % 251);
+    var budget = @import("test_allocator.zig").BudgetAllocator{ .backing = alloc, .limit = 512 * 1024 };
+    {
+        var docs = try docstore.Store.createWithOptions(budget.allocator(), path, .{ .no_sync = true, .io = std.testing.io });
+        defer docs.close();
+        docs.file.page_cache_enabled.store(false, .monotonic);
+        var indexes = Store.init(budget.allocator(), &docs);
+        const storage = indexes.storage();
+        try storage.writeFileAbsolute("/block", "old");
+        var writer = try storage.beginAtomicWrite(budget.allocator(), "/block");
+        var active = true;
+        defer if (active) writer.abort();
+        try writer.appendSlice(expected[0..33]);
+        try writer.appendSlice(expected[33..]);
+        try std.testing.expectEqual(expected.len, writer.len());
+        const impl: *NativeAtomicWriteSink = @ptrCast(@alignCast(writer.ptr));
+        try std.testing.expect(impl.file != null);
+        if (comptime builtin.os.tag != .windows) try std.testing.expect(impl.tmp_path == null);
+        const patch_offsets = [_]usize{ 3, 65530, impl.persisted - 3, expected.len - 8 };
+        for (patch_offsets) |offset| {
+            const patch = "PATCHED!";
+            try writer.writeAt(offset, patch);
+            @memcpy(expected[offset..][0..patch.len], patch);
+        }
+        try std.testing.expectEqual(Crc32.hash(expected), try writer.crc32Prefix(expected.len));
+        try std.testing.expectEqual(Crc32.hash(expected[65530..66530]), try writer.crc32Range(65530, 1000));
+        try std.testing.expectEqual(Crc32.hash(expected[expected.len - 10 ..]), try writer.crc32Range(expected.len - 10, 10));
+        try std.testing.expectEqual(Crc32.hash(""), try writer.crc32Range(expected.len, 0));
+        try std.testing.expectError(error.InvalidAtomicWriteOffset, writer.writeAt(expected.len, "x"));
+        try std.testing.expectError(error.InvalidAtomicWriteOffset, writer.crc32Range(expected.len, 1));
+        const old = try storage.readFileAlloc(alloc, "/block", 10);
+        defer alloc.free(old);
+        try std.testing.expectEqualStrings("old", old);
+
+        // A second staged writer and a document transaction can coexist. The
+        // first sink is private and must not depend on the original generation.
+        {
+            var txn = try docs.beginWrite();
+            errdefer txn.abort();
+            try txn.put("doc", "committed");
+            var other = try storage.beginAtomicWrite(budget.allocator(), "/other");
+            try other.appendSlice(expected[0..70000]);
+            try other.finish();
+            try txn.commit();
+        }
+        _ = try docs.vacuum();
+        const before = docs.file.activeCheckpoint();
+        active = false;
+        try writer.finish();
+        try std.testing.expectEqual(before.commit_sequence + 1, docs.file.activeCheckpoint().commit_sequence);
+        try std.testing.expect(budget.peak <= budget.limit);
+        const actual = try storage.readFileAlloc(alloc, "/block", expected.len);
+        defer alloc.free(actual);
+        try std.testing.expectEqualSlices(u8, expected, actual);
+        // Full integrity checking maintains a separate page reachability set.
+        budget.limit = std.math.maxInt(usize);
+        try std.testing.expect((try docs.file.check()).valid);
+    }
+    try std.testing.expectEqual(@as(usize, 0), budget.live);
+    var reopened = try docstore.Store.open(alloc, path, true);
+    defer reopened.close();
+    const value = (try reopened.file.getIndexCatalogRecordAlloc(alloc, "/block")).?;
+    defer alloc.free(value);
+    try std.testing.expectEqualSlices(u8, expected, value);
+    const document = (try reopened.file.getDocumentAlloc(alloc, "doc")).?;
+    defer alloc.free(document);
+    try std.testing.expectEqualStrings("committed", document);
+}
+
+test "lite native staged atomic writes discard failed imports and poisoned sources" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "failed-staging.aflite");
+    defer alloc.free(path);
+    var docs = try docstore.Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io });
+    defer docs.close();
+    var indexes = Store.init(alloc, &docs);
+    const storage = indexes.storage();
+    try storage.writeFileAbsolute("/stable", "old");
+    const checkpoint = docs.file.activeCheckpoint();
+    const bytes: [128 * 1024]u8 = @splat('v');
+    for ([_]bool{ false, true }) |checksum_first| {
+        var writer = try storage.beginAtomicWrite(alloc, "/stable");
+        try writer.appendSlice(&bytes);
+        const impl: *NativeAtomicWriteSink = @ptrCast(@alignCast(writer.ptr));
+        try impl.file.?.setLength(std.testing.io, 65536);
+        if (checksum_first) {
+            try std.testing.expectError(error.EndOfStream, writer.crc32Prefix(bytes.len));
+            try std.testing.expectError(error.EndOfStream, writer.appendSlice("must not recover silently"));
+        }
+        try std.testing.expectError(error.EndOfStream, writer.finish());
+        try std.testing.expect(std.meta.eql(checkpoint, docs.file.activeCheckpoint()));
+        const value = try storage.readFileAlloc(alloc, "/stable", 10);
+        defer alloc.free(value);
+        try std.testing.expectEqualStrings("old", value);
+    }
+    var aborted = try storage.beginAtomicWrite(alloc, "/stable");
+    try aborted.appendSlice(&bytes);
+    aborted.abort();
+    try std.testing.expect(std.meta.eql(checkpoint, docs.file.activeCheckpoint()));
+    var empty = try storage.beginAtomicWrite(alloc, "/empty");
+    try empty.finish();
+    try std.testing.expectEqual(@as(u64, 0), try storage.fileSize("/empty"));
+    var retry = try storage.beginAtomicWrite(alloc, "/stable");
+    try retry.appendSlice(&bytes);
+    try retry.finish();
+    const value = try storage.readFileAlloc(alloc, "/stable", bytes.len);
+    defer alloc.free(value);
+    try std.testing.expectEqualSlices(u8, &bytes, value);
+    try std.testing.expect((try docs.file.check()).valid);
+}
+
+test "lite native atomic writes spill with long database basenames" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Valid under NAME_MAX=255, including the writer lock's .lock suffix.
+    // Appending the former 50-byte staging suffix would exceed that limit.
+    const name = "x" ** 213 ++ ".aflite";
+    const path = try testPath(alloc, tmp, name);
+    defer alloc.free(path);
+    const bytes: [128 * 1024 + 17]u8 = @splat('s');
+    {
+        var docs = try docstore.Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io });
+        defer docs.close();
+        var indexes = Store.init(alloc, &docs);
+        const storage = indexes.storage();
+        var writer = try storage.beginAtomicWrite(alloc, "/long-name");
+        var active = true;
+        defer if (active) writer.abort();
+        try writer.appendSlice(&bytes);
+        active = false;
+        try writer.finish();
+        {
+            var aborted = try storage.beginAtomicWrite(alloc, "/aborted");
+            defer aborted.abort();
+            try aborted.appendSlice(&bytes);
+        }
+        try std.testing.expectError(error.FileNotFound, storage.fileSize("/aborted"));
+    }
+    var reopened = try docstore.Store.open(alloc, path, true);
+    defer reopened.close();
+    const actual = (try reopened.file.getIndexCatalogRecordAlloc(alloc, "/long-name")).?;
+    defer alloc.free(actual);
+    try std.testing.expectEqualSlices(u8, &bytes, actual);
+    try std.testing.expect((try reopened.file.check()).valid);
+}
+
+test "lite native cold atomic writes preserve hot pages with bounded cache admission" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "cold-atomic.aflite");
+    defer alloc.free(path);
+    const bytes = try alloc.alloc(u8, 2 * 1024 * 1024 + 17);
+    defer alloc.free(bytes);
+    for (bytes, 0..) |*byte, i| byte.* = @intCast(i % 251);
+    {
+        var docs = try docstore.Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io });
+        defer docs.close();
+        docs.file.page_cache.limit_bytes = 256 * 1024;
+        var indexes = Store.init(alloc, &docs);
+        const storage = indexes.storage();
+        try storage.writeFileAbsolute("/hot", bytes[0..12000]);
+        const hot = try storage.readFileAlloc(alloc, "/hot", 12000);
+        defer alloc.free(hot);
+        try std.testing.expectEqualSlices(u8, bytes[0..12000], hot);
+        var hot_pages = std.ArrayList(u64).empty;
+        defer hot_pages.deinit(alloc);
+        var cached = docs.file.page_cache.pages.iterator();
+        while (cached.next()) |entry| {
+            if (entry.value_ptr.*[4] == @intFromEnum(native.PageKind.value)) try hot_pages.append(alloc, entry.key_ptr.*);
+        }
+        try std.testing.expect(hot_pages.items.len > 0);
+
+        // Cover both the in-memory external-value path and the file importer.
+        // The spilled payload is eight times the entire page-cache capacity.
+        const cases = .{ .{ "/cold-buffered", @as(usize, 32000) }, .{ "/cold-staged", bytes.len } };
+        inline for (cases) |case| {
+            var writer = try storage.beginAtomicWrite(alloc, case[0]);
+            var active = true;
+            defer if (active) writer.abort();
+            writer.setCacheIntent(.cold_sequential);
+            try writer.appendSlice(bytes[0..case[1]]);
+            active = false;
+            try writer.finish();
+            for (hot_pages.items) |id| try std.testing.expect(docs.file.page_cache.pages.contains(id));
+            cached = docs.file.page_cache.pages.iterator();
+            var payload_pages: usize = 0;
+            while (cached.next()) |entry| {
+                if (entry.value_ptr.*[4] == @intFromEnum(native.PageKind.value)) payload_pages += 1;
+            }
+            try std.testing.expectEqual(hot_pages.items.len, payload_pages);
+            try std.testing.expect(docs.file.page_cache.pages.contains(docs.file.activeCheckpoint().index_catalog_root_page));
+        }
+
+        // Policy is local to the sink, and can be changed before publication.
+        var normal = try storage.beginAtomicWrite(alloc, "/normal");
+        var active = true;
+        defer if (active) normal.abort();
+        normal.setCacheIntent(.cold_sequential);
+        try normal.appendSlice(bytes[0..32000]);
+        normal.setCacheIntent(.normal);
+        active = false;
+        try normal.finish();
+        var payload_pages: usize = 0;
+        cached = docs.file.page_cache.pages.iterator();
+        while (cached.next()) |entry| {
+            if (entry.value_ptr.*[4] == @intFromEnum(native.PageKind.value)) payload_pages += 1;
+        }
+        try std.testing.expect(payload_pages > hot_pages.items.len);
+        for (hot_pages.items) |id| try std.testing.expect(docs.file.page_cache.pages.contains(id));
+    }
+    var reopened = try docstore.Store.open(alloc, path, true);
+    defer reopened.close();
+    inline for (.{ .{ "/hot", @as(usize, 12000) }, .{ "/cold-buffered", @as(usize, 32000) }, .{ "/cold-staged", bytes.len }, .{ "/normal", @as(usize, 32000) } }) |case| {
+        const actual = (try reopened.file.getIndexCatalogRecordAlloc(alloc, case[0])).?;
+        defer alloc.free(actual);
+        try std.testing.expectEqualSlices(u8, bytes[0..case[1]], actual);
+    }
+    try std.testing.expect((try reopened.file.check()).valid);
+}
+
+test "lite native directory cursor skips large subtrees and preserves boundary files" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "directory-subtree-skip.aflite");
+    defer alloc.free(path);
+    {
+        var docs = try docstore.Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io });
+        defer docs.close();
+        var indexes = Store.initWithNamespace(alloc, &docs, "/a");
+        const storage = indexes.storage();
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        var mutations = std.ArrayList(native.CatalogMutation).empty;
+        for (0..4096) |i| {
+            const dir = if (i < 2048) "sub" else "other";
+            try mutations.append(scratch, .{ .key = try std.fmt.allocPrint(scratch, "/a/{s}/deep/{d:0>8}", .{ dir, i }), .value = "nested" });
+        }
+        for ([_][]const u8{ "/a", "/a/sub", "/a/sub.", "/a/sub0", "/a/submarine", "/a/other0", "/a/z", "/top" }) |key|
+            try mutations.append(scratch, .{ .key = key, .value = "direct" });
+        try docs.file.putIndexCatalogBatch(mutations.items);
+        const pinned = docs.file.activeCheckpoint();
+        const reads = docs.file.test_page_reads.load(.monotonic);
+        const names = try storage.listFileNamesAlloc(alloc, "/a/");
+        defer StorageIo.freeFileNames(alloc, names);
+        const expected = [_][]const u8{ "other0", "sub", "sub.", "sub0", "submarine", "z" };
+        try std.testing.expectEqual(expected.len, names.len);
+        for (expected, names) |want, got| try std.testing.expectEqualStrings(want, got);
+        try std.testing.expect(docs.file.test_page_reads.load(.monotonic) - reads <= 40);
+        var unscoped = Store.init(alloc, &docs);
+        const root_names = try unscoped.storage().listFileNamesAlloc(alloc, "/");
+        defer StorageIo.freeFileNames(alloc, root_names);
+        try std.testing.expectEqual(@as(usize, 2), root_names.len);
+        try std.testing.expectEqualStrings("a", root_names[0]);
+        try std.testing.expectEqualStrings("top", root_names[1]);
+        // The cursor remains in its original checkpoint even after live
+        // deletion. Seek-past must not silently rebind to the latest root.
+        var cursor = try docs.file.indexCatalogDirectoryCursor(pinned, "/a/");
+        defer cursor.deinit();
+        try storage.deleteFileAbsolute("/a/sub0");
+        var count: usize = 0;
+        while (try cursor.next()) |entry| {
+            defer alloc.free(entry.key);
+            try std.testing.expectEqualStrings(expected[count], std.fs.path.basename(entry.key));
+            count += 1;
+        }
+        try std.testing.expectEqual(expected.len, count);
+    }
+    var reopened = try docstore.Store.open(alloc, path, true);
+    defer reopened.close();
+    var indexes = Store.initWithNamespace(alloc, &reopened, "/a");
+    const names = try indexes.storage().listFileNamesAlloc(alloc, "/a");
+    defer StorageIo.freeFileNames(alloc, names);
+    try std.testing.expectEqual(@as(usize, 5), names.len);
+    try std.testing.expect((try reopened.file.check()).valid);
+}
+
+test "lite native atomic imports batch writes and preserve publication on failed flush" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "batched-import.aflite");
+    defer alloc.free(path);
+    const bytes = try alloc.alloc(u8, 2 * 1024 * 1024 + 17);
+    defer alloc.free(bytes);
+    for (bytes, 0..) |*byte, i| byte.* = @intCast(i % 251);
+    {
+        var docs = try docstore.Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io });
+        defer docs.close();
+        var indexes = Store.init(alloc, &docs);
+        const storage = indexes.storage();
+        try storage.writeFileAbsolute("/value", "old");
+        const old = docs.file.activeCheckpoint();
+        // Fail after one complete page batch reached disk, and on the first
+        // batch. Neither path may publish the unfinished replacement.
+        for ([_]usize{ 0, 1 }) |after| {
+            var writer = try storage.beginAtomicWrite(alloc, "/value");
+            var active = true;
+            defer if (active) writer.abort();
+            try writer.appendSlice(bytes);
+            docs.file.test_page_write_fail_after = after;
+            active = false;
+            try std.testing.expectError(error.TestPageWriteFailure, writer.finish());
+            docs.file.test_page_write_fail_after = null;
+            try std.testing.expect(std.meta.eql(old, docs.file.activeCheckpoint()));
+            const value = try storage.readFileAlloc(alloc, "/value", 10);
+            defer alloc.free(value);
+            try std.testing.expectEqualStrings("old", value);
+            var pinned = try docstore.Store.open(alloc, path, true);
+            defer pinned.close();
+            const disk = (try pinned.file.getIndexCatalogRecordAlloc(alloc, "/value")).?;
+            defer alloc.free(disk);
+            try std.testing.expectEqualStrings("old", disk);
+        }
+        var writer = try storage.beginAtomicWrite(alloc, "/value");
+        var active = true;
+        defer if (active) writer.abort();
+        writer.setCacheIntent(.cold_sequential);
+        try writer.appendSlice(bytes);
+        const writes = docs.file.test_page_write_calls.load(.monotonic);
+        const pages = docs.file.test_page_writes.load(.monotonic);
+        active = false;
+        try writer.finish();
+        try std.testing.expect(docs.file.test_page_writes.load(.monotonic) - pages > 500);
+        try std.testing.expect(docs.file.test_page_write_calls.load(.monotonic) - writes <= 40);
+        // Buffered external values use the same batch writer.
+        const buffered_writes = docs.file.test_page_write_calls.load(.monotonic);
+        var buffered = try storage.beginAtomicWrite(alloc, "/buffered");
+        var buffered_active = true;
+        defer if (buffered_active) buffered.abort();
+        try buffered.appendSlice(bytes[0..32000]);
+        buffered_active = false;
+        try buffered.finish();
+        try std.testing.expect(docs.file.test_page_write_calls.load(.monotonic) - buffered_writes <= 5);
+    }
+    var reopened = try docstore.Store.open(alloc, path, true);
+    defer reopened.close();
+    const value = (try reopened.file.getIndexCatalogRecordAlloc(alloc, "/value")).?;
+    defer alloc.free(value);
+    try std.testing.expectEqualSlices(u8, bytes, value);
+    const buffered = (try reopened.file.getIndexCatalogRecordAlloc(alloc, "/buffered")).?;
+    defer alloc.free(buffered);
+    try std.testing.expectEqualSlices(u8, bytes[0..32000], buffered);
+    try std.testing.expect((try reopened.file.check()).valid);
+}
+
+test "lite native unscoped listings preserve accepted non-normalized keys" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "unscoped-path-listing.aflite");
+    defer alloc.free(path);
+    const keys = [_][]const u8{
+        "/a//file",
+        "/a/file/",
+        // '!' sorts before '/', so a descendant can precede the trailing
+        // separator alias. Merely trimming the first encountered key would
+        // still skip the alias when jumping over this subtree.
+        "/a/dir/!nested",
+        "/a/dir//",
+        "/a/dir/nested",
+        "/a/dir0",
+        "/a/normal",
+    };
+    const expected = [_][]const u8{ "file", "dir", "dir0", "file", "renamed" };
+    {
+        var docs = try docstore.Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io });
+        defer docs.close();
+        var indexes = Store.init(alloc, &docs);
+        const storage = indexes.storage();
+        for (keys) |key| try storage.writeFileAbsolute(key, key);
+        try storage.renameAbsolute("/a/normal", "/a/renamed/");
+        var writer = try storage.beginAtomicWrite(alloc, "/a//file");
+        var active = true;
+        defer if (active) writer.abort();
+        try writer.appendSlice("updated");
+        active = false;
+        try writer.finish();
+        const names = try storage.listFileNamesAlloc(alloc, "/a/");
+        defer StorageIo.freeFileNames(alloc, names);
+        try std.testing.expectEqual(expected.len, names.len);
+        for (expected, names) |want, got| try std.testing.expectEqualStrings(want, got);
+        const renamed = try storage.readFileAlloc(alloc, "/a/renamed/", 100);
+        defer alloc.free(renamed);
+        try std.testing.expectEqualStrings("/a/normal", renamed);
+        // The production namespace contract rejects these aliases; it is
+        // what makes subtree skipping safe for the scoped adapter.
+        var scoped = Store.initWithNamespace(alloc, &docs, "/a");
+        for ([_][]const u8{ "/a//other", "/a/other/", "/a/other//" }) |key|
+            try std.testing.expectError(error.InvalidNativeIndexPath, scoped.storage().writeFileAbsolute(key, "invalid"));
+    }
+    var reopened = try docstore.Store.open(alloc, path, true);
+    defer reopened.close();
+    var indexes = Store.init(alloc, &reopened);
+    const storage = indexes.storage();
+    const names = try storage.listFileNamesAlloc(alloc, "/a");
+    defer StorageIo.freeFileNames(alloc, names);
+    try std.testing.expectEqual(expected.len, names.len);
+    for (expected, names) |want, got| try std.testing.expectEqualStrings(want, got);
+    const updated = try storage.readFileAlloc(alloc, "/a//file", 100);
+    defer alloc.free(updated);
+    try std.testing.expectEqualStrings("updated", updated);
+    const trailing = try storage.readFileAlloc(alloc, "/a/file/", 100);
+    defer alloc.free(trailing);
+    try std.testing.expectEqualStrings("/a/file/", trailing);
+    try std.testing.expect((try reopened.file.check()).valid);
 }

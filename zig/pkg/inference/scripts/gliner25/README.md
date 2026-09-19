@@ -23,8 +23,10 @@ The canonical direct-core comparisons are:
 - [`BENCHMARK.md`](BENCHMARK.md): native CPU versus pinned Fastino CPU.
 - [`METAL_BENCHMARK.md`](METAL_BENCHMARK.md): native Metal versus pinned
   Fastino MPS and CPU.
+- [`CUDA.md`](CUDA.md): CUDA kernels and training, required-GPU tests, and
+  pinned Fastino CUDA eager, compiled, mixed-precision and FlashDeBERTa candidates.
 
-Both harnesses verify model, source, token, and output identity before timing.
+All comparisons verify model, source, token, and output identity before timing.
 They write reports outside the repository and do not qualify HTTP serving or
 release-tail performance.
 

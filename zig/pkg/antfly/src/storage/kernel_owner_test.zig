@@ -934,6 +934,24 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     const sibling_changed = try std.mem.replaceOwned(u8, std.testing.allocator, replacement_indexes_json, "\"dimension\":3", "\"dimension\":4");
     defer std.testing.allocator.free(sibling_changed);
     _ = try owner.reconcile("docs", "", sibling_changed, "full_text_index_v0", false);
+    // Installing a replacement index does not backfill it. Complete the
+    // targeted repair before checking query visibility later in this test.
+    var replacement_text_reconciled = false;
+    for (0..64) |_| {
+        const result = try owner.reconcile("docs", "", sibling_changed, "full_text_index_v0", true);
+        try std.testing.expect(result.state != .degraded);
+        if (result.state == .complete) {
+            replacement_text_reconciled = true;
+            break;
+        }
+    }
+    try std.testing.expect(replacement_text_reconciled);
+    var replacement_text_query = try owner.queryJson(
+        "docs",
+        "{\"full_text_search\":{\"match\":\"alpha\",\"field\":\"title\"},\"indexes\":[\"full_text_index_v0\"],\"limit\":10}",
+    );
+    defer replacement_text_query.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, replacement_text_query.bytes(), "doc:a") != null);
 
     var indexed_batch = try owner.batchJson(
         "docs",
@@ -1798,7 +1816,7 @@ test "opaque metadata listener boundary preserves incarnation commit ordering" {
 test "storage kernel status registry is unique and lossless" {
     try error_identity.validateForTest();
     const runtime_error = @import("../runtime_error_abi.zig");
-    for ([_]anyerror{ error.IndexRebuilding, error.IncompletePublishedSnapshot, error.DistributedQueryUnavailable }) |expected| {
+    for ([_]anyerror{ error.IndexRebuilding, error.IncompletePublishedSnapshot, error.DistributedQueryUnavailable, error.TableTopologyProtocolUpgradeRequired, error.StorageReadTemporarilyUnavailable }) |expected| {
         const failure = error_identity.failureFromError(
             expected,
             .local_query,
@@ -1813,7 +1831,8 @@ test "storage kernel status registry is unique and lossless" {
         };
         try std.testing.expectEqual(expected, received);
         const public_status = runtime_error.statusFromError(received);
-        try std.testing.expectEqual(@intFromEnum(runtime_error.Code.retryable), public_status.code);
+        const expected_code: runtime_error.Code = if (expected == error.TableTopologyProtocolUpgradeRequired) .unavailable else .retryable;
+        try std.testing.expectEqual(@intFromEnum(expected_code), public_status.code);
         try std.testing.expectEqual(expected, runtime_error.errorFromStatus(public_status));
     }
 }
@@ -1922,6 +1941,36 @@ test "storage query wire preserves empty projection and decoded sort profile lif
             try result.setOwnedSortProfile(result.sort_profile.?);
         }
     }.decode, .{allocation_wire.json});
+}
+
+test "storage and shard query contracts preserve search effort" {
+    const alloc = std.testing.allocator;
+    const contract = @import("../api/local_query_contract.zig");
+    const query = @import("../api/query_contract.zig");
+    // Start at the public request parser, as the benchmark adapter does.
+    // Both the in-process storage boundary and shard forwarding re-encode it.
+    for ([_]?f32{ null, 0, 0.35, 0.5, 1 }) |effort| {
+        const public_wire = try std.json.Stringify.valueAlloc(alloc, .{
+            .embeddings = .{ .vec = [_]f32{ 1, 0 } },
+            .limit = @as(u32, 100),
+            .fields = [_][]const u8{},
+            .search_effort = effort,
+        }, .{ .emit_null_optional_fields = false });
+        defer alloc.free(public_wire);
+        var original = try query.parsePublicQueryRequest(alloc, null, "docs", public_wire);
+        defer original.deinit(alloc);
+        try std.testing.expectEqual(effort, original.req.search_effort);
+        inline for (.{ contract.encodeStorageKernelQueryRequest, contract.encodeQueryRequest }) |encode| {
+            const wire = try encode(alloc, original.req);
+            defer alloc.free(wire);
+            var restored = try query.parseQueryRequest(alloc, null, "docs", wire);
+            defer restored.deinit(alloc);
+            try std.testing.expectEqual(effort, restored.req.search_effort);
+            try std.testing.expectEqual(@as(u32, 100), restored.req.limit);
+            try std.testing.expectEqual(@as(usize, 1), restored.req.dense_queries.len);
+            if (effort == null) try std.testing.expect(std.mem.indexOf(u8, wire, "search_effort") == null);
+        }
+    }
 }
 
 test "storage query contract preserves each vector candidate budget" {

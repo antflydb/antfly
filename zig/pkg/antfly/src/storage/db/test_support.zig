@@ -98,6 +98,13 @@ pub fn allocStressDenseDocJson(alloc: Allocator, dims: usize, doc_index: usize) 
     return owned;
 }
 
+pub fn fastTempPath(buf: []u8) [*:0]const u8 {
+    const root = @import("../../common/test_directory.zig").workspaceRoot() orelse return tempPath(buf);
+    const nonce = @atomicRmw(u64, &temp_path_nonce, .Add, 1, .monotonic);
+    const path = std.fmt.bufPrintZ(buf, "{s}/db-{d}-{d}-{d}", .{ root, std.posix.system.getpid(), platform.time.monotonicNs(), nonce }) catch @panic("test workspace path too long");
+    return path.ptr;
+}
+
 pub fn tempPath(buf: []u8) [*:0]const u8 {
     const base = "/tmp/antfly-db-test-";
     const ts = platform.time.monotonicNs();

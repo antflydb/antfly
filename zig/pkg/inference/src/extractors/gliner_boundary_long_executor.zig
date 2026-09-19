@@ -13,9 +13,9 @@ const pipeline = @import("../pipelines/gliner_boundary_pipeline.zig");
 const document_mod = @import("../pipelines/gliner_boundary_long_document.zig");
 const long_relations = @import("../pipelines/gliner_boundary_long_relations.zig");
 const boundary = @import("../pipelines/gliner_boundary_decode.zig");
-const engine = @import("../architectures/gliner_boundary_engine.zig");
-const head = @import("../architectures/gliner_boundary_head.zig");
-const device_request = @import("../architectures/gliner_boundary_request_device.zig");
+const engine = @import("../architectures/gliner/boundary_engine.zig");
+const head = @import("../architectures/gliner/boundary_head.zig");
+const device_request = @import("../architectures/gliner/boundary_request_device.zig");
 const compute = @import("../ops/ops.zig");
 const Tokenizer = @import("inference_tokenizer").Tokenizer;
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
@@ -462,7 +462,7 @@ pub fn executeNative(cb: *const compute.ComputeBackend, allocator: Allocator, co
 }
 
 pub fn executeDevice(cb: *const compute.ComputeBackend, allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, item: *const wire.Item, supplied: Options) !Result {
-    if (cb.kind() != .metal) return error.UnsupportedGlinerBoundaryBackend;
+    if ((cb.kind() != .metal and cb.kind() != .cuda)) return error.UnsupportedGlinerBoundaryBackend;
     if (cb.decoderRuntimeHasActiveFrame()) return error.GlinerBoundaryExternalFrame;
     return execute(cb, allocator, config, tokenizer, item, supplied);
 }
@@ -525,7 +525,7 @@ fn admitWindows(backend: compute.BackendKind, allocator: Allocator, config: *con
         try receiver.observe(item.text.len, document.words.len, document.windows.len, &prepared);
         const attention_per_layer = switch (backend) {
             .native => (try engine.plan(config, &prepared, engine_options)).attention_work_items,
-            .metal => (try device_request.plan(config, &prepared, &.{&item.compiled}, device_options)).encoder.native.attention_work_items,
+            .metal, .cuda => (try device_request.plan(config, &prepared, &.{&item.compiled}, device_options)).encoder.native.attention_work_items,
             else => return error.UnsupportedGlinerBoundaryBackend,
         };
         // Count attention score elements across every encoder layer. This is
@@ -549,7 +549,7 @@ pub fn qualifyGeometry(cb: *const compute.ComputeBackend, allocator: Allocator, 
 /// Host planning can run before acquiring an accelerator execution mutex.
 /// This explicit backend tag permits no dispatch or backend construction.
 pub fn planGeometry(backend: compute.BackendKind, allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, item: *const wire.Item, supplied: Options, receiver: anytype) !GeometryUsage {
-    if (backend != .native and backend != .metal) return error.UnsupportedGlinerBoundaryBackend;
+    if (backend != .native and (backend != .metal and backend != .cuda)) return error.UnsupportedGlinerBoundaryBackend;
     var quiet = supplied;
     quiet.observer = null;
     var planned = try prepareDocument(backend, allocator, config, item, quiet);
@@ -560,7 +560,7 @@ pub fn planGeometry(backend: compute.BackendKind, allocator: Allocator, config: 
 }
 
 pub fn executeQualified(cb: *const compute.ComputeBackend, allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, item: *const wire.Item, supplied: Options, gate: *qualification.Gate) !Result {
-    if (cb.kind() != .native and cb.kind() != .metal) return error.UnsupportedGlinerBoundaryBackend;
+    if (cb.kind() != .native and (cb.kind() != .metal and cb.kind() != .cuda)) return error.UnsupportedGlinerBoundaryBackend;
     if (cb.kind() == .metal and cb.decoderRuntimeHasActiveFrame()) return error.GlinerBoundaryExternalFrame;
     return executeChecked(cb, allocator, config, tokenizer, item, supplied, gate);
 }
@@ -601,7 +601,7 @@ fn encodeGroup(
             var scorer = pipeline.scoring.NativeContext{ .cb = cb, .config = config, .prepared = prepared, .core = .{ .text_states = encoded.text_states, .query_states = encoded.query_states, .classification_states = encoded.classification_states, .text_lengths = encoded.text_lengths }, .scores = if (headed) |*value| value else null };
             break :native try pipeline.runScoredWindows(output_allocator, config, prepared, schemas, if (headed) |*value| pipeline.scoring.CandidateScoreView.fromNative(value) else null, scorer.scorer(), pipeline_options, &.{});
         },
-        .metal => (try device_request.runWindowsWithOutputAllocator(cb, allocator, output_allocator, config, prepared, schemas, device_options)).outputs,
+        .metal, .cuda => (try device_request.runWindowsWithOutputAllocator(cb, allocator, output_allocator, config, prepared, schemas, device_options)).outputs,
         else => return error.UnsupportedGlinerBoundaryBackend,
     };
 }
@@ -748,7 +748,7 @@ test "gliner boundary long executor profile preserves declared policy across wor
         \\{"schema_version":2,"model":"profile","schema":{"entities":["person"]},"inputs":[{"content":"Ada"}]}
     , .{});
     defer request.deinit();
-    const config = @import("../architectures/gliner_boundary_engine.zig").TestBatch.config();
+    const config = @import("../architectures/gliner/boundary_engine.zig").TestBatch.config();
     var options = Options{ .identity = .{ .backbone = config.backbone, .precision = .fp32, .weight = artifact.Digest.of("profile weights"), .sidecars = @splat(artifact.Digest.of("profile config")) } };
     const original = try profile(a, &config, &request.items[0], options, "metal");
     options.profile_encoder_device_limit = options.device.max_encoder_device_bytes;
@@ -836,7 +836,7 @@ test "gliner boundary long executor pinned small Metal one-window task parity an
 
 fn testPinnedSmallWindows(directory: []const u8, metal: bool) !void {
     const a = std.testing.allocator;
-    const fixtures = @import("../architectures/gliner_boundary_parity_test.zig");
+    const fixtures = @import("../architectures/gliner/boundary_parity_test.zig");
     const bytes = try fixtures.fixtureBytes(a, "pipeline_cases.json");
     defer a.free(bytes);
     var reference = try std.json.parseFromSlice(pipeline.ReferenceFixture, a, bytes, .{});
@@ -894,7 +894,7 @@ fn fakeWindow(a: Allocator, sample: pipeline.Sample, rows: []const []const f64, 
 /// All packets below are synthetic post-score evidence. No tokenizer, encoder,
 /// boundary head, or checkpoint is used by these global integration tests.
 fn exerciseFakeMerge(a: Allocator, mode: FakeMergeMode) !void {
-    const fixtures = @import("../architectures/gliner_boundary_parity_test.zig");
+    const fixtures = @import("../architectures/gliner/boundary_parity_test.zig");
     const config_bytes = try fixtures.fixtureBytes(a, "models/small/config.json");
     defer a.free(config_bytes);
     const encoder_bytes = try fixtures.fixtureBytes(a, "models/small/encoder_config.json");

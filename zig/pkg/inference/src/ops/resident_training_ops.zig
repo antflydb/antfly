@@ -16,13 +16,59 @@ pub const Limits = struct {
 };
 
 pub const NormInput = struct { tensor: CT, elem_count: usize };
-pub const NormLimits = struct {
+pub const ValidationInput = NormInput;
+pub const ValidationLimits = struct {
     primitive: Limits = .{},
     max_tensors: usize = 4096,
     max_total_elements: usize = 1024 * 1024 * 1024,
     max_partial_bytes: usize = 64 * 1024 * 1024,
 };
+/// Boolean properties only: this operation must never substitute for clipping.
+pub const ValidationSummary = struct {
+    finite: bool,
+    all_zero: bool,
+    tensor_count: usize,
+    partial_bytes: usize,
+    download_bytes: usize,
+};
+
+pub fn validationChunks(elements: usize) !usize {
+    if (elements == 0) return error.InvalidResidentTrainingShape;
+    if (elements > std.math.maxInt(i32)) return error.ResourceLimitExceeded;
+    return std.math.divCeil(usize, elements, 65536);
+}
+
+/// One u32 per 64K-element chunk, then one final flags word. Used by both
+/// transaction admission and CUDA dispatch; no initialization buffer is needed.
+pub fn validationScratch(tensors: usize, chunks: usize) !usize {
+    if (tensors > 16384 or chunks >= std.math.maxInt(i32)) return error.ResourceLimitExceeded;
+    if (tensors == 0) {
+        if (chunks != 0) return error.InvalidResidentTrainingShape;
+        return 0;
+    }
+    if (chunks < tensors) return error.InvalidResidentTrainingShape;
+    return std.math.mul(usize, try std.math.add(usize, chunks, 1), 4);
+}
+pub const NormProfile = enum { scaled_f64, pytorch_f32 };
+pub const NormLimits = struct {
+    /// Explicit CUDA arithmetic profile; other backends retain scaled norms.
+    profile: NormProfile = .scaled_f64,
+    primitive: Limits = .{},
+    max_tensors: usize = 4096,
+    max_total_elements: usize = 1024 * 1024 * 1024,
+    max_partial_bytes: usize = 64 * 1024 * 1024,
+};
+/// Largest reusable chunk buffer, ordered tensor norms, and one result scalar.
+pub fn pytorchNormScratch(tensors: usize, largest_elements: usize) !usize {
+    if (tensors > 16384 or largest_elements > std.math.maxInt(i32)) return error.ResourceLimitExceeded;
+    if (tensors == 0) return 0;
+    if (largest_elements == 0) return error.InvalidResidentTrainingShape;
+    const chunks = try std.math.divCeil(usize, largest_elements, 65536);
+    return std.math.mul(usize, try std.math.add(usize, chunks, try std.math.add(usize, tensors, 1)), 4);
+}
+
 pub const NormSummary = struct {
+    /// For pytorch_f32 this is the square of the rounded final norm.
     sum_squares: f64,
     norm: f64,
     finite: bool,
@@ -98,4 +144,21 @@ test "resident training primitive admission uses exact integer bounds and scatte
     try std.testing.expectError(error.InvalidResidentTrainingShape, shapeElements(i64, &.{ @as(i64, std.math.maxInt(i32)) + 1, 1 }, .{}));
     try std.testing.expectError(error.ResourceLimitExceeded, shapeElements(i32, &.{ 4096, 4096 }, .{ .max_tensor_bytes = 1024 }));
     try std.testing.expectError(error.ResourceLimitExceeded, scatterWork(1024, 1024, .{ .max_scatter_work = 1000 }));
+}
+
+test "resident validation scratch admission bounds tails and legacy allowance" {
+    try std.testing.expectEqual(@as(usize, 0), try validationScratch(0, 0));
+    try std.testing.expectError(error.InvalidResidentTrainingShape, validationChunks(0));
+    try std.testing.expectError(error.ResourceLimitExceeded, validationChunks(@as(usize, std.math.maxInt(i32)) + 1));
+    try std.testing.expectError(error.InvalidResidentTrainingShape, validationScratch(0, 1));
+    try std.testing.expectError(error.InvalidResidentTrainingShape, validationScratch(2, 1));
+    try std.testing.expectError(error.ResourceLimitExceeded, validationScratch(16385, 16385));
+    try std.testing.expectError(error.ResourceLimitExceeded, validationScratch(1, std.math.maxInt(i32)));
+    for ([_]usize{ 1, 1023, 1024, 1025, 65535, 65536, 65537, std.math.maxInt(i32) }) |n| {
+        for ([_]usize{ 1, 128, 256, 16384 }) |tensors| {
+            const bytes = try validationScratch(tensors, tensors * try validationChunks(n));
+            const legacy = tensors * (try std.math.divCeil(usize, n, 1024)) * 12;
+            try std.testing.expect(bytes <= legacy);
+        }
+    }
 }

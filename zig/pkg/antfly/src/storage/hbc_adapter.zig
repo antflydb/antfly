@@ -16032,8 +16032,19 @@ pub const HBCIndex = struct {
         values_storage: []?[]const u8,
         scratch: []f32,
     ) !bool {
-        if (self.bulk_split_vector_workspace.active) {
-            return try self.loadExternalVectorsTransformedIntoMatrixWithBulkSplitWorkspace(
+        const loaded = if (self.bulk_split_vector_workspace.active)
+            try self.loadExternalVectorsTransformedIntoMatrixWithBulkSplitWorkspace(
+                txn,
+                vector_ids,
+                matrix_positions,
+                matrix,
+                lookup_storage,
+                key_views_storage,
+                values_storage,
+                scratch,
+            )
+        else
+            try self.loadExternalVectorsTransformedIntoMatrixUncached(
                 txn,
                 vector_ids,
                 matrix_positions,
@@ -16043,17 +16054,21 @@ pub const HBCIndex = struct {
                 values_storage,
                 scratch,
             );
+        if (loaded) return true;
+        // Point loaders cannot fill a batch view directly. Transform each
+        // point while its one-vector scratch is hot, instead of staging a
+        // second leaf-sized matrix of raw vectors before transforming it.
+        // Keep the existing batch-loader fallback and current/previous-vector
+        // selection intact; no source data survives this call.
+        if (!self.hasExternalVectorLoader() or self.external_vector_batch_scratch_loader != null) return false;
+        if (vector_ids.len != matrix_positions.len or scratch.len < self.config.dims) return error.InvalidArgument;
+        for (vector_ids, matrix_positions) |vector_id, position| {
+            const offset = std.math.mul(usize, position, self.config.dims) catch return error.BufferTooSmall;
+            if (offset > matrix.len or matrix.len - offset < self.config.dims) return error.BufferTooSmall;
+            const original = try self.getVectorInto(txn, vector_id, scratch);
+            _ = self.transformVector(original, matrix[offset..][0..self.config.dims]);
         }
-        return try self.loadExternalVectorsTransformedIntoMatrixUncached(
-            txn,
-            vector_ids,
-            matrix_positions,
-            matrix,
-            lookup_storage,
-            key_views_storage,
-            values_storage,
-            scratch,
-        );
+        return true;
     }
 
     /// The replay/split path already owns one bounded, transaction-scoped
@@ -19668,7 +19683,9 @@ pub const HBCDebugNode = vectorindex_search_types.HBCDebugNode;
 // ============================================================================
 
 test "create and open index" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -19692,7 +19709,9 @@ test "create and open index" {
 }
 
 test "hbc randomized insert delete churn preserves tree link invariants" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -19756,7 +19775,9 @@ test "hbc randomized insert delete churn preserves tree link invariants" {
 }
 
 test "hbc repairTreeLinks clears dangling references and restores consistency" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -19843,7 +19864,9 @@ test "hbc repairTreeLinks clears dangling references and restores consistency" {
 }
 
 test "flat rabitq complete snapshot rejects a directory built with dangling nodes" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -19896,7 +19919,9 @@ test "flat rabitq complete snapshot rejects a directory built with dangling node
 }
 
 test "flat rabitq complete snapshot rejects a cyclic directory topology" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -19961,7 +19986,9 @@ test "flat rabitq complete snapshot rejects a cyclic directory topology" {
 }
 
 test "search node loading rejects oversized published internal fanout" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -20015,7 +20042,9 @@ test "search node loading rejects oversized published internal fanout" {
 }
 
 test "flat directory node loading bounds oversized leaf payloads and centroids" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -20077,7 +20106,9 @@ test "flat directory node loading bounds oversized leaf payloads and centroids" 
 }
 
 test "complete snapshot rejects orphaned reachable coverage and schedules generation repair" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -20138,7 +20169,9 @@ test "complete snapshot rejects orphaned reachable coverage and schedules genera
 }
 
 test "small quantized complete snapshot validates authoritative leaf assignments" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -20184,7 +20217,9 @@ test "small quantized complete snapshot validates authoritative leaf assignments
 }
 
 test "incomplete snapshot repair marker is scoped to its publication generation" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -20215,7 +20250,9 @@ test "incomplete snapshot repair marker is scoped to its publication generation"
 }
 
 test "complete coverage validation claim caches success and retries failure" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -20252,7 +20289,9 @@ fn waitForCompleteCoverageWaiter(index: *HBCIndex, generation: u64, io: std.Io) 
 
 test "complete coverage validation waiter honors cancellation without canceling owner" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -20291,7 +20330,9 @@ test "complete coverage validation waiter honors cancellation without canceling 
 }
 
 test "complete coverage flight preserves older success after newer validation" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -20320,7 +20361,9 @@ test "complete coverage flight preserves older success after newer validation" {
 
 test "complete coverage flight shares a deterministic producer failure" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -20355,7 +20398,9 @@ test "complete coverage flight shares a deterministic producer failure" {
 }
 
 test "complete coverage flight retries an owner-local cancellation" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -20377,7 +20422,9 @@ test "complete coverage flight retries an owner-local cancellation" {
 }
 
 test "complete coverage flight does not broadcast a query-scoped failure" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -20399,7 +20446,9 @@ test "complete coverage flight does not broadcast a query-scoped failure" {
 }
 
 test "complete coverage flight propagates backend runtime cancellation" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -20436,7 +20485,9 @@ fn waitForFlatCentroidBuildWaiter(index: *HBCIndex, generation: u64, io: std.Io)
 
 test "flat centroid build single flight waits on backend runtime" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -20479,7 +20530,9 @@ test "flat centroid build single flight waits on backend runtime" {
 
 test "flat centroid build flight shares a completed stale generation result" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -20527,7 +20580,9 @@ test "flat centroid build flight shares a completed stale generation result" {
 
 test "flat centroid build flight shares a deterministic producer failure" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -20566,7 +20621,9 @@ test "flat centroid build flight shares a deterministic producer failure" {
 }
 
 test "stale flat directory build preserves the current generation cache" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -20642,7 +20699,9 @@ test "stale flat directory build preserves the current generation cache" {
 }
 
 test "coverage and flat build flights do not block a newer generation" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -20672,7 +20731,9 @@ test "coverage and flat build flights do not block a newer generation" {
 
 test "search publication wait uses runtime wakeups and honors cancellation" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -20781,7 +20842,9 @@ test "search publication wait uses runtime wakeups and honors cancellation" {
 }
 
 test "complete snapshot retry releases publication fence after durable txn capture" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -20862,7 +20925,9 @@ test "complete snapshot retry releases publication fence after durable txn captu
 }
 
 test "durable snapshot captures a publisher immediately before its fence" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -20934,7 +20999,9 @@ test "durable snapshot captures a publisher immediately before its fence" {
 }
 
 test "durable incomplete snapshot terminates when publication advances during traversal" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -21009,7 +21076,9 @@ test "durable incomplete snapshot terminates when publication advances during tr
 }
 
 test "aborted published transaction cannot leak staged topology through caches" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -21071,7 +21140,9 @@ test "aborted published transaction cannot leak staged topology through caches" 
 }
 
 test "root leaf complete snapshot rejects a missing referenced vector" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -21117,7 +21188,9 @@ test "root leaf complete snapshot rejects a missing referenced vector" {
 }
 
 test "hbc duplicate child links are dropped by unlink and repair" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -21202,7 +21275,9 @@ test "hbc duplicate child links are dropped by unlink and repair" {
 }
 
 test "default random ortho transform matches go hbc" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     const input = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
 
     {
@@ -21255,7 +21330,9 @@ test "hbc shared cache namespaces entries" {
 }
 
 test "hbc index reports shared cache ownership" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -21271,7 +21348,9 @@ test "hbc index reports shared cache ownership" {
 }
 
 test "hbc shared cache rejects node quantized and metadata fills from an older publication" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var cache = Cache.init(alloc);
     defer cache.deinit();
     const namespace = hbcCacheNamespace("/tmp/hbc-publication-fill-guard");
@@ -21540,7 +21619,9 @@ test "hbc shared vector leases remain coherent during invalidate and replacement
 }
 
 test "hbc vector fill captured before a committed mutation cannot repopulate stale data" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -21567,7 +21648,9 @@ test "hbc vector fill captured before a committed mutation cannot repopulate sta
 }
 
 test "hbc vector cache clear fences scalar and residency fill generations" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -21615,7 +21698,9 @@ test "hbc shared detached leases remain physically accounted until release" {
 }
 
 test "hbc retained node and quantized handles survive threaded eviction" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var resource_manager = resource_manager_mod.ResourceManager.init(.{});
     defer resource_manager.deinit(alloc);
     var cache = Cache.init(alloc);
@@ -21669,12 +21754,14 @@ test "hbc retained node and quantized handles survive threaded eviction" {
 }
 
 test "hbc standalone detached leases remain physically accounted until release" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
     var resource_manager = resource_manager_mod.ResourceManager.init(.{});
-    defer resource_manager.deinit(std.testing.allocator);
+    defer resource_manager.deinit(alloc);
     var idx = try HBCIndex.open(alloc, path, .{ .dims = 4, .max_cached_vectors = 8 });
     defer idx.close();
     idx.attachResourceManager(&resource_manager);
@@ -21692,7 +21779,9 @@ test "hbc standalone detached leases remain physically accounted until release" 
 }
 
 test "hbc standalone cache yields to foreground aggregate admission" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -21701,7 +21790,7 @@ test "hbc standalone cache yields to foreground aggregate admission" {
     var resource_manager = resource_manager_mod.ResourceManager.init(.{
         .memory_budget = .{ .soft_limit_bytes = bytes, .hard_limit_bytes = bytes + 1 },
     });
-    defer resource_manager.deinit(std.testing.allocator);
+    defer resource_manager.deinit(alloc);
     var idx = try HBCIndex.open(alloc, path, .{ .dims = 4, .max_cached_vectors = 8 });
     defer idx.close();
     idx.attachResourceManager(&resource_manager);
@@ -21760,7 +21849,9 @@ test "hbc concurrent vector admission samples at a full steady target" {
 }
 
 test "hbc decoded residency lease reserves a complete query and bypasses mid-query sampling" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -21812,7 +21903,9 @@ test "hbc decoded residency lease reserves a complete query and bypasses mid-que
 }
 
 test "hbc sequential cold-start leases fill eagerly and sample replacement at capacity" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -21868,7 +21961,9 @@ test "hbc sequential cold-start leases fill eagerly and sample replacement at ca
 }
 
 test "hbc overlapping cold-start leases activate the admission doorkeeper" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -21915,7 +22010,9 @@ test "hbc overlapping cold-start leases activate the admission doorkeeper" {
 }
 
 test "hbc concurrent cold-start lease acquisition remains bounded" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -21975,7 +22072,9 @@ test "hbc concurrent cold-start lease acquisition remains bounded" {
 }
 
 test "hbc sampled decoded residency evolves a full resident set within its byte target" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -22017,7 +22116,9 @@ test "hbc sampled decoded residency evolves a full resident set within its byte 
 }
 
 test "hbc decoded residency fails closed when pinned entries prevent precharge" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -22051,7 +22152,9 @@ test "hbc decoded residency fails closed when pinned entries prevent precharge" 
 }
 
 test "hbc route observation counts external distance timing once" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -22083,7 +22186,9 @@ test "hbc route observation counts external distance timing once" {
 }
 
 test "hbc exact-route vector admission samples outside the search epoch" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -22192,13 +22297,15 @@ test "hbc shared cache reclaims an over-quota namespace for a borrowing peer" {
 }
 
 test "hbc shared vector cache warms during concurrent search" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
 
     var resource_manager = resource_manager_mod.ResourceManager.init(.{});
-    defer resource_manager.deinit(std.testing.allocator);
+    defer resource_manager.deinit(alloc);
     var cache = Cache.init(alloc);
     defer cache.deinit();
     cache.attachResourceManager(&resource_manager);
@@ -22221,7 +22328,9 @@ test "hbc shared vector cache warms during concurrent search" {
 }
 
 test "hbc external rerank loads metadata only for decoded vector misses" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -22358,7 +22467,9 @@ test "hbc external rerank loads metadata only for decoded vector misses" {
 }
 
 test "hbc external rerank completes saved locations before metadata fallback" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -22464,7 +22575,9 @@ test "hbc external rerank completes saved locations before metadata fallback" {
 }
 
 test "hbc uncached external rerank does not publish snapshot metadata" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -22536,7 +22649,9 @@ test "hbc uncached external rerank does not publish snapshot metadata" {
 }
 
 test "hbc old snapshot metadata cannot poison the current cache generation" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -22603,7 +22718,9 @@ test "hbc old snapshot metadata cannot poison the current cache generation" {
 }
 
 test "hbc old snapshot cannot repopulate pinned upper tree after publication" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -22872,7 +22989,9 @@ test "hbc shared cache writer progresses under continuous striped reads" {
 }
 
 test "hbc stable cache namespace canonicalizes equivalent path spellings" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -22896,7 +23015,9 @@ test "hbc stable cache namespace canonicalizes equivalent path spellings" {
 }
 
 test "hbc index cache disable clears shared namespace and stops accounting growth" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -22928,7 +23049,9 @@ test "hbc index cache disable clears shared namespace and stops accounting growt
 }
 
 test "hbc retained vector cache is bypassed during external vector replay" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -22951,7 +23074,9 @@ test "hbc retained vector cache is bypassed during external vector replay" {
 }
 
 test "hbc retained vector cache can be disabled independently of metadata cache" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -22981,7 +23106,9 @@ test "hbc retained vector cache can be disabled independently of metadata cache"
 }
 
 test "hbc metadata cache remains active when vector cache capacity is zero" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -23015,7 +23142,9 @@ test "hbc metadata cache remains active when vector cache capacity is zero" {
 }
 
 test "hbc shared vector cache batch admission is concurrent and epoch guarded" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -23066,7 +23195,9 @@ test "hbc shared vector cache batch admission is concurrent and epoch guarded" {
 }
 
 test "hbc shared vector cache batch scoring returns exact hits and misses" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -23119,7 +23250,9 @@ test "hbc shared vector cache batch scoring returns exact hits and misses" {
 }
 
 test "hbc metadata cache is retained and resource managed during concurrent search" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -23148,7 +23281,9 @@ test "hbc metadata cache is retained and resource managed during concurrent sear
 }
 
 test "hbc retained vector cache defaults on for search performance" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -23171,7 +23306,9 @@ test "hbc retained vector cache defaults on for search performance" {
 }
 
 test "hbc vector artifact reads avoid duplicate LSM block residency only with retained vectors" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -23195,7 +23332,9 @@ test "hbc vector artifact reads avoid duplicate LSM block residency only with re
 }
 
 test "hbc index close does not clear shared namespace bytes" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -23221,7 +23360,9 @@ test "hbc index close does not clear shared namespace bytes" {
 }
 
 test "hbc shared cache releases unused namespace path registrations" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -23253,7 +23394,9 @@ test "hbc shared cache releases unused namespace path registrations" {
 }
 
 test "hbc shared cache bounds namespace state across path churn" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var cache = Cache.init(alloc);
     defer cache.deinit();
 
@@ -23273,7 +23416,9 @@ test "hbc shared cache bounds namespace state across path churn" {
 }
 
 test "hbc cache reports byte usage to resource manager" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -23304,7 +23449,9 @@ test "hbc cache reports byte usage to resource manager" {
 }
 
 test "hbc retains a bounded pool of concurrent search scratch" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -23354,7 +23501,9 @@ test "hbc retains a bounded pool of concurrent search scratch" {
 }
 
 test "hbc search charges estimated quantized scan bytes to node admission" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -23403,7 +23552,9 @@ test "hbc search charges estimated quantized scan bytes to node admission" {
 }
 
 test "missing optional projections preserve immutable scan admission and shadow fallback" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     const centroid = [_]f32{0} ** 64;
     const members = [_]u64{ 1, 2 };
     var packed_node: [vectorindex_hbc.packedNodeValueSize(@sizeOf(@TypeOf(centroid)), @sizeOf(@TypeOf(members)))]u8 = undefined;
@@ -23460,7 +23611,9 @@ test "missing optional projections preserve immutable scan admission and shadow 
 }
 
 test "native flat admission sums authenticated selected leaf costs" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -23670,7 +23823,9 @@ test "native flat admission sums authenticated selected leaf costs" {
 }
 
 test "progressive scan growth releases old permits before FIFO reacquisition" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
@@ -23731,7 +23886,9 @@ test "progressive scan growth releases old permits before FIFO reacquisition" {
 }
 
 test "progressive scan growth cancellation releases the old reservation and queue entry" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
@@ -23782,7 +23939,9 @@ test "progressive scan growth cancellation releases the old reservation and queu
 }
 
 test "hbc admission follows and pins the current immutable generation" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -23890,7 +24049,9 @@ test "hbc admission follows and pins the current immutable generation" {
 }
 
 test "hbc queued admission rebinds topology and reservation to the current generation" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -24007,7 +24168,9 @@ test "hbc queued admission rebinds topology and reservation to the current gener
 }
 
 test "hbc empty search bypasses saturated dense bandwidth" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -24062,15 +24225,17 @@ test "hbc empty search bypasses saturated dense bandwidth" {
 }
 
 test "hbc resource manager reattachment is idempotent and transfers local cache usage" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
 
     var first_manager = resource_manager_mod.ResourceManager.init(.{});
-    defer first_manager.deinit(std.testing.allocator);
+    defer first_manager.deinit(alloc);
     var second_manager = resource_manager_mod.ResourceManager.init(.{});
-    defer second_manager.deinit(std.testing.allocator);
+    defer second_manager.deinit(alloc);
     var idx = try HBCIndex.open(alloc, path, .{ .dims = 4 });
     defer idx.close();
 
@@ -24090,7 +24255,9 @@ test "hbc resource manager reattachment is idempotent and transfers local cache 
 }
 
 test "hbc opportunistic vector cache skips instead of overcommitting resource budget" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -24118,7 +24285,9 @@ test "hbc opportunistic vector cache skips instead of overcommitting resource bu
 }
 
 test "hbc routing scratch reports bytes to resource manager" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -24148,7 +24317,9 @@ test "hbc routing scratch reports bytes to resource manager" {
 }
 
 test "hbc search scratch reports bytes to resource manager" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -24181,7 +24352,9 @@ test "hbc search scratch reports bytes to resource manager" {
 }
 
 test "failed search scratch reservation keeps partially grown buffers accounted" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -24211,7 +24384,9 @@ test "failed search scratch reservation keeps partially grown buffers accounted"
 }
 
 test "cold flat centroid build preadmits transient and retained memory" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -24270,7 +24445,9 @@ test "cold flat centroid build preadmits transient and retained memory" {
 }
 
 test "flat centroid directory stays accounted until its final reference" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -24318,7 +24495,9 @@ test "flat centroid directory stays accounted until its final reference" {
 }
 
 test "flat centroid reservation handoff does not double count retained bytes" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -24354,7 +24533,9 @@ test "flat centroid reservation handoff does not double count retained bytes" {
 }
 
 test "exhaustive search workspace is admitted before growth and released after rejection" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -24420,7 +24601,9 @@ test "exhaustive search workspace is admitted before growth and released after r
 }
 
 test "flat block scoring workspace is included in exhaustive pre-admission" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -24440,10 +24623,16 @@ test "flat block scoring workspace is included in exhaustive pre-admission" {
     });
     var idx_open = true;
     defer if (idx_open) idx.close();
-    for (0..128) |i| {
+    // Preserve directory/block and leaf sizes; insertion has separate split
+    // regressions and is not part of search workspace admission.
+    var vectors: [128][dims]f32 = undefined;
+    var items: [128]BatchInsertItem = undefined;
+    for (&vectors, &items, 0..) |*vector, *item, i| {
         const value: f32 = @floatFromInt(i);
-        try idx.insert(@intCast(i + 1), &.{ value, value / 8 });
+        vector.* = .{ value, value / 8 };
+        item.* = .{ .vector_id = @intCast(i + 1), .vector = vector };
     }
+    try idx.bulkBuildWithMetadata(&items);
 
     // Materialize the immutable directory, then return the cached request
     // scratch to its bounded shape so this test controls every later growth.
@@ -24527,7 +24716,9 @@ test "flat block scoring workspace is included in exhaustive pre-admission" {
 }
 
 test "resource pressure reclaims retained flat search scratch" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -24546,12 +24737,16 @@ test "resource pressure reclaims retained flat search scratch" {
     });
     var idx_open = true;
     defer if (idx_open) idx.close();
-    var vector: [dims]f32 = undefined;
-    for (0..192) |i| {
-        for (&vector, 0..) |*value, dim| value.* = @floatFromInt(i + dim);
-        try idx.insert(@intCast(i + 1), &vector);
+    // This fixture tests retained search scratch, not incremental splitting.
+    // Preserve all 192 vectors and the two-member leaf admission boundary.
+    var vectors: [192][dims]f32 = undefined;
+    var items: [192]BatchInsertItem = undefined;
+    for (&vectors, &items, 0..) |*vector, *item, i| {
+        for (vector, 0..) |*value, dim| value.* = @floatFromInt(i + dim);
+        item.* = .{ .vector_id = @intCast(i + 1), .vector = vector };
     }
-    @memset(&vector, 0);
+    try idx.bulkBuildWithMetadata(&items);
+    const vector: [dims]f32 = @splat(0);
     var warm = try idx.searchWithRequest(.{
         .query = &vector,
         .k = 3,
@@ -24589,7 +24784,9 @@ test "resource pressure reclaims retained flat search scratch" {
 }
 
 test "hbc leaf split matrix reports dense apply workspace bytes" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -24616,7 +24813,9 @@ test "hbc leaf split matrix reports dense apply workspace bytes" {
 }
 
 test "hbc cache shrinks to resource budget under pressure" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -24667,7 +24866,9 @@ test "posting patch cache distributes sequential postings across stripes" {
 }
 
 test "reopen rejects dimension mismatch" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -24681,7 +24882,9 @@ test "reopen rejects dimension mismatch" {
 }
 
 test "reopen rejects metric mismatch" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -24695,7 +24898,9 @@ test "reopen rejects metric mismatch" {
 }
 
 test "insert and search" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -24769,7 +24974,9 @@ fn createTestExperimentalPostingReadState(
 }
 
 test "posting WAL recovery reconstructs patch bases without pinning the serving cache" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     const original = [_]u8{7} ** 4096;
     var middle = original;
     middle[2048] = 9;
@@ -24806,7 +25013,9 @@ test "posting WAL recovery reconstructs patch bases without pinning the serving 
 }
 
 test "posting capture value leases release reconstructed patches at transaction end" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -24843,7 +25052,9 @@ test "posting capture value leases release reconstructed patches at transaction 
 }
 
 test "posting patch cache eviction retains request values and physical accounting" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var manager = resource_manager_mod.ResourceManager.init(.{});
     defer manager.deinit(alloc);
     const original = [_]u8{7} ** 4096;
@@ -24892,7 +25103,9 @@ test "posting patch cache eviction retains request values and physical accountin
 }
 
 test "immutable posting replacement patches resolve bounded chains and compact logically" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     const id: u64 = 41;
     var base: [4096]u8 = undefined;
     for (&base, 0..) |*byte, i| byte.* = @truncate(i *% 193 +% i / 11);
@@ -25016,7 +25229,9 @@ test "immutable posting replacement patches resolve bounded chains and compact l
 }
 
 test "quantized patches resolve their logical base from a native full checkpoint" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     for ([_]bool{ false, true }) |omitted_l2| {
         const id: u64 = 73;
         var original = proto.RaBitQuantizedVectorSet{
@@ -25103,7 +25318,9 @@ test "quantized patches resolve their logical base from a native full checkpoint
 }
 
 test "immutable posting replacement patches reject wrong bases and targets" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     const id: u64 = 17;
     var base: [4096]u8 = undefined;
     for (&base, 0..) |*byte, i| byte.* = @truncate(i *% 131 +% i / 7);
@@ -25143,7 +25360,9 @@ test "immutable posting replacement patches reject wrong bases and targets" {
 }
 
 test "immutable posting delta embeds exact centroid replacements" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     const id: u64 = 7;
     const header = NodeHeader{ .is_leaf = true, .level = 0, .parent = 1 };
     const members = [_]u64{ 11, 13 };
@@ -25291,7 +25510,9 @@ test "posting scan compaction requires substantial measured obsolete bytes" {
 }
 
 test "compact subgroup concurrent staging preserves resource accounting" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var runtime = std.Io.Threaded.init(alloc, .{});
     defer runtime.deinit();
     var manager = resource_manager_mod.ResourceManager.init(.{});
@@ -25335,7 +25556,9 @@ test "certified subgroup native lifecycle preserves exact scores with tree routi
 }
 
 fn testNativeSubgroupLifecycleMode(directory_mode: HBCConfig.CentroidDirectoryMode, global: bool, compact: bool, certified: bool) !void {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -25480,7 +25703,9 @@ test "compact subgroup plan preserves native lifecycle with tree routing" {
 }
 
 test "quantized native routing serves exact complete coverage across delta and reopen" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -25550,7 +25775,9 @@ test "quantized native routing serves exact complete coverage across delta and r
 }
 
 test "experimental posting checkpoint reopens safely and publishes immutable generations" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -25740,7 +25967,9 @@ test "experimental posting checkpoint reopens safely and publishes immutable gen
 }
 
 test "native suffix checkpoint preserves pinned readers tombstones and a concurrent WAL tail across restart" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -25869,7 +26098,9 @@ test "native suffix checkpoint preserves pinned readers tombstones and a concurr
 }
 
 test "prepared posting activation rejects incompatible metadata before CURRENT and keeps writes serviceable" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -25978,7 +26209,9 @@ test "posting reader rebase retains blobs tombstones and coverage without replay
 }
 
 test "background posting checkpoint preserves concurrent same-sequence WAL tail" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -26250,7 +26483,9 @@ test "max-chain full checkpoint starts below the hard WAL budget" {
 }
 
 test "posting WAL capacity rejection starts mandatory checkpoint recovery" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -26298,7 +26533,9 @@ test "posting WAL capacity rejection starts mandatory checkpoint recovery" {
 }
 
 test "posting WAL capacity recovery checkpoints only committed mutation metadata" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -26382,7 +26619,9 @@ test "posting WAL capacity recovery checkpoints only committed mutation metadata
 }
 
 test "native posting initial acceleration is distinct from later consolidation" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -26541,7 +26780,9 @@ test "native posting initial acceleration is distinct from later consolidation" 
 }
 
 test "posting WAL mutations provide read your writes without derived LSM persistence" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -26652,7 +26893,9 @@ test "posting WAL mutations provide read your writes without derived LSM persist
 }
 
 test "native old read cannot consume current routing and vector caches" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -26696,7 +26939,9 @@ test "native old read cannot consume current routing and vector caches" {
 }
 
 test "native delayed admission retains its original cache epoch" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -26753,9 +26998,13 @@ test "wide native external update query results survive reopening unchanged" {
 }
 
 fn testNativeExternalUpdateReopen(comptime dims: usize) !void {
+    var profile = @import("test_work_profile.zig").Profile(enum { setup, insert, persist, query, cache_check, checkpoint, close, reopen }).init();
+    defer profile.report("external-update-reopen");
     const vector_count = if (dims == 1536) 4096 else 512;
     const query_k = if (dims == 1536) 100 else 10;
-    const alloc = std.testing.allocator;
+    var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
+    defer std.debug.assert(allocator_state.deinit() == .ok);
+    const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -26798,6 +27047,7 @@ fn testNativeExternalUpdateReopen(comptime dims: usize) !void {
             idx.attachResourceManager(&resources);
             idx.attachSharedCache(&cache);
         }
+        profile.mark(.setup);
         var batch: [vector_count / 16]BatchInsertItem = undefined;
         for (0..24) |step| {
             const start = if (step < 16) step * batch.len else (step - 16) * batch.len;
@@ -26809,21 +27059,36 @@ fn testNativeExternalUpdateReopen(comptime dims: usize) !void {
                 item.* = .{ .vector_id = id + 1, .vector = &source.vectors[id], .metadata = "embedding" };
             }
             try idx.beginExperimentalPostingMutationCapture();
+            const routes_before = idx.getWriteProfile().insert_find_leaf_calls;
             try idx.batchInsertWithMetadataOptions(&batch, .{ .skip_vector_store = true, .assume_absent_ids = step < 16, .coalesce_leaf_writes = true, .defer_quantized_rebuild = dims == 1536 });
+            try std.testing.expect(idx.getWriteProfile().insert_find_leaf_calls - routes_before <= batch.len);
+            profile.mark(.insert);
             try idx.persistExperimentalPostingSidecarAtAppliedSequence(step + 1, .{});
             if (step == 0) {
                 idx.setExperimentalPostingAuthorityTransitionPermitted(true);
                 try idx.enableNativePostingMutationStore();
             }
+            profile.mark(.persist);
             var query = try idx.searchWithRequest(.{ .query = &source.vectors[0], .k = query_k, .search_width = if (dims == 1536) 17 else 4, .epsilon = if (dims == 1536) 1.45 else 0.1, .rerank_factor = if (dims == 1536) 9 else 3 });
             query.deinit();
+            profile.mark(.query);
         }
+        const work = idx.getWriteProfile();
+        // At most one routing traversal for each of the 24 x 256 mutations.
+        try std.testing.expect(work.insert_find_leaf_calls <= 24 * 256);
+        if (dims == 1536) {
+            try std.testing.expect(work.centroid_delta_removals > 0);
+            try std.testing.expect(work.centroid_recompute_members_total < 110_000);
+        }
+        if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_WORK_PROFILE"))
+            std.debug.print("\nWORK external-update dims={d} routes={d} centroid_recomputes={d} centroid_members={d}\n", .{ dims, work.insert_find_leaf_calls, work.centroid_recompute_calls, work.centroid_recompute_members_total });
         for (&expected, 0..) |*ids, query_id| {
             var result = try idx.searchWithRequest(.{ .query = &source.vectors[query_id * 7], .k = query_k, .search_width = if (dims == 1536) 17 else 4, .epsilon = if (dims == 1536) 1.45 else 0.1, .rerank_factor = if (dims == 1536) 9 else 3 });
             defer result.deinit();
             try std.testing.expectEqual(ids.len, result.items.items.len);
             for (ids, result.items.items) |*id, item| id.* = item.vector_id;
         }
+        profile.mark(.query);
         {
             var txn = try idx.beginRuntimeReadTxn();
             defer txn.abort();
@@ -26848,6 +27113,7 @@ fn testNativeExternalUpdateReopen(comptime dims: usize) !void {
                 }
             }
         }
+        profile.mark(.cache_check);
         idx.clearQuantizedCache();
         for (expected, 0..) |ids, query_id| {
             var result = try idx.searchWithRequest(.{ .query = &source.vectors[query_id * 7], .k = query_k, .search_width = if (dims == 1536) 17 else 4, .epsilon = if (dims == 1536) 1.45 else 0.1, .rerank_factor = if (dims == 1536) 9 else 3 });
@@ -26855,6 +27121,7 @@ fn testNativeExternalUpdateReopen(comptime dims: usize) !void {
             try std.testing.expectEqual(ids.len, result.items.items.len);
             for (ids, result.items.items) |id, item| try std.testing.expectEqual(id, item.vector_id);
         }
+        profile.mark(.query);
         const before_generation = idx.retainCurrentExperimentalPostingReadGeneration().?;
         defer before_generation.release();
         _ = try idx.publishExperimentalPostingCheckpoint(24);
@@ -26873,12 +27140,14 @@ fn testNativeExternalUpdateReopen(comptime dims: usize) !void {
                 };
             }
         }
+        profile.mark(.checkpoint);
         for (expected, 0..) |ids, query_id| {
             var result = try idx.searchWithRequest(.{ .query = &source.vectors[query_id * 7], .k = query_k, .search_width = if (dims == 1536) 17 else 4, .epsilon = if (dims == 1536) 1.45 else 0.1, .rerank_factor = if (dims == 1536) 9 else 3 });
             defer result.deinit();
             try std.testing.expectEqual(ids.len, result.items.items.len);
             for (ids, result.items.items) |id, item| try std.testing.expectEqual(id, item.vector_id);
         }
+        profile.mark(.query);
         // Repeating identical packed/scoring values must retain the native
         // generation and append only coverage, rather than shadowing its scan
         // planes with copy-only patches and scheduling redundant checkpoints.
@@ -26903,13 +27172,16 @@ fn testNativeExternalUpdateReopen(comptime dims: usize) !void {
             try idx.captureNativeRowValue(id, .posting_state, value.bytes);
         }
         try idx.persistExperimentalPostingSidecarAtAppliedSequence(26, .{});
+        profile.mark(.persist);
         for (expected, 0..) |ids, query_id| {
             var result = try idx.searchWithRequest(.{ .query = &source.vectors[query_id * 7], .k = query_k, .search_width = if (dims == 1536) 17 else 4, .epsilon = if (dims == 1536) 1.45 else 0.1, .rerank_factor = if (dims == 1536) 9 else 3 });
             defer result.deinit();
             try std.testing.expectEqual(ids.len, result.items.items.len);
             for (ids, result.items.items) |id, item| try std.testing.expectEqual(id, item.vector_id);
         }
+        profile.mark(.query);
     }
+    profile.mark(.close);
     var reopened = try HBCIndex.open(alloc, path, config);
     defer reopened.close();
     reopened.setExternalVectorLoader(source, Source.load);
@@ -26918,16 +27190,20 @@ fn testNativeExternalUpdateReopen(comptime dims: usize) !void {
         reopened.attachSharedCache(&cache);
     }
     try reopened.activateExperimentalPostingReads(26);
+    profile.mark(.reopen);
     for (expected, 0..) |ids, query_id| {
         var result = try reopened.searchWithRequest(.{ .query = &source.vectors[query_id * 7], .k = query_k, .search_width = if (dims == 1536) 17 else 4, .epsilon = if (dims == 1536) 1.45 else 0.1, .rerank_factor = if (dims == 1536) 9 else 3 });
         defer result.deinit();
         try std.testing.expectEqual(ids.len, result.items.items.len);
         for (ids, result.items.items) |id, item| try std.testing.expectEqual(id, item.vector_id);
     }
+    profile.mark(.query);
 }
 
 test "posting WAL mutation capture aborts without publishing partial state" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -27005,7 +27281,10 @@ test "posting WAL mutation capture aborts without publishing partial state" {
 }
 
 test "authoritative external-vector HBC detaches legacy LSM and reopens native first" {
-    const alloc = std.testing.allocator;
+    @import("../test_error_logs.zig").expectErrorLogs(1);
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -27133,7 +27412,9 @@ test "authoritative external-vector HBC detaches legacy LSM and reopens native f
 }
 
 test "stable generation finalization bootstraps capture-free rebuild into native authority" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -27227,7 +27508,9 @@ test "stable generation finalization bootstraps capture-free rebuild into native
 }
 
 test "completed checkpoint publication drains deferred legacy LSM detach" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -27300,7 +27583,9 @@ test "completed checkpoint publication drains deferred legacy LSM detach" {
 }
 
 test "posting WAL capture can begin inside a streaming replay session" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -27365,7 +27650,9 @@ test "posting WAL capture can begin inside a streaming replay session" {
 }
 
 test "managed posting sidecar follows applied sequence and uncovered writes invalidate it" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -27500,7 +27787,9 @@ test "managed posting sidecar follows applied sequence and uncovered writes inva
 }
 
 test "managed posting capture exports coalesced exact vector mutations" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -27586,7 +27875,9 @@ test "managed posting capture exports coalesced exact vector mutations" {
 }
 
 test "managed posting sidecar records maintenance without advancing source coverage" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -27678,7 +27969,9 @@ test "managed posting sidecar records maintenance without advancing source cover
 }
 
 test "progressive filtered l2 traversal preserves exact top k without bound stops" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -27720,7 +28013,9 @@ test "progressive filtered l2 traversal preserves exact top k without bound stop
 }
 
 test "flat rabitq centroid directory searches leaf postings" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -27761,7 +28056,9 @@ test "flat rabitq centroid directory searches leaf postings" {
 }
 
 test "flat rabitq filtered traversal advances then stops on a certified bound" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -27806,7 +28103,9 @@ test "flat rabitq filtered traversal advances then stops on a certified bound" {
 }
 
 test "flat traversal does not treat a full candidate heap as a pruning proof" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -27827,10 +28126,15 @@ test "flat traversal does not treat a full candidate heap as a pruning proof" {
     });
     defer idx.close();
 
-    for (0..128) |i| {
-        const value: f32 = @floatFromInt(i + 1);
-        try idx.insert(@intCast(i + 1), &.{ value, 1 });
+    // Traversal needs a published directory with more than two leaves. A
+    // balanced build isolates that contract from adversarial binary insertion.
+    var vectors: [128][2]f32 = undefined;
+    var items: [128]BatchInsertItem = undefined;
+    for (&vectors, &items, 0..) |*vector, *item, i| {
+        vector.* = .{ @floatFromInt(i + 1), 1 };
+        item.* = .{ .vector_id = @intCast(i + 1), .vector = vector };
     }
+    try idx.bulkBuildWithMetadata(&items);
 
     var profiled = try idx.searchProfiledRequest(.{
         .query = &.{ 1, 0 },
@@ -27845,8 +28149,61 @@ test "flat traversal does not treat a full candidate heap as a pruning proof" {
     try std.testing.expect(profiled.profile.leaves_explored > 2);
 }
 
+test "hbc monotone insertion has bounded split and save work" {
+    try testMonotoneInsertionWork(128, 16);
+}
+
+test "hbc binary monotone insertion production scale" {
+    try testMonotoneInsertionWork(128, 2);
+}
+
+fn testMonotoneInsertionWork(count: usize, fanout: u32) !void {
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 2,
+        .metric = .inner_product,
+        .leaf_size = 8,
+        .branching_factor = fanout,
+        .search_width = 8,
+        .use_quantization = true,
+        .rerank_policy = .boundary,
+        .centroid_directory_mode = .flat_exact,
+        .flat_centroid_block_size = 4,
+        .flat_centroid_probe_count = 2,
+    });
+    defer idx.close();
+    for (0..count) |i| try idx.insert(@intCast(i + 1), &.{ @floatFromInt(i + 1), 1 });
+    const profile = idx.write_profile;
+    // Binary fanout permits unary internal nodes and quadratic split cascades.
+    // Keep its original adversarial fixture in the scale suite; ordinary
+    // fanout must stay within a linear work budget on the same ordered input.
+    const split_budget = if (fanout == 2) count * count / 16 else count;
+    const save_budget = if (fanout == 2) count * count / 4 else 8 * count;
+    try std.testing.expect(profile.split_leaf_calls <= count / 2);
+    try std.testing.expect(profile.split_internal_calls <= split_budget);
+    try std.testing.expect(profile.save_node_calls <= save_budget);
+    if (fanout != 2) try std.testing.expect(profile.range_nodes_examined <= 64 * count);
+    var result = try idx.searchProfiledRequest(.{
+        .query = &.{ 1, 0 },
+        .k = 1,
+        .search_width = 8,
+        .load_metadata = false,
+    });
+    defer result.results.deinit();
+    try std.testing.expectEqual(@as(u64, @intCast(count)), result.results.getHits()[0].vector_id);
+    if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_WORK_PROFILE"))
+        std.debug.print("\nWORK insertion fanout={d} count={d} leaf_splits={d} internal_splits={d} saves={d} range_nodes={d}\n", .{ fanout, count, profile.split_leaf_calls, profile.split_internal_calls, profile.save_node_calls, profile.range_nodes_examined });
+}
+
 test "flat rabitq full effort exhausts an underfilled published directory" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -27904,7 +28261,9 @@ test "flat rabitq full effort exhausts an underfilled published directory" {
 }
 
 test "tree full effort exhausts underfilled leaves beyond estimated width" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -27944,7 +28303,9 @@ test "tree full effort exhausts underfilled leaves beyond estimated width" {
 }
 
 test "searchProfiled records phase timings and counters" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -27973,7 +28334,9 @@ test "searchProfiled records phase timings and counters" {
 }
 
 test "reopened lsm hbc loads quantized payloads on cold cache miss" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -28018,7 +28381,9 @@ test "reopened lsm hbc loads quantized payloads on cold cache miss" {
 }
 
 test "searchWithRequest returns empty when published root is missing" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -28282,7 +28647,9 @@ test "searchProfiled respects rerank_policy never" {
 }
 
 test "tree child scoring grows scalar scratch after native-only queries" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var path: TestPath = .{};
     const tmp_path = path.init();
     defer path.cleanup();
@@ -28362,7 +28729,9 @@ test "root quantized set is persisted as nonquantized" {
 }
 
 test "loadQuantized rejects malformed non-root quantized count" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var path: TestPath = .{};
     const tmp_path = path.init();
     defer path.cleanup();
@@ -28479,8 +28848,64 @@ test "batch insert options can defer quantized rebuild until finish" {
     }
 }
 
+test "deferred quantized relocation publishes payloads only at batch finish" {
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
+    var path: TestPath = .{};
+    const tmp_path = path.init();
+    defer path.cleanup();
+    var idx = try HBCIndex.open(alloc, tmp_path, .{
+        .dims = 2,
+        .leaf_size = 8,
+        .branching_factor = 4,
+        .search_width = 8,
+        .use_quantization = true,
+    });
+    defer idx.close();
+    const vectors = [_][2]f32{
+        .{ 0.0, 0.0 },   .{ 0.1, 0.0 }, .{ 0.2, 0.0 }, .{ 0.3, 0.0 },
+        .{ 8.0, 8.0 },   .{ 8.1, 8.0 }, .{ 8.2, 8.0 }, .{ 8.3, 8.0 },
+        .{ 16.0, 16.0 },
+    };
+    var items: [vectors.len]BatchInsertItem = undefined;
+    for (&items, 0..) |*item, i| item.* = .{ .vector_id = i + 1, .vector = &vectors[i], .metadata = "doc" };
+    try idx.bulkBuildWithMetadata(&items);
+    const update = [_]BatchInsertItem{.{ .vector_id = 1, .vector = &.{ 16.05, 16.0 }, .metadata = "updated" }};
+    const options: BatchInsertOptions = .{
+        .defer_quantized_rebuild = true,
+        .suppress_quantized_payload_persist = true,
+        .centroid_only_routing = true,
+    };
+    var txn = try idx.beginWriteTxn();
+    var active = true;
+    errdefer if (active) txn.abort();
+    const source = try idx.getVecLeaf(&txn, 1);
+    const target = try idx.getVecLeaf(&txn, 9);
+    try std.testing.expect(source != target);
+    idx.resetWriteProfile();
+    try idx.batchInsertWithMetadataTxnOptions(&txn, &update, options);
+    try std.testing.expectEqual(target, try idx.getVecLeaf(&txn, 1));
+    // Both the removed-from and inserted-into leaves must honor the batch's
+    // publication boundary, rather than rebuilding per relocated vector.
+    try std.testing.expectEqual(@as(u64, 0), idx.getWriteProfile().ns_quant_put_calls);
+    try std.testing.expect(idx.deferred_quantized_nodes.contains(source));
+    try std.testing.expect(idx.deferred_quantized_nodes.contains(target));
+    try idx.finishWriteTxnOptions(&txn, options);
+    active = false;
+    try std.testing.expect(idx.getWriteProfile().ns_quant_put_calls > 0);
+    try std.testing.expect(idx.getWriteProfile().ns_quant_put_calls <= idx.metadata.node_count);
+    try std.testing.expectEqual(@as(u32, 0), idx.deferred_quantized_nodes.count());
+    var result = try idx.search(update[0].vector, 1);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.getHits().len);
+    try std.testing.expectEqual(@as(u64, 1), result.getHits()[0].vector_id);
+}
+
 test "deferred quantized rebuild refreshes touched nodes only" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var path: TestPath = .{};
     const tmp_path = path.init();
     defer path.cleanup();
@@ -28528,7 +28953,9 @@ test "deferred quantized rebuild refreshes touched nodes only" {
 }
 
 test "deferred quantized append updates leaf without queued full rebuild" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var path: TestPath = .{};
     const tmp_path = path.init();
     defer path.cleanup();
@@ -28602,7 +29029,9 @@ test "deferred quantized append updates leaf without queued full rebuild" {
 }
 
 test "bulk ingest session publishes deferred quantized nodes once at finish" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var path: TestPath = .{};
     const tmp_path = path.init();
     defer path.cleanup();
@@ -28662,7 +29091,9 @@ test "bulk ingest session publishes deferred quantized nodes once at finish" {
 }
 
 test "streaming replay session publishes reopenable batches without incomplete marker" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var path: TestPath = .{};
     const tmp_path = path.init();
     defer path.cleanup();
@@ -28784,7 +29215,9 @@ test "streaming replay session publishes reopenable batches without incomplete m
 }
 
 test "streaming replay finish establishes durability for relaxed backend" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var path: TestPath = .{};
     const tmp_path = path.init();
     defer path.cleanup();
@@ -28818,7 +29251,9 @@ test "streaming replay finish establishes durability for relaxed backend" {
 
 test "streaming replay finish establishes explicit durability for lmdb no_sync" {
     if (!supports_lmdb) return error.SkipZigTest;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var path: TestPath = .{};
     const tmp_path = path.init();
     defer path.cleanup();
@@ -28851,7 +29286,9 @@ test "streaming replay finish establishes explicit durability for lmdb no_sync" 
 }
 
 test "interrupted bulk publication remains quarantined" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var path: TestPath = .{};
     const tmp_path = path.init();
     defer path.cleanup();
@@ -28877,7 +29314,9 @@ test "interrupted bulk publication remains quarantined" {
 }
 
 test "bulk publication revalidates admission before every publish window" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var path: TestPath = .{};
     const tmp_path = path.init();
     defer path.cleanup();
@@ -28943,7 +29382,9 @@ test "bulk publication revalidates admission before every publish window" {
 }
 
 test "bulk publication abort clears only an unmodified session" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var empty_path: TestPath = .{};
     const empty_tmp_path = empty_path.init();
     defer empty_path.cleanup();
@@ -28980,7 +29421,9 @@ test "bulk publication abort clears only an unmodified session" {
 }
 
 test "write sessions reject mixed nested publication semantics" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var path: TestPath = .{};
     const tmp_path = path.init();
     defer path.cleanup();
@@ -28996,7 +29439,9 @@ test "write sessions reject mixed nested publication semantics" {
 }
 
 test "bulk ingest keeps published search state stale until finish" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -29044,7 +29489,9 @@ test "bulk ingest keeps published search state stale until finish" {
 }
 
 test "flat centroid search ignores staged bulk ingest nodes until publish" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -29144,7 +29591,9 @@ test "bulk build creates searchable index and persists metadata" {
 }
 
 test "bulk build refreshes quantized payload after internal reparenting" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var path: TestPath = .{};
     const tmp_path = path.init();
     defer path.cleanup();
@@ -29377,7 +29826,9 @@ test "reinsert existing vector id after reopen on lsm backend updates search" {
 }
 
 test "kmeans split produces balanced clusters" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -29412,7 +29863,9 @@ test "kmeans split produces balanced clusters" {
 }
 
 test "inner product split keeps mean centroids" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -29448,7 +29901,9 @@ test "inner product split keeps mean centroids" {
 }
 
 test "cosine split rejects non unit vectors" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -29475,7 +29930,9 @@ test "cosine split rejects non unit vectors" {
 }
 
 test "cosine leaf centroid stays unit through insert update delete" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -29521,7 +29978,9 @@ test "cosine leaf centroid stays unit through insert update delete" {
 }
 
 test "cosine split root centroid stays unit" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -29608,7 +30067,9 @@ test "hilbert split produces balanced clusters" {
 }
 
 test "hbc local cache admission has one owner across allocation failures" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -29666,7 +30127,9 @@ test "hbc local cache admission has one owner across allocation failures" {
 }
 
 test "hbc reused delete vectors preserve eager payloads bounds and reopen" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     const Loader = struct {
         calls: usize = 0,
         fn vector(id: u64) [4]f32 {
@@ -29751,7 +30214,9 @@ test "hbc reused delete vectors preserve eager payloads bounds and reopen" {
 }
 
 test "hbc stable origins preserve rows without survivor reads and retain repair debt" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     const Loader = struct {
         calls: usize = 0,
         fn vector(id: u64) [4]f32 {
@@ -29840,7 +30305,9 @@ test "hbc stable origins preserve rows without survivor reads and retain repair 
 }
 
 test "hbc stable origin churn bounds debt and disabling experiment repairs statistics" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -29883,7 +30350,9 @@ test "hbc stable origin churn bounds debt and disabling experiment repairs stati
 }
 
 test "hbc stable origins replace changed external vector revisions across reopen" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     const Loader = struct {
         changed: bool = false,
         const replacement = [_]f32{ -100, 12, 5, 1 };
@@ -29973,7 +30442,9 @@ test "native posting row debt is revision scoped oldest first and bounded" {
 }
 
 test "native posting row integration survives mutation checkpoint and reopen" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var runtime = std.Io.Threaded.init(alloc, .{});
     defer runtime.deinit();
     var manager = resource_manager_mod.ResourceManager.init(.{});
@@ -30292,7 +30763,9 @@ test "native posting row integration survives mutation checkpoint and reopen" {
 }
 
 test "delete removes vector" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -30318,7 +30791,9 @@ test "delete removes vector" {
 }
 
 test "batchApply supports mixed writes and deletes" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -30355,7 +30830,9 @@ test "batchApply supports mixed writes and deletes" {
 }
 
 test "search returns metadata for hits" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -30376,7 +30853,9 @@ test "search returns metadata for hits" {
 }
 
 test "delete repairs underfull leaf" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -30411,7 +30890,9 @@ test "delete repairs underfull leaf" {
 }
 
 test "node roundtrip" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -30458,7 +30939,9 @@ test "node roundtrip" {
 }
 
 test "node split ranges classify left right and mixed subtrees" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -30508,7 +30991,9 @@ test "node split ranges classify left right and mixed subtrees" {
 }
 
 test "coalesced batch insert extends ancestor split ranges for small leaf groups" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -30557,7 +31042,9 @@ test "coalesced batch insert extends ancestor split ranges for small leaf groups
 }
 
 test "coalesced batch insert keeps routed child nodes stable across cache eviction" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -30625,7 +31112,9 @@ test "coalesced batch insert keeps routed child nodes stable across cache evicti
 }
 
 test "mixed delete write batch keeps covered replacements on sequential routing" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -30674,7 +31163,9 @@ test "mixed delete write batch keeps covered replacements on sequential routing"
 }
 
 test "coalesced batch insert routes writes with quantized child scores" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -30736,7 +31227,9 @@ test "coalesced batch insert routes writes with quantized child scores" {
 }
 
 test "coalesced batch insert splits one-overflow leaf group once" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -30788,7 +31281,9 @@ test "coalesced batch insert splits one-overflow leaf group once" {
 }
 
 test "coalesced batch insert recursively splits bounded overflow leaf group" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -30843,7 +31338,9 @@ test "coalesced batch insert recursively splits bounded overflow leaf group" {
 }
 
 test "split planning stats count reusable dense subtrees" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -30871,7 +31368,9 @@ test "split planning stats count reusable dense subtrees" {
 }
 
 test "split reuse plan finds right-only subtree roots" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -30902,7 +31401,9 @@ test "split reuse plan finds right-only subtree roots" {
 }
 
 test "split rebuild work counts reusable and mixed-right members" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -30926,7 +31427,9 @@ test "split rebuild work counts reusable and mixed-right members" {
 }
 
 test "search returns results from both halves after split" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -30951,7 +31454,9 @@ test "search returns results from both halves after split" {
 }
 
 test "vector to leaf mapping stays in sync across repeated splits" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -30994,7 +31499,9 @@ test "vector to leaf mapping stays in sync across repeated splits" {
 }
 
 test "insert tolerates loaded leaf with empty stored centroid" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -31057,7 +31564,9 @@ test "insert tolerates loaded leaf with empty stored centroid" {
 }
 
 test "flat centroid search falls back when published leaves have no centroids" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -31102,7 +31611,9 @@ test "flat centroid search falls back when published leaves have no centroids" {
 }
 
 test "insert tolerates stale vec_leaf mapping without dropping the member" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -31152,7 +31663,9 @@ test "insert tolerates stale vec_leaf mapping without dropping the member" {
 }
 
 test "posting refresh resumes bounded scans and rechecks mutations behind cursor" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -31210,7 +31723,9 @@ test "posting refresh resumes bounded scans and rechecks mutations behind cursor
 }
 
 test "posting refresh certificate must be reverified after reopen" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -31234,7 +31749,9 @@ test "posting refresh certificate must be reverified after reopen" {
 }
 
 test "posting refresh deferral retains cursor and pending debt" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -31269,7 +31786,9 @@ test "posting refresh deferral retains cursor and pending debt" {
 }
 
 test "posting maintenance repairs dirty leaf centroid and state" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -31332,7 +31851,9 @@ test "posting maintenance repairs dirty leaf centroid and state" {
 }
 
 test "stable posting validation repairs missing clean quantized payload" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -31375,7 +31896,9 @@ test "stable posting validation repairs missing clean quantized payload" {
 }
 
 test "stable posting validation accepts canonical empty posting payload absence" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -31403,7 +31926,9 @@ test "stable posting validation accepts canonical empty posting payload absence"
 }
 
 test "lazy posting maintenance defers foreground centroid refresh" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -31448,7 +31973,9 @@ test "lazy posting maintenance defers foreground centroid refresh" {
 }
 
 test "posting backlog stats report lazy dirty leaves with std Io writer" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -31479,7 +32006,9 @@ test "posting backlog stats report lazy dirty leaves with std Io writer" {
 }
 
 test "dirty quantized posting payloads are scored exactly" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -31518,7 +32047,9 @@ test "dirty quantized posting payloads are scored exactly" {
 }
 
 test "auto posting maintenance repairs bounded lazy backlog before commit" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -31555,7 +32086,9 @@ test "auto posting maintenance repairs bounded lazy backlog before commit" {
 }
 
 test "manual posting repair honors explicit bound when auto repair is configured" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -31610,7 +32143,9 @@ test "manual posting repair honors explicit bound when auto repair is configured
 }
 
 test "posting dirty state survives reopen and bounded repair makes progress" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -31648,7 +32183,9 @@ test "posting dirty state survives reopen and bounded repair makes progress" {
 }
 
 test "lazy posting maintenance keeps assignment map and members consistent through dynamic writes" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -31712,7 +32249,9 @@ test "lazy posting maintenance keeps assignment map and members consistent throu
 }
 
 test "posting maintenance can split and merge postings as bounded layout work" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -31767,7 +32306,9 @@ test "posting maintenance can split and merge postings as bounded layout work" {
 }
 
 test "posting maintenance merge error releases transferred node slices once" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -31834,7 +32375,9 @@ test "posting maintenance merge error releases transferred node slices once" {
 }
 
 test "bulk replay recomputes same-leaf existing members once per leaf" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -31913,7 +32456,9 @@ test "bulk replay recomputes same-leaf existing members once per leaf" {
 }
 
 test "atomic replacements do not take the grouped new-id routing path" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -31953,7 +32498,9 @@ test "atomic replacements do not take the grouped new-id routing path" {
 }
 
 test "deferred quantized rebuild uses current batch vectors before external loader" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -32007,11 +32554,13 @@ test "deferred quantized rebuild uses current batch vectors before external load
     var txn = try idx.beginReadTxn();
     defer txn.abort();
     var quantized = (try idx.getQuantized(&txn, idx.metadata.root_node, true, items.len)) orelse return error.TestUnexpectedResult;
-    quantized.deinit(std.testing.allocator);
+    quantized.deinit(alloc);
 }
 
 test "vector storage roundtrip" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -32031,7 +32580,9 @@ test "vector storage roundtrip" {
 }
 
 test "getVectorScratch caches external vector loads" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -32085,7 +32636,9 @@ test "getVectorScratch caches external vector loads" {
 }
 
 test "getVectorScratch can bypass external vector cache during replay sessions" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -32142,7 +32695,9 @@ test "getVectorScratch can bypass external vector cache during replay sessions" 
 }
 
 test "skip vector store writes do not seed retained vector cache when bypassed" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -32173,7 +32728,9 @@ test "skip vector store writes do not seed retained vector cache when bypassed" 
 }
 
 test "getVectorInto skips external vector cache population during concurrent search" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -32232,7 +32789,9 @@ test "getVectorInto skips external vector cache population during concurrent sea
 }
 
 test "deferred quantized rebuild publishes fresh posting state" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -32259,7 +32818,9 @@ test "deferred quantized rebuild publishes fresh posting state" {
 }
 
 test "quantized rebuild preserves failure outcomes instead of certifying missing payloads" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -32304,7 +32865,9 @@ test "quantized rebuild preserves failure outcomes instead of certifying missing
 }
 
 test "coalesced centroid deltas survive a later member moving to another leaf" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -32370,8 +32933,219 @@ test "coalesced centroid deltas survive a later member moving to another leaf" {
     }
 }
 
+test "interleaved external relocations reuse versioned source sums" {
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
+    var path: TestPath = .{};
+    var idx = try HBCIndex.open(alloc, path.init(), .{
+        .dims = 2,
+        .metric = .l2_squared,
+        .leaf_size = 32,
+        .branching_factor = 4,
+        .use_quantization = false,
+        .lazy_posting_maintenance = false,
+        .stable_posting_origin_max_mutations = 0,
+    });
+    defer path.cleanup();
+    defer idx.close();
+    const Source = struct {
+        vectors: [128][2]f32,
+        fn load(raw: *anyopaque, a: Allocator, id: u64, _: []const u8) ![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return a.dupe(f32, &self.vectors[id - 1]);
+        }
+    };
+    var source: Source = undefined;
+    const centers = [_][2]f32{ .{ -2, 0 }, .{ 0, -2 }, .{ 2, 0 }, .{ 0, 2 } };
+    var items: [128]BatchInsertItem = undefined;
+    for (&source.vectors, &items, 0..) |*vector, *item, i| {
+        vector.* = centers[i / 32];
+        vector[1] += @as(f32, @floatFromInt(i % 32)) / 1000;
+        item.* = .{ .vector_id = i + 1, .vector = vector, .metadata = "doc" };
+    }
+    try idx.bulkBuildWithMetadata(&items);
+    idx.setExternalVectorLoader(&source, Source.load);
+    idx.setBypassExternalVectorCache(true);
+    for (0..2) |revision| {
+        var updates: [8]BatchInsertItem = undefined;
+        for (&updates, 0..) |*item, i| {
+            const id = (i % 2) * 32 + revision * 4 + i / 2;
+            source.vectors[id] = .{ 2, 0 };
+            item.* = .{ .vector_id = id + 1, .vector = &source.vectors[id], .metadata = "doc" };
+        }
+        const before = idx.getWriteProfile().centroid_delta_removals;
+        try idx.batchInsertWithMetadataOptions(&updates, .{ .skip_vector_store = true, .defer_quantized_rebuild = true });
+        // Most removals must reuse sums even when their sources alternate.
+        // A destination split may invalidate a source through redistribution.
+        // A single-entry cache instead rebuilds on every source switch.
+        try std.testing.expect(idx.getWriteProfile().centroid_delta_removals - before >= 4);
+        var txn = try idx.beginReadTxn();
+        defer txn.abort();
+        for ([_]u64{ 32, 64 }) |survivor| {
+            var leaf = try idx.loadNode(&txn, try idx.getVecLeaf(&txn, survivor));
+            defer leaf.deinit(alloc);
+            const matrix = try alloc.alloc(f32, leaf.members.len * 2);
+            defer alloc.free(matrix);
+            var mean: [2]f32 = @splat(0);
+            for (leaf.members, 0..) |id, row| {
+                const vector = matrix[row * 2 ..][0..2];
+                _ = idx.transformVector(&source.vectors[id - 1], vector);
+                for (&mean, vector) |*sum, value| sum.* += value;
+            }
+            for (&mean, leaf.centroid) |*want, got| {
+                want.* /= @floatFromInt(leaf.members.len);
+                try std.testing.expectApproxEqAbs(want.*, got, 0.00001);
+            }
+            const radius = vectorindex_posting.coveringRadiusForMatrix(.l2_squared, leaf.centroid, matrix, leaf.members.len);
+            try std.testing.expect(leaf.covering_radius + 0.00001 >= radius);
+        }
+    }
+}
+
+test "external relocation sums are batch scoped and covering radii remain conservative" {
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
+    for ([_]vec.DistanceMetric{ .cosine, .l2_squared, .inner_product }) |metric| {
+        var path: TestPath = .{};
+        var idx = try HBCIndex.open(alloc, path.init(), .{
+            .dims = 2,
+            .metric = metric,
+            .leaf_size = 64,
+            .branching_factor = 2,
+            .use_quantization = false,
+            .lazy_posting_maintenance = false,
+            .stable_posting_origin_max_mutations = 0,
+        });
+        defer path.cleanup();
+        defer idx.close();
+        const Source = struct {
+            vectors: [128][2]f32,
+            fn load(raw: *anyopaque, a: Allocator, id: u64, _: []const u8) ![]f32 {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                return a.dupe(f32, &self.vectors[id - 1]);
+            }
+        };
+        var source: Source = undefined;
+        var items: [128]BatchInsertItem = undefined;
+        for (&source.vectors, &items, 0..) |*vector, *item, i| {
+            vector.* = .{ if (i < 64) -2 else 2, @as(f32, @floatFromInt(i % 64)) / 1000 };
+            item.* = .{ .vector_id = i + 1, .vector = vector, .metadata = "doc" };
+        }
+        try idx.bulkBuildWithMetadata(&items);
+        idx.setExternalVectorLoader(&source, Source.load);
+        idx.setBypassExternalVectorCache(true);
+        // Two primary revisions: no sum may survive the batch boundary.
+        for (0..2) |revision| {
+            var updates: [8]BatchInsertItem = undefined;
+            for (&updates, 0..) |*item, i| {
+                // An in-place update between removals changes the source
+                // version without replacing the cache entry's leaf identity.
+                const id = if (i == 2) 63 else revision * 8 + i;
+                if (i == 2) source.vectors[id][1] += 0.001 else source.vectors[id][0] = 2;
+                item.* = .{ .vector_id = id + 1, .vector = &source.vectors[id], .metadata = "doc" };
+            }
+            const before = idx.getWriteProfile().centroid_delta_removals;
+            try idx.batchInsertWithMetadataOptions(&updates, .{ .skip_vector_store = true, .defer_quantized_rebuild = true });
+            try std.testing.expect(idx.getWriteProfile().centroid_delta_removals > before);
+            var txn = try idx.beginReadTxn();
+            defer txn.abort();
+            const source_id = try idx.getVecLeaf(&txn, 64);
+            var leaf = try idx.loadNode(&txn, source_id);
+            defer leaf.deinit(alloc);
+            const matrix = try alloc.alloc(f32, leaf.members.len * 2);
+            defer alloc.free(matrix);
+            var expected: [2]f32 = @splat(0);
+            for (leaf.members, 0..) |id, row| {
+                const transformed = matrix[row * 2 ..][0..2];
+                _ = idx.transformVector(&source.vectors[id - 1], transformed);
+                for (&expected, transformed) |*sum, value| sum.* += value;
+            }
+            for (&expected) |*value| value.* /= @floatFromInt(leaf.members.len);
+            if (metric == .cosine) _ = vec.normalize(&expected);
+            for (expected, leaf.centroid) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.00001);
+            const exact_radius = vectorindex_posting.coveringRadiusForMatrix(metric, leaf.centroid, matrix, leaf.members.len);
+            if (std.math.isFinite(exact_radius)) try std.testing.expect(leaf.covering_radius + 0.00001 >= exact_radius);
+        }
+    }
+}
+
+test "batched external vector relocations route once per mutation" {
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
+    for ([_]vec.DistanceMetric{ .cosine, .l2_squared, .inner_product }) |metric| {
+        var batch_path: TestPath = .{};
+        var serial_path: TestPath = .{};
+        const bp = batch_path.init();
+        defer batch_path.cleanup();
+        const sp = serial_path.init();
+        defer serial_path.cleanup();
+        const config: HBCConfig = .{ .dims = 2, .metric = metric, .leaf_size = 8, .branching_factor = 4, .use_quantization = false, .lazy_posting_maintenance = false, .stable_posting_origin_max_mutations = 0 };
+        var batch = try HBCIndex.open(alloc, bp, config);
+        defer batch.close();
+        var serial = try HBCIndex.open(alloc, sp, config);
+        defer serial.close();
+        const Source = struct {
+            vectors: [16][2]f32,
+            fn load(raw: *anyopaque, a: Allocator, id: u64, _: []const u8) ![]f32 {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                return a.dupe(f32, &self.vectors[id - 1]);
+            }
+        };
+        var source: Source = undefined;
+        var items: [16]BatchInsertItem = undefined;
+        for (&source.vectors, &items, 0..) |*vector, *item, i| {
+            vector.* = .{ if (i < 8) -2 else 2, @as(f32, @floatFromInt(i % 8)) / 100 };
+            item.* = .{ .vector_id = i + 1, .vector = vector, .metadata = "doc" };
+        }
+        for ([_]*HBCIndex{ &batch, &serial }) |idx| {
+            try idx.bulkBuildWithMetadata(&items);
+            idx.setExternalVectorLoader(&source, Source.load);
+            idx.setBypassExternalVectorCache(true);
+        }
+        const old_leaf = blk: {
+            var txn = try batch.beginReadTxn();
+            defer txn.abort();
+            break :blk try batch.getVecLeaf(&txn, 1);
+        };
+        // Primary revisions commit before ANN replay. A route is reused only
+        // for its own mutation: removal can merge leaves/collapse ancestors.
+        const ids = [_]u64{ 1, 2, 9, 10 };
+        var updates: [ids.len]BatchInsertItem = undefined;
+        for (ids, &updates) |id, *item| {
+            source.vectors[id - 1][0] *= -1;
+            item.* = .{ .vector_id = id, .vector = &source.vectors[id - 1], .metadata = "doc" };
+        }
+        const before = batch.getWriteProfile();
+        try batch.batchInsertWithMetadataOptions(&updates, .{ .skip_vector_store = true });
+        const after = batch.getWriteProfile();
+        try std.testing.expectEqual(@as(u64, ids.len), after.insert_find_leaf_calls - before.insert_find_leaf_calls);
+        for (updates) |update| try serial.batchInsertWithMetadataOptions(&.{update}, .{ .skip_vector_store = true });
+        var bt = try batch.beginReadTxn();
+        defer bt.abort();
+        var st = try serial.beginReadTxn();
+        defer st.abort();
+        try std.testing.expect(old_leaf != try batch.getVecLeaf(&bt, 1));
+        for (1..17) |id| {
+            const leaf_id = try batch.getVecLeaf(&bt, id);
+            try std.testing.expectEqual(try serial.getVecLeaf(&st, id), leaf_id);
+            var actual = try batch.loadNode(&bt, leaf_id);
+            defer actual.deinit(alloc);
+            var expected = try serial.loadNode(&st, leaf_id);
+            defer expected.deinit(alloc);
+            try std.testing.expectEqualSlices(u64, expected.members, actual.members);
+            try std.testing.expectEqualSlices(f32, expected.centroid, actual.centroid);
+            if (std.math.isFinite(expected.covering_radius)) try std.testing.expectEqual(expected.covering_radius, actual.covering_radius);
+        }
+    }
+}
+
 test "external vector updates do not use the new payload as the previous centroid contribution" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -32424,7 +33198,9 @@ test "external vector updates do not use the new payload as the previous centroi
 }
 
 test "updating an existing vector in the same leaf uses centroid delta instead of full recompute" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -32448,7 +33224,9 @@ test "updating an existing vector in the same leaf uses centroid delta instead o
 }
 
 test "reinserting the same vector without metadata is a no-op" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -32472,7 +33250,9 @@ test "reinserting the same vector without metadata is a no-op" {
 }
 
 test "bulk ingest existing vector update can stay on existing leaf without reroute" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -32505,7 +33285,9 @@ test "bulk ingest existing vector update can stay on existing leaf without rerou
 }
 
 test "hbc namespace adapters expose multi-partition txn operations" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -32544,7 +33326,9 @@ test "hbc namespace adapters expose multi-partition txn operations" {
 }
 
 test "hbc backend runtime erases namespace store handles" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -32552,7 +33336,7 @@ test "hbc backend runtime erases namespace store handles" {
     var idx = try HBCIndex.open(alloc, path, .{ .dims = 3 });
     defer idx.close();
 
-    var runtime = try idx.runtimeNamespaceStore(std.testing.allocator);
+    var runtime = try idx.runtimeNamespaceStore(alloc);
     defer runtime.deinit();
 
     {
@@ -32571,7 +33355,9 @@ test "hbc backend runtime erases namespace store handles" {
 }
 
 test "hbc core persistence helpers work through erased namespace txns" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -32582,7 +33368,7 @@ test "hbc core persistence helpers work through erased namespace txns" {
     });
     defer idx.close();
 
-    var runtime = try idx.runtimeNamespaceStore(std.testing.allocator);
+    var runtime = try idx.runtimeNamespaceStore(alloc);
     defer runtime.deinit();
 
     {
@@ -32637,7 +33423,9 @@ test "hbc core persistence helpers work through erased namespace txns" {
 }
 
 test "hbc runtime namespace store works for lsm backend" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -32649,7 +33437,7 @@ test "hbc runtime namespace store works for lsm backend" {
     });
     defer idx.close();
 
-    var runtime = try idx.runtimeNamespaceStore(std.testing.allocator);
+    var runtime = try idx.runtimeNamespaceStore(alloc);
     defer runtime.deinit();
 
     {
@@ -32675,7 +33463,9 @@ test "hbc runtime namespace store works for lsm backend" {
 }
 
 test "hbc getMetadataManySortedInTxn batches ordered metadata lookups and caches results" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -32710,7 +33500,9 @@ test "hbc getMetadataManySortedInTxn batches ordered metadata lookups and caches
 }
 
 test "hbc bulk ingest skips retained metadata cache population" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -32733,7 +33525,9 @@ test "hbc bulk ingest skips retained metadata cache population" {
 }
 
 test "hbc bulk ingest skips retained vector cache population" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -32760,7 +33554,9 @@ test "hbc bulk ingest skips retained vector cache population" {
 }
 
 test "hbc bulk ingest mutation batches defer manifest without direct sorted ingest" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -32877,7 +33673,9 @@ test "hbc bulk ingest mutation batches defer manifest without direct sorted inge
 }
 
 test "hbc reset stored structure preserves an empty query root" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -32930,7 +33728,9 @@ test "hbc reset stored structure preserves an empty query root" {
 }
 
 test "bulk ingest defers oversized root leaf until finish" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -33001,7 +33801,9 @@ test "bulk ingest defers oversized root leaf until finish" {
 }
 
 test "bulk ingest uses kway kmeans for large deferred oversized leaf" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -33094,7 +33896,9 @@ test "bulk ingest uses kway kmeans for large deferred oversized leaf" {
 }
 
 test "bulk ingest does not persist deferred oversized leaf quantized payloads" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -33179,8 +33983,64 @@ test "bulk ingest does not persist deferred oversized leaf quantized payloads" {
     try std.testing.expectEqual(@as(u64, 10), results.getHits()[0].vector_id);
 }
 
+test "point-loaded centroid matrices avoid raw batch staging and observe invalidation" {
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
+    const Source = struct {
+        vectors: [3][2]f32 = .{ .{ 1, 2 }, .{ 3, -4 }, .{ -5, 6 } },
+        fn load(ctx: *anyopaque, allocator: Allocator, id: u64, _: []const u8) ![]f32 {
+            const source: *@This() = @ptrCast(@alignCast(ctx));
+            if (id == 0 or id > source.vectors.len) return error.NotFound;
+            return allocator.dupe(f32, &source.vectors[id - 1]);
+        }
+    };
+    inline for (.{ .l2_squared, .cosine, .inner_product }) |metric| {
+        var tp: TestPath = .{};
+        const path = tp.init();
+        defer tp.cleanup();
+        var resources = resource_manager_mod.ResourceManager.init(.{});
+        defer resources.deinit(alloc);
+        var idx = try HBCIndex.open(alloc, path, .{
+            .dims = 2,
+            .leaf_size = 4,
+            .branching_factor = 4,
+            .metric = metric,
+            .use_quantization = false,
+            .storage_backend = .lsm,
+        });
+        defer idx.close();
+        idx.attachResourceManager(&resources);
+        var source = Source{};
+        idx.setExternalVectorLoader(&source, Source.load);
+        var txn = try idx.beginWriteTxn();
+        defer txn.abort();
+        for (1..4) |id| try idx.putMetadata(&txn, id, "embedding");
+        const ids = [_]u64{ 3, 1, 2 };
+        var matrix: [6]f32 = undefined;
+        const baseline = resources.sliceStats(.dense_apply_working_set).peak_bytes;
+        for (0..2) |iteration| {
+            if (iteration == 1) {
+                source.vectors[1] = .{ -7, 8 };
+                idx.invalidateVectorCache(2);
+            }
+            try idx.loadPostingVectorsTransformed(&txn, &ids, &matrix);
+            for (ids, 0..) |id, row| {
+                var expected: [2]f32 = undefined;
+                _ = idx.transformVector(&source.vectors[id - 1], &expected);
+                try std.testing.expectEqualSlices(f32, &expected, matrix[row * 2 ..][0..2]);
+            }
+            // The caller's transformed matrix is sufficient: no additional
+            // member-count × dimensions raw-vector apply workspace is needed.
+            try std.testing.expectEqual(baseline, resources.sliceStats(.dense_apply_working_set).peak_bytes);
+        }
+    }
+}
+
 test "bulk split workspace reuses transformed external vectors and reports apply memory" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -33268,7 +34128,9 @@ test "bulk split workspace reuses transformed external vectors and reports apply
 }
 
 test "recursive topology rebuild atomically replaces a live external-vector tree" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -33363,7 +34225,9 @@ test "recursive topology rebuild atomically replaces a live external-vector tree
 }
 
 test "streaming split vector workspace survives retirement and ring churn" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -33408,7 +34272,9 @@ test "streaming split vector workspace survives retirement and ring churn" {
 }
 
 test "streaming split vector workspace leaves dense apply budget headroom" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -33435,7 +34301,9 @@ test "streaming split vector workspace leaves dense apply budget headroom" {
 }
 
 test "bulk ingest deferred leaf splits publish in bounded windows" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -33503,7 +34371,9 @@ test "bulk ingest deferred leaf splits publish in bounded windows" {
 }
 
 test "bulk ingest deferred leaf split member budget bounds publish windows" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -33565,7 +34435,9 @@ test "bulk ingest deferred leaf split member budget bounds publish windows" {
 }
 
 test "bulk ingest deferred leaf split quantized publish reuses split vectors" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -33630,7 +34502,9 @@ test "bulk ingest deferred leaf split quantized publish reuses split vectors" {
 }
 
 test "append-only deferred leaf split bounds source fallback with native delta" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -33715,7 +34589,9 @@ test "append-only deferred leaf split bounds source fallback with native delta" 
 }
 
 test "bulk ingest oversized leaf finish rebuilds local subtree instead of repeated binary splits" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -33801,7 +34677,9 @@ test "bulk ingest oversized leaf finish rebuilds local subtree instead of repeat
 }
 
 test "bulk ingest batch-finish leaf splits normalize before commit" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -33859,7 +34737,9 @@ test "bulk ingest batch-finish leaf splits normalize before commit" {
 }
 
 test "bulk ingest splits oversized leaves incrementally by default" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -33910,7 +34790,9 @@ test "bulk ingest splits oversized leaves incrementally by default" {
 }
 
 test "hbc bulk build skip vector store can delete using live vector cache" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -33970,7 +34852,9 @@ test "hbc routes dense lsm profile options" {
 }
 
 test "large insert and search" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -34018,7 +34902,9 @@ test "findLeafWithOptions does not use-after-free when cache evicts mid-traversa
     // during traversal once the tree has more than a couple of internal nodes.
     // Without the fix (copying children to local storage), this test segfaults
     // or triggers Zig's debug allocator use-after-free detection (0xaa poison).
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -34066,7 +34952,9 @@ test "findLeafWithOptions does not use-after-free when cache evicts mid-traversa
 }
 
 test "findLeafWithOptions fails closed when cached internal children are stale" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -34115,7 +35003,9 @@ test "findLeafWithOptions fails closed when cached internal children are stale" 
 }
 
 test "insert routes while search cache admission is disabled" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -34150,7 +35040,9 @@ test "insert routes while search cache admission is disabled" {
 }
 
 test "scoreLeafMembers does not use-after-free when cache evicts during member scoring" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -34216,22 +35108,20 @@ test "HBC runtime batch mode preserves bulk only for non-direct LSM bulk session
 // ============================================================================
 
 const TestPath = struct {
-    buf: [256]u8 = undefined,
+    directory: ?@import("../common/test_directory.zig").TestDirectory = null,
 
     fn init(self: *TestPath) [*:0]const u8 {
-        const ts = platform_time.monotonicNs();
-        const nonce = @atomicRmw(u64, &temp_path_nonce, .Add, 1, .monotonic);
-        const slice = std.fmt.bufPrint(&self.buf, "/tmp/antfly-hbc-test-{d}-{d}\x00", .{ ts, nonce }) catch unreachable;
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-        defer io_impl.deinit();
-        std.Io.Dir.cwd().createDirPath(io_impl.io(), std.mem.span(@as([*:0]const u8, @ptrCast(slice.ptr)))) catch {};
-        return @ptrCast(slice.ptr);
+        self.directory = @import("../common/test_directory.zig").TestDirectory.initFast("hbc") catch @panic("cannot create HBC fixture");
+        return self.directory.?.path().ptr;
+    }
+
+    fn initDisk(self: *TestPath) [*:0]const u8 {
+        self.directory = @import("../common/test_directory.zig").TestDirectory.init("hbc") catch @panic("cannot create HBC durability fixture");
+        return self.directory.?.path().ptr;
     }
 
     fn cleanup(self: *TestPath) void {
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-        defer io_impl.deinit();
-        std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(@as([*:0]const u8, @ptrCast(&self.buf)))) catch {};
+        self.directory.?.cleanup();
     }
 };
 
@@ -34240,7 +35130,9 @@ test "native posting capture keeps committed search fills out of mutation caches
 }
 
 fn testCaptureCacheIsolation(shared: bool) !void {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var cache = Cache.init(alloc);
     defer cache.deinit();
     var tp: TestPath = .{};
@@ -34337,7 +35229,9 @@ test "query snapshot retains ANN membership and metadata across publication" {
 }
 
 fn testQuerySnapshotPublication(directory_mode: HBCConfig.CentroidDirectoryMode) !void {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var runtime = std.Io.Threaded.init(alloc, .{});
     defer runtime.deinit();
     var tp: TestPath = .{};
@@ -34404,7 +35298,9 @@ fn testQuerySnapshotPublication(directory_mode: HBCConfig.CentroidDirectoryMode)
 }
 
 test "prepared posting refresh matches synchronous centroid payload and ancestor repair" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     for ([_]vec.DistanceMetric{ .l2_squared, .cosine, .inner_product }) |metric| {
         var left_path: TestPath = .{};
         const lp = left_path.init();
@@ -34464,7 +35360,9 @@ test "prepared posting refresh matches synchronous centroid payload and ancestor
 }
 
 test "prepared posting refresh rejects intervening updates deletes and aborted writes" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -34492,7 +35390,9 @@ test "prepared posting refresh rejects intervening updates deletes and aborted w
 }
 
 test "prepared posting refresh releases denied scratch and deletes empty payload" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -34523,7 +35423,9 @@ test "prepared posting refresh releases denied scratch and deletes empty payload
 }
 
 test "detached posting metadata batch survives mutations tombstones and index destruction" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();

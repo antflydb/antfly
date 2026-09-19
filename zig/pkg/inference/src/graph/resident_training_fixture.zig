@@ -45,6 +45,51 @@ pub const Device = struct {
     }
 };
 
+/// CUDA fixture shares the graph, bindings and pinned source data with Metal.
+/// Qualification runners must set TERMITE_REQUIRE_CUDA_TESTS=1: an unavailable
+/// driver then fails instead of turning a missing GPU into a passing report.
+pub const CudaDevice = struct {
+    allocator: Allocator,
+    backend: *@import("../ops/cuda/cuda_compute.zig").CudaCompute,
+
+    pub fn requireAvailable() !void {
+        const required = @import("antfly_platform").env.getenvBoolDefault("TERMITE_REQUIRE_CUDA_TESTS", false);
+        if (comptime !@import("build_options").enable_cuda) {
+            if (required) return error.RequiredCudaBuildDisabled;
+            return error.SkipZigTest;
+        }
+        var driver = @import("../ops/cuda/driver.zig").CudaDriver.open() catch |err| {
+            if (required) return err;
+            return error.SkipZigTest;
+        };
+        defer driver.deinit();
+        // Probe without the runtime's error logger: Zig counts logged errors
+        // as test failures even when the test intentionally returns a skip.
+        var count: c_int = 0;
+        if (driver.fns.cuInit(0) != 0 or driver.fns.cuDeviceGetCount(&count) != 0 or count <= 0) {
+            if (required) return error.RequiredCudaDeviceUnavailable;
+            return error.SkipZigTest;
+        }
+    }
+
+    pub fn init(a: Allocator) !CudaDevice {
+        try requireAvailable();
+        const backend = try a.create(@import("../ops/cuda/cuda_compute.zig").CudaCompute);
+        errdefer a.destroy(backend);
+        backend.* = try @import("../ops/cuda/cuda_compute.zig").CudaCompute.init(a);
+        errdefer backend.deinit();
+        if (backend.kernels.gliner25_boundary_f32 == null or !backend.kernels.hasGliner25Attention())
+            return error.CudaKernelUnavailable;
+        return .{ .allocator = a, .backend = backend };
+    }
+
+    pub fn deinit(self: *CudaDevice) void {
+        self.backend.deinit();
+        self.allocator.destroy(self.backend);
+        self.* = undefined;
+    }
+};
+
 fn uploadNative(a: Allocator, device: *const ops.ComputeBackend, source: *const ops.ComputeBackend, value: ops.CT, shape: ml.Shape) !ops.CT {
     if (source.kind() != .native) return error.InvalidResidentFixtureSource;
     try seeded.validateTensor(a, source, value, shape);
@@ -112,7 +157,7 @@ pub fn validate(a: Allocator, session: *const seeded.Session) !void {
 /// explicit uploads, physical i32 routing and independent device captures.
 /// Cotangents are in declared seed order; null runs the forward fixtures only.
 pub fn run(a: Allocator, device: *const ops.ComputeBackend, source: *const ops.ComputeBackend, session: *const seeded.Session, inputs: []const interpreter.RuntimeInput, cotangents: ?[]const ops.CT) !Result {
-    if (device.kind() != .metal or source.kind() != .native) return error.InvalidResidentFixtureBackend;
+    if ((device.kind() != .metal and device.kind() != .cuda) or source.kind() != .native) return error.InvalidResidentFixtureBackend;
     if (cotangents) |values| if (values.len != session.seeds.len) return error.InvalidResidentFixtureSeed;
     var forward = try program.Program.init(a, &session.differentiated.graph, session.captures, .{});
     defer forward.deinit();

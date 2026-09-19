@@ -704,8 +704,8 @@ const TestDevice = struct {
 
 const TestOwner = OwnerWithDevice(TestDevice);
 const test_specs = [_]Spec{
-    .{ .name = "encoder.embeddings.word_embeddings.weight", .shape = &.{ 2, 2 } },
-    .{ .name = "encoder.encoder.LayerNorm.weight", .shape = &.{2} },
+    .{ .name = "encoder.embeddings.word_embeddings.weight", .shape = &.{ 2, 2 }, .registration_order = 0 },
+    .{ .name = "encoder.encoder.LayerNorm.weight", .shape = &.{2}, .registration_order = 1 },
 };
 const test_geometry = Geometry{ .layers = 1, .relative_rows = 2, .hidden = 2 };
 const test_keys = [_]device.DerivedKey{ .relative_normalized, .{ .relative_query = 0 }, .{ .relative_key = 0 } };

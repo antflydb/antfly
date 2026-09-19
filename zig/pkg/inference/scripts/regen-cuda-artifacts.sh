@@ -221,6 +221,8 @@ required_symbols=(
   termite_training_accumulate_f32
   termite_training_adamw_f32
   termite_training_sum_squares_f32
+  termite_training_validate_f32
+  termite_training_validate_finish
   termite_masked_bce_accumulate_f32
   termite_masked_bce_finalize_f32
   termite_masked_bce_backward_f32
@@ -231,6 +233,8 @@ required_symbols=(
   termite_primitive_broadcast_f32
   termite_layer_norm_backward_f32
   termite_primitive_softmax_f32
+  termite_gliner25_layer_norm_f32
+  termite_gliner25_softmax_f32
   termite_primitive_gather_f32
   termite_primitive_scatter_add_axis0_f32
   termite_primitive_transpose_f32

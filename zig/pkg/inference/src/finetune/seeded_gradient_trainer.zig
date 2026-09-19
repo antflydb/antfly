@@ -20,11 +20,11 @@ const device_transaction = @import("seeded_device_transaction.zig");
 const device_state = @import("seeded_device_state.zig");
 const Budget = @import("../runtime/bounded_allocator.zig").BoundedAllocator;
 
-pub const Group = struct { optimizer: optimizers.AdamWConfig = .{}, schedule: optimizers.LearningRateSchedule };
+pub const Group = device_transaction.Group;
 pub const Parameter = struct { name: []const u8, values: []const f32, dimensions: []const i32, group: usize };
 pub const Gradient = struct { name: []const u8, values: []const f32 };
 pub const ResidentGradient = struct { name: []const u8, value: union(enum) { zero, tensor: ops.CT } };
-pub const Execution = enum { native, resident_metal };
+pub const Execution = @import("../graph/seeded_training.zig").Execution;
 pub const Identity = struct { optimizer_step: u64, microbatch_step: u64 };
 pub const RestoreValidation = struct {
     context: ?*const anyopaque,
@@ -50,6 +50,7 @@ pub const Limits = struct {
     max_checkpoint_header_heap_bytes: usize = 64 * 1024 * 1024,
 };
 pub const Config = struct {
+    pytorch_clip_order: ?[]const usize = null,
     groups: []const Group,
     grad_accum_steps: u32 = 1,
     max_grad_norm: f32 = 1,
@@ -263,6 +264,7 @@ fn validateSchedule(schedule: optimizers.LearningRateSchedule) !void {
 }
 
 pub const Trainer = struct {
+    pytorch_clip_order: ?[]usize = null,
     owner: real.RealAutodiffTrainer,
     groups: []Group,
     group_ids: []usize,
@@ -279,19 +281,25 @@ pub const Trainer = struct {
     pub fn init(a: Allocator, cb: *const ops.ComputeBackend, parameters: []const Parameter, config: Config) !Trainer {
         var result = try initOwnedHost(a, cb, parameters, config);
         errdefer result.deinit();
-        if (config.execution == .resident_metal) try result.initializeDevice(cb.execution_control);
+        if (config.execution != .native) try result.initializeDevice(cb.execution_control);
         return result;
     }
 
     fn initOwnedHost(a: Allocator, cb: *const ops.ComputeBackend, parameters: []const Parameter, config: Config) !Trainer {
-        if ((config.execution == .native and cb.kind() != .native) or (config.execution == .resident_metal and cb.kind() != .metal)) return error.UnsupportedSeededTrainingBackend;
+        if ((config.execution == .native and cb.kind() != .native) or (config.execution != .native and cb.kind() != config.execution.backendKind())) return error.UnsupportedSeededTrainingBackend;
         if (parameters.len == 0 or parameters.len > config.limits.max_parameters or config.groups.len == 0 or config.groups.len > config.limits.max_groups or config.grad_accum_steps == 0 or config.grad_accum_steps > 65536 or !std.math.isFinite(config.max_grad_norm) or config.max_grad_norm < 0) return error.InvalidSeededTrainerConfig;
+        if (config.pytorch_clip_order) |order| {
+            if (config.execution != .resident_cuda) return error.UnsupportedSeededTrainingBackend;
+            try device_transaction.validateClippingOrder(order, parameters.len);
+        }
         for (config.groups) |group| {
+            if (group.pytorch_fused != null and config.execution != .resident_cuda) return error.UnsupportedSeededTrainingBackend;
+            if (group.pytorch_fused != null) try device_transaction.validateGroup(group);
             const o = group.optimizer;
             if (!std.math.isFinite(o.beta1) or o.beta1 < 0 or o.beta1 >= 1 or !std.math.isFinite(o.beta2) or o.beta2 < 0 or o.beta2 >= 1 or !std.math.isFinite(o.eps) or o.eps <= 0 or !std.math.isFinite(o.weight_decay) or o.weight_decay < 0) return error.InvalidOptimizerGroup;
             try validateSchedule(group.schedule);
         }
-        var bytes: usize = 0;
+        var bytes: usize = if (config.pytorch_clip_order != null) parameters.len * @sizeOf(usize) else 0;
         var largest_upload: usize = 0;
         for (parameters, 0..) |parameter, i| {
             if (parameter.name.len == 0 or parameter.name.len > config.limits.max_parameter_name_bytes or parameter.dimensions.len > 8 or parameter.group >= config.groups.len) return error.InvalidTrainingParameter;
@@ -304,11 +312,11 @@ pub const Trainer = struct {
             }
             if (elements != parameter.values.len) return error.InvalidTrainingParameter;
             try finite(parameter.values);
-            bytes = std.math.add(usize, bytes, std.math.mul(usize, elements, @as(usize, if (config.execution == .resident_metal) 8 else 4) * @sizeOf(f32)) catch return error.TrainingOptimizerLimitExceeded) catch return error.TrainingOptimizerLimitExceeded;
+            bytes = std.math.add(usize, bytes, std.math.mul(usize, elements, @as(usize, if (config.execution != .native) 8 else 4) * @sizeOf(f32)) catch return error.TrainingOptimizerLimitExceeded) catch return error.TrainingOptimizerLimitExceeded;
             largest_upload = @max(largest_upload, std.math.mul(usize, elements, @sizeOf(f32)) catch return error.TrainingOptimizerLimitExceeded);
             bytes = std.math.add(usize, bytes, parameter.name.len * 2 + parameter.dimensions.len * @sizeOf(i32) + 1024) catch return error.TrainingOptimizerLimitExceeded;
         }
-        if (config.execution == .resident_metal) bytes = std.math.add(usize, bytes, @max(largest_upload, 2 * 1024 * 1024)) catch return error.TrainingOptimizerLimitExceeded;
+        if (config.execution != .native) bytes = std.math.add(usize, bytes, @max(largest_upload, 2 * 1024 * 1024)) catch return error.TrainingOptimizerLimitExceeded;
         if (bytes > config.limits.max_state_bytes) return error.TrainingOptimizerLimitExceeded;
         var owner = try real.RealAutodiffTrainer.init(a, cb, .{ .lora = .{ .rank = 1, .target_patterns = &.{} }, .optimizer = config.groups[0].optimizer, .lr_schedule = config.groups[0].schedule, .grad_accum_steps = config.grad_accum_steps, .max_grad_norm = config.max_grad_norm });
         errdefer owner.deinit();
@@ -330,9 +338,11 @@ pub const Trainer = struct {
         const group_ids = try a.alloc(usize, parameters.len);
         errdefer a.free(group_ids);
         for (parameters, group_ids) |parameter, *id| id.* = parameter.group;
+        const clip_order = if (config.pytorch_clip_order) |order| try a.dupe(usize, order) else null;
+        errdefer if (clip_order) |order| a.free(order);
         const present = try a.alloc(bool, parameters.len);
         @memset(present, false);
-        return .{ .owner = owner, .groups = groups, .group_ids = group_ids, .present = present, .limits = config.limits, .execution = config.execution };
+        return .{ .pytorch_clip_order = clip_order, .owner = owner, .groups = groups, .group_ids = group_ids, .present = present, .limits = config.limits, .execution = config.execution };
     }
 
     pub fn deinit(self: *Trainer) void {
@@ -341,6 +351,7 @@ pub const Trainer = struct {
         a.free(self.groups);
         a.free(self.group_ids);
         a.free(self.present);
+        if (self.pytorch_clip_order) |order| a.free(order);
         self.owner.deinit();
         self.* = undefined;
     }
@@ -380,7 +391,7 @@ pub const Trainer = struct {
         }
         const digest = try self.fingerprint(run);
         try check(control);
-        try self.owner.saveTrainingStateWithExtensions(path, &digest, null, .{ .tensors = tensors.items, .accumulation_count = self.owner.accum_count, .execution_control = control, .use_synchronized_host_state = self.execution == .resident_metal });
+        try self.owner.saveTrainingStateWithExtensions(path, &digest, null, .{ .tensors = tensors.items, .accumulation_count = self.owner.accum_count, .execution_control = control, .use_synchronized_host_state = self.execution != .native });
     }
 
     /// Restore into a fresh staged owner and swap only after every field has
@@ -397,15 +408,15 @@ pub const Trainer = struct {
         const a = self.owner.allocator;
         const parameters = try a.alloc(Parameter, self.owner.regular_params.items.len);
         defer a.free(parameters);
-        var staging_bytes: usize = 0;
+        var staging_bytes: usize = if (self.pytorch_clip_order) |order| order.len * @sizeOf(usize) else 0;
         var largest_upload: usize = 0;
         for (self.owner.regular_params.items, self.group_ids, parameters) |slot, group, *parameter| {
             parameter.* = .{ .name = slot.name, .values = slot.weights, .dimensions = slot.dims, .group = group };
-            staging_bytes = std.math.add(usize, staging_bytes, std.math.mul(usize, slot.weights.len, @as(usize, if (self.execution == .resident_metal) 8 else 4) * @sizeOf(f32)) catch return error.TrainingOptimizerLimitExceeded) catch return error.TrainingOptimizerLimitExceeded;
+            staging_bytes = std.math.add(usize, staging_bytes, std.math.mul(usize, slot.weights.len, @as(usize, if (self.execution != .native) 8 else 4) * @sizeOf(f32)) catch return error.TrainingOptimizerLimitExceeded) catch return error.TrainingOptimizerLimitExceeded;
             largest_upload = @max(largest_upload, std.math.mul(usize, slot.weights.len, @sizeOf(f32)) catch return error.TrainingOptimizerLimitExceeded);
             staging_bytes = std.math.add(usize, staging_bytes, slot.name.len * 2 + slot.dims.len * @sizeOf(i32) + 1024) catch return error.TrainingOptimizerLimitExceeded;
         }
-        if (self.execution == .resident_metal) staging_bytes = std.math.add(usize, staging_bytes, @max(largest_upload, 2 * 1024 * 1024)) catch return error.TrainingOptimizerLimitExceeded;
+        if (self.execution != .native) staging_bytes = std.math.add(usize, staging_bytes, @max(largest_upload, 2 * 1024 * 1024)) catch return error.TrainingOptimizerLimitExceeded;
         if (staging_bytes >= self.limits.max_transaction_bytes) return error.TrainingOptimizerLimitExceeded;
         const file = try snapshot_file.openRegular(compat.io(), compat.cwd(), path, control);
         defer file.close(compat.io());
@@ -445,7 +456,7 @@ pub const Trainer = struct {
         };
         defer reader.deinit();
         try check(control);
-        var staged = try initOwnedHost(a, self.owner.compute_backend, parameters, .{ .groups = self.groups, .grad_accum_steps = self.owner.config.grad_accum_steps, .max_grad_norm = self.owner.config.max_grad_norm, .limits = self.limits, .execution = self.execution });
+        var staged = try initOwnedHost(a, self.owner.compute_backend, parameters, .{ .groups = self.groups, .grad_accum_steps = self.owner.config.grad_accum_steps, .max_grad_norm = self.owner.config.max_grad_norm, .limits = self.limits, .execution = self.execution, .pytorch_clip_order = self.pytorch_clip_order });
         errdefer staged.deinit();
         staged.owner.optimizer_state.deinit();
         staged.owner.optimizer_state = optimizers.OptimizerState.init(a);
@@ -486,7 +497,7 @@ pub const Trainer = struct {
         const state_digest = try staged.stateFingerprint(run, control);
         if (validation) |v| if (v.expected_state_sha256) |expected| if (!std.mem.eql(u8, &expected, &state_digest)) return error.TrainingRestoreStateMismatch;
         staged.last_restore_receipt = .{ .state_sha256 = state_digest, .identity = staged.identity(), .accumulated_microbatches = staged.owner.accum_count, .checkpoint = .{ .size_bytes = snapshot.len, .sha256 = snapshot_hash.finalResult() } };
-        if (self.execution == .resident_metal) try staged.initializeDevice(control);
+        if (self.execution != .native) try staged.initializeDevice(control);
         try check(control);
         self.deinit();
         self.* = staged;
@@ -515,7 +526,7 @@ pub const Trainer = struct {
                 for (slot.dims, shape.dims[0..shape.rank()]) |actual, expected| if (actual != expected) return error.TrainingBindingShapeMismatch;
                 var controlled = cb.*;
                 controlled.execution_control = combined.control();
-                const value = if (self.execution == .resident_metal)
+                const value = if (self.execution != .native)
                     try controlled.residentTrainingPrimitive(&.{ .reshape = .{ .input = (slot.device orelse return error.DeviceOptimizerNotInitialized).weight, .shape = slot.dims } }, .{})
                 else
                     try controlled.fromFloat32Shape(slot.weights, slot.dims);
@@ -540,7 +551,7 @@ pub const Trainer = struct {
     /// matching GLiNER2.5's _renormalize_partial_accumulation. Parameters absent
     /// for the entire window retain grad=None, including their weight decay.
     pub fn flush(self: *Trainer, expected: Identity, control: ?Control) !Result {
-        if (self.execution == .resident_metal) return self.updateResident(expected, null, &.{}, true, control);
+        if (self.execution != .native) return self.updateResident(expected, null, &.{}, true, control);
         return self.update(expected, null, &.{}, true, control);
     }
 
@@ -575,7 +586,7 @@ pub const Trainer = struct {
     /// Includes every device slot for a prospective complete flush, even when
     /// the current microbatch or accumulation window uses only a subset.
     pub fn residentUpdateAdmission(self: *const Trainer, a: Allocator) !device_transaction.Estimate {
-        if (self.execution != .resident_metal) return error.UnsupportedSeededTrainingBackend;
+        if (self.execution == .native) return error.UnsupportedSeededTrainingBackend;
         const parameters = self.owner.regular_params.items;
         const slots = try a.alloc(device_transaction.Slot, parameters.len);
         defer a.free(slots);
@@ -583,19 +594,19 @@ pub const Trainer = struct {
         defer a.free(groups);
         const gradients = try a.alloc(device_transaction.Gradient, parameters.len);
         defer a.free(gradients);
-        for (self.groups, groups) |group, *out| out.* = .{ .optimizer = group.optimizer, .schedule = group.schedule };
+        for (self.groups, groups) |group, *out| out.* = group;
         for (parameters, slots, self.group_ids, gradients, 0..) |slot, *out, group, *gradient, index| {
             const device = slot.device orelse return error.DeviceOptimizerNotInitialized;
             out.* = .{ .weight = device.weight, .grad_accum = device.grad_accum, .m = device.m, .v = device.v, .shape = slot.dims, .group = group, .adam_step = slot.adam_step_count, .present = false };
             gradient.* = .{ .slot = index, .value = .zero };
         }
         const prospective = device_transaction.Identity{ .optimizer_step = self.owner.optimizer_step_count, .microbatch_step = @max(self.owner.step_count, self.owner.config.grad_accum_steps) };
-        return device_transaction.estimate(.{ .identity = prospective, .accumulated_microbatches = self.owner.config.grad_accum_steps - 1, .grad_accum_steps = self.owner.config.grad_accum_steps, .max_grad_norm = self.owner.config.max_grad_norm, .slots = slots, .groups = groups }, .{ .expected = prospective, .action = .submit, .loss = 0, .gradients = gradients }, try residentTransactionLimits(self.limits));
+        return device_transaction.estimate(.{ .identity = prospective, .accumulated_microbatches = self.owner.config.grad_accum_steps - 1, .grad_accum_steps = self.owner.config.grad_accum_steps, .max_grad_norm = self.owner.config.max_grad_norm, .pytorch_clip_order = self.pytorch_clip_order, .slots = slots, .groups = groups }, .{ .expected = prospective, .action = .submit, .loss = 0, .gradients = gradients }, try residentTransactionLimits(self.limits));
     }
 
     fn updateResident(self: *Trainer, expected: Identity, loss: ?f32, gradients: []const ResidentGradient, flush_only: bool, control: ?Control) !Result {
         try check(control);
-        if (self.execution != .resident_metal) return error.UnsupportedSeededTrainingBackend;
+        if (self.execution == .native) return error.UnsupportedSeededTrainingBackend;
         if (self.active_binding) return error.TrainingTapeStillLive;
         if (!std.meta.eql(expected, self.identity())) return error.TrainingTapeIdentityMismatch;
         const parameters = self.owner.regular_params.items;
@@ -608,7 +619,7 @@ pub const Trainer = struct {
         const slots = try a.alloc(device_transaction.Slot, parameters.len);
         const groups = try a.alloc(device_transaction.Group, self.groups.len);
         const incoming = try a.alloc(device_transaction.Gradient, gradients.len);
-        for (self.groups, groups) |group, *out| out.* = .{ .optimizer = group.optimizer, .schedule = group.schedule };
+        for (self.groups, groups) |group, *out| out.* = group;
         for (parameters, slots, self.group_ids, self.present) |slot, *out, group, present| {
             const device = slot.device orelse return error.DeviceOptimizerNotInitialized;
             const state = self.owner.optimizer_state.param_states.get(slot.name) orelse return error.InvalidOptimizerState;
@@ -629,6 +640,7 @@ pub const Trainer = struct {
             .accumulated_microbatches = self.owner.accum_count,
             .grad_accum_steps = self.owner.config.grad_accum_steps,
             .max_grad_norm = self.owner.config.max_grad_norm,
+            .pytorch_clip_order = self.pytorch_clip_order,
             .slots = slots,
             .groups = groups,
         }, .{ .expected = .{ .optimizer_step = expected.optimizer_step, .microbatch_step = expected.microbatch_step }, .action = if (flush_only) .flush else .submit, .loss = loss, .gradients = incoming }, transaction_limits, control);
@@ -832,11 +844,12 @@ pub const Trainer = struct {
     /// Checkpoint callers must use this digest, not the input digest alone.
     pub fn fingerprint(self: *const Trainer, run: [32]u8) ![32]u8 {
         const a = self.owner.allocator;
-        const settings = try std.json.Stringify.valueAlloc(a, .{ .groups = self.groups, .grad_accum_steps = self.owner.config.grad_accum_steps, .max_grad_norm = self.owner.config.max_grad_norm, .partial_window = "actual_microbatches" }, .{});
+        const settings = try std.json.Stringify.valueAlloc(a, .{ .groups = self.groups, .grad_accum_steps = self.owner.config.grad_accum_steps, .max_grad_norm = self.owner.config.max_grad_norm, .partial_window = "actual_microbatches", .pytorch_clip_order = self.pytorch_clip_order }, .{ .emit_null_optional_fields = false });
         defer a.free(settings);
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
         hash.update("antfly.seeded-gradient-trainer.v1");
-        if (self.execution == .resident_metal) hash.update("\x00resident_f32_optimizer_v1\x00");
+        if (self.execution != .native) hash.update("\x00resident_f32_optimizer_v1\x00");
+        if (self.execution == .resident_cuda) hash.update("cuda_f32_v1\x00");
         hash.update(&run);
         hash.update(settings);
         for (self.owner.regular_params.items, self.group_ids) |slot, group| {

@@ -1500,11 +1500,10 @@ pub fn build(b: *std.Build) void {
     cli_test_step.dependOn(&run_cli_tests.step);
 
     const finetune_ctx = finetune_common.fromWorkflow(workflow_ctx);
-    const finetune_commands = finetune_tools.register(finetune_ctx);
-    const finetune_workflow_commands = finetune_workflows.register(finetune_ctx);
+    _ = finetune_tools.register(finetune_ctx);
+    _ = finetune_workflows.register(finetune_ctx);
     const finetune_test_step = finetune_tests.addTests(finetune_ctx, "test-finetune");
-    for (finetune_commands) |command| finetune_test_step.dependOn(&command.executable.step);
-    for (finetune_workflow_commands) |command| finetune_test_step.dependOn(&command.executable.step);
+    finetune_test_step.dependOn(finetune_common.addCommandChecks(finetune_ctx, &(finetune_tools.specs ++ finetune_workflows.specs)));
 
     const run_quant_kernel_compiler_tests = b.addRunArtifact(tests);
     run_quant_kernel_compiler_tests.addArg("--test-filter");
@@ -1526,12 +1525,16 @@ pub fn build(b: *std.Build) void {
         run_quant_kernel_cuda_microbench_tests.addArg("cuda microbench");
         quant_kernel_local_check_step.dependOn(&run_quant_kernel_cuda_microbench_tests.step);
     }
-    _ = workflows_tests.addDefault(workflow_ctx, suite, .{
+    const default_test_step = workflows_tests.addDefault(workflow_ctx, suite, .{
         .codegen = quant_kernel_codegen_test_check,
         .cuda_source = cuda_artifact_source_policy_check,
         .metal_runtime = run_quant_kernel_metal_runtime_check_tests,
         .bge_benchmark = run_bge_m3_e2e_bench_tests,
     });
+    // The standalone default includes both owners. Requesting test-finetune
+    // alongside test still reaches the same run node and executes it once.
+    if (suite.selected_test_filters.len == 0)
+        default_test_step.dependOn(&b.top_level_steps.get("test-finetune-unit").?.step);
     const install_tests = b.addInstallArtifact(tests, .{
         .dest_sub_path = "antfly-inference-tests",
     });

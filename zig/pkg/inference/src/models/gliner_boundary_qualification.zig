@@ -21,7 +21,7 @@ const artifact = @import("gliner_boundary_artifact.zig");
 
 pub const policy_version: u32 = 1;
 pub const max_entries: usize = 64;
-pub const Backend = enum { native, metal };
+pub const Backend = enum { native, metal, cuda };
 
 /// Required features come from the complete compiled request, never from
 /// capability strings supplied by a model or client. A row declares support

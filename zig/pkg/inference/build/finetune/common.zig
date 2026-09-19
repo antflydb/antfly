@@ -131,15 +131,22 @@ pub const CommandSpec = struct {
     link_libc: bool = false,
     /// This command writes a release version to its output or training manifest.
     release_metadata: bool = false,
+    // Entrypoints that import another CLI through a relative source path must
+    // retain one module boundary (Zig rejects the file in two modules).
+    shared_check: bool = true,
 };
 
 pub const TestSpec = struct {
+    /// This import-only root is completely covered by the full inference unit gate.
+    covered_by_inference: bool = false,
     step_name: []const u8,
     root_source_file: []const u8,
     description: []const u8,
     imports: []const Import = &.{},
     native_link: NativeLink = .none,
     filters: []const []const u8 = &.{},
+    /// Runtime family selection when a focused target includes imported tests.
+    focused_filters: []const []const u8 = &.{},
 };
 
 pub const Command = struct {
@@ -165,6 +172,20 @@ pub fn addCommand(ctx: Context, spec: CommandSpec) Command {
             .optimize = ctx.optimize,
         }),
     });
+    configureCommand(ctx, spec, exe);
+
+    const run = b.addRunArtifact(exe);
+    run.setCwd(ctx.root orelse b.path("."));
+    if (ctx.args orelse b.args) |args| run.addArgs(args);
+    if (ctx.publish_targets) {
+        const step = b.step(spec.name, spec.description);
+        step.dependOn(&run.step);
+    }
+    return .{ .executable = exe, .run = run };
+}
+
+fn configureCommand(ctx: Context, spec: CommandSpec, exe: *std.Build.Step.Compile) void {
+    const b = ctx.b;
     addImports(ctx, exe.root_module, spec.imports, ctx.pjrt_mod);
     if (spec.assets) |owner| exe.root_module.addImport("inference_finetune_assets", @import("assets.zig").create(.{
         .b = b,
@@ -182,15 +203,114 @@ pub fn addCommand(ctx: Context, spec: CommandSpec) Command {
         exe.root_module.addObject(ctx.build_info_object);
     }
     if (spec.link_libc) exe.root_module.link_libc = true;
+}
 
-    const run = b.addRunArtifact(exe);
-    run.setCwd(ctx.root orelse b.path("."));
-    if (ctx.args orelse b.args) |args| run.addArgs(args);
-    if (ctx.publish_targets) {
-        const step = b.step(spec.name, spec.description);
-        step.dependOn(&run.step);
+fn sameCommandConfiguration(a: CommandSpec, b: CommandSpec) bool {
+    // inference_internal owns the Metal translation unit when imported; otherwise
+    // configureNative supplies it at the executable root. Keep that ownership.
+    return a.shared_check and b.shared_check and a.assets == b.assets and a.native_link == b.native_link and
+        a.link_libc == b.link_libc and a.release_metadata == b.release_metadata and
+        containsImport(a.imports, .inference_internal) == containsImport(b.imports, .inference_internal);
+}
+
+/// Check every registered entrypoint without recompiling its shared inference
+/// implementation for every CLI. Compatible link profiles share a compilation;
+/// each command module still receives only its declared imports.
+/// Individual command artifacts and run targets remain independently buildable.
+pub fn addCommandChecks(ctx: Context, specs: []const CommandSpec) *std.Build.Step {
+    const b = ctx.b;
+    const step = b.step(if (ctx.publish_targets) "test-finetune-command-check" else "inference-finetune-command-check", "Compile and link all finetuning CLI entrypoints in shared configuration groups");
+    const assigned = b.allocator.alloc(bool, specs.len) catch @panic("OOM");
+    @memset(assigned, false);
+    var group_index: usize = 0;
+    for (specs, 0..) |spec, first| {
+        if (assigned[first]) continue;
+        var names: std.ArrayList([]const u8) = .empty;
+        var commands: std.ArrayList(CommandSpec) = .empty;
+        for (specs, 0..) |candidate, index| {
+            if (assigned[index] or (index != first and !sameCommandConfiguration(spec, candidate))) continue;
+            std.debug.assert(std.mem.startsWith(u8, candidate.root_source_file, "src/"));
+            names.append(b.allocator, candidate.name) catch @panic("OOM");
+            commands.append(b.allocator, candidate) catch @panic("OOM");
+            assigned[index] = true;
+        }
+        const generated = b.addWriteFiles();
+        var source: std.Io.Writer.Allocating = .init(b.allocator);
+        source.writer.writeAll(@embedFile("command_check_preamble.zig.txt")) catch @panic("OOM");
+        for (names.items, 0..) |name, index| {
+            source.writer.print("    if (std.mem.eql(u8, name, \"{s}\")) return @import(\"command_{d}\").main(init);\n", .{ name, index }) catch @panic("OOM");
+        }
+        source.writer.writeAll("    return error.CompileCheckOnly;\n}\n") catch @panic("OOM");
+        const check = b.addExecutable(.{
+            .name = b.fmt("finetune-command-check-{d}", .{group_index}),
+            .max_rss = ctx.test_compile_max_rss,
+            .root_module = b.createModule(.{
+                .root_source_file = generated.add("check.zig", source.written()),
+                .target = ctx.target,
+                .optimize = ctx.optimize,
+            }),
+        });
+        configureCommand(ctx, spec, check);
+        // Share each named dependency within the group, while retaining the
+        // original source boundary for each command module.
+        for (commands.items, 0..) |command, index| {
+            const module = b.createModule(.{
+                .root_source_file = ctx.path(command.root_source_file),
+                .target = ctx.target,
+                .optimize = ctx.optimize,
+            });
+            // Commands keep their declared imports even when their link-compatible
+            // checks share an executable. A union of imports would mask missing
+            // dependency declarations in standalone commands.
+            for (command.imports) |dependency| {
+                const name = @tagName(dependency);
+                if (!check.root_module.import_table.contains(name))
+                    addImports(ctx, check.root_module, &.{dependency}, ctx.qualification_pjrt_mod);
+                if (check.root_module.import_table.get(name)) |shared|
+                    module.addImport(name, shared);
+                if (dependency == .onnx_graph) module.addImport("onnx_data", ctx.onnx.data);
+            }
+            if (command.native_link != .none) ctx.identities.addImports(module);
+            if (command.assets != null)
+                module.addImport("inference_finetune_assets", check.root_module.import_table.get("inference_finetune_assets").?);
+            if (command.release_metadata)
+                module.addImport("build_info", ctx.build_info_mod);
+            check.root_module.addImport(b.fmt("command_{d}", .{index}), module);
+        }
+        _ = check.getEmittedBin();
+        step.dependOn(&check.step);
+        group_index += 1;
     }
-    return .{ .executable = exe, .run = run };
+    return step;
+}
+
+/// One source boundary and compile artifact for ordinary finetuning tests.
+/// Reuse inference's dependency identities so implementations have one owner.
+pub fn sharedTests(ctx: Context, specs: []const TestSpec) *std.Build.Step.Compile {
+    const b = ctx.b;
+    const root = b.createModule(.{
+        .root_source_file = ctx.path("src/finetune_test_root.zig"),
+        .target = ctx.target,
+        .optimize = ctx.optimize,
+    });
+    const exe = b.addTest(.{
+        .name = "finetune-tests",
+        .max_rss = ctx.test_compile_max_rss,
+        .root_module = root,
+        .test_runner = .{ .path = ctx.path("src/test_runner_filter.zig"), .mode = .simple },
+    });
+    root.addImport("antfly_platform", ctx.antfly_platform_mod);
+    for (specs) |spec| {
+        if (spec.covered_by_inference) continue;
+        std.debug.assert(spec.filters.len == 0);
+        std.debug.assert(spec.native_link != .no_accel);
+        for (spec.imports) |dependency| {
+            if (!root.import_table.contains(@tagName(dependency)))
+                addImports(ctx, root, &.{dependency}, ctx.qualification_pjrt_mod);
+        }
+    }
+    configureNative(ctx, exe, .default, &.{.inference_internal});
+    return exe;
 }
 
 pub fn addTest(ctx: Context, spec: TestSpec) *std.Build.Step {

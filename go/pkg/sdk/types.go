@@ -234,10 +234,10 @@ type (
 	SSEToolMode      = oapi.SSEToolMode
 	SSEError         = oapi.SSEError
 
-	RetrievalQueryRequest = oapi.RetrievalQueryRequest
-	RetrievalStrategy     = oapi.RetrievalStrategy
-	TreeSearchConfig      = oapi.TreeSearchConfig
-	QueryHit              = oapi.QueryHit
+	RetrievalQueryRequest     = oapi.QueryRequest
+	RetrievalStrategy         = oapi.RetrievalStrategy
+	RetrievalNavigationConfig = oapi.RetrievalNavigationConfig
+	QueryHit                  = oapi.QueryHit
 
 	// Evaluation types
 	EvalConfig    = oapi.EvalConfig
