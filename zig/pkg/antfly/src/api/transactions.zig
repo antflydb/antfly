@@ -1370,6 +1370,9 @@ pub const SessionRegistry = struct {
 
     mutex: AtomicMutex = .{},
     session_locks: [session_lock_count]AtomicMutex = [_]AtomicMutex{.{}} ** session_lock_count,
+    // Record locks protect individual durable mutations. Execution ownership
+    // spans 2PC and its response handoff, which must not race a local replay.
+    commit_locks: [session_lock_count]AtomicMutex = [_]AtomicMutex{.{}} ** session_lock_count,
     sessions: std.AutoHashMapUnmanaged(db_mod.types.TxnId, Session) = .empty,
     durable: ?*DurableSessionStore = null,
     lease_store: ?SessionLeaseStore = null,
@@ -1383,6 +1386,35 @@ pub const SessionRegistry = struct {
     recovery_index_cursor: ?db_mod.types.TxnId = null,
     recovery_audit_cursor: ?db_mod.types.TxnId = null,
     memory_recovery_scan_offset: usize = 0,
+
+    pub const CommitExecution = struct {
+        lock: *AtomicMutex,
+
+        pub fn release(self: CommitExecution) void {
+            self.lock.unlock();
+        }
+    };
+
+    pub fn acquireCommitExecution(self: *SessionRegistry, txn_id: db_mod.types.TxnId, io: std.Io) std.Io.Cancelable!CommitExecution {
+        const lock = self.commitLock(txn_id);
+        // Execution can yield during network/storage work. A contending HTTP
+        // retry must yield through its caller's Io as well, including under
+        // cooperative execution, and must remain cancellable.
+        while (!lock.inner.tryLock()) try io.sleep(.fromMilliseconds(1), .awake);
+        return .{ .lock = lock };
+    }
+
+    /// Maintenance skips live requests instead of waiting on their execution.
+    /// The durable recovery index remains intact for a later pass or restart.
+    pub fn tryAcquireCommitExecution(self: *SessionRegistry, txn_id: db_mod.types.TxnId) ?CommitExecution {
+        const lock = self.commitLock(txn_id);
+        if (!lock.inner.tryLock()) return null;
+        return .{ .lock = lock };
+    }
+
+    fn commitLock(self: *SessionRegistry, txn_id: db_mod.types.TxnId) *AtomicMutex {
+        return &self.commit_locks[std.hash.Wyhash.hash(0, &txn_id) % session_lock_count];
+    }
 
     pub fn init(durable: ?*DurableSessionStore) SessionRegistry {
         return initWithOptions(durable, null, null, null, null, null);
@@ -4635,6 +4667,39 @@ test "durable session mutations publish only after persistence succeeds" {
         owned.deinit(std.testing.allocator);
     }
     try std.testing.expectEqual(@as(usize, 0), details.status.staged_write_count);
+}
+
+test "transaction commit execution yields through caller io and preserves ownership on cancellation" {
+    var registry = SessionRegistry.init(null);
+    defer registry.deinit(std.testing.allocator);
+    const txn_id = try distributed_txn.parseTxnIdHex("00112233445566778899aabbccddeeff");
+    const Wait = struct {
+        held: ?SessionRegistry.CommitExecution,
+        cancel: bool = true,
+        calls: usize = 0,
+
+        fn sleep(ptr: ?*anyopaque, _: std.Io.Timeout) std.Io.Cancelable!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.calls += 1;
+            if (self.cancel) return error.Canceled;
+            self.held.?.release();
+            self.held = null;
+        }
+    };
+    var waiter = Wait{ .held = try registry.acquireCommitExecution(txn_id, std.testing.io) };
+    defer if (waiter.held) |held| held.release();
+    var vtable = std.testing.io.vtable.*;
+    vtable.sleep = Wait.sleep;
+    const io: std.Io = .{ .userdata = &waiter, .vtable = &vtable };
+    try std.testing.expectError(error.Canceled, registry.acquireCommitExecution(txn_id, io));
+    try std.testing.expect(registry.tryAcquireCommitExecution(txn_id) == null);
+    waiter.cancel = false;
+    const next = try registry.acquireCommitExecution(txn_id, io);
+    try std.testing.expectEqual(@as(usize, 2), waiter.calls);
+    try std.testing.expect(registry.tryAcquireCommitExecution(txn_id) == null);
+    next.release();
+    const recovery = registry.tryAcquireCommitExecution(txn_id) orelse return error.TestUnexpectedResult;
+    recovery.release();
 }
 
 test "durable transaction sessions retain terminal commit coordinator handoff" {

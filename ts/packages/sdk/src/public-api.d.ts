@@ -6075,6 +6075,10 @@ export interface components {
             /** @description Secret name (e.g., openai.api_key) */
             key: string;
             status: components["schemas"]["SecretStatus"];
+            /** @description Name of the winning source, or environment. */
+            source?: string;
+            /** @description Whether this key has an Antfly-managed override that can be deleted. */
+            managed?: boolean;
             /** @description Corresponding environment variable name (e.g., OPENAI_API_KEY) */
             env_var?: string;
             /** Format: date-time */
@@ -6083,6 +6087,8 @@ export interface components {
             updated_at?: string;
         };
         SecretList: {
+            /** @description Whether this server has a native store for secret API writes. */
+            writable?: boolean;
             secrets: components["schemas"]["SecretEntry"][];
         };
         SecretWriteRequest: {

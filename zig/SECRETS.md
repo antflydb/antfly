@@ -1,18 +1,473 @@
-# Antfly Zig Secrets Store
+# Antfly Secret Sources and Native Store
 
 ## Goal
 
-Antfly-zig needs a small local secrets store for standalone mode. The store backs the
-`/secrets` API, resolves `${secret:key}` references in configuration, and lets
-operators keep provider credentials out of ordinary config files.
+Antfly resolves `${secret:key}` references through an ordered resolver and backs
+the `/secrets` API with an optional Antfly-managed native store. Operators can
+keep credentials outside ordinary configuration and combine native overrides,
+externally managed sources, and environment fallback.
 
-The implementation is intentionally simple: one JSON file on local disk is held
-as an in-memory snapshot. Reads refresh that snapshot when the file changes, and
-API writes refresh first, stage a replacement snapshot, persist it atomically,
-then publish the new in-memory state.
+The current backends are JSON files and the process environment. File snapshots
+refresh on changes; native writes persist atomically before publishing new state.
+This document describes that implementation and the remaining rotation roadmap.
 
-This document captures the current design, what is already implemented, and the
-remaining plan for runtime secret rotation.
+## Source configuration and ownership
+
+The `secrets` section configures the resolver before ordinary configuration
+references are resolved:
+
+```json
+{
+  "secrets": {
+    "native": {
+      "name": "native",
+      "path": "/var/lib/antfly/secrets.json"
+    },
+    "sources": [
+      {
+        "name": "tenant",
+        "type": "file",
+        "path": "/run/secrets/tenant/secrets.json"
+      },
+      {
+        "name": "platform",
+        "type": "file",
+        "path": "/run/secrets/platform/secrets.json"
+      }
+    ],
+    "environment": true
+  }
+}
+```
+
+Resolution is deterministic: a native override wins, then the first matching
+source in array order, then the environment if enabled. An empty value is a
+present value, not a reason to fall through. A source's last-known-good snapshot
+retains its precedence when a refresh fails.
+
+- `native` is optional and is the only store the secret API can write. Its name
+  defaults to `native`. The name describes Antfly ownership, not storage topology.
+  This first implementation requires `path` and is file-backed and node-local;
+  it does **not** replicate API mutations across a distributed cluster.
+- `sources` defaults to `[]`. Entries require a unique `name`, a `type`, and
+  provider-specific settings. Only `type: "file"` is implemented now. These are
+  externally managed and read-only to Antfly, regardless of filesystem permissions.
+- `environment` defaults to `true`, including when `secrets` is `{}`. It is a
+  final fallback, not an entry implicitly inserted into the ordered source array.
+  `false` disables environment lookup for `${secret:...}` and environment secret
+  discovery. It does not disable unrelated environment configuration, explicit
+  provider environment defaults/settings, or cloud SDK workload identity.
+- An explicit section without `native` disables secret API writes. In particular,
+  `{"secrets":{"environment":false}}` creates an empty resolver that cannot fall
+  back to the process environment. No default native file is added.
+- Names use ASCII letters, digits, dots, underscores, or hyphens; `environment`
+  is reserved. Duplicate names (including the native name), empty paths, unknown
+  source types/properties, and secret-reference paths are configuration errors.
+  A native path must not also be an external source. Exact duplicate paths are
+  rejected; operators must also avoid aliases or symlinks to the same file.
+- Paths are literal and relative paths use the process working directory. Keep
+  configured logical paths for reads so projected-volume symlink rotation works.
+  Native atomic writes follow the current target without replacing the symlink;
+  dangling targets fail rather than replacing the link.
+
+Source membership, ordering, names, and environment policy are startup-only.
+Restart to change them; the existing file-content rotation behavior stays live.
+Standalone, metadata, data, and serverless startup all use this bootstrap parser.
+
+### Compatibility and migration
+
+When `secrets` is absent, preserve existing deployment defaults and
+`--secret-store-path` behavior: standalone uses `<base>/secrets.json` by default,
+other modes have no file store by default, and explicit legacy paths use the
+first file as the writable store and remaining files as fallbacks. Environment
+fallback remains enabled. Serverless's legacy `ANTFLY_SECRET_STORE_PATH` also
+continues to work.
+
+Do not combine an explicit `secrets` section with legacy secret-store flags (or
+serverless's legacy path environment variable); startup rejects the ambiguity.
+For projected Kubernetes volumes, migrate every projected file into `sources`.
+Add a separate native path only when node-local overrides are desired.
+
+### API and dashboard
+
+Ownership is per source, not a per-key read/write permission. Values remain
+write-only through the API:
+
+- `GET /secrets` includes `writable`, indicating whether this server has a native
+  write destination. Each effective key includes `source` (winning source name)
+  and `managed` (whether a native override exists), alongside existing metadata.
+  File paths and secret values are not returned. Legacy file/env status fields
+  remain compatible; `configured_both` only considers enabled environment fallback.
+- `PUT /secrets/{key}` creates or replaces a native override. It never mutates
+  the external source that currently supplies the key. Without native, return 503.
+- `DELETE /secrets/{key}` removes only the native override; any external or
+  environment value becomes effective immediately. Return 404 when there is no
+  native override, even if an external value exists, and 503 without native.
+  There are no deletion tombstones that hide external values.
+- The dashboard uses the returned capability, displays the winning source, and
+  offers deletion only for managed keys. Its delete confirmation explains that
+  a fallback may become active. Adding an existing key creates an override.
+
+### Extension boundary
+
+Keep resolution policy separate from source ownership. A future source provider
+should supply lookup, metadata, refresh/health, and revision information; only
+native storage needs mutation support. The current `FileStore` uses explicit
+writable/environment policy and ordered file snapshots, retaining its existing
+cross-archive callback boundary. It is not yet a generic remote-provider engine.
+
+Remote source types can extend the tagged `sources` entries without changing
+precedence or `${secret:key}` syntax. Define authentication, timeout, caching,
+last-known-good, and revision semantics before adding a provider. A distributed
+native backend can later implement the same override behavior, but needs explicit
+replication and consistency semantics; the `native` name makes no distribution
+promise today. Same-open-file metadata/read snapshots remain a separate hardening
+step for rotations that occur between the current stat and read operations.
+
+## Intended native storage architecture
+
+The native store is an Antfly-owned logical service. Its persistence follows the
+storage backend; `native` does not imply a file or a distributed service. All
+implementations share secret identity, encryption, conditional mutation, and
+resolution semantics.
+
+| Deployment | Intended persistence | Commit boundary |
+| --- | --- | --- |
+| Distributed Antfly | Dedicated encrypted metadata records replicated through metadata Raft | Durable quorum commit and application of the conditional mutation |
+| Antfly Lite | Reserved encrypted records inside the native `.aflite` file | Atomic durable commit through the existing single-writer machinery |
+| Antfly Serverless | Immutable encrypted objects and a versioned head per scope | Successful conditional publication of the head |
+
+The common contracts (`common/secret_contract.zig`), AFSE codec
+(`common/secret_record.zig`), and Lite persistence adapter
+(`storage/lite/secret_store.zig`) are implemented. Embedding hosts can obtain a
+scope-bound adapter through `lite.backend.Handle.secretStore`. Existing runtime
+consumers still use `FileStore`: JSON files remain plaintext and are not silently
+converted. Distributed/serverless adapters, migration, production key-provider
+configuration, RPCs, and runtime resolver integration remain follow-up work.
+
+### Common source and native writer contract
+
+`Source` borrows a provider handle and exposes `resolve`, `listMetadata`, and
+`refresh` (returning health). `NativeStore` combines a source with a writer that
+exposes `put` and `removeOverride`. Read-only sources have no writer capability.
+Callbacks use the existing checked runtime callback boundary to preserve error
+semantics across separately compiled archives. Providers own their lifecycle;
+they must outlive borrowed handles and all in-flight calls.
+
+- Identity is `(scope, key, revision)`. Scope is a trusted, stable tenant/database
+  identity, not a user-provided namespace that bypasses authorization.
+- Revisions are source-local unsigned 64-bit counters. Native revisions are
+  durable, monotonically increasing per scope; zero means the initial empty
+  snapshot and cannot identify a stored value. Every effective mutation,
+  including deletion, advances the scope revision; writes assign that revision
+  to the entry. Overflow must reject a write, never wrap or reuse a revision.
+- `Lookup` returns a scope snapshot revision and an optional value with its own
+  entry revision. An absent key is a successful lookup with `value = null`, not
+  an I/O error. A present empty byte string is still a winning secret.
+- Read options include a minimum source-local snapshot revision. The wrapper
+  rejects older snapshots even when they report absence. Providers additionally
+  enforce authorization and their declared freshness policy before returning a
+  snapshot. Revisions from different sources must never be compared.
+- `resolveOrdered` accepts named sources in priority order. It falls through only
+  after successful absence; unavailability, corruption, and authorization errors
+  propagate. The caller supplies native first, external sources next, and an
+  environment adapter last only when enabled. No adapter is implicitly added.
+- Writer preconditions are `any`, `absent`, or `exact(entry_revision)`. Backends
+  check these inside their commit boundary. Conflicts return `error.Conflict`;
+  a preliminary read followed by an unconditional write is insufficient.
+- Mutations return the committed scope revision. Removal of an already absent
+  override is a no-op with `changed = false`. Internal deletion markers may be
+  needed for replication/cache invalidation; they must not hide external fallback.
+- Returned values and metadata use the caller's allocator. `SecretBytes.deinit`
+  securely zeros its owned allocation before releasing it. This is best-effort
+  cleanup, not a guarantee about application copies, swap, or crash dumps.
+
+`ExpectedRevision.check` is shared precondition logic, not a transaction engine.
+The common layer validates requests and returned revisions but cannot supply
+backend atomicity, tenant authorization, durability, or cache freshness itself.
+
+### Encrypted record format: AFSE v1
+
+The storage-independent codec implements envelope encryption using Zig's
+`XChaCha20Poly1305`: a new 32-byte data key and 24-byte nonce are generated with
+fallible `Io.randomSecure` on every seal. There is no public caller-selected
+nonce API and no fallback to weaker randomness when entropy is unavailable.
+The extended nonce construction supports randomized nonces; see the
+[libsodium construction documentation](https://libsodium.gitbook.io/doc/secret-key_cryptography/aead/chacha20-poly1305/xchacha20-poly1305_construction).
+
+A caller-supplied `KeyProvider` wraps the data key and returns an opaque wrapped
+blob plus a concrete wrapping-key identifier. Its unwrap callback receives the
+expected identity, key identifier, and blob and fills a temporary 32-byte key.
+A provider must authenticate its wrapping format and enforce allowed key IDs and
+scope policy. Provider configuration is trusted bootstrap state; record bytes
+cannot select an arbitrary provider or credential source. No production KMS,
+raw-key, or OS-keychain provider is introduced in this phase.
+
+The canonical binary format uses unsigned little-endian integers:
+
+| Offset | Field |
+| --- | --- |
+| 0 | Magic `AFSE` (4 bytes) |
+| 4 | Format version `1` (u16) |
+| 6 | Algorithm `1` = XChaCha20-Poly1305 (u16) |
+| 8 | Entry revision (u64, nonzero) |
+| 16 | Scope byte length (u16) |
+| 18 | Secret-name byte length (u16) |
+| 20 | Wrapping-key identifier byte length (u16) |
+| 22 | Wrapped-data-key byte length (u32) |
+| 26 | Ciphertext byte length (u32; equals plaintext length) |
+| 30 | Nonce (24 bytes) |
+| 54 | Scope, secret name, key identifier, wrapped key, in that order |
+| Variable | Ciphertext, then 16-byte authentication tag |
+
+The entire prefix through the wrapped key is AEAD associated data. This binds
+version, algorithm, lengths, scope, name, revision, nonce, wrapping-key identity,
+and wrapped key to the ciphertext. Identities and key IDs are nonempty UTF-8,
+without NUL bytes, limited to 1 KiB each; wrapped keys are limited to 64 KiB and
+values to 1 MiB. Empty values and arbitrary binary secret values are supported.
+The parser rejects unsupported versions/algorithms, oversized lengths,
+truncation, and trailing bytes before asking the key provider to unwrap anything.
+Names, key identifiers, lengths, and revisions are authenticated but not encrypted.
+
+`decode` returns a borrowed **unauthenticated** framing view. It is not a trusted
+metadata or authorization API. `open` requires an expected identity from the
+backend's trusted index/current committed revision and rejects substitution before
+unwrapping. Authentication failure produces `error.CorruptInput`; unavailable key
+providers remain errors rather than triggering source fallback. Temporary data
+keys are erased on success and failure, and failed plaintext buffers are erased
+and freed. A returned plaintext buffer remains the caller's responsibility.
+
+AEAD does not provide rollback protection by itself. A previously valid record
+is still valid at its original revision. Backends must obtain the expected
+revision from their authoritative head and enforce read freshness. Restore must
+not silently reset counters under an existing scope; it needs an explicit
+freshness fence or a new scope incarnation with appropriately re-encrypted data.
+Rewrapping changes authenticated bytes, so v1 requires resealing the record; an
+in-place wrapped-key replacement is invalid.
+
+### Backend implementation plan
+
+**Distributed:** Add a protected metadata namespace and conditional Raft command
+for encrypted secret records. Encrypt before proposing; Raft apply validates and
+persists ciphertext deterministically without KMS calls. Because the revision is
+authenticated, prepare against a scope snapshot, propose the expected scope
+revision and the next revision together, and retry preparation if another writer
+wins. Do not assume a future Raft log index before it has been assigned. Public
+metadata/query/export paths must not expose these records as ordinary documents.
+Authenticated internal RPCs authorize each worker's scope and required secret.
+Publish invalidations after commit and periodically reconcile revisions so missed
+notifications cannot leave permanent stale caches.
+
+#### Distributed secret delivery to data nodes (planned)
+
+Metadata nodes implement the authoritative `NativeStore`; every data node hosts
+a read-only remote `Source` backed by internal RPCs and a memory cache. Metadata
+Raft replicates durable encrypted AFSE records. Data nodes obtain values needed
+by their assigned work and authorized scopes. Cluster-wide secrets may be
+available to all nodes, while tenant secrets require tenant-specific access.
+Having a node identity alone does not grant access to every scope or key.
+
+The initial delivery model decrypts on the metadata service and sends resolved
+values over mutually authenticated TLS. Only metadata nodes need KMS/key-provider
+access. Data nodes keep resolved values in memory, with no plaintext disk cache;
+responses and errors must not put secret values in logs or tracing. Direct AFSE
+delivery is a possible later alternative, but would require each recipient to
+have authorized unwrap access and separately provisioned key-provider credentials.
+Node identity, transport trust, and metadata key-provider credentials come from
+bootstrap configuration, not from the native store they unlock.
+
+The mutation and delivery sequence is:
+
+1. Encrypt the mutation and durably commit/apply it through metadata Raft,
+   advancing the scope revision and recording the changed entry revision.
+2. Publish an invalidation containing scope, key, committed revision, and change
+   kind (update or deletion). Notifications contain no secret values.
+3. An affected data node resolves the key through an authenticated internal RPC,
+   requiring at least the notified scope revision. The service authorizes the
+   node's scope/key access before returning a value or authoritative absence.
+4. The node publishes the refreshed cache entry and advances the relevant local
+   consumer generation. Provider clients, connection pools, and workers apply
+   the subsystem-specific rotation rules described later in this document.
+
+The intended internal protocol is:
+
+| Operation | Semantics |
+| --- | --- |
+| `ResolveSecret(scope, key, min_revision)` | Return an authorized value with its entry revision, or authoritative absence, plus the observed scope revision. |
+| `WatchSecrets(scope, after_revision)` | Deliver ordered committed changes/deletions after a scope revision, or explicitly report that replay history is unavailable. |
+| `GetSecretRevision(scope)` | Read an authorized current scope revision for periodic reconciliation. |
+
+Authoritative reads need a Raft read barrier or equivalent leader-confirmed
+freshness. Merely satisfying a caller's old minimum revision on an isolated
+follower must not renew a cache's freshness indefinitely. A node that cannot
+serve the requested revision and freshness must wait, forward, or return an
+availability error. Watch publication follows commit; reconnect/reconciliation
+must recover changes even if a leader fails between commit and notification.
+
+Watch delivery is an optimization, not the sole correctness mechanism. At
+startup, on reconnect, and after a watch-history gap, nodes reconcile their
+cached keys against authoritative metadata. Periodic revision checks catch
+missed notifications. Use a snapshot/cursor handoff or replay from the fetched
+snapshot revision so changes during reconciliation are not lost. Receiving a
+new scope revision does not by itself mark every cached entry as refreshed;
+advance a fully reconciled revision only after processing all changes through
+that revision or reconciling the affected cache. Reject stale responses that
+would overwrite newer values or deletion knowledge.
+
+Cache both values and authoritative absence with bounded freshness. The
+distributed adapter must specify the freshness duration and whether still-valid
+cached values may serve during an outage before runtime integration is enabled.
+Use monotonic elapsed time for local expiry. Expired entries fail resolution if
+metadata cannot revalidate them; unavailability must never cause source fallback.
+Once a change notification establishes that a cached answer is outdated, that
+answer cannot satisfy reads requiring the notified revision. Evict cached values
+when their scope assignment or authorization is withdrawn, and perform best-effort
+plaintext cleanup when replacing or removing owned buffers.
+
+A deletion invalidates the native override, including any cached value. Only
+after confirming authoritative absence may ordered resolution expose an external
+source or the environment. External files and environment variables remain
+separately provisioned sources; this protocol distributes native secrets and
+does not make node-local fallback configurations consistent automatically.
+
+Mutation success means durable metadata commit, not acknowledgement from every
+data node. Return the committed revision and separately expose each node's
+observed/reconciled revision and relevant consumer activation status. Do not
+claim that a consumer has switched credentials merely because its node fetched
+the new value. A caller needing coordinated rollout can wait for the required
+nodes/consumers to report readiness without making every write depend on all
+nodes being available.
+
+Rotation is not instantaneous revocation: a partitioned node may use an allowed
+cached value until its freshness deadline, and an in-flight request may already
+hold the old credential. Revoking that credential at the external provider is a
+separate operation. Rollout should account for that overlap and for rebuilding
+long-lived clients or sessions where changing a cached string is insufficient.
+
+Distributed delivery tests must cover unauthorized scope/key access, node join
+and reassignment, leader failure between commit and notification, reconnect and
+watch-history gaps, missed/deferred invalidations, out-of-order fetch responses,
+negative-cache invalidation on create, deletion revealing fallback, partitioned
+freshness expiry, stale follower reads, and consumer activation acknowledgements.
+
+#### Lite persistence
+
+**Lite (implemented):** A reserved metadata catalog namespace stores encrypted
+records inside the existing native file. A single catalog batch commits
+ciphertext, entry revision, and scope revision through the existing writer lock
+and checkpoint durability guarantees. Read-only and `no_sync` handles expose
+only a source, because unsynced writes cannot promise durable mutation success.
+The embedding application supplies a key-provider callback. Future CLI
+integration will use an explicit platform/mounted-key provider. The database never stores its
+unwrapped root key. File copies and backups carry ciphertext; key access/recovery
+must be provisioned separately. Opening storage must not require resolving an
+application secret from that same unopened store.
+
+The embedding API is:
+
+```zig
+var secrets = try handle.secretStore(allocator, trusted_scope, key_provider);
+defer secrets.deinit();
+const source = secrets.source();
+if (secrets.nativeStore()) |native_store| {
+    const committed = try native_store.writer.put(
+        trusted_scope, "provider.token", token_bytes, .absent,
+    );
+    var value = try source.resolve(allocator, trusted_scope, "provider.token",
+        .{ .min_revision = committed.revision });
+    defer value.deinit(allocator);
+}
+```
+
+The handle and key provider must outlive the adapter and all calls. Keep the
+adapter at a stable address while its borrowed interfaces exist. The host chooses
+authorized scope identities; calls with a different scope fail `Unauthorized`.
+The bridge engine does not support this adapter. Key-provider callbacks may do
+I/O, but must not reenter a writer or maintenance operation on the same handle:
+a mutation retains the writer reservation while releasing the catalog mutex for
+wrapping. Readers and index writers can proceed during wrapping.
+
+The private metadata layout is versioned separately from AFSE:
+
+- Prefix: `\x00antfly.secrets.v1/<hex SHA-256(scope)>/`.
+- `head`: exactly one little-endian `u64` scope revision. An absent head means
+  the initial revision zero. Once written, it survives removal of every entry.
+- `entries/<hex SHA-256(key)>`: little-endian `u64` entry revision, `u16` UTF-8
+  key length, key bytes, then an AFSE v1 envelope. The index supplies the expected
+  revision and identity when opening the envelope; they are not selected from
+  unauthenticated AFSE fields. Hashes bound catalog-key size and avoid delimiter
+  ambiguities. Index metadata and names are visible, while values stay encrypted.
+
+A successful mutation is durably published. Conditional writes use entry
+revisions and serialize across adapters sharing the handle. Deletion of an
+absent entry is a no-op; deletion and recreation never reuse a committed revision.
+Counter exhaustion fails `Unavailable`. Reads copy the index and record under
+the catalog lock, then unwrap outside it. Listings return sorted index metadata
+without invoking the key provider; they validate record framing and matching
+identities, but do not authenticate ciphertext. Resolving a value authenticates
+it and never treats a corrupt record or unavailable key provider as absence.
+
+There is no secret cache. `refresh` reports the handle's current snapshot; it
+does not reopen a read-only file or discover writes made through another process.
+Minimum-revision reads fail when that snapshot is too old. A catalog publication
+failure returns `OutcomeUnknown` and fences all secret adapters on that live
+handle, including reads, listings, and refresh. Reopen is required to select a
+complete checkpoint before continuing. A new adapter on the same handle does
+not clear the fence. Failed key wrapping happens before publication and does
+not advance the revision.
+
+Vacuum and stable file snapshots preserve the private catalog and its encrypted
+records; ordinary document reads/exports do not include them. Portable import
+rejects generation replacement with `LiteImportTargetNotEmpty` if the live target
+contains any secret state, including a scope head retained after all entries are
+deleted. Embedded imports check under the writer reservation and catalog lock
+at publication, so secrets committed during import preparation cannot be lost.
+CLI imports without `--replace` check while holding the target file writer lock,
+before staging, and retain that lock through publication. Explicit CLI
+`--replace` remains a destructive whole-file replacement, including secret state.
+For a non-destructive import, use a fresh file instead; deleting secrets does not
+erase revision history or make an existing scope pristine. File backups still need separately
+provisioned key access. Whole-file rollback has the restore and
+freshness limitations described above; restoring a backup is not a monotonic
+secret revision update.
+
+#### Serverless persistence
+
+**Serverless:** Store immutable encrypted records or, initially, a small encrypted
+record collection under a dedicated per-scope prefix. Upload objects before
+conditionally publishing a head that identifies the committed revision. Use
+ETag/generation compare-and-swap; concurrent writers fail/retry rather than lose
+updates. Readers follow the head, never infer the latest revision from listings.
+The head/index needs the same trusted access boundary as other control metadata;
+AEAD on records alone does not authenticate a forged absence in an index. Reuse
+object-store conditional-write primitives, but do not couple secret lifetime to
+a table manifest or table deletion. Garbage-collect unreferenced objects only
+after accounting for readers and retained backups. Reject storage providers that
+cannot supply the required conditional publication semantics.
+
+### Bootstrap, caching, and rollout
+
+Startup becomes two phases: obtain storage access, node identity, and key-provider
+access from workload identity, mounted sources, or the host application; then open
+native storage and resolve application secrets. Bootstrap credentials cannot
+reference the store they unlock. Adjust today's eager configuration resolution
+when backend integration lands. The existing `environment` switch controls
+resolver fallback, not cloud workload identity or the encryption provider.
+
+API mutation success means durable publication, not that all workers have already
+refreshed. Return a committed revision, expose observed revisions, and allow
+operations to require a minimum revision. Define bounded cache freshness and
+whether still-valid last-known-good values are usable during outages. Expired
+caches fail; backend outages must not silently change the winning source. Remove
+native override and revoke external credential remain different operations.
+
+Lite persistence is implemented; next add distributed Raft persistence and
+serverless publication against the same contract suite. Backend tests must cover crash
+recovery, competing conditional writers, delete/recreate without revision reuse,
+missed invalidations, stale/partitioned reads, key-provider failure and rotation,
+unauthorized scope access, and backup/restore. Migration from existing JSON is an
+explicit, verifiable import; never overwrite the sole plaintext source before
+the encrypted destination is durably committed and readable.
 
 ## Status Summary
 
@@ -62,8 +517,8 @@ Still needed:
   remote-content credential rotation.
 - Optional Prometheus metrics for reload state if operators need scrape-based
   alerting in addition to `GET /status`.
-- A future encrypted-at-rest codec, if non-Kubernetes deployments need local
-  secret-file encryption.
+- Integrate the shared encrypted record codec with native backends and trusted
+  key providers; existing file-store JSON remains plaintext.
 
 ## Current Implementation
 
@@ -103,7 +558,8 @@ the file itself must be protected by filesystem permissions.
 
 Startup:
 
-1. Standalone runtime resolves the store path, normally `<base>/secrets.json`.
+1. Runtime bootstraps the explicit `secrets` section, or resolves legacy paths
+   and deployment defaults when the section is absent.
 2. `FileStore.init(alloc, path)` duplicates the path and calls `load()`.
 3. `load()` reads and parses the JSON file if it exists.
 4. Parsed entries are copied into `entries`.
@@ -115,8 +571,8 @@ Reads:
    `resolveValueOwned()`, and `resolveValueWithGenerationOwned()` refresh from
    disk first if the file metadata changed.
 3. `getOwned()` returns the stored value if present.
-4. If the key is not stored, `getOwned()` maps the key to an environment variable
-   and returns the environment value if set.
+4. If no configured file contains the key, `getOwned()` uses environment fallback
+   only when enabled.
 5. `resolveValueOwned()` resolves `${secret:key}` references through `getOwned()`.
 6. `resolveReferenceOwned()` resolves through a `FileStore` when one is supplied,
    or through environment variables only when there is no store.
@@ -130,15 +586,16 @@ Writes:
 2. `delete()` refreshes from disk, stages removal from `entries`, persists it,
    publishes the staged entries, and returns whether an entry existed.
 3. `persist()` serializes all entries, writes a temporary file, then renames it
-   over the configured store path.
+   over the current native target, preserving any configured symlink.
 
 The `/secrets` API is wired through:
 
 - `zig/pkg/antfly/src/api/http_server.zig`
 - `zig/pkg/antfly/src/api/httpx_handler.zig`
 
-In standalone mode those handlers receive `ApiHttpServerConfig.secret_store`. In
-multi-node mode the store is absent and secret management writes return 503.
+The handlers receive `ApiHttpServerConfig.secret_store` where a resolver is
+configured. Writes require its native write capability, independently of deployment
+mode. A file-backed native store on one node does not update other nodes.
 
 ## Environment Fallback
 
@@ -157,8 +614,9 @@ can both exist; the list API reports that as `configured_both`.
 
 Lookup precedence is:
 
-1. File store entry
-2. Environment variable fallback
+1. Native override, if configured
+2. First matching external source in configured order
+3. Environment variable fallback, enabled by default
 
 ## Current Limitation
 
@@ -241,7 +699,7 @@ only when the file changed.
 
 ### Write Paths
 
-`put()` and `delete()` should continue to update the in-memory map first and
+`put()` and `delete()` stage a replacement map and
 persist atomically, but they need conflict handling around external edits.
 
 Recommended flow:
@@ -374,26 +832,16 @@ deployments and simpler VM/bare-metal deployments. It is less urgent for the
 Kubernetes enterprise path, where the external manager and Kubernetes secret
 projection own most of the secret lifecycle.
 
-The file store should still be designed with a codec boundary so encrypted files
-can be added without rewriting store semantics:
-
-```zig
-const SecretsCodec = struct {
-    decode: fn (alloc: std.mem.Allocator, bytes: []const u8) anyerror!PersistedSecretsFile,
-    encode: fn (alloc: std.mem.Allocator, file: PersistedSecretsFile) anyerror![]u8,
-};
-```
-
-Initial codec:
-
-- plaintext JSON, protected by filesystem permissions
-
-Future codec:
-
-- authenticated encrypted envelope
-- key supplied by environment variable, key file, or Kubernetes-mounted key
-- ciphertext contains the current inner `PersistedSecretsFile` JSON
-- failed authentication is treated like malformed JSON: keep last known good
+The shared encrypted record codec and key-provider contract are now implemented
+as AFSE v1 above. It encrypts individual secret values with authenticated identity
+metadata; it does not encrypt the existing `PersistedSecretsFile` JSON wholesale.
+The codec has an independently generated libsodium/PyNaCl wire vector and tests
+for tampering, truncation, wrong keys, entropy failure, and allocation cleanup.
+Lite persistence is available to embedding hosts; runtime resolver integration
+and distributed/serverless persistence remain pending. Projected files continue to
+use the existing JSON format and last-known-good reload behavior. Any future
+encrypted-file adapter must enforce an explicit cache freshness policy on failed
+authentication rather than treating an unreadable native store as absence.
 
 ## Runtime Secret Rotation Plan
 
@@ -532,14 +980,15 @@ The public API should continue to avoid returning secret values.
 
 - refresh before applying the write
 - validate the key
-- update or add exactly that key
+- require a native store and update or add exactly that key there
 - persist successfully before returning 200
 
 `DELETE /secrets/{key}` should:
 
 - refresh before applying the delete
 - persist successfully before returning 204
-- return 404 if the key is absent after refresh
+- return 404 if the native override is absent after refresh, without touching sources
+- reveal the next matching source or environment value after removal
 
 ## Testing Plan
 
@@ -624,8 +1073,8 @@ Additional runtime tests:
 5. Kubernetes-projected files are the primary enterprise integration surface.
    Direct external secret manager integrations are deferred.
 6. Plaintext JSON remains the initial store format, protected by filesystem
-   permissions. Add a codec boundary so encrypted-at-rest support can be added
-   later.
+   permissions. The AFSE codec and Lite adapter are implemented; runtime
+   integration, other persistence adapters, and explicit migration remain pending.
 7. Start true live rotation with managed embedder API keys.
 8. Support live rotation for all credential-bearing integrations that Antfly
    owns: generator/reranker providers, remote-content credentials, S3/backup
@@ -638,7 +1087,7 @@ Additional runtime tests:
 
 1. Should Prometheus metrics mirror the compact `GET /status` secret-store
    state for scrape-based alerting?
-2. What encrypted envelope format and key-source contract should the future
-   encrypted codec use?
+2. Which production key providers and key-recovery workflows should be shipped
+   first, and what bounded cache freshness policy should native backends use?
 3. Should S3/backup and remote-content clients share a generation-keyed
    credential cache, or should each subsystem own its own cache?

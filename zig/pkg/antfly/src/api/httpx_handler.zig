@@ -3586,7 +3586,8 @@ pub const AntflyApiHandler = struct {
         else
             try common_secrets.listEnvironmentSecrets(alloc);
         defer common_secrets.freeListedSecrets(alloc, listed);
-        const secret_list = try http_server_mod.makeSecretList(alloc, listed);
+        var secret_list = try http_server_mod.makeSecretList(alloc, listed);
+        secret_list.writable = if (self.api_server.cfg.secret_store) |store| store.writable else false;
         defer alloc.free(secret_list.secrets);
         return ctx.openApiJson(secret_list);
     }
@@ -3598,8 +3599,12 @@ pub const AntflyApiHandler = struct {
         const alloc = ctx.allocator;
         const secret_store = self.api_server.cfg.secret_store orelse {
             _ = ctx.status(503);
-            return ctx.text("secret management not available in multi-node mode");
+            return ctx.text("secret management requires secrets.native");
         };
+        if (!secret_store.writable) {
+            _ = ctx.status(503);
+            return ctx.text("secret management requires secrets.native");
+        }
         const body_data = (try ctx.body()) orelse {
             _ = ctx.status(400);
             return ctx.text("invalid secret request");
@@ -3626,8 +3631,12 @@ pub const AntflyApiHandler = struct {
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const secret_store = self.api_server.cfg.secret_store orelse {
             _ = ctx.status(503);
-            return ctx.text("secret management not available in multi-node mode");
+            return ctx.text("secret management requires secrets.native");
         };
+        if (!secret_store.writable) {
+            _ = ctx.status(503);
+            return ctx.text("secret management requires secrets.native");
+        }
         if (!(try secret_store.delete(key))) {
             _ = ctx.status(404);
             return ctx.text("not found");
@@ -4402,6 +4411,8 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(404);
             return ctx.text("not found");
         }
+        const execution = try self.api_server.txn_sessions.acquireCommitExecution(txn_id, ctx.io);
+        defer execution.release();
         const alloc = self.api_server.alloc;
         const session = self.api_server.txn_sessions.getInfo(txn_id) orelse {
             _ = ctx.status(404);
@@ -10538,11 +10549,19 @@ test "httpx antfly routes require auth and enforce admin middleware" {
 
     const batch_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/docs/batch", .{base_url});
     defer alloc.free(batch_url);
-    const batch_headers = [_][2][]const u8{
+    // Keep the repeated forbidden-response ownership regression without doing
+    // 100 password KDFs. The first request still exercises Basic auth; the
+    // remainder use a real restricted API key through the same middleware.
+    var reader_key = try auth.manager.createApiKey("reader", "forbidden-batch", &read_permission, &.{}, null);
+    defer reader_key.deinit(alloc);
+    const key_auth = try std.fmt.allocPrint(alloc, "ApiKey {s}", .{reader_key.encoded});
+    defer alloc.free(key_auth);
+    var batch_headers = [_][2][]const u8{
         .{ "authorization", reader_auth },
         .{ "content-type", "application/json" },
     };
-    for (0..100) |_| {
+    for (0..100) |request_index| {
+        batch_headers[0][1] = if (request_index == 0) reader_auth else key_auth;
         var denied_batch = try requestWithRetry(
             &client,
             client_io.io(),

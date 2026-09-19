@@ -3636,8 +3636,8 @@ pub fn runFromIterator(
     var secret_store_initialized = false;
     defer if (secret_store_initialized) secret_store.deinit();
 
-    if (cli.secret_store_paths.items.len > 0) {
-        secret_store = try initLayeredSecretStore(alloc, setup_io.io(), cli.secret_store_paths.items);
+    if (try antfly.common.secrets.initFromConfigPathWithIo(alloc, setup_io.io(), cli.config_path, cli.secret_store_paths.items)) |configured_store| {
+        secret_store = configured_store;
         secret_store_initialized = true;
     } else {
         const default_secret_store_path = try resolveDefaultSecretStorePathBeforeConfig(alloc, cli);
@@ -3714,7 +3714,7 @@ pub fn runFromIterator(
     try ensureParent(setup_io.io(), resolved.replica_catalog_path);
     try ensureParent(setup_io.io(), resolved.local_metadata_catalog_path);
     try ensureDirPath(setup_io.io(), resolved.snapshot_root_dir);
-    try ensureParent(setup_io.io(), resolved.secret_store_path);
+    if (secret_store.writable) try ensureParent(setup_io.io(), secret_store.path);
     try ensureDirPath(setup_io.io(), resolved.auth_store_root_dir);
 
     const auth_enabled = resolveAuthEnabled(cli, if (loaded_config) |*cfg| cfg else null);

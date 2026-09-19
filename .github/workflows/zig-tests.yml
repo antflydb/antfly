@@ -554,6 +554,7 @@ jobs:
           python3 -m unittest
           tools/test_patch_zig_0_16_build_runner_maxrss.py
           tools/test_run_bounded_zig_build.py
+          tools/test_fixture_workspace.py
           tools/test_prune_completed_test_cache.py
           tools/test_analyze_zig_import_graph.py
           tools/test_audit_storage_test_shards.py
@@ -561,6 +562,7 @@ jobs:
           tools/test_audit_unit_test_ownership.py
           tools/test_check_storage_compilation.py
           tools/test_run_test_partitions.py
+          tools/test_retain_test_process.py
           tools/test_run_recall_checks.py
           tools/test_test_runner.py
           tools/test_sync_generated.py
@@ -647,18 +649,7 @@ jobs:
 
       - name: Prepare bounded correctness-fixture workspace
         if: needs.changes.outputs.zig_tests == 'true'
-        run: |
-          workspace=$(mktemp -d "${RUNNER_TEMP}/antfly-fixtures.XXXXXX")
-          # This is fixture data only, not the compiler cache. Bound its charge
-          # within the pod's 2 GiB headroom above the compiler reservation.
-          if sudo mount -t tmpfs -o "size=512m,mode=0700,uid=$(id -u),gid=$(id -g)" tmpfs "$workspace"; then
-            echo "ANTFLY_TEST_WORKSPACE=$workspace" >> "$GITHUB_ENV"
-          else
-            # Restricted ARC pods may not grant mount capability. Preserve the
-            # complete gate on disk and make the missing acceleration visible.
-            rmdir "$workspace"
-            echo "::warning::Runner cannot mount fixture tmpfs; using disk-backed fixtures"
-          fi
+        run: python3 zig/tools/fixture_workspace.py prepare
 
       - name: Run hermetic Antfly unit tests
         if: needs.changes.outputs.zig_tests == 'true'
@@ -714,6 +705,9 @@ jobs:
               cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
               case "$cmdline" in
                 *"/test "*|*"/test"*|*"-tests "*|*"-tests"|*"zig build"*|*" make "*)
+                  # Ephemeral runner caches disappear with the pod. Keep the
+                  # test bytes even when ptrace cannot supply a stack trace.
+                  python3 zig/tools/retain_test_process.py "$pid" "$ANTFLY_TEST_LOG_DIR/hung" || true
                   echo "::group::proc snapshot pid=$pid cmd=$cmdline"
                   if [ -r "/proc/$pid/status" ]; then
                     grep -E "^(Name|State|Pid|PPid|Threads|VmRSS|VmHWM|voluntary_ctxt_switches|nonvoluntary_ctxt_switches):" "/proc/$pid/status" || true
@@ -843,8 +837,7 @@ jobs:
         if: always() && env.ANTFLY_TEST_WORKSPACE != ''
         run: |
           df -h "$ANTFLY_TEST_WORKSPACE"
-          sudo umount "$ANTFLY_TEST_WORKSPACE"
-          rmdir "$ANTFLY_TEST_WORKSPACE"
+          python3 zig/tools/fixture_workspace.py cleanup
 
       - name: Retain unit test progress
         if: always()
@@ -854,6 +847,7 @@ jobs:
           path: |
             ${{ runner.temp }}/antfly-zig-unit.log
             ${{ runner.temp }}/antfly-zig-test-logs/*.log
+            ${{ runner.temp }}/antfly-zig-test-logs/hung/
           if-no-files-found: ignore
           retention-days: 14
 
@@ -939,6 +933,7 @@ jobs:
           python3 -m unittest
           tools/test_patch_zig_0_16_build_runner_maxrss.py
           tools/test_run_bounded_zig_build.py
+          tools/test_fixture_workspace.py
           tools/test_prune_completed_test_cache.py
           tools/test_analyze_zig_import_graph.py
           tools/test_audit_storage_test_shards.py
@@ -946,6 +941,7 @@ jobs:
           tools/test_audit_unit_test_ownership.py
           tools/test_check_storage_compilation.py
           tools/test_run_test_partitions.py
+          tools/test_retain_test_process.py
           tools/test_run_recall_checks.py
           tools/test_test_runner.py
           tools/test_sync_generated.py

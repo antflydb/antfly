@@ -15378,6 +15378,24 @@ fn loadMissingProjectedMatchAllHitDocuments(
     executor: MatchAllExecutor,
     hits: []types.SearchHit,
 ) !ProjectedSourceLoadProfile {
+    return loadMissingProjectedHitDocuments(alloc, req, executor, hits);
+}
+
+fn loadMissingProjectedTextHitDocuments(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    executor: SearchTextQueryExecutor,
+    hits: []types.SearchHit,
+) !ProjectedSourceLoadProfile {
+    return loadMissingProjectedHitDocuments(alloc, req, executor, hits);
+}
+
+fn loadMissingProjectedHitDocuments(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    executor: anytype,
+    hits: []types.SearchHit,
+) !ProjectedSourceLoadProfile {
     if (executor.load_projected_documents) |load_many| {
         return loadMissingProjectedHitBatches(alloc, req, executor.ctx, load_many, hits);
     }
@@ -15399,33 +15417,13 @@ fn loadMissingProjectedMatchAllHitDocuments(
     for (hits, 0..) |*hit, i| {
         if (hit.stored_data != null) continue;
         if (i % 1024 == 0) try checkSearchRequestDeadline(req);
-        hit.stored_data = try executor.load_projected_document(executor.ctx, alloc, req, hit.id);
-        profile.loaded_count += 1;
-        profile.batch_count += 1;
-    }
-    profile.total_ns = platform_time.monotonicNs() - start_ns;
-    return profile;
-}
-
-fn loadMissingProjectedTextHitDocuments(
-    alloc: Allocator,
-    req: types.SearchRequest,
-    executor: SearchTextQueryExecutor,
-    hits: []types.SearchHit,
-) !ProjectedSourceLoadProfile {
-    if (executor.load_projected_documents) |load_many| {
-        return loadMissingProjectedHitBatches(alloc, req, executor.ctx, load_many, hits);
-    }
-    const start_ns = platform_time.monotonicNs();
-    var profile = ProjectedSourceLoadProfile{};
-    try checkSearchRequestDeadline(req);
-    for (hits, 0..) |*hit, i| {
-        if (hit.stored_data != null) continue;
-        if (i % 1024 == 0) try checkSearchRequestDeadline(req);
-        profile.requested_count += 1;
-        const stored = (try executor.load_stored(executor.ctx, alloc, hit.id)) orelse return error.StoredDocMissing;
-        defer alloc.free(stored);
-        hit.stored_data = try executor.project_stored_search(executor.ctx, alloc, req, hit.id, stored);
+        hit.stored_data = if (comptime @hasField(@TypeOf(executor), "load_projected_document"))
+            try executor.load_projected_document(executor.ctx, alloc, req, hit.id)
+        else blk: {
+            const stored = (try executor.load_stored(executor.ctx, alloc, hit.id)) orelse return error.StoredDocMissing;
+            defer alloc.free(stored);
+            break :blk try executor.project_stored_search(executor.ctx, alloc, req, hit.id, stored);
+        };
         profile.loaded_count += 1;
         profile.batch_count += 1;
     }
@@ -25978,6 +25976,77 @@ test "native doc values sort plan requires a native loader" {
         .include_stored = false,
         .limit = 1,
     }, null, testUnexpectedLoadStoredCallback, .{ .kind = .native_doc_values_top_n, .require_native = true }, null));
+}
+
+test "text projected source batch preserves selection and cleans up failed hydration" {
+    const Harness = struct {
+        const Mode = enum { success, missing, invalid_count, expired };
+        mode: Mode,
+        calls: usize = 0,
+
+        fn loadMany(ctx: ?*anyopaque, alloc: Allocator, req: types.SearchRequest, keys: []const []const u8) ![]?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.calls += 1;
+            try std.testing.expectEqual(@as(usize, 2), keys.len);
+            try std.testing.expectEqualStrings("doc:c", keys[0]);
+            try std.testing.expectEqualStrings("doc:a", keys[1]);
+            try std.testing.expectEqualStrings("age", req.fields[0]);
+            const values = try alloc.alloc(?[]u8, if (self.mode == .invalid_count) 3 else keys.len);
+            @memset(values, null);
+            errdefer freeOptionalOwnedBytes(alloc, values);
+            for (keys, 0..) |key, i| {
+                if (self.mode == .missing and i == 1) continue;
+                values[i] = try std.fmt.allocPrint(alloc, "projected:{s}", .{key});
+            }
+            return values;
+        }
+
+        fn run(alloc: Allocator, mode: Mode) !void {
+            var harness = @This(){ .mode = mode };
+            var hits = [_]types.SearchHit{
+                .{ .id = @constCast("present"), .stored_data = null },
+                .{ .id = @constCast("doc:c") },
+                .{ .id = @constCast("doc:a") },
+            };
+            defer for (&hits) |hit| if (hit.stored_data) |stored| alloc.free(stored);
+            hits[0].stored_data = try alloc.dupe(u8, "already projected");
+            const executor: SearchTextQueryExecutor = .{
+                .ctx = &harness,
+                .text_index_entry = undefined,
+                .text_index_is_chunk_backed = undefined,
+                .search_match_all = undefined,
+                .project_stored_search = undefined,
+                .load_stored = undefined,
+                .load_projected_documents = loadMany,
+                .postprocess = undefined,
+            };
+            const result = loadMissingProjectedTextHitDocuments(alloc, .{
+                .fields = &.{"age"},
+                .execution_deadline_ns = if (mode == .expired) 1 else null,
+            }, executor, &hits);
+            switch (mode) {
+                .success => {
+                    const profile = try result;
+                    try std.testing.expectEqual(@as(usize, 1), profile.batch_count);
+                    try std.testing.expectEqual(@as(usize, 2), profile.loaded_count);
+                    try std.testing.expectEqualStrings("already projected", hits[0].stored_data.?);
+                    try std.testing.expectEqualStrings("projected:doc:c", hits[1].stored_data.?);
+                    try std.testing.expectEqualStrings("projected:doc:a", hits[2].stored_data.?);
+                    _ = try loadMissingProjectedTextHitDocuments(alloc, .{}, executor, &hits);
+                    try std.testing.expectEqual(@as(usize, 1), harness.calls);
+                },
+                .missing => try std.testing.expectError(error.StoredDocMissing, result),
+                .invalid_count => try std.testing.expectError(error.InvalidSearchResult, result),
+                .expired => {
+                    try std.testing.expectError(error.Timeout, result);
+                    try std.testing.expectEqual(@as(usize, 0), harness.calls);
+                },
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{Harness.Mode.success});
+    inline for (.{ Harness.Mode.missing, Harness.Mode.invalid_count, Harness.Mode.expired }) |mode|
+        try Harness.run(std.testing.allocator, mode);
 }
 
 test "text field sort source loading happens only for selected missing hits" {

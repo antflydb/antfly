@@ -13,6 +13,7 @@
 // limitations.
 
 const local_query_contract = @import("local_query_contract.zig");
+const aggregation_plan = @import("aggregation_plan.zig");
 const physical_local_query = if (@import("storage_source_options").control_only) struct {} else @import("antfly_source_root").antfly_sources.local_query;
 const std = @import("std");
 const TestDirectory = @import("../common/test_directory.zig").TestDirectory;
@@ -274,20 +275,9 @@ fn benchQueryApiPhaseProfileEnabled() bool {
         std.c.getenv("ANTFLY_BENCH_QUERY_PROFILE_EVERY\x00") != null;
 }
 
-const default_aggregation_full_result_budget: u32 = 100_000;
-
-fn aggregationFullResultBudgetFromRaw(raw: ?[*:0]u8) u32 {
-    const value = raw orelse return default_aggregation_full_result_budget;
-    const slice = std.mem.span(value);
-    if (slice.len == 0) return default_aggregation_full_result_budget;
-    const parsed = std.fmt.parseUnsigned(u32, slice, 10) catch return default_aggregation_full_result_budget;
-    if (parsed == 0) return default_aggregation_full_result_budget;
-    return @min(parsed, @as(u32, @intCast(db_mod.aggregations.max_aggregation_source_hits)));
-}
-
-fn aggregationFullResultBudget() u32 {
-    return aggregationFullResultBudgetFromRaw(std.c.getenv("ANTFLY_AGGREGATION_FULL_RESULT_BUDGET\x00"));
-}
+const aggregationFullResultBudgetFromRaw = aggregation_plan.aggregationFullResultBudgetFromRaw;
+const default_aggregation_full_result_budget = aggregation_plan.default_aggregation_full_result_budget;
+const aggregationFullResultBudget = aggregation_plan.aggregationFullResultBudget;
 
 const checkQueryDeadline = local_query_contract.checkQueryDeadline;
 
@@ -1950,17 +1940,24 @@ fn provisionedLocalQueryDbOwnerIfPresent(
     return .{ .cached = lease };
 }
 
+const QueryReadLease = if (control_only_storage_sources) struct {} else db_mod.DB.QueryReadLease;
+
 const LocalQueryExecution = struct {
     request: db_mod.types.SearchRequest,
     result: db_mod.types.SearchResult,
     dense_profile: ?query_api.QueryResponseMeta.DenseSearchProfile = null,
     db_owner: ?LocalQueryDbOwner = null,
+    aggregation_lease: ?QueryReadLease = null,
 
     fn db(self: *@This()) *db_mod.DB {
         return self.db_owner.?.db();
     }
 
     fn releaseDb(self: *@This()) void {
+        if (comptime !control_only_storage_sources) {
+            if (self.aggregation_lease) |*lease| lease.release();
+        }
+        self.aggregation_lease = null;
         if (self.db_owner) |*owner| owner.deinit();
         self.db_owner = null;
     }
@@ -2634,8 +2631,15 @@ pub const BoundTableReadSource = struct {
         // writer race and causes the entire query to be replayed.
         const snapshot_ns: u64 = 0;
         var execution: LocalQueryExecution = .{ .request = req, .result = undefined };
+        defer execution.releaseDb();
         const search_start_ns = if (phase_profile) platform_time.monotonicNs() else 0;
-        if (profiledDenseQuery(req)) |dense| {
+        if (req.aggregations_json.len != 0) {
+            execution.aggregation_lease = try self.db.beginQueryReadLease();
+            const captured = try execution.aggregation_lease.?.search(alloc, req);
+            execution.request = captured.request;
+            execution.result = captured.result;
+            execution.dense_profile = if (captured.dense_profile) |profile| mapDenseSearchProfile(profile) else null;
+        } else if (profiledDenseQuery(req)) |dense| {
             const captured = try self.db.searchDenseProfiledWithCapturedRequest(alloc, dense.req, dense.query);
             var response_req = req;
             response_req.identity_read_generation = captured.request.identity_read_generation;
@@ -2672,8 +2676,9 @@ pub const BoundTableReadSource = struct {
         defer meta.deinit(alloc);
         const agg_start_ns = if (phase_profile) platform_time.monotonicNs() else 0;
         if (collection_req != null) try requireCompleteAggregationFullResult(search_req, result, "bound-single-pass");
-        try applyBoundQueryAggregations(self, alloc, execution.request, &result, &meta, consistency);
+        try applyBoundQueryAggregations(self, alloc, execution.request, &result, &meta, if (execution.aggregation_lease) |*lease| lease else null, consistency);
         if (collection_req != null) discardAggregationOnlyHits(&result);
+        execution.releaseDb();
         const agg_ns = if (phase_profile) platform_time.monotonicNs() - agg_start_ns else 0;
         try checkQueryDeadline(response_req);
         const post_start_ns = if (phase_profile) platform_time.monotonicNs() else 0;
@@ -4161,7 +4166,7 @@ pub const ProvisionedTableReadSource = struct {
                 };
                 defer meta.deinit(alloc);
                 if (local_collection_req != null) try requireCompleteAggregationFullResult(local_search_req, result, "provisioned-local-single-pass");
-                try applyProvisionedQueryAggregations(routed, alloc, group_ids, table_name, execution.request, &result, &meta, execution.db(), .stale);
+                try applyProvisionedQueryAggregations(routed, alloc, group_ids, table_name, execution.request, &result, &meta, execution.db(), if (execution.aggregation_lease) |*lease| lease else null, .stale);
                 if (local_collection_req != null) discardAggregationOnlyHits(&result);
                 execution.releaseDb();
                 try checkQueryDeadline(response_req);
@@ -4239,7 +4244,7 @@ pub const ProvisionedTableReadSource = struct {
                 .merged = true,
             };
             defer meta.deinit(alloc);
-            applyProvisionedQueryAggregations(routed, alloc, group_ids, table_name, graph_req, &merged, &meta, null, .stale) catch |err| switch (err) {
+            applyProvisionedQueryAggregations(routed, alloc, group_ids, table_name, graph_req, &merged, &meta, null, null, .stale) catch |err| switch (err) {
                 error.ResidentDbRetryRequired => {
                     prepared.releaseActivity();
                     try routed.prepareResidentGroupsForReadRetry(alloc, table_name, group_ids);
@@ -4276,7 +4281,7 @@ pub const ProvisionedTableReadSource = struct {
         };
         defer meta.deinit(alloc);
         if (collection_req != null) try requireCompleteAggregationFullResult(search_req, merged, "provisioned-single-pass");
-        applyProvisionedQueryAggregations(routed, alloc, group_ids, table_name, search_req, &merged, &meta, null, .stale) catch |err| switch (err) {
+        applyProvisionedQueryAggregations(routed, alloc, group_ids, table_name, search_req, &merged, &meta, null, null, .stale) catch |err| switch (err) {
             error.ResidentDbRetryRequired => {
                 prepared.releaseActivity();
                 try routed.prepareResidentGroupsForReadRetry(alloc, table_name, group_ids);
@@ -4296,12 +4301,12 @@ pub const ProvisionedTableReadSource = struct {
         return try query_api.encodeQueryResponses(alloc, table_name, req, meta, merged);
     }
 
-    /// These response stages depend on process-runtime capabilities or
-    /// distributed aggregation state and therefore remain coordinator-owned.
-    /// Even a one-shard compiled storage query must return its raw SearchResult
-    /// through the coarse ABI before these stages run.
+    /// Runtime transforms and cross-table aggregates remain coordinator-owned.
+    /// Ordinary single-shard aggregation is finalized by the physical provider
+    /// under one read lease, before its captured generation is released.
     fn queryRequiresCoordinatorFinalization(req: db_mod.types.SearchRequest) bool {
-        return req.reranker != null or req.pruner != null or req.aggregations_json.len > 0;
+        return req.reranker != null or req.pruner != null or
+            std.mem.indexOf(u8, req.aggregations_json, "\"algebraic_join\"") != null;
     }
 
     fn preflightQuery(
@@ -4952,7 +4957,7 @@ pub const ProvisionedTableReadSource = struct {
             .dense_search = execution.dense_profile,
         };
         defer meta.deinit(alloc);
-        try applyProvisionedQueryAggregations(self, alloc, &.{group_id}, table_name, response_req, &result, &meta, execution.db(), consistency);
+        try applyProvisionedQueryAggregations(self, alloc, &.{group_id}, table_name, response_req, &result, &meta, execution.db(), if (execution.aggregation_lease) |*lease| lease else null, consistency);
         execution.releaseDb();
         try applyQueryPostProcessing(alloc, response_req, &result, &meta, self.managedReadRuntimeConfig().forTable(table_name));
         return try query_api.encodeQueryResponses(alloc, table_name, response_req, meta, result);
@@ -6537,7 +6542,7 @@ pub const HostedProvisionedTableReadSource = struct {
                 .merged = true,
             };
             defer meta.deinit(alloc);
-            try applyHostedProvisionedQueryAggregations(self, alloc, group_ids, table_name, graph_req, &merged, &meta, null, consistency);
+            try applyHostedProvisionedQueryAggregations(self, alloc, group_ids, table_name, graph_req, &merged, &meta, null, null, consistency);
             try checkQueryDeadline(graph_req);
             try applyQueryPostProcessing(alloc, graph_req, &merged, &meta, self.managedReadRuntimeConfig().forTable(table_name));
             return try query_api.encodeQueryResponses(alloc, table_name, graph_req, meta, merged);
@@ -6554,7 +6559,7 @@ pub const HostedProvisionedTableReadSource = struct {
         };
         defer meta.deinit(alloc);
         if (collection_req != null) try requireCompleteAggregationFullResult(search_req, merged, "hosted-single-pass");
-        try applyHostedProvisionedQueryAggregations(self, alloc, group_ids, table_name, search_req, &merged, &meta, null, consistency);
+        try applyHostedProvisionedQueryAggregations(self, alloc, group_ids, table_name, search_req, &merged, &meta, null, null, consistency);
         if (collection_req != null) discardAggregationOnlyHits(&merged);
         try checkQueryDeadline(req);
         try applyQueryPostProcessing(alloc, req, &merged, &meta, self.managedReadRuntimeConfig().forTable(table_name));
@@ -6833,7 +6838,7 @@ pub const HostedProvisionedTableReadSource = struct {
             .dense_search = execution.dense_profile,
         };
         defer meta.deinit(alloc);
-        try applyHostedProvisionedQueryAggregations(self, alloc, &.{group_id}, table_name, response_req, &result, &meta, execution.db(), consistency);
+        try applyHostedProvisionedQueryAggregations(self, alloc, &.{group_id}, table_name, response_req, &result, &meta, execution.db(), if (execution.aggregation_lease) |*lease| lease else null, consistency);
         execution.releaseDb();
         try applyQueryPostProcessing(alloc, response_req, &result, &meta, self.managedReadRuntimeConfig().forTable(table_name));
         return try query_api.encodeQueryResponses(alloc, table_name, response_req, meta, result);
@@ -10834,6 +10839,18 @@ fn queryDbDetailed(
     const db = owner.db();
     var reads = raft_mod.FeatureDBReads.init(group_id, read_safety_barrier);
     try reads.reads.prepareSearchWithConsistency(group_id, req, consistency);
+    if (req.aggregations_json.len != 0) {
+        var lease = try db.beginQueryReadLease();
+        errdefer lease.release();
+        const captured = try lease.search(alloc, req);
+        return .{
+            .request = captured.request,
+            .result = captured.result,
+            .dense_profile = if (captured.dense_profile) |profile| mapDenseSearchProfile(profile) else null,
+            .db_owner = owner,
+            .aggregation_lease = lease,
+        };
+    }
     if (profiledDenseQuery(req)) |dense| {
         const captured = try db.searchDenseProfiledWithCapturedRequest(alloc, dense.req, dense.query);
         var response_req = req;
@@ -11319,30 +11336,7 @@ fn algebraicIndexFreshEnoughForRequest(
 
 const algebraicIndexFreshEnoughForName = physical_local_query.algebraicIndexFreshEnoughForName;
 
-fn canConsiderAlgebraicAggregations(req: db_mod.types.SearchRequest) bool {
-    return req.full_text == null and
-        req.filter_text == null and
-        req.exclusion_text == null and
-        req.exclusion_query_json.len == 0 and
-        req.full_text_queries.len == 0 and
-        req.dense == null and
-        req.sparse == null and
-        req.dense_queries.len == 0 and
-        req.sparse_queries.len == 0 and
-        req.graph_queries.len == 0 and
-        req.merge_config == null and
-        req.reranker == null and
-        req.pruner == null and
-        req.filter_prefix.len == 0 and
-        req.filter_ids.len == 0 and
-        req.exclude_ids.len == 0 and
-        req.filter_doc_ids.len == 0 and
-        !req.filter_doc_ids_positive and
-        req.exclude_doc_ids.len == 0 and
-        !searchRequestHasResolvedDocFilter(req) and
-        req.distance_over == null and
-        req.distance_under == null;
-}
+const canConsiderAlgebraicAggregations = aggregation_plan.canConsiderAlgebraicAggregations;
 
 const algebraicConstraintsForRequestAlloc = local_query_contract.algebraicConstraintsForRequestAlloc;
 
@@ -11602,101 +11596,14 @@ fn requestWithResultIdentityGeneration(
     return out;
 }
 
-fn identityGenerationForAggregationFullResultRerun(
-    req: db_mod.types.SearchRequest,
-    result: db_mod.types.SearchResult,
-) !?u64 {
-    if (aggregationCanUseCurrentResult(req, result)) return req.identity_read_generation orelse result.identity_read_generation;
-    return req.identity_read_generation orelse result.identity_read_generation orelse error.UnsupportedQueryRequest;
-}
-
-fn aggregationCanUseCurrentResult(req: db_mod.types.SearchRequest, result: db_mod.types.SearchResult) bool {
-    if (result.total_hits_relation != .exact) return false;
-    if (result.total_hits == 0) return true;
-    return !req.count_only and result.hits.len == result.total_hits;
-}
-
-fn aggregationFullResultLimit(req: db_mod.types.SearchRequest, result: db_mod.types.SearchResult, operation: []const u8) !u32 {
-    try checkQueryDeadline(req);
-    const budget = aggregationFullResultBudget();
-    if (result.total_hits_relation == .exact and result.total_hits > budget) {
-        std.log.warn("query aggregation full-result rerun budget exceeded operation={s} total_hits={d} budget={d}", .{
-            operation,
-            result.total_hits,
-            budget,
-        });
-        return error.QueryCandidateBudgetExceeded;
-    }
-    // Even an exact first-page count only describes that execution's text
-    // snapshot. Derived indexing can publish more already committed documents
-    // before the rerun without advancing the primary identity generation.
-    // Collect up to the budget, then prove completeness against the rerun's
-    // own total instead of truncating to the earlier snapshot's count.
-    return budget;
-}
-
-fn requireCompleteAggregationFullResult(
-    req: db_mod.types.SearchRequest,
-    result: db_mod.types.SearchResult,
-    operation: []const u8,
-) !void {
-    try checkQueryDeadline(req);
-    if (aggregationCanUseCurrentResult(req, result)) return;
-    std.log.warn("query aggregation bounded full-result rerun remained incomplete operation={s} relation={s} total_hits={d} returned_hits={d} budget={d}", .{
-        operation,
-        @tagName(result.total_hits_relation),
-        result.total_hits,
-        result.hits.len,
-        aggregationFullResultBudget(),
-    });
-    if (result.total_hits_relation == .gte or result.total_hits >= aggregationFullResultBudget()) {
-        return error.QueryCandidateBudgetExceeded;
-    }
-    return error.UnsupportedQueryRequest;
-}
-
-fn aggregationFullResultRequest(req: db_mod.types.SearchRequest, result: db_mod.types.SearchResult, operation: []const u8) !db_mod.types.SearchRequest {
-    const identity_read_generation = try identityGenerationForAggregationFullResultRerun(req, result);
-    return try aggregationFullResultRequestAtGeneration(req, result, operation, identity_read_generation);
-}
-
-fn distributedAggregationFullResultRequest(req: db_mod.types.SearchRequest, result: db_mod.types.SearchResult, operation: []const u8) !db_mod.types.SearchRequest {
-    if (result.shard_identity_read_generations.len == 0) return try aggregationFullResultRequest(req, result, operation);
-    return try aggregationFullResultRequestAtGeneration(req, result, operation, null);
-}
-
-fn aggregationFullResultRequestAtGeneration(
-    req: db_mod.types.SearchRequest,
-    result: db_mod.types.SearchResult,
-    operation: []const u8,
-    identity_read_generation: ?u64,
-) !db_mod.types.SearchRequest {
-    const full_limit = try aggregationFullResultLimit(req, result, operation);
-    return aggregationCollectionRequest(req, full_limit, identity_read_generation);
-}
-
-fn aggregationCollectionRequest(req: db_mod.types.SearchRequest, full_limit: u32, identity_read_generation: ?u64) db_mod.types.SearchRequest {
-    var full_req = req;
-    full_req.identity_read_generation = identity_read_generation;
-    full_req.offset = 0;
-    full_req.limit = full_limit;
-    full_req.include_stored = true;
-    full_req.count_only = false;
-    full_req.order_by = &.{};
-    full_req.search_after = &.{};
-    full_req.search_before = &.{};
-    // Graph-metric reranking only orders and scores the returned hit page.
-    // Aggregations consume stored fields from every match, so the internal
-    // collection must not inherit its bounded candidate window. The original
-    // request and its already-reranked hits remain unchanged.
-    full_req.graph_metric_rerank = null;
-    // Aggregations operate on the top-level result set. Canonical hierarchy
-    // matches are a bounded evidence projection attached to those groups, not
-    // additional aggregation rows. Disable nested expansion for the complete
-    // aggregation rerun so its internal full-result limit is not mistaken for
-    // a public groups-times-matches response budget.
-    return db_mod.types.canonicalGroupedMatchSelectionRequest(full_req);
-}
+const identityGenerationForAggregationFullResultRerun = aggregation_plan.identityGenerationForAggregationFullResultRerun;
+const aggregationCanUseCurrentResult = aggregation_plan.aggregationCanUseCurrentResult;
+const aggregationFullResultLimit = aggregation_plan.aggregationFullResultLimit;
+const requireCompleteAggregationFullResult = aggregation_plan.requireCompleteAggregationFullResult;
+const aggregationFullResultRequest = aggregation_plan.aggregationFullResultRequest;
+const distributedAggregationFullResultRequest = aggregation_plan.distributedAggregationFullResultRequest;
+const aggregationFullResultRequestAtGeneration = aggregation_plan.aggregationFullResultRequestAtGeneration;
+const aggregationCollectionRequest = aggregation_plan.aggregationCollectionRequest;
 
 /// A zero-hit response needs one complete aggregation input, not a count at
 /// generation A followed by a scan that can only start while A is still live.
@@ -11729,6 +11636,7 @@ fn applyBoundQueryAggregations(
     req: db_mod.types.SearchRequest,
     result: *db_mod.types.SearchResult,
     meta: *query_api.QueryResponseMeta,
+    lease: ?*QueryReadLease,
     consistency: raft_mod.ReadConsistency,
 ) !void {
     if (req.aggregations_json.len == 0) return;
@@ -11738,13 +11646,28 @@ fn applyBoundQueryAggregations(
     }
 
     const full_req = try aggregationFullResultRequest(req, result.*, "bound");
-    var full_result = try self.reads.searchWithConsistency(alloc, self.db, full_req, consistency);
+    var full_result = if (lease) |held|
+        (try held.search(alloc, full_req)).result
+    else
+        try self.reads.searchWithConsistency(alloc, self.db, full_req, consistency);
     defer full_result.deinit();
-    try requireCompleteAggregationFullResult(full_req, full_result, "bound");
-    // The complete rerun owns its rows just like a complete first page. A
-    // writer admitted after search releases its lease must not invalidate
-    // those rows or force the entire query to replay.
-    return try applyAggregationResults(alloc, full_req, full_result, try aggregationContextForCapturedResultDb(alloc, full_req, self.db), meta);
+    return try applyCapturedFullResultAggregations(alloc, full_req, full_result, self.db, meta, "bound");
+}
+
+fn applyCapturedFullResultAggregations(
+    alloc: std.mem.Allocator,
+    req: db_mod.types.SearchRequest,
+    result: db_mod.types.SearchResult,
+    db: *db_mod.DB,
+    meta: *query_api.QueryResponseMeta,
+    scope: []const u8,
+) !void {
+    try requireCompleteAggregationFullResult(req, result, scope);
+    // The rerun owns complete stored rows just like the first-search fast path.
+    // A write after capture must not invalidate those immutable aggregation
+    // inputs or mix them with acceleration state from a newer generation.
+    const ctx = try aggregationContextForCapturedResultDb(alloc, req, db);
+    return try applyAggregationResults(alloc, req, result, ctx, meta);
 }
 
 fn applyCapturedDbQueryAggregations(
@@ -11757,6 +11680,7 @@ fn applyCapturedDbQueryAggregations(
     result: *db_mod.types.SearchResult,
     meta: *query_api.QueryResponseMeta,
     db: *db_mod.DB,
+    lease: ?*QueryReadLease,
     consistency: raft_mod.ReadConsistency,
 ) !void {
     const aggregation_req = requestWithResultIdentityGeneration(req, result.*);
@@ -11782,17 +11706,12 @@ fn applyCapturedDbQueryAggregations(
         });
         return err;
     };
-    var full_result = reads.searchWithConsistency(alloc, db, full_req, consistency) catch |err| {
+    var full_result = (if (lease) |held| (try held.search(alloc, full_req)).result else reads.searchWithConsistency(alloc, db, full_req, consistency)) catch |err| {
         std.log.warn("local aggregation full-result search failed table={s} generation={?d} err={s}", .{ table_name, full_req.identity_read_generation, @errorName(err) });
         return err;
     };
     defer full_result.deinit();
-    try requireCompleteAggregationFullResult(full_req, full_result, scope);
-    const aggregation_ctx = aggregationContextForCapturedResultDb(alloc, full_req, db) catch |err| {
-        std.log.warn("local aggregation context failed table={s} generation={?d} err={s}", .{ table_name, full_req.identity_read_generation, @errorName(err) });
-        return err;
-    };
-    return applyAggregationResults(alloc, full_req, full_result, aggregation_ctx, meta) catch |err| {
+    return applyCapturedFullResultAggregations(alloc, full_req, full_result, db, meta, scope) catch |err| {
         std.log.warn("local aggregation execution failed table={s} err={s}", .{ table_name, @errorName(err) });
         return err;
     };
@@ -11807,6 +11726,7 @@ fn applyProvisionedQueryAggregations(
     result: *db_mod.types.SearchResult,
     meta: *query_api.QueryResponseMeta,
     captured_db: ?*db_mod.DB,
+    lease: ?*QueryReadLease,
     consistency: raft_mod.ReadConsistency,
 ) !void {
     if (req.aggregations_json.len == 0) return;
@@ -11824,6 +11744,7 @@ fn applyProvisionedQueryAggregations(
                     result,
                     meta,
                     db,
+                    lease,
                     consistency,
                 );
             }
@@ -11840,7 +11761,7 @@ fn applyProvisionedQueryAggregations(
                 self.callerReadActivityHeld(),
             );
             defer db_owner.deinit();
-            return try applyCapturedDbQueryAggregations(alloc, self.read_safety_barrier, group_ids[0], table_name, "provisioned-local", req, result, meta, db_owner.db(), consistency);
+            return try applyCapturedDbQueryAggregations(alloc, self.read_safety_barrier, group_ids[0], table_name, "provisioned-local", req, result, meta, db_owner.db(), null, consistency);
         }
     }
 
@@ -12059,6 +11980,7 @@ fn applyHostedProvisionedQueryAggregations(
     result: *db_mod.types.SearchResult,
     meta: *query_api.QueryResponseMeta,
     captured_db: ?*db_mod.DB,
+    lease: ?*QueryReadLease,
     consistency: raft_mod.ReadConsistency,
 ) !void {
     if (req.aggregations_json.len == 0) return;
@@ -12070,14 +11992,14 @@ fn applyHostedProvisionedQueryAggregations(
         switch (route) {
             .local => {
                 if (captured_db) |db| {
-                    return try applyCapturedDbQueryAggregations(alloc, self.read_safety_barrier, group_ids[0], table_name, "hosted-local", req, result, meta, db, consistency);
+                    return try applyCapturedDbQueryAggregations(alloc, self.read_safety_barrier, group_ids[0], table_name, "hosted-local", req, result, meta, db, lease, consistency);
                 }
                 const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_ids[0]);
                 defer alloc.free(path);
                 var db = try openProvisionedQueryDbForTableWithRuntime(alloc, path, self.catalog, table_name, group_ids[0], self.visibleRootGeneration(group_ids[0]), self.backend_runtime);
                 defer db.close();
 
-                return try applyCapturedDbQueryAggregations(alloc, self.read_safety_barrier, group_ids[0], table_name, "hosted-local", req, result, meta, &db, consistency);
+                return try applyCapturedDbQueryAggregations(alloc, self.read_safety_barrier, group_ids[0], table_name, "hosted-local", req, result, meta, &db, null, consistency);
             },
             .remote => {},
         }
@@ -20153,8 +20075,11 @@ fn consumerTests() type {
             try std.testing.expect(ProvisionedTableReadSource.queryRequiresCoordinatorFinalization(.{
                 .pruner = .{ .min_absolute_score = 10 },
             }));
-            try std.testing.expect(ProvisionedTableReadSource.queryRequiresCoordinatorFinalization(.{
+            try std.testing.expect(!ProvisionedTableReadSource.queryRequiresCoordinatorFinalization(.{
                 .aggregations_json = "{}",
+            }));
+            try std.testing.expect(ProvisionedTableReadSource.queryRequiresCoordinatorFinalization(.{
+                .aggregations_json = "{\"pairs\":{\"algebraic_join\":{\"name\":\"joined\"}}}",
             }));
             try std.testing.expect(ProvisionedTableReadSource.queryRequiresCoordinatorFinalization(.{
                 .reranker = .{
@@ -20208,6 +20133,7 @@ fn consumerTests() type {
                 calls: usize = 0,
                 group_id: u64 = 0,
                 limit: u32 = 0,
+                aggregations: []const u8 = "",
                 consistency: raft_mod.ReadConsistency = .stale,
 
                 fn source(self: *@This()) TableReadSource {
@@ -20269,6 +20195,7 @@ fn consumerTests() type {
                     self.calls += 1;
                     self.group_id = group_id;
                     self.limit = req.limit;
+                    self.aggregations = req.aggregations_json;
                     self.consistency = consistency;
                     return .{ .json = try response_alloc.dupe(u8, "{\"from\":\"local-owner\"}") };
                 }
@@ -20291,7 +20218,7 @@ fn consumerTests() type {
             var source = ProvisionedTableReadSource.init(
                 "/tmp/unused-antfly-local-owner-delegation",
                 FakeCatalog.iface(),
-                raft_mod.read_gate.noopReadableLeaseRequester(),
+                raft_mod.read_gate.alreadyReadSafeBarrier(),
             );
             _ = source.withLocalReadSource(local_owner.source());
 
@@ -20303,6 +20230,15 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(u64, 7001), local_owner.group_id);
             try std.testing.expectEqual(@as(u32, 17), local_owner.limit);
             try std.testing.expectEqual(raft_mod.ReadConsistency.stale, local_owner.consistency);
+            const aggregations = "{\"age\":{\"type\":\"stats\",\"field\":\"age\"}}";
+            var aggregate_response = (try source.source().query(alloc, "docs", .{
+                .limit = 1,
+                .aggregations_json = aggregations,
+            }, .read_index)).?;
+            defer aggregate_response.deinit(alloc);
+            try std.testing.expectEqualStrings("{\"from\":\"local-owner\"}", aggregate_response.json);
+            try std.testing.expectEqual(@as(usize, 2), local_owner.calls);
+            try std.testing.expectEqualStrings(aggregations, local_owner.aggregations);
         }
 
         test "provisioned table read source runtime status falls back to shared snapshot cache" {
@@ -27446,7 +27382,7 @@ fn implementationTests() type {
 
                 var meta: query_api.QueryResponseMeta = .{};
                 defer meta.deinit(alloc);
-                try applyBoundQueryAggregations(&source, alloc, first.request, &first.result, &meta, .read_index);
+                try applyBoundQueryAggregations(&source, alloc, first.request, &first.result, &meta, null, .read_index);
                 try std.testing.expectEqual(@as(usize, 1), meta.aggregation_results.len);
                 const Stats = struct { count: i64, sum: f64, min: f64, max: f64, avg: f64 };
                 var stats = try std.json.parseFromSlice(Stats, alloc, meta.aggregation_results[0].value_json.?, .{ .ignore_unknown_fields = true });
@@ -27458,6 +27394,165 @@ fn implementationTests() type {
                 try std.testing.expect(first.result.hits[0].score_details != null);
                 try std.testing.expectEqual(candidate_count, first.request.graph_metric_rerank.?.candidate_count);
             }
+        }
+
+        test "local query provider returns complete aggregations and preserves the requested hit page" {
+            const alloc = std.testing.allocator;
+            const provider = @import("../storage/local_query_provider.zig");
+            const abi = @import("kernel_owner_abi");
+            var path_tmp = try TestDirectory.init("antfly-api-local-aggregation-provider");
+            defer path_tmp.cleanup();
+            var db = try db_mod.DB.open(alloc, path_tmp.path(), .{ .start_index_workers = false });
+            defer db.close();
+            try db.batch(.{
+                .writes = &.{
+                    .{ .key = "a", .value = "{\"age\":18}" },
+                    .{ .key = "b", .value = "{\"age\":20}" },
+                },
+                .sync_level = .write,
+            });
+            const Response = struct {
+                responses: []struct {
+                    hits: struct { hits: []std.json.Value },
+                    aggregations: ?struct { age: struct { count: i64, sum: f64 } } = null,
+                },
+            };
+            for ([_]usize{ 0, 1 }) |limit| {
+                for ([_]bool{ false, true }) |raw| {
+                    // Exercise the production encoder too: generic shard
+                    // forwarding intentionally omits coordinator aggregates.
+                    const body = try encodeStorageKernelQueryRequest(alloc, .{
+                        .limit = @intCast(limit),
+                        .count_only = limit == 0,
+                        .aggregations_json = "{\"age\":{\"type\":\"stats\",\"field\":\"age\"}}",
+                    });
+                    defer alloc.free(body);
+                    var response: abi.QueryOwnedResponse = .{};
+                    var failure: abi.FailureIdentity = .{};
+                    const status = provider.execute(&.{
+                        .db = @ptrCast(&db),
+                        .table_name = .fromSlice("docs"),
+                        .request_json = .fromSlice(body),
+                        .execution_options = .{ .enabled = 1, .raw_search_result = @intFromBool(raw) },
+                    }, &response, &failure);
+                    defer if (response.buffer.ptr) |ptr| std.heap.c_allocator.free(ptr[0..@intCast(response.buffer.len)]);
+                    try std.testing.expectEqual(abi.Status.ok, status);
+                    var parsed = try std.json.parseFromSlice(Response, alloc, response.buffer.slice(), .{ .ignore_unknown_fields = true });
+                    defer parsed.deinit();
+                    try std.testing.expectEqual(@as(usize, 1), parsed.value.responses.len);
+                    try std.testing.expectEqual(limit, parsed.value.responses[0].hits.hits.len);
+                    if (raw) {
+                        try std.testing.expect(parsed.value.responses[0].aggregations == null);
+                    } else {
+                        try std.testing.expectEqual(@as(i64, 2), parsed.value.responses[0].aggregations.?.age.count);
+                        try std.testing.expectEqual(@as(f64, 38), parsed.value.responses[0].aggregations.?.age.sum);
+                    }
+                    try std.testing.expect(db.core.tryLockApplyExclusive());
+                    db.core.unlockApplyExclusive();
+                }
+            }
+        }
+
+        test "aggregation selection and rerun share a read lease without repeating the raft barrier" {
+            const alloc = std.testing.allocator;
+            var path_tmp = try TestDirectory.init("antfly-api-aggregation-read-lease");
+            defer path_tmp.cleanup();
+            var db = try db_mod.DB.open(alloc, path_tmp.path(), .{ .start_index_workers = false });
+            defer db.close();
+            try db.batch(.{
+                .writes = &.{.{ .key = "a", .value = "{\"age\":18}" }},
+                .sync_level = .write,
+            });
+            const Barrier = struct {
+                db: *db_mod.DB,
+                calls: usize = 0,
+                fn wait(ptr: ?*anyopaque, _: u64, _: []const u8) !void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr.?));
+                    self.calls += 1;
+                    // A read-index barrier may need a writer to apply. It must
+                    // run before the read lease, never inside the rerun.
+                    if (!self.db.core.tryLockApplyExclusive()) return error.TestUnexpectedResult;
+                    self.db.core.unlockApplyExclusive();
+                }
+            };
+            var barrier = Barrier{ .db = &db };
+            const callback = raft_mod.read_gate.CallbackReadSafetyBarrier.init(&barrier, Barrier.wait);
+            var source = BoundTableReadSource.init("docs", 77, &db, callback.barrier());
+            const req: db_mod.types.SearchRequest = .{
+                .limit = 0,
+                .count_only = true,
+                .aggregations_json =
+                \\{"age":{"type":"stats","field":"age"}}
+                ,
+            };
+            try source.reads.reads.prepareSearchWithConsistency(77, req, .read_index);
+            var lease: ?QueryReadLease = try db.beginQueryReadLease();
+            defer if (lease) |*held| held.release();
+            var first = try lease.?.search(alloc, req);
+            defer first.result.deinit();
+            try std.testing.expectEqual(@as(usize, 0), first.result.hits.len);
+            const writer_entered = db.core.tryLockApplyExclusive();
+            if (writer_entered) db.core.unlockApplyExclusive();
+            try std.testing.expect(!writer_entered);
+            var meta: query_api.QueryResponseMeta = .{};
+            defer meta.deinit(alloc);
+            try applyBoundQueryAggregations(&source, alloc, first.request, &first.result, &meta, &lease.?, .read_index);
+            try std.testing.expectEqual(@as(usize, 1), barrier.calls);
+            try std.testing.expectEqual(@as(usize, 1), meta.aggregation_results.len);
+            const Stats = struct { count: i64, sum: f64 };
+            var stats = try std.json.parseFromSlice(Stats, alloc, meta.aggregation_results[0].value_json.?, .{ .ignore_unknown_fields = true });
+            defer stats.deinit();
+            try std.testing.expectEqual(Stats{ .count = 1, .sum = 18 }, stats.value);
+            lease.?.release();
+            lease = null;
+            try db.batch(.{
+                .writes = &.{.{ .key = "b", .value = "{\"age\":20}" }},
+                .sync_level = .write,
+            });
+            try std.testing.expectError(error.IdentityReadGenerationChanged, db.searchRequestAtCurrentIdentityGeneration(first.request));
+        }
+
+        test "aggregation full-result capture survives a later primary write" {
+            const alloc = std.testing.allocator;
+            var path_tmp = try TestDirectory.init("antfly-api-aggregation-captured-rerun");
+            defer path_tmp.cleanup();
+            var db = try db_mod.DB.open(alloc, path_tmp.path(), .{ .start_index_workers = false });
+            defer db.close();
+            try db.batch(.{
+                .writes = &.{
+                    .{ .key = "a", .value = "{\"age\":18}" },
+                    .{ .key = "b", .value = "{\"age\":20}" },
+                },
+                .sync_level = .write,
+            });
+            var full = try db.searchWithCapturedRequest(alloc, .{
+                .limit = 100,
+                .include_stored = true,
+                .aggregations_json =
+                \\{"age":{"type":"stats","field":"age"}}
+                ,
+            });
+            defer full.result.deinit();
+            try std.testing.expectEqual(@as(usize, 2), full.result.hits.len);
+
+            // Force the post-search/pre-aggregation race without timing. The
+            // current DB differs in both value and cardinality from the capture.
+            try db.batch(.{
+                .writes = &.{
+                    .{ .key = "a", .value = "{\"age\":100}" },
+                    .{ .key = "c", .value = "{\"age\":50}" },
+                },
+                .sync_level = .write,
+            });
+            try std.testing.expectError(error.IdentityReadGenerationChanged, aggregationContextForDb(alloc, full.request, &db));
+            var meta: query_api.QueryResponseMeta = .{};
+            defer meta.deinit(alloc);
+            try applyCapturedFullResultAggregations(alloc, full.request, full.result, &db, &meta, "test-captured-rerun");
+            try std.testing.expectEqual(@as(usize, 1), meta.aggregation_results.len);
+            const Stats = struct { count: i64, sum: f64, min: f64, max: f64, avg: f64 };
+            var stats = try std.json.parseFromSlice(Stats, alloc, meta.aggregation_results[0].value_json.?, .{ .ignore_unknown_fields = true });
+            defer stats.deinit();
+            try std.testing.expectEqual(Stats{ .count = 2, .sum = 38, .min = 18, .max = 20, .avg = 19 }, stats.value);
         }
 
         test "aggregation context rejects non-current identity generation" {
@@ -31104,11 +31199,12 @@ fn implementationTests() type {
         }
 
         test "hosted cross-range graph metric fan-in merges compatible hits pair" {
-            const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
-            defer tmp.cleanup();
-            const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/hosted-cross-range-graph-metric-hits-pair", .{tmp.sub_path});
-            defer alloc.free(path);
+            var allocator_state: @import("../storage/test_allocator.zig").TestAllocator = .{};
+            defer allocator_state.deinit();
+            const alloc = allocator_state.allocator();
+            var path_tmp = try TestDirectory.initFast("hosted-cross-range-graph-metric-hits-pair");
+            defer path_tmp.cleanup();
+            const path = path_tmp.path();
             const shard_count = 8;
             const group_ids = [_]u64{ 7311, 7312, 7313, 7314, 7315, 7316, 7317, 7318 };
             const prefixes = [_][]const u8{ "j", "k", "l", "m", "n", "o", "p", "q" };

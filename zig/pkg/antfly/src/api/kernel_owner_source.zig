@@ -3110,6 +3110,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         table_name: []const u8,
         req: db_types.SearchRequest,
         consistency: read_gate.ReadConsistency,
+        raw_search_result: bool,
     ) !client.QueryResponse {
         try table_reads.checkQueryDeadline(req);
         try self.prepareQueryRead(group_id, req, consistency);
@@ -3119,11 +3120,13 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer lease.deinit();
         try table_reads.checkQueryDeadline(req);
         var cancellation = req.cancellation;
+        var execution = @import("../storage/local_query_controls.zig").executionOptions(req);
+        execution.raw_search_result = @intFromBool(raw_search_result);
         var response = try lease.owner().queryJsonWithOptions(table_name, request_json, .{
             .execution_deadline_ns = req.execution_deadline_ns,
             .cancellation_ctx = if (cancellation != null) @ptrCast(&cancellation.?) else null,
             .cancellation_fn = if (cancellation != null) cancellationTokenRequested else null,
-            .execution = @import("../storage/local_query_controls.zig").executionOptions(req),
+            .execution = execution,
         });
         errdefer response.deinit();
         try table_reads.checkQueryDeadline(req);
@@ -4837,7 +4840,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         consistency: read_gate.ReadConsistency,
     ) !?query_response.QueryResponse {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
-        var response = try self.executeQuery(alloc, group_id, table_name, req, consistency);
+        var response = try self.executeQuery(alloc, group_id, table_name, req, consistency, false);
         defer response.deinit();
         return .{
             .json = try alloc.dupe(u8, response.bytes()),
@@ -4854,7 +4857,9 @@ pub const ProvisionedKernelOwnerSource = struct {
         consistency: read_gate.ReadConsistency,
     ) !?db_types.SearchResult {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
-        var response = try self.executeQuery(alloc, group_id, table_name, req, consistency);
+        // This is a raw shard phase. The coordinator owns its aggregation;
+        // queryGroupLocal instead requests a complete local response.
+        var response = try self.executeQuery(alloc, group_id, table_name, req, consistency, true);
         defer response.deinit();
         var result = try table_reads.parseStorageKernelSearchResult(alloc, response.bytes());
         errdefer result.deinit();

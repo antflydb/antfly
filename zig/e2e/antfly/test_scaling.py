@@ -866,12 +866,14 @@ class MultiNodeScalingCluster:
         initial_data_node_count: int = 5,
         max_shard_size_bytes: int = 0,
         startup_deadline_at: float | None = None,
+        tick_ms: int | None = 25,
     ):
         self.binary = binary
         self.host = "127.0.0.1"
         self.tempdir = tempfile.TemporaryDirectory(prefix="antfly-zig-scaling-e2e-")
         self.root = Path(self.tempdir.name)
         self.max_shard_size_bytes = max_shard_size_bytes
+        self.tick_ms = tick_ms
         self.startup_deadline = (
             _ClusterStartupDeadline(startup_deadline_at)
             if startup_deadline_at is not None
@@ -983,6 +985,16 @@ class MultiNodeScalingCluster:
         self.log_files.append(handle)
         return handle
 
+    def _cadence_args(self) -> list[str]:
+        if self.tick_ms is None:
+            return []
+        return [
+            "--raft-tick-ms",
+            str(self.tick_ms),
+            "--control-tick-ms",
+            str(self.tick_ms),
+        ]
+
     def _start(self) -> None:
         for node in self.metadata_nodes:
             log = self._open_log(f"metadata-{node['id']}.log")
@@ -997,10 +1009,7 @@ class MultiNodeScalingCluster:
                 # does not need a second health listener competing for ports.
                 "--health",
                 "false",
-                "--raft-tick-ms",
-                "25",
-                "--control-tick-ms",
-                "25",
+                *self._cadence_args(),
                 "--replica-root-dir",
                 str(self.root / f"metadata-{node['id']}-replicas"),
                 "--replica-catalog-path",
@@ -1095,10 +1104,7 @@ class MultiNodeScalingCluster:
             # fixture, so an additional health listener is unnecessary.
             "--health",
             "false",
-            "--raft-tick-ms",
-            "25",
-            "--control-tick-ms",
-            "25",
+            *self._cadence_args(),
             "--replica-root-dir",
             str(self.root / f"data-{node['id']}-replicas"),
             "--replica-catalog-path",
@@ -2337,9 +2343,10 @@ def _wait_node_owns_group(
                 # completed without the desired placement, the next outer
                 # observation may safely establish a successor generation.
                 remaining = max(0.0, deadline - time.monotonic())
-                return wait_until(
-                    owns_group, timeout_s=remaining, interval_s=0.5
-                ), submission_error
+                return (
+                    wait_until(owns_group, timeout_s=remaining, interval_s=0.5),
+                    submission_error,
+                )
             continue
         if snapshot_owns_group(observed):
             return observed, submission_error

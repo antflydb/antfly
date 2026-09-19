@@ -40,7 +40,11 @@ def catalog_cluster(request):
     binary = Path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))).resolve()
     if not binary.exists():
         pytest.skip(f"antfly binary not built: {binary}")
-    cluster = MultiNodeScalingCluster(str(binary), initial_data_node_count=3)
+    # Real disk syncs in CI can exceed a second. Use the production election
+    # cadence for the large catalog workload, as the restore fixture does.
+    cluster = MultiNodeScalingCluster(
+        str(binary), initial_data_node_count=3, tick_ms=None
+    )
     try:
         yield cluster
     finally:
@@ -63,6 +67,17 @@ def post_report(cluster, path, body):
             return index, response
         failures.append((index, response.status_code, response.text))
     raise AssertionError(failures)
+
+
+def require_success(response):
+    """Retain the rejection identity and delivery evidence; never replay a write."""
+    assert response.ok, (
+        response.request.method,
+        response.url,
+        response.status_code,
+        dict(response.headers),
+        response.text,
+    )
 
 
 def register_reporter(cluster, groups):
@@ -155,10 +170,13 @@ def read_pages(cluster, index, *, control, number_lexemes=False, retry_admission
             chunks.append(response.content)
             offset = sum(sizes)
             if offset == int(response.headers["X-Antfly-Snapshot-Bytes"]):
-                return json.loads(
-                    b"".join(chunks),
-                    **({"parse_float": JsonNumber} if number_lexemes else {}),
-                ), sizes
+                return (
+                    json.loads(
+                        b"".join(chunks),
+                        **({"parse_float": JsonNumber} if number_lexemes else {}),
+                    ),
+                    sizes,
+                )
             body = {"token": token, "offset": offset}
     finally:
         if token is not None:
@@ -246,16 +264,16 @@ def test_large_inventory_uses_bounded_control_and_diagnostic_transfers(catalog_c
         assert released.status_code == 204
     table_path = c.data_api_urls[0] + "/tables/large_inventory_docs"
     response = requests.post(table_path, json={}, timeout=30)
-    response.raise_for_status()
+    require_success(response)
     response = requests.delete(table_path, timeout=30)
-    response.raise_for_status()
+    require_success(response)
     # The original regression killed the real data nodes on their next control
     # rounds. Exercise multiple rounds and actual writes, not just process start.
     for i in range(12):
         response = requests.post(
             c.data_api_urls[0] + f"/databases/large_{i}", json={}, timeout=15
         )
-        response.raise_for_status()
+        require_success(response)
         assert all(p.poll() is None for p in c.data_procs), c.debug_logs()
         time.sleep(1)
 

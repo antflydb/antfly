@@ -14594,6 +14594,12 @@ components:
           description: Secret name (e.g., openai.api_key)
         status:
           $ref: '#/components/schemas/SecretStatus'
+        source:
+          type: string
+          description: Name of the winning source, or environment.
+        managed:
+          type: boolean
+          description: Whether this key has an Antfly-managed override that can be deleted.
         env_var:
           type: string
           description: Corresponding environment variable name (e.g., OPENAI_API_KEY)
@@ -14608,6 +14614,9 @@ components:
       required:
         - secrets
       properties:
+        writable:
+          type: boolean
+          description: Whether this server has a native store for secret API writes.
         secrets:
           type: array
           items:
