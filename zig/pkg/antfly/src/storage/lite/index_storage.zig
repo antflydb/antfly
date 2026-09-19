@@ -335,6 +335,7 @@ const NativeAtomicWriteSink = struct {
     buffered: usize = 0,
     buffer: [buffer_size]u8 = undefined,
     failure: ?anyerror = null,
+    write_options: native.WriteOptions = .{},
 
     const vtable: AtomicWriteSink.VTable = .{
         .len = len,
@@ -344,6 +345,7 @@ const NativeAtomicWriteSink = struct {
         .crc32_range = crc32Range,
         .finish = finish,
         .abort = abort,
+        .set_cache_intent = setCacheIntent,
     };
 
     fn create(allocator: Allocator, storage: *Store, path: []const u8) !AtomicWriteSink {
@@ -369,7 +371,13 @@ const NativeAtomicWriteSink = struct {
         const io = self.storage.docs.file.runtime();
         var random: [16]u8 = undefined;
         try io.randomSecure(&random);
-        const path = try std.fmt.allocPrint(self.allocator, "{s}.tmp-aflite-write-{x}", .{ self.storage.docs.file.path, random });
+        // Keep the basename independent of the database name so every valid
+        // database basename can spill. Retain sibling placement and exclusive
+        // creation; the random name is private to this writer.
+        const basename = try std.fmt.allocPrint(self.allocator, ".aflite-write-{x}", .{random});
+        defer self.allocator.free(basename);
+        const parent = std.fs.path.dirname(self.storage.docs.file.path) orelse ".";
+        const path = try std.fs.path.join(self.allocator, &.{ parent, basename });
         errdefer self.allocator.free(path);
         const file = try std.Io.Dir.cwd().createFile(io, path, .{ .read = true, .exclusive = true, .permissions = .fromMode(0o600) });
         self.file = file;
@@ -446,15 +454,26 @@ const NativeAtomicWriteSink = struct {
         return crc.final();
     }
 
+    fn setCacheIntent(ptr: *anyopaque, intent: storage_io.AtomicWriteCacheIntent) void {
+        const self: *NativeAtomicWriteSink = @ptrCast(@alignCast(ptr));
+        self.write_options.payload_cache = switch (intent) {
+            .normal => .normal,
+            .cold_sequential => .cold_sequential,
+        };
+    }
+
     fn finish(ptr: *anyopaque) !void {
         const self: *NativeAtomicWriteSink = @ptrCast(@alignCast(ptr));
         defer self.deinit();
         if (self.failure) |err| return err;
-        if (self.file == null) return try writeFileReserved(self.storage, self.path, self.buffer[0..self.buffered]);
-        try self.flush();
+        if (self.file != null) try self.flush();
         lockStore(self.storage.docs);
         defer self.storage.docs.mutex.unlock();
-        try self.storage.docs.file.putIndexCatalogRecordFromFile(self.path, self.file.?, self.persisted);
+        if (self.file) |file| {
+            try self.storage.docs.file.putIndexCatalogRecordFromFile(self.path, file, self.persisted, self.write_options);
+        } else {
+            try self.storage.docs.file.putIndexCatalogRecordWithOptions(self.path, self.buffer[0..self.buffered], self.write_options);
+        }
     }
 
     fn abort(ptr: *anyopaque) void {
@@ -1058,4 +1077,115 @@ test "lite native staged atomic writes discard failed imports and poisoned sourc
     defer alloc.free(value);
     try std.testing.expectEqualSlices(u8, &bytes, value);
     try std.testing.expect((try docs.file.check()).valid);
+}
+
+test "lite native atomic writes spill with long database basenames" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Valid under NAME_MAX=255, including the writer lock's .lock suffix.
+    // Appending the former 50-byte staging suffix would exceed that limit.
+    const name = "x" ** 213 ++ ".aflite";
+    const path = try testPath(alloc, tmp, name);
+    defer alloc.free(path);
+    const bytes: [128 * 1024 + 17]u8 = @splat('s');
+    {
+        var docs = try docstore.Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io });
+        defer docs.close();
+        var indexes = Store.init(alloc, &docs);
+        const storage = indexes.storage();
+        var writer = try storage.beginAtomicWrite(alloc, "/long-name");
+        var active = true;
+        defer if (active) writer.abort();
+        try writer.appendSlice(&bytes);
+        active = false;
+        try writer.finish();
+        {
+            var aborted = try storage.beginAtomicWrite(alloc, "/aborted");
+            defer aborted.abort();
+            try aborted.appendSlice(&bytes);
+        }
+        try std.testing.expectError(error.FileNotFound, storage.fileSize("/aborted"));
+    }
+    var reopened = try docstore.Store.open(alloc, path, true);
+    defer reopened.close();
+    const actual = (try reopened.file.getIndexCatalogRecordAlloc(alloc, "/long-name")).?;
+    defer alloc.free(actual);
+    try std.testing.expectEqualSlices(u8, &bytes, actual);
+    try std.testing.expect((try reopened.file.check()).valid);
+}
+
+test "lite native cold atomic writes preserve hot pages with bounded cache admission" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "cold-atomic.aflite");
+    defer alloc.free(path);
+    const bytes = try alloc.alloc(u8, 2 * 1024 * 1024 + 17);
+    defer alloc.free(bytes);
+    for (bytes, 0..) |*byte, i| byte.* = @intCast(i % 251);
+    {
+        var docs = try docstore.Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io });
+        defer docs.close();
+        docs.file.page_cache.limit_bytes = 256 * 1024;
+        var indexes = Store.init(alloc, &docs);
+        const storage = indexes.storage();
+        try storage.writeFileAbsolute("/hot", bytes[0..12000]);
+        const hot = try storage.readFileAlloc(alloc, "/hot", 12000);
+        defer alloc.free(hot);
+        try std.testing.expectEqualSlices(u8, bytes[0..12000], hot);
+        var hot_pages = std.ArrayList(u64).empty;
+        defer hot_pages.deinit(alloc);
+        var cached = docs.file.page_cache.pages.iterator();
+        while (cached.next()) |entry| {
+            if (entry.value_ptr.*[4] == @intFromEnum(native.PageKind.value)) try hot_pages.append(alloc, entry.key_ptr.*);
+        }
+        try std.testing.expect(hot_pages.items.len > 0);
+
+        // Cover both the in-memory external-value path and the file importer.
+        // The spilled payload is eight times the entire page-cache capacity.
+        const cases = .{ .{ "/cold-buffered", @as(usize, 32000) }, .{ "/cold-staged", bytes.len } };
+        inline for (cases) |case| {
+            var writer = try storage.beginAtomicWrite(alloc, case[0]);
+            var active = true;
+            defer if (active) writer.abort();
+            writer.setCacheIntent(.cold_sequential);
+            try writer.appendSlice(bytes[0..case[1]]);
+            active = false;
+            try writer.finish();
+            for (hot_pages.items) |id| try std.testing.expect(docs.file.page_cache.pages.contains(id));
+            cached = docs.file.page_cache.pages.iterator();
+            var payload_pages: usize = 0;
+            while (cached.next()) |entry| {
+                if (entry.value_ptr.*[4] == @intFromEnum(native.PageKind.value)) payload_pages += 1;
+            }
+            try std.testing.expectEqual(hot_pages.items.len, payload_pages);
+            try std.testing.expect(docs.file.page_cache.pages.contains(docs.file.activeCheckpoint().index_catalog_root_page));
+        }
+
+        // Policy is local to the sink, and can be changed before publication.
+        var normal = try storage.beginAtomicWrite(alloc, "/normal");
+        var active = true;
+        defer if (active) normal.abort();
+        normal.setCacheIntent(.cold_sequential);
+        try normal.appendSlice(bytes[0..32000]);
+        normal.setCacheIntent(.normal);
+        active = false;
+        try normal.finish();
+        var payload_pages: usize = 0;
+        cached = docs.file.page_cache.pages.iterator();
+        while (cached.next()) |entry| {
+            if (entry.value_ptr.*[4] == @intFromEnum(native.PageKind.value)) payload_pages += 1;
+        }
+        try std.testing.expect(payload_pages > hot_pages.items.len);
+        for (hot_pages.items) |id| try std.testing.expect(docs.file.page_cache.pages.contains(id));
+    }
+    var reopened = try docstore.Store.open(alloc, path, true);
+    defer reopened.close();
+    inline for (.{ .{ "/hot", @as(usize, 12000) }, .{ "/cold-buffered", @as(usize, 32000) }, .{ "/cold-staged", bytes.len }, .{ "/normal", @as(usize, 32000) } }) |case| {
+        const actual = (try reopened.file.getIndexCatalogRecordAlloc(alloc, case[0])).?;
+        defer alloc.free(actual);
+        try std.testing.expectEqualSlices(u8, bytes[0..case[1]], actual);
+    }
+    try std.testing.expect((try reopened.file.check()).valid);
 }

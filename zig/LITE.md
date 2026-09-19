@@ -121,13 +121,22 @@ The implementation now consists of:
   catalog indexes and extent trees; integrity checks validate both structures.
   Atomic index writes use a fixed 64 KiB buffer and a private staging file.
   Header patches and range checksums operate on the buffered tail and positional
-  file I/O. POSIX staging files are unlinked while open so abort and process
+  file I/O. Staging uses a short random sibling basename independent of the
+  database name, including when the database basename approaches filesystem
+  limits. POSIX staging files are unlinked while open so abort and process
   death reclaim them. Staging holds neither a document writer slot nor a
   generation pin; unrelated commits and vacuum can proceed. Finish streams the
   staged bytes into native extents and publishes one checkpoint under the store
   mutex. This adds a staging I/O pass in exchange for bounded payload heap use;
   it does not eliminate the final copy or its publication lock. I/O failures
   poison the sink, and finish consumes it on success or error.
+  Atomic writers carry cache intent through both buffered publication and
+  staged imports. Cold sequential writes bypass admission for external payload
+  pages, preserving hot reads; catalog records and tree navigation pages remain
+  cacheable. Reused page IDs invalidate cached bytes and links even when the
+  replacement bypasses admission. The policy belongs to each writer and does
+  not disable caching for concurrent readers; subsequent reads can cache the
+  cold-written data normally.
   Positional page writes extend the file directly, without per-page stat or
   resize calls; data, checkpoint-slot, and active-slot sync barriers remain.
   Revision 2 and other unsupported headers are rejected without mutation;

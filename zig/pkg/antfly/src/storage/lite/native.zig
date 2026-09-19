@@ -29,6 +29,13 @@ const maintenance = @import("../maintenance.zig");
 
 const Allocator = std.mem.Allocator;
 
+/// Per-operation admission for newly written external payload pages. Catalog
+/// records and tree navigation pages remain eligible for caching. Bypassing
+/// admission still invalidates both cached bytes and links for reused page IDs.
+pub const WriteOptions = struct {
+    payload_cache: enum { normal, cold_sequential } = .normal,
+};
+
 pub const magic = "AFLITE\x03N";
 pub const format_version: u32 = 3;
 pub const default_page_size: u32 = 4096;
@@ -1496,18 +1503,22 @@ pub const NativeFile = struct {
     }
 
     pub fn putCatalogBatch(self: *NativeFile, mutations: []const CatalogMutation) !void {
-        return try self.putCatalogBatchForRoot(.metadata, mutations);
+        return try self.putCatalogBatchForRoot(.metadata, mutations, .{});
     }
 
     pub fn putIndexCatalogRecord(self: *NativeFile, key: []const u8, value: []const u8) !void {
-        try self.putIndexCatalogBatch(&.{.{ .key = key, .value = value }});
+        try self.putIndexCatalogRecordWithOptions(key, value, .{});
+    }
+
+    pub fn putIndexCatalogRecordWithOptions(self: *NativeFile, key: []const u8, value: []const u8, options: WriteOptions) !void {
+        try self.putCatalogBatchForRoot(.index, &.{.{ .key = key, .value = value }}, options);
     }
 
     /// Import a private, seekable staging file using bounded buffers. The
     /// caller serializes publication with other native mutations and keeps the
     /// source alive and unchanged throughout this call. No staged data enters
     /// the committed catalog until the final checkpoint publication.
-    pub fn putIndexCatalogRecordFromFile(self: *NativeFile, key: []const u8, source: std.Io.File, len: usize) !void {
+    pub fn putIndexCatalogRecordFromFile(self: *NativeFile, key: []const u8, source: std.Io.File, len: usize, options: WriteOptions) !void {
         if (self.read_only) return error.ReadOnly;
         if (key.len > catalog_key_len_mask or len > std.math.maxInt(u32)) return error.RecordTooLarge;
         const fixed_len = 16 + key.len;
@@ -1515,7 +1526,7 @@ pub const NativeFile = struct {
         var buffer: [65536]u8 = undefined;
         if (len <= self.maxPagePayloadBytes() - fixed_len) {
             try readExactAt(source, self.runtimeIo(), buffer[0..len], 0);
-            return try self.putIndexCatalogRecord(key, buffer[0..len]);
+            return try self.putIndexCatalogRecordWithOptions(key, buffer[0..len], options);
         }
         if (fixed_len + 8 > self.maxPagePayloadBytes()) return error.PageTooLarge;
         const previous = self.activeCheckpoint();
@@ -1533,7 +1544,7 @@ pub const NativeFile = struct {
             var pos: usize = 0;
             while (pos < n) {
                 const end = @min(n, pos + chunk_size);
-                try builder.push(try self.writeExtentLeaf(&pages, buffer[pos..end]));
+                try builder.push(try self.writeExtentLeaf(&pages, buffer[pos..end], options));
                 pos = end;
             }
             offset += n;
@@ -1571,7 +1582,7 @@ pub const NativeFile = struct {
     }
 
     pub fn putIndexCatalogBatch(self: *NativeFile, mutations: []const CatalogMutation) !void {
-        return try self.putCatalogBatchForRoot(.index, mutations);
+        return try self.putCatalogBatchForRoot(.index, mutations, .{});
     }
 
     const CatalogRoots = struct { history: u64, index: u64 = 0, indexed: bool = false };
@@ -1639,7 +1650,7 @@ pub const NativeFile = struct {
         }
     }
 
-    fn putCatalogBatchForRoot(self: *NativeFile, root: CatalogRoot, mutations: []const CatalogMutation) !void {
+    fn putCatalogBatchForRoot(self: *NativeFile, root: CatalogRoot, mutations: []const CatalogMutation, options: WriteOptions) !void {
         if (self.read_only) return error.ReadOnly;
         if (mutations.len == 0) return;
         for (mutations) |mutation| try self.validateCatalogMutation(mutation);
@@ -1672,7 +1683,7 @@ pub const NativeFile = struct {
         for (mutations) |mutation| {
             var external_value_root_page: u64 = 0;
             if (!mutation.is_delete and !self.catalogEntryFitsInline(mutation.key, mutation.value)) {
-                external_value_root_page = try self.writeCatalogValue(&page_allocator, mutation.value);
+                external_value_root_page = try self.writeCatalogValue(&page_allocator, mutation.value, options);
             }
 
             const page_id = try page_allocator.allocate();
@@ -1708,13 +1719,13 @@ pub const NativeFile = struct {
 
         const previous = self.activeCheckpoint();
         const found_page = (try self.lookupCatalogPage(previous, root, key)) orelse {
-            return try self.putCatalogBatchForRoot(root, &.{.{ .key = key, .value = suffix }});
+            return try self.putCatalogBatchForRoot(root, &.{.{ .key = key, .value = suffix }}, .{});
         };
         const found_payload = try self.readPagePayloadByKindAlloc(self.allocator, found_page, .catalog);
         defer self.allocator.free(found_payload);
         const entry = try decodeCatalogEntry(found_payload);
         if (!std.mem.eql(u8, entry.key, key)) return error.InvalidNativePageChain;
-        if (entry.is_delete) return try self.putCatalogBatchForRoot(root, &.{.{ .key = key, .value = suffix }});
+        if (entry.is_delete) return try self.putCatalogBatchForRoot(root, &.{.{ .key = key, .value = suffix }}, .{});
 
         const old_len = if (entry.external_value_root_page != 0) entry.external_value_len else entry.value.len;
         const total_len = try std.math.add(usize, old_len, suffix.len);
@@ -2877,7 +2888,7 @@ pub const NativeFile = struct {
                 if (buffered == chunk_size or written + buffered == len) {
                     if (cancel) |token| try token.check();
                     if (tree) {
-                        try builder.push(try writer.writeExtentLeaf(&pages, buffer[value_page_header_size..][0..buffered]));
+                        try builder.push(try writer.writeExtentLeaf(&pages, buffer[value_page_header_size..][0..buffered], .{}));
                     } else {
                         const next = if (written + buffered < len) next_page.* + 1 else 0;
                         std.mem.writeInt(u64, buffer[0..8], next, .little);
@@ -3434,31 +3445,31 @@ pub const NativeFile = struct {
         return .{ .page = page, .len = len, .height = height };
     }
 
-    fn writeExtentLeaf(self: *NativeFile, pages: *PageAllocator, value: []const u8) !ExtentRef {
+    fn writeExtentLeaf(self: *NativeFile, pages: *PageAllocator, value: []const u8, options: WriteOptions) !ExtentRef {
         if (value.len == 0 or value.len > self.maxValuePagePayloadBytes()) return error.InvalidNativeValueChain;
         const page = try pages.allocate();
         const ids = [_]u64{page};
-        try self.writeValuePageChunk(@constCast(&ids), 0, value);
+        try self.writeValuePageChunk(&ids, 0, value, options);
         return .{ .page = page, .len = value.len };
     }
 
     /// Stream a packed tree through the same bounded frontier used by appends.
     /// Neither initial writes nor vacuum need an array of every leaf reference.
-    fn writeValueTree(self: *NativeFile, pages: *PageAllocator, value: []const u8) !ExtentRef {
+    fn writeValueTree(self: *NativeFile, pages: *PageAllocator, value: []const u8, options: WriteOptions) !ExtentRef {
         if (value.len == 0) return error.InvalidNativeValueChain;
         var builder = ExtentAppender{ .file = self, .pages = pages, .tail = undefined };
         defer builder.deinit();
         var offset: usize = 0;
         while (offset < value.len) {
             const end = @min(value.len, offset + self.maxValuePagePayloadBytes());
-            try builder.push(try self.writeExtentLeaf(pages, value[offset..end]));
+            try builder.push(try self.writeExtentLeaf(pages, value[offset..end], options));
             offset = end;
         }
         return try builder.finish();
     }
 
-    fn writeCatalogValue(self: *NativeFile, pages: *PageAllocator, value: []const u8) !u64 {
-        return (try self.writeValueTree(pages, value)).page;
+    fn writeCatalogValue(self: *NativeFile, pages: *PageAllocator, value: []const u8, options: WriteOptions) !u64 {
+        return (try self.writeValueTree(pages, value, options)).page;
     }
 
     fn valueTreeRoot(self: *NativeFile, root: u64, len: usize, checkpoint: CheckpointSlot) !?ExtentRef {
@@ -3580,9 +3591,9 @@ pub const NativeFile = struct {
         const root = if (entry.external_value_root_page != 0)
             (try self.valueTreeRoot(entry.external_value_root_page, entry.external_value_len, self.activeCheckpoint())) orelse return error.InvalidNativeValueChain
         else if (entry.value.len > 0)
-            try self.writeValueTree(pages, entry.value)
+            try self.writeValueTree(pages, entry.value, .{})
         else
-            return (try self.writeValueTree(pages, suffix)).page;
+            return (try self.writeValueTree(pages, suffix, .{})).page;
         if (suffix.len == 0) return root.page;
         var appender = try ExtentAppender.init(self, pages, root);
         defer appender.deinit();
@@ -3600,12 +3611,12 @@ pub const NativeFile = struct {
             defer self.allocator.free(combined);
             @memcpy(combined[0..tail.chunk.len], tail.chunk);
             @memcpy(combined[tail.chunk.len..], suffix[0..take]);
-            try appender.push(try self.writeExtentLeaf(pages, combined));
+            try appender.push(try self.writeExtentLeaf(pages, combined, .{}));
         }
         var offset = take;
         while (offset < suffix.len) {
             const end = @min(suffix.len, offset + self.maxValuePagePayloadBytes());
-            try appender.push(try self.writeExtentLeaf(pages, suffix[offset..end]));
+            try appender.push(try self.writeExtentLeaf(pages, suffix[offset..end], .{}));
             offset = end;
         }
         return (try appender.finish()).page;
@@ -3686,14 +3697,14 @@ pub const NativeFile = struct {
         return page_ids[0];
     }
 
-    fn writeValuePageChunk(self: *NativeFile, page_ids: []const u64, page_index: usize, chunk: []const u8) !void {
+    fn writeValuePageChunk(self: *NativeFile, page_ids: []const u64, page_index: usize, chunk: []const u8, options: WriteOptions) !void {
         if (chunk.len == 0 or chunk.len > self.maxValuePagePayloadBytes()) return error.InvalidNativeValueChain;
         const next_page_id = if (page_index + 1 < page_ids.len) page_ids[page_index + 1] else 0;
         const payload = try self.allocator.alloc(u8, value_page_header_size + chunk.len);
         defer self.allocator.free(payload);
         std.mem.writeInt(u64, payload[0..8], next_page_id, .little);
         @memcpy(payload[value_page_header_size..], chunk);
-        try self.writePage(page_ids[page_index], .value, payload);
+        try self.writePageWithOptions(page_ids[page_index], .value, payload, options);
     }
 
     fn pageAllocatorFromFreeMap(self: *NativeFile, checkpoint: CheckpointSlot) !PageAllocator {
@@ -4163,6 +4174,10 @@ pub const NativeFile = struct {
     }
 
     fn writePage(self: *NativeFile, page_id: u64, kind: PageKind, contents: []const u8) !void {
+        return self.writePageWithOptions(page_id, kind, contents, .{});
+    }
+
+    fn writePageWithOptions(self: *NativeFile, page_id: u64, kind: PageKind, contents: []const u8, options: WriteOptions) !void {
         if (builtin.is_test) _ = self.test_page_writes.fetchAdd(1, .monotonic);
         if (contents.len > self.maxPagePayloadBytes()) return error.PageTooLarge;
 
@@ -4177,9 +4192,10 @@ pub const NativeFile = struct {
         // page added two filesystem calls and provided no durability benefit;
         // publication still syncs complete pages before publishing the slot.
         try self.file.writePositionalAll(self.runtimeIo(), page, page_offset);
-        if (kind == .free_map) {
-            // A reused page id may still be cached under its previous life;
-            // free-map pages themselves are not cached (see read path).
+        if (kind == .free_map or (kind == .value and options.payload_cache == .cold_sequential)) {
+            // Skipping admission must still remove stale bytes AND navigation
+            // links from a previous use of this page ID. Cold payload pages
+            // also skip link admission; extent/catalog metadata stays warm.
             self.page_cache.remove(self.allocator, page_id);
         } else if (self.page_cache_enabled.load(.monotonic)) {
             self.page_cache.put(self.allocator, page_id, page);
@@ -8691,4 +8707,31 @@ test "lite native bulk index frontier releases ownership on allocation failures"
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "lite native cold payload writes invalidate reused page bytes and links" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "cold-reuse.aflite");
+    defer alloc.free(path);
+    var file = try NativeFile.createWithOptions(alloc, path, .{ .no_sync = true });
+    defer file.close();
+    const id = try file.allocatePage("old");
+    const ids = [_]u64{id};
+    // Exercise the overwrite boundary directly, including a cached link from
+    // the page's previous lifetime. A cold replacement must invalidate both.
+    try file.writeValuePageChunk(&ids, 0, "old payload", .{});
+    try std.testing.expect(file.page_cache.pages.contains(id));
+    try std.testing.expect(file.page_cache.links.contains(id));
+    try file.writeValuePageChunk(&ids, 0, "cold replacement", .{ .payload_cache = .cold_sequential });
+    try std.testing.expect(!file.page_cache.pages.contains(id));
+    try std.testing.expect(!file.page_cache.links.contains(id));
+    const page = try file.readPageAlloc(alloc, id);
+    defer alloc.free(page);
+    const payload = try decodePagePayloadAlloc(alloc, page, .value);
+    defer alloc.free(payload);
+    try std.testing.expectEqualStrings("cold replacement", payload[value_page_header_size..]);
+    // A subsequent read can admit cold-written data normally.
+    try std.testing.expect(file.page_cache.pages.contains(id));
 }
