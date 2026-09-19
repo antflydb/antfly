@@ -585,6 +585,8 @@ pub const OpenOptions = struct {
         degree_canary,
     };
 
+    /// Trusted local construction only; never enabled by managed data runtimes.
+    allow_local_durable_completion: bool = false,
     table_storage: ?table_storage_mod.Settings = null,
     open_mode: OpenOptions.OpenMode = .writer,
     map_size: usize = 256 * 1024 * 1024,
@@ -5105,6 +5107,8 @@ pub const DB = struct {
     owned_backend_runtime: ?background_runtime_mod.BackendRuntimeHandle,
     owned_resource_manager: ?*resource_manager_mod.ResourceManager,
     capacity_source: ?types.RepairCapacitySource,
+    allow_local_durable_completion: bool = false,
+    durable_completion_backlog: ?derived_executor_mod.BacklogAdmission = null,
     executor: *derived_executor_mod.Executor,
     start_index_workers: bool,
     optional_runtime_workers_enabled: bool,
@@ -5694,6 +5698,8 @@ pub const DB = struct {
                     }
                 }
             }
+            if (opts.allow_local_durable_completion and (opts.staged_generation != null or opts.exclusive_generation != null or opts.physical_root_mode != .filesystem_managed))
+                return error.LocalCompletionAuthorityRequired;
             const runtime_alloc = backgroundRuntimeAllocator(alloc);
             var owned_backend_runtime: ?background_runtime_mod.BackendRuntimeHandle = null;
             errdefer if (owned_backend_runtime) |*handle| handle.deinit();
@@ -5888,6 +5894,7 @@ pub const DB = struct {
             );
             core_owned = false;
             core_owner_initialized = true;
+            core_owner.index_manager.completion_eligibility = &core_owner.completion_eligibility;
             core_owner.identity_visibility.summary = try doc_identity.visibilitySummaryFromStore(core_owner.store);
             var db = DB{
                 .alloc = alloc,
@@ -5909,6 +5916,7 @@ pub const DB = struct {
                 .owned_resource_manager = owned_resource_manager,
                 .capacity_source = opts.capacity_source orelse opts.resource_manager.?.capacitySource(),
                 .executor = executor,
+                .allow_local_durable_completion = opts.allow_local_durable_completion,
                 .start_index_workers = start_index_workers,
                 .optional_runtime_workers_enabled = false,
                 .graph_metric_idle_maintenance = opts.graph_metric_idle_maintenance,
@@ -5960,6 +5968,7 @@ pub const DB = struct {
             try db.initAsyncInfrastructure(effective_executor, opts.resource_manager);
             profile.init_async_infrastructure_ns = elapsedSince(init_async_started_ns);
             executor_ready = true;
+            try db.restoreDurableCompletionBacklog();
             const table_storage_started_ns = monotonicTimeNs();
             try db.initializeTableStorage(opts.table_storage);
             profile.table_storage_ns = elapsedSince(table_storage_started_ns);
@@ -6015,7 +6024,15 @@ pub const DB = struct {
                 db.requestManagedAdmissionMaterialization();
             }
 
-            if (opts.open_mode == .status_only) {
+            if (db.core.primary_store_owner.lsmBackend() != null and db.core.primary_store_owner.lsmBackend().?.durable_completion != null) {
+                // Restoration has already installed the structural fence.
+                // Bind only the proven empty catalog; ordinary load can create
+                // runtimes/backfills and must continue to reject this fence.
+                const workspace = try alloc.alloc(u8, 1024 * 1024);
+                defer alloc.free(workspace);
+                var fixed = std.heap.FixedBufferAllocator.init(workspace);
+                try db.core.index_manager.initializeEmptyCompletionCatalog(fixed.allocator(), db.core.store);
+            } else if (opts.open_mode == .status_only) {
                 try db.core.loadIndexCatalogOnly();
             } else if (opts.open_mode == .query_readonly) {
                 const load_indexes_started_ns = monotonicTimeNs();
@@ -6353,6 +6370,8 @@ pub const DB = struct {
     }
 
     pub fn startVectorMigration(self: *DB, request: vector_migration.contract.Request) !void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         try request.validate();
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         if (request.mode == .offline and !self.vector_migration_offline_candidate) return error.VectorStoreRequiresOfflineCommand;
@@ -6421,6 +6440,8 @@ pub const DB = struct {
     }
 
     pub fn advanceVectorMigration(self: *DB, job_id: []const u8) anyerror!void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         // Staging pins index/catalog lifetime but never holds table apply over
         // corpus-sized ANN work. Completion is checked again under apply.
         const status = try self.vectorMigrationStatus(self.alloc) orelse return error.VectorMigrationNotFound;
@@ -6523,6 +6544,8 @@ pub const DB = struct {
     }
 
     pub fn publishVectorMigration(self: *DB, job_id: []const u8) !void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         var structural = self.beginIndexStructuralMutation("source ownership publication", "*");
         defer structural.deinit();
         try self.lockApplyForPortableRuntime();
@@ -6545,6 +6568,8 @@ pub const DB = struct {
     }
 
     pub fn cancelVectorMigration(self: *DB, job_id: []const u8) !void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         return self.cancelVectorMigrationImpl(job_id, null);
     }
 
@@ -6657,6 +6682,8 @@ pub const DB = struct {
     /// Creation/provisioning-only configuration. Existing persisted authority
     /// cannot be changed, and populated roots require an explicit migration.
     pub fn configureTableStorage(self: *DB, settings: table_storage_mod.Settings) !void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         if (settings.transaction_recovery) |policy| try policy.validate();
         lockApply(self);
         defer self.core.unlockApply();
@@ -6846,6 +6873,9 @@ pub const DB = struct {
             .text_merge_runtime = null,
         };
         self.core.index_manager.setRelationalBaseRows(self.async_context.relational_base_rows);
+        // Initialize cleanup-owned context before a restore can fail, but
+        // restore structural exclusion before constructing any executor worker.
+        try self.restoreDurableCompletionEligibility();
         self.executor.* = try derived_executor_mod.init(
             self.runtime_alloc,
             executor_config,
@@ -7299,6 +7329,8 @@ pub const DB = struct {
 
         var owned_cfg = cfg;
         defer self.deinitEnrichmentConfig(&owned_cfg);
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
 
         const query_visibility_hook_present = hasQueryVisibilityHook(self.async_context);
         var detached = try self.createDetachedEnrichmentRuntime(&owned_cfg);
@@ -7748,6 +7780,8 @@ pub const DB = struct {
     }
 
     fn deinitWrapperState(self: *DB, executor_ready: bool) void {
+        if (self.durable_completion_backlog) |*admission| admission.cancel();
+        self.durable_completion_backlog = null;
         // Stop background workers before tearing down stores, runtimes, and
         // index state they may inspect.
         self.async_context.background_closing.store(true, .release);
@@ -7901,6 +7935,14 @@ pub const DB = struct {
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
         if (!config.enabled) return .{};
+        if (try self.recoverDurableCompletion(config.clock.nowRealtimeNs())) |resolved| return .{
+            .enabled = true,
+            .lease_owned = config.lease_owned,
+            .runs = 1,
+            .scanned_records = 1,
+            .resolved_finalized = @intFromBool(resolved),
+            .deferred_unresolved = @intFromBool(!resolved),
+        };
         if (self.core.table_catalog.transaction_recovery_max_count != 0) if (self.core.index_manager.resource_manager) |manager| if (manager.transactionCompletionMetadata()) |metadata| {
             var effective = config;
             effective.completion_metadata = metadata;
@@ -7990,6 +8032,8 @@ pub const DB = struct {
     }
 
     pub fn beginBulkIngestSession(self: *DB) !void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
@@ -8060,6 +8104,8 @@ pub const DB = struct {
     }
 
     pub fn beginDenseAutoBulkIngestSession(self: *DB) !void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
@@ -8074,6 +8120,8 @@ pub const DB = struct {
     }
 
     pub fn beginPrimaryStoreAutoBulkIngestSession(self: *DB) !void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
@@ -9054,6 +9102,8 @@ pub const DB = struct {
         transition: types.SplitTransitionMutation,
         identity: RaftAppliedEntryIdentity,
     ) !void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         var snapshot_mutation = self.core.snapshot_admission.acquireMutation();
         defer snapshot_mutation.release();
         lockApply(self);
@@ -9545,6 +9595,13 @@ pub const DB = struct {
         generated_memo: *GeneratedEmbeddingMemo,
         prepared_row_allocator: *PreparedRowAllocator,
     ) anyerror!void {
+        // Topology checkpoints share this path with ordinary document writes.
+        // Only the former change the prepared completion's range authority.
+        var completion_transition = if (req.split_replication != null or req.split_checkpoint != null or req.merge_checkpoint != null)
+            try self.core.completion_eligibility.beginTransition()
+        else
+            null;
+        defer if (completion_transition) |*transition| transition.deinit();
         const schema_namespace = if (opts.transaction_resolution) |resolution|
             resolution.schema_namespace_generation orelse self.core.schemaNamespaceGeneration()
         else
@@ -11272,7 +11329,13 @@ pub const DB = struct {
     /// right after a DB is opened, since managed DBs open lazily and cannot
     /// thread the source through `OpenOptions`. No-op when this DB has no
     /// resolution runtime (e.g. read-only / status opens).
-    pub fn setResolutionCandidateSource(self: *DB, src: ?resolution_runtime_mod.CandidateSource) void {
+    pub fn setResolutionCandidateSource(self: *DB, src: ?resolution_runtime_mod.CandidateSource) !void {
+        // Clearing a borrowed hook is always legal during owner teardown.
+        var completion_transition = if (src != null)
+            try self.core.completion_eligibility.beginTransition()
+        else
+            null;
+        defer if (completion_transition) |*transition| transition.deinit();
         self.resolution_candidate_source = src;
         if (self.resolution_runtime) |runtime| runtime.setCandidateSource(src);
     }
@@ -11281,7 +11344,13 @@ pub const DB = struct {
     /// serving layer (managed write cache) calls this right after a DB is opened,
     /// since managed DBs open lazily and cannot thread the sink through
     /// `OpenOptions`. No-op when this DB has no promotion runtime.
-    pub fn setEntitySink(self: *DB, sink: ?promotion_runtime_mod.EntitySink) void {
+    pub fn setEntitySink(self: *DB, sink: ?promotion_runtime_mod.EntitySink) !void {
+        // Clearing a borrowed hook is always legal during owner teardown.
+        var completion_transition = if (sink != null)
+            try self.core.completion_eligibility.beginTransition()
+        else
+            null;
+        defer if (completion_transition) |*transition| transition.deinit();
         self.entity_sink = sink;
         if (self.promotion_runtime) |runtime| runtime.setSink(sink);
     }
@@ -11289,7 +11358,13 @@ pub const DB = struct {
     /// Inject (or clear) the source-shard promotion owner on an already-open DB.
     /// Serving-layer managed DBs use this to keep follower raft apply from
     /// turning replay into public entity-table writes.
-    pub fn setPromotionOwner(self: *DB, owner: ?promotion_runtime_mod.PromotionOwner) void {
+    pub fn setPromotionOwner(self: *DB, owner: ?promotion_runtime_mod.PromotionOwner) !void {
+        // Clearing a borrowed hook is always legal during owner teardown.
+        var completion_transition = if (owner != null)
+            try self.core.completion_eligibility.beginTransition()
+        else
+            null;
+        defer if (completion_transition) |*transition| transition.deinit();
         self.promotion_owner = owner;
         if (self.promotion_runtime) |runtime| runtime.setOwner(owner);
     }
@@ -21723,6 +21798,8 @@ pub const DB = struct {
     }
 
     pub fn updateRange(self: *DB, byte_range: types.ByteRange) !void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
@@ -21788,6 +21865,8 @@ pub const DB = struct {
     }
 
     pub fn setSplitState(self: *DB, state: ?types.SplitState) !void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         if (self.source_vectors.load(.acquire) != null) return error.VectorStoreLifecycleUnsupported;
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
@@ -21820,6 +21899,8 @@ pub const DB = struct {
     }
 
     pub fn setSplitDeltaFinalSeq(self: *DB, seq: u64) !void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
@@ -21844,6 +21925,8 @@ pub const DB = struct {
     }
 
     pub fn setSplitBootstrapMarker(self: *DB, marker: range_state_mod.SplitBootstrapMarker) !void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         try self.core.saveSplitBootstrapMarker(marker);
@@ -21858,6 +21941,8 @@ pub const DB = struct {
         byte_range: types.ByteRange,
         writes: []const types.BatchWrite,
     ) !void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         lockAtomicWithBackoff(&self.generation_replace_mutex);
         defer self.generation_replace_mutex.unlock();
         if (byte_range.start.len > 0 and byte_range.end.len > 0 and
@@ -21926,6 +22011,8 @@ pub const DB = struct {
         byte_range: types.ByteRange,
         writes: []const types.BatchWrite,
     ) !void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         try staged_generation.validatePath(self.core.path);
         if (byte_range.start.len > 0 and byte_range.end.len > 0 and
             std.mem.order(u8, byte_range.start, byte_range.end) != .lt)
@@ -21949,6 +22036,8 @@ pub const DB = struct {
         staged_generation: *const generation_lifecycle.StagedGeneration,
         byte_range: types.ByteRange,
     ) !void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         try staged_generation.validatePath(self.core.path);
         const range_value = try range_state_mod.encodeRangeAlloc(self.alloc, byte_range);
         defer self.alloc.free(range_value);
@@ -21974,6 +22063,8 @@ pub const DB = struct {
         base_delta_sequence: u64,
         marker: range_state_mod.SplitBootstrapMarker,
     ) !bool {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         lockAtomicWithBackoff(&self.generation_replace_mutex);
         defer self.generation_replace_mutex.unlock();
 
@@ -22093,6 +22184,8 @@ pub const DB = struct {
         base_delta_sequence: u64,
         marker: range_state_mod.SplitBootstrapMarker,
     ) !bool {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         lockAtomicWithBackoff(&self.generation_replace_mutex);
         defer self.generation_replace_mutex.unlock();
 
@@ -22214,6 +22307,8 @@ pub const DB = struct {
     }
 
     pub fn createShadowIndexManager(self: *DB, split_key: []const u8, original_range_end: []const u8) !void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
@@ -22297,6 +22392,8 @@ pub const DB = struct {
         dest_dir2: []const u8,
         prepare_only: bool,
     ) !void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         if (self.source_vectors.load(.acquire) != null) return error.VectorStoreLifecycleUnsupported;
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
@@ -22336,6 +22433,8 @@ pub const DB = struct {
     }
 
     pub fn finalizeSplit(self: *DB, new_range: types.ByteRange) !void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
@@ -22436,6 +22535,8 @@ pub const DB = struct {
         cancellation: types.CancellationToken,
         maintenance_deadline_ns: ?u64,
     ) !u64 {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         try self.ensurePrimaryOnlySnapshot();
         // Serialize only snapshot construction/publication. Normal writes can
         // resume before native manifest hashing, while same-ID captures cannot
@@ -22901,6 +23002,8 @@ pub const DB = struct {
         donor: *DB,
         byte_range: types.ByteRange,
     ) !void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         if (self == donor or std.mem.eql(u8, self.core.path, donor.core.path))
             return error.InvalidArgument;
 
@@ -24365,6 +24468,8 @@ pub const DB = struct {
     }
 
     pub fn setSchema(self: *DB, table_schema: schema_mod.TableSchema) !void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         var schedule_ha_recovery_on_exit = false;
         defer if (schedule_ha_recovery_on_exit) self.scheduleDurableHAOutboxRecovery();
         var prepared_recovery = if (self.transaction_recovery_identity_context != null)
@@ -24619,6 +24724,8 @@ pub const DB = struct {
     }
 
     pub fn setSchemaJson(self: *DB, alloc: Allocator, schema_json: []const u8) !void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         var schedule_ha_recovery_on_exit = false;
         defer if (schedule_ha_recovery_on_exit) self.scheduleDurableHAOutboxRecovery();
         _ = alloc;
@@ -24904,6 +25011,7 @@ pub const DB = struct {
 
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
+        try self.rejectUnreservedDurablePrepareLocked(txn_id);
         if (schema_namespace != self.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
         if (binding == null) try self.validatePreparedSchemaViewLocked(view);
         try self.failIfIdentityOrdinalExhaustedForNewUpserts(identity_upsert_keys.items);
@@ -25031,6 +25139,7 @@ pub const DB = struct {
 
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
+        try self.rejectUnreservedDurablePrepareLocked(txn_id);
         if (schema_namespace != self.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
         if (binding == null) try self.validatePreparedSchemaViewLocked(prepared_schema_view);
         try self.validateTransformReadSnapshot(transform_snapshot);
@@ -25081,6 +25190,222 @@ pub const DB = struct {
         };
     }
 
+    /// Internal opt-in local path only. Reservation precedes the real prepared
+    /// vote; ordinary transaction APIs never select this profile automatically.
+    pub fn prepareDurableCompletion(
+        self: *DB,
+        txn_id: transactions_mod.TxnId,
+        intents: []const transactions_mod.WriteIntent,
+        predicates: []const transactions_mod.VersionPredicate,
+    ) !void {
+        if (!self.allow_local_durable_completion or self.generation_read_lease == null) return error.LocalCompletionAuthorityRequired;
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        const backend = self.core.primary_store_owner.lsmBackend() orelse return error.UnsupportedCompletionBackend;
+        if (backend.durable_completion != null) return error.PreparedCompletionActive;
+        try self.core.completion_eligibility.begin(txn_id);
+        errdefer {
+            backend.cancelUnpreparedCompletion();
+            // An uncertain or durable prepare keeps both physical ownership
+            // and structural exclusion until reconciliation/reopen.
+            if (backend.durable_completion == null) {
+                if (self.durable_completion_backlog) |*admission| admission.cancel();
+                self.durable_completion_backlog = null;
+                self.core.completion_eligibility.retire(txn_id) catch unreachable;
+            }
+        }
+        const observation = try self.inspectSingleOverwriteCompletionProfileLocked(self.alloc, txn_id, intents);
+        const key = intents[0].key;
+        const replacement = intents[0].value.?;
+        const store_key = try encodeStoreLookupKeyAlloc(self, self.alloc, key);
+        defer self.alloc.free(store_key);
+        const primary = try self.core.store.get(self.alloc, store_key);
+        defer self.alloc.free(primary);
+        const changed = !storedDocumentValuesEqual(self.alloc, primary, replacement);
+        // Use the same thin replay builder as normal document transaction
+        // resolution, including equal-value empty replay and overwrite hints.
+        const extracted = [_]mapper.ExtractedWrite{.{
+            .cleaned_value = @constCast(replacement),
+            .cleaned_value_owned = false,
+            .graph_writes = &.{},
+            .mentioned_graph_indexes = &.{},
+            .dense_embeddings = &.{},
+            .sparse_embeddings = &.{},
+        }};
+        const payload = try encodeThinReplayRecordPayload(self.alloc, .{ .writes = &.{.{ .key = key, .value = replacement }} }, &extracted, &.{}, &.{}, &.{true}, &.{changed}, 1, false, null, null);
+        defer self.alloc.free(payload);
+        var manager = try transactions_mod.TxnManager.init(self.alloc, self.core.store);
+        defer manager.deinit();
+        manager.completion_limits = .{
+            .max_transaction_bytes = if (self.core.table_catalog.transaction_recovery_max_count != 0) self.core.table_catalog.transaction_admission_bytes else 0,
+            .max_count = self.core.table_catalog.transaction_recovery_max_count,
+            .max_bytes = self.core.table_catalog.transaction_recovery_max_bytes,
+        };
+        var txn_snapshot = try manager.store.beginRead();
+        defer txn_snapshot.abort();
+        var templates = try manager.compileCompletionTemplates(txn_id, intents, predicates, .{ .schema_binding = .{}, .max_intent_admission_bytes = self.core.table_catalog.transaction_admission_bytes }, .{ .replay = .{ .sequence = 1, .payload = payload } }, .{}, .{ .snapshot = &txn_snapshot, .timestamp = 1, .replay_payload_sequence_offset = 6 });
+        defer templates.deinit();
+        const codec = @import("../lsm_backend/completion_slot.zig");
+        const fence_bytes = try self.encodeCompletionProfileObservation(observation);
+        const encoded = try codec.encode(self.alloc, .{
+            .txn_id = txn_id,
+            .intent_revision = templates.intent_revision,
+            .namespace = "docs",
+            .limits = lsm_backend_mod.Backend.durable_completion_limits,
+            .profile_fence = &fence_bytes,
+            .commit = templates.commit.operations,
+            .abort = templates.abort.operations,
+        }, .{});
+        defer self.alloc.free(encoded);
+        // Initialize the cached counter before voting; resolution must not
+        // acquire ordinary provider memory merely to choose its replay number.
+        _ = self.core.nextDerivedAppendSequence();
+        self.durable_completion_backlog = try self.executor.admitBacklogBytes(@intCast(payload.len));
+        try backend.reserveDurableCompletion(encoded);
+        try self.core.writeIntentsExtraBatch(txn_id, intents, predicates, .{
+            .schema_binding = .{},
+            .writes = &.{.{ .key = codec.storage_key, .value = encoded }},
+        });
+        try backend.confirmDurableCompletion(txn_id);
+    }
+
+    fn encodeCompletionProfileObservation(self: *DB, observation: CompletionProfileObservation) ![200]u8 {
+        var out: [200]u8 = undefined;
+        @memcpy(out[0..8], "DBCSF001");
+        var offset: usize = 8;
+        for ([_]u64{ observation.root_generation, observation.schema_namespace_generation, observation.index_generation }) |value| {
+            std.mem.writeInt(u64, out[offset..][0..8], value, .little);
+            offset += 8;
+        }
+        @memcpy(out[offset..][0..32], &observation.range_digest);
+        offset += 32;
+        for ([_]u64{ observation.identity_namespace.table_id, observation.identity_namespace.shard_id, observation.identity_namespace.range_id, observation.ordinal, observation.identity_created_generation }) |value| {
+            std.mem.writeInt(u64, out[offset..][0..8], value, .little);
+            offset += 8;
+        }
+        @memcpy(out[offset..][0..32], &observation.primary_digest);
+        @memcpy(out[offset + 32 ..][0..32], &observation.input_digest);
+        const io = self.backend_runtime.filesystemIo() orelse return error.MissingBackendRuntimeIo;
+        const canonical = if (std.fs.path.isAbsolute(self.core.path))
+            try std.Io.Dir.realPathFileAbsoluteAlloc(io, self.core.path, self.alloc)
+        else
+            try std.Io.Dir.cwd().realPathFileAlloc(io, self.core.path, self.alloc);
+        defer self.alloc.free(canonical);
+        std.crypto.hash.sha2.Sha256.hash(canonical, out[168..200], .{});
+        return out;
+    }
+
+    fn restoreDurableCompletionEligibility(self: *DB) !void {
+        const backend = self.core.primary_store_owner.lsmBackend() orelse return;
+        const slot = backend.durable_completion orelse return;
+        if (!self.allow_local_durable_completion) return error.LocalCompletionAuthorityRequired;
+        if (slot.descriptor.descriptor.namespace == null or !std.mem.eql(u8, slot.descriptor.descriptor.namespace.?, "docs"))
+            return error.UnsupportedCompletionProfile;
+        try self.core.completion_eligibility.restore(slot.descriptor.descriptor.txn_id);
+        const descriptor = slot.descriptor.descriptor;
+        var primary: ?@import("../lsm_backend/completion_slot.zig").Operation = null;
+        for (descriptor.commit) |op| if (op.kind == .put and internal_keys.isPrimaryDocumentKey(op.key)) {
+            if (primary != null) return error.UnsupportedCompletionProfile;
+            primary = op;
+        };
+        const op = primary orelse return error.InvalidCompletionSlot;
+        const key = (try internal_keys.decodePrimaryDocumentKeyAlloc(self.alloc, op.key)) orelse return error.InvalidCompletionSlot;
+        defer self.alloc.free(key);
+        const observation = try self.inspectSingleOverwriteCompletionProfile(self.alloc, descriptor.txn_id, &.{.{ .key = key, .value = op.value }});
+        const current = try self.encodeCompletionProfileObservation(observation);
+        // Runtime generation counters may reset on reopen. Fresh inspection
+        // already proves no unsupported schema/index work; compare durable
+        // range/identity/value/root binding, not those process-local counters.
+        if (descriptor.profile_fence.len != current.len or
+            !std.mem.eql(u8, descriptor.profile_fence[0..8], current[0..8]) or
+            !std.mem.eql(u8, descriptor.profile_fence[32..], current[32..])) return error.CompletionProfileChanged;
+    }
+
+    fn restoreDurableCompletionBacklog(self: *DB) !void {
+        const backend = self.core.primary_store_owner.lsmBackend() orelse return;
+        const slot = backend.durable_completion orelse return;
+        var replay_bytes: ?usize = null;
+        for (slot.descriptor.descriptor.commit) |op| {
+            if (op.kind == .put and op.key.len == internal_keys.replay_key_len and
+                op.key[0] == internal_keys.replay_namespace and op.key[1] == internal_keys.replay_all_kind)
+                replay_bytes = op.value.len;
+        }
+        const bytes = replay_bytes orelse return error.InvalidCompletionSlot;
+        _ = self.core.nextDerivedAppendSequence();
+        self.durable_completion_backlog = try self.executor.admitBacklogBytes(@intCast(bytes));
+    }
+
+    /// Returns the committed replay fence. The live-slot path performs no
+    /// ordinary request workspace or backlog admission after prepare.
+    pub fn resolveDurableCompletion(self: *DB, txn_id: transactions_mod.TxnId, status: transactions_mod.TxnStatus, timestamp: u64) !u64 {
+        if (!self.allow_local_durable_completion) return error.LocalCompletionAuthorityRequired;
+        if (status == .pending or timestamp == 0) return error.InvalidArgument;
+        const sequence = blk: {
+            try self.lockApplyForPortableRuntime();
+            defer self.core.unlockApply();
+            break :blk try self.resolveDurableCompletionLocked(txn_id, status, timestamp);
+        };
+        self.notifyDurableCompletion(sequence);
+        return sequence;
+    }
+
+    fn notifyDurableCompletion(self: *DB, sequence: u64) void {
+        if (sequence == 0) return;
+        // The fenced profile is index-free. Publish the known empty target
+        // scope after releasing apply, matching ordinary committed batches.
+        notifyQueryVisibilityTargetAdvancedScoped(self.async_context, sequence, &.{}, true);
+        self.executor.notifySequence(sequence);
+    }
+
+    fn resolveDurableCompletionLocked(self: *DB, txn_id: transactions_mod.TxnId, status: transactions_mod.TxnStatus, timestamp: u64) !u64 {
+        if (status == .pending or timestamp == 0) return error.InvalidArgument;
+        const backend = self.core.primary_store_owner.lsmBackend() orelse return error.UnsupportedCompletionBackend;
+        const slot = backend.durable_completion orelse return error.CompletionNotPrepared;
+        if (!std.mem.eql(u8, &slot.descriptor.descriptor.txn_id, &txn_id)) return error.CompletionNotPrepared;
+        const sequence = self.core.store.next_replay_sequence_cached.load(.acquire);
+        if (sequence == 0 or sequence == std.math.maxInt(u64)) return error.InvalidReplaySequence;
+        if (self.durable_completion_backlog == null) return error.CompletionRecoveryCapacityRequired;
+        try backend.completeDurableCompletion(txn_id, status == .committed, .{
+            .commit_timestamp = timestamp,
+            .replay_sequence = sequence,
+            // The native serialized completion boundary derives authoritative
+            // post-retirement ledger values; caller-supplied samples are unused.
+            .shared_ledger_count = 0,
+            .shared_ledger_bytes = 0,
+        });
+        if (status == .committed) {
+            self.core.store.observeExternalReplayCommit(sequence);
+            self.executor.commitBacklogAdmission(sequence, &self.durable_completion_backlog.?);
+        } else self.durable_completion_backlog.?.cancel();
+        self.durable_completion_backlog = null;
+        try self.core.completion_eligibility.retire(txn_id);
+        return if (status == .committed) sequence else 0;
+    }
+
+    fn recoverDurableCompletion(self: *DB, fallback_timestamp: u64) !?bool {
+        if (!self.allow_local_durable_completion) return null;
+        const sequence = blk: {
+            try self.lockApplyForPortableRuntime();
+            defer self.core.unlockApply();
+            const backend = self.core.primary_store_owner.lsmBackend() orelse return null;
+            const slot = backend.durable_completion orelse return null;
+            const txn_id = slot.descriptor.descriptor.txn_id;
+            const decision = try backend.durableCompletionDecision(txn_id);
+            if (decision.status == .pending) return false;
+            const timestamp = if (decision.status == .committed and decision.commit_version != 0) decision.commit_version else if (decision.finalized_at != 0) decision.finalized_at else fallback_timestamp;
+            break :blk try self.resolveDurableCompletionLocked(txn_id, if (decision.status == .committed) .committed else .aborted, timestamp);
+        };
+        self.notifyDurableCompletion(sequence);
+        return true;
+    }
+
+    fn rejectUnreservedDurablePrepareLocked(self: *DB, txn_id: transactions_mod.TxnId) !void {
+        if (self.core.primary_store_owner.lsmBackend()) |backend| if (backend.durable_completion) |slot| {
+            if (std.mem.eql(u8, &slot.descriptor.descriptor.txn_id, &txn_id)) return error.PreparedCompletionActive;
+        };
+    }
+
     /// Internal process-local observation only. It owns no schema/topology lease,
     /// prepaid resources or durable authority after this call returns.
     const CompletionProfileObservation = struct {
@@ -25101,6 +25426,17 @@ pub const DB = struct {
         txn_id: transactions_mod.TxnId,
         intents: []const transactions_mod.WriteIntent,
     ) !CompletionProfileObservation {
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        return self.inspectSingleOverwriteCompletionProfileLocked(backing, txn_id, intents);
+    }
+
+    fn inspectSingleOverwriteCompletionProfileLocked(
+        self: *DB,
+        backing: Allocator,
+        txn_id: transactions_mod.TxnId,
+        intents: []const transactions_mod.WriteIntent,
+    ) !CompletionProfileObservation {
         const workspace = try backing.alloc(u8, 1024 * 1024);
         defer backing.free(workspace);
         var fixed = std.heap.FixedBufferAllocator.init(workspace);
@@ -25110,12 +25446,10 @@ pub const DB = struct {
             intents[0].prepared_row != null) return error.UnsupportedCompletionProfile;
         const replacement = intents[0].value orelse return error.UnsupportedCompletionProfile;
         try inspectCompletionInlineDocument(alloc, replacement);
-        try self.lockApplyForPortableRuntime();
-        defer self.core.unlockApply();
         // Initially only explicitly schemaless local document tables qualify.
         // Even index-free schema validation/TTL evolution needs a later fence.
         if (self.core.schema != null or self.core.table_catalog.storage_mode != .document or
-            self.shadow != null or self.core.splitState() != null or self.bulk_ingest_coalescer.active or self.core.hasArtifactCleanupMaybe() or
+            self.shadow != null or self.core.splitState() != null or self.bulk_ingest_coalescer.active or
             self.ha_async_effect_mirror != null or self.ha_async_batch_mirror != null or
             self.ha_async_metadata_mirror != null or self.ha_write_gate != null or
             self.enrichment_runtime != null or self.resolution_candidate_source != null or
@@ -25138,10 +25472,36 @@ pub const DB = struct {
             manager.algebraic_indexes.items.len != 0 or manager.enrichments.items.len != 0 or
             manager.resolvers.items.len != 0 or manager.status_only_index_configs.len != 0)
             return error.UnsupportedCompletionProfile;
+        try index_manager_mod.IndexManager.validateEmptyCompletionCatalog(alloc, self.core.store);
         const key = intents[0].key;
         if (!self.core.byteRange().contains(key)) return error.UnsupportedCompletionProfile;
         const store_key = try encodeStoreLookupKeyAlloc(self, alloc, key);
         defer alloc.free(store_key);
+        // The process-wide artifact hint conservatively becomes true on any
+        // nonempty legacy/reopened store. Prove the actual target footprint:
+        // only its inline primary and optional version timestamp may exist.
+        // The third entry necessarily rejects; no prefix is materialized.
+        const document_prefix = try internal_keys.documentExactPrefixAlloc(alloc, key);
+        defer alloc.free(document_prefix);
+        const version_key = try internal_keys.ttlKeyAlloc(alloc, key);
+        defer alloc.free(version_key);
+        {
+            var profile_scan = try self.core.store.beginCurrentScanTxn();
+            defer profile_scan.abort();
+            var cursor = try profile_scan.openCursor();
+            defer cursor.close();
+            var entry = try cursor.seekAtOrAfter(document_prefix);
+            var seen: usize = 0;
+            while (entry) |current| {
+                if (!std.mem.startsWith(u8, current.key, document_prefix)) break;
+                seen += 1;
+                if (seen > 2) return error.UnsupportedCompletionProfile;
+                if (!std.mem.eql(u8, current.key, store_key) and
+                    !(std.mem.eql(u8, current.key, version_key) and current.value.len == 8))
+                    return error.UnsupportedCompletionProfile;
+                entry = try cursor.next();
+            }
+        }
         var read = try self.core.store.beginProbeTxn();
         defer read.abort();
         const primary = read.get(store_key) catch |err| switch (err) {
@@ -25343,6 +25703,24 @@ pub const DB = struct {
         raft_entry: ?RaftAppliedEntryIdentity,
         resolved_participant: ?[]const u8,
     ) !void {
+        if (self.allow_local_durable_completion) {
+            var completed: ?u64 = null;
+            {
+                try self.lockApplyForPortableRuntime();
+                defer self.core.unlockApply();
+                if (self.core.primary_store_owner.lsmBackend()) |backend| if (backend.durable_completion) |slot| {
+                    if (std.mem.eql(u8, &slot.descriptor.descriptor.txn_id, &txn_id)) {
+                        if (raft_entry != null or resolved_participant != null) return error.UnsupportedCompletionProfile;
+                        completed = try self.resolveDurableCompletionLocked(txn_id, status, commit_version);
+                    }
+                };
+            }
+            if (completed) |sequence| {
+                self.notifyDurableCompletion(sequence);
+                if (status == .committed) try self.waitForResolvedTransactionSyncWithCancellation(sync_level, sequence, visibility_cancellation);
+                return;
+            }
+        }
         if (self.core.table_catalog.transaction_recovery_max_count != 0) if (self.core.index_manager.resource_manager) |manager| if (manager.transactionCompletion()) |workspace| {
             var resolved_sequence: u64 = 0;
             {
@@ -25613,6 +25991,11 @@ pub const DB = struct {
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
+        if (try self.recoverDurableCompletion(resolution_timestamp)) |resolved| return .{
+            .scanned_records = 1,
+            .resolved_finalized = @intFromBool(resolved),
+            .deferred_unresolved = @intFromBool(!resolved),
+        };
         if (self.core.table_catalog.transaction_recovery_max_count != 0) if (self.core.index_manager.resource_manager) |resources| if (resources.transactionCompletionMetadata()) |workspace| {
             var metadata = try workspace.tryAcquire();
             defer metadata.release();
@@ -26267,6 +26650,8 @@ pub const DB = struct {
         cfg: types.IndexConfig,
         admission_mode: IndexAdmissionMode,
     ) !InstalledIndex {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         if (admission_mode == .managed and !indexKindSupportsManagedGenerationRepair(cfg.kind))
@@ -33707,6 +34092,8 @@ pub const DB = struct {
     }
 
     pub fn reassignIdentityNamespaceForInternalTransition(self: *DB, namespace: doc_identity.Namespace) !void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         if (self.open_mode == .status_only) return error.UnsupportedOperation;
         lockApply(self);
         defer self.core.unlockApply();
@@ -33976,6 +34363,8 @@ pub const DB = struct {
         backup: []const u8,
         target_identity: doc_identity.Namespace,
     ) !void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         if (self.open_mode == .status_only or self.open_mode == .query_readonly) return error.UnsupportedOperation;
 
         lockApply(self);
@@ -34005,6 +34394,8 @@ pub const DB = struct {
         file_size: u64,
         target_identity: doc_identity.Namespace,
     ) !void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         if (self.open_mode == .status_only or self.open_mode == .query_readonly) return error.UnsupportedOperation;
 
         lockApply(self);
@@ -34034,6 +34425,8 @@ pub const DB = struct {
         context: anytype,
         comptime adopt: anytype,
     ) !void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         if (self.open_mode == .status_only or self.open_mode == .query_readonly) return error.UnsupportedOperation;
         lockApply(self);
         var apply_locked = true;
@@ -34074,6 +34467,8 @@ pub const DB = struct {
         backup: []const u8,
         target_identity: doc_identity.Namespace,
     ) !void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         if (self.open_mode == .status_only or self.open_mode == .query_readonly) return error.UnsupportedOperation;
         var stage = try PortableImportStage.init(alloc, self.core.path, backup, .{});
         defer stage.deinit();
@@ -34108,6 +34503,8 @@ pub const DB = struct {
     /// Refresh every schema-dependent runtime view after a portable restore
     /// has replaced durable metadata beneath this already-open DB.
     pub fn reloadSchemaForInternalRestore(self: *DB) !void {
+        var completion_transition = try self.core.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         if (self.open_mode == .status_only) return error.UnsupportedOperation;
         lockApply(self);
         defer self.core.unlockApply();
@@ -79120,7 +79517,7 @@ test "db managed resolver changes fence in-flight replay and reset durable curso
                 return false;
             }
         };
-        if (follower) db.setPromotionOwner(.{ .ptr = undefined, .vtable = &.{ .is_local_owner = FollowerOwner.isLocal } });
+        if (follower) try db.setPromotionOwner(.{ .ptr = undefined, .vtable = &.{ .is_local_owner = FollowerOwner.isLocal } });
         // Retirement is durable replay work; keep the catalog until it finishes.
         try std.testing.expectError(error.WriterLocked, db.removeResolverWithoutDrain(cfg.name));
         try db.runUntilIdle();
@@ -80325,7 +80722,7 @@ test "db mention edge weight is fused from extractor trust and mention confidenc
     defer db.close();
     var promotion_sink = FakePromotionSink{ .alloc = alloc };
     defer promotion_sink.deinit();
-    db.setEntitySink(promotion_sink.sink());
+    try db.setEntitySink(promotion_sink.sink());
 
     try db.addIndex(.{
         .name = "prov_graph",
@@ -131829,6 +132226,213 @@ test "workload admission enabling small node reserve never strands legacy commit
     try std.testing.expect(!try db.core.transactionHasIntents(txn_id));
 }
 
+test "workload admission durable DB completion uses reserved resources across unrelated writes and repeated resolve" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |equal_value| {
+        var tmp = try TestDirectory.init("durable-db-completion");
+        defer tmp.cleanup();
+        var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+        defer manager.deinit(alloc);
+        try manager.configureTransactionCompletion(1024 * 1024);
+        var db = try DB.open(alloc, std.mem.span(tmp.path().ptr), .{
+            .allow_local_durable_completion = true,
+            .resource_manager = &manager,
+            .table_storage = .{ .transaction_recovery = .{ .protocol_version = 1, .max_count = 16, .max_bytes = 1024 * 1024, .max_transaction_bytes = 64 * 1024 } },
+            .start_index_workers = false,
+            .start_optional_runtimes = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+        try db.batch(.{ .writes = &.{.{ .key = "document", .value = "{\"value\":1}" }} });
+        const id = try db.beginTransaction(1000);
+        const replacement = if (equal_value) "{\"value\":1}" else "{\"value\":2}";
+        const intents = [_]transactions_mod.WriteIntent{.{ .key = "document", .value = replacement }};
+        try db.prepareDurableCompletion(id, &intents, &.{});
+        try std.testing.expect(db.core.primary_store_owner.lsmBackend().?.durable_completion != null);
+        try std.testing.expectError(error.PreparedCompletionActive, db.writeIntents(id, &intents, &.{}));
+        try std.testing.expectError(error.PreparedCompletionActive, db.writeTransaction(id, .{ .writes = &.{.{ .key = "document", .value = replacement }} }));
+        const other = try db.beginTransaction(1001);
+        try db.writeIntents(other, &.{.{ .key = "other-transaction", .value = "{\"independent\":true}" }}, &.{});
+        for (0..16) |n| {
+            var key_buf: [32]u8 = undefined;
+            const key = try std.fmt.bufPrint(&key_buf, "unrelated-{d}", .{n});
+            try db.batch(.{ .writes = &.{.{ .key = key, .value = "{\"independent\":true}" }} });
+        }
+        const Hook = struct {
+            calls: usize = 0,
+            sequence: u64 = 0,
+            known_empty: bool = false,
+            fn changed(ptr: *anyopaque, _: []const u8, _: u64, _: ?*DB, event: QueryVisibilityEvent) void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                if (event.change != .target_advanced) return;
+                self.calls += 1;
+                self.sequence = event.target_sequence orelse 0;
+                self.known_empty = event.target_scope_known and event.target_indexes.len == 0;
+            }
+        };
+        var hook: Hook = .{};
+        db.setQueryVisibilityHook(.{ .ptr = &hook, .table_name = "docs", .group_id = 1, .db = &db, .on_change = Hook.changed });
+        defer db.setQueryVisibilityHook(null);
+        const old_limit = manager.memory.budget.hard_limit_bytes;
+        manager.memory.budget.hard_limit_bytes = 1;
+        const completed = db.resolveTransactionIntents(id, .committed, 2000);
+        manager.memory.budget.hard_limit_bytes = old_limit;
+        try completed;
+        try std.testing.expectEqual(@as(usize, 1), hook.calls);
+        try std.testing.expectEqual(db.core.nextDerivedSequence(), hook.sequence);
+        try std.testing.expect(hook.known_empty);
+        try std.testing.expect(db.core.primary_store_owner.lsmBackend().?.durable_completion == null);
+        try db.core.completion_eligibility.checkTransition();
+        const usage = try db.core.store.get(alloc, "\x00\x00__metadata__:txn_completion_v1");
+        defer alloc.free(usage);
+        try std.testing.expectEqual(@as(u64, 1), std.mem.readInt(u64, usage[0..8], .little));
+        const result = (try db.get(alloc, "document")).?;
+        defer alloc.free(result);
+        try std.testing.expectEqualStrings(replacement, result);
+        try std.testing.expectEqual(@as(u64, 2000), try db.getTimestamp(alloc, "document"));
+        const replay = try db.core.store.iterateReplayFrom(alloc, db.core.nextDerivedSequence());
+        defer {
+            for (replay) |*entry| entry.deinit(alloc);
+            alloc.free(replay);
+        }
+        try std.testing.expectEqual(@as(usize, 1), replay.len);
+        var decoded = try change_journal_mod.decodeRecord(alloc, replay[0].payload);
+        defer decoded.deinit();
+        try std.testing.expectEqual(@as(usize, if (equal_value) 0 else 1), decoded.record.changed_doc_keys.len);
+        try std.testing.expectEqual(@as(usize, if (equal_value) 0 else 1), decoded.record.overwritten_doc_keys.len);
+        try db.batch(.{ .writes = &.{.{ .key = "document", .value = "{\"value\":3}" }} });
+        try db.resolveTransactionIntents(id, .committed, 2000);
+        const newer = (try db.get(alloc, "document")).?;
+        defer alloc.free(newer);
+        try std.testing.expectEqualStrings("{\"value\":3}", newer);
+    }
+}
+
+test "workload admission durable DB completion reservation failure precedes vote and abort releases ownership" {
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("durable-db-reservation-abort");
+    defer tmp.cleanup();
+    var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer manager.deinit(alloc);
+    try manager.configureTransactionCompletion(1024 * 1024);
+    var db = try DB.open(alloc, std.mem.span(tmp.path().ptr), .{
+        .allow_local_durable_completion = true,
+        .resource_manager = &manager,
+        .table_storage = .{ .transaction_recovery = .{ .protocol_version = 1, .max_count = 16, .max_bytes = 1024 * 1024, .max_transaction_bytes = 64 * 1024 } },
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "document", .value = "{\"value\":1}" }}, .timestamp_ns = 100 });
+    const id = try db.beginTransaction(200);
+    const intents = [_]transactions_mod.WriteIntent{.{ .key = "document", .value = "{\"value\":2}" }};
+    const before_sequence = db.core.nextDerivedSequence();
+    const backlog_slice = @intFromEnum(resource_manager_mod.Slice.derived_backlog);
+    const before_backlog = manager.snapshot().slices[backlog_slice].used_bytes;
+    {
+        const previous_limit = manager.memory.budget.hard_limit_bytes;
+        manager.memory.budget.hard_limit_bytes = 32 * 1024 * 1024;
+        defer manager.memory.budget.hard_limit_bytes = previous_limit;
+        if (db.prepareDurableCompletion(id, &intents, &.{})) |_| {
+            return error.TestExpectedError;
+        } else |err| {
+            try std.testing.expect(err == error.ResourceBudgetExceeded or err == error.CompletionRecoveryCapacityRequired);
+        }
+    }
+    const record_key = "\x00\x00__txn_records__:".* ++ id;
+    const record = try db.core.store.get(alloc, &record_key);
+    defer alloc.free(record);
+    try std.testing.expectEqual(@as(usize, 53), record.len);
+    try std.testing.expectEqual(@as(u8, 0), record[49]);
+    try std.testing.expect(!try db.core.transactionHasIntents(id));
+    try std.testing.expect(db.core.primary_store_owner.lsmBackend().?.durable_completion == null);
+    try std.testing.expect(db.durable_completion_backlog == null);
+    try db.core.completion_eligibility.checkTransition();
+    try std.testing.expectEqual(before_backlog, manager.snapshot().slices[backlog_slice].used_bytes);
+    try std.testing.expectEqual(before_sequence, db.core.nextDerivedSequence());
+    try db.prepareDurableCompletion(id, &intents, &.{});
+    try std.testing.expect(db.durable_completion_backlog != null);
+    try db.abortTransaction(id, 300);
+    try std.testing.expectEqual(transactions_mod.TxnStatus.aborted, try db.getTransactionStatus(id));
+    try std.testing.expect(!try db.core.transactionHasIntents(id));
+    try std.testing.expect(db.core.primary_store_owner.lsmBackend().?.durable_completion == null);
+    try std.testing.expect(db.durable_completion_backlog == null);
+    try db.core.completion_eligibility.checkTransition();
+    try std.testing.expectEqual(before_backlog, manager.snapshot().slices[backlog_slice].used_bytes);
+    try std.testing.expectEqual(before_sequence, db.core.nextDerivedSequence());
+    const usage = try db.core.store.get(alloc, "\x00\x00__metadata__:txn_completion_v1");
+    defer alloc.free(usage);
+    try std.testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, usage[0..8], .little));
+    try std.testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, usage[8..16], .little));
+    const actual = (try db.get(alloc, "document")).?;
+    defer alloc.free(actual);
+    try std.testing.expectEqualStrings("{\"value\":1}", actual);
+    try std.testing.expectEqual(@as(u64, 100), try db.getTimestamp(alloc, "document"));
+}
+
+test "workload admission durable DB completion restores pending and durable decisions before recovery" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |decided| {
+        var tmp = try TestDirectory.init("durable-db-reopen");
+        defer tmp.cleanup();
+        const path = std.mem.span(tmp.path().ptr);
+        const options: OpenOptions = .{ .allow_local_durable_completion = true, .start_index_workers = false, .start_optional_runtimes = false, .ttl_cleanup = .{ .enabled = false } };
+        const id: transactions_mod.TxnId = @splat(151);
+        {
+            var db = try DB.open(alloc, path, options);
+            defer db.close();
+            try db.batch(.{ .writes = &.{.{ .key = "document", .value = "{\"value\":1}" }} });
+            _ = try db.beginTransactionWithId(id, 1000);
+            try db.prepareDurableCompletion(id, &.{.{ .key = "document", .value = "{\"value\":2}" }}, &.{});
+            if (decided) {
+                const prefix = "\x00\x00__txn_records__:";
+                const key = prefix.* ++ id;
+                const raw = try db.core.store.get(alloc, &key);
+                defer alloc.free(raw);
+                raw[0] = @intFromEnum(transactions_mod.TxnStatus.committed);
+                std.mem.writeInt(u64, raw[9..17], 2000, .little);
+                std.mem.writeInt(u64, raw[25..33], 2000, .little);
+                try db.core.store.put(&key, raw);
+            }
+        }
+        var unauthorized = options;
+        unauthorized.allow_local_durable_completion = false;
+        try std.testing.expectError(error.LocalCompletionAuthorityRequired, DB.open(alloc, path, unauthorized));
+        var reopened = try DB.open(alloc, path, options);
+        defer reopened.close();
+        try std.testing.expectError(error.PreparedCompletionActive, reopened.core.completion_eligibility.checkTransition());
+        const recovered = try reopened.recoverTransactions(std.math.maxInt(u64), 3000);
+        if (decided) {
+            try std.testing.expectEqual(@as(u64, 1), recovered.resolved_finalized);
+        } else {
+            try std.testing.expectEqual(@as(u64, 1), recovered.deferred_unresolved);
+            try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try reopened.getTransactionStatus(id));
+            try reopened.resolveTransactionIntents(id, .aborted, 2000);
+        }
+        try std.testing.expect(reopened.core.primary_store_owner.lsmBackend().?.durable_completion == null);
+        try reopened.core.completion_eligibility.checkTransition();
+        const actual = (try reopened.get(alloc, "document")).?;
+        defer alloc.free(actual);
+        try std.testing.expectEqualStrings(if (decided) "{\"value\":2}" else "{\"value\":1}", actual);
+    }
+}
+
+test "workload admission durable DB completion requires explicit local authority and releases failed profile fence" {
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("durable-db-local-authority");
+    defer tmp.cleanup();
+    var db = try DB.open(alloc, std.mem.span(tmp.path().ptr), .{ .start_index_workers = false, .start_optional_runtimes = false });
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "document", .value = "{\"value\":1}" }} });
+    const id = try db.beginTransaction(1000);
+    try std.testing.expectError(error.LocalCompletionAuthorityRequired, db.prepareDurableCompletion(id, &.{.{ .key = "document", .value = "{\"value\":2}" }}, &.{}));
+    db.allow_local_durable_completion = true;
+    try std.testing.expectError(error.UnsupportedCompletionProfile, db.prepareDurableCompletion(id, &.{.{ .key = "document", .value = "{\"nested\":{}}" }}, &.{}));
+    try db.core.completion_eligibility.checkTransition();
+    try std.testing.expect(!try db.core.transactionHasIntents(id));
+}
+
 test "workload admission completion profile observation exercises real prepare resolve and becomes stale" {
     const alloc = std.testing.allocator;
     var tmp = try TestDirectory.init("completion-profile");
@@ -131887,6 +132491,14 @@ test "workload admission completion profile rejects unsupported inputs before pr
         .{ .key = "doc:a", .value = "not-json" },
     }) |unsupported| try std.testing.expectError(error.UnsupportedCompletionProfile, db.inspectSingleOverwriteCompletionProfile(alloc, txn, &.{unsupported}));
     try std.testing.expectError(error.UnsupportedCompletionProfile, db.inspectSingleOverwriteCompletionProfile(alloc, txn, &.{ ordinary[0], ordinary[0] }));
+    const artifact = try internal_keys.artifactRootPrefixAlloc(alloc, "doc:a");
+    defer alloc.free(artifact);
+    try db.core.store.putBatch(&.{.{ .key = artifact, .value = "retained child" }}, &.{});
+    try std.testing.expectError(error.UnsupportedCompletionProfile, db.inspectSingleOverwriteCompletionProfile(alloc, txn, &ordinary));
+    try db.core.store.putBatch(&.{}, &.{artifact});
+    // A conservative startup hint is not evidence of target child records.
+    db.core.artifact_cleanup_maybe.store(true, .release);
+    _ = try db.inspectSingleOverwriteCompletionProfile(alloc, txn, &ordinary);
     try db.addIndex(.{ .name = "profile_text", .kind = .full_text, .config_json = "{}" });
     try std.testing.expectError(error.UnsupportedCompletionProfile, db.inspectSingleOverwriteCompletionProfile(alloc, txn, &ordinary));
     const summaries = try db.core.listTransactions(alloc);
@@ -131945,4 +132557,94 @@ test "workload admission completion profile excludes named participants and TTL 
     defer alloc.free(summaries);
     try std.testing.expectEqual(@as(usize, 2), summaries.len);
     for (summaries) |summary| try std.testing.expect(!summary.prepared);
+}
+
+test "workload admission completion eligibility fences real structural entry points through prepare and resolve" {
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("completion-eligibility");
+    defer tmp.cleanup();
+    const path = tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false, .ttl_cleanup = .{ .enabled = false } });
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"value\":1}" }} });
+    const txn = try db.beginTransaction(1000);
+    const intents = [_]transactions_mod.WriteIntent{.{ .key = "doc:a", .value = "{\"value\":2}" }};
+    _ = try db.inspectSingleOverwriteCompletionProfile(alloc, txn, &intents);
+    // The durable slot integration owns this bracket; this regression tests
+    // the real mutation boundaries without pretending this fence is durable.
+    try db.core.completion_eligibility.begin(txn);
+    try db.writeIntents(txn, &intents, &.{});
+    try std.testing.expectError(error.PreparedCompletionActive, db.setSchemaJson(alloc, "{}"));
+    try std.testing.expectError(error.PreparedCompletionActive, db.setSchema(.{ .version = 1 }));
+    try std.testing.expectError(error.PreparedCompletionActive, db.updateRange(.{ .start = "a", .end = "z" }));
+    try std.testing.expectError(error.PreparedCompletionActive, db.core.updateRange(.{ .start = "a", .end = "z" }));
+    try std.testing.expectError(error.PreparedCompletionActive, db.setSplitState(null));
+    try std.testing.expectError(error.PreparedCompletionActive, db.configureTableStorage(.{}));
+    try std.testing.expectError(error.PreparedCompletionActive, db.beginBulkIngestSession());
+    try std.testing.expectError(error.PreparedCompletionActive, db.beginDenseAutoBulkIngestSession());
+    try std.testing.expectError(error.PreparedCompletionActive, db.beginPrimaryStoreAutoBulkIngestSession());
+    const Hooks = struct {
+        fn get(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8) anyerror!?[]u8 {
+            return error.UnexpectedRuntimeHook;
+        }
+        fn upsert(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: []const u8) anyerror!void {
+            return error.UnexpectedRuntimeHook;
+        }
+        fn isLocal(_: *anyopaque) bool {
+            return false;
+        }
+    };
+    var hook_context: u8 = 0;
+    const candidate: resolution_runtime_mod.CandidateSource = .{ .ptr = &hook_context, .vtable = &.{ .get = Hooks.get } };
+    const sink: promotion_runtime_mod.EntitySink = .{ .ptr = &hook_context, .vtable = &.{ .upsert = Hooks.upsert } };
+    const owner: promotion_runtime_mod.PromotionOwner = .{ .ptr = &hook_context, .vtable = &.{ .is_local_owner = Hooks.isLocal } };
+    try std.testing.expectError(error.PreparedCompletionActive, db.setResolutionCandidateSource(candidate));
+    try std.testing.expectError(error.PreparedCompletionActive, db.setEntitySink(sink));
+    try std.testing.expectError(error.PreparedCompletionActive, db.setPromotionOwner(owner));
+    try db.setResolutionCandidateSource(null);
+    try db.setEntitySink(null);
+    try db.setPromotionOwner(null);
+    try std.testing.expect(db.resolution_candidate_source == null and db.entity_sink == null and db.promotion_owner == null);
+    try std.testing.expectError(error.PreparedCompletionActive, db.reassignIdentityNamespaceForInternalTransition(db.core.identity_namespace));
+    try std.testing.expectError(error.PreparedCompletionActive, db.importPortableIntoEmpty(alloc, "invalid", db.core.identity_namespace));
+    const index: types.IndexConfig = .{ .name = "blocked", .kind = .full_text, .config_json = "{}" };
+    try std.testing.expectError(error.PreparedCompletionActive, db.addIndex(index));
+    try std.testing.expectError(error.PreparedCompletionActive, db.core.index_manager.add(db.core.store, index));
+    try std.testing.expectError(error.PreparedCompletionActive, db.core.index_manager.registerShadowIndex(db.core.store, index));
+    try std.testing.expectError(error.PreparedCompletionActive, db.core.index_manager.registerReplacementIndex(db.core.store, index));
+    try std.testing.expectError(error.PreparedCompletionActive, db.core.index_manager.upsertEnrichment(db.core.store, undefined));
+    try std.testing.expectError(error.PreparedCompletionActive, db.core.index_manager.upsertResolver(db.core.store, undefined));
+    // Independent ordinary writes remain available while the structural
+    // profile is fixed. The normal transaction manager owns key conflicts.
+    try db.batch(.{ .writes = &.{.{ .key = "doc:b", .value = "{\"value\":3}" }} });
+    try db.resolveTransactionIntents(txn, .committed, 2000);
+    try std.testing.expectError(error.PreparedCompletionActive, db.core.completion_eligibility.checkTransition());
+    const value = (try db.get(alloc, "doc:a")).?;
+    defer alloc.free(value);
+    try std.testing.expectEqualStrings("{\"value\":2}", value);
+    try std.testing.expectEqual(@as(usize, 0), db.core.indexCount());
+    try std.testing.expect(db.core.schema == null);
+    try db.core.completion_eligibility.retire(txn);
+    try db.setSchemaJson(alloc, "{}");
+    try db.addIndex(index);
+    try std.testing.expectEqual(@as(usize, 1), db.core.indexCount());
+}
+
+test "workload admission completion eligibility rejects prepare during a nested catalog transition" {
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("completion-eligibility-transition");
+    defer tmp.cleanup();
+    const path = tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false, .ttl_cleanup = .{ .enabled = false } });
+    defer db.close();
+    var transition = (try db.core.index_manager.beginCompletionTransition()).?;
+    try db.updateRange(.{ .start = "a", .end = "z" });
+    try std.testing.expectError(error.CompletionTransitionInProgress, db.core.completion_eligibility.begin(@splat(1)));
+    transition.deinit();
+    try db.core.completion_eligibility.restore(@splat(1));
+    try std.testing.expectError(error.PreparedCompletionActive, db.reloadSchemaForInternalRestore());
+    try db.core.completion_eligibility.retire(@splat(1));
+    try db.reloadSchemaForInternalRestore();
 }
