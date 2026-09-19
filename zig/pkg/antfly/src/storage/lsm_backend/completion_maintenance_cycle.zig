@@ -189,7 +189,7 @@ pub fn run(comptime Backend: type, pool: anytype, backend: *Backend) !void {
     // Input identities and mutable are stable behind the maintenance fence.
     // Reader/owner lifetime stays pinned while the expensive scan runs unlocked.
     runtime.unlockBackend(Backend, backend, true);
-    const result = stream.build(scratch, pool.io.storage(), root, input_paths[0..backend.runs.count()], &current, output_base, .{
+    const result = stream.buildCertified(scratch, pool.io.storage(), root, input_paths[0..backend.runs.count()], &current, output_base, .{
         .max_inputs = pool.config.shape.max_runs,
         .max_outputs = 64,
         .max_metadata_bytes = pool.config.shape.max_metadata_bytes,

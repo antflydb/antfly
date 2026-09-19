@@ -392,10 +392,8 @@ The following gates remain:
   cell. Capacity four therefore needs about 200 MiB physical memory and 32 MiB
   WAL credit before installation; global resource admission may reject it.
   This covers four prepare/outcome cells, not the separate decision/ack control
-  reservations. Aggregate decoder/encoder/result scratch and contiguous reuse
-  remain outstanding: the 16 MiB input frontier alone is not a working-set
-  certificate, and free bytes in a recycling allocator do not prove a suitably
-  sized span exists after arbitrary streaming allocation history. The owning
+  reservations. The maintenance aggregate scratch certificate is described
+  below; the separate completion-drain scratch proof remains outstanding. The owning
   Debug gate passed 14/14 with zero skips, failures, or leaks, including four
   256-operation prepare/outcome plans under denied ordinary memory/FD admission,
   retained mutable readers, actual 64-run binary-bound metadata publication,
@@ -408,14 +406,32 @@ The following gates remain:
   Direct prefix encoding and two-buffer decoding preserve v11 bytes, including
   prefix+Snappy and binary keys larger than a normal block. The bounded encoder
   helper reserves precise arrays and a caller-owned compression workspace, and
-  rejects its metadata ceiling before flushing; integrating that helper and
-  retained output bounds into the complete maintenance scratch partition is
-  still pending. Cohort admission now also bounds its own future metadata below
+  rejects its metadata ceiling before flushing. Maintenance now integrates
+  that helper using the aggregate partition described below. Cohort admission
+  also bounds its own future metadata below
   the single protected SST's input-metadata limit. Existing immutable database
   size is excluded from that cohort-only check. The owning Debug gate passed
   18/18 with zero skips, failures, or leaks: byte differential/reuse tests,
   actual oversized-key SST metadata, pre-sidecar cumulative-cohort rejection,
   and all prior generation/capacity/restart regressions.
+- **Aggregate maintenance workspace (implemented stage).** The pre-ACK check
+  sums current/future cursor buffers and compact indexes, one input metadata
+  buffer, exact encoder arrays, compression bytes, path/buffer overhead, and
+  all simultaneously retained output metadata, including allocator headers and
+  alignment. The sum must fit the physically owned 32 MiB compiler domain.
+  Maintenance borrows that empty domain exclusively, retains fixed input
+  buffers, and resets one fixed writer arena between outputs. Its production
+  builder checks the same format-cost output certificate before output I/O;
+  no per-block or per-record allocation can fragment the writer workspace.
+  Completed output metadata owns separate copies and cannot retain arena
+  slices. After construction frees the writer/cursor buffers, checkpointing
+  needs one 64 KiB buffer plus bounded paths; the released writer span alone
+  exceeds that requirement. The owning Debug gate passed 20/20, zero skips,
+  failures, or leaks, including a sum-of-individually-valid-buffers rejection
+  and actual split SST construction with exactly the certified scratch bytes
+  while backing allocation and ordinary FD admission were disabled. This
+  certificate covers no-debt maintenance; Slot.drain's shared scratch and
+  retained canonical-prepare payloads still require their separate proof.
 - **Output-count and future-frontier certificate (implemented).** Qualification
   scans CRC-checked physical records and keeps additive encoded-data, metadata,
   and block costs. Admission adds canonical operations, both possible outcomes,
@@ -425,8 +441,8 @@ The following gates remain:
   Both the current-input-plus-growth frontier and future replacement frontier
   must fit 16 MiB. This is a format-cost limit, not a fixed database byte ceiling.
   Maintenance starts from the separate empty compiler workspace, so retained
-  replay nodes cannot consume its initial span. This does not yet prove all
-  allocator/transient/publication costs in the preceding aggregate-memory gate.
+  replay nodes cannot consume its initial span. Maintenance allocator and
+  result costs are included in the aggregate workspace check above.
 - **Counter headroom (implemented).** Before acceptance, checked native bounds
   cover cohort manifest increments, the next checkpoint/output identifiers,
   and bounded WAL rotations. Authoritative and proposed replay-next/summary

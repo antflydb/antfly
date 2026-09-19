@@ -21,6 +21,10 @@ const Allocator = std.mem.Allocator;
 pub const maintenance = @import("completion_maintenance.zig");
 const capacity = @import("completion_capacity.zig");
 const generations_mod = @import("completion_generations.zig");
+comptime {
+    if (completion.scratch_bytes != maintenance.compiler_workspace_bytes)
+        @compileError("completion maintenance certificate must match installed compiler backing");
+}
 
 pub const max_slots = completion.max_slots;
 pub const accepted_filenames = [_][]const u8{
@@ -663,6 +667,11 @@ pub fn Pool(comptime Backend: type) type {
             // layout would omit this first maintenance frontier.
             if (self.capacity_baseline_frontier +| added.frontier_bytes > 16 * 1024 * 1024)
                 return error.UnsupportedCompletionProfile;
+            _ = try maintenance.workspaceRequirement(total, @max(proof.frontier_bytes, self.capacity_baseline_frontier +| added.frontier_bytes), proof.outputs, .{
+                .max_metadata_bytes = self.config.shape.max_metadata_bytes,
+                .max_output_metadata_bytes = self.config.shape.max_metadata_bytes,
+                .max_record_bytes = self.config.shape.max_record_bytes,
+            });
         }
 
         fn chargeCapacity(self: *Self, growth: capacity.Cost) void {
@@ -929,6 +938,11 @@ pub fn Pool(comptime Backend: type) type {
             });
             const proof = try capacity.certify(measured.cost, .{ .metadata_bytes = self.config.shape.max_metadata_bytes, .additional_runs = self.cell_count });
             try metadataCapacity(proof.outputs, measured.cost.max_key_bytes);
+            _ = try maintenance.workspaceRequirement(measured.cost, @max(measured.frontier_bytes, proof.frontier_bytes), proof.outputs, .{
+                .max_metadata_bytes = self.config.shape.max_metadata_bytes,
+                .max_output_metadata_bytes = self.config.shape.max_metadata_bytes,
+                .max_record_bytes = self.config.shape.max_record_bytes,
+            });
             try self.restoreProgress(backend, alloc);
             self.capacity_cost = measured.cost;
             self.capacity_growth = .{};

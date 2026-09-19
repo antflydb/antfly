@@ -154,20 +154,63 @@ pub fn measure(allocator: Allocator, io: io_mod.Storage, paths: []const []const 
     return .{ .cost = cost, .frontier_bytes = frontier };
 }
 
+pub const compiler_workspace_bytes = 32 * 1024 * 1024;
+pub const Workspace = struct {
+    writer: usize,
+    compression: usize,
+    key: usize,
+    record: usize,
+    outputs: usize,
+    total: usize,
+};
+
+/// Monotonic outer allocations plus one resettable writer arena. Input buffers
+/// remain live throughout; output metadata only accumulates. No allocation size
+/// depends on prior streaming history or on total logical database bytes.
+pub fn workspaceRequirement(cost: capacity.Cost, frontier: u64, output_count: u64, limits: Limits) !Workspace {
+    const record = std.math.cast(usize, @max(cost.max_record_bytes, 1)) orelse return error.UnsupportedCompletionProfile;
+    const key = std.math.cast(usize, cost.max_key_bytes) orelse return error.UnsupportedCompletionProfile;
+    const outputs = std.math.cast(usize, output_count) orelse return error.UnsupportedCompletionProfile;
+    if (outputs > limits.max_outputs or record > limits.max_record_bytes or key > record) return error.UnsupportedCompletionProfile;
+    const encoder = try table.boundedEncoderWorkspace(.{ .metadata_bytes = @min(limits.max_metadata_bytes, limits.max_output_metadata_bytes), .record_bytes = record, .key_bytes = key });
+    var writer = try std.math.add(usize, encoder.persistent_bytes, try repository.streamingWriterWorkspaceBytes(512));
+    writer = try std.math.add(usize, writer, try std.math.mul(usize, key, 2));
+    const footprint = domains.RecyclingScratch.allocationFootprint;
+    var total = std.math.cast(usize, frontier) orelse return error.UnsupportedCompletionProfile;
+    // Each cursor owns one compact index and two fixed block allocations.
+    total = try std.math.add(usize, total, try std.math.mul(usize, 3 * 68, try footprint(0, 8)));
+    total = try std.math.add(usize, total, try footprint(limits.max_metadata_bytes, 1));
+    total = try std.math.add(usize, total, try footprint(writer, 1));
+    total = try std.math.add(usize, total, try footprint(encoder.compression_bytes, 1));
+    total = try std.math.add(usize, total, try footprint(try std.math.mul(usize, outputs, @sizeOf(repository.Run)), @alignOf(repository.Run)));
+    const bounds = try std.math.mul(usize, 2, try std.math.add(usize, try footprint(key, 1), try footprint(0, 1)));
+    const per_output = try std.math.add(usize, bounds, try footprint(512 + 32, 1));
+    total = try std.math.add(usize, total, try std.math.mul(usize, outputs, per_output));
+    if (total > compiler_workspace_bytes) return error.UnsupportedCompletionProfile;
+    return .{ .writer = writer, .compression = encoder.compression_bytes, .key = key, .record = record, .outputs = outputs, .total = total };
+}
+
 const Output = struct {
     allocator: Allocator,
+    fixed: std.heap.FixedBufferAllocator,
+    first_bound: []u8,
+    last_bound: []u8,
     writer: repository.StreamingRunFileWriter = undefined,
     run: repository.Run,
-    fn init(self: *Output, allocator: Allocator, io: io_mod.Storage, root: []const u8, id: u64, file_bytes: usize) !void {
-        self.* = .{ .allocator = allocator, .run = .{ .id = id, .level = 1, .size_bytes = 0, .path = null, .smallest_namespace_name = null, .smallest_key = &.{}, .largest_namespace_name = null, .largest_key = &.{}, .entry_count = 0, .bloom_filter = null, .state = null, .tombstone_count = 0 } };
-        // A fixed small run filter may saturate (extra false positives), but
-        // never rejects an inserted key. Block filters remain bounded by the
-        // encoder block size; no allocation is sized from the whole store.
-        try self.writer.initInPlace(io, allocator, root, id, 1, @min(file_bytes, repository.maxRunFileReadBytes()), .{ .bits_per_key = 1, .min_bits = 64, .max_hash_count = 1 }, .snappy_adaptive, .none, null, .cold_sequential);
+    fn init(self: *Output, allocator: Allocator, io: io_mod.Storage, root: []const u8, id: u64, limits: Limits, shape: Workspace, writer_buffer: []u8, compression: []u8) !void {
+        self.* = .{ .allocator = allocator, .fixed = std.heap.FixedBufferAllocator.init(writer_buffer), .first_bound = undefined, .last_bound = undefined, .run = .{ .id = id, .level = 1, .size_bytes = 0, .path = null, .smallest_namespace_name = null, .smallest_key = &.{}, .largest_namespace_name = null, .largest_key = &.{}, .entry_count = 0, .bloom_filter = null, .state = null, .tombstone_count = 0 } };
+        const fixed = self.fixed.allocator();
+        self.first_bound = try fixed.alloc(u8, shape.key);
+        self.last_bound = try fixed.alloc(u8, shape.key);
+        try self.writer.initInPlace(io, fixed, root, id, 1, @min(limits.max_output_file_bytes, repository.maxRunFileReadBytes()), .{ .bits_per_key = 1, .min_bits = 64, .max_hash_count = 1 }, .snappy_adaptive, .none, null, .cold_sequential);
+        errdefer self.writer.deinit();
+        try self.writer.encoder.configureBoundedWorkspace(.{ .metadata_bytes = @min(limits.max_metadata_bytes, limits.max_output_metadata_bytes), .record_bytes = shape.record, .key_bytes = shape.key }, compression);
     }
     fn deinit(self: *Output) void {
         self.writer.deinit();
-        self.run.deinit(self.allocator);
+        // run's temporary bounds borrow the two fixed arrays. Only finish's
+        // separately owned clone may escape this writer arena.
+        self.* = undefined;
     }
     fn fits(self: *Output, entry: table.Entry, limits: Limits) bool {
         const total = self.writer.encoder.encodedSizeUpperBoundAfterEntry(entry) catch return false;
@@ -175,35 +218,30 @@ const Output = struct {
         return total >= data and total - data <= @min(limits.max_metadata_bytes, limits.max_output_metadata_bytes) and self.writer.canAppendEntry(entry);
     }
     fn append(self: *Output, entry: table.Entry) !void {
-        const allocator = self.allocator;
+        const ns = entry.namespace_name orelse "";
+        if (ns.len > self.last_bound.len or entry.key.len > self.last_bound.len - ns.len) return error.UnsupportedCompletionProfile;
         if (self.run.entry_count == 0) {
-            self.run.smallest_namespace_name = if (entry.namespace_name) |name| try allocator.dupe(u8, name) else null;
-            self.run.smallest_key = try allocator.dupe(u8, entry.key);
+            @memcpy(self.first_bound[0..ns.len], ns);
+            @memcpy(self.first_bound[ns.len..][0..entry.key.len], entry.key);
+            self.run.smallest_namespace_name = if (entry.namespace_name != null) self.first_bound[0..ns.len] else null;
+            self.run.smallest_key = self.first_bound[ns.len..][0..entry.key.len];
         }
-        const last_ns = if (entry.namespace_name) |name| try allocator.dupe(u8, name) else null;
-        errdefer if (last_ns) |name| allocator.free(name);
-        const last_key = try allocator.dupe(u8, entry.key);
-        errdefer allocator.free(last_key);
         try self.writer.appendEntry(entry);
-        if (self.run.largest_namespace_name) |name| allocator.free(name);
-        allocator.free(self.run.largest_key);
-        self.run.largest_namespace_name = last_ns;
-        self.run.largest_key = last_key;
+        @memcpy(self.last_bound[0..ns.len], ns);
+        @memcpy(self.last_bound[ns.len..][0..entry.key.len], entry.key);
+        self.run.largest_namespace_name = if (entry.namespace_name != null) self.last_bound[0..ns.len] else null;
+        self.run.largest_key = self.last_bound[ns.len..][0..entry.key.len];
         self.run.entry_count += 1;
         if (entry.tombstone) self.run.tombstone_count.? += 1;
     }
     fn finish(self: *Output) !repository.Run {
         var file = try self.writer.finish();
-        // On-disk lookup uses the encoded fixed filter; do not retain a second
-        // in-memory copy in the newly published run metadata.
-        file.filter.deinit(self.allocator);
+        defer file.filter.deinit(self.fixed.allocator());
+        defer self.fixed.allocator().free(file.path);
         self.run.path = file.path;
-        self.run.owns_path = true;
         self.run.size_bytes = file.size_bytes;
         self.run.compression_stats = file.compression_stats;
-        const result = self.run;
-        self.run = .{ .id = 0, .level = 0, .size_bytes = 0, .path = null, .smallest_namespace_name = null, .smallest_key = &.{}, .largest_namespace_name = null, .largest_key = &.{}, .entry_count = 0, .bloom_filter = null, .state = null };
-        return result;
+        return repository.cloneRunCompactionSnapshot(self.allocator, self.run);
     }
 };
 
@@ -212,7 +250,18 @@ const Output = struct {
 /// ordinary allocator, FD admission, or unbounded whole-store materialization.
 /// The caller owns cleanup of written paths after any failure.
 pub fn build(allocator: Allocator, io: io_mod.Storage, root: []const u8, paths: []const []const u8, mutable: *const state.State, output_base: u64, limits: Limits) !std.ArrayListUnmanaged(repository.Run) {
-    if (!domains.isPrepaid(allocator) or paths.len > 68 or paths.len > limits.max_inputs or limits.max_outputs > 64)
+    return buildInternal(allocator, io, root, paths, mutable, output_base, limits, false);
+}
+
+/// Installed pools require the same format-cost output proof checked before
+/// acceptance. Generic build callers instead preown their full output limit;
+/// those callers receive the ordinary bounded-output error if it is exhausted.
+pub fn buildCertified(allocator: Allocator, io: io_mod.Storage, root: []const u8, paths: []const []const u8, mutable: *const state.State, output_base: u64, limits: Limits) !std.ArrayListUnmanaged(repository.Run) {
+    return buildInternal(allocator, io, root, paths, mutable, output_base, limits, true);
+}
+
+fn buildInternal(allocator: Allocator, io: io_mod.Storage, root: []const u8, paths: []const []const u8, mutable: *const state.State, output_base: u64, limits: Limits, certified: bool) !std.ArrayListUnmanaged(repository.Run) {
+    if (!domains.isPrepaid(allocator) or root.len > 512 or paths.len > 68 or paths.len > limits.max_inputs or limits.max_outputs > 64)
         return error.UnsupportedCompletionProfile;
     const metadata = try allocator.alloc(u8, limits.max_metadata_bytes);
     defer allocator.free(metadata);
@@ -226,12 +275,42 @@ pub fn build(allocator: Allocator, io: io_mod.Storage, root: []const u8, paths: 
         cursor_count += 1;
         if (frontier > limits.max_frontier_bytes) return error.UnsupportedCompletionProfile;
     }
+    // Scan once before any output I/O, retaining the same fixed cursor buffers.
+    // The second pass merges; neither pass allocates per block or record.
+    var cost: capacity.Cost = .{};
+    for (cursors[0..cursor_count]) |*cursor| {
+        while (try cursor.current()) |entry| {
+            cost = try cost.plus(try capacity.Cost.record(if (entry.namespace_name) |ns| ns.len else 0, entry.key.len, entry.value.len));
+            try cursor.advance();
+        }
+        cursor.block = 0;
+        cursor.entry_in_block = 0;
+        cursor.advanced_entries = 0;
+        cursor.offset = 0;
+        cursor.loaded = null;
+        cursor.entry = null;
+    }
+    for (0..mutable.entryCount()) |i| {
+        const entry = mutable.entryAt(i);
+        if (encodedEntryLen(stateEntry(entry)) > limits.max_record_bytes) return error.UnsupportedCompletionProfile;
+        cost = try cost.plus(try capacity.Cost.record(if (entry.namespace_name) |ns| ns.len else 0, entry.key.len, entry.value.len));
+    }
+    const output_count = if (certified) (try capacity.certify(cost, .{
+        .metadata_bytes = @min(limits.max_metadata_bytes, limits.max_output_metadata_bytes),
+        .file_bytes = @min(limits.max_output_file_bytes, repository.maxRunFileReadBytes()),
+        .outputs = limits.max_outputs,
+    })).outputs else limits.max_outputs;
+    const shape = try workspaceRequirement(cost, frontier, output_count, limits);
+    const writer_buffer = try allocator.alloc(u8, shape.writer);
+    defer allocator.free(writer_buffer);
+    const compression = try allocator.alloc(u8, shape.compression);
+    defer allocator.free(compression);
     var results: std.ArrayListUnmanaged(repository.Run) = .empty;
     errdefer {
         for (results.items) |*run| run.deinit(allocator);
         results.deinit(allocator);
     }
-    try results.ensureTotalCapacity(allocator, limits.max_outputs);
+    try results.ensureTotalCapacityPrecise(allocator, shape.outputs);
     var output: Output = undefined;
     var active = false;
     defer if (active) output.deinit();
@@ -253,8 +332,8 @@ pub fn build(allocator: Allocator, io: io_mod.Storage, root: []const u8, paths: 
             active = false;
         }
         if (!active) {
-            if (results.items.len == limits.max_outputs) return error.UnsupportedCompletionProfile;
-            try output.init(allocator, io, root, try std.math.add(u64, output_base, results.items.len), limits.max_output_file_bytes);
+            if (results.items.len == shape.outputs) return error.UnsupportedCompletionProfile;
+            try output.init(allocator, io, root, try std.math.add(u64, output_base, results.items.len), limits, shape, writer_buffer, compression);
             active = true;
         }
         if (!output.fits(winner, limits)) return error.UnsupportedCompletionProfile;
@@ -462,4 +541,80 @@ test "workload admission completion single drain certificate matches actual over
     try std.testing.expect(footer.metadata_len <= metadata_limit);
     const grown = try cost.plus(try (try capacity.Cost.record(0, key.len, 1)).repeated(6));
     try std.testing.expectError(error.UnsupportedCompletionProfile, capacity.certifySingleDrain(grown, metadata_limit));
+}
+
+test "workload admission completion aggregate workspace rejects a sum exceeding individually bounded frontiers" {
+    const cost = try (try capacity.Cost.record(4, 64, 1024)).repeated(1000);
+    const proof = try capacity.certify(cost, .{});
+    const normal = try workspaceRequirement(cost, 16 * 1024 * 1024, proof.outputs, .{});
+    try std.testing.expect(normal.total <= compiler_workspace_bytes);
+    // Each larger metadata buffer is individually bounded and the cursor
+    // frontier still fits; their aggregate writer arrays do not fit 32 MiB.
+    try std.testing.expectError(error.UnsupportedCompletionProfile, workspaceRequirement(cost, 16 * 1024 * 1024, proof.outputs, .{
+        .max_metadata_bytes = 4 * 1024 * 1024,
+        .max_output_metadata_bytes = 4 * 1024 * 1024,
+    }));
+}
+
+test "workload admission completion aggregate workspace builds split binary runs with exactly certified backing" {
+    const alloc = std.testing.allocator;
+    const resources = @import("../resource_manager.zig");
+    var failing = std.testing.FailingAllocator.init(alloc, .{});
+    var manager = resources.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer manager.deinit(alloc);
+    var fd_pool = io_mod.NativeStoragePool.initWithCapacityForTest(alloc, 16);
+    defer fd_pool.deinit();
+    var native = try io_mod.NativeStorage.initWithPool(alloc, .threaded, &fd_pool);
+    defer native.deinit();
+    var root_buffer: [256]u8 = undefined;
+    const root_z = repository.tmpPath(&root_buffer, "completion-exact-workspace");
+    defer repository.cleanupTmp(root_z);
+    const root = std.mem.span(root_z);
+    var paths: [3][]u8 = undefined;
+    var path_count: usize = 0;
+    defer for (paths[0..path_count]) |path| alloc.free(path);
+    for (&paths, 0..) |*path, i| {
+        path.* = try repository.runPath(alloc, root, i + 1);
+        path_count += 1;
+    }
+    {
+        var writer: repository.StreamingRunFileWriter = undefined;
+        try writer.initInPlace(native.storage(), alloc, root, 1, 8, 8 * 1024 * 1024, .{}, .snappy_adaptive, .none, null, .normal);
+        defer writer.deinit();
+        var key: [40000]u8 = @splat(0x91);
+        for (0..8) |i| {
+            std.mem.writeInt(u64, key[0..8], i, .big);
+            try writer.appendEntry(.{ .namespace_name = "ns\x00\xff", .key = &key, .value = "value" });
+        }
+        var result = try writer.finish();
+        result.filter.deinit(alloc);
+        alloc.free(result.path);
+    }
+    var specs: [3]io_mod.NativeCompletionIo.FileSpec = undefined;
+    for (paths, &specs) |path, *spec| spec.* = .{ .path = path, .max_bytes = 8 * 1024 * 1024, .allow_delete = true };
+    const scope = try io_mod.NativeCompletionIo.createWithFiles(alloc, &native, root, &specs);
+    defer scope.deinit() catch unreachable;
+    scope.allow_sequential_input = true;
+    const limits: Limits = .{ .max_outputs = 2, .max_output_metadata_bytes = 512 * 1024 };
+    const measured = try measure(alloc, scope.storage(), paths[0..1], limits);
+    const proof = try capacity.certify(measured.cost, .{ .metadata_bytes = limits.max_output_metadata_bytes, .outputs = limits.max_outputs });
+    const shape = try workspaceRequirement(measured.cost, measured.frontier_bytes, proof.outputs, limits);
+    const scratch = try domains.RecyclingScratch.create(failing.allocator(), &manager, shape.total);
+    defer scratch.destroy() catch unreachable;
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    manager.memory.budget.hard_limit_bytes = 1;
+    fd_pool.fd_cache.capacity = 1;
+    const mutable: state.State = .{};
+    var output = try buildCertified(scratch.allocator(), scope.storage(), root, paths[0..1], &mutable, 2, limits);
+    defer {
+        for (output.items) |*run| run.deinit(scratch.allocator());
+        output.deinit(scratch.allocator());
+    }
+    try std.testing.expectEqual(@as(usize, 2), output.items.len);
+    try std.testing.expectEqual(@as(usize, 8), output.items[0].entry_count + output.items[1].entry_count);
+    try std.testing.expect(std.mem.order(u8, output.items[0].largest_key, output.items[1].smallest_key) == .lt);
+    try std.testing.expectEqualStrings("ns\x00\xff", output.items[0].smallest_namespace_name.?);
+    try std.testing.expectEqual(@as(usize, 40000), output.items[1].largest_key.len);
+    try std.testing.expect(!failing.has_induced_failure);
 }

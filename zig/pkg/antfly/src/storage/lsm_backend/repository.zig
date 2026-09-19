@@ -1949,6 +1949,15 @@ pub const PersistedStreamingRunFile = struct {
     filter: bloom.OwnedFilter,
 };
 
+/// Writer-owned auxiliary buffers for a sequential, already prepared native
+/// provider. Provider-specific allocations are outside this bound. Directory
+/// and final path formatting each allocate at most root+32 bytes; the sink
+/// retains its fixed buffer. The padding covers their byte/struct alignment.
+pub fn streamingWriterWorkspaceBytes(root_bytes: usize) !usize {
+    const paths = try std.math.mul(usize, 2, try std.math.add(usize, root_bytes, 32));
+    return std.math.add(usize, table_write_buffer_size + 64, paths);
+}
+
 pub const StreamingRunFileWriter = struct {
     allocator: Allocator,
     path: []u8 = &.{},
