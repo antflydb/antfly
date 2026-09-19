@@ -153,6 +153,9 @@ components:
         - $ref: "#/components/schemas/WebSearchConfig"
         - type: object
           properties:
+            provider:
+              type: string
+              enum: ["exa"]
             api_key:
               type: string
               description: "Exa API key (or set EXA_API_KEY env var)"
@@ -200,6 +203,9 @@ components:
         - $ref: "#/components/schemas/WebSearchConfig"
         - type: object
           properties:
+            provider:
+              type: string
+              enum: ["serper"]
             api_key:
               type: string
               description: "Serper API key (or set SERPER_API_KEY env var)"
@@ -230,6 +236,9 @@ components:
         - $ref: "#/components/schemas/WebSearchConfig"
         - type: object
           properties:
+            provider:
+              type: string
+              enum: ["tavily"]
             api_key:
               type: string
               description: "Tavily API key (or set TAVILY_API_KEY env var)"
@@ -276,6 +285,9 @@ components:
         - $ref: "#/components/schemas/WebSearchConfig"
         - type: object
           properties:
+            provider:
+              type: string
+              enum: ["brave"]
             api_key:
               type: string
               description: "Brave Search API key (or set BRAVE_API_KEY env var)"
@@ -309,6 +321,9 @@ components:
         - $ref: "#/components/schemas/WebSearchConfig"
         - type: object
           properties:
+            provider:
+              type: string
+              enum: ["you"]
             api_key:
               type: string
               description: "You.com API key (or set YOU_API_KEY env var)"
@@ -334,6 +349,9 @@ components:
         - $ref: "#/components/schemas/WebSearchConfig"
         - type: object
           properties:
+            provider:
+              type: string
+              enum: ["linkup"]
             api_key:
               type: string
               description: "Linkup API key (or set LINKUP_API_KEY env var)"
@@ -367,6 +385,9 @@ components:
         - $ref: "#/components/schemas/WebSearchConfig"
         - type: object
           properties:
+            provider:
+              type: string
+              enum: ["vertex"]
             service:
               type: string
               enum: ["agent_search"]

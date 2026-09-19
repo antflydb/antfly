@@ -6,8 +6,8 @@ from typing import Any, TypeVar, cast
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.tavily_search_config_provider import TavilySearchConfigProvider
 from ..models.tavily_search_config_search_depth import TavilySearchConfigSearchDepth
-from ..models.web_search_provider import WebSearchProvider
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="TavilySearchConfig")
@@ -27,7 +27,7 @@ class TavilySearchConfig:
     **Docs:** https://docs.tavily.com
 
         Attributes:
-            provider (WebSearchProvider): The web search provider to use.
+            provider (TavilySearchConfigProvider): The web search provider to use.
 
                 - **exa**: Exa neural/semantic web search API
                 - **serper**: Serper.dev Google Search API (simpler setup)
@@ -64,7 +64,7 @@ class TavilySearchConfig:
             exclude_domains (list[str] | Unset): Exclude results from these domains
     """
 
-    provider: WebSearchProvider
+    provider: TavilySearchConfigProvider
     api_key: str | Unset = UNSET
     endpoint: str | Unset = UNSET
     project_id: str | Unset = UNSET
@@ -184,7 +184,7 @@ class TavilySearchConfig:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
-        provider = WebSearchProvider(d.pop("provider"))
+        provider = TavilySearchConfigProvider(d.pop("provider"))
 
         api_key = d.pop("api_key", UNSET)
 

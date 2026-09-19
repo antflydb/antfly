@@ -1926,7 +1926,7 @@ fn executeModelTools(
     @memset(last_hit_counts, null);
     const navigation = try arena.alloc(NavigationState, request.queries.len);
     @memset(navigation, .{});
-    var navigation_context_bytes: usize = 0;
+    var tool_context_bytes: usize = 0;
     const navigation_advanced = try arena.alloc(bool, request.queries.len);
     while (budget.used < rounds) {
         @memset(navigation_advanced, false);
@@ -1993,14 +1993,19 @@ fn executeModelTools(
                 try details.map.put(arena, "hit_count", .{ .integer = @intCast(found.len) });
                 try appendStep(arena, steps, live, .{ .kind = .tool_call, .name = "web_search", .action = "searched the web with Exa", .status = .success, .details = details });
                 try live.emitHits(found, false);
-                const context_limit: usize = if (request.max_context_tokens) |tokens| @intCast(@min(@max(tokens - (request.reserve_tokens orelse 4000), 0), 16384) * 4) else 32768;
+                const context_limit = toolContextLimit(request) -| tool_context_bytes;
                 var count = found.len;
                 var payload: []const u8 = try std.json.Stringify.valueAlloc(arena, .{ .provider = "exa", .hits = found, .truncated = false }, .{});
                 while (payload.len > context_limit and count > 0) {
                     count -= 1;
                     payload = try std.json.Stringify.valueAlloc(arena, .{ .provider = "exa", .hits = found[0..count], .truncated = true }, .{});
                 }
-                if (payload.len > context_limit) payload = "{\"truncated\":true,\"error\":\"Web results exceed the context budget\"}";
+                if (payload.len > context_limit or (found.len > 0 and count == 0)) {
+                    try appendStep(arena, steps, live, .{ .kind = .planning, .name = "web_search", .action = "stopped retrieval at the accumulated context budget", .status = .skipped });
+                    outcome.exhausted = true;
+                    return outcome;
+                }
+                tool_context_bytes += payload.len;
                 try history.append(.tool, payload, call.id);
                 continue;
             }
@@ -2135,7 +2140,7 @@ fn executeModelTools(
                 const from_key = if (config.strategy == .tree) state.parents.get(args.value.next_key) else state.current_key;
                 navigation_advanced[index] = true;
                 state.moves += 1;
-                const payload = executeNavigationRead(alloc, arena, runner, request, active_queries[index], config, active_predicates[index], args.value.next_key, state, &navigation_context_bytes, hits, seen, live) catch |err| switch (err) {
+                const payload = executeNavigationRead(alloc, arena, runner, request, active_queries[index], config, active_predicates[index], args.value.next_key, state, &tool_context_bytes, hits, seen, live) catch |err| switch (err) {
                     error.AgentContextLimitExceeded => {
                         try appendStep(arena, steps, live, .{ .kind = .planning, .name = if (config.strategy == .tree) "tree_navigation" else "graph_navigation", .action = "stopped navigation at the accumulated context budget", .status = .skipped });
                         outcome.exhausted = true;
@@ -2173,7 +2178,7 @@ fn executeModelTools(
                     continue;
                 }
                 navigation_advanced[index] = true;
-                const payload = executeNavigationRead(alloc, arena, runner, request, query, config, active_predicates[index], config.start_key, state, &navigation_context_bytes, hits, seen, live) catch |err| switch (err) {
+                const payload = executeNavigationRead(alloc, arena, runner, request, query, config, active_predicates[index], config.start_key, state, &tool_context_bytes, hits, seen, live) catch |err| switch (err) {
                     error.AgentContextLimitExceeded => {
                         try appendStep(arena, steps, live, .{ .kind = .planning, .name = if (config.strategy == .tree) "tree_navigation" else "graph_navigation", .action = "stopped navigation at the accumulated context budget", .status = .skipped });
                         outcome.exhausted = true;
@@ -2206,19 +2211,30 @@ fn executeModelTools(
             try live.emitHits(found, query.tree_search != null);
             // Keep complete JSON documents; never truncate in the middle of a
             // UTF-8 string or silently lose the tool/result correlation.
-            const context_limit: usize = if (request.max_context_tokens) |tokens| @intCast(@min(@max(tokens - (request.reserve_tokens orelse 4000), 0), 16384) * 4) else 32768;
+            const context_limit = toolContextLimit(request) -| tool_context_bytes;
             var count = found.len;
             var payload: []const u8 = try std.json.Stringify.valueAlloc(arena, .{ .hits = found, .results = executed.summaries, .truncated = false }, .{});
             while (payload.len > context_limit and count > 0) {
                 count -= 1;
                 payload = try std.json.Stringify.valueAlloc(arena, .{ .hits = found[0..count], .results = executed.summaries, .truncated = true }, .{});
             }
-            if (payload.len > context_limit) payload = "{\"truncated\":true,\"error\":\"Query results exceed the context budget; refine the query to return fewer buckets or graph results\"}";
+            if (payload.len > context_limit or (found.len > 0 and count == 0)) {
+                try appendStep(arena, steps, live, .{ .kind = .planning, .name = "search", .action = "stopped retrieval at the accumulated context budget", .status = .skipped });
+                outcome.exhausted = true;
+                return outcome;
+            }
+            tool_context_bytes += payload.len;
             try history.append(.tool, payload, call.id);
         }
     }
     outcome.exhausted = true;
     return outcome;
+}
+
+// All evidence retained in model history shares one budget, including web,
+// database, and navigation results. Tool metadata is conservatively counted.
+fn toolContextLimit(request: RetrievalAgentRequest) usize {
+    return if (request.max_context_tokens) |tokens| @intCast(@min(@max(tokens - (request.reserve_tokens orelse 4000), 0), 16384) * 4) else 32768;
 }
 
 fn retrievalNavigation(request: RetrievalAgentRequest) ?RetrievalNavigationConfig {
@@ -2494,7 +2510,7 @@ fn executeNavigationRead(
             if (!state.visited.contains(node.key)) try neighbors.append(arena, node);
         }
     }
-    const limit: usize = if (request.max_context_tokens) |tokens| @intCast(@min(@max(tokens - (request.reserve_tokens orelse 4000), 0), 16384) * 4) else 32768;
+    const limit = toolContextLimit(request);
     const remaining = limit -| context_bytes.*;
     const total = neighbors.items.len;
     var value = .{

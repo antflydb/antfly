@@ -6,9 +6,9 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.serper_search_config_provider import SerperSearchConfigProvider
 from ..models.serper_search_config_search_type import SerperSearchConfigSearchType
 from ..models.serper_search_config_time_period import SerperSearchConfigTimePeriod
-from ..models.web_search_provider import WebSearchProvider
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="SerperSearchConfig")
@@ -28,7 +28,7 @@ class SerperSearchConfig:
     **Docs:** https://serper.dev/docs
 
         Attributes:
-            provider (WebSearchProvider): The web search provider to use.
+            provider (SerperSearchConfigProvider): The web search provider to use.
 
                 - **exa**: Exa neural/semantic web search API
                 - **serper**: Serper.dev Google Search API (simpler setup)
@@ -60,7 +60,7 @@ class SerperSearchConfig:
             time_period (SerperSearchConfigTimePeriod | Unset): Time period filter: d=day, w=week, m=month, y=year
     """
 
-    provider: WebSearchProvider
+    provider: SerperSearchConfigProvider
     api_key: str | Unset = UNSET
     endpoint: str | Unset = UNSET
     project_id: str | Unset = UNSET
@@ -163,7 +163,7 @@ class SerperSearchConfig:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
-        provider = WebSearchProvider(d.pop("provider"))
+        provider = SerperSearchConfigProvider(d.pop("provider"))
 
         api_key = d.pop("api_key", UNSET)
 

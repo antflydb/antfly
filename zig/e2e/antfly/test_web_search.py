@@ -43,6 +43,9 @@ def web_runtime(tmp_path):
         "status": 200,
         "malformed": False,
         "delay": 0,
+        "search_calls": 1,
+        "parallel_searches": 1,
+        "database_first": False,
         "binary": binary,
     }
 
@@ -81,7 +84,7 @@ def web_runtime(tmp_path):
             elif self.path == "/v1/chat/completions":
                 state["generations"].append(payload)
                 previous = [m for m in payload["messages"] if m["role"] == "tool"]
-                if previous:
+                if len(previous) >= state["search_calls"]:
                     message = {
                         "role": "assistant",
                         "content": "EXA-HTTP-CANARY-731 [source](https://example.com/evidence)",
@@ -92,15 +95,22 @@ def web_runtime(tmp_path):
                         "content": None,
                         "tool_calls": [
                             {
-                                "id": "call-exa",
+                                "id": "call-exa"
+                                if not previous and call_index == 0
+                                else f"call-exa-{len(previous) + call_index}",
                                 "type": "function",
                                 "function": {
-                                    "name": "web_search",
+                                    "name": "search"
+                                    if state["database_first"] and not previous
+                                    else "web_search",
                                     "arguments": json.dumps(
-                                        {"query": "Antfly evidence"}
+                                        {"query_index": 0}
+                                        if state["database_first"] and not previous
+                                        else {"query": "Antfly evidence"}
                                     ),
                                 },
                             }
+                            for call_index in range(state["parallel_searches"])
                         ],
                     }
                 body = {
@@ -414,3 +424,78 @@ def test_exa_rejects_conflicting_configuration_scopes(web_runtime):
     assert response.status_code == 400, response.text
     assert not state["searches"]
     assert not state["generations"]
+
+
+@pytest.mark.parametrize("parallel", [1, 3])
+@pytest.mark.parametrize("stream", [False, True])
+def test_exa_repeated_searches_share_context_budget(web_runtime, parallel, stream):
+    url, payload, state = web_runtime
+    state.update(search_calls=3, parallel_searches=parallel)
+    payload.update(
+        max_context_tokens=128,
+        reserve_tokens=0,
+        max_internal_iterations=4,
+        stream=stream,
+    )
+    response = requests.post(url + "/agents/retrieval", json=payload, timeout=30)
+    assert response.status_code == 200, response.text
+    if stream:
+        done = next(
+            frame
+            for frame in response.text.split("\n\n")
+            if frame.startswith("event: done\n")
+        )
+        result = json.loads(done.split("data: ", 1)[1])
+    else:
+        result = response.json()
+    assert result["status"] == "incomplete"
+    assert result.get("generation") is None
+    assert len(state["searches"]) == 2
+    for generation in state["generations"]:
+        evidence_bytes = sum(
+            len(m["content"].encode())
+            for m in generation["messages"]
+            if m["role"] == "tool"
+        )
+        assert evidence_bytes <= 128 * 4
+    assert any(
+        step["action"] == "stopped retrieval at the accumulated context budget"
+        for step in result["steps"]
+    )
+
+
+def test_exa_and_database_results_share_context_budget(web_runtime):
+    url, payload, state = web_runtime
+    created = requests.post(
+        url + "/tables/web_budget", json={"num_shards": 1}, timeout=30
+    )
+    assert created.status_code == 200, created.text
+    payload["queries"] = [
+        {"table": "web_budget", "full_text_search": {"query": "antfly"}, "limit": 2}
+    ]
+    payload["tools"]["enabled_tools"].append("full_text_search")
+    payload["max_internal_iterations"] = 4
+    state.update(database_first=True, search_calls=3)
+    # Measure the serialized evidence, then allow room for only two results.
+    initial = requests.post(url + "/agents/retrieval", json=payload, timeout=30)
+    assert initial.status_code == 200, initial.text
+    assert initial.json()["status"] == "completed"
+    messages = [m for m in state["generations"][-1]["messages"] if m["role"] == "tool"]
+    assert len(messages) == 3
+    budget = (sum(len(m["content"].encode()) for m in messages[:2]) + 3) // 4
+    state["generations"].clear()
+    state["searches"].clear()
+    payload.update(max_context_tokens=budget, reserve_tokens=0)
+    response = requests.post(url + "/agents/retrieval", json=payload, timeout=30)
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "incomplete"
+    assert response.json().get("generation") is None
+    for generation in state["generations"]:
+        assert (
+            sum(
+                len(m["content"].encode())
+                for m in generation["messages"]
+                if m["role"] == "tool"
+            )
+            <= budget * 4
+        )

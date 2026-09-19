@@ -13,3 +13,6 @@ export const webTools = {
   enabled_tools: ["web_search"],
   web_search_config: provider,
 } satisfies ChatToolsConfig;
+
+// @ts-expect-error A provider-specific configuration must use its own discriminator.
+export const invalidExa: ExaSearchConfig = { provider: "tavily" };

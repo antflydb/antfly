@@ -7,7 +7,7 @@ from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..models.brave_search_config_freshness import BraveSearchConfigFreshness
-from ..models.web_search_provider import WebSearchProvider
+from ..models.brave_search_config_provider import BraveSearchConfigProvider
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="BraveSearchConfig")
@@ -26,7 +26,7 @@ class BraveSearchConfig:
     **Docs:** https://api.search.brave.com/app/documentation
 
         Attributes:
-            provider (WebSearchProvider): The web search provider to use.
+            provider (BraveSearchConfigProvider): The web search provider to use.
 
                 - **exa**: Exa neural/semantic web search API
                 - **serper**: Serper.dev Google Search API (simpler setup)
@@ -58,7 +58,7 @@ class BraveSearchConfig:
             spellcheck (bool | Unset): Enable spellcheck suggestions Default: True.
     """
 
-    provider: WebSearchProvider
+    provider: BraveSearchConfigProvider
     api_key: str | Unset = UNSET
     endpoint: str | Unset = UNSET
     project_id: str | Unset = UNSET
@@ -164,7 +164,7 @@ class BraveSearchConfig:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
-        provider = WebSearchProvider(d.pop("provider"))
+        provider = BraveSearchConfigProvider(d.pop("provider"))
 
         api_key = d.pop("api_key", UNSET)
 

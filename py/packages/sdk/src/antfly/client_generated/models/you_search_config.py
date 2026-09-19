@@ -6,7 +6,7 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-from ..models.web_search_provider import WebSearchProvider
+from ..models.you_search_config_provider import YouSearchConfigProvider
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="YouSearchConfig")
@@ -26,7 +26,7 @@ class YouSearchConfig:
     **Docs:** https://api.you.com
 
         Attributes:
-            provider (WebSearchProvider): The web search provider to use.
+            provider (YouSearchConfigProvider): The web search provider to use.
 
                 - **exa**: Exa neural/semantic web search API
                 - **serper**: Serper.dev Google Search API (simpler setup)
@@ -55,7 +55,7 @@ class YouSearchConfig:
                 False.
     """
 
-    provider: WebSearchProvider
+    provider: YouSearchConfigProvider
     api_key: str | Unset = UNSET
     endpoint: str | Unset = UNSET
     project_id: str | Unset = UNSET
@@ -144,7 +144,7 @@ class YouSearchConfig:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
-        provider = WebSearchProvider(d.pop("provider"))
+        provider = YouSearchConfigProvider(d.pop("provider"))
 
         api_key = d.pop("api_key", UNSET)
 

@@ -226,7 +226,21 @@ fn bounded(text: []const u8, max: usize) []const u8 {
     return text[0..end];
 }
 
-fn domainMatches(host: []const u8, domain: []const u8) bool {
+// Compare URL authority, not its percent-encoded spelling. Reject non-ASCII
+// hostnames (use their IDNA ASCII form) and decoded delimiters rather than
+// letting a downstream URL parser reinterpret them after the policy check.
+fn canonicalHost(arena: std.mem.Allocator, encoded: []const u8) !?[]const u8 {
+    const decoded = std.Uri.percentDecodeInPlace(try arena.dupe(u8, encoded));
+    const host = std.mem.trimEnd(u8, decoded, ".");
+    if (host.len == 0) return null;
+    for (host) |c| {
+        if (!std.ascii.isAlphanumeric(c) and std.mem.indexOfScalar(u8, ".-_:[]", c) == null) return null;
+    }
+    return host;
+}
+
+fn domainMatches(host: []const u8, configured_domain: []const u8) bool {
+    const domain = std.mem.trimEnd(u8, configured_domain, ".");
     return std.ascii.eqlIgnoreCase(host, domain) or (host.len > domain.len and host[host.len - domain.len - 1] == '.' and std.ascii.eqlIgnoreCase(host[host.len - domain.len ..], domain));
 }
 
@@ -251,7 +265,7 @@ pub fn parseResults(arena: std.mem.Allocator, config: Config, body: []const u8) 
         if (item.url.len == 0 or item.url.len > 8192 or seen.contains(item.url)) continue;
         const uri = std.Uri.parse(item.url) catch continue;
         if ((!std.mem.eql(u8, uri.scheme, "https") and !std.mem.eql(u8, uri.scheme, "http")) or uri.host == null or uri.user != null or uri.password != null) continue;
-        const host = uri.host.?.percent_encoded;
+        const host = (try canonicalHost(arena, uri.host.?.percent_encoded)) orelse continue;
         var allowed = config.include_domains.len == 0;
         for (config.include_domains) |domain| if (domainMatches(host, domain)) {
             allowed = true;
@@ -357,4 +371,18 @@ test "Exa response normalizes citations and bounds content while enforcing domai
     try std.testing.expect(!no_content[0]._source.?.map.contains("highlights"));
     try std.testing.expectError(error.InvalidWebSearchResponse, parseResults(a, config, "{\"error\":\"secret\"}"));
     try std.testing.expectEqualStrings("a", bounded("aé", 2));
+}
+
+test "Exa domain policy checks decoded hostnames and DNS root dots" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const body =
+        \\{"results":[{"url":"https://%65xample.com/encoded"},{"url":"https://EXAMPLE.com./root-dot"},{"url":"https://sub%2eexample.com/subdomain"},{"url":"https://outside.example/ok"},{"url":"https://example.com%2f.evil/invalid"},{"url":"https://%zz.example/invalid"},{"url":"https://%EF%BD%85xample.com/unicode"}]}
+    ;
+    const excluded = try parseResults(a, .{ .exclude_domains = &.{"example.com"} }, body);
+    try std.testing.expectEqual(@as(usize, 1), excluded.len);
+    try std.testing.expectEqualStrings("https://outside.example/ok", excluded[0]._source.?.map.get("url").?.string);
+    const included = try parseResults(a, .{ .include_domains = &.{"EXAMPLE.com."} }, body);
+    try std.testing.expectEqual(@as(usize, 3), included.len);
 }

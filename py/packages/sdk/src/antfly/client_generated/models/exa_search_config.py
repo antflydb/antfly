@@ -6,8 +6,8 @@ from typing import Any, TypeVar, cast
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.exa_search_config_provider import ExaSearchConfigProvider
 from ..models.exa_search_config_search_type import ExaSearchConfigSearchType
-from ..models.web_search_provider import WebSearchProvider
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="ExaSearchConfig")
@@ -27,7 +27,7 @@ class ExaSearchConfig:
     **Docs:** https://docs.exa.ai
 
         Attributes:
-            provider (WebSearchProvider): The web search provider to use.
+            provider (ExaSearchConfigProvider): The web search provider to use.
 
                 - **exa**: Exa neural/semantic web search API
                 - **serper**: Serper.dev Google Search API (simpler setup)
@@ -63,7 +63,7 @@ class ExaSearchConfig:
             exclude_domains (list[str] | Unset): Exclude results from these domains
     """
 
-    provider: WebSearchProvider
+    provider: ExaSearchConfigProvider
     api_key: str | Unset = UNSET
     endpoint: str | Unset = UNSET
     project_id: str | Unset = UNSET
@@ -188,7 +188,7 @@ class ExaSearchConfig:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
-        provider = WebSearchProvider(d.pop("provider"))
+        provider = ExaSearchConfigProvider(d.pop("provider"))
 
         api_key = d.pop("api_key", UNSET)
 

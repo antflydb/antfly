@@ -81,7 +81,9 @@ Inline Exa options include `max_results`/`num_results` (1–20), `timeout_ms`,
 `safe_search` (sent as Exa `moderation`), `search_type`, published-date bounds,
 `include_domains`, `exclude_domains`, `region` (two-letter country code), and
 content/highlight switches. Domain filters accept domain names, including their
-subdomains. Language filtering is unsupported and rejected. The wire format
+subdomains. Result hostnames are percent-decoded and compared without DNS root
+dots; non-ASCII hostnames must use their IDNA ASCII form. Language filtering is
+unsupported and rejected. The wire format
 follows the [Exa search API](https://exa.ai/docs/reference/search).
 
 A request may supply a named connection plus inline options to narrow its
@@ -90,7 +92,9 @@ connection's provider, endpoint, credentials, or expand content/domain access.
 Configure custom endpoints on the server's named connection; inline requests
 are restricted to `https://api.exa.ai/search`. Redirects are disabled. Provider
 responses are capped at 1 MiB and text/highlights at 4,000 bytes each per result;
-model history also respects the agent's context budget. Configuration belongs
+web, database, and navigation evidence retained in model history shares one
+cumulative context budget. Retrieval returns `incomplete` if another result
+cannot fit, including within a batch of parallel tool calls. Configuration belongs
 in either top-level `tools` or `steps.retrieval.tools`, not both. Both tool
 allowlists still apply. Other provider tokens describe the shared connection
 contract below; this retrieval adapter currently implements Exa only.

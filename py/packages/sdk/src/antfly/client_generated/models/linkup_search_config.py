@@ -8,7 +8,7 @@ from attrs import field as _attrs_field
 
 from ..models.linkup_search_config_depth import LinkupSearchConfigDepth
 from ..models.linkup_search_config_output_type import LinkupSearchConfigOutputType
-from ..models.web_search_provider import WebSearchProvider
+from ..models.linkup_search_config_provider import LinkupSearchConfigProvider
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="LinkupSearchConfig")
@@ -28,7 +28,7 @@ class LinkupSearchConfig:
     **Docs:** https://docs.linkup.so
 
         Attributes:
-            provider (WebSearchProvider): The web search provider to use.
+            provider (LinkupSearchConfigProvider): The web search provider to use.
 
                 - **exa**: Exa neural/semantic web search API
                 - **serper**: Serper.dev Google Search API (simpler setup)
@@ -61,7 +61,7 @@ class LinkupSearchConfig:
                 LinkupSearchConfigOutputType.SEARCHRESULTS.
     """
 
-    provider: WebSearchProvider
+    provider: LinkupSearchConfigProvider
     api_key: str | Unset = UNSET
     endpoint: str | Unset = UNSET
     project_id: str | Unset = UNSET
@@ -164,7 +164,7 @@ class LinkupSearchConfig:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
-        provider = WebSearchProvider(d.pop("provider"))
+        provider = LinkupSearchConfigProvider(d.pop("provider"))
 
         api_key = d.pop("api_key", UNSET)
 
