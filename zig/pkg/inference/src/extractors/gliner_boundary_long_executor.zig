@@ -576,6 +576,36 @@ const WindowGate = struct {
     }
 };
 
+/// One forward pass (encode, optional head, score) over `schemas.len`
+/// windows, sharing one WindowResult. Callers own retry-on-OutOfMemory with a
+/// smaller group; this always attempts exactly the group it is given.
+fn encodeGroup(
+    cb: *const compute.ComputeBackend,
+    allocator: Allocator,
+    config: *const model.Config,
+    prepared: *const processor.PreparedBatch,
+    engine_options: engine.Options,
+    device_options: device_request.Options,
+    schemas: anytype,
+    output_allocator: Allocator,
+    pipeline_options: pipeline.Options,
+    control: ?Control,
+    head_limits: head.Limits,
+) !pipeline.WindowResult {
+    return switch (cb.kind()) {
+        .native => native: {
+            var encoded = try engine.encodeNative(cb, allocator, config, prepared, engine_options);
+            defer encoded.deinit();
+            var headed: ?head.Result = if (prepared.query_width > 0) try head.forwardNative(cb, allocator, config, encoded.asHeadInput(control), head_limits) else null;
+            defer if (headed) |*value| value.deinit();
+            var scorer = pipeline.scoring.NativeContext{ .cb = cb, .config = config, .prepared = prepared, .core = .{ .text_states = encoded.text_states, .query_states = encoded.query_states, .classification_states = encoded.classification_states, .text_lengths = encoded.text_lengths }, .scores = if (headed) |*value| value else null };
+            break :native try pipeline.runScoredWindows(output_allocator, config, prepared, schemas, if (headed) |*value| pipeline.scoring.CandidateScoreView.fromNative(value) else null, scorer.scorer(), pipeline_options, &.{});
+        },
+        .metal => (try device_request.runWindowsWithOutputAllocator(cb, allocator, output_allocator, config, prepared, schemas, device_options)).outputs,
+        else => return error.UnsupportedGlinerBoundaryBackend,
+    };
+}
+
 fn executeChecked(cb: *const compute.ComputeBackend, allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, item: *const wire.Item, supplied: Options, gate: ?*qualification.Gate) !Result {
     var planned = try prepareDocument(cb.kind(), allocator, config, item, supplied);
     defer planned.document.deinit();
@@ -614,46 +644,54 @@ fn executeChecked(cb: *const compute.ComputeBackend, allocator: Allocator, confi
     // Limits.window_batch_size's doc comment and GLINER25.md's
     // long-document throughput section).
     const batchable = item.compiled.schema.classifications.len == 0 and item.compiled.schema.joint_ie == null;
-    const group_size = if (batchable) @max(1, @min(options.limits.window_batch_size, document.windows.len)) else 1;
 
     var start: usize = 0;
     while (start < document.windows.len) {
         try check(options);
-        const end = @min(document.windows.len, start + group_size);
-        const n = end - start;
-        observation.emit(options.observer, .{ .phase = .tokenizing });
-        const window_items = allocator.alloc(processor.Item, n) catch |err| return evidenceAllocationError(terminal, err);
-        defer allocator.free(window_items);
-        for (document.windows[start..end], window_items) |window, *wi| {
-            wi.* = .{ .text = try document.windowText(window.index), .schema = &item.compiled };
-        }
-        var prepared = try processor.prepare(allocator, tokenizer, window_items, process_options);
-        defer prepared.deinit();
-        // Every window's admission already ran through admitWindows above,
-        // one window at a time; grouping their execution here does not
-        // change what was already admitted, so no further gate check runs.
-        var pipeline_options = options.pipeline;
-        pipeline_options.control = options.control;
-        // Retained candidates and final presented outputs have different
-        // budgets: a scalar output may need many alternatives for merging.
-        pipeline_options.max_output_values = options.limits.merge.max_input_candidates;
-        observation.emit(options.observer, .{ .phase = .execution });
-        const SchemaPtr = @TypeOf(&item.compiled);
-        const schemas = allocator.alloc(SchemaPtr, n) catch |err| return evidenceAllocationError(terminal, err);
-        defer allocator.free(schemas);
-        for (schemas) |*s| s.* = &item.compiled;
-        var result = switch (cb.kind()) {
-            .native => native: {
-                var encoded = try engine.encodeNative(cb, allocator, config, &prepared, engine_options);
-                defer encoded.deinit();
-                var headed: ?head.Result = if (prepared.query_width > 0) try head.forwardNative(cb, allocator, config, encoded.asHeadInput(options.control), options.pipeline.head_limits) else null;
-                defer if (headed) |*value| value.deinit();
-                var scorer = pipeline.scoring.NativeContext{ .cb = cb, .config = config, .prepared = &prepared, .core = .{ .text_states = encoded.text_states, .query_states = encoded.query_states, .classification_states = encoded.classification_states, .text_lengths = encoded.text_lengths }, .scores = if (headed) |*value| value else null };
-                break :native pipeline.runScoredWindows(budget.allocator(), config, &prepared, schemas, if (headed) |*value| pipeline.scoring.CandidateScoreView.fromNative(value) else null, scorer.scorer(), pipeline_options, &.{}) catch |err| return evidenceAllocationError(terminal, err);
-            },
-            .metal => (device_request.runWindowsWithOutputAllocator(cb, allocator, budget.allocator(), config, &prepared, schemas, device_options) catch |err| return evidenceAllocationError(terminal, err)).outputs,
-            else => return error.UnsupportedGlinerBoundaryBackend,
+        // The configured group size is a starting point, not a fixed shape:
+        // a genuine allocation failure while encoding/scoring this exact
+        // group (host or device memory pressure -- never a declared-limit
+        // rejection, which a smaller group would not relieve; see
+        // evidenceAllocationError) retries the SAME starting position with a
+        // strictly smaller group, down to one window, instead of failing the
+        // whole document or repeating the identical shape. Every window's
+        // admission already ran through admitWindows above one window at a
+        // time, independent of how windows get grouped for execution, so a
+        // smaller runtime group needs no re-admission.
+        var n: usize = if (batchable) @max(1, @min(options.limits.window_batch_size, document.windows.len - start)) else 1;
+        var prepared: processor.PreparedBatch = undefined;
+        var result: pipeline.WindowResult = attempt: while (true) {
+            const end = start + n;
+            observation.emit(options.observer, .{ .phase = .tokenizing });
+            const window_items = allocator.alloc(processor.Item, n) catch |err| return evidenceAllocationError(terminal, err);
+            defer allocator.free(window_items);
+            for (document.windows[start..end], window_items) |window, *wi| {
+                wi.* = .{ .text = try document.windowText(window.index), .schema = &item.compiled };
+            }
+            prepared = try processor.prepare(allocator, tokenizer, window_items, process_options);
+            errdefer prepared.deinit();
+            var pipeline_options = options.pipeline;
+            pipeline_options.control = options.control;
+            // Retained candidates and final presented outputs have different
+            // budgets: a scalar output may need many alternatives for merging.
+            pipeline_options.max_output_values = options.limits.merge.max_input_candidates;
+            observation.emit(options.observer, .{ .phase = .execution });
+            const SchemaPtr = @TypeOf(&item.compiled);
+            const schemas = allocator.alloc(SchemaPtr, n) catch |err| return evidenceAllocationError(terminal, err);
+            defer allocator.free(schemas);
+            for (schemas) |*s| s.* = &item.compiled;
+            if (encodeGroup(cb, allocator, config, &prepared, engine_options, device_options, schemas, budget.allocator(), pipeline_options, options.control, options.pipeline.head_limits)) |value| {
+                break :attempt value;
+            } else |err| {
+                if (err == error.OutOfMemory and n > 1) {
+                    prepared.deinit();
+                    n = (n + 1) / 2;
+                    continue :attempt;
+                }
+                return evidenceAllocationError(terminal, err);
+            }
         };
+        defer prepared.deinit();
         if (batchable) {
             batch_results.append(metadata.allocator(), result) catch |err| {
                 result.deinit();
@@ -670,7 +708,7 @@ fn executeChecked(cb: *const compute.ComputeBackend, allocator: Allocator, confi
             completed += 1;
             observation.emit(options.observer, .window_completed);
         }
-        start = end;
+        start += n;
     }
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
@@ -989,6 +1027,89 @@ test "gliner boundary long executor evidence terminal allocation preserves backi
     try std.testing.expect(observed.requested_bytes <= observed.limit_bytes - observed.live_bytes);
     try std.testing.expectEqual(error.OutOfMemory, evidenceAllocationError(terminal, actual));
     try std.testing.expectEqual(error.Cancelled, evidenceAllocationError(terminal, error.Cancelled));
+}
+
+// Real memory pressure -- not a fake/synthetic backend -- against the pinned
+// base checkpoint: a bounded host allocator sized so the configured
+// window_batch_size=4 group's encode/head/score forward pass genuinely
+// cannot allocate, but a smaller group (down to one window) can. Calibrated
+// empirically (see this task's report) against this exact document/schema:
+// 6 MiB reliably forces at least one 4->2 shrink (and some positions shrink
+// further to 1) while still completing the whole document; 8 MiB and above
+// never needs to shrink at all. Picked comfortably inside that window so the
+// test exercises the retry path deterministically without being so tight it
+// fails even at group size 1 (which would make this a resource-exhaustion
+// test instead of a recovery test).
+test "gliner boundary long executor adaptive group shrink recovers from real encode-phase OutOfMemory pressure" {
+    const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_BASE_MODEL_DIR") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const factory = @import("../architectures/session_factory.zig");
+    const session = try factory.createNativeSession(a, directory);
+    defer session.close();
+    const identity = try factory.getGlinerBoundaryIdentity(session);
+    const config = try factory.getGlinerBoundaryConfig(session);
+    const path = try std.fs.path.join(a, &.{ directory, "tokenizer.json" });
+    defer a.free(path);
+    const tokenizer_bytes = try @import("../util/c_file.zig").readFileMax(a, path, 32 * 1024 * 1024);
+    defer a.free(tokenizer_bytes);
+    const tokenizer = try @import("inference_hf_tokenizer").HfTokenizer.loadFromBytes(a, tokenizer_bytes);
+    defer tokenizer.tokenizer().deinitTokenizer();
+    var managed = try factory.getManagedComputeBackend(session, a, null, null);
+    defer managed.deinit();
+
+    // 12 repeats of an 11-word sentence, windowed at word_words=20/overlap=2,
+    // produces exactly 10 windows -- several full window_batch_size=4 groups,
+    // so the retry path is exercised more than once.
+    var words = std.ArrayListUnmanaged(u8).empty;
+    defer words.deinit(a);
+    for (0..12) |_| try words.appendSlice(a, "Alice met Bob at the Antfly office to discuss the metadata server. ");
+    const raw = try std.json.Stringify.valueAlloc(a, .{
+        .schema_version = @as(u32, 2),
+        .model = "boundary",
+        .schema = .{ .entities = &[_][]const u8{"person"}, .relations = &[_]struct { type: []const u8 }{.{ .type = "depends_on" }} },
+        .inputs = &.{.{ .content = words.items }},
+        .options = .{ .long_document = .{ .mode = "window", .window_words = @as(u32, 20), .overlap_words = @as(u32, 2) } },
+    }, .{});
+    defer a.free(raw);
+    var request = try wire.parseJson(a, raw, .{});
+    defer request.deinit();
+    const item = &request.items[0];
+    const options = Options{ .identity = identity, .pipeline = item.options.native(.{}) };
+
+    // Unbounded control: proves 10 windows is the real shape this document
+    // produces, independent of the pressure below.
+    var unbounded = try execute(&managed.backend, a, &config, tokenizer.tokenizer(), item, options);
+    defer unbounded.deinit();
+    try std.testing.expectEqual(@as(usize, 10), unbounded.window_count);
+
+    var pressure = BoundedAllocator{ .backing = a, .limit = 6 * 1024 * 1024 };
+    var result = try execute(&managed.backend, pressure.allocator(), &config, tokenizer.tokenizer(), item, options);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 10), result.window_count);
+    try std.testing.expect(result.sample.entities.len > 0);
+    var mentions: usize = 0;
+    for (result.sample.entities) |group| mentions += group.values.len;
+    try std.testing.expect(mentions > 0);
+}
+
+test "gliner boundary long executor adaptive group shrink strictly decreases and always reaches one" {
+    // The core correctness property of the OutOfMemory retry in the group
+    // execution loop: starting from any group size, repeatedly halving
+    // (rounding up) strictly decreases the group and reaches exactly 1 in a
+    // bounded number of steps, so a caller can never retry the identical
+    // shape and can never loop indefinitely.
+    for ([_]usize{ 1, 2, 3, 4, 5, 7, 16, 128, 4096 }) |start_n| {
+        var n = start_n;
+        var steps: usize = 0;
+        while (n > 1) {
+            const next = (n + 1) / 2;
+            try std.testing.expect(next < n);
+            n = next;
+            steps += 1;
+            try std.testing.expect(steps <= 64);
+        }
+        try std.testing.expectEqual(@as(usize, 1), n);
+    }
 }
 
 test "gliner boundary long executor evidence terminal allocation retains declared memory limit" {

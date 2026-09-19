@@ -21948,7 +21948,15 @@ test "microbatch registration qualifies concrete GLiNER bundles and Qwen embeddi
         .gliner_head_gguf_path = "head.gguf",
     };
     try std.testing.expectEqual(.native_gliner_extraction, resolvedExecutorKind("extract", &gliner));
-    try std.testing.expectEqual(.native, resolvedExecutorBatchImplementation("extract", resolvedExecutorKind("extract", &gliner)).mode);
+    // The concrete GLiNER boundary executor is recognized as its own kind
+    // (never falls back to the generic compatibility loop), but its reviewed
+    // qualification covers exactly one item per request today, so it must
+    // not advertise native batching beyond that -- see
+    // resolvedExecutorBatchImplementation's doc comment.
+    const gliner_batch = resolvedExecutorBatchImplementation("extract", resolvedExecutorKind("extract", &gliner));
+    try std.testing.expectEqual(.none, gliner_batch.mode);
+    try std.testing.expectEqual(@as(usize, 1), gliner_batch.max_items);
+    try std.testing.expectEqual(@as(usize, 1), gliner_batch.preferred_items);
     const onnx = manifest_mod.ModelManifest{ .allocator = std.testing.allocator, .gliner_model_type = "gliner2" };
     try std.testing.expectEqual(.compatibility, resolvedExecutorKind("extract", &onnx));
     const qwen = manifest_mod.ModelManifest{ .allocator = std.testing.allocator, .embedding_style = .qwen3_embedding };
@@ -21981,6 +21989,25 @@ pub fn resolvedExecutorBatchImplementation(
     resolved_task: []const u8,
     executor_kind: ResolvedExecutorKind,
 ) ResolvedExecutorBatchImplementation {
+    // GLiNER boundary extraction's reviewed production qualification (see
+    // models/gliner_boundary_qualification.zig's LengthContract.request_items,
+    // and GLINER25.md's long-document section) covers exactly one item per
+    // request, for both the single-window and windowed long-document rows:
+    // no correctness evidence exists yet for a batched multi-item request
+    // through either merge path. Advertising more here let a caller (the
+    // antfly asset-producer batcher) opportunistically group multiple
+    // documents into one call, which then failed closed for the whole group
+    // regardless of any individual document's size -- this is exactly the
+    // "long documents fail closed with UnsupportedGlinerBoundaryRuntime for
+    // no apparent geometric reason" incident traced in GLINER25.md. This
+    // stays fixed at one item until batched multi-item execution is reviewed
+    // and reflected in that table.
+    if (executor_kind == .native_gliner_extraction) return .{
+        .mode = .none,
+        .preferred_items = 1,
+        .max_items = 1,
+        .per_item_failures = false,
+    };
     const task_max_items = resolvedTaskMaxItems(resolved_task);
     const native_reader = executor_kind == .native_florence_reader and
         effectiveNativeReadBatchSize() > 1;
@@ -21990,7 +22017,7 @@ pub fn resolvedExecutorBatchImplementation(
         task_max_items;
     const preferred_items = @min(@as(usize, 8), max_items);
     const native = executor_kind == .native_dense_embedding or
-        executor_kind == .native_sparse_embedding or executor_kind == .native_gliner_extraction or native_reader;
+        executor_kind == .native_sparse_embedding or native_reader;
     return .{
         .mode = if (max_items == 1) .none else if (native) .native else .serial_compatibility,
         .preferred_items = preferred_items,

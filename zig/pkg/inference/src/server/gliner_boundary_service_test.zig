@@ -723,3 +723,148 @@ fn longExecutorProviderCanonicalShape(metal: bool) !void {
         }
     }
 }
+
+// Corpus-maximum-scale companion to the two windowed tests above: zig/PDF.md's
+// "Review findings and required fixes" is the largest single section
+// examples/dogfood's real docsaf.MarkdownProcessor splitting currently
+// produces across the whole ingest corpus (measured directly in
+// extractors/gliner_boundary_qualification.zig's long-document geometry
+// test: ~92KB body, 15 windows at the wire's 1024-word default), so this
+// exercises the merge path at real production scale through both entries a
+// caller can reach it from -- the HTTP handler and the in-process provider
+// entry (Node.extractDirect, as examples/dogfood's embedded worker calls
+// it) -- rather than only the ~37KB section the tests above already cover.
+test "gliner boundary long executor HTTP canonical schema_version 2 shape for the corpus-maximum real section" {
+    const a = std.testing.allocator;
+    const requested_directory = platform.env.getenv("ANTFLY_GLINER25_BASE_MODEL_DIR") orelse return error.SkipZigTest;
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = if (std.fs.path.isAbsolute(requested_directory))
+        try std.Io.Dir.realPathFileAbsolute(std.testing.io, requested_directory, &path_buffer)
+    else
+        try std.Io.Dir.cwd().realPathFile(std.testing.io, requested_directory, &path_buffer);
+    const directory = path_buffer[0..path_len];
+    const models_dir = std.fs.path.dirname(directory) orelse return error.InvalidModelPath;
+    const name = std.fs.path.basename(directory);
+
+    var node = try Node.init(a, .{
+        .models_dir = models_dir,
+        .max_loaded_models = 1,
+        .max_concurrent_requests = 1,
+        .generation_budget_overrides = .{ .host_limit_bytes = 16 * 1024 * 1024 * 1024, .scratch_limit_bytes = 4 * 1024 * 1024 * 1024, .combined_limit_bytes = 16 * 1024 * 1024 * 1024, .backend_limit_bytes = 16 * 1024 * 1024 * 1024, .kv_limit_bytes = 4 * 1024 * 1024 * 1024 },
+    });
+    defer node.deinit();
+    useNativeBackend(&node);
+    try node.attachIo(std.testing.io);
+
+    // Path relative to the inference-test binary's working directory
+    // (zig/pkg/inference, per zig/TESTING.md's build steps).
+    const full = try @import("../util/c_file.zig").readFile(a, "../../PDF.md");
+    defer a.free(full);
+    const section = try extractHeadingSection(full, "## Review findings and required fixes");
+    try std.testing.expect(section.len > 90000);
+
+    const schema_source =
+        \\{"entities":["component","subsystem","file","test","invariant","decision","person","model","backend","format","protocol"],"relations":[{"type":"depends_on"},{"type":"owns"},{"type":"implements"},{"type":"supersedes"},{"type":"tested_by"},{"type":"documented_in"}]}
+    ;
+    var parsed_schema = try std.json.parseFromSlice(Value, a, schema_source, .{});
+    defer parsed_schema.deinit();
+    const body = try std.json.Stringify.valueAlloc(a, .{
+        .schema_version = @as(u32, 2),
+        .model = name,
+        .schema = parsed_schema.value,
+        .options = .{ .include_confidence = true, .include_spans = true, .long_document = .{ .mode = "window" } },
+        .inputs = &.{.{ .id = "1", .content = section }},
+    }, .{});
+    defer a.free(body);
+
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/extract");
+    defer request.deinit();
+    request.body = body;
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    ctx.max_request_body_size = 128 * 1024;
+    ctx.application_deadline_ns = platform.time.monotonicNs() + 180 * std.time.ns_per_s;
+    var response = try node.extractJSON(&ctx);
+    defer response.deinit();
+    errdefer std.debug.print("corpus-maximum HTTP response: status={d} body={s}\n", .{ response.status.code, response.body orelse "<absent>" });
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    var parsed = try std.json.parseFromSlice(Value, a, response.body orelse return error.MissingResponseBody, .{});
+    defer parsed.deinit();
+    const output = parsed.value.object.get("data").?.array.items[0].object;
+
+    // Confirms this really took the multi-window merge path at close to the
+    // qualified window_count ceiling, not a coincidentally-small window count.
+    const window_count = output.get("long_document").?.object.get("window_count").?.integer;
+    try std.testing.expect(window_count >= 10);
+
+    const entities = output.get("entities").?.array.items;
+    try std.testing.expect(entities.len > 0);
+    for (entities) |raw_entity| {
+        const entity = raw_entity.object;
+        try std.testing.expect(entity.contains("label"));
+        try std.testing.expect(entity.contains("text"));
+        try std.testing.expect(entity.contains("start"));
+        try std.testing.expect(entity.contains("end"));
+        try std.testing.expect(entity.contains("score"));
+    }
+    const relations = output.get("relations").?.array.items;
+    try std.testing.expect(relations.len > 0);
+    for (relations) |raw_relation| {
+        const relation = raw_relation.object;
+        try std.testing.expect(relation.contains("type"));
+        try std.testing.expect(relation.contains("source"));
+        try std.testing.expect(relation.contains("target"));
+        try std.testing.expect(!relation.contains("head"));
+        try std.testing.expect(!relation.contains("tail"));
+    }
+}
+
+test "gliner boundary long executor provider extractDirect canonical schema_version 2 shape for the corpus-maximum real section" {
+    const a = std.testing.allocator;
+    const home = platform.env.getenv("HOME") orelse return error.SkipZigTest;
+    const directory = try std.fs.path.join(a, &.{ home, ".antfly", "inference", "models", "fastino", "gliner2.5-base-v1" });
+    defer a.free(directory);
+    std.Io.Dir.cwd().access(std.testing.io, directory, .{}) catch return error.SkipZigTest;
+    const models_dir = try std.fs.path.join(a, &.{ home, ".antfly", "inference", "models", "fastino" });
+    defer a.free(models_dir);
+
+    var node = try Node.init(a, .{
+        .models_dir = models_dir,
+        .max_loaded_models = 1,
+        .max_concurrent_requests = 1,
+        .generation_budget_overrides = .{ .host_limit_bytes = 16 * 1024 * 1024 * 1024, .scratch_limit_bytes = 4 * 1024 * 1024 * 1024, .combined_limit_bytes = 16 * 1024 * 1024 * 1024, .backend_limit_bytes = 16 * 1024 * 1024 * 1024, .kv_limit_bytes = 4 * 1024 * 1024 * 1024 },
+    });
+    defer node.deinit();
+    useNativeBackend(&node);
+    try node.attachIo(std.testing.io);
+
+    const full = try @import("../util/c_file.zig").readFile(a, "../../PDF.md");
+    defer a.free(full);
+    const section = try extractHeadingSection(full, "## Review findings and required fixes");
+    try std.testing.expect(section.len > 90000);
+    const content_json = try std.json.Stringify.valueAlloc(a, section, .{});
+    defer a.free(content_json);
+
+    const request = extracting_api.Request{
+        .schema_version = 2,
+        .inputs = &.{.{ .id = "1", .content_json = content_json }},
+        .schema_json =
+        \\{"entities":["component","subsystem","file","test","invariant","decision","person","model","backend","format","protocol"],"relations":[{"type":"depends_on"},{"type":"owns"},{"type":"implements"},{"type":"supersedes"},{"type":"tested_by"},{"type":"documented_in"}]}
+        ,
+        .options_json =
+        \\{"include_confidence":true,"include_spans":true,"long_document":{"mode":"window"}}
+        ,
+    };
+    var response = try node.extractDirect(a, "gliner2.5-base-v1", request);
+    defer response.deinit();
+    errdefer std.debug.print("corpus-maximum provider response: {s}\n", .{response.json});
+    var parsed = try std.json.parseFromSlice(Value, a, response.json, .{});
+    defer parsed.deinit();
+    const output = parsed.value.object.get("data").?.array.items[0].object;
+    const window_count = output.get("long_document").?.object.get("window_count").?.integer;
+    try std.testing.expect(window_count >= 10);
+    const entities = output.get("entities").?.array.items;
+    try std.testing.expect(entities.len > 0);
+    const relations = output.get("relations").?.array.items;
+    try std.testing.expect(relations.len > 0);
+}

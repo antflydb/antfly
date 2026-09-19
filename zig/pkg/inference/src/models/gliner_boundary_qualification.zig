@@ -130,6 +130,61 @@ pub const LengthContract = struct {
     }
 };
 
+/// A bounded-length rejection: identity, backend, and every required feature
+/// already matched at least one production row (see start()/Candidates), but
+/// the observed geometry falls outside every remaining candidate row's
+/// reviewed range. Distinct from error.UnsupportedGlinerBoundaryRuntime,
+/// which covers everything else this policy can refuse -- an unreviewed
+/// identity, backend, feature, or a malformed table -- so a caller (and the
+/// HTTP error mapping) can tell a "this document is too big/too batched for
+/// what was reviewed" rejection apart from "this request shape was never
+/// reviewed at all" and report the exceeded dimension by name. One error per
+/// LengthContract field, in the same declaration order.
+pub const LengthLimitError = error{
+    GlinerBoundaryRequestItemsLimitExceeded,
+    GlinerBoundaryDocumentBytesLimitExceeded,
+    GlinerBoundaryDocumentWordsLimitExceeded,
+    GlinerBoundaryWindowCountLimitExceeded,
+    GlinerBoundaryWindowWordsLimitExceeded,
+    GlinerBoundaryPaddedSequenceLimitExceeded,
+};
+
+/// Every error narrow()/require() can return: the generic closed-policy
+/// refusal plus the named bounded-length rejections above.
+pub const QualificationError = error{UnsupportedGlinerBoundaryRuntime} || LengthLimitError;
+
+fn fieldLimitError(comptime field_name: []const u8) LengthLimitError {
+    if (comptime std.mem.eql(u8, field_name, "request_items")) return error.GlinerBoundaryRequestItemsLimitExceeded;
+    if (comptime std.mem.eql(u8, field_name, "document_bytes")) return error.GlinerBoundaryDocumentBytesLimitExceeded;
+    if (comptime std.mem.eql(u8, field_name, "document_words")) return error.GlinerBoundaryDocumentWordsLimitExceeded;
+    if (comptime std.mem.eql(u8, field_name, "window_count")) return error.GlinerBoundaryWindowCountLimitExceeded;
+    if (comptime std.mem.eql(u8, field_name, "window_words")) return error.GlinerBoundaryWindowWordsLimitExceeded;
+    if (comptime std.mem.eql(u8, field_name, "padded_sequence_tokens")) return error.GlinerBoundaryPaddedSequenceLimitExceeded;
+    @compileError("gliner_boundary_qualification: unmapped LengthContract field " ++ field_name);
+}
+
+/// `previous` is a nonempty bitmask of rows that matched identity, backend,
+/// and every required feature; `remaining` (all of `previous`'s rows failed
+/// to contain `observed`) is why this is being called. Blame the first
+/// LengthContract field, in declaration order, for which NONE of the
+/// `previous` rows' range contains `observed`'s value -- the dimension that
+/// actually closed off every candidate. If every field is individually
+/// satisfiable by some previous row but no single row satisfies all of them
+/// together, that is a cross-row combination rather than one measured bound;
+/// blame the first field as a conservative default (still a genuine
+/// bounded-length rejection, not an unreviewed request shape).
+fn blamedLengthDimension(entries: []const Entry, previous: u64, observed: LengthContract) LengthLimitError {
+    inline for (@typeInfo(LengthContract).@"struct".fields) |field| {
+        var covered = false;
+        for (entries, 0..) |entry, index| {
+            const bit = @as(u64, 1) << @intCast(index);
+            if (previous & bit != 0 and @field(entry.lengths, field.name).contains(@field(observed, field.name))) covered = true;
+        }
+        if (!covered) return fieldLimitError(field.name);
+    }
+    return fieldLimitError(@typeInfo(LengthContract).@"struct".fields[0].name);
+}
+
 /// Data only. Identity includes all five file sizes and digests, the variant,
 /// and precision. No wildcard identity, implicit backend, or inherited limits.
 pub const Entry = struct {
@@ -251,22 +306,36 @@ const fastino_gliner25_base_v1_lengths = LengthContract{
 //  - Geometry: measured directly against the pinned tokenizer/planner (no
 //    model weights) over the real examples/dogfood production schema (11
 //    entities, 6 relations) against the same short fixtures as the
-//    single-window row above, plus three real repository sections spanning
-//    the corpus-wide range this file's long-document section documents
-//    (95th percentile and max section size across zig/*.md and
-//    work-log/**/*.md): zig/pkg/antfly/src/storage/lsm/LSM.md's "Read And
-//    Scan Work" (6.8KB), zig/VOPR.md's "Completion-Claim Audit" (37KB), and
-//    zig/PDF.md's "Review findings and required fixes" (99KB, the corpus
-//    max) -- each swept at window_words=1024 (the wire's default; see
-//    extraction_v2.zig's LongDocument doc comment and GLINER25.md's
-//    throughput section for why) AND window_words=4096 (the widest a
-//    request may still explicitly opt into), in
-//    ../../extractors/gliner_boundary_qualification.zig ("gliner boundary
-//    qualification measures pinned base checkpoint long-document production
-//    geometry"). The bounds below are the union of both sweeps' exact
-//    observed ranges (window_count differs sharply by window size -- up to
-//    17 windows at 1024 words each versus up to 4 at 4096 -- everything else
-//    the two sweeps measured overlaps).
+//    single-window row above, three real repository sections spanning the
+//    corpus-wide range this file's long-document section documents (95th
+//    percentile and max section size across zig/*.md and work-log/**/*.md):
+//    zig/pkg/antfly/src/storage/lsm/LSM.md's "Read And Scan Work" (6.8KB),
+//    zig/VOPR.md's "Completion-Claim Audit" (37KB), and zig/PDF.md's "Review
+//    findings and required fixes" (99KB) -- plus two synthetic documents
+//    built by concatenating real corpus sections (zig/PDF.md's two largest
+//    real sections, per a docsaf-accurate Go-side sweep of the whole ingest
+//    corpus) up to 130KB and 182KB/28275 words, well past every individual
+//    real section docsaf currently produces, to qualify past the corpus's
+//    single-section maximum with real margin -- each swept at
+//    window_words=1024 (the wire's default; see extraction_v2.zig's
+//    LongDocument doc comment and GLINER25.md's throughput section for why)
+//    AND window_words=4096 (the widest a request may still explicitly opt
+//    into), in ../../extractors/gliner_boundary_qualification.zig ("gliner
+//    boundary qualification measures pinned base checkpoint long-document
+//    production geometry"). The bounds below are the union of both sweeps'
+//    exact observed ranges (window_count differs sharply by window size --
+//    up to 29 windows at 1024 words each versus up to 8 at 4096 -- everything
+//    else the two sweeps measured overlaps). This also qualifies the
+//    request_items dimension up to the single reviewed value of 1: a request
+//    batching more than one document into one call (examples/dogfood never
+//    does this, but the inference server's generic "extract" task capability
+//    advertisement did, until this same change fixed
+//    resolvedExecutorBatchImplementation in server/server.zig to stop
+//    advertising native batching for GLiNER boundary extraction) still
+//    correctly fails closed, now with the named
+//    error.GlinerBoundaryRequestItemsLimitExceeded instead of the generic
+//    error.UnsupportedGlinerBoundaryRuntime -- see GLINER25.md's long-document
+//    section for the production incident this traces to.
 //  - Throughput: see GLINER25.md's long-document section for per-window and
 //    per-section throughput on Metal, before and after switching the
 //    default window size and adding grouped-window batching.
@@ -289,14 +358,17 @@ const fastino_gliner25_base_v1_long_document_features = Features.initMany(&.{
 // cited above (the two short single-window-shaped fixtures, still requested
 // with long_document.mode=window since examples/dogfood requests it
 // unconditionally -- see index_config.go's knowledgeGraphIndexJSON -- plus
-// the three real multi-window sections). A document needing more than this
-// measured range -- window_count > 17, or bytes/words/tokens above the
-// printed maxima -- has not been measured and correctly fails closed.
+// the three real multi-window sections and the two synthetic 130KB/182KB
+// documents). A document needing more than this measured range --
+// window_count > 29, or bytes/words/tokens above the printed maxima -- has
+// not been measured and correctly fails closed with the named
+// error.GlinerBoundaryWindowCountLimitExceeded (etc.), not the generic
+// error.UnsupportedGlinerBoundaryRuntime.
 const fastino_gliner25_base_v1_long_document_lengths = LengthContract{
     .request_items = .{ .min = 1, .max = 1 },
-    .document_bytes = .{ .min = 26, .max = 99008 },
-    .document_words = .{ .min = 5, .max = 15894 },
-    .window_count = .{ .min = 1, .max = 17 },
+    .document_bytes = .{ .min = 26, .max = 182000 },
+    .document_words = .{ .min = 5, .max = 28275 },
+    .window_count = .{ .min = 1, .max = 29 },
     .window_words = .{ .min = 5, .max = 4096 },
     .padded_sequence_tokens = .{ .min = 106, .max = 5708 },
 };
@@ -366,7 +438,7 @@ pub const Candidates = enum(u64) {
     /// Intersect with one actual document/window observation. A failed check
     /// consumes all candidates, so retrying with shorter geometry cannot revive
     /// a rejected request. This mutates no global state and allocates nothing.
-    pub fn narrow(self: *Candidates, observed: LengthContract) error{UnsupportedGlinerBoundaryRuntime}!void {
+    pub fn narrow(self: *Candidates, observed: LengthContract) QualificationError!void {
         return narrowEntries(production_entries, self, observed);
     }
 };
@@ -390,7 +462,7 @@ pub fn supportsFeatures(consumed: bundle.Identity, backend: Backend, required: F
 /// all supplied length ranges. For long documents, use actual tokenizer and
 /// planner observations, and enforce before any window executes. For a batch,
 /// accumulate observed ranges rather than joining independently matching rows.
-pub fn require(consumed: bundle.Identity, backend: Backend, required: Features, observed: LengthContract) error{UnsupportedGlinerBoundaryRuntime}!void {
+pub fn require(consumed: bundle.Identity, backend: Backend, required: Features, observed: LengthContract) QualificationError!void {
     var candidates = try start(consumed, backend, required);
     try candidates.narrow(observed);
 }
@@ -439,24 +511,27 @@ fn startEntries(entries: []const Entry, consumed: bundle.Identity, backend: Back
     return @enumFromInt(remaining);
 }
 
-fn narrowEntries(entries: []const Entry, candidates: *Candidates, observed: LengthContract) error{UnsupportedGlinerBoundaryRuntime}!void {
+fn narrowEntries(entries: []const Entry, candidates: *Candidates, observed: LengthContract) QualificationError!void {
     const previous = @intFromEnum(candidates.*);
     candidates.* = .rejected;
     if (!validEntries(entries) or !observed.valid()) return error.UnsupportedGlinerBoundaryRuntime;
     const valid_mask = if (entries.len == max_entries) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(entries.len)) - 1;
     if (previous & ~valid_mask != 0) return error.UnsupportedGlinerBoundaryRuntime;
+    // Nothing matched identity/backend/features to begin with: that is an
+    // unreviewed request shape, not a bounded-length rejection.
+    if (previous == 0) return error.UnsupportedGlinerBoundaryRuntime;
     var remaining: u64 = 0;
     for (entries, 0..) |entry, index| {
         const bit = @as(u64, 1) << @intCast(index);
         if (previous & bit != 0 and entry.lengths.contains(observed)) remaining |= bit;
     }
     candidates.* = @enumFromInt(remaining);
-    if (remaining == 0) return error.UnsupportedGlinerBoundaryRuntime;
+    if (remaining == 0) return blamedLengthDimension(entries, previous, observed);
 }
 
 /// Only this module's tests can supply synthetic rows. Runtime callers always
 /// use the immutable production table; no allocation or external state occurs.
-fn matchEntries(entries: []const Entry, consumed: bundle.Identity, backend: Backend, required: Features, observed: ?LengthContract) error{UnsupportedGlinerBoundaryRuntime}!void {
+fn matchEntries(entries: []const Entry, consumed: bundle.Identity, backend: Backend, required: Features, observed: ?LengthContract) QualificationError!void {
     var candidates = try startEntries(entries, consumed, backend, required);
     if (observed) |lengths| try narrowEntries(entries, &candidates, lengths);
 }
@@ -542,14 +617,34 @@ test "boundary qualification serves the reviewed fastino gliner2.5 base checkpoi
     mismatched.precision = .q8_0;
     try std.testing.expect(!hasQualifiedIdentity(mismatched));
 
-    try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, require(identity, .native, Features.initOne(.long_document), fastino_gliner25_base_v1_lengths));
+    // Requiring only .long_document is satisfied by the long-document row
+    // alone (its feature set is a superset), so this reaches geometry: the
+    // single-window row's narrower padded_sequence_tokens minimum (14) falls
+    // under the long-document row's reviewed minimum (106) -- a genuine
+    // bounded-length rejection, named accordingly, not a feature mismatch.
+    try std.testing.expectError(error.GlinerBoundaryPaddedSequenceLimitExceeded, require(identity, .native, Features.initOne(.long_document), fastino_gliner25_base_v1_lengths));
 
+    // Out-of-range geometry, unlike every identity/backend mismatch above, is
+    // a bounded-length rejection: identity, backend, and features all matched
+    // a reviewed row, so it must name the exceeded dimension rather than the
+    // generic error.
     var observed = fastino_gliner25_base_v1_lengths;
     observed.document_bytes = Range.exact(fastino_gliner25_base_v1_lengths.document_bytes.max + 1);
-    try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, require(identity, .native, fastino_gliner25_base_v1_features, observed));
+    try std.testing.expectError(error.GlinerBoundaryDocumentBytesLimitExceeded, require(identity, .native, fastino_gliner25_base_v1_features, observed));
     observed = fastino_gliner25_base_v1_lengths;
     observed.padded_sequence_tokens = Range.exact(fastino_gliner25_base_v1_lengths.padded_sequence_tokens.max + 1);
-    try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, require(identity, .metal, fastino_gliner25_base_v1_features, observed));
+    try std.testing.expectError(error.GlinerBoundaryPaddedSequenceLimitExceeded, require(identity, .metal, fastino_gliner25_base_v1_features, observed));
+
+    // The same distinction holds for the long-document row: a batch of more
+    // than one item is a bounded-length (request_items) rejection now, not
+    // the generic "unreviewed request shape" error -- this is the exact
+    // production incident (native batching advertised for GLiNER extraction
+    // groups multiple documents into one call; see server/server.zig's
+    // resolvedExecutorBatchImplementation and GLINER25.md's long-document
+    // section) that motivated naming this dimension.
+    observed = fastino_gliner25_base_v1_long_document_lengths;
+    observed.request_items = Range.exact(2);
+    try std.testing.expectError(error.GlinerBoundaryRequestItemsLimitExceeded, require(identity, .native, fastino_gliner25_base_v1_long_document_features, observed));
 }
 
 test "boundary qualification matches all five consumed file sizes and hashes" {
@@ -627,12 +722,17 @@ test "boundary qualification checks every inclusive geometry endpoint and unit" 
         try matchEntries(&.{row}, row.identity, .native, row.features, observed);
         @field(observed, field.name) = Range.exact(range.max);
         try matchEntries(&.{row}, row.identity, .native, row.features, observed);
+        // A single field outside its row's range, with the rest of the
+        // contract otherwise valid, is a bounded-length rejection: it must
+        // name exactly this field, not the generic error.
         @field(observed, field.name) = Range.exact(range.max + 1);
-        try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, matchEntries(&.{row}, row.identity, .native, row.features, observed));
+        try std.testing.expectError(fieldLimitError(field.name), matchEntries(&.{row}, row.identity, .native, row.features, observed));
         if (range.min != 0) {
             @field(observed, field.name) = Range.exact(range.min - 1);
-            try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, matchEntries(&.{row}, row.identity, .native, row.features, observed));
+            try std.testing.expectError(fieldLimitError(field.name), matchEntries(&.{row}, row.identity, .native, row.features, observed));
         }
+        // An internally-invalid range (min > max) is a malformed observation,
+        // not a bounded-length rejection: it fails before any row is checked.
         @field(observed, field.name) = .{ .min = 2, .max = 1 };
         try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, matchEntries(&.{row}, row.identity, .native, row.features, observed));
     }
@@ -640,7 +740,7 @@ test "boundary qualification checks every inclusive geometry endpoint and unit" 
     var schema_heavy = row.lengths;
     schema_heavy.document_words = Range.exact(1);
     schema_heavy.padded_sequence_tokens = Range.exact(513);
-    try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, matchEntries(&.{row}, row.identity, .native, row.features, schema_heavy));
+    try std.testing.expectError(error.GlinerBoundaryPaddedSequenceLimitExceeded, matchEntries(&.{row}, row.identity, .native, row.features, schema_heavy));
 }
 
 test "boundary qualification does not merge geometry or feature grants across rows" {
@@ -648,11 +748,11 @@ test "boundary qualification does not merge geometry or feature grants across ro
     var long = short;
     short.lengths.padded_sequence_tokens = .{ .min = 16, .max = 255 };
     long.lengths.padded_sequence_tokens = .{ .min = 256, .max = 512 };
-    try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, matchEntries(&.{ short, long }, short.identity, .native, short.features, testLengths()));
+    try std.testing.expectError(error.GlinerBoundaryPaddedSequenceLimitExceeded, matchEntries(&.{ short, long }, short.identity, .native, short.features, testLengths()));
     // Nor may a feature match from one row borrow another row's larger lengths.
     long.features.insert(.joint_ie);
     var observed = short.lengths;
-    try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, matchEntries(&.{ short, long }, short.identity, .native, long.features, observed));
+    try std.testing.expectError(error.GlinerBoundaryPaddedSequenceLimitExceeded, matchEntries(&.{ short, long }, short.identity, .native, long.features, observed));
     observed.padded_sequence_tokens = Range.exact(512);
     try matchEntries(&.{ short, long }, short.identity, .native, long.features, observed);
 }
@@ -668,8 +768,11 @@ test "boundary qualification intersects every window and cannot revive a failed 
     observed.padded_sequence_tokens = Range.exact(128);
     try narrowEntries(&rows, &candidates, observed);
     observed.padded_sequence_tokens = Range.exact(384);
-    try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, narrowEntries(&rows, &candidates, observed));
+    try std.testing.expectError(error.GlinerBoundaryPaddedSequenceLimitExceeded, narrowEntries(&rows, &candidates, observed));
     observed.padded_sequence_tokens = Range.exact(128);
+    // Candidates were already fully consumed by the failed narrow above: this
+    // retry has no previously-matched row left to blame a dimension against,
+    // so it is the generic error, not a revived bounded-length one.
     try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, narrowEntries(&rows, &candidates, observed));
     // A real covering row survives both observations in either order.
     const covering = testEntry();
@@ -678,9 +781,11 @@ test "boundary qualification intersects every window and cannot revive a failed 
     try narrowEntries(&covered_rows, &candidates, observed);
     observed.padded_sequence_tokens = Range.exact(384);
     try narrowEntries(&covered_rows, &candidates, observed);
-    // Total request count cannot be replaced by a smaller current batch size.
+    // Total request count cannot be replaced by a smaller current batch size,
+    // and the rejection names request_items -- the exact production incident
+    // this dimension exists to diagnose.
     observed.request_items = Range.exact(5);
-    try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, narrowEntries(&covered_rows, &candidates, observed));
+    try std.testing.expectError(error.GlinerBoundaryRequestItemsLimitExceeded, narrowEntries(&covered_rows, &candidates, observed));
 }
 
 test "boundary qualification feature preflight never grants unchecked geometry" {
@@ -688,7 +793,10 @@ test "boundary qualification feature preflight never grants unchecked geometry" 
     try matchEntries(&.{row}, row.identity, .native, row.features, null);
     var observed = row.lengths;
     observed.window_count = Range.exact(9);
-    try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, matchEntries(&.{row}, row.identity, .native, row.features, observed));
+    try std.testing.expectError(error.GlinerBoundaryWindowCountLimitExceeded, matchEntries(&.{row}, row.identity, .native, row.features, observed));
+    // supportsFeatures/start() always check the real production table, never
+    // the test-local `row`, so this is an unreviewed identity, not a
+    // bounded-length rejection.
     try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, supportsFeatures(row.identity, .native, row.features));
 }
 
@@ -708,9 +816,14 @@ test "boundary qualification rejects malformed or oversized tables before matchi
     try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, matchEntries(&rows, row.identity, .native, row.features, row.lengths));
     var invalid_selection: Candidates = @enumFromInt(@as(u64, 1) << 63);
     try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, narrowEntries(&.{row}, &invalid_selection, row.lengths));
-    // Even test-supplied synthetic selections cannot access a production row.
+    // Even test-supplied synthetic selections cannot access a production row:
+    // the public narrow() always checks against the real production table, so
+    // this bit index instead lands on the real fastino single-window row,
+    // whose tight request_items=[1,1] rejects testLengths()'s {1,4} -- a
+    // bounded-length rejection against the real row, still not a route to
+    // pretending the synthetic `row` was ever reviewed.
     var synthetic = try startEntries(&.{row}, row.identity, .native, row.features);
-    try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, synthetic.narrow(row.lengths));
+    try std.testing.expectError(error.GlinerBoundaryRequestItemsLimitExceeded, synthetic.narrow(row.lengths));
 }
 
 test "boundary qualification range matching has no saturating or overflow acceptance" {
@@ -720,5 +833,5 @@ test "boundary qualification range matching has no saturating or overflow accept
     observed.document_bytes = Range.exact(std.math.maxInt(u64));
     try matchEntries(&.{row}, row.identity, .native, row.features, observed);
     row.lengths.document_bytes.max -= 1;
-    try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, matchEntries(&.{row}, row.identity, .native, row.features, observed));
+    try std.testing.expectError(error.GlinerBoundaryDocumentBytesLimitExceeded, matchEntries(&.{row}, row.identity, .native, row.features, observed));
 }

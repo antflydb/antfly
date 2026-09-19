@@ -896,6 +896,17 @@ const long_document_geometry_cases = [_]LongDocumentCase{
     .{ .name = "LSM.md \"Read And Scan Work\" (~p95 real section size, 6.8KB)", .path = "../antfly/src/storage/lsm/LSM.md", .heading = "### Read And Scan Work" },
     .{ .name = "VOPR.md \"Completion-Claim Audit\" (37KB real section)", .path = "../../VOPR.md", .heading = "### Completion-Claim Audit" },
     .{ .name = "PDF.md \"Review findings and required fixes\" (max real section across zig/*.md and work-log/**/*.md, 99KB)", .path = "../../PDF.md", .heading = "## Review findings and required fixes" },
+    // Synthetic documents built by concatenating zig/PDF.md's two largest
+    // real sections (verbatim, per a docsaf-accurate Go-side sweep of the
+    // whole ingest corpus that also confirmed no single real section
+    // currently exceeds ~94KB), fixtured under testdata/gliner25/. A
+    // production incident (see GLINER25.md's long-document section) traced 9
+    // dogfood extraction failures to batched multi-item requests, not
+    // document size -- but qualifying past the corpus's current real
+    // single-section maximum, with real measured margin instead of
+    // extrapolation, is still the right defensive posture for corpus growth.
+    .{ .name = "synthetic 130KB (PDF.md sections concatenated)", .path = "testdata/gliner25/long_document_probe/combo130.txt" },
+    .{ .name = "synthetic 182KB/28275-word (PDF.md sections concatenated)", .path = "testdata/gliner25/long_document_probe/combo182.txt" },
 };
 
 /// Measures exact window geometry for one (window_words, overlap_words) pair
@@ -930,7 +941,7 @@ fn measureLongDocumentGeometry(
                 continue;
             };
             owned_full = full;
-            break :blk try extractHeadingSection(full, case.heading);
+            break :blk if (case.heading.len == 0) full else try extractHeadingSection(full, case.heading);
         };
         const body = try std.json.Stringify.valueAlloc(a, .{
             .schema_version = @as(u32, 2),

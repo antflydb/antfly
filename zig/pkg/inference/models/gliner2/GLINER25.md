@@ -15,8 +15,8 @@ first such review.
 | --- | --- | --- | --- | --- |
 | `fastino/gliner2.5-base-v1` (rev `72ac19b486cd4557424c8d61114e7530c243e9b0`) | base | fp32 (safetensors) | native | Qualified (single-window) |
 | `fastino/gliner2.5-base-v1` (rev `72ac19b486cd4557424c8d61114e7530c243e9b0`) | base | fp32 (safetensors) | metal | Qualified (single-window) |
-| `fastino/gliner2.5-base-v1` (rev `72ac19b486cd4557424c8d61114e7530c243e9b0`) | base | fp32 (safetensors) | native | Qualified (long-document windowing, up to 99,008 document bytes -- section 9) |
-| `fastino/gliner2.5-base-v1` (rev `72ac19b486cd4557424c8d61114e7530c243e9b0`) | base | fp32 (safetensors) | metal | Qualified (long-document windowing, up to 99,008 document bytes -- section 9) |
+| `fastino/gliner2.5-base-v1` (rev `72ac19b486cd4557424c8d61114e7530c243e9b0`) | base | fp32 (safetensors) | native | Qualified (long-document windowing, up to 182,000 document bytes -- sections 9, 11) |
+| `fastino/gliner2.5-base-v1` (rev `72ac19b486cd4557424c8d61114e7530c243e9b0`) | base | fp32 (safetensors) | metal | Qualified (long-document windowing, up to 182,000 document bytes -- sections 9, 11) |
 | `fastino/gliner2.5-small-v1` | small | any | any | Not reviewed |
 | `fastino/gliner2.5-multi-v1` | multi | any | any | Not reviewed |
 | Any other digest, revision, or precision of `gliner2.5-base-v1` | base | any | any | Not reviewed |
@@ -657,6 +657,149 @@ the same reviewed rigor as sections 1-6, which this pass did not attempt.
 passed, `22` skipped -- unrelated `small`-backbone tests gated on an unset
 env var --, `0` failed) after every change in this section, including the
 window-size default change and the batching refactor together.
+
+### 11. Follow-up: the 9-request incident was batching, not document geometry, plus a widened bound and named length-limit errors
+
+A real `examples/dogfood ingest -reset` run against the corpus (1,205
+sections; see `dogfood-followup-final2.log`, scratchpad) reported 9
+extraction failures with `error.UnsupportedGlinerBoundaryRuntime`,
+`request_bytes` from 33,130 to 99,631 -- all comfortably within section 9's
+qualified `document_bytes<=99,008` bound, which made the failures look like a
+geometry-qualification gap.
+
+**Root cause: it wasn't document size.** Reproducing single real sections at
+each reported byte size (largest sections of `zig/PDF.md`, `zig/VOPR.md`,
+`zig/VECTORDBBENCH_FINDINGS.md`, `work-log/**`) through both
+`Node.extractDirect` and a live `antfly inference run --port 8098` server
+never failed -- every individual section, up to the real corpus maximum, was
+served correctly. Searching for **pairs** of real corpus sections whose
+combined multi-item batch request size matched each of the 9 reported sizes
+found near-exact matches for all 9 (approximate-size diff under 50 bytes for
+7 of 9, under 100 for the rest, before accounting for JSON-escaping of real
+content). The actual cause:
+`zig/pkg/inference/src/server/server.zig`'s `resolvedExecutorBatchImplementation`
+advertised **native batching** (`mode = .native`, `max_items =
+max_serial_family_batch_items = 128`) for the GLiNER boundary
+(`native_gliner_extraction`) executor kind, so
+`zig/pkg/antfly/src/asset_producer_runtime.zig`'s batcher (opportunistically,
+under concurrent ingestion) grouped multiple documents into one wire request
+whenever several extraction jobs happened to be pending at once. Every
+`examples/dogfood` document requests `long_document.mode=window`
+unconditionally (section 8), so any such batch had `request_items > 1` --
+which both the single-window and long-document production rows have always
+required to be exactly `1` (`LengthContract.request_items`, since no
+correctness evidence for a batched multi-item request exists for either
+merge path). The rejection was correct; it was reported as the generic
+`error.UnsupportedGlinerBoundaryRuntime` with no indication that the
+document itself was never the problem.
+
+**Fix: stop advertising a capability that was never qualified.**
+`resolvedExecutorBatchImplementation` now returns `mode = .none, max_items =
+1, preferred_items = 1` unconditionally for `.native_gliner_extraction`,
+regardless of the generic `max_serial_family_batch_items` ceiling used by
+other tasks. This stops the antfly-side batcher from ever grouping GLiNER
+extraction requests, eliminating the incident's root cause without touching
+`zig/pkg/antfly/**`. See `models/gliner_boundary_qualification.test."boundary
+qualification serves the reviewed fastino gliner2.5 base checkpoint and
+still denies any mismatch"` and `server/server.test."microbatch registration
+qualifies concrete GLiNER bundles and Qwen embedding profiles"`.
+
+**Widened the long-document bound anyway, with real measured margin.**
+Independently of the above, the corpus's real maximum section (per an exact
+`docsaf`-accurate Go-side sweep of the whole ingest corpus, not the
+approximate heading-to-heading text search sections 9-10's evidence used)
+is `zig/PDF.md`'s "Review findings and required fixes" at 92,302 body bytes
+/ 14,503 words / 15 windows at the default 1024-word window -- already
+inside the section 9/10 bound, and no other real section comes close. To
+qualify past today's corpus maximum with real margin (not extrapolation --
+this file's stated policy), two synthetic documents were built by
+concatenating `zig/PDF.md`'s two largest real sections verbatim (130KB and
+182KB/28,275 words), fixtured under
+`zig/pkg/inference/testdata/gliner25/long_document_probe/`, and swept
+through `extractors/gliner_boundary_qualification.zig`'s existing
+long-document geometry test at both window_words=1024 and 4096:
+
+```
+document_bytes=[26,182000] document_words=[5,28275] window_count=[1,29] window_words=[5,4096] padded_sequence_tokens=[106,5708]
+```
+
+`window_count` rose from 17 to 29 (window_words=1024: up to 29 windows;
+window_words=4096: up to 8) and `document_bytes`/`document_words` rose to
+182,000/28,275; `window_words`/`padded_sequence_tokens` were already wide
+enough (the new synthetic documents' per-window token counts, up to 4,831,
+stayed under the existing 5,708 maximum). This is now the production
+`fastino_gliner25_base_v1_long_document_lengths` row.
+
+**Bounded-length rejections now name the dimension.** A closed-policy
+rejection was always either "identity/backend/feature never reviewed" or
+"geometry outside the reviewed row," collapsed into the same
+`error.UnsupportedGlinerBoundaryRuntime`. These are now distinguished:
+`models/gliner_boundary_qualification.zig`'s `Candidates.narrow`/`require`
+return one of six new named errors
+(`error.GlinerBoundary{RequestItems,DocumentBytes,DocumentWords,WindowCount,
+WindowWords,PaddedSequence}LimitExceeded`) when identity, backend, and every
+required feature already matched a reviewed row but the observed geometry
+did not -- the generic error is now reserved for an actually-unreviewed
+request shape. `extractors/extraction_v2.zig`'s `errorDetails` maps all six
+to HTTP 413 `EXTRACTION_LIMIT_EXCEEDED` (the same family as
+`BoundaryTextLimitExceeded` and friends) with a message naming the exceeded
+dimension, instead of the generic 400 `UNSUPPORTED_EXTRACTION_FEATURE`. A
+request batching more than one document (the exact incident above) now
+returns `error.GlinerBoundaryRequestItemsLimitExceeded` /
+`"GLiNER boundary extraction exceeds the qualified request_items (batch
+size) limit"` rather than a bare unsupported-feature response.
+
+**The long executor's window-batching now recovers from real memory
+pressure instead of failing the whole document.** `window_batch_size`
+(section 10's grouped-window batching, default 4) is a starting point, not
+a fixed shape: an `error.OutOfMemory` while encoding/scoring one group (host
+or device allocation pressure -- never a declared evidence-budget rejection,
+which a smaller group would not relieve) now retries the same starting
+window position with a strictly smaller group (halved, rounding up, down to
+one window) instead of failing the whole document or repeating the
+identical shape. Verified two ways: a pure property test that the halving
+sequence from any starting size always strictly decreases and reaches
+exactly 1 in a bounded number of steps, and a real-model integration test
+(pinned base checkpoint, native) that wraps the executor's allocator in a
+6 MiB `BoundedAllocator` -- small enough that the configured group of 4
+windows cannot allocate but a smaller group can -- and confirms the document
+still completes with the correct window count and nonempty entities, versus
+an unbounded control run.
+
+**On the reported CPU-spin/retry-storm follow-up.** A later run (after an
+unrelated drain-livelock fix) hit `error.GlinerBoundaryRequestItemsLimitExceeded`
+and `error.InferenceInvocationMemoryExceeded` on the large sections, then the
+ingest process stalled at 100% CPU with no further log output
+(`dogfood-drain-fix.log`, scratchpad). Investigation confirmed: every
+`GlinerBoundary*LimitExceeded` error (like the pre-existing
+`UnsupportedGlinerBoundaryRuntime`) collapses to the stable
+`error.InferenceProviderFailure` at the provider ABI boundary
+(`zig/pkg/antfly/src/standalone/provider_failure.zig`), which
+`enrichment_runtime.zig`'s `enrichmentErrorDisposition` already classifies
+`.terminal_request` (not retried) -- confirmed by code reading and by
+reproducing the exact 2-item-batch rejection against a live `antfly
+inference run` server with no hang or elevated CPU afterward. But
+`error.InferenceInvocationMemoryExceeded` -- a deterministic,
+request-byte-size-based pre-flight estimate in
+`asset_producer_runtime.zig`/`asset_producer.zig`, raised **before** the
+GLiNER executor is ever invoked, unrelated to `window_batch_size` -- is
+**not** in that disposition table and defaults to `.retryable_request`; the
+log shows exactly 5 wasted retries before a terminal give-up. This fix (and
+the still-open CPU-spin root cause, which the standalone HTTP server could
+not reproduce and needs an embedded-worker repro with `sample`/`lldb`) both
+live in `zig/pkg/antfly/**`, outside this file's ownership -- documented in
+`gliner25-retry-and-spin-handoff.md` (scratchpad).
+
+**Verification.** `zig build inference-test -Doptimize=ReleaseFast --
+--test-filter "gliner boundary"` (native + Metal; `160` selected, `138`
+passed, `22` skipped, `0` failed) and `--test-filter "extraction"` (`100`
+selected, `99` passed, `1` skipped, `0` failed) after every change in this
+section. A live `antfly inference run --port 8098` server (same budget
+flags as section 9) served the real 99,631-byte corpus-maximum request
+(`zig/PDF.md`'s "Review findings and required fixes") end to end: HTTP 200,
+279 entities and 13 relations, ~6-7s, both before and after a full
+`zig build -Doptimize=ReleaseFast` rebuild with every change in this
+section applied.
 
 ## How to re-qualify a different or wider artifact
 
