@@ -9568,11 +9568,12 @@ pub const DataServer = struct {
             error.Timeout => error.LeaderUnavailable,
             else => err,
         };
-        return (try apply_sm.write_source.source().txnStatusGroupLocal(
+        return (try apply_sm.write_source.source().txnStatusGroupLocalUntil(
             alloc,
             group_id,
             table_name,
             txn_id,
+            deadline_ns,
         )) orelse error.UnknownGroup;
     }
 
@@ -17860,6 +17861,15 @@ pub const DataServer = struct {
     }
 
     fn runProvisionedStartupCatchUp(self: *DataServer) ProvisionedStartupCatchUpStats {
+        // Recovery requests enqueue only owned, bounded hints. Native owner
+        // restoration runs on this existing shutdown-owned lifecycle lane,
+        // independently of the request's expired recovery budget.
+        if (self.kernel_owner_source) |source| {
+            source.drainRecoveryOwnerRequest() catch |err|
+                std.log.warn("recovery owner lifecycle retry deferred err={s}", .{@errorName(err)});
+        }
+        self.liveRuntimeWriteSource().drainRecoveryOwnerWarmups() catch |err|
+            std.log.warn("native recovery owner lifecycle retry deferred err={s}", .{@errorName(err)});
         const started_epoch = self.provisioned_startup_catch_up_epoch.load(.acquire);
         const requested_full_scan_epoch = self.provisioned_startup_catch_up_full_scan_epoch.load(.acquire);
         const full_scan = requested_full_scan_epoch !=
@@ -18920,14 +18930,19 @@ pub const DataServer = struct {
         return .skip_nonlocal;
     }
 
+    fn hasPendingRecoveryOwners(self: *DataServer) bool {
+        if (self.kernel_owner_source) |source| if (source.hasPendingRecoveryOwners()) return true;
+        return self.liveRuntimeWriteSource().hasPendingRecoveryOwnerWarmups();
+    }
+
     fn maybeRequestProvisionedStartupCatchUp(self: *DataServer) !void {
-        const registration = self.store_registration orelse return;
-        _ = registration;
-        if (!self.provisioned_startup_catch_up_dirty.load(.acquire)) return;
+        const recovery_pending = self.hasPendingRecoveryOwners();
+        if (self.store_registration == null and !recovery_pending) return;
+        if (!self.provisioned_startup_catch_up_dirty.load(.acquire) and !recovery_pending) return;
 
         const now_ms = self.backgroundMonotonicMs();
         const not_before_ms = self.provisioned_startup_catch_up_not_before_ms.load(.acquire);
-        if (not_before_ms != 0 and now_ms < not_before_ms) return;
+        if (!recovery_pending and not_before_ms != 0 and now_ms < not_before_ms) return;
         const last_at_ms = self.provisioned_startup_catch_up_last_run_at_ms.load(.monotonic);
         if (last_at_ms != 0 and now_ms -| last_at_ms < (if (self.schema_repair_pending.load(.acquire)) @as(u64, 100) else provisioned_startup_catch_up_interval_ms)) return;
         self.requestProvisionedStartupCatchUp() catch |err| switch (err) {
@@ -19043,8 +19058,7 @@ pub const DataServer = struct {
     }
 
     fn requestProvisionedStartupCatchUp(self: *DataServer) !void {
-        const registration = self.store_registration orelse return;
-        _ = registration;
+        if (self.store_registration == null and !self.hasPendingRecoveryOwners()) return;
         try self.requestProvisionedStartupCatchUpWithSubmitter(submitBackgroundJob);
     }
 
@@ -29375,6 +29389,77 @@ pub const consumer_tests = consumerTests();
 fn consumerTests() type {
     if (!(@import("builtin").is_test and !implementation_tests_only)) return struct {};
     const Suite = struct {
+        test "workload admission recovery lifecycle scheduler opens deferred owner without request budget" {
+            if (comptime !linked_storage) return error.SkipZigTest;
+            const alloc = std.testing.allocator;
+            var directory = try @import("../common/test_directory.zig").TestDirectory.init("data-recovery-owner-job");
+            defer directory.cleanup();
+            const root = std.mem.span(directory.path().ptr);
+            const Fixture = struct {
+                fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
+                    return .{ .metadata_group_id = 9, .metrics = .{} };
+                }
+                fn admin(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+                    return error.UnexpectedAdminSnapshot;
+                }
+                fn freeAdmin(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+                fn point(_: *anyopaque, _: []const u8, _: ?u64) !antfly.metadata_api.CatalogRoutingSnapshot {
+                    return .{
+                        .metadata_group_id = 9,
+                        .tables = @constCast((&[_]antfly.metadata.TableRecord{.{ .table_id = 1, .name = "docs", .indexes_json = "{}" }})[0..]),
+                        .ranges = @constCast((&[_]antfly.metadata.RangeRecord{.{ .table_id = 1, .group_id = 2, .range_id = 3, .start_key = "", .doc_identity_shard_id = 2, .doc_identity_range_id = 3 }})[0..]),
+                    };
+                }
+                fn freePoint(_: *anyopaque, _: *antfly.metadata_api.CatalogRoutingSnapshot) void {}
+                fn catalog() antfly.public_api.table_catalog.CatalogSource {
+                    return .{ .ptr = undefined, .vtable = &.{ .admin_snapshot = admin, .free_admin_snapshot = freeAdmin, .table_routing_snapshot = point, .free_routing_snapshot = freePoint } };
+                }
+            };
+            const txn_id: antfly.db.types.TxnId = @splat(0x7b);
+            const participant = "table2:00000004:docs:2";
+            {
+                var original = antfly.public_api.ProvisionedKernelOwnerSource.init(alloc, root, Fixture.catalog(), antfly.raft.read_gate.alreadyReadSafeBarrier());
+                defer original.deinit();
+                const writes = original.writeSource();
+                _ = try writes.txnBeginGroupLocal(alloc, 2, "docs", txn_id, 100, 1, true, &.{participant});
+                _ = try writes.txnResolveGroupLocal(alloc, 2, "docs", txn_id, .committed, 200, 1, .propose);
+            }
+            var runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{});
+            defer runtime.deinit();
+            const owner_source = try alloc.create(antfly.public_api.ProvisionedKernelOwnerSource);
+            owner_source.* = antfly.public_api.ProvisionedKernelOwnerSource.init(alloc, root, Fixture.catalog(), antfly.raft.read_gate.alreadyReadSafeBarrier());
+            var server: DataServer = .{
+                .alloc = alloc,
+                .backend_runtime = runtime.ptr(),
+                .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+                .read_source = antfly.public_api.ProvisionedTableReadSource.init(root, Fixture.catalog(), antfly.raft.read_gate.alreadyReadSafeBarrier()),
+                .write_source = antfly.public_api.ProvisionedTableWriteSource.init(root, Fixture.catalog()),
+                .status_source = .{ .ptr = undefined, .vtable = &.{ .status = Fixture.status, .admin_snapshot = Fixture.admin, .free_admin_snapshot = Fixture.freeAdmin } },
+                .api_server_cfg = .{},
+                .query_async_limit = .nothing,
+                .listener_cfg = undefined,
+                .kernel_owner_source = owner_source,
+            };
+            defer server.deinit();
+            const writes = owner_source.writeSource();
+            const request_deadline = platform_time.monotonicNs() + std.time.ns_per_s;
+            try std.testing.expectError(error.CommitPropagationIncomplete, writes.txnAcknowledgeGroupLocalUntil(alloc, 2, "docs", txn_id, participant, request_deadline));
+            try std.testing.expect(owner_source.hasPendingRecoveryOwners());
+            try std.testing.expectEqual(@as(usize, 0), owner_source.ownerCountForTest());
+            // Registration and unrelated schema debt must not suppress this
+            // explicit handoff. The request has already returned; the worker
+            // owns native open and is drained before SourceOwner destruction.
+            try std.testing.expect(server.store_registration == null);
+            server.provisioned_startup_catch_up_dirty.store(false, .release);
+            server.provisioned_startup_catch_up_not_before_ms.store(std.math.maxInt(u64), .release);
+            try server.maybeRequestProvisionedStartupCatchUp();
+            server.drainDataServerBackgroundJobs();
+            try std.testing.expectEqual(@as(u64, 1), server.provisioned_startup_catch_up_completed.load(.acquire));
+            try std.testing.expect(!owner_source.hasPendingRecoveryOwners());
+            try std.testing.expectEqual(@as(usize, 1), owner_source.ownerCountForTest());
+            _ = try writes.txnAcknowledgeGroupLocalUntil(alloc, 2, "docs", txn_id, participant, platform_time.monotonicNs() + std.time.ns_per_s);
+        }
+
         test "workload admission first decision preserves local proposal certainty" {
             if (comptime !linked_storage) return error.SkipZigTest;
             const alloc = std.testing.allocator;
@@ -29400,17 +29485,26 @@ fn consumerTests() type {
                 snapshot: antfly.metadata_api.AdminSnapshot,
                 clock: *VoprIo,
                 expire_on_catalog: bool = false,
+                wait_until_ns: ?u64 = null,
                 fn execute(_: *anyopaque, _: std.mem.Allocator, _: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
                     return .{ .status = 503 };
                 }
                 fn snapshotFn(ptr: *anyopaque) !antfly.metadata_api.AdminSnapshot {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     if (self.expire_on_catalog) self.clock.monotonic_ns = 12 * std.time.ns_per_s;
+                    if (self.wait_until_ns) |deadline| while (platform_time.monotonicNs() < deadline) {
+                        platform_time.sleepNs(std.time.ns_per_ms);
+                    };
                     return self.snapshot;
                 }
                 fn freeSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+                fn point(ptr: *anyopaque, _: []const u8, _: ?u64) !antfly.metadata_api.CatalogRoutingSnapshot {
+                    const value = try snapshotFn(ptr);
+                    return .{ .metadata_group_id = value.status.metadata_group_id, .tables = value.tables, .ranges = value.ranges };
+                }
+                fn freePoint(_: *anyopaque, _: *antfly.metadata_api.CatalogRoutingSnapshot) void {}
                 fn catalog(self: *@This()) antfly.public_api.table_catalog.CatalogSource {
-                    return .{ .ptr = self, .vtable = &.{ .admin_snapshot = snapshotFn, .free_admin_snapshot = freeSnapshot } };
+                    return .{ .ptr = self, .vtable = &.{ .admin_snapshot = snapshotFn, .free_admin_snapshot = freeSnapshot, .table_routing_snapshot = point, .free_routing_snapshot = freePoint } };
                 }
             };
             var tables = [_]antfly.metadata.TableRecord{.{ .table_id = 1, .name = "docs", .indexes_json = "{}" }};
@@ -29490,6 +29584,42 @@ fn consumerTests() type {
             // Acceptance has made the original deadline irrelevant to recovery.
             _ = try host.runRound(0, 16);
             try std.testing.expectEqual(antfly.db.types.TxnStatus.committed, (try source.txnStatusGroupLocal(alloc, 2, "docs", txn_id)).?);
+            const StatusRead = struct {
+                server: *DataServer,
+                alloc: std.mem.Allocator,
+                txn_id: antfly.db.types.TxnId,
+                deadline: u64,
+                done: std.atomic.Value(bool) = .init(false),
+                fn run(work: *@This()) anyerror!antfly.db.types.TxnStatus {
+                    defer work.done.store(true, .release);
+                    return DataServer.localRaftTxnStatusGroupAuthoritativeLocalUntil(work.server, work.alloc, 2, "docs", work.txn_id, work.deadline);
+                }
+                fn observe(data: *DataServer, io: std.Io, allocator: std.mem.Allocator, id: antfly.db.types.TxnId, deadline: u64) !antfly.db.types.TxnStatus {
+                    var work: @This() = .{ .server = data, .alloc = allocator, .txn_id = id, .deadline = deadline };
+                    var future = try io.concurrent(@This().run, .{&work});
+                    var joined = false;
+                    defer if (!joined) {
+                        _ = future.await(io) catch {};
+                    };
+                    while (!work.done.load(.acquire) and platform_time.monotonicNs() < deadline) {
+                        {
+                            lockAtomic(&data.data_raft_mutex);
+                            defer data.data_raft_mutex.unlock();
+                            _ = try data.data_raft.?.host.http_host.host.runRound(0, 16);
+                        }
+                        platform_time.sleepNs(std.time.ns_per_ms);
+                    }
+                    joined = true;
+                    return future.await(io);
+                }
+            };
+            // The real quorum read barrier must pass the original remaining
+            // budget into raw owner acquisition, without recursively issuing
+            // another Raft read or falling back to an unbounded local read.
+            try std.testing.expectEqual(antfly.db.types.TxnStatus.committed, try StatusRead.observe(&server, io_impl.io(), alloc, txn_id, platform_time.monotonicNs() + 5 * std.time.ns_per_s));
+            fixture.wait_until_ns = platform_time.monotonicNs() + std.time.ns_per_s;
+            try std.testing.expectError(error.Timeout, StatusRead.observe(&server, io_impl.io(), alloc, txn_id, fixture.wait_until_ns.?));
+            fixture.wait_until_ns = null;
             // A different leader must never trigger forwarding on this proof
             // path: local nonacceptance says nothing about a remote proposal.
             const committed = host.raftStatus(2).?;

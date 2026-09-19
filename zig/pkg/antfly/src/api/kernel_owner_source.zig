@@ -86,6 +86,27 @@ pub const ProvisionedKernelOwnerSource = struct {
     owner_cache_hits: std.atomic.Value(u64) = .init(0),
     owner_cache_misses: std.atomic.Value(u64) = .init(0),
 
+    // Requests only publish a bounded hint; native open/close belongs to the
+    // independently owned DATA lifecycle worker. No caller memory escapes.
+    recovery_owner_mutex: std.atomic.Mutex = .unlocked,
+    recovery_owner_requests: [256]RecoveryOwnerRequest = @splat(.{}),
+    recovery_owner_pending: std.atomic.Value(usize) = .init(0),
+    recovery_owner_closing: std.atomic.Value(bool) = .init(false),
+    recovery_owner_draining: std.atomic.Value(bool) = .init(false),
+    recovery_owner_cursor: usize = 0,
+
+    const RecoveryOwnerRequest = struct {
+        group_id: u64 = 0,
+        // Covers public names and qualified internal restore identities.
+        table_name: [1024]u8 = undefined,
+        table_name_len: usize = 0,
+        revision: u64 = 0,
+
+        fn name(self: *const @This()) []const u8 {
+            return self.table_name[0..self.table_name_len];
+        }
+    };
+
     const CompletionInstallation = struct {
         binding: abi.completion_pool.InstallBinding,
         read_schema_json: []u8,
@@ -347,10 +368,12 @@ pub const ProvisionedKernelOwnerSource = struct {
         return self;
     }
 
-    /// Call only after every attached read/write source has drained. Owner
+    /// Call only after every attached read/write source and lifecycle job has drained. Owner
     /// closure is deliberately centralized here so one live DB serves both
     /// operation families for its full group lifecycle.
     pub fn deinit(self: *ProvisionedKernelOwnerSource) void {
+        self.recovery_owner_closing.store(true, .release);
+        std.debug.assert(!self.recovery_owner_draining.load(.acquire));
         lock(&self.mutex);
         self.quiescing = true;
         for (self.entries.items) |entry| {
@@ -375,9 +398,10 @@ pub const ProvisionedKernelOwnerSource = struct {
 
     /// Close admission and join every DB-owned worker while its Raft,
     /// candidate, sink, and provider callback contexts are still alive.
-    /// Attached request/apply sources must already be stopped. Keep the
+    /// Attached request/apply sources and lifecycle jobs must already be stopped. Keep the
     /// registry and context valid until their ordinary final deinit.
     pub fn quiesce(self: *ProvisionedKernelOwnerSource, io: std.Io) !void {
+        self.recovery_owner_closing.store(true, .release);
         while (true) {
             const drained = blk: {
                 lock(&self.mutex);
@@ -442,8 +466,10 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .txn_prepare_group_local = txnPrepareGroupLocal,
                 .txn_resolve_group_local = txnResolveGroupLocal,
                 .txn_resolve_group_local_with_cancellation = txnResolveGroupLocalWithCancellation,
+                .txn_resolve_group_local_until = txnResolveGroupLocalUntil,
                 .txn_decide_group_local_with_pre_decision_context = txnDecideGroupLocalWithPreDecisionContext,
                 .txn_status_group_local = txnStatusGroupLocal,
+                .txn_status_group_local_until = txnStatusGroupLocalUntil,
                 .txn_acknowledge_group_local = txnAcknowledgeGroupLocal,
                 .txn_acknowledge_group_local_until = txnAcknowledgeGroupLocalUntil,
                 .begin_bulk_ingest_group_local = beginBulkIngestGroupLocal,
@@ -1969,6 +1995,129 @@ pub const ProvisionedKernelOwnerSource = struct {
 
     fn transactionRecoveryStatus(err: anyerror) abi.Status {
         return kernel_error_identity.statusFromError(err);
+    }
+
+    fn checkRecoveryBudget(deadline_ns: u64, cancellation: db_types.CancellationToken) !void {
+        try cancellation.check();
+        if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+    }
+
+    fn acquireForRecovery(
+        self: *ProvisionedKernelOwnerSource,
+        group_id: u64,
+        table_name: []const u8,
+        deadline_ns: u64,
+        cancellation: db_types.CancellationToken,
+    ) !Lease {
+        try checkRecoveryBudget(deadline_ns, cancellation);
+        const catalog_deadline = self.catalog.budget(null).deadlineFrom(table_catalog.RoutingBudget.init(deadline_ns));
+        var descriptor = self.loadDescriptorWithDeadline(self.alloc, group_id, table_name, catalog_deadline) catch |err| {
+            try checkRecoveryBudget(deadline_ns, cancellation);
+            return if (err == error.CatalogRoutingUnavailable) error.CommitPropagationIncomplete else err;
+        };
+        defer descriptor.deinit(self.alloc);
+        try checkRecoveryBudget(deadline_ns, cancellation);
+        // Opening, closing, or reconfiguring a native owner cannot be made
+        // interruptible by checking a clock afterwards. Hand that work to the
+        // lifecycle lane; this request only borrows an exact resident match.
+        return self.borrowRecoveryOwner(group_id, table_name, descriptor.view()) catch |err| {
+            try checkRecoveryBudget(deadline_ns, cancellation);
+            if (err == error.CommitPropagationIncomplete) try self.requestRecoveryOwner(group_id, table_name);
+            return err;
+        };
+    }
+
+    fn borrowRecoveryOwner(
+        self: *ProvisionedKernelOwnerSource,
+        group_id: u64,
+        table_name: []const u8,
+        descriptor: descriptor_contract.Descriptor,
+    ) !Lease {
+        if (!self.mutex.tryLock()) return error.CommitPropagationIncomplete;
+        defer self.mutex.unlock();
+        if (self.quiescing) return error.Canceled;
+        if (self.completion_installations.get(group_id)) |record| {
+            if (record.state != .backed or !record.active) return error.CompletionAdmissionUnavailable;
+        }
+        if (self.publicationPendingLocked(group_id, table_name)) return error.CommitPropagationIncomplete;
+        for (self.entries.items) |entry| {
+            if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name)) continue;
+            if (!entry.resident or entry.retired or entry.closing or
+                entry.generation != descriptor.lsm_root_generation or
+                !entry.identity.eql(descriptor.identity) or
+                !std.mem.eql(u8, entry.schema_json, descriptor.schema_json) or
+                !std.mem.eql(u8, entry.indexes_json, descriptor.indexes_json) or
+                !std.meta.eql(entry.table_storage, descriptor.table_storage))
+                return error.CommitPropagationIncomplete;
+            return self.borrowEntryLocked(entry) catch return error.CommitPropagationIncomplete;
+        }
+        return error.CommitPropagationIncomplete;
+    }
+
+    fn requestRecoveryOwner(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8) !void {
+        if (self.recovery_owner_closing.load(.acquire)) return error.Canceled;
+        if (table_name.len == 0 or table_name.len > 1024) return error.CommitPropagationIncomplete;
+        if (!self.recovery_owner_mutex.tryLock()) return error.CommitPropagationIncomplete;
+        defer self.recovery_owner_mutex.unlock();
+        if (self.recovery_owner_closing.load(.acquire)) return error.Canceled;
+        var free_slot: ?*RecoveryOwnerRequest = null;
+        for (&self.recovery_owner_requests) |*request| {
+            if (request.table_name_len == 0) {
+                if (free_slot == null) free_slot = request;
+            } else if (request.group_id == group_id and std.mem.eql(u8, request.name(), table_name)) {
+                // A request arriving during open must survive that attempt's
+                // completion; its descriptor may name a newer generation.
+                request.revision = std.math.add(u64, request.revision, 1) catch return error.CommitPropagationIncomplete;
+                return;
+            }
+        }
+        const slot = free_slot orelse return error.CommitPropagationIncomplete;
+        slot.group_id = group_id;
+        slot.table_name_len = table_name.len;
+        @memcpy(slot.table_name[0..table_name.len], table_name);
+        slot.revision = 1;
+        _ = self.recovery_owner_pending.fetchAdd(1, .release);
+    }
+
+    pub fn hasPendingRecoveryOwners(self: *const ProvisionedKernelOwnerSource) bool {
+        return !self.recovery_owner_closing.load(.acquire) and self.recovery_owner_pending.load(.acquire) != 0;
+    }
+
+    /// Called by DATA's existing shutdown-owned lifecycle job, never by the
+    /// deadline-bound request. Each pass attempts one slot and rotates before
+    /// doing I/O, so an unavailable catalog/owner cannot starve other groups.
+    pub fn drainRecoveryOwnerRequest(self: *ProvisionedKernelOwnerSource) !void {
+        if (!self.hasPendingRecoveryOwners()) return;
+        if (self.recovery_owner_draining.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return;
+        defer self.recovery_owner_draining.store(false, .release);
+        const selected = blk: {
+            if (!self.recovery_owner_mutex.tryLock()) return;
+            defer self.recovery_owner_mutex.unlock();
+            if (self.recovery_owner_closing.load(.acquire)) return;
+            for (0..self.recovery_owner_requests.len) |offset| {
+                const index = (self.recovery_owner_cursor + offset) % self.recovery_owner_requests.len;
+                const request = self.recovery_owner_requests[index];
+                if (request.table_name_len == 0) continue;
+                self.recovery_owner_cursor = (index + 1) % self.recovery_owner_requests.len;
+                break :blk .{ .index = index, .request = request };
+            }
+            return;
+        };
+        // Fresh metadata is required after every failure or topology change.
+        // Even the lifecycle lane uses the bounded point projection; only the
+        // native open itself is outside the caller's recovery budget.
+        const catalog_deadline = self.catalog.budget(null).deadlineFrom(table_catalog.RoutingBudget.init(platform_time.monotonicNs() +| 5 * std.time.ns_per_s));
+        var descriptor = try self.loadDescriptorWithDeadline(self.alloc, selected.request.group_id, selected.request.name(), catalog_deadline);
+        defer descriptor.deinit(self.alloc);
+        var lease = try self.acquireDescriptor(selected.request.group_id, selected.request.name(), descriptor.path, descriptor.view());
+        defer lease.deinit();
+        lock(&self.recovery_owner_mutex);
+        defer self.recovery_owner_mutex.unlock();
+        const current = &self.recovery_owner_requests[selected.index];
+        if (current.revision == selected.request.revision) {
+            current.table_name_len = 0;
+            _ = self.recovery_owner_pending.fetchSub(1, .release);
+        }
     }
 
     const CandidateConsumerBridge = struct {
@@ -4003,6 +4152,34 @@ pub const ProvisionedKernelOwnerSource = struct {
         return {};
     }
 
+    fn txnResolveGroupLocalUntil(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_types.TxnId,
+        status: db_types.TxnStatus,
+        commit_version: u64,
+        _: u64,
+        sync_level: db_types.SyncLevel,
+        deadline_ns: u64,
+        cancellation: db_types.CancellationToken,
+    ) !?void {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        try checkRecoveryBudget(deadline_ns, cancellation);
+        const request_json = try table_writes.encodeStorageKernelBatchRequest(alloc, .{
+            .sync_level = sync_level,
+            .transaction = .{ .resolve = .{ .txn_id = txn_id, .status = status, .commit_version = commit_version } },
+        });
+        defer alloc.free(request_json);
+        var lease = try self.acquireForRecovery(group_id, table_name, deadline_ns, cancellation);
+        defer lease.deinit();
+        try checkRecoveryBudget(deadline_ns, cancellation);
+        var response = try lease.owner().replicatedBatchJson(table_name, request_json);
+        defer response.deinit();
+        return {};
+    }
+
     fn txnDecideGroupLocalWithPreDecisionContext(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -4051,6 +4228,29 @@ pub const ProvisionedKernelOwnerSource = struct {
         };
     }
 
+    fn txnStatusGroupLocalUntil(
+        ptr: *anyopaque,
+        _: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_types.TxnId,
+        deadline_ns: u64,
+    ) !?db_types.TxnStatus {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        var lease = try self.acquireForRecovery(group_id, table_name, deadline_ns, .none);
+        defer lease.deinit();
+        try checkRecoveryBudget(deadline_ns, .none);
+        const status = try lease.owner().transactionStatus(table_name, txn_id);
+        // This is a read, not a new decision: an observation finishing after
+        // its budget cannot substitute for a timely authoritative response.
+        try checkRecoveryBudget(deadline_ns, .none);
+        return switch (status) {
+            .pending => .pending,
+            .committed => .committed,
+            .aborted => .aborted,
+        };
+    }
+
     fn txnAcknowledgeGroupLocal(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -4084,7 +4284,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .transaction = .{ .acknowledge = .{ .txn_id = txn_id, .participant = participant } },
         });
         defer alloc.free(request_json);
-        var lease = try self.acquire(group_id, table_name);
+        var lease = try self.acquireForRecovery(group_id, table_name, deadline_ns, .none);
         defer lease.deinit();
         // Recovery owns this absolute deadline independently of the original
         // caller. Acquisition cannot silently rebase its remaining budget.
@@ -5073,11 +5273,16 @@ test "workload admission recovery ACK deadline and abort token survive owner acq
             };
         }
         fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+        fn point(ptr: *anyopaque, _: []const u8, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
+            const value = try snapshot(ptr);
+            return .{ .metadata_group_id = value.status.metadata_group_id, .tables = value.tables, .ranges = value.ranges };
+        }
+        fn freePoint(_: *anyopaque, _: *metadata_api.CatalogRoutingSnapshot) void {}
     };
     var catalog: Catalog = .{};
     var owner_source = ProvisionedKernelOwnerSource.init(alloc, std.mem.span(directory.path().ptr), .{
         .ptr = &catalog,
-        .vtable = &.{ .admin_snapshot = Catalog.snapshot, .free_admin_snapshot = Catalog.free },
+        .vtable = &.{ .admin_snapshot = Catalog.snapshot, .free_admin_snapshot = Catalog.free, .table_routing_snapshot = Catalog.point, .free_routing_snapshot = Catalog.freePoint },
     }, read_gate.alreadyReadSafeBarrier());
     defer owner_source.deinit();
     const writes = owner_source.writeSource();
@@ -5104,12 +5309,151 @@ test "workload admission recovery ACK deadline and abort token survive owner acq
     _ = try writes.txnBeginGroupLocal(alloc, 2, "docs", abort_id, 300, 1, true, &.{participant});
     var recovery_expired = std.atomic.Value(bool).init(false);
     catalog.cancel_on_catalog = &recovery_expired;
-    try std.testing.expectError(error.Canceled, writes.txnResolveGroupLocalWithCancellation(alloc, 2, "docs", abort_id, .aborted, 301, 1, .propose, .fromAtomic(&recovery_expired)));
+    try std.testing.expectError(error.Canceled, writes.txnResolveGroupLocalUntil(alloc, 2, "docs", abort_id, .aborted, 301, 1, .propose, platform_time.monotonicNs() + std.time.ns_per_s, .fromAtomic(&recovery_expired)));
     catalog.cancel_on_catalog = null;
     try std.testing.expect(recovery_expired.load(.acquire));
     try std.testing.expectEqual(db_types.TxnStatus.pending, (try writes.txnStatusGroupLocal(alloc, 2, "docs", abort_id)).?);
-    _ = try writes.txnResolveGroupLocalWithCancellation(alloc, 2, "docs", abort_id, .aborted, 301, 1, .propose, .none);
+    _ = try writes.txnResolveGroupLocalUntil(alloc, 2, "docs", abort_id, .aborted, 301, 1, .propose, platform_time.monotonicNs() + std.time.ns_per_s, .none);
     try std.testing.expectEqual(db_types.TxnStatus.aborted, (try writes.txnStatusGroupLocal(alloc, 2, "docs", abort_id)).?);
+}
+
+test "workload admission recovery descriptor acquisition translates clocks and never falls back" {
+    const alloc = std.testing.allocator;
+    const ns = std.time.ns_per_s;
+    var clock = PublicationWaitTest{ .now_ns = @intCast(platform_time.monotonicNs() + 1000 * ns) };
+    var clock_vtable: std.Io.VTable = undefined;
+    const io = clock.io(&clock_vtable);
+    const Fixture = struct {
+        last_deadline: ?u64 = null,
+        point_calls: usize = 0,
+        admin_calls: usize = 0,
+        cancel_on_point: ?*std.atomic.Value(bool) = null,
+        fn admin(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.admin_calls += 1;
+            return error.UnexpectedAdminSnapshot;
+        }
+        fn freeAdmin(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+        fn point(ptr: *anyopaque, _: []const u8, deadline: ?u64) !metadata_api.CatalogRoutingSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.point_calls += 1;
+            self.last_deadline = deadline;
+            if (self.cancel_on_point) |signal| signal.store(true, .release);
+            return .{ .tables = &.{}, .ranges = &.{} };
+        }
+        fn freePoint(_: *anyopaque, _: *metadata_api.CatalogRoutingSnapshot) void {}
+    };
+    var fixture: Fixture = .{};
+    var source = ProvisionedKernelOwnerSource.init(alloc, "unused", .{
+        .ptr = &fixture,
+        .io = @import("../runtime_io_abi.zig").Borrow.init(&io),
+        .vtable = &.{ .admin_snapshot = Fixture.admin, .free_admin_snapshot = Fixture.freeAdmin, .table_routing_snapshot = Fixture.point, .free_routing_snapshot = Fixture.freePoint },
+    }, read_gate.alreadyReadSafeBarrier());
+    defer source.deinit();
+    const writes = source.writeSource();
+    const txn_id: db_types.TxnId = @splat(0x79);
+    const native_deadline = platform_time.monotonicNs() + 5 * ns;
+    const catalog_now = source.catalog.budget(null).nowNs();
+    try std.testing.expectError(error.CommitPropagationIncomplete, writes.txnAcknowledgeGroupLocalUntil(alloc, 2, "docs", txn_id, "table2:00000004:docs:2", native_deadline));
+    try std.testing.expect(fixture.last_deadline.? > catalog_now);
+    try std.testing.expect(fixture.last_deadline.? <= catalog_now + 5 * ns);
+    try std.testing.expectEqual(@as(usize, 0), fixture.admin_calls);
+    try std.testing.expect(!source.hasPendingRecoveryOwners());
+    try std.testing.expectError(error.Timeout, writes.txnAcknowledgeGroupLocalUntil(alloc, 2, "docs", txn_id, "table2:00000004:docs:2", 0));
+    try std.testing.expectEqual(@as(usize, 1), fixture.point_calls);
+    var signal = std.atomic.Value(bool).init(false);
+    fixture.cancel_on_point = &signal;
+    try std.testing.expectError(error.Canceled, writes.txnResolveGroupLocalUntil(alloc, 2, "docs", txn_id, .aborted, 10, 1, .propose, native_deadline, .fromAtomic(&signal)));
+    try std.testing.expectEqual(@as(usize, 2), fixture.point_calls);
+    try std.testing.expect(!source.hasPendingRecoveryOwners());
+    // A rolling peer without point projection cannot silently select the
+    // unbounded administrative projection, even when it can serve one.
+    source.catalog.vtable = &.{ .admin_snapshot = Fixture.admin, .free_admin_snapshot = Fixture.freeAdmin };
+    try std.testing.expectError(error.CommitPropagationIncomplete, writes.txnAcknowledgeGroupLocalUntil(alloc, 2, "docs", txn_id, "table2:00000004:docs:2", native_deadline));
+    try std.testing.expectEqual(@as(usize, 0), fixture.admin_calls);
+    try std.testing.expectEqual(@as(usize, 0), source.ownerCountForTest());
+}
+
+test "workload admission recovery owner lifecycle opens cold debt independently and retries fairly" {
+    const alloc = std.testing.allocator;
+    var directory = try @import("../common/test_directory.zig").TestDirectory.init("recovery-owner-lifecycle");
+    defer directory.cleanup();
+    const Catalog = struct {
+        point_calls: usize = 0,
+        fn admin(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedAdminSnapshot;
+        }
+        fn freeAdmin(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+        fn point(ptr: *anyopaque, name: []const u8, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.point_calls += 1;
+            if (!std.mem.eql(u8, name, "docs")) return error.CatalogRoutingUnavailable;
+            const metadata = @import("../metadata/table_manager.zig");
+            return .{
+                .metadata_group_id = 9,
+                .tables = @constCast((&[_]metadata.TableRecord{.{ .table_id = 1, .name = "docs", .indexes_json = "{}" }})[0..]),
+                .ranges = @constCast((&[_]metadata.RangeRecord{.{ .table_id = 1, .group_id = 2, .range_id = 3, .start_key = "", .doc_identity_shard_id = 2, .doc_identity_range_id = 3 }})[0..]),
+            };
+        }
+        fn freePoint(_: *anyopaque, _: *metadata_api.CatalogRoutingSnapshot) void {}
+        fn source(self: *@This()) table_catalog.CatalogSource {
+            return .{ .ptr = self, .vtable = &.{ .admin_snapshot = admin, .free_admin_snapshot = freeAdmin, .table_routing_snapshot = point, .free_routing_snapshot = freePoint } };
+        }
+    };
+    var catalog: Catalog = .{};
+    const root = std.mem.span(directory.path().ptr);
+    const txn_id: db_types.TxnId = @splat(0x7a);
+    const participant = "table2:00000004:docs:2";
+    {
+        var original = ProvisionedKernelOwnerSource.init(alloc, root, catalog.source(), read_gate.alreadyReadSafeBarrier());
+        defer original.deinit();
+        const writes = original.writeSource();
+        _ = try writes.txnBeginGroupLocal(alloc, 2, "docs", txn_id, 100, 1, true, &.{participant});
+        _ = try writes.txnResolveGroupLocal(alloc, 2, "docs", txn_id, .committed, 200, 1, .propose);
+    }
+    var restored = ProvisionedKernelOwnerSource.init(alloc, root, catalog.source(), read_gate.alreadyReadSafeBarrier());
+    defer restored.deinit();
+    const writes = restored.writeSource();
+    // One unavailable group precedes the real debt, exercising cursor fairness.
+    try restored.requestRecoveryOwner(9, "unavailable");
+    var request_name = [_]u8{ 'd', 'o', 'c', 's' };
+    try std.testing.expectError(error.CommitPropagationIncomplete, writes.txnStatusGroupLocalUntil(alloc, 2, &request_name, txn_id, platform_time.monotonicNs() + std.time.ns_per_s));
+    for (0..2) |_| {
+        try std.testing.expectError(error.CommitPropagationIncomplete, writes.txnAcknowledgeGroupLocalUntil(alloc, 2, &request_name, txn_id, participant, platform_time.monotonicNs() + std.time.ns_per_s));
+    }
+    request_name[0] = 'X';
+    try std.testing.expectEqual(@as(usize, 2), restored.recovery_owner_pending.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), restored.ownerCountForTest());
+    try std.testing.expectError(error.CatalogRoutingUnavailable, restored.drainRecoveryOwnerRequest());
+    try std.testing.expectEqual(@as(usize, 0), restored.ownerCountForTest());
+    // DATA's lifecycle lane invokes this method after the request has returned.
+    try restored.drainRecoveryOwnerRequest();
+    try std.testing.expectEqual(@as(usize, 1), restored.ownerCountForTest());
+    try std.testing.expectEqual(@as(usize, 1), restored.recovery_owner_pending.load(.acquire));
+    try std.testing.expectEqual(db_types.TxnStatus.committed, (try writes.txnStatusGroupLocalUntil(alloc, 2, "docs", txn_id, platform_time.monotonicNs() + std.time.ns_per_s)).?);
+    _ = try writes.txnAcknowledgeGroupLocalUntil(alloc, 2, "docs", txn_id, participant, platform_time.monotonicNs() + std.time.ns_per_s);
+    _ = try writes.txnAcknowledgeGroupLocalUntil(alloc, 2, "docs", txn_id, participant, platform_time.monotonicNs() + std.time.ns_per_s);
+}
+
+test "workload admission recovery owner handoff bounds admission and closes with lifecycle" {
+    var source = ProvisionedKernelOwnerSource.init(std.testing.failing_allocator, "unused", undefined, undefined);
+    defer source.deinit();
+    // Queueing owns its strings without consulting the normal allocator.
+    var name = [_]u8{ 'd', 'o', 'c', 's' };
+    for (0..source.recovery_owner_requests.len) |index| try source.requestRecoveryOwner(index + 1, &name);
+    name[0] = 'X';
+    try std.testing.expectEqualStrings("docs", source.recovery_owner_requests[0].name());
+    try source.requestRecoveryOwner(1, "docs");
+    try std.testing.expectEqual(source.recovery_owner_requests.len, source.recovery_owner_pending.load(.acquire));
+    try std.testing.expectError(error.CommitPropagationIncomplete, source.requestRecoveryOwner(999, "docs"));
+    try std.testing.expect(source.recovery_owner_mutex.tryLock());
+    try std.testing.expectError(error.CommitPropagationIncomplete, source.requestRecoveryOwner(1, "docs"));
+    source.recovery_owner_mutex.unlock();
+    try source.quiesce(std.testing.io);
+    try std.testing.expect(!source.hasPendingRecoveryOwners());
+    try std.testing.expectError(error.Canceled, source.requestRecoveryOwner(1, "docs"));
+    // No catalog or native owner call occurs once shutdown closes admission.
+    try source.drainRecoveryOwnerRequest();
 }
 
 test "workload admission provisioned routed reads translate fence clock domains" {

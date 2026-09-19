@@ -260,3 +260,26 @@ replica progress'`. Evidence: `/tmp/workload-invalid-participant-data1.log`.
   Evidence: `/tmp/workload-recovery-owner-deadline6.log`, actual exit0, one test
   with zero skips, failures or leaks. This stage prevents late submission;
   bounding descriptor acquisition itself remains the next stage.
+- Recovery owner acquisition now uses the bounded point catalog projection,
+  translates the original native deadline into the catalog clock, and borrows
+  only an exact resident owner. It never falls back to an administrative scan
+  or opens/closes native storage on the caller's recovery budget. A fixed,
+  deduplicated queue owns cold-owner hints; DATA's existing shutdown-owned
+  lifecycle lane rotates failed groups and restores owners independently of
+  request admission, registration, and unrelated schema retry backoff. Resolve,
+  ACK, and raw local status share this path. DATA retains the same deadline
+  when reading owner status after the real Raft read barrier.
+  The owning compiled SourceOwner gate passed four tests, and DATA passed
+  three consumer tests, all with zero skips, failures or leaks. They verify
+  shifted catalog clocks, no legacy projection fallback, cancellation before C
+  submission, cold status/ACK followed by lifecycle restoration and successful
+  retry, bounded queue overflow/deduplication/shutdown, actual DATA job
+  scheduling, and status expiry after the quorum barrier. Existing canonical
+  proposal and disabled-admission WAL restart coverage also passed. Evidence:
+  `/tmp/workload-recovery-owner-bounded2.log` (actual exit0) and
+  `/tmp/workload-recovery-owner-data2.log` (actual exit0).
+  This is metadata-routed recovery: offline transaction-control recovery still
+  requires the separately owned durable control proof. Catalog point callbacks
+  accept a deadline but no cancellation token; cancellation is checked before
+  and after the bounded fetch and before mutation submission. Fresh production
+  activation remains disabled.
