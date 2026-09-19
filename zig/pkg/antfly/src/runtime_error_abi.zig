@@ -477,6 +477,7 @@ pub const Detail = enum(c_int) {
     completion_admission_unavailable,
     completion_admission_policy_changed,
     missing_completion_admission_guard,
+    invalid_completion_catalog,
 };
 
 pub const Status = extern struct {
@@ -581,6 +582,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.CompletionRecoveryCapacityRequired => status(.unavailable, .completion_recovery_capacity_required),
         error.CompletionResourceManagerRequired => status(.unavailable, .completion_resource_manager_required),
         error.CompletionProfileChanged => status(.conflict, .completion_profile_changed),
+        error.InvalidCompletionCatalog => status(.corrupt, .invalid_completion_catalog),
         error.CompletionDrainShapeChanged => status(.conflict, .completion_drain_shape_changed),
         error.CompletionNotPrepared => status(.conflict, .completion_not_prepared),
         error.InvalidCompletionSlot => status(.corrupt, .invalid_completion_slot),
@@ -1085,6 +1087,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .completion_recovery_capacity_required => "CompletionRecoveryCapacityRequired",
         .completion_resource_manager_required => "CompletionResourceManagerRequired",
         .completion_profile_changed => "CompletionProfileChanged",
+        .invalid_completion_catalog => "InvalidCompletionCatalog",
         .completion_drain_shape_changed => "CompletionDrainShapeChanged",
         .completion_not_prepared => "CompletionNotPrepared",
         .invalid_completion_slot => "InvalidCompletionSlot",
@@ -1644,4 +1647,10 @@ test "workload admission replicated completion guard classification preserves un
     try std.testing.expectEqual(@intFromEnum(Code.unavailable), statusFromError(error.CompletionAdmissionPolicyChanged).code);
     try std.testing.expectEqual(error.MissingCompletionAdmissionGuard, errorFromStatus(statusFromError(error.MissingCompletionAdmissionGuard)));
     try std.testing.expectEqual(@intFromEnum(Code.internal), statusFromError(error.MissingCompletionAdmissionGuard).code);
+}
+
+test "workload admission invalid completion catalog preserves checked boundary identity" {
+    const result = statusFromError(error.InvalidCompletionCatalog);
+    try std.testing.expectEqual(@intFromEnum(Code.corrupt), result.code);
+    try std.testing.expectEqual(error.InvalidCompletionCatalog, errorFromStatus(result));
 }

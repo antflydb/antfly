@@ -29,6 +29,7 @@ const Mapping = struct {
 };
 
 const mappings = [_]Mapping{
+    .{ .status = .invalid_completion_catalog, .err = error.InvalidCompletionCatalog },
     .{ .status = .completion_admission_unavailable, .err = error.CompletionAdmissionUnavailable },
     .{ .status = .completion_admission_policy_changed, .err = error.CompletionAdmissionPolicyChanged },
     .{ .status = .missing_completion_admission_guard, .err = error.MissingCompletionAdmissionGuard },
@@ -835,7 +836,7 @@ test "workload admission uncertain completion recovery preserves exact storage f
 }
 
 test "workload admission replicated completion guard failures preserve exact identity" {
-    for ([_]anyerror{ error.CompletionAdmissionUnavailable, error.CompletionAdmissionPolicyChanged, error.MissingCompletionAdmissionGuard }) |expected| {
+    for ([_]anyerror{ error.CompletionAdmissionUnavailable, error.CompletionAdmissionPolicyChanged, error.MissingCompletionAdmissionGuard, error.InvalidCompletionCatalog }) |expected| {
         const failure = failureFromError(expected, .storage_owner, abi.abi_version, 1);
         try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
         try std.testing.expect(failure.status != .internal);

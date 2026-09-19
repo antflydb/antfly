@@ -42,6 +42,19 @@ pub const Identity = extern struct {
     policy_digest: [32]u8 = @splat(0),
     generation: u64 = 0,
 };
+/// Internal trusted installer output. DATA constructs this only after verifying
+/// a metadata installation response; it is never decoded from a write request.
+/// Catalog bytes travel separately and must match the advertised digest before
+/// native backing is qualified.
+pub const InstallBinding = extern struct {
+    identity: Identity = .{},
+    schema_catalog_digest: [32]u8 = @splat(0),
+    table_id: u64 = 0,
+    range_id: u64 = 0,
+    split_attempt_epoch: u64 = 0,
+    expected_definition: [32]u8 = @splat(0),
+};
+
 pub const State = extern struct {
     applied_term: u64 = 0,
     applied_term_known: u8 = 0,
@@ -150,6 +163,47 @@ pub const CheckResult = extern struct {
     reserved: [3]u8 = @splat(0),
     append_prefix: u64 = 0,
 };
+/// Permanent group-wide durable progress, not a transaction receipt. The
+/// issuer retains it across transaction retirement and certifies that every
+/// predecessor has completed durably. Consumers still match the exact entry.
+pub const Progress = extern struct {
+    term: u64 = 0,
+    index: u64 = 0,
+    payload_digest: [32]u8 = @splat(0),
+};
+pub const max_durable_cells = 4;
+pub const DurableCell = extern struct {
+    identity: Progress = .{},
+    prepared: u8 = 0,
+    reserved: [7]u8 = @splat(0),
+};
+pub const DurableCells = extern struct {
+    version: u32 = pool_abi_version,
+    count: u32 = 0,
+    startup_reconciliation_pending: u8 = 0,
+    reserved: [3]u8 = @splat(0),
+    cells: [max_durable_cells]DurableCell = @splat(.{}),
+};
+pub const DurableObservation = extern struct {
+    expected: Progress = .{},
+    observed_term: u64 = 0,
+    observed_digest: [32]u8 = @splat(0),
+    present: u8 = 0,
+    replaced_in_this_persist: u8 = 0,
+    reserved: [6]u8 = @splat(0),
+};
+pub const ReconcileMode = enum(u32) { startup_complete = 1, persisted_replacement = 2, _ };
+pub const DurableLog = extern struct {
+    version: u32 = pool_abi_version,
+    mode: ReconcileMode,
+    compacted_index: u64 = 0,
+    compacted_term: u64 = 0,
+    last_index: u64 = 0,
+    commit_index: u64 = 0,
+    count: u32 = 0,
+    reserved: u32 = 0,
+    observations: [max_durable_cells]DurableObservation = @splat(.{}),
+};
 pub const VTable = extern struct {
     /// Inbound checks are nonmutating readiness checks. Ready may acquire
     /// accepted-entry ownership before persistence/ACK. A changed volatile
@@ -164,6 +218,16 @@ pub const VTable = extern struct {
     /// Synchronous apply of the exact previously accepted envelope; all bytes
     /// are borrowed and the owner/DB lifetime is pinned by this lease.
     apply_accepted: ?*const fn (?*anyopaque, u64, u64, Bytes) callconv(.c) failure.Status = null,
+    /// Allocation-free query from the retained native owner. not_found means
+    /// no durable receipt, never permission to infer a volatile frontier.
+    progress: ?*const fn (?*anyopaque, *Progress) callconv(.c) failure.Status = null,
+    /// Exact accepted ownership, including protected resolutions. Classification
+    /// must consult owned state or a matching durable receipt, not payload flags.
+    owns_accepted: ?*const fn (?*anyopaque, u64, u64, Bytes, *u8) callconv(.c) failure.Status = null,
+    /// Enumerates owned identities without allocating. Only complete persisted
+    /// log evidence may retire them; a Ready preview is never sufficient.
+    durable_cells: ?*const fn (?*anyopaque, *DurableCells) callconv(.c) failure.Status = null,
+    reconcile_durable: ?*const fn (?*anyopaque, *const DurableLog) callconv(.c) failure.Status = null,
 };
 pub const Lease = extern struct {
     identity: Identity,

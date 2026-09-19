@@ -18,7 +18,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 69;
+pub const abi_version: u32 = 70;
 pub const Status = failure_abi.Status;
 pub const completion_pool = @import("completion_pool_abi.zig");
 pub const FailureBoundary = failure_abi.FailureBoundary;
@@ -997,6 +997,10 @@ pub const TargetObserver = extern struct {
 pub const OpenRequest = extern struct {
     version: u32 = abi_version,
     _reserved0: u32 = 0,
+    /// Synchronously borrowed from the runtime's verified installation registry.
+    completion_installation: ?*const completion_pool.InstallBinding = null,
+    completion_read_schema_json: BorrowedBytes = .{},
+    completion_settings_json: BorrowedBytes = .{},
     context: ?*anyopaque = null,
     path: BorrowedBytes = .{},
     table_name: BorrowedBytes = .{},
@@ -1015,11 +1019,32 @@ pub const OpenRequest = extern struct {
     runtime_hooks: RuntimeHooksConfig = .{},
 };
 
+pub const InstallCompletionRequest = extern struct {
+    version: u32 = abi_version,
+    reserved: u32 = 0,
+    binding: completion_pool.InstallBinding,
+    schema_json: BorrowedBytes = .{},
+    read_schema_json: BorrowedBytes = .{},
+    indexes_json: BorrowedBytes = .{},
+    settings_json: BorrowedBytes = .{},
+};
+
 pub const JsonOperationRequest = extern struct {
     version: u32 = abi_version,
     _reserved0: u32 = 0,
     table_name: BorrowedBytes = .{},
     request_json: BorrowedBytes = .{},
+};
+
+/// Leader-only proposal candidate compilation. The returned bytes grant no
+/// authority; the retained native guard must adopt resources before acceptance.
+pub const CompileReplicatedCompletionRequest = extern struct {
+    version: u32 = abi_version,
+    reserved: u32 = 0,
+    table_name: BorrowedBytes = .{},
+    request_json: BorrowedBytes = .{},
+    previous_term: u64 = 0,
+    previous_index: u64 = 0,
 };
 
 /// One committed data-Raft mutation. The log identity is persisted atomically
@@ -1694,6 +1719,7 @@ pub extern fn antfly_storage_owner_open(
     out_owner: *?*anyopaque,
 ) callconv(.c) Status;
 
+pub extern fn antfly_storage_owner_quiesce(owner: ?*anyopaque) callconv(.c) Status;
 pub extern fn antfly_storage_owner_close(owner: ?*anyopaque) callconv(.c) void;
 
 pub extern fn antfly_storage_hot_standby_seed_activate_json(
@@ -1769,6 +1795,12 @@ pub extern fn antfly_storage_owner_replicated_batch_json(
 pub extern fn antfly_storage_owner_replicated_batch_at_raft_entry_json(
     owner: ?*anyopaque,
     request: *const ReplicatedBatchAtRaftEntryRequest,
+    out_response: *OwnedBytes,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_owner_compile_replicated_completion(
+    owner: ?*anyopaque,
+    request: *const CompileReplicatedCompletionRequest,
     out_response: *OwnedBytes,
 ) callconv(.c) Status;
 
@@ -2066,3 +2098,8 @@ pub extern fn antfly_storage_wal_append_idempotent(
     request: *const WalIdempotentAppendRequest,
     result: *WalIdempotentAppendResult,
 ) Status;
+
+pub extern fn antfly_storage_owner_acquire_completion_lease(owner: ?*anyopaque, group_id: u64, node_id: u64, output: *completion_pool.Lease) Status;
+pub extern fn antfly_storage_owner_attest_completion_backing(owner: ?*anyopaque, group_id: u64, node_id: u64, output: *completion_pool.NativeAttestation) Status;
+
+pub extern fn antfly_storage_owner_install_completion(owner: ?*anyopaque, request: *const InstallCompletionRequest) Status;
