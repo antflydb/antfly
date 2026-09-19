@@ -2097,6 +2097,7 @@ pub const NativeWalCompletionIo = struct {
     writer_limit: usize = std.math.maxInt(usize),
     writer_parent: [:0]const u8 = "",
     files: []PreparedFile = &.{},
+    files_allocator: ?Allocator = null,
     crc_scratch: [64 * 1024]u8 = undefined,
     // Explicit authority granted only after a full manifest checkpoint. The
     // default one-shot WAL scope cannot truncate or retire segments.
@@ -2117,6 +2118,19 @@ pub const NativeWalCompletionIo = struct {
         if (specs.len > 64) return error.CompletionFileCapacityExceeded;
         const self = try createWithHeadroom(allocator, native, root_dir, headroom);
         errdefer self.deinit() catch unreachable;
+        try self.replacePreparedFiles(allocator, specs);
+        return self;
+    }
+
+    /// Rebind an idle sequential scope using caller-prepaid path storage.
+    /// The owner must exclude every borrowed Storage operation/reader; this
+    /// does not create permission to replace paths during admitted execution.
+    /// The FD bundle and native-state reference are retained without reacquire.
+    /// Failure preserves the prior allowlist and its allocation provenance.
+    pub fn replacePreparedFiles(self: *NativeCompletionIo, allocator: Allocator, specs: []const FileSpec) !void {
+        try self.idle();
+        if (specs.len > 64) return error.CompletionFileCapacityExceeded;
+        const root_dir = self.root;
         const files = try allocator.alloc(PreparedFile, specs.len);
         var initialized: usize = 0;
         errdefer {
@@ -2153,8 +2167,12 @@ pub const NativeWalCompletionIo = struct {
         for (files) |file| for (files) |other| {
             if (std.mem.eql(u8, file.temp, other.final)) return error.UnsupportedCompletionPath;
         };
+        const previous = self.files;
+        const previous_allocator = self.files_allocator orelse self.allocator;
         self.files = files;
-        return self;
+        self.files_allocator = allocator;
+        for (previous) |file| file.deinit(previous_allocator);
+        previous_allocator.free(previous);
     }
 
     pub fn create(allocator: Allocator, native: *NativeStorage, root_dir: []const u8) !*NativeWalCompletionIo {
@@ -2204,8 +2222,9 @@ pub const NativeWalCompletionIo = struct {
     pub fn deinit(self: *NativeWalCompletionIo) !void {
         if (self.writer_fd != null) return error.CompletionWriterLive;
         const allocator = self.allocator;
-        for (self.files) |file| file.deinit(allocator);
-        allocator.free(self.files);
+        const files_allocator = self.files_allocator orelse allocator;
+        for (self.files) |file| file.deinit(files_allocator);
+        files_allocator.free(self.files);
         allocator.free(self.temp_checkpoint);
         allocator.free(self.temp_index);
         allocator.free(self.segment);
@@ -6398,4 +6417,27 @@ test "workload admission native completion scopes preserve shared ordinary FD he
     const replacement = try NativeCompletionIo.createWithFilesAndHeadroom(alloc, &second_native, root, &.{}, 2);
     try replacement.deinit();
     try std.testing.expectEqual(@as(usize, 0), pool.snapshotStats().fd_admitted_descriptors);
+}
+
+test "workload admission native completion scope rebinds prepaid paths without fresh FD admission" {
+    if (!supports_posix_fd_cache) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var pool = NativeStoragePool.initWithCapacityForTest(alloc, 2);
+    defer pool.deinit();
+    var native = try NativeStorage.initWithPool(alloc, .threaded, &pool);
+    defer native.deinit();
+    const scope = try NativeCompletionIo.createWithFiles(alloc, &native, "/scope-rebind", &.{.{ .path = "/scope-rebind/first", .max_bytes = 32 }});
+    defer scope.deinit() catch unreachable;
+    const count = pool.snapshotStats().fd_admitted_descriptors;
+    pool.fd_cache.capacity = 1;
+    try std.testing.expectError(error.OutOfMemory, scope.replacePreparedFiles(std.testing.failing_allocator, &.{.{ .path = "/scope-rebind/second", .max_bytes = 32 }}));
+    try std.testing.expect(scope.preparedFile("/scope-rebind/first") != null);
+    var bytes: [4096]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&bytes);
+    try scope.replacePreparedFiles(fixed.allocator(), &.{.{ .path = "/scope-rebind/second", .max_bytes = 32 }});
+    try std.testing.expect(scope.preparedFile("/scope-rebind/first") == null);
+    try std.testing.expect(scope.preparedFile("/scope-rebind/second") != null);
+    try std.testing.expectEqual(count, pool.snapshotStats().fd_admitted_descriptors);
+    try std.testing.expectError(error.UnsupportedCompletionPath, scope.replacePreparedFiles(alloc, &.{.{ .path = "/different/root", .max_bytes = 32 }}));
+    try std.testing.expect(scope.preparedFile("/scope-rebind/second") != null);
 }

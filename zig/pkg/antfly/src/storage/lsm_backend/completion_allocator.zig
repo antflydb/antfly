@@ -111,7 +111,7 @@ pub const Owner = struct {
 /// Only this trusted allocator can exclude bytes from the aggregate observer:
 /// it has already staged those exact bytes on the dedicated credit observer.
 pub fn isPrepaid(allocator: std.mem.Allocator) bool {
-    return allocator.vtable == &Owner.vtable or allocator.vtable == &Arena.vtable;
+    return allocator.vtable == &Owner.vtable or allocator.vtable == &Arena.vtable or allocator.vtable == &RecyclingScratch.vtable;
 }
 
 /// A physically allocated, heap-stable completion domain. All backing memory
@@ -141,6 +141,17 @@ pub const Arena = struct {
 
     pub fn allocator(self: *Arena) std.mem.Allocator {
         return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    /// Reuse physical backing only after every allocated buffer is retired.
+    /// The pool owner must serialize this with new allocations and retain its
+    /// own reference throughout. Published roots/readers prevent recycling.
+    /// Reset retains the original physical charge and performs no allocation.
+    pub fn resetIfExclusive(self: *Arena) !void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
+        if (self.refs.load(.acquire) != 1) return error.CompletionReservationBusy;
+        self.used = 0;
     }
 
     /// Drop the preparing/dispatching owner's reference. Allocations retain
@@ -218,4 +229,227 @@ test "completion arena aligns sealed allocations and retains full slab through f
     allocation.rawFree(aligned[0..31], alignment, @returnAddress());
     try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
     try std.testing.expectEqual(backing.allocated_bytes, backing.freed_bytes);
+}
+
+test "workload admission completion arena refuses recycle while readers retain physical buffers" {
+    const alloc = std.testing.allocator;
+    var manager = resources.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer manager.deinit(alloc);
+    var backing = std.testing.FailingAllocator.init(alloc, .{});
+    const arena = try Arena.create(backing.allocator(), &manager, 4096);
+    defer arena.release();
+    const before = manager.snapshot().memory.used_bytes;
+    const first = try arena.allocator().alloc(u8, 3072);
+    @memset(first, 0x5a);
+    try std.testing.expectError(error.CompletionReservationBusy, arena.resetIfExclusive());
+    try std.testing.expectEqual(@as(u8, 0x5a), first[0]);
+    arena.allocator().free(first);
+    backing.fail_index = backing.alloc_index;
+    backing.resize_fail_index = backing.resize_index;
+    manager.memory.budget.hard_limit_bytes = 1;
+    try arena.resetIfExclusive();
+    const next = try arena.allocator().alloc(u8, 4096);
+    try std.testing.expectEqual(@intFromPtr(first.ptr), @intFromPtr(next.ptr));
+    @memset(next, 0x31);
+    arena.allocator().free(next);
+    try arena.resetIfExclusive();
+    try std.testing.expectEqual(before, manager.snapshot().memory.used_bytes);
+}
+
+/// Reusable, physically backed scratch for streaming cursors/builders. Unlike
+/// Arena it coalesces freed spans, so reading successive blocks does not consume
+/// capacity proportional to the whole database. Publication must use Arena:
+/// scratch destruction explicitly refuses outstanding borrowed allocations.
+pub const RecyclingScratch = struct {
+    const none = std.math.maxInt(usize);
+    const Block = struct {
+        size: usize,
+        previous_size: usize,
+        next_free: usize = none,
+        previous_free: usize = none,
+        allocated: bool = false,
+    };
+    const block_alignment = @alignOf(Block);
+    const minimum_block = std.mem.alignForward(usize, @sizeOf(Block) + @sizeOf(usize) + 1, block_alignment);
+
+    domain: *Arena,
+    storage: []align(@alignOf(Block)) u8,
+    free_head: usize = 0,
+    live: usize = 0,
+    mutex: std.atomic.Mutex = .unlocked,
+
+    pub fn create(backing: std.mem.Allocator, manager: *resources.ResourceManager, bytes: usize) !*RecyclingScratch {
+        const usable = std.mem.alignBackward(usize, bytes, block_alignment);
+        if (usable < minimum_block) return error.ResourceBudgetExceeded;
+        const total = std.math.add(usize, usable, @sizeOf(RecyclingScratch) + 2 * @alignOf(RecyclingScratch)) catch return error.ResourceBudgetExceeded;
+        const domain = try Arena.create(backing, manager, total);
+        errdefer domain.release();
+        const owned = domain.allocator();
+        const self = try owned.create(RecyclingScratch);
+        errdefer owned.destroy(self);
+        const storage = try owned.alignedAlloc(u8, .fromByteUnits(block_alignment), usable);
+        self.* = .{ .domain = domain, .storage = storage };
+        self.block(0).* = .{ .size = usable, .previous_size = 0 };
+        return self;
+    }
+
+    pub fn allocator(self: *RecyclingScratch) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    pub fn destroy(self: *RecyclingScratch) !void {
+        self.lock();
+        if (self.live != 0) {
+            self.mutex.unlock();
+            return error.CompletionReservationBusy;
+        }
+        const domain = self.domain;
+        const owned = domain.allocator();
+        const storage = self.storage;
+        self.mutex.unlock();
+        owned.free(storage);
+        owned.destroy(self);
+        domain.release();
+    }
+
+    fn lock(self: *RecyclingScratch) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+    fn block(self: *RecyclingScratch, offset: usize) *Block {
+        return @ptrCast(@alignCast(self.storage.ptr + offset));
+    }
+    fn removeFree(self: *RecyclingScratch, offset: usize) void {
+        const item = self.block(offset);
+        if (item.previous_free == none) self.free_head = item.next_free else self.block(item.previous_free).next_free = item.next_free;
+        if (item.next_free != none) self.block(item.next_free).previous_free = item.previous_free;
+        item.next_free = none;
+        item.previous_free = none;
+    }
+    fn addFree(self: *RecyclingScratch, offset: usize) void {
+        const item = self.block(offset);
+        item.next_free = self.free_head;
+        item.previous_free = none;
+        if (self.free_head != none) self.block(self.free_head).previous_free = offset;
+        self.free_head = offset;
+    }
+    fn updateFollowing(self: *RecyclingScratch, offset: usize) void {
+        const item = self.block(offset);
+        const next = offset + item.size;
+        if (next < self.storage.len) self.block(next).previous_size = item.size;
+    }
+
+    const vtable: std.mem.Allocator.VTable = .{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
+    fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, _: usize) ?[*]u8 {
+        const self: *RecyclingScratch = @ptrCast(@alignCast(raw));
+        self.lock();
+        defer self.mutex.unlock();
+        var offset = self.free_head;
+        const base = @intFromPtr(self.storage.ptr);
+        while (offset != none) {
+            const item = self.block(offset);
+            const next_free = item.next_free;
+            const unaligned = base + offset + @sizeOf(Block) + @sizeOf(usize);
+            const rounded = std.math.add(usize, unaligned, alignment.toByteUnits() - 1) catch return null;
+            const address = std.mem.alignBackward(usize, rounded, alignment.toByteUnits());
+            const end = std.math.add(usize, address - base, @max(len, 1)) catch return null;
+            const rounded_end = std.math.add(usize, end, block_alignment - 1) catch return null;
+            const needed = std.mem.alignBackward(usize, rounded_end, block_alignment) - offset;
+            if (needed <= item.size) {
+                const original_size = item.size;
+                self.removeFree(offset);
+                if (original_size - needed >= minimum_block) {
+                    item.size = needed;
+                    const split = offset + needed;
+                    self.block(split).* = .{ .size = original_size - needed, .previous_size = needed };
+                    self.updateFollowing(split);
+                    self.addFree(split);
+                }
+                item.allocated = true;
+                self.updateFollowing(offset);
+                const result: [*]u8 = @ptrFromInt(address);
+                @memcpy((result - @sizeOf(usize))[0..@sizeOf(usize)], std.mem.asBytes(&offset));
+                self.live += 1;
+                return result;
+            }
+            offset = next_free;
+        }
+        return null;
+    }
+    fn resize(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
+        return false;
+    }
+    fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+        return null;
+    }
+    fn free(raw: *anyopaque, memory: []u8, _: std.mem.Alignment, _: usize) void {
+        const self: *RecyclingScratch = @ptrCast(@alignCast(raw));
+        self.lock();
+        defer self.mutex.unlock();
+        std.debug.assert(@intFromPtr(memory.ptr) >= @intFromPtr(self.storage.ptr) + @sizeOf(usize));
+        std.debug.assert(@intFromPtr(memory.ptr) + memory.len <= @intFromPtr(self.storage.ptr) + self.storage.len);
+        var offset = std.mem.bytesToValue(usize, (memory.ptr - @sizeOf(usize))[0..@sizeOf(usize)]);
+        var item = self.block(offset);
+        std.debug.assert(item.allocated and self.live != 0);
+        item.allocated = false;
+        self.live -= 1;
+        if (item.previous_size != 0) {
+            const previous_offset = offset - item.previous_size;
+            const previous = self.block(previous_offset);
+            if (!previous.allocated) {
+                self.removeFree(previous_offset);
+                previous.size += item.size;
+                offset = previous_offset;
+                item = previous;
+            }
+        }
+        const next_offset = offset + item.size;
+        if (next_offset < self.storage.len) {
+            const next = self.block(next_offset);
+            if (!next.allocated) {
+                self.removeFree(next_offset);
+                item.size += next.size;
+            }
+        }
+        self.updateFollowing(offset);
+        self.addFree(offset);
+    }
+};
+
+test "workload admission completion scratch recycles interleaved streaming buffers under failed backing" {
+    const alloc = std.testing.allocator;
+    var manager = resources.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer manager.deinit(alloc);
+    var backing = std.testing.FailingAllocator.init(alloc, .{});
+    const scratch = try RecyclingScratch.create(backing.allocator(), &manager, 64 * 1024);
+    defer scratch.destroy() catch unreachable;
+    const charged = manager.snapshot().memory.used_bytes;
+    backing.fail_index = backing.alloc_index;
+    backing.resize_fail_index = backing.resize_index;
+    manager.memory.budget.hard_limit_bytes = 1;
+    const working = scratch.allocator();
+    const pinned = try working.alignedAlloc(u8, .@"64", 513);
+    @memset(pinned, 0xac);
+    var streams: [8]?[]u8 = @splat(null);
+    defer for (streams) |stream| {
+        if (stream) |bytes| working.free(bytes);
+    };
+    for (0..2048) |i| {
+        const index = (i * 5) % streams.len;
+        if (streams[index]) |bytes| {
+            try std.testing.expectEqual(@as(u8, @intCast(index)), bytes[0]);
+            working.free(bytes);
+        }
+        streams[index] = try working.alloc(u8, 1024 + (i % 17) * 97);
+        @memset(streams[index].?, @intCast(index));
+    }
+    try std.testing.expectError(error.CompletionReservationBusy, scratch.destroy());
+    try std.testing.expectEqual(@as(u8, 0xac), pinned[512]);
+    working.free(pinned);
+    for (&streams) |*stream| if (stream.*) |bytes| {
+        working.free(bytes);
+        stream.* = null;
+    };
+    const coalesced = try working.alloc(u8, 60 * 1024);
+    working.free(coalesced);
+    try std.testing.expectEqual(charged, manager.snapshot().memory.used_bytes);
 }
