@@ -22637,7 +22637,10 @@ const RemoteMetadataSource = struct {
                         error.InvalidCatalogName, error.CatalogNotFound, error.CatalogGenerationChanged, error.CatalogCommandTooLarge, error.OutOfMemory, error.Cancelled, error.Canceled => return err,
                         else => {
                             if (!antfly.metadata.authority.isRetryableError(err) and
-                                !isRetryableControlPlaneTransportError(err) and err != error.RemoteUnavailable)
+                                !isRetryableControlPlaneTransportError(err) and err != error.RemoteUnavailable and
+                                // This read may wait for the shared local HTTP
+                                // executor, using the same original budget.
+                                err != error.ConcurrencyUnavailable)
                                 terminal_error = err;
                             continue;
                         },
@@ -29111,6 +29114,90 @@ fn consumerTests() type {
             var cancellation = antfly.raft.transport.http_common.RequestCancellation{};
             fake = .{ .unavailable = std.math.maxInt(usize), .cancel = &cancellation };
             try std.testing.expectError(error.Canceled, source.readSystemCatalog(alloc, .{ .cancellation = cancellation.token() }, .snapshot));
+            try std.testing.expectEqual(@as(usize, 1), fake.calls);
+        }
+
+        test "system catalog remote reads survive elections without skipping peers or extending budgets under executor exhaustion" {
+            if (@import("builtin").single_threaded or @import("builtin").os.tag == .freestanding) return error.SkipZigTest;
+            const alloc = std.testing.allocator;
+            const Http = antfly.common.http;
+            const Fake = struct {
+                io: std.Io,
+                release: *std.Io.Event,
+                parked: ?*std.Io.Future(void),
+                calls: usize = 0,
+                forced_error: ?anyerror = null,
+                cancel: ?*antfly.raft.transport.http_common.RequestCancellation = null,
+                last_timeout_ms: u32 = std.math.maxInt(u32),
+
+                fn block(io: std.Io, release: *std.Io.Event) void {
+                    release.waitUncancelable(io);
+                }
+                fn available() void {}
+                fn execute(ptr: *anyopaque, a: std.mem.Allocator, request: Http.HttpRequest) !Http.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.calls += 1;
+                    const timeout = request.timeout_ms orelse return error.MissingTimeout;
+                    try std.testing.expect(timeout <= self.last_timeout_ms);
+                    self.last_timeout_ms = timeout;
+                    if (self.cancel) |signal| signal.cancel();
+                    if (self.forced_error) |err| return err;
+                    // The same concurrent submission used by the native HTTP
+                    // executor must fail while its sole worker is occupied.
+                    var task = self.io.concurrent(available, .{}) catch |err| {
+                        if (self.parked) |parked| {
+                            self.release.set(self.io);
+                            parked.await(self.io);
+                            self.parked = null;
+                        }
+                        return err;
+                    };
+                    task.await(self.io);
+                    const headers = try a.alloc(Http.Header, 2);
+                    headers[0] = .{ .name = try a.dupe(u8, "x-antfly-catalog-metadata-group"), .value = try a.dupe(u8, "9") };
+                    headers[1] = .{ .name = try a.dupe(u8, "x-antfly-catalog-metadata-incarnation"), .value = try a.dupe(u8, "11111111111111111111111111111111") };
+                    return .{ .status = 200, .headers = headers, .body = try a.dupe(u8, "null") };
+                }
+            };
+            var threaded = std.Io.Threaded.init(alloc, .{ .concurrent_limit = .limited(1) });
+            defer threaded.deinit();
+            const io = threaded.io();
+            var release: std.Io.Event = .unset;
+            var parked = try io.concurrent(Fake.block, .{ io, &release });
+            var fake: Fake = .{ .io = io, .release = &release, .parked = &parked };
+            defer if (fake.parked) |task| {
+                release.set(io);
+                task.await(io);
+            };
+            var source = try RemoteMetadataSource.initWithRequestExecutors(alloc, &.{"http://metadata.invalid"}, &.{.{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } }}, io);
+            defer source.deinit();
+            const body = try source.readSystemCatalog(alloc, .{ .deadline_ns = platform_time.monotonicNs() +| std.time.ns_per_s }, .snapshot);
+            defer alloc.free(body);
+            try std.testing.expectEqualStrings("null", body);
+            try std.testing.expect(fake.calls >= 2);
+            try std.testing.expect(fake.parked == null);
+
+            fake.calls = 0;
+            fake.forced_error = error.ConcurrencyUnavailable;
+            fake.last_timeout_ms = std.math.maxInt(u32);
+            try std.testing.expectError(error.DeadlineExceeded, source.readSystemCatalog(alloc, .{
+                .deadline_ns = platform_time.monotonicNs() +| 25 * std.time.ns_per_ms,
+            }, .snapshot));
+            try std.testing.expect(fake.calls > 0);
+            try std.testing.expect(fake.last_timeout_ms <= 25);
+
+            fake.calls = 0;
+            fake.last_timeout_ms = std.math.maxInt(u32);
+            var cancellation = antfly.raft.transport.http_common.RequestCancellation{};
+            fake.cancel = &cancellation;
+            try std.testing.expectError(error.Canceled, source.readSystemCatalog(alloc, .{ .cancellation = cancellation.token() }, .snapshot));
+            try std.testing.expectEqual(@as(usize, 1), fake.calls);
+
+            fake.calls = 0;
+            fake.last_timeout_ms = std.math.maxInt(u32);
+            fake.cancel = null;
+            fake.forced_error = error.UnexpectedExecutorFailure;
+            try std.testing.expectError(error.UnexpectedExecutorFailure, source.readSystemCatalog(alloc, .{}, .snapshot));
             try std.testing.expectEqual(@as(usize, 1), fake.calls);
         }
 
