@@ -257,10 +257,7 @@ pub fn Guard(comptime DB: type) type {
                 owner.resolveAcceptedCompletion(value.id, value.commit, value.timestamp, .{ .term = term, .index = index }, codec.protocol.payloadDigest(data)) catch |err| return errors.statusFromError(err);
                 return .ok;
             }
-            owner.core.lockApply();
-            defer owner.core.unlockApply();
-            const b = backend(owner) catch |err| return errors.statusFromError(err);
-            b.applyAcceptedCompletion(term, index, codec.protocol.payloadDigest(data)) catch |err| return errors.statusFromError(err);
+            owner.applyAcceptedCompletion(term, index, codec.protocol.payloadDigest(data)) catch |err| return errors.statusFromError(err);
             return .ok;
         }
         fn durableCells(raw: ?*anyopaque, out: *abi.DurableCells) callconv(.c) failure.Status {

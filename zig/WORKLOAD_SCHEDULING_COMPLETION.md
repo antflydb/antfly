@@ -56,8 +56,14 @@ prerequisites are implemented and verified.
   physical before/after comparison with an independently published ordinary
   batch for document and relational rows, nonpublishing repeat compilation,
   and native rejection when only a predicate timestamp or intent lock changes.
-  Native single-phase acceptance/application and DATA routing remain open;
-  returning a candidate does not establish their completion guarantee.
+  The subsequent 26-test owning gate also accepted and applied that candidate
+  through the real retained C lease with ordinary memory admission exhausted,
+  verified duplicate application and complete physical state, and confirmed
+  that no prepared transaction record was created. Native apply drains the
+  mutation and its progress together; DB publication consumes retained replay
+  and visibility ownership before cohort retirement. DATA routing, accepted
+  mutation restart/fault qualification, and transaction-control reservations
+  remain open.
 - The current single-phase candidate profile rejects external payload stores,
   generated-enrichment producers, graph-index catalogs, child-range dispatch,
   HA mirrors, split/shadow/bulk state, and structural commands. In particular,

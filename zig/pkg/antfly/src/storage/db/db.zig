@@ -2936,6 +2936,8 @@ const DurableCompletionPublication = struct {
     summary: ?doc_identity.VisibilitySummary = null,
     summary_bindings: u3 = 0,
     columnar: bool = false,
+    artifacts: bool = false,
+    replay_sequence: u64 = 0,
 };
 
 const DurableCompletionResult = struct {
@@ -26044,6 +26046,7 @@ pub const DB = struct {
         const fence = replicatedCompletionFence(authority, entry.entry.original_input_digest);
         if (!std.mem.eql(u8, &fence, entry.decoded_descriptor.descriptor.profile_fence)) return error.CompletionProfileChanged;
         const id = entry.entry.txn_id;
+        const operations = if (entry.entry.kind == .mutation) entry.entry.prepare_operations else entry.decoded_descriptor.descriptor.commit;
         const token = try alloc.create(CompletionPublicationToken);
         errdefer alloc.destroy(token);
         const new_admission = self.findDurableCompletionBacklog(id) == null;
@@ -26052,14 +26055,14 @@ pub const DB = struct {
             try self.core.completion_eligibility.begin(id);
             errdefer self.core.completion_eligibility.retire(id) catch unreachable;
             var replay_bytes: ?usize = null;
-            for (entry.decoded_descriptor.descriptor.commit) |op| if (op.kind == .put and op.key.len == internal_keys.replay_key_len and
+            for (operations) |op| if (op.kind == .put and op.key.len == internal_keys.replay_key_len and
                 op.key[0] == internal_keys.replay_namespace and op.key[1] == internal_keys.replay_all_kind)
             {
                 replay_bytes = op.value.len;
             };
             try self.reserveDurableCompletionBacklog(id, @intCast(replay_bytes orelse return error.InvalidCompletionSlot));
             errdefer self.cancelDurableCompletionBacklog(id);
-            try self.prepareDurableCompletionPublication(id, entry.decoded_descriptor.descriptor.commit);
+            try self.prepareDurableCompletionPublication(id, operations);
             _ = self.core.nextDerivedAppendSequence();
         }
         return token;
@@ -26099,6 +26102,7 @@ pub const DB = struct {
             for (operations) |op| {
                 if (internal_keys.isRelationalRowKey(op.key)) publication.columnar = true;
                 if (op.kind != .put) continue;
+                if (std.mem.eql(u8, op.key, &internal_keys.artifact_presence_key)) publication.artifacts = true;
                 if (std.mem.eql(u8, op.key, table_catalog_mod.key)) publication.catalog = try table_catalog_mod.Catalog.decode(op.value);
                 if (std.mem.eql(u8, op.key, &internal_keys.identity_visibility_summary_key)) {
                     publication.summary = try doc_identity.visibilitySummaryFromWrites(&.{.{ .key = op.key, .value = op.value }});
@@ -26115,6 +26119,9 @@ pub const DB = struct {
                 if (op.key.len == internal_keys.replay_key_len and op.key[0] == internal_keys.replay_namespace and op.key[1] == internal_keys.replay_all_kind) {
                     var decoded = try change_journal_mod.decodeRecord(self.alloc, op.value);
                     defer decoded.deinit();
+                    if (publication.replay_sequence != 0 or decoded.record.sequence == 0 or
+                        decoded.record.sequence != std.mem.readInt(u64, op.key[2..10], .big)) return error.InvalidCompletionSlot;
+                    publication.replay_sequence = decoded.record.sequence;
                     publication.targets = try collectManagedSyncTargetsForRecord(self.alloc, self.core.index_manager, decoded.record);
                 }
             }
@@ -26127,7 +26134,10 @@ pub const DB = struct {
 
     fn restoreDurableCompletionPublications(self: *DB) !void {
         const backend = self.core.primary_store_owner.lsmBackend() orelse return;
-        for (backend.durableCompletionSlots()) |member| if (member) |slot| try self.prepareDurableCompletionPublication(slot.descriptor.descriptor.txn_id, slot.descriptor.descriptor.commit);
+        for (backend.durableCompletionSlots()) |member| if (member) |slot| {
+            if (slot.retired) continue;
+            try self.prepareDurableCompletionPublication(slot.descriptor.descriptor.txn_id, slot.descriptor.descriptor.commit);
+        };
     }
 
     fn hasLocalDurableCompletionAuthority(self: *const DB) bool {
@@ -26274,7 +26284,10 @@ pub const DB = struct {
     fn restoreDurableCompletionEligibility(self: *DB) !void {
         const backend = self.core.primary_store_owner.lsmBackend() orelse return;
         if (backend.completion_pool != null) try self.core.completion_eligibility.retainInstalledPool();
-        for (backend.durableCompletionSlots()) |member| if (member) |slot| try self.restoreDurableSlotEligibility(slot);
+        for (backend.durableCompletionSlots()) |member| if (member) |slot| {
+            if (slot.retired) continue;
+            try self.restoreDurableSlotEligibility(slot);
+        };
     }
 
     fn restoreDurableSlotEligibility(self: *DB, slot: anytype) !void {
@@ -26327,6 +26340,7 @@ pub const DB = struct {
     fn restoreDurableCompletionBacklog(self: *DB) !void {
         const backend = self.core.primary_store_owner.lsmBackend() orelse return;
         for (backend.durableCompletionSlots()) |member| if (member) |slot| {
+            if (slot.retired) continue;
             var replay_bytes: ?usize = null;
             for (slot.descriptor.descriptor.commit) |op| {
                 if (op.kind == .put and op.key.len == internal_keys.replay_key_len and
@@ -26351,6 +26365,37 @@ pub const DB = struct {
         };
         self.notifyDurableCompletion(sequence);
         return sequence.sequence;
+    }
+
+    /// Native storage publication runs under backend serialization; DB cache
+    /// and visibility publication follows under the outer apply fence using
+    /// only targets/backlog already owned before consensus acceptance.
+    pub fn applyAcceptedCompletion(self: *DB, term: u64, index: u64, digest: [32]u8) !void {
+        var cleanup_error: ?anyerror = null;
+        const result = blk: {
+            try self.lockApplyForPortableRuntime();
+            defer self.core.unlockApply();
+            const backend = self.core.primary_store_owner.lsmBackend() orelse return error.UnsupportedCompletionBackend;
+            const mutation_id = try backend.applyAcceptedCompletion(term, index, digest);
+            var publication: DurableCompletionResult = .{ .sequence = 0 };
+            if (mutation_id) |id| {
+                if (self.findDurableCompletionBacklog(id) != null) {
+                    const sequence = for (self.async_context.durable_completion_backlogs) |entry| {
+                        if (entry) |owned| if (std.mem.eql(u8, &owned.txn_id, &id)) break owned.publication.replay_sequence;
+                    } else return error.CompletionRecoveryCapacityRequired;
+                    if (sequence == 0) return error.InvalidReplaySequence;
+                    publication = try self.consumeDurableCompletionPublicationLocked(id, .committed, sequence);
+                }
+                backend.finishAcceptedMutation() catch |err| {
+                    cleanup_error = err;
+                };
+            }
+            break :blk publication;
+        };
+        // Even uncertain guard cleanup cannot discard the notification for a
+        // successfully committed primary batch and its preowned derived debt.
+        self.notifyDurableCompletion(result);
+        if (cleanup_error) |err| return err;
     }
 
     /// Retained native-owner entrypoint. Pool admission has already bound the
@@ -26387,7 +26432,7 @@ pub const DB = struct {
         } else if (raft_entry != null) return error.UnsupportedCompletionProfile;
         const sequence = self.core.store.next_replay_sequence_cached.load(.acquire);
         if (sequence == 0 or sequence == std.math.maxInt(u64)) return error.InvalidReplaySequence;
-        const backlog = self.findDurableCompletionBacklog(txn_id) orelse return error.CompletionRecoveryCapacityRequired;
+        _ = self.findDurableCompletionBacklog(txn_id) orelse return error.CompletionRecoveryCapacityRequired;
         try backend.completeDurableCompletion(txn_id, status == .committed, .{
             .commit_timestamp = timestamp,
             .replay_sequence = sequence,
@@ -26399,6 +26444,11 @@ pub const DB = struct {
             .raft_index = if (raft_entry) |identity| identity.index else 0,
             .canonical_payload_digest = payload_digest orelse @splat(0),
         });
+        return self.consumeDurableCompletionPublicationLocked(txn_id, status, sequence);
+    }
+
+    fn consumeDurableCompletionPublicationLocked(self: *DB, txn_id: transactions_mod.TxnId, status: transactions_mod.TxnStatus, sequence: u64) !DurableCompletionResult {
+        const backlog = self.findDurableCompletionBacklog(txn_id) orelse return error.CompletionRecoveryCapacityRequired;
         if (status == .committed) {
             self.core.store.observeExternalReplayCommit(sequence);
             self.executor.commitBacklogAdmission(sequence, backlog);
@@ -26419,6 +26469,7 @@ pub const DB = struct {
                     self.clearNonVisibleDocSetCache();
                 }
                 if (publication.columnar) _ = self.core.store.columnar_revision.fetchAdd(1, .release);
+                if (publication.artifacts) self.core.artifact_cleanup_maybe.store(true, .release);
                 result.targets = publication.targets;
                 publication.targets = .{};
             }
@@ -134106,6 +134157,47 @@ test "workload admission physical completion single-phase compiler captures actu
         try std.testing.expect(decoded.entry.prepare_operations.len > request.writes.len + request.deletes.len);
         try Checks.projectedStore(reference_before, reference_after, decoded.entry.prepare_operations);
         var cells: abi.DurableCells = undefined;
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.durable_cells.?(lease.context, &cells));
+        try std.testing.expectEqual(@as(u32, 0), cells.count);
+        // The actual retained C lease reserves and applies this same physical
+        // candidate after ordinary request memory admission is exhausted.
+        const payloads = [_]abi.Bytes{.{ .ptr = wire.ptr, .len = wire.len }};
+        const proposal: abi.Check = .{
+            .kind = .proposal,
+            .new_work_allowed = 1,
+            .state = .{ .term = 2, .applied_term = 1, .applied_term_known = 1, .applied_index = 1, .commit_index = 1, .last_index = 1 },
+            .proposals = .{ .ptr = &payloads, .len = 1 },
+        };
+        var result: abi.CheckResult = undefined;
+        try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.check(lease.context, &proposal, &result));
+        const accepted: abi.ProposalResult = .{ .state = proposal.state, .first_index = 2, .last_index = 2, .payloads = proposal.proposals };
+        lease.vtable.proposal_result(lease.context, &accepted);
+        {
+            const ordinary_limit = resources.memory.budget.hard_limit_bytes;
+            resources.memory.budget.hard_limit_bytes = 1;
+            defer resources.memory.budget.hard_limit_bytes = ordinary_limit;
+            try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.apply_accepted.?(lease.context, 2, 2, payloads[0]));
+            try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.apply_accepted.?(lease.context, 2, 2, payloads[0]));
+        }
+        const applied = try db.core.store.scanPrefix(alloc, "");
+        defer docstore_mod.DocStore.freeResults(alloc, applied);
+        var expected_native = std.ArrayListUnmanaged(@import("../lsm_backend/completion_slot.zig").Operation).empty;
+        defer expected_native.deinit(alloc);
+        try expected_native.appendSlice(alloc, decoded.entry.prepare_operations);
+        const native_keys = [_][]const u8{
+            &internal_keys.raft_document_applied_entry_key,
+            entry_codec.group_progress_key,
+            @import("../lsm_backend/completion_runtime.zig").applied_keys[0],
+        };
+        for (native_keys) |key| {
+            const value = for (applied) |row| {
+                if (std.mem.eql(u8, key, row.key)) break row.value;
+            } else return error.TestUnexpectedResult;
+            try expected_native.append(alloc, .{ .kind = .put, .key = key, .value = value });
+        }
+        try Checks.projectedStore(physical_before, applied, expected_native.items);
+        try std.testing.expectError(error.TxnNotFound, db.getTransactionStatus(decoded.entry.txn_id));
+        try std.testing.expectEqual(sequence_before + 1, db.core.nextDerivedAppendSequence());
         try std.testing.expectEqual(runtime_failure_abi.Status.ok, lease.vtable.durable_cells.?(lease.context, &cells));
         try std.testing.expectEqual(@as(u32, 0), cells.count);
     }

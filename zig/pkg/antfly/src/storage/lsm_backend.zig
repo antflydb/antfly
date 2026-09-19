@@ -4747,11 +4747,20 @@ pub const Backend = struct {
 
     /// Apply exactly the preowned envelope identified by consensus. No ordinary
     /// planner, allocator or callback discovery may run at this boundary.
-    pub fn applyAcceptedCompletion(self: *Backend, term: u64, index: u64, digest: [32]u8) !void {
+    pub fn applyAcceptedCompletion(self: *Backend, term: u64, index: u64, digest: [32]u8) !?[16]u8 {
         const locked = runtime_mod.lockBackend(Backend, self);
         defer runtime_mod.unlockBackend(Backend, self, locked);
         if (self.manifest_recovery_required) return error.RecoveryRequired;
         const pool = self.completion_pool orelse return error.CompletionRecoveryCapacityRequired;
+        if (pool.progress) |progress| if (progress.term == term and progress.index == index and std.mem.eql(u8, &progress.digest, &digest)) {
+            // A terminal mutation may still have DB publication to consume on
+            // a same-process retry; retain its identity until cohort retirement.
+            for (pool.cells[0..pool.cell_count]) |cell| {
+                if (cell.term == term and cell.index == index and cell.entry != null and cell.entry.?.entry.kind == .mutation)
+                    return cell.entry.?.entry.txn_id;
+            }
+            return null;
+        };
         const cell_index = for (pool.cells[0..pool.cell_count], 0..) |cell, i| {
             if (cell.index != index or cell.term != term or cell.entry == null) continue;
             if (!std.mem.eql(u8, &cell.entry.?.digest, &digest)) return error.InvalidCompletionSlot;
@@ -4762,8 +4771,25 @@ pub const Backend = struct {
             if (existing != slot) return error.InvalidCompletionSlot;
         } else self.durable_completion_members[cell_index] = slot;
         if (self.durable_completion == null) self.durable_completion = slot;
-        try slot.applyCanonicalPrepare(self, pool.cells[cell_index].entry.?.entry.prepare_operations);
+        const entry = pool.cells[cell_index].entry.?.entry;
+        switch (entry.kind) {
+            .prepare => try slot.applyCanonicalPrepare(self, entry.prepare_operations),
+            .mutation => try slot.applyCanonicalMutation(self, entry.prepare_operations),
+        }
         pool.notifyApplied(cell_index);
+        if (entry.kind == .mutation) {
+            slot.retired = true;
+            return entry.txn_id;
+        }
+        return null;
+    }
+
+    /// DB publication has consumed its preowned visibility/backlog token. Only
+    /// now may cleanup release the accepted sidecars and publication owners.
+    pub fn finishAcceptedMutation(self: *Backend) !void {
+        const locked = runtime_mod.lockBackend(Backend, self);
+        defer runtime_mod.unlockBackend(Backend, self, locked);
+        try self.retireDurableCompletionCohort();
     }
 
     pub fn releaseCompletionPool(self: *Backend) void {

@@ -535,9 +535,6 @@ pub fn Pool(comptime Backend: type) type {
 
         fn validateEntry(self: *Self, entry: *const entry_codec.OwnedEntry) !void {
             const e = entry.entry;
-            // The codec reserves the single-phase format before its native
-            // publisher is integrated. Never apply it as a prepared vote.
-            if (e.kind != .prepare) return error.UnsupportedCompletionProfile;
             const identity = self.config.identity;
             if (e.group_id != identity.group_id or !std.mem.eql(u8, &e.group_incarnation, &identity.incarnation) or
                 !std.mem.eql(u8, &e.policy_digest, &identity.policy_digest) or
@@ -715,6 +712,8 @@ pub fn Pool(comptime Backend: type) type {
             if (checked.entry.previous_index != index - 1 or checked.entry.previous_term != previous_term or
                 (index > 1 and previous_term == 0)) return error.CompletionProfileChanged;
             try Slot.validateFootprint(backend, checked.decoded_descriptor.descriptor);
+            if (checked.entry.kind == .mutation)
+                try Slot.validateCanonicalFootprint(backend, checked.decoded_descriptor.descriptor.namespace, checked.entry.prepare_operations);
             try self.validateBaseline(backend, scratch, &checked);
             const growth = try entryCapacity(&checked);
             try self.checkCapacity(growth);
@@ -1256,6 +1255,7 @@ pub fn Pool(comptime Backend: type) type {
             errdefer self.releasePublicationOwnerAfterQuiesce();
             for (self.cells[0..self.cell_count]) |*cell| {
                 if (cell.phase != .accepted and cell.phase != .prepared) continue;
+                if (cell.phase == .prepared and cell.slot.retired) continue;
                 cell.publication_token = try owner.prepare(owner.context, cell.publication.?.allocator(), &cell.entry.?);
                 if (cell.phase == .prepared and cell.slot.durable) {
                     owner.applied(owner.context, cell.publication_token.?, cell.term, cell.index);

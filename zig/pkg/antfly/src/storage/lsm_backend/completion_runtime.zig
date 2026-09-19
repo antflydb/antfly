@@ -300,6 +300,40 @@ pub fn Slot(comptime Backend: type) type {
             owner.publish_progress(owner.context, identity);
         }
 
+        /// One atomic physical mutation consumes its accepted reservation and
+        /// becomes terminal immediately. No prepared descriptor or transaction
+        /// receipt is published, and no later decision is needed to drain it.
+        pub fn applyCanonicalMutation(self: *Self, backend: *Backend, operations: []const codec.Operation) !void {
+            const identity = self.accepted_identity orelse return error.InvalidCompletionSlot;
+            const owner = self.pooled_owner orelse return error.InvalidCompletionSlot;
+            if (identity.term == 0 or identity.index == 0 or operations.len == 0 or operations.len > 256 or
+                self.descriptor.descriptor.commit.len != 0 or self.descriptor.descriptor.abort.len != 0)
+                return error.InvalidCompletionSlot;
+            if (self.attempted or backend.manifest_recovery_required) return error.RecoveryRequired;
+            if (self.durable) return;
+            const progress = try owner.prepare_progress(owner.context, self, identity, null);
+            self.attempted = true;
+            errdefer backend.fenceFailedBulkWal();
+            const alloc = self.scratch.allocator();
+            const namespace = @import("../backend_types.zig").Namespace{ .name = self.descriptor.descriptor.namespace };
+            var delta: state.ActiveMemTable = .{};
+            defer delta.deinit(alloc);
+            for (operations) |op| {
+                if (op.bindings.len != 0) return error.InvalidCompletionSlot;
+                try delta.upsert(alloc, namespace, op.key, op.value, op.kind == .delete);
+            }
+            const marker = identity.encode();
+            try delta.upsert(alloc, namespace, &@import("../internal_keys.zig").raft_document_applied_entry_key, marker[0..16], false);
+            try delta.upsert(alloc, namespace, @import("completion_entry.zig").group_progress_key, &progress, false);
+            try delta.upsert(alloc, namespace, self.appliedKey(), &self.descriptor.descriptor.txn_id, false);
+            try backend.checkCompletionPoolFootprint(&delta);
+            try self.writeGuard();
+            try self.drain(backend, &delta, true, true);
+            self.durable = true;
+            self.attempted = false;
+            owner.publish_progress(owner.context, identity);
+        }
+
         fn captureBaseline(backend: *Backend, namespace: ?[]const u8, key: []const u8, comptime size: usize) !?[size]u8 {
             const raw = backend.getMergedWithMutable(&backend.mutable, .{ .name = namespace }, key) catch |err| switch (err) {
                 error.NotFound => return null,
@@ -555,6 +589,18 @@ pub fn Slot(comptime Backend: type) type {
                     if (!same_namespace or member.durable or member.retired or entry.tombstone or !std.mem.eql(u8, entry.value, member.encoded)) return error.PreparedCompletionActive;
                 };
             }
+        }
+
+        pub fn validateCanonicalFootprint(backend: *Backend, namespace: ?[]const u8, operations: []const codec.Operation) !void {
+            for (backend.durable_completion_members) |maybe| if (maybe) |member| {
+                if (member.retired) continue;
+                const other_namespace = member.descriptor.descriptor.namespace;
+                if (namespace == null and other_namespace != null or namespace != null and other_namespace == null) continue;
+                if (namespace != null and !std.mem.eql(u8, namespace.?, other_namespace.?)) continue;
+                for (operations) |op| for ([_][]const codec.Operation{ member.descriptor.descriptor.commit, member.descriptor.descriptor.abort }) |owned| for (owned) |other| {
+                    if (std.mem.eql(u8, op.key, other.key) and !codec.isSharedDynamicOperation(other)) return error.PreparedCompletionActive;
+                };
+            };
         }
 
         pub fn validateFootprint(backend: *Backend, descriptor: codec.Descriptor) !void {
