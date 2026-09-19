@@ -1477,18 +1477,29 @@ The parallel `production-e2e` job builds and retains one production executable,
 checks its SHA-256 before and after testing, repeats the compiled storage-owner
 publication tests 20 times, and runs 200 public restore cases. It also runs
 200 multi-node Autograph resolution/promotion/hydration cases: 50 original and
-50 data-restart cases with normal file-descriptor limits, then the same counts
-with a limit of 256, using two workers per profile. Restart cases reopen every
-data node after the initial document commit and require promotion without a new
-write to wake the recovered owners.
-`scripts/ci/zig-e2e-autograph-soak.sh` exposes the same profiles locally; set
+50 data-restart cases per normal and 256-FD profile, with two workers. Restart
+cases reopen every data node after the initial document commit and require
+promotion without a new write to wake recovered owners.
+
+The same job runs 100 large-catalog control/diagnostic isolation cases (50 per
+profile), plus 200 concurrent aggregation/savepoint-transform cases (50 of each
+per profile). Catalog fixtures use production Raft/control cadence and retain
+HTTP rejection details without retrying failed mutations. The aggregation case
+retains its exact-result assertions and 15-second per-request deadline.
+
+`scripts/ci/zig-e2e-autograph-soak.sh`, `scripts/ci/zig-e2e-catalog-soak.sh`, and
+`scripts/ci/zig-e2e-query-transaction-soak.sh` expose these profiles locally. Set
 `ANTFLY_E2E_REGRESSION_REPORT_DIR` to a fresh directory and optionally override
-workers/repetitions. These are production E2E stress tests; they do not provide
-VOPR schedule replay. They complement the deterministic runtime and Raft tests.
+workers/repetitions. These native stress tests complement deterministic runtime
+and Raft tests; they do not provide VOPR schedule replay. Session unit tests
+separately force foreground/recovery overlap and cancellable execution handoff.
+Aggregation unit tests advance the primary generation after result capture and
+require exact results from the captured rows. They also require one read lease
+across selection and collection, with Raft admission before writer exclusion.
 The `production-e2e-soak` artifact retains the executable, logs, exact per-case
-JUnit reports, and failed server roots with native-stack diagnostics. Missing,
-skipped, failed, or incorrectly counted tests cannot qualify a run. PR-only
-qualification skips these full production soaks.
+JUnit reports, and failed server roots. Missing, skipped, failed, or incorrectly
+counted cases cannot qualify a run. PR-only qualification skips these full
+production soaks.
 
 A bounded-fair suffix randomizes runnable work, ages continuously enabled
 alternatives, and services the oldest overdue alternative after a 256-choice

@@ -164,7 +164,7 @@
   "ops-compute-backend": {
    "path": "zig/pkg/inference/src/ops/ops.zig",
    "anchor": "pub const ComputeBackend = struct {",
-   "line": 1392
+   "line": 1398
   },
   "node-primitive-op": {
    "path": "zig/lib/ml/src/graph/node.zig",
@@ -229,7 +229,7 @@
   "gliner-deberta-graph": {
    "path": "zig/pkg/inference/src/architectures/deberta_graph.zig",
    "anchor": "pub fn buildForwardGraph(",
-   "line": 179
+   "line": 187
   },
   "gliner-rel-bucket": {
    "path": "zig/pkg/inference/src/models/deberta.zig",
@@ -239,7 +239,7 @@
   "gliner-fused-attn-gate": {
    "path": "zig/pkg/inference/src/architectures/deberta_graph.zig",
    "anchor": "pub fn fusedDisentangledAttentionEnabledForProduction(",
-   "line": 430
+   "line": 454
   },
   "gliner-fused-attn-kernel": {
    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
@@ -482,42 +482,42 @@
    "line": 72
   },
   "gliner25-engine-native": {
-   "path": "zig/pkg/inference/src/architectures/gliner_boundary_engine.zig",
+   "path": "zig/pkg/inference/src/architectures/gliner/boundary_engine.zig",
    "anchor": "pub fn encodeNative(",
    "line": 357
   },
   "gliner25-engine-device": {
-   "path": "zig/pkg/inference/src/architectures/gliner_boundary_engine_device.zig",
+   "path": "zig/pkg/inference/src/architectures/gliner/boundary_engine_device.zig",
    "anchor": "pub fn encodeDevice(",
    "line": 236
   },
   "gliner25-resident-constants": {
-   "path": "zig/pkg/inference/src/architectures/gliner_boundary_engine_device.zig",
+   "path": "zig/pkg/inference/src/architectures/gliner/boundary_engine_device.zig",
    "anchor": "pub fn prepareResidentConstants(",
    "line": 214
   },
   "gliner25-boundary-encoder": {
-   "path": "zig/pkg/inference/src/architectures/gliner_boundary_head.zig",
+   "path": "zig/pkg/inference/src/architectures/gliner/boundary_head.zig",
    "anchor": "fn encodeBoundaries(",
    "line": 327
   },
   "gliner25-proposer-marginals": {
-   "path": "zig/pkg/inference/src/architectures/gliner_boundary_head.zig",
+   "path": "zig/pkg/inference/src/architectures/gliner/boundary_head.zig",
    "anchor": "fn computeMarginals(",
    "line": 406
   },
   "gliner25-shared-pool-film": {
-   "path": "zig/pkg/inference/src/architectures/gliner_boundary_head.zig",
+   "path": "zig/pkg/inference/src/architectures/gliner/boundary_head.zig",
    "anchor": "fn scoreSharedPool(",
    "line": 490
   },
   "gliner25-head-forward": {
-   "path": "zig/pkg/inference/src/architectures/gliner_boundary_head.zig",
+   "path": "zig/pkg/inference/src/architectures/gliner/boundary_head.zig",
    "anchor": "pub fn forwardNative(",
    "line": 246
   },
   "gliner25-rotary-endpoints": {
-   "path": "zig/pkg/inference/src/architectures/gliner_boundary_head.zig",
+   "path": "zig/pkg/inference/src/architectures/gliner/boundary_head.zig",
    "anchor": "fn rotateEndpoints(",
    "line": 718
   },
@@ -547,17 +547,17 @@
    "line": 622
   },
   "gliner25-task-classify": {
-   "path": "zig/pkg/inference/src/architectures/gliner_boundary_tasks.zig",
+   "path": "zig/pkg/inference/src/architectures/gliner/boundary_tasks.zig",
    "anchor": "pub fn classifyNative(",
    "line": 97
   },
   "gliner25-task-relations": {
-   "path": "zig/pkg/inference/src/architectures/gliner_boundary_tasks.zig",
+   "path": "zig/pkg/inference/src/architectures/gliner/boundary_tasks.zig",
    "anchor": "pub fn scoreRelationsNative(",
    "line": 157
   },
   "gliner25-task-records": {
-   "path": "zig/pkg/inference/src/architectures/gliner_boundary_tasks.zig",
+   "path": "zig/pkg/inference/src/architectures/gliner/boundary_tasks.zig",
    "anchor": "pub fn scoreRecordNative(",
    "line": 291
   },
@@ -577,27 +577,27 @@
    "line": 46
   },
   "gliner25-peft-inject": {
-   "path": "zig/pkg/inference/src/finetune/gliner_boundary_peft_graph.zig",
+   "path": "zig/pkg/inference/src/finetune/gliner/boundary_peft_graph.zig",
    "anchor": "pub fn inject(",
    "line": 314
   },
   "gliner25-peft-kinds": {
-   "path": "zig/pkg/inference/src/finetune/gliner_boundary_peft_graph.zig",
+   "path": "zig/pkg/inference/src/finetune/gliner/boundary_peft_graph.zig",
    "anchor": "pub const Kind = enum { lora, dora };",
    "line": 15
   },
   "gliner25-stop-gradient": {
    "path": "zig/lib/ml/src/graph/node.zig",
    "anchor": "stop_gradient: void,",
-   "line": 535
+   "line": 683
   },
   "gliner25-adamw-renorm": {
    "path": "zig/pkg/inference/src/finetune/seeded_gradient_trainer.zig",
    "anchor": "matching GLiNER2.5's _renormalize_partial_accumulation. Parameters absent",
-   "line": 540
+   "line": 551
   },
   "gliner25-hungarian-match": {
-   "path": "zig/pkg/inference/src/finetune/gliner_boundary_matching.zig",
+   "path": "zig/pkg/inference/src/finetune/gliner/boundary_matching.zig",
    "anchor": "pub fn match(",
    "line": 488
   },
@@ -628,13 +628,13 @@
   },
   "train-adamw-config": {
    "path": "zig/lib/ml/src/graph/optimizers.zig",
-   "anchor": "pub const AdamWConfig = struct {",
-   "line": 128
+   "anchor": "pub fn AdamWConfigOf(comptime Float: type) type {",
+   "line": 148
   },
   "train-adamw-step": {
    "path": "zig/lib/ml/src/graph/optimizers.zig",
    "anchor": "pub fn step(",
-   "line": 221
+   "line": 260
   },
   "train-executor-flag": {
    "path": "zig/pkg/inference/src/graph/training.zig",
@@ -744,12 +744,12 @@
   "gliner2-ft-masked-bce": {
    "path": "zig/lib/ml/src/graph/builder.zig",
    "anchor": "pub fn maskedBceWithLogitsLoss(",
-   "line": 681
+   "line": 697
   },
   "gliner2-ft-attn-vjp": {
    "path": "zig/lib/ml/src/graph/autodiff.zig",
    "anchor": ".op = .{ .fused_disentangled_attention_backward = attrs },",
-   "line": 827
+   "line": 908
   },
   "gliner2-ft-bwd-kernel": {
    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
@@ -797,64 +797,64 @@
    "line": 485
   },
   "gliner25-ft-job-validate": {
-   "path": "zig/pkg/inference/src/finetune/gliner_boundary_training_job.zig",
+   "path": "zig/pkg/inference/src/finetune/gliner/boundary_training_job.zig",
    "anchor": "pub fn validate(config: Config) !void {",
    "line": 154
   },
   "gliner25-ft-job-execute": {
-   "path": "zig/pkg/inference/src/finetune/gliner_boundary_training_job.zig",
+   "path": "zig/pkg/inference/src/finetune/gliner/boundary_training_job.zig",
    "anchor": "pub fn execute(",
    "line": 219
   },
   "gliner25-ft-gold-schedule": {
-   "path": "zig/pkg/inference/src/finetune/gliner_boundary_train_objectives.zig",
+   "path": "zig/pkg/inference/src/finetune/gliner/boundary_train_objectives.zig",
    "anchor": "pub fn scales(",
    "line": 24
   },
   "gliner25-ft-objectives": {
-   "path": "zig/pkg/inference/src/finetune/gliner_boundary_train_objectives.zig",
+   "path": "zig/pkg/inference/src/finetune/gliner/boundary_train_objectives.zig",
    "anchor": "pub fn boundary(",
-   "line": 149
+   "line": 159
   },
   "gliner25-ft-focal": {
-   "path": "zig/pkg/inference/src/finetune/gliner_boundary_losses.zig",
+   "path": "zig/pkg/inference/src/finetune/gliner/boundary_losses.zig",
    "anchor": "pub fn asymmetricFocal(",
-   "line": 242
+   "line": 348
   },
   "gliner25-ft-listwise": {
-   "path": "zig/pkg/inference/src/finetune/gliner_boundary_losses.zig",
+   "path": "zig/pkg/inference/src/finetune/gliner/boundary_losses.zig",
    "anchor": "pub fn listwise(",
-   "line": 272
+   "line": 378
   },
   "gliner25-ft-consistency": {
-   "path": "zig/pkg/inference/src/finetune/gliner_boundary_losses.zig",
+   "path": "zig/pkg/inference/src/finetune/gliner/boundary_losses.zig",
    "anchor": "pub fn marginalConsistency(",
-   "line": 549
+   "line": 788
   },
   "gliner25-ft-hard-negatives": {
-   "path": "zig/pkg/inference/src/finetune/gliner_boundary_losses.zig",
+   "path": "zig/pkg/inference/src/finetune/gliner/boundary_losses.zig",
    "anchor": "pub fn hardNegatives(",
-   "line": 423
+   "line": 661
   },
   "gliner25-ft-costs-f32": {
-   "path": "zig/pkg/inference/src/finetune/gliner_boundary_matching.zig",
+   "path": "zig/pkg/inference/src/finetune/gliner/boundary_matching.zig",
    "anchor": "pub fn buildFloat32Costs(",
    "line": 409
   },
   "gliner25-ft-attn-profiles": {
-   "path": "zig/pkg/inference/src/finetune/gliner_boundary_encoder_graph.zig",
+   "path": "zig/pkg/inference/src/finetune/gliner/boundary_encoder_graph.zig",
    "anchor": "pub const AttentionProfile = enum { materialized_v1, replay_tiled_v1 };",
    "line": 24
   },
   "gliner25-ft-activation-profiles": {
-   "path": "zig/pkg/inference/src/finetune/gliner_boundary_encoder_graph.zig",
+   "path": "zig/pkg/inference/src/finetune/gliner/boundary_encoder_graph.zig",
    "anchor": "pub const ActivationProfile = enum { retained_v1, layer_recompute_v1 };",
-   "line": 25
+   "line": 26
   },
   "gliner25-ft-attn-vjp": {
    "path": "zig/lib/ml/src/graph/autodiff.zig",
    "anchor": ".op = .{ .fused_deberta_training_attention_backward_v1 = attrs },",
-   "line": 851
+   "line": 947
   },
   "gliner25-ft-dt-kernel": {
    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
@@ -862,37 +862,37 @@
    "line": 45735
   },
   "gliner25-ft-streams": {
-   "path": "zig/pkg/inference/src/finetune/gliner_boundary_run.zig",
+   "path": "zig/pkg/inference/src/finetune/gliner/boundary_run.zig",
    "anchor": "pub fn init(seed: u64, counter: u64, domain: []const u8) Random {",
-   "line": 187
+   "line": 254
   },
   "gliner25-ft-transaction": {
    "path": "zig/pkg/inference/src/finetune/seeded_device_transaction.zig",
    "anchor": "pub fn prepare(",
-   "line": 534
+   "line": 629
   },
   "gliner25-ft-export": {
-   "path": "zig/pkg/inference/src/finetune/gliner_boundary_training_export.zig",
+   "path": "zig/pkg/inference/src/finetune/gliner/boundary_training_export.zig",
    "anchor": "pub fn exportSnapshot(",
    "line": 172
   },
   "gliner25-ft-merge-policy": {
-   "path": "zig/pkg/inference/src/finetune/gliner_boundary_merge.zig",
+   "path": "zig/pkg/inference/src/finetune/gliner/boundary_merge.zig",
    "anchor": "pub const math_policy = \"f32_lora_delta_f64_dora_row_norm_v1\";",
    "line": 29
   },
   "gliner25-ft-recompute": {
-   "path": "zig/pkg/inference/src/finetune/gliner_boundary_recomputed_graph.zig",
+   "path": "zig/pkg/inference/src/finetune/gliner/boundary_recomputed_graph.zig",
    "anchor": "pub fn build(",
    "line": 90
   },
   "gliner25-ft-dataset-row": {
-   "path": "zig/pkg/inference/src/finetune/gliner_boundary_dataset.zig",
+   "path": "zig/pkg/inference/src/finetune/gliner/boundary_dataset.zig",
    "anchor": "pub const Row = struct {",
    "line": 26
   },
   "gliner25-ft-targets-compile": {
-   "path": "zig/pkg/inference/src/finetune/gliner_boundary_targets.zig",
+   "path": "zig/pkg/inference/src/finetune/gliner/boundary_targets.zig",
    "anchor": "pub fn compileBatch(",
    "line": 337
   }

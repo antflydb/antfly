@@ -4,6 +4,7 @@
 import os
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -11,6 +12,9 @@ ZIG_ROOT = Path(__file__).resolve().parents[1]
 
 
 class TestRunnerSelection(unittest.TestCase):
+    runner_path = ZIG_ROOT / "pkg/antfly/src/test_runner.zig"
+    progress_prefix = "test"
+
     @classmethod
     def setUpClass(cls):
         cls.temp = tempfile.TemporaryDirectory()
@@ -24,6 +28,7 @@ class TestRunnerSelection(unittest.TestCase):
             'test "verbose logging" { std.testing.log_level = .debug; '
             'std.log.debug("visible debug", .{}); }\n'
             'test "timed body" { try std.testing.io.sleep(.fromMilliseconds(20), .awake); }\n'
+            'test "progress body" { try std.testing.io.sleep(.fromSeconds(2), .awake); }\n'
             'test "error logging" { std.log.err("visible error", .{}); }\n'
         )
         cls.binary = root / "tests"
@@ -31,9 +36,12 @@ class TestRunnerSelection(unittest.TestCase):
             [
                 "zig",
                 "test",
-                str(source),
+                "--dep",
+                "antfly_platform",
+                f"-Mroot={source}",
+                f"-Mantfly_platform={ZIG_ROOT / 'lib/platform/src/root.zig'}",
                 "--test-runner",
-                str(ZIG_ROOT / "pkg/antfly/src/test_runner.zig"),
+                str(cls.runner_path),
                 "--test-no-exec",
                 "-lc",
                 f"-femit-bin={cls.binary}",
@@ -84,6 +92,48 @@ class TestRunnerSelection(unittest.TestCase):
         self.assertEqual(disabled.returncode, 0, disabled.stderr)
         self.assertNotIn("TIMING\t", disabled.stderr)
 
+    def test_progress_survives_captured_output_before_exit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            process = subprocess.Popen(
+                [str(self.binary), "--test-filter", "progress body"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env={**os.environ, "ANTFLY_TEST_LOG_DIR": directory},
+            )
+            try:
+                path = Path(directory) / f"{self.progress_prefix}-{process.pid}.log"
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    if path.exists() and "START\t" in path.read_text():
+                        break
+                    time.sleep(0.01)
+                else:
+                    self.fail("test attribution was buffered until process exit")
+                self.assertIsNone(process.poll())
+                progress = path.read_text()
+                self.assertIn(f"ARG\t{self.binary}\n", progress)
+                self.assertIn("progress body", progress)
+                self.assertNotIn("DONE\t", progress)
+                _, stderr = process.communicate(timeout=5)
+                self.assertEqual(process.returncode, 0, stderr.decode())
+                progress = path.read_text()
+                for phase in ("IO_DEINIT", "ALLOCATOR_DEINIT", "DONE"):
+                    self.assertIn(f"{phase}\tselection.test.progress body\n", progress)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                process.communicate()
+
+    def test_inventory_does_not_create_progress_logs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = subprocess.run(
+                [str(self.binary), "--list-tests"],
+                capture_output=True,
+                env={**os.environ, "ANTFLY_TEST_LOG_DIR": directory},
+            )
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+            self.assertEqual(list(Path(directory).iterdir()), [])
+
     def test_default_and_narrowed_inventory(self):
         result = self.run_selection("--list-tests")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -126,6 +176,41 @@ class TestRunnerSelection(unittest.TestCase):
         )
         self.assertNotEqual(failure.returncode, 0)
         self.assertIn("visible error", failure.stderr)
+
+
+class InferenceRunnerProgress(unittest.TestCase):
+    runner_path = ZIG_ROOT / "pkg/inference/src/test_runner_filter.zig"
+    progress_prefix = "inference-test"
+    setUpClass = classmethod(TestRunnerSelection.setUpClass.__func__)
+    tearDownClass = classmethod(TestRunnerSelection.tearDownClass.__func__)
+    test_progress_survives_captured_output_before_exit = (
+        TestRunnerSelection.test_progress_survives_captured_output_before_exit
+    )
+
+    def test_inventory_preserves_selection_without_running_tests(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "inventory.txt"
+            result = subprocess.run(
+                [
+                    str(self.binary),
+                    "--test-filter",
+                    "enrichment",
+                    "--skip-test-filter",
+                    "merge",
+                ],
+                capture_output=True,
+                timeout=5,
+                env={**os.environ, "ANTFLY_INFERENCE_TEST_LIST_FILE": str(output)},
+            )
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+            self.assertEqual(
+                output.read_text().splitlines(),
+                [
+                    "selection.test.enrichment split",
+                    "selection.test.enrichment logging",
+                ],
+            )
+            self.assertNotIn(b"visible warning", result.stderr)
 
 
 if __name__ == "__main__":
