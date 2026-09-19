@@ -17,6 +17,25 @@ fn mul(a: u64, b: u64) !u64 {
     return std.math.mul(u64, a, b) catch error.UnsupportedCompletionProfile;
 }
 
+/// Monotonic append counters also enforce retained-WAL admission. They must
+/// not wrap or saturate while a completion owns a subtraction baseline.
+pub const AppendCounters = struct {
+    bytes: u64 = 0,
+    entries: u64 = 0,
+    records: u64 = 0,
+
+    pub fn plus(a: AppendCounters, b: AppendCounters) !AppendCounters {
+        return .{ .bytes = try add(a.bytes, b.bytes), .entries = try add(a.entries, b.entries), .records = try add(a.records, b.records) };
+    }
+    pub fn repeated(self: AppendCounters, count: u64) !AppendCounters {
+        return .{ .bytes = try mul(self.bytes, count), .entries = try mul(self.entries, count), .records = try mul(self.records, count) };
+    }
+    pub fn requireHeadroom(reserved: AppendCounters, stats: anytype, incoming: AppendCounters) !void {
+        const current: AppendCounters = .{ .bytes = stats.wal_append_bytes, .entries = stats.wal_append_entries, .records = stats.wal_append_records };
+        _ = try (try current.plus(incoming)).plus(reserved);
+    }
+};
+
 pub const Cost = struct {
     records: u64 = 0,
     encoded_bytes: u64 = 0,
@@ -175,4 +194,19 @@ test "completion capacity certificate reserves cohort counter successors before 
     try std.testing.expectError(error.UnsupportedCompletionProfile, nativeCounterHeadroom(1, 1, max - 136, 4));
     try sharedCounterHeadroom(max - 40, 10, 4);
     try std.testing.expectError(error.UnsupportedCompletionProfile, sharedCounterHeadroom(max - 39, 10, 4));
+}
+
+test "completion capacity certificate preserves append counter subtraction headroom" {
+    const reserve: AppendCounters = .{ .bytes = 9000, .entries = 520, .records = 2 };
+    const max = std.math.maxInt(u64);
+    var stats: struct { wal_append_bytes: u64, wal_append_entries: u64, wal_append_records: u64 } = .{ .wal_append_bytes = max - reserve.bytes, .wal_append_entries = max - reserve.entries, .wal_append_records = max - reserve.records };
+    try reserve.requireHeadroom(stats, .{});
+    try std.testing.expectError(error.UnsupportedCompletionProfile, reserve.requireHeadroom(stats, .{ .bytes = 1 }));
+    try std.testing.expectError(error.UnsupportedCompletionProfile, reserve.requireHeadroom(stats, .{ .entries = 1 }));
+    try std.testing.expectError(error.UnsupportedCompletionProfile, reserve.requireHeadroom(stats, .{ .records = 1 }));
+    stats.wal_append_bytes -= 100;
+    stats.wal_append_entries -= 3;
+    stats.wal_append_records -= 1;
+    try reserve.requireHeadroom(stats, .{ .bytes = 100, .entries = 3, .records = 1 });
+    try std.testing.expectError(error.UnsupportedCompletionProfile, (AppendCounters{ .bytes = max }).plus(.{ .bytes = 1 }));
 }

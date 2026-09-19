@@ -520,6 +520,21 @@ The following gates remain:
   passed 10/10 with zero leaks: arithmetic boundaries, actual SST encoder
   comparisons, pre-sidecar rejection, restart/crash/reader regressions, and
   maintenance under denied ordinary memory/FD admission.
+- **Append-counter reservations (implemented).** The monotonic WAL byte,
+  entry and record counters also enforce retained-WAL subtraction baselines;
+  they are never reset or saturated. Fresh qualification and new acceptance
+  reserve the remaining canonical prepare/mutation and outcome phases plus the
+  foreground allowance. Ordinary WAL admission checks its actual next record
+  against the remaining mandatory reserve, including after checkpoint renewal
+  of foreground baselines. Applied prepares release only their consumed phase;
+  terminal cells need no further append. Standalone cohorts likewise protect
+  every reserved outcome. The owning Debug gate passed 57/57 with zero skips,
+  failures or leaks (`/tmp/workload-native-counter-headroom1.log`): four maximum
+  point plans accepted near `u64` exhaustion all finish, each counter rejects
+  ordinary appends before I/O at the protected boundary after every checkpoint,
+  and exhausted fresh rearm fails before readiness. Restored counter baselines
+  and standalone durable/cohort/crash regressions also pass. The named phase
+  budgets exclude the separately pending retained transaction-control lifetime.
 - **Actual I/O fault coverage.** Maintenance crash hooks verify the selected
   publication boundaries. Partial writes, fsync failures, and failures after
   pointer rename still need direct injected-I/O coverage, including durable

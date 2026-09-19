@@ -59,6 +59,27 @@ pub const limits: codec.Limits = .{
     .max_encoded_bytes = 256 * 1024,
 };
 
+pub const AppendCounters = @import("completion_capacity.zig").AppendCounters;
+pub const private_records_per_phase = 4;
+pub const records_per_phase = limits.max_operations + private_records_per_phase;
+pub const max_private_key_bytes = blk: {
+    var largest: usize = @max(receiptKey(@splat(0)).len, @import("completion_entry.zig").group_progress_key.len);
+    largest = @max(largest, @import("../internal_keys.zig").raft_document_applied_entry_key.len);
+    for (storage_keys ++ applied_keys) |key| largest = @max(largest, key.len);
+    break :blk largest;
+};
+pub const wal_phase_overhead = private_records_per_phase * (max_private_key_bytes + 112) + records_per_phase * ("docs".len + 16) + 20;
+// One canonical prepare (or one-phase mutation) and one document outcome.
+// A retained transaction-control lifetime must add its own separate budget.
+pub const prepare_append_budget: AppendCounters = .{ .bytes = @import("completion_entry.zig").max_wire_bytes + wal_phase_overhead, .entries = records_per_phase, .records = 1 };
+pub const outcome_append_budget: AppendCounters = .{ .bytes = limits.max_encoded_bytes + wal_phase_overhead, .entries = records_per_phase, .records = 1 };
+pub const foreground_append_budget: AppendCounters = .{ .bytes = recovery_wal_bytes, .entries = foreground_entries, .records = recovery_wal_records };
+
+pub fn incomingAppendCounters(incoming: anytype) AppendCounters {
+    if (incoming.entryCount() == 0) return .{};
+    return .{ .bytes = wal.encodedStateRecordLen(incoming), .entries = incoming.entryCount(), .records = 1 };
+}
+
 pub const OperationWorkspace = struct {
     temporary_tree: usize,
     bindings: usize,
@@ -76,15 +97,10 @@ pub const OperationWorkspace = struct {
 /// consumption. Thus the sum also proves every individual contiguous request.
 pub fn operationWorkspaceRequirement(cost: @import("completion_capacity.zig").Cost, writer_limits: @import("completion_maintenance.zig").Limits) !OperationWorkspace {
     const footprint = domains.RecyclingScratch.allocationFootprint;
-    const private_records = 4; // prepare: descriptor/marker/receipt/progress; outcome: four control edits.
+    const private_records = private_records_per_phase; // prepare: descriptor/marker/receipt/progress; outcome: four control edits.
     const entries = limits.max_operations + private_records;
     const namespace_bytes = "docs".len; // The only non-null native completion namespace.
-    const private_key_bytes = comptime blk: {
-        var largest: usize = @max(receiptKey(@splat(0)).len, @import("completion_entry.zig").group_progress_key.len);
-        largest = @max(largest, @import("../internal_keys.zig").raft_document_applied_entry_key.len);
-        for (storage_keys ++ applied_keys) |key| largest = @max(largest, key.len);
-        break :blk largest;
-    };
+    const private_key_bytes = max_private_key_bytes;
     // Canonical wire bounds all public keys/values. Descriptor storage is an
     // additional private value; the other private values fit the 112-byte
     // authority-bound group receipt. Repeated namespaces are charged separately.
@@ -473,6 +489,8 @@ pub fn Slot(comptime Backend: type) type {
             if ((if (checked.descriptor.namespace) |name| !std.mem.eql(u8, name, "docs") else false) or !std.meta.eql(checked.descriptor.limits, limits))
                 return error.UnsupportedCompletionProfile;
             if (backend.manifest_recovery_required) return error.RecoveryRequired;
+            const append_reserve = try (try outcome_append_budget.repeated(cohort.capacity())).plus(foreground_append_budget);
+            try append_reserve.requireHeadroom(backend.write_stats, .{});
             if (backend.bulkIngestActive() or backend.activeImmutableMemtableCount() != 0 or
                 backend.immutable_flush_build_in_flight or backend.manifest_publish_in_flight or
                 backend.manifest_checkpoint_build_in_flight or backend.runs.count() > @as(usize, cohort.initial_runs) + cohort.capacity() or
@@ -640,6 +658,12 @@ pub fn Slot(comptime Backend: type) type {
         /// callers cannot alter the anchor/marker or evade cumulative bounds.
         pub fn checkWalInput(self: *Self, backend: *Backend, incoming: anytype) !void {
             if (self.attempted and !self.retired) return error.RecoveryRequired;
+            if (self.pooled_owner == null) {
+                // Ordinary prepare belongs to the foreground allowance. Keep
+                // every reserved standalone outcome's increments untouched.
+                const reserve = try outcome_append_budget.repeated(self.cohort.capacity());
+                reserve.requireHeadroom(backend.write_stats, incomingAppendCounters(incoming)) catch return error.CompletionForegroundCapacityExceeded;
+            }
             const append_bytes = backend.write_stats.wal_append_bytes -| self.wal_append_start;
             const incoming_bytes = wal.encodedStateRecordLen(incoming);
             if (self.replayed_wal_bytes +| append_bytes +| incoming_bytes > recovery_wal_bytes or

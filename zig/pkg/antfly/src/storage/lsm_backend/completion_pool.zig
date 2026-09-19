@@ -310,18 +310,8 @@ fn entryCapacity(entry: *const entry_codec.OwnedEntry) !capacity.Cost {
 }
 
 const replay_max_records = completion.recovery_wal_records + 2 * max_slots;
-const replay_max_entries = completion.foreground_entries + max_slots * 2 * (completion.limits.max_operations + 4);
-const replay_private_key_bytes = blk: {
-    var largest: usize = @max(entry_codec.receiptKey(@splat(0)).len, entry_codec.group_progress_key.len);
-    largest = @max(largest, @import("../internal_keys.zig").raft_document_applied_entry_key.len);
-    for (completion.storage_keys ++ completion.applied_keys) |key| largest = @max(largest, key.len);
-    break :blk largest;
-};
-// Canonical wire covers its public payload plus stored descriptor; descriptor
-// wire covers either outcome's public payload. Add both phases' native-only
-// keys/values, repeated docs namespace, 16-byte entry and 20-byte record framing.
-const replay_phase_overhead = 4 * (replay_private_key_bytes + 112) + (completion.limits.max_operations + 4) * ("docs".len + 16) + 20;
-const replay_max_bytes = completion.recovery_wal_bytes + max_slots * (entry_codec.max_wire_bytes + completion.limits.max_encoded_bytes + 2 * replay_phase_overhead);
+const replay_max_entries = completion.foreground_entries + max_slots * 2 * completion.records_per_phase;
+const replay_max_bytes = completion.recovery_wal_bytes + max_slots * (completion.prepare_append_budget.bytes + completion.outcome_append_budget.bytes);
 const ReplayWorkspace = struct { tree: usize, pending: usize, paths: usize, total: usize };
 
 /// Replay starts with no readers or shared roots. Payload includes every WAL
@@ -676,9 +666,36 @@ pub fn Pool(comptime Backend: type) type {
             if (!std.mem.eql(u8, &hash.finish(), &entry.entry.baseline_digest)) return error.CompletionProfileChanged;
         }
 
+        /// Free cells may still become prepare+outcome obligations. Applied
+        /// prepares need only their outcome; durable terminal cells need no WAL.
+        /// This budget excludes the future transaction-control owner lifetime.
+        fn remainingAppendBudget(self: *const Self) !completion.AppendCounters {
+            var result: completion.AppendCounters = .{};
+            for (self.cells[0..self.cell_count]) |cell| {
+                switch (cell.phase) {
+                    .spent => continue,
+                    .free => result = try result.plus(try completion.prepare_append_budget.plus(completion.outcome_append_budget)),
+                    .accepted, .prepared => {
+                        if (cell.phase == .prepared and cell.slot.retired) continue;
+                        const is_prepare = cell.entry.?.entry.kind == .prepare;
+                        if (cell.phase == .accepted or !cell.slot.durable) result = try result.plus(completion.prepare_append_budget);
+                        if (is_prepare) result = try result.plus(completion.outcome_append_budget);
+                    },
+                }
+            }
+            return result;
+        }
+
+        fn checkFreshAppendHeadroom(self: *const Self, backend: *const Backend) !void {
+            const reserve = try (try self.remainingAppendBudget()).plus(completion.foreground_append_budget);
+            try reserve.requireHeadroom(backend.write_stats, .{});
+        }
+
         pub fn checkOrdinary(self: *Self, backend: *Backend, incoming: anytype) !void {
             if (self.maintenance_active) return error.CompletionReservationBusy;
             if (self.failed or !self.restored) return error.RecoveryRequired;
+            const reserve = try self.remainingAppendBudget();
+            reserve.requireHeadroom(backend.write_stats, completion.incomingAppendCounters(incoming)) catch return error.CompletionForegroundCapacityExceeded;
             if (incoming.estimatedLogicalBytes() > completion.foreground_bytes -| backend.mutable.estimatedLogicalBytes() or
                 incoming.entryCount() > completion.foreground_entries -| backend.mutable.entryCount() or
                 self.replayed_wal_bytes +| (backend.write_stats.wal_append_bytes -| self.wal_bytes_start) +| @import("wal.zig").encodedStateRecordLen(incoming) > completion.recovery_wal_bytes or
@@ -753,6 +770,7 @@ pub fn Pool(comptime Backend: type) type {
         }
 
         fn checkCounterHeadroom(self: *Self, backend: *Backend, alloc: Allocator, entry: *const entry_codec.OwnedEntry) !u64 {
+            try self.checkFreshAppendHeadroom(backend);
             try capacity.nativeCounterHeadroom(backend.manifest_journal.sequence orelse return error.RecoveryRequired, backend.next_run_id, if (backend.wal_retention.primary) |primary| primary.current_segment else 1, self.cell_count);
             var maximum_credit = self.capacity_max_credit_bytes;
             const credit_prefix = "\x00\x00__txn_completion_v1__:";
@@ -984,6 +1002,7 @@ pub fn Pool(comptime Backend: type) type {
         pub fn qualifyFresh(self: *Self, backend: *Backend) !void {
             if (!self.restored or self.failed or backend.manifest_recovery_required) return error.RecoveryRequired;
             if (self.maintenanceRequired(backend)) return error.CompletionReservationBusy;
+            try self.checkFreshAppendHeadroom(backend);
             for (self.cells[0..self.cell_count]) |cell| if (cell.phase != .free) return error.CompletionReservationBusy;
             if (!backend.mutable.ordered_enabled) return error.UnsupportedCompletionProfile;
             if (backend.mutable.entryCount() != 0 or backend.activeImmutableMemtableCount() != 0 or
@@ -1542,6 +1561,15 @@ test "workload admission physical completion pool accepts through native prepaid
     try std.testing.expectEqual(Pool(Backend).Phase.free, pool.cells[0].phase);
     try std.testing.expectError(error.FileNotFound, pool.io.storage().fileSize(pool.accepted_paths[0]));
     pool.config.shape.max_record_bytes = (Shape{}).max_record_bytes;
+    const required_counters = try (try pool.remainingAppendBudget()).plus(completion.foreground_append_budget);
+    inline for (.{ .{ "wal_append_bytes", "bytes" }, .{ "wal_append_entries", "entries" }, .{ "wal_append_records", "records" } }) |fields| {
+        const before = @field(backend.write_stats, fields[0]);
+        @field(backend.write_stats, fields[0]) = std.math.maxInt(u64) - @field(required_counters, fields[1]) + 1;
+        try std.testing.expectError(error.UnsupportedCompletionProfile, pool.accept(&backend, 3, 9, 3, 8, envelope));
+        try std.testing.expectEqual(Pool(Backend).Phase.free, pool.cells[0].phase);
+        try std.testing.expectError(error.FileNotFound, pool.io.storage().fileSize(pool.accepted_paths[0]));
+        @field(backend.write_stats, fields[0]) = before;
+    }
     const saved_sequence = backend.manifest_journal.sequence;
     backend.manifest_journal.sequence = std.math.maxInt(u64) - 5;
     try std.testing.expectError(error.UnsupportedCompletionProfile, pool.accept(&backend, 3, 9, 3, 8, envelope));
@@ -1663,6 +1691,12 @@ test "workload admission completion generations carry four maximum point plans w
     const identity: abi.Identity = .{ .capacity = 4, .group_id = 23, .node_id = 7, .incarnation = @splat(11), .policy_digest = @splat(12), .generation = 19 };
     const locked = runtime.lockBackend(Backend, &backend);
     defer runtime.unlockBackend(Backend, &backend, locked);
+    // Exactly the full cohort plus foreground counter allowance remains near
+    // u64 exhaustion. Every accepted prepare and commit/abort must still finish.
+    const counter_budget = try (try (try completion.prepare_append_budget.plus(completion.outcome_append_budget)).repeated(max_slots)).plus(completion.foreground_append_budget);
+    backend.write_stats.wal_append_bytes = std.math.maxInt(u64) - counter_budget.bytes;
+    backend.write_stats.wal_append_entries = std.math.maxInt(u64) - counter_budget.entries;
+    backend.write_stats.wal_append_records = std.math.maxInt(u64) - counter_budget.records;
     try backend.installCompletionPoolLocked(.{ .identity = identity, .schema_catalog_digest = @splat(13), .namespace = .root });
     const pool = backend.completion_pool.?;
     try pool.qualifyFresh(&backend);
@@ -1731,6 +1765,19 @@ test "workload admission completion generations carry four maximum point plans w
         pool.notifyApplied(i);
         if (i == 1) reader = try backend.mutable.snapshot(alloc);
     }
+    // Ordinary WAL admission cannot consume the mandatory counter reserve.
+    var ordinary: @import("state.zig").ActiveMemTable = .{};
+    defer ordinary.deinit(alloc);
+    try ordinary.upsert(alloc, .{}, "ordinary-spare", "value", false);
+    const remaining_counters = try pool.remainingAppendBudget();
+    inline for (.{ .{ "wal_append_bytes", "bytes" }, .{ "wal_append_entries", "entries" }, .{ "wal_append_records", "records" } }) |fields| {
+        const before = @field(backend.write_stats, fields[0]);
+        @field(backend.write_stats, fields[0]) = std.math.maxInt(u64) - @field(remaining_counters, fields[1]);
+        const records_before = backend.write_stats.wal_append_records;
+        try std.testing.expectError(error.CompletionForegroundCapacityExceeded, backend.appendWalForMutable(&ordinary));
+        try std.testing.expectEqual(records_before, backend.write_stats.wal_append_records);
+        @field(backend.write_stats, fields[0]) = before;
+    }
     // Normal admission epochs may be exhausted after acceptance; all owned
     // outcomes and mandatory checkpoint maintenance must still make progress.
     pool.compiler.generation = std.math.maxInt(u64);
@@ -1742,10 +1789,27 @@ test "workload admission completion generations carry four maximum point plans w
         const slot = pool.cells[i].slot;
         try slot.complete(&backend, commit, .{ .commit_timestamp = 200, .replay_sequence = 1, .shared_ledger_count = 0, .shared_ledger_bytes = 0, .raft_term = 3, .raft_index = progress.index, .canonical_payload_digest = progress.digest });
         slot.retired = true;
+        // Checkpoint renewed foreground baselines, not monotonic counter room.
+        try std.testing.expectEqual(backend.write_stats.wal_append_bytes, pool.wal_bytes_start);
+        try std.testing.expectEqual(backend.write_stats.wal_append_entries, pool.wal_entries_start);
+        try std.testing.expectEqual(backend.write_stats.wal_append_records, pool.wal_records_start);
+        const after_checkpoint = try pool.remainingAppendBudget();
+        inline for (.{ .{ "wal_append_bytes", "bytes" }, .{ "wal_append_entries", "entries" }, .{ "wal_append_records", "records" } }) |fields| {
+            const before = @field(backend.write_stats, fields[0]);
+            @field(backend.write_stats, fields[0]) = std.math.maxInt(u64) - @field(after_checkpoint, fields[1]);
+            const records_before = backend.write_stats.wal_append_records;
+            try std.testing.expectError(error.CompletionForegroundCapacityExceeded, backend.appendWalForMutable(&ordinary));
+            try std.testing.expectEqual(records_before, backend.write_stats.wal_append_records);
+            @field(backend.write_stats, fields[0]) = before;
+        }
     }
     try backend.retireDurableCompletionCohort();
     try pool.maintainLocked(&backend);
-    try std.testing.expectError(error.CompletionReservationBusy, pool.qualifyFresh(&backend));
+    try std.testing.expect(backend.write_stats.wal_append_bytes > std.math.maxInt(u64) - counter_budget.bytes);
+    try std.testing.expect(backend.write_stats.wal_append_entries > std.math.maxInt(u64) - counter_budget.entries);
+    try std.testing.expect(backend.write_stats.wal_append_records > std.math.maxInt(u64) - counter_budget.records);
+    try std.testing.expectError(error.UnsupportedCompletionProfile, pool.qualifyFresh(&backend));
+    try std.testing.expectError(error.CompletionReservationBusy, pool.compiler.tryBorrow());
     try std.testing.expect(!pool.ready and !pool.failed);
     try std.testing.expect(!backend.hasDurableCompletions());
     for (0..4) |i| {
@@ -1831,6 +1895,9 @@ test "workload admission physical completion pool restores accepted and prepared
             defer restored.abandonAfterCrash();
             const pool = restored.completion_pool.?;
             try std.testing.expect(pool.restored and !pool.ready);
+            try std.testing.expectEqual(restored.write_stats.wal_append_bytes, pool.wal_bytes_start);
+            try std.testing.expectEqual(restored.write_stats.wal_append_entries, pool.wal_entries_start);
+            try std.testing.expectEqual(restored.write_stats.wal_append_records, pool.wal_records_start);
             try std.testing.expectEqual(if (prepared) Pool(Backend).Phase.prepared else .accepted, pool.cells[0].phase);
             try std.testing.expectEqual(prepared, restored.findDurableCompletion(id) != null);
             const value = try pool.point(&restored, alloc, null, "intent");
