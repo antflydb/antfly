@@ -37,11 +37,14 @@ pub const ModelKind = enum {
     chunker,
     reranker,
     generator,
-    recognizer,
     classifier,
     rewriter,
     reader,
     transcriber,
+    /// GLiNER-style entity/relation/classification extraction models. Also
+    /// the discovery hint for the legacy `extractors/` subdirectory layout
+    /// (`inferModelKindFromPath`/`discoverLegacy`), so both the manifest-
+    /// declared and path-inferred routes to this kind now agree on one name.
     extractor,
 };
 
@@ -975,7 +978,7 @@ fn modelKindFromManifestType(model_type: manifest_mod.ModelType) ModelKind {
         .chunker => .chunker,
         .reranker => .reranker,
         .generator => .generator,
-        .recognizer => .recognizer,
+        .extractor => .extractor,
         .classifier => .classifier,
         .rewriter => .rewriter,
         .reader => .reader,
@@ -1018,7 +1021,7 @@ fn modelTypeName(model_type: manifest_mod.ModelType) []const u8 {
         .chunker => "chunker",
         .reranker => "reranker",
         .generator => "generator",
-        .recognizer => "recognizer",
+        .extractor => "extractor",
         .classifier => "classifier",
         .rewriter => "rewriter",
         .reader => "reader",
@@ -1078,7 +1081,7 @@ fn appendManifestTasks(
         .chunker => try appendUniqueOwnedString(allocator, tasks, "chunk"),
         .reranker => try appendUniqueOwnedString(allocator, tasks, "rerank"),
         .generator => try appendUniqueOwnedString(allocator, tasks, "generate"),
-        .recognizer => try appendUniqueOwnedString(allocator, tasks, "extract"),
+        .extractor => try appendUniqueOwnedString(allocator, tasks, "extract"),
         .classifier => try appendUniqueOwnedString(allocator, tasks, "classify"),
         .rewriter => try appendUniqueOwnedString(allocator, tasks, "rewrite"),
         .reader => try appendUniqueOwnedString(allocator, tasks, "read"),
@@ -1109,7 +1112,7 @@ test "gliner boundary registry withholds tasks until runtime support exists" {
     var declared_capabilities = [_][]const u8{ "classification", "relations", "extraction" };
     var manifest = manifest_mod.ModelManifest{
         .allocator = allocator,
-        .model_type = .recognizer,
+        .model_type = .extractor,
         .gliner_architecture = .boundary,
         .tasks = &declared_tasks,
         .capabilities = &declared_capabilities,
@@ -1141,7 +1144,7 @@ test "gliner boundary registry serves tasks and derived capabilities once the ar
     var config = gliner_boundary.HeadConfig{};
     var manifest = manifest_mod.ModelManifest{
         .allocator = allocator,
-        .model_type = .recognizer,
+        .model_type = .extractor,
         .gliner_architecture = .boundary,
         .tasks = &declared_tasks,
         .capabilities = &declared_capabilities,
@@ -1341,7 +1344,7 @@ fn appendInferredInputs(
             if (has_visual) try appendUniqueOwnedString(allocator, inputs, "image");
             if (has_audio) try appendUniqueOwnedString(allocator, inputs, "audio");
         },
-        .chunker, .reranker, .generator, .recognizer, .classifier, .rewriter => {
+        .chunker, .reranker, .generator, .extractor, .classifier, .rewriter => {
             try appendUniqueOwnedString(allocator, inputs, "text");
             if (effective_type == .generator and has_visual) {
                 try appendUniqueOwnedString(allocator, inputs, "image");
@@ -1399,7 +1402,7 @@ fn appendJsonStringArray(
 
 fn manifestTypeFromTasks(tasks: []const []const u8, fallback: manifest_mod.ModelType) manifest_mod.ModelType {
     for (tasks) |task| {
-        if (std.mem.eql(u8, task, "extract") or std.mem.eql(u8, task, "extractors")) return .recognizer;
+        if (std.mem.eql(u8, task, "extract") or std.mem.eql(u8, task, "extractors")) return .extractor;
     }
     if (tasksIncludeVad(tasks)) return .classifier;
     for (tasks) |task| {

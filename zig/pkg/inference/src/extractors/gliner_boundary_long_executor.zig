@@ -871,7 +871,7 @@ fn testPinnedSmallWindows(directory: []const u8, metal: bool) !void {
         var result = try execute(&managed.backend, a, &config, tokenizer.tokenizer(), item, options);
         defer result.deinit();
         try std.testing.expectEqual(@as(usize, 1), result.window_count);
-        try pipeline.expectSample(case.expected, result.sample);
+        try pipeline.expectSample(case.expected, result.sample, pipeline.fp32_confidence_tolerance);
         options.limits.max_total_encoded_tokens = 1;
         try std.testing.expectError(error.LongDocumentWorkLimitExceeded, execute(&managed.backend, a, &config, tokenizer.tokenizer(), item, options));
     }

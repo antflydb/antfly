@@ -45,7 +45,7 @@ pub fn modelSupportsCapability(
     if (std.mem.eql(u8, model_kind, "classifier")) {
         return std.mem.eql(u8, capability, "classification");
     }
-    if (!std.mem.eql(u8, model_kind, "recognizer")) return false;
+    if (!std.mem.eql(u8, model_kind, "extractor")) return false;
     if (!std.mem.eql(u8, gliner_model_type, "gliner2")) return false;
     return std.mem.eql(u8, capability, "classification") or
         std.mem.eql(u8, capability, "relations") or
@@ -91,7 +91,6 @@ pub fn modelKindAcceptsInput(
     return std.mem.eql(u8, model_kind, "chunker") or
         std.mem.eql(u8, model_kind, "reranker") or
         std.mem.eql(u8, model_kind, "generator") or
-        std.mem.eql(u8, model_kind, "recognizer") or
         std.mem.eql(u8, model_kind, "classifier") or
         std.mem.eql(u8, model_kind, "rewriter") or
         std.mem.eql(u8, model_kind, "extractor") or
@@ -102,21 +101,21 @@ pub fn modelKindAcceptsInput(
 test "modelSupportsCapability infers gliner2 extraction and classification" {
     try std.testing.expect(modelSupportsCapability("classifier", "", &.{}, "classification"));
     try std.testing.expect(!modelSupportsCapability("classifier", "", &.{}, "extraction"));
-    try std.testing.expect(modelSupportsCapability("recognizer", "gliner2", &.{"labels"}, "classification"));
-    try std.testing.expect(modelSupportsCapability("recognizer", "gliner2", &.{"labels"}, "relations"));
-    try std.testing.expect(modelSupportsCapability("recognizer", "gliner2", &.{"labels"}, "extraction"));
-    try std.testing.expect(!modelSupportsCapability("recognizer", "", &.{"labels"}, "extraction"));
+    try std.testing.expect(modelSupportsCapability("extractor", "gliner2", &.{"labels"}, "classification"));
+    try std.testing.expect(modelSupportsCapability("extractor", "gliner2", &.{"labels"}, "relations"));
+    try std.testing.expect(modelSupportsCapability("extractor", "gliner2", &.{"labels"}, "extraction"));
+    try std.testing.expect(!modelSupportsCapability("extractor", "", &.{"labels"}, "extraction"));
 }
 
 test "modelKindAcceptsInput infers text and image modalities" {
-    try std.testing.expect(modelKindAcceptsInput("recognizer", "gliner2", &.{}, false, false, "text"));
-    try std.testing.expect(!modelKindAcceptsInput("recognizer", "gliner2", &.{}, false, false, "image"));
+    try std.testing.expect(modelKindAcceptsInput("extractor", "gliner2", &.{}, false, false, "text"));
+    try std.testing.expect(!modelKindAcceptsInput("extractor", "gliner2", &.{}, false, false, "image"));
     try std.testing.expect(modelKindAcceptsInput("reader", "", &.{}, false, false, "image"));
     try std.testing.expect(!modelKindAcceptsInput("reader", "", &.{}, false, false, "text"));
     try std.testing.expect(modelKindAcceptsInput("embedder", "", &.{}, true, false, "image"));
     try std.testing.expect(modelKindAcceptsInput("transcriber", "", &.{}, false, false, "audio"));
-    try std.testing.expect(modelKindAcceptsInput("recognizer", "", &.{"image"}, false, false, "image"));
-    try std.testing.expect(!modelKindAcceptsInput("recognizer", "", &.{"image"}, false, false, "text"));
+    try std.testing.expect(modelKindAcceptsInput("extractor", "", &.{"image"}, false, false, "image"));
+    try std.testing.expect(!modelKindAcceptsInput("extractor", "", &.{"image"}, false, false, "text"));
 }
 
 /// Artifact compatibility for a non-decoder model class.
@@ -158,14 +157,14 @@ test "gliner boundary capability trust follows the reviewed family runtime, neve
     // boundaryIdentityIsQualified check is what limits which specific
     // artifacts ever get a non-empty capabilities list in the first place.
     for ([_][]const u8{ "classification", "relations", "extraction" }) |capability| {
-        try std.testing.expect(modelSupportsCapability("recognizer", "gliner2.5", &.{capability}, capability));
+        try std.testing.expect(modelSupportsCapability("extractor", "gliner2.5", &.{capability}, capability));
     }
     // An undeclared capability, or an artifact with none declared (the
     // correct on-disk state for an unqualified digest/variant), is still
     // denied -- there is no inference bonus for gliner2.5 the way there is
     // for the legacy "gliner2" span family below.
-    try std.testing.expect(!modelSupportsCapability("recognizer", "gliner2.5", &.{}, "extraction"));
-    try std.testing.expect(!modelSupportsCapability("recognizer", "gliner2.5", &.{"extraction"}, "relations"));
+    try std.testing.expect(!modelSupportsCapability("extractor", "gliner2.5", &.{}, "extraction"));
+    try std.testing.expect(!modelSupportsCapability("extractor", "gliner2.5", &.{"extraction"}, "relations"));
 }
 
 test "clipclap stays compatible while standalone clip and clap do not" {

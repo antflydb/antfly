@@ -19299,7 +19299,7 @@ fn canonicalExtractionOperation(schema: extraction_api.ExtractionSchema) !Canoni
 /// with an extraction-capable head and standard BIO token recognizers. Reject
 /// other model families before constructing a pipeline or running inference.
 fn validateTextEntityExtractionManifest(manifest: *const manifest_mod.ModelManifest) !void {
-    if (manifest.model_type != .recognizer) return error.InvalidModelForExtraction;
+    if (manifest.model_type != .extractor) return error.InvalidModelForExtraction;
     if (!model_caps.modelAcceptsInput(manifest, "text")) return error.UnsupportedInput;
     if (manifest.gliner_model_type.len > 0 and !model_caps.modelSupportsCapability(
         @tagName(manifest.model_type),
@@ -21258,7 +21258,25 @@ fn taskMatchesModelListing(
         }
         return false;
     }
-    if (task.len > 0 and std.mem.eql(u8, task[0 .. task.len - 1], model_kind)) return true;
+    // Every other kind's plural task-category name doubles as an always-on
+    // listing convenience once nothing above already returned -- including a
+    // plain "extractor" kind with no gliner_model_type at all (e.g. the
+    // legacy `extractors/` directory discovery hint) or a legacy "gliner2"
+    // (span) extractor, neither of which has a reviewed-row gate. A
+    // gliner2.5 BOUNDARY-family extractor must NOT take this shortcut: it is
+    // withheld from listing until pull-time synthesis (registry.zig's
+    // boundaryIdentityIsQualified) has actually granted it real tasks/
+    // capabilities for its exact reviewed bytes (see GLINER25.md's
+    // "Two-tier gate"). Before the `recognizer` -> `extractor` rename, the
+    // enum literal was spelled "recognizer" specifically so it could never
+    // coincide with the "extractors" task name and take this fallback by
+    // accident for ANY gliner kind; now that the name matches, only the
+    // boundary family (identified by gliner_model_type, not model_kind) is
+    // excluded, explicitly, so the pre-rename gate survives exactly as
+    // narrowly as before.
+    const is_unreviewed_gate_kind = std.mem.eql(u8, model_kind, "extractor") and
+        std.mem.eql(u8, gliner_model_type, gliner_boundary_model.model_type);
+    if (task.len > 0 and !is_unreviewed_gate_kind and std.mem.eql(u8, task[0 .. task.len - 1], model_kind)) return true;
     return std.mem.eql(u8, task, "extractors") and
         model_caps.modelSupportsCapability(model_kind, gliner_model_type, capabilities, "extraction");
 }
@@ -26524,7 +26542,7 @@ test "canonical extraction operation routes every documented schema family" {
 test "entity extraction model preflight rejects incompatible families and modalities" {
     var manifest = manifest_mod.ModelManifest{
         .allocator = std.testing.allocator,
-        .model_type = .recognizer,
+        .model_type = .extractor,
     };
     try validateTextEntityExtractionManifest(&manifest);
 
@@ -26535,7 +26553,7 @@ test "entity extraction model preflight rejects incompatible families and modali
     );
 
     var image_inputs = [_][]const u8{"image"};
-    manifest.model_type = .recognizer;
+    manifest.model_type = .extractor;
     manifest.inputs = &image_inputs;
     try std.testing.expectError(
         error.UnsupportedInput,
@@ -27521,13 +27539,13 @@ test "prompt cache stays disabled while CUDA continuous batching releases the mo
 
 test "taskMatchesModelListing exposes extraction-capable models only as extractors" {
     try std.testing.expect(taskMatchesModelListing("extractors", "extractor", "", &.{}, &.{}, false));
-    try std.testing.expect(taskMatchesModelListing("extractors", "recognizer", "", &.{}, &.{"extraction"}, false));
+    try std.testing.expect(taskMatchesModelListing("extractors", "extractor", "", &.{}, &.{"extraction"}, false));
     try std.testing.expect(taskMatchesModelListing("extractors", "reader", "", &.{}, &.{"extraction"}, false));
-    try std.testing.expect(taskMatchesModelListing("extractors", "recognizer", "gliner2", &.{}, &.{"labels"}, true));
+    try std.testing.expect(taskMatchesModelListing("extractors", "extractor", "gliner2", &.{}, &.{"labels"}, true));
     try std.testing.expect(taskMatchesModelListing("extractors", "classifier", "", &.{"classify"}, &.{}, true));
     try std.testing.expect(!taskMatchesModelListing("extractors", "classifier", "", &.{"classify"}, &.{}, false));
     try std.testing.expect(!taskMatchesModelListing("classifiers", "classifier", "", &.{"classify"}, &.{}, true));
-    try std.testing.expect(!taskMatchesModelListing("classifiers", "recognizer", "gliner2", &.{}, &.{"classification"}, true));
+    try std.testing.expect(!taskMatchesModelListing("classifiers", "extractor", "gliner2", &.{}, &.{"classification"}, true));
 }
 
 test "classification extraction applies top-k to single-label and threshold to multi-label taxonomies" {
@@ -33192,23 +33210,27 @@ test "boundary qualification model listings withhold every unqualified gliner2.5
     // production row for its actual bytes) still has nothing to list here,
     // exactly like any other model kind with an empty tasks/capabilities set.
     try std.testing.expect(gliner_boundary_model.runtime_available);
-    // Every real gliner2.5 manifest reports model_type "recognizer"
-    // (parseBoundaryConfigFromCatalog), never "extractor"/"generator": those
-    // other kinds are excluded here only to keep this loop's realistic
-    // "recognizer" case next to the unrelated, kind-name-based pluralization
-    // fallback (task[0..len-1] == model_kind) that a literal kind of
-    // "extractor" would otherwise trigger regardless of gliner_model_type.
+    // Every real gliner2.5 manifest reports model_type "extractor" (was
+    // "recognizer"; parseBoundaryConfigFromCatalog). Include "extractors"
+    // itself here on purpose: model_kind now equals the singular of its own
+    // task category name, which for every OTHER kind would trigger the
+    // generic kind-name pluralization fallback (task[0..len-1] == model_kind)
+    // regardless of tasks/capabilities -- taskMatchesModelListing explicitly
+    // excludes "extractor" from that fallback (see its comment) so an
+    // unqualified/empty-capabilities gliner2.5 artifact still cannot slip
+    // into a listing this way. This loop is exactly the regression guard for
+    // that exclusion.
     for ([_][]const u8{ "extractors", "generators", "readers" }) |task| {
-        try std.testing.expect(!taskMatchesModelListing(task, "recognizer", "gliner2.5", &.{}, &.{}, false));
+        try std.testing.expect(!taskMatchesModelListing(task, "extractor", "gliner2.5", &.{}, &.{}, false));
     }
 
     // A reviewed, qualified artifact carries real tasks/capabilities written
-    // by registry.zig and is listed the same way as any other recognizer:
+    // by registry.zig and is listed the same way as any other extractor:
     // present under "extractors" and its declared capabilities, absent from
     // categories it never claimed.
-    try std.testing.expect(taskMatchesModelListing("extractors", "recognizer", "gliner2.5", &.{"extract"}, &.{ "extraction", "classification", "relations", "records" }, false));
-    try std.testing.expect(!taskMatchesModelListing("generators", "recognizer", "gliner2.5", &.{"extract"}, &.{ "extraction", "classification", "relations", "records" }, false));
-    try std.testing.expect(!taskMatchesModelListing("readers", "recognizer", "gliner2.5", &.{"extract"}, &.{ "extraction", "classification", "relations", "records" }, false));
+    try std.testing.expect(taskMatchesModelListing("extractors", "extractor", "gliner2.5", &.{"extract"}, &.{ "extraction", "classification", "relations", "records" }, false));
+    try std.testing.expect(!taskMatchesModelListing("generators", "extractor", "gliner2.5", &.{"extract"}, &.{ "extraction", "classification", "relations", "records" }, false));
+    try std.testing.expect(!taskMatchesModelListing("readers", "extractor", "gliner2.5", &.{"extract"}, &.{ "extraction", "classification", "relations", "records" }, false));
 
-    try std.testing.expect(taskMatchesModelListing("extractors", "recognizer", "gliner2", &.{"extract"}, &.{"labels"}, true));
+    try std.testing.expect(taskMatchesModelListing("extractors", "extractor", "gliner2", &.{"extract"}, &.{"labels"}, true));
 }

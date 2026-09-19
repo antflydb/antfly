@@ -94,7 +94,11 @@ pub const ModelType = enum {
     reranker,
     chunker,
     generator,
-    recognizer,
+    /// GLiNER-style entity/relation/classification extraction models. Named
+    /// `extractor` (was `recognizer`); `parseManifestModelTypeJson` still
+    /// accepts the legacy `"recognizer"` spelling from previously written
+    /// `model_manifest.json` files and normalizes it to this value on load.
+    extractor,
     rewriter,
     classifier,
     reader,
@@ -1062,7 +1066,7 @@ fn parseBoundaryConfigFromCatalog(
     manifest.bert_layer_norm_eps = config.encoder.layer_norm_eps;
     manifest.bert_pad_token_id = config.encoder.pad_token_id;
     manifest.max_position_embeddings = config.encoder.max_position_embeddings;
-    manifest.model_type = .recognizer;
+    manifest.model_type = .extractor;
     manifest.model_type_origin = .config;
     return true;
 }
@@ -1537,7 +1541,7 @@ fn applyImplicitModelTypeHints(manifest: *ModelManifest, model_dir_path: []const
     }
 
     if (manifest.gliner_model_type.len > 0) {
-        manifest.model_type = .recognizer;
+        manifest.model_type = .extractor;
         if (manifest.inference_bundle_family.len > 0) {
             manifest.model_type_origin = .bundle;
         } else if (manifest.model_type_origin != .config) {
@@ -1581,7 +1585,7 @@ fn applyImplicitModelTypeHints(manifest: *ModelManifest, model_dir_path: []const
 
 fn inferModelTypeFromTasks(tasks: []const []const u8) ?ModelType {
     for (tasks) |task| {
-        if (std.mem.eql(u8, task, "extract")) return .recognizer;
+        if (std.mem.eql(u8, task, "extract")) return .extractor;
     }
     for (tasks) |task| {
         if (std.mem.eql(u8, task, "rerank")) return .reranker;
@@ -1662,7 +1666,7 @@ fn inferModelTypeFromPath(model_dir_path: []const u8) ?ModelType {
         if (std.mem.eql(u8, component, "rerankers")) return .reranker;
         if (std.mem.eql(u8, component, "chunkers")) return .chunker;
         if (std.mem.eql(u8, component, "generators")) return .generator;
-        if (std.mem.eql(u8, component, "extractors")) return .recognizer;
+        if (std.mem.eql(u8, component, "extractors")) return .extractor;
         if (std.mem.eql(u8, component, "classifiers")) return .classifier;
         if (std.mem.eql(u8, component, "rewriters")) return .rewriter;
         if (std.mem.eql(u8, component, "readers")) return .reader;
@@ -2624,6 +2628,10 @@ fn parseEmbeddingStyleJson(value: std.json.Value) !EmbeddingStyle {
 
 fn parseManifestModelTypeJson(value: std.json.Value) !ModelType {
     if (value != .string) return error.InvalidModelManifest;
+    // "recognizer" is the pre-rename spelling of `.extractor`. Accept it from
+    // previously pulled/written model_manifest.json files so they keep
+    // working; every manifest written from here on uses "extractor".
+    if (std.mem.eql(u8, value.string, "recognizer")) return .extractor;
     return std.meta.stringToEnum(ModelType, value.string) orelse error.InvalidModelManifest;
 }
 
@@ -2941,7 +2949,7 @@ fn parseInferenceBundleJsonInternal(
         errdefer allocator.free(model_path);
         const owned_family = try allocator.dupe(u8, bundle_family);
         errdefer allocator.free(owned_family);
-        try applyBundleContract(allocator, manifest, .recognizer, &.{"text"});
+        try applyBundleContract(allocator, manifest, .extractor, &.{"text"});
         replaceOwnedString(allocator, &manifest.inference_bundle_family, owned_family);
         setOptionalPath(allocator, &manifest.gguf_path, model_path);
         if (manifest.gliner_boundary_bundle) |*prior| prior.deinit();
@@ -2975,7 +2983,7 @@ fn parseInferenceBundleJsonInternal(
         else
             null;
         errdefer if (owned_wrapper) |value| allocator.free(value);
-        try applyBundleContract(allocator, manifest, .recognizer, &.{"text"});
+        try applyBundleContract(allocator, manifest, .extractor, &.{"text"});
 
         replaceOwnedString(allocator, &manifest.inference_bundle_family, owned_family);
         if (owned_wrapper) |value| replaceOwnedString(allocator, &manifest.gliner_model_type, value);
@@ -3245,7 +3253,7 @@ fn parseGliner2InferenceVariantsJson(
     errdefer allocator.free(family);
     const wrapper = try allocator.dupe(u8, "gliner2");
     errdefer allocator.free(wrapper);
-    try applyBundleContract(allocator, manifest, .recognizer, &.{"text"});
+    try applyBundleContract(allocator, manifest, .extractor, &.{"text"});
 
     if (manifest.inference_bundle_family.len > 0) allocator.free(manifest.inference_bundle_family);
     manifest.inference_bundle_family = family;
@@ -3879,7 +3887,13 @@ test "Whisper conditional generation config remains a transcriber" {
 }
 
 test "inferModelTypeFromPath detects extractor directory" {
-    try std.testing.expectEqual(@as(?ModelType, .recognizer), inferModelTypeFromPath("C:\\models\\extractors\\fastino\\gliner2-base-v1"));
+    try std.testing.expectEqual(@as(?ModelType, .extractor), inferModelTypeFromPath("C:\\models\\extractors\\fastino\\gliner2-base-v1"));
+}
+
+test "parseManifestModelTypeJson normalizes the legacy recognizer spelling to extractor" {
+    try std.testing.expectEqual(ModelType.extractor, try parseManifestModelTypeJson(.{ .string = "recognizer" }));
+    try std.testing.expectEqual(ModelType.extractor, try parseManifestModelTypeJson(.{ .string = "extractor" }));
+    try std.testing.expectError(error.InvalidModelManifest, parseManifestModelTypeJson(.{ .string = "not_a_model_type" }));
 }
 
 test "parseModelManifestJson parses inputs array" {
@@ -3887,7 +3901,7 @@ test "parseModelManifestJson parses inputs array" {
     defer manifest.deinit();
 
     try parseModelManifestJson(&manifest, std.testing.allocator,
-        \\{"type":"recognizer","tasks":["extract"],"capabilities":["extraction"],"inputs":["text","image"],"sparse_3d_output_layout":"seq_batch"}
+        \\{"type":"extractor","tasks":["extract"],"capabilities":["extraction"],"inputs":["text","image"],"sparse_3d_output_layout":"seq_batch"}
     );
 
     try std.testing.expect(manifest.hasTask("extract"));
@@ -3966,7 +3980,7 @@ fn extractToken(allocator: std.mem.Allocator, obj: std.json.ObjectMap, key: []co
 }
 
 fn inferModelTypeFromArchitectureName(arch_name: []const u8) ?ModelType {
-    if (std.mem.endsWith(u8, arch_name, "ForTokenClassification")) return .recognizer;
+    if (std.mem.endsWith(u8, arch_name, "ForTokenClassification")) return .extractor;
     if (std.mem.endsWith(u8, arch_name, "ForSequenceClassification")) return .classifier;
     if (std.mem.eql(u8, arch_name, "VisionEncoderDecoderModel")) return .reader;
     if (std.mem.endsWith(u8, arch_name, "ForConditionalGeneration")) return .generator;
@@ -4591,13 +4605,16 @@ test "model manifest execution fields override qwen sentence-transformers sideca
     }
 }
 
-test "GLiNER sidecars preserve explicit model type provenance" {
+test "GLiNER sidecars preserve explicit model type provenance and accept the legacy recognizer alias" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(io, "model");
+    // "recognizer" is the pre-rename spelling of `.extractor`, still written
+    // by model_manifest.json files pulled before the rename. This must keep
+    // loading and normalize to `.extractor`, not fail or stay unrecognized.
     try tmp.dir.writeFile(io, .{
         .sub_path = "model/model_manifest.json",
         .data = "{\"type\":\"recognizer\"}",
@@ -4616,7 +4633,7 @@ test "GLiNER sidecars preserve explicit model type provenance" {
     defer listing.deinit();
 
     for ([_]*const ModelManifest{ &full, &listing }) |manifest| {
-        try std.testing.expectEqual(ModelType.recognizer, manifest.model_type);
+        try std.testing.expectEqual(ModelType.extractor, manifest.model_type);
         try std.testing.expectEqual(ModelTypeOrigin.manifest, manifest.model_type_origin);
         try std.testing.expectEqualStrings("gliner2", manifest.gliner_model_type);
     }
@@ -5031,9 +5048,9 @@ test "Antfly bundles must agree with explicit manifest contracts" {
 
     var matching = ModelManifest{ .allocator = allocator };
     defer matching.deinit();
-    try parseModelManifestJson(&matching, allocator, "{\"type\":\"recognizer\",\"inputs\":[\"text\"]}");
+    try parseModelManifestJson(&matching, allocator, "{\"type\":\"extractor\",\"inputs\":[\"text\"]}");
     try parseInferenceBundleJson(&matching, allocator, model_dir, gliner_bundle);
-    try std.testing.expectEqual(ModelType.recognizer, matching.model_type);
+    try std.testing.expectEqual(ModelType.extractor, matching.model_type);
     try std.testing.expectEqual(ModelTypeOrigin.manifest, matching.model_type_origin);
     try std.testing.expect(matching.model_manifest_declarations.inputs);
     try std.testing.expectEqualStrings("text", matching.inputs[0]);
@@ -5826,9 +5843,9 @@ test "manifest detects layoutlmv3 as classifier-native bundle" {
     try std.testing.expectEqualStrings("layoutlmv3", manifest_inst.config_model_arch);
 }
 
-test "manifest detects layoutlmv3 token classification architecture as recognizer" {
+test "manifest detects layoutlmv3 token classification architecture as extractor" {
     const allocator = std.testing.allocator;
-    const model_dir = try testScratchDir(allocator, "manifest-layoutlmv3-token-recognizer");
+    const model_dir = try testScratchDir(allocator, "manifest-layoutlmv3-token-extractor");
     defer {
         compat.cwd().deleteTree(compat.io(), model_dir) catch {};
         allocator.free(model_dir);
@@ -5850,7 +5867,7 @@ test "manifest detects layoutlmv3 token classification architecture as recognize
 
     var manifest_inst = try loadFromDir(allocator, model_dir);
     defer manifest_inst.deinit();
-    try std.testing.expectEqual(ModelType.recognizer, manifest_inst.model_type);
+    try std.testing.expectEqual(ModelType.extractor, manifest_inst.model_type);
     try std.testing.expectEqual(NativeArchHint.layoutlmv3, manifest_inst.native_arch_hint);
 }
 
@@ -6846,7 +6863,7 @@ test "gliner boundary manifest loading and listing preserve versioned architectu
     try tmp.dir.createDirPath(std.testing.io, "encoder_config");
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data = config });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "encoder_config/config.json", .data = encoder });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model_manifest.json", .data = "{\"type\":\"recognizer\",\"tasks\":[\"extract\"],\"capabilities\":[\"extraction\",\"classification\",\"relations\"]}" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model_manifest.json", .data = "{\"type\":\"extractor\",\"tasks\":[\"extract\"],\"capabilities\":[\"extraction\",\"classification\",\"relations\"]}" });
     const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
     defer allocator.free(model_dir);
     const Check = struct {

@@ -486,6 +486,104 @@ test "gliner boundary provider extractDirect upgrades a plain request for the qu
     try std.testing.expect(std.mem.indexOf(u8, response.json, "\"relations\":[") != null);
 }
 
+// Follow-up: closing the gap between the in-process provider rate (measured
+// at ~1.8 sections/s during a real examples/dogfood ingest, which also runs
+// the Qwen3 embedder concurrently on the same Metal device -- a confound) and
+// the standalone-server HTTP rate (~4.5 sections/s, GLINER25.md's long-document
+// throughput section). This isolates the provider entry itself
+// (Node.extractDirectWithControl, exactly as the in-process worker's
+// "extract" provider operation calls it -- see the upgrade test above and
+// GLINER25.md section 8) from that confound: same real corpus sections, same
+// schema, same backend budgets, same window defaults, no concurrent
+// embedding work, sequential (one request in flight at a time, matching
+// GLINER25.md's "direct" baseline). Compare its printed sections/s against a
+// live `antfly inference run --port 8098` server fed the identical corpus
+// file with the identical schema (see GLINER25.md's throughput section for
+// the exact HTTP-side command and numbers). Skipped unless both env vars are
+// set; never asserts a specific throughput number itself (machine-dependent),
+// only that every section is served successfully, so this stays a stable
+// regression guard while GLINER25.md records the actual measured numbers.
+test "gliner boundary provider extractDirect throughput on a real corpus matches a live HTTP baseline" {
+    const home = platform.env.getenv("HOME") orelse return error.SkipZigTest;
+    const corpus_path = platform.env.getenv("ANTFLY_GLINER25_THROUGHPUT_CORPUS") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const directory = try std.fs.path.join(a, &.{ home, ".antfly", "inference", "models", "fastino", "gliner2.5-base-v1" });
+    defer a.free(directory);
+    std.Io.Dir.cwd().access(std.testing.io, directory, .{}) catch return error.SkipZigTest;
+    const models_dir = try std.fs.path.join(a, &.{ home, ".antfly", "inference", "models", "fastino" });
+    defer a.free(models_dir);
+
+    const Section = struct { id: []const u8, text: []const u8 };
+    const corpus_bytes = try @import("../util/c_file.zig").readFileMax(a, corpus_path, 8 * 1024 * 1024);
+    defer a.free(corpus_bytes);
+    var parsed_corpus = try std.json.parseFromSlice([]const Section, a, corpus_bytes, .{});
+    defer parsed_corpus.deinit();
+    const sections = parsed_corpus.value;
+
+    // Same 11-entity/6-relation dogfood schema and window.mode as
+    // GLINER25.md's throughput section and examples/dogfood's
+    // knowledgeGraphIndexJSON, so this measures the identical request shape.
+    const schema_json =
+        \\{"entities":["component","subsystem","file","test","invariant","decision","person","model","backend","format","protocol"],"relations":[{"type":"depends_on"},{"type":"owns"},{"type":"implements"},{"type":"supersedes"},{"type":"tested_by"},{"type":"documented_in"}]}
+    ;
+    const options_json =
+        \\{"include_confidence":true,"include_spans":true,"long_document":{"mode":"window"}}
+    ;
+
+    var node = try Node.init(a, .{
+        .models_dir = models_dir,
+        .max_loaded_models = 1,
+        .max_concurrent_requests = 1,
+        .keep_alive_ms = 30 * 60 * 1000,
+        .process_termination_available = true,
+        .generation_budget_overrides = .{ .host_limit_bytes = 16 * 1024 * 1024 * 1024, .scratch_limit_bytes = 16 * 1024 * 1024 * 1024, .combined_limit_bytes = 32 * 1024 * 1024 * 1024, .backend_limit_bytes = 16 * 1024 * 1024 * 1024, .kv_limit_bytes = 4 * 1024 * 1024 * 1024 },
+    });
+    defer node.deinit();
+    try node.attachIo(std.testing.io);
+    const control = Control{ .hard_cancellation = node.hard_cancellation_watchdog.?.boundary(), .deadline_ns = platform.time.monotonicNs() + 900 * std.time.ns_per_s };
+
+    // Warm-up call: load weights and prepare the Metal session once before
+    // timing, matching a long-lived server that has already served traffic.
+    {
+        const warm_content = try std.json.Stringify.valueAlloc(a, "The metadata server coordinates Raft groups. VOPR exercises the DataServer under fault injection.", .{});
+        defer a.free(warm_content);
+        var response = try node.extractDirectWithControl(a, "gliner2.5-base-v1", .{
+            .inputs = &.{.{ .id = "warm", .content_json = warm_content }},
+            .schema_version = 2,
+            .schema_json = schema_json,
+            .options_json = options_json,
+        }, control);
+        response.deinit();
+    }
+
+    var errors: usize = 0;
+    const wall_started = platform.time.monotonicNs();
+    for (sections, 0..) |section, index| {
+        const content_json = try std.json.Stringify.valueAlloc(a, section.text, .{});
+        defer a.free(content_json);
+        const started = platform.time.monotonicNs();
+        const outcome = node.extractDirectWithControl(a, "gliner2.5-base-v1", .{
+            .inputs = &.{.{ .id = section.id, .content_json = content_json }},
+            .schema_version = 2,
+            .schema_json = schema_json,
+            .options_json = options_json,
+        }, control);
+        const elapsed_ms = (platform.time.monotonicNs() - started) / std.time.ns_per_ms;
+        if (outcome) |*response| {
+            var mutable_response = response.*;
+            defer mutable_response.deinit();
+            std.debug.print("provider throughput [{d}/{d}] id={s} bytes={d} latency_ms={d}\n", .{ index + 1, sections.len, section.id, section.text.len, elapsed_ms });
+        } else |err| {
+            errors += 1;
+            std.debug.print("provider throughput [{d}/{d}] id={s} bytes={d} latency_ms={d} ERROR={s}\n", .{ index + 1, sections.len, section.id, section.text.len, elapsed_ms, @errorName(err) });
+        }
+    }
+    const wall_ns = platform.time.monotonicNs() - wall_started;
+    const wall_s = @as(f64, @floatFromInt(wall_ns)) / @as(f64, @floatFromInt(std.time.ns_per_s));
+    std.debug.print("provider throughput TOTAL sections={d} errors={d} wall_s={d:.3} sections_per_s={d:.3}\n", .{ sections.len, errors, wall_s, @as(f64, @floatFromInt(sections.len)) / wall_s });
+    try std.testing.expectEqual(@as(usize, 0), errors);
+}
+
 // Slices out the section starting at `heading` and running to the next
 // Markdown heading line or end of file. Mirrors the section boundaries
 // examples/dogfood's docsaf.MarkdownProcessor produces (a new section at

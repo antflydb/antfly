@@ -86,7 +86,7 @@ fn shouldPreferNativeSession(man: manifest_mod.ModelManifest) bool {
     }
     if (man.gliner_model_type.len > 0) return true;
     switch (man.model_type) {
-        .classifier, .recognizer => return true,
+        .classifier, .extractor => return true,
         else => {},
     }
     return switch (man.native_arch_hint) {
@@ -10080,7 +10080,7 @@ test "shouldPreferNativeSession prefers native CLIP, Whisper, and Florence weigh
     try std.testing.expect(shouldPreferNativeSession(florence));
 }
 
-test "shouldPreferNativeSession prefers native classifier and recognizer weights" {
+test "shouldPreferNativeSession prefers native classifier and extractor weights" {
     const allocator = std.testing.allocator;
 
     var classifier = manifest_mod.ModelManifest{ .allocator = allocator, .model_type = .classifier };
@@ -10089,11 +10089,11 @@ test "shouldPreferNativeSession prefers native classifier and recognizer weights
     classifier.safetensors_path = try allocator.dupe(u8, "model.safetensors");
     try std.testing.expect(shouldPreferNativeSession(classifier));
 
-    var recognizer = manifest_mod.ModelManifest{ .allocator = allocator, .model_type = .recognizer };
-    defer recognizer.deinit();
-    try std.testing.expect(!shouldPreferNativeSession(recognizer));
-    recognizer.safetensors_path = try allocator.dupe(u8, "model.safetensors");
-    try std.testing.expect(shouldPreferNativeSession(recognizer));
+    var extractor = manifest_mod.ModelManifest{ .allocator = allocator, .model_type = .extractor };
+    defer extractor.deinit();
+    try std.testing.expect(!shouldPreferNativeSession(extractor));
+    extractor.safetensors_path = try allocator.dupe(u8, "model.safetensors");
+    try std.testing.expect(shouldPreferNativeSession(extractor));
 }
 
 test "effectiveLoadBackends keeps gpu native backends ahead of cpu native before onnx" {
@@ -11429,7 +11429,7 @@ test "ModelManager loads split gliner bundle and exposes runtime pipeline" {
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "config.json",
         .data =
-        \\{"model_type":"recognizer","hidden_size":4,"num_hidden_layers":1,"num_attention_heads":2,"intermediate_size":8,"vocab_size":16,"max_position_embeddings":16,"position_buckets":16}
+        \\{"model_type":"extractor","hidden_size":4,"num_hidden_layers":1,"num_attention_heads":2,"intermediate_size":8,"vocab_size":16,"max_position_embeddings":16,"position_buckets":16}
         ,
     });
     try tmp.dir.writeFile(std.testing.io, .{
@@ -11438,7 +11438,7 @@ test "ModelManager loads split gliner bundle and exposes runtime pipeline" {
     });
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "model_manifest.json",
-        .data = "{\"type\":\"recognizer\",\"capabilities\":[\"extraction\"]}",
+        .data = "{\"type\":\"extractor\",\"capabilities\":[\"extraction\"]}",
     });
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "antfly_inference_bundle.json",
@@ -11613,7 +11613,7 @@ test "ModelManager loads split gliner gguf-head bundle and exposes runtime pipel
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "config.json",
         .data =
-        \\{"model_type":"recognizer","hidden_size":4,"num_hidden_layers":1,"num_attention_heads":2,"intermediate_size":8,"vocab_size":16,"max_position_embeddings":16,"position_buckets":16}
+        \\{"model_type":"extractor","hidden_size":4,"num_hidden_layers":1,"num_attention_heads":2,"intermediate_size":8,"vocab_size":16,"max_position_embeddings":16,"position_buckets":16}
         ,
     });
     try tmp.dir.writeFile(std.testing.io, .{
@@ -11622,7 +11622,7 @@ test "ModelManager loads split gliner gguf-head bundle and exposes runtime pipel
     });
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "model_manifest.json",
-        .data = "{\"type\":\"recognizer\",\"capabilities\":[\"extraction\"]}",
+        .data = "{\"type\":\"extractor\",\"capabilities\":[\"extraction\"]}",
     });
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "antfly_inference_bundle.json",

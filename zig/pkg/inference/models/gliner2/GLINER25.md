@@ -19,6 +19,7 @@ first such review.
 | `fastino/gliner2.5-base-v1` (rev `72ac19b486cd4557424c8d61114e7530c243e9b0`) | base | fp32 (safetensors) | metal | Qualified (long-document windowing, up to 182,000 document bytes -- sections 9, 11) |
 | `fastino/gliner2.5-small-v1` | small | any | any | Not reviewed |
 | `fastino/gliner2.5-multi-v1` | multi | any | any | Not reviewed |
+| `fastino/gliner2.5-base-v1` (converted via `gliner25-convert`, same rev) | base | fp16_encoder | native, metal | **Not qualified** -- real-pipeline parity measured (section 12); narrowly exceeds the existing tolerance on 1 of 62 checked confidence values, both backends |
 | Any other digest, revision, or precision of `gliner2.5-base-v1` | base | any | any | Not reviewed |
 
 `gliner_boundary.runtime_available` is now `true`, and
@@ -800,6 +801,305 @@ flags as section 9) served the real 99,631-byte corpus-maximum request
 279 entities and 13 relations, ~6-7s, both before and after a full
 `zig build -Doptimize=ReleaseFast` rebuild with every change in this
 section applied.
+
+### 12. Follow-up: fp16-encoder qualification attempt -- real-pipeline parity measured, does not yet clear the bar
+
+Section 10 left `fp16_encoder` as "investigated, not yet formally qualified,"
+noting the informal `gliner25-bundle-check` comparator (`qualification:false`
+in its own output) found ~1e-4 differences on a handful of sampled confidence
+scores. This section does the qualification properly -- deterministic
+artifact production with recorded digests, full canonical-fixture parity
+through the real session/executor path (not bundle-check's raw diagnostic
+dump), and a Metal-vs-native throughput comparison -- and the honest result
+is that **it does not clear the bar this file holds fp32 to**, so no
+production row is added.
+
+**Deterministic artifact production.** `antfly-inference-gliner25-convert
+--model-dir ~/.antfly/inference/models/fastino/gliner2.5-base-v1
+--output-dir <dir> --precision fp16_encoder` was run twice into independent
+output directories. Both runs produced byte-identical `model.gguf` files
+(confirmed with `cmp` and independent `shasum -a 256`, not just the tool's
+own receipt):
+
+| File | Size (bytes) | SHA-256 |
+| --- | ---: | --- |
+| `model.gguf` (fp16_encoder, converted) | 407,861,568 | `1dce97cb1727e3b4e4c8242e88b46ad5f8f31801c2c9d24919393a8816a92d11` |
+| `config.json`, `encoder_config/config.json`, `tokenizer.json`, `tokenizer_config.json` | unchanged | identical to the fp32 digests in section 1 (copied verbatim by the converter; `gliner_boundary_bundle.validate` enforces this) |
+
+The converted bundle's own receipt (`antfly_inference_bundle.json`) records
+`precision:"fp16_encoder"` and `source_files` pointing at the exact pinned
+fp32 `model.safetensors` digest from section 1 -- so the bundle's own
+metadata proves what it was converted from, independent of this document.
+`antfly-inference-gliner25-convert --verify-dir <dir>` and
+`session_factory.createNativeSession`/`createMetalSession` both load it
+without error (334 tensors, ~193.6M parameters, ~407.8MB stored).
+
+**Real-pipeline parity (not bundle-check).** Two new tests were added --
+`"gliner boundary pipeline Python parity converted fp16 encoder base
+checkpoint all inference tasks native"` and `"...metal"`
+(`pipelines/gliner_boundary_pipeline.zig`) -- gated on
+`ANTFLY_GLINER25_BASE_FP16_MODEL_DIR`. Unlike `gliner25-bundle-check` (which
+only emits results for an external diff), these open the converted bundle
+through the exact same `session_factory.createNativeSession`/
+`createMetalSession` + `getManagedComputeBackend` + `encodeNative`/
+`runNative` (native) or `gliner_boundary_request_device.run` (Metal) path
+production uses, verify every sidecar byte-for-byte against the same pinned
+fp32 fixture digests (proving the converter didn't touch them), verify the
+bundle's own receipt records the exact pinned fp32 `model.safetensors` as
+its source, and then assert each of the ten canonical fixtures with
+`expectSample` -- the identical comparator the fp32 pinned tests use.
+
+That comparator's confidence check already carried a tolerance
+(`expectApproxEqAbs`, previously a bare `5e-4` literal at every call site);
+this pass threaded it into a named, single-sourced constant
+(`fp32_confidence_tolerance = 5e-4`) passed explicitly by every fp32 pinned
+test (`publishedCheckpointParity`, the Metal full-pipeline parity test in
+`gliner_boundary_scorer_device_test.zig`, and the long-executor canonical
+test in `gliner_boundary_long_executor.zig` -- three call sites, none of
+which had their behavior changed) so a future precision-specific tolerance
+can never silently loosen the fp32 evidence.
+
+**Exhaustive comparison, not sampled.** Running the two new tests directly
+surfaced a failure the sampled bundle-check comparison missed: one attribute
+label confidence in the `entity_attributes` fixture, off by 5.9e-4, just
+outside the fp32 rows' 5e-4 bound. To see the complete picture rather than
+stopping at the first failing assertion, `gliner25-bundle-check` was run
+against the converted bundle on both backends and every leaf confidence
+value in all ten fixtures' output was diffed against `pipeline_cases_base.
+json`'s `expected` fixtures (62 comparable confidence values per backend,
+after excluding record-instance-level confidence that `expectSample` itself
+never checks):
+
+| Backend | Values compared | Max abs diff | Count over 5e-4 |
+| --- | ---: | ---: | ---: |
+| native | 62 | 0.0005911 (`entity_attributes`, idx 1) | 1 |
+| metal | 62 | 0.0005909 (`entity_attributes`, idx 1) | 1 |
+
+The next-largest diffs on both backends are 3.1e-4 (`entity_attributes`,
+another attribute), 2.3e-4 and 2.2e-4 (`record_latent`), 1.9e-4
+(`record_natural`) -- comfortably inside tolerance. The one violation is the
+**same fixture, same value index, same ~5.9e-4 magnitude on both backends**
+(0.5588979 native / 0.5588977 metal vs. 0.5583068 expected) -- a real,
+deterministic effect of narrowing the encoder to fp16, not measurement noise
+or a backend-specific bug (native and Metal compute this with different
+kernels but land on the same answer to 6 decimal places, because both start
+from the same fp16-rounded weights).
+
+**Decision: not qualified.** This document's own instructions for
+qualifying a new artifact (see below) and this task's brief both frame the
+bar as "matches the tolerance the existing rows use." 61 of 62 checked
+values do; one doesn't, by 18% of the bound, reproducibly, on both backends.
+That is a genuine (if narrow) miss, not a coin flip that a rerun would
+clear, so **no `fp16_encoder` row was added to `production_entries`** in
+`models/gliner_boundary_qualification.zig`. Widening the tolerance
+specifically for a reduced-precision row is a real option (5.9e-4 has
+essentially no operational significance for ranking/thresholding at typical
+`threshold` settings), but it is a policy call about what "qualified" means
+for a lower-precision artifact -- exactly the kind of reviewed release
+decision this module's own design note says a row must never get by
+inference from a successful test run. This document instead records a
+`fp16_encoder_confidence_tolerance = 7.5e-4` constant (comment: measured
+max 5.909e-4-5.911e-4, with headroom) used **only** by the two new
+diagnostic tests above, so they stay a real regression guard (a converter
+change that measurably regresses further still fails them) without
+misrepresenting the artifact as meeting the fp32 bar. If a future reviewer
+decides 7.5e-4 (or some other explicit, documented number) is an acceptable
+bar for a `fp16_encoder` row specifically, adding the row is then a matter
+of copying `fastino_gliner25_base_v1`'s identity in
+`models/gliner_boundary_qualification.zig` with `precision = .fp16_encoder`,
+the weight digest above, the same sidecar digests, the same
+`fastino_gliner25_base_v1_features`/`_lengths` (geometry and tokenizer are
+unaffected by encoder weight precision, so the single-window
+`LengthContract` measured in section 3 applies unchanged), and updating this
+table -- everything needed to do that is already measured and recorded
+above; a long-document row would additionally need its own geometry/
+correctness pass through the long executor, which was not attempted here.
+
+**Throughput (informal, single-window, `gliner25-bundle-check`, same machine
+running other concurrent builds -- treat as directional, not a clean
+benchmark).** Repeated single-process runs of the ten canonical fixtures,
+warm session, comparing a converted **fp32** bundle (via
+`gliner25-convert --precision fp32`, so the comparison is bundle-vs-bundle,
+not safetensors-vs-GGUF) against the fp16_encoder bundle:
+
+| Backend | fp32 wall (3 runs) | fp16_encoder wall (3 runs) |
+| --- | --- | --- |
+| native | 1.04-2.87s | 1.89-4.59s (**slower**) |
+| metal | 3.69-4.89s | 2.66-2.99s (**faster**) |
+
+Native got *slower* with fp16 weights across every repetition, consistent
+with the native/BLAS compute path dequantizing F16 rows to f32 before each
+matmul (extra CPU work with no compensating bandwidth win on a path that
+was never memory-bandwidth-bound); Metal got *faster* in 2 of 3 reps,
+consistent with section 10's expectation that a smaller weight footprint
+helps a bandwidth-bound GPU dispatch. Given the unqualified status above,
+this is supporting color for a future reviewer's decision, not a throughput
+qualification -- and it specifically argues *against* making fp16_encoder
+the default on native regardless of what happens with the tolerance
+question.
+
+**`antfly inference pull` is unchanged, on purpose.** Because `fp16_encoder`
+is not qualified, `pull`'s existing pull-time gate
+(`registry.zig`'s `boundaryIdentityIsQualified`) correctly continues to
+advertise only the fp32 identity's tasks/capabilities; it was not modified
+to special-case a converted artifact it cannot know is a reviewed row.
+**To produce and experiment with the bundle today** (informally -- request-time
+`require()` will correctly refuse to execute against it, since no
+production row exists):
+
+```sh
+antfly-inference-gliner25-convert \
+  --model-dir ~/.antfly/inference/models/fastino/gliner2.5-base-v1 \
+  --output-dir ~/.antfly/inference/models/fastino/gliner2.5-base-v1-fp16 \
+  --precision fp16_encoder
+```
+
+places a normal model directory under the standard `owner/name` layout, so
+it is discoverable by name (`fastino/gliner2.5-base-v1-fp16`) the same way
+any pulled model is -- but pull-time synthesis never ran for it, so it has
+no `model_manifest.json` and will not list a supported task. If a future
+reviewer qualifies it, the production row is what actually authorizes
+execution (the two-tier gate above); until then, deliberately do not
+hand-author a `model_manifest.json` claiming `"tasks":["extract"]` for this
+directory to make it runnable -- `require()` in
+`gliner_boundary_qualification.zig` would still correctly refuse it with
+`error.UnsupportedGlinerBoundaryRuntime` at request time regardless (its
+identity matches no row), so doing so would only be misleading, not
+functional. There is currently no way to select this precision through the
+extractor producer config that actually executes, because it is not
+qualified -- this is intentional, not a missing feature.
+
+**Verification.** `zig build inference-test -Doptimize=ReleaseFast --
+--test-filter "gliner boundary"` with `ANTFLY_GLINER25_BASE_MODEL_DIR` and
+`ANTFLY_GLINER25_BASE_FP16_MODEL_DIR` both set: first run 162 selected, 139
+passed, 22 skipped, 1 failed (`ResourceTemporarilyUnavailable` from Metal
+live-memory admission on a long-document Metal test unrelated to this
+section's changes, on a machine also running other concurrent Metal-using
+processes); after the unrelated `ModelType.recognizer` -> `.extractor`
+terminology rename applied across `zig/pkg/inference` (registry, manifest,
+capabilities, session/model-manager, server listing, and the
+`extractors/extractor.zig` executor -- see that rename's own commit for
+detail; briefly, `model_manifest.json`'s `"type"` field and every internal
+enum/identifier now say `extractor`, with `"recognizer"` still accepted and
+normalized on load for previously-written manifests) and a full rebuild, a
+clean re-run gave 163 selected, 140 passed, 23 skipped, 0 failed. The two new converted-bundle tests passed on both backends every
+run. `--test-filter "extraction"` also passed unchanged (100/100). Log
+paths (scratchpad, not committed): `fp16-convert-a.json`,
+`fp16-convert-b.json`, `fp16-native-only.log`, `fp16-both-test1.log`,
+`fp16-full-boundary-test.log`, `retest-windowed-metal.log`,
+`fp16-bundlecheck-native.jsonl`, `fp16-bundlecheck-metal.jsonl`,
+`diff_fp16.py`, `final-boundary-after-rename.log`,
+`final-extraction-after-rename.log`.
+
+### 13. Follow-up: closing the in-process-vs-HTTP throughput gap -- measured equal, root cause is elsewhere
+
+Section 10 estimated ~4.5 sections/s for a live `antfly inference run` HTTP
+server on a corpus-shaped mix of window sizes, versus a real
+`examples/dogfood ingest` run that measured ~1.8 sections/s
+(`extract_items=1231`, `extract_ns=678364084000` -- see
+`dogfood-followup-final3.log`, scratchpad) through the in-process embedded
+worker's provider path. This section measures both precisely on the
+identical 40-section set (a reproducible corpus sample: 32 sections of
+1-8KB and 8 of 20-40KB, drawn from `zig/*.md` and `work-log/**/*.md` by
+Markdown heading, saved as `throughput-corpus.json`, scratchpad) to find out
+whether the gap is in `zig/pkg/inference`'s extraction call path.
+
+**Method.** (a) A live `antfly inference run --port 8098` server (same
+budget flags as section 7), fed the 40 sections sequentially (one request in
+flight, matching section 10's "direct" baseline) with the real dogfood
+schema and `long_document.mode=window`, timed end to end including HTTP and
+JSON overhead. (b) `server/gliner_boundary_service_test.zig`'s
+`"gliner boundary provider extractDirect throughput on a real corpus
+matches a live HTTP baseline"` test (gated on
+`ANTFLY_GLINER25_THROUGHPUT_CORPUS`; already present in this tree),
+which builds a warm `Node` directly (`process_termination_available = true`,
+the same generous budget flags, one warm-up call, then sequential
+`Node.extractDirectWithControl` calls) -- the same entry point
+(`Node.extractDirect`/`extractDirectWithControl`) the in-process embedded
+worker's "extract" provider operation calls (see section 8) -- with no HTTP,
+no JSON transport, and critically **no concurrent embedding work**, unlike
+the real dogfood ingest which runs the Qwen3 embedder and the extractor
+concurrently on the same single Metal device.
+
+**Result: (a) and (b) are the same, within noise.**
+
+| | Wall time (40 sections) | sections/s |
+| --- | ---: | ---: |
+| (a) HTTP (`antfly inference run --port 8098`) | 14.841 s | 2.695 |
+| (b) `Node.extractDirect` (direct, in-process) | 14.698 s | 2.721 |
+
+Per-section latencies match within a few percent across the whole range (a
+610-byte-class request: 83 ms HTTP / 70 ms direct; a 40,008-byte request:
+1815 ms HTTP / 1794 ms direct; the corpus max in this sample, 37,142 bytes:
+2192 ms HTTP / 2170 ms direct), with HTTP consistently a hair higher --
+consistent with JSON/transport overhead being real but small, not a
+multi-x gap. Both runs completed all 40 sections with zero errors.
+
+Per this task's own instructions: **(b) equals (a)**, so the remaining gap
+between this measurement (~2.7 sections/s on a sample deliberately
+weighted toward large sections for statistical power -- 20% of this sample
+is 20-40KB, versus the real corpus's actual tail, p99 = 23,428 bytes,
+i.e. large sections are closer to 1% of the real corpus) and section 10's
+~4.5 sections/s corpus-weighted estimate, and separately the much larger
+gap down to the real ingest's measured 1.8 sections/s, is **not** caused by
+any inefficiency in `Node.extractDirect`/the boundary executor itself --
+there is no missing session reuse, no missing warm executor cache
+(`isGlinerBoundaryResidentReady`/`.optimized_v2` is keyed off the shared
+`model_manager` session cache, not the caller, so both paths get the same
+resident-weight/async-submission optimization once the session is warm; see
+`server.zig`'s `extractV2InMemory`), and no extra per-call tokenizer/schema
+re-encoding specific to the direct path -- both call the identical
+`extractV2WithAdmission` -> `extractV2Observed` -> `extractV2InMemory`
+machinery, differing only in `admission_owner` (`.direct` vs `.http_route`)
+and JSON-vs-typed input, neither of which this measurement shows costs
+anything material.
+
+**Where the real corpus's gap likely comes from instead (read-only
+findings, outside this file's ownership to fix):**
+
+- **GPU contention with concurrent embedding.** The real ingest's
+  `extract_ns=678s` and `embed_ns=293s` sum to more than the run's
+  `wall_ms=846s`, meaning embed and extract work overlap and compete for
+  this machine's one Metal device; a request's wall-clock latency (which is
+  what both (a) and (b) above measure) includes any time spent queued
+  behind another session's GPU dispatch. Section 10's own throughput
+  numbers, and this section's, only ever measured extraction in isolation.
+  This is an admission/scheduling property of how much embed/extract
+  concurrency `zig/pkg/antfly`'s enrichment runtime allows, not something
+  `zig/pkg/inference`'s Node/executor controls.
+- **The embedded worker's out-of-process hop, on Metal.** Reading (not
+  editing) `zig/pkg/antfly/src/standalone/inference_host.zig`:
+  `linkedInferenceCreateLocal` sets `use_worker = ... and
+  inference.backends.BackendRuntime.availableRequiresProcessIsolation()`,
+  and when true, `linkedInferenceInvokeProvider` routes every provider call
+  (including "extract") through `worker_runtime.invokeProvider` to a
+  **separate `antfly` worker process**, rather than calling
+  `state.node.extractDirect` in the same process -- because the main
+  standalone process runs with `process_termination_available = false` (it
+  hosts the DB and cannot be killed/restarted the way a dedicated worker
+  can) and Metal requires that capability to safely reload a session. This
+  worktree's `examples/dogfood` run sets `ANTFLY_INFERENCE_WORKER=zig-out/
+  bin/antfly` for exactly this reason. This benchmark's (b) measurement,
+  and the pre-existing `gliner_boundary_service_test.zig` test it uses,
+  intentionally construct a `Node` directly and never cross that IPC
+  boundary (it lives in `zig/pkg/antfly`, outside this file's ownership) --
+  so if the worker hop itself adds meaningful per-call latency, it would
+  show up as a further gap beyond what (a)/(b) capture here, not within
+  them.
+
+Both explanations point at `zig/pkg/antfly`'s enrichment-runtime/embedded-
+worker layer, not `zig/pkg/inference`. No code change was made here for
+this section: the measurement shows there is nothing to fix on this side of
+the boundary.
+
+**Verification.** `antfly inference run --port 8098` was stopped after the
+HTTP measurement (`pkill`). The provider-path test:
+`ANTFLY_GLINER25_THROUGHPUT_CORPUS=<path> zig build inference-test
+-Doptimize=ReleaseFast -- --test-filter "provider extractDirect throughput
+on a real corpus"` -- 1 selected, 1 passed, 0 skipped, 0 failed. Log paths
+(scratchpad): `http_throughput.py`, `http-throughput-out.log`,
+`http-throughput-err.log`, `make_sections.py`, `bench40.json`,
+`throughput-corpus.json`, `provider-throughput-test.log`.
 
 ## How to re-qualify a different or wider artifact
 

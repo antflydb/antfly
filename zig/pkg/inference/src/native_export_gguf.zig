@@ -7276,7 +7276,7 @@ test "gliner2 export can quantize gguf head sidecar tensors" {
     try compat.cwd().writeFile(compat.io(), .{
         .sub_path = config_path,
         .data =
-        \\{"model_type":"recognizer","hidden_size":4,"num_hidden_layers":1,"num_attention_heads":2,"intermediate_size":8,"vocab_size":16,"max_position_embeddings":16,"position_buckets":16}
+        \\{"model_type":"extractor","hidden_size":4,"num_hidden_layers":1,"num_attention_heads":2,"intermediate_size":8,"vocab_size":16,"max_position_embeddings":16,"position_buckets":16}
         ,
     });
 
