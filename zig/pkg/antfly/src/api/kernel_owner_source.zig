@@ -441,9 +441,11 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .txn_begin_group_local = txnBeginGroupLocal,
                 .txn_prepare_group_local = txnPrepareGroupLocal,
                 .txn_resolve_group_local = txnResolveGroupLocal,
+                .txn_resolve_group_local_with_cancellation = txnResolveGroupLocalWithCancellation,
                 .txn_decide_group_local_with_pre_decision_context = txnDecideGroupLocalWithPreDecisionContext,
                 .txn_status_group_local = txnStatusGroupLocal,
                 .txn_acknowledge_group_local = txnAcknowledgeGroupLocal,
+                .txn_acknowledge_group_local_until = txnAcknowledgeGroupLocalUntil,
                 .begin_bulk_ingest_group_local = beginBulkIngestGroupLocal,
                 .finish_bulk_ingest_group_local = finishBulkIngestGroupLocal,
                 .abort_bulk_ingest_group_local = abortBulkIngestGroupLocal,
@@ -3974,6 +3976,33 @@ pub const ProvisionedKernelOwnerSource = struct {
         return {};
     }
 
+    fn txnResolveGroupLocalWithCancellation(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_types.TxnId,
+        status: db_types.TxnStatus,
+        commit_version: u64,
+        _: u64,
+        sync_level: db_types.SyncLevel,
+        cancellation: db_types.CancellationToken,
+    ) !?void {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        try cancellation.check();
+        const request_json = try table_writes.encodeStorageKernelBatchRequest(alloc, .{
+            .sync_level = sync_level,
+            .transaction = .{ .resolve = .{ .txn_id = txn_id, .status = status, .commit_version = commit_version } },
+        });
+        defer alloc.free(request_json);
+        var lease = try self.acquire(group_id, table_name);
+        defer lease.deinit();
+        try cancellation.check();
+        var response = try lease.owner().replicatedBatchJson(table_name, request_json);
+        defer response.deinit();
+        return {};
+    }
+
     fn txnDecideGroupLocalWithPreDecisionContext(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -4037,6 +4066,31 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .participant = participant,
             } },
         });
+        return {};
+    }
+
+    fn txnAcknowledgeGroupLocalUntil(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_types.TxnId,
+        participant: []const u8,
+        deadline_ns: u64,
+    ) !?void {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+        const request_json = try table_writes.encodeStorageKernelBatchRequest(alloc, .{
+            .transaction = .{ .acknowledge = .{ .txn_id = txn_id, .participant = participant } },
+        });
+        defer alloc.free(request_json);
+        var lease = try self.acquire(group_id, table_name);
+        defer lease.deinit();
+        // Recovery owns this absolute deadline independently of the original
+        // caller. Acquisition cannot silently rebase its remaining budget.
+        if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+        var response = try lease.owner().replicatedBatchJson(table_name, request_json);
+        defer response.deinit();
         return {};
     }
 
@@ -4990,6 +5044,72 @@ test "publication cancellation and timeout release admission without invalidatin
         var replacement = try source.acquireDescriptor(1, "docs", path, descriptor);
         defer replacement.deinit();
     }
+}
+
+test "workload admission recovery ACK deadline and abort token survive owner acquisition" {
+    const alloc = std.testing.allocator;
+    var directory = try @import("../common/test_directory.zig").TestDirectory.init("owner-ack-deadline");
+    defer directory.cleanup();
+    const Catalog = struct {
+        wait_until_ns: ?u64 = null,
+        late_acquisitions: usize = 0,
+        cancel_on_catalog: ?*std.atomic.Value(bool) = null,
+        fn snapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.cancel_on_catalog) |signal| signal.store(true, .release);
+            if (self.wait_until_ns) |deadline| {
+                self.late_acquisitions += 1;
+                while (platform_time.monotonicNs() < deadline) platform_time.sleepNs(std.time.ns_per_ms);
+            }
+            const metadata = @import("../metadata/table_manager.zig");
+            return .{
+                .status = .{ .metadata_group_id = 9, .metadata_epoch = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata.TableRecord{.{ .table_id = 1, .name = "docs", .indexes_json = "{}" }})[0..]),
+                .ranges = @constCast((&[_]metadata.RangeRecord{.{ .table_id = 1, .group_id = 2, .range_id = 3, .start_key = "", .doc_identity_shard_id = 2, .doc_identity_range_id = 3 }})[0..]),
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+        fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+    var catalog: Catalog = .{};
+    var owner_source = ProvisionedKernelOwnerSource.init(alloc, std.mem.span(directory.path().ptr), .{
+        .ptr = &catalog,
+        .vtable = &.{ .admin_snapshot = Catalog.snapshot, .free_admin_snapshot = Catalog.free },
+    }, read_gate.alreadyReadSafeBarrier());
+    defer owner_source.deinit();
+    const writes = owner_source.writeSource();
+    const txn_id: db_types.TxnId = @splat(0x72);
+    const participant = "table2:00000004:docs:2";
+    _ = try writes.txnBeginGroupLocal(alloc, 2, "docs", txn_id, 100, 1, true, &.{participant});
+    _ = try writes.txnResolveGroupLocal(alloc, 2, "docs", txn_id, .committed, 200, 1, .propose);
+    const deadline = platform_time.monotonicNs() + std.time.ns_per_s;
+    catalog.wait_until_ns = deadline;
+    // The public boundary starts before expiry, then real catalog acquisition
+    // consumes the remaining budget. Without the final pre-C check this would
+    // return InvalidParticipant, proving an ACK was invoked after its deadline.
+    try std.testing.expectError(error.Timeout, writes.txnAcknowledgeGroupLocalUntil(alloc, 2, "docs", txn_id, "not-enlisted", deadline));
+    try std.testing.expectEqual(@as(usize, 1), catalog.late_acquisitions);
+    catalog.wait_until_ns = null;
+    const recovery_deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+    try std.testing.expectError(error.InvalidParticipant, writes.txnAcknowledgeGroupLocalUntil(alloc, 2, "docs", txn_id, "not-enlisted", recovery_deadline));
+    // A new recovery window is independent from the expired window and the
+    // original request. Accepted C errors/results pass through unchanged.
+    _ = try writes.txnAcknowledgeGroupLocalUntil(alloc, 2, "docs", txn_id, participant, recovery_deadline);
+    _ = try writes.txnAcknowledgeGroupLocalUntil(alloc, 2, "docs", txn_id, participant, recovery_deadline);
+
+    const abort_id: db_types.TxnId = @splat(0x73);
+    _ = try writes.txnBeginGroupLocal(alloc, 2, "docs", abort_id, 300, 1, true, &.{participant});
+    var recovery_expired = std.atomic.Value(bool).init(false);
+    catalog.cancel_on_catalog = &recovery_expired;
+    try std.testing.expectError(error.Canceled, writes.txnResolveGroupLocalWithCancellation(alloc, 2, "docs", abort_id, .aborted, 301, 1, .propose, .fromAtomic(&recovery_expired)));
+    catalog.cancel_on_catalog = null;
+    try std.testing.expect(recovery_expired.load(.acquire));
+    try std.testing.expectEqual(db_types.TxnStatus.pending, (try writes.txnStatusGroupLocal(alloc, 2, "docs", abort_id)).?);
+    _ = try writes.txnResolveGroupLocalWithCancellation(alloc, 2, "docs", abort_id, .aborted, 301, 1, .propose, .none);
+    try std.testing.expectEqual(db_types.TxnStatus.aborted, (try writes.txnStatusGroupLocal(alloc, 2, "docs", abort_id)).?);
 }
 
 test "workload admission provisioned routed reads translate fence clock domains" {

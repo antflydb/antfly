@@ -195,3 +195,12 @@ prerequisites are implemented and verified.
   Evidence: `/tmp/workload-first-decision-data1.log`, actual exit0. This tests
   the decision certainty boundary on a legacy table; protected control capacity
   and replicated quorum-failure qualification remain separate requirements.
+- SourceOwner preserves the independent recovery ACK deadline and abort token
+  through owner acquisition, checks them immediately before invoking the C
+  owner, and leaves post-invocation results unchanged. The real compiled-owner
+  regression forces expiry during catalog acquisition, verifies no late ACK or
+  abort was submitted, then completes both with a fresh recovery window. It
+  also preserves the native InvalidParticipant error through the checked ABI.
+  Evidence: `/tmp/workload-recovery-owner-deadline6.log`, actual exit0, one test
+  with zero skips, failures or leaks. This stage prevents late submission;
+  bounding descriptor acquisition itself remains the next stage.
