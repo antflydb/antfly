@@ -8836,6 +8836,57 @@ pub const Node = struct {
         return .{ .allocator = allocator, .json = try allocator.dupe(u8, json) };
     }
 
+    fn tryExtractLayaV2(self: *Node, scratch: std.mem.Allocator, request_json: []const u8, control: ?InferenceExecutionControl, response_limit: ?usize) !?[]u8 {
+        try extraction_v2.scanJsonEnvelope(request_json, .{});
+        const parsed = try std.json.parseFromSlice(std.json.Value, scratch, request_json, .{ .duplicate_field_behavior = .@"error" });
+        defer parsed.deinit();
+        if (parsed.value != .object) return null;
+        const name = parsed.value.object.get("model") orelse return null;
+        if (name != .string or name.string.len == 0) return null;
+        var owned_io: ?std.Io.Threaded = null;
+        defer if (owned_io) |*io_impl| io_impl.deinit();
+        const io = self.inferenceIo(scratch, null, &owned_io);
+        const path = self.resolveRequestModelPath(scratch, io, name.string, "extractors") catch |err| switch (err) {
+            error.ModelNotFound => return null,
+            else => return err,
+        };
+        defer scratch.free(path);
+        var manifest = try manifest_mod.loadListingFromDir(scratch, path);
+        defer manifest.deinit();
+        if (!manifest.hasCapability("typed_decisions")) return null;
+        const laya = @import("../extractors/laya.zig");
+        var arena = std.heap.ArenaAllocator.init(scratch);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        const request = try laya.parse(allocator, parsed.value);
+        const contract = try resolvedInferenceExecutorContractFromDir(self, allocator, path, "extract");
+        const texts = try allocator.alloc([]const u8, request.tasks.len);
+        var max_candidates: usize = 0;
+        var schema_text_bytes: usize = 0;
+        for (request.tasks, texts) |task, *text| {
+            text.* = task.text;
+            max_candidates = @max(max_candidates, task.question.labels.len);
+            var question_bytes = task.question.instruction.len;
+            for (task.question.labels, task.question.descriptions) |label, description| question_bytes += label.len + description.len;
+            schema_text_bytes = @max(schema_text_bytes, question_bytes);
+        }
+        try validateTextExecutorInvocation(contract, texts.len, texts, schema_text_bytes, 0, max_candidates, request.schema_bytes);
+        const effective = control orelse InferenceExecutionControl{};
+        try effective.check();
+        var handle = try self.model_manager.acquireFromDirWithControl(path, effective);
+        defer handle.release();
+        const loaded = handle.get();
+        const config = session_factory.getLayaConfig(loaded.session) orelse return error.UnsupportedExtractionModel;
+        if (loaded.session.backend() != .native and loaded.session.backend() != .metal) return error.UnsupportedExtractionBackend;
+        const mutex = loaded.targetInferenceExecutionMutex();
+        if (mutex) |lock| try effective.lock(lock);
+        defer if (mutex) |lock| lock.unlock();
+        const result = try @import("../pipelines/laya.zig").executeWithScratch(allocator, scratch, loaded.session, loaded.getTokenizer(), config, request.tasks, effective, contract.batch.max_input_tokens_per_item);
+        const bytes = try laya.response(allocator, request, result, @min(64 * 1024 * 1024, response_limit orelse 64 * 1024 * 1024));
+        try effective.check();
+        return try scratch.dupe(u8, bytes);
+    }
+
     fn extractV2InMemory(
         self: *Node,
         scratch: std.mem.Allocator,
@@ -8848,6 +8899,8 @@ pub const Node = struct {
         working_bytes: usize,
         allocation_failure: *ExtractionAllocationFailure,
     ) ![]u8 {
+        // Each architecture retains its own schema validation and qualification.
+        if (try self.tryExtractLayaV2(scratch, request_json, control, response_limit)) |json| return json;
         const regex = @import("../pipelines/extraction_regex.zig");
         var validators = regex.Context.init(scratch, .{
             .compile_options = .{ .control = control },
@@ -21470,7 +21523,7 @@ fn taskMatchesModelListing(
     if (std.mem.eql(u8, task, "extractors") and
         model_caps.modelSupportsCapability(model_kind, gliner_model_type, capabilities, "classification"))
     {
-        return !std.mem.eql(u8, model_kind, "classifier") or zero_shot_classification;
+        return !std.mem.eql(u8, model_kind, "classifier") or zero_shot_classification or model_caps.hasCapability(capabilities, "typed_decisions");
     }
     if (tasks.len > 0) {
         const singular_task: ?[]const u8 = if (std.mem.eql(u8, task, "embedders"))
@@ -33382,4 +33435,76 @@ test "boundary qualification model listings reject raw explicit tasks and capabi
     }
     try std.testing.expect(!taskMatchesModelListing("extractors", "extractor", "gliner2.5", &.{}, &.{}, false));
     try std.testing.expect(taskMatchesModelListing("extractors", "recognizer", "gliner2", &.{"extract"}, &.{"labels"}, true));
+}
+
+test "laya extraction v2 serves typed decisions over HTTP and embedded calls" {
+    const root = platform.env.getenv("ANTFLY_LAYA_QUALIFICATION") orelse platform.env.getenv("ANTFLY_LAYA_REFERENCE") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var node = try Node.init(a, .{ .models_dir = root, .allow_unknown_models = true, .max_concurrent_requests = 1, .process_termination_available = true });
+    defer node.deinit();
+    try node.attachIo(std.testing.io);
+    const backend: backends_mod.BackendType = if (platform.env.getenv("ANTFLY_LAYA_METAL") != null) .metal else .native;
+    node.session_manager.required_backend = backend;
+    node.model_manager.session_manager.required_backend = backend;
+    const body =
+        \\{"model":"model","schema_version":2,"inputs":[{"content":"please find the document"}],"schema":{"classifications":[{"name":"tool","mode":"single","instruction":"which tool is needed?","labels":["search","fetch","none"]},{"name":"urgency","mode":"ordinal","instruction":"urgency?","labels":["low","medium","high"]},{"name":"needed","mode":"boolean","instruction":"is search needed?","labels":["false","true"]}]}}
+    ;
+    var direct = try node.extractV2DirectJsonWithControl(a, body, null);
+    defer direct.deinit();
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, direct.json, .{});
+    defer parsed.deinit();
+    const item = parsed.value.object.get("data").?.array.items[0].object;
+    try std.testing.expect(!item.contains("id"));
+    const decisions = item.get("decisions").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), decisions.len);
+    try std.testing.expectEqualStrings("normalized_inverse_entropy", decisions[0].object.get("confidence_method").?.string);
+    try std.testing.expect(decisions[1].object.contains("expected_value"));
+    try std.testing.expect(decisions[2].object.contains("true_probability"));
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/extract");
+    defer request.deinit();
+    request.body = body;
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try node.extractJSON(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    try std.testing.expectEqualStrings(direct.json, response.body.?);
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    const invalid = try std.mem.replaceOwned(u8, a, body, "\"mode\":\"boolean\"", "\"mode\":\"multi\"");
+    defer a.free(invalid);
+    try std.testing.expectError(error.UnsupportedExtractionFeature, node.extractV2DirectJsonWithControl(a, invalid, null));
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    const shared_schema = "{\"classifications\":[{\"name\":\"tool\",\"instruction\":\"which tool is needed?\",\"labels\":[\"search\",\"fetch\",\"none\"]}]}";
+    const input_rows = [_][]const u8{
+        "{\"id\":\"first\",\"content\":\"please find the document\"}",
+        "{\"id\":\"second\",\"content\":\"urgent\",\"schema\":{\"classifications\":[{\"name\":\"needed\",\"mode\":\"boolean\",\"instruction\":\"is search needed?\",\"labels\":[\"false\",\"true\"]}]}}",
+        "{\"id\":\"third\",\"content\":\"hello world\"}",
+    };
+    const batch_body = try std.fmt.allocPrint(a, "{{\"model\":\"model\",\"schema_version\":2,\"schema\":{s},\"inputs\":[{s},{s},{s}]}}", .{ shared_schema, input_rows[0], input_rows[1], input_rows[2] });
+    defer a.free(batch_body);
+    var batch_result = try node.extractV2DirectJsonWithControl(a, batch_body, null);
+    defer batch_result.deinit();
+    const BatchResponse = struct { data: []const struct { id: []const u8, decisions: []const struct { name: []const u8, label: []const u8, probabilities: []const struct { probability: f32 } } } };
+    const batch_parsed = try std.json.parseFromSlice(BatchResponse, a, batch_result.json, .{ .ignore_unknown_fields = true });
+    defer batch_parsed.deinit();
+    try std.testing.expectEqual(input_rows.len, batch_parsed.value.data.len);
+    for (input_rows, batch_parsed.value.data) |input, actual| {
+        const single_body = try std.fmt.allocPrint(a, "{{\"model\":\"model\",\"schema_version\":2,\"schema\":{s},\"inputs\":[{s}]}}", .{ shared_schema, input });
+        defer a.free(single_body);
+        var single = try node.extractV2DirectJsonWithControl(a, single_body, null);
+        defer single.deinit();
+        const single_parsed = try std.json.parseFromSlice(BatchResponse, a, single.json, .{ .ignore_unknown_fields = true });
+        defer single_parsed.deinit();
+        const expected = single_parsed.value.data[0];
+        try std.testing.expectEqualStrings(expected.id, actual.id);
+        try std.testing.expectEqual(expected.decisions.len, actual.decisions.len);
+        for (expected.decisions, actual.decisions) |want, got| {
+            try std.testing.expectEqualStrings(want.name, got.name);
+            try std.testing.expectEqualStrings(want.label, got.label);
+            for (want.probabilities, got.probabilities) |p, q| try std.testing.expectApproxEqAbs(p.probability, q.probability, 5e-4);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    try std.testing.expect(taskMatchesModelListing("extractors", "classifier", "", &.{"extract"}, &.{"typed_decisions"}, false));
+    try std.testing.expect(!taskMatchesModelListing("classifiers", "classifier", "", &.{"extract"}, &.{"typed_decisions"}, false));
 }

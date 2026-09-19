@@ -289,3 +289,29 @@ def test_extraction_v2_explicit_empty_id_is_not_anonymous_and_legacy_is_unchange
     legacy = {"object": "extraction", "model": "legacy-model", "data": [{"entities": []}]}
     client = client_with_transport(lambda _: httpx.Response(200, json=legacy))
     assert client.extract(identified_request()).to_dict() == legacy
+
+
+def test_laya_decision_roundtrip_preserves_boolean_zero_probability():
+    decision = {
+        "name": "needed",
+        "type": "boolean",
+        "label": "false",
+        "probabilities": [{"label": "false", "probability": 1}, {"label": "true", "probability": 0}],
+        "confidence": 1,
+        "confidence_method": "max_probability",
+        "act_probability": 0,
+        "true_probability": 0,
+    }
+    payload = extraction_envelope(data=[{"decisions": [decision]}])
+    request = {
+        "model": "m",
+        "schema": {
+            "classifications": [
+                {"name": "needed", "mode": "boolean", "instruction": "Need search?", "labels": ["false", "true"]}
+            ]
+        },
+        "inputs": [{"content": "hello"}],
+    }
+    response = client_with_transport(lambda _: httpx.Response(200, json=payload)).extract_v2(request)
+    assert response.data[0].decisions[0].true_probability == 0
+    assert response.data[0].decisions[0].to_dict() == decision

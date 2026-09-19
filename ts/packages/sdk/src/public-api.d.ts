@@ -17423,9 +17423,11 @@ export interface components {
             top_k?: number;
             /**
              * @description Version 2 classification mode. Ordinal labels are ordered from lowest to highest.
+             *     Typed-decision extractors support boolean with labels ["false", "true"] in that order.
+             *     Each model rejects modes it does not support.
              * @enum {string}
              */
-            mode?: "single" | "multi" | "ordinal";
+            mode?: "single" | "multi" | "ordinal" | "boolean";
             label_definitions?: {
                 [key: string]: components["schemas"]["ExtractionLabelDefinition"];
             };
@@ -17930,6 +17932,42 @@ export interface components {
             schema: components["schemas"]["ExtractionSchema"];
             options?: components["schemas"]["ExtractionOptions"];
         };
+        ExtractionLabelProbability: {
+            label: string;
+            /** Format: float */
+            probability: number;
+        };
+        /** @description Version 2 typed classification decision. Probabilities follow request label order; ordinal levels are zero-based. */
+        ExtractionDecision: {
+            name: string;
+            /** @enum {string} */
+            type: "choice" | "score" | "boolean";
+            /** @description Highest-probability label. This is distinct from the expected ordinal value. */
+            label: string;
+            probabilities: components["schemas"]["ExtractionLabelProbability"][];
+            /** Format: float */
+            confidence: number;
+            /**
+             * @description Entropy confidence is not the probability that the selected label is correct.
+             * @enum {string}
+             */
+            confidence_method: "normalized_inverse_entropy" | "max_probability";
+            /**
+             * Format: float
+             * @description Score decisions only; sum of zero-based level index times probability.
+             */
+            expected_value?: number;
+            /**
+             * Format: float
+             * @description Boolean decisions only; probability of the true label.
+             */
+            true_probability?: number;
+            /**
+             * Format: float
+             * @description Auxiliary model estimate for acting. Does not authorize or execute a tool call.
+             */
+            act_probability: number;
+        };
         ExtractionAttributeLabel: {
             label: string;
             confidence: components["schemas"]["ExtractionProbability"];
@@ -18018,6 +18056,8 @@ export interface components {
             solver_optimality_scope: "retained_candidate_graph";
         };
         ExtractionObject: {
+            /** @description Typed decision results from capable extractors, alongside compatible per-label classifications. */
+            decisions?: components["schemas"]["ExtractionDecision"][];
             id?: string;
             offset_unit?: components["schemas"]["ExtractionOffsetUnit"];
             entities?: components["schemas"]["ExtractionEntity"][];

@@ -33512,7 +33512,13 @@ components:
             - single
             - multi
             - ordinal
-          description: Version 2 classification mode. Ordinal labels are ordered from lowest to highest.
+            - boolean
+          description: >
+            Version 2 classification mode. Ordinal labels are ordered from lowest to highest.
+
+            Typed-decision extractors support boolean with labels ["false", "true"] in that order.
+
+            Each model rejects modes it does not support.
           x-go-type-skip-optional-pointer: false
         label_definitions:
           type: object
@@ -34682,6 +34688,77 @@ components:
           $ref: '#/components/schemas/ExtractionSchema'
         options:
           $ref: '#/components/schemas/ExtractionOptions'
+    ExtractionLabelProbability:
+      type: object
+      required:
+        - label
+        - probability
+      properties:
+        label:
+          type: string
+        probability:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+    ExtractionDecision:
+      type: object
+      description: Version 2 typed classification decision. Probabilities follow request label order;
+        ordinal levels are zero-based.
+      required:
+        - name
+        - type
+        - label
+        - probabilities
+        - confidence
+        - confidence_method
+        - act_probability
+      properties:
+        name:
+          type: string
+        type:
+          type: string
+          enum:
+            - choice
+            - score
+            - boolean
+        label:
+          type: string
+          description: Highest-probability label. This is distinct from the expected ordinal value.
+        probabilities:
+          type: array
+          items:
+            $ref: '#/components/schemas/ExtractionLabelProbability'
+        confidence:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+        confidence_method:
+          type: string
+          enum:
+            - normalized_inverse_entropy
+            - max_probability
+          description: Entropy confidence is not the probability that the selected label is correct.
+        expected_value:
+          type: number
+          format: float
+          description: Score decisions only; sum of zero-based level index times probability.
+          minimum: 0
+          x-go-type-skip-optional-pointer: false
+        true_probability:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+          description: Boolean decisions only; probability of the true label.
+          x-go-type-skip-optional-pointer: false
+        act_probability:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+          description: Auxiliary model estimate for acting. Does not authorize or execute a tool call.
     ExtractionAttributeLabel:
       type: object
       required:
@@ -34896,6 +34973,12 @@ components:
     ExtractionObject:
       type: object
       properties:
+        decisions:
+          type: array
+          description: Typed decision results from capable extractors, alongside compatible per-label
+            classifications.
+          items:
+            $ref: '#/components/schemas/ExtractionDecision'
         id:
           type: string
         offset_unit:
