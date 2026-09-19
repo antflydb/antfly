@@ -157,6 +157,26 @@ fn openIntoPolicy(comptime BackendType: type, backend: *BackendType, allocator: 
         if (!stable_address) return error.UnsupportedCompletionBackend;
         if (backend.options.completion_pool_config == null) return error.CompletionRecoveryCapacityRequired;
     }
+    const pool_configured = if (comptime @hasField(BackendType, "completion_pool")) backend.options.completion_pool_config != null else false;
+    const installed_pool_guarded = installed: {
+        const path = try std.fs.path.join(allocator, &.{ root_dir, "completion-installation.guard" });
+        defer allocator.free(path);
+        if (backend.storage.?.fileSize(path)) |_| break :installed true else |err| {
+            if (err != error.FileNotFound) return err;
+            break :installed false;
+        }
+    };
+    if (installed_pool_guarded and !pool_configured) return error.CompletionRecoveryCapacityRequired;
+    if (pool_configured and !stable_address) return error.UnsupportedCompletionBackend;
+    if (pool_configured and !accepted_pool_guarded) {
+        // A local reservation cannot be silently reinterpreted as a replicated
+        // pool merely because trusted startup configuration changed.
+        for (@import("completion_runtime.zig").guard_filenames) |filename| {
+            const path = try std.fs.path.join(allocator, &.{ root_dir, filename });
+            defer allocator.free(path);
+            if (backend.storage.?.fileSize(path)) |_| return error.InvalidCompletionSlot else |err| if (err != error.FileNotFound) return err;
+        }
+    }
     cleanupRecoveredRunFiles(BackendType, backend, "before_manifest", true);
 
     const loaded_manifest = blk: {
@@ -228,6 +248,9 @@ fn openIntoPolicy(comptime BackendType: type, backend: *BackendType, allocator: 
             },
         );
     }
+    // An installed/accepted owner cannot become a fresh empty store merely
+    // because its authoritative manifest disappeared.
+    if (!loaded_manifest and (installed_pool_guarded or accepted_pool_guarded)) return error.InvalidManifest;
     if (!loaded_manifest and options.create_if_missing) {
         const phase_start = beginOpenPhase(BackendType, backend, .ensuring_dirs);
         defer finishOpenPhase(BackendType, backend, .ensuring_dirs, phase_start);
@@ -251,11 +274,15 @@ fn openIntoPolicy(comptime BackendType: type, backend: *BackendType, allocator: 
             if (@hasDecl(BackendType, "registerOpenManifestRunRefs")) try backend.registerOpenManifestRunRefs();
             if (@hasDecl(BackendType, "mountRunDirectory")) try backend.mountRunDirectory();
         }
+        // Trusted installed policy also owns idle/receipt-only replay. Waiting
+        // for an accepted sidecar would replay into ordinary memory and lose the
+        // fixed restart envelope immediately after the last slot retired.
+        const restore_pool = pool_configured and loaded_manifest;
         if (comptime @hasField(BackendType, "completion_pool")) {
-            if (accepted_pool_guarded) try backend.installCompletionPoolLocked(backend.options.completion_pool_config.?);
+            if (restore_pool) try backend.installCompletionPoolLocked(backend.options.completion_pool_config.?);
         }
         const guarded = if (comptime @hasField(BackendType, "durable_completion"))
-            if (accepted_pool_guarded) false else try completion_recovery.restoreBeforeReplay(BackendType, backend)
+            if (restore_pool) false else try completion_recovery.restoreBeforeReplay(BackendType, backend)
         else
             false;
         if (@hasDecl(BackendType, "replayWalIntoMutable")) {
@@ -263,7 +290,7 @@ fn openIntoPolicy(comptime BackendType: type, backend: *BackendType, allocator: 
             const phase_start = beginOpenPhase(BackendType, backend, .replaying_wal);
             defer finishOpenPhase(BackendType, backend, .replaying_wal, phase_start);
             if (comptime @hasField(BackendType, "durable_completion")) {
-                if (accepted_pool_guarded) {
+                if (restore_pool) {
                     const pool = backend.completion_pool.?;
                     try pool.replayBeforePublication(backend);
                     try pool.restoreMaterialized(backend);

@@ -2057,7 +2057,7 @@ pub const NativeFdPermit = struct {
 pub const NativeCompletionIo = NativeWalCompletionIo;
 
 pub const NativeWalCompletionIo = struct {
-    pub const max_prepared_files = 96;
+    pub const max_prepared_files = 768;
     /// Exact, slot-owned files in addition to the standard WAL paths. The
     /// caller reserves these names before sealing; this is no authority to
     /// overwrite, delete or recover another slot's files.

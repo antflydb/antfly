@@ -7233,7 +7233,7 @@ pub const Backend = struct {
         run.deinit(allocator);
     }
 
-    fn obsoletePathPinnedByOpenVersion(self: *Backend, path: []const u8) bool {
+    pub fn obsoletePathPinnedByOpenVersion(self: *Backend, path: []const u8) bool {
         if (self.manifest_journal.protectsPath(path)) return true;
         if (repository_mod.manifest_set.identify(path)) |file| {
             if (self.manifest_checkpoint_build_id == file.id) return true;

@@ -26,7 +26,7 @@ pub const accepted_filenames = [_][]const u8{
     "completion-accepted-2.guard", "completion-accepted-3.guard",
 };
 pub const publication_per_cell = 8 * 1024 * 1024;
-pub const control_bytes = 2 * 1024 * 1024;
+pub const control_bytes = 8 * 1024 * 1024;
 pub const accepted_header_bytes = 192;
 pub const max_accepted_bytes = accepted_header_bytes + entry_codec.max_wire_bytes;
 
@@ -282,7 +282,11 @@ pub fn Pool(comptime Backend: type) type {
             resolution: ?struct { identity: completion.AcceptedIdentity, commit: bool } = null,
         };
         config: Config,
-        control: *domains.Arena,
+        control: *domains.RecyclingScratch,
+        maintenance_active: bool = false,
+        maintenance_pending: bool = false,
+        legacy_obsolete_imported: bool = false,
+        retired: [2]@import("completion_maintenance_cycle.zig").Retired = .{ .{}, .{} },
         publication: *domains.RecyclingScratch,
         scratch: *domains.RecyclingScratch,
         compiler: domains.CompilerWorkspace,
@@ -316,6 +320,7 @@ pub fn Pool(comptime Backend: type) type {
             try validateIdentity(config.identity);
             const native = backend.storage_owner orelse return error.UnsupportedCompletionBackend;
             const root = backend.root_dir orelse return error.UnsupportedCompletionBackend;
+            if (root.len > 512) return error.UnsupportedCompletionProfile;
             const manager = backend.options.resource_manager orelse return error.CompletionResourceManagerRequired;
             if (backend.options.backend.read_only or backend.options.backend.durability != .full or
                 !backend.options.wal_enabled or !backend.options.wal_sync_on_commit or
@@ -327,11 +332,11 @@ pub fn Pool(comptime Backend: type) type {
                 backend.manifest_journal.sequence == null or backend.manifest_journal.active_segment == 0)
                 return error.CompletionReservationBusy;
             const saved = try savedCohort(backend.storage.?, backend.allocator, root, config.identity);
-            const cohort = saved orelse completion.guard.Info{ .base_run_id = backend.next_run_id, .initial_runs = @intCast(backend.runs.count()), .cohort_id = config.identity.incarnation };
+            const cohort = saved orelse completion.guard.Info{ .base_run_id = backend.next_run_id, .initial_runs = @intCast(@min(backend.runs.count(), 64)), .cohort_id = config.identity.incarnation };
             if (cohort.initial_runs > 64 or backend.runs.count() > cohort.initial_runs + max_slots) return error.CompletionReservationBusy;
             const next_id = std.math.add(u64, cohort.base_run_id, max_slots) catch return error.CompletionReservationBusy;
-            const control = try domains.Arena.create(backend.allocator, manager, control_bytes);
-            errdefer control.release();
+            const control = try domains.RecyclingScratch.create(backend.allocator, manager, control_bytes);
+            errdefer control.retire();
             const alloc = control.allocator();
             const self = try alloc.create(Self);
             errdefer alloc.destroy(self);
@@ -345,7 +350,7 @@ pub fn Pool(comptime Backend: type) type {
             errdefer memory_pin.release() catch unreachable;
             var wal_pin = try manager.pinObserverMetadata(.lsm_wal_retention, &backend.tracked_wal_retention_bytes);
             errdefer wal_pin.release() catch unreachable;
-            var specs: [96]storage_io.NativeCompletionIo.FileSpec = undefined;
+            var specs: [storage_io.NativeCompletionIo.max_prepared_files]storage_io.NativeCompletionIo.FileSpec = undefined;
             var spec_count: usize = 0;
             var guard_paths: [max_slots][]u8 = undefined;
             var accepted_paths: [max_slots][]u8 = undefined;
@@ -473,10 +478,11 @@ pub fn Pool(comptime Backend: type) type {
                 self.control.allocator().free(self.run_paths[i].?);
             }
             self.control.allocator().free(self.journal_path);
+            for (&self.retired) |*generation| generation.deinit(self.control.allocator());
             self.publication.retire();
             const control = self.control;
             control.allocator().destroy(self);
-            control.release();
+            control.retire();
         }
 
         fn validateEntry(self: *Self, entry: *const entry_codec.OwnedEntry) !void {
@@ -517,6 +523,7 @@ pub fn Pool(comptime Backend: type) type {
         }
 
         pub fn checkOrdinary(self: *Self, backend: *Backend, incoming: anytype) !void {
+            if (self.maintenance_active) return error.CompletionReservationBusy;
             if (self.failed or !self.restored) return error.RecoveryRequired;
             if (incoming.estimatedLogicalBytes() > completion.foreground_bytes -| backend.mutable.estimatedLogicalBytes() or
                 incoming.entryCount() > completion.foreground_entries -| backend.mutable.entryCount() or
@@ -715,23 +722,40 @@ pub fn Pool(comptime Backend: type) type {
             self.restored = true;
         }
 
+        pub fn maintenanceRequired(self: *const Self, backend: *const Backend) bool {
+            if (self.maintenance_pending or backend.mutable.entryCount() != 0 or backend.runs.count() > 64) return true;
+            for (self.cells[0..self.cell_count]) |cell| if (cell.phase == .spent) return true;
+            return false;
+        }
+
         /// Baseline shape qualification runs outside consensus locks. It does
         /// no compaction and issues no proof while restoration has pending debt.
         pub fn qualifyFresh(self: *Self, backend: *Backend) !void {
             if (!self.restored or self.failed or backend.manifest_recovery_required) return error.RecoveryRequired;
+            if (self.maintenanceRequired(backend)) return error.CompletionReservationBusy;
             for (self.cells[0..self.cell_count]) |cell| if (cell.phase != .free) return error.CompletionReservationBusy;
             if (backend.mutable.entryCount() != 0 or backend.activeImmutableMemtableCount() != 0 or
                 backend.runs.count() > self.config.shape.max_runs) return error.CompletionReservationBusy;
             var borrow = try self.compiler.tryBorrow();
             defer borrow.release() catch unreachable;
             const alloc = try borrow.allocator();
-            for (0..backend.runs.count()) |i| {
-                const run = backend.runs.at(i);
-                const value = try readRunPoint(self.io.storage(), alloc, run.path orelse return error.UnsupportedCompletionProfile, self.config.shape, run.smallest_namespace_name, run.smallest_key);
-                value.deinit(alloc);
-            }
+            var paths: [68][]const u8 = undefined;
+            for (0..backend.runs.count()) |i| paths[i] = backend.runs.at(i).path orelse return error.UnsupportedCompletionProfile;
+            try maintenance.qualify(alloc, self.io.storage(), paths[0..backend.runs.count()], .{
+                .max_inputs = self.config.shape.max_runs,
+                .max_metadata_bytes = self.config.shape.max_metadata_bytes,
+                .max_block_bytes = self.config.shape.max_block_bytes,
+                .max_record_bytes = self.config.shape.max_record_bytes,
+            });
             try self.restoreProgress(backend, alloc);
             self.ready = true;
+        }
+
+        /// Caller holds backend serialization and runs outside consensus locks.
+        /// This may release the backend lock for streaming I/O; readiness and
+        /// every ordinary mutation are fenced until the handoff completes.
+        pub fn maintainLocked(self: *Self, backend: *Backend) !void {
+            try @import("completion_maintenance_cycle.zig").run(Backend, self, backend);
         }
 
         /// Adoption transfers the concrete publication span into the native
@@ -1136,7 +1160,7 @@ pub fn Pool(comptime Backend: type) type {
             unreachable;
         }
 
-        fn restoreWalCredits(raw: *anyopaque, backend: *Backend) !void {
+        pub fn restoreWalCredits(raw: *anyopaque, backend: *Backend) !void {
             const self: *Self = @ptrCast(@alignCast(raw));
             for (self.cells[0..self.cell_count]) |*cell| {
                 const needed = completion.limits.wal_bytes -| cell.slot.wal_credit;
@@ -1294,6 +1318,21 @@ test "workload admission physical completion pool accepts through native prepaid
     try std.testing.expectError(error.InvalidCompletionSlot, pool.ownsAccepted(4, 10, resolution_payload));
     try std.testing.expect(!(try pool.ownsAccepted(3, 11, resolution_payload)));
     try std.testing.expectError(error.FileNotFound, pool.io.storage().fileSize(pool.accepted_paths[0]));
+    const old_base = pool.cohort.base_run_id;
+    try pool.maintainLocked(&backend);
+    try std.testing.expect(!pool.ready);
+    try std.testing.expect(pool.cohort.base_run_id > old_base);
+    try std.testing.expectEqual(Pool(Backend).Phase.free, pool.cells[0].phase);
+    try pool.qualifyFresh(&backend);
+    try std.testing.expect(pool.ready);
+    for (0..3) |_| {
+        try pool.maintainLocked(&backend);
+        try pool.qualifyFresh(&backend);
+    }
+    const maintained = try pool.point(&backend, alloc, null, "row");
+    defer maintained.deinit(alloc);
+    try std.testing.expectEqualStrings("complete", maintained.value.?);
+    try std.testing.expectEqual(@as(u64, 10), (try pool.durableProgress()).index);
     try std.testing.expect(!failing.has_induced_failure);
 }
 
@@ -1420,4 +1459,202 @@ test "workload admission physical completion pool restores accepted and prepared
         }
         try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
     }
+}
+
+test "workload admission physical completion pool idle receipt restoration survives maintenance boundaries" {
+    const Backend = @import("../lsm_backend.zig").Backend;
+    const Options = @import("../lsm_backend.zig").Options;
+    const runtime = @import("runtime.zig");
+    const cycle = @import("completion_maintenance_cycle.zig");
+    const alloc = std.testing.allocator;
+    const config: Config = .{ .identity = .{ .capacity = 4, .group_id = 23, .node_id = 7, .incarnation = @splat(11), .policy_digest = @splat(12), .generation = 19 }, .schema_catalog_digest = @splat(13), .namespace = .root };
+    const progress: completion.AcceptedIdentity = .{ .term = 3, .index = 17, .digest = @splat(71) };
+    const progress_bytes = encodeProgress(config.identity, progress);
+    for ([_]?cycle.Fault{ null, .before_publish, .after_publish, .after_reset }) |failure| {
+        var fd_pool = storage_io.NativeStoragePool.initWithCapacityForTest(alloc, 32);
+        defer fd_pool.deinit();
+        var manager = resources.ResourceManager.init(.{ .identity_allocator = alloc, .memory_budget = .{ .hard_limit_bytes = 256 * 1024 * 1024 } });
+        defer manager.deinit(alloc);
+        var path_buffer: [256]u8 = undefined;
+        const path = repository.tmpPath(&path_buffer, "native-pool-idle-cycle");
+        defer repository.cleanupTmp(path);
+        const options: Options = .{ .resource_manager = &manager, .native_storage_pool = &fd_pool, .flush_threshold = 10000, .compact_threshold_runs = 1024, .l0_overlap_compact_threshold_runs = 1024 };
+        const receipt_path = try std.fs.path.join(alloc, &.{ std.mem.span(path), "completion-installation.guard" });
+        defer alloc.free(receipt_path);
+        {
+            var backend: Backend = undefined;
+            try backend.openInto(alloc, std.mem.span(path), options);
+            defer backend.abandonAfterCrash();
+            {
+                var write = try backend.beginWrite();
+                errdefer write.abort();
+                try write.put(.{}, entry_codec.group_progress_key, &progress_bytes);
+                try write.put(.{}, "row", "old");
+                try write.commit();
+            }
+            try backend.checkpointWalAfterDurableBoundary();
+            if (failure == null) {
+                // The last four-member cohort can leave 65-68 runs without
+                // any accepted guard; restoration must permit maintenance.
+                for (0..64) |i| {
+                    {
+                        var write = try backend.beginWrite();
+                        errdefer write.abort();
+                        var key: [32]u8 = undefined;
+                        try write.put(.{}, try std.fmt.bufPrint(&key, "edge-{d}", .{i}), "retained");
+                        try write.commit();
+                    }
+                    try backend.checkpointWalAfterDurableBoundary();
+                }
+                try std.testing.expectEqual(@as(usize, 65), backend.runs.count());
+            }
+            {
+                const locked = runtime.lockBackend(Backend, &backend);
+                defer runtime.unlockBackend(Backend, &backend, locked);
+                try backend.installCompletionPoolLocked(config);
+                if (failure == null) try std.testing.expectError(error.CompletionReservationBusy, backend.completion_pool.?.qualifyFresh(&backend)) else try backend.completion_pool.?.qualifyFresh(&backend);
+            }
+            // Native recovery only checks the presence fence; DB separately
+            // validates the real authenticated installation receipt bytes.
+            try manifest_set.replace(alloc, backend.storage.?, receipt_path, "installed");
+            {
+                var write = try backend.beginWrite();
+                errdefer write.abort();
+                try write.put(.{}, "row", "latest");
+                try write.commit();
+            }
+            if (failure) |point| {
+                cycle.test_fail_at = point;
+                defer cycle.test_fail_at = null;
+                const locked = runtime.lockBackend(Backend, &backend);
+                defer runtime.unlockBackend(Backend, &backend, locked);
+                try std.testing.expectError(error.RecoveryRequired, backend.completion_pool.?.maintainLocked(&backend));
+                try std.testing.expect(!backend.completion_pool.?.ready);
+                if (point == .before_publish) try std.testing.expectError(error.CompletionReservationBusy, backend.completion_pool.?.qualifyFresh(&backend));
+            }
+        }
+        {
+            var missing: Backend = undefined;
+            try std.testing.expectError(error.CompletionRecoveryCapacityRequired, missing.openInto(alloc, std.mem.span(path), options));
+        }
+        {
+            var restored: Backend = undefined;
+            var restoring_options = options;
+            restoring_options.completion_pool_config = config;
+            try restored.openInto(alloc, std.mem.span(path), restoring_options);
+            defer restored.abandonAfterCrash();
+            const pool = restored.completion_pool.?;
+            try std.testing.expect(pool.restored and !pool.ready and !pool.startup_reconciliation_pending);
+            for (pool.cells[0..pool.cell_count]) |cell| try std.testing.expectEqual(Pool(Backend).Phase.free, cell.phase);
+            try std.testing.expectEqual(@as(u64, 17), (try pool.durableProgress()).index);
+            const latest = try pool.point(&restored, alloc, null, "row");
+            defer latest.deinit(alloc);
+            try std.testing.expectEqualStrings("latest", latest.value.?);
+            {
+                const locked = runtime.lockBackend(Backend, &restored);
+                defer runtime.unlockBackend(Backend, &restored, locked);
+                if (pool.maintenanceRequired(&restored)) try pool.maintainLocked(&restored);
+                try pool.qualifyFresh(&restored);
+                try std.testing.expect(pool.ready);
+                // Repeated idle checkpoints must not forget permanent progress.
+                try pool.maintainLocked(&restored);
+                try pool.qualifyFresh(&restored);
+                try std.testing.expectEqual(@as(u64, 17), (try pool.durableProgress()).index);
+            }
+        }
+        {
+            var native = try storage_io.NativeStorage.initWithPool(alloc, .threaded, &fd_pool);
+            defer native.deinit();
+            const pointer = try repository.manifestPath(alloc, std.mem.span(path));
+            defer alloc.free(pointer);
+            try native.storage().deleteFileAbsolute(pointer);
+            var missing_manifest: Backend = undefined;
+            var restoring_options = options;
+            restoring_options.completion_pool_config = config;
+            try std.testing.expectError(error.InvalidManifest, missing_manifest.openInto(alloc, std.mem.span(path), restoring_options));
+            try std.testing.expectEqual(@as(u64, 9), try native.storage().fileSize(receipt_path));
+        }
+        try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+    }
+}
+
+test "workload admission physical completion pool bounds reader-retained maintenance generations" {
+    const Backend = @import("../lsm_backend.zig").Backend;
+    const runtime = @import("runtime.zig");
+    const alloc = std.testing.allocator;
+    var fd_pool = storage_io.NativeStoragePool.initWithCapacityForTest(alloc, 32);
+    defer fd_pool.deinit();
+    var manager = resources.ResourceManager.init(.{ .identity_allocator = alloc, .memory_budget = .{ .hard_limit_bytes = 256 * 1024 * 1024 } });
+    defer manager.deinit(alloc);
+    var path_buffer: [256]u8 = undefined;
+    const path = repository.tmpPath(&path_buffer, "native-pool-readers-cycle");
+    defer repository.cleanupTmp(path);
+    {
+        var backend: Backend = undefined;
+        try backend.openInto(alloc, std.mem.span(path), .{ .resource_manager = &manager, .native_storage_pool = &fd_pool, .flush_threshold = 10000 });
+        defer backend.abandonAfterCrash();
+        {
+            var write = try backend.beginWrite();
+            errdefer write.abort();
+            try write.put(.{}, "row", "version0");
+            try write.commit();
+        }
+        try backend.checkpointWalAfterDurableBoundary();
+        {
+            const locked = runtime.lockBackend(Backend, &backend);
+            defer runtime.unlockBackend(Backend, &backend, locked);
+            try backend.installCompletionPoolLocked(.{ .identity = .{ .capacity = 4, .group_id = 23, .node_id = 7, .incarnation = @splat(11), .policy_digest = @splat(12), .generation = 19 }, .schema_catalog_digest = @splat(13), .namespace = .root });
+            try backend.completion_pool.?.qualifyFresh(&backend);
+        }
+        const pool = backend.completion_pool.?;
+        var first = try backend.beginRead();
+        var first_live = true;
+        defer if (first_live) first.abort();
+        {
+            var write = try backend.beginWrite();
+            errdefer write.abort();
+            try write.put(.{}, "row", "version1");
+            try write.commit();
+        }
+        {
+            const locked = runtime.lockBackend(Backend, &backend);
+            defer runtime.unlockBackend(Backend, &backend, locked);
+            try pool.maintainLocked(&backend);
+            try pool.qualifyFresh(&backend);
+        }
+        var second = try backend.beginRead();
+        var second_live = true;
+        defer if (second_live) second.abort();
+        {
+            var write = try backend.beginWrite();
+            errdefer write.abort();
+            try write.put(.{}, "row", "version2");
+            try write.commit();
+        }
+        {
+            const locked = runtime.lockBackend(Backend, &backend);
+            defer runtime.unlockBackend(Backend, &backend, locked);
+            try pool.maintainLocked(&backend);
+            try pool.qualifyFresh(&backend);
+            try std.testing.expectError(error.CompletionReservationBusy, pool.maintainLocked(&backend));
+            try std.testing.expect(!pool.ready and !pool.failed);
+        }
+        try std.testing.expectEqualStrings("version0", try first.get(.{}, "row"));
+        try std.testing.expectEqualStrings("version1", try second.get(.{}, "row"));
+        first.abort();
+        first_live = false;
+        {
+            const locked = runtime.lockBackend(Backend, &backend);
+            defer runtime.unlockBackend(Backend, &backend, locked);
+            try pool.maintainLocked(&backend);
+            try pool.qualifyFresh(&backend);
+        }
+        try std.testing.expectEqualStrings("version1", try second.get(.{}, "row"));
+        second.abort();
+        second_live = false;
+        var latest = try backend.beginRead();
+        defer latest.abort();
+        try std.testing.expectEqualStrings("version2", try latest.get(.{}, "row"));
+    }
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
 }
