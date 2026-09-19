@@ -727,7 +727,7 @@ pub const AntflyApiHandler = struct {
         if (control) return .control;
         if (config.recovery_requests == 0 or !std.mem.eql(u8, request.method, "POST")) return .general;
         if (!std.mem.eql(u8, request.path, routes.workload_attempt_control) and
-            routes.matchGroupTxnResolve(request.path) == null and routes.matchGroupTxnDecide(request.path) == null and routes.matchGroupTxnStatus(request.path) == null and
+            routes.matchGroupTxnResolve(request.path) == null and routes.matchGroupTxnResolveRecovery(request.path) == null and routes.matchGroupTxnAcknowledgeRecovery(request.path) == null and routes.matchGroupTxnDecide(request.path) == null and routes.matchGroupTxnStatus(request.path) == null and
             routes.matchGroupTxnAcknowledge(request.path) == null) return .general;
         if (request.transfer_encoding != null or request.content_encoding != null or
             request.body_received_bytes > 8192 or content_length > 8192 or
@@ -893,6 +893,7 @@ pub const AntflyApiHandler = struct {
         establishInternalRoutedBatchDeadline(ctx);
         establishInternalTxnPreDecisionDeadline(ctx);
         establishInternalTxnStatusDeadline(ctx);
+        establishInternalTxnRecoveryDeadline(ctx);
         establishInternalBackupDeadline(ctx);
         establishCatalogRouteFenceDeadline(ctx);
         establishPublicMutationDeadline(ctx);
@@ -984,6 +985,26 @@ pub const AntflyApiHandler = struct {
         ctx.application_deadline_io = ctx.io;
         ctx.application_deadline_ns = @as(u64, @intCast(@max(0, std.Io.Clock.now(.awake, ctx.io).nanoseconds))) +|
             @as(u64, budget_ms) *| std.time.ns_per_ms;
+    }
+
+    fn establishInternalTxnRecoveryDeadline(ctx: *httpx.Context) void {
+        if (ctx.application_deadline_invalid) return;
+        const path = ctx.request.uri.path;
+        if (routes.matchGroupTxnResolveRecovery(path) == null and routes.matchGroupTxnAcknowledgeRecovery(path) == null) return;
+        const raw = ctx.header(distributed_txn_contract.recovery_remaining_ms_header) orelse return;
+        const budget_ms = std.fmt.parseUnsigned(u32, raw, 10) catch {
+            ctx.application_deadline_invalid = true;
+            return;
+        };
+        if (budget_ms == 0 or budget_ms > distributed_txn_contract.max_recovery_server_budget_ms) {
+            ctx.application_deadline_invalid = true;
+            return;
+        }
+        const budget = @import("table_catalog.zig").RoutingBudget.initIo(null, ctx.io);
+        const prior = budget.deadlineFrom(.{ .deadline_ns = ctx.application_deadline_ns, .io = if (ctx.application_deadline_io) |io| @import("../runtime_io_abi.zig").Borrow.init(&io) else null });
+        const deadline = budget.nowNs() +| @as(u64, budget_ms) * std.time.ns_per_ms;
+        ctx.application_deadline_io = ctx.io;
+        ctx.application_deadline_ns = @min(prior orelse deadline, deadline);
     }
 
     fn establishInternalTxnStatusDeadline(ctx: *httpx.Context) void {
@@ -1431,6 +1452,8 @@ pub const AntflyApiHandler = struct {
         try server.post(table_prefix ++ routes.txn_prepare_suffix, httpx.Handler.bind(self, internalTxnPrepare));
         try server.post(table_prefix ++ routes.txn_resolve_suffix, httpx.Handler.bind(self, internalTxnResolve));
         try server.post(table_prefix ++ routes.txn_decide_suffix, httpx.Handler.bind(self, internalTxnDecide));
+        try server.post(table_prefix ++ routes.txn_resolve_recovery_suffix, httpx.Handler.bind(self, internalTxnResolveRecovery));
+        try server.post(table_prefix ++ routes.txn_acknowledge_recovery_suffix, httpx.Handler.bind(self, internalTxnAcknowledgeRecovery));
         try server.post(table_prefix ++ routes.txn_status_suffix, httpx.Handler.bind(self, internalTxnStatus));
         try server.post(table_prefix ++ routes.txn_acknowledge_suffix, httpx.Handler.bind(self, internalTxnAcknowledge));
         try server.post(table_prefix ++ routes.artifact_repair_suffix, httpx.Handler.bind(self, internalArtifactRepairList));
@@ -3726,6 +3749,16 @@ pub const AntflyApiHandler = struct {
         self.internalGroupOperations().txnPrepare(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, input) catch |err|
             return internalTxnErrorResponse(ctx, err, .prepare);
         return ctx.json(struct {}{});
+    }
+
+    fn internalTxnResolveRecovery(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        if (ctx.application_deadline_invalid or ctx.application_deadline_ns == null or ctx.header(distributed_txn_contract.recovery_remaining_ms_header) == null) return textResponse(ctx, 400, "recovery deadline required");
+        return try self.internalTxnResolve(ctx);
+    }
+
+    fn internalTxnAcknowledgeRecovery(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        if (ctx.application_deadline_invalid or ctx.application_deadline_ns == null or ctx.header(distributed_txn_contract.recovery_remaining_ms_header) == null) return textResponse(ctx, 400, "recovery deadline required");
+        return try self.internalTxnAcknowledge(ctx);
     }
 
     fn internalTxnResolve(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -8708,6 +8741,44 @@ test "internal transaction HTTP size rejection is actionable without claiming no
     // The rejection can originate from an applied Raft command; do not claim
     // that no proposal was sent just because no prepare vote was written.
     try std.testing.expect(response.headers.get(distributed_txn_contract.pre_decision_outcome_header) == null);
+}
+
+test "transaction recovery endpoint requires budget and translates the ingress clock" {
+    const Fake = struct {
+        calls: usize = 0,
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
+            return null;
+        }
+        fn ack(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: []const u8, deadline: u64) anyerror!?void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const now = @import("antfly_platform").time.monotonicNs();
+            try std.testing.expect(deadline > now and deadline <= now + std.time.ns_per_s);
+            self.calls += 1;
+            return {};
+        }
+    };
+    var fake: Fake = .{};
+    var status_source = AuthStatusSource{};
+    var api_server = ApiHttpServer.init(std.testing.allocator, .{}, status_source.iface(), null, .{ .ptr = &fake, .vtable = &.{ .batch = Fake.batch, .txn_acknowledge_group_local_until = Fake.ack } });
+    defer api_server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &api_server };
+    const body = try distributed_txn.encodeTxnAcknowledgeRequest(std.testing.allocator, .{ .txn_id = [_]u8{1} ** 16, .participant = "table2:00000004:docs:7" });
+    defer std.testing.allocator.free(body);
+    inline for ([_]?[]const u8{ null, "0", "5001", "bad", "1000" }) |header| {
+        var request = try httpx.Request.init(std.testing.allocator, .POST, "http://127.0.0.1/internal/v1/groups/7/tables/docs/txn-acknowledge-v2");
+        defer request.deinit();
+        request.body = body;
+        if (header) |value| try request.setHeader(distributed_txn_contract.recovery_remaining_ms_header, value);
+        var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+        defer ctx.deinit();
+        ctx.params = &.{ .{ .name = "group_id", .value = "7" }, .{ .name = "table_name", .value = "docs" } };
+        AntflyApiHandler.establishInternalTxnRecoveryDeadline(&ctx);
+        var response = try handler.internalTxnAcknowledgeRecovery(&ctx);
+        defer response.deinit();
+        const valid = if (header) |value| std.mem.eql(u8, value, "1000") else false;
+        try std.testing.expectEqual(@as(u16, if (valid) 200 else 400), response.status.code);
+    }
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
 }
 
 test "first decision endpoint emits proof only for precise preaccept rejection" {

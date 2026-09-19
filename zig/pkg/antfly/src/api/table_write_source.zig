@@ -646,8 +646,16 @@ pub const TableWriteSource = struct {
         /// First decision only. PreDecisionNotProposed certifies that no
         /// proposal/local mutation was submitted; all other errors may be ambiguous.
         txn_decide_group_local_with_pre_decision_context: ?*const fn (*anyopaque, std.mem.Allocator, u64, []const u8, db_mod.types.TxnId, db_mod.types.TxnStatus, u64, u64, db_mod.types.SyncLevel, distributed_txn.PreDecisionContext) anyerror!?void = null,
+        /// Independent recovery deadline; never borrowed from user admission.
+        txn_acknowledge_group_local_until: ?*const fn (*anyopaque, std.mem.Allocator, u64, []const u8, db_mod.types.TxnId, []const u8, u64) anyerror!?void = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
+
+    pub fn txnAcknowledgeGroupLocalUntil(self: TableWriteSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, participant: []const u8, deadline_ns: u64) !?void {
+        if (@import("antfly_platform").time.monotonicNs() >= deadline_ns) return error.Timeout;
+        const callback = self.vtable.txn_acknowledge_group_local_until orelse return error.CommitPropagationIncomplete;
+        return try BoundaryAbi.call("txn_acknowledge_group_local_until", self.boundary_dispatch, callback, .{ self.ptr, alloc, group_id, table_name, txn_id, participant, deadline_ns });
+    }
 
     pub fn txnDecideGroupLocalWithPreDecisionContext(self: TableWriteSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, status: db_mod.types.TxnStatus, commit_version: u64, topology_epoch: u64, sync_level: db_mod.types.SyncLevel, context: distributed_txn.PreDecisionContext) !?void {
         if (status != .committed) return error.PreDecisionNotProposed;
@@ -1588,6 +1596,32 @@ fn consumerTests() type {
     const test_owner_root = @import("antfly_source_root");
     if (@hasDecl(test_owner_root, "implementation_tests_only") and test_owner_root.implementation_tests_only) return struct {};
     const Suite = struct {
+        test "transaction recovery acknowledgement boundary rejects expiry and preserves accepted errors" {
+            const Fake = struct {
+                calls: usize = 0,
+                fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
+                    return null;
+                }
+                fn ack(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: []const u8, _: u64) !?void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.calls += 1;
+                    return error.RaftBatchWriteOutcomeUnknown;
+                }
+                fn dispatch(contract: *const runtime_native_abi.CallContract, callback: *const anyopaque, args: *const anyopaque, output: ?*anyopaque) callconv(.c) runtime_error_abi.Status {
+                    return TableWriteSource.BoundaryAbi.local_dispatch(contract, callback, args, output);
+                }
+            };
+            var fake: Fake = .{};
+            const source: TableWriteSource = .{ .ptr = &fake, .boundary_dispatch = Fake.dispatch, .vtable = &.{ .batch = Fake.batch, .txn_acknowledge_group_local_until = Fake.ack } };
+            const legacy: TableWriteSource = .{ .ptr = &fake, .vtable = &.{ .batch = Fake.batch } };
+            const deadline = @import("antfly_platform").time.monotonicNs() + std.time.ns_per_s;
+            try std.testing.expectError(error.Timeout, source.txnAcknowledgeGroupLocalUntil(std.testing.allocator, 7, "docs", [_]u8{1} ** 16, "peer", 0));
+            try std.testing.expectEqual(@as(usize, 0), fake.calls);
+            try std.testing.expectError(error.CommitPropagationIncomplete, legacy.txnAcknowledgeGroupLocalUntil(std.testing.allocator, 7, "docs", [_]u8{1} ** 16, "peer", deadline));
+            try std.testing.expectError(error.RaftBatchWriteOutcomeUnknown, source.txnAcknowledgeGroupLocalUntil(std.testing.allocator, 7, "docs", [_]u8{1} ** 16, "peer", deadline));
+            try std.testing.expectEqual(@as(usize, 1), fake.calls);
+        }
+
         test "first decision boundary preserves rejection identity and never calls legacy resolve" {
             const Fake = struct {
                 calls: usize = 0,

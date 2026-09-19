@@ -29,6 +29,7 @@ const Mapping = struct {
 };
 
 const mappings = [_]Mapping{
+    .{ .status = .invalid_participant, .err = error.InvalidParticipant },
     .{ .status = .pre_decision_not_proposed, .err = error.PreDecisionNotProposed },
     .{ .status = .invalid_completion_catalog, .err = error.InvalidCompletionCatalog },
     .{ .status = .completion_admission_unavailable, .err = error.CompletionAdmissionUnavailable },
@@ -854,4 +855,11 @@ test "first decision rejection preserves exact compiled failure identity" {
     try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
     try std.testing.expectEqual(abi.Status.pre_decision_not_proposed, failure.status);
     try std.testing.expectError(error.PreDecisionNotProposed, statusToError(failure.status));
+}
+
+test "transaction recovery invalid participant preserves failure identity" {
+    const failure = failureFromError(error.InvalidParticipant, .storage_owner, abi.abi_version, 1);
+    try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
+    try std.testing.expectEqual(abi.Status.invalid_participant, failure.status);
+    try std.testing.expectError(error.InvalidParticipant, statusToError(failure.status));
 }

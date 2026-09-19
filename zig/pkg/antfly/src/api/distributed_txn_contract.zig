@@ -15,6 +15,9 @@ const db_types = @import("../storage/db/types.zig");
 pub const pre_decision_outcome_header = "X-Antfly-Txn-Pre-Decision-Outcome";
 pub const pre_decision_not_proposed_v1 = "not-proposed-v1";
 pub const first_decision_not_proposed_v1 = "first-decision-not-proposed-v1";
+pub const recovery_remaining_ms_header = "X-Antfly-Txn-Recovery-Remaining-Ms";
+pub const max_recovery_server_budget_ms: u32 = 5_000;
+pub const recovery_response_reserve_ms: u32 = 50;
 /// Relative server-side budget. Monotonic clocks are process-local, so the
 /// coordinator sends a duration and ingress establishes the absolute deadline
 /// before authentication and request dispatch consume it.
@@ -33,6 +36,8 @@ pub const status_server_response_reserve_ms: u32 = 50;
 /// no earlier application deadline exists. Cleanup/decision recovery use
 /// independent bounded budgets after a participant has been contacted.
 pub const default_transaction_admission_timeout_ms: u32 = 20_000;
+/// Independent budget for one abort or post-decision recovery operation.
+pub const default_transaction_recovery_timeout_ns: u64 = 5 * @import("std").time.ns_per_s;
 
 /// Process-local execution context; never serialized across the wire.
 pub const PreDecisionContext = struct {

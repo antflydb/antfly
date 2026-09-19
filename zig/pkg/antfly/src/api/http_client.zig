@@ -3463,7 +3463,7 @@ pub const ApiHttpClient = struct {
         timeout_ms: u32,
         cancellation: ?*const http_common.RequestCancellation,
     ) !EmptyResponse {
-        return try fetchInternalPostEmpty(self, base_uri, group_id, table_name, routes.Routes.txn_resolve_suffix, body, timeout_ms, cancellation);
+        return try fetchInternalPostEmpty(self, base_uri, group_id, table_name, routes.Routes.txn_resolve_recovery_suffix, body, timeout_ms, cancellation);
     }
 
     pub fn fetchGroupTxnAcknowledge(
@@ -3474,6 +3474,10 @@ pub const ApiHttpClient = struct {
         body: []const u8,
     ) !EmptyResponse {
         return try fetchInternalPostEmpty(self, base_uri, group_id, table_name, routes.Routes.txn_acknowledge_suffix, body, null, null);
+    }
+
+    pub fn fetchGroupTxnAcknowledgeWithControlAndTimeout(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, body: []const u8, timeout_ms: u32, cancellation: ?*const http_common.RequestCancellation) !EmptyResponse {
+        return try fetchInternalPostEmpty(self, base_uri, group_id, table_name, routes.Routes.txn_acknowledge_recovery_suffix, body, timeout_ms, cancellation);
     }
 
     pub fn fetchGroupTxnStatus(
@@ -3647,12 +3651,21 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
+        var budget_buf: [10]u8 = undefined;
+        const recovery = std.mem.eql(u8, suffix_name, routes.Routes.txn_resolve_recovery_suffix) or std.mem.eql(u8, suffix_name, routes.Routes.txn_acknowledge_recovery_suffix);
+        const headers: []const http_common.RequestHeader = if (recovery) blk: {
+            const remaining = timeout_ms orelse return error.Timeout;
+            if (remaining <= txn_contract.recovery_response_reserve_ms) return error.Timeout;
+            const budget = @min(remaining - txn_contract.recovery_response_reserve_ms, txn_contract.max_recovery_server_budget_ms);
+            break :blk &.{.{ .name = txn_contract.recovery_remaining_ms_header, .value = try std.fmt.bufPrint(&budget_buf, "{d}", .{budget}) }};
+        } else &.{};
         var resp = try self.executeRequest(.{
             .method = .POST,
             .uri = uri,
             .content_type = "application/json",
             .body = body,
             .timeout_ms = timeout_ms,
+            .headers = headers,
             .cancellation = cancellation,
         });
         defer resp.deinit(self.alloc);
@@ -5244,6 +5257,36 @@ fn consumerTests() type {
                 null,
             ));
             try std.testing.expectEqual(@as(usize, 1), executor.attempts);
+        }
+
+        test "transaction recovery transport requires bounded versioned peers without fallback" {
+            const Fake = struct {
+                calls: usize = 0,
+                acknowledged: bool = false,
+                fn execute(raw: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.calls += 1;
+                    try std.testing.expect(std.mem.endsWith(u8, req.uri, if (self.acknowledged) "/txn-acknowledge-v2" else "/txn-resolve-v2"));
+                    try std.testing.expectEqual(@as(?u32, 2000), req.timeout_ms);
+                    try std.testing.expect(req.cancellation != null);
+                    var found = false;
+                    for (req.headers) |header| if (std.ascii.eqlIgnoreCase(header.name, txn_contract.recovery_remaining_ms_header)) {
+                        try std.testing.expectEqualStrings("1950", header.value);
+                        found = true;
+                    };
+                    try std.testing.expect(found);
+                    return http_route_helpers.textResponse(alloc, 404, "old peer");
+                }
+            };
+            var fake: Fake = .{};
+            var client = ApiHttpClient.init(std.testing.allocator, .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } });
+            var cancellation: http_common.RequestCancellation = .{};
+            try std.testing.expectError(error.UnknownGroup, client.fetchGroupTxnResolveWithControlAndTimeout("http://127.0.0.1:1", 7, "docs", "{}", 2000, &cancellation));
+            fake.acknowledged = true;
+            try std.testing.expectError(error.UnknownGroup, client.fetchGroupTxnAcknowledgeWithControlAndTimeout("http://127.0.0.1:1", 7, "docs", "{}", 2000, &cancellation));
+            try std.testing.expectEqual(@as(usize, 2), fake.calls);
+            try std.testing.expectError(error.Timeout, client.fetchGroupTxnAcknowledgeWithControlAndTimeout("http://127.0.0.1:1", 7, "docs", "{}", 50, &cancellation));
+            try std.testing.expectEqual(@as(usize, 2), fake.calls);
         }
 
         test "first decision transport never downgrades endpoint or ambiguous delivery" {

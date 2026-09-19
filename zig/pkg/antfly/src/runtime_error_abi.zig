@@ -479,6 +479,7 @@ pub const Detail = enum(c_int) {
     missing_completion_admission_guard,
     invalid_completion_catalog,
     pre_decision_not_proposed,
+    invalid_participant,
 };
 
 pub const Status = extern struct {
@@ -544,6 +545,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.InvalidManifest => status(.invalid_argument, .invalid_manifest),
         error.InvalidTableFile => status(.invalid_argument, .invalid_table_file),
         error.InvalidTxnRecord => status(.invalid_argument, .invalid_txn_record),
+        error.InvalidParticipant => status(.invalid_argument, .invalid_participant),
         error.NotFound => status(.not_found, .not_found),
         error.FileNotFound => status(.not_found, .file_not_found),
         error.TableNotFound => status(.not_found, .table_not_found),
@@ -1050,6 +1052,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .invalid_manifest => "InvalidManifest",
         .invalid_table_file => "InvalidTableFile",
         .invalid_txn_record => "InvalidTxnRecord",
+        .invalid_participant => "InvalidParticipant",
         .not_found => "NotFound",
         .file_not_found => "FileNotFound",
         .table_not_found => "TableNotFound",
@@ -1661,4 +1664,10 @@ test "workload admission invalid completion catalog preserves checked boundary i
 test "first decision rejection preserves checked status identity" {
     try std.testing.expectEqual(error.PreDecisionNotProposed, errorFromStatus(statusFromError(error.PreDecisionNotProposed)));
     try std.testing.expectEqual(@intFromEnum(Detail.pre_decision_not_proposed), statusFromError(error.PreDecisionNotProposed).detail);
+}
+
+test "transaction recovery invalid participant preserves checked status identity" {
+    const result = statusFromError(error.InvalidParticipant);
+    try std.testing.expectEqual(@intFromEnum(Code.invalid_argument), result.code);
+    try std.testing.expectEqual(error.InvalidParticipant, errorFromStatus(result));
 }

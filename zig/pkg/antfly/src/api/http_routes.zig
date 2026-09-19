@@ -110,6 +110,8 @@ pub const Routes = struct {
     pub const txn_prepare_suffix = "/txn-prepare";
     pub const txn_resolve_suffix = "/txn-resolve";
     pub const txn_decide_suffix = "/txn-decide-v1";
+    pub const txn_resolve_recovery_suffix = "/txn-resolve-v2";
+    pub const txn_acknowledge_recovery_suffix = "/txn-acknowledge-v2";
     pub const txn_status_suffix = "/txn-status";
     pub const txn_acknowledge_suffix = "/txn-acknowledge";
     pub const corrupt_embedding_artifact_suffix = "/corrupt-embedding-artifact";
@@ -1354,6 +1356,17 @@ pub const Routes = struct {
         return .{ .group_id = group.group_id, .table_name = table_name };
     }
 
+    pub fn matchGroupTxnResolveRecovery(path: []const u8) ?GroupTxnResolve {
+        const group = parseGroupPrefix(path) orelse return null;
+        const rest = group.rest;
+        if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
+        if (!std.mem.endsWith(u8, rest, txn_resolve_recovery_suffix)) return null;
+        if (rest.len <= tables_prefix.len + txn_resolve_recovery_suffix.len) return null;
+        const table_name = rest[tables_prefix.len .. rest.len - txn_resolve_recovery_suffix.len];
+        if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
+        return .{ .group_id = group.group_id, .table_name = table_name };
+    }
+
     pub fn matchGroupTxnDecide(path: []const u8) ?GroupTxnResolve {
         const group = parseGroupPrefix(path) orelse return null;
         const rest = group.rest;
@@ -1383,6 +1396,17 @@ pub const Routes = struct {
         if (!std.mem.endsWith(u8, rest, txn_acknowledge_suffix)) return null;
         if (rest.len <= tables_prefix.len + txn_acknowledge_suffix.len) return null;
         const table_name = rest[tables_prefix.len .. rest.len - txn_acknowledge_suffix.len];
+        if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
+        return .{ .group_id = group.group_id, .table_name = table_name };
+    }
+
+    pub fn matchGroupTxnAcknowledgeRecovery(path: []const u8) ?GroupTxnAcknowledge {
+        const group = parseGroupPrefix(path) orelse return null;
+        const rest = group.rest;
+        if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
+        if (!std.mem.endsWith(u8, rest, txn_acknowledge_recovery_suffix)) return null;
+        if (rest.len <= tables_prefix.len + txn_acknowledge_recovery_suffix.len) return null;
+        const table_name = rest[tables_prefix.len .. rest.len - txn_acknowledge_recovery_suffix.len];
         if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
         return .{ .group_id = group.group_id, .table_name = table_name };
     }
@@ -1749,9 +1773,11 @@ test "workload admission group routes reject overlapping and empty table names" 
         .{ Routes.matchGroupTxnBegin, Routes.txn_begin_suffix },
         .{ Routes.matchGroupTxnPrepare, Routes.txn_prepare_suffix },
         .{ Routes.matchGroupTxnResolve, Routes.txn_resolve_suffix },
+        .{ Routes.matchGroupTxnResolveRecovery, Routes.txn_resolve_recovery_suffix },
         .{ Routes.matchGroupTxnDecide, Routes.txn_decide_suffix },
         .{ Routes.matchGroupTxnStatus, Routes.txn_status_suffix },
         .{ Routes.matchGroupTxnAcknowledge, Routes.txn_acknowledge_suffix },
+        .{ Routes.matchGroupTxnAcknowledgeRecovery, Routes.txn_acknowledge_recovery_suffix },
     }) |case| {
         const matcher = case[0];
         const suffix = case[1];

@@ -5819,6 +5819,17 @@ const LegacyTableWriteSource = struct {
     }
 };
 
+const TxnRecoveryDeadlineCancellation = struct {
+    deadline_ns: u64,
+    fn token(self: *const @This()) db_mod.types.CancellationToken {
+        return .{ .ptr = self, .is_cancelled_fn = isCancelled };
+    }
+    fn isCancelled(ptr: *const anyopaque) bool {
+        const self: *const @This() = @ptrCast(@alignCast(ptr));
+        return platform_time.monotonicNs() >= self.deadline_ns;
+    }
+};
+
 pub const RaftBatcher = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -6134,6 +6145,7 @@ pub const BoundTableWriteSource = struct {
                 .txn_decide_group_local_with_pre_decision_context = txnDecideGroupLocalWithPreDecisionContext,
                 .txn_status_group_local = txnStatusGroupLocal,
                 .txn_acknowledge_group_local = txnAcknowledgeGroupLocal,
+                .txn_acknowledge_group_local_until = txnAcknowledgeGroupLocalUntil,
                 .corrupt_embedding_artifact = corruptEmbeddingArtifact,
                 .reprocess_document_artifact = reprocessDocumentArtifact,
                 .reprocess_document_artifact_range = reprocessDocumentArtifactRange,
@@ -7196,6 +7208,7 @@ pub const BoundTableWriteSource = struct {
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
         const db = try self.activeDb();
         if (first_context) |context| ensurePreDecisionContextActive(context) catch return error.PreDecisionNotProposed;
+        try cancellation.check();
         try db.resolveTransactionIntentsWithSyncLevelAndCancellation(txn_id, status, commit_version, sync_level, cancellation);
         const participant = try distributed_txn.participantIdForGroup(db.alloc, table_name, group_id);
         defer db.alloc.free(participant);
@@ -7217,19 +7230,31 @@ pub const BoundTableWriteSource = struct {
         return try (try self.activeDb()).getTransactionStatus(txn_id);
     }
 
-    fn txnAcknowledgeGroupLocal(
+    fn txnAcknowledgeGroupLocalUntil(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, participant: []const u8, deadline_ns: u64) anyerror!?void {
+        if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+        return try txnAcknowledgeGroupLocalImpl(ptr, alloc, group_id, table_name, txn_id, participant, deadline_ns);
+    }
+
+    fn txnAcknowledgeGroupLocal(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, participant: []const u8) anyerror!?void {
+        return try txnAcknowledgeGroupLocalImpl(ptr, alloc, group_id, table_name, txn_id, participant, null);
+    }
+
+    fn txnAcknowledgeGroupLocalImpl(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         group_id: u64,
         table_name: []const u8,
         txn_id: db_mod.types.TxnId,
         participant: []const u8,
+        deadline_ns: ?u64,
     ) !?void {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
         _ = group_id;
         _ = alloc;
-        try (try self.activeDb()).markTransactionParticipantResolved(txn_id, participant);
+        const db = try self.activeDb();
+        if (deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.Timeout;
+        try db.markTransactionParticipantResolved(txn_id, participant);
     }
 };
 
@@ -20762,6 +20787,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .txn_status_group_authoritative_local = txnStatusGroupAuthoritativeLocal,
                 .txn_status_group_authoritative_local_until = txnStatusGroupAuthoritativeLocalUntil,
                 .txn_acknowledge_group_local = txnAcknowledgeGroupLocal,
+                .txn_acknowledge_group_local_until = txnAcknowledgeGroupLocalUntil,
                 .corrupt_embedding_artifact = corruptEmbeddingArtifact,
                 .corrupt_embedding_artifact_group_local = corruptEmbeddingArtifactGroupLocal,
                 .reprocess_document_artifact = reprocessDocumentArtifact,
@@ -22756,12 +22782,14 @@ pub const ProvisionedTableWriteSource = struct {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         const participant = try distributed_txn.participantIdForGroup(alloc, coordinator_table_name, coordinator_group_id);
         defer alloc.free(participant);
-        return try self.source().txnAcknowledgeGroupLocal(
+        const deadline = platform_time.monotonicNs() +| @import("distributed_txn_contract.zig").default_transaction_recovery_timeout_ns;
+        return try self.source().txnAcknowledgeGroupLocalUntil(
             alloc,
             coordinator_group_id,
             coordinator_table_name,
             txn_id,
             participant,
+            deadline,
         );
     }
 
@@ -23954,6 +23982,8 @@ pub const ProvisionedTableWriteSource = struct {
                     .commit_version = commit_version,
                 } },
             };
+            if (first_context == null and cancellation.ptr != null and batcher.vtable.batch_group_with_cancellation == null)
+                return error.CommitDecisionUnknown;
             if (first_context) |context|
                 try batcher.decideGroupLocalWithPreDecisionContext(alloc, group_id, table_name, decision_request, context)
             else
@@ -23973,10 +24003,11 @@ pub const ProvisionedTableWriteSource = struct {
             }
         }
         if (self.groupLocalWriteSource()) |owner| {
+            if (first_context == null and cancellation.ptr != null and owner.vtable.txn_resolve_group_local_with_cancellation == null) return error.CommitDecisionUnknown;
             const result = if (first_context) |context|
                 try owner.txnDecideGroupLocalWithPreDecisionContext(alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level, context)
             else
-                try owner.txnResolveGroupLocal(alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level);
+                try owner.txnResolveGroupLocalWithCancellation(alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level, cancellation);
             if (result == null) return null;
             if (status == .committed) {
                 lockAtomic(&self.local_db_mutex);
@@ -23996,6 +24027,7 @@ pub const ProvisionedTableWriteSource = struct {
             var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default_async, null, null);
             defer cached.deinit(alloc);
             if (first_context) |context| ensurePreDecisionContextActive(context) catch return error.PreDecisionNotProposed;
+            try cancellation.check();
             try applyReplicatedTransactionMutationWithCancellation(alloc, cached.db, table_name, group_id, .{
                 .sync_level = sync_level,
                 .transaction = .{ .resolve = .{ .txn_id = txn_id, .status = status, .commit_version = commit_version } },
@@ -24012,6 +24044,7 @@ pub const ProvisionedTableWriteSource = struct {
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
             if (first_context) |context| ensurePreDecisionContextActive(context) catch return error.PreDecisionNotProposed;
+            try cancellation.check();
             try applyReplicatedTransactionMutationWithCancellation(alloc, &db, table_name, group_id, .{
                 .sync_level = sync_level,
                 .transaction = .{ .resolve = .{ .txn_id = txn_id, .status = status, .commit_version = commit_version } },
@@ -24122,49 +24155,52 @@ pub const ProvisionedTableWriteSource = struct {
         return try batcher.txnStatusGroupLocalUntil(alloc, group_id, table_name, txn_id, deadline_ns);
     }
 
-    fn txnAcknowledgeGroupLocal(
+    fn txnAcknowledgeGroupLocalUntil(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, participant: []const u8, deadline_ns: u64) anyerror!?void {
+        if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+        return try txnAcknowledgeGroupLocalImpl(ptr, alloc, group_id, table_name, txn_id, participant, deadline_ns);
+    }
+
+    fn txnAcknowledgeGroupLocal(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, participant: []const u8) anyerror!?void {
+        return try txnAcknowledgeGroupLocalImpl(ptr, alloc, group_id, table_name, txn_id, participant, null);
+    }
+
+    fn txnAcknowledgeGroupLocalImpl(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         group_id: u64,
         table_name: []const u8,
         txn_id: db_mod.types.TxnId,
         participant: []const u8,
+        deadline_ns: ?u64,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         try enforceHAWriteGateOptional(self.ha_write_gate);
         if (self.raft_batcher) |batcher| {
-            try batcher.batchGroupLocal(alloc, group_id, table_name, .{
+            const request: db_mod.types.BatchRequest = .{
                 .sync_level = .write,
                 .transaction = .{ .acknowledge = .{ .txn_id = txn_id, .participant = participant } },
-            });
+            };
+            if (deadline_ns) |deadline| {
+                if (platform_time.monotonicNs() >= deadline) return error.Timeout;
+                if (batcher.vtable.batch_group_local_with_cancellation == null) return error.CommitPropagationIncomplete;
+                var cancellation: TxnRecoveryDeadlineCancellation = .{ .deadline_ns = deadline };
+                try batcher.batchGroupLocalWithCancellation(alloc, group_id, table_name, request, cancellation.token());
+            } else try batcher.batchGroupLocal(alloc, group_id, table_name, request);
             return {};
         }
         self.beginGroupOperation(table_name, group_id);
         defer self.endGroupOperation(table_name, group_id);
-        if (comptime control_only_storage_sources) {
-            const owner = self.groupLocalWriteSource() orelse
-                return error.StorageKernelOwnerUnavailable;
-            return try owner.txnAcknowledgeGroupLocal(
-                alloc,
-                group_id,
-                table_name,
-                txn_id,
-                participant,
-            );
+        if (self.groupLocalWriteSource()) |owner| {
+            if (deadline_ns) |deadline| return try owner.txnAcknowledgeGroupLocalUntil(alloc, group_id, table_name, txn_id, participant, deadline);
+            return try owner.txnAcknowledgeGroupLocal(alloc, group_id, table_name, txn_id, participant);
         }
-        if (self.groupLocalWriteSource()) |owner|
-            return try owner.txnAcknowledgeGroupLocal(
-                alloc,
-                group_id,
-                table_name,
-                txn_id,
-                participant,
-            );
+        if (comptime control_only_storage_sources) return error.StorageKernelOwnerUnavailable;
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
         if (self.write_cache) |cache| {
             var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default_async, null, null);
             defer cached.deinit(alloc);
+            if (deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.Timeout;
             try cached.db.markTransactionParticipantResolved(txn_id, participant);
             lockAtomic(&self.local_db_mutex);
             self.markWriteCacheDirty(table_name);
@@ -24173,6 +24209,7 @@ pub const ProvisionedTableWriteSource = struct {
             var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
+            if (deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.Timeout;
             try db.markTransactionParticipantResolved(txn_id, participant);
             self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
         }
@@ -26003,6 +26040,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .txn_decide_group_local_with_pre_decision_context = txnDecideGroupLocalWithPreDecisionContext,
                 .txn_status_group_local = txnStatusGroupLocal,
                 .txn_acknowledge_group_local = txnAcknowledgeGroupLocal,
+                .txn_acknowledge_group_local_until = txnAcknowledgeGroupLocalUntil,
                 .corrupt_embedding_artifact = corruptEmbeddingArtifact,
                 .reprocess_document_artifact = reprocessDocumentArtifact,
                 .reprocess_document_artifact_range = reprocessDocumentArtifactRange,
@@ -26640,7 +26678,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         defer alloc.free(participant);
         var worker = distributed_txn.HostedParticipantWorker.init(self.catalog, self.router, self.source(), self.executor);
         _ = worker.withInternalServiceAuth(self.internal_service_secret, self.internal_service_issuer);
-        try worker.worker().acknowledgeGroup(alloc, coordinator_group_id, coordinator_table_name, .{
+        try worker.worker().startRecovery().acknowledgeGroup(alloc, coordinator_group_id, coordinator_table_name, .{
             .txn_id = txn_id,
             .participant = participant,
         });
@@ -26991,6 +27029,11 @@ pub const HostedProvisionedTableWriteSource = struct {
                 try table_catalog.validateTransactionTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
             const local_source = self.groupLocalWriteSource() orelse
                 return error.StorageKernelOwnerUnavailable;
+            if (req.transaction) |mutation| if (mutation == .resolve and context.cancellation.ptr != null) {
+                if (local_source.vtable.txn_resolve_group_local_with_cancellation == null) return error.CommitDecisionUnknown;
+                const decision = mutation.resolve;
+                return try local_source.txnResolveGroupLocalWithCancellation(alloc, group_id, table_name, decision.txn_id, decision.status, decision.commit_version, topology_epoch, req.sync_level, context.cancellation);
+            };
             return try local_source.batchGroupLocal(alloc, group_id, table_name, req);
         }
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
@@ -27157,6 +27200,23 @@ pub const HostedProvisionedTableWriteSource = struct {
         var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default);
         defer cached.deinit(hosted_cache.write_cache.alloc);
         return try cached.db.getTransactionStatus(txn_id);
+    }
+
+    fn txnAcknowledgeGroupLocalUntil(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, participant: []const u8, deadline_ns: u64) anyerror!?void {
+        if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (comptime control_only_storage_sources) {
+            const owner = self.groupLocalWriteSource() orelse return error.StorageKernelOwnerUnavailable;
+            return try owner.txnAcknowledgeGroupLocalUntil(alloc, group_id, table_name, txn_id, participant, deadline_ns);
+        }
+        var cancellation: TxnRecoveryDeadlineCancellation = .{ .deadline_ns = deadline_ns };
+        return batchGroupLocalFencedWithPreDecisionContext(ptr, alloc, group_id, table_name, .{
+            .sync_level = .write,
+            .transaction = .{ .acknowledge = .{ .txn_id = txn_id, .participant = participant } },
+        }, 0, .{ .deadline_ns = deadline_ns, .cancellation = cancellation.token() }) catch |err| switch (err) {
+            error.PreDecisionDeadlineExceeded => error.Timeout,
+            else => err,
+        };
     }
 
     fn txnAcknowledgeGroupLocal(
@@ -34021,6 +34081,25 @@ fn consumerTests() type {
                 try std.testing.expectEqual(@as(u64, 1), expired.auto_aborted);
                 try std.testing.expectEqual(transactions_mod.TxnStatus.aborted, try manager.getTransactionStatus(txn_id));
             }
+        }
+
+        test "transaction recovery provisioned adapter never loses budget through legacy Raft callbacks" {
+            const Fake = struct {
+                calls: usize = 0,
+                fn batch(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.BatchRequest) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.calls += 1;
+                }
+            };
+            var fake: Fake = .{};
+            var source = ProvisionedTableWriteSource.init("/unused-recovery-capability-test", table_catalog.emptyCatalogSource());
+            defer source.deinit();
+            _ = source.withRaftBatcher(.{ .ptr = &fake, .vtable = &.{ .batch_group = Fake.batch, .batch_group_local = Fake.batch } });
+            var stopped = std.atomic.Value(bool).init(false);
+            const cancellation = db_mod.types.CancellationToken.fromAtomic(&stopped);
+            try std.testing.expectError(error.CommitDecisionUnknown, source.source().txnResolveGroupLocalWithCancellation(std.testing.allocator, 7, "docs", [_]u8{1} ** 16, .aborted, 8, 0, .write, cancellation));
+            try std.testing.expectError(error.CommitPropagationIncomplete, source.source().txnAcknowledgeGroupLocalUntil(std.testing.allocator, 7, "docs", [_]u8{1} ** 16, "peer", platform_time.monotonicNs() + std.time.ns_per_s));
+            try std.testing.expectEqual(@as(usize, 0), fake.calls);
         }
 
         test "routed atomic batch preserves deadline without changing accepted outcome" {

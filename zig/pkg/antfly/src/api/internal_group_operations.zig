@@ -609,7 +609,19 @@ pub const Operations = struct {
     pub fn txnResolve(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: distributed_txn.TxnResolveRequest) Error!void {
         try request.ensureActive();
         const writes = self.writes orelse return error.NotFound;
-        _ = (writes.txnResolveGroupLocalWithCancellation(alloc, group_id, table_name, input.txn_id, input.status, input.commit_version, input.topology_epoch, input.sync_level, request.cancellation) catch |err| switch (err) {
+        const DeadlineScope = struct {
+            request: operation.RequestContext,
+            fn check(raw: *const anyopaque) !void {
+                const scope: *const @This() = @ptrCast(@alignCast(raw));
+                try scope.request.ensureActive();
+            }
+        };
+        var scope: DeadlineScope = .{ .request = request };
+        if (request.deadline_ns != null and writes.vtable.txn_resolve_group_local_with_cancellation == null) return error.Unavailable;
+        const cancellation: CancellationToken = if (request.deadline_ns != null) .{ .ptr = &scope, .check_fn = DeadlineScope.check } else request.cancellation;
+        _ = (writes.txnResolveGroupLocalWithCancellation(alloc, group_id, table_name, input.txn_id, input.status, input.commit_version, input.topology_epoch, input.sync_level, cancellation) catch |err| switch (err) {
+            error.Canceled, error.Cancelled => return error.Canceled,
+            error.Timeout, error.DeadlineExceeded => return error.DeadlineExceeded,
             error.DecisionConflict => return error.DecisionConflict,
             error.TopologyChanged => return error.TopologyChanged,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
@@ -646,7 +658,10 @@ pub const Operations = struct {
     pub fn txnAcknowledge(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: distributed_txn.TxnAcknowledgeRequest) Error!void {
         try request.ensureActive();
         const writes = self.writes orelse return error.NotFound;
-        _ = (writes.txnAcknowledgeGroupLocal(alloc, group_id, table_name, input.txn_id, input.participant) catch |err| switch (err) {
+        const deadline = @import("table_catalog.zig").RoutingBudget.init(null).deadlineFrom(.{ .deadline_ns = request.deadline_ns, .io = request.deadline_io });
+        _ = ((if (deadline) |value| writes.txnAcknowledgeGroupLocalUntil(alloc, group_id, table_name, input.txn_id, input.participant, value) else writes.txnAcknowledgeGroupLocal(alloc, group_id, table_name, input.txn_id, input.participant)) catch |err| switch (err) {
+            error.Timeout, error.DeadlineExceeded => return error.DeadlineExceeded,
+            error.CommitPropagationIncomplete => return error.Unavailable,
             error.InvalidParticipant, error.DecisionConflict => return error.DecisionConflict,
             error.UnsupportedOperation => return error.Unsupported,
             error.UnknownGroup, error.TxnNotFound => return error.NotFound,

@@ -218,7 +218,8 @@ zig test --dep runtime_failure_abi \
 ```
 
 The matching DATA local-leader/user-receipt and SourceOwner acquisition hooks
-have their own pending integration gate. These API results do not qualify the
+passed their separate four-test owning gate (actual exit 0,
+`/tmp/workload-first-decision-data1.log`, commit `025e550647`). These API results do not qualify the
 remaining aggregate abort/ack deadline or multi-peer process-loss/shutdown
 schedules listed above.
 
@@ -246,3 +247,97 @@ these before execution; both were corrected before this successful API gate.
 The target was invoked with `-j1`; its internal test/library children were seen
 compiling concurrently, so the target still needs scheduling review if strict
 single-compiler peak memory is required.
+
+
+### Aggregate abort and acknowledgement recovery (API 36, failure ABI 61)
+
+Production participant adapters start one independent five-second recovery
+window after a possible decision or when abort cleanup begins. Coordinator
+status/same-decision retry, participant waves and their acknowledgements retain
+that absolute deadline. Stable-ID retries start it before inspecting a conflicting
+coordinator begin. Expiry after known commit preserves committed propagation debt;
+expiry during abort delivery retains the remaining durable enlistment. An
+already-expired user admission deadline does not cancel this recovery window.
+Explicit follower/shutdown cancellation remains combined with its deadline.
+Legacy custom in-process workers retain their explicit null-budget contract.
+
+Bounded resolve and ACK use `/txn-resolve-v2` and `/txn-acknowledge-v2`, require
+a server budget, and never fall back to older endpoints. The transport reserves
+50 ms for the response and caps the remote work budget at five seconds. A peer
+without the capability leaves the participant enlisted. Native ACK receives its
+own absolute monotonic deadline through checked API ABI 36. The handler converts
+its ingress clock, and the owner checks again after acquisition before invoking
+C. Post-invocation errors retain their existing uncertainty classification.
+
+New focused tests cover shared abort/status/resolve/ACK windows; committed
+follower ACK expiry without dispatching later participants; preservation of an
+explicit cancellation token; absence of unbounded callback fallback; old-peer
+rejection; required server budgets and clock conversion; and checked ACK callback
+transport. The first SourceOwner attempt found a nested local-name shadow (fixed);
+the next attempt exhausted the
+build volume before tests, without source diagnostics. The third attempt lost
+a generated file while the shared cache changed externally. Subsequent team
+gates use repository-local `zig/.zig-cache/workload-local` and
+`zig/.zig-cache/workload-global` after the isolated `/tmp` retry also lost a
+generated tool artifact.
+
+This stage prevents late submission but does not yet interrupt SourceOwner
+catalog acquisition or synchronous native work already invoked. The next bounded
+stage needs an explicit resolve deadline callback and budgeted owner descriptor
+acquisition. General multi-peer loss, process shutdown/late response schedules,
+and the full eight-item completion qualification remain open.
+
+
+The real SourceOwner fixture subsequently exposed an undeclared compiled-boundary
+error: ACK of an unenlisted participant returned `StorageKernelFailure` instead
+of `InvalidParticipant`. Failure ABI 61 appends semantic status 575; the checked
+callback detail also preserves the same identity. The standalone identity gate
+passed **1/1, actual exit 0** (`/tmp/workload-recovery-invalid-participant.log`).
+The late-acquisition timeout assertion passed before this mapping failure; the
+owner fixture is retained unchanged for its follow-up gate.
+
+
+The first aggregate API run compiled successfully and passed **44/45 tests,
+0 skips, 0 leaks, actual exit 1** (`/tmp/workload-recovery-api1.log`). Its only
+failure was the new HTTP fixture using the invalid participant string `peer`;
+the parser correctly rejected it before dispatch. The fixture now uses the
+canonical table/group participant encoding. The broad recovery suite inventory
+also selected 23 existing native recovery tests, all of which passed; the default
+inventory has been narrowed to the seven exact new API/checked-status tests.
+The corrected owning gate passed **22/22, 0 skips, 0 failures, 0 leaks,
+actual exit 0** (`/tmp/workload-recovery-api2.log`). The custom runner prints a
+`failed command` diagnostic after expected warnings even when the build exits 0;
+the actual process exit was collected independently.
+
+
+After the semantic mapping fix, the real compiled-owner gate passed **1/1,
+0 skips, 0 failures, 0 leaks, actual exit 0**
+(`/tmp/workload-recovery-owner-deadline6.log`). It expires the native ACK deadline
+inside actual catalog acquisition and proves no ACK occurred, preserves the
+unenlisted-participant error with a fresh deadline, completes valid and duplicate
+ACKs, then cancels an abort during owner acquisition and proves the transaction
+remains pending until an independent retry resolves it.
+
+Reproduce the 22-test API gate from `zig/`:
+
+```sh
+zig build antfly-api-test -j1 --cache-dir .zig-cache/workload-local --global-cache-dir .zig-cache/workload-global -- \
+  --test-filter 'transaction recovery endpoint requires budget and translates the ingress clock' \
+  --test-filter 'transaction recovery shares abort and acknowledgement budget independently of admission' \
+  --test-filter 'transaction recovery retains shutdown cancellation and rejects unbounded fallback' \
+  --test-filter 'transaction recovery acknowledgement boundary rejects expiry and preserves accepted errors' \
+  --test-filter 'transaction recovery provisioned adapter never loses budget through legacy Raft callbacks' \
+  --test-filter 'transaction recovery transport requires bounded versioned peers without fallback' \
+  --test-filter 'transaction recovery invalid participant preserves checked status identity' \
+  --test-filter 'distributed txn preserves original deadline across participant waves and cleanup' \
+  --test-filter 'transaction attempt budgets follow the borrowed transport clock' \
+  --test-filter 'transaction commit boundary preserves ingress context and never downgrades deadlines' \
+  --test-filter 'routed atomic batch preserves deadline without changing accepted outcome' \
+  --test-filter 'public transaction ingress establishes one original deadline before dispatch' \
+  --test-filter 'shared stateless batch retries borrow IO and preserve unknown outcomes' \
+  --test-filter 'stable distributed transaction retry resumes a durable commit decision' \
+  --test-filter 'compiled table write boundary transports cancellation and committed failure identity' \
+  --test-filter 'httpx multi batch route uses the batch commit hook and public response contract' \
+  --test-filter 'workload admission stable transaction commit durably hands off recovery before acknowledgement' \
+  --test-filter 'first decision'
+```
