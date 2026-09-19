@@ -2627,6 +2627,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const vopr_cli = b.addTest(.{
         .name = "vopr",
         .root_module = vopr_cli_mod,
+        // The command runner invokes only this entrypoint. Exclude unrelated
+        // imported unit tests from compilation while retaining test facilities
+        // and every scenario reachable from the command dispatcher.
+        .filters = &.{"VOPR command entrypoint"},
         .test_runner = .{
             .path = b.path("pkg/antfly/src/vopr/cli_runner.zig"),
             .mode = .simple,
