@@ -453,3 +453,96 @@ test "workload admission completion scratch recycles interleaved streaming buffe
     working.free(coalesced);
     try std.testing.expectEqual(charged, manager.snapshot().memory.used_bytes);
 }
+
+/// Single-borrow compiler workspace backed before consensus admission. Templates
+/// must be copied to accepted-slot ownership before release. This component alone
+/// is not a completion-capacity attestation. Keep its address stable while borrowed.
+pub const CompilerWorkspace = struct {
+    scratch: *RecyclingScratch,
+    mutex: std.atomic.Mutex = .unlocked,
+    generation: u64 = 0,
+    borrowed: bool = false,
+
+    pub const Borrow = struct {
+        workspace: *CompilerWorkspace,
+        generation: u64,
+
+        pub fn allocator(self: Borrow) !std.mem.Allocator {
+            const owner = self.workspace;
+            owner.lock();
+            defer owner.mutex.unlock();
+            if (!owner.borrowed or owner.generation != self.generation) return error.CompletionReservationBusy;
+            return owner.scratch.allocator();
+        }
+
+        /// Failure leaves this borrow active so the caller can free remaining
+        /// buffers and retry. A copied old token cannot release a newer borrow.
+        pub fn release(self: Borrow) !void {
+            const owner = self.workspace;
+            owner.lock();
+            defer owner.mutex.unlock();
+            if (!owner.borrowed or owner.generation != self.generation) return error.CompletionReservationBusy;
+            owner.scratch.lock();
+            defer owner.scratch.mutex.unlock();
+            if (owner.scratch.live != 0) return error.CompletionReservationBusy;
+            owner.borrowed = false;
+        }
+    };
+
+    pub fn init(backing: std.mem.Allocator, manager: *resources.ResourceManager, bytes: usize) !CompilerWorkspace {
+        return .{ .scratch = try RecyclingScratch.create(backing, manager, bytes) };
+    }
+
+    fn lock(self: *CompilerWorkspace) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    pub fn tryBorrow(self: *CompilerWorkspace) !Borrow {
+        self.lock();
+        defer self.mutex.unlock();
+        if (self.borrowed or self.generation == std.math.maxInt(u64)) return error.CompletionReservationBusy;
+        self.generation += 1;
+        self.borrowed = true;
+        return .{ .workspace = self, .generation = self.generation };
+    }
+
+    /// Owner excludes further borrow calls before destroying the workspace.
+    pub fn deinit(self: *CompilerWorkspace) !void {
+        self.lock();
+        defer self.mutex.unlock();
+        if (self.borrowed) return error.CompletionReservationBusy;
+        try self.scratch.destroy();
+    }
+};
+
+test "workload admission completion compiler borrows retain preowned capacity and reject stale release" {
+    const alloc = std.testing.allocator;
+    var manager = resources.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer manager.deinit(alloc);
+    var backing = std.testing.FailingAllocator.init(alloc, .{});
+    var workspace = try CompilerWorkspace.init(backing.allocator(), &manager, 64 * 1024);
+    defer workspace.deinit() catch unreachable;
+    const charged = manager.snapshot().memory.used_bytes;
+    backing.fail_index = backing.alloc_index;
+    backing.resize_fail_index = backing.resize_index;
+    manager.memory.budget.hard_limit_bytes = 1;
+    const first = try workspace.tryBorrow();
+    const allocator = try first.allocator();
+    const bytes = try allocator.alloc(u8, 48 * 1024);
+    @memset(bytes, 0x5a);
+    try std.testing.expectError(error.CompletionReservationBusy, workspace.tryBorrow());
+    try std.testing.expectError(error.CompletionReservationBusy, first.release());
+    try std.testing.expectError(error.CompletionReservationBusy, workspace.deinit());
+    try std.testing.expectEqual(@as(u8, 0x5a), bytes[bytes.len - 1]);
+    allocator.free(bytes);
+    try first.release();
+    const second = try workspace.tryBorrow();
+    try std.testing.expectError(error.CompletionReservationBusy, first.release());
+    try std.testing.expectError(error.CompletionReservationBusy, first.allocator());
+    const next_allocator = try second.allocator();
+    const next = try next_allocator.alloc(u8, 60 * 1024);
+    next_allocator.free(next);
+    try second.release();
+    try std.testing.expectEqual(charged, manager.snapshot().memory.used_bytes);
+    try std.testing.expect(!backing.has_induced_failure);
+}

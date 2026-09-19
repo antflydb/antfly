@@ -2102,6 +2102,9 @@ pub const NativeWalCompletionIo = struct {
     // Explicit authority granted only after a full manifest checkpoint. The
     // default one-shot WAL scope cannot truncate or retire segments.
     allow_wal_reset: bool = false,
+    /// Sequential compaction may read one distinct input while its output writer
+    /// retains the other descriptor. No concurrent operations or escaped reader.
+    allow_sequential_input: bool = false,
 
     /// Prepare a finite allowlist for sequential WAL, SST and manifest I/O.
     /// All path ownership, writer state, CRC scratch and two FD permits are
@@ -2248,6 +2251,12 @@ pub const NativeWalCompletionIo = struct {
         if (self.writer_fd != null) return error.CompletionWriterLive;
     }
 
+    fn readable(self: *NativeWalCompletionIo, value: []const u8) !void {
+        if (self.writer_fd == null) return;
+        if (!self.allow_sequential_input or std.mem.eql(u8, value, self.writer_final) or
+            std.mem.eql(u8, value, self.writer_temp)) return error.CompletionWriterLive;
+    }
+
     fn preparedFile(self: *NativeWalCompletionIo, value: []const u8) ?*const PreparedFile {
         for (self.files) |*file| if (std.mem.eql(u8, value, file.final)) return file;
         return null;
@@ -2290,7 +2299,7 @@ pub const NativeWalCompletionIo = struct {
 
     fn size(raw: *anyopaque, value: []const u8) !u64 {
         const self = get(raw);
-        try self.idle();
+        try self.readable(value);
         const fd = try std.posix.openatZ(std.posix.AT.FDCWD, try self.path(value), .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
         defer closeFd(fd);
         return try fileSizeFromFd(fd);
@@ -2298,7 +2307,7 @@ pub const NativeWalCompletionIo = struct {
 
     fn readInto(raw: *anyopaque, value: []const u8, offset: u64, out: []u8) !void {
         const self = get(raw);
-        try self.idle();
+        try self.readable(value);
         const fd = try std.posix.openatZ(std.posix.AT.FDCWD, try self.path(value), .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
         defer closeFd(fd);
         try readAllAtOffset(fd, out, offset);
@@ -6440,4 +6449,54 @@ test "workload admission native completion scope rebinds prepaid paths without f
     try std.testing.expectEqual(count, pool.snapshotStats().fd_admitted_descriptors);
     try std.testing.expectError(error.UnsupportedCompletionPath, scope.replacePreparedFiles(alloc, &.{.{ .path = "/different/root", .max_bytes = 32 }}));
     try std.testing.expect(scope.preparedFile("/scope-rebind/second") != null);
+}
+
+test "workload admission native completion scope streams distinct input with retained output under exhaustion" {
+    if (!supports_posix_fd_cache) return error.SkipZigTest;
+    const repository = @import("repository.zig");
+    const alloc = std.testing.allocator;
+    var path_buffer: [256]u8 = undefined;
+    const root_z = repository.tmpPath(&path_buffer, "completion-streaming-input");
+    const root = std.mem.span(root_z);
+    defer repository.cleanupTmp(root_z);
+    const input = try std.fmt.allocPrint(alloc, "{s}/input", .{root});
+    defer alloc.free(input);
+    const output = try std.fmt.allocPrint(alloc, "{s}/output", .{root});
+    defer alloc.free(output);
+    var failing = std.testing.FailingAllocator.init(alloc, .{});
+    var pool = NativeStoragePool.initWithCapacityForTest(failing.allocator(), 2);
+    defer pool.deinit();
+    var native = try NativeStorage.initWithPool(failing.allocator(), .threaded, &pool);
+    defer native.deinit();
+    try native.storage().createDirPath(root);
+    const scope = try NativeCompletionIo.createWithFiles(failing.allocator(), &native, root, &.{
+        .{ .path = input, .max_bytes = 32 }, .{ .path = output, .max_bytes = 32 },
+    });
+    defer scope.deinit() catch unreachable;
+    const storage = scope.storage();
+    {
+        var initial = try storage.beginAtomicWrite(std.testing.failing_allocator, input);
+        errdefer initial.abort();
+        try initial.appendSlice("streaming-source");
+        try initial.finish();
+    }
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    pool.fd_cache.capacity = 1;
+    var writer = try storage.beginAtomicWrite(std.testing.failing_allocator, output);
+    defer writer.abort();
+    try std.testing.expectError(error.CompletionWriterLive, storage.fileSize(input));
+    scope.allow_sequential_input = true;
+    try std.testing.expectEqual(@as(u64, 16), try storage.fileSize(input));
+    var data: [16]u8 = undefined;
+    try storage.readFileRangeInto(std.testing.failing_allocator, input, 0, &data);
+    try std.testing.expectEqualStrings("streaming-source", &data);
+    try std.testing.expectError(error.CompletionWriterLive, storage.fileSize(output));
+    try std.testing.expectError(error.CompletionWriterLive, storage.readFileRangeInto(std.testing.failing_allocator, scope.writer_temp, 0, &data));
+    try writer.appendSlice(&data);
+    try writer.finish();
+    try storage.readFileRangeInto(std.testing.failing_allocator, output, 0, &data);
+    try std.testing.expectEqualStrings("streaming-source", &data);
+    try std.testing.expectEqual(@as(usize, 2), pool.snapshotStats().fd_admitted_descriptors);
+    try std.testing.expect(!failing.has_induced_failure);
 }
