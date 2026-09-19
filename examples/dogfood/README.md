@@ -65,27 +65,26 @@ work-log entries reads sensibly end to end.
 
    ```sh
    antfly inference pull Qwen/Qwen3-Embedding-0.6B-GGUF
-   antfly inference pull antflydb/gliner2-base-v1
+   antfly inference pull fastino/gliner2.5-base-v1
    ```
 
-   `fastino/gliner2.5-base-v1` (a bare HuggingFace `owner/name` reference,
-   same form as the Qwen3 pull above; an explicit `hf:` prefix also works) is
-   the target extractor and pulls successfully, but as of this writing the
-   runtime intentionally keeps GLiNER2.5 gated off for serving until a
-   production qualification row lands
-   (`zig/pkg/inference/src/models/gliner_boundary_qualification.zig`) --
-   `POST /ai/v1/extract` answers `INVALID_MODEL: model does not support
-   entity extraction`. `dogfood` defaults `-extract-model` to
-   `antflydb/gliner2-base-v1`, which is fully qualified and works end to end
-   against a local `antfly inference run`. Switch back to
-   `-extract-model fastino/gliner2.5-base-v1` once its qualification row
-   lands.
+   `fastino/gliner2.5-base-v1` is qualified for production extraction on
+   native and Metal, including windowed long documents (see
+   `zig/pkg/inference/models/gliner2/GLINER25.md` for the evidence and
+   bounds); `dogfood` defaults `-extract-model` to it and requests
+   `long_document: {mode: "window"}`. `antflydb/gliner2-base-v1` is a
+   smaller fallback (`-extract-model antflydb/gliner2-base-v1`). An
+   unqualified boundary checkpoint answers `MODEL_NOT_QUALIFIED`.
+
+   In-process inference budgets (host, backend, combined, KV, scratch) are
+   derived from the host memory policy the way `antfly inference run` derives
+   its defaults, and can be overridden on `antflylite.OpenOptions`.
 
 4. `dogfood ingest` fails fast before doing any work: in-process mode it
    checks that the linked `libantfly` advertises `local_inference_runtime`;
    in remote mode it probes `GET /healthz` and runs a one-sentence
    `POST /ai/v1/extract` against `-extract-model` so a gated model surfaces the
-   server's own error (for GLiNER2.5, `INVALID_MODEL` above) instead of
+   server's own error (for an unqualified model, `MODEL_NOT_QUALIFIED`) instead of
    failing deep inside `RunUntilIdle`. `dogfood status` prints the same
    checks.
 
@@ -126,98 +125,74 @@ recognition at the first positional token).
 
 ## Index configuration
 
-`dogfood` talks to the raw Lite C ABI (`antfly_db_add_index_json`), not the
-network `CreateIndexRequest` API, so the JSON shapes below use the storage
-engine's own field names rather than the public OpenAPI schema names. Two
-differences worth calling out explicitly (found by testing against a real
-`libantfly` build, see `index_config.go`):
+`dogfood` talks to the raw Lite C ABI (`antfly_db_add_index_json`) and uses
+the same two-stage chunk-artifact pattern as the server (`go/pkg/docsaf`,
+`antfly.NewArtifactEmbeddingIndexConfig`). Both enrichments travel inline on
+the index that owns them and Lite registers them in dependency order before
+admitting the index; see `index_config.go`.
 
-- The raw `dense_vector` index kind uses `dims` and `metric`, not the public
-  API's `dimension` and `distance_metric`.
-- `dogfood` originally tried the artifact-indirection pattern used by
-  `go/pkg/docsaf/cmd/docsaf` (an inline `chunk` enrichment producing a
-  `doc_chunks_v1` artifact, consumed by the embeddings index via
-  `"sources": [{"artifact": "doc_chunks_v1"}]`). That JSON parses cleanly
-  against the engine's config parser, but `antfly_db_add_index_json`
-  consistently returned a generic `ANTFLY_INTERNAL` error for every
-  `sources`-based `dense_vector` config tried (including the two-stage
-  chunk-enrichment + embedding-enrichment form docsaf uses), regardless of
-  field/embedder details. This looks like artifact-sourced dense-vector
-  indexes are not yet wired up for Lite's native profile. `dogfood` instead
-  uses the inline `chunker` field on the `chunk_vectors` index itself (the
-  same pattern `examples/epstein/main.go`'s `createEmbeddingIndexConfig`
-  uses against full Antfly): Lite chunks each document at write time and
-  embeds every chunk, without exposing the intermediate chunks as a
-  separately queryable artifact. Lexical search still runs against the
-  default full-text index over whole section bodies, unaffected by this.
+1. `chunk_vectors` (`dense_vector`): `type: "embeddings"`,
+   `sources: [{artifact: "doc_chunk_dense_v1"}]`, `dimension: 1024`,
+   `distance_metric: "cosine"`, `embedder: {provider: "antfly", model:
+   "Qwen/Qwen3-Embedding-0.6B-GGUF"}`, and two inline enrichments:
+   - `doc_chunks_v1` (`chunk`, field `body`): `chunk_size`/`chunk_overlap`
+     on a chunk enrichment are **byte** counts (the runtime's fixed byte
+     slicer), so the token-aware `fixed` chunker is selected through
+     `chunker_json` (`target_tokens: 400`, `overlap_tokens: 40`) and the byte
+     counts are kept consistent at four bytes per token.
+   - `doc_chunk_dense_v1` (`embedding`, `source_artifact_name:
+     "doc_chunks_v1"`, `expected_dims: 1024`).
+   Chunks are a queryable artifact; semantic hits carry
+   `hierarchy.parent_doc_key`, which `query` uses to project a chunk back to
+   its section before graph traversal.
+2. `knowledge` (`graph`): the extraction-fed graph ("autograph") --
+   `artifact.producer_json` runs the `extractor` producer (`provider:
+   "antfly"`, `model: fastino/gliner2.5-base-v1`, `long_document: {mode:
+   "window"}`) over each section body with the entity/relation schema above,
+   `include_confidence`/`include_spans`, and a `pagerank` metric (retried
+   once without `metrics` if the engine rejects it). Edges use the canonical
+   extraction envelope (`$.relations[*]` with `source.entity_index` /
+   `target.entity_index`).
+3. `full_text_index_v0`: the table's default full-text index, provisioned by
+   every Lite creation surface (C ABI, embedded package, `antfly lite init`).
 
-The three indexes `dogfood` builds:
-
-1. `chunk_vectors` (`dense_vector`): `field: "body"`, `dims: 1024`,
-   `metric: "cosine"`, `embedder: {provider: "antfly", model:
-   "Qwen/Qwen3-Embedding-0.6B-GGUF", api_url: <inference-url>}`, `chunker:
-   {provider: "antfly", model: "fixed", api_url: <inference-url>, text:
-   {target_tokens: 400, overlap_tokens: 40}}`.
-2. `knowledge` (`graph`): a single artifact source/producer pair (the
-   "autograph" pattern) -- `artifact.producer_json` runs the `extractor`
-   producer (`provider: "antfly", model: <extract-model>, api_url:
-   <inference-url>`) over each document's `body`, with the entity/relation
-   schema described above, `include_confidence`/`include_spans` enabled, and
-   a `pagerank` graph metric. If the engine rejects the `metrics` field,
-   `dogfood` logs a warning and retries once without it.
-3. `full_text_index_v0`: the table's default full-text index, matching
-   `zig/pkg/antfly/src/api/full_text_indexes.zig`'s
-   `default_full_text_index_name` constant. Current libantfly builds
-   auto-provision this on `Create`, matching the full server; `dogfood`
-   checks `IndexesJSON` first and only adds it explicitly (over `body`) as a
-   fallback for older builds that do not.
-
-`dogfood query` merges full-text and semantic search with
-`"merge_config": {"strategy": "rrf"}` in one `SearchJSON` call
-(`"full_text_search"`, `"full_text_index": "full_text_index_v0"`,
-`"semantic_search"`, `"indexes": ["chunk_vectors"]`). Hits that come from the
-chunked embedding index carry a `hierarchy.parent_doc_key` field (see
-`specs/openapi/antfly/metadata.yaml`'s `QueryHit`/`QueryHitHierarchy`), which
-`dogfood` uses to project each chunk hit back to its source document before
-deduplicating and traversing the graph -- no separate merge step is needed.
+`dogfood query` sends one `SearchJSON` request: `full_text_search` (match
+form) merged by RRF with `semantic_search`, which Antfly embeds through the
+index's configured embedder (in-process or the index's `api_url`).
 
 ## Known limitations
 
 Measured on an Apple Silicon laptop against this repository's corpus
-(1196 markdown sections), in-process on Metal, 2026-09-17:
+(1,206 markdown sections), in-process on Metal, 2026-09-18, with GLiNER2.5
+base and windowed long documents:
 
 | Step | Result |
 |---|---|
-| Ingest wall time | 9.4 min (drain 562 s) |
-| Chunks embedded | 4,978 in 173 batches, 13.3 chunks/s |
-| Sections extracted | 1,196 in 150 batches, 7.9 sections/s |
-| `query "how does VOPR fence strong reads"` | 8 RRF-merged hits, 2 entities, 2 `tested_by` edges |
+| Ingest wall time | 14.1 min (drain 846 s) |
+| Chunks embedded | 5,024 in 174 batches, 17.1 chunks/s |
+| Sections extracted | 1,231 items in 176 batches, 1.8 sections/s (5 sections lost) |
+| `query "how does VOPR fence strong reads"` | 8 RRF-merged hits, 44 entities, 51 edges |
+| `entity "Raft"` | 4 edges (`implements`, `supersedes`, ...) |
+
+The previous run with GLiNER2 base and inline chunking took 9.4 min; the
+fp32 GLiNER2.5 checkpoint with windowed long documents is heavier per
+section, and extraction is now the bottleneck.
 
 What remains:
 
-- **Throughput is below the direct baseline.** Called directly through the
-  inference server the same models do ~23 chunks/s and ~13 sections/s, so the
-  corpus would take ~5 minutes. Lite's enrichment runtime runs the extract
-  stream and the embed stream strictly one after the other per ~64-item
-  window (`flushDeferredGeneratedWork` in
-  `zig/pkg/antfly/src/storage/db/enrichment/enrichment_runtime.zig`), which
-  both serializes the two models and lowers per-item throughput. Running the
-  two streams concurrently needs care around crash-idempotent replay and
-  belongs in a change with VOPR coverage.
-- `fastino/gliner2.5-base-v1` is gated off for serving pending a
-  qualification row (see Prerequisites).
-- Artifact-sourced dense-vector indexes (`sources: [{artifact: ...}]`, the
-  server's chunk-artifact pattern) fail with `ANTFLY_INTERNAL` in Lite's
-  native profile, so `chunk_vectors` chunks inline via its `chunker` field
-  and the chunks are not a separately queryable artifact.
-- Lite's raw `dense_vector` config uses `dims`/`metric`, not the public
-  schema's `dimension`/`distance_metric`.
-- `antfly lite init` still does not provision `full_text_index_v0` (only the
-  C ABI and embedded facade do), and `antfly lite query` cannot open a
-  binding-created file (`IdentityNamespaceMismatch`).
+- **Extraction throughput.** The asset lane runs at ~1.8 sections/s
+  in-process versus ~4.5 sections/s measured through the standalone server
+  on the same sections; the two enrichment lanes also do not overlap fully
+  (wall 846 s versus 678 s of extraction and 293 s of embedding). An fp16
+  encoder for GLiNER2.5 matched fp32 on every fixture but is not yet
+  qualified as a production row.
+- **Five sections are still lost**: the enrichment runtime occasionally
+  groups two documents into one extraction request, which the boundary
+  model's contract (one document per request) rejects, and the resulting
+  deterministic rejections are retried five times before giving up.
 - Entity node names are the extractor's surface strings (for example
-  `Full-cluster v42`), so `dogfood entity` needs the exact extracted text;
-  there is no entity resolution step in this example yet.
+  `Raft`, `Full-cluster v42`), so `dogfood entity` needs the exact extracted
+  text; there is no entity resolution step in this example.
 
 ## Files
 

@@ -44,12 +44,11 @@ const (
 	// (--host 127.0.0.1 --port 8090; see zig/pkg/inference/src/main.zig).
 	defaultInferenceURL = "" // empty: in-process inference via libantfly
 	defaultEmbedModel   = "Qwen/Qwen3-Embedding-0.6B-GGUF"
-	// GLiNER2.5 is the target extractor, but the runtime intentionally keeps
-	// it unqualified for serving until a production qualification row lands
-	// (zig/pkg/inference/src/models/gliner_boundary_qualification.zig), so
-	// the default is the qualified GLiNER2 base model.
-	defaultExtractModel  = "antflydb/gliner2-base-v1"
-	targetExtractModel   = "fastino/gliner2.5-base-v1"
+	// GLiNER2.5 base is qualified for production extraction (see
+	// zig/pkg/inference/models/gliner2/GLINER25.md); GLiNER2 base remains a
+	// smaller fallback.
+	defaultExtractModel  = "fastino/gliner2.5-base-v1"
+	fallbackExtractModel = "antflydb/gliner2-base-v1"
 	defaultTargetTokens  = 400
 	defaultOverlapTokens = 40
 
@@ -103,7 +102,7 @@ func runIngestCmd(args []string) error {
 	reset := fs.Bool("reset", false, "remove the existing Lite database before ingesting")
 	inferenceURL := fs.String("inference-url", defaultInferenceURL, "optional remote antfly inference server (e.g. http://127.0.0.1:8090); empty runs inference in-process")
 	embedModel := fs.String("embed-model", defaultEmbedModel, "Antfly inference embedding model for chunk_vectors")
-	extractModel := fs.String("extract-model", defaultExtractModel, "Antfly inference extraction model for the knowledge graph (target once qualified: "+targetExtractModel+")")
+	extractModel := fs.String("extract-model", defaultExtractModel, "Antfly inference extraction model for the knowledge graph (fallback: "+fallbackExtractModel+")")
 	targetTokens := fs.Int("target-tokens", defaultTargetTokens, "fixed chunker target tokens per chunk")
 	overlapTokens := fs.Int("overlap-tokens", defaultOverlapTokens, "fixed chunker overlap tokens between chunks")
 	metrics := fs.Bool("metrics", true, "publish a pagerank metric on the knowledge graph index")
