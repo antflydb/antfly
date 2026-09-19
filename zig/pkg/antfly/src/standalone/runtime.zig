@@ -2949,6 +2949,9 @@ pub fn runFromIterator(
     if (try antfly.common.secrets.initFromConfigPathWithIo(alloc, setup_io.io(), cli.config_path, cli.secret_store_paths.items)) |configured_store| {
         secret_store = configured_store;
         secret_store_initialized = true;
+        // Encrypted native stores are attached by metadata/serverless runtimes;
+        // embedding hosts use Lite's native handle directly.
+        if (secret_store.native_config != null) return error.InvalidConfig;
     } else {
         const default_secret_store_path = try resolveDefaultSecretStorePathBeforeConfig(alloc, cli);
         defer alloc.free(default_secret_store_path);

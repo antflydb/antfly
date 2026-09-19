@@ -510,6 +510,8 @@ pub const MetadataProjectionKind = enum(u32) {
     table_restore_admission = 38,
     verify_table_create_projection = 39,
     system_catalog = 41,
+    /// Opaque binary AFSC bytes (empty = absent), unlike JSON projections.
+    secret_collection = 42,
 };
 
 pub const MetadataProjectionRequest = extern struct {

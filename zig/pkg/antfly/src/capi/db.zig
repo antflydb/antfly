@@ -3489,6 +3489,14 @@ pub fn metadataApplyStoreProjection(
             defer handle.store.freeRestoreJobRows(alloc, value);
             break :blk metadataProjectionJson(alloc, out_json, value);
         },
+        .secret_collection => blk: {
+            const value = handle.store.getSecretCollection(alloc, request.group_id, request.key.slice()) catch |err|
+                break :blk storageOwnerStatusFromError(err);
+            // This projection is opaque binary, never a JSON UTF-8 string.
+            // Empty means absent; a persisted collection always has a header.
+            out_json.* = if (value) |bytes| .{ .ptr = bytes.ptr, .len = @intCast(bytes.len) } else .{};
+            break :blk .ok;
+        },
         .restore_job_value => blk: {
             const value = handle.store.getRestoreJobValue(alloc, request.group_id, request.key.slice()) catch |err|
                 break :blk storageOwnerStatusFromError(err);
