@@ -1578,13 +1578,19 @@ pub const NativeFile = struct {
 
     pub fn checkWithCancel(self: *NativeFile, cancel: ?*const maintenance.CancelToken) !CheckReport {
         if (cancel) |token| try token.check();
+        return self.checkAtFileSizeWithCancel((try self.file.stat(self.runtimeIo())).size, cancel);
+    }
+
+    /// Check a pinned header against the file length captured with that header.
+    /// Appends after pinning do not turn a valid snapshot into a tail error.
+    pub fn checkAtFileSizeWithCancel(self: *NativeFile, file_size: u64, cancel: ?*const maintenance.CancelToken) !CheckReport {
+        if (cancel) |token| try token.check();
         // Integrity checking must observe on-disk state, not cached pages.
         _ = self.page_cache_bypass.fetchAdd(1, .monotonic);
         defer _ = self.page_cache_bypass.fetchSub(1, .monotonic);
 
         const checkpoint = self.activeCheckpoint();
         const expected_size = try checkpointPrefixSize(checkpoint, self.header.page_size);
-        const file_size = (try self.file.stat(self.runtimeIo())).size;
 
         const report = CheckReport{
             .valid = true,

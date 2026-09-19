@@ -88,9 +88,9 @@ The implementation now consists of:
   remain indexed until vacuum and are skipped during iteration. Write cursors
   merge a sorted, latest-write-wins overlay containing only that transaction's
   pending mutations; this provides read-your-writes without materializing the
-  durable namespace. Pinned reads use concurrent positional I/O. A
-  `std.Io.RwLock` allows normal append-only commits while readers pin roots and
-  blocks vacuum before it can reclaim those roots.
+  durable namespace. Pinned reads use concurrent positional I/O and retain
+  their file generation across vacuum. Short index reads use a generation
+  lock during publication; old document readers continue on their original inode.
 - `storage/lite/index_storage.zig` stores Antfly index logical files in the
   native index catalog inside the same `.aflite` file.
   Each catalog checkpoint owns an immutable descriptor containing its history
@@ -356,12 +356,14 @@ checks the token at safe page and record boundaries, including during shutdown.
 Only one maintenance job runs at a time; a
 conflicting request returns `409`, and an engine that does not support an
 operation returns `422`. Completed jobs are retained in a bounded in-memory
-history. Lite reports `online: false`: check, compaction, and vacuum acquire the
-exclusive maintenance gate. Readiness becomes false and new database requests
-receive `503` while admin status and cancellation remain available. This avoids
-unbounded request queues and does not call a stop-the-world rewrite "online".
+history. Native Lite reports `online: true`: integrity checks pin a header and
+file length, while compaction and vacuum copy a pinned generation and catch up
+foreground mutations before publication. Readiness stays available during these
+jobs. The compatibility bridge still uses the exclusive maintenance gate.
 Native checkpoint publication and generation replacement serialize under the
-Lite store mutex. Document writes and maintenance also use FIFO writer admission.
+Lite store mutex. Document writers use FIFO admission; vacuum reserves the writer
+slot for its short publication window and returns `FileBusy` if bounded catch-up
+cannot finish.
 Private staged index output enters the store mutex only for final publication.
 Vacuum walks the current checkpoint's catalog and document indexes, skips
 tombstones, and streams values into replacement pages without a temporary LSM
@@ -1078,6 +1080,12 @@ and caches are released after their last reader. Physical reclamation occurs by
 replacing and retiring whole file generations, rather than reusing pages that
 might still belong to a reader. Compaction is explicitly requested through the
 existing maintenance API; this change does not add an automatic vacuum policy.
+
+The server maintenance coordinator advertises native maintenance as online.
+Integrity checks pin both the header and observed file length under the mutation
+mutex, then validate that snapshot outside it. Later appends do not create false
+tail-corruption reports; a tail already present when pinned remains an error.
+Compaction releases the namespace registry lock after its initial sync barrier.
 
 Secret metadata enumeration also uses a scope-bounded catalog cursor. It does
 not materialize unrelated private metadata or encrypted values from other scopes.

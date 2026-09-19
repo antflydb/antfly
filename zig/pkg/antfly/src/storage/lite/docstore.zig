@@ -185,6 +185,21 @@ pub const Store = struct {
         return try backend_erased.storeFrom(allocator, RuntimeStore{ .store = self, .prefix = prefix });
     }
 
+    pub fn checkWithCancel(self: *Store, cancel: ?*const @import("../maintenance.zig").CancelToken) !native.CheckReport {
+        if (self.read_only) return self.file.checkWithCancel(cancel);
+        var snapshot, const size = blk: {
+            lockStore(self);
+            defer self.mutex.unlock();
+            if (self.file.checkpoint_publication_uncertain or self.secret_store_uncertain) return error.OutcomeUnknown;
+            var file = try native.NativeFile.openWithIo(self.allocator, self.file.runtime(), self.file.path, .{ .read_only = true });
+            errdefer file.close();
+            file.header = self.file.header;
+            break :blk .{ file, (try file.file.stat(file.runtime())).size };
+        };
+        defer snapshot.close();
+        return snapshot.checkAtFileSizeWithCancel(size, cancel);
+    }
+
     pub fn vacuum(self: *Store) !native.VacuumReport {
         return try self.vacuumWithCancel(null);
     }
@@ -753,7 +768,9 @@ pub const Txn = struct {
             .store = store,
             .read_only = true,
             .prefix = prefix,
-            .read_generation = try store.pinReadGeneration(),
+            // Read-only stores already own their immutable generation. Reopening
+            // the pathname here could select a replacement inode after vacuum.
+            .read_generation = if (store.read_only) null else try store.pinReadGeneration(),
             .checkpoint = checkpoint,
         };
     }

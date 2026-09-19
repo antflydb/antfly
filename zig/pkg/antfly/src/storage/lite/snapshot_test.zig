@@ -18,6 +18,8 @@ test "lite generation readers use each transaction checkpoint for external value
     var write = try store.beginWrite();
     try write.put("doc", old_value);
     try write.commit();
+    var unopened_reader = try docstore.Store.openWithOptions(alloc, path, .{ .read_only = true, .io = std.testing.io });
+    defer unopened_reader.close();
     var pinned = try store.beginRead();
     defer pinned.abort();
     write = try store.beginWrite();
@@ -34,6 +36,32 @@ test "lite generation readers use each transaction checkpoint for external value
     const first = try cursor.first();
     try std.testing.expectEqualStrings(new_value, first.value);
     _ = try store.vacuum();
+    var delayed = try unopened_reader.beginRead();
+    defer delayed.abort();
+    try std.testing.expectEqualStrings(old_value, try delayed.get("doc"));
     try std.testing.expectEqualStrings(old_value, try pinned.get("doc"));
     try std.testing.expectEqualStrings(new_value, try fresh.get("doc"));
+}
+
+test "lite online checks validate the pinned file length while later commits append" {
+    const native = @import("native.zig");
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/online-check.aflite", .{tmp.sub_path});
+    defer alloc.free(path);
+    var store = try docstore.Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io });
+    defer store.close();
+    try store.file.putDocument("doc", "before");
+    var snapshot = try native.NativeFile.openWithIo(alloc, std.testing.io, path, .{ .read_only = true });
+    defer snapshot.close();
+    const size = (try snapshot.file.stat(std.testing.io)).size;
+    try store.file.putDocument("doc", "after");
+    try std.testing.expect((try snapshot.checkAtFileSizeWithCancel(size, null)).valid);
+    try std.testing.expect((try store.checkWithCancel(null)).valid);
+    // A tail already present when the check pins its header remains corruption.
+    try store.file.file.writePositionalAll(std.testing.io, "bad tail", (try store.file.file.stat(std.testing.io)).size);
+    const invalid = try store.checkWithCancel(null);
+    try std.testing.expect(!invalid.valid);
+    try std.testing.expectEqualStrings("tail_bytes", invalid.issue.?);
 }
