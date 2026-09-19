@@ -59,6 +59,12 @@ components:
         Each provider has specific configuration requirements. Use the appropriate
         provider-specific config or set common options at the top level.
 
+        Omitted options inherit the named connection when one is supplied.
+        Inline configurations preserve omission; clients must not materialize
+        defaults as overrides. Without a connection, the server applies provider
+        defaults (Exa: 5 results, 10000 ms timeout, safe search enabled, content
+        and highlights disabled, and auto search).
+
         **Environment Variables (fallbacks):**
         - EXA_API_KEY
         - SERPER_API_KEY
@@ -96,18 +102,15 @@ components:
           description: "Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC."
         max_results:
           type: integer
-          default: 5
           minimum: 1
           maximum: 20
           description: "Maximum number of search results to return"
         timeout_ms:
           type: integer
-          default: 10000
           description: "Request timeout in milliseconds"
         safe_search:
           x-go-type-skip-optional-pointer: false
           type: boolean
-          default: true
           description: "Enable safe search filtering"
         language:
           type: string
@@ -118,12 +121,12 @@ components:
           description: "Preferred region for results (e.g., 'us', 'uk', 'de')"
           example: "us"
         include_content:
+          x-go-type-skip-optional-pointer: false
           type: boolean
-          default: false
           description: "Ask the provider to return extracted page content when supported"
         include_highlights:
+          x-go-type-skip-optional-pointer: false
           type: boolean
-          default: false
           description: "Ask the provider to return highlighted passages when supported"
       discriminator:
         propertyName: provider
@@ -162,7 +165,6 @@ components:
             search_type:
               type: string
               enum: ["auto", "neural", "keyword"]
-              default: "auto"
               description: "Search mode to request from Exa"
             num_results:
               type: integer
@@ -212,7 +214,6 @@ components:
             search_type:
               type: string
               enum: ["search", "news", "images", "places", "shopping"]
-              default: "search"
               description: "Type of search to perform"
             time_period:
               type: string
@@ -245,18 +246,15 @@ components:
             search_depth:
               type: string
               enum: ["basic", "advanced"]
-              default: "basic"
               description: |
                 Search depth:
                 - basic: Fast search with standard results
                 - advanced: Deeper search with more comprehensive results
             include_answer:
               type: boolean
-              default: true
               description: "Include AI-generated answer summary"
             include_raw_content:
               type: boolean
-              default: false
               description: "Include raw HTML content of pages"
             include_domains:
               type: array
@@ -297,11 +295,9 @@ components:
               description: "Freshness filter: pd=day, pw=week, pm=month, py=year"
             text_decorations:
               type: boolean
-              default: false
               description: "Include text decorations (bold, italic markers)"
             spellcheck:
               type: boolean
-              default: true
               description: "Enable spellcheck suggestions"
 
     YouSearchConfig:
@@ -358,12 +354,10 @@ components:
             depth:
               type: string
               enum: ["standard", "deep"]
-              default: "standard"
               description: "Search depth to request from Linkup"
             output_type:
               type: string
               enum: ["searchResults", "sourcedAnswer"]
-              default: "searchResults"
               description: "Linkup response shape to request"
 
     VertexSearchConfig:
@@ -391,21 +385,18 @@ components:
             service:
               type: string
               enum: ["agent_search"]
-              default: "agent_search"
               description: "Google Cloud search service flavor"
             project_id:
               type: string
               description: "Google Cloud project ID. Falls back to GOOGLE_CLOUD_PROJECT."
             location:
               type: string
-              default: "global"
               description: "Google Cloud location. Falls back to GOOGLE_CLOUD_LOCATION."
             data_store:
               type: string
               description: "Agent Search data store ID."
             serving_config:
               type: string
-              default: "default_config"
               description: "Agent Search serving config ID."
             credentials_path:
               type: string

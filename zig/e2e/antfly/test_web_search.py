@@ -46,6 +46,7 @@ def web_runtime(tmp_path):
         "search_calls": 1,
         "parallel_searches": 1,
         "database_first": False,
+        "answer_summary": False,
         "binary": binary,
     }
 
@@ -85,10 +86,18 @@ def web_runtime(tmp_path):
                 state["generations"].append(payload)
                 previous = [m for m in payload["messages"] if m["role"] == "tool"]
                 if len(previous) >= state["search_calls"]:
-                    message = {
-                        "role": "assistant",
-                        "content": "EXA-HTTP-CANARY-731 [source](https://example.com/evidence)",
-                    }
+                    answer = (
+                        "EXA-HTTP-CANARY-731 [source](https://example.com/evidence)"
+                    )
+                    if state["answer_summary"]:
+                        summary = json.loads(previous[-1]["content"])["results"][0]
+                        count = (
+                            summary["aggregations"]["doc_count"]["value"]
+                            if "aggregations" in summary
+                            else summary["hits"]["total"]["value"]
+                        )
+                        answer = f"Document count: {count:g}"
+                    message = {"role": "assistant", "content": answer}
                 else:
                     message = {
                         "role": "assistant",
@@ -499,3 +508,73 @@ def test_exa_and_database_results_share_context_budget(web_runtime):
             )
             <= budget * 4
         )
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("aggregate", [False, True])
+def test_pruned_documents_preserve_summary_evidence(web_runtime, stream, aggregate):
+    url, payload, state = web_runtime
+    state.update(database_first=True, answer_summary=True)
+    created = requests.post(
+        url + "/tables/summary_budget", json={"num_shards": 1}, timeout=30
+    )
+    assert created.status_code == 200, created.text
+    inserted = requests.post(
+        url + "/tables/summary_budget/batch",
+        json={
+            "inserts": {"a": {"title": "antfly", "body": "A" * 6000}},
+            "sync_level": "write",
+        },
+        timeout=30,
+    )
+    assert inserted.status_code == 201, inserted.text
+    query = {"table": "summary_budget", "query": {"match_all": {}}, "limit": 1}
+    if aggregate:
+        query["aggregations"] = {"doc_count": {"type": "count", "field": "title"}}
+    payload.update(query="How many documents are there?", queries=[query], tools={})
+    # Wait for publication and verify the document is actually oversized.
+    deadline = time.monotonic() + 10
+    while True:
+        state["generations"].clear()
+        initial = requests.post(url + "/agents/retrieval", json=payload, timeout=30)
+        assert initial.status_code == 200, initial.text
+        if initial.json()["hits"]:
+            break
+        assert time.monotonic() < deadline, initial.text
+        time.sleep(0.05)
+    original = state["generations"][-1]["messages"][-1]["content"]
+    assert len(original.encode()) > 1024
+
+    payload.update(max_context_tokens=256, reserve_tokens=0, stream=stream)
+    state["generations"].clear()
+    response = requests.post(url + "/agents/retrieval", json=payload, timeout=30)
+    assert response.status_code == 200, response.text
+    if stream:
+        done = next(
+            frame
+            for frame in response.text.split("\n\n")
+            if frame.startswith("event: done\n")
+        )
+        result = json.loads(done.split("data: ", 1)[1])
+    else:
+        result = response.json()
+    assert result["status"] == "completed"
+    assert result["generation"] == "Document count: 1"
+    messages = [m for m in state["generations"][-1]["messages"] if m["role"] == "tool"]
+    assert len(messages) == 1
+    assert len(messages[0]["content"].encode()) <= 1024
+    evidence = json.loads(messages[0]["content"])
+    assert evidence["hits"] == [] and evidence["truncated"]
+    summary = evidence["results"][0]
+    assert summary["hits"]["total"]["value"] == 1
+    if aggregate:
+        assert summary["aggregations"]["doc_count"]["value"] == 1
+
+    # A summary which itself exceeds the budget must still stop generation.
+    payload.update(max_context_tokens=8, stream=False)
+    state["generations"].clear()
+    response = requests.post(url + "/agents/retrieval", json=payload, timeout=30)
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "incomplete"
+    assert response.json().get("generation") is None
+    assert len(state["generations"]) == 1

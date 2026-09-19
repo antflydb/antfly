@@ -13485,7 +13485,6 @@ export interface components {
             api_key?: string;
             /**
              * @description Type of search to perform
-             * @default search
              * @enum {string}
              */
             search_type?: "search" | "news" | "images" | "places" | "shopping";
@@ -13528,19 +13527,12 @@ export interface components {
              * @description Search depth:
              *     - basic: Fast search with standard results
              *     - advanced: Deeper search with more comprehensive results
-             * @default basic
              * @enum {string}
              */
             search_depth?: "basic" | "advanced";
-            /**
-             * @description Include AI-generated answer summary
-             * @default true
-             */
+            /** @description Include AI-generated answer summary */
             include_answer?: boolean;
-            /**
-             * @description Include raw HTML content of pages
-             * @default false
-             */
+            /** @description Include raw HTML content of pages */
             include_raw_content?: boolean;
             /** @description Only include results from these domains */
             include_domains?: string[];
@@ -13580,15 +13572,9 @@ export interface components {
              * @enum {string}
              */
             freshness?: "pd" | "pw" | "pm" | "py";
-            /**
-             * @description Include text decorations (bold, italic markers)
-             * @default false
-             */
+            /** @description Include text decorations (bold, italic markers) */
             text_decorations?: boolean;
-            /**
-             * @description Enable spellcheck suggestions
-             * @default true
-             */
+            /** @description Enable spellcheck suggestions */
             spellcheck?: boolean;
         } & {
             /**
@@ -13657,13 +13643,11 @@ export interface components {
             api_key?: string;
             /**
              * @description Search depth to request from Linkup
-             * @default standard
              * @enum {string}
              */
             depth?: "standard" | "deep";
             /**
              * @description Linkup response shape to request
-             * @default searchResults
              * @enum {string}
              */
             output_type?: "searchResults" | "sourcedAnswer";
@@ -13699,23 +13683,16 @@ export interface components {
             provider?: "vertex";
             /**
              * @description Google Cloud search service flavor
-             * @default agent_search
              * @enum {string}
              */
             service?: "agent_search";
             /** @description Google Cloud project ID. Falls back to GOOGLE_CLOUD_PROJECT. */
             project_id?: string;
-            /**
-             * @description Google Cloud location. Falls back to GOOGLE_CLOUD_LOCATION.
-             * @default global
-             */
+            /** @description Google Cloud location. Falls back to GOOGLE_CLOUD_LOCATION. */
             location?: string;
             /** @description Agent Search data store ID. */
             data_store?: string;
-            /**
-             * @description Agent Search serving config ID.
-             * @default default_config
-             */
+            /** @description Agent Search serving config ID. */
             serving_config?: string;
             /** @description Service account JSON path. Falls back to GOOGLE_APPLICATION_CREDENTIALS. */
             credentials_path?: string;
@@ -13737,6 +13714,12 @@ export interface components {
          *
          *     Each provider has specific configuration requirements. Use the appropriate
          *     provider-specific config or set common options at the top level.
+         *
+         *     Omitted options inherit the named connection when one is supplied.
+         *     Inline configurations preserve omission; clients must not materialize
+         *     defaults as overrides. Without a connection, the server applies provider
+         *     defaults (Exa: 5 results, 10000 ms timeout, safe search enabled, content
+         *     and highlights disabled, and auto search).
          *
          *     **Environment Variables (fallbacks):**
          *     - EXA_API_KEY
@@ -13763,20 +13746,11 @@ export interface components {
             serving_config?: string;
             /** @description Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC. */
             credentials_path?: string;
-            /**
-             * @description Maximum number of search results to return
-             * @default 5
-             */
+            /** @description Maximum number of search results to return */
             max_results?: number;
-            /**
-             * @description Request timeout in milliseconds
-             * @default 10000
-             */
+            /** @description Request timeout in milliseconds */
             timeout_ms?: number;
-            /**
-             * @description Enable safe search filtering
-             * @default true
-             */
+            /** @description Enable safe search filtering */
             safe_search?: boolean;
             /**
              * @description Preferred language for results (e.g., 'en', 'es', 'fr')
@@ -13788,15 +13762,9 @@ export interface components {
              * @example us
              */
             region?: string;
-            /**
-             * @description Ask the provider to return extracted page content when supported
-             * @default false
-             */
+            /** @description Ask the provider to return extracted page content when supported */
             include_content?: boolean;
-            /**
-             * @description Ask the provider to return highlighted passages when supported
-             * @default false
-             */
+            /** @description Ask the provider to return highlighted passages when supported */
             include_highlights?: boolean;
         };
         /**
@@ -13818,7 +13786,6 @@ export interface components {
             api_key?: string;
             /**
              * @description Search mode to request from Exa
-             * @default auto
              * @enum {string}
              */
             search_type?: "auto" | "neural" | "keyword";

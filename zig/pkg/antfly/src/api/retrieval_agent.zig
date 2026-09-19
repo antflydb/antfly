@@ -2218,7 +2218,7 @@ fn executeModelTools(
                 count -= 1;
                 payload = try std.json.Stringify.valueAlloc(arena, .{ .hits = found[0..count], .results = executed.summaries, .truncated = true }, .{});
             }
-            if (payload.len > context_limit or (found.len > 0 and count == 0)) {
+            if (payload.len > context_limit or (found.len > 0 and count == 0 and !hasQuerySummaryEvidence(executed.summaries))) {
                 try appendStep(arena, steps, live, .{ .kind = .planning, .name = "search", .action = "stopped retrieval at the accumulated context budget", .status = .skipped });
                 outcome.exhausted = true;
                 return outcome;
@@ -2229,6 +2229,19 @@ fn executeModelTools(
     }
     outcome.exhausted = true;
     return outcome;
+}
+
+// Pruning document bodies does not discard independently useful query results.
+// Zero counts and empty result sets in a named aggregation are evidence too.
+fn hasQuerySummaryEvidence(summaries: []const metadata_openapi.QueryResult) bool {
+    for (summaries) |summary| {
+        if (summary.status < 200 or summary.status >= 300 or summary.@"error" != null) continue;
+        if (summary.hits) |hits| if (hits.total != null) return true;
+        inline for (.{ "aggregations", "analyses", "graph_results", "graph_metric_results" }) |field| {
+            if (@field(summary, field)) |results| if (results.map.count() > 0) return true;
+        }
+    }
+    return false;
 }
 
 // All evidence retained in model history shares one budget, including web,

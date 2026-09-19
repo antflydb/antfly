@@ -46,16 +46,14 @@ class ExaSearchConfig:
             serving_config (str | Unset): Agent Search serving config ID for provider vertex. Defaults to default_config.
             credentials_path (str | Unset): Service account JSON path for provider vertex. Shared Vertex credential field;
                 see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
-            max_results (int | Unset): Maximum number of search results to return Default: 5.
-            timeout_ms (int | Unset): Request timeout in milliseconds Default: 10000.
-            safe_search (bool | Unset): Enable safe search filtering Default: True.
+            max_results (int | Unset): Maximum number of search results to return
+            timeout_ms (int | Unset): Request timeout in milliseconds
+            safe_search (bool | Unset): Enable safe search filtering
             language (str | Unset): Preferred language for results (e.g., 'en', 'es', 'fr') Example: en.
             region (str | Unset): Preferred region for results (e.g., 'us', 'uk', 'de') Example: us.
-            include_content (bool | Unset): Ask the provider to return extracted page content when supported Default: False.
-            include_highlights (bool | Unset): Ask the provider to return highlighted passages when supported Default:
-                False.
-            search_type (ExaSearchConfigSearchType | Unset): Search mode to request from Exa Default:
-                ExaSearchConfigSearchType.AUTO.
+            include_content (bool | Unset): Ask the provider to return extracted page content when supported
+            include_highlights (bool | Unset): Ask the provider to return highlighted passages when supported
+            search_type (ExaSearchConfigSearchType | Unset): Search mode to request from Exa
             num_results (int | Unset): Provider-specific result count override
             start_published_date (str | Unset): ISO date/time lower bound for published date filtering
             end_published_date (str | Unset): ISO date/time upper bound for published date filtering
@@ -71,14 +69,14 @@ class ExaSearchConfig:
     data_store: str | Unset = UNSET
     serving_config: str | Unset = UNSET
     credentials_path: str | Unset = UNSET
-    max_results: int | Unset = 5
-    timeout_ms: int | Unset = 10000
-    safe_search: bool | Unset = True
+    max_results: int | Unset = UNSET
+    timeout_ms: int | Unset = UNSET
+    safe_search: bool | Unset = UNSET
     language: str | Unset = UNSET
     region: str | Unset = UNSET
-    include_content: bool | Unset = False
-    include_highlights: bool | Unset = False
-    search_type: ExaSearchConfigSearchType | Unset = ExaSearchConfigSearchType.AUTO
+    include_content: bool | Unset = UNSET
+    include_highlights: bool | Unset = UNSET
+    search_type: ExaSearchConfigSearchType | Unset = UNSET
     num_results: int | Unset = UNSET
     start_published_date: str | Unset = UNSET
     end_published_date: str | Unset = UNSET

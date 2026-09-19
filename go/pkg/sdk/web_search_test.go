@@ -50,3 +50,47 @@ func TestRetrievalExaProviderOptionsRoundTrip(t *testing.T) {
 		t.Fatalf("unexpected wire config: %s", encoded)
 	}
 }
+
+func TestRetrievalExaContentOverridesPreservePresence(t *testing.T) {
+	disabled := false
+	enabled := true
+	for _, tc := range []struct {
+		name string
+		flag *bool
+	}{
+		{name: "omitted"},
+		{name: "disabled", flag: &disabled},
+		{name: "enabled", flag: &enabled},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			exa := ExaSearchConfig{Provider: "exa", NumResults: 1, IncludeContent: tc.flag, IncludeHighlights: tc.flag}
+			var provider WebSearchProviderConfig
+			if err := provider.FromExaSearchConfig(exa); err != nil {
+				t.Fatal(err)
+			}
+			encoded, err := json.Marshal(ChatToolsConfig{WebSearchConnection: "production-search", WebSearchConfig: provider})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var wire struct {
+				Config map[string]any `json:"web_search_config"`
+			}
+			if err := json.Unmarshal(encoded, &wire); err != nil {
+				t.Fatal(err)
+			}
+			for _, field := range []string{"include_content", "include_highlights"} {
+				value, present := wire.Config[field]
+				if present != (tc.flag != nil) || (present && value != *tc.flag) {
+					t.Fatalf("lost override presence: %s", encoded)
+				}
+			}
+			decoded, err := provider.AsExaSearchConfig()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if (decoded.IncludeContent == nil) != (tc.flag == nil) {
+				t.Fatalf("lost override on decode: %s", encoded)
+			}
+		})
+	}
+}

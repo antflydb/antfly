@@ -1000,7 +1000,7 @@ pub const VertexSearchConfig = struct {
     }
 };
 
-/// A unified configuration for web search providers. Each provider has specific configuration requirements. Use the appropriate provider-specific config or set common options at the top level. **Environment Variables (fallbacks):** - EXA_API_KEY - SERPER_API_KEY - TAVILY_API_KEY - BRAVE_API_KEY - YOU_API_KEY - LINKUP_API_KEY - GOOGLE_APPLICATION_CREDENTIALS, GOOGLE_CLOUD_PROJECT, GOOGLE_CLOUD_LOCATION
+/// A unified configuration for web search providers. Each provider has specific configuration requirements. Use the appropriate provider-specific config or set common options at the top level. Omitted options inherit the named connection when one is supplied. Inline configurations preserve omission; clients must not materialize defaults as overrides. Without a connection, the server applies provider defaults (Exa: 5 results, 10000 ms timeout, safe search enabled, content and highlights disabled, and auto search). **Environment Variables (fallbacks):** - EXA_API_KEY - SERPER_API_KEY - TAVILY_API_KEY - BRAVE_API_KEY - YOU_API_KEY - LINKUP_API_KEY - GOOGLE_APPLICATION_CREDENTIALS, GOOGLE_CLOUD_PROJECT, GOOGLE_CLOUD_LOCATION
 pub const WebSearchConfig = struct {
     provider: WebSearchProvider,
     /// Provider API key or secret reference. Prefer named web_search connections for production use.

@@ -86,6 +86,10 @@ dots; non-ASCII hostnames must use their IDNA ASCII form. Language filtering is
 unsupported and rejected. The wire format
 follows the [Exa search API](https://exa.ai/docs/reference/search).
 
+Inline options preserve omission: generated clients leave unspecified fields
+unset, while explicit `false` values disable content/highlights. Omitted settings
+inherit the connection, or use server defaults when no connection is supplied.
+
 A request may supply a named connection plus inline options to narrow its
 result limit, timeout, domains, or content settings. It cannot replace the
 connection's provider, endpoint, credentials, or expand content/domain access.
@@ -94,7 +98,9 @@ are restricted to `https://api.exa.ai/search`. Redirects are disabled. Provider
 responses are capped at 1 MiB and text/highlights at 4,000 bytes each per result;
 web, database, and navigation evidence retained in model history shares one
 cumulative context budget. Retrieval returns `incomplete` if another result
-cannot fit, including within a batch of parallel tool calls. Configuration belongs
+cannot fit, including within a batch of parallel tool calls. Database counts,
+aggregations, and other summaries can still support an answer when document
+bodies are pruned, provided the summaries fit within the remaining budget. Configuration belongs
 in either top-level `tools` or `steps.retrieval.tools`, not both. Both tool
 allowlists still apply. Other provider tokens describe the shared connection
 contract below; this retrieval adapter currently implements Exa only.
