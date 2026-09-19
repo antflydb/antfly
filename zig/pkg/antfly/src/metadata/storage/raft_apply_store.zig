@@ -1182,6 +1182,16 @@ test "relational integrity metadata topology admission persists rollout floor an
     defer metadata_table_manager.freeStore(alloc, decoded_store);
     try std.testing.expectEqual(@as(u16, 1), decoded_store.relational_topology_protocol_version);
     try std.testing.expect(try store.tableMatchesTransitionContractTxn(&txn, group_id, contract));
+    // Normal production registration persists a compact header and separate
+    // report pages; rollout admission needs only the header's capabilities.
+    _ = try store.writeStoreComponentsTxn(&txn, group_id, capable.store_id, capable, false, null, null);
+    try std.testing.expect(std.mem.startsWith(u8, try txn.get(store_key), RaftApplyStore.store_header_magic));
+    try std.testing.expect(try store.tableMatchesTransitionContractTxn(&txn, group_id, contract));
+    var unsupported = capable;
+    unsupported.relational_topology_protocol_version = 0;
+    _ = try store.writeStoreComponentsTxn(&txn, group_id, capable.store_id, unsupported, false, null, null);
+    try std.testing.expect(!try store.tableMatchesTransitionContractTxn(&txn, group_id, contract));
+    _ = try store.writeStoreComponentsTxn(&txn, group_id, capable.store_id, capable, false, null, null);
     var previous = contract;
     previous.read_schema_json = "{}";
     try std.testing.expect(!try store.tableMatchesTransitionContractTxn(&txn, group_id, previous));
@@ -11912,7 +11922,9 @@ pub const RaftApplyStore = struct {
             if (!std.mem.startsWith(u8, kv.key, prefix)) break;
             count += 1;
             if (count > 4096) return false;
-            const record = try decodeStoreRecord(self.alloc, kv.value);
+            // Capability admission needs only the compact durable header,
+            // never the separately paged group/runtime report payloads.
+            const record = try decodeStoredHeader(self.alloc, kv.value);
             defer metadata_table_manager.freeStore(self.alloc, record);
             if (!metadata_table_manager.storeServesTableData(record.role)) continue;
             found = true;
@@ -17668,12 +17680,15 @@ test "metadata raft apply store online merge phases persist exact attempt and re
         .receiver_group_id = 30,
         .allow_doc_identity_reassignment = true,
         .table_contract = contract,
-        .online = .{ .scope = .{
-            .fence = .{ .transition_id = 601, .attempt = 1, .peer_group_id = 30, .owner_group_id = 31, .role = .merge_source, .namespace = .{ .table_id = 7, .shard_id = 31, .range_id = 700 }, .catalog_digest = @splat(8) },
-            .receiver_namespace = .{ .table_id = 7, .shard_id = 30, .range_id = 701 },
-            .consumer_epoch = 4,
-            .copy_attempt = .{ .donor_term = 5, .sequence = 6 },
-        } },
+        .online = .{
+            .scope = .{
+                // Real catalog hashes contain arbitrary bytes, not UTF-8 strings.
+                .fence = .{ .transition_id = 601, .attempt = 1, .peer_group_id = 30, .owner_group_id = 31, .role = .merge_source, .namespace = .{ .table_id = 7, .shard_id = 31, .range_id = 700 }, .catalog_digest = @splat(0xff) },
+                .receiver_namespace = .{ .table_id = 7, .shard_id = 30, .range_id = 701 },
+                .consumer_epoch = 4,
+                .copy_attempt = .{ .donor_term = 5, .sequence = 6 },
+            },
+        },
     };
     {
         var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
