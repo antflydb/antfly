@@ -4,6 +4,7 @@
 const std = @import("std");
 const docstore = @import("docstore.zig");
 const native = @import("native.zig");
+const resource = @import("../resource_manager.zig");
 const time = @import("antfly_platform").time;
 
 test "lite throughput benchmark" {
@@ -51,5 +52,85 @@ test "lite throughput benchmark" {
             count,                                                      assembled - start,                                                                committed - assembled, read - reading,
             store.file.test_page_reads.load(.monotonic) - before_reads, store.file.activeCheckpoint().page_count * @as(u64, store.file.header.page_size),
         });
+    }
+}
+
+test "lite throughput benchmark vacuum catchup" {
+    if (std.c.getenv("ANTFLY_LITE_BENCH") == null) return error.SkipZigTest;
+    const a = std.heap.c_allocator;
+    for ([_]usize{ 1024, 4096 }) |n| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/catchup.aflite", .{tmp.sub_path});
+        defer a.free(path);
+        var budgets = resource.Options.defaultBudgets();
+        budgets[@intFromEnum(resource.Slice.lite_native_page_cache)] = .{ .soft_limit_bytes = 32768, .hard_limit_bytes = 65536 };
+        var manager = resource.ResourceManager.init(.{ .budgets = budgets });
+        var file = try native.NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true, .resource_manager = &manager });
+        defer file.close();
+        try file.putDocument("seed", "value");
+        var image = try file.prepareVacuum(null);
+        defer image.deinit();
+        var capture = native.ChangeCapture{};
+        defer capture.deinit(a);
+        file.change_capture = &capture;
+        defer file.change_capture = null;
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const muts = try arena.allocator().alloc(native.DocumentMutation, n);
+        for (muts, 0..) |*m, i| m.* = .{ .key = try std.fmt.allocPrint(arena.allocator(), "key-{d:0>8}", .{i}), .value = "small payload" };
+        const start = time.monotonicNs();
+        try file.putDocumentBatch(muts);
+        const written = time.monotonicNs();
+        try file.applyCapturedChanges(&image.prepared, &capture, &image.report, null);
+        const caught = time.monotonicNs();
+        std.debug.print("LITE_BENCH_CATCHUP n={d} source_bytes={d} image_bytes={d} batch_ns={d} catchup_ns={d}\n", .{ n, file.activeCheckpoint().page_count * 4096, image.prepared.activeCheckpoint().page_count * 4096, written - start, caught - written });
+        std.debug.print("LITE_BENCH_BUDGET n={d} configured_hard=65536 accounted_bytes={d} prepared_cache_bytes={d} prepared_budget_attached={}\n", .{ n, manager.sliceStats(.lite_native_page_cache).used_bytes, image.prepared.page_cache.total_bytes, image.prepared.page_cache.resource_manager != null });
+        try std.testing.expect((try image.prepared.check()).valid);
+    }
+}
+
+test "lite throughput benchmark packed cursor" {
+    if (std.c.getenv("ANTFLY_LITE_BENCH") == null) return error.SkipZigTest;
+    const a = std.heap.c_allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/cursor.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var store = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io });
+    defer store.close();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const n = 16000;
+    const muts = try arena.allocator().alloc(native.DocumentMutation, n);
+    const keys = try arena.allocator().alloc([]const u8, n);
+    for (muts, keys, 0..) |*m, *key, i| {
+        key.* = try std.fmt.allocPrint(arena.allocator(), "key-{d:0>8}", .{i});
+        m.* = .{ .key = key.*, .value = "small payload" };
+    }
+    try store.file.putDocumentBatch(muts);
+    for (0..3) |_| {
+        var txn = try store.beginRead();
+        defer txn.abort();
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        const start = time.monotonicNs();
+        var entry = try cursor.first();
+        var count: usize = 0;
+        while (true) {
+            try std.testing.expectEqualStrings("small payload", entry.value);
+            count += 1;
+            entry = cursor.next() catch |err| switch (err) {
+                error.NotFound => break,
+                else => return err,
+            };
+        }
+        const scanned = time.monotonicNs();
+        const values = try a.alloc(?[]const u8, n);
+        defer a.free(values);
+        try txn.getManySorted(keys, values);
+        const batched = time.monotonicNs();
+        try std.testing.expectEqual(@as(usize, n), count);
+        std.debug.print("LITE_BENCH_CURSOR n={d} scan_ns={d} batch_ns={d}\n", .{ n, scanned - start, batched - scanned });
     }
 }

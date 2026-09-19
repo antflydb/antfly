@@ -1113,3 +1113,36 @@ accesses include cache lookups; they are not physical disk I/O counts. Other
 builds ran on the host during measurement. Durable fsync throughput, vector
 index construction, and sustained concurrent compaction need separate workload
 qualification. Timing thresholds are intentionally absent from the tests.
+
+Vacuum catch-up sorts each root's changed keys and applies batches of at most
+1,024 keys, with a 1 MiB target for retained inline values and key bytes (at most
+one record can cross that target). Each batch shares its index editor and page
+allocator. External values stream to the private image before batch publication.
+A catch-up round remains one native transaction: failure or cancellation restores
+its checkpoint, file length, and report. Rollback also invalidates cached bytes
+and links in the discarded tail, preserving the restored checkpoint’s cache;
+streamed retry writes can safely reuse those page IDs. The regression workload replays changes
+to all three roots and separately bounds heap usage while copying 12 MiB of inline
+values, including cancellation after earlier batches have written.
+
+Maintenance snapshots and prepared images share the live store's resource
+manager. Their page caches admit only navigation pages; sequential payload scans
+use cursor-local storage. Accounting belongs to each handle until it closes,
+including private images and retired descriptors after publication. The regression
+suite exercises a shared 32 KiB soft / 64 KiB hard page-cache budget and verifies
+that cleanup releases both page-cache and link-cache usage.
+
+Document, catalog, vacuum, and sorted multi-read paths share a record-page reader.
+It validates each physical page's checksum and packed-record boundaries once per load,
+then borrows payload slices until it loads another page. Reverse scans and seeks
+use the same validated offsets; returned document and catalog values retain their
+existing ownership contracts. Cursor storage is bounded by one physical page and
+its record-offset directory.
+
+The benchmark target also includes vacuum catch-up under a 64 KiB shared cache
+budget and forward document scans. In the review diagnostic with 4,096 newly
+inserted small documents, the catch-up image shrank from 83,275,776 to 507,904 bytes
+(the source was 450,560 bytes). Catch-up fell from approximately 121 ms to 18 ms;
+16,000-record scans fell from approximately 20 ms to 1.7–2.1 ms. These are local
+`no_sync` observations, not latency guarantees. Tests enforce bounded image growth,
+cache accounting, heap usage, and physical-page accesses instead of elapsed time.

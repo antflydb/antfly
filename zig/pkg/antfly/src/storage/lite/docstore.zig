@@ -191,8 +191,9 @@ pub const Store = struct {
             lockStore(self);
             defer self.mutex.unlock();
             if (self.file.checkpoint_publication_uncertain or self.secret_store_uncertain) return error.OutcomeUnknown;
-            var file = try native.NativeFile.openWithIo(self.allocator, self.file.runtime(), self.file.path, .{ .read_only = true });
+            var file = try native.NativeFile.openWithIo(self.allocator, self.file.runtime(), self.file.path, .{ .read_only = true, .resource_manager = self.resource_manager });
             errdefer file.close();
+            file.page_cache_policy = .metadata_only;
             file.header = self.file.header;
             break :blk .{ file, (try file.file.stat(file.runtime())).size };
         };
@@ -214,7 +215,8 @@ pub const Store = struct {
             defer self.mutex.unlock();
             if (self.file.change_capture != null) return error.FileBusy;
             if (self.file.checkpoint_publication_uncertain or self.secret_store_uncertain) return error.OutcomeUnknown;
-            var snapshot = try native.NativeFile.openWithIo(self.allocator, io, self.file.path, .{ .read_only = true, .no_sync = self.file.no_sync });
+            var snapshot = try native.NativeFile.openWithIo(self.allocator, io, self.file.path, .{ .read_only = true, .no_sync = self.file.no_sync, .resource_manager = self.resource_manager });
+            snapshot.page_cache_policy = .metadata_only;
             snapshot.header = self.file.header;
             self.file.change_capture = &capture;
             break :blk snapshot;
@@ -265,7 +267,8 @@ pub const Store = struct {
                 lockStore(self);
                 defer self.mutex.unlock();
                 if (capture.overflow) return error.FileBusy;
-                var snapshot = try native.NativeFile.openWithIo(self.allocator, io, self.file.path, .{ .read_only = true, .no_sync = true });
+                var snapshot = try native.NativeFile.openWithIo(self.allocator, io, self.file.path, .{ .read_only = true, .no_sync = true, .resource_manager = self.resource_manager });
+                snapshot.page_cache_policy = .metadata_only;
                 snapshot.header = self.file.header;
                 std.mem.swap(native.ChangeCapture, &changes, &capture);
                 break :blk snapshot;
@@ -1026,6 +1029,7 @@ pub const Cursor = struct {
 
     txn: *Txn,
     index_cursor: native.DocumentIndexCursor,
+    records: native.RecordPageReader = .{},
     current_key: ?[]u8 = null,
     upper_bound: ?[]const u8 = null,
     owned_value: ?[]u8 = null,
@@ -1033,6 +1037,7 @@ pub const Cursor = struct {
     last_direction: ?Direction = null,
 
     pub fn close(self: *Cursor) void {
+        self.records.deinit(self.txn.allocator);
         self.index_cursor.deinit();
         if (self.disk_candidate) |*candidate| candidate.deinit(self.txn.allocator);
         if (self.current_key) |key| self.txn.allocator.free(key);
@@ -1197,7 +1202,7 @@ pub const Cursor = struct {
             if (disk) |indexed| {
                 var consumed = indexed;
                 disk = null;
-                const value = file.documentValueAtIndexEntryAlloc(self.txn.allocator, self.txn.checkpoint, consumed) catch |err| {
+                const value = self.records.documentValueAlloc(file, self.txn.allocator, self.txn.checkpoint, consumed) catch |err| {
                     consumed.deinit(self.txn.allocator);
                     return err;
                 };
@@ -2410,4 +2415,68 @@ test "lite grouped durability failures recover all roots at one checkpoint" {
         try std.testing.expectEqualStrings(doc, meta);
         try std.testing.expect((try reopened.file.check()).valid);
     }
+}
+
+test "lite packed document cursors read each physical bundle once per scan" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "packed-cursor.aflite");
+    defer alloc.free(path);
+    var store = try Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io });
+    defer store.close();
+    var write = try store.beginWrite();
+    var buffer: [32]u8 = undefined;
+    const count = 2048;
+    for (0..count) |i| try write.put(try std.fmt.bufPrint(&buffer, "key-{d:0>8}", .{i}), "payload");
+    try write.commit();
+    var txn = try store.beginRead();
+    defer txn.abort();
+    const file = try txn.readFile();
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    for ([_]bool{ false, true }) |reverse| {
+        const before = file.test_page_reads.load(.monotonic);
+        var entry = if (reverse) try cursor.last() else try cursor.first();
+        for (0..count) |i| {
+            const key = try std.fmt.bufPrint(&buffer, "key-{d:0>8}", .{if (reverse) count - 1 - i else i});
+            try std.testing.expectEqualStrings(key, entry.key);
+            try std.testing.expectEqualStrings("payload", entry.value);
+            if (i + 1 < count) entry = if (reverse) try cursor.prev() else try cursor.next();
+        }
+        if (reverse) try std.testing.expectError(error.NotFound, cursor.prev()) else try std.testing.expectError(error.NotFound, cursor.next());
+        try std.testing.expect(file.test_page_reads.load(.monotonic) - before < count / 8);
+    }
+    try std.testing.expectEqualStrings("key-00001000", (try cursor.seekAtOrAfter("key-00001000")).key);
+    try std.testing.expectEqualStrings("key-00000999", (try cursor.prev()).key);
+    try std.testing.expectEqualStrings("key-00001000", (try cursor.next()).key);
+}
+
+test "lite maintenance snapshots release shared cache accounting on cancellation and publication" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "maintenance-budget.aflite");
+    defer alloc.free(path);
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.lite_native_page_cache)] = .{ .soft_limit_bytes = 32768, .hard_limit_bytes = 65536 };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    {
+        var store = try Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io, .resource_manager = &manager });
+        defer store.close();
+        var write = try store.beginWrite();
+        var buffer: [32]u8 = undefined;
+        for (0..2048) |i| try write.put(try std.fmt.bufPrint(&buffer, "key-{d:0>8}", .{i}), "payload");
+        try write.commit();
+        var cancel = @import("../maintenance.zig").CancelToken{};
+        cancel.request();
+        try std.testing.expectError(error.MaintenanceCanceled, store.vacuumWithCancel(&cancel));
+        try std.testing.expectError(error.MaintenanceCanceled, store.checkWithCancel(&cancel));
+        try std.testing.expect((try store.checkWithCancel(null)).valid);
+        _ = try store.vacuum();
+        try std.testing.expectEqual(store.file.page_cache.total_bytes, manager.sliceStats(.lite_native_page_cache).used_bytes);
+        try std.testing.expect(manager.sliceStats(.lite_native_page_cache).used_bytes <= 65536);
+    }
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lite_native_page_cache).used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lite_native_link_cache).used_bytes);
 }
