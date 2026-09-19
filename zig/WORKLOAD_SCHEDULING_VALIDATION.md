@@ -5,6 +5,32 @@ This record separates correctness evidence from the full
 row is qualified. Native experiments below use Debug builds on an unconstrained
 macOS host. They cannot establish Cloud package throughput or latency limits.
 
+## Durable transaction integration checkpoint (2026-09-19)
+
+`zig build antfly-durable-completion-test -j1` exited successfully with 19/19
+Debug tests and no leaks (`/tmp/workload-physical-db8.log`). These cover normal
+transaction prepare/resolve APIs, multi-document insert/update/delete, exact
+retry, admission-disabled restart, four simultaneous native reservations,
+background recovery ownership, relational timestamp/checksum preservation,
+index visibility targets, checked physical binding, compiler allocation failure,
+and canonical candidates that include absent read dependencies.
+
+The native pool gate passed 9/9 with no leaks
+(`/tmp/workload-native-pool-third.log`). Acceptance, canonical apply and completion
+use retained capacity while ordinary heap, memory admission and descriptor
+admission are unavailable. Accepted and prepared obligations restore before
+native admission. The authenticated capacity-attestation gate passed 4/4; the
+compiled owner authority gate passed 1/1.
+
+These checks do not qualify replicated deployment. Candidate emission and DB
+publication-owner hooks are integration surfaces; production readiness still
+requires trusted installation, exact durable Raft suffix reconciliation,
+protected DATA progress publication, terminal-resolution routing, idle pool
+maintenance/reuse, and replicated failure tests. External payload ownership,
+remote child-range outboxes, and named-participant acknowledgement mutations
+remain unsupported physical profiles and must reject before prepare. No Cloud
+performance qualification or new default is implied.
+
 ## Current committed correctness checks
 
 The clean Debug build at `95aba99ad4305b6d836125ac32bcf86c622258da` passed.

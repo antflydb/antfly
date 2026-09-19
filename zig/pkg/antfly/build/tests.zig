@@ -139,6 +139,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const run_workload_admission_tests = addFilteredTestRunArtifact(b, workload_admission_tests);
     b.step("antfly-workload-admission-test", "Run workload admission ownership, transport, ABI, and VOPR regressions").dependOn(&run_workload_admission_tests.step);
+
     const vopr_mod = options.vopr;
     const casbin_mod = antfly_imports.casbin;
     const antfly_mod = options.antfly_mod;
@@ -213,6 +214,20 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_workload_metadata_tests = addFilteredTestRunArtifact(b, workload_metadata_tests);
     b.step("antfly-workload-admission-metadata-test", "Run workload policy persistence and metadata capability regressions").dependOn(&run_workload_metadata_tests.step);
     run_workload_admission_tests.step.dependOn(&run_workload_metadata_tests.step);
+    const durable_completion_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/durable_completion_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, durable_completion_mod, true, true);
+    durable_completion_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const durable_completion_tests = b.addTest(.{
+        .root_module = durable_completion_mod,
+        .filters = &.{ "workload admission physical completion", "workload admission durable DB completion", "workload admission completion compiler" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-durable-completion-test", "Run bounded durable prepare, completion, and restart regressions").dependOn(&addFilteredTestRunArtifact(b, durable_completion_tests).step);
 
     const completion_attestation_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/completion_attestation_test_root.zig"),

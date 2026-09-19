@@ -421,6 +421,8 @@ pub const TxnManager = struct {
     /// Must come from the replicated table catalog. The caller's apply lock
     /// serializes these point reads with the batch that publishes the change.
     completion_limits: CompletionLimits = .{},
+    /// Private compiler capability; never enabled on a live manager.
+    capture_physical_mutations: bool = false,
 
     pub const RecoveryExtraBatchHooks = struct {
         ctx: ?*anyopaque = null,
@@ -1027,14 +1029,17 @@ pub const TxnManager = struct {
         abort_extra: ResolutionExtraBatch,
         options: completion_compiler.Options,
     ) !completion_compiler.CompiledTemplates {
-        if (intents.len != 1 or intents[0].value == null or intents[0].prepared_row != null or
-            intents[0].key.len == 0 or prepare_extra.schema_binding == null or
-            prepare_extra.schema_binding.?.version != null or prepare_extra.writes.len != 0 or prepare_extra.deletes.len != 0)
+        if (intents.len == 0 or intents.len > 32 or prepare_extra.schema_binding == null)
             return error.UnsupportedCompletionTemplate;
+        for (intents) |intent| if (intent.key.len == 0 or (!options.physical_mutations and intent.prepared_row != null))
+            return error.UnsupportedCompletionTemplate;
+        if (!options.physical_mutations and (prepare_extra.schema_binding.?.version != null or
+            prepare_extra.writes.len != 0 or prepare_extra.deletes.len != 0)) return error.UnsupportedCompletionTemplate;
         for ([_]ResolutionExtraBatch{ commit_extra, abort_extra }) |extra| {
-            if (extra.writes.len != 0 or extra.deletes.len != 0 or extra.completion_writes.len != 0 or
-                extra.completion_deletes.len != 0 or extra.captured_intents != null or extra.skip_all_intent_application or
-                extra.skip_intent_keys.len != 0 or extra.resolved_participant != null or extra.cleanup_context != null)
+            if (extra.captured_intents != null or extra.skip_intent_keys.len != 0 or extra.cleanup_context != null or
+                (!options.physical_mutations and (extra.writes.len != 0 or extra.deletes.len != 0 or
+                    extra.completion_writes.len != 0 or extra.completion_deletes.len != 0 or extra.skip_all_intent_application)) or
+                (!options.allow_named_participants and extra.resolved_participant != null))
                 return error.UnsupportedCompletionTemplate;
         }
         if (abort_extra.replay != null or options.timestamp == 0) return error.UnsupportedCompletionTemplate;
@@ -1044,7 +1049,7 @@ pub const TxnManager = struct {
         const alloc = fixed.allocator();
         var overlay = try completion_compiler.Overlay.init(alloc, options.snapshot, options.plan_limits);
         defer overlay.deinit();
-        var private = TxnManager{ .store = overlay.store(), .owns_store = false, .alloc = alloc, .completion_limits = self.completion_limits };
+        var private = TxnManager{ .store = overlay.store(), .owns_store = false, .alloc = alloc, .completion_limits = self.completion_limits, .capture_physical_mutations = options.physical_mutations };
         const original = try private.loadTransactionRecord(txn_id);
         if (original.status != .pending or original.prepared or !original.prepared_known or original.intent_revision != 0 or original.replay_sequence != 0)
             return error.UnsupportedCompletionTemplate;
@@ -1053,7 +1058,7 @@ pub const TxnManager = struct {
         }
         const participants = try private.getParticipants(alloc, txn_id);
         defer freeParticipantList(alloc, participants);
-        if (participants.len != 0 or try private.hasHAOutbox(txn_id)) return error.UnsupportedCompletionTemplate;
+        if ((!options.allow_named_participants and participants.len != 0) or try private.hasHAOutbox(txn_id)) return error.UnsupportedCompletionTemplate;
         // Reconciliation scans belong before compilation, never in its bounded
         // workspace. No fallback may initialize the real store here.
         if (private.completion_limits.enabled() and try private.completionUsage() == null)
@@ -1071,20 +1076,21 @@ pub const TxnManager = struct {
         var prepare = prepare_extra;
         prepare.preparation_allocator = alloc;
         try private.writeIntentsExtraBatch(txn_id, intents, predicates, prepare);
-        for (overlay.log.operations()) |op| try validateInspectedCompletionKey(op.key);
+        if (!options.physical_mutations) for (overlay.log.operations()) |op| try validateInspectedCompletionKey(op.key);
         const prepared = try private.loadTransactionRecord(txn_id);
         for ([_]ResolutionExtraBatch{ commit_extra, abort_extra }) |extra| {
             if (extra.expected_intent_revision) |expected| if (expected != prepared.intent_revision)
                 return error.IntentSnapshotChanged;
         }
-        const keys = [_][]const u8{intents[0].key};
+        const keys = try alloc.alloc([]const u8, intents.len);
+        for (intents, keys) |intent, *key| key.* = intent.key;
         var commit = commit_extra;
         commit.preparation_allocator = alloc;
-        commit.known_intent_keys = &keys;
+        commit.known_intent_keys = keys;
         commit.expected_intent_revision = prepared.intent_revision;
         var aborted = abort_extra;
         aborted.preparation_allocator = alloc;
-        aborted.known_intent_keys = &keys;
+        aborted.known_intent_keys = keys;
         aborted.expected_intent_revision = prepared.intent_revision;
         var commit_plan = try private.inspectResolutionMutations(txn_id, .committed, options.timestamp, commit, options.plan_limits);
         defer commit_plan.deinit();
@@ -1096,13 +1102,13 @@ pub const TxnManager = struct {
         errdefer commit_template.deinit();
         var abort_template = try completion_compiler.Template.copy(self.alloc, &abort_plan.mutations);
         errdefer abort_template.deinit();
-        try bindCompletionTemplate(&prepare_template, txn_id, .pending, null);
-        try bindCompletionTemplate(&commit_template, txn_id, .committed, commit.replay);
-        try bindCompletionTemplate(&abort_template, txn_id, .aborted, null);
-        return .{ .prepare = prepare_template, .commit = commit_template, .abort = abort_template, .intent_revision = prepared.intent_revision, .timestamp = options.timestamp, .replay_sequence = if (commit.replay) |replay| replay.sequence else null };
+        try bindCompletionTemplate(&prepare_template, txn_id, .pending, null, options);
+        try bindCompletionTemplate(&commit_template, txn_id, .committed, commit.replay, options);
+        try bindCompletionTemplate(&abort_template, txn_id, .aborted, null, options);
+        return .{ .prepare = prepare_template, .commit = commit_template, .abort = abort_template, .intent_revision = prepared.intent_revision, .timestamp = options.timestamp, .replay_sequence = if (commit.replay) |replay| replay.sequence else null, .baseline_reads = try overlay.copyBaselineReads(self.alloc) };
     }
 
-    fn bindCompletionTemplate(template: *completion_compiler.Template, txn_id: TxnId, status: TxnStatus, replay: ?ReplayAppend) !void {
+    fn bindCompletionTemplate(template: *completion_compiler.Template, txn_id: TxnId, status: TxnStatus, replay: ?ReplayAppend, options: completion_compiler.Options) !void {
         const record_key = makeRecordKey(txn_id);
         for (template.operations, 0..) |op, i| {
             if (op.kind == .delete) continue;
@@ -1117,7 +1123,12 @@ pub const TxnManager = struct {
                 if (replay != null) try template.bind(i, .{ .kind = .replay_sequence, .target = .value, .byte_order = .little, .offset = 41 });
             } else if (internal_keys.isTtlKey(op.key) and status == .committed) {
                 if (op.value.len != 8) return error.UnsupportedCompletionTemplate;
-                try template.bind(i, .{ .kind = .commit_timestamp, .target = .value, .byte_order = .little, .offset = 0 });
+                if (@import("completion_physical.zig").bindTimestampKey(options.timestamp_keys, op.key))
+                    try template.bind(i, .{ .kind = .commit_timestamp, .target = .value, .byte_order = .little, .offset = 0 });
+            } else if (std.mem.eql(u8, op.key, &internal_keys.raft_document_applied_entry_key)) {
+                if (!options.allow_named_participants or op.value.len != 16) return error.UnsupportedCompletionTemplate;
+                try template.bind(i, .{ .kind = .raft_term, .target = .value, .byte_order = .little, .offset = 0 });
+                try template.bind(i, .{ .kind = .raft_index, .target = .value, .byte_order = .little, .offset = 8 });
             } else if (op.key.len != 0 and op.key[0] == internal_keys.replay_namespace) {
                 const entry = replay orelse return error.UnsupportedCompletionTemplate;
                 if (std.mem.eql(u8, op.key, &internal_keys.replay_meta_init_key)) {
@@ -1134,8 +1145,10 @@ pub const TxnManager = struct {
                         return error.UnsupportedCompletionTemplate;
                     try template.bind(i, .{ .kind = .replay_sequence, .target = .key, .byte_order = .big, .offset = 2 });
                     try template.bind(i, .{ .kind = .replay_sequence, .target = .value, .byte_order = .little, .offset = 6 });
-                } else return error.UnsupportedCompletionTemplate;
+                } else if (!options.physical_mutations) return error.UnsupportedCompletionTemplate;
             }
+            if (options.physical_mutations and status == .committed)
+                try @import("completion_physical.zig").bindOperation(template, i, if (replay) |entry| entry.sequence else 0, options.timestamp_keys);
         }
     }
 
@@ -2436,6 +2449,20 @@ pub const TxnManager = struct {
             summary = (try self.adjustCompletionUsage(current_summary, previous, next)).encode();
         }
         if (capture) |sink| {
+            if (self.capture_physical_mutations) {
+                var physical: completion_compiler.PhysicalSink = .{ .baseline = &batch, .plan = sink };
+                var runtime = physical.runtime(self.alloc);
+                const writer = physical.writer(self.alloc, &runtime);
+                for (deletes) |key| try writer.delete(key);
+                for (writes) |kv| {
+                    if (completion != null and std.mem.eql(u8, kv.key, completion_summary_key)) continue;
+                    try writer.put(kv.key, kv.value);
+                }
+                if (summary) |*value| try writer.put(completion_summary_key, value);
+                if (replay) |entry| try writer.setReplayOpaque(entry.sequence, entry.payload);
+                batch.abort();
+                return;
+            }
             // Retain the shared completion writer gate for the same ledger
             // calculation when present, but never mutate or commit this batch.
             for (deletes) |key| try validateInspectedCompletionKey(key);
@@ -2980,6 +3007,7 @@ fn rebindCompiledTemplateForTest(template: *completion_compiler.Template, timest
             .replay_next_sequence => try std.math.add(u64, sequence, 1),
             .shared_ledger_count => usage.count,
             .shared_ledger_bytes => usage.bytes,
+            .raft_term, .raft_index => return error.UnsupportedCompletionTemplate,
         };
         const target = @constCast(switch (binding.target) {
             .key => op.key,
@@ -3056,6 +3084,66 @@ test "workload admission completion compiler prepares privately and matches both
     }
 }
 
+test "workload admission completion compiler candidate covers absent reads and preserves future bindings" {
+    const alloc = std.testing.allocator;
+    var backend = lsm_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    var manager = try TxnManager.init(alloc, &store);
+    defer manager.deinit();
+    const id: TxnId = @splat(129);
+    try manager.initTransaction(id, 100);
+    var read = try manager.store.beginRead();
+    defer read.abort();
+    var compiled = try manager.compileCompletionTemplates(id, &.{.{ .key = "new", .value = "value" }}, &.{}, .{ .schema_binding = .{} }, .{}, .{}, .{ .snapshot = &read, .timestamp = 200 });
+    defer compiled.deinit();
+    const slot = completion_compiler.slot;
+    const descriptor = try slot.encode(alloc, .{
+        .txn_id = id,
+        .intent_revision = compiled.intent_revision,
+        .limits = lsm_backend.Backend.durable_completion_limits,
+        .profile_fence = "candidate-test",
+        .commit = compiled.commit.operations,
+        .abort = compiled.abort.operations,
+    }, .{});
+    defer alloc.free(descriptor);
+    const candidate = @import("completion_candidate.zig");
+    const wire = try candidate.encode(alloc, .{
+        .group_id = 9,
+        .incarnation = @splat(3),
+        .policy_digest = @splat(4),
+        .schema_catalog_digest = @splat(5),
+        .previous_term = 2,
+        .previous_index = 17,
+    }, id, @splat(6), descriptor, &compiled, &read, &.{ "absent-transform-input", "absent-transform-input" });
+    defer alloc.free(wire);
+    const entry_codec = @import("lsm_backend/completion_entry.zig");
+    var decoded = try entry_codec.decode(alloc, wire);
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(u64, 17), decoded.entry.previous_index);
+    try std.testing.expectEqual(@as(u64, 2), decoded.entry.previous_term);
+    var absent_count: usize = 0;
+    for (decoded.entry.baseline_keys) |key| if (std.mem.eql(u8, key, "absent-transform-input")) {
+        absent_count += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 1), absent_count);
+    for (decoded.entry.prepare_operations) |op| try std.testing.expectEqual(@as(usize, 0), op.bindings.len);
+    var future_bindings: usize = 0;
+    for (decoded.decoded_descriptor.descriptor.commit) |op| future_bindings += op.bindings.len;
+    try std.testing.expect(future_bindings != 0);
+    try std.testing.expect(!(try manager.loadTransactionRecord(id)).prepared);
+    var changed = entry_codec.BaselineHasher.init();
+    for (decoded.entry.baseline_keys) |key| {
+        const value = if (std.mem.eql(u8, key, "absent-transform-input")) "now-present" else read.get(key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        try changed.add(key, value);
+    }
+    try std.testing.expect(!std.mem.eql(u8, &changed.finish(), &decoded.entry.baseline_digest));
+}
+
 test "workload admission completion compiler bounded failures never prepare backing transaction" {
     const alloc = std.testing.allocator;
     var backend = lsm_backend.Backend.init(alloc, .{});
@@ -3087,6 +3175,21 @@ test "workload admission completion compiler bounded failures never prepare back
     defer read.abort();
     try std.testing.expectError(error.UnsupportedCompletionTemplateScan, read.openCursor());
     try std.testing.expectError(error.UnsupportedCompletionTemplateWrite, private_store.beginWrite());
+    // Absence is a dependency too; duplicate probes must not consume the
+    // bounded footprint twice, and overlay-local writes are not base reads.
+    try std.testing.expectError(error.NotFound, read.get("absent-dependency"));
+    try std.testing.expectError(error.NotFound, read.get("absent-dependency"));
+    var batch = try private_store.beginBatch();
+    try batch.put("overlay-local", "value");
+    try std.testing.expectEqualStrings("value", try batch.get("overlay-local"));
+    batch.abort();
+    const dependencies = try overlay.copyBaselineReads(alloc);
+    defer {
+        for (dependencies) |key| alloc.free(key);
+        alloc.free(dependencies);
+    }
+    try std.testing.expectEqual(@as(usize, 1), dependencies.len);
+    try std.testing.expectEqualStrings("absent-dependency", dependencies[0]);
 }
 
 test "workload admission completion compiler allocation failure unwinds every output without backing writes" {

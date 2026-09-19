@@ -21,6 +21,13 @@ pub const Options = struct {
     /// Only the current CJ2 binary sequence field is accepted. Arbitrary
     /// offsets cannot turn a matching constant into a dynamic field.
     replay_payload_sequence_offset: ?u32 = null,
+    /// The DB's final batch planner supplies complete logical mutations. Expand
+    /// DocStore columnar metadata into point operations before sealing them.
+    physical_mutations: bool = false,
+    allow_named_participants: bool = false,
+    /// Null preserves the legacy timestamp binding. Physical plans enumerate
+    /// only rows whose TTL timestamp came from the future commit clock.
+    timestamp_keys: ?[]const []const u8 = null,
 };
 pub const Template = struct {
     allocator: Allocator,
@@ -38,7 +45,7 @@ pub const Template = struct {
         };
         const operations = try alloc.alloc(slot.Operation, source.count);
         errdefer alloc.free(operations);
-        const bindings = try alloc.alloc(slot.Binding, std.math.mul(usize, source.count, 4) catch return error.CompletionPlanCapacityExceeded);
+        const bindings = try alloc.alloc(slot.Binding, std.math.mul(usize, source.count, 128) catch return error.CompletionPlanCapacityExceeded);
         for (plan.operations(), operations) |op, *out| out.* = .{
             .kind = if (op.kind == .put) .put else .delete,
             .key = op.key,
@@ -68,6 +75,47 @@ pub const Template = struct {
         self.* = undefined;
     }
 };
+
+/// Exercise the same DocStore row/columnar expansion as publication, while the
+/// only writable capability is a bounded mutation log. Payload externalization
+/// is deliberately absent: a caller must prove all artifacts are inline.
+pub const PhysicalSink = struct {
+    baseline: *erased.Batch,
+    plan: *mutations.Plan,
+    columns_invalidated: bool = false,
+    columnar_mutation: ?@import("internal_keys.zig").ColumnarMutationToken = null,
+
+    pub fn runtime(self: *PhysicalSink, alloc: Allocator) erased.Batch {
+        return .{ .allocator = alloc, .ptr = self, .vtable = &vtable };
+    }
+    pub fn writer(self: *PhysicalSink, alloc: Allocator, batch: *erased.Batch) @import("docstore.zig").DocStore.Batch.BatchTxn {
+        return .{ .alloc = alloc, .runtime = batch, .columns_invalidated = &self.columns_invalidated, .columnar_mutation = &self.columnar_mutation };
+    }
+    fn cast(raw: *anyopaque) *PhysicalSink {
+        return @ptrCast(@alignCast(raw));
+    }
+    fn get(raw: *anyopaque, key: []const u8) anyerror![]const u8 {
+        const self = cast(raw);
+        var remaining = self.plan.count;
+        while (remaining != 0) {
+            remaining -= 1;
+            const op = self.plan.operations()[remaining];
+            if (std.mem.eql(u8, op.key, key)) return if (op.kind == .put) op.value else error.NotFound;
+        }
+        return self.baseline.get(key);
+    }
+    fn put(raw: *anyopaque, key: []const u8, value: []const u8) anyerror!void {
+        try cast(raw).plan.put(key, value);
+    }
+    fn delete(raw: *anyopaque, key: []const u8) anyerror!void {
+        try cast(raw).plan.delete(key);
+    }
+    fn abort(_: Allocator, _: *anyopaque) void {}
+    fn commit(_: Allocator, _: *anyopaque) anyerror!void {
+        return error.UnsupportedCompletionTemplateWrite;
+    }
+    const vtable: erased.Batch.VTable = .{ .abort = abort, .commit = commit, .get = get, .put = put, .delete = delete };
+};
 pub const CompiledTemplates = struct {
     prepare: Template,
     commit: Template,
@@ -76,7 +124,12 @@ pub const CompiledTemplates = struct {
     /// These are the compiler's sample inputs, not future authoritative values.
     timestamp: u64,
     replay_sequence: ?u64,
+    /// Actual point reads against the immutable base, including absent keys.
+    /// Replicated admission must cover these dependencies as well as writes.
+    baseline_reads: [][]const u8,
     pub fn deinit(self: *CompiledTemplates) void {
+        for (self.baseline_reads) |key| self.prepare.allocator.free(key);
+        self.prepare.allocator.free(self.baseline_reads);
         self.prepare.deinit();
         self.commit.deinit();
         self.abort.deinit();
@@ -90,12 +143,29 @@ pub const Overlay = struct {
     committed_count: usize = 0,
     committed_bytes: usize = 0,
     batch_open: bool = false,
+    baseline_reads: std.ArrayListUnmanaged([]const u8) = .empty,
+    baseline_read_bytes: usize = 0,
     pub fn init(alloc: Allocator, snapshot: *erased.ReadTxn, limits: mutations.Limits) !Overlay {
         return .{ .snapshot = snapshot, .log = try mutations.Plan.init(alloc, limits) };
     }
     pub fn deinit(self: *Overlay) void {
         std.debug.assert(!self.batch_open);
+        for (self.baseline_reads.items) |key| self.log.alloc.free(key);
+        self.baseline_reads.deinit(self.log.alloc);
         self.log.deinit();
+    }
+    pub fn copyBaselineReads(self: *const Overlay, alloc: Allocator) ![][]const u8 {
+        const keys = try alloc.alloc([]const u8, self.baseline_reads.items.len);
+        var copied: usize = 0;
+        errdefer {
+            for (keys[0..copied]) |key| alloc.free(key);
+            alloc.free(keys);
+        }
+        for (self.baseline_reads.items, keys) |key, *out| {
+            out.* = try alloc.dupe(u8, key);
+            copied += 1;
+        }
+        return keys;
     }
     pub fn store(self: *Overlay) erased.Store {
         return .{ .allocator = self.log.alloc, .ptr = self, .vtable = &store_vtable };
@@ -111,6 +181,15 @@ pub const Overlay = struct {
             const op = self.log.operations()[i];
             if (std.mem.eql(u8, op.key, key)) return if (op.kind == .delete) error.NotFound else op.value;
         }
+        for (self.baseline_reads.items) |existing| if (std.mem.eql(u8, existing, key)) return self.snapshot.get(key);
+        if (self.baseline_reads.items.len == 512 or key.len > 256 * 1024 -| self.baseline_read_bytes)
+            return error.CompletionPlanCapacityExceeded;
+        const owned = try self.log.alloc.dupe(u8, key);
+        self.baseline_reads.append(self.log.alloc, owned) catch |err| {
+            self.log.alloc.free(owned);
+            return err;
+        };
+        self.baseline_read_bytes += key.len;
         return self.snapshot.get(key);
     }
     fn noDeinit(_: Allocator, _: *anyopaque) void {}
