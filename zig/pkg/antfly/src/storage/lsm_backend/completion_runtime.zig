@@ -67,6 +67,7 @@ pub const Values = struct {
     /// Supplied only by the applying Raft runtime, never by transaction JSON.
     raft_term: u64 = 0,
     raft_index: u64 = 0,
+    canonical_payload_digest: [32]u8 = @splat(0),
 };
 
 pub const PooledBaseline = struct {
@@ -154,6 +155,8 @@ pub fn Slot(comptime Backend: type) type {
             context: *anyopaque,
             release_cell: *const fn (*anyopaque, *Self) void,
             restore_wal_credits_after_checkpoint: *const fn (*anyopaque, *Backend) anyerror!void,
+            prepare_progress: *const fn (*anyopaque, *Self, AcceptedIdentity, ?bool) anyerror![112]u8,
+            publish_progress: *const fn (*anyopaque, AcceptedIdentity) void,
         };
 
         pub const PooledInput = struct {
@@ -262,6 +265,9 @@ pub fn Slot(comptime Backend: type) type {
             try incoming.upsert(alloc, namespace, self.storageKey(), self.encoded, false);
             try incoming.upsert(alloc, namespace, &marker_key, receipt[0..16], false);
             try incoming.upsert(alloc, namespace, &receipt_key, &receipt, false);
+            const owner = self.pooled_owner.?;
+            const progress = try owner.prepare_progress(owner.context, self, identity, null);
+            try incoming.upsert(alloc, namespace, @import("completion_entry.zig").group_progress_key, &progress, false);
             var candidate = try backend.mutable.preparePublication(publication_alloc, &incoming);
             defer candidate.deinit(publication_alloc);
             var append = try wal.PreparedAppend.init(alloc, backend.root_dir.?, &incoming, true, .{ .segment_bytes = backend.options.wal_segment_bytes });
@@ -290,6 +296,7 @@ pub fn Slot(comptime Backend: type) type {
             self.baseline_slot_present = true;
             self.durable = true;
             self.attempted = false;
+            owner.publish_progress(owner.context, identity);
         }
 
         fn captureBaseline(backend: *Backend, namespace: ?[]const u8, key: []const u8, comptime size: usize) !?[size]u8 {
@@ -549,6 +556,7 @@ pub fn Slot(comptime Backend: type) type {
             for ([_][]const codec.Operation{ descriptor.commit, descriptor.abort }) |ops| for (ops) |op| {
                 for (storage_keys) |key| if (std.mem.eql(u8, op.key, key)) return error.UnsupportedCompletionTemplate;
                 for (applied_keys) |key| if (std.mem.eql(u8, op.key, key)) return error.UnsupportedCompletionTemplate;
+                if (std.mem.eql(u8, op.key, @import("completion_entry.zig").group_progress_key) or std.mem.startsWith(u8, op.key, receipt_prefix)) return error.UnsupportedCompletionTemplate;
                 const shared = codec.isSharedDynamicOperation(op);
                 for (op.bindings) |binding| if (binding.target == .key and !shared) return error.UnsupportedCompletionTemplate;
                 for (backend.durable_completion_members) |maybe| if (maybe) |member| {
@@ -597,6 +605,11 @@ pub fn Slot(comptime Backend: type) type {
         pub fn complete(self: *Self, backend: *Backend, commit: bool, values: Values) !void {
             if (!self.durable) return error.CompletionNotPrepared;
             if (self.attempted or backend.manifest_recovery_required) return error.RecoveryRequired;
+            const group_progress = if (self.pooled_owner) |owner| try owner.prepare_progress(owner.context, self, .{
+                .term = values.raft_term,
+                .index = values.raft_index,
+                .digest = values.canonical_payload_digest,
+            }, commit) else null;
             // The bump domains are single-attempt. Even a pre-I/O allocation
             // failure must not allow an unbounded sequence of retries.
             self.attempted = true;
@@ -633,11 +646,13 @@ pub fn Slot(comptime Backend: type) type {
             if (self.pooled_owner != null) {
                 const receipt_key = receiptKey(self.descriptor.descriptor.txn_id);
                 try delta.upsert(alloc, .{ .name = self.descriptor.descriptor.namespace }, &receipt_key, "", true);
+                try delta.upsert(alloc, .{ .name = self.descriptor.descriptor.namespace }, @import("completion_entry.zig").group_progress_key, &group_progress.?, false);
             }
             try delta.upsert(alloc, .{ .name = self.descriptor.descriptor.namespace }, self.storageKey(), "", true);
             try delta.upsert(alloc, .{ .name = self.descriptor.descriptor.namespace }, self.appliedKey(), &self.descriptor.descriptor.txn_id, false);
             try backend.checkCompletionPoolFootprint(&delta);
             try self.drain(backend, &delta, true, true);
+            if (self.pooled_owner) |owner| owner.publish_progress(owner.context, .{ .term = values.raft_term, .index = values.raft_index, .digest = values.canonical_payload_digest });
         }
 
         /// Replay has already applied the whole atomic completion record. Drain

@@ -40,8 +40,32 @@ pub const Shape = struct {
 pub const Config = struct {
     identity: abi.Identity,
     schema_catalog_digest: [32]u8,
+    namespace: enum(u8) { root, docs } = .docs,
     shape: Shape = .{},
 };
+
+pub fn encodeProgress(identity: abi.Identity, progress: completion.AcceptedIdentity) [112]u8 {
+    var bytes: [112]u8 = undefined;
+    std.mem.writeInt(u64, bytes[0..8], identity.group_id, .little);
+    @memcpy(bytes[8..24], &identity.incarnation);
+    @memcpy(bytes[24..56], &identity.policy_digest);
+    std.mem.writeInt(u64, bytes[56..64], identity.generation, .little);
+    @memcpy(bytes[64..112], &progress.encode());
+    return bytes;
+}
+
+pub fn decodeProgress(identity: abi.Identity, bytes: []const u8) !completion.AcceptedIdentity {
+    if (bytes.len != 112 or std.mem.readInt(u64, bytes[0..8], .little) != identity.group_id or
+        !std.mem.eql(u8, bytes[8..24], &identity.incarnation) or !std.mem.eql(u8, bytes[24..56], &identity.policy_digest) or
+        std.mem.readInt(u64, bytes[56..64], .little) != identity.generation) return error.InvalidCompletionSlot;
+    const result: completion.AcceptedIdentity = .{
+        .term = std.mem.readInt(u64, bytes[64..72], .little),
+        .index = std.mem.readInt(u64, bytes[72..80], .little),
+        .digest = bytes[80..112].*,
+    };
+    if (result.term == 0 or result.index == 0 or std.mem.allEqual(u8, &result.digest, 0)) return error.InvalidCompletionSlot;
+    return result;
+}
 
 /// Storage-kernel-local callbacks; never a cross-runtime raw error vtable.
 /// Provider takes DB apply serialization BEFORE backend.mu. Callbacks assume
@@ -214,6 +238,28 @@ pub fn readRunPoint(io: storage_io.Storage, alloc: Allocator, path: []const u8, 
     return .{ .found = true, .value = if (found.entry.tombstone) null else try alloc.dupe(u8, found.entry.value) };
 }
 
+/// These observations come only from a successfully persisted complete log
+/// image, never volatile Raft state or a pre-persistence Ready preview.
+pub const DurableCell = struct {
+    identity: completion.AcceptedIdentity,
+    prepared: bool,
+};
+pub const DurableObservation = struct {
+    expected: completion.AcceptedIdentity,
+    present: bool,
+    observed_term: u64 = 0,
+    observed_digest: [32]u8 = @splat(0),
+    replaced_in_this_persist: bool = false,
+};
+pub const DurableLog = struct {
+    mode: enum { startup_complete, persisted_replacement },
+    compacted_index: u64,
+    compacted_term: u64,
+    last_index: u64,
+    commit_index: u64,
+    observations: []const DurableObservation,
+};
+
 pub fn Pool(comptime Backend: type) type {
     return struct {
         const Self = @This();
@@ -232,6 +278,7 @@ pub fn Pool(comptime Backend: type) type {
             publication_token: ?*anyopaque = null,
             publication_notified: bool = false,
             restored_prepared: bool = false,
+            resolution: ?struct { identity: completion.AcceptedIdentity, commit: bool } = null,
         };
         config: Config,
         control: *domains.Arena,
@@ -249,12 +296,17 @@ pub fn Pool(comptime Backend: type) type {
         run_paths: [max_slots]?[]const u8,
         journal_path: []u8,
         restored: bool = false,
+        startup_reconciliation_pending: bool = false,
         ready: bool = false,
         failed: bool = false,
+        progress: ?completion.AcceptedIdentity = null,
         publication_owner: ?PublicationOwner = null,
         wal_bytes_start: u64,
         wal_entries_start: u64,
         wal_records_start: u64,
+        replayed_wal_bytes: u64 = 0,
+        replayed_wal_entries: u64 = 0,
+        replayed_wal_records: u64 = 0,
 
         /// Caller established a durable baseline before installing the pool.
         /// Creation is fallible ordinary startup work and grants no Raft proof.
@@ -427,6 +479,10 @@ pub fn Pool(comptime Backend: type) type {
                 !std.mem.eql(u8, &e.policy_digest, &identity.policy_digest) or
                 !std.mem.eql(u8, &e.schema_catalog_digest, &self.config.schema_catalog_digest) or
                 !std.meta.eql(entry.decoded_descriptor.descriptor.limits, completion.limits)) return error.UnsupportedCompletionProfile;
+            const namespace = entry.decoded_descriptor.descriptor.namespace;
+            if (self.config.namespace == .root) {
+                if (namespace != null) return error.UnsupportedCompletionProfile;
+            } else if (namespace == null or !std.mem.eql(u8, namespace.?, "docs")) return error.UnsupportedCompletionProfile;
         }
 
         fn point(self: *Self, backend: *Backend, alloc: Allocator, namespace: ?[]const u8, key: []const u8) !Point {
@@ -457,10 +513,17 @@ pub fn Pool(comptime Backend: type) type {
             if (self.failed or !self.restored) return error.RecoveryRequired;
             if (incoming.estimatedLogicalBytes() > completion.foreground_bytes -| backend.mutable.estimatedLogicalBytes() or
                 incoming.entryCount() > completion.foreground_entries -| backend.mutable.entryCount() or
-                backend.write_stats.wal_append_bytes -| self.wal_bytes_start +| @import("wal.zig").encodedStateRecordLen(incoming) > completion.recovery_wal_bytes or
-                backend.write_stats.wal_append_entries -| self.wal_entries_start +| incoming.entryCount() > completion.foreground_entries or
-                backend.write_stats.wal_append_records -| self.wal_records_start >= completion.recovery_wal_records)
+                self.replayed_wal_bytes +| (backend.write_stats.wal_append_bytes -| self.wal_bytes_start) +| @import("wal.zig").encodedStateRecordLen(incoming) > completion.recovery_wal_bytes or
+                self.replayed_wal_entries +| (backend.write_stats.wal_append_entries -| self.wal_entries_start) +| incoming.entryCount() > completion.foreground_entries or
+                self.replayed_wal_records +| (backend.write_stats.wal_append_records -| self.wal_records_start) >= completion.recovery_wal_records)
                 return error.CompletionForegroundCapacityExceeded;
+            for (0..incoming.entryCount()) |i| {
+                const key = incoming.entryAt(i).key;
+                if (std.mem.eql(u8, key, entry_codec.group_progress_key) or
+                    std.mem.startsWith(u8, key, entry_codec.receipt_prefix) or
+                    std.mem.startsWith(u8, key, completion.storage_key) or
+                    std.mem.startsWith(u8, key, completion.applied_key)) return error.PreparedCompletionActive;
+            }
             try self.checkAcceptedFootprint(incoming);
         }
 
@@ -634,6 +697,7 @@ pub fn Pool(comptime Backend: type) type {
                 cell.term = accepted.term;
                 cell.index = accepted.index;
                 cell.phase = .accepted;
+                self.startup_reconciliation_pending = true;
                 transferred = true;
                 cell.baseline = try self.captureBaseline(backend, scratch, cell, i);
             }
@@ -659,6 +723,7 @@ pub fn Pool(comptime Backend: type) type {
                 const value = try readRunPoint(self.io.storage(), alloc, run.path orelse return error.UnsupportedCompletionProfile, self.config.shape, run.smallest_namespace_name, run.smallest_key);
                 value.deinit(alloc);
             }
+            try self.restoreProgress(backend, alloc);
             self.ready = true;
         }
 
@@ -678,7 +743,7 @@ pub fn Pool(comptime Backend: type) type {
                 .io = self.io,
                 .memory_pin = self.memory_pin,
                 .wal_pin = self.wal_pin,
-                .owner = .{ .context = self, .release_cell = releaseCell, .restore_wal_credits_after_checkpoint = restoreWalCredits },
+                .owner = .{ .context = self, .release_cell = releaseCell, .restore_wal_credits_after_checkpoint = restoreWalCredits, .prepare_progress = prepareProgress, .publish_progress = publishProgress },
                 .baseline = cell.baseline,
                 .accepted_identity = .{ .term = cell.term, .index = cell.index, .digest = cell.entry.?.digest },
                 .durable_restored = cell.restored_prepared,
@@ -752,6 +817,12 @@ pub fn Pool(comptime Backend: type) type {
                 remaining -= charge;
             }
             if (remaining != 0) return error.CompletionRecoveryCapacityRequired;
+            // Restarts do not renew the cumulative foreground allowance. Count
+            // all retained records conservatively until a protected checkpoint;
+            // this also covers duplicate versions absent from the mutable root.
+            self.replayed_wal_bytes = backend.wal_retention.primary.?.bytes;
+            self.replayed_wal_entries = stats.entries;
+            self.replayed_wal_records = stats.records;
             backend.write_stats.wal_replay_records += stats.records;
             backend.write_stats.wal_replay_entries += stats.entries;
             backend.write_stats.wal_replay_bytes += stats.bytes;
@@ -766,6 +837,7 @@ pub fn Pool(comptime Backend: type) type {
             var borrow = try self.compiler.tryBorrow();
             defer borrow.release() catch unreachable;
             const alloc = try borrow.allocator();
+            try self.restoreProgress(backend, alloc);
             var completed: [max_slots]bool = @splat(false);
             var needs_drain: ?*Slot = null;
             // Materialize all siblings before any drain refreshes their shared
@@ -807,6 +879,200 @@ pub fn Pool(comptime Backend: type) type {
             if (cell.publication_notified) return;
             if (cell.publication_token) |token| self.publication_owner.?.applied(self.publication_owner.?.context, token, cell.term, cell.index);
             cell.publication_notified = true;
+        }
+
+        fn restoreProgress(self: *Self, backend: *Backend, alloc: Allocator) !void {
+            const value = try self.point(backend, alloc, if (self.config.namespace == .docs) "docs" else null, entry_codec.group_progress_key);
+            defer value.deinit(alloc);
+            self.progress = if (value.value) |bytes| try decodeProgress(self.config.identity, bytes) else null;
+        }
+
+        /// No allocation or storage reads. Only a successfully published native
+        /// operation updates this cache; failed/uncertain pools never issue it.
+        pub fn durableProgress(self: *const Self) !abi.Progress {
+            if (self.failed or !self.restored) return error.RecoveryRequired;
+            const progress = self.progress orelse return error.NotFound;
+            return .{ .term = progress.term, .index = progress.index, .payload_digest = progress.digest };
+        }
+
+        pub fn durableCells(self: *const Self, out: *[max_slots]DurableCell) ![]const DurableCell {
+            if (self.failed or !self.restored) return error.RecoveryRequired;
+            var count: usize = 0;
+            for (self.cells[0..self.cell_count]) |cell| {
+                if (cell.phase != .accepted and cell.phase != .prepared) continue;
+                out[count] = .{
+                    .identity = .{ .term = cell.term, .index = cell.index, .digest = cell.entry.?.digest },
+                    .prepared = cell.phase == .prepared,
+                };
+                count += 1;
+            }
+            return out[0..count];
+        }
+
+        /// Only accepted, never-applied ownership can be retired by durable log
+        /// replacement. Online absence is not proof: the accepted entry may be
+        /// queued beyond the just-persisted prefix. At process startup the full
+        /// replayed durable log can additionally prove an absent suffix.
+        /// Caller holds the DB publication lock before the backend lock.
+        pub fn reconcileDurableLog(self: *Self, backend: *Backend, log: DurableLog) !void {
+            if (self.failed or !self.restored) return error.RecoveryRequired;
+            if (log.commit_index > log.last_index or log.compacted_index > log.commit_index or
+                (log.compacted_index == 0) != (log.compacted_term == 0) or log.observations.len > max_slots)
+                return error.InvalidCompletionSlot;
+            if (log.mode == .startup_complete and (!self.startup_reconciliation_pending or self.ready))
+                return error.InvalidCompletionSlot;
+            var retire: [max_slots]bool = @splat(false);
+            var observed: [max_slots]bool = @splat(false);
+            var live_count: usize = 0;
+            for (self.cells[0..self.cell_count], 0..) |cell, i| {
+                if (cell.phase != .accepted and cell.phase != .prepared) continue;
+                live_count += 1;
+                const expected: completion.AcceptedIdentity = .{ .term = cell.term, .index = cell.index, .digest = cell.entry.?.digest };
+                const observation = for (log.observations, 0..) |candidate, j| {
+                    if (!std.meta.eql(candidate.expected, expected)) continue;
+                    if (observed[j]) return error.InvalidCompletionSlot;
+                    observed[j] = true;
+                    break candidate;
+                } else return error.InvalidCompletionSlot;
+                if (observation.present) {
+                    if (cell.index <= log.compacted_index or cell.index > log.last_index or observation.observed_term == 0 or
+                        std.mem.allEqual(u8, &observation.observed_digest, 0)) return error.InvalidCompletionSlot;
+                } else if (observation.observed_term != 0 or !std.mem.allEqual(u8, &observation.observed_digest, 0) or observation.replaced_in_this_persist)
+                    return error.InvalidCompletionSlot;
+                if (cell.index <= log.compacted_index) {
+                    if (cell.phase != .prepared or !cell.slot.durable) return error.RecoveryRequired;
+                    // The exact native descriptor + receipt were validated when
+                    // this prepared cell was restored; absence alone is unused.
+                    continue;
+                }
+                const matches = observation.present and observation.observed_term == cell.term and
+                    std.mem.eql(u8, &observation.observed_digest, &cell.entry.?.digest);
+                if (matches) continue;
+                if (cell.phase == .prepared) return error.RecoveryRequired;
+                if (!observation.present and cell.index <= log.last_index) return error.InvalidCompletionSlot;
+                retire[i] = log.mode == .startup_complete or (observation.present and observation.replaced_in_this_persist);
+            }
+            if (live_count != log.observations.len) return error.InvalidCompletionSlot;
+            for (observed[0..log.observations.len]) |used| if (!used) return error.InvalidCompletionSlot;
+            // Validate the entire bounded proof before any irreversible cleanup.
+            for (retire[0..self.cell_count], 0..) |remove, i| {
+                if (!remove) continue;
+                try self.retireUnappliedCell(backend, i);
+            }
+            if (log.mode == .startup_complete) self.startup_reconciliation_pending = false;
+        }
+
+        /// Explicit local proposal rejection is proof only for this exact
+        /// provisional tuple. Clearing a resolution never retires its prepared
+        /// transaction or releases the resources backing either outcome.
+        pub fn cancelUnacceptedProposal(self: *Self, backend: *Backend, identity: completion.AcceptedIdentity) !void {
+            if (self.failed or !self.restored) return error.RecoveryRequired;
+            for (self.cells[0..self.cell_count], 0..) |*cell, i| {
+                if (cell.phase != .accepted and cell.phase != .prepared) continue;
+                if (cell.resolution) |resolution| if (std.meta.eql(identity, resolution.identity)) {
+                    cell.resolution = null;
+                    return;
+                };
+                if (cell.term != identity.term or cell.index != identity.index or
+                    !std.mem.eql(u8, &cell.entry.?.digest, &identity.digest)) continue;
+                if (cell.phase != .accepted) return error.RecoveryRequired;
+                return self.retireUnappliedCell(backend, i);
+            }
+            return error.NotFound;
+        }
+
+        fn retireUnappliedCell(self: *Self, backend: *Backend, i: usize) !void {
+            const cell = &self.cells[i];
+            std.debug.assert(cell.phase == .accepted);
+            self.io.storage().deleteFileAbsolute(self.accepted_paths[i]) catch |err| {
+                backend.fenceFailedBulkWal();
+                return err;
+            };
+            self.io.storage().syncParentAbsolute(self.accepted_paths[i]) catch |err| {
+                backend.fenceFailedBulkWal();
+                return err;
+            };
+            if (cell.publication_token) |token| self.publication_owner.?.cancel(self.publication_owner.?.context, token);
+            cell.publication_token = null;
+            const reservation = cell.publication.?;
+            reservation.allocator().free(cell.accepted_wire.?);
+            cell.accepted_wire = null;
+            cell.entry.?.deinit();
+            cell.entry = null;
+            cell.publication = null;
+            reservation.finish();
+            cell.phase = .spent;
+            self.ready = false;
+        }
+
+        /// Exact ownership, never an index-only inference. A retired latest
+        /// operation remains owned through its durable group receipt. Older
+        /// operations must be skipped using the verified applied checkpoint;
+        /// falling back to ordinary execution would replay their effects.
+        pub fn ownsAccepted(self: *const Self, term: u64, index: u64, payload: []const u8) !bool {
+            if (self.failed or !self.restored) return error.RecoveryRequired;
+            const digest = entry_codec.protocol.payloadDigest(payload);
+            const identity: completion.AcceptedIdentity = .{ .term = term, .index = index, .digest = digest };
+            for (self.cells[0..self.cell_count]) |cell| {
+                if (cell.phase != .accepted and cell.phase != .prepared) continue;
+                if (cell.term == term and cell.index == index) {
+                    if (!std.mem.eql(u8, &cell.entry.?.digest, &digest)) return error.InvalidCompletionSlot;
+                    return true;
+                }
+                if (cell.resolution) |resolution| if (resolution.identity.index == index) {
+                    if (!std.meta.eql(resolution.identity, identity)) return error.InvalidCompletionSlot;
+                    return true;
+                };
+            }
+            if (self.progress) |progress| {
+                if (progress.index == index) {
+                    if (!std.meta.eql(progress, identity)) return error.InvalidCompletionSlot;
+                    return true;
+                }
+                if (index < progress.index) return error.RecoveryRequired;
+            }
+            return false;
+        }
+
+        /// Called by the native consensus classifier for an existing prepared
+        /// transaction at its actual applied predecessor. No new memory/FD
+        /// admission occurs: either outcome is already owned by this cell.
+        pub fn reserveResolution(self: *Self, id: [16]u8, identity: completion.AcceptedIdentity, commit: bool, applied: u64) !void {
+            if (self.failed or !self.restored or self.hasAcceptedDebt()) return error.RecoveryRequired;
+            if (identity.term == 0 or identity.index == 0 or applied != identity.index - 1 or std.mem.allEqual(u8, &identity.digest, 0)) return error.InvalidCompletionSlot;
+            for (self.cells[0..self.cell_count]) |*cell| {
+                if (cell.phase != .prepared or cell.slot.retired or !cell.slot.durable or
+                    !std.mem.eql(u8, &cell.entry.?.entry.txn_id, &id)) continue;
+                if (cell.resolution) |existing| {
+                    if (existing.commit == commit and std.meta.eql(existing.identity, identity)) return;
+                    return error.CompletionReservationBusy;
+                }
+                cell.resolution = .{ .identity = identity, .commit = commit };
+                return;
+            }
+            return error.CompletionNotPrepared;
+        }
+
+        fn prepareProgress(raw: *anyopaque, slot: *Slot, identity: completion.AcceptedIdentity, commit: ?bool) ![112]u8 {
+            const self: *Self = @ptrCast(@alignCast(raw));
+            if (self.failed or !self.restored) return error.RecoveryRequired;
+            if (identity.term == 0 or identity.index == 0 or std.mem.allEqual(u8, &identity.digest, 0)) return error.InvalidCompletionSlot;
+            if (self.progress) |old| if (identity.index <= old.index or identity.term < old.term) return error.InvalidCompletionSlot;
+            for (self.cells[0..self.cell_count]) |*cell| {
+                if (cell.slot != slot or cell.phase != .prepared) continue;
+                if (commit) |outcome| {
+                    const accepted = cell.resolution orelse return error.CompletionNotPrepared;
+                    if (accepted.commit != outcome or !std.meta.eql(accepted.identity, identity)) return error.InvalidCompletionSlot;
+                } else if (cell.term != identity.term or cell.index != identity.index or !std.mem.eql(u8, &cell.entry.?.digest, &identity.digest)) return error.InvalidCompletionSlot;
+                return encodeProgress(self.config.identity, identity);
+            }
+            return error.InvalidCompletionSlot;
+        }
+
+        fn publishProgress(raw: *anyopaque, identity: completion.AcceptedIdentity) void {
+            const self: *Self = @ptrCast(@alignCast(raw));
+            if (self.progress) |old| std.debug.assert(identity.index > old.index);
+            self.progress = identity;
         }
 
         /// DB quiesces its apply/workers before detaching its stable snapshot.
@@ -872,6 +1138,9 @@ pub fn Pool(comptime Backend: type) type {
             self.wal_bytes_start = backend.write_stats.wal_append_bytes;
             self.wal_entries_start = backend.write_stats.wal_append_entries;
             self.wal_records_start = backend.write_stats.wal_append_records;
+            self.replayed_wal_bytes = 0;
+            self.replayed_wal_entries = 0;
+            self.replayed_wal_records = 0;
         }
     };
 }
@@ -891,6 +1160,26 @@ test "workload admission completion accepted guard binds durable owner and rejec
     bytes[bytes.len - 1] ^= 1;
     try std.testing.expectError(error.CompletionSlotChecksumMismatch, decodeAccepted(bytes));
     try std.testing.expectError(error.InvalidCompletionSlot, decodeAccepted(bytes[0 .. bytes.len - 1]));
+}
+
+test "workload admission physical completion progress binds incarnation policy and exact payload" {
+    const identity: abi.Identity = .{ .capacity = 4, .group_id = 23, .node_id = 7, .incarnation = @splat(11), .policy_digest = @splat(12), .generation = 19 };
+    const progress: completion.AcceptedIdentity = .{ .term = 5, .index = 113, .digest = @splat(17) };
+    const bytes = encodeProgress(identity, progress);
+    try std.testing.expectEqualDeep(progress, try decodeProgress(identity, &bytes));
+    // The replicated record is shared by applying members, not node-local.
+    var other = identity;
+    other.node_id = 21;
+    try std.testing.expectEqualDeep(progress, try decodeProgress(other, &bytes));
+    other.incarnation[0] ^= 1;
+    try std.testing.expectError(error.InvalidCompletionSlot, decodeProgress(other, &bytes));
+    other = identity;
+    other.policy_digest[0] ^= 1;
+    try std.testing.expectError(error.InvalidCompletionSlot, decodeProgress(other, &bytes));
+    other = identity;
+    other.generation += 1;
+    try std.testing.expectError(error.InvalidCompletionSlot, decodeProgress(other, &bytes));
+    try std.testing.expectError(error.InvalidCompletionSlot, decodeProgress(identity, bytes[0..48]));
 }
 
 test "workload admission physical completion pool accepts through native prepaid baseline IO and fences read dependencies" {
@@ -918,7 +1207,7 @@ test "workload admission physical completion pool accepts through native prepaid
     const identity: abi.Identity = .{ .capacity = 4, .group_id = 23, .node_id = 7, .incarnation = @splat(11), .policy_digest = @splat(12), .generation = 19 };
     const locked = runtime.lockBackend(Backend, &backend);
     defer runtime.unlockBackend(Backend, &backend, locked);
-    try backend.installCompletionPoolLocked(.{ .identity = identity, .schema_catalog_digest = @splat(13) });
+    try backend.installCompletionPoolLocked(.{ .identity = identity, .schema_catalog_digest = @splat(13), .namespace = .root });
     const pool = backend.completion_pool.?;
     try pool.qualifyFresh(&backend);
     const id: [16]u8 = @splat(51);
@@ -949,20 +1238,47 @@ test "workload admission physical completion pool accepts through native prepaid
     backend.durable_completion_members[0] = slot;
     try slot.applyCanonicalPrepare(&backend, pool.cells[0].entry.?.entry.prepare_operations);
     pool.notifyApplied(0);
+    try std.testing.expectEqual(@as(u64, 9), (try pool.durableProgress()).index);
     const receipt_key = entry_codec.receiptKey(id);
     const prepared_receipt = try pool.point(&backend, alloc, null, &receipt_key);
     defer prepared_receipt.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 48), prepared_receipt.value.?.len);
     try std.testing.expectEqual(@as(u64, 9), std.mem.readInt(u64, prepared_receipt.value.?[8..16], .little));
-    try slot.complete(&backend, true, .{ .commit_timestamp = 200, .replay_sequence = 0, .shared_ledger_count = 0, .shared_ledger_bytes = 0, .raft_term = 3, .raft_index = 10 });
+    try std.testing.expectError(error.InvalidCompletionSlot, slot.complete(&backend, true, .{
+        .commit_timestamp = 200,
+        .replay_sequence = 0,
+        .shared_ledger_count = 0,
+        .shared_ledger_bytes = 0,
+        .raft_term = 3,
+        .raft_index = 10,
+    }));
+    try std.testing.expect(!slot.attempted and !backend.manifest_recovery_required);
+    const resolution_payload = "exact original resolution Raft entry";
+    const resolution_digest = entry_codec.protocol.payloadDigest(resolution_payload);
+    try std.testing.expect(try pool.ownsAccepted(3, 9, envelope));
+    try pool.reserveResolution(id, .{ .term = 3, .index = 10, .digest = resolution_digest }, true, 9);
+    try std.testing.expect(try pool.ownsAccepted(3, 10, resolution_payload));
+    try std.testing.expectError(error.InvalidCompletionSlot, pool.ownsAccepted(3, 10, "other payload"));
+    try pool.cancelUnacceptedProposal(&backend, .{ .term = 3, .index = 10, .digest = resolution_digest });
+    try std.testing.expectEqual(Pool(Backend).Phase.prepared, pool.cells[0].phase);
+    try std.testing.expect(!(try pool.ownsAccepted(3, 10, resolution_payload)));
+    try pool.reserveResolution(id, .{ .term = 3, .index = 10, .digest = resolution_digest }, true, 9);
+    try slot.complete(&backend, true, .{ .canonical_payload_digest = resolution_digest, .commit_timestamp = 200, .replay_sequence = 0, .shared_ledger_count = 0, .shared_ledger_bytes = 0, .raft_term = 3, .raft_index = 10 });
     const completed_row = try pool.point(&backend, alloc, null, "row");
     defer completed_row.deinit(alloc);
     try std.testing.expectEqualStrings("complete", completed_row.value.?);
     const completed_receipt = try pool.point(&backend, alloc, null, &receipt_key);
     defer completed_receipt.deinit(alloc);
     try std.testing.expect(completed_receipt.value == null);
+    const durable_progress = try pool.durableProgress();
+    try std.testing.expectEqual(@as(u64, 10), durable_progress.index);
+    try std.testing.expectEqual(resolution_digest, durable_progress.payload_digest);
     slot.retired = true;
     try backend.retireDurableCompletionCohort();
+    try std.testing.expect(try pool.ownsAccepted(3, 10, resolution_payload));
+    try std.testing.expectError(error.RecoveryRequired, pool.ownsAccepted(3, 9, envelope));
+    try std.testing.expectError(error.InvalidCompletionSlot, pool.ownsAccepted(4, 10, resolution_payload));
+    try std.testing.expect(!(try pool.ownsAccepted(3, 11, resolution_payload)));
     try std.testing.expectError(error.FileNotFound, pool.io.storage().fileSize(pool.accepted_paths[0]));
     try std.testing.expect(!failing.has_induced_failure);
 }
@@ -979,7 +1295,7 @@ test "workload admission physical completion pool restores accepted and prepared
         var path_buffer: [256]u8 = undefined;
         const path = repository.tmpPath(&path_buffer, "native-pool-restore");
         defer repository.cleanupTmp(path);
-        const config: Config = .{ .identity = .{ .capacity = 4, .group_id = 23, .node_id = 7, .incarnation = @splat(11), .policy_digest = @splat(12), .generation = 19 }, .schema_catalog_digest = @splat(13) };
+        const config: Config = .{ .identity = .{ .capacity = 4, .group_id = 23, .node_id = 7, .incarnation = @splat(11), .policy_digest = @splat(12), .generation = 19 }, .schema_catalog_digest = @splat(13), .namespace = .root };
         const options: @import("../lsm_backend.zig").Options = .{ .resource_manager = &manager, .native_storage_pool = &fd_pool, .flush_threshold = 10000 };
         const id: [16]u8 = @splat(51);
         const descriptor = try slot_codec.encode(alloc, .{ .txn_id = id, .intent_revision = 1, .limits = completion.limits, .profile_fence = "replicated-profile", .commit = &.{.{ .kind = .put, .key = "row", .value = "complete" }}, .abort = &.{} }, .{});
@@ -1005,18 +1321,26 @@ test "workload admission physical completion pool restores accepted and prepared
             try backend.openInto(alloc, std.mem.span(path), options);
             defer backend.abandonAfterCrash();
             try backend.persistManifest();
-            const locked = runtime.lockBackend(Backend, &backend);
-            defer runtime.unlockBackend(Backend, &backend, locked);
-            try backend.installCompletionPoolLocked(config);
-            const pool = backend.completion_pool.?;
-            try pool.qualifyFresh(&backend);
-            _ = try pool.accept(&backend, 3, 1, 0, 0, envelope);
-            if (prepared) {
-                const slot = try pool.adopt(&backend, 0);
-                backend.durable_completion = slot;
-                backend.durable_completion_members[0] = slot;
-                try slot.applyCanonicalPrepare(&backend, pool.cells[0].entry.?.entry.prepare_operations);
+            {
+                const locked = runtime.lockBackend(Backend, &backend);
+                defer runtime.unlockBackend(Backend, &backend, locked);
+                try backend.installCompletionPoolLocked(config);
+                const pool = backend.completion_pool.?;
+                try pool.qualifyFresh(&backend);
+                _ = try pool.accept(&backend, 3, 1, 0, 0, envelope);
+                if (prepared) {
+                    const slot = try pool.adopt(&backend, 0);
+                    backend.durable_completion = slot;
+                    backend.durable_completion_members[0] = slot;
+                    try slot.applyCanonicalPrepare(&backend, pool.cells[0].entry.?.entry.prepare_operations);
+                }
             }
+            if (!prepared) for (0..completion.recovery_wal_records) |_| {
+                var batch = try backend.beginWrite();
+                errdefer batch.abort();
+                try batch.put(.{}, "unrelated-overwrite", "retained");
+                try batch.commit();
+            };
         }
         {
             var missing: Backend = undefined;
@@ -1036,6 +1360,49 @@ test "workload admission physical completion pool restores accepted and prepared
             defer value.deinit(alloc);
             if (prepared) try std.testing.expectEqualStrings("prepared", value.value.?) else try std.testing.expect(value.value == null);
             try std.testing.expect((try pool.io.storage().fileSize(pool.accepted_paths[0])) > accepted_header_bytes);
+            if (!prepared) {
+                try std.testing.expectEqual(completion.recovery_wal_records, pool.replayed_wal_records);
+                var incoming: @import("state.zig").ActiveMemTable = .{};
+                defer incoming.deinit(alloc);
+                try incoming.upsert(alloc, .{}, "unrelated-overwrite", "new", false);
+                try std.testing.expectError(error.CompletionForegroundCapacityExceeded, pool.checkOrdinary(&restored, &incoming));
+            } else try std.testing.expectEqual(@as(u64, 1), (try pool.durableProgress()).index);
+            var cell_buffer: [max_slots]DurableCell = undefined;
+            const cells = try pool.durableCells(&cell_buffer);
+            try std.testing.expectEqual(@as(usize, 1), cells.len);
+            var observation: DurableObservation = .{ .expected = cells[0].identity, .present = false };
+            const missing: DurableLog = .{ .mode = .persisted_replacement, .compacted_index = 0, .compacted_term = 0, .last_index = 0, .commit_index = 0, .observations = (&observation)[0..1] };
+            if (prepared) {
+                try std.testing.expectError(error.RecoveryRequired, pool.reconcileDurableLog(&restored, missing));
+                observation.present = true;
+                observation.observed_term = 4;
+                observation.observed_digest = @splat(82);
+                observation.replaced_in_this_persist = true;
+                var replacement = missing;
+                replacement.last_index = 1;
+                replacement.commit_index = 1;
+                try std.testing.expectError(error.RecoveryRequired, pool.reconcileDurableLog(&restored, replacement));
+                try std.testing.expectEqual(Pool(Backend).Phase.prepared, pool.cells[0].phase);
+                observation = .{ .expected = cells[0].identity, .present = false };
+                var compacted = missing;
+                compacted.mode = .startup_complete;
+                compacted.last_index = 1;
+                compacted.commit_index = 1;
+                compacted.compacted_index = 1;
+                compacted.compacted_term = 3;
+                try pool.reconcileDurableLog(&restored, compacted);
+                try std.testing.expectEqual(Pool(Backend).Phase.prepared, pool.cells[0].phase);
+            } else {
+                // Online suffix absence cannot discard a queued accepted entry.
+                try pool.reconcileDurableLog(&restored, missing);
+                try std.testing.expectEqual(Pool(Backend).Phase.accepted, pool.cells[0].phase);
+                var startup = missing;
+                startup.mode = .startup_complete;
+                try pool.reconcileDurableLog(&restored, startup);
+                try std.testing.expectEqual(Pool(Backend).Phase.spent, pool.cells[0].phase);
+                try std.testing.expect(!pool.ready);
+                try std.testing.expectError(error.FileNotFound, pool.io.storage().fileSize(pool.accepted_paths[0]));
+            }
         }
         try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
     }

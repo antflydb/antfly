@@ -10,6 +10,14 @@ pub const profile: u16 = 1;
 pub const max_wire_bytes = 512 * 1024;
 pub const raft_batch_protocol_version: u16 = 7;
 
+/// Durable progress matches the complete original Raft Entry.data bytes.
+/// Envelope checksums are validated separately and are included in this hash.
+pub fn payloadDigest(bytes: []const u8) [32]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    return digest;
+}
+
 /// Truncated magic is still reserved: dispatch must reject it through the
 /// canonical validator, never silently classify it as an ignored normal entry.
 pub fn looksLike(bytes: []const u8) bool {

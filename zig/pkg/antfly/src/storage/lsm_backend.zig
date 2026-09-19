@@ -6180,6 +6180,7 @@ pub const Backend = struct {
     pub fn fenceFailedBulkWal(self: *Backend) void {
         if (self.root_dir == null or !self.options.wal_enabled) return;
         self.manifest_recovery_required = true;
+        if (self.completion_pool) |pool| pool.failed = true;
         self.markManifestDirty();
     }
 

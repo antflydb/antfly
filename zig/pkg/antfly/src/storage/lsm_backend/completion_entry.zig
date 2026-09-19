@@ -17,6 +17,7 @@ pub const max_descriptor_bytes = 256 * 1024;
 pub const max_operations = 256;
 pub const max_baseline_keys = 512;
 pub const receipt_prefix = "\x00\x00__metadata__:completion_entry_v1:";
+pub const group_progress_key = "\x00\x00__metadata__:completion_group_progress_v1";
 pub fn receiptKey(txn_id: [16]u8) [receipt_prefix.len + 16]u8 {
     var key: [receipt_prefix.len + 16]u8 = undefined;
     @memcpy(key[0..receipt_prefix.len], receipt_prefix);
@@ -69,6 +70,7 @@ fn checksum(bytes: []const u8) [32]u8 {
 fn validateOperation(op: slot.Operation) !void {
     if (op.key.len == 0 or op.bindings.len != 0 or (op.kind == .delete and op.value.len != 0))
         return error.InvalidCompletionSlot;
+    if (std.mem.eql(u8, op.key, group_progress_key)) return error.InvalidCompletionSlot;
     // Native ownership records cannot be selected or overwritten by a leader's
     // canonical operation list. Accepted apply appends its own indexed records.
     inline for (.{ "\x00\x00__metadata__:completion_slot_v1", "\x00\x00__metadata__:completion_applied_v1", receipt_prefix }) |prefix| {
@@ -270,7 +272,7 @@ pub fn decode(allocator: Allocator, encoded: []const u8) !OwnedEntry {
     _ = try readOperations(wire, descriptor_len, count, operations);
     try readBaselineKeys(wire, keys_offset, baseline_count, keys);
     try validateCoverage(keys, operations, descriptor.descriptor);
-    return .{ .allocator = allocator, .storage = storage, .decoded_descriptor = descriptor, .digest = digest, .entry = .{
+    return .{ .allocator = allocator, .storage = storage, .decoded_descriptor = descriptor, .digest = protocol.payloadDigest(encoded), .entry = .{
         .group_id = group_id,
         .group_incarnation = wire[176..192].*,
         .baseline_keys = keys,
