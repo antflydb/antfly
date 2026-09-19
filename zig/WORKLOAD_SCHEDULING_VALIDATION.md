@@ -916,3 +916,79 @@ These are signed observed exchanges and relay ordering, backed by sampled
 coordinator accounting. They do not prove application consumption of every
 response, every durable-decision crash boundary, mandatory write-completion
 reservations or release performance.
+
+## Completion inspection and native ledger serialization
+
+The reviewable source stages are `4a03c0cfb6` (shared replay emitter),
+`273a506ea9` (checked backend serialization capability and native ABI 12), and
+`7a24bb98ad` (completion-ledger integration, bounded resolution inspection and
+private DB profile observations). Native LSM completion fixtures replace the
+memory backend: whole-snapshot memory commits cannot safely advertise this
+participating-writer capability while ordinary batches remain independent.
+
+The combined Debug command, from `zig/`, exited zero:
+
+```sh
+zig build antfly-workload-admission-test -j1 \
+  --cache-dir /tmp/zig-local-cache --global-cache-dir /tmp/zig-global-cache
+```
+
+`/tmp/workload-completion-combined-debug-v2.log` records 157/157 prerequisite
+tests and 250 main tests passed, one expected Wasmtime skip, zero failures and
+zero leaks. Six logged errors were expected by the tests. The prerequisite
+artifact predates only a test cleanup-scope correction; the corrected nested-gate
+test was independently rerun with all six focused adapter/native tests passing,
+actual exit zero, in `/tmp/workload-serialized-store-scoped-cleanup.log`.
+Direct LMDB coverage passed 2/2, exit zero, zero leaks, in
+`/tmp/workload-serialized-lmdb-focused.log`. Native ABI contract tests passed 4/4
+in `/tmp/workload-completion-native-contract.log`.
+
+The native regression first demonstrates that two ordinary batches can both
+read the same counter and overwrite one increment, then checks independent
+serialized writers preserve both increments. Transaction tests race two native
+managers for one completion slot across 16 fresh backends; exactly one is
+admitted. Commit/abort inspection compares the whole physical store, including
+binary keys, four replay lanes, shared debt, cleanup and a terminal retry after a
+newer write. Profile tests use real prepare/resolve paths and reject incomplete
+identity, unsupported indexes/schema, unknown transactions and retained HA
+outboxes without changing those obligations.
+
+Retained failed predecessors are not qualification: the first profile run
+rejected always-present runtime objects rather than configured work; the first
+combined run failed four completion fixtures after the memory provider correctly
+began rejecting serialization. The profile guards were corrected and the four
+fixtures migrated to native LSM. Capacity failures and unsupported-key rejection
+remain tested without publishing captured writes.
+
+These results establish the shared-accounting fix and internal observations.
+They do not establish pre-prepare physical certificates, allocation-free
+resolution, protected SST/manifest drain, restart reservation restoration,
+mandatory completion or optimized release performance.
+
+### Production Debug runtime check
+
+Frozen `7a24bb98adbc26e434d2f66c8aa4200d6de7e273` built successfully with
+`zig build antfly -Doptimize=Debug -j1`, actual exit zero. The preserved binary
+`/tmp/workload-completion-7a24-antfly` has SHA-256
+`09babb3592e463d6fbea00d3b56c78632250d37e434dcbdb5d3d51fbc39744cd`;
+the build command, source state and result are recorded in
+`/tmp/workload-completion-7a24-production-debug-receipt.json`.
+
+The unchanged local H1 task-partition fixture passed with that binary, actual
+exit zero, in `/tmp/workload-completion-7a24-dispatch-receipts`. All 32 held reads
+succeeded, two excess general requests received structured rejections, and
+recovery completed in 3.802 seconds within the ten-second limit. Dispatch span
+was 1.315 ms and latest dispatch was 1.420 ms after submission, both within the
+100 ms generator bound. The fixture reported no cleanup errors. This checks the
+rebuilt runtime and local request-task isolation; it does not qualify connection
+exhaustion, transaction completion reservations or optimized performance.
+
+Independent read-only verification matched all 26 manifest checksums and the
+copied binary. Fresh samples showed 32 active query and public HTTP tasks while
+health/readiness and authenticated protocol-3 discovery progressed; all held
+clients remained pending during those probes. Both excess requests returned
+`AdmissionFull` 429 with `Retry-After: 1`. Final tracked ownership stayed at zero
+for 1.035 seconds. All three processes exited zero without forced cleanup and
+their PIDs were absent afterward; all 35 proxy connections closed without error.
+Discovery signatures were verified live; redacted credentials preclude repeating
+that HMAC check offline. The audit left the receipts unchanged.
