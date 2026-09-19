@@ -14,10 +14,17 @@
 
 const std = @import("std");
 
+/// An empty CI environment value disables the opt-in workspace just like an
+/// absent variable. GitHub Actions clears job-scoped values by writing `NAME=`.
+pub fn workspaceRoot() ?[]const u8 {
+    const root = @import("antfly_platform").env.getenv("ANTFLY_TEST_WORKSPACE") orelse return null;
+    return if (root.len == 0) null else root;
+}
+
 /// Opt-in workspace for correctness fixtures. Durability tests keep using
 /// std.testing.tmpDir and therefore remain on the ordinary filesystem.
 pub fn fastTmpDir(opts: std.Io.Dir.OpenOptions) std.testing.TmpDir {
-    const root = @import("antfly_platform").env.getenv("ANTFLY_TEST_WORKSPACE") orelse return std.testing.tmpDir(opts);
+    const root = workspaceRoot() orelse return std.testing.tmpDir(opts);
     std.debug.assert(std.fs.path.isAbsolute(root));
     var random: [12]u8 = undefined;
     std.testing.io.random(&random);
@@ -94,7 +101,7 @@ test "test directory fast workspace isolates fixtures and cleans siblings" {
     var second = try TestDirectory.initFast("db");
     defer second.cleanup();
     try std.testing.expect(!std.mem.eql(u8, first.path(), second.path()));
-    if (@import("antfly_platform").env.getenv("ANTFLY_TEST_WORKSPACE")) |root| {
+    if (workspaceRoot()) |root| {
         const resolved = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, root, std.testing.allocator);
         defer std.testing.allocator.free(resolved);
         try std.testing.expect(std.mem.startsWith(u8, first.path(), resolved));
