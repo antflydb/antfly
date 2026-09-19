@@ -623,7 +623,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const lib_common_secrets_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{ "file secret store", "remote content runtime" },
+        .filters = &.{ "file secret store", "remote content runtime", "secret contract", "secret record" },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,

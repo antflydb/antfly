@@ -22358,6 +22358,8 @@ fn extensionAgentUnsupportedRuntimeEventAlloc(
 
 pub fn makeSecretEntry(listed: common_secrets.ListedSecret) metadata_openapi.SecretEntry {
     return .{
+        .source = listed.source orelse if (listed.status == .configured_env) "environment" else null,
+        .managed = listed.managed,
         .key = listed.key,
         .status = mapSecretStatus(listed.status),
         .env_var = listed.env_var,
@@ -29796,6 +29798,9 @@ test "api http server serves secrets crud when backed by a local store" {
         }
     }
     try std.testing.expect(found_openai);
+    try std.testing.expect(list.value.writable.?);
+    try std.testing.expect(put_entry.value.managed.?);
+    try std.testing.expectEqualStrings("native", put_entry.value.source.?);
 
     try std.Io.Dir.cwd().writeFile(io_impl.io(), .{
         .sub_path = store_path,
@@ -29828,6 +29833,34 @@ test "api http server serves secrets crud when backed by a local store" {
     });
     defer delete_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 204), delete_resp.status);
+
+    // A configured external source remains read-only even on standalone.
+    var readonly = try common_secrets.FileStore.initConfiguredWithIo(alloc, io_impl.io(), .{
+        .sources = &.{.{ .name = "platform", .type = .file, .path = store_path }},
+        .environment = false,
+    });
+    defer readonly.deinit();
+    server.cfg.secret_store = &readonly;
+    var readonly_list_resp = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = "/secrets" });
+    defer readonly_list_resp.deinit(alloc);
+    var readonly_list = try std.json.parseFromSlice(metadata_openapi.SecretList, alloc, readonly_list_resp.body, .{});
+    defer readonly_list.deinit();
+    try std.testing.expect(!readonly_list.value.writable.?);
+    try std.testing.expectEqual(@as(usize, 1), readonly_list.value.secrets.len);
+    try std.testing.expect(!readonly_list.value.secrets[0].managed.?);
+    try std.testing.expectEqualStrings("platform", readonly_list.value.secrets[0].source.?);
+    for ([_]http_common.Method{ .PUT, .DELETE }) |method| {
+        var denied = try executeHttpxTestRequest(&server, .{
+            .method = method,
+            .uri = "/secrets/gemini.api_key",
+            .body = if (method == .PUT) "{\"value\":\"bad\"}" else "",
+        });
+        defer denied.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 503), denied.status);
+    }
+    const unchanged = (try readonly.getOwned(alloc, "gemini.api_key")).?;
+    defer alloc.free(unchanged);
+    try std.testing.expectEqualStrings("externally-managed", unchanged);
 }
 
 test "api http server status includes secret store reload health" {
@@ -30737,7 +30770,7 @@ test "api http server rejects secret writes without a local secret store" {
     defer resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 503), resp.status);
     try std.testing.expectEqualStrings("text/plain; charset=utf-8", resp.content_type.?);
-    try std.testing.expectEqualStrings("secret management not available in multi-node mode", resp.body);
+    try std.testing.expectEqualStrings("secret management requires secrets.native", resp.body);
 }
 
 test "api http server serves table lookup with version header" {

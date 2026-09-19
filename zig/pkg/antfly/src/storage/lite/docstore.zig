@@ -47,6 +47,8 @@ pub const Store = struct {
     allocator: Allocator,
     file: native.NativeFile,
     read_only: bool = false,
+    /// Guarded by mutex. Secret publication failures fence every adapter until reopen.
+    secret_store_uncertain: bool = false,
     mutex: std.atomic.Mutex = .unlocked,
     writer_mutex: std.Io.Mutex = .init,
     writer_ready: std.Io.Condition = .init,
@@ -157,6 +159,10 @@ pub const Store = struct {
         defer self.mutex.unlock();
         lockStore(prepared);
         defer prepared.mutex.unlock();
+        // Portable archives omit secrets. Check at publication while reserving
+        // the writer slot so a secret committed during preparation cannot be lost.
+        if (self.secret_store_uncertain or self.file.checkpoint_publication_uncertain) return error.OutcomeUnknown;
+        if (try self.file.hasSecretState()) return error.LiteImportTargetNotEmpty;
         return try self.file.replaceWithPreparedGeneration(&prepared.file);
     }
 

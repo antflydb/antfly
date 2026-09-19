@@ -3377,7 +3377,8 @@ pub const AntflyApiHandler = struct {
         else
             try common_secrets.listEnvironmentSecrets(alloc);
         defer common_secrets.freeListedSecrets(alloc, listed);
-        const secret_list = try http_server_mod.makeSecretList(alloc, listed);
+        var secret_list = try http_server_mod.makeSecretList(alloc, listed);
+        secret_list.writable = if (self.api_server.cfg.secret_store) |store| store.writable else false;
         defer alloc.free(secret_list.secrets);
         return ctx.openApiJson(secret_list);
     }
@@ -3389,8 +3390,12 @@ pub const AntflyApiHandler = struct {
         const alloc = ctx.allocator;
         const secret_store = self.api_server.cfg.secret_store orelse {
             _ = ctx.status(503);
-            return ctx.text("secret management not available in multi-node mode");
+            return ctx.text("secret management requires secrets.native");
         };
+        if (!secret_store.writable) {
+            _ = ctx.status(503);
+            return ctx.text("secret management requires secrets.native");
+        }
         const body_data = (try ctx.body()) orelse {
             _ = ctx.status(400);
             return ctx.text("invalid secret request");
@@ -3417,8 +3422,12 @@ pub const AntflyApiHandler = struct {
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const secret_store = self.api_server.cfg.secret_store orelse {
             _ = ctx.status(503);
-            return ctx.text("secret management not available in multi-node mode");
+            return ctx.text("secret management requires secrets.native");
         };
+        if (!secret_store.writable) {
+            _ = ctx.status(503);
+            return ctx.text("secret management requires secrets.native");
+        }
         if (!(try secret_store.delete(key))) {
             _ = ctx.status(404);
             return ctx.text("not found");
