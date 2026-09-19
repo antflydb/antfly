@@ -19,17 +19,35 @@ class FixtureWorkspaceTests(unittest.TestCase):
                 ("tmpfs", workspace.BUDGET, 32 << 20),
                 ("tmpfs", 1 << 30, 1 << 30),
             ]:
-                with self.subTest(kind=kind, total=total, free=free), \
-                     patch.object(workspace.subprocess, "check_output", return_value=kind), \
-                     patch.object(workspace.os, "statvfs", return_value=SimpleNamespace(f_blocks=total, f_bavail=free, f_frsize=1)):
+                with (
+                    self.subTest(kind=kind, total=total, free=free),
+                    patch.object(
+                        workspace.subprocess, "check_output", return_value=kind
+                    ),
+                    patch.object(
+                        workspace.os,
+                        "statvfs",
+                        return_value=SimpleNamespace(
+                            f_blocks=total, f_bavail=free, f_frsize=1
+                        ),
+                    ),
+                ):
                     with self.assertRaises(ValueError):
                         workspace.validate_root(root)
 
     def test_preprovisioned_volume_is_private_and_never_unmounted(self):
-        with tempfile.TemporaryDirectory() as root, \
-             patch.object(workspace.subprocess, "check_output", return_value="tmpfs\n"), \
-             patch.object(workspace.os, "statvfs", return_value=SimpleNamespace(f_blocks=workspace.BUDGET, f_bavail=workspace.BUDGET, f_frsize=1)), \
-             patch.object(workspace.subprocess, "run") as run:
+        with (
+            tempfile.TemporaryDirectory() as root,
+            patch.object(workspace.subprocess, "check_output", return_value="tmpfs\n"),
+            patch.object(
+                workspace.os,
+                "statvfs",
+                return_value=SimpleNamespace(
+                    f_blocks=workspace.BUDGET, f_bavail=workspace.BUDGET, f_frsize=1
+                ),
+            ),
+            patch.object(workspace.subprocess, "run") as run,
+        ):
             first, mounted = workspace.prepare({"ANTFLY_CI_FIXTURE_ROOT": root})
             second, _ = workspace.prepare({"ANTFLY_CI_FIXTURE_ROOT": root})
             self.assertFalse(mounted)
@@ -49,9 +67,13 @@ class FixtureWorkspaceTests(unittest.TestCase):
             run.assert_not_called()
 
     def test_denied_mount_removes_only_empty_directory(self):
-        with tempfile.TemporaryDirectory() as root, \
-             patch.object(Path, "exists", return_value=False), \
-             patch.object(workspace.subprocess, "run", return_value=SimpleNamespace(returncode=1)):
+        with (
+            tempfile.TemporaryDirectory() as root,
+            patch.object(Path, "exists", return_value=False),
+            patch.object(
+                workspace.subprocess, "run", return_value=SimpleNamespace(returncode=1)
+            ),
+        ):
             self.assertIsNone(workspace.prepare({"RUNNER_TEMP": root}))
             self.assertEqual(os.listdir(root), [])
 

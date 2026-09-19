@@ -118,3 +118,47 @@ for the centroid work limit and VOPR budget.
 Residual wide-vector time is chiefly insertion, sidecar persistence, and
 queries (about 4.8 / 1.9 / 3.4 seconds locally); reopening is about 1 ms. Further
 algorithm work should target those phases, not weaken the reopen assertions.
+
+
+## First Linux CI result
+
+[Run 35405408551, x86 job](https://github.com/antflydb/antfly/actions/runs/35405408551/job/105794404064)
+passed. The hermetic unit step took **28m37s**, versus **28m46s** in the baseline.
+These are two observed Linux runs, not controlled latency benchmarks. The
+retained logs contain 9,734 distinct timing records; only one exceeds 30s.
+The SDK job separately failed Ruff formatting for the two new workspace Python
+files. They have been formatted, the exact Python formatting gate passes
+(1,871 files), and all five workspace tests pass.
+
+| Requested fixture | Baseline CI seconds | Follow-up CI seconds |
+| --- | ---: | ---: |
+| Flushed overwrites | 49.56 | 62.58 |
+| Activation deferral | 32.59 | 0.74 |
+| Wide-vector update/reopen | 32.19 | 26.09 |
+| Decoded reuse (benchmark -> unit contract) | 30.12 | 10.73 |
+| Reopened PageRank | 29.29 | 27.23 |
+| Three-server VOPR record/replay | 27.23 | 20.06 |
+| Clean coalescing | 26.92 | 26.16 |
+| Repeated identity restore | 25.22 | 20.53 |
+| HTTP auth/admin middleware | 24.68 | 1.12 |
+| Compatible HITS fan-in | 23.79 | 11.29 |
+
+The trusted-main workflow again reported a denied tmpfs mount and disk fallback.
+The disk-dependent gains remain unvalidated until the runner volume is deployed.
+PageRank still spends 16.52s closing handles out of 27.23s total. The unchanged
+1,025-flush workload became slower in this run; do not treat runner-to-runner
+wall-clock differences as production regressions without controlled profiling.
+
+Deterministic work improvements did reproduce on Linux: wide-vector centroid
+work is exactly 778 recomputations / 100,278 members, and VOPR record/replay each
+uses 4,354 transitions and 187–189 rounds per node, within both new contracts.
+VOPR's remaining CI time is not explained by excess polling alone.
+
+The longest remaining tests are flushed overwrites (62.58s), graph warm rebuild
+across summary pages (28.24s), reopened PageRank (27.23s), clean coalescing
+(26.16s), and wide-vector updates (26.09s). Build-summary run steps still report
+about nine minutes for partitioned DB-core and eight minutes for storage support.
+These overlap other work and must not be added as elapsed time. Runtime graph
+metrics total 190.18s (previously 198.82s); HBC totals 128.13s (138.48s), while
+`graph.graph` totals 240.54s (204.67s). The improved individual tests therefore
+have not yet yielded a material reduction in the whole gate's critical path.
