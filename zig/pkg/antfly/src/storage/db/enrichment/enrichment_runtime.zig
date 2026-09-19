@@ -4135,46 +4135,20 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         var replay_cursor_dense = try loadReplayCursorForPass(self, self.applied_sequence, .dense);
         defer if (replay_cursor_dense) |*cursor| cursor.deinit(self.alloc);
 
-        var chunk_cache = std.ArrayListUnmanaged(WorkerChunkCacheEntry).empty;
-        defer freeWorkerChunkCache(self.alloc, &chunk_cache);
-        var request_plan_cache = std.ArrayListUnmanaged(RequestPlanCacheEntry).empty;
-        defer freeRequestPlanCache(self.alloc, &request_plan_cache);
-        var deferred_plain_dense = std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest).empty;
-        defer deferred_plain_dense.deinit(self.alloc);
-        var deferred_chunked_dense = std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest).empty;
-        defer deferred_chunked_dense.deinit(self.alloc);
-        var deferred_assets = std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest).empty;
-        defer deferred_assets.deinit(self.alloc);
-        var window = GeneratedReplayWindow{ .alloc = self.alloc };
-        defer window.deinit();
-        const max_window_items = generatedReplayWindowItems();
-        const max_preparation_items = generatedPreparationWindowItems();
         var processed_request_count: u64 = 0;
-
-        var max_seen = self.applied_sequence;
-        var last_processed: ?enrichment_worker.PendingDocumentGroup = null;
-        for (pending) |group| {
-            try guard.check();
-            max_seen = @max(max_seen, group.sequence);
-            if (replayCursorsCoverGroup(replay_cursor_assets, replay_cursor_dense, self.applied_sequence, group)) continue;
-            try processPendingDocumentGroup(self, group, &chunk_cache, &request_plan_cache, &deferred_plain_dense, &deferred_chunked_dense, &deferred_assets, &window, &processed_request_count, guard);
-            last_processed = group;
-            if (deferredGeneratedWorkShouldFlush(
-                deferred_plain_dense.items.len,
-                deferred_chunked_dense.items.len,
-                deferred_assets.items.len,
-                max_preparation_items,
-            )) {
-                // Cursor checkpoints are saved per-lane inside
-                // flushDeferredGeneratedWork as each stream durably publishes.
-                try flushDeferredGeneratedWork(self, &chunk_cache, &request_plan_cache, &deferred_plain_dense, &deferred_chunked_dense, &deferred_assets, &window, self.applied_sequence, group);
-            } else if (window.itemCount() >= max_window_items) {
-                try flushGeneratedReplayWindow(self, &window);
-                try saveReplayCursorForGroupBothStreams(self, self.applied_sequence, group);
-            }
-        }
-        try guard.check();
-        try flushDeferredGeneratedWork(self, &chunk_cache, &request_plan_cache, &deferred_plain_dense, &deferred_chunked_dense, &deferred_assets, &window, self.applied_sequence, last_processed);
+        var pipeline = LanePipeline.init(self);
+        // Draining unconditionally (not just on the success path) is what
+        // keeps cross-quantum pipelining from turning into abandoned
+        // concurrent work: a guard timeout/cancellation or scan-time error
+        // can still leave an earlier quantum's dispatched lane running in
+        // the background, and it must be awaited before this call returns.
+        const scan_result = runGeneratedCatchUpQuanta(self, pending, replay_cursor_assets, replay_cursor_dense, guard, &pipeline, &processed_request_count);
+        const drain_result = pipeline.drainAll();
+        var max_seen = scan_result catch |err| {
+            drain_result catch {};
+            return err;
+        };
+        try drain_result;
         if (pending.len == 0) {
             max_seen = sequence;
         }
@@ -6459,72 +6433,20 @@ fn runForegroundCatchUpPassOwned(
     try guard.check();
 
     var processed_request_count: u64 = 0;
-    var max_seen = runtime.applied_sequence;
-
-    while (true) {
-        if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
-        var chunk_cache = std.ArrayListUnmanaged(WorkerChunkCacheEntry).empty;
-        defer freeWorkerChunkCache(runtime.alloc, &chunk_cache);
-        var request_plan_cache = std.ArrayListUnmanaged(RequestPlanCacheEntry).empty;
-        defer freeRequestPlanCache(runtime.alloc, &request_plan_cache);
-        var deferred_plain_dense = std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest).empty;
-        defer deferred_plain_dense.deinit(runtime.alloc);
-        var deferred_chunked_dense = std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest).empty;
-        defer deferred_chunked_dense.deinit(runtime.alloc);
-        var deferred_assets = std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest).empty;
-        defer deferred_assets.deinit(runtime.alloc);
-        var window = GeneratedReplayWindow{ .alloc = runtime.alloc };
-        defer window.deinit();
-        const max_window_items = generatedReplayWindowItems();
-        const max_preparation_items = generatedPreparationWindowItems();
-
-        processed_request_count = 0;
-        max_seen = runtime.applied_sequence;
-        var last_processed: ?enrichment_worker.PendingDocumentGroup = null;
-
-        for (pending) |group| {
-            try guard.check();
-            max_seen = @max(max_seen, group.sequence);
-            if (replayCursorsCoverGroup(replay_cursor_assets, replay_cursor_dense, runtime.applied_sequence, group)) continue;
-            processPendingDocumentGroup(runtime, group, &chunk_cache, &request_plan_cache, &deferred_plain_dense, &deferred_chunked_dense, &deferred_assets, &window, &processed_request_count, guard) catch |err| {
-                if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return err;
-                // The embedder already performed its bounded inline retry
-                // budget. Yield durable pending work to the supervised
-                // worker/scheduler boundary instead of spinning this entire
-                // replay window without backoff.
-                return err;
-            };
-            last_processed = group;
-            if (deferredGeneratedWorkShouldFlush(
-                deferred_plain_dense.items.len,
-                deferred_chunked_dense.items.len,
-                deferred_assets.items.len,
-                max_preparation_items,
-            )) {
-                // Cursor checkpoints are saved per-lane inside
-                // flushDeferredGeneratedWork as each stream durably publishes.
-                flushDeferredGeneratedWork(runtime, &chunk_cache, &request_plan_cache, &deferred_plain_dense, &deferred_chunked_dense, &deferred_assets, &window, runtime.applied_sequence, group) catch |err| {
-                    if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return err;
-                    return err;
-                };
-            } else {
-                const publish_window = window.itemCount() >= max_window_items;
-                flushGeneratedReplayWindowIfNeeded(runtime, &window, max_window_items) catch |err| {
-                    if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return err;
-                    return err;
-                };
-                if (publish_window) {
-                    try saveReplayCursorForGroupBothStreams(runtime, runtime.applied_sequence, group);
-                }
-            }
-        }
-        try guard.check();
-        flushDeferredGeneratedWork(runtime, &chunk_cache, &request_plan_cache, &deferred_plain_dense, &deferred_chunked_dense, &deferred_assets, &window, runtime.applied_sequence, last_processed) catch |err| {
-            if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return err;
-            return err;
-        };
-        break;
-    }
+    var pipeline = LanePipeline.init(runtime);
+    if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
+    // Draining unconditionally (not just on the success path) is what keeps
+    // cross-quantum pipelining from turning into abandoned concurrent work:
+    // a guard timeout/cancellation or scan-time error can still leave an
+    // earlier quantum's dispatched lane running in the background, and it
+    // must be awaited before this call returns.
+    const scan_result = runGeneratedCatchUpQuanta(runtime, pending, replay_cursor_assets, replay_cursor_dense, guard, &pipeline, &processed_request_count);
+    const drain_result = pipeline.drainAll();
+    var max_seen = scan_result catch |err| {
+        drain_result catch {};
+        return err;
+    };
+    try drain_result;
     if (pending.len == 0) {
         max_seen = target_sequence;
     }
@@ -10710,6 +10632,13 @@ fn processPendingDocumentGroup(
 /// private window and replay cursor scope so it can publish independently of
 /// the dense-embedding lane; see "Two-Stream Execution Model" in
 /// ENRICHMENTS.md.
+///
+/// Every field here is dispatch-owned: `requests` is a clone independent of
+/// `request_plan_cache`'s lifetime (never a borrow of it), so the caller may
+/// reuse or clear its own queues and caches the instant dispatch returns,
+/// even while this lane's `run` is still executing concurrently in a later
+/// preparation quantum. `deinitOwned` frees that owned state and must only
+/// run after `run` has returned (synchronously, or via an awaited future).
 const AssetExecutionLane = struct {
     runtime: *EnrichmentRuntime,
     requests: []const enrichment_types.GeneratedEnrichmentRequest,
@@ -10717,7 +10646,7 @@ const AssetExecutionLane = struct {
     applied_sequence: u64,
     group: ?enrichment_worker.PendingDocumentGroup,
 
-    fn run(self: *AssetExecutionLane) !void {
+    fn run(self: *AssetExecutionLane) anyerror!void {
         if (runtimeShuttingDown(self.runtime)) return error.EnrichmentRetryAborted;
         var deferred_retry_error: ?anyerror = null;
         var deferred_retry_fingerprint: u64 = 0;
@@ -10739,21 +10668,31 @@ const AssetExecutionLane = struct {
         }
         if (self.group) |group| try saveReplayCursorForGroup(self.runtime, .assets, self.applied_sequence, group);
     }
+
+    fn deinitOwned(self: *AssetExecutionLane) void {
+        self.window.deinit();
+        enrichment_types.deinitGeneratedRequests(self.runtime.alloc, self.requests);
+    }
 };
 
 /// The dense-embedding execution lane (plain-document and chunked sources).
 /// Owns a private window and replay cursor scope, independent of the sibling
-/// asset-producer lane.
+/// asset-producer lane. `plain_dense`/`chunked_dense` are dispatch-owned
+/// clones and `chunk_cache_storage` is the caller's chunk cache moved
+/// wholesale (dense is its only reader, so no clone is needed); see
+/// `AssetExecutionLane`'s doc comment for the ownership contract this
+/// mirrors.
 const DenseExecutionLane = struct {
     runtime: *EnrichmentRuntime,
     plain_dense: []const enrichment_types.GeneratedEnrichmentRequest,
     chunked_dense: []const enrichment_types.GeneratedEnrichmentRequest,
     chunk_cache: *std.ArrayListUnmanaged(WorkerChunkCacheEntry),
+    chunk_cache_storage: std.ArrayListUnmanaged(WorkerChunkCacheEntry) = .empty,
     window: GeneratedReplayWindow,
     applied_sequence: u64,
     group: ?enrichment_worker.PendingDocumentGroup,
 
-    fn run(self: *DenseExecutionLane) !void {
+    fn run(self: *DenseExecutionLane) anyerror!void {
         if (runtimeShuttingDown(self.runtime)) return error.EnrichmentRetryAborted;
         var deferred_retry_error: ?anyerror = null;
         var deferred_retry_fingerprint: u64 = 0;
@@ -10784,24 +10723,225 @@ const DenseExecutionLane = struct {
         }
         if (self.group) |group| try saveReplayCursorForGroup(self.runtime, .dense, self.applied_sequence, group);
     }
+
+    fn deinitOwned(self: *DenseExecutionLane) void {
+        self.window.deinit();
+        enrichment_types.deinitGeneratedRequests(self.runtime.alloc, self.plain_dense);
+        enrichment_types.deinitGeneratedRequests(self.runtime.alloc, self.chunked_dense);
+        freeWorkerChunkCache(self.runtime.alloc, &self.chunk_cache_storage);
+    }
 };
 
-/// Finish one bounded preparation quantum and publish all output before
-/// inspecting more source documents. Request and chunk caches own the strings
-/// borrowed by the deferred queues, so they are cleared only after every queue
-/// has completed and both derived windows are durable.
+fn concurrencyIo(runtime: *EnrichmentRuntime) Io {
+    return if (runtime.io_impl) |impl| impl.io() else std.Io.Threaded.global_single_threaded.io();
+}
+
+fn prepareAssetLane(
+    runtime: *EnrichmentRuntime,
+    deferred_assets: *std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest),
+    applied_sequence: u64,
+    group: ?enrichment_worker.PendingDocumentGroup,
+) !*AssetExecutionLane {
+    // Clone rather than move: `deferred_assets`'s values borrow their string
+    // fields from `request_plan_cache`, which is cleared once both lanes
+    // have been *dispatched* for this quantum (not once they finish -- that
+    // would defeat cross-quantum pipelining). An independent owned copy
+    // decouples this lane's lifetime from request_plan_cache's entirely,
+    // which is what makes it safe for the lane to keep running after
+    // dispatch returns. This is the confirmed root cause fix from the
+    // lane-pipelining handoff: the previous attempt moved the *list* out but
+    // left request_plan_cache itself freed unconditionally underneath it.
+    const owned = try enrichment_types.cloneGeneratedRequests(runtime.alloc, deferred_assets.items);
+    errdefer enrichment_types.deinitGeneratedRequests(runtime.alloc, owned);
+
+    const lane = try runtime.alloc.create(AssetExecutionLane);
+    lane.* = .{
+        .runtime = runtime,
+        .requests = owned,
+        .window = .{ .alloc = runtime.alloc },
+        .applied_sequence = applied_sequence,
+        .group = group,
+    };
+    deferred_assets.clearRetainingCapacity();
+    return lane;
+}
+
+fn prepareDenseLane(
+    runtime: *EnrichmentRuntime,
+    deferred_plain_dense: *std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest),
+    deferred_chunked_dense: *std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest),
+    chunk_cache: *std.ArrayListUnmanaged(WorkerChunkCacheEntry),
+    applied_sequence: u64,
+    group: ?enrichment_worker.PendingDocumentGroup,
+) !*DenseExecutionLane {
+    const owned_plain = try enrichment_types.cloneGeneratedRequests(runtime.alloc, deferred_plain_dense.items);
+    errdefer enrichment_types.deinitGeneratedRequests(runtime.alloc, owned_plain);
+    const owned_chunked = try enrichment_types.cloneGeneratedRequests(runtime.alloc, deferred_chunked_dense.items);
+    errdefer enrichment_types.deinitGeneratedRequests(runtime.alloc, owned_chunked);
+
+    const lane = try runtime.alloc.create(DenseExecutionLane);
+    lane.* = .{
+        .runtime = runtime,
+        .plain_dense = owned_plain,
+        .chunked_dense = owned_chunked,
+        .chunk_cache = undefined,
+        // Dense is chunk_cache's only reader, so move it wholesale instead
+        // of cloning every cached chunk's text.
+        .chunk_cache_storage = chunk_cache.*,
+        .window = .{ .alloc = runtime.alloc },
+        .applied_sequence = applied_sequence,
+        .group = group,
+    };
+    lane.chunk_cache = &lane.chunk_cache_storage;
+
+    deferred_plain_dense.clearRetainingCapacity();
+    deferred_chunked_dense.clearRetainingCapacity();
+    chunk_cache.* = .empty;
+    return lane;
+}
+
+/// Cross-quantum pipeline for the two execution lanes. Bounds in-flight work
+/// to exactly one preparation quantum per lane: dispatching a new quantum for
+/// a lane first awaits (and frees) that same lane's previous quantum, but a
+/// dispatch never waits on the *sibling* lane, so a fast lane's quanta keep
+/// flowing while a slow sibling lane is still catching up. See "Two-Stream
+/// Execution Model" in ENRICHMENTS.md.
+const LanePipeline = struct {
+    const AssetInFlight = struct {
+        lane: *AssetExecutionLane,
+        future: std.Io.Future(anyerror!void),
+    };
+    const DenseInFlight = struct {
+        lane: *DenseExecutionLane,
+        future: std.Io.Future(anyerror!void),
+    };
+
+    runtime: *EnrichmentRuntime,
+    asset_inflight: ?AssetInFlight = null,
+    dense_inflight: ?DenseInFlight = null,
+
+    fn init(runtime: *EnrichmentRuntime) LanePipeline {
+        return .{ .runtime = runtime };
+    }
+
+    /// Await and free the asset lane's in-flight quantum, if any. A no-op
+    /// when nothing is in flight.
+    fn drainAsset(self: *LanePipeline) !void {
+        const inflight = self.asset_inflight orelse return;
+        self.asset_inflight = null;
+        var future = inflight.future;
+        const result = future.await(concurrencyIo(self.runtime));
+        inflight.lane.deinitOwned();
+        self.runtime.alloc.destroy(inflight.lane);
+        return result;
+    }
+
+    /// Await and free the dense lane's in-flight quantum, if any.
+    fn drainDense(self: *LanePipeline) !void {
+        const inflight = self.dense_inflight orelse return;
+        self.dense_inflight = null;
+        var future = inflight.future;
+        const result = future.await(concurrencyIo(self.runtime));
+        inflight.lane.deinitOwned();
+        self.runtime.alloc.destroy(inflight.lane);
+        return result;
+    }
+
+    /// Await and free every in-flight quantum regardless of outcome, so a
+    /// spawned future is never abandoned even when one lane's drain fails.
+    /// Preserves the historical asset-then-dense error priority. Cancellation
+    /// and pass-abort paths alike must call this before returning: an
+    /// in-flight lane future is real background work that must be awaited,
+    /// not abandoned.
+    fn drainAll(self: *LanePipeline) !void {
+        const asset_result = self.drainAsset();
+        const dense_result = self.drainDense();
+        asset_result catch |err| {
+            dense_result catch {};
+            return err;
+        };
+        return dense_result;
+    }
+
+    /// Dispatch this quantum's asset-producer work, if any, without
+    /// awaiting it. A previous in-flight asset quantum (bounded to one) is
+    /// awaited and freed first.
+    fn dispatchAsset(
+        self: *LanePipeline,
+        deferred_assets: *std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest),
+        applied_sequence: u64,
+        group: ?enrichment_worker.PendingDocumentGroup,
+    ) !void {
+        if (deferred_assets.items.len == 0) return;
+        try self.drainAsset();
+
+        const runtime = self.runtime;
+        const lane = try prepareAssetLane(runtime, deferred_assets, applied_sequence, group);
+        const io = concurrencyIo(runtime);
+        if (io.concurrent(AssetExecutionLane.run, .{lane})) |future| {
+            self.asset_inflight = .{ .lane = lane, .future = future };
+            return;
+        } else |_| {
+            // This Io backend does not support concurrency (for example a
+            // deterministic single-flow simulation harness). Run inline;
+            // correctness is unaffected, only the cross-quantum overlap is
+            // lost for this backend.
+            const result = AssetExecutionLane.run(lane);
+            lane.deinitOwned();
+            runtime.alloc.destroy(lane);
+            return result;
+        }
+    }
+
+    /// Dispatch this quantum's dense-embedding work, if any, without
+    /// awaiting it. A previous in-flight dense quantum (bounded to one) is
+    /// awaited and freed first.
+    fn dispatchDense(
+        self: *LanePipeline,
+        deferred_plain_dense: *std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest),
+        deferred_chunked_dense: *std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest),
+        chunk_cache: *std.ArrayListUnmanaged(WorkerChunkCacheEntry),
+        applied_sequence: u64,
+        group: ?enrichment_worker.PendingDocumentGroup,
+    ) !void {
+        if (deferred_plain_dense.items.len == 0 and deferred_chunked_dense.items.len == 0) return;
+        try self.drainDense();
+
+        const runtime = self.runtime;
+        const lane = try prepareDenseLane(runtime, deferred_plain_dense, deferred_chunked_dense, chunk_cache, applied_sequence, group);
+        const io = concurrencyIo(runtime);
+        if (io.concurrent(DenseExecutionLane.run, .{lane})) |future| {
+            self.dense_inflight = .{ .lane = lane, .future = future };
+            return;
+        } else |_| {
+            const result = DenseExecutionLane.run(lane);
+            lane.deinitOwned();
+            runtime.alloc.destroy(lane);
+            return result;
+        }
+    }
+};
+
+/// Finish one bounded preparation quantum: publish the shared synchronous
+/// window, then dispatch (without awaiting) whichever of the two execution
+/// lanes has new work, bounded to one in-flight quantum per lane by
+/// `LanePipeline`. Request and chunk caches are drained into the dispatched
+/// lanes' own memory before this function returns, so the caller may reuse
+/// them for the next quantum's scan immediately, even while a lane's `run` is
+/// still executing concurrently in the background.
 ///
 /// The asset-producer (extraction) and dense-embedding classes run as two
 /// independent execution lanes so each provider's model stays resident and
 /// serves consecutive batches without waiting on the other's round trip. Each
 /// lane owns a private `GeneratedReplayWindow` and publishes (and checkpoints
 /// its own replay cursor) as soon as its own work is durable -- neither lane
-/// blocks on the other's completion. A fatal (non-retryable) error in one
-/// lane no longer prevents the sibling lane's independent, crash-idempotent
-/// work from being attempted and published in the same quantum; see
-/// "Two-Stream Execution Model" in ENRICHMENTS.md.
-fn flushDeferredGeneratedWork(
-    runtime: *EnrichmentRuntime,
+/// blocks on the other's completion, nor on a lane's own previous quantum
+/// finishing before the *next* quantum's documents are scanned. A fatal
+/// (non-retryable) error in one lane no longer prevents the sibling lane's
+/// independent, crash-idempotent work from being attempted and published in
+/// the same quantum; see "Two-Stream Execution Model" in ENRICHMENTS.md.
+fn dispatchDeferredGeneratedWork(
+    pipeline: *LanePipeline,
     chunk_cache: *std.ArrayListUnmanaged(WorkerChunkCacheEntry),
     request_plan_cache: *std.ArrayListUnmanaged(RequestPlanCacheEntry),
     deferred_plain_dense: *std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest),
@@ -10811,6 +10951,7 @@ fn flushDeferredGeneratedWork(
     applied_sequence: u64,
     group: ?enrichment_worker.PendingDocumentGroup,
 ) !void {
+    const runtime = pipeline.runtime;
     if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
     // Publish any synchronous inline writes (chunk_text, sparse_embedding, and
     // copy/document_extraction assets) the single-threaded scan already
@@ -10818,63 +10959,91 @@ fn flushDeferredGeneratedWork(
     // below start, each with its own private window.
     try flushGeneratedReplayWindow(runtime, window);
 
-    var asset_lane = AssetExecutionLane{
-        .runtime = runtime,
-        .requests = deferred_assets.items,
-        .window = .{ .alloc = runtime.alloc },
-        .applied_sequence = applied_sequence,
-        .group = group,
-    };
-    defer asset_lane.window.deinit();
-    var dense_lane = DenseExecutionLane{
-        .runtime = runtime,
-        .plain_dense = deferred_plain_dense.items,
-        .chunked_dense = deferred_chunked_dense.items,
-        .chunk_cache = chunk_cache,
-        .window = .{ .alloc = runtime.alloc },
-        .applied_sequence = applied_sequence,
-        .group = group,
-    };
-    defer dense_lane.window.deinit();
+    // Dispatch both lanes unconditionally (even if the asset dispatch below
+    // fails) so a fatal error in one lane never prevents the sibling lane's
+    // own quantum from being attempted and durably published; see the
+    // "Two-Stream Execution Model" doc comment above.
+    const asset_result = pipeline.dispatchAsset(deferred_assets, applied_sequence, group);
+    const dense_result = pipeline.dispatchDense(deferred_plain_dense, deferred_chunked_dense, chunk_cache, applied_sequence, group);
 
-    var asset_result: anyerror!void = {};
-    var dense_result: anyerror!void = {};
-    // Only worth a concurrent task when both lanes have real provider work to
-    // overlap; an empty lane's own run() call is a cheap no-op either way.
-    const both_lanes_have_work = asset_lane.requests.len > 0 and
-        (dense_lane.plain_dense.len > 0 or dense_lane.chunked_dense.len > 0);
-
-    if (both_lanes_have_work) {
-        const io = if (runtime.io_impl) |impl| impl.io() else std.Io.Threaded.global_single_threaded.io();
-        if (io.concurrent(AssetExecutionLane.run, .{&asset_lane})) |spawned| {
-            var future = spawned;
-            dense_result = DenseExecutionLane.run(&dense_lane);
-            asset_result = future.await(io);
-        } else |_| {
-            // This Io backend does not support concurrency (for example a
-            // deterministic single-flow simulation harness). Fall back to the
-            // historical strictly sequential order; correctness is
-            // unaffected, only the overlap is lost.
-            asset_result = AssetExecutionLane.run(&asset_lane);
-            dense_result = DenseExecutionLane.run(&dense_lane);
-        }
-    } else {
-        asset_result = AssetExecutionLane.run(&asset_lane);
-        dense_result = DenseExecutionLane.run(&dense_lane);
-    }
-
-    deferred_assets.clearRetainingCapacity();
-    deferred_plain_dense.clearRetainingCapacity();
-    deferred_chunked_dense.clearRetainingCapacity();
-    clearWorkerChunkCache(runtime.alloc, chunk_cache);
+    // Every request queued for this quantum has now either been cloned into
+    // whichever lane(s) dispatch created, or freed by a failed dispatch
+    // above; chunk_cache has been moved wholesale into the dense lane (or
+    // left untouched by a failed dense dispatch, in which case the whole
+    // pass is about to abort anyway). request_plan_cache's backing strings
+    // are no longer borrowed by anything reachable from here, so it is safe
+    // to clear it now regardless of how long the dispatched lanes actually
+    // take to finish running in the background.
     clearRequestPlanCache(runtime.alloc, request_plan_cache);
 
     // Preserve the historical error priority (assets, then dense) for
-    // whichever representative error a lane returns. Each lane has already
-    // recorded its own retry authorization and cursor state before
-    // returning, independent of the other lane's outcome.
-    asset_result catch |err| return err;
-    dense_result catch |err| return err;
+    // whichever representative error a lane returns.
+    asset_result catch |err| {
+        dense_result catch {};
+        return err;
+    };
+    try dense_result;
+}
+
+/// Shared quantum-scanning loop for both foreground catch-up entry points
+/// (the background-worker pass in `runForegroundCatchUpPassOwned` and Lite's
+/// synchronous `catchUpUntilGuarded` manual-maintenance drive). Returns the
+/// highest sequence observed across `pending`.
+///
+/// The caller owns `pipeline` and must drain it (`LanePipeline.drainAll`)
+/// after this returns, whether it returns an error or not: a guard
+/// timeout/cancellation or a scan-time error here can still leave an earlier
+/// quantum's dispatched lane running in the background, and it must be
+/// awaited, never abandoned.
+fn runGeneratedCatchUpQuanta(
+    runtime: *EnrichmentRuntime,
+    pending: []const enrichment_worker.PendingDocumentGroup,
+    replay_cursor_assets: ?enrichment_state.ReplayCursor,
+    replay_cursor_dense: ?enrichment_state.ReplayCursor,
+    guard: ForegroundCatchUpGuard,
+    pipeline: *LanePipeline,
+    processed_request_count: *u64,
+) !u64 {
+    var chunk_cache = std.ArrayListUnmanaged(WorkerChunkCacheEntry).empty;
+    defer freeWorkerChunkCache(runtime.alloc, &chunk_cache);
+    var request_plan_cache = std.ArrayListUnmanaged(RequestPlanCacheEntry).empty;
+    defer freeRequestPlanCache(runtime.alloc, &request_plan_cache);
+    var deferred_plain_dense = std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest).empty;
+    defer deferred_plain_dense.deinit(runtime.alloc);
+    var deferred_chunked_dense = std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest).empty;
+    defer deferred_chunked_dense.deinit(runtime.alloc);
+    var deferred_assets = std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest).empty;
+    defer deferred_assets.deinit(runtime.alloc);
+    var window = GeneratedReplayWindow{ .alloc = runtime.alloc };
+    defer window.deinit();
+    const max_window_items = generatedReplayWindowItems();
+    const max_preparation_items = generatedPreparationWindowItems();
+
+    var max_seen = runtime.applied_sequence;
+    var last_processed: ?enrichment_worker.PendingDocumentGroup = null;
+    for (pending) |group| {
+        try guard.check();
+        max_seen = @max(max_seen, group.sequence);
+        if (replayCursorsCoverGroup(replay_cursor_assets, replay_cursor_dense, runtime.applied_sequence, group)) continue;
+        try processPendingDocumentGroup(runtime, group, &chunk_cache, &request_plan_cache, &deferred_plain_dense, &deferred_chunked_dense, &deferred_assets, &window, processed_request_count, guard);
+        last_processed = group;
+        if (deferredGeneratedWorkShouldFlush(
+            deferred_plain_dense.items.len,
+            deferred_chunked_dense.items.len,
+            deferred_assets.items.len,
+            max_preparation_items,
+        )) {
+            // Cursor checkpoints are saved per-lane inside dispatch as each
+            // stream durably publishes.
+            try dispatchDeferredGeneratedWork(pipeline, &chunk_cache, &request_plan_cache, &deferred_plain_dense, &deferred_chunked_dense, &deferred_assets, &window, runtime.applied_sequence, group);
+        } else if (window.itemCount() >= max_window_items) {
+            try flushGeneratedReplayWindow(runtime, &window);
+            try saveReplayCursorForGroupBothStreams(runtime, runtime.applied_sequence, group);
+        }
+    }
+    try guard.check();
+    try dispatchDeferredGeneratedWork(pipeline, &chunk_cache, &request_plan_cache, &deferred_plain_dense, &deferred_chunked_dense, &deferred_assets, &window, runtime.applied_sequence, last_processed);
+    return max_seen;
 }
 
 fn processAsset(

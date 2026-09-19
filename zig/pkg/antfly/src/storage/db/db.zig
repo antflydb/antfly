@@ -65861,6 +65861,38 @@ const GateAssetProducer = struct {
     }
 };
 
+/// An asset producer whose `produce` call parks on `allowed` until the test
+/// explicitly releases it, tracking whether a call has started and whether
+/// it has returned. Used to prove cross-quantum lane pipelining: dispatching
+/// a later quantum (of either lane) must not depend on this call returning.
+const SlowGatedAssetProducer = struct {
+    allowed: std.atomic.Value(bool) = .init(false),
+    calls: std.atomic.Value(usize) = .init(0),
+    started: std.atomic.Value(bool) = .init(false),
+    finished: std.atomic.Value(bool) = .init(false),
+
+    fn produce(ptr: *anyopaque, alloc: Allocator, request: asset_producer_mod.Request) ![]u8 {
+        const self: *SlowGatedAssetProducer = @ptrCast(@alignCast(ptr));
+        self.started.store(true, .release);
+        _ = self.calls.fetchAdd(1, .monotonic);
+        while (!self.allowed.load(.acquire)) sleepNs(2 * std.time.ns_per_ms);
+        const out = try std.fmt.allocPrint(alloc, "asset:{s}", .{request.source_text});
+        self.finished.store(true, .release);
+        return out;
+    }
+
+    fn interface(self: *@This()) asset_producer_mod.Producer {
+        return .{ .ptr = self, .vtable = &.{
+            .produce = produce,
+            .invocation_memory_for_requests = GateAssetProducer.invocationMemory,
+        } };
+    }
+
+    fn allow(self: *@This()) void {
+        self.allowed.store(true, .release);
+    }
+};
+
 const CountingSparseEmbedder = struct {
     deterministic: embedder_mod.DeterministicSparseEmbedder = .{},
     calls: usize = 0,
@@ -89365,6 +89397,256 @@ test "db blocked dense embedding lane does not force the independent asset lane 
     // The already-checkpointed asset lane is not redone once the sibling
     // dense lane finally publishes.
     try std.testing.expectEqual(first_asset_successes, gated_asset.successful_requests.load(.acquire));
+}
+
+test "cross-quantum lane pipelining publishes a fast dense quantum while a slower asset quantum is still in flight" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    const c = struct {
+        extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+        extern fn unsetenv(name: [*:0]const u8) c_int;
+    };
+    const window_env = "ANTFLY_ENRICHMENT_PREPARATION_WINDOW_ITEMS";
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(window_env, "1", 1));
+    defer _ = c.unsetenv(window_env);
+
+    var slow_asset = SlowGatedAssetProducer{};
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .asset_producer = slow_asset.interface(),
+            .dense_embedder = deterministic.interface(),
+            .inline_retry_max_attempts = 1,
+        },
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    // Safety net, evaluated (LIFO) before the `db.close()` defer above: if
+    // any assertion below fails before the explicit `slow_asset.allow()`
+    // call, this still releases the parked producer so `db.close()`'s
+    // shutdown drain cannot hang the whole test binary waiting on a gate
+    // nothing will ever open. Calling `allow()` twice is harmless (it is a
+    // one-way latch).
+    defer slow_asset.allow();
+
+    try db.addEnrichment(.{
+        .name = "summary_v1",
+        .kind = .asset,
+        .field = "body",
+        .content_type = "text/plain",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}",
+    });
+    try db.addIndex(.{
+        .name = "title_dense",
+        .kind = .dense_vector,
+        .config_json =
+        \\{"field":"embedding","dims":3,"publication_policy":"progressive","generator":{"kind":"dense_embedding","source_field":"title","embedding_name":"title_dense"}}
+        ,
+    });
+
+    // doc:a has only "body" (queues asset-lane work -- quantum 1); doc:b has
+    // only "title" (queues dense-lane work -- quantum 2, scanned strictly
+    // after quantum 1). The preparation window is forced to 1 item, so these
+    // become two separate preparation quanta instead of one shared quantum
+    // (within-quantum concurrency already worked before this change; the
+    // bug this test targets is specifically about a *later* quantum's
+    // dispatch waiting on an *earlier* quantum's still-running lane).
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"alpha summary source\"}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"independent title\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    // Poll until the asset lane's producer call has started but not yet
+    // returned. The historical bug dispatched quantum 1's asset lane
+    // synchronously-to-the-caller: the scan (and therefore quantum 2's
+    // dispatch) could not proceed until this call returned.
+    var attempts: usize = 0;
+    var caught_overlap = false;
+    while (attempts < default_test_wait_attempts) : (attempts += 1) {
+        if (slow_asset.started.load(.acquire) and !slow_asset.finished.load(.acquire)) {
+            caught_overlap = true;
+            break;
+        }
+        sleepPollInterval();
+    }
+    try std.testing.expect(caught_overlap);
+    try std.testing.expect(!slow_asset.finished.load(.acquire));
+
+    // The dense lane's quantum -- scanned strictly after the still-in-flight
+    // asset quantum -- must already have been dispatched, run, published,
+    // and checkpointed its own replay cursor scope, independent of the
+    // sibling asset lane's own quantum still being in flight; see
+    // "Two-Stream Execution Model" in ENRICHMENTS.md.
+    var dense_cursor_seen = false;
+    attempts = 0;
+    while (attempts < default_test_wait_attempts) : (attempts += 1) {
+        if (try enrichment_state.loadReplayCursor(alloc, db.enrichment_runtime.?.store, "generated.dense")) |cursor| {
+            var owned = cursor;
+            owned.deinit(alloc);
+            dense_cursor_seen = true;
+            break;
+        }
+        if (slow_asset.finished.load(.acquire)) break;
+        sleepPollInterval();
+    }
+    try std.testing.expect(dense_cursor_seen);
+    // The overlap was real, not a lucky race after the asset call already
+    // returned: it was still parked when the dense cursor appeared.
+    try std.testing.expect(!slow_asset.finished.load(.acquire));
+
+    slow_asset.allow();
+    try db.runUntilIdle();
+
+    // Both lanes' work is durable and correct once the whole pass has
+    // drained -- the dense cursor observed above while asset was still
+    // parked was real published progress, not a stale/partial artifact.
+    var result = try db.search(alloc, .{
+        .index_name = "title_dense",
+        .dense = .{ .vector = &.{ 1.0, 0.0, 0.0 }, .k = 1 },
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+
+    const artifact_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "summary_v1");
+    defer alloc.free(artifact_key);
+    const artifact_value = try db.core.store.get(alloc, artifact_key);
+    defer alloc.free(artifact_value);
+    try std.testing.expectEqualStrings("asset:alpha summary source", artifact_value);
+    try std.testing.expectEqual(@as(usize, 1), slow_asset.calls.load(.acquire));
+}
+
+test "cross-quantum dispatch clones queued requests so later caller reuse cannot corrupt an in-flight asset quantum" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    const c = struct {
+        extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+        extern fn unsetenv(name: [*:0]const u8) c_int;
+    };
+    const window_env = "ANTFLY_ENRICHMENT_PREPARATION_WINDOW_ITEMS";
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(window_env, "1", 1));
+    defer _ = c.unsetenv(window_env);
+
+    var slow_asset = SlowGatedAssetProducer{};
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    // Manual/hosted maintenance mode (Lite's synchronous `catchUpUntilGuarded`
+    // drive, e.g. `runUntilIdle` called from the app thread), not the
+    // background worker -- this test exercises that path specifically.
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_optional_runtime_workers = false,
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .asset_producer = slow_asset.interface(),
+            .dense_embedder = deterministic.interface(),
+            .inline_retry_max_attempts = 1,
+        },
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    // Safety net, evaluated (LIFO) before the `db.close()` defer above: if
+    // any assertion below fails before the unblocker thread (or its
+    // explicit `allow()`) runs, this still releases the parked producer so
+    // `db.close()`'s shutdown drain cannot hang the whole test binary
+    // waiting on a gate nothing will ever open. Calling `allow()` twice is
+    // harmless (it is a one-way latch).
+    defer slow_asset.allow();
+
+    try db.addEnrichment(.{
+        .name = "summary_v1",
+        .kind = .asset,
+        .field = "body",
+        .content_type = "text/plain",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}",
+    });
+    try db.addIndex(.{
+        .name = "title_dense",
+        .kind = .dense_vector,
+        .config_json =
+        \\{"field":"embedding","dims":3,"publication_policy":"progressive","generator":{"kind":"dense_embedding","source_field":"title","embedding_name":"title_dense"}}
+        ,
+    });
+
+    // doc:a queues the (parked) asset quantum first. The 24 dense-only
+    // documents that follow each become their own preparation quantum
+    // (window = 1 item): every one of those quanta clones its own request,
+    // dispatches, publishes, and repeatedly reallocates/frees
+    // request_plan_cache and the deferred-request lists while doc:a's asset
+    // quantum is still parked inside its producer call. If the asset lane's
+    // request were still borrowing its doc_key/source_field strings from
+    // request_plan_cache -- the confirmed root cause of the reverted first
+    // pipelining attempt -- this churn would read freed/reused memory by
+    // the time the producer call actually reads them, corrupting or
+    // crashing instead of producing "doc:a"'s own artifact. Running under
+    // `std.testing.allocator` also catches any use-after-free directly.
+    const dense_doc_count = 24;
+    var writes: [1 + dense_doc_count]types.BatchWrite = undefined;
+    writes[0] = .{ .key = "doc:a", .value = "{\"body\":\"alpha summary source\"}" };
+    var dense_keys: [dense_doc_count][]u8 = undefined;
+    var dense_values: [dense_doc_count][]u8 = undefined;
+    for (0..dense_doc_count) |i| {
+        dense_keys[i] = try std.fmt.allocPrint(alloc, "doc:b{d}", .{i});
+        dense_values[i] = try std.fmt.allocPrint(alloc, "{{\"title\":\"independent title {d}\"}}", .{i});
+        writes[1 + i] = .{ .key = dense_keys[i], .value = dense_values[i] };
+    }
+    defer for (0..dense_doc_count) |i| {
+        alloc.free(dense_keys[i]);
+        alloc.free(dense_values[i]);
+    };
+
+    try db.batch(.{ .writes = &writes, .sync_level = .write });
+
+    const sequence = db.core.nextEnrichmentSequence();
+
+    const Unblocker = struct {
+        fn run(producer: *SlowGatedAssetProducer) void {
+            // Give the manual drive time to dispatch doc:a's asset quantum
+            // and churn through every dense-only quantum before releasing
+            // the parked producer call.
+            sleepNs(80 * std.time.ns_per_ms);
+            producer.allow();
+        }
+    };
+    const unblock_thread = try std.Thread.spawn(.{}, Unblocker.run, .{&slow_asset});
+    defer unblock_thread.join();
+
+    try db.runEnrichmentUntil(sequence);
+
+    try std.testing.expectEqual(@as(usize, 1), slow_asset.calls.load(.acquire));
+    try std.testing.expect(slow_asset.finished.load(.acquire));
+
+    const artifact_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "summary_v1");
+    defer alloc.free(artifact_key);
+    const artifact_value = try db.core.store.get(alloc, artifact_key);
+    defer alloc.free(artifact_value);
+    try std.testing.expectEqualStrings("asset:alpha summary source", artifact_value);
+
+    // Durable coverage accounting (not approximate vector-search recall) is
+    // the exact signal that every one of the 24 independently dispatched
+    // dense quanta produced and published its own embedding correctly
+    // despite the concurrent request_plan_cache/chunk_cache churn.
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    for (stats.indexes) |index_stats| {
+        if (!std.mem.eql(u8, index_stats.name, "title_dense")) continue;
+        try std.testing.expectEqual(@as(u64, dense_doc_count), index_stats.coverage_produced_count);
+        try std.testing.expectEqual(@as(u64, 0), index_stats.coverage_terminal_failed_count);
+    }
 }
 
 test "db managed dense enrichment retries temporary model capacity without terminal coverage" {

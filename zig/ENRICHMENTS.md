@@ -172,17 +172,46 @@ extract-then-embed pipeline. Each lane:
   lane, `generated.dense` for the dense lane) immediately after its own
   publish succeeds, independent of the sibling lane's progress.
 
-Both lanes are handed the same document group's classified work and, when
-both have real work for the quantum, are scheduled with `Io.concurrent` so
-their provider round trips overlap; the calling task runs the dense lane
-inline while awaiting the concurrently spawned asset lane. If the `Io`
-backend does not support concurrency (for example a deterministic
-single-flow VOPR/simulation harness), both lanes still run, just
-sequentially, with identical outcomes -- concurrency is a scheduling
-optimization, not a correctness requirement. In-flight work is bounded to
-exactly one preparation quantum per lane (no deeper cross-quantum
-pipelining in this slice), so memory stays bounded to today's window sizes
-without new configuration.
+Both lanes are handed the same document group's classified work and are
+dispatched with `Io.concurrent` so their provider round trips overlap. If the
+`Io` backend does not support concurrency (for example a deterministic
+single-flow VOPR/simulation harness), a lane runs inline instead --
+concurrency is a scheduling optimization, not a correctness requirement.
+
+Overlap is not limited to the two lanes within one preparation quantum: each
+lane also pipelines *across* quanta. `LanePipeline` dispatches a quantum's
+lane work without awaiting it, so the foreground scan can immediately move on
+to classifying the next quantum's documents instead of idling until the
+slower sibling lane's current quantum finishes. In-flight work is bounded to
+exactly one preparation quantum *per lane* (not per pass): dispatching lane
+L's next quantum first awaits and frees lane L's previous quantum, but never
+waits on the sibling lane, so wall time for a pass approaches
+`max(extract_ns, embed_ns)` instead of their sum once both lanes have steady
+work. Memory therefore stays bounded to at most two in-flight quanta (one per
+lane) at any time, not the whole backlog.
+
+Making a quantum's lane work independent of the calling scan's own state
+requires every value the dispatched lane reads to be owned by that lane, not
+borrowed from a cache the scan will keep mutating for the next quantum.
+`LanePipeline` clones the queued `GeneratedEnrichmentRequest` values (deep
+copy, since `request_plan_cache` -- which owns their backing strings -- is
+cleared as soon as *both* lanes for a quantum have been dispatched, not once
+they finish) and moves the chunk cache wholesale into the dense lane (a move
+suffices there since chunk_cache has exactly one reader). A prior attempt at
+this pipelining moved the deferred request *lists* out per quantum but left
+`request_plan_cache` itself cleared unconditionally underneath them, which
+freed the borrowed strings while a dispatched lane could still be reading
+them; cloning decouples a dispatched quantum's lifetime from the scan's
+caches entirely and closes that gap.
+
+A guard timeout, cancellation, or scan-time error still leaves an
+already-dispatched quantum's lane running in the background; the caller of
+the foreground scan always drains `LanePipeline` (awaiting and freeing every
+in-flight quantum) before returning, so an in-flight future is never
+abandoned and a terminal error in one lane still surfaces even if the sibling
+lane's quantum is still running. The final `applied_sequence` watermark
+still only advances after that drain completes for every quantum in the
+pass, preserving the durability contract below.
 
 Replay skip-ahead on the next pass still requires *both* per-stream cursors
 to cover a document group before that group is skipped
