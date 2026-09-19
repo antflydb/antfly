@@ -727,13 +727,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .optimize = optimize,
         .link_libc = true,
     });
+    runtime_callback_abi_provider.root_module.addImport("antfly_platform", platform_mod);
     runtime_callback_abi_test_mod.linkLibrary(runtime_callback_abi_provider);
     const runtime_callback_abi_tests = b.addTest(.{
         .root_module = runtime_callback_abi_test_mod,
         .filters = &.{"callback archive boundary"},
     });
     const run_runtime_callback_abi_tests = b.addRunArtifact(runtime_callback_abi_tests);
-    b.step("runtime-callback-abi-test", "Run dense admission errors across independently compiled callback archives").dependOn(&run_runtime_callback_abi_tests.step);
+    b.step("runtime-callback-abi-test", "Run admission and write outcomes across independently compiled callback archives").dependOn(&run_runtime_callback_abi_tests.step);
 
     const scan_sink_provider = b.addLibrary(.{
         .name = "runtime-scan-sink-test-provider",

@@ -10341,11 +10341,12 @@ pub const DataServer = struct {
                 if (!known_leader_unreachable) {
                     if (leader_node_id) |target_node_id| {
                         if (target_node_id != local_node_id) {
-                            const leader_base_uri = self.dataApiUriForNode(alloc, target_node_id, route, deadline_ns) catch |err| switch (err) {
+                            const leader_route = self.dataApiUriForNode(alloc, target_node_id, route, deadline_ns) catch |err| switch (err) {
                                 error.Timeout => return error.LeaderUnavailable,
                                 else => return err,
                             };
-                            if (leader_base_uri) |base_uri| {
+                            if (leader_route == .found) {
+                                const base_uri = leader_route.found;
                                 defer alloc.free(base_uri);
                                 // Forward through the DataServer's borrowed
                                 // transport authority. Constructing a native
@@ -10428,8 +10429,7 @@ pub const DataServer = struct {
                                 }) catch return error.RaftBatchWriteOutcomeUnknown;
                                 return;
                             } else {
-                                failed_known_leader_node_id = target_node_id;
-                                last_placement_target_node_id = target_node_id;
+                                leader_route.noteUnavailableTarget(target_node_id, &failed_known_leader_node_id, &last_placement_target_node_id);
                             }
                         }
                     }
@@ -10454,14 +10454,40 @@ pub const DataServer = struct {
         }
     }
 
+    fn cachedDataRaftBatchRoutingSnapshot(self: *DataServer, remote_metadata: *RemoteMetadataSource) !?antfly.metadata_api.AdminSnapshot {
+        const snapshot = try remote_metadata.cachedSnapshot();
+        if (snapshot == null) {
+            // No target has been selected or sent a mutation. An internal
+            // forwarded request remains cache-only: wake the control owner,
+            // then let the existing leader loop wait within its original
+            // deadline/cancellation/hop budget. Allocation errors still escape.
+            self.requestDataRaftMetadataSync();
+        }
+        return snapshot;
+    }
+
+    const DataRaftApiRoute = union(enum) {
+        cache_unavailable,
+        target_missing,
+        found: []u8,
+
+        fn noteUnavailableTarget(self: @This(), node_id: u64, failed_leader: *?u64, last_placement: *?u64) void {
+            // A cold cache is not evidence that this leader is unreachable.
+            // Preserve its eligibility when the control capture arrives.
+            if (self != .target_missing) return;
+            failed_leader.* = node_id;
+            last_placement.* = node_id;
+        }
+    };
+
     fn dataApiUriForNode(
         self: *DataServer,
         alloc: std.mem.Allocator,
         node_id: u64,
         route: DataRaftBatchRoute,
         deadline_ns: u64,
-    ) !?[]u8 {
-        const remote_metadata = self.remote_metadata orelse return null;
+    ) !DataRaftApiRoute {
+        const remote_metadata = self.remote_metadata orelse return .target_missing;
         var snapshot = if (route.discovery.mayRefreshCatalog())
             try remote_metadata.fetchSnapshotWithBudget(.{
                 .deadline_ns = deadline_ns,
@@ -10469,11 +10495,11 @@ pub const DataServer = struct {
                 .io = self.dataRaftIo(),
             })
         else
-            (try remote_metadata.cachedSnapshot()) orelse return error.MetadataSnapshotUnavailable;
+            (try self.cachedDataRaftBatchRoutingSnapshot(remote_metadata)) orelse return .cache_unavailable;
         defer freeAdminSnapshotOwned(self.alloc, &snapshot);
-        const store = findSnapshotStoreByNodeId(snapshot.stores, node_id) orelse return null;
-        if (store.api_url.len == 0) return null;
-        return try alloc.dupe(u8, store.api_url);
+        const store = findSnapshotStoreByNodeId(snapshot.stores, node_id) orelse return .target_missing;
+        if (store.api_url.len == 0) return .target_missing;
+        return .{ .found = try alloc.dupe(u8, store.api_url) };
     }
 
     fn logRaftBatchLeaderTimeout(self: *DataServer, group_id: u64) void {
@@ -10553,7 +10579,7 @@ pub const DataServer = struct {
                 .io = self.dataRaftIo(),
             })
         else
-            (try remote_metadata.cachedSnapshot()) orelse return error.MetadataSnapshotUnavailable;
+            (try self.cachedDataRaftBatchRoutingSnapshot(remote_metadata)) orelse return false;
         defer freeAdminSnapshotOwned(self.alloc, &snapshot);
 
         var preferred_node_id: ?u64 = null;
@@ -39391,6 +39417,87 @@ fn consumerTests() type {
             try DataServer.ensureDataRaftBatchRouteActive(cancellable_route);
             cancellation.cancel();
             try std.testing.expectError(error.Cancelled, DataServer.ensureDataRaftBatchRouteActive(cancellable_route));
+        }
+
+        test "data raft batch forwarding bounds routing campaigns deadlines and deterministic fallback while cache warms" {
+            const alloc = std.testing.allocator;
+            const Executor = struct {
+                calls: usize = 0,
+                fn execute(ptr: *anyopaque, _: std.mem.Allocator, _: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.calls += 1;
+                    return error.UnexpectedSynchronousMetadataFetch;
+                }
+            };
+            var executor: Executor = .{};
+            var remote = try RemoteMetadataSource.initWithRequestExecutors(alloc, &.{"http://metadata.invalid"}, &.{.{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } }}, std.testing.io);
+            defer remote.deinit();
+            // This routing-only fixture never initializes Raft or storage;
+            // absence must return before a mutation or synchronous HTTP call.
+            var server: DataServer = .{
+                .alloc = alloc,
+                .remote_metadata = &remote,
+                .provisioned_storage = undefined,
+                .read_source = undefined,
+                .write_source = undefined,
+                .status_source = undefined,
+                .api_server_cfg = undefined,
+                .query_async_limit = .nothing,
+                .listener_cfg = undefined,
+            };
+            const deadline_ns = 500 * std.time.ns_per_ms;
+            var cancellation = antfly.raft.transport.http_common.RequestCancellation{};
+            const route: DataRaftBatchRoute = .{ .discovery = .cached, .admission_deadline_ns = deadline_ns, .forwards_remaining = 1, .campaign_allowed = false, .cancellation = &cancellation };
+            try std.testing.expect((try server.cachedDataRaftBatchRoutingSnapshot(&remote)) == null);
+            try std.testing.expect(server.data_raft_metadata_sync_requested.swap(false, .acq_rel));
+            const cold_route = try server.dataApiUriForNode(alloc, 101, route, deadline_ns);
+            try std.testing.expect(cold_route == .cache_unavailable);
+            var failed_leader: ?u64 = null;
+            var last_placement: ?u64 = null;
+            cold_route.noteUnavailableTarget(101, &failed_leader, &last_placement);
+            try std.testing.expect(failed_leader == null and last_placement == null);
+            try std.testing.expect(server.data_raft_metadata_sync_requested.swap(false, .acq_rel));
+            try std.testing.expectEqual(@as(usize, 0), executor.calls);
+
+            // Model the control owner publishing its first successful capture.
+            remote.cached_snapshot = try cloneAdminSnapshotOwned(alloc, .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = &.{},
+                .ranges = &.{},
+                .stores = @constCast(&[_]antfly.metadata.table_manager.StoreRecord{.{ .store_id = 1, .node_id = 101, .role = "data", .api_url = "http://ready.invalid" }}),
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            });
+            const ready_route = try server.dataApiUriForNode(alloc, 101, route, deadline_ns);
+            try std.testing.expect(ready_route == .found);
+            try std.testing.expect(failed_leader != 101 and last_placement != 101);
+            const uri = ready_route.found;
+            defer alloc.free(uri);
+            try std.testing.expectEqualStrings("http://ready.invalid", uri);
+            try std.testing.expect(!server.data_raft_metadata_sync_requested.load(.acquire));
+            const missing_route = try server.dataApiUriForNode(alloc, 202, route, deadline_ns);
+            try std.testing.expect(missing_route == .target_missing);
+            missing_route.noteUnavailableTarget(202, &failed_leader, &last_placement);
+            try std.testing.expectEqual(@as(?u64, 202), failed_leader);
+            try std.testing.expectEqual(@as(?u64, 202), last_placement);
+            remote.invalidateCache();
+            try std.testing.expectEqualStrings("http://ready.invalid", uri);
+            const invalidated_route = try server.dataApiUriForNode(alloc, 101, route, deadline_ns);
+            try std.testing.expect(invalidated_route == .cache_unavailable);
+            invalidated_route.noteUnavailableTarget(101, &failed_leader, &last_placement);
+            try std.testing.expectEqual(@as(?u64, 202), failed_leader);
+            try std.testing.expectEqual(@as(?u64, 202), last_placement);
+            try std.testing.expect(server.data_raft_metadata_sync_requested.load(.acquire));
+            try std.testing.expectEqual(@as(usize, 0), executor.calls);
+
+            // A cache wake neither grants a new forwarding budget nor revokes
+            // cancellation in the existing pre-proposal leader loop.
+            try std.testing.expect(DataServer.dataRaftBatchForwardingAt(deadline_ns, deadline_ns, route, true) == null);
+            try std.testing.expectEqual(@as(?u64, deadline_ns), route.admission_deadline_ns);
+            try std.testing.expectEqual(@as(u8, 1), route.forwards_remaining);
+            cancellation.cancel();
+            try std.testing.expectError(error.Cancelled, DataServer.ensureDataRaftBatchRouteActive(route));
         }
 
         test "remote routing cache entries retain immutable snapshots outside the cache lock" {

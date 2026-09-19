@@ -4,9 +4,35 @@
 const std = @import("std");
 const callback = @import("runtime_callback_abi.zig");
 const error_abi = @import("runtime_error_abi.zig");
-const VTable = struct { query: *const fn (u8) anyerror!void };
+const VTable = struct {
+    query: *const fn (u8) anyerror!void,
+    routed_write: *const fn (u8) anyerror!?void,
+};
 extern fn runtime_callback_test_dispatch() callback.CallbackDispatch;
 extern fn runtime_callback_test_query() *const anyopaque;
+extern fn runtime_callback_test_routed_write() *const anyopaque;
+
+test "callback archive boundary preserves optional write results and routing failures" {
+    const boundary = callback.Boundary(VTable);
+    const foreign = runtime_callback_test_dispatch();
+    try std.testing.expect(foreign != boundary.local_dispatch);
+    const write: @FieldType(VTable, "routed_write") = @ptrCast(@alignCast(runtime_callback_test_routed_write()));
+    try std.testing.expect((try boundary.call("routed_write", foreign, write, .{@as(u8, 0)})) != null);
+    try std.testing.expect((try boundary.call("routed_write", foreign, write, .{@as(u8, 1)})) == null);
+    const failures = [_]anyerror{
+        error.MetadataSnapshotUnavailable,
+        error.GroupLeaderUnavailable,
+        error.LeaderUnavailable,
+        error.RaftBatchWriteOutcomeUnknown,
+        error.DeadlineExceeded,
+        error.Canceled,
+    };
+    for (failures, 2..) |failure, mode| {
+        try std.testing.expectError(failure, boundary.call("routed_write", foreign, write, .{@as(u8, @intCast(mode))}));
+        try std.testing.expectEqualStrings(@errorName(failure), @errorName(error_abi.errorFromStatus(error_abi.statusFromError(failure))));
+        try std.testing.expect(error_abi.errorHasStableDetail(failure));
+    }
+}
 
 test "callback archive boundary preserves dense admission and query lifetime failures" {
     const boundary = callback.Boundary(VTable);

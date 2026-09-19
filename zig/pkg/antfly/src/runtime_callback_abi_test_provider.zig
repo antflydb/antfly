@@ -4,7 +4,10 @@
 const std = @import("std");
 const callback = @import("runtime_callback_abi.zig");
 const dense = @import("storage/dense_execution.zig");
-const VTable = struct { query: *const fn (u8) anyerror!void };
+const VTable = struct {
+    query: *const fn (u8) anyerror!void,
+    routed_write: *const fn (u8) anyerror!?void,
+};
 
 export fn runtime_callback_test_dispatch() callback.CallbackDispatch {
     return callback.Boundary(VTable).local_dispatch;
@@ -12,6 +15,24 @@ export fn runtime_callback_test_dispatch() callback.CallbackDispatch {
 
 export fn runtime_callback_test_query() *const anyopaque {
     return @ptrCast(&query);
+}
+
+export fn runtime_callback_test_routed_write() *const anyopaque {
+    return @ptrCast(&routedWrite);
+}
+
+fn routedWrite(mode: u8) anyerror!?void {
+    return switch (mode) {
+        0 => {},
+        1 => null,
+        2 => error.MetadataSnapshotUnavailable,
+        3 => error.GroupLeaderUnavailable,
+        4 => error.LeaderUnavailable,
+        5 => error.RaftBatchWriteOutcomeUnknown,
+        6 => error.DeadlineExceeded,
+        7 => error.Canceled,
+        else => error.InvalidArgument,
+    };
 }
 
 fn query(mode: u8) anyerror!void {

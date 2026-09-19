@@ -221,7 +221,7 @@ The REST/httpx, alternate-listener API-kernel paths, MCP, query builder, A2A,
 extension-host query/write calls, and serverless query/write handlers share this
 owner at their existing admission boundaries. Legacy nonwaiting callers cannot
 jump ahead of queued work. Metadata/data teardown can close admission across the
-compiled API boundary. The current API ABI is 30, storage-owner ABI is 68, and
+compiled API boundary. The current API ABI is 31, storage-owner ABI is 68, and
 native runtime ABI is 11; these include admission diagnostics, dense I/O context,
 executor capabilities, and worker configuration. Incompatible layouts are
 rejected. No inference-provider admission or transaction durability contract
@@ -565,6 +565,14 @@ signed internal-service credential; ordinary URL matching is insufficient.
 H1 transport rejection has an allocation-free structured 429 response, while
 H2 retains REFUSED_STREAM semantics. Task reservations do not reserve connection
 slots or establish a process-wide execution/progress guarantee.
+
+Read-only catalog and local routed lookup calls now wait for nested executor
+capacity within their original deadline and cancellation budget. A failed local
+lookup releases temporary ownership before retrying; remote HTTP failures are
+not retried or turned into missing documents. Routed write and validation
+callbacks use checked status transport across independently compiled runtimes
+(API ABI 31), preserving routing readiness and unknown-write outcomes without
+passing compilation-local error values.
 
 Ordinary LSM append failures now distinguish pre-I/O preparation from uncertain
 storage effects. Uncertainty fences mutation and preserves manifest debt.

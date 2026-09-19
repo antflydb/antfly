@@ -438,6 +438,10 @@ pub const Detail = enum(c_int) {
     transaction_completion_capacity_mismatch,
     transaction_completion_policy_required,
     transaction_completion_changed,
+    // Forwarded writes distinguish routing readiness from an unknown proposal
+    // outcome. Preserve these before the API applies its response policy.
+    metadata_snapshot_unavailable,
+    group_leader_unavailable,
 };
 
 pub const Status = extern struct {
@@ -566,6 +570,8 @@ pub fn statusFromError(err: anyerror) Status {
         error.InternalFailure => status(.internal, .internal_failure),
         error.NotLeader => status(.retryable, .not_leader),
         error.LeaderUnavailable => status(.unavailable, .leader_unavailable),
+        error.MetadataSnapshotUnavailable => status(.unavailable, .metadata_snapshot_unavailable),
+        error.GroupLeaderUnavailable => status(.unavailable, .group_leader_unavailable),
         error.TopologyChanged => status(.retryable, .topology_changed),
         error.IndexGenerationMismatch => status(.retryable, .index_generation_mismatch),
         error.IdentityReadGenerationChanged => status(.conflict, .identity_read_generation_changed),
@@ -1089,6 +1095,8 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .abort_decision_not_durable => "AbortDecisionNotDurable",
         .commit_visibility_not_satisfied => "CommitVisibilityNotSatisfied",
         .leader_unavailable => "LeaderUnavailable",
+        .metadata_snapshot_unavailable => "MetadataSnapshotUnavailable",
+        .group_leader_unavailable => "GroupLeaderUnavailable",
         .raft_batch_write_outcome_unknown => "RaftBatchWriteOutcomeUnknown",
         .raft_batch_write_partial_outcome => "RaftBatchWritePartialOutcome",
         .enrichment_retry_in_progress => "EnrichmentRetryInProgress",

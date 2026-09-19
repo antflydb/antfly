@@ -774,3 +774,67 @@ as absence. The run did not reach its final idle/recovery gate and does not
 qualify the full policy. The harness diagnostic fix `b82cf608b6` now reports the
 status and bounded body excerpt instead of masking non-JSON failures with a
 JSON decoding exception; it changes no acceptance threshold.
+
+### Routed lookup capacity and explicit absence
+
+`fc647c346f` bounds retries of local routed lookup executor exhaustion by the
+original route fence and request deadline. Each failed attempt unwinds its
+temporary ownership before waiting; cancellation is checked on both request
+and fence, and noncapacity errors are not retried. Only an explicit remote 404
+is absence. Unexpected HTTP failures propagate instead of becoming a missing
+document. The focused availability gate passed 3/3, actual exit zero
+(`/tmp/workload-lookup-status-availability-final.log`).
+
+The final admission gate passed 144 metadata/storage tests. Its runtime suite
+initially hit sandbox loopback restrictions; the identical already-built runtime
+test binary passed with socket permission: 236 tests, one optional Wasmtime skip,
+zero failures or leaks, actual exit zero
+(`/tmp/workload-routed-lookup-capacity-permitted.log`). A fresh review found no
+blocking issue in retry ownership, deadline translation or error mapping.
+
+The clean frozen Debug build of
+`fc647c346fc1b969736d8a273c5a33cffc3efd21` exited zero. Binary SHA-256 is
+`f63530872fef0fa2edcd60e622c8005769ada73334da3d0aca633dd878a60477`;
+build receipt: `/tmp/workload-dispatch-fc647-production-debug-receipt.json`.
+The native run **failed during setup**, before any saturation or protected-probe
+checks: `/tmp/workload-dispatch-fc647c346f-receipts`. All 22 receipt checksums
+verified. The seed batch timed out with an unknown write outcome and was not
+replayed. The data process aborted while logging a routed-write error; API and
+metadata exited zero. All three owned PIDs were absent after cleanup, but the
+receipt correctly records two cleanup errors for the unexpected data crash.
+
+The producer reported `MetadataSnapshotUnavailable` during cache-only routing
+before proposal. The routed batch callback passed a compilation-local Zig error
+directly into the separately compiled API runtime, where error-name logging
+used the wrong error domain. This failure supplies no overload qualification
+evidence. Both the unchecked callback boundary and pre-proposal cache-readiness
+handling require correction; no acceptance thresholds or failed receipts changed.
+
+Manifest review also found that the dispatch fixture's component-name exclusion
+omitted the entire node named `data`, including its server log and config.
+`78c284149b` prunes only configured node storage directories and the root binary
+directory, and includes node logs, configs and catalog evidence. Nine focused
+harness tests and lint/format checks passed. Old receipts remain unchanged;
+the failed `fc647c346f` data evidence is separately hashed in
+`/tmp/workload-dispatch-fc647c346f-data-evidence-checksums.json`. Its server-log
+SHA-256 is `6d1228add2557e5df5ea2246795fec6dc7960cfba54fa0dd3fd613648b7768f9`.
+
+### Checked write callbacks and cache-only startup routing
+
+The follow-up replaces raw routed-write error callbacks with the checked native
+callback trampoline, including the sibling validation/cancellation carriers.
+API ABI 31 rejects incompatible configuration layouts before reading them.
+`MetadataSnapshotUnavailable` and `GroupLeaderUnavailable` have append-only
+stable status details; unknown write outcomes retain their separate identity.
+The independent archive test exercises optional-void success/absence and exact
+write-error reconstruction, in addition to the existing dense admission cases:
+`zig build runtime-callback-abi-test -j1` exited zero (two selected tests), log
+`/tmp/workload-routed-write-callback-abi-final.log`. Its first build exposed a
+missing platform import in that test target, which was corrected before rerun.
+
+Cache-only forwarded writes now request asynchronous metadata synchronization
+when the cache is absent, then remain in the existing pre-proposal leader loop.
+An absent cache does not mark an unattempted leader unreachable. A known missing
+target still follows the existing placement fallback. The change grants no new
+deadline, forwarding hop or campaign budget, performs no synchronous metadata
+request, and does not retry an ambiguous mutation.

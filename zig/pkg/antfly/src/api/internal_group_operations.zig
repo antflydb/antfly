@@ -31,6 +31,7 @@ const query_api = @import("query.zig");
 const runtime_preflight = @import("../storage/db/runtime_preflight.zig");
 const internal_batch_forwarding = @import("internal_batch_forwarding.zig");
 const platform_time = @import("antfly_platform").time;
+const runtime_callback_abi = @import("../runtime_callback_abi.zig");
 
 pub const Error = operation.ApiError || error{
     TopologyChanged,
@@ -62,11 +63,16 @@ pub const Error = operation.ApiError || error{
 };
 
 pub const RepairCancellationLookup = struct {
+    const VTable = struct {
+        is_requested: *const fn (*anyopaque, std.mem.Allocator, []const u8, u64, u64, ?[]const u8) anyerror!bool,
+    };
+    pub const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
     ptr: *anyopaque,
     is_requested_fn: *const fn (*anyopaque, std.mem.Allocator, []const u8, u64, u64, ?[]const u8) anyerror!bool,
+    boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
 
     fn isRequested(self: @This(), alloc: std.mem.Allocator, table_name: []const u8, job_id: u64, attempt_id: u64, base_uri: ?[]const u8) !bool {
-        return self.is_requested_fn(self.ptr, alloc, table_name, job_id, attempt_id, base_uri);
+        return BoundaryAbi.call("is_requested", self.boundary_dispatch, self.is_requested_fn, .{ self.ptr, alloc, table_name, job_id, attempt_id, base_uri });
     }
 };
 
@@ -81,8 +87,7 @@ pub const RoutedBatchAuthority = union(enum) {
 };
 
 pub const RoutedRaftBatchWriter = struct {
-    ptr: *anyopaque,
-    write_fn: *const fn (
+    pub const WriteFn = *const fn (
         *anyopaque,
         std.mem.Allocator,
         RoutedBatchAuthority,
@@ -91,28 +96,46 @@ pub const RoutedRaftBatchWriter = struct {
         db_mod.types.BatchRequest,
         internal_batch_forwarding.Context,
         operation.RequestContext,
-    ) anyerror!?void,
+    ) anyerror!?void;
+    const VTable = struct { write: WriteFn };
+    pub const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
+
+    ptr: *anyopaque,
+    write_fn: WriteFn,
+    // Initialized by the callback producer, including native DataServer
+    // configurations copied into an independently compiled API kernel.
+    boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
 
     fn write(self: @This(), alloc: std.mem.Allocator, authority: RoutedBatchAuthority, group_id: u64, table_name: []const u8, input: db_mod.types.BatchRequest, forwarding: internal_batch_forwarding.Context, request: operation.RequestContext) !?void {
-        return self.write_fn(self.ptr, alloc, authority, group_id, table_name, input, forwarding, request);
+        return BoundaryAbi.call("write", self.boundary_dispatch, self.write_fn, .{ self.ptr, alloc, authority, group_id, table_name, input, forwarding, request });
     }
 };
 
 pub const BatchValidator = struct {
+    const VTable = struct {
+        validate: *const fn (*anyopaque, operation.RequestContext, []const u8, []const db_mod.types.BatchWrite) anyerror!void,
+    };
+    pub const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
     ptr: *anyopaque,
     validate_fn: *const fn (*anyopaque, operation.RequestContext, []const u8, []const db_mod.types.BatchWrite) anyerror!void,
+    boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
 
     fn validate(self: BatchValidator, request: operation.RequestContext, table_name: []const u8, writes: []const db_mod.types.BatchWrite) !void {
-        return self.validate_fn(self.ptr, request, table_name, writes);
+        return BoundaryAbi.call("validate", self.boundary_dispatch, self.validate_fn, .{ self.ptr, request, table_name, writes });
     }
 };
 
 pub const TxnValidator = struct {
+    const VTable = struct {
+        validate: *const fn (*anyopaque, operation.RequestContext, []const u8, []const db_mod.types.TransactionWrite) anyerror!void,
+    };
+    pub const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
     ptr: *anyopaque,
     validate_fn: *const fn (*anyopaque, operation.RequestContext, []const u8, []const db_mod.types.TransactionWrite) anyerror!void,
+    boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
 
     fn validate(self: TxnValidator, request: operation.RequestContext, table_name: []const u8, writes: []const db_mod.types.TransactionWrite) !void {
-        return self.validate_fn(self.ptr, request, table_name, writes);
+        return BoundaryAbi.call("validate", self.boundary_dispatch, self.validate_fn, .{ self.ptr, request, table_name, writes });
     }
 };
 
@@ -1465,6 +1488,51 @@ fn consumerTests() type {
                 "docs",
                 .{ .txn_id = txn_id, .begin_timestamp = 1, .participants = &.{"table2:docs:group:7"} },
             ));
+        }
+
+        test "workload admission typed routed batch preserves forwarding cancellation and identity conflicts across checked callbacks" {
+            const native_abi = @import("../runtime_native_abi.zig");
+            const error_abi = @import("../runtime_error_abi.zig");
+            const State = struct {
+                failure: ?anyerror = null,
+                found: bool = true,
+                calls: usize = 0,
+
+                fn write(ptr: *anyopaque, _: std.mem.Allocator, _: RoutedBatchAuthority, _: u64, _: []const u8, _: db_mod.types.BatchRequest, _: internal_batch_forwarding.Context, _: operation.RequestContext) anyerror!?void {
+                    const state: *@This() = @ptrCast(@alignCast(ptr));
+                    state.calls += 1;
+                    if (state.failure) |err| return err;
+                    return if (state.found) {} else null;
+                }
+
+                fn foreign(contract: *const native_abi.CallContract, callback: *const anyopaque, args: *const anyopaque, output: ?*anyopaque) callconv(.c) error_abi.Status {
+                    return RoutedRaftBatchWriter.BoundaryAbi.local_dispatch(contract, callback, args, output);
+                }
+
+                fn incompatible(contract: *const native_abi.CallContract, callback: *const anyopaque, args: *const anyopaque, output: ?*anyopaque) callconv(.c) error_abi.Status {
+                    var wrong = contract.*;
+                    wrong.arguments.size += 1;
+                    return RoutedRaftBatchWriter.BoundaryAbi.local_dispatch(&wrong, callback, args, output);
+                }
+            };
+            var state: State = .{};
+            var writer: RoutedRaftBatchWriter = .{ .ptr = &state, .write_fn = State.write };
+            const forwarding: internal_batch_forwarding.Context = .{ .remaining_ms = 425, .forwards_remaining = 1, .campaign_allowed = false };
+            state.failure = error.PrivateLocalCallbackError;
+            try std.testing.expectError(error.PrivateLocalCallbackError, writer.write(std.testing.allocator, .transaction, 17, "documents", .{}, forwarding, .{}));
+            writer.boundary_dispatch = State.foreign;
+            for ([_]anyerror{ error.MetadataSnapshotUnavailable, error.GroupLeaderUnavailable, error.RaftBatchWriteOutcomeUnknown, error.Canceled }) |failure| {
+                state.failure = failure;
+                try std.testing.expectError(failure, writer.write(std.testing.allocator, .transaction, 17, "documents", .{}, forwarding, .{}));
+            }
+            state.failure = null;
+            try std.testing.expect((try writer.write(std.testing.allocator, .transaction, 17, "documents", .{}, forwarding, .{})) != null);
+            state.found = false;
+            try std.testing.expect((try writer.write(std.testing.allocator, .transaction, 17, "documents", .{}, forwarding, .{})) == null);
+            const calls = state.calls;
+            writer.boundary_dispatch = State.incompatible;
+            try std.testing.expectError(error.InvalidArgument, writer.write(std.testing.allocator, .transaction, 17, "documents", .{}, forwarding, .{}));
+            try std.testing.expectEqual(calls, state.calls);
         }
 
         test "typed routed batch preserves forwarding cancellation and identity conflicts" {
