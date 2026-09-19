@@ -1178,7 +1178,11 @@ const PageCache = struct {
         const manager = self.resource_manager orelse return false;
         const stats = manager.sliceStats(.lite_native_page_cache);
         if (stats.pressure != .hard or stats.hard_action != .shrink_cache) return false;
-        self.evictPagesToLocked(allocator, @intCast(@min(stats.soft_limit_bytes, self.limit_bytes)));
+        // Budgets are shared across generations and handles. Reclaim this
+        // cache's share of the aggregate excess, even when it is individually
+        // smaller than the slice's soft limit.
+        const reclaim: usize = @intCast(@min(stats.used_bytes -| stats.soft_limit_bytes, self.total_bytes));
+        self.evictPagesToLocked(allocator, @min(self.total_bytes - reclaim, self.limit_bytes));
         self.refreshPageResourceUsageLocked();
         return true;
     }
@@ -9584,10 +9588,12 @@ test "lite page replacement invalidates old bytes even when shared pressure bypa
     defer cache.deinit(alloc);
     cache.attachResourceManager(&manager);
     cache.put(alloc, 1, "old-page");
+    cache.put(alloc, 2, "other");
     var external: u64 = 0;
     manager.observeUsage(.lite_native_page_cache, &external, 32);
     defer manager.observeUsage(.lite_native_page_cache, &external, 0);
     try std.testing.expectEqual(.hard, manager.sliceStats(.lite_native_page_cache).pressure);
     cache.put(alloc, 1, "new-page");
     try std.testing.expect((try cache.getCopy(alloc, 1)) == null);
+    try std.testing.expectEqual(@as(usize, 0), cache.total_bytes);
 }

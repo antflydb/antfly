@@ -8,7 +8,8 @@ const time = @import("antfly_platform").time;
 
 test "lite throughput benchmark" {
     if (std.c.getenv("ANTFLY_LITE_BENCH") == null) return error.SkipZigTest;
-    const alloc = std.testing.allocator;
+    // Avoid measuring the test allocator's leak-tracking overhead.
+    const alloc = std.heap.c_allocator;
     for ([_]usize{ 1000, 4000, 16000 }) |count| {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
