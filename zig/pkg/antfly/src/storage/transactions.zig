@@ -35,6 +35,7 @@ const tracing = @import("../tracing/antfly_trace_writer.zig");
 const stderr_writer = @import("../tracing/stderr_writer.zig");
 const ttl = @import("ttl.zig");
 const completion_mutations = @import("completion_mutations.zig");
+pub const completion_compiler = @import("completion_compiler.zig");
 
 // ============================================================================
 // Key prefixes
@@ -1010,6 +1011,132 @@ pub const TxnManager = struct {
         errdefer mutations.deinit();
         const outcome = try self.resolveIntentsWithExtraBatchImpl(txn_id, status, timestamp, extra_batch, &mutations);
         return .{ .mutations = mutations, .outcome = outcome };
+    }
+
+    /// Compile before the real prepare vote using the exact prepare and resolve
+    /// implementations against a private, point-only overlay. The caller must
+    /// retain the DB eligibility fences and immutable snapshot through actual
+    /// prepare. This result owns templates, not backend completion resources.
+    pub fn compileCompletionTemplates(
+        self: *TxnManager,
+        txn_id: TxnId,
+        intents: []const WriteIntent,
+        predicates: []const VersionPredicate,
+        prepare_extra: MutationExtraBatch,
+        commit_extra: ResolutionExtraBatch,
+        abort_extra: ResolutionExtraBatch,
+        options: completion_compiler.Options,
+    ) !completion_compiler.CompiledTemplates {
+        if (intents.len != 1 or intents[0].value == null or intents[0].prepared_row != null or
+            intents[0].key.len == 0 or prepare_extra.schema_binding == null or
+            prepare_extra.schema_binding.?.version != null or prepare_extra.writes.len != 0 or prepare_extra.deletes.len != 0)
+            return error.UnsupportedCompletionTemplate;
+        for ([_]ResolutionExtraBatch{ commit_extra, abort_extra }) |extra| {
+            if (extra.writes.len != 0 or extra.deletes.len != 0 or extra.completion_writes.len != 0 or
+                extra.completion_deletes.len != 0 or extra.captured_intents != null or extra.skip_all_intent_application or
+                extra.skip_intent_keys.len != 0 or extra.resolved_participant != null or extra.cleanup_context != null)
+                return error.UnsupportedCompletionTemplate;
+        }
+        if (abort_extra.replay != null or options.timestamp == 0) return error.UnsupportedCompletionTemplate;
+        const scratch = try self.alloc.alloc(u8, options.scratch_bytes);
+        defer self.alloc.free(scratch);
+        var fixed = std.heap.FixedBufferAllocator.init(scratch);
+        const alloc = fixed.allocator();
+        var overlay = try completion_compiler.Overlay.init(alloc, options.snapshot, options.plan_limits);
+        defer overlay.deinit();
+        var private = TxnManager{ .store = overlay.store(), .owns_store = false, .alloc = alloc, .completion_limits = self.completion_limits };
+        const original = try private.loadTransactionRecord(txn_id);
+        if (original.status != .pending or original.prepared or !original.prepared_known or original.intent_revision != 0 or original.replay_sequence != 0)
+            return error.UnsupportedCompletionTemplate;
+        if (try private.loadIntentAdmission(alloc, txn_id)) |admission| {
+            if (admission.count != 0 or admission.bytes != 0) return error.UnsupportedCompletionTemplate;
+        }
+        const participants = try private.getParticipants(alloc, txn_id);
+        defer freeParticipantList(alloc, participants);
+        if (participants.len != 0 or try private.hasHAOutbox(txn_id)) return error.UnsupportedCompletionTemplate;
+        // Reconciliation scans belong before compilation, never in its bounded
+        // workspace. No fallback may initialize the real store here.
+        if (private.completion_limits.enabled() and try private.completionUsage() == null)
+            return error.TransactionRecoveryReconciliationRequired;
+        if (commit_extra.replay) |replay| {
+            if (replay.sequence == 0 or replay.sequence == std.math.maxInt(u64) or options.replay_payload_sequence_offset != 6)
+                return error.UnsupportedCompletionTemplate;
+            const journal = @import("db/derived/change_journal.zig");
+            var decoded = try journal.decodeRecord(alloc, replay.payload);
+            defer decoded.deinit();
+            if (decoded.record.version != 1 or decoded.record.sequence != replay.sequence or
+                replay.payload.len < 14 or !std.mem.eql(u8, replay.payload[0..4], "CJ2\x00"))
+                return error.UnsupportedCompletionTemplate;
+        } else if (options.replay_payload_sequence_offset != null) return error.UnsupportedCompletionTemplate;
+        var prepare = prepare_extra;
+        prepare.preparation_allocator = alloc;
+        try private.writeIntentsExtraBatch(txn_id, intents, predicates, prepare);
+        for (overlay.log.operations()) |op| try validateInspectedCompletionKey(op.key);
+        const prepared = try private.loadTransactionRecord(txn_id);
+        for ([_]ResolutionExtraBatch{ commit_extra, abort_extra }) |extra| {
+            if (extra.expected_intent_revision) |expected| if (expected != prepared.intent_revision)
+                return error.IntentSnapshotChanged;
+        }
+        const keys = [_][]const u8{intents[0].key};
+        var commit = commit_extra;
+        commit.preparation_allocator = alloc;
+        commit.known_intent_keys = &keys;
+        commit.expected_intent_revision = prepared.intent_revision;
+        var aborted = abort_extra;
+        aborted.preparation_allocator = alloc;
+        aborted.known_intent_keys = &keys;
+        aborted.expected_intent_revision = prepared.intent_revision;
+        var commit_plan = try private.inspectResolutionMutations(txn_id, .committed, options.timestamp, commit, options.plan_limits);
+        defer commit_plan.deinit();
+        var abort_plan = try private.inspectResolutionMutations(txn_id, .aborted, options.timestamp, aborted, options.plan_limits);
+        defer abort_plan.deinit();
+        var prepare_template = try completion_compiler.Template.copy(self.alloc, &overlay.log);
+        errdefer prepare_template.deinit();
+        var commit_template = try completion_compiler.Template.copy(self.alloc, &commit_plan.mutations);
+        errdefer commit_template.deinit();
+        var abort_template = try completion_compiler.Template.copy(self.alloc, &abort_plan.mutations);
+        errdefer abort_template.deinit();
+        try bindCompletionTemplate(&prepare_template, txn_id, .pending, null);
+        try bindCompletionTemplate(&commit_template, txn_id, .committed, commit.replay);
+        try bindCompletionTemplate(&abort_template, txn_id, .aborted, null);
+        return .{ .prepare = prepare_template, .commit = commit_template, .abort = abort_template, .intent_revision = prepared.intent_revision, .timestamp = options.timestamp, .replay_sequence = if (commit.replay) |replay| replay.sequence else null };
+    }
+
+    fn bindCompletionTemplate(template: *completion_compiler.Template, txn_id: TxnId, status: TxnStatus, replay: ?ReplayAppend) !void {
+        const record_key = makeRecordKey(txn_id);
+        for (template.operations, 0..) |op, i| {
+            if (op.kind == .delete) continue;
+            if (std.mem.eql(u8, op.key, completion_summary_key)) {
+                if (op.value.len != 16) return error.UnsupportedCompletionTemplate;
+                try template.bind(i, .{ .kind = .shared_ledger_count, .target = .value, .byte_order = .little, .offset = 0 });
+                try template.bind(i, .{ .kind = .shared_ledger_bytes, .target = .value, .byte_order = .little, .offset = 8 });
+            } else if (std.mem.eql(u8, op.key, &record_key) and status != .pending) {
+                if (op.value.len != txn_record_v6_size) return error.UnsupportedCompletionTemplate;
+                if (status == .committed) try template.bind(i, .{ .kind = .commit_timestamp, .target = .value, .byte_order = .little, .offset = 9 });
+                try template.bind(i, .{ .kind = .commit_timestamp, .target = .value, .byte_order = .little, .offset = 25 });
+                if (replay != null) try template.bind(i, .{ .kind = .replay_sequence, .target = .value, .byte_order = .little, .offset = 41 });
+            } else if (internal_keys.isTtlKey(op.key) and status == .committed) {
+                if (op.value.len != 8) return error.UnsupportedCompletionTemplate;
+                try template.bind(i, .{ .kind = .commit_timestamp, .target = .value, .byte_order = .little, .offset = 0 });
+            } else if (op.key.len != 0 and op.key[0] == internal_keys.replay_namespace) {
+                const entry = replay orelse return error.UnsupportedCompletionTemplate;
+                if (std.mem.eql(u8, op.key, &internal_keys.replay_meta_init_key)) {
+                    if (op.value.len != 0) return error.UnsupportedCompletionTemplate;
+                } else if (std.mem.eql(u8, op.key, &internal_keys.replay_meta_next_sequence_key)) {
+                    if (op.value.len != 8) return error.UnsupportedCompletionTemplate;
+                    try template.bind(i, .{ .kind = .replay_next_sequence, .target = .value, .byte_order = .little, .offset = 0 });
+                } else if (op.key.len == 4 and op.key[1] == 0xff and op.key[2] == internal_keys.replay_meta_latest_sequence_kind) {
+                    if (op.value.len != 8) return error.UnsupportedCompletionTemplate;
+                    try template.bind(i, .{ .kind = .replay_sequence, .target = .value, .byte_order = .little, .offset = 0 });
+                } else if (op.key.len == internal_keys.replay_key_len and op.key[1] != 0xff) {
+                    if (std.mem.readInt(u64, op.key[2..10], .big) != entry.sequence or op.value.len < 14 or
+                        !std.mem.eql(u8, op.value[0..4], "CJ2\x00") or std.mem.readInt(u64, op.value[6..14], .little) != entry.sequence)
+                        return error.UnsupportedCompletionTemplate;
+                    try template.bind(i, .{ .kind = .replay_sequence, .target = .key, .byte_order = .big, .offset = 2 });
+                    try template.bind(i, .{ .kind = .replay_sequence, .target = .value, .byte_order = .little, .offset = 6 });
+                } else return error.UnsupportedCompletionTemplate;
+            }
+        }
     }
 
     fn resolveIntentsWithExtraBatchImpl(
@@ -2843,6 +2970,148 @@ fn expectResolutionInspectionMatchesStore(alloc: Allocator, baseline: []const ba
         try std.testing.expectEqualStrings(a.key, b.key);
         try std.testing.expectEqualStrings(a.value, b.value);
     }
+}
+
+fn rebindCompiledTemplateForTest(template: *completion_compiler.Template, timestamp: u64, sequence: u64, usage: CompletionUsage) !void {
+    for (template.operations) |op| for (op.bindings) |binding| {
+        const value = switch (binding.kind) {
+            .commit_timestamp => timestamp,
+            .replay_sequence => sequence,
+            .replay_next_sequence => try std.math.add(u64, sequence, 1),
+            .shared_ledger_count => usage.count,
+            .shared_ledger_bytes => usage.bytes,
+        };
+        const target = @constCast(switch (binding.target) {
+            .key => op.key,
+            .value => op.value,
+        });
+        std.mem.writeInt(u64, target[binding.offset..][0..8], value, if (binding.byte_order == .little) .little else .big);
+    };
+}
+
+test "workload admission completion compiler prepares privately and matches both real outcomes after rebinding" {
+    const alloc = std.testing.allocator;
+    const journal = @import("db/derived/change_journal.zig");
+    const key = "compiler-doc";
+    for ([_]TxnStatus{ .committed, .aborted }) |status| {
+        var backend = lsm_backend.Backend.init(alloc, .{});
+        defer backend.close();
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        var manager = try TxnManager.init(alloc, &store);
+        defer manager.deinit();
+        manager.completion_limits = .{ .max_count = 4, .max_bytes = 1024 * 1024 };
+        const id: TxnId = @splat(121);
+        try putVisibleDoc(&store, alloc, key, "old");
+        try manager.initTransaction(id, 100);
+        const intents = [_]WriteIntent{.{ .key = key, .value = "replacement" }};
+        const sample_payload = try journal.encodeRecord(alloc, .{
+            .sequence = 7,
+            .changed_doc_keys = &.{key},
+            .overwritten_doc_keys = &.{key},
+            .target_hints = &.{ .full_text, .dense_vector, .sparse_vector, .algebraic },
+        });
+        defer alloc.free(sample_payload);
+        var snapshot = try manager.store.beginRead();
+        var compiled = manager.compileCompletionTemplates(id, &intents, &.{}, .{ .schema_binding = .{} }, .{ .replay = .{ .sequence = 7, .payload = sample_payload } }, .{}, .{ .snapshot = &snapshot, .timestamp = 200, .replay_payload_sequence_offset = 6 }) catch |err| {
+            snapshot.abort();
+            return err;
+        };
+        snapshot.abort();
+        defer compiled.deinit();
+        try std.testing.expect(!(try manager.loadTransactionRecord(id)).prepared);
+        try std.testing.expectEqual(@as(u64, 0), (try manager.loadTransactionRecord(id)).intent_revision);
+        try std.testing.expect(try manager.loadIntentAdmission(alloc, id) == null);
+        const old = try getVisibleDoc(&store, alloc, key);
+        defer alloc.free(old);
+        try std.testing.expectEqualStrings("old", old);
+        // Unrelated transaction debt invalidates the sample shared counters.
+        // Bind the exact result under the real serialized transition instead.
+        const other: TxnId = @splat(122);
+        try manager.initTransaction(other, 101);
+        try manager.writeIntents(other, &.{.{ .key = "unrelated", .value = "preserved" }}, &.{});
+        const before_prepare = try backend_scan.scanPrefix(alloc, &manager.store, "");
+        defer backend_scan.freeResults(alloc, before_prepare);
+        try manager.writeIntentsExtraBatch(id, &intents, &.{}, .{ .schema_binding = .{} });
+        try rebindCompiledTemplateForTest(&compiled.prepare, 400, 11, (try manager.completionUsage()).?);
+        try expectResolutionInspectionMatchesStore(alloc, before_prepare, &compiled.prepare.plan, &manager.store);
+        const before_resolve = try backend_scan.scanPrefix(alloc, &manager.store, "");
+        defer backend_scan.freeResults(alloc, before_resolve);
+        const actual_payload = try journal.encodeRecord(alloc, .{
+            .sequence = 11,
+            .changed_doc_keys = &.{key},
+            .overwritten_doc_keys = &.{key},
+            .target_hints = &.{ .full_text, .dense_vector, .sparse_vector, .algebraic },
+        });
+        defer alloc.free(actual_payload);
+        _ = try manager.resolveIntentsWithExtraBatch(id, status, 400, .{
+            .replay = if (status == .committed) .{ .sequence = 11, .payload = actual_payload } else null,
+            .known_intent_keys = &.{key},
+            .expected_intent_revision = compiled.intent_revision,
+        });
+        const chosen = if (status == .committed) &compiled.commit else &compiled.abort;
+        try rebindCompiledTemplateForTest(chosen, 400, 11, (try manager.completionUsage()).?);
+        try expectResolutionInspectionMatchesStore(alloc, before_resolve, &chosen.plan, &manager.store);
+        try std.testing.expectEqual(@as(u64, 1), (try manager.completionUsage()).?.count);
+    }
+}
+
+test "workload admission completion compiler bounded failures never prepare backing transaction" {
+    const alloc = std.testing.allocator;
+    var backend = lsm_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(alloc, .{});
+    defer runtime.deinit();
+    var manager = try TxnManager.init(alloc, &runtime);
+    defer manager.deinit();
+    const id: TxnId = @splat(123);
+    try manager.initTransaction(id, 100);
+    var snapshot = try manager.store.beginRead();
+    defer snapshot.abort();
+    const intents = [_]WriteIntent{.{ .key = "doc", .value = "replacement" }};
+    const base_options: completion_compiler.Options = .{ .snapshot = &snapshot, .timestamp = 200 };
+    var options = base_options;
+    options.scratch_bytes = 32;
+    try std.testing.expectError(error.OutOfMemory, manager.compileCompletionTemplates(id, &intents, &.{}, .{ .schema_binding = .{} }, .{}, .{}, options));
+    options = base_options;
+    options.plan_limits = .{ .max_operations = 1, .max_bytes = 1024 };
+    try std.testing.expectError(error.CompletionPlanCapacityExceeded, manager.compileCompletionTemplates(id, &intents, &.{}, .{ .schema_binding = .{} }, .{}, .{}, options));
+    manager.completion_limits = .{ .max_count = 4, .max_bytes = 1024 * 1024 };
+    try std.testing.expectError(error.TransactionRecoveryReconciliationRequired, manager.compileCompletionTemplates(id, &intents, &.{}, .{ .schema_binding = .{} }, .{}, .{}, base_options));
+    try std.testing.expect(!(try manager.loadTransactionRecord(id)).prepared);
+    try std.testing.expect(try manager.loadIntentAdmission(alloc, id) == null);
+    var overlay = try completion_compiler.Overlay.init(alloc, &snapshot, .{ .max_operations = 4, .max_bytes = 1024 });
+    defer overlay.deinit();
+    var private_store = overlay.store();
+    var read = try private_store.beginRead();
+    defer read.abort();
+    try std.testing.expectError(error.UnsupportedCompletionTemplateScan, read.openCursor());
+    try std.testing.expectError(error.UnsupportedCompletionTemplateWrite, private_store.beginWrite());
+}
+
+test "workload admission completion compiler allocation failure unwinds every output without backing writes" {
+    const alloc = std.testing.allocator;
+    var backend = lsm_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(alloc, .{});
+    defer runtime.deinit();
+    var manager = try TxnManager.init(alloc, &runtime);
+    defer manager.deinit();
+    const id: TxnId = @splat(124);
+    try manager.initTransaction(id, 100);
+    var snapshot = try manager.store.beginRead();
+    defer snapshot.abort();
+    const Case = struct {
+        fn run(failing: Allocator, source: *TxnManager, read: *backend_erased.ReadTxn, txn_id: TxnId) !void {
+            var local = source.*;
+            local.alloc = failing;
+            var compiled = try local.compileCompletionTemplates(txn_id, &.{.{ .key = "doc", .value = "replacement" }}, &.{}, .{ .schema_binding = .{} }, .{}, .{}, .{ .snapshot = read, .timestamp = 200 });
+            defer compiled.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, Case.run, .{ &manager, &snapshot, id });
+    try std.testing.expect(!(try manager.loadTransactionRecord(id)).prepared);
+    try std.testing.expect(try manager.loadIntentAdmission(alloc, id) == null);
 }
 
 test "workload admission completion inspection matches commit abort replay and terminal retry" {
