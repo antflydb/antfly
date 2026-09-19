@@ -262,7 +262,7 @@ fn listFileNamesAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8) !
     else
         try std.fmt.allocPrint(allocator, "{s}/", .{directory});
     defer allocator.free(prefix);
-    var cursor = try self.docs.file.indexCatalogCursor(checkpoint, prefix);
+    var cursor = try self.docs.file.indexCatalogDirectoryCursor(checkpoint, prefix);
     defer cursor.deinit();
     var names = std.ArrayListUnmanaged([]u8).empty;
     errdefer {
@@ -1187,5 +1187,131 @@ test "lite native cold atomic writes preserve hot pages with bounded cache admis
         defer alloc.free(actual);
         try std.testing.expectEqualSlices(u8, bytes[0..case[1]], actual);
     }
+    try std.testing.expect((try reopened.file.check()).valid);
+}
+
+test "lite native directory cursor skips large subtrees and preserves boundary files" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "directory-subtree-skip.aflite");
+    defer alloc.free(path);
+    {
+        var docs = try docstore.Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io });
+        defer docs.close();
+        var indexes = Store.init(alloc, &docs);
+        const storage = indexes.storage();
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        var mutations = std.ArrayList(native.CatalogMutation).empty;
+        for (0..4096) |i| {
+            const dir = if (i < 2048) "sub" else "other";
+            try mutations.append(scratch, .{ .key = try std.fmt.allocPrint(scratch, "/a/{s}/deep/{d:0>8}", .{ dir, i }), .value = "nested" });
+        }
+        for ([_][]const u8{ "/a", "/a/sub", "/a/sub.", "/a/sub0", "/a/submarine", "/a/other0", "/a/z", "/top" }) |key|
+            try mutations.append(scratch, .{ .key = key, .value = "direct" });
+        try docs.file.putIndexCatalogBatch(mutations.items);
+        const pinned = docs.file.activeCheckpoint();
+        const reads = docs.file.test_page_reads.load(.monotonic);
+        const names = try storage.listFileNamesAlloc(alloc, "/a/");
+        defer StorageIo.freeFileNames(alloc, names);
+        const expected = [_][]const u8{ "other0", "sub", "sub.", "sub0", "submarine", "z" };
+        try std.testing.expectEqual(expected.len, names.len);
+        for (expected, names) |want, got| try std.testing.expectEqualStrings(want, got);
+        try std.testing.expect(docs.file.test_page_reads.load(.monotonic) - reads <= 40);
+        const root_names = try storage.listFileNamesAlloc(alloc, "/");
+        defer StorageIo.freeFileNames(alloc, root_names);
+        try std.testing.expectEqual(@as(usize, 2), root_names.len);
+        try std.testing.expectEqualStrings("a", root_names[0]);
+        try std.testing.expectEqualStrings("top", root_names[1]);
+        // The cursor remains in its original checkpoint even after live
+        // deletion. Seek-past must not silently rebind to the latest root.
+        var cursor = try docs.file.indexCatalogDirectoryCursor(pinned, "/a/");
+        defer cursor.deinit();
+        try storage.deleteFileAbsolute("/a/sub0");
+        var count: usize = 0;
+        while (try cursor.next()) |entry| {
+            defer alloc.free(entry.key);
+            try std.testing.expectEqualStrings(expected[count], std.fs.path.basename(entry.key));
+            count += 1;
+        }
+        try std.testing.expectEqual(expected.len, count);
+    }
+    var reopened = try docstore.Store.open(alloc, path, true);
+    defer reopened.close();
+    var indexes = Store.init(alloc, &reopened);
+    const names = try indexes.storage().listFileNamesAlloc(alloc, "/a");
+    defer StorageIo.freeFileNames(alloc, names);
+    try std.testing.expectEqual(@as(usize, 5), names.len);
+    try std.testing.expect((try reopened.file.check()).valid);
+}
+
+test "lite native atomic imports batch writes and preserve publication on failed flush" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "batched-import.aflite");
+    defer alloc.free(path);
+    const bytes = try alloc.alloc(u8, 2 * 1024 * 1024 + 17);
+    defer alloc.free(bytes);
+    for (bytes, 0..) |*byte, i| byte.* = @intCast(i % 251);
+    {
+        var docs = try docstore.Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io });
+        defer docs.close();
+        var indexes = Store.init(alloc, &docs);
+        const storage = indexes.storage();
+        try storage.writeFileAbsolute("/value", "old");
+        const old = docs.file.activeCheckpoint();
+        // Fail after one complete page batch reached disk, and on the first
+        // batch. Neither path may publish the unfinished replacement.
+        for ([_]usize{ 0, 1 }) |after| {
+            var writer = try storage.beginAtomicWrite(alloc, "/value");
+            var active = true;
+            defer if (active) writer.abort();
+            try writer.appendSlice(bytes);
+            docs.file.test_page_write_fail_after = after;
+            active = false;
+            try std.testing.expectError(error.TestPageWriteFailure, writer.finish());
+            docs.file.test_page_write_fail_after = null;
+            try std.testing.expect(std.meta.eql(old, docs.file.activeCheckpoint()));
+            const value = try storage.readFileAlloc(alloc, "/value", 10);
+            defer alloc.free(value);
+            try std.testing.expectEqualStrings("old", value);
+            var pinned = try docstore.Store.open(alloc, path, true);
+            defer pinned.close();
+            const disk = (try pinned.file.getIndexCatalogRecordAlloc(alloc, "/value")).?;
+            defer alloc.free(disk);
+            try std.testing.expectEqualStrings("old", disk);
+        }
+        var writer = try storage.beginAtomicWrite(alloc, "/value");
+        var active = true;
+        defer if (active) writer.abort();
+        writer.setCacheIntent(.cold_sequential);
+        try writer.appendSlice(bytes);
+        const writes = docs.file.test_page_write_calls.load(.monotonic);
+        const pages = docs.file.test_page_writes.load(.monotonic);
+        active = false;
+        try writer.finish();
+        try std.testing.expect(docs.file.test_page_writes.load(.monotonic) - pages > 500);
+        try std.testing.expect(docs.file.test_page_write_calls.load(.monotonic) - writes <= 40);
+        // Buffered external values use the same batch writer.
+        const buffered_writes = docs.file.test_page_write_calls.load(.monotonic);
+        var buffered = try storage.beginAtomicWrite(alloc, "/buffered");
+        var buffered_active = true;
+        defer if (buffered_active) buffered.abort();
+        try buffered.appendSlice(bytes[0..32000]);
+        buffered_active = false;
+        try buffered.finish();
+        try std.testing.expect(docs.file.test_page_write_calls.load(.monotonic) - buffered_writes <= 5);
+    }
+    var reopened = try docstore.Store.open(alloc, path, true);
+    defer reopened.close();
+    const value = (try reopened.file.getIndexCatalogRecordAlloc(alloc, "/value")).?;
+    defer alloc.free(value);
+    try std.testing.expectEqualSlices(u8, bytes, value);
+    const buffered = (try reopened.file.getIndexCatalogRecordAlloc(alloc, "/buffered")).?;
+    defer alloc.free(buffered);
+    try std.testing.expectEqualSlices(u8, bytes[0..32000], buffered);
     try std.testing.expect((try reopened.file.check()).valid);
 }

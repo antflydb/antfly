@@ -112,6 +112,9 @@ The implementation now consists of:
   work. Directory listing and subtree deletion seek the live catalog tree at a
   path prefix instead of replaying mutation history. Listing pins a checkpoint
   and holds the generation read lock, allowing ordinary commits to continue.
+  Immediate-file listings seek past each nested directory's exclusive prefix
+  bound before reading descendant catalog records. Listing work depends on
+  direct files and directory prefixes encountered, not nested file count.
   External catalog values use a 64-way immutable extent tree with byte lengths
   on each child. Appends retain one unfinished node per height, fill the partial
   tail leaf, and seal suffix subtrees once. Existing full subtrees remain
@@ -137,6 +140,14 @@ The implementation now consists of:
   replacement bypasses admission. The policy belongs to each writer and does
   not disable caching for concurrent readers; subsequent reads can cache the
   cold-written data normally.
+  Native external-value writes encode directly into an operation-owned 64 KiB
+  page buffer. Staged imports, buffered external values, appends, document chains,
+  and vacuum copies coalesce consecutive page IDs into positional writes;
+  fragmented free-page runs flush separately. Value-chain writers retain only
+  one next-page ID. A completed tree is flushed before its root can be read or
+  published. A failed flush admits no pages and poisons its batch; abort drops
+  pending bytes without an implicit retry. Cache policy is applied per page
+  after a successful write.
   Positional page writes extend the file directly, without per-page stat or
   resize calls; data, checkpoint-slot, and active-slot sync barriers remain.
   Revision 2 and other unsupported headers are rejected without mutation;

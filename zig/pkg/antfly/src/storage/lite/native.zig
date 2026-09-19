@@ -299,6 +299,7 @@ pub const CatalogCursor = struct {
     prefix: []const u8,
     started: bool = false,
     done: bool = false,
+    immediate_children_only: bool = false,
 
     pub fn deinit(self: *CatalogCursor) void {
         self.index.deinit();
@@ -309,26 +310,38 @@ pub const CatalogCursor = struct {
     pub fn next(self: *CatalogCursor) !?OwnedCatalogKey {
         if (self.done) return null;
         const file = self.index.file;
-        while (true) {
-            var entry = (if (self.started) try self.index.next() else try self.index.seekAtOrAfter(self.prefix, false)) orelse {
-                self.done = true;
-                return null;
-            };
-            self.started = true;
+        var candidate = if (self.started) try self.index.next() else try self.index.seekAtOrAfter(self.prefix, false);
+        self.started = true;
+        while (candidate) |owned| {
+            var entry = owned;
             defer entry.deinit(file.allocator);
-            if (!std.mem.startsWith(u8, entry.key, self.prefix)) {
-                self.done = true;
-                return null;
+            if (!std.mem.startsWith(u8, entry.key, self.prefix)) break;
+            if (self.immediate_children_only) {
+                if (std.mem.indexOfScalar(u8, entry.key[self.prefix.len..], '/')) |slash| {
+                    // '/' is not the maximum byte, so incrementing the final
+                    // slash is the exact exclusive upper bound of this subtree.
+                    // Seek before decoding any descendant catalog records.
+                    const bound = try file.allocator.dupe(u8, entry.key[0 .. self.prefix.len + slash + 1]);
+                    defer file.allocator.free(bound);
+                    bound[bound.len - 1] += 1;
+                    candidate = try self.index.seekAtOrAfter(bound, false);
+                    continue;
+                }
             }
             var scratch: [65536]u8 = undefined;
             const raw = try file.readPageInto(entry.document_page_id, self.index.checkpoint, &scratch);
             const record = try decodeCatalogEntry(try decodePagePayload(raw, .catalog));
             if (!std.mem.eql(u8, entry.key, record.key)) return error.InvalidDocumentIndex;
-            if (record.is_delete) continue;
+            if (record.is_delete) {
+                candidate = try self.index.next();
+                continue;
+            }
             const key = entry.key;
             entry.key = &.{};
             return .{ .key = key };
         }
+        self.done = true;
+        return null;
     }
 };
 
@@ -1089,6 +1102,66 @@ const PageCache = struct {
     }
 };
 
+/// An operation-owned encoded-page buffer. Abort drops pending bytes; callers
+/// must flush before finalization. Consecutive page IDs coalesce, while gaps
+/// and full buffers flush independently. No metadata needed to read a pending page is
+/// published before its owner's final flush.
+const PageWriteBatch = struct {
+    const capacity = 64 * 1024;
+    file: *NativeFile,
+    options: WriteOptions = .{},
+    buffer: [capacity]u8 = undefined,
+    used: usize = 0,
+    first_page: u64 = 0,
+    failure: ?anyerror = null,
+
+    fn reserve(self: *PageWriteBatch, page_id: u64) ![]u8 {
+        if (self.failure) |err| return err;
+        const size: usize = self.file.header.page_size;
+        if (self.used != 0 and (self.used + size > self.buffer.len or page_id != self.first_page + self.used / size)) try self.flush();
+        if (self.used == 0) self.first_page = page_id;
+        return self.buffer[self.used..][0..size];
+    }
+
+    fn appendPage(self: *PageWriteBatch, page_id: u64, kind: PageKind, payload: []const u8) !void {
+        if (payload.len > self.file.maxPagePayloadBytes()) return error.PageTooLarge;
+        const page = try self.reserve(page_id);
+        encodePage(page, kind, payload);
+        self.used += page.len;
+    }
+
+    fn appendValue(self: *PageWriteBatch, page_id: u64, next: u64, chunk: []const u8) !void {
+        if (chunk.len == 0 or chunk.len > self.file.maxValuePagePayloadBytes()) return error.InvalidNativeValueChain;
+        const page = try self.reserve(page_id);
+        var prefix: [value_page_header_size]u8 = undefined;
+        std.mem.writeInt(u64, &prefix, next, .little);
+        encodePageParts(page, .value, &prefix, chunk);
+        self.used += page.len;
+    }
+
+    fn flush(self: *PageWriteBatch) !void {
+        if (self.failure) |err| return err;
+        if (self.used == 0) return;
+        errdefer |err| self.failure = err;
+        const file = self.file;
+        const size: usize = file.header.page_size;
+        if (builtin.is_test) {
+            if (file.test_page_write_fail_after) |remaining| {
+                if (remaining == 0) return error.TestPageWriteFailure;
+                file.test_page_write_fail_after = remaining - 1;
+            }
+            _ = file.test_page_write_calls.fetchAdd(1, .monotonic);
+            _ = file.test_page_writes.fetchAdd(@intCast(self.used / size), .monotonic);
+        }
+        try file.file.writePositionalAll(file.runtimeIo(), self.buffer[0..self.used], self.first_page * @as(u64, size));
+        var offset: usize = 0;
+        while (offset < self.used) : (offset += size) {
+            file.cacheWrittenPage(self.first_page + offset / size, self.buffer[offset..][0..size], self.options);
+        }
+        self.used = 0;
+    }
+};
+
 pub const NativeFile = struct {
     allocator: Allocator,
     /// The default constructors own this Threaded runtime. Borrowed-I/O
@@ -1132,6 +1205,9 @@ pub const NativeFile = struct {
     // filesystem speed and cache warmth. No counters exist in production.
     test_page_reads: if (builtin.is_test) std.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
     test_page_writes: if (builtin.is_test) std.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
+
+    test_page_write_calls: if (builtin.is_test) std.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
+    test_page_write_fail_after: if (builtin.is_test) ?usize else void = if (builtin.is_test) null else {},
 
     pub fn open(allocator: Allocator, path: []const u8, read_only: bool) !NativeFile {
         return try openWithOptions(allocator, path, .{ .read_only = read_only });
@@ -1533,7 +1609,7 @@ pub const NativeFile = struct {
         const roots = try self.readCatalogRoots(previous.index_catalog_root_page, previous);
         var pages = try self.pageAllocatorFromFreeMap(previous);
         defer pages.deinit();
-        var builder = ExtentAppender{ .file = self, .pages = &pages, .tail = undefined };
+        var builder = ExtentAppender{ .file = self, .pages = &pages, .tail = undefined, .batch = .{ .file = self, .options = options } };
         defer builder.deinit();
         const chunk_size = self.maxValuePagePayloadBytes();
         const read_size = buffer.len / chunk_size * chunk_size;
@@ -1544,7 +1620,7 @@ pub const NativeFile = struct {
             var pos: usize = 0;
             while (pos < n) {
                 const end = @min(n, pos + chunk_size);
-                try builder.push(try self.writeExtentLeaf(&pages, buffer[pos..end], options));
+                try builder.pushValue(buffer[pos..end]);
                 pos = end;
             }
             offset += n;
@@ -1983,6 +2059,15 @@ pub const NativeFile = struct {
 
     pub fn indexCatalogCursor(self: *NativeFile, checkpoint: CheckpointSlot, prefix: []const u8) !CatalogCursor {
         return try self.catalogCursor(checkpoint, .index, prefix);
+    }
+
+    /// The borrowed prefix must end at a directory separator. Nested
+    /// subtrees are skipped using B-tree seeks within the same checkpoint.
+    pub fn indexCatalogDirectoryCursor(self: *NativeFile, checkpoint: CheckpointSlot, prefix: []const u8) !CatalogCursor {
+        if (prefix.len == 0 or prefix[prefix.len - 1] != '/') return error.InvalidNativeIndexPath;
+        var cursor = try self.catalogCursor(checkpoint, .index, prefix);
+        cursor.immediate_children_only = true;
+        return cursor;
     }
 
     fn catalogCursor(self: *NativeFile, checkpoint: CheckpointSlot, root: CatalogRoot, prefix: []const u8) !CatalogCursor {
@@ -2871,7 +2956,7 @@ pub const NativeFile = struct {
             .page_cache_enabled = .init(false),
         };
         var pages = PageAllocator{ .file = &writer, .free_pages = &.{}, .next_page_id = next_page.* };
-        var builder = ExtentAppender{ .file = &writer, .pages = &pages, .tail = undefined };
+        var builder = ExtentAppender{ .file = &writer, .pages = &pages, .tail = undefined, .batch = .{ .file = &writer } };
         defer builder.deinit();
         const chain_root = next_page.*;
         var buffer: [65536]u8 = undefined;
@@ -2888,11 +2973,11 @@ pub const NativeFile = struct {
                 if (buffered == chunk_size or written + buffered == len) {
                     if (cancel) |token| try token.check();
                     if (tree) {
-                        try builder.push(try writer.writeExtentLeaf(&pages, buffer[value_page_header_size..][0..buffered], .{}));
+                        try builder.pushValue(buffer[value_page_header_size..][0..buffered]);
                     } else {
-                        const next = if (written + buffered < len) next_page.* + 1 else 0;
-                        std.mem.writeInt(u64, buffer[0..8], next, .little);
-                        _ = try appendPageToFile(self.allocator, file, self.runtimeIo(), self.header.page_size, next_page, .value, buffer[0 .. value_page_header_size + buffered]);
+                        const page = try pages.allocate();
+                        const next = if (written + buffered < len) page + 1 else 0;
+                        try builder.batch.appendValue(page, next, buffer[value_page_header_size..][0..buffered]);
                     }
                     written += buffered;
                     buffered = 0;
@@ -2900,7 +2985,11 @@ pub const NativeFile = struct {
             }
         }
         if (buffered != 0 or written != len) return error.InvalidNativeValueChain;
-        if (!tree) return chain_root;
+        if (!tree) {
+            try builder.batch.flush();
+            next_page.* = pages.next_page_id;
+            return chain_root;
+        }
         const result = try builder.finish();
         next_page.* = pages.next_page_id;
         return result.page;
@@ -3426,7 +3515,8 @@ pub const NativeFile = struct {
         return node;
     }
 
-    fn writeExtentNode(self: *NativeFile, pages: *PageAllocator, height: u8, children: []const ExtentRef) !ExtentRef {
+    fn writeExtentNode(self: *NativeFile, pages: *PageAllocator, batch: *PageWriteBatch, height: u8, children: []const ExtentRef) !ExtentRef {
+        _ = self;
         if (height == 0 or height > 63 or children.len == 0 or children.len > extent_fanout) return error.InvalidNativeValueChain;
         var payload: [extent_header_size + extent_fanout * 16]u8 = @splat(0);
         @memcpy(payload[0..8], extent_magic);
@@ -3441,28 +3531,20 @@ pub const NativeFile = struct {
             std.mem.writeInt(u64, bytes[8..16], child.len, .little);
         }
         const page = try pages.allocate();
-        try self.writePage(page, .value_extent, payload[0 .. extent_header_size + children.len * 16]);
+        try batch.appendPage(page, .value_extent, payload[0 .. extent_header_size + children.len * 16]);
         return .{ .page = page, .len = len, .height = height };
-    }
-
-    fn writeExtentLeaf(self: *NativeFile, pages: *PageAllocator, value: []const u8, options: WriteOptions) !ExtentRef {
-        if (value.len == 0 or value.len > self.maxValuePagePayloadBytes()) return error.InvalidNativeValueChain;
-        const page = try pages.allocate();
-        const ids = [_]u64{page};
-        try self.writeValuePageChunk(&ids, 0, value, options);
-        return .{ .page = page, .len = value.len };
     }
 
     /// Stream a packed tree through the same bounded frontier used by appends.
     /// Neither initial writes nor vacuum need an array of every leaf reference.
     fn writeValueTree(self: *NativeFile, pages: *PageAllocator, value: []const u8, options: WriteOptions) !ExtentRef {
         if (value.len == 0) return error.InvalidNativeValueChain;
-        var builder = ExtentAppender{ .file = self, .pages = pages, .tail = undefined };
+        var builder = ExtentAppender{ .file = self, .pages = pages, .tail = undefined, .batch = .{ .file = self, .options = options } };
         defer builder.deinit();
         var offset: usize = 0;
         while (offset < value.len) {
             const end = @min(value.len, offset + self.maxValuePagePayloadBytes());
-            try builder.push(try self.writeExtentLeaf(pages, value[offset..end], options));
+            try builder.pushValue(value[offset..end]);
             offset = end;
         }
         return try builder.finish();
@@ -3506,9 +3588,16 @@ pub const NativeFile = struct {
         pages: *PageAllocator,
         levels: std.ArrayListUnmanaged(Level) = .empty,
         tail: ExtentRef,
+        batch: PageWriteBatch,
+
+        fn pushValue(self: *ExtentAppender, value: []const u8) !void {
+            const page = try self.pages.allocate();
+            try self.batch.appendValue(page, 0, value);
+            try self.push(.{ .page = page, .len = value.len });
+        }
 
         fn init(file: *NativeFile, pages: *PageAllocator, root: ExtentRef) !ExtentAppender {
-            var result = ExtentAppender{ .file = file, .pages = pages, .tail = root };
+            var result = ExtentAppender{ .file = file, .pages = pages, .tail = root, .batch = .{ .file = file } };
             errdefer result.deinit();
             var checkpoint = file.activeCheckpoint();
             checkpoint.page_count = pages.next_page_id;
@@ -3563,12 +3652,20 @@ pub const NativeFile = struct {
             const ref = if (level.unchanged and level.original != null and level.count == level.original_count)
                 level.original.?
             else
-                try self.file.writeExtentNode(self.pages, height, level.children[0..level.count]);
+                try self.file.writeExtentNode(self.pages, &self.batch, height, level.children[0..level.count]);
             level.* = .{};
             return ref;
         }
 
         fn finish(self: *ExtentAppender) !ExtentRef {
+            const root = try self.finishTree();
+            // Callers may read newly built trees, then publish their roots.
+            // Never return a root while any of its pages remain buffered.
+            try self.batch.flush();
+            return root;
+        }
+
+        fn finishTree(self: *ExtentAppender) !ExtentRef {
             var height: usize = 1;
             while (height < self.levels.items.len) : (height += 1) {
                 const level = &self.levels.items[height];
@@ -3611,12 +3708,12 @@ pub const NativeFile = struct {
             defer self.allocator.free(combined);
             @memcpy(combined[0..tail.chunk.len], tail.chunk);
             @memcpy(combined[tail.chunk.len..], suffix[0..take]);
-            try appender.push(try self.writeExtentLeaf(pages, combined, .{}));
+            try appender.pushValue(combined);
         }
         var offset = take;
         while (offset < suffix.len) {
             const end = @min(suffix.len, offset + self.maxValuePagePayloadBytes());
-            try appender.push(try self.writeExtentLeaf(pages, suffix[offset..end], .{}));
+            try appender.pushValue(suffix[offset..end]);
             offset = end;
         }
         return (try appender.finish()).page;
@@ -3672,39 +3769,29 @@ pub const NativeFile = struct {
         if (value.len == 0) return error.InvalidNativeValueChain;
         const chunk_size = self.maxValuePagePayloadBytes();
         if (chunk_size == 0) return error.InvalidNativePageLength;
-        const page_count = std.math.divCeil(usize, value.len, chunk_size) catch unreachable;
-
-        const page_ids = try self.allocator.alloc(u64, page_count);
-        defer self.allocator.free(page_ids);
-        for (page_ids) |*page_id| page_id.* = try page_allocator.allocate();
-
+        var batch = PageWriteBatch{ .file = self };
+        var page = try page_allocator.allocate();
+        const root = page;
         var offset: usize = 0;
-        var page_index: usize = 0;
-        while (offset < value.len) : (page_index += 1) {
+        while (offset < value.len) {
             const len = @min(chunk_size, value.len - offset);
-            const page_id = page_ids[page_index];
-            const next_page = if (page_index + 1 < page_count) page_ids[page_index + 1] else 0;
-
-            const payload = try self.allocator.alloc(u8, value_page_header_size + len);
-            defer self.allocator.free(payload);
-            std.mem.writeInt(u64, payload[0..8], next_page, .little);
-            @memcpy(payload[value_page_header_size..][0..len], value[offset..][0..len]);
-
-            try self.writePage(page_id, .value, payload);
+            // One-page lookahead preserves arbitrary free-page allocation
+            // order without retaining an array of every page in the chain.
+            const next = if (offset + len < value.len) try page_allocator.allocate() else 0;
+            try batch.appendValue(page, next, value[offset..][0..len]);
+            page = next;
             offset += len;
         }
-
-        return page_ids[0];
+        try batch.flush();
+        return root;
     }
 
     fn writeValuePageChunk(self: *NativeFile, page_ids: []const u64, page_index: usize, chunk: []const u8, options: WriteOptions) !void {
         if (chunk.len == 0 or chunk.len > self.maxValuePagePayloadBytes()) return error.InvalidNativeValueChain;
         const next_page_id = if (page_index + 1 < page_ids.len) page_ids[page_index + 1] else 0;
-        const payload = try self.allocator.alloc(u8, value_page_header_size + chunk.len);
-        defer self.allocator.free(payload);
-        std.mem.writeInt(u64, payload[0..8], next_page_id, .little);
-        @memcpy(payload[value_page_header_size..], chunk);
-        try self.writePageWithOptions(page_ids[page_index], .value, payload, options);
+        var batch = PageWriteBatch{ .file = self, .options = options };
+        try batch.appendValue(page_ids[page_index], next_page_id, chunk);
+        try batch.flush();
     }
 
     fn pageAllocatorFromFreeMap(self: *NativeFile, checkpoint: CheckpointSlot) !PageAllocator {
@@ -4178,20 +4265,16 @@ pub const NativeFile = struct {
     }
 
     fn writePageWithOptions(self: *NativeFile, page_id: u64, kind: PageKind, contents: []const u8, options: WriteOptions) !void {
-        if (builtin.is_test) _ = self.test_page_writes.fetchAdd(1, .monotonic);
-        if (contents.len > self.maxPagePayloadBytes()) return error.PageTooLarge;
+        var batch = PageWriteBatch{ .file = self, .options = options };
+        try batch.appendPage(page_id, kind, contents);
+        try batch.flush();
+    }
 
-        const page_size: usize = @intCast(self.header.page_size);
-        const page_offset = page_id * @as(u64, self.header.page_size);
-
-        const page = try self.allocator.alloc(u8, page_size);
-        defer self.allocator.free(page);
-        encodePage(page, kind, contents);
-
-        // A positional write extends the file to its end. Pre-sizing every
-        // page added two filesystem calls and provided no durability benefit;
-        // publication still syncs complete pages before publishing the slot.
-        try self.file.writePositionalAll(self.runtimeIo(), page, page_offset);
+    /// Cache admission happens only after the complete encoded write succeeds.
+    fn cacheWrittenPage(self: *NativeFile, page_id: u64, page: []const u8, options: WriteOptions) void {
+        const kind: PageKind = @enumFromInt(page[4]);
+        const len = std.mem.readInt(u32, page[8..12], .little);
+        const contents = page[page_header_size..][0..len];
         if (kind == .free_map or (kind == .value and options.payload_cache == .cold_sequential)) {
             // Skipping admission must still remove stale bytes AND navigation
             // links from a previous use of this page ID. Cold payload pages
@@ -5055,17 +5138,23 @@ fn selectCompleteCheckpointForFile(header: Header, file_size: u64) !u8 {
 }
 
 fn encodePage(out: []u8, kind: PageKind, payload: []const u8) void {
+    encodePageParts(out, kind, &.{}, payload);
+}
+
+fn encodePageParts(out: []u8, kind: PageKind, prefix: []const u8, payload: []const u8) void {
+    const len = prefix.len + payload.len;
     std.debug.assert(out.len >= page_header_size);
-    std.debug.assert(payload.len <= out.len - page_header_size);
+    std.debug.assert(len <= out.len - page_header_size);
     @memset(out, 0);
     @memcpy(out[0..page_magic.len], page_magic);
     out[4] = @intFromEnum(kind);
-    std.mem.writeInt(u32, out[8..12], @intCast(payload.len), .little);
-    @memcpy(out[page_header_size..][0..payload.len], payload);
+    std.mem.writeInt(u32, out[8..12], @intCast(len), .little);
+    @memcpy(out[page_header_size..][0..prefix.len], prefix);
+    @memcpy(out[page_header_size + prefix.len ..][0..payload.len], payload);
 
     var crc = Crc32.init();
     crc.update(out[0..page_crc_offset]);
-    crc.update(out[page_header_size..][0..payload.len]);
+    crc.update(out[page_header_size..][0..len]);
     std.mem.writeInt(u32, out[page_crc_offset..][0..4], crc.final(), .little);
 }
 
@@ -8734,4 +8823,70 @@ test "lite native cold payload writes invalidate reused page bytes and links" {
     try std.testing.expectEqualStrings("cold replacement", payload[value_page_header_size..]);
     // A subsequent read can admit cold-written data normally.
     try std.testing.expect(file.page_cache.pages.contains(id));
+}
+
+test "lite native page batches coalesce runs without heap allocation and preserve gaps" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "page-batch.aflite");
+    defer alloc.free(path);
+    var budget = MaintenanceTestAllocator{ .backing = alloc };
+    var file = try NativeFile.createWithIo(budget.allocator(), std.testing.io, path, .{ .no_sync = true });
+    defer file.close();
+    file.page_cache_enabled.store(false, .monotonic);
+    budget.limit = budget.live; // Neither encoding nor batching may allocate.
+    for ([_]u32{ 4096, 65536 }) |size| {
+        file.header.page_size = size;
+        const run: u64 = PageWriteBatch.capacity / size;
+        var batch = PageWriteBatch{ .file = &file };
+        const before = file.test_page_write_calls.load(.monotonic);
+        // Keep a sentinel between disjoint runs and visit the second run in
+        // descending page order, as can happen with a fragmented free map.
+        try file.writePage(100, .data, "untouched gap");
+        for (1..@intCast(run + 2)) |id| try batch.appendValue(id, 0, "batched value");
+        try batch.appendPage(102, .data, "high page");
+        try batch.appendPage(101, .data, "low page");
+        try batch.flush();
+        try std.testing.expectEqual(@as(u64, 5), file.test_page_write_calls.load(.monotonic) - before);
+        var raw: [65536]u8 = undefined;
+        try readExactAt(file.file, std.testing.io, raw[0..size], @as(u64, size) * 100);
+        try std.testing.expectEqualStrings("untouched gap", try decodePagePayload(raw[0..size], .data));
+        for (1..@intCast(run + 2)) |id| {
+            try readExactAt(file.file, std.testing.io, raw[0..size], @as(u64, size) * id);
+            const value = try decodeValuePage(try decodePagePayload(raw[0..size], .value));
+            try std.testing.expectEqualStrings("batched value", value.chunk);
+            try std.testing.expectEqual(@as(u64, 0), value.next_page);
+        }
+        try readExactAt(file.file, std.testing.io, raw[0..size], @as(u64, size) * 101);
+        try std.testing.expectEqualStrings("low page", try decodePagePayload(raw[0..size], .data));
+        try readExactAt(file.file, std.testing.io, raw[0..size], @as(u64, size) * 102);
+        try std.testing.expectEqualStrings("high page", try decodePagePayload(raw[0..size], .data));
+    }
+}
+
+test "lite native failed page batches do not admit cache entries or retry" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "failed-page-batch.aflite");
+    defer alloc.free(path);
+    var file = try NativeFile.createWithIo(alloc, std.testing.io, path, .{ .no_sync = true });
+    defer file.close();
+    const first = file.activeCheckpoint().page_count;
+    var batch = PageWriteBatch{ .file = &file };
+    try batch.appendValue(first, 0, "private");
+    try std.testing.expect(!file.page_cache.pages.contains(first));
+    file.test_page_write_fail_after = 0;
+    try std.testing.expectError(error.TestPageWriteFailure, batch.flush());
+    try std.testing.expect(!file.page_cache.pages.contains(first));
+    try std.testing.expect(!file.page_cache.links.contains(first));
+    file.test_page_write_fail_after = null;
+    try std.testing.expectError(error.TestPageWriteFailure, batch.appendValue(first + 1, 0, "retry"));
+    try std.testing.expectError(error.TestPageWriteFailure, batch.flush());
+    var fresh = PageWriteBatch{ .file = &file };
+    try fresh.appendValue(first, 0, "fresh");
+    try fresh.flush();
+    try std.testing.expect(file.page_cache.pages.contains(first));
+    try std.testing.expect(file.page_cache.links.contains(first));
 }
