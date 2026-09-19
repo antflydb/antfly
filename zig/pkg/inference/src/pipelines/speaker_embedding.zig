@@ -497,7 +497,12 @@ fn msToSamples(ms: u64) usize {
 }
 
 /// Label of the window whose centre is nearest to `position`.
-fn nearestWindowLabel(windows: []const Window, position: usize) u8 {
+/// Label of the window whose centre is nearest to `position`, or null when
+/// there are no windows to ask. A recording can end up with none: the
+/// recognizer clamps a phrase's timestamps to the clip's duration, and a
+/// phrase sitting exactly at the end overlaps no window at all.
+fn nearestWindowLabel(windows: []const Window, position: usize) ?u8 {
+    if (windows.len == 0) return null;
     var best: usize = 0;
     var best_distance: usize = std.math.maxInt(usize);
     for (windows, 0..) |window, i| {
@@ -509,6 +514,14 @@ fn nearestWindowLabel(windows: []const Window, position: usize) u8 {
         }
     }
     return windows[best].label;
+}
+
+fn sameLabel(a: ?u8, b: ?u8) bool {
+    if (a) |left| {
+        const right = b orelse return false;
+        return left == right;
+    }
+    return b == null;
 }
 
 /// Speaker-attributed phrases for a transcript: 3 s windows over the spoken
@@ -541,6 +554,16 @@ pub fn diarizeSegmentsAlloc(
         windows = try speechWindowsAlloc(allocator, samples.len, segments, hop);
     }
     defer allocator.free(windows);
+    if (windows.len == 0) {
+        // Nothing to sample: every phrase landed where the clip ends, which
+        // is where the recognizer clamps a timestamp it could not place.
+        // The transcript comes back unattributed rather than guessed at.
+        for (segments) |segment| {
+            const copy = try dupeSegment(allocator, segment, segment.words, segment.start_ms, segment.end_ms);
+            try out.append(allocator, copy);
+        }
+        return out.toOwnedSlice(allocator);
+    }
 
     // Embed and cluster the windows.
     const embeddings = try allocator.alloc([]const f32, windows.len);
@@ -565,7 +588,7 @@ pub fn diarizeSegmentsAlloc(
     for (windows, labels) |*w, label| w.label = label;
 
     // Assign words, smooth, split.
-    var word_labels = std.ArrayList(u8).empty;
+    var word_labels = std.ArrayList(?u8).empty;
     defer word_labels.deinit(allocator);
     for (segments) |segment| {
         if (segment.words.len == 0) {
@@ -585,13 +608,13 @@ pub fn diarizeSegmentsAlloc(
         const wl = word_labels.items;
         if (wl.len >= 3) {
             for (1..wl.len - 1) |i| {
-                if (wl[i - 1] == wl[i + 1] and wl[i] != wl[i - 1]) wl[i] = wl[i - 1];
+                if (sameLabel(wl[i - 1], wl[i + 1]) and !sameLabel(wl[i], wl[i - 1])) wl[i] = wl[i - 1];
             }
         }
         var run_start: usize = 0;
         while (run_start < wl.len) {
             var run_end = run_start + 1;
-            while (run_end < wl.len and wl[run_end] == wl[run_start]) run_end += 1;
+            while (run_end < wl.len and sameLabel(wl[run_end], wl[run_start])) run_end += 1;
             const words = segment.words[run_start..run_end];
             const start_ms = if (run_start == 0) segment.start_ms else words[0].start_ms;
             const end_ms = if (run_end == wl.len) segment.end_ms else words[words.len - 1].end_ms;
@@ -761,6 +784,71 @@ test "speech windows cover phrases at the hop and clamp to the clip" {
     const short = try speechWindowsAlloc(std.testing.allocator, 8000, segments[0..1], 24000);
     defer std.testing.allocator.free(short);
     try std.testing.expectEqual(@as(usize, 1), short.len);
+}
+
+test "a phrase clamped to the clip's end leaves the transcript unattributed" {
+    const alloc = std.testing.allocator;
+    // The recognizer clamps a timestamp it cannot place to the clip's
+    // duration. A phrase sitting exactly there overlaps no window, so there
+    // is nothing to sample and nothing to attribute: asking the nearest
+    // window used to read past the end of an empty list.
+    const clip_samples = 4 * @as(usize, sample_rate);
+    const words = [_]long_transcription.Word{};
+    var segments = [_]long_transcription.Segment{
+        .{ .text = @constCast("thanks"), .start_ms = 4000, .end_ms = 4000, .words = @constCast(&words) },
+    };
+
+    const windows = try speechWindowsAlloc(alloc, clip_samples, &segments, 24000);
+    defer alloc.free(windows);
+    try std.testing.expectEqual(@as(usize, 0), windows.len);
+    try std.testing.expectEqual(@as(?u8, null), nearestWindowLabel(windows, clip_samples / 2));
+
+    // The whole path runs without touching the model, because there is no
+    // window to embed; a session that would fail if used proves it.
+    var embedder = Embedder{ .allocator = alloc, .session = unusedSession() };
+    const samples = try alloc.alloc(f32, clip_samples);
+    defer alloc.free(samples);
+    @memset(samples, 0);
+
+    const labelled = try diarizeSegmentsAlloc(alloc, &embedder, samples, &segments, .{}, null);
+    defer long_transcription.freeSegments(alloc, labelled);
+    try std.testing.expectEqual(@as(usize, 1), labelled.len);
+    try std.testing.expectEqual(@as(?u8, null), labelled[0].speaker_index);
+    try std.testing.expectEqualStrings("thanks", labelled[0].text);
+    try std.testing.expectEqual(@as(u64, 4000), labelled[0].start_ms);
+}
+
+/// A session that fails any call. Diarization must not reach the model when
+/// there is no audio window to embed.
+fn unusedSession() Session {
+    const Stub = struct {
+        fn run(_: *anyopaque, _: []const backends.Tensor, _: std.mem.Allocator) anyerror![]backends.Tensor {
+            return error.SessionShouldNotRun;
+        }
+        fn runWithControl(_: *anyopaque, _: []const backends.Tensor, _: std.mem.Allocator, _: InferenceExecutionControl) anyerror![]backends.Tensor {
+            return error.SessionShouldNotRun;
+        }
+        fn inputInfo(_: *anyopaque) []const backends.TensorInfo {
+            return &.{};
+        }
+        fn outputInfo(_: *anyopaque) []const backends.TensorInfo {
+            return &.{};
+        }
+        fn backend(_: *anyopaque) backends.BackendType {
+            return .native;
+        }
+        fn close(_: *anyopaque) void {}
+        const vtable = Session.VTable{
+            .run = run,
+            .runWithControl = runWithControl,
+            .inputInfo = inputInfo,
+            .outputInfo = outputInfo,
+            .backend = backend,
+            .close = close,
+        };
+    };
+    var nothing: u8 = 0;
+    return .{ .ptr = @ptrCast(&nothing), .vtable = &Stub.vtable };
 }
 
 test "nearest window label picks the window centred closest" {
