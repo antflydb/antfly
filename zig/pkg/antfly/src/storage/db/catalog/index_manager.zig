@@ -10898,6 +10898,62 @@ pub const IndexManager = struct {
         try self.loadWithBackfill(store, false, true);
     }
 
+    /// Prove the persisted restricted completion profile without constructing
+    /// indexes or treating an uninitialized manager as an empty catalog. The
+    /// caller supplies bounded scratch and holds the DB apply/startup boundary.
+    pub fn validateEmptyCompletionCatalog(alloc: Allocator, store: anytype) !void {
+        var runtime_store = try initRuntimeStore(alloc, store);
+        defer runtime_store.deinit();
+        {
+            var txn = try runtime_store.store.beginProbe();
+            defer txn.abort();
+            inline for (.{ index_catalog_key, enrichment_catalog_key, resolver_catalog_key }, 0..) |key, kind| {
+                const maybe_data: ?[]const u8 = txn.get(key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                if (maybe_data) |data| {
+                    if (data.len > 1024 * 1024) return error.UnsupportedCompletionProfile;
+                    const configs = if (kind == 0)
+                        try deserializeCatalog(alloc, data)
+                    else if (kind == 1)
+                        try enrichment_catalog.deserializeCatalog(alloc, data)
+                    else
+                        try resolver_catalog.deserializeCatalog(alloc, data);
+                    defer {
+                        for (configs) |*cfg| cfg.deinit(alloc);
+                        alloc.free(configs);
+                    }
+                    if (configs.len != 0) return error.UnsupportedCompletionProfile;
+                }
+            }
+        }
+        // A queued managed admission is future index work even if no index
+        // has been materialized yet. Probe only the first matching row.
+        const prefix = try internal_keys.managedIndexAdmissionRootPrefixAlloc(alloc);
+        defer alloc.free(prefix);
+        var scan_txn = try runtime_store.store.beginCurrentScan();
+        defer scan_txn.abort();
+        var cursor = try scan_txn.openCursor();
+        defer cursor.close();
+        if (try cursor.seekAtOrAfter(prefix)) |entry| {
+            if (std.mem.startsWith(u8, entry.key, prefix)) return error.UnsupportedCompletionProfile;
+        }
+    }
+
+    /// Startup-only initialization for a positively restored empty profile.
+    /// No catalog mutation, index opening, or vector generation loading occurs.
+    pub fn initializeEmptyCompletionCatalog(self: *IndexManager, alloc: Allocator, store: anytype) !void {
+        if (self.text_indexes.items.len != 0 or self.dense_indexes.items.len != 0 or
+            self.sparse_indexes.items.len != 0 or self.graph_indexes.items.len != 0 or
+            self.algebraic_indexes.items.len != 0 or self.enrichments.items.len != 0 or
+            self.resolvers.items.len != 0 or self.status_only_index_configs.len != 0)
+            return error.UnsupportedCompletionProfile;
+        try validateEmptyCompletionCatalog(alloc, store);
+        if (comptime @TypeOf(store) == *docstore_mod.DocStore) self.primary_store = store;
+        self.storeGeneratedEnrichmentTargetCache(false);
+    }
+
     fn loadWithBackfill(self: *IndexManager, store: anytype, allow_backfill: bool, read_only: bool) !void {
         var completion_transition = try self.beginCompletionTransition();
         defer if (completion_transition) |*transition| transition.deinit();
@@ -29384,6 +29440,60 @@ test "index catalog rejects impossible entry count before allocation" {
     std.mem.writeInt(u32, encoded[8..12], std.math.maxInt(u32), .little);
 
     try std.testing.expectError(error.InvalidIndexCatalog, validateSerializedCatalog(std.testing.allocator, &encoded));
+}
+
+test "workload admission completion empty catalog validates persisted definitions and pending admissions" {
+    const alloc = std.testing.allocator;
+    var backend = lsm_backend_mod.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer store.deinit();
+    try IndexManager.validateEmptyCompletionCatalog(alloc, store);
+
+    var manager = try IndexManager.init(alloc, ".");
+    defer manager.deinit();
+    const empty_index = try serializeCatalog(alloc, &manager);
+    defer alloc.free(empty_index);
+    const empty_enrichment = try enrichment_catalog.serializeCatalog(alloc, &.{});
+    defer alloc.free(empty_enrichment);
+    const empty_resolver = try resolver_catalog.serializeCatalog(alloc, &.{});
+    defer alloc.free(empty_resolver);
+    manager.status_only_index_configs = try alloc.alloc(types.IndexConfig, 1);
+    manager.status_only_index_configs[0] = try types.IndexConfig.clone(alloc, .{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    const defined_index = try serializeCatalog(alloc, &manager);
+    defer alloc.free(defined_index);
+    const defined_enrichment = try enrichment_catalog.serializeCatalog(alloc, &.{.{ .name = "asset", .kind = .asset, .source_field = "body" }});
+    defer alloc.free(defined_enrichment);
+    const defined_resolver = try resolver_catalog.serializeCatalog(alloc, &.{.{ .name = "resolver", .table = "entities", .source_artifact = "asset", .resolution_artifact = "resolution", .key_template = "{{name}}" }});
+    defer alloc.free(defined_resolver);
+    const keys = [_][]const u8{ index_catalog_key, enrichment_catalog_key, resolver_catalog_key };
+    const empty = [_][]const u8{ empty_index, empty_enrichment, empty_resolver };
+    const defined = [_][]const u8{ defined_index, defined_enrichment, defined_resolver };
+    for (keys, empty, defined) |key, empty_data, defined_data| {
+        {
+            var txn = try store.beginWrite();
+            errdefer txn.abort();
+            try txn.put(key, defined_data);
+            try txn.commit();
+        }
+        try std.testing.expectError(error.UnsupportedCompletionProfile, IndexManager.validateEmptyCompletionCatalog(alloc, store));
+        {
+            var txn = try store.beginWrite();
+            errdefer txn.abort();
+            try txn.put(key, empty_data);
+            try txn.commit();
+        }
+        try IndexManager.validateEmptyCompletionCatalog(alloc, store);
+    }
+    const prefix = try internal_keys.managedIndexAdmissionRootPrefixAlloc(alloc);
+    defer alloc.free(prefix);
+    const pending_key = try std.mem.concat(alloc, u8, &.{ prefix, "pending" });
+    defer alloc.free(pending_key);
+    var txn = try store.beginWrite();
+    errdefer txn.abort();
+    try txn.put(pending_key, "pending");
+    try txn.commit();
+    try std.testing.expectError(error.UnsupportedCompletionProfile, IndexManager.validateEmptyCompletionCatalog(alloc, store));
 }
 
 fn appendU32(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, value: u32) !void {
