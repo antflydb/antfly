@@ -146,9 +146,9 @@ pub fn Guard(comptime DB: type) type {
         const Resolution = struct { id: [16]u8, commit: bool, timestamp: u64 };
         fn resolution(p: *native.Backend.CompletionPool, payload: []const u8) !?Resolution {
             if (payload.len == 0 or payload.len > codec.max_wire_bytes) return error.CompletionPlanCapacityExceeded;
-            var borrow = try p.compiler.tryBorrow();
-            defer borrow.release() catch unreachable;
-            const alloc = try borrow.allocator();
+            return p.compiler.withCompletion(?Resolution, payload, parseResolution);
+        }
+        fn parseResolution(payload: []const u8, alloc: std.mem.Allocator) !?Resolution {
             var decoded = try @import("../data/raft_batch.zig").decode(alloc, payload);
             defer decoded.deinit(alloc);
             if (decoded.protocol_barrier_version != null) return null;

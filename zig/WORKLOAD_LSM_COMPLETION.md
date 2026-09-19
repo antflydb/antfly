@@ -444,8 +444,20 @@ The following gates remain:
   skips, failures, or leaks, including exact-budget binary-key/tombstone merge,
   file-cap rejection, payload provenance after scratch release, and prior
   four-cell/restart/generation tests. This does not cover the standalone Slot's
-  generic writer, shared scratch used by WAL/delta/replay work, or mandatory
-  compiler-borrow counter headroom; those remain explicit capacity gates.
+  generic writer or shared scratch used by WAL/delta/replay work; those remain
+  explicit capacity gates.
+- **Mandatory workspace borrowing (implemented).** Drains, no-debt maintenance,
+  and bounded resolution parsing borrow the compiler domain through a lexical
+  completion scope with no escaping epoch token and no epoch increment. Normal
+  admission/qualification still use checked monotonic epochs. Normal tokens
+  cannot allocate or release during a completion scope, and nested borrowers
+  are rejected. Callback cleanup must leave the domain empty on both success
+  and failure; otherwise it stays unavailable. The owning Debug gate passed
+  28/28 with zero skips, failures, or leaks. It includes stale/nested/error
+  scope checks and four maximum accepted plans completing commit/abort plus
+  maintenance after normal epochs reach u64 maximum, while new admission stays
+  closed. Existing accepted completion does not depend on restarting to reset
+  this process-local counter.
 - **Output-count and future-frontier certificate (implemented).** Qualification
   scans CRC-checked physical records and keeps additive encoded-data, metadata,
   and block costs. Admission adds canonical operations, both possible outcomes,

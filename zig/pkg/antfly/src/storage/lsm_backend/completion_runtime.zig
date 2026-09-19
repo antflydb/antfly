@@ -797,12 +797,18 @@ pub fn Slot(comptime Backend: type) type {
                 if (builtin.is_test) if (test_after_wal) |hook| if (hook()) return error.RecoveryRequired;
             }
             var run = if (self.drain_workspace) |workspace| bounded: {
-                var borrow = try workspace.tryBorrow();
-                defer borrow.release() catch unreachable;
-                const writer_alloc = try borrow.allocator();
-                var output = try @import("completion_maintenance.zig").buildStateDrain(writer_alloc, self.io.storage(), backend.root_dir.?, &states, self.run_id, self.drain_limits);
-                defer output.deinit(writer_alloc);
-                break :bounded try repository.cloneRunCompactionSnapshot(pub_alloc, output);
+                const Context = struct {
+                    slot: *Self,
+                    root: []const u8,
+                    states: []const *const state.State,
+                    publication_alloc: std.mem.Allocator,
+                    fn write(context: @This(), writer_alloc: std.mem.Allocator) !repository.Run {
+                        var output = try @import("completion_maintenance.zig").buildStateDrain(writer_alloc, context.slot.io.storage(), context.root, context.states, context.slot.run_id, context.slot.drain_limits);
+                        defer output.deinit(writer_alloc);
+                        return repository.cloneRunCompactionSnapshot(context.publication_alloc, output);
+                    }
+                };
+                break :bounded try workspace.withCompletion(repository.Run, Context{ .slot = self, .root = backend.root_dir.?, .states = &states, .publication_alloc = pub_alloc }, Context.write);
             } else legacy: {
                 // Standalone reservations retain their existing generic writer;
                 // the fixed pooled-workspace certificate does not cover it.

@@ -59,6 +59,17 @@ fn addSpec(specs: []storage_io.NativeCompletionIo.FileSpec, count: *usize, path:
 }
 
 pub fn run(comptime Backend: type, pool: anytype, backend: *Backend) !void {
+    const Context = struct {
+        pool: @TypeOf(pool),
+        backend: *Backend,
+        fn execute(context: @This(), scratch: Allocator) !void {
+            return runWithWorkspace(Backend, context.pool, context.backend, scratch);
+        }
+    };
+    return pool.compiler.withCompletion(void, Context{ .pool = pool, .backend = backend }, Context.execute);
+}
+
+fn runWithWorkspace(comptime Backend: type, pool: anytype, backend: *Backend, scratch: Allocator) !void {
     if (pool.failed or backend.manifest_recovery_required or !pool.restored) return error.RecoveryRequired;
     if (pool.maintenance_active or pool.startup_reconciliation_pending or backend.hasDurableCompletions() or backend.activeImmutableMemtableCount() != 0)
         return error.CompletionReservationBusy;
@@ -76,9 +87,6 @@ pub fn run(comptime Backend: type, pool: anytype, backend: *Backend) !void {
     // Replay/old readers may retain nodes in pool.scratch. The compiler domain
     // is exclusively borrowed and empty at entry, so those nodes cannot steal
     // the maintenance working frontier or fragment its starting span.
-    var workspace = try pool.compiler.tryBorrow();
-    defer workspace.release() catch unreachable;
-    const scratch = try workspace.allocator();
     const root = backend.root_dir.?;
     // Paths are an explicitly bounded part of the retained control domain.
     if (root.len > 512) return error.UnsupportedCompletionProfile;

@@ -1659,6 +1659,10 @@ test "workload admission completion generations carry four maximum point plans w
         pool.notifyApplied(i);
         if (i == 1) reader = try backend.mutable.snapshot(alloc);
     }
+    // Normal admission epochs may be exhausted after acceptance; all owned
+    // outcomes and mandatory checkpoint maintenance must still make progress.
+    pool.compiler.generation = std.math.maxInt(u64);
+    try std.testing.expectError(error.CompletionReservationBusy, pool.compiler.tryBorrow());
     for (ids, 0..) |id, i| {
         const progress = completion.AcceptedIdentity{ .term = 3, .index = 5 + i, .digest = @splat(@intCast(70 + i)) };
         const commit = i % 2 == 0;
@@ -1669,7 +1673,9 @@ test "workload admission completion generations carry four maximum point plans w
     }
     try backend.retireDurableCompletionCohort();
     try pool.maintainLocked(&backend);
-    try pool.qualifyFresh(&backend);
+    try std.testing.expectError(error.CompletionReservationBusy, pool.qualifyFresh(&backend));
+    try std.testing.expect(!pool.ready and !pool.failed);
+    try std.testing.expect(!backend.hasDurableCompletions());
     for (0..4) |i| {
         var key: [8]u8 = undefined;
         std.mem.writeInt(u64, &key, i * 1024 + 256, .big);

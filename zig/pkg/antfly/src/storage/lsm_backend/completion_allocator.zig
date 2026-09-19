@@ -504,6 +504,7 @@ pub const CompilerWorkspace = struct {
     mutex: std.atomic.Mutex = .unlocked,
     generation: u64 = 0,
     borrowed: bool = false,
+    completion_scope: bool = false,
 
     pub const Borrow = struct {
         workspace: *CompilerWorkspace,
@@ -513,7 +514,7 @@ pub const CompilerWorkspace = struct {
             const owner = self.workspace;
             owner.lock();
             defer owner.mutex.unlock();
-            if (!owner.borrowed or owner.generation != self.generation) return error.CompletionReservationBusy;
+            if (!owner.borrowed or owner.completion_scope or owner.generation != self.generation) return error.CompletionReservationBusy;
             return owner.scratch.allocator();
         }
 
@@ -523,7 +524,7 @@ pub const CompilerWorkspace = struct {
             const owner = self.workspace;
             owner.lock();
             defer owner.mutex.unlock();
-            if (!owner.borrowed or owner.generation != self.generation) return error.CompletionReservationBusy;
+            if (!owner.borrowed or owner.completion_scope or owner.generation != self.generation) return error.CompletionReservationBusy;
             owner.scratch.lock();
             defer owner.scratch.mutex.unlock();
             if (owner.scratch.live != 0) return error.CompletionReservationBusy;
@@ -546,6 +547,30 @@ pub const CompilerWorkspace = struct {
         self.generation += 1;
         self.borrowed = true;
         return .{ .workspace = self, .generation = self.generation };
+    }
+
+    /// Mandatory completion uses an exclusive lexical scope, not an escaping
+    /// epoch token. It cannot exhaust the normal-admission counter, and stale
+    /// normal tokens cannot allocate or release while this scope is active.
+    /// The callback must free every scratch allocation before returning; owned
+    /// results must be copied into their publication domain. A violated cleanup
+    /// contract leaves the workspace unavailable instead of reusing live bytes.
+    pub fn withCompletion(self: *CompilerWorkspace, comptime T: type, context: anytype, comptime callback: anytype) anyerror!T {
+        self.lock();
+        if (self.borrowed) {
+            self.mutex.unlock();
+            return error.CompletionReservationBusy;
+        }
+        self.borrowed = true;
+        self.completion_scope = true;
+        self.mutex.unlock();
+        const result: anyerror!T = callback(context, self.scratch.allocator());
+        self.lock();
+        defer self.mutex.unlock();
+        if (!self.scratch.isEmpty()) return error.CompletionReservationBusy;
+        self.completion_scope = false;
+        self.borrowed = false;
+        return result;
     }
 
     /// Owner excludes further borrow calls before destroying the workspace.
@@ -794,4 +819,42 @@ test "workload admission completion preowned publication remains usable after do
     try std.testing.expectEqual(@as(u8, 0x41), completion[completion.len - 1]);
     allocator.free(completion);
     try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+}
+
+test "workload admission completion compiler critical scopes survive exhausted epochs and reject stale or nested borrowing" {
+    const alloc = std.testing.allocator;
+    var manager = resources.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer manager.deinit(alloc);
+    var workspace = try CompilerWorkspace.init(alloc, &manager, 64 * 1024);
+    defer workspace.deinit() catch unreachable;
+    workspace.generation = std.math.maxInt(u64) - 1;
+    const last_normal = try workspace.tryBorrow();
+    const Context = struct {
+        owner: *CompilerWorkspace,
+        stale: CompilerWorkspace.Borrow,
+        fail: bool = false,
+        fn empty(_: void, _: std.mem.Allocator) !void {}
+        fn run(context: @This(), scratch: std.mem.Allocator) !usize {
+            try std.testing.expectError(error.CompletionReservationBusy, context.stale.allocator());
+            try std.testing.expectError(error.CompletionReservationBusy, context.stale.release());
+            try std.testing.expectError(error.CompletionReservationBusy, context.owner.tryBorrow());
+            try std.testing.expectError(error.CompletionReservationBusy, context.owner.withCompletion(void, {}, empty));
+            const bytes = try scratch.alloc(u8, 32768);
+            defer scratch.free(bytes);
+            @memset(bytes, 0x73);
+            if (context.fail) return error.InjectedCompletionFailure;
+            return bytes.len;
+        }
+    };
+    try std.testing.expectError(error.CompletionReservationBusy, workspace.withCompletion(void, {}, Context.empty));
+    try last_normal.release();
+    try std.testing.expectError(error.CompletionReservationBusy, workspace.tryBorrow());
+    try std.testing.expectError(error.InjectedCompletionFailure, workspace.withCompletion(usize, Context{ .owner = &workspace, .stale = last_normal, .fail = true }, Context.run));
+    try std.testing.expect(workspace.scratch.isEmpty());
+    for (0..32) |_| {
+        try std.testing.expectEqual(@as(usize, 32768), try workspace.withCompletion(usize, Context{ .owner = &workspace, .stale = last_normal }, Context.run));
+        try std.testing.expect(workspace.scratch.isEmpty());
+    }
+    try std.testing.expectEqual(std.math.maxInt(u64), workspace.generation);
+    try std.testing.expectError(error.CompletionReservationBusy, workspace.tryBorrow());
 }
