@@ -59,6 +59,55 @@ pub const limits: codec.Limits = .{
     .max_encoded_bytes = 256 * 1024,
 };
 
+pub const OperationWorkspace = struct {
+    temporary_tree: usize,
+    bindings: usize,
+    wal_record: usize,
+    manifest_frame: usize,
+    paths: usize,
+    writer: usize,
+    largest_span: usize,
+    total: usize,
+};
+
+/// Cumulative allocation bound, not just simultaneously live logical bytes.
+/// Starting with an empty recycling domain, every split consumes no more than
+/// its charged footprint; freeing/reusing a block cannot increase high-water
+/// consumption. Thus the sum also proves every individual contiguous request.
+pub fn operationWorkspaceRequirement(cost: @import("completion_capacity.zig").Cost, writer_limits: @import("completion_maintenance.zig").Limits) !OperationWorkspace {
+    const footprint = domains.RecyclingScratch.allocationFootprint;
+    const private_records = 4; // prepare: descriptor/marker/receipt/progress; outcome: four control edits.
+    const entries = limits.max_operations + private_records;
+    const namespace_bytes = "docs".len; // The only non-null native completion namespace.
+    const private_key_bytes = comptime blk: {
+        var largest: usize = @max(receiptKey(@splat(0)).len, @import("completion_entry.zig").group_progress_key.len);
+        largest = @max(largest, @import("../internal_keys.zig").raft_document_applied_entry_key.len);
+        for (storage_keys ++ applied_keys) |key| largest = @max(largest, key.len);
+        break :blk largest;
+    };
+    // Canonical wire bounds all public keys/values. Descriptor storage is an
+    // additional private value; the other private values fit the 112-byte
+    // authority-bound group receipt. Repeated namespaces are charged separately.
+    const payload_bytes = @import("completion_entry.zig").max_wire_bytes + limits.max_encoded_bytes +
+        entries * namespace_bytes + private_records * (private_key_bytes + 112);
+    const temporary = try state.ActiveMemTable.publicationAllocationBound(entries, entries, payload_bytes);
+    const bindings = try std.math.add(usize, limits.max_encoded_bytes, try std.math.mul(usize, 2 * limits.max_operations, try footprint(0, 1)));
+    const wal_record = try footprint(payload_bytes + 16 * entries + 20, 1); // WAL entry/header/count framing.
+    const key = std.math.cast(usize, cost.max_key_bytes) orelse return error.UnsupportedCompletionProfile;
+    const manifest_frame = try footprint(try manifest.singleRunJournalFrameSize(512 + 32, key, key), 1);
+    const max_segments = recovery_wal_records + 2 * max_slots + 1;
+    const append_paths = 4;
+    const reset_fixed_paths = 11; // directory/read-index/first/legacy, three controls, replay directory/index/segments, final legacy.
+    const paths = try std.math.mul(usize, append_paths + reset_fixed_paths + max_segments - 1, try footprint(512 + 32, 1));
+    const writer = try @import("completion_maintenance.zig").drainWorkspaceRequirement(cost, writer_limits);
+    var total = writer.total;
+    for ([_]usize{ temporary, bindings, wal_record, manifest_frame, paths }) |bytes| total = try std.math.add(usize, total, bytes);
+    const largest = @max(try footprint(writer.writer, 1), @max(try footprint(writer.compression, 1), @max(wal_record, manifest_frame)));
+    if (total > scratch_bytes or largest > scratch_bytes) return error.UnsupportedCompletionProfile;
+    total = std.mem.alignForward(usize, total, @alignOf(usize));
+    return .{ .temporary_tree = temporary, .bindings = bindings, .wal_record = wal_record, .manifest_frame = manifest_frame, .paths = paths, .writer = writer.total, .largest_span = largest, .total = total };
+}
+
 pub const Values = struct {
     commit_timestamp: u64,
     replay_sequence: u64,
@@ -243,20 +292,39 @@ pub fn Slot(comptime Backend: type) type {
             return self;
         }
 
+        fn runOperation(self: *Self, backend: *Backend, args: anytype, comptime execute: anytype) !void {
+            if (self.drain_workspace) |workspace| {
+                const Context = struct {
+                    slot: *Self,
+                    backend: *Backend,
+                    args: @TypeOf(args),
+                    fn run(context: @This(), alloc: std.mem.Allocator) !void {
+                        return execute(context.slot, context.backend, context.args, alloc);
+                    }
+                };
+                return workspace.withCompletion(void, Context{ .slot = self, .backend = backend, .args = args }, Context.run);
+            }
+            return execute(self, backend, args, self.scratch.allocator());
+        }
+
         /// Publish the leader's canonical prepare using held native capacity.
         /// The caller holds backend serialization and has installed this cell
         /// in the pending cohort. No logical planner/provider is invoked here.
         pub fn applyCanonicalPrepare(self: *Self, backend: *Backend, operations: []const codec.Operation) !void {
+            return self.runOperation(backend, .{operations}, applyCanonicalPrepareInWorkspace);
+        }
+
+        fn applyCanonicalPrepareInWorkspace(self: *Self, backend: *Backend, args: anytype, alloc: std.mem.Allocator) !void {
+            const operations: []const codec.Operation = args[0];
             const identity = self.accepted_identity orelse return error.InvalidCompletionSlot;
             if (identity.term == 0 or identity.index == 0 or operations.len == 0 or operations.len > 256)
                 return error.InvalidCompletionSlot;
             if (self.pooled_owner == null or self.attempted or backend.manifest_recovery_required)
                 return error.RecoveryRequired;
             if (self.durable) return;
-            const alloc = self.scratch.allocator();
             const publication_alloc = self.publication.allocator();
             const namespace = @import("../backend_types.zig").Namespace{ .name = self.descriptor.descriptor.namespace };
-            var incoming: state.ActiveMemTable = .{ .ordered_enabled = false };
+            var incoming: state.ActiveMemTable = .{};
             defer incoming.deinit(alloc);
             for (operations) |op| {
                 if (op.bindings.len != 0) return error.InvalidCompletionSlot;
@@ -310,6 +378,11 @@ pub fn Slot(comptime Backend: type) type {
         /// becomes terminal immediately. No prepared descriptor or transaction
         /// receipt is published, and no later decision is needed to drain it.
         pub fn applyCanonicalMutation(self: *Self, backend: *Backend, operations: []const codec.Operation) !void {
+            return self.runOperation(backend, .{operations}, applyCanonicalMutationInWorkspace);
+        }
+
+        fn applyCanonicalMutationInWorkspace(self: *Self, backend: *Backend, args: anytype, alloc: std.mem.Allocator) !void {
+            const operations: []const codec.Operation = args[0];
             const identity = self.accepted_identity orelse return error.InvalidCompletionSlot;
             const owner = self.pooled_owner orelse return error.InvalidCompletionSlot;
             if (identity.term == 0 or identity.index == 0 or operations.len == 0 or operations.len > 256 or
@@ -320,7 +393,6 @@ pub fn Slot(comptime Backend: type) type {
             const progress = try owner.prepare_progress(owner.context, self, identity, null);
             self.attempted = true;
             errdefer backend.fenceFailedBulkWal();
-            const alloc = self.scratch.allocator();
             const namespace = @import("../backend_types.zig").Namespace{ .name = self.descriptor.descriptor.namespace };
             var delta: state.ActiveMemTable = .{};
             defer delta.deinit(alloc);
@@ -334,7 +406,7 @@ pub fn Slot(comptime Backend: type) type {
             try delta.upsert(alloc, namespace, self.appliedKey(), &self.descriptor.descriptor.txn_id, false);
             try backend.checkCompletionPoolFootprint(&delta);
             try self.writeGuard();
-            try self.drain(backend, &delta, true, true);
+            try self.drain(backend, &delta, true, true, alloc);
             self.durable = true;
             self.attempted = false;
             owner.publish_progress(owner.context, identity);
@@ -660,6 +732,12 @@ pub fn Slot(comptime Backend: type) type {
         /// before prepare. The existing mutable is bounded while this slot is
         /// live; one merged SST drains both intervening writes and completion.
         pub fn complete(self: *Self, backend: *Backend, commit: bool, values: Values) !void {
+            return self.runOperation(backend, .{ commit, values }, completeInWorkspace);
+        }
+
+        fn completeInWorkspace(self: *Self, backend: *Backend, args: anytype, alloc: std.mem.Allocator) !void {
+            const commit: bool = args[0];
+            const values: Values = args[1];
             if (!self.durable) return error.CompletionNotPrepared;
             if (self.attempted or backend.manifest_recovery_required) return error.RecoveryRequired;
             const group_progress = if (self.pooled_owner) |owner| try owner.prepare_progress(owner.context, self, .{
@@ -671,7 +749,6 @@ pub fn Slot(comptime Backend: type) type {
             // failure must not allow an unbounded sequence of retries.
             self.attempted = true;
             errdefer backend.fenceFailedBulkWal();
-            const alloc = self.scratch.allocator();
             var delta: state.ActiveMemTable = .{};
             defer delta.deinit(alloc);
             const operations = if (commit) self.descriptor.descriptor.commit else self.descriptor.descriptor.abort;
@@ -708,22 +785,26 @@ pub fn Slot(comptime Backend: type) type {
             try delta.upsert(alloc, .{ .name = self.descriptor.descriptor.namespace }, self.storageKey(), "", true);
             try delta.upsert(alloc, .{ .name = self.descriptor.descriptor.namespace }, self.appliedKey(), &self.descriptor.descriptor.txn_id, false);
             try backend.checkCompletionPoolFootprint(&delta);
-            try self.drain(backend, &delta, true, true);
+            try self.drain(backend, &delta, true, true, alloc);
             if (self.pooled_owner) |owner| owner.publish_progress(owner.context, .{ .term = values.raft_term, .index = values.raft_index, .digest = values.canonical_payload_digest });
         }
 
         /// Replay has already applied the whole atomic completion record. Drain
         /// its current result; never bind the transaction templates a second time.
         pub fn finishReplayed(self: *Self, backend: *Backend) !void {
+            return self.runOperation(backend, .{}, finishReplayedInWorkspace);
+        }
+
+        fn finishReplayedInWorkspace(self: *Self, backend: *Backend, _: anytype, alloc: std.mem.Allocator) !void {
             if (self.attempted) return error.RecoveryRequired;
             self.attempted = true;
             errdefer backend.fenceFailedBulkWal();
             var delta: state.ActiveMemTable = .{};
-            defer delta.deinit(self.scratch.allocator());
+            defer delta.deinit(alloc);
             // A tombstone keeps the drain nonempty even after a prior manifest
             // survived and WAL reset completed before guard unlink failed.
-            try delta.upsert(self.scratch.allocator(), .{ .name = self.descriptor.descriptor.namespace }, self.storageKey(), "", true);
-            try self.drain(backend, &delta, false, true);
+            try delta.upsert(alloc, .{ .name = self.descriptor.descriptor.namespace }, self.storageKey(), "", true);
+            try self.drain(backend, &delta, false, true, alloc);
         }
 
         /// The manifest already contains the completion marker and no slot
@@ -731,6 +812,10 @@ pub fn Slot(comptime Backend: type) type {
         /// replay contains only the already-manifested prefix. Avoid another
         /// SST on every retry of checkpoint/guard cleanup.
         pub fn finishManifested(self: *Self, backend: *Backend) !void {
+            return self.runOperation(backend, .{}, finishManifestedInWorkspace);
+        }
+
+        fn finishManifestedInWorkspace(self: *Self, backend: *Backend, _: anytype, alloc: std.mem.Allocator) !void {
             if (self.attempted or self.baseline_slot_present) return error.InvalidCompletionSlot;
             const marker = self.baseline_applied orelse return error.InvalidCompletionSlot;
             if (!std.mem.eql(u8, &marker, &self.descriptor.descriptor.txn_id)) return error.InvalidCompletionSlot;
@@ -738,7 +823,7 @@ pub fn Slot(comptime Backend: type) type {
             errdefer backend.fenceFailedBulkWal();
             var wal_lock = try backend.acquireWalOperationLock(.exclusive);
             defer wal_lock.release();
-            try self.checkpointAndClearGuard(backend, true);
+            try self.checkpointAndClearGuard(backend, true, alloc);
             backend.invalidateMutableReadSnapshot();
             backend.mutable.deinit(backend.allocator);
             backend.mutable = .{};
@@ -747,8 +832,7 @@ pub fn Slot(comptime Backend: type) type {
             backend.syncTrackedInMemoryStateUsageCurrentLocked();
         }
 
-        fn drain(self: *Self, backend: *Backend, delta: *state.ActiveMemTable, append_wal: bool, retire_guard: bool) !void {
-            const alloc = self.scratch.allocator();
+        fn drain(self: *Self, backend: *Backend, delta: *state.ActiveMemTable, append_wal: bool, retire_guard: bool, alloc: std.mem.Allocator) !void {
             const pub_alloc = self.publication.allocator();
             const output_index = if (self.cohort.legacy) @as(usize, 0) else backend.runs.count() -| self.cohort.initial_runs;
             if (output_index >= self.cohort.capacity()) return error.CompletionPlanCapacityExceeded;
@@ -796,19 +880,12 @@ pub fn Slot(comptime Backend: type) type {
                 backend.write_stats.wal_append_bytes += result.bytes;
                 if (builtin.is_test) if (test_after_wal) |hook| if (hook()) return error.RecoveryRequired;
             }
-            var run = if (self.drain_workspace) |workspace| bounded: {
-                const Context = struct {
-                    slot: *Self,
-                    root: []const u8,
-                    states: []const *const state.State,
-                    publication_alloc: std.mem.Allocator,
-                    fn write(context: @This(), writer_alloc: std.mem.Allocator) !repository.Run {
-                        var output = try @import("completion_maintenance.zig").buildStateDrain(writer_alloc, context.slot.io.storage(), context.root, context.states, context.slot.run_id, context.slot.drain_limits);
-                        defer output.deinit(writer_alloc);
-                        return repository.cloneRunCompactionSnapshot(context.publication_alloc, output);
-                    }
-                };
-                break :bounded try workspace.withCompletion(repository.Run, Context{ .slot = self, .root = backend.root_dir.?, .states = &states, .publication_alloc = pub_alloc }, Context.write);
+            var run = if (self.drain_workspace != null) bounded: {
+                // The entire operation already owns the empty compiler scope;
+                // replay/readers retain their independent scratch allocation.
+                var output = try @import("completion_maintenance.zig").buildStateDrain(alloc, self.io.storage(), backend.root_dir.?, &states, self.run_id, self.drain_limits);
+                defer output.deinit(alloc);
+                break :bounded try repository.cloneRunCompactionSnapshot(pub_alloc, output);
             } else legacy: {
                 // Standalone reservations retain their existing generic writer;
                 // the fixed pooled-workspace certificate does not cover it.
@@ -849,11 +926,7 @@ pub fn Slot(comptime Backend: type) type {
             var meta = repository.runMeta(run);
             meta.path = repository.manifestRelativePath(backend.root_dir.?, meta.path);
             const sequence = try std.math.add(u64, backend.manifest_journal.sequence.?, 1);
-            const frame = try manifest.encodeJournalFrameAlloc(alloc, sequence, false, &.{}, &.{}, .{
-                .next_run_id = backend.next_run_id,
-                .runs = &.{meta},
-                .obsolete_paths = &.{},
-            });
+            const frame = try manifest.encodeSingleRunJournalFrameAlloc(alloc, sequence, backend.next_run_id, meta);
             defer alloc.free(frame);
             // An uncertain manifest append may already reference this SST.
             manifest_attempted = true;
@@ -883,17 +956,20 @@ pub fn Slot(comptime Backend: type) type {
             backend.manifest_pending_mutation_bytes = 0;
             backend.clearPublishedWalLogicalDebtLocked();
             backend.syncTrackedInMemoryStateUsageCurrentLocked();
-            try self.checkpointAndClearGuard(backend, retire_guard);
+            try self.checkpointAndClearGuard(backend, retire_guard, alloc);
         }
 
         pub fn finishCheckpointCut(self: *Self, backend: *Backend) !void {
-            var wal_lock = try backend.acquireWalOperationLock(.exclusive);
-            defer wal_lock.release();
-            try self.checkpointAndClearGuard(backend, false);
+            return self.runOperation(backend, .{}, finishCheckpointCutInWorkspace);
         }
 
-        fn checkpointAndClearGuard(self: *Self, backend: *Backend, retire_guard: bool) !void {
-            const alloc = self.scratch.allocator();
+        fn finishCheckpointCutInWorkspace(self: *Self, backend: *Backend, _: anytype, alloc: std.mem.Allocator) !void {
+            var wal_lock = try backend.acquireWalOperationLock(.exclusive);
+            defer wal_lock.release();
+            try self.checkpointAndClearGuard(backend, false, alloc);
+        }
+
+        fn checkpointAndClearGuard(self: *Self, backend: *Backend, retire_guard: bool, alloc: std.mem.Allocator) !void {
             // Only the durable manifest authorizes retiring WAL recovery data.
             try wal.protectedReset(self.io.storage(), alloc, backend.root_dir.?);
             backend.wal_retention.primary = .{ .oldest_retained_segment = 1, .current_segment = 1 };
@@ -913,4 +989,29 @@ pub fn Slot(comptime Backend: type) type {
             };
         }
     };
+}
+
+test "workload admission completion operation workspace rejects cumulative costs beyond a valid writer span" {
+    const capacity = @import("completion_capacity.zig");
+    const maintenance = @import("completion_maintenance.zig");
+    const cost = try capacity.Cost.record("docs".len, 128, 1024);
+    const normal = try operationWorkspaceRequirement(cost, .{ .max_output_file_bytes = limits.flush_bytes });
+    try std.testing.expect(normal.total <= scratch_bytes);
+    try std.testing.expect(normal.largest_span <= normal.total);
+    var rejected_sum = false;
+    for (16..128) |steps| {
+        const shape: maintenance.Limits = .{ .max_metadata_bytes = steps * 64 * 1024, .max_output_metadata_bytes = steps * 64 * 1024, .max_output_file_bytes = limits.flush_bytes };
+        _ = maintenance.drainWorkspaceRequirement(cost, shape) catch continue;
+        _ = operationWorkspaceRequirement(cost, shape) catch |err| {
+            try std.testing.expectEqual(error.UnsupportedCompletionProfile, err);
+            rejected_sum = true;
+            break;
+        };
+    }
+    try std.testing.expect(rejected_sum);
+    // Namespace and key may together almost fill the maximum physical record.
+    const widest = try capacity.Cost.record("docs".len, limits.max_encoded_bytes - 64, 0);
+    const bound = try operationWorkspaceRequirement(widest, .{ .max_output_file_bytes = limits.flush_bytes });
+    try std.testing.expect(bound.manifest_frame >= 2 * widest.max_key_bytes);
+    try std.testing.expect(bound.total <= scratch_bytes);
 }

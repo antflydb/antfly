@@ -309,6 +309,21 @@ fn entryCapacity(entry: *const entry_codec.OwnedEntry) !capacity.Cost {
     return result;
 }
 
+/// A manifest frame retains both physical key bounds. Reserve the configured
+/// record ceiling for each bound; an accepted small key must not lend future
+/// journal capacity to another member of its already-owned cohort.
+fn journalHeadroom(max_record_bytes: usize, remaining_outputs: usize) !usize {
+    const frame = try @import("../lsm/manifest.zig").singleRunJournalFrameSize(512 + 32, max_record_bytes, max_record_bytes);
+    return std.math.mul(usize, remaining_outputs, frame) catch error.CompletionReservationBusy;
+}
+
+fn journalNeedsMaintenance(journal_size: u64, max_record_bytes: usize, remaining_outputs: usize) !bool {
+    const limit = repository.maxManifestReadBytes();
+    const reserve = try journalHeadroom(max_record_bytes, remaining_outputs);
+    if (reserve > limit or journal_size > limit) return error.CompletionReservationBusy;
+    return journal_size > limit - reserve;
+}
+
 fn metadataCapacity(outputs: u64, key_bytes: u64) !void {
     // Root <=512 bytes, slash + runs/ + maximum 20-digit u64 + .tbl.
     const path_bytes = 512 + 1 + 5 + 20 + 4;
@@ -426,7 +441,8 @@ pub fn Pool(comptime Backend: type) type {
                 return error.CompletionReservationBusy;
             const saved = try savedCohort(backend.storage.?, backend.allocator, root, config.identity);
             const cohort = saved orelse completion.guard.Info{ .base_run_id = backend.next_run_id, .initial_runs = @intCast(@min(backend.runs.count(), 64)), .cohort_id = config.identity.incarnation };
-            if (cohort.initial_runs > 64 or backend.runs.count() > cohort.initial_runs + max_slots) return error.CompletionReservationBusy;
+            if (cohort.initial_runs > 64 or backend.runs.count() > cohort.initial_runs + max_slots or
+                (saved != null and backend.runs.count() < cohort.initial_runs)) return error.CompletionReservationBusy;
             const next_id = std.math.add(u64, cohort.base_run_id, max_slots) catch return error.CompletionReservationBusy;
             const control = try domains.RecyclingScratch.create(backend.allocator, manager, control_bytes);
             errdefer control.retire();
@@ -479,7 +495,13 @@ pub fn Pool(comptime Backend: type) type {
             specs[spec_count] = .{ .path = journal_path, .max_bytes = repository.maxManifestReadBytes(), .allow_append = true };
             spec_count += 1;
             const journal_size = try backend.storage.?.fileSize(journal_path);
-            if (journal_size > repository.maxManifestReadBytes() - max_slots * (completion.limits.max_encoded_bytes + 64 * 1024)) return error.CompletionReservationBusy;
+            // Persisted output runs have already consumed their frame; only
+            // the remaining cohort drains need headroom on a guarded reopen.
+            const manifested_outputs = if (saved != null) backend.runs.count() - cohort.initial_runs else 0;
+            const journal_maintenance = try journalNeedsMaintenance(journal_size, config.shape.max_record_bytes, max_slots - manifested_outputs);
+            if (saved != null and journal_maintenance) return error.CompletionRecoveryCapacityRequired;
+            // An idle installation can rotate a full journal with its prepaid
+            // maintenance scope before issuing a fresh readiness proof.
             var wal_paths: [3][]u8 = undefined;
             var wal_count: usize = 0;
             defer for (wal_paths[0..wal_count]) |path| alloc.free(path);
@@ -506,6 +528,7 @@ pub fn Pool(comptime Backend: type) type {
             io.allow_wal_reset = true;
             self.* = .{
                 .config = config,
+                .maintenance_pending = journal_maintenance,
                 .control = control,
                 .generations = generations,
                 .scratch = scratch,
@@ -660,7 +683,7 @@ pub fn Pool(comptime Backend: type) type {
             const future = try self.capacity_growth.plus(growth);
             // A protected drain writes one run from mutable+delta. Its metadata
             // must remain readable by the later bounded maintenance cursor.
-            _ = try maintenance.drainWorkspaceRequirement(future, .{
+            _ = try completion.operationWorkspaceRequirement(future, .{
                 .max_metadata_bytes = self.config.shape.max_metadata_bytes,
                 .max_output_metadata_bytes = self.config.shape.max_metadata_bytes,
                 .max_record_bytes = self.config.shape.max_record_bytes,
@@ -928,6 +951,7 @@ pub fn Pool(comptime Backend: type) type {
             if (!self.restored or self.failed or backend.manifest_recovery_required) return error.RecoveryRequired;
             if (self.maintenanceRequired(backend)) return error.CompletionReservationBusy;
             for (self.cells[0..self.cell_count]) |cell| if (cell.phase != .free) return error.CompletionReservationBusy;
+            if (!backend.mutable.ordered_enabled) return error.UnsupportedCompletionProfile;
             if (backend.mutable.entryCount() != 0 or backend.activeImmutableMemtableCount() != 0 or
                 backend.runs.count() > self.config.shape.max_runs) return error.CompletionReservationBusy;
             var borrow = try self.compiler.tryBorrow();
@@ -1642,6 +1666,20 @@ test "workload admission completion generations carry four maximum point plans w
             .prepare_operations = &prepare_ops,
         });
     }
+    var future_cost: capacity.Cost = .{};
+    for (envelopes) |wire| {
+        var decoded = try entry_codec.decode(alloc, wire.?);
+        defer decoded.deinit();
+        future_cost = try future_cost.plus(try entryCapacity(&decoded));
+    }
+    const operation_bound = try completion.operationWorkspaceRequirement(future_cost, .{ .max_output_file_bytes = completion.limits.flush_bytes });
+    const exact_workspace = try domains.RecyclingScratch.create(failing.allocator(), &manager, operation_bound.total);
+    try pool.compiler.scratch.destroy();
+    pool.compiler.scratch = exact_workspace;
+    // Existing replay/readers may consume almost the entire independent domain.
+    // New accepted operations must use only the separately certified workspace.
+    const retained_scratch = try pool.scratch.allocator().alloc(u8, completion.scratch_bytes - 1024);
+    defer pool.scratch.allocator().free(retained_scratch);
     failing.fail_index = failing.alloc_index;
     failing.resize_fail_index = failing.resize_index;
     fd_pool.fd_cache.capacity = 1;
@@ -2132,4 +2170,22 @@ test "workload admission completion single drain rejects cumulative large keys b
             pool.notifyApplied(i);
         }
     }
+}
+
+test "workload admission completion operation workspace reserves exact remaining journal frames" {
+    const record_limit = (Shape{}).max_record_bytes;
+    const frame = try journalHeadroom(record_limit, 1);
+    try std.testing.expect(frame > completion.limits.max_encoded_bytes + 64 * 1024);
+    const cap = repository.maxManifestReadBytes();
+    const initial = cap - try journalHeadroom(record_limit, max_slots);
+    for (0..max_slots + 1) |manifested| {
+        const size = initial + manifested * frame;
+        try std.testing.expect(!try journalNeedsMaintenance(size, record_limit, max_slots - manifested));
+    }
+    try std.testing.expect(try journalNeedsMaintenance(initial + 1, record_limit, max_slots));
+    // A fully manifested cohort may reopen at the file ceiling, then requires
+    // rotation before any new cohort can be admitted.
+    try std.testing.expect(!try journalNeedsMaintenance(cap, record_limit, 0));
+    try std.testing.expect(try journalNeedsMaintenance(cap, record_limit, max_slots));
+    try std.testing.expectError(error.CompletionReservationBusy, journalNeedsMaintenance(cap + 1, record_limit, 0));
 }

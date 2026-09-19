@@ -458,6 +458,30 @@ The following gates remain:
   maintenance after normal epochs reach u64 maximum, while new admission stays
   closed. Existing accepted completion does not depend on restarting to reset
   this process-local counter.
+- **Whole pooled operation workspace (implemented).** Canonical prepare,
+  one-phase mutation, outcome binding/drain, and replay/manifest/checkpoint
+  cleanup now use one exclusive empty compiler domain for the entire operation.
+  The pre-ACK certificate sums temporary ordered-tree allocation, binding
+  copies, WAL framing, fixed SST writer buffers, exact manifest encoding, and
+  checkpoint paths, including allocator headers, alignment and split tails.
+  Its production maxima are 256 public plus four private records, a 512 KiB
+  canonical envelope, a 256 KiB descriptor, null or `docs` namespace, and 151
+  bounded path allocations (four append, eleven reset controls, and at most
+  136 retired WAL segments). Both cumulative allocation and largest contiguous
+  request must fit the installed 32 MiB domain. Publication copies retain
+  their own allocator, so no operation workspace escapes into mutable readers.
+  A one-allocation v11 manifest encoder matches the existing encoder byte for
+  byte. Journal admission reserves both maximum record-sized key bounds for
+  every remaining cohort output; restoration does not charge already-published
+  outputs twice, and an idle full journal requires protected maintenance before
+  fresh qualification. The owning Debug gate passed 32/32, zero skips, failures,
+  or leaks (`/tmp/workload-native-whole-operation1.log`). It completes four
+  maximum plans with exactly the computed compiler capacity while nearly all
+  independent replay scratch is held, backing/ordinary FD allocation is denied,
+  and normal borrowing epochs are exhausted. This closes the pooled healthy
+  operation scratch gap above. Restart replay's tree/parser construction still
+  needs its separate exact allocation bound; the standalone generic writer and
+  standalone journal reservation remain outside this pooled certificate.
 - **Output-count and future-frontier certificate (implemented).** Qualification
   scans CRC-checked physical records and keeps additive encoded-data, metadata,
   and block costs. Admission adds canonical operations, both possible outcomes,
