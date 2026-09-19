@@ -250,6 +250,8 @@ export type {
   EvalSummary,
   EvaluatorName,
   EvaluatorScore,
+  // Web search types
+  ExaSearchConfig,
   ExternalIoConnection,
   ExternalIoProtocol,
   FetchConfig,
@@ -400,8 +402,6 @@ export type {
   UpdatePasswordRequest,
   // User and permission types
   User,
-  // Web search types
-  ExaSearchConfig,
   WebSearchConfig,
   WebSearchProviderConfig,
   WebSearchResultItem,
