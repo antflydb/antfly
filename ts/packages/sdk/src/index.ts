@@ -87,7 +87,12 @@ export {
   InferenceCapacityError,
   InferenceClient,
 } from "./inference-client.js";
-export { deserializeEmbeddings, serializeEmbeddings } from "./inference-codec.js";
+export {
+  decodeNumericDenseFrame,
+  NUMERIC_RESPONSE_ACCEPT,
+  NUMERIC_RESPONSE_MEDIA_TYPE,
+  serializeNumericDenseFrame,
+} from "./inference-codec.js";
 export type {
   Chunk,
   ChunkConfig,

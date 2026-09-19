@@ -202,6 +202,30 @@ pub fn isStreamingOrBinaryResponse(op: types.Operation) bool {
     return false;
 }
 
+/// Whether a success response can arrive either as JSON or in another format
+/// the caller asks for with `Accept`, such as a packed numeric frame.
+///
+/// Streaming and purely binary responses keep the raw path: they have no JSON
+/// form to fall back to. A negotiated operation has both, so its client keeps
+/// the typed JSON value and gains the bytes when the server answers with the
+/// other format.
+pub fn hasNegotiatedResponse(op: types.Operation) bool {
+    if (isStreamingOrBinaryResponse(op)) return false;
+    for (success_status_codes) |code| {
+        const resp_or = op.responses.get(code) orelse continue;
+        const resp = switch (resp_or) {
+            .response => |r| r,
+            .ref => continue,
+        };
+        if (resp.content.get("application/json") == null) continue;
+        var it = resp.content.iterator();
+        while (it.next()) |entry| {
+            if (!std.mem.eql(u8, entry.key_ptr.*, "application/json")) return true;
+        }
+    }
+    return false;
+}
+
 /// Look for a success response type (200, 201, 202, 2XX).
 pub fn getSuccessResponseType(arena: Allocator, resolver: *Resolver, type_gen: *TypeGenerator, op: types.Operation) ![]const u8 {
     for (success_status_codes) |code| {
