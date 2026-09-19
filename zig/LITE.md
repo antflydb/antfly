@@ -87,7 +87,10 @@ The implementation now consists of:
   `O(log N)` pages. A cursor retains one decoded root-to-leaf path, its current
   key, and its current value, so sequential next/previous traversal is
   amortized `O(1)` and cold-scan memory remains bounded by tree height and the
-  page cache rather than live-key count or document payload volume. Legacy
+  page cache rather than live-key count or document payload volume. Overflow
+  keys remain encoded until a comparison or returned entry needs them; resolved
+  comparison keys are released immediately. Full integrity checks still resolve
+  every key and validate ordering and references. Legacy
   indexed tombstones are skipped during iteration; new deletes prune the active
   index immediately. Key-only cursors share snapshot, prefix, seek, and overlay
   behavior, validating record metadata without loading external values. Replay
@@ -95,7 +98,11 @@ The implementation now consists of:
   prefixed-key target (a single key may exceed that target). Each chunk reserves
   the writer from scan through commit, then releases it so other writers can
   proceed. The cutoff is exclusive. Errors propagate; earlier completed chunks
-  remain committed and retries safely process the remaining entries. Write cursors
+  remain committed and retries safely process the remaining entries. Replay
+  readers share one traversal that treats only not-found as end-of-lane; allocation,
+  I/O, corruption, malformed-key, and callback errors propagate. Materialized replay
+  results reserve list capacity before taking payload ownership and release all
+  collected payloads on failure. Write cursors
   merge a sorted, latest-write-wins overlay containing only that transaction's
   pending mutations; this provides read-your-writes without materializing the
   durable namespace. Pinned reads use concurrent positional I/O and retain
@@ -132,7 +139,9 @@ The implementation now consists of:
   on each child. Appends retain one unfinished node per height, fill the partial
   tail leaf, and seal suffix subtrees once. Existing full subtrees remain
   shared, so large appends no longer rewrite the ancestor path per leaf and
-  temporary memory depends on tree height rather than suffix length.
+  temporary memory depends on tree height rather than suffix length. Within a
+  native transaction, repeated appends share that frontier and partial tail,
+  so small calls write the same suffix pages as one combined append.
   Range reads seek directly to the requested extents. Vacuum builds packed
   catalog indexes and extent trees; integrity checks validate both structures.
   Atomic index writes use a fixed 64 KiB buffer and a private staging file.
@@ -1075,6 +1084,16 @@ rename reuse these extent references, and point/range reads see earlier staged
 writes. Writer-side scans explicitly materialize the pending batch before
 pinning cursor roots. Pinned reader APIs only consult immutable roots and never
 access the mutable write set.
+In addition to the key/value staging budget, a transaction retains at most four
+append frontiers across the metadata and index catalogs. Each owns a partial
+value page, a 64 KiB write buffer, and one bounded extent node per tree height.
+Full leaves stream once; commit, spill, and snapshot materialization seal the
+frontiers. Active full/range reads and rename seal only the source file they
+need, while size reads use its buffered length. Overwrite, delete, and abort
+discard obsolete buffers without flushing. Appending to another file when all
+four frontier slots are occupied flushes private state without publishing or
+ending the transaction. These changes retain
+the revision-3 encoding and immutable checkpoint semantics.
 An already assembled large batch is consumed synchronously from the caller's
 buffers with one index edit, avoiding another owned staging copy. Its existing
 batch editor uses scratch proportional to the supplied batch; the 1,024-key /
@@ -1186,3 +1205,15 @@ file. Before transaction staging, individual callbacks wrote 4,962 pages in
 independent of fsync timing. Regression tests also cover mixed-root groups,
 streamed imports and appends, rename ordering, spill/abort, allocation failure,
 and adoption probes over large values and excluded internal key ranges.
+
+The append-frontier regression compares 1,024 64-byte appends to a 1 MiB file
+inside one transaction with one combined 64 KiB append. Both now write 23 pages
+in five write calls and add 94,208 bytes to the file; the individual calls
+previously wrote 3,090 pages in 1,027 calls and added 12,656,640 bytes. With 64
+small calls, both forms write eight pages in four calls and add 32,768 bytes.
+The long-key seek diagnostic uses 16,000 keys of 1,000 bytes with page caching
+disabled. Lazy resolution reduces a seek from 298 logical page reads and
+313,848 bytes of peak scratch to 17 reads and 14,768 bytes. Permanent regressions
+bound page writes and cursor scratch, and cover forward/reverse scans, pinned
+roots, complete integrity audits, append visibility barriers, extent boundaries,
+private spills, allocation failures, and streaming-write rollback.

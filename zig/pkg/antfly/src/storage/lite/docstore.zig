@@ -492,36 +492,7 @@ pub const Store = struct {
     }
 
     pub fn iterateReplayFrom(self: *Store, alloc: Allocator, from_sequence: u64) ![]backend_types.ReplayEntry {
-        var entries = std.ArrayListUnmanaged(backend_types.ReplayEntry).empty;
-        errdefer {
-            for (entries.items) |*entry| entry.deinit(alloc);
-            entries.deinit(alloc);
-        }
-
-        const Context = struct {
-            allocator: Allocator,
-            entries: *std.ArrayListUnmanaged(backend_types.ReplayEntry),
-
-            fn handle(ctx: *@This(), sequence: u64, payload: []const u8) !void {
-                try ctx.entries.append(ctx.allocator, .{
-                    .sequence = sequence,
-                    .payload = try ctx.allocator.dupe(u8, payload),
-                });
-            }
-        };
-        const Adapter = struct {
-            fn handle(ptr: *anyopaque, sequence: u64, payload: []const u8) !void {
-                const ctx: *Context = @ptrCast(@alignCast(ptr));
-                try Context.handle(ctx, sequence, payload);
-            }
-        };
-
-        var ctx = Context{
-            .allocator = alloc,
-            .entries = &entries,
-        };
-        _ = try self.forEachReplayLaneFrom(internal_keys.replay_all_kind, from_sequence, 0, &ctx, Adapter.handle);
-        return try entries.toOwnedSlice(alloc);
+        return try collectReplayEntries(self, "", alloc, from_sequence);
     }
 
     pub fn forEachReplayLaneFrom(
@@ -532,30 +503,7 @@ pub const Store = struct {
         callback_ctx: *anyopaque,
         callback: backend_erased.Store.ReplayCallback,
     ) !backend_types.ReplayLaneIterationStats {
-        var read = try self.beginRead();
-        defer read.abort();
-        _ = read.get(internal_keys.replay_meta_init_key[0..]) catch return error.ReplayIndexUnavailable;
-
-        var cursor = try read.openCursor();
-        defer cursor.close();
-
-        const lower = internal_keys.replayRangeLower(kind_ordinal, from_sequence);
-        const upper = internal_keys.replayRangeUpper(kind_ordinal);
-        cursor.setUpperBound(upper[0..]);
-
-        var stats = backend_types.ReplayLaneIterationStats{ .scan_batches = 1 };
-        var entry = cursor.seekAtOrAfter(lower[0..]) catch return stats;
-        while (true) {
-            if (std.mem.order(u8, entry.key, upper[0..]) != .lt) break;
-            const sequence = internal_keys.parseReplayEntrySequence(entry.key, kind_ordinal) orelse break;
-            try callback(callback_ctx, sequence, entry.value);
-            stats.scanned_entries += 1;
-            stats.matched_entries += 1;
-            stats.last_sequence = sequence;
-            if (max_entries != 0 and stats.matched_entries >= max_entries) break;
-            entry = cursor.next() catch break;
-        }
-        return stats;
+        return try forEachReplayLane(self, "", kind_ordinal, from_sequence, max_entries, callback_ctx, callback);
     }
 
     pub fn truncateReplayUpTo(self: *Store, alloc: Allocator, up_to_sequence: u64) !void {
@@ -616,25 +564,7 @@ const RuntimeStore = struct {
     }
 
     pub fn iterateReplayFrom(self: *RuntimeStore, alloc: Allocator, from_sequence: u64) ![]backend_types.ReplayEntry {
-        var entries = std.ArrayListUnmanaged(backend_types.ReplayEntry).empty;
-        errdefer {
-            for (entries.items) |*entry| entry.deinit(alloc);
-            entries.deinit(alloc);
-        }
-        const Context = struct {
-            allocator: Allocator,
-            entries: *std.ArrayListUnmanaged(backend_types.ReplayEntry),
-            fn handle(ptr: *anyopaque, sequence: u64, payload: []const u8) !void {
-                const ctx: *@This() = @ptrCast(@alignCast(ptr));
-                try ctx.entries.append(ctx.allocator, .{
-                    .sequence = sequence,
-                    .payload = try ctx.allocator.dupe(u8, payload),
-                });
-            }
-        };
-        var ctx = Context{ .allocator = alloc, .entries = &entries };
-        _ = try self.forEachReplayLaneFrom(internal_keys.replay_all_kind, from_sequence, 0, &ctx, Context.handle);
-        return try entries.toOwnedSlice(alloc);
+        return try collectReplayEntries(self.store, self.prefix, alloc, from_sequence);
     }
 
     pub fn forEachReplayLaneFrom(
@@ -645,27 +575,7 @@ const RuntimeStore = struct {
         callback_ctx: *anyopaque,
         callback: backend_erased.Store.ReplayCallback,
     ) !backend_types.ReplayLaneIterationStats {
-        var read = try self.beginRead();
-        defer read.abort();
-        _ = read.get(internal_keys.replay_meta_init_key[0..]) catch return error.ReplayIndexUnavailable;
-        var cursor = try read.openCursor();
-        defer cursor.close();
-        const lower = internal_keys.replayRangeLower(kind_ordinal, from_sequence);
-        const upper = internal_keys.replayRangeUpper(kind_ordinal);
-        cursor.setUpperBound(upper[0..]);
-        var stats = backend_types.ReplayLaneIterationStats{ .scan_batches = 1 };
-        var entry = cursor.seekAtOrAfter(lower[0..]) catch return stats;
-        while (true) {
-            if (std.mem.order(u8, entry.key, upper[0..]) != .lt) break;
-            const sequence = internal_keys.parseReplayEntrySequence(entry.key, kind_ordinal) orelse break;
-            try callback(callback_ctx, sequence, entry.value);
-            stats.scanned_entries += 1;
-            stats.matched_entries += 1;
-            stats.last_sequence = sequence;
-            if (max_entries != 0 and stats.matched_entries >= max_entries) break;
-            entry = cursor.next() catch break;
-        }
-        return stats;
+        return try forEachReplayLane(self.store, self.prefix, kind_ordinal, from_sequence, max_entries, callback_ctx, callback);
     }
 
     pub fn truncateReplayUpTo(self: *RuntimeStore, alloc: Allocator, up_to_sequence: u64) !void {
@@ -1441,6 +1351,70 @@ fn writeReplayEntries(alloc: Allocator, txn: anytype, sequence: u64, payload: []
         const latest_key = internal_keys.replayLatestSequenceKey(replayHintOrdinal(hint));
         try txn.put(latest_key[0..], latest_raw[0..]);
     }
+}
+
+// Both runtime adapters share traversal and ownership rules. Only NotFound
+// means exhaustion; failed reads and malformed keys must reach replay workers.
+fn forEachReplayLane(
+    store: *Store,
+    prefix: []const u8,
+    kind: u8,
+    from_sequence: u64,
+    max_entries: usize,
+    context: *anyopaque,
+    callback: backend_erased.Store.ReplayCallback,
+) !backend_types.ReplayLaneIterationStats {
+    var read = try Txn.openReadWithPrefix(store, prefix);
+    defer read.abort();
+    _ = read.get(&internal_keys.replay_meta_init_key) catch |err| switch (err) {
+        error.NotFound => return error.ReplayIndexUnavailable,
+        else => return err,
+    };
+    var cursor = try read.openCursor();
+    defer cursor.close();
+    const lower = internal_keys.replayRangeLower(kind, from_sequence);
+    const upper = internal_keys.replayRangeUpper(kind);
+    cursor.setUpperBound(&upper);
+    var stats = backend_types.ReplayLaneIterationStats{ .scan_batches = 1 };
+    var entry = cursor.seekAtOrAfter(&lower) catch |err| switch (err) {
+        error.NotFound => return stats,
+        else => return err,
+    };
+    while (true) {
+        const sequence = internal_keys.parseReplayEntrySequence(entry.key, kind) orelse return error.InvalidReplayEntryKey;
+        try callback(context, sequence, entry.value);
+        stats.scanned_entries += 1;
+        stats.matched_entries += 1;
+        stats.last_sequence = sequence;
+        if (max_entries != 0 and stats.matched_entries >= max_entries) return stats;
+        entry = cursor.next() catch |err| switch (err) {
+            error.NotFound => return stats,
+            else => return err,
+        };
+    }
+}
+
+fn collectReplayEntries(store: *Store, prefix: []const u8, alloc: Allocator, from_sequence: u64) ![]backend_types.ReplayEntry {
+    const Collector = struct {
+        allocator: Allocator,
+        entries: std.ArrayListUnmanaged(backend_types.ReplayEntry) = .empty,
+
+        fn collect(ptr: *anyopaque, sequence: u64, payload: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            // Reserve before acquiring the payload: insertion cannot fail
+            // once the collector takes ownership of the duplicated bytes.
+            try self.entries.ensureUnusedCapacity(self.allocator, 1);
+            const owned = try self.allocator.dupe(u8, payload);
+            self.entries.appendAssumeCapacity(.{ .sequence = sequence, .payload = owned });
+        }
+    };
+    var collector = Collector{ .allocator = alloc };
+    errdefer {
+        for (collector.entries.items) |*entry| entry.deinit(alloc);
+        collector.entries.deinit(alloc);
+    }
+    _ = try forEachReplayLane(store, prefix, internal_keys.replay_all_kind, from_sequence, 0, &collector, Collector.collect);
+    return try collector.entries.toOwnedSlice(alloc);
 }
 
 const replay_cleanup_max_keys = 512;
@@ -2711,4 +2685,126 @@ test "lite replay cleanup propagates record corruption without deleting a partia
     try std.testing.expect((try store.file.getDocumentAlloc(a, &first)) == null);
     try std.testing.expect((try store.file.getDocumentAlloc(a, &second)) == null);
     try std.testing.expect((try store.file.check()).valid);
+}
+
+test "lite replay readers propagate allocation errors before and after callbacks" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "", "scope\x00" }) |prefix| {
+        var budget = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try testPath(a, tmp, "replay-read-errors.aflite");
+        defer a.free(path);
+        var store = try Store.createWithOptions(budget.allocator(), path, .{ .no_sync = true, .io = std.testing.io });
+        defer store.close();
+        const large = try a.alloc(u8, 4 * 1024 * 1024);
+        defer a.free(large);
+        @memset(large, 'v');
+        var runtime = RuntimeStore{ .store = &store, .prefix = prefix };
+        try runtime.appendReplayOpaque(a, 1, "small");
+        try runtime.appendReplayOpaque(a, 2, large);
+        {
+            var read = try runtime.beginRead();
+            read.abort();
+        }
+        store.read_generation.?.file.page_cache_enabled.store(false, .monotonic);
+        const Context = struct {
+            count: usize = 0,
+            fn handle(ptr: *anyopaque, _: u64, _: []const u8) !void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.count += 1;
+            }
+        };
+        var ctx = Context{};
+        budget.limit = budget.live;
+        try std.testing.expectError(error.OutOfMemory, runtime.forEachReplayLaneFrom(internal_keys.replay_all_kind, 1, 0, &ctx, Context.handle));
+        budget.limit = budget.live + 1024 * 1024;
+        if (prefix.len == 0) {
+            try std.testing.expectError(error.OutOfMemory, store.forEachReplayLaneFrom(internal_keys.replay_all_kind, 1, 0, &ctx, Context.handle));
+        } else {
+            try std.testing.expectError(error.OutOfMemory, runtime.forEachReplayLaneFrom(internal_keys.replay_all_kind, 1, 0, &ctx, Context.handle));
+        }
+        try std.testing.expectEqual(@as(usize, 1), ctx.count);
+        try std.testing.expectError(error.OutOfMemory, runtime.forEachReplayLaneFrom(internal_keys.replay_all_kind, 2, 0, &ctx, Context.handle));
+        budget.limit = std.math.maxInt(usize);
+        ctx = .{};
+        const result = try runtime.forEachReplayLaneFrom(internal_keys.replay_all_kind, 1, 0, &ctx, Context.handle);
+        try std.testing.expectEqual(@as(usize, 2), result.matched_entries);
+        try std.testing.expectEqual(@as(usize, 2), ctx.count);
+        const empty = try runtime.forEachReplayLaneFrom(internal_keys.replay_all_kind, 3, 0, &ctx, Context.handle);
+        try std.testing.expectEqual(@as(usize, 0), empty.matched_entries);
+    }
+}
+
+test "lite replay collection owns every payload through allocation failures" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "replay-owned-results.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io });
+    defer store.close();
+    for ([_][]const u8{ "", "scope\x00" }) |prefix| {
+        var runtime = RuntimeStore{ .store = &store, .prefix = prefix };
+        for (1..20) |i| try runtime.appendReplayOpaque(a, i, "payload");
+        var succeeded = false;
+        for (0..64) |fail_index| {
+            var budget = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+            var failing = std.testing.FailingAllocator.init(budget.allocator(), .{ .fail_index = fail_index });
+            const result = if (prefix.len == 0) store.iterateReplayFrom(failing.allocator(), 1) else runtime.iterateReplayFrom(failing.allocator(), 1);
+            if (result) |entries| {
+                try std.testing.expectEqual(@as(usize, 19), entries.len);
+                for (entries) |*entry| entry.deinit(failing.allocator());
+                failing.allocator().free(entries);
+                succeeded = !failing.has_induced_failure;
+            } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expectEqual(@as(usize, 0), budget.live);
+            if (succeeded) break;
+        }
+        try std.testing.expect(succeeded);
+    }
+}
+
+test "lite replay readers propagate corruption malformed keys and callback errors" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "replay-corrupt-read.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io });
+    defer store.close();
+    const first = internal_keys.replayEntryKey(internal_keys.replay_all_kind, 1);
+    const second = internal_keys.replayEntryKey(internal_keys.replay_all_kind, 2);
+    try store.file.putDocument(&internal_keys.replay_meta_init_key, "");
+    try store.file.putDocument(&first, "first");
+    try store.file.putDocument(&second, "second");
+    const offset = store.file.activeCheckpoint().document_root_page * native.default_page_size + native.page_header_size;
+    var byte: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try store.file.file.readPositionalAll(std.testing.io, &byte, offset));
+    try store.file.file.writePositionalAll(std.testing.io, &.{byte[0] ^ 1}, offset);
+    const Context = struct {
+        count: usize = 0,
+        stop: bool = false,
+        fn handle(ptr: *anyopaque, _: u64, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.count += 1;
+            if (self.stop) return error.ConsumerStopped;
+        }
+    };
+    var ctx = Context{};
+    {
+        var read = try store.beginRead();
+        read.abort();
+    }
+    store.read_generation.?.file.page_cache_enabled.store(false, .monotonic);
+    try std.testing.expectError(error.NativePageChecksumMismatch, store.forEachReplayLaneFrom(internal_keys.replay_all_kind, 1, 0, &ctx, Context.handle));
+    try std.testing.expectEqual(@as(usize, 1), ctx.count);
+    const limited = try store.forEachReplayLaneFrom(internal_keys.replay_all_kind, 1, 1, &ctx, Context.handle);
+    try std.testing.expectEqual(@as(usize, 1), limited.matched_entries);
+    ctx.stop = true;
+    try std.testing.expectError(error.ConsumerStopped, store.forEachReplayLaneFrom(internal_keys.replay_all_kind, 1, 0, &ctx, Context.handle));
+    try store.file.file.writePositionalAll(std.testing.io, &byte, offset);
+    try store.file.putDocument(second ++ "bad", "malformed");
+    ctx.stop = false;
+    try std.testing.expectError(error.InvalidReplayEntryKey, store.forEachReplayLaneFrom(internal_keys.replay_all_kind, 1, 0, &ctx, Context.handle));
 }

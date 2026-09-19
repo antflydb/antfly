@@ -178,9 +178,12 @@ pub const DocumentIndexCursor = struct {
         var page_id = self.checkpoint.document_index_root_page;
         while (page_id != 0) {
             if (self.frames.items.len > 64) return error.InvalidDocumentIndex;
-            var node = try self.file.readDocumentIndexNode(page_id, self.checkpoint);
+            var node = try self.file.readUnresolvedDocumentIndexNode(page_id, self.checkpoint);
             if (node.kind == .leaf) {
-                const position = if (strict) upperBoundIndexKeys(node.keys, key) else lowerBoundIndexKeys(node.keys, key);
+                const position = self.findBound(&node, key, strict) catch |err| {
+                    node.deinit(self.file.allocator);
+                    return err;
+                };
                 self.frames.append(self.file.allocator, .{ .node = node, .position = position }) catch |err| {
                     node.deinit(self.file.allocator);
                     return err;
@@ -188,7 +191,10 @@ pub const DocumentIndexCursor = struct {
                 if (position < node.keys.len) return try self.currentEntry();
                 return try self.next();
             }
-            const position = upperBoundIndexKeys(node.keys, key);
+            const position = self.findBound(&node, key, true) catch |err| {
+                node.deinit(self.file.allocator);
+                return err;
+            };
             page_id = node.pointers[position];
             self.frames.append(self.file.allocator, .{ .node = node, .position = position }) catch |err| {
                 node.deinit(self.file.allocator);
@@ -203,9 +209,12 @@ pub const DocumentIndexCursor = struct {
         var page_id = self.checkpoint.document_index_root_page;
         while (page_id != 0) {
             if (self.frames.items.len > 64) return error.InvalidDocumentIndex;
-            var node = try self.file.readDocumentIndexNode(page_id, self.checkpoint);
+            var node = try self.file.readUnresolvedDocumentIndexNode(page_id, self.checkpoint);
             if (node.kind == .leaf) {
-                const bound = if (strict) lowerBoundIndexKeys(node.keys, key) else upperBoundIndexKeys(node.keys, key);
+                const bound = self.findBound(&node, key, !strict) catch |err| {
+                    node.deinit(self.file.allocator);
+                    return err;
+                };
                 self.frames.append(self.file.allocator, .{ .node = node, .position = if (bound == 0) 0 else bound - 1 }) catch |err| {
                     node.deinit(self.file.allocator);
                     return err;
@@ -213,7 +222,10 @@ pub const DocumentIndexCursor = struct {
                 if (bound > 0) return try self.currentEntry();
                 return try self.prev();
             }
-            const position = upperBoundIndexKeys(node.keys, key);
+            const position = self.findBound(&node, key, true) catch |err| {
+                node.deinit(self.file.allocator);
+                return err;
+            };
             page_id = node.pointers[position];
             self.frames.append(self.file.allocator, .{ .node = node, .position = position }) catch |err| {
                 node.deinit(self.file.allocator);
@@ -273,7 +285,7 @@ pub const DocumentIndexCursor = struct {
         var page_id = root_page_id;
         while (page_id != 0) {
             if (self.frames.items.len > 64) return error.InvalidDocumentIndex;
-            var node = try self.file.readDocumentIndexNode(page_id, self.checkpoint);
+            var node = try self.file.readUnresolvedDocumentIndexNode(page_id, self.checkpoint);
             const position = switch (node.kind) {
                 .leaf => if (toward_first) 0 else node.keys.len - 1,
                 .internal => if (toward_first) 0 else node.pointers.len - 1,
@@ -291,10 +303,33 @@ pub const DocumentIndexCursor = struct {
         if (self.frames.items.len == 0) return null;
         const frame = &self.frames.items[self.frames.items.len - 1];
         if (frame.node.kind != .leaf or frame.position >= frame.node.keys.len) return null;
-        return .{
-            .key = try self.file.allocator.dupe(u8, frame.node.keys[frame.position]),
-            .document_page_id = frame.node.pointers[frame.position],
-        };
+        const key = try self.file.resolveIndexKey(&frame.node, frame.position, self.checkpoint);
+        const owned = if (frame.node.key_pages.?[frame.position] != 0) blk: {
+            // Transfer the resolved overflow key instead of retaining every
+            // scanned key until its leaf frame is retired.
+            const bytes = frame.node.keys[frame.position];
+            frame.node.keys[frame.position] = &.{};
+            break :blk bytes;
+        } else try self.file.allocator.dupe(u8, key);
+        return .{ .key = owned, .document_page_id = frame.node.pointers[frame.position] };
+    }
+
+    // Overflow keys stay encoded until a comparison or returned entry needs
+    // them. Integrity checks still resolve and validate the complete ordering.
+    fn findBound(self: *DocumentIndexCursor, node: *DocumentIndexNode, key: []const u8, upper: bool) !usize {
+        var low: usize = 0;
+        var high = node.keys.len;
+        while (low < high) {
+            const mid = low + (high - low) / 2;
+            const candidate = try self.file.resolveIndexKey(node, mid, self.checkpoint);
+            const order = std.mem.order(u8, candidate, key);
+            if (node.key_pages.?[mid] != 0) {
+                self.file.allocator.free(node.keys[mid]);
+                node.keys[mid] = &.{};
+            }
+            if (order == .lt or (upper and order == .eq)) low = mid + 1 else high = mid;
+        }
+        return low;
     }
 
     fn popFrame(self: *DocumentIndexCursor) void {
@@ -870,12 +905,25 @@ const TransactionWrites = struct {
     const Root = enum { metadata, index, documents };
     const max_keys = 1024;
     const max_bytes = 1024 * 1024;
+    const max_append_files = 4;
     maps: [3]std.StringHashMapUnmanaged(CatalogMutation) = .{ .empty, .empty, .empty },
     bytes: usize = 0,
     count: usize = 0,
     pages: PageAllocator,
+    // Each active file retains one page tail, a write batch, and a bounded
+    // extent frontier. Limit simultaneous frontiers independently of key/value
+    // staging; a fifth file spills the transaction's private state.
+    appends: [2]std.StringHashMapUnmanaged(*NativeFile.CatalogAppendState) = .{ .empty, .empty },
+    append_count: usize = 0,
 
     fn clear(self: *TransactionWrites, allocator: Allocator) void {
+        for (&self.appends) |*map| {
+            var it = map.valueIterator();
+            while (it.next()) |state| state.*.destroy();
+            map.deinit(allocator);
+            map.* = .empty;
+        }
+        self.append_count = 0;
         for (&self.maps) |*map| {
             var it = map.valueIterator();
             while (it.next()) |mutation| {
@@ -2054,6 +2102,7 @@ pub const NativeFile = struct {
         if (self.read_only) return error.ReadOnly;
         if (mutations.len == 0) return;
         for (mutations) |mutation| try self.validateCatalogMutation(mutation);
+        if (self.stagingTransaction()) for (mutations) |mutation| self.discardCatalogAppend(root, mutation.key);
         if (self.change_capture) |capture| for (mutations) |mutation| capture.record(self.allocator, if (root == .metadata) .metadata else .index, mutation.key);
 
         // Small index files include WAL control records, which are frequently
@@ -2143,6 +2192,7 @@ pub const NativeFile = struct {
     }
 
     fn transactionCatalogEntry(self: *NativeFile, root: CatalogRoot, key: []const u8, scratch: *[65536]u8) !?CatalogEntry {
+        try self.finishCatalogAppend(root, key);
         const checkpoint = self.activeCheckpoint();
         if (self.stagedEntry(if (root == .metadata) .metadata else .index, key)) |entry| return if (entry.is_delete) null else entry;
         const page = (try self.lookupCatalogPage(checkpoint, root, key)) orelse return null;
@@ -2153,6 +2203,15 @@ pub const NativeFile = struct {
     }
 
     fn stageCatalogAppend(self: *NativeFile, root: CatalogRoot, key: []const u8, suffix: []const u8) !void {
+        if (self.transaction_writes) |writes| {
+            if (writes.appends[@intFromEnum(root)].get(key)) |state| {
+                if (suffix.len == 0) return;
+                try state.append(suffix);
+                self.header.checkpoints[self.header.active_checkpoint].commit_sequence += 1;
+                return;
+            }
+            if (writes.append_count >= TransactionWrites.max_append_files) try self.flushTransactionWrites();
+        }
         var scratch: [65536]u8 = undefined;
         const entry = (try self.transactionCatalogEntry(root, key, &scratch)) orelse
             return self.putCatalogBatchForRoot(root, &.{.{ .key = key, .value = suffix }}, .{});
@@ -2174,10 +2233,65 @@ pub const NativeFile = struct {
             return self.putCatalogBatchForRoot(root, &.{.{ .key = key, .value = value }}, .{});
         }
         if (fixed_len + 8 > self.maxPagePayloadBytes()) return error.PageTooLarge;
-        const writes = try self.transactionWrites();
-        const value_root = try self.appendCatalogValueTree(&writes.pages, entry, suffix);
-        try self.flushTransactionPayloads();
-        return self.putCatalogBatchForRoot(root, &.{.{ .key = key, .external_value_root_page = value_root, .external_value_len = len }}, .{});
+        // Own the base entry before any staging spill can release its bytes.
+        // Its slot also owns the key borrowed by the append-state map.
+        try self.stageMutation(if (root == .metadata) .metadata else .index, .{
+            .key = key,
+            .value = entry.value,
+            .external_value_root_page = entry.external_value_root_page,
+            .external_value_len = entry.external_value_len,
+        }, .{});
+        const writes = self.transaction_writes.?;
+        const base = writes.maps[@intFromEnum(root)].get(key).?;
+        const state = try CatalogAppendState.create(self, &writes.pages, TransactionWrites.entry(base));
+        errdefer state.destroy();
+        try state.append(suffix);
+        try writes.appends[@intFromEnum(root)].put(self.allocator, base.key, state);
+        writes.append_count += 1;
+    }
+
+    fn discardCatalogAppend(self: *NativeFile, root: CatalogRoot, key: []const u8) void {
+        const writes = self.transaction_writes orelse return;
+        if (writes.appends[@intFromEnum(root)].fetchRemove(key)) |removed| {
+            removed.value.destroy();
+            writes.append_count -= 1;
+        }
+    }
+
+    // Writer-only visibility barrier. Pinned checkpoint APIs deliberately never
+    // touch append frontiers or any other private transaction state.
+    fn finishCatalogAppend(self: *NativeFile, root: CatalogRoot, key: []const u8) !void {
+        if (!self.stagingTransaction()) return;
+        const writes = self.transaction_writes orelse return;
+        const map = &writes.appends[@intFromEnum(root)];
+        const state = map.get(key) orelse return;
+        try self.finishCatalogAppendState(writes, root, key, state);
+        _ = map.remove(key);
+        state.destroy();
+        writes.append_count -= 1;
+    }
+
+    fn finishCatalogAppendState(self: *NativeFile, writes: *TransactionWrites, root: CatalogRoot, key: []const u8, state: *CatalogAppendState) !void {
+        const ref = try state.finish();
+        const mutation = writes.maps[@intFromEnum(root)].getPtr(key).?;
+        writes.bytes -= mutation.value.len;
+        self.allocator.free(mutation.value);
+        mutation.value = &.{};
+        mutation.external_value_root_page = ref.page;
+        mutation.external_value_len = state.len;
+        self.header.checkpoints[self.header.active_checkpoint].page_count = writes.pages.next_page_id;
+    }
+
+    fn finishCatalogAppends(self: *NativeFile, writes: *TransactionWrites) !void {
+        for (&writes.appends, 0..) |*map, root| {
+            var it = map.iterator();
+            while (it.next()) |entry| {
+                try self.finishCatalogAppendState(writes, @enumFromInt(root), entry.key_ptr.*, entry.value_ptr.*);
+                entry.value_ptr.*.destroy();
+                _ = map.remove(entry.key_ptr.*);
+                writes.append_count -= 1;
+            }
+        }
     }
 
     fn stageCatalogRename(self: *NativeFile, root: CatalogRoot, old_key: []const u8, new_key: []const u8) !void {
@@ -2398,6 +2512,7 @@ pub const NativeFile = struct {
         root: CatalogRoot,
         key: []const u8,
     ) !?[]u8 {
+        try self.finishCatalogAppend(root, key);
         if (self.stagedEntry(if (root == .metadata) .metadata else .index, key)) |entry| {
             if (entry.is_delete) return null;
             return try self.catalogEntryValueAtCheckpointAlloc(allocator, entry, self.activeCheckpoint());
@@ -2426,6 +2541,11 @@ pub const NativeFile = struct {
         root: CatalogRoot,
         key: []const u8,
     ) !?usize {
+        if (self.stagingTransaction()) {
+            if (self.transaction_writes) |writes| {
+                if (writes.appends[@intFromEnum(root)].get(key)) |state| return state.len;
+            }
+        }
         if (self.stagedEntry(if (root == .metadata) .metadata else .index, key)) |entry| {
             if (entry.is_delete) return null;
             return if (entry.external_value_root_page != 0) entry.external_value_len else entry.value.len;
@@ -2456,6 +2576,7 @@ pub const NativeFile = struct {
         offset: u64,
         len: usize,
     ) !?[]u8 {
+        try self.finishCatalogAppend(root, key);
         if (self.stagedEntry(if (root == .metadata) .metadata else .index, key)) |entry| {
             if (entry.is_delete) return null;
             return try self.catalogEntryRangeAlloc(allocator, entry, offset, len, self.activeCheckpoint());
@@ -3133,6 +3254,12 @@ pub const NativeFile = struct {
         new_entries.items.len = 0;
         self.namespace_directory_cache_root = directory_page;
         self.namespace_directory_delta_depth = if (write_snapshot) 0 else self.namespace_directory_delta_depth + 1;
+    }
+
+    fn readUnresolvedDocumentIndexNode(self: *NativeFile, page_id: u64, checkpoint: CheckpointSlot) !DocumentIndexNode {
+        const payload = try self.readPagePayloadByKindAllocForCheckpoint(self.allocator, page_id, .document_index, checkpoint);
+        defer self.allocator.free(payload);
+        return try decodeDocumentIndexNode(self.allocator, payload);
     }
 
     fn readDocumentIndexNode(self: *NativeFile, page_id: u64, checkpoint: CheckpointSlot) !DocumentIndexNode {
@@ -4416,6 +4543,81 @@ pub const NativeFile = struct {
         }
     };
 
+    /// Transaction-owned append state: retain the partial leaf and unfinished
+    /// right frontier, stream full leaves once, and seal ancestors only at a
+    /// visibility barrier. Abort/overwrite discard buffers without flushing.
+    const CatalogAppendState = struct {
+        builder: ExtentAppender,
+        tail: []u8,
+        used: usize = 0,
+        len: usize,
+
+        fn create(file: *NativeFile, pages: *PageAllocator, entry: CatalogEntry) !*CatalogAppendState {
+            const self = try file.allocator.create(CatalogAppendState);
+            errdefer file.allocator.destroy(self);
+            self.* = .{
+                .builder = .{ .file = file, .pages = pages, .tail = undefined, .batch = .{ .file = file } },
+                .tail = try file.allocator.alloc(u8, file.maxValuePagePayloadBytes()),
+                .len = if (entry.external_value_root_page != 0) entry.external_value_len else entry.value.len,
+            };
+            errdefer self.builder.deinit();
+            errdefer file.allocator.free(self.tail);
+            if (entry.external_value_root_page == 0) {
+                @memcpy(self.tail[0..entry.value.len], entry.value);
+                self.used = entry.value.len;
+            } else {
+                var checkpoint = file.activeCheckpoint();
+                checkpoint.page_count = pages.next_page_id;
+                const root = (try file.valueTreeRoot(entry.external_value_root_page, entry.external_value_len, checkpoint)) orelse return error.InvalidNativeValueChain;
+                self.builder = try ExtentAppender.init(file, pages, root);
+                const payload = try file.readPagePayloadByKindAllocForCheckpoint(file.allocator, self.builder.tail.page, .value, checkpoint);
+                defer file.allocator.free(payload);
+                const leaf = try decodeValuePage(payload);
+                if (leaf.next_page != 0 or leaf.chunk.len != self.builder.tail.len) return error.InvalidNativeValueChain;
+                if (leaf.chunk.len == file.maxValuePagePayloadBytes()) {
+                    try self.builder.push(self.builder.tail);
+                } else {
+                    @memcpy(self.tail[0..leaf.chunk.len], leaf.chunk);
+                    self.used = leaf.chunk.len;
+                }
+            }
+            return self;
+        }
+
+        fn append(self: *CatalogAppendState, suffix: []const u8) !void {
+            const len = try std.math.add(usize, self.len, suffix.len);
+            if (len > std.math.maxInt(u32)) return error.RecordTooLarge;
+            const capacity = self.builder.file.maxValuePagePayloadBytes();
+            var offset: usize = 0;
+            while (offset < suffix.len) {
+                const n = @min(capacity - self.used, suffix.len - offset);
+                @memcpy(self.tail[self.used..][0..n], suffix[offset..][0..n]);
+                self.used += n;
+                offset += n;
+                if (self.used == capacity) {
+                    try self.builder.pushValue(self.tail[0..self.used]);
+                    self.used = 0;
+                }
+            }
+            self.len = len;
+        }
+
+        fn finish(self: *CatalogAppendState) !ExtentRef {
+            if (self.used != 0) {
+                try self.builder.pushValue(self.tail[0..self.used]);
+                self.used = 0;
+            }
+            return try self.builder.finish();
+        }
+
+        fn destroy(self: *CatalogAppendState) void {
+            const allocator = self.builder.file.allocator;
+            self.builder.deinit();
+            allocator.free(self.tail);
+            allocator.destroy(self);
+        }
+    };
+
     fn appendCatalogValueTree(self: *NativeFile, pages: *PageAllocator, entry: CatalogEntry, suffix: []const u8) !u64 {
         const root = if (entry.external_value_root_page != 0)
             (try self.valueTreeRoot(entry.external_value_root_page, entry.external_value_len, self.activeCheckpoint())) orelse return error.InvalidNativeValueChain
@@ -5163,6 +5365,7 @@ pub const NativeFile = struct {
     fn flushTransactionWrites(self: *NativeFile) anyerror!void {
         if (self.flushing_transaction) return;
         const writes = self.transaction_writes orelse return;
+        try self.finishCatalogAppends(writes);
         self.flushing_transaction = true;
         self.transaction_pages = &writes.pages;
         defer {
@@ -10721,4 +10924,262 @@ test "lite document index coverage accepts legacy tombstones and rejects missing
     try std.testing.expectEqual(@as(u64, 0), file.activeCheckpoint().document_index_root_page);
     try file.putDocument("doc", "reborn");
     try std.testing.expect((try file.check()).valid);
+}
+
+test "lite lazy overflow cursor bounds seeks scans and allocation failures" {
+    const a = std.testing.allocator;
+    var budget = MaintenanceTestAllocator{ .backing = a };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "lazy-overflow.aflite");
+    defer a.free(path);
+    var file = try NativeFile.createWithIo(budget.allocator(), std.testing.io, path, .{ .no_sync = true });
+    defer file.close();
+    file.page_cache_enabled.store(false, .monotonic);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const batch = try arena.allocator().alloc(DocumentMutation, 4096);
+    for (batch, 0..) |*m, i| {
+        const key = try arena.allocator().alloc(u8, 1000);
+        @memset(key, 'x');
+        _ = try std.fmt.bufPrint(key[0..8], "{d:0>8}", .{i});
+        m.* = .{ .key = key, .value = "value" };
+    }
+    try file.putDocumentBatch(batch);
+    const pinned = file.activeCheckpoint();
+    var cursor = DocumentIndexCursor.init(&file, pinned);
+    defer cursor.deinit();
+    const baseline = budget.live;
+    budget.limit = baseline;
+    try std.testing.expectError(error.OutOfMemory, cursor.seekAtOrAfter(batch[2000].key, false));
+    budget.limit = baseline + 128 * 1024;
+    const reads = file.test_page_reads.load(.monotonic);
+    var entry = (try cursor.seekAtOrAfter(batch[2000].key, false)).?;
+    try std.testing.expectEqualSlices(u8, batch[2000].key, entry.key);
+    entry.deinit(budget.allocator());
+    try std.testing.expect(file.test_page_reads.load(.monotonic) - reads <= 24);
+    entry = (try cursor.seekAtOrBefore(batch[2000].key, true)).?;
+    try std.testing.expectEqualSlices(u8, batch[1999].key, entry.key);
+    entry.deinit(budget.allocator());
+    entry = (try cursor.seekAtOrAfter(batch[2000].key, true)).?;
+    try std.testing.expectEqualSlices(u8, batch[2001].key, entry.key);
+    entry.deinit(budget.allocator());
+    var next = try cursor.first();
+    var count: usize = 0;
+    while (next) |e| {
+        var owned = e;
+        try std.testing.expectEqualSlices(u8, batch[count].key, owned.key);
+        owned.deinit(budget.allocator());
+        count += 1;
+        next = try cursor.next();
+    }
+    try std.testing.expectEqual(batch.len, count);
+    next = try cursor.last();
+    while (next) |e| {
+        var owned = e;
+        count -= 1;
+        try std.testing.expectEqualSlices(u8, batch[count].key, owned.key);
+        owned.deinit(budget.allocator());
+        next = try cursor.prev();
+    }
+    try std.testing.expectEqual(@as(usize, 0), count);
+    budget.limit = std.math.maxInt(usize);
+    try file.deleteDocument(batch[2000].key);
+    entry = (try cursor.seekAtOrAfter(batch[2000].key, false)).?;
+    defer entry.deinit(budget.allocator());
+    try std.testing.expectEqualSlices(u8, batch[2000].key, entry.key);
+    try std.testing.expect((try file.check()).valid);
+    // Full audits must still validate overflow references that a narrow seek
+    // need not visit.
+    const checkpoint = file.activeCheckpoint();
+    var root = try file.readDocumentIndexNode(checkpoint.document_index_root_page, checkpoint);
+    defer root.deinit(budget.allocator());
+    root.key_pages.?[0] = checkpoint.page_count;
+    const encoded = try encodeDocumentIndexNode(budget.allocator(), root);
+    defer budget.allocator().free(encoded);
+    try file.writePage(checkpoint.document_index_root_page, .document_index, encoded);
+    try std.testing.expect(!(try file.check()).valid);
+}
+
+test "lite append frontiers write the same pages as one combined append" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "append-frontier.aflite");
+    defer a.free(path);
+    const initial = try a.alloc(u8, 1024 * 1024);
+    defer a.free(initial);
+    @memset(initial, 'i');
+    const suffix = [_]u8{'s'} ** (1024 * 64);
+    var combined_pages: u64 = 0;
+    for ([_]bool{ true, false }) |combined| {
+        var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+        defer file.close();
+        file.page_cache_enabled.store(false, .monotonic);
+        try file.putIndexCatalogRecord("/wal", initial);
+        const pinned = file.activeCheckpoint();
+        const before = file.test_page_writes.load(.monotonic);
+        try file.beginTransaction();
+        errdefer file.abortTransaction();
+        if (combined) try file.appendIndexCatalogRecord("/wal", &suffix) else {
+            for (0..1024) |_| try file.appendIndexCatalogRecord("/wal", suffix[0..64]);
+        }
+        // Size checks consult buffered length without sealing the frontier.
+        try std.testing.expectEqual(@as(?usize, initial.len + suffix.len), try file.getIndexCatalogRecordSize("/wal"));
+        try std.testing.expectEqual(@as(usize, 1), file.transaction_writes.?.append_count);
+        try std.testing.expectEqual(@as(?usize, initial.len), try file.getIndexCatalogRecordSizeAtCheckpoint("/wal", pinned));
+        try file.commitTransaction();
+        const pages = file.test_page_writes.load(.monotonic) - before;
+        if (combined) combined_pages = pages else try std.testing.expectEqual(combined_pages, pages);
+        try std.testing.expect(pages <= 24);
+        const tail = (try file.getIndexCatalogRecordRangeAlloc(a, "/wal", initial.len, suffix.len)).?;
+        defer a.free(tail);
+        try std.testing.expectEqualSlices(u8, &suffix, tail);
+        try std.testing.expect((try file.check()).valid);
+    }
+}
+
+test "lite append frontiers preserve barriers replacements and bounded spills" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "append-barriers.aflite");
+    defer a.free(path);
+    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+    defer file.close();
+    const base = [_]u8{'b'} ** 8192;
+    const keys = [_][]const u8{ "/a", "/b", "/c", "/d", "/e", "/f" };
+    for (keys) |key| try file.putIndexCatalogRecord(key, &base);
+    const pinned = file.activeCheckpoint();
+    try file.beginTransaction();
+    errdefer file.abortTransaction();
+    for (keys) |key| {
+        try file.appendIndexCatalogRecord(key, "suffix");
+        try std.testing.expect(file.transaction_writes.?.append_count <= TransactionWrites.max_append_files);
+    }
+    const range = (try file.getIndexCatalogRecordRangeAlloc(a, "/e", base.len, 6)).?;
+    defer a.free(range);
+    try std.testing.expectEqualStrings("suffix", range);
+    // Reading one file must not finalize the other retained frontier.
+    try std.testing.expectEqual(@as(usize, 1), file.transaction_writes.?.append_count);
+    try file.appendIndexCatalogRecord("/e", "again");
+    try file.renameIndexCatalogRecord("/e", "/f");
+    try file.appendIndexCatalogRecord("/f", "last");
+    try file.putIndexCatalogRecord("/a", "replacement");
+    try file.deleteIndexCatalogRecord("/b");
+    const snapshot = try file.materializeTransactionCheckpoint();
+    try std.testing.expectEqual(@as(?usize, base.len + 15), try file.getIndexCatalogRecordSizeAtCheckpoint("/f", snapshot));
+    try file.commitTransaction();
+    const value = (try file.getIndexCatalogRecordRangeAlloc(a, "/f", base.len, 15)).?;
+    defer a.free(value);
+    try std.testing.expectEqualStrings("suffixagainlast", value);
+    try std.testing.expect((try file.getIndexCatalogRecordSize("/e")) == null);
+    try std.testing.expect((try file.getIndexCatalogRecordSize("/b")) == null);
+    try std.testing.expectEqual(@as(?usize, "replacement".len), try file.getIndexCatalogRecordSize("/a"));
+    try std.testing.expectEqual(@as(?usize, base.len), try file.getIndexCatalogRecordSizeAtCheckpoint("/a", pinned));
+    try std.testing.expect((try file.check()).valid);
+    const before = file.activeCheckpoint();
+    try file.beginTransaction();
+    try file.appendIndexCatalogRecord("/f", "discard");
+    _ = try file.materializeTransactionCheckpoint();
+    file.abortTransaction();
+    try std.testing.expectEqual(before.index_catalog_root_page, file.activeCheckpoint().index_catalog_root_page);
+    try std.testing.expect((try file.check()).valid);
+}
+
+test "lite append frontier allocation and streaming failures roll back and retry" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "append-failures.aflite");
+    defer a.free(path);
+    const Runner = struct {
+        fn apply(file: *NativeFile) !void {
+            try file.beginTransaction();
+            errdefer file.abortTransaction();
+            for (0..64) |_| {
+                try file.appendIndexCatalogRecord("/a", "12345678");
+                try file.appendIndexCatalogRecord("/b", "abcdefgh");
+            }
+            const range = (try file.getIndexCatalogRecordRangeAlloc(file.allocator, "/a", 8192, 512)).?;
+            defer file.allocator.free(range);
+            try file.appendIndexCatalogRecord("/a", "more");
+            try file.renameIndexCatalogRecord("/b", "/renamed");
+            _ = try file.materializeTransactionCheckpoint();
+            try file.appendIndexCatalogRecord("/a", "tail");
+            try file.commitTransaction();
+        }
+    };
+    var exhausted = false;
+    for (0..512) |fail_index| {
+        var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+        defer file.close();
+        file.page_cache_enabled.store(false, .monotonic);
+        const base = [_]u8{'v'} ** 8192;
+        try file.putIndexCatalogRecord("/a", &base);
+        try file.putIndexCatalogRecord("/b", &base);
+        const before = file.activeCheckpoint();
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = fail_index });
+        file.allocator = failing.allocator();
+        const result = Runner.apply(&file);
+        file.allocator = a;
+        if (result) |_| {
+            exhausted = !failing.has_induced_failure;
+        } else |err| {
+            try std.testing.expect(failing.has_induced_failure);
+            try std.testing.expect(err == error.OutOfMemory or err == error.WriteFailed);
+            try std.testing.expectEqual(before.index_catalog_root_page, file.activeCheckpoint().index_catalog_root_page);
+            try std.testing.expect((try file.check()).valid);
+            try Runner.apply(&file);
+        }
+        try std.testing.expectEqual(@as(?usize, base.len + 520), try file.getIndexCatalogRecordSize("/a"));
+        try std.testing.expectEqual(@as(?usize, base.len + 512), try file.getIndexCatalogRecordSize("/renamed"));
+        try std.testing.expect((try file.check()).valid);
+        if (exhausted) break;
+    }
+    try std.testing.expect(exhausted);
+    var file = try NativeFile.openWithIo(a, std.testing.io, path, .{ .no_sync = true });
+    defer file.close();
+    const before = file.activeCheckpoint();
+    try file.beginTransaction();
+    file.test_page_write_fail_after = 0;
+    try std.testing.expectError(error.TestPageWriteFailure, file.appendIndexCatalogRecord("/a", &([_]u8{'s'} ** (128 * 1024))));
+    file.test_page_write_fail_after = null;
+    file.abortTransaction();
+    try std.testing.expectEqual(before.index_catalog_root_page, file.activeCheckpoint().index_catalog_root_page);
+    try std.testing.expect((try file.check()).valid);
+    try file.beginTransaction();
+    try file.appendIndexCatalogRecord("/a", "retry");
+    try file.commitTransaction();
+    try std.testing.expect((try file.check()).valid);
+}
+
+test "lite append frontiers span inline leaf and full subtree boundaries" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "append-boundaries.aflite");
+    defer a.free(path);
+    const leaf_size = default_page_size - page_header_size - value_page_header_size;
+    for ([_]usize{ 0, 1, leaf_size, leaf_size * 64 - 1, leaf_size * 64, leaf_size * 65 }) |initial_len| {
+        var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+        defer file.close();
+        const initial = try a.alloc(u8, initial_len);
+        defer a.free(initial);
+        @memset(initial, 'i');
+        try file.putIndexCatalogRecord("file", initial);
+        const pinned = file.activeCheckpoint();
+        try file.beginTransaction();
+        errdefer file.abortTransaction();
+        for (0..127) |_| try file.appendIndexCatalogRecord("file", &([_]u8{'s'} ** 127));
+        try file.appendIndexCatalogRecord("file", "");
+        try file.commitTransaction();
+        const value = (try file.getIndexCatalogRecordAlloc(a, "file")).?;
+        defer a.free(value);
+        try std.testing.expectEqual(@as(usize, initial_len + 127 * 127), value.len);
+        try std.testing.expectEqualSlices(u8, initial, value[0..initial_len]);
+        for (value[initial_len..]) |byte| try std.testing.expectEqual(@as(u8, 's'), byte);
+        try std.testing.expectEqual(@as(?usize, initial_len), try file.getIndexCatalogRecordSizeAtCheckpoint("file", pinned));
+        try std.testing.expect((try file.check()).valid);
+    }
 }
