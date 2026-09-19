@@ -2051,7 +2051,33 @@ pub const NativeFdPermit = struct {
 /// convenience wrappers are outside the PreparedAppend-only contract.
 /// Exclusive temp creation fails on leftovers; this grants no authority to
 /// remove another attempt's temp or recover an uncertain prior append.
+pub const NativeCompletionIo = NativeWalCompletionIo;
+
 pub const NativeWalCompletionIo = struct {
+    /// Exact, slot-owned files in addition to the standard WAL paths. The
+    /// caller reserves these names before sealing; this is no authority to
+    /// overwrite, delete or recover another slot's files.
+    pub const FileSpec = struct {
+        path: []const u8,
+        max_bytes: usize,
+        allow_append: bool = false,
+        allow_delete: bool = false,
+    };
+    const PreparedFile = struct {
+        final: [:0]u8,
+        temp: [:0]u8,
+        parent: [:0]u8,
+        parent_parent: [:0]u8,
+        max_bytes: usize,
+        allow_append: bool,
+        allow_delete: bool,
+        fn deinit(self: PreparedFile, allocator: Allocator) void {
+            allocator.free(self.parent_parent);
+            allocator.free(self.parent);
+            allocator.free(self.temp);
+            allocator.free(self.final);
+        }
+    };
     allocator: Allocator,
     permit: NativeFdPermit,
     root: [:0]u8,
@@ -2065,6 +2091,57 @@ pub const NativeWalCompletionIo = struct {
     writer_final: [:0]const u8 = "",
     writer_temp: [:0]const u8 = "",
     writer_bytes: usize = 0,
+    writer_limit: usize = std.math.maxInt(usize),
+    writer_parent: [:0]const u8 = "",
+    files: []PreparedFile = &.{},
+    crc_scratch: [64 * 1024]u8 = undefined,
+
+    /// Prepare a finite allowlist for sequential WAL, SST and manifest I/O.
+    /// All path ownership, writer state, CRC scratch and two FD permits are
+    /// retained until deinit; execution never allocates or reacquires permits.
+    /// This excludes builders, encoders and generic allocating Storage helpers.
+    /// Parent directories must already exist or be created top-down explicitly.
+    pub fn createWithFiles(allocator: Allocator, native: *NativeStorage, root_dir: []const u8, specs: []const FileSpec) !*NativeCompletionIo {
+        if (specs.len > 64) return error.CompletionFileCapacityExceeded;
+        const self = try create(allocator, native, root_dir);
+        errdefer self.deinit() catch unreachable;
+        const files = try allocator.alloc(PreparedFile, specs.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (files[0..initialized]) |file| file.deinit(allocator);
+            allocator.free(files);
+        }
+        const nonce = atomic_write_nonce.fetchAdd(1, .monotonic);
+        for (specs, 0..) |spec, i| {
+            if (spec.path.len <= root_dir.len or !std.mem.startsWith(u8, spec.path, root_dir) or
+                spec.path[root_dir.len] != '/' or std.mem.indexOfScalar(u8, spec.path, 0) != null)
+                return error.UnsupportedCompletionPath;
+            const relative = spec.path[root_dir.len + 1 ..];
+            var parts = std.mem.splitScalar(u8, relative, '/');
+            while (parts.next()) |part| {
+                if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return error.UnsupportedCompletionPath;
+            }
+            // WAL permissions and naming remain governed by the original scope.
+            if (std.mem.eql(u8, relative, "wal") or std.mem.startsWith(u8, relative, "wal/")) return error.UnsupportedCompletionPath;
+            for (files[0..initialized]) |file| if (std.mem.eql(u8, spec.path, file.final)) return error.UnsupportedCompletionPath;
+            const final = try allocator.dupeZ(u8, spec.path);
+            errdefer allocator.free(final);
+            const parent = try allocator.dupeZ(u8, std.fs.path.dirname(spec.path) orelse return error.UnsupportedCompletionPath);
+            errdefer allocator.free(parent);
+            const parent_parent = try allocator.dupeZ(u8, std.fs.path.dirname(parent) orelse return error.UnsupportedCompletionPath);
+            errdefer allocator.free(parent_parent);
+            const temp = try std.fmt.allocPrintSentinel(allocator, "{s}.tmp-{d}-{d}", .{ spec.path, nonce, i }, 0);
+            errdefer allocator.free(temp);
+            if (temp.len >= std.fs.max_path_bytes) return error.NameTooLong;
+            files[i] = .{ .final = final, .parent = parent, .parent_parent = parent_parent, .temp = temp, .max_bytes = spec.max_bytes, .allow_append = spec.allow_append, .allow_delete = spec.allow_delete };
+            initialized += 1;
+        }
+        for (files) |file| for (files) |other| {
+            if (std.mem.eql(u8, file.temp, other.final)) return error.UnsupportedCompletionPath;
+        };
+        self.files = files;
+        return self;
+    }
 
     pub fn create(allocator: Allocator, native: *NativeStorage, root_dir: []const u8) !*NativeWalCompletionIo {
         if (comptime !supports_posix_fd_cache) return error.UnsupportedCompletionProvider;
@@ -2104,6 +2181,8 @@ pub const NativeWalCompletionIo = struct {
     pub fn deinit(self: *NativeWalCompletionIo) !void {
         if (self.writer_fd != null) return error.CompletionWriterLive;
         const allocator = self.allocator;
+        for (self.files) |file| file.deinit(allocator);
+        allocator.free(self.files);
         allocator.free(self.temp_checkpoint);
         allocator.free(self.temp_index);
         allocator.free(self.segment);
@@ -2127,7 +2206,13 @@ pub const NativeWalCompletionIo = struct {
         if (self.writer_fd != null) return error.CompletionWriterLive;
     }
 
+    fn preparedFile(self: *NativeWalCompletionIo, value: []const u8) ?*const PreparedFile {
+        for (self.files) |*file| if (std.mem.eql(u8, value, file.final)) return file;
+        return null;
+    }
+
     fn path(self: *NativeWalCompletionIo, value: []const u8) ![:0]const u8 {
+        if (self.preparedFile(value)) |file| return file.final;
         if (std.mem.eql(u8, value, self.index)) return self.index;
         if (std.mem.eql(u8, value, self.checkpoint)) return self.checkpoint;
         const prefix_len = self.segment.len - 24;
@@ -2142,12 +2227,15 @@ pub const NativeWalCompletionIo = struct {
     fn createDir(raw: *anyopaque, value: []const u8) !void {
         const self = get(raw);
         try self.idle();
-        if (!std.mem.eql(u8, value, self.wal_dir)) return error.UnsupportedCompletionPath;
-        while (true) switch (std.posix.errno(std.posix.system.mkdir(self.wal_dir, std.Io.Dir.Permissions.default_dir.toMode()))) {
+        const dir = if (std.mem.eql(u8, value, self.wal_dir)) self.wal_dir else if (self.files.len != 0 and std.mem.eql(u8, value, self.root)) self.root else blk: {
+            for (self.files) |file| if (std.mem.eql(u8, value, file.parent)) break :blk file.parent;
+            return error.UnsupportedCompletionPath;
+        };
+        while (true) switch (std.posix.errno(std.posix.system.mkdir(dir, std.Io.Dir.Permissions.default_dir.toMode()))) {
             .SUCCESS => return,
             .INTR => continue,
             .EXIST => {
-                const fd = try std.posix.openatZ(std.posix.AT.FDCWD, self.wal_dir, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
+                const fd = try std.posix.openatZ(std.posix.AT.FDCWD, dir, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
                 closeFd(fd);
                 return;
             },
@@ -2178,19 +2266,25 @@ pub const NativeWalCompletionIo = struct {
         const self = get(raw);
         try self.idle();
         const owned_path = try self.path(value);
-        if (owned_path.ptr != self.segment.ptr) return error.UnsupportedCompletionPath;
+        const limit = if (self.preparedFile(value)) |file| blk: {
+            if (!file.allow_append) return error.UnsupportedCompletionOperation;
+            break :blk file.max_bytes;
+        } else if (owned_path.ptr == self.segment.ptr) std.math.maxInt(usize) else return error.UnsupportedCompletionPath;
         self.permit.state.invalidatePath(value);
         defer self.permit.state.invalidatePath(value);
         const fd = try std.posix.openatZ(std.posix.AT.FDCWD, owned_path, .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true }, std.Io.File.Permissions.default_file.toMode());
         defer closeFd(fd);
-        try writeAllAtOffset(fd, bytes, try fileSizeFromFd(fd));
+        const current = try fileSizeFromFd(fd);
+        if (current > limit or bytes.len > limit - current) return error.CompletionFileCapacityExceeded;
+        try writeAllAtOffset(fd, bytes, current);
         if (sync) try fs_paths.syncFileFdPortable(fd);
     }
 
     fn syncParent(raw: *anyopaque, value: []const u8) !void {
         const self = get(raw);
         try self.idle();
-        const parent = if (std.mem.eql(u8, value, self.wal_dir)) self.root else blk: {
+        const parent = if (self.preparedFile(value)) |file| file.parent else if (std.mem.eql(u8, value, self.wal_dir)) self.root else blk: {
+            for (self.files) |file| if (std.mem.eql(u8, value, file.parent)) break :blk file.parent_parent;
             _ = try self.path(value);
             break :blk self.wal_dir;
         };
@@ -2203,11 +2297,14 @@ pub const NativeWalCompletionIo = struct {
         const self = get(raw);
         try self.idle();
         const owned_path = try self.path(value);
-        const tmp = if (owned_path.ptr == self.index.ptr) self.temp_index else if (owned_path.ptr == self.checkpoint.ptr) self.temp_checkpoint else return error.UnsupportedCompletionPath;
+        const prepared = self.preparedFile(value);
+        const tmp = if (prepared) |file| file.temp else if (owned_path.ptr == self.index.ptr) self.temp_index else if (owned_path.ptr == self.checkpoint.ptr) self.temp_checkpoint else return error.UnsupportedCompletionPath;
         self.writer_fd = try std.posix.openatZ(std.posix.AT.FDCWD, tmp, .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true, .CLOEXEC = true }, std.Io.File.Permissions.default_file.toMode());
         self.writer_final = owned_path;
         self.writer_temp = tmp;
         self.writer_bytes = 0;
+        self.writer_limit = if (prepared) |file| file.max_bytes else std.math.maxInt(usize);
+        self.writer_parent = if (prepared) |file| file.parent else self.wal_dir;
         return .{ .ptr = self, .vtable = &writer_vtable };
     }
 
@@ -2217,6 +2314,7 @@ pub const NativeWalCompletionIo = struct {
     fn writerAppend(raw: *anyopaque, bytes: []const u8) !void {
         const self = get(raw);
         const fd = self.writer_fd orelse return error.CompletionWriterClosed;
+        if (bytes.len > self.writer_limit - self.writer_bytes) return error.CompletionFileCapacityExceeded;
         try writeAllAtOffset(fd, bytes, self.writer_bytes);
         self.writer_bytes += bytes.len;
     }
@@ -2235,7 +2333,7 @@ pub const NativeWalCompletionIo = struct {
         closeFd(fd);
         open = false;
         try renamePrepared(self.writer_temp, self.writer_final);
-        const parent = try std.posix.openatZ(std.posix.AT.FDCWD, self.wal_dir, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
+        const parent = try std.posix.openatZ(std.posix.AT.FDCWD, self.writer_parent, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
         defer closeFd(parent);
         try fs_paths.syncDirectoryFdPortable(parent);
     }
@@ -2248,6 +2346,45 @@ pub const NativeWalCompletionIo = struct {
             unlinkPrepared(self.writer_temp) catch {};
             self.permit.state.invalidatePath(self.writer_temp);
         }
+    }
+    fn writerWriteAt(raw: *anyopaque, offset: usize, bytes: []const u8) !void {
+        const self = get(raw);
+        const fd = self.writer_fd orelse return error.CompletionWriterClosed;
+        if (offset > self.writer_bytes or bytes.len > self.writer_bytes - offset) return error.InvalidAtomicWriteOffset;
+        try writeAllAtOffset(fd, bytes, offset);
+    }
+    fn writerCrcPrefix(raw: *anyopaque, len: usize) !u32 {
+        return writerCrcRange(raw, 0, len);
+    }
+    fn writerCrcRange(raw: *anyopaque, start: usize, len: usize) !u32 {
+        const self = get(raw);
+        const fd = self.writer_fd orelse return error.CompletionWriterClosed;
+        if (start > self.writer_bytes or len > self.writer_bytes - start) return error.InvalidAtomicWriteOffset;
+        var crc = Crc32.init();
+        var offset: usize = 0;
+        while (offset < len) {
+            const n = @min(self.crc_scratch.len, len - offset);
+            try readAllAtOffset(fd, self.crc_scratch[0..n], start + offset);
+            crc.update(self.crc_scratch[0..n]);
+            offset += n;
+        }
+        return crc.final();
+    }
+    fn syncContents(raw: *anyopaque, value: []const u8) !void {
+        const self = get(raw);
+        try self.idle();
+        const fd = try std.posix.openatZ(std.posix.AT.FDCWD, try self.path(value), .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+        defer closeFd(fd);
+        try fs_paths.syncFileFdPortable(fd);
+    }
+    fn deletePrepared(raw: *anyopaque, value: []const u8) !void {
+        const self = get(raw);
+        try self.idle();
+        const file = self.preparedFile(value) orelse return error.UnsupportedCompletionPath;
+        if (!file.allow_delete) return error.UnsupportedCompletionOperation;
+        self.permit.state.invalidatePath(value);
+        defer self.permit.state.invalidatePath(value);
+        try unlinkPrepared(file.final);
     }
     fn renamePrepared(old: [:0]const u8, new: [:0]const u8) !void {
         return renameAbsoluteDirectPosixZ(old, new);
@@ -2314,7 +2451,7 @@ pub const NativeWalCompletionIo = struct {
         .begin_atomic_write = beginAtomic,
         .sync_parent_absolute = syncParent,
         .rename_absolute = unsupportedWrite,
-        .delete_file_absolute = unsupportedPath,
+        .delete_file_absolute = deletePrepared,
         .delete_tree = unsupportedPath,
         .now_ns = now,
         .begin_read_file_range_alloc = unsupportedFuture,
@@ -2326,14 +2463,14 @@ pub const NativeWalCompletionIo = struct {
         .try_begin_cold_random_reads = unsupportedColdGroup,
         .cold_sequential_reader_capacity = noColdCapacity,
         .root_identity_alloc = unsupportedIdentity,
-        .sync_contents_absolute = unsupportedPath,
+        .sync_contents_absolute = syncContents,
     };
     const writer_vtable: AtomicWriteSink.VTable = .{
         .len = writerLen,
         .append_slice = writerAppend,
-        .write_at = unsupportedAt,
-        .crc32_prefix = unsupportedCrc,
-        .crc32_range = unsupportedCrcRange,
+        .write_at = writerWriteAt,
+        .crc32_prefix = writerCrcPrefix,
+        .crc32_range = writerCrcRange,
         .finish = writerFinish,
         .abort = writerAbort,
     };
@@ -5898,5 +6035,192 @@ test "native WAL completion scope preserves preexisting temp on uncertain initia
     try std.testing.expectEqualStrings("previous-owner", &previous);
     try std.testing.expectEqual(@as(u64, previous.len), try fileSizeFromFd(old));
     try std.testing.expectError(error.FileNotFound, scope.storage().fileSize(scope.index));
+    try std.testing.expectEqual(@as(usize, 2), pool.snapshotStats().fd_admitted_descriptors);
+}
+
+test "native completion scope drains prepared SST manifest and WAL with exhausted ordinary resources" {
+    if (!supports_posix_fd_cache) return error.SkipZigTest;
+    const repository = @import("repository.zig");
+    const wal = @import("wal.zig");
+    var path_buffer: [256]u8 = undefined;
+    const root_z = repository.tmpPath(&path_buffer, "native-completion-drain");
+    const root = std.mem.span(root_z);
+    defer repository.cleanupTmp(root_z);
+    const sst = try std.fmt.allocPrint(std.testing.allocator, "{s}/runs/run-1.sst", .{root});
+    defer std.testing.allocator.free(sst);
+    const manifest = try std.fmt.allocPrint(std.testing.allocator, "{s}/manifest.bin", .{root});
+    defer std.testing.allocator.free(manifest);
+    const journal = try std.fmt.allocPrint(std.testing.allocator, "{s}/manifest-1.journal", .{root});
+    defer std.testing.allocator.free(journal);
+    var cache_alloc = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var pool = NativeStoragePool.initWithCapacityForTest(cache_alloc.allocator(), 2);
+    defer pool.deinit();
+    var native_alloc = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var native = try NativeStorage.initWithPool(native_alloc.allocator(), .threaded, &pool);
+    var native_open = true;
+    defer if (native_open) native.deinit();
+    try native.storage().createDirPath(root);
+    var state: @import("state.zig").State = .{};
+    defer state.deinit(std.testing.allocator);
+    try state.upsert(std.testing.allocator, .{}, "key", "durable", false);
+    var scratch = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var prepared = try wal.PreparedAppend.init(scratch.allocator(), root, &state, true, .{});
+    defer prepared.deinit();
+    const scope = try NativeCompletionIo.createWithFiles(scratch.allocator(), &native, root, &.{
+        .{ .path = sst, .max_bytes = 128 * 1024, .allow_delete = true },
+        .{ .path = manifest, .max_bytes = 8 },
+        .{ .path = journal, .max_bytes = 8, .allow_append = true },
+    });
+    var scope_open = true;
+    defer if (scope_open) scope.deinit() catch unreachable;
+    try std.testing.expectEqual(@as(usize, 2), pool.snapshotStats().fd_admitted_descriptors);
+    try std.testing.expectEqual(@as(?[]ColdSequentialReader, null), try native.storage().tryBeginColdRandomReads(std.testing.allocator, &.{sst}));
+    native.deinit();
+    native_open = false;
+    pool.fd_cache.capacity = 1;
+    scratch.fail_index = scratch.alloc_index;
+    native_alloc.fail_index = native_alloc.alloc_index;
+    cache_alloc.fail_index = cache_alloc.alloc_index;
+    const storage = scope.storage();
+    try storage.createDirPath(root);
+    try storage.createDirPath(scope.files[0].parent);
+    try storage.syncParentAbsolute(scope.files[0].parent);
+    const wal_result = try prepared.execute(storage, scratch.allocator());
+    try std.testing.expect(wal_result == .appended);
+    var block: [64 * 1024]u8 = @splat('x');
+    var writer = try storage.beginAtomicWrite(scratch.allocator(), sst);
+    try writer.appendSlice(&block);
+    try writer.appendSlice(&block);
+    try std.testing.expectError(error.CompletionFileCapacityExceeded, writer.appendSlice("x"));
+    try writer.writeAt(0, "SST!");
+    try std.testing.expectError(error.InvalidAtomicWriteOffset, writer.writeAt(block.len * 2, "x"));
+    @memcpy(block[0..4], "SST!");
+    var crc = Crc32.init();
+    crc.update(&block);
+    @memset(block[0..4], 'x');
+    crc.update(&block);
+    try std.testing.expectEqual(crc.final(), try writer.crc32Prefix(block.len * 2));
+    try std.testing.expectEqual(Crc32.hash("xxxx"), try writer.crc32Range(block.len - 2, 4));
+    try writer.finish();
+    writer = try storage.beginAtomicWrite(scratch.allocator(), manifest);
+    try writer.appendSlice("manifest");
+    try writer.finish();
+    writer = try storage.beginAtomicWrite(scratch.allocator(), journal);
+    try writer.appendSlice("head");
+    try writer.finish();
+    try storage.appendFileAbsolute(scratch.allocator(), journal, "tail", true);
+    try std.testing.expectError(error.CompletionFileCapacityExceeded, storage.appendFileAbsolute(scratch.allocator(), journal, "x", true));
+    try std.testing.expectError(error.UnsupportedCompletionOperation, storage.appendFileAbsolute(scratch.allocator(), sst, "x", true));
+    try std.testing.expectError(error.UnsupportedCompletionOperation, storage.deleteFileAbsolute(manifest));
+    try storage.syncFileContentsAbsolute(sst);
+    try storage.syncParentAbsolute(sst);
+    try std.testing.expectEqual(@as(u64, 128 * 1024), try storage.fileSize(sst));
+    var head: [8]u8 = undefined;
+    try storage.readFileRangeInto(scratch.allocator(), sst, 0, &head);
+    try std.testing.expectEqualStrings("SST!xxxx", &head);
+    try storage.readFileRangeInto(scratch.allocator(), journal, 0, &head);
+    try std.testing.expectEqualStrings("headtail", &head);
+    try std.testing.expect(!scratch.has_induced_failure and !native_alloc.has_induced_failure and !cache_alloc.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 0), pool.snapshotStats().fd_cache_entries);
+    try scope.deinit();
+    scope_open = false;
+    try std.testing.expectEqual(@as(usize, 0), pool.snapshotStats().fd_admitted_descriptors);
+    var verifier = try NativeStorage.init(std.testing.allocator, .threaded);
+    defer verifier.deinit();
+    const actual = try verifier.storage().readFileAlloc(std.testing.allocator, sst, 128 * 1024 + 1);
+    defer std.testing.allocator.free(actual);
+    try std.testing.expectEqual(crc.final(), Crc32.hash(actual));
+    const descriptor = try verifier.storage().readFileAlloc(std.testing.allocator, manifest, 9);
+    defer std.testing.allocator.free(descriptor);
+    try std.testing.expectEqualStrings("manifest", descriptor);
+    var recovered: @import("state.zig").State = .{};
+    defer recovered.deinit(std.testing.allocator);
+    const replay = try wal.replayIntoMutable(verifier.storage(), std.testing.allocator, root, &recovered);
+    try std.testing.expectEqual(@as(u64, 1), replay.records);
+    try std.testing.expectEqualStrings("durable", try recovered.get(.{}, "key"));
+}
+
+test "native completion scope prepare failures and path permissions retain no ownership" {
+    if (!supports_posix_fd_cache) return error.SkipZigTest;
+    const Fixture = struct {
+        fn check(allocator: Allocator) !void {
+            var pool = NativeStoragePool.initWithCapacityForTest(std.testing.allocator, 2);
+            defer pool.deinit();
+            var native = try NativeStorage.initWithPool(std.testing.allocator, .threaded, &pool);
+            defer native.deinit();
+            defer std.debug.assert(pool.snapshotStats().fd_admitted_descriptors == 0);
+            const scope = try NativeCompletionIo.createWithFiles(allocator, &native, "/unopened-completion-root", &.{
+                .{ .path = "/unopened-completion-root/runs/run-1.sst", .max_bytes = 1024 },
+                .{ .path = "/unopened-completion-root/manifest.bin", .max_bytes = 8 },
+            });
+            try scope.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.check, .{});
+    var pool = NativeStoragePool.initWithCapacityForTest(std.testing.allocator, 2);
+    defer pool.deinit();
+    var native = try NativeStorage.initWithPool(std.testing.allocator, .threaded, &pool);
+    defer native.deinit();
+    for ([_][]const u8{ "/other/manifest.bin", "/root/../outside", "/root/wal/index", "/root/run//table" }) |path_value| {
+        try std.testing.expectError(error.UnsupportedCompletionPath, NativeCompletionIo.createWithFiles(std.testing.allocator, &native, "/root", &.{.{ .path = path_value, .max_bytes = 8 }}));
+        try std.testing.expectEqual(@as(usize, 0), pool.snapshotStats().fd_admitted_descriptors);
+    }
+    try std.testing.expectError(error.UnsupportedCompletionPath, NativeCompletionIo.createWithFiles(std.testing.allocator, &native, "/root", &.{
+        .{ .path = "/root/same", .max_bytes = 8 }, .{ .path = "/root/same", .max_bytes = 8 },
+    }));
+    try std.testing.expectEqual(@as(usize, 0), pool.snapshotStats().fd_admitted_descriptors);
+}
+
+test "native completion scope preserves files on failed atomic publication and leftover temp" {
+    if (!supports_posix_fd_cache) return error.SkipZigTest;
+    const repository = @import("repository.zig");
+    var path_buffer: [256]u8 = undefined;
+    const root_z = repository.tmpPath(&path_buffer, "native-completion-errors");
+    const root = std.mem.span(root_z);
+    defer repository.cleanupTmp(root_z);
+    const final = try std.fmt.allocPrint(std.testing.allocator, "{s}/manifest.bin", .{root});
+    defer std.testing.allocator.free(final);
+    const blocked = try std.fmt.allocPrint(std.testing.allocator, "{s}/blocked", .{root});
+    defer std.testing.allocator.free(blocked);
+    var pool = NativeStoragePool.initWithCapacityForTest(std.testing.allocator, 2);
+    defer pool.deinit();
+    var native = try NativeStorage.initWithPool(std.testing.allocator, .threaded, &pool);
+    defer native.deinit();
+    try native.storage().createDirPath(root);
+    try native.storage().createDirPath(blocked);
+    const scope = try NativeCompletionIo.createWithFiles(std.testing.allocator, &native, root, &.{
+        .{ .path = final, .max_bytes = 8, .allow_delete = true },
+        .{ .path = blocked, .max_bytes = 8 },
+    });
+    defer scope.deinit() catch unreachable;
+    const storage = scope.storage();
+    var writer = try storage.beginAtomicWrite(std.testing.allocator, final);
+    try writer.appendSlice("original");
+    try writer.finish();
+    writer = try storage.beginAtomicWrite(std.testing.allocator, final);
+    try writer.appendSlice("partial");
+    try std.testing.expectError(error.CompletionWriterLive, scope.deinit());
+    writer.abort();
+    var bytes: [8]u8 = undefined;
+    try storage.readFileRangeInto(std.testing.allocator, final, 0, &bytes);
+    try std.testing.expectEqualStrings("original", &bytes);
+    // Finish is consuming even when the rename fails; close must stay legal
+    // and the native descriptor bundle remains owned for recovery/cleanup.
+    writer = try storage.beginAtomicWrite(std.testing.allocator, blocked);
+    try writer.appendSlice("blocked");
+    try std.testing.expectError(error.IsDir, writer.finish());
+    try std.testing.expect(scope.writer_fd == null);
+    try std.testing.expectError(error.FileNotFound, std.posix.openatZ(std.posix.AT.FDCWD, scope.files[1].temp, .{ .ACCMODE = .RDONLY }, 0));
+    const leftover = try std.posix.openatZ(std.posix.AT.FDCWD, scope.files[0].temp, .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true }, std.Io.File.Permissions.default_file.toMode());
+    defer closeFd(leftover);
+    try writeAllAtOffset(leftover, "previous", 0);
+    try std.testing.expectError(error.PathAlreadyExists, storage.beginAtomicWrite(std.testing.allocator, final));
+    try readAllAtOffset(leftover, &bytes, 0);
+    try std.testing.expectEqualStrings("previous", &bytes);
+    try storage.readFileRangeInto(std.testing.allocator, final, 0, &bytes);
+    try std.testing.expectEqualStrings("original", &bytes);
+    try storage.deleteFileAbsolute(final);
+    try storage.syncParentAbsolute(final);
+    try std.testing.expectError(error.FileNotFound, storage.fileSize(final));
     try std.testing.expectEqual(@as(usize, 2), pool.snapshotStats().fd_admitted_descriptors);
 }

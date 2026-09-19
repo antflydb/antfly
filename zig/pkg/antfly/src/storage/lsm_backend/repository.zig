@@ -366,9 +366,13 @@ test "lsm snapshot clone has one metadata owner on state failure" {
 }
 
 pub fn ensureOpenDirsWithStorage(storage: storage_io.Storage, root_dir: []const u8) !void {
+    return ensureOpenDirsWithAllocator(storage, std.heap.page_allocator, root_dir);
+}
+
+pub fn ensureOpenDirsWithAllocator(storage: storage_io.Storage, allocator: Allocator, root_dir: []const u8) !void {
     try storage.createDirPath(root_dir);
-    const runs_dir = try std.fs.path.join(std.heap.page_allocator, &.{ root_dir, "runs" });
-    defer std.heap.page_allocator.free(runs_dir);
+    const runs_dir = try std.fs.path.join(allocator, &.{ root_dir, "runs" });
+    defer allocator.free(runs_dir);
     try storage.createDirPath(runs_dir);
 }
 
@@ -1973,7 +1977,7 @@ pub const StreamingRunFileWriter = struct {
             .resource_manager = resource_manager,
             .max_file_bytes = max_file_bytes,
         };
-        try ensureOpenDirsWithStorage(storage, root_dir);
+        try ensureOpenDirsWithAllocator(storage, allocator, root_dir);
         self.path = try runPath(allocator, root_dir, run_id);
         errdefer {
             allocator.free(self.path);
