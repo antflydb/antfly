@@ -23,8 +23,11 @@
 /// Version 6 fences merge copy attempts across donor leadership changes.
 /// Version 7 carries native-backed canonical completion entries. Capability
 /// alone never grants admission; an installed retained pool is also required.
-pub const batch_protocol_version: u16 = 7;
+/// Version 8 adds atomic single-phase canonical mutations. A v7 prepare parser
+/// cannot safely apply these as a transaction waiting for a later decision.
+pub const batch_protocol_version: u16 = 8;
 pub const batch_completion_protocol_version: u16 = 7;
+pub const batch_mutation_completion_protocol_version: u16 = 8;
 pub const batch_timestamp_protocol_version: u16 = 1;
 pub const batch_activation_barrier_protocol_version: u16 = 2;
 pub const batch_merge_transition_protocol_version: u16 = 3;

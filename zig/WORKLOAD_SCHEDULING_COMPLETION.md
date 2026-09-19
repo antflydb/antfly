@@ -37,8 +37,10 @@ prerequisites are implemented and verified.
 
 - Canonical single-phase envelopes use wire version 2 and require Raft batch
   protocol 8. Version 1 prepares remain byte-compatible. Seven owning codec
-  tests passed; peer capability advertisement and native mutation application
-  are not enabled by the format change.
+  tests passed. DATA now advertises version 8 and requires that floor for
+  ordinary canonical mutations; prepare retains its version 7 floor. The
+  owning DATA selection regression passed. Actual mixed-peer proposal and
+  Raft-WAL fault schedules remain to qualify; production activation is disabled.
 - The native capacity certificate stage passed ten owning tests, including
   actual SST encoding, before-acceptance counter/capacity rejection, accepted
   restart and retained readers. Separating retained allocations from transient
@@ -61,9 +63,16 @@ prerequisites are implemented and verified.
   verified duplicate application and complete physical state, and confirmed
   that no prepared transaction record was created. Native apply drains the
   mutation and its progress together; DB publication consumes retained replay
-  and visibility ownership before cohort retirement. DATA routing, accepted
-  mutation restart/fault qualification, and transaction-control reservations
+  and visibility ownership before cohort retirement. DATA routing is connected;
+  its full proposal/fault qualification and transaction-control reservations
   remain open.
+- Trusted local installation capsules now restore actual accepted ordinary
+  debt with empty metadata/catalog access, no service keys, and new admission
+  disabled. Five owning SourceOwner tests passed, including immutable identity,
+  atomic publication cuts, exact accepted reconciliation and duplicate apply.
+  Six owning DATA tests passed for local restoration/authorization, native-owner
+  shutdown before coordinator destruction, and canonical protocol selection.
+  These component results do not replace real replicated process/quorum faults.
 - The current single-phase candidate profile rejects external payload stores,
   generated-enrichment producers, graph-index catalogs, child-range dispatch,
   HA mirrors, split/shadow/bulk state, and structural commands. In particular,

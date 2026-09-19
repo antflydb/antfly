@@ -10103,11 +10103,15 @@ pub const DataServer = struct {
     }
 
     fn requiresCanonicalCompletion(req: antfly.db.types.BatchRequest, storage: ?antfly.common.table_storage.Settings) bool {
-        const transaction = req.transaction orelse return false;
-        if (transaction != .prepare) return false;
-        const settings = storage orelse return false;
-        const policy = settings.transaction_recovery orelse return false;
-        return policy.completion_protocol_version != 0 or policy.profile_version != 0;
+        return canonicalCompletionProtocolVersion(req, storage) != null;
+    }
+
+    fn canonicalCompletionProtocolVersion(req: antfly.db.types.BatchRequest, storage: ?antfly.common.table_storage.Settings) ?u16 {
+        if (req.transaction) |transaction| if (transaction != .prepare) return null;
+        const settings = storage orelse return null;
+        const policy = settings.transaction_recovery orelse return null;
+        if (policy.completion_protocol_version == 0 and policy.profile_version == 0) return null;
+        return if (req.transaction != null) data_raft_batch.completion_protocol_version else data_raft_batch.mutation_completion_protocol_version;
     }
 
     fn proposeRaftBatchGroupWithLeaderWait(
@@ -10180,8 +10184,8 @@ pub const DataServer = struct {
                 if (comptime linked_storage) {
                     const owner_source = try self.ensureKernelOwnerSource();
                     storage_owner_descriptor = try owner_source.loadDescriptor(alloc, group_id, table_name);
-                    if (requiresCanonicalCompletion(req, storage_owner_descriptor.?.view().table_storage))
-                        required_protocol_version = data_raft_batch.completion_protocol_version;
+                    if (canonicalCompletionProtocolVersion(req, storage_owner_descriptor.?.view().table_storage)) |version|
+                        required_protocol_version = version;
                 }
                 const activation_entry = try self.dataRaftProtocolActivationEntry(group_id);
                 protocol_activation_entry = activation_entry;
@@ -48839,7 +48843,11 @@ fn implementationTests() type {
             settings.transaction_recovery.?.completion_protocol_version = 1;
             settings.transaction_recovery.?.profile_version = 1;
             try std.testing.expect(DataServer.requiresCanonicalCompletion(prepare, settings));
-            try std.testing.expect(!DataServer.requiresCanonicalCompletion(.{}, settings));
+            try std.testing.expect(DataServer.requiresCanonicalCompletion(.{}, settings));
+            const ordinary: antfly.db.types.BatchRequest = .{ .writes = &.{.{ .key = "doc", .value = "{}" }} };
+            try std.testing.expectEqual(@as(?u16, 8), DataServer.canonicalCompletionProtocolVersion(ordinary, settings));
+            try std.testing.expectEqual(@as(?u16, 7), DataServer.canonicalCompletionProtocolVersion(prepare, settings));
+            try std.testing.expectEqual(@as(?u16, null), DataServer.canonicalCompletionProtocolVersion(ordinary, null));
             // Unknown future/malformed policy is never silently downgraded to the
             // legacy logical prepare format; the canonical compiler rejects it.
             settings.transaction_recovery.?.completion_protocol_version = 2;
