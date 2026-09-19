@@ -29,10 +29,16 @@ const std = @import("std");
 /// Version 9 adds durable membership-bound protocol activation.
 /// Version 10 adds resumable store inventories and atomic schema-progress batches.
 /// Version 11 preserves nondefault table storage policy in binary records.
-pub const current_version: u16 = 11;
+/// Version 12 preserves physical completion policy and profile versions.
+pub const current_version: u16 = 12;
+pub const completion_storage_version: u16 = 12;
 pub const table_storage_version: u16 = 11;
 
 pub fn tableStorageVersion(settings: @import("../common/table_storage.zig").Settings, minimum: u16) u16 {
+    if (settings.transaction_recovery) |policy| {
+        if (policy.completion_protocol_version != 0 or policy.profile_version != 0)
+            return @max(minimum, completion_storage_version);
+    }
     return if (settings.transaction_recovery != null or settings.dense_embeddings != .primary_lsm) @max(minimum, table_storage_version) else minimum;
 }
 pub const durable_activation_version: u16 = 9;

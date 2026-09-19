@@ -87,10 +87,18 @@ pub fn tableDefinitionFingerprint(table: TableDefinition) TableDefinitionFingerp
         hashTableDefinitionPart(&hasher, @tagName(table.storage.dense_embeddings));
     if (table.storage.transaction_recovery) |policy| {
         hashTableDefinitionPart(&hasher, "transaction-recovery-v1");
-        inline for (std.meta.fields(@TypeOf(policy))) |field| {
+        inline for (.{ "protocol_version", "max_count", "max_bytes", "max_transaction_bytes" }) |field| {
             var bytes: [8]u8 = undefined;
-            std.mem.writeInt(u64, &bytes, @field(policy, field.name), .little);
+            std.mem.writeInt(u64, &bytes, @field(policy, field), .little);
             hasher.update(&bytes);
+        }
+        if (policy.completion_protocol_version != 0 or policy.profile_version != 0) {
+            hashTableDefinitionPart(&hasher, "physical-completion-policy-v1");
+            inline for (.{ "completion_protocol_version", "profile_version" }) |field| {
+                var bytes: [8]u8 = undefined;
+                std.mem.writeInt(u64, &bytes, @field(policy, field), .little);
+                hasher.update(&bytes);
+            }
         }
     }
     var encoded: [@sizeOf(u64)]u8 = undefined;
@@ -3554,4 +3562,19 @@ test "workload admission recovery policy participates in table identity" {
     active.storage.transaction_recovery.?.max_count += 1;
     try std.testing.expect(!tableDefinitionsEqual(previous, active));
     try std.testing.expect(!std.mem.eql(u8, &tableDefinitionFingerprint(previous), &tableDefinitionFingerprint(active)));
+}
+
+test "workload admission table completion policy preserves legacy definition fingerprint" {
+    var table: TableDefinition = .{ .table_id = 42, .name = "table:42", .storage = .{ .transaction_recovery = .{
+        .protocol_version = 1,
+        .max_count = 4,
+        .max_bytes = 4194304,
+        .max_transaction_bytes = 1048576,
+    } } };
+    // Golden predecessor digest: only the original four recovery fields.
+    const legacy = tableDefinitionFingerprint(table);
+    try std.testing.expectEqualStrings("1c0a13766acf4ae016a84cb528e8b29e2f0d526f674568b445c2c96b3e065878", &std.fmt.bytesToHex(legacy, .lower));
+    table.storage.transaction_recovery.?.completion_protocol_version = 1;
+    table.storage.transaction_recovery.?.profile_version = 1;
+    try std.testing.expect(!std.mem.eql(u8, &legacy, &tableDefinitionFingerprint(table)));
 }

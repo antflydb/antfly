@@ -2469,6 +2469,12 @@ pub const MetadataHttpServer = struct {
             try ctx.setHeader("Retry-After", "1");
             return ctx.status(503).text("metadata mutation was superseded before application; retry on the current leader");
         }
+        if (err == error.CompletionAdmissionUnavailable or err == error.CompletionAdmissionPolicyChanged) {
+            // A capacity/guard failure alone is not proof that no prior mutation
+            // was proposed. Preserve the caller's unknown outcome marker.
+            try ctx.setHeader("Retry-After", "1");
+            return ctx.status(503).text("transaction completion backing unavailable");
+        }
         if (err == error.UnsupportedOperation) return ctx.status(405).text("unsupported operation");
         if (err == error.InvalidRestoreProgressRequest)
             return ctx.status(400).text("invalid restore progress request");
@@ -7608,4 +7614,18 @@ test "metadata node lifecycle distinguishes pre-admission rejection from partial
         http_common.metadata_not_leader_value,
         partial.headers.get(http_common.metadata_not_leader_header).?,
     );
+}
+
+test "workload admission metadata completion capacity preserves unknown mutation outcome" {
+    var request = try httpx.Request.init(std.testing.allocator, .POST, routes.Routes.internal_forwarded_table_mutation);
+    defer request.deinit();
+    var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    defer ctx.deinit();
+    try ctx.setHeader(routes.Routes.raft_mutation_outcome_header, routes.Routes.raft_mutation_outcome_unknown);
+    var response = try MetadataHttpServer.metadataMutationError(&ctx, error.CompletionAdmissionUnavailable);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 503), response.status.code);
+    try std.testing.expectEqualStrings("1", response.headers.get("Retry-After").?);
+    try std.testing.expectEqualStrings(routes.Routes.raft_mutation_outcome_unknown, response.headers.get(routes.Routes.raft_mutation_outcome_header).?);
+    try std.testing.expect(response.headers.get(http_common.metadata_mutation_not_admitted_header) == null);
 }

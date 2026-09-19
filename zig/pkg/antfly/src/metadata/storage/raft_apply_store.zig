@@ -106,6 +106,7 @@ pub const ExtensionLifecycleDelta = struct {
     remove_extension_dependencies: []const ExtensionDependencyKey = &.{},
 };
 
+pub const completion_activation = @import("../completion_activation.zig");
 pub const TableTransitionFence = apply_contract.TableTransitionFence;
 /// Exact predecessor wire shape for transition tag 40. Semantic preconditions
 /// must never be smuggled into this JSON object: predecessor binaries ignore
@@ -143,6 +144,7 @@ const RestoreJobWrite = struct { key: []const u8, value: []const u8 };
 pub const TransitionCommand = union(enum) {
     /// Versioned system catalog request, applied atomically with any table topology.
     activate_topology_protocol: []const u8,
+    apply_completion_activation: []const u8,
     apply_system_catalog: []const u8,
     initialize_metadata_incarnation: metadata_incarnation.MetadataClusterIncarnation,
     upsert_node: metadata.NodeRecord,
@@ -270,7 +272,7 @@ pub const TransitionCommand = union(enum) {
     pub fn deinit(self: *TransitionCommand, alloc: std.mem.Allocator) void {
         switch (self.*) {
             .upsert_schema_progress_batch => |records| alloc.free(records),
-            .activate_topology_protocol, .apply_system_catalog, .apply_store_report_update, .apply_store_report_baseline => |bytes| alloc.free(bytes),
+            .activate_topology_protocol, .apply_completion_activation, .apply_system_catalog, .apply_store_report_update, .apply_store_report_baseline => |bytes| alloc.free(bytes),
             .upsert_node, .register_node => |*record| {
                 metadata_table_manager.freeNode(alloc, record.*);
             },
@@ -3303,6 +3305,130 @@ pub const RaftApplyStore = struct {
         return try decodeRangeRecord(alloc, encoded);
     }
 
+    /// Captures a finite installation intent from one coherent catalog read.
+    /// No physical policy is made routable by this operation.
+    pub fn captureCompletionActivation(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, table_id: u64, policy: @import("../../common/table_storage.zig").TransactionRecovery) ![]u8 {
+        try policy.validate();
+        if (policy.completion_protocol_version != 1 or policy.profile_version != 1) return error.InvalidCompletionActivation;
+        if (try self.getCompletionActivation(alloc, group_id, table_id)) |value| {
+            var prior = value;
+            defer prior.deinit();
+            if (!std.meta.eql(prior.value.policy, policy)) return error.CompletionAdmissionPolicyChanged;
+            return completion_activation.encode(alloc, prior.value);
+        }
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        var key_buf: [192]u8 = undefined;
+        const cluster = (try decodeMetadataIncarnationRecord(try txn.get(try metadataIncarnationKeyForGroup(&key_buf, group_id)))).incarnation;
+        const table = try decodeTableRecord(alloc, try txn.get(try tableKeyForGroup(&key_buf, group_id, table_id)));
+        defer metadata_table_manager.freeTable(alloc, table);
+        if (table.storage.transaction_recovery) |current| if (current.completion_protocol_version != 0) return error.CompletionAdmissionPolicyChanged;
+        const fence = try self.loadTableTransitionFenceTxn(&txn, group_id, table_id);
+        if (fence.active()) return error.TableTransitionActive;
+        if (fence.generation == std.math.maxInt(u64)) return error.TableTransitionGenerationExhausted;
+        if (fence.range_membership.count == 0 or fence.range_membership.count > completion_activation.max_groups) return error.CompletionAdmissionUnavailable;
+        var groups: [completion_activation.max_groups]completion_activation.Group = undefined;
+        var count: usize = 0;
+        var prefix_buf: [192]u8 = undefined;
+        const prefix = try tableRangeIndexPrefixForTable(&prefix_buf, group_id, table_id);
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var entry = try cursor.seekAtOrAfter(prefix);
+        while (entry) |row| : (entry = try cursor.next()) {
+            if (!std.mem.startsWith(u8, row.key, prefix)) break;
+            if (count == groups.len or row.value.len != 8) return error.InvalidDerivedCatalogIndex;
+            const data_group = std.mem.readInt(u64, row.value[0..8], .little);
+            const bytes = try txn.get(try rangeKeyForGroup(&key_buf, group_id, data_group));
+            const range = try decodeRangeRecord(alloc, bytes);
+            defer metadata_table_manager.freeRange(alloc, range);
+            if (range.table_id != table_id or range.group_id != data_group or range.restore_backup_id.len != 0) return error.CompletionAdmissionUnavailable;
+            groups[count] = .{ .group_id = data_group, .range_id = range.range_id, .split_attempt_epoch = range.split_attempt_epoch, .range_digest = undefined };
+            std.crypto.hash.sha2.Sha256.hash(bytes, &groups[count].range_digest, .{});
+            count += 1;
+        }
+        std.mem.sort(completion_activation.Group, groups[0..count], {}, struct {
+            fn less(_: void, a: completion_activation.Group, b: completion_activation.Group) bool {
+                return a.group_id < b.group_id;
+            }
+        }.less);
+        const record: completion_activation.Record = .{ .cluster_incarnation = cluster, .table_id = table_id, .expected_definition = metadata_table_manager.tableDefinitionFingerprint(table), .schema_catalog_digest = try @import("../../common/completion_catalog_digest.zig").digest(alloc, table.schema_json, table.read_schema_json, table.indexes_json), .expected_transition_generation = fence.generation, .generation = fence.generation + 1, .policy = policy, .groups = groups[0..count] };
+        if (!fence.membership(table_id).eql(try record.membership())) return error.InvalidDerivedCatalogIndex;
+        return completion_activation.encode(alloc, record);
+    }
+
+    pub fn getCompletionActivation(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, table_id: u64) !?std.json.Parsed(completion_activation.Record) {
+        var key_buf: [192]u8 = undefined;
+        const bytes = self.store.get(alloc, try completionActivationKeyForGroup(&key_buf, group_id, table_id)) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        defer alloc.free(bytes);
+        return try completion_activation.decode(alloc, bytes);
+    }
+
+    fn applyCompletionActivationTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, bytes: []const u8) !void {
+        var parsed = try completion_activation.decode(self.alloc, bytes);
+        defer parsed.deinit();
+        const record = parsed.value;
+        var incarnation_key: [160]u8 = undefined;
+        const incarnation_bytes = try txn.get(try metadataIncarnationKeyForGroup(&incarnation_key, group_id));
+        if (!std.meta.eql((try decodeMetadataIncarnationRecord(incarnation_bytes)).incarnation, record.cluster_incarnation)) return;
+        var activation_key_buf: [192]u8 = undefined;
+        const activation_key = try completionActivationKeyForGroup(&activation_key_buf, group_id, record.table_id);
+        const previous_bytes = txn.get(activation_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (previous_bytes) |previous| {
+            var prior = try completion_activation.decode(self.alloc, previous);
+            defer prior.deinit();
+            // No timeout abort, generation replacement or removal can release
+            // already-installed pools. Exact pending/active retries are inert.
+            if (!record.sameIntent(prior.value)) return;
+            if (record.phase == .pending or prior.value.phase == .active) return;
+        } else if (record.phase != .pending) return;
+
+        var table_key_buf: [160]u8 = undefined;
+        const table_key = try tableKeyForGroup(&table_key_buf, group_id, record.table_id);
+        const table_bytes = txn.get(table_key) catch |err| switch (err) {
+            error.NotFound => return,
+            else => return err,
+        };
+        var table = try decodeTableRecord(self.alloc, table_bytes);
+        defer metadata_table_manager.freeTable(self.alloc, table);
+        if (!std.meta.eql(metadata_table_manager.tableDefinitionFingerprint(table), record.expected_definition)) return;
+        if (!std.meta.eql(try @import("../../common/completion_catalog_digest.zig").digest(self.alloc, table.schema_json, table.read_schema_json, table.indexes_json), record.schema_catalog_digest)) return;
+        const fence = try self.loadTableTransitionFenceTxn(txn, group_id, record.table_id);
+        if (record.phase == .pending) {
+            if (fence.active() or fence.generation != record.expected_transition_generation) return;
+            if (table.storage.transaction_recovery) |policy| if (policy.completion_protocol_version != 0) return;
+        } else if (fence.active_count != 1 or fence.generation != record.generation) return;
+        if (!fence.membership(record.table_id).eql(try record.membership())) return;
+        // The complete physical range rows, not just group IDs, must remain
+        // identical across installation and publication.
+        for (record.groups) |expected| {
+            var range_key_buf: [160]u8 = undefined;
+            const range_bytes = txn.get(try rangeKeyForGroup(&range_key_buf, group_id, expected.group_id)) catch |err| switch (err) {
+                error.NotFound => return,
+                else => return err,
+            };
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(range_bytes, &digest, .{});
+            if (!std.meta.eql(digest, expected.range_digest)) return;
+            const range = try decodeRangeRecord(self.alloc, range_bytes);
+            defer metadata_table_manager.freeRange(self.alloc, range);
+            if (range.table_id != record.table_id or range.range_id != expected.range_id or range.split_attempt_epoch != expected.split_attempt_epoch or range.restore_backup_id.len != 0) return;
+        }
+        if (record.phase == .pending) {
+            try self.updateTableTransitionFenceTxn(txn, group_id, record.table_id, false, true);
+        } else {
+            table.storage.transaction_recovery = record.policy;
+            try self.putTableRecordTxn(txn, group_id, table_key, table);
+        }
+        try txn.put(activation_key, bytes);
+        self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = activation_key });
+    }
+
     pub fn getTableTransitionFence(
         self: *RaftApplyStore,
         group_id: u64,
@@ -5897,6 +6023,7 @@ pub const RaftApplyStore = struct {
         store_report_generation,
         table,
         table_transition_fence,
+        completion_activation,
         schema_progress,
         restore_progress,
         replication_source_status,
@@ -5921,6 +6048,7 @@ pub const RaftApplyStore = struct {
         key: MetadataSnapshotKey,
     };
     const metadata_snapshot_projections = [_]MetadataSnapshotProjectionDescriptor{
+        .{ .projection = .completion_activation, .key = .{ .prefix = completionActivationPrefixForGroup } },
         .{ .projection = .topology_activation, .key = .{ .point = topologyActivationKeyForGroup } },
         .{ .projection = .system_catalog, .key = .{ .prefix = system_catalog_storage.prefixForGroup } },
         .{ .projection = .metadata_incarnation, .key = .{ .point = metadataIncarnationKeyForGroup } },
@@ -5961,6 +6089,7 @@ pub const RaftApplyStore = struct {
     fn transitionCommandProjectionMask(tag: std.meta.Tag(TransitionCommand)) u32 {
         return switch (tag) {
             .activate_topology_protocol => metadataSnapshotProjectionBit(.topology_activation),
+            .apply_completion_activation => metadataSnapshotProjectionBit(.completion_activation) | metadataSnapshotProjectionBit(.table_transition_fence) | metadataSnapshotProjectionBit(.table) | metadataSnapshotProjectionBit(.catalog_revision),
             .apply_store_report_baseline => metadataSnapshotProjectionBit(.store) | metadataSnapshotProjectionBit(.store_report_cursor) | metadataSnapshotProjectionBit(.store_report_baseline) | metadataSnapshotProjectionBit(.store_report_generation),
             .apply_system_catalog => metadataSnapshotProjectionBit(.system_catalog) |
                 metadataSnapshotProjectionBit(.table) | metadataSnapshotProjectionBit(.range) |
@@ -6447,6 +6576,7 @@ pub const RaftApplyStore = struct {
     fn applyTransitionCommandTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, command: TransitionCommand) !void {
         try validateTransitionCommandDataGroupIds(command);
         switch (command) {
+            .apply_completion_activation => |bytes| try self.applyCompletionActivationTxn(txn, group_id, bytes),
             .activate_topology_protocol => |bytes| {
                 var parsed = try std.json.parseFromSlice(topology_protocol.Activation, self.alloc, bytes, .{});
                 defer parsed.deinit();
@@ -6792,6 +6922,7 @@ pub const RaftApplyStore = struct {
                 );
             },
             .upsert_range => |record| {
+                if (try self.tableCompletionActivationInstalledTxn(txn, group_id, record.table_id)) return;
                 const table_name = try self.lookupTableNameTxn(txn, group_id, record.table_id);
                 defer if (table_name) |name| self.alloc.free(name);
                 // Range records are table-owned. A delayed reconciliation
@@ -6867,6 +6998,7 @@ pub const RaftApplyStore = struct {
                 });
             },
             .remove_range => |record| {
+                if (try self.groupCompletionActivationInstalledTxn(txn, group_id, record.group_id)) return;
                 const existing = blk: {
                     var key_buf: [160]u8 = undefined;
                     const existing_key = try rangeKeyForGroup(&key_buf, group_id, record.group_id);
@@ -8157,6 +8289,7 @@ pub const RaftApplyStore = struct {
         group_id: u64,
         contract: metadata.TransitionTableContract,
     ) !bool {
+        if (try self.tableCompletionActivationInstalledTxn(txn, group_id, contract.table_id)) return false;
         var key_buf: [160]u8 = undefined;
         const key = try tableKeyForGroup(&key_buf, group_id, contract.table_id);
         const encoded = txn.get(key) catch |err| switch (err) {
@@ -8701,6 +8834,30 @@ pub const RaftApplyStore = struct {
         return drain_requested;
     }
 
+    fn tableCompletionActivationInstalledTxn(_: *RaftApplyStore, txn: *docstore.DocStore.Txn, metadata_group_id: u64, table_id: u64) !bool {
+        var key: [192]u8 = undefined;
+        _ = txn.get(try completionActivationKeyForGroup(&key, metadata_group_id, table_id)) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => return err,
+        };
+        return true;
+    }
+
+    fn groupCompletionActivationInstalledTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, metadata_group_id: u64, data_group_id: u64) !bool {
+        var key: [192]u8 = undefined;
+        const bytes = txn.get(try rangeKeyForGroup(&key, metadata_group_id, data_group_id)) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => return err,
+        };
+        const range = try decodeRangeRecord(self.alloc, bytes);
+        defer metadata_table_manager.freeRange(self.alloc, range);
+        _ = txn.get(try completionActivationKeyForGroup(&key, metadata_group_id, range.table_id)) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => return err,
+        };
+        return true;
+    }
+
     fn applyPlacementCompareAndUpsertTxn(
         self: *RaftApplyStore,
         txn: *docstore.DocStore.Txn,
@@ -8710,6 +8867,7 @@ pub const RaftApplyStore = struct {
         expected_target_drain_requested: bool,
         replacement: raft_reconciler.PlacementIntent,
     ) !void {
+        if (try self.groupCompletionActivationInstalledTxn(txn, metadata_group_id, replacement.record.group_id)) return;
         const target_drain_requested = (try self.placementTargetDrainRequestedTxn(
             txn,
             metadata_group_id,
@@ -8781,6 +8939,7 @@ pub const RaftApplyStore = struct {
         local_node_id: u64,
         expected_metadata_version: u64,
     ) !void {
+        if (try self.groupCompletionActivationInstalledTxn(txn, metadata_group_id, range_group_id)) return;
         var key_buf: [192]u8 = undefined;
         const key = try placementKeyForGroup(&key_buf, metadata_group_id, range_group_id, local_node_id);
         const existing = (try self.loadPlacementIntentTxn(txn, key)) orelse return;
@@ -9204,6 +9363,7 @@ fn storeRuntimeStatusRecordVersion(record: metadata.StoreRecord) ?u16 {
 }
 
 const TransitionTag = enum(u8) {
+    apply_completion_activation = 60,
     upsert_schema_progress_batch = 59,
     activate_topology_protocol = 57,
     apply_system_catalog = 54,
@@ -9270,6 +9430,11 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
 
     try out.appendSlice(alloc, transition_magic);
     switch (command) {
+        .apply_completion_activation => |bytes| {
+            if (bytes.len > completion_activation.max_encoded_bytes) return error.InvalidCompletionActivation;
+            try out.append(alloc, @intFromEnum(TransitionTag.apply_completion_activation));
+            try appendRequiredString(alloc, &out, bytes);
+        },
         .activate_topology_protocol => |bytes| {
             if (bytes.len > 1024) return error.InvalidMetadataTransitionEncoding;
             try out.append(alloc, @intFromEnum(TransitionTag.activate_topology_protocol));
@@ -9597,6 +9762,13 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
     pos += 1;
 
     return switch (tag) {
+        .apply_completion_activation => blk: {
+            if (encoded.len > completion_activation.max_encoded_bytes + 16) return error.InvalidCompletionActivation;
+            const bytes = try readRequiredString(alloc, encoded, &pos);
+            errdefer alloc.free(bytes);
+            if (pos != encoded.len) return error.InvalidMetadataTransitionEncoding;
+            break :blk .{ .apply_completion_activation = bytes };
+        },
         .activate_topology_protocol => blk: {
             if (encoded.len > 1040) return error.InvalidMetadataTransitionEncoding;
             break :blk .{ .activate_topology_protocol = try readRequiredString(alloc, encoded, &pos) };
@@ -11699,8 +11871,12 @@ fn appendTableRecord(
     // Inactive records keep their historical bytes. The extension is gated
     // by the metadata storage-policy capability before replicated admission.
     if (record.storage.dense_embeddings != .primary_lsm or record.storage.transaction_recovery != null) {
+        const completion_policy = if (record.storage.transaction_recovery) |policy|
+            policy.completion_protocol_version != 0 or policy.profile_version != 0
+        else
+            false;
         try out.appendSlice(alloc, table_storage_extension_magic);
-        try out.append(alloc, 1);
+        try out.append(alloc, if (completion_policy) 2 else 1);
         try out.append(alloc, switch (record.storage.dense_embeddings) {
             .primary_lsm => 0,
             .vector_store => 1,
@@ -11712,6 +11888,10 @@ fn appendTableRecord(
             try appendInt(alloc, out, u64, policy.max_count);
             try appendInt(alloc, out, u64, policy.max_bytes);
             try appendInt(alloc, out, u64, policy.max_transaction_bytes);
+            if (completion_policy) {
+                try appendInt(alloc, out, u32, policy.completion_protocol_version);
+                try appendInt(alloc, out, u32, policy.profile_version);
+            }
         }
     }
 }
@@ -11720,7 +11900,8 @@ const table_storage_extension_magic = "\x00TSTORE\x00";
 
 fn readTableStorageExtension(encoded: []const u8, pos: *usize) !@import("../../common/table_storage.zig").Settings {
     pos.* += table_storage_extension_magic.len;
-    if (try readInt(encoded, pos, u8) != 1) return error.InvalidMetadataTransitionEncoding;
+    const version = try readInt(encoded, pos, u8);
+    if (version != 1 and version != 2) return error.InvalidMetadataTransitionEncoding;
     var settings: @import("../../common/table_storage.zig").Settings = .{
         .dense_embeddings = switch (try readInt(encoded, pos, u8)) {
             0 => .primary_lsm,
@@ -11737,10 +11918,16 @@ fn readTableStorageExtension(encoded: []const u8, pos: *usize) !@import("../../c
                 .max_bytes = try readInt(encoded, pos, u64),
                 .max_transaction_bytes = try readInt(encoded, pos, u64),
             };
+            if (version == 2) {
+                settings.transaction_recovery.?.completion_protocol_version = try readInt(encoded, pos, u32);
+                settings.transaction_recovery.?.profile_version = try readInt(encoded, pos, u32);
+                if (settings.transaction_recovery.?.completion_protocol_version == 0) return error.InvalidMetadataTransitionEncoding;
+            }
             settings.transaction_recovery.?.validate() catch return error.InvalidMetadataTransitionEncoding;
         },
         else => return error.InvalidMetadataTransitionEncoding,
     }
+    if (version == 2 and settings.transaction_recovery == null) return error.InvalidMetadataTransitionEncoding;
     if (pos.* != encoded.len) return error.InvalidMetadataTransitionEncoding;
     return settings;
 }
@@ -20583,4 +20770,128 @@ test "workload admission table record storage extension preserves legacy bytes a
         defer vector_identity.deinit(alloc);
         try std.testing.expectEqual(vector.table_id, vector_identity.table_id);
     }
+}
+
+test "workload admission table record completion policy requires bounded versioned extension" {
+    const alloc = std.testing.allocator;
+    const active: metadata.TableRecord = .{
+        .table_id = 42,
+        .name = "table:42",
+        .storage = .{ .transaction_recovery = .{
+            .protocol_version = 1,
+            .max_count = 4,
+            .max_bytes = 4194304,
+            .max_transaction_bytes = 1048576,
+            .completion_protocol_version = 1,
+            .profile_version = 1,
+        } },
+    };
+    const wire = try encodeTableRecord(alloc, active);
+    defer alloc.free(wire);
+    const decoded = try decodeTableRecord(alloc, wire);
+    defer metadata_table_manager.freeTable(alloc, decoded);
+    try std.testing.expectEqualDeep(active.storage, decoded.storage);
+    var identity = try decodeTableIdentity(alloc, wire);
+    defer identity.deinit(alloc);
+    try std.testing.expectEqual(active.table_id, identity.table_id);
+    for (1..9) |missing| {
+        try std.testing.expectError(error.InvalidMetadataTransitionEncoding, decodeTableRecord(alloc, wire[0 .. wire.len - missing]));
+    }
+    const malformed = try alloc.dupe(u8, wire);
+    defer alloc.free(malformed);
+    std.mem.writeInt(u32, malformed[malformed.len - 4 ..][0..4], 2, .little);
+    try std.testing.expectError(error.InvalidMetadataTransitionEncoding, decodeTableRecord(alloc, malformed));
+    const command = try encodeTransitionCommand(alloc, .{ .compare_and_replace_table = .{ .expected = active, .replacement = active } });
+    defer alloc.free(command);
+    var result = (try decodeTransitionCommand(alloc, command)).?;
+    defer result.deinit(alloc);
+    try std.testing.expectEqualDeep(active.storage, result.compare_and_replace_table.expected.storage);
+    try std.testing.expectEqualDeep(active.storage, result.compare_and_replace_table.replacement.storage);
+}
+
+fn completionActivationPrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
+    return std.fmt.bufPrint(buf, "\x00\x00__metadata__:completion_activation:{d}:", .{group_id});
+}
+fn completionActivationKeyForGroup(buf: []u8, group_id: u64, table_id: u64) ![]const u8 {
+    const prefix = try completionActivationPrefixForGroup(buf, group_id);
+    const suffix = try std.fmt.bufPrint(buf[prefix.len..], "{d}", .{table_id});
+    return buf[0 .. prefix.len + suffix.len];
+}
+
+test "workload admission completion activation is durable atomic and structurally fenced" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/completion-activation", .{tmp.sub_path});
+    defer alloc.free(root);
+    const target_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/completion-restored", .{tmp.sub_path});
+    defer alloc.free(target_root);
+    const group_id = group_ids.main_metadata_group_id;
+    const table: metadata.TableRecord = .{ .table_id = 7, .name = "docs", .min_ranges = 1 };
+    const Apply = struct {
+        fn command(store: *RaftApplyStore, index: u64, value: TransitionCommand) !void {
+            const bytes = try encodeTransitionCommand(alloc, value);
+            defer alloc.free(bytes);
+            const entries = try raft_state_machine.encodeCommittedEntries(alloc, &.{.{ .term = 1, .index = index, .entry_type = .normal, .data = bytes }});
+            defer alloc.free(entries);
+            try store.snapshotBuilder().applyBatch(.{ .group_id = group_id, .commit_index = index, .entries_bytes = entries });
+        }
+    };
+    var source = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+    defer source.deinit();
+    try Apply.command(&source, 1, .{ .initialize_metadata_incarnation = "11111111111111111111111111111111".* });
+    try Apply.command(&source, 2, .{ .apply_table_topology = .{ .create = .{ .table = table, .expected_transition_generation = 0, .ranges = &.{.{ .group_id = 1001, .range_id = 3, .table_id = 7, .start_key = "" }} } } });
+    const contract: metadata.TransitionTableContract = .{ .table_id = table.table_id, .table_name = table.name, .schema_json = table.schema_json, .indexes_json = table.indexes_json };
+    {
+        var read = try source.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect(try source.tableMatchesTransitionContractTxn(&read, group_id, contract));
+    }
+    const policy: @import("../../common/table_storage.zig").TransactionRecovery = .{ .protocol_version = 1, .max_count = 4, .max_bytes = 65536, .max_transaction_bytes = 16384, .completion_protocol_version = 1, .profile_version = 1 };
+    const pending_bytes = try source.captureCompletionActivation(alloc, group_id, 7, policy);
+    defer alloc.free(pending_bytes);
+    try Apply.command(&source, 3, .{ .apply_completion_activation = pending_bytes });
+    var pending = (try source.getCompletionActivation(alloc, group_id, 7)).?;
+    defer pending.deinit();
+    try std.testing.expectEqual(completion_activation.Phase.pending, pending.value.phase);
+    try std.testing.expectEqual(@as(u32, 1), (try source.getTableTransitionFence(group_id, 7)).active_count);
+    {
+        var read = try source.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect(!try source.tableMatchesTransitionContractTxn(&read, group_id, contract));
+    }
+    const snapshot = try source.snapshotBuilder().buildSnapshot(alloc, group_id);
+    defer alloc.free(snapshot);
+    var target = try RaftApplyStore.init(alloc, .{ .root_dir = target_root });
+    defer target.deinit();
+    try std.testing.expect(try target.snapshotBuilder().installSnapshot(alloc, group_id, 3, snapshot));
+    var restored = (try target.getCompletionActivation(alloc, group_id, 7)).?;
+    defer restored.deinit();
+    try std.testing.expect(restored.value.sameIntent(pending.value));
+    // Pending prevents topology deletion, and does not publish the policy.
+    try Apply.command(&target, 4, .{ .remove_table = .{ .table_id = 7, .expected_transition_generation = pending.value.generation } });
+    const before = (try target.getTable(alloc, group_id, 7)).?;
+    defer metadata_table_manager.freeTable(alloc, before);
+    try std.testing.expect(before.storage.transaction_recovery == null);
+    var active = pending.value;
+    active.phase = .active;
+    active.evidence_digest = @splat(9);
+    // This low-level apply fixture supplies already-verified evidence. The
+    // service proposal test separately rejects an unverified active command.
+    const active_bytes = try completion_activation.encode(alloc, active);
+    defer alloc.free(active_bytes);
+    try Apply.command(&target, 5, .{ .apply_completion_activation = active_bytes });
+    const after = (try target.getTable(alloc, group_id, 7)).?;
+    defer metadata_table_manager.freeTable(alloc, after);
+    try std.testing.expectEqualDeep(policy, after.storage.transaction_recovery.?);
+    try std.testing.expectEqual(@as(u32, 1), (try target.getTableTransitionFence(group_id, 7)).active_count);
+    try Apply.command(&target, 6, .{ .apply_completion_activation = pending_bytes });
+    var terminal = (try target.getCompletionActivation(alloc, group_id, 7)).?;
+    defer terminal.deinit();
+    try std.testing.expectEqual(completion_activation.Phase.active, terminal.value.phase);
+    try Apply.command(&target, 7, .{ .upsert_range = .{ .group_id = 1001, .range_id = 3, .table_id = 7, .split_attempt_epoch = 99, .start_key = "changed" } });
+    const preserved = (try target.getRange(alloc, group_id, 1001)).?;
+    defer metadata_table_manager.freeRange(alloc, preserved);
+    try std.testing.expectEqual(@as(u64, 0), preserved.split_attempt_epoch);
+    try std.testing.expectEqualStrings("", preserved.start_key);
 }
