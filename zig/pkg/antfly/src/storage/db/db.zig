@@ -25081,6 +25081,129 @@ pub const DB = struct {
         };
     }
 
+    /// Internal process-local observation only. It owns no schema/topology lease,
+    /// prepaid resources or durable authority after this call returns.
+    const CompletionProfileObservation = struct {
+        root_generation: u64,
+        schema_namespace_generation: u64,
+        index_generation: u64,
+        range_digest: [32]u8,
+        identity_namespace: doc_identity.Namespace,
+        ordinal: doc_identity.DocOrdinal,
+        identity_created_generation: u64,
+        primary_digest: [32]u8,
+        input_digest: [32]u8,
+    };
+
+    fn inspectSingleOverwriteCompletionProfile(
+        self: *DB,
+        backing: Allocator,
+        txn_id: transactions_mod.TxnId,
+        intents: []const transactions_mod.WriteIntent,
+    ) !CompletionProfileObservation {
+        const workspace = try backing.alloc(u8, 1024 * 1024);
+        defer backing.free(workspace);
+        var fixed = std.heap.FixedBufferAllocator.init(workspace);
+        const alloc = fixed.allocator();
+        if (intents.len != 1 or intents[0].key.len == 0 or intents[0].key.len > 1024 or
+            isMetadataKey(intents[0].key) or internal_keys.isInternalUserKey(intents[0].key) or
+            intents[0].prepared_row != null) return error.UnsupportedCompletionProfile;
+        const replacement = intents[0].value orelse return error.UnsupportedCompletionProfile;
+        try inspectCompletionInlineDocument(alloc, replacement);
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        // Initially only explicitly schemaless local document tables qualify.
+        // Even index-free schema validation/TTL evolution needs a later fence.
+        if (self.core.schema != null or self.core.table_catalog.storage_mode != .document or
+            self.shadow != null or self.core.splitState() != null or self.bulk_ingest_coalescer.active or self.core.hasArtifactCleanupMaybe() or
+            self.ha_async_effect_mirror != null or self.ha_async_batch_mirror != null or
+            self.ha_async_metadata_mirror != null or self.ha_write_gate != null or
+            self.enrichment_runtime != null or self.resolution_candidate_source != null or
+            self.resolution_embedder != null or self.promotion_owner != null or self.entity_sink != null)
+            return error.UnsupportedCompletionProfile;
+        // A missing participant sidecar also occurs for an unknown identity;
+        // require the transaction itself before interpreting local-only state.
+        _ = try self.core.getTransactionStatus(txn_id);
+        if (try self.core.transactionHasHAOutbox(txn_id)) return error.UnsupportedCompletionProfile;
+        const participants = try self.core.getTransactionParticipants(alloc, txn_id);
+        defer transactions_mod.freeParticipantList(alloc, participants);
+        // Empty participants is the existing local-only transaction spelling;
+        // named participants require routing/placement authority not held here.
+        if (participants.len != 0) return error.UnsupportedCompletionProfile;
+        const manager = self.core.index_manager;
+        manager.catalog_mutex.lockShared();
+        defer manager.catalog_mutex.unlockShared();
+        if (manager.text_indexes.items.len != 0 or manager.dense_indexes.items.len != 0 or
+            manager.sparse_indexes.items.len != 0 or manager.graph_indexes.items.len != 0 or
+            manager.algebraic_indexes.items.len != 0 or manager.enrichments.items.len != 0 or
+            manager.resolvers.items.len != 0 or manager.status_only_index_configs.len != 0)
+            return error.UnsupportedCompletionProfile;
+        const key = intents[0].key;
+        if (!self.core.byteRange().contains(key)) return error.UnsupportedCompletionProfile;
+        const store_key = try encodeStoreLookupKeyAlloc(self, alloc, key);
+        defer alloc.free(store_key);
+        var read = try self.core.store.beginProbeTxn();
+        defer read.abort();
+        const primary = read.get(store_key) catch |err| switch (err) {
+            error.NotFound => return error.UnsupportedCompletionProfile,
+            else => return err,
+        };
+        try inspectCompletionInlineDocument(alloc, primary);
+        const namespace = (try doc_identity.loadNamespaceTxn(&read)) orelse return error.UnsupportedCompletionProfile;
+        if (!namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
+        const ordinal = (try doc_identity.lookupOrdinalTxn(alloc, &read, key)) orelse return error.UnsupportedCompletionProfile;
+        const state = (try doc_identity.lookupStateTxn(&read, ordinal)) orelse return error.UnsupportedCompletionProfile;
+        if (!state.isLive()) return error.UnsupportedCompletionProfile;
+        if (state.canonical_doc_id != doc_identity.canonicalDocIdForNamespace(namespace, key)) return error.InvalidDocIdentity;
+        const canonical = (try doc_identity.lookupCanonicalOrdinalTxn(&read, state.canonical_doc_id)) orelse return error.UnsupportedCompletionProfile;
+        if (canonical != ordinal) return error.InvalidDocIdentity;
+        const reverse = (try doc_identity.lookupDocIdTxn(alloc, &read, ordinal)) orelse return error.UnsupportedCompletionProfile;
+        defer alloc.free(reverse);
+        if (!std.mem.eql(u8, reverse, key)) return error.InvalidDocIdentity;
+        var observation: CompletionProfileObservation = .{
+            .root_generation = self.core.root_generation,
+            .schema_namespace_generation = self.core.schemaNamespaceGeneration(),
+            .index_generation = manager.writePlanGeneration(),
+            .range_digest = undefined,
+            .identity_namespace = namespace,
+            .ordinal = ordinal,
+            .identity_created_generation = state.created_generation,
+            .primary_digest = undefined,
+            .input_digest = undefined,
+        };
+        var range_hash = std.crypto.hash.sha2.Sha256.init(.{});
+        for ([_][]const u8{ self.core.byteRange().start, self.core.byteRange().end }) |bound| {
+            var length: [8]u8 = undefined;
+            std.mem.writeInt(u64, &length, @intCast(bound.len), .big);
+            range_hash.update(&length);
+            range_hash.update(bound);
+        }
+        range_hash.final(&observation.range_digest);
+        std.crypto.hash.sha2.Sha256.hash(primary, &observation.primary_digest, .{});
+        std.crypto.hash.sha2.Sha256.hash(replacement, &observation.input_digest, .{});
+        return observation;
+    }
+
+    fn inspectCompletionInlineDocument(alloc: Allocator, value: []const u8) !void {
+        if (value.len == 0 or value.len > 64 * 1024) return error.UnsupportedCompletionProfile;
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, value, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.UnsupportedCompletionProfile,
+        };
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.UnsupportedCompletionProfile;
+        var fields = parsed.value.object.iterator();
+        while (fields.next()) |field| {
+            // Explicit artifacts, edges, vectors, extraction and payload
+            // references are excluded, including nested containers for now.
+            if (std.mem.startsWith(u8, field.key_ptr.*, "_")) return error.UnsupportedCompletionProfile;
+            switch (field.value_ptr.*) {
+                .null, .bool, .integer, .float, .number_string, .string => {},
+                else => return error.UnsupportedCompletionProfile,
+            }
+        }
+    }
+
     fn prepareTransactionRows(
         self: *DB,
         alloc: Allocator,
@@ -131704,4 +131827,122 @@ test "workload admission enabling small node reserve never strands legacy commit
     defer alloc.free(recovered);
     try std.testing.expectEqualStrings(body, recovered);
     try std.testing.expect(!try db.core.transactionHasIntents(txn_id));
+}
+
+test "workload admission completion profile observation exercises real prepare resolve and becomes stale" {
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("completion-profile");
+    defer tmp.cleanup();
+    const path = tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false, .ttl_cleanup = .{ .enabled = false } });
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"value\":1}" }} });
+    const txn = try db.beginTransaction(1000);
+    const intents = [_]transactions_mod.WriteIntent{.{ .key = "doc:a", .value = "{\"value\":2}" }};
+    const before = try db.inspectSingleOverwriteCompletionProfile(alloc, txn, &intents);
+    try db.writeIntents(txn, &intents, &.{});
+    const prepared = try db.inspectSingleOverwriteCompletionProfile(alloc, txn, &intents);
+    try std.testing.expect(std.meta.eql(before, prepared));
+    try db.resolveTransactionIntents(txn, .committed, 2000);
+    const current = (try db.get(alloc, "doc:a")) orelse return error.TestExpectedEqual;
+    defer alloc.free(current);
+    try std.testing.expectEqualStrings("{\"value\":2}", current);
+    try std.testing.expectEqual(@as(u64, 2000), try db.getTimestamp(alloc, "doc:a"));
+    const after = try db.inspectSingleOverwriteCompletionProfile(alloc, txn, &intents);
+    try std.testing.expect(!std.mem.eql(u8, &before.primary_digest, &after.primary_digest));
+    try std.testing.expectEqual(before.ordinal, after.ordinal);
+    try db.batch(.{ .deletes = &.{"doc:a"} });
+    try std.testing.expectError(error.UnsupportedCompletionProfile, db.inspectSingleOverwriteCompletionProfile(alloc, txn, &intents));
+}
+
+test "workload admission completion profile rejects unsupported inputs before prepare and index changes" {
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("completion-profile");
+    defer tmp.cleanup();
+    const path = tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false, .ttl_cleanup = .{ .enabled = false } });
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"value\":1}" }} });
+    const txn = try db.beginTransaction(1000);
+    const ordinary = [_]transactions_mod.WriteIntent{.{ .key = "doc:a", .value = "{\"value\":2}" }};
+    _ = try db.inspectSingleOverwriteCompletionProfile(alloc, txn, &ordinary);
+    try std.testing.expectError(error.TxnNotFound, db.inspectSingleOverwriteCompletionProfile(alloc, @splat(254), &ordinary));
+    // Durable obligations can remain even after every active HA hook is gone.
+    inline for (.{ transactions_mod.makeTransactionHABatchOutboxKey(txn), transactions_mod.makeTransactionHAReplayOutboxKey(txn) }) |outbox_key| {
+        try db.core.store.putBatch(&.{.{ .key = &outbox_key, .value = "retained" }}, &.{});
+        try std.testing.expectError(error.UnsupportedCompletionProfile, db.inspectSingleOverwriteCompletionProfile(alloc, txn, &ordinary));
+        const retained = try db.core.store.get(alloc, &outbox_key);
+        defer alloc.free(retained);
+        try std.testing.expectEqualStrings("retained", retained);
+        try db.core.store.putBatch(&.{}, &.{&outbox_key});
+    }
+    _ = try db.inspectSingleOverwriteCompletionProfile(alloc, txn, &ordinary);
+    for ([_]transactions_mod.WriteIntent{
+        .{ .key = "absent", .value = "{}" },
+        .{ .key = "doc:a", .value = null },
+        .{ .key = "doc:a", .value = "{\"_edges\":[]}" },
+        .{ .key = "doc:a", .value = "{\"nested\":{}}" },
+        .{ .key = "doc:a", .value = "not-json" },
+    }) |unsupported| try std.testing.expectError(error.UnsupportedCompletionProfile, db.inspectSingleOverwriteCompletionProfile(alloc, txn, &.{unsupported}));
+    try std.testing.expectError(error.UnsupportedCompletionProfile, db.inspectSingleOverwriteCompletionProfile(alloc, txn, &.{ ordinary[0], ordinary[0] }));
+    try db.addIndex(.{ .name = "profile_text", .kind = .full_text, .config_json = "{}" });
+    try std.testing.expectError(error.UnsupportedCompletionProfile, db.inspectSingleOverwriteCompletionProfile(alloc, txn, &ordinary));
+    const summaries = try db.core.listTransactions(alloc);
+    defer alloc.free(summaries);
+    try std.testing.expectEqual(@as(usize, 1), summaries.len);
+    try std.testing.expect(!summaries[0].prepared);
+    var pending = try db.core.collectTransactionIntentBatch(alloc, txn);
+    defer pending.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), pending.writes.len);
+    try std.testing.expectEqual(@as(usize, 0), pending.deletes.len);
+}
+
+test "workload admission completion profile requires complete bidirectional live identity" {
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("completion-profile");
+    defer tmp.cleanup();
+    const path = tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false, .ttl_cleanup = .{ .enabled = false } });
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{}" }} });
+    const txn = try db.beginTransaction(1000);
+    const intents = [_]transactions_mod.WriteIntent{.{ .key = "doc:a", .value = "{\"value\":2}" }};
+    const observation = try db.inspectSingleOverwriteCompletionProfile(alloc, txn, &intents);
+    const reverse = internal_keys.identityOrdinalToDocKey(observation.ordinal);
+    try db.core.store.putBatch(&.{}, &.{&reverse});
+    try std.testing.expectError(error.UnsupportedCompletionProfile, db.inspectSingleOverwriteCompletionProfile(alloc, txn, &intents));
+    try db.core.store.putBatch(&.{.{ .key = &reverse, .value = "doc:wrong" }}, &.{});
+    try std.testing.expectError(error.InvalidDocIdentity, db.inspectSingleOverwriteCompletionProfile(alloc, txn, &intents));
+    try db.core.store.putBatch(&.{.{ .key = &reverse, .value = "doc:a" }}, &.{});
+    const canonical = internal_keys.identityCanonicalToOrdinalKey(doc_identity.canonicalDocIdForNamespace(observation.identity_namespace, "doc:a"));
+    try db.core.store.putBatch(&.{}, &.{&canonical});
+    try std.testing.expectError(error.UnsupportedCompletionProfile, db.inspectSingleOverwriteCompletionProfile(alloc, txn, &intents));
+    const summaries = try db.core.listTransactions(alloc);
+    defer alloc.free(summaries);
+    try std.testing.expect(!summaries[0].prepared);
+}
+
+test "workload admission completion profile excludes named participants and TTL schema before prepare" {
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("completion-profile");
+    defer tmp.cleanup();
+    const path = tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false, .ttl_cleanup = .{ .enabled = false } });
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{}" }} });
+    const remote = try db.beginTransactionWithParticipants(1000, &.{"remote"});
+    const local = try db.beginTransaction(1100);
+    const intents = [_]transactions_mod.WriteIntent{.{ .key = "doc:a", .value = "{\"value\":2}" }};
+    try std.testing.expectError(error.UnsupportedCompletionProfile, db.inspectSingleOverwriteCompletionProfile(alloc, remote, &intents));
+    _ = try db.inspectSingleOverwriteCompletionProfile(alloc, local, &intents);
+    try db.setSchemaJson(alloc, "{\"ttl_duration_ns\":1000000000}");
+    try std.testing.expectError(error.UnsupportedCompletionProfile, db.inspectSingleOverwriteCompletionProfile(alloc, local, &intents));
+    const summaries = try db.core.listTransactions(alloc);
+    defer alloc.free(summaries);
+    try std.testing.expectEqual(@as(usize, 2), summaries.len);
+    for (summaries) |summary| try std.testing.expect(!summary.prepared);
 }

@@ -34,6 +34,7 @@ const build_options = @import("build_options");
 const tracing = @import("../tracing/antfly_trace_writer.zig");
 const stderr_writer = @import("../tracing/stderr_writer.zig");
 const ttl = @import("ttl.zig");
+const completion_mutations = @import("completion_mutations.zig");
 
 // ============================================================================
 // Key prefixes
@@ -538,7 +539,7 @@ pub const TxnManager = struct {
         for (entries.items) |*entry| try writes.append(self.alloc, .{ .key = &entry.key, .value = &entry.value });
         const summary = usage.encode();
         try writes.append(self.alloc, .{ .key = completion_summary_key, .value = &summary });
-        var batch = try self.store.beginBatch();
+        var batch = try self.store.beginSerializedBatch();
         errdefer batch.abort();
         if (batch.get(completion_summary_key)) |_| {
             // Another owner initialized the ledger after our read snapshot.
@@ -975,6 +976,50 @@ pub const TxnManager = struct {
         timestamp: u64,
         extra_batch: ResolutionExtraBatch,
     ) !ResolutionOutcome {
+        return self.resolveIntentsWithExtraBatchImpl(txn_id, status, timestamp, extra_batch, null);
+    }
+
+    pub const ResolutionInspection = struct {
+        mutations: completion_mutations.Plan,
+        outcome: ResolutionOutcome,
+
+        pub fn deinit(self: *@This()) void {
+            self.mutations.deinit();
+            self.* = undefined;
+        }
+    };
+
+    /// Inspects the ordered document/transaction primary-store mutations of a resolution,
+    /// including replay expansion and freshly recomputed completion accounting.
+    /// The caller must hold the same apply serialization as real resolution.
+    /// No write or resolution trace is published. The result is an observation,
+    /// NOT a prepare-time certificate or an executable retry: shared counters,
+    /// replay sequence and acknowledgement state may change immediately after
+    /// the backend snapshot is released. No backend resources are reserved.
+    /// Unknown keyspaces are rejected: relational/columnar and payload-owner
+    /// expansion need a separate plan.
+    pub fn inspectResolutionMutations(
+        self: *TxnManager,
+        txn_id: TxnId,
+        status: TxnStatus,
+        timestamp: u64,
+        extra_batch: ResolutionExtraBatch,
+        limits: completion_mutations.Limits,
+    ) !ResolutionInspection {
+        var mutations = try completion_mutations.Plan.init(self.alloc, limits);
+        errdefer mutations.deinit();
+        const outcome = try self.resolveIntentsWithExtraBatchImpl(txn_id, status, timestamp, extra_batch, &mutations);
+        return .{ .mutations = mutations, .outcome = outcome };
+    }
+
+    fn resolveIntentsWithExtraBatchImpl(
+        self: *TxnManager,
+        txn_id: TxnId,
+        status: TxnStatus,
+        timestamp: u64,
+        extra_batch: ResolutionExtraBatch,
+        capture: ?*completion_mutations.Plan,
+    ) !ResolutionOutcome {
         const rec_key = makeRecordKey(txn_id);
         const schema_lease_key = makeSidecarKey(schema_leases_prefix, txn_id);
         var record = try self.loadTransactionRecord(txn_id);
@@ -1017,7 +1062,7 @@ pub const TxnManager = struct {
         const was_terminal = record.status != .pending;
         applyResolveDecision(&record, status, timestamp) catch |err| {
             if (err == TxnError.DecisionConflict) {
-                if (self.trace_writer) |tw| {
+                if (if (capture == null) self.trace_writer else null) |tw| {
                     tw.traceEvent(&.{
                         .name = "ResolveDecisionConflict",
                         .txn_id = txn_id,
@@ -1042,7 +1087,7 @@ pub const TxnManager = struct {
             var retirement = try self.completionRetirement(txn_id, extra_batch.resolved_participant, completion_writes.items);
             if (retirement) |*change| try change.append(self.alloc, &completion_writes, &completion_deletes);
             if (completion_writes.items.len != 0 or completion_deletes.items.len != 0) {
-                try self.applyBatchWithCompletion(completion_writes.items, completion_deletes.items, null, retirement);
+                try self.emitOrApplyCompletionBatch(completion_writes.items, completion_deletes.items, null, retirement, capture);
             }
             return .{
                 .applied = false,
@@ -1095,7 +1140,7 @@ pub const TxnManager = struct {
             try completion_deletes.appendSlice(self.alloc, extra_batch.completion_deletes);
             var retirement = try self.completionRetirement(txn_id, extra_batch.resolved_participant, completion_writes.items);
             if (retirement) |*change| try change.append(self.alloc, &completion_writes, &completion_deletes);
-            try self.applyBatchWithCompletion(completion_writes.items, completion_deletes.items, null, retirement);
+            try self.emitOrApplyCompletionBatch(completion_writes.items, completion_deletes.items, null, retirement, capture);
             return .{
                 .applied = false,
                 .replay_sequence = record.replay_sequence,
@@ -1193,9 +1238,9 @@ pub const TxnManager = struct {
         var retirement = try self.completionRetirement(txn_id, extra_batch.resolved_participant, writes.items);
         if (retirement) |*change| try change.append(self.alloc, &writes, &deletes);
 
-        try self.applyBatchWithCompletion(writes.items, deletes.items, extra_batch.replay, retirement);
+        try self.emitOrApplyCompletionBatch(writes.items, deletes.items, extra_batch.replay, retirement, capture);
 
-        if (self.trace_writer) |tw| {
+        if (if (capture == null) self.trace_writer else null) |tw| {
             tw.traceEvent(&.{
                 .name = if (status == .committed) "CommitTransaction" else "AbortTransaction",
                 .txn_id = txn_id,
@@ -2241,7 +2286,11 @@ pub const TxnManager = struct {
     }
 
     fn applyBatchWithCompletion(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend, completion: ?CompletionChange) !void {
-        var batch = try self.store.beginBatch();
+        return self.emitOrApplyCompletionBatch(writes, deletes, replay, completion, null);
+    }
+
+    fn emitOrApplyCompletionBatch(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend, completion: ?CompletionChange, capture: ?*completion_mutations.Plan) !void {
+        var batch = if (completion != null) try self.store.beginSerializedBatch() else try self.store.beginBatch();
         errdefer batch.abort();
         var summary: ?[16]u8 = null;
         if (completion) |change| {
@@ -2254,9 +2303,25 @@ pub const TxnManager = struct {
             const current_summary = try CompletionUsage.decode(try batch.get(completion_summary_key));
             const next: ?CompletionRecord = if (change.record) |raw| try CompletionRecord.decode(&raw) else null;
             // Background acknowledgements do not hold the foreground DB apply
-            // mutex. Recompute against the serialized backend write snapshot,
-            // so independent transactions cannot lose each other's credits.
+            // mutex. The explicit shared writer gate spans this re-read and
+            // commit/abort; an ordinary native LSM batch alone does not.
+            // Independent completion writers cannot lose each other's credits.
             summary = (try self.adjustCompletionUsage(current_summary, previous, next)).encode();
+        }
+        if (capture) |sink| {
+            // Retain the shared completion writer gate for the same ledger
+            // calculation when present, but never mutate or commit this batch.
+            for (deletes) |key| try validateInspectedCompletionKey(key);
+            for (writes) |kv| try validateInspectedCompletionKey(kv.key);
+            for (deletes) |key| try sink.delete(key);
+            for (writes) |kv| {
+                if (completion != null and std.mem.eql(u8, kv.key, completion_summary_key)) continue;
+                try sink.put(kv.key, kv.value);
+            }
+            if (summary) |*value| try sink.put(completion_summary_key, value);
+            if (replay) |entry| try docstore.emitReplayMutations(self.alloc, sink, entry.sequence, entry.payload);
+            batch.abort();
+            return;
         }
         for (deletes) |key| {
             batch.delete(key) catch |err| switch (err) {
@@ -2271,6 +2336,21 @@ pub const TxnManager = struct {
         if (summary) |*value| try batch.put(completion_summary_key, value);
         if (replay) |entry| try batch.setReplayOpaque(entry.sequence, entry.payload);
         try batch.commit();
+    }
+
+    fn validateInspectedCompletionKey(key: []const u8) !void {
+        // These keyspaces pass through DocStore unchanged. Other keys may
+        // allocate columnar dirty/manifest or external payload ownership rows.
+        if (internal_keys.isPrimaryDocumentKey(key) or internal_keys.isTtlKey(key) or
+            std.mem.eql(u8, key, completion_summary_key)) return;
+        inline for (.{ records_prefix, schema_leases_prefix, participants_prefix, resolved_participants_prefix, intent_keys_prefix, intent_admission_prefix, completion_prefix }) |prefix| {
+            if (key.len == prefix.len + 16 and std.mem.startsWith(u8, key, prefix)) return;
+        }
+        inline for (.{ intents_prefix, intent_members_prefix }) |prefix| {
+            if (key.len > prefix.len + 17 and std.mem.startsWith(u8, key, prefix) and key[prefix.len + 16] == ':') return;
+        }
+        if (key.len > intent_locks_prefix.len and std.mem.startsWith(u8, key, intent_locks_prefix)) return;
+        return error.UnsupportedCompletionMutation;
     }
 
     fn traceWriteIntentSuccess(self: *TxnManager, txn_id: TxnId, intents: []const WriteIntent, predicates: []const VersionPredicate) void {
@@ -2736,9 +2816,142 @@ fn tempTestPath(alloc: Allocator, label: []const u8) ![:0]u8 {
 // Tests
 // ============================================================================
 
+fn expectResolutionInspectionMatchesStore(alloc: Allocator, baseline: []const backend_scan.OwnedKVPair, plan: *const completion_mutations.Plan, actual: *backend_erased.Store) !void {
+    var mirror = mem_backend.Backend.init(alloc, .{});
+    defer mirror.close();
+    var expected = try mirror.runtimeStore(alloc, .{});
+    defer expected.deinit();
+    {
+        var batch = try expected.beginBatch();
+        errdefer batch.abort();
+        for (baseline) |kv| try batch.put(kv.key, kv.value);
+        for (plan.operations()) |mutation| switch (mutation.kind) {
+            .put => try batch.put(mutation.key, mutation.value),
+            .delete => batch.delete(mutation.key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            },
+        };
+        try batch.commit();
+    }
+    const expected_rows = try backend_scan.scanPrefix(alloc, &expected, "");
+    defer backend_scan.freeResults(alloc, expected_rows);
+    const actual_rows = try backend_scan.scanPrefix(alloc, actual, "");
+    defer backend_scan.freeResults(alloc, actual_rows);
+    try std.testing.expectEqual(expected_rows.len, actual_rows.len);
+    for (expected_rows, actual_rows) |a, b| {
+        try std.testing.expectEqualStrings(a.key, b.key);
+        try std.testing.expectEqualStrings(a.value, b.value);
+    }
+}
+
+test "workload admission completion inspection matches commit abort replay and terminal retry" {
+    const alloc = std.testing.allocator;
+    const journal = @import("db/derived/change_journal.zig");
+    const key = "doc:\x00\xff:one";
+    for ([_]TxnStatus{ .committed, .aborted }) |status| {
+        var backend = lsm_backend.Backend.init(alloc, .{});
+        defer backend.close();
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        var manager = try TxnManager.init(alloc, &store);
+        defer manager.deinit();
+        manager.completion_limits = .{ .max_count = 4, .max_bytes = 1024 * 1024 };
+        const id: TxnId = @splat(81);
+        try putVisibleDoc(&store, alloc, key, "old");
+        try manager.initTransactionWithParticipantsCreatedAtRoleAndRetention(id, 100, 100, &.{"local"}, true, true);
+        try manager.writeIntentsExtraBatch(id, &.{.{ .key = key, .value = "replacement" }}, &.{}, .{ .schema_binding = .{} });
+        const payload = try journal.encodeRecord(alloc, .{
+            .sequence = 7,
+            .changed_doc_keys = &.{key},
+            .overwritten_doc_keys = &.{key},
+            .target_hints = &.{ .full_text, .dense_vector, .sparse_vector, .algebraic },
+        });
+        defer alloc.free(payload);
+        const extra: ResolutionExtraBatch = .{
+            .resolved_participant = "local",
+            .replay = if (status == .committed) .{ .sequence = 7, .payload = payload } else null,
+            .expected_intent_revision = 1,
+        };
+        const baseline = try backend_scan.scanPrefix(alloc, &manager.store, "");
+        defer backend_scan.freeResults(alloc, baseline);
+        const usage = (try manager.completionUsage()).?;
+        var unsupported = extra;
+        unsupported.writes = &.{.{ .key = "\x00\x00__metadata__:schema", .value = "{}" }};
+        try std.testing.expectError(error.UnsupportedCompletionMutation, manager.inspectResolutionMutations(id, status, 200, unsupported, .{ .max_operations = 64, .max_bytes = 65536 }));
+        // Failure after a prefix has been captured must not retire an intent,
+        // acknowledgement, completion credit or terminal record.
+        try std.testing.expectError(error.CompletionPlanCapacityExceeded, manager.inspectResolutionMutations(id, status, 200, extra, .{ .max_operations = 1, .max_bytes = 4096 }));
+        try std.testing.expectEqual(TxnStatus.pending, try manager.getTransactionStatus(id));
+        try std.testing.expectEqualDeep(usage, (try manager.completionUsage()).?);
+        var inspected = try manager.inspectResolutionMutations(id, status, 200, extra, .{ .max_operations = 64, .max_bytes = 65536 });
+        defer inspected.deinit();
+        const old = try getVisibleDoc(&store, alloc, key);
+        defer alloc.free(old);
+        try std.testing.expectEqualStrings("old", old);
+        try std.testing.expectEqual(TxnStatus.pending, try manager.getTransactionStatus(id));
+        try std.testing.expectEqualDeep(usage, (try manager.completionUsage()).?);
+        const outcome = try manager.resolveIntentsWithExtraBatch(id, status, 200, extra);
+        try std.testing.expectEqualDeep(inspected.outcome, outcome);
+        try expectResolutionInspectionMatchesStore(alloc, baseline, &inspected.mutations, &manager.store);
+        try std.testing.expectEqualDeep(CompletionUsage{}, (try manager.completionUsage()).?);
+        if (status == .committed) try std.testing.expectEqual(@as(u64, 200), (try readTimestampRuntime(&manager.store, alloc, key)).?);
+
+        // A newer foreground write must survive a terminal retry. The captured
+        // retry has no user writes or replay, even if the caller supplies them.
+        try putVisibleDoc(&store, alloc, key, "newer");
+        var retry = try manager.inspectResolutionMutations(id, status, 200, extra, .{ .max_operations = 64, .max_bytes = 65536 });
+        defer retry.deinit();
+        try std.testing.expect(!retry.outcome.applied);
+        try std.testing.expectEqual(@as(usize, 0), retry.mutations.count);
+        _ = try manager.resolveIntentsWithExtraBatch(id, status, 200, extra);
+        const newer = try getVisibleDoc(&store, alloc, key);
+        defer alloc.free(newer);
+        try std.testing.expectEqualStrings("newer", newer);
+    }
+}
+
+test "workload admission completion inspection rebinds shared accounting after unrelated prepare" {
+    const alloc = std.testing.allocator;
+    var backend = lsm_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(alloc, .{});
+    defer runtime.deinit();
+    var manager = try TxnManager.init(alloc, &runtime);
+    defer manager.deinit();
+    manager.completion_limits = .{ .max_count = 4, .max_bytes = 1024 * 1024 };
+    const first: TxnId = @splat(91);
+    const second: TxnId = @splat(92);
+    try manager.initTransaction(first, 100);
+    try manager.writeIntents(first, &.{.{ .key = "a", .value = "first" }}, &.{});
+    const limits: completion_mutations.Limits = .{ .max_operations = 64, .max_bytes = 65536 };
+    var before = try manager.inspectResolutionMutations(first, .committed, 200, .{}, limits);
+    defer before.deinit();
+    try manager.initTransaction(second, 101);
+    try manager.writeIntents(second, &.{.{ .key = "b", .value = "second" }}, &.{});
+    var after = try manager.inspectResolutionMutations(first, .committed, 200, .{}, limits);
+    defer after.deinit();
+    var before_usage: ?CompletionUsage = null;
+    var after_usage: ?CompletionUsage = null;
+    for (before.mutations.operations()) |op| if (std.mem.eql(u8, op.key, completion_summary_key)) {
+        before_usage = try CompletionUsage.decode(op.value);
+    };
+    for (after.mutations.operations()) |op| if (std.mem.eql(u8, op.key, completion_summary_key)) {
+        after_usage = try CompletionUsage.decode(op.value);
+    };
+    try std.testing.expectEqual(@as(u64, 0), before_usage.?.count);
+    try std.testing.expectEqual(@as(u64, 1), after_usage.?.count);
+    const baseline = try backend_scan.scanPrefix(alloc, &manager.store, "");
+    defer backend_scan.freeResults(alloc, baseline);
+    try manager.resolveIntents(first, .committed, 200);
+    try expectResolutionInspectionMatchesStore(alloc, baseline, &after.mutations, &manager.store);
+    try std.testing.expectEqualDeep(after_usage.?, (try manager.completionUsage()).?);
+    try std.testing.expectEqual(TxnStatus.pending, try manager.getTransactionStatus(second));
+}
+
 test "workload admission storage completion debt is atomic through coordinator handoff" {
     const alloc = std.testing.allocator;
-    var backend = mem_backend.Backend.init(alloc, .{});
+    var backend = lsm_backend.Backend.init(alloc, .{});
     defer backend.close();
     var runtime = try backend.runtimeStore(alloc, .{});
     defer runtime.deinit();
@@ -2820,7 +3033,7 @@ test "workload admission storage completion survives reopen and restores legacy 
 
 test "workload admission follower completion does not wait for coordinator fanout acknowledgements" {
     const alloc = std.testing.allocator;
-    var backend = mem_backend.Backend.init(alloc, .{});
+    var backend = lsm_backend.Backend.init(alloc, .{});
     defer backend.close();
     var runtime = try backend.runtimeStore(alloc, .{});
     defer runtime.deinit();
@@ -2841,6 +3054,22 @@ test "workload admission independent storage writers cannot overspend one comple
     defer cleanupTestDir(path);
     var store = try DocStore.open(alloc, path, .{});
     defer store.close();
+    try exerciseIndependentCompletionWriters(&store);
+}
+
+test "workload admission native completion writers share one admission gate" {
+    const alloc = std.testing.allocator;
+    for (0..16) |_| {
+        var backend = lsm_backend.Backend.init(alloc, .{ .flush_threshold = 4096 });
+        defer backend.close();
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        try exerciseIndependentCompletionWriters(&store);
+    }
+}
+
+fn exerciseIndependentCompletionWriters(store: *DocStore) !void {
+    const alloc = std.testing.allocator;
     const State = struct {
         store: *DocStore,
         ready: std.atomic.Value(usize) = .init(0),
@@ -2863,7 +3092,7 @@ test "workload admission independent storage writers cannot overspend one comple
             };
         }
     };
-    var state: State = .{ .store = &store };
+    var state: State = .{ .store = store };
     const first = try std.Thread.spawn(.{}, State.run, .{ &state, @as(usize, 0) });
     const second = std.Thread.spawn(.{}, State.run, .{ &state, @as(usize, 1) }) catch |err| {
         state.go.store(true, .release);
@@ -2879,7 +3108,7 @@ test "workload admission independent storage writers cannot overspend one comple
         if (failure) |err| try std.testing.expectEqual(error.TransactionRecoveryCapacityExhausted, err) else successes += 1;
     }
     try std.testing.expectEqual(@as(usize, 1), successes);
-    var reader = try TxnManager.init(alloc, &store);
+    var reader = try TxnManager.init(alloc, store);
     defer reader.deinit();
     try std.testing.expectEqual(@as(u64, 1), (try reader.completionUsage()).?.count);
     const records = try reader.listTransactions(alloc);

@@ -173,7 +173,7 @@ row encoding, not a complete physical plan. Resolution enters the general DB
 batch expander again. Even the proposed document overwrite needs document and
 TTL writes, transaction status, intent/member/lock/admission/schema cleanup,
 completion accounting and derived replay. Transaction resolution explicitly
-cannot elide replay; `docstore.writeReplayEntries` adds sequence metadata and
+cannot elide replay; `docstore.emitReplayMutations` adds sequence metadata and
 replay entries. Commit version, replay sequence, Raft markers and shared ledger
 values cannot be frozen to their earlier values. The persisted plan must enumerate
 operations plus bounded late-binding fields and encoding workspace. It must never
@@ -228,3 +228,42 @@ Acceptance for this stage requires actual prepare and resolution paths:
 Keep this path internal until those proofs pass. A physical-plan encoder alone,
 or a successful one-shot WAL test, does not establish mandatory transaction
 completion or full performance qualification.
+
+### Implemented inspection and shared accounting foundation
+
+`completion_mutations.Plan` owns bounded copied mutation slots and bytes. The
+transaction manager's internal resolution inspection uses the real decision and
+cleanup paths, recomputes current completion accounting, and emits DocStore's
+replay expansion into those slots. It aborts its backend batch without publishing
+changes or resolution traces. Unsupported keyspaces fail closed because DocStore
+may expand them into relational or payload-ownership operations. Tests compare
+the entire resulting physical store for commit and abort, including binary keys,
+four replay lanes, metadata cleanup and terminal retries after newer writes.
+
+This is an observation at resolution time, not a pre-prepare compiler. Its shared
+counter and sequence values become stale after inspection. It has no apply API,
+persisted descriptor or reserved backend resources; scratch used to derive the
+operations may still allocate. The separately factored replay emitter preserves
+the existing malformed/decode-failure fallback, so bounds must charge the values
+actually emitted, including full-payload fallback copies.
+
+The private DB profile inspector recognizes a still narrower initial candidate:
+one overwrite in an explicitly schemaless, local-only document table, with a
+bounded scalar JSON value and complete live identity mappings. It records root,
+schema, index, range and identity observations and rejects unsupported configured
+work. There is no production caller or public activation. It retains no lease;
+observing eligibility before prepare does not fence later schema, index, identity
+or topology changes through retirement.
+
+Completion-ledger updates now explicitly acquire a backend-shared writer gate
+through commit or abort. Ordinary native LSM batches serialize publication but
+not the whole read/modify/write operation, so independent transaction managers
+could previously lose shared accounting updates. Native LSM stores expose
+their shared gate; LMDB exposes its intrinsic writer serialization. The memory
+backend is excluded because ordinary commits replace its entire snapshot. Nested
+DocStore adapters preserve that capability without acquiring the same gate twice.
+Unknown providers fail closed. Ordinary batches remain concurrent, and this gate
+does not establish cancellation, bounded progress or physical completion credit.
+
+The durable slot, prepare-time resource reservation, protected SST/manifest drain,
+restart restoration and activation proofs above remain the next integration work.

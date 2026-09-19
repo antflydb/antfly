@@ -595,6 +595,15 @@ transaction guarantee: exact physical plans, durable certificates, pre-admitted
 SST/manifest completion, restart restoration and production transaction wiring
 remain required.
 
+The next completion foundation adds bounded resolution-mutation inspection and a
+private observer for the initial local inline-overwrite profile. Both remain
+internal observations without durable authority. Completion accounting now uses
+explicit backend-shared serialization: ordinary native LSM batch publication did
+not protect independent managers' shared read/modify/write totals. Native ABI 12
+fences the added storage capability callback. These changes do not activate a
+mandatory-completion transaction policy; the durable slot and restart proof remain
+open in the completion design.
+
 ## Remaining design phases
 
 | Design phase | Current status |

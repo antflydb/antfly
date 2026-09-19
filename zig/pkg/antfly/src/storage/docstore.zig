@@ -4190,27 +4190,36 @@ test "workload admission docstore serialized batches forward native shared gates
             // Same explicit gate on the outer graph-style view must not relock
             // the inner gate. The ungated variant obtains the same native gate.
             outer.write_gate = &backend.serialized_write_mutex;
-            var batch = try outer.beginSerializedBatch();
-            errdefer batch.abort();
-            try std.testing.expect(!backend.serialized_write_mutex.tryLock());
-            try batch.put("serialized-key", "committed");
-            // Snapshot readers remain usable while the participating writer is held.
-            var reader = try outer.beginRead();
-            reader.abort();
-            try batch.commit();
+            {
+                var batch = try outer.beginSerializedBatch();
+                errdefer batch.abort();
+                try std.testing.expect(!backend.serialized_write_mutex.tryLock());
+                try batch.put("serialized-key", "committed");
+                // Snapshot readers remain usable while the participating writer is held.
+                var reader = try outer.beginRead();
+                reader.abort();
+                try batch.commit();
+            }
             try std.testing.expect(backend.serialized_write_mutex.tryLock());
             backend.serialized_write_mutex.unlock();
-            var read = try outer.beginRead();
-            try std.testing.expectEqualStrings("committed", try read.get("serialized-key"));
-            read.abort();
-            batch = try outer.beginSerializedBatch();
-            try batch.put("serialized-key", "aborted");
-            batch.abort();
+            {
+                var read = try outer.beginRead();
+                defer read.abort();
+                try std.testing.expectEqualStrings("committed", try read.get("serialized-key"));
+            }
+            {
+                var batch = try outer.beginSerializedBatch();
+                errdefer batch.abort();
+                try batch.put("serialized-key", "aborted");
+                batch.abort();
+            }
             try std.testing.expect(backend.serialized_write_mutex.tryLock());
             backend.serialized_write_mutex.unlock();
-            read = try outer.beginRead();
-            try std.testing.expectEqualStrings("committed", try read.get("serialized-key"));
-            read.abort();
+            {
+                var read = try outer.beginRead();
+                defer read.abort();
+                try std.testing.expectEqualStrings("committed", try read.get("serialized-key"));
+            }
         }
     }
 }
