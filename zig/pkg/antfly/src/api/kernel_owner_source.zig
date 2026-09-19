@@ -109,6 +109,51 @@ test "source owner deadlines normalize executor clock epochs without extending b
     try std.testing.expectEqual(native_context.deadline_ns, (try platformDeadlineContext(native_context)).deadline_ns);
 }
 
+test "source owner routed admission preserves the fence clock" {
+    const Fixture = struct {
+        now: u64,
+        io: std.Io = undefined,
+        calls: usize = 0,
+        fn clock(raw: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            return .{ .nanoseconds = self.now };
+        }
+        fn resolve(raw: *anyopaque, _: std.mem.Allocator, _: []const u8, _: table_catalog.RouteQuery, deadline: ?u64) !table_catalog.RouteResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try table_catalog.RoutingBudget.initIo(deadline, self.io).checkpoint();
+            try std.testing.expectEqual(self.now + std.time.ns_per_s, deadline.?);
+            self.calls += 1;
+            return .not_found;
+        }
+        fn admin(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.TestUnexpectedResult;
+        }
+        fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+    var vtable = std.testing.io.vtable.*;
+    vtable.now = Fixture.clock;
+    var request: Fixture = .{ .now = 10 };
+    request.io = .{ .userdata = &request, .vtable = &vtable };
+    var catalog: Fixture = .{ .now = 1000 * std.time.ns_per_s };
+    catalog.io = .{ .userdata = &catalog, .vtable = &vtable };
+    var source: ProvisionedKernelOwnerSource = undefined;
+    source.catalog = .{ .ptr = &catalog, .io = @import("../runtime_io_abi.zig").Borrow.init(&catalog.io), .vtable = &.{ .admin_snapshot = Fixture.admin, .free_admin_snapshot = Fixture.free, .validate_route = Fixture.resolve } };
+    const fence: metadata_api.CatalogRouteFence = .{
+        .metadata_group_id = 1,
+        .catalog_revision = 1,
+        .table_id = 1,
+        .topology_epoch = 1,
+        .route = .{ .group_id = 2, .range_id = 2, .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 } },
+        .admission_deadline_ns = request.now + std.time.ns_per_s,
+        .admission_deadline_io = @import("../runtime_io_abi.zig").Borrow.init(&request.io),
+    };
+    try std.testing.expectError(error.TopologyChanged, source.validateRoutedRead(std.testing.allocator, fence, 2, "rows"));
+    try std.testing.expectEqual(@as(usize, 1), catalog.calls);
+    request.now = fence.admission_deadline_ns.?;
+    try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, source.validateRoutedRead(std.testing.allocator, fence, 2, "rows"));
+    try std.testing.expectEqual(@as(usize, 1), catalog.calls);
+}
+
 pub const ProvisionedKernelOwnerSource = struct {
     alloc: std.mem.Allocator,
     replica_root_dir: []const u8,
@@ -3190,7 +3235,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             self.catalog,
             table_name,
             fence,
-            fence.admission_deadline_ns,
+            self.catalog.routeFenceDeadline(fence),
         );
         try fence.admission_cancellation.check();
     }

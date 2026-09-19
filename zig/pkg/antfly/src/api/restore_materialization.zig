@@ -143,7 +143,17 @@ pub fn stepPortableDecoder(alloc: std.mem.Allocator, io: std.Io, artifact: std.I
     var store = try @import("../storage/docstore.zig").DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{ .name = "docs" }));
     defer store.close();
     const portable = @import("../storage/portable_backup.zig");
-    const complete = if (source.rewrite) |rewrite| try portable.importSourceCopyFilePage(alloc, &store, io, artifact, source.artifact_size_bytes, .{ .scope = rewrite.source_scope orelse return error.RestoreSourceProofMissing, .applied_index = rewrite.source_applied_index, .retained_start = rewrite.retained_start }, scope.digest(), 128, cancellation) else try portable.importCohortFilePage(alloc, &store, io, artifact, source.artifact_size_bytes, .{ .seal = source.cohort_seal.?, .namespace = scope.source_namespace }, scope.digest(), 128, cancellation);
+    // A page may only advance a manifest/layout phase, without importing a
+    // row. Amortize decoder opens and coordinator RPCs across a bounded burst
+    // of these durable steps. Each page still commits its restart checkpoint;
+    // cancellation and either budget end the burst without losing progress.
+    const started = std.Io.Clock.awake.now(io);
+    var complete = false;
+    for (0..8) |_| {
+        try cancellation.check();
+        complete = if (source.rewrite) |rewrite| try portable.importSourceCopyFilePage(alloc, &store, io, artifact, source.artifact_size_bytes, .{ .scope = rewrite.source_scope orelse return error.RestoreSourceProofMissing, .applied_index = rewrite.source_applied_index, .retained_start = rewrite.retained_start }, scope.digest(), 128, cancellation) else try portable.importCohortFilePage(alloc, &store, io, artifact, source.artifact_size_bytes, .{ .seal = source.cohort_seal.?, .namespace = scope.source_namespace }, scope.digest(), 128, cancellation);
+        if (complete or started.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds() >= 25 * std.time.ns_per_ms) break;
+    }
     if (complete) try bindPortableDecoderRange(alloc, &store, owner_range);
     try fs.syncDirPortable(io, files);
     try fs.syncDirPortable(io, root);

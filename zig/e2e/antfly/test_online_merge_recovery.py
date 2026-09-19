@@ -29,7 +29,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 import requests
-
 import test_backup_restore as backups
 from helpers import wait_until
 
@@ -54,6 +53,7 @@ class OwnerLinkFault:
         # Diagnostic only: retain bounded failures after fault healing too.
         # Never change matching, forwarding, or decision tracking below.
         self.failed_owner_responses = deque(maxlen=128)
+        self.owner_progress = deque(maxlen=32)
 
     @staticmethod
     def transaction_identity(body):
@@ -76,6 +76,27 @@ class OwnerLinkFault:
     def observe_response(self, index, body, response):
         with self.lock:
             path = body.get("_fault_path", "")
+            if response.status_code == 200 and path.endswith("/restore-owner"):
+                try:
+                    value = response.json()
+                    rewrite = value.get("rewrite") or {}
+                    self.owner_progress.append(
+                        (
+                            index,
+                            body.get("action"),
+                            path,
+                            {
+                                "phase": value.get("phase"),
+                                "rows": value.get("rows"),
+                                "source_next_offset": value.get("source_next_offset"),
+                                "snapshot_complete": rewrite.get("snapshot_complete"),
+                                "sequence": rewrite.get("sequence"),
+                                "final_cut": rewrite.get("final_cut") is not None,
+                            },
+                        )
+                    )
+                except ValueError:
+                    pass
             if response.status_code >= 400 and path.endswith(
                 ("/restore-owner", "/txn-prepare")
             ):
@@ -326,7 +347,10 @@ def owner_link_fault(request, monkeypatch):
             return result
 
         monkeypatch.setattr(backups.ThreeByThreeBackupCluster, "_data_command", command)
-        yield fault
+        try:
+            yield fault
+        finally:
+            print(f"restore owner progress: {list(fault.owner_progress)}")
 
 
 @pytest.fixture

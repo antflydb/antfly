@@ -2635,7 +2635,7 @@ pub const BoundTableReadSource = struct {
         const search_start_ns = if (phase_profile) platform_time.monotonicNs() else 0;
         if (req.aggregations_json.len != 0) {
             execution.aggregation_lease = try self.db.beginQueryReadLease();
-            const captured = try execution.aggregation_lease.?.search(alloc, req);
+            const captured = try execution.aggregation_lease.?.search(alloc, search_req);
             execution.request = captured.request;
             execution.result = captured.result;
             execution.dense_profile = if (captured.dense_profile) |profile| mapDenseSearchProfile(profile) else null;
@@ -3029,7 +3029,7 @@ pub const ProvisionedTableReadSource = struct {
 
         fn fence(
             self: PreparedKeyRead,
-            deadline_ns: ?u64,
+            budget: table_catalog.RoutingBudget,
             cancellation: ?db_mod.types.CancellationToken,
         ) ?metadata_api.CatalogRouteFence {
             const route = self.route orelse return null;
@@ -3040,7 +3040,8 @@ pub const ProvisionedTableReadSource = struct {
                 .table_id = self.table_id,
                 .topology_epoch = self.topology_epoch,
                 .route = route,
-                .admission_deadline_ns = deadline_ns,
+                .admission_deadline_ns = budget.deadline_ns,
+                .admission_deadline_io = budget.io,
                 .admission_cancellation = cancellation orelse .none,
             };
         }
@@ -3877,10 +3878,15 @@ pub const ProvisionedTableReadSource = struct {
             // scope, never an ordinary named-table open.
             const routed = try table_catalog.routedGroupSnapshotUntil(alloc, self.catalog, table_name, key, lookupRoutingDeadline(self.catalog, opts));
             const fence = routed.fence() orelse return null;
-            var scoped = opts;
-            scoped.restore_staging_scope = (try self.catalog.restoreScopeForGroup(table_name, fence.route.group_id)) orelse return error.RestoreStagingScopeChanged;
-            scoped.restore_staging_plan_id = try self.catalog.restorePlanForGroup(table_name, fence.route.group_id);
-            return self.lookupRestoreStaging(alloc, fence.route.group_id, table_name, key, scoped, fence);
+            // Routing views forward this optional capability even for normal
+            // published tables. Only a returned scope authorizes staging;
+            // restore catalogs reject unknown owners instead of returning null.
+            if (try self.catalog.restoreScopeForGroup(table_name, fence.route.group_id)) |scope| {
+                var scoped = opts;
+                scoped.restore_staging_scope = scope;
+                scoped.restore_staging_plan_id = try self.catalog.restorePlanForGroup(table_name, fence.route.group_id);
+                return self.lookupRestoreStaging(alloc, fence.route.group_id, table_name, key, scoped, fence);
+            }
         }
         if (self.distributed_router != null) {
             var hosted = self.routedHostedSource();
@@ -3895,9 +3901,9 @@ pub const ProvisionedTableReadSource = struct {
             const route = prepared.route orelse return null;
             const group_id = route.group_id;
             const result = if (comptime control_only_storage_sources)
-                self.groupLocalSourceWithFence(prepared.fence(opts.execution_deadline_ns, opts.cancellation).?).lookupGroupLocal(alloc, group_id, table_name, key, opts, .stale)
+                self.groupLocalSourceWithFence(prepared.fence(.{ .deadline_ns = opts.execution_deadline_ns, .io = opts.execution_io }, opts.cancellation).?).lookupGroupLocal(alloc, group_id, table_name, key, opts, .stale)
             else if (self.local_read_source != null)
-                self.groupLocalSourceWithFence(prepared.fence(opts.execution_deadline_ns, opts.cancellation).?).lookupGroupLocal(alloc, group_id, table_name, key, opts, .stale)
+                self.groupLocalSourceWithFence(prepared.fence(.{ .deadline_ns = opts.execution_deadline_ns, .io = opts.execution_io }, opts.cancellation).?).lookupGroupLocal(alloc, group_id, table_name, key, opts, .stale)
             else
                 lookupProvisionedHostedLocal(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.read_safety_barrier, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, key, opts, .stale, prepared.activity != null, docIdentityNamespaceForRoute(route));
             return result catch |err| switch (err) {
@@ -3941,9 +3947,9 @@ pub const ProvisionedTableReadSource = struct {
             const route = prepared.route orelse return null;
             const group_id = route.group_id;
             const result = if (comptime control_only_storage_sources)
-                self.groupLocalSourceWithFence(prepared.fence(null, null).?).documentArtifactManifestGroupLocal(alloc, group_id, table_name, doc_key, artifact_name, .stale)
+                self.groupLocalSourceWithFence(prepared.fence(.{}, null).?).documentArtifactManifestGroupLocal(alloc, group_id, table_name, doc_key, artifact_name, .stale)
             else if (self.local_read_source != null)
-                self.groupLocalSourceWithFence(prepared.fence(null, null).?).documentArtifactManifestGroupLocal(alloc, group_id, table_name, doc_key, artifact_name, .stale)
+                self.groupLocalSourceWithFence(prepared.fence(.{}, null).?).documentArtifactManifestGroupLocal(alloc, group_id, table_name, doc_key, artifact_name, .stale)
             else
                 documentArtifactManifestProvisionedHostedLocal(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.read_safety_barrier, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, doc_key, artifact_name, .stale, prepared.activity != null, docIdentityNamespaceForRoute(route));
             return result catch |err| switch (err) {
@@ -3985,9 +3991,9 @@ pub const ProvisionedTableReadSource = struct {
             const route = prepared.route orelse return null;
             const group_id = route.group_id;
             const result = if (comptime control_only_storage_sources)
-                self.groupLocalSourceWithFence(prepared.fence(null, null).?).documentArtifactManifestsGroupLocal(alloc, group_id, table_name, doc_key, .stale)
+                self.groupLocalSourceWithFence(prepared.fence(.{}, null).?).documentArtifactManifestsGroupLocal(alloc, group_id, table_name, doc_key, .stale)
             else if (self.local_read_source != null)
-                self.groupLocalSourceWithFence(prepared.fence(null, null).?).documentArtifactManifestsGroupLocal(alloc, group_id, table_name, doc_key, .stale)
+                self.groupLocalSourceWithFence(prepared.fence(.{}, null).?).documentArtifactManifestsGroupLocal(alloc, group_id, table_name, doc_key, .stale)
             else
                 documentArtifactManifestsProvisionedHostedLocal(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.read_safety_barrier, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, doc_key, .stale, prepared.activity != null, docIdentityNamespaceForRoute(route));
             return result catch |err| switch (err) {
@@ -15587,6 +15593,9 @@ fn consumerTests() type {
                 acknowledge: bool = true,
                 absence: []const u8 = "1",
                 status: u16 = 404,
+                fn restoreScope(_: *anyopaque, _: []const u8, _: u64) !?[32]u8 {
+                    return null;
+                }
                 fn localNodeId(_: *anyopaque) u64 {
                     return 1;
                 }
@@ -15635,12 +15644,19 @@ fn consumerTests() type {
                 }
             };
             var fixture: Fixture = .{};
-            const catalog: table_catalog.CatalogSource = .{ .ptr = &fixture, .vtable = &.{ .admin_snapshot = Fixture.adminSnapshot, .free_admin_snapshot = Fixture.freeAdminSnapshot, .resolve_route = Fixture.resolve } };
+            const catalog: table_catalog.CatalogSource = .{ .ptr = &fixture, .vtable = &.{ .admin_snapshot = Fixture.adminSnapshot, .free_admin_snapshot = Fixture.freeAdminSnapshot, .resolve_route = Fixture.resolve, .restore_scope_for_group = Fixture.restoreScope } };
             const router: table_router.HostedGroupRouter = .{ .ptr = &fixture, .vtable = &.{ .local_node_id = Fixture.localNodeId, .local_status = Fixture.localStatus, .group_leader_node_id = Fixture.leader, .node_base_uri = Fixture.nodeBaseUri } };
             var hosted = HostedProvisionedTableReadSource.init("unused", catalog, raft_mod.read_gate.alreadyReadSafeBarrier(), router, .{ .ptr = &fixture, .vtable = &.{ .execute = Fixture.execute } });
             _ = hosted.withLocalReadSource(.{ .ptr = &fixture, .strict_read_index_absence = true, .vtable = &.{ .lookup = unsupportedPhysicalTopLevelLookup, .scan = unsupportedPhysicalTopLevelScan, .query = unsupportedPhysicalTopLevelQuery, .lookup_group_local_routed = Fixture.lookup } });
             for (0..36) |_| try std.testing.expect((try hosted.source().lookup(std.testing.allocator, "rows", "absent", .{}, .read_index)) == null);
             try std.testing.expectEqual(@as(usize, 36), fixture.reads);
+            // Pinned routing views expose a forwarding restore callback, not
+            // a blanket declaration that ordinary rows belong to staging.
+            var provisioned_view = ProvisionedTableReadSource.init("unused", catalog, raft_mod.read_gate.alreadyReadSafeBarrier());
+            provisioned_view.distributed_router = router;
+            provisioned_view.distributed_executor = hosted.executor;
+            provisioned_view.local_read_source = hosted.local_read_source;
+            try std.testing.expect((try provisioned_view.source().lookup(std.testing.allocator, "rows", "absent", .{}, .read_index)) == null);
             // No absence is inferred from failed barriers; stale reads retain
             // the existing fallback behavior instead of claiming authority.
             fixture.failure = error.ReadIndexTimeout;
@@ -27300,6 +27316,13 @@ fn implementationTests() type {
             try std.testing.expectEqual(@as(u32, 2), full.result.total_hits);
             try requireCompleteAggregationFullResult(full_req, full.result, "test-text-publication");
             try std.testing.expectEqual(@as(usize, 2), full.result.hits.len);
+
+            // The bound path must capture the aggregation collection request,
+            // not the original zero-hit/count-only page, under its new lease.
+            var source = BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
+            var response = (try source.source().query(alloc, "docs", req, .read_index)).?;
+            defer response.deinit(alloc);
+            try std.testing.expect(std.mem.indexOf(u8, response.json, "\"stats\"") != null);
 
             // Once hydration is complete, a writer may replace a matching row
             // before reduction begins. Reduce the owned old values, not the

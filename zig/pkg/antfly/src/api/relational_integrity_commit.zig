@@ -23,6 +23,7 @@ const TableRecord = @import("../metadata/table_manager.zig").TableRecord;
 const RangeRecord = @import("../metadata/table_manager.zig").RangeRecord;
 const Allocator = std.mem.Allocator;
 const RequestContext = @import("operation.zig").RequestContext;
+var preparation_diagnostic_gate: @import("bounded_diagnostic_gate.zig").Gate = .{};
 
 /// ScanOptions has a platform-monotonic deadline but no borrowed clock. Move
 /// the remaining budget across that boundary; never copy an Io-awake epoch.
@@ -177,6 +178,8 @@ const Builder = struct {
     const Witnesses = struct { required: bool, values: []const Witness };
     alloc: Allocator,
     source: reads.TableReadSource,
+    read_view: ?*reads.JoinReadView = null,
+    read_view_attempted: bool = false,
     metadata: []const TableRecord,
     loaded: std.ArrayList(*Loaded) = .empty,
     output: std.ArrayList(contract.TableCommitRequest) = .empty,
@@ -211,13 +214,25 @@ const Builder = struct {
 
     fn lookup(self: *Builder, table: []const u8, key: []const u8, options: types.LookupOptions) !?reads.LookupResponse {
         try self.control.ensureActive();
+        // Preparation observes many primary rows and claims. Pin one routing
+        // generation for the request instead of fetching the catalog for each
+        // point read. Owner read-index and commit predicates still establish
+        // data consistency; the view only amortizes immutable route planning.
+        if (!self.read_view_attempted) {
+            self.read_view = try self.source.acquireJoinView(self.alloc, .{ .clock = .{ .deadline_ns = self.control.deadline_ns, .io = self.control.deadline_io }, .cancellation = self.control.cancellation });
+            if (self.read_view) |view| self.source = view.source;
+            self.read_view_attempted = true;
+        }
         var opts = options;
         opts.include_primary_digest = !options.relational_integrity_catalog and !options.relational_integrity_action and
             options.relational_integrity_jobs_json.len == 0 and options.relational_index_status_json.len == 0 and options.relational_activation_json.len == 0 and options.relational_topology_json.len == 0;
         opts.execution_deadline_ns = self.control.deadline_ns;
         opts.execution_io = self.control.deadline_io;
         opts.cancellation = self.control.cancellation;
-        return self.source.lookup(self.alloc, table, key, opts, .read_index);
+        return self.source.lookup(self.alloc, table, key, opts, .read_index) catch |err| {
+            if (preparation_diagnostic_gate.admit(@import("antfly_platform").time.monotonicNs())) std.log.warn("preparation lookup failed catalog={} jobs={} work={d} class={s}", .{ opts.relational_integrity_catalog, opts.relational_integrity_jobs_json.len != 0, self.work.items.len, @errorName(err) });
+            return err;
+        };
     }
 
     fn charge(self: *Builder, bytes: usize) !void {
@@ -648,6 +663,7 @@ const Builder = struct {
     }
 
     fn deinit(self: *Builder) void {
+        if (self.read_view) |view| view.deinit();
         for (self.loaded.items) |table| {
             if (table.plan) |*plan| plan.deinit();
             table.view.release();
@@ -1034,7 +1050,11 @@ pub fn prepareWithCoverageControlled(alloc: Allocator, source: reads.TableReadSo
 /// the distributed commit call itself. Preserve that distinction at the API.
 fn preparationError(err: anyerror) anyerror {
     return switch (err) {
-        error.ReadIndexTimeout, error.CatalogRoutingSnapshotTimeout, error.Timeout, error.NotLeader, error.GroupLeaderUnavailable, error.LeaderUnavailable, error.DistributedQueryUnavailable => error.IntegrityCatalogUnavailable,
+        error.ReadIndexTimeout, error.CatalogRoutingSnapshotTimeout, error.Timeout, error.NotLeader, error.GroupLeaderUnavailable, error.LeaderUnavailable, error.DistributedQueryUnavailable => blk: {
+            if (preparation_diagnostic_gate.admit(@import("antfly_platform").time.monotonicNs()))
+                std.log.warn("relational preparation read deferred class={s}", .{@errorName(err)});
+            break :blk error.IntegrityCatalogUnavailable;
+        },
         error.DeadlineExceeded => error.PreDecisionDeadlineExceeded,
         else => err,
     };
@@ -1181,6 +1201,7 @@ pub fn guardBackfillFailure(prepared: *Prepared, source: reads.TableReadSource, 
             var response = try source.lookup(owned, request.table_name, &command.address.routing, .{
                 .relational_integrity_jobs_json = query,
                 .execution_deadline_ns = control.deadline_ns,
+                .execution_io = control.deadline_io,
                 .cancellation = control.cancellation,
             }, .read_index);
             defer if (response) |*value| value.deinit(owned);
@@ -1318,6 +1339,45 @@ pub fn prepareBackfillWithCoverageControlled(alloc: Allocator, source: reads.Tab
         try ensureUniqueCoverageControlled(alloc, source, metadata, ranges, parent_names.items, control);
     }
     return prepared;
+}
+
+test "distributed txn preparation pins one routing view and releases it" {
+    const Fixture = struct {
+        view: reads.JoinReadView = undefined,
+        acquisitions: usize = 0,
+        lookups: usize = 0,
+        releases: usize = 0,
+        fn acquire(ptr: *anyopaque, _: Allocator, budget: @import("table_router.zig").RouteBudget) !*reads.JoinReadView {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try budget.check();
+            self.acquisitions += 1;
+            return &self.view;
+        }
+        fn destroy(view: *reads.JoinReadView) void {
+            const self: *@This() = @fieldParentPtr("view", view);
+            self.releases += 1;
+        }
+        fn original(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: types.LookupOptions, _: @import("../raft/read_gate.zig").ReadConsistency) !?reads.LookupResponse {
+            return error.TestUnexpectedResult;
+        }
+        fn lookup(ptr: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: types.LookupOptions, consistency: @import("../raft/read_gate.zig").ReadConsistency) !?reads.LookupResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(.read_index, consistency);
+            self.lookups += 1;
+            return null;
+        }
+    };
+    var fixture: Fixture = .{};
+    fixture.view = .{ .session = undefined, .source = .{ .ptr = &fixture, .vtable = &.{ .lookup = Fixture.lookup, .scan = undefined, .query = undefined } }, .destroy = Fixture.destroy };
+    var builder: Builder = .{ .alloc = std.testing.allocator, .metadata = &.{}, .source = .{ .ptr = &fixture, .vtable = &.{ .lookup = Fixture.original, .scan = undefined, .query = undefined, .acquire_join_view = Fixture.acquire } } };
+    {
+        defer builder.deinit();
+        try std.testing.expect(try builder.lookup("rows", "a", .{}) == null);
+        try std.testing.expect(try builder.lookup("rows", "b", .{}) == null);
+        try std.testing.expectEqual(@as(usize, 1), fixture.acquisitions);
+        try std.testing.expectEqual(@as(usize, 2), fixture.lookups);
+    }
+    try std.testing.expectEqual(@as(usize, 1), fixture.releases);
 }
 
 fn testCatalogEnvelope(alloc: Allocator, table_id: u64, json: []const u8) ![]u8 {

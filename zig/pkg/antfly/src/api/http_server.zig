@@ -15934,6 +15934,9 @@ pub const ApiHttpServer = struct {
         defer self.alloc.free(worker_json);
         var worker_state = try std.json.parseFromSlice(restore_jobs.JobState, self.alloc, worker_json, .{});
         defer worker_state.deinit();
+        errdefer |err| if (err == error.RestoreStagingYield and restore_staging_diagnostic_gate.admit(platform_time.monotonicNs())) {
+            std.log.info("restore work slice phase={s} rewrite_phase={s} owner={d} round={d}", .{ @tagName(job.value.state), @tagName(worker_state.value.rewrite_progress.phase), worker_state.value.rewrite_progress.owner, worker_state.value.rewrite_progress.round });
+        };
         if (is_rewrite) rewrite_diagnostic = worker_state.value.rewrite_progress;
         const failed = worker_state.value.staging_failure.len != 0;
         if (!failed and !worker_state.value.cancel_requested and job.value.state != .published and job.value.state != .canceled) {
