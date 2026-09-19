@@ -4246,6 +4246,8 @@ pub const ApiHttpServer = struct {
         const local_node_id = self.localSessionNodeId();
         const now_ns = platform_time.realtimeNs();
         for (pending) |txn_id| {
+            const execution = self.txn_sessions.tryAcquireCommitExecution(txn_id) orelse continue;
+            defer execution.release();
             var recovery = (self.txn_sessions.claimPendingRecovery(self.alloc, txn_id, local_node_id, now_ns) catch |err| {
                 std.log.warn("stable transaction recovery claim deferred txn_id={x} err={s}", .{ txn_id, @errorName(err) });
                 continue;
@@ -35557,6 +35559,7 @@ test "api session maintenance recovers crash window after durable 2pc commit" {
     );
     defer alloc.free(body);
 
+    @import("../test_error_logs.zig").expectErrorLogs(1);
     var first = try executeHttpxTestRequest(&server, .{ .method = .POST, .uri = commit_uri, .content_type = "application/json", .body = body });
     defer first.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 503), first.status);
@@ -35572,6 +35575,118 @@ test "api session maintenance recovers crash window after durable 2pc commit" {
     defer retry.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), retry.status);
     try std.testing.expectEqual(@as(usize, 2), writes.commit_calls);
+}
+
+test "api session maintenance skips live commit execution and acknowledgement" {
+    const alloc = std.testing.allocator;
+    var session_path_tmp = try TestDirectory.init("antfly-api-http-session-live-commit");
+    defer session_path_tmp.cleanup();
+    const session_path = session_path_tmp.path();
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), session_path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), session_path) catch {};
+
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{ .ptr = undefined, .vtable = &.{ .status = status } };
+        }
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+    const FakeWrites = struct {
+        server: ?*ApiHttpServer = null,
+        commit_calls: usize = 0,
+        acknowledge_calls: usize = 0,
+
+        fn source(self: *@This()) table_writes.TableWriteSource {
+            return .{ .ptr = self, .vtable = &.{
+                .batch = batch,
+                .commit_transaction_with_id = commitTransactionWithId,
+                .acknowledge_transaction_commit = acknowledgeTransactionCommit,
+            } };
+        }
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
+            return error.TestUnexpectedResult;
+        }
+        fn commitTransactionWithId(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: db_mod.types.TxnId,
+            _: u64,
+            _: []const distributed_txn.TableCommitRequest,
+            _: db_mod.types.SyncLevel,
+        ) anyerror!?distributed_txn.CommitOutcome {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.commit_calls += 1;
+            // Force maintenance into the interval after the recovery index is
+            // durable but before the foreground coordinator has completed.
+            if (self.commit_calls > 1) return error.TransactionBeginFailed;
+            try self.server.?.runSessionMaintenanceOnce();
+            if (self.commit_calls != 1) return error.TransactionBeginFailed;
+            return .{ .committed = .{
+                .participant_count = 1,
+                .coordinator_group_id = 7001,
+                .coordinator_table_name = "docs",
+            } };
+        }
+        fn acknowledgeTransactionCommit(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: db_mod.types.TxnId,
+            _: u64,
+            _: []const u8,
+        ) anyerror!?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.acknowledge_calls += 1;
+            if (self.acknowledge_calls > 1) return error.TestUnexpectedResult;
+            // The same ownership must cover the terminal response/ACK gap.
+            try self.server.?.runSessionMaintenanceOnce();
+            if (self.acknowledge_calls != 1) return error.TestUnexpectedResult;
+            return {};
+        }
+    };
+
+    var source = FakeSource{};
+    var writes = FakeWrites{};
+    var server = try ApiHttpServer.initWithConfig(alloc, .{ .session_store_path = session_path }, source.iface(), null, writes.source());
+    defer server.deinit();
+    writes.server = &server;
+
+    var begin = try executeHttpxTestRequest(&server, .{ .method = .POST, .uri = routes.Routes.transactions_begin, .content_type = "application/json", .body = "{}" });
+    defer begin.deinit(alloc);
+    var parsed_begin = try std.json.parseFromSlice(transactions_api.BeginResponse, alloc, begin.body, .{});
+    defer parsed_begin.deinit();
+    const commit_uri = try std.fmt.allocPrint(alloc, "{s}{s}{s}", .{
+        routes.Routes.transactions_prefix,
+        parsed_begin.value.transaction_id,
+        routes.Routes.transactions_commit_suffix,
+    });
+    defer alloc.free(commit_uri);
+    const batch_body = try test_contract_helpers.normalizeBatchRequest(alloc, "{\"inserts\":{\"counter\":{\"value\":1}}}");
+    defer alloc.free(batch_body);
+    const body = try test_contract_helpers.encodeTransactionCommitRequest(
+        alloc,
+        &.{},
+        &.{.{ .table_name = "docs", .batch_json = batch_body }},
+        null,
+    );
+    defer alloc.free(body);
+
+    var first = try executeHttpxTestRequest(&server, .{ .method = .POST, .uri = commit_uri, .content_type = "application/json", .body = body });
+    defer first.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), first.status);
+    try std.testing.expectEqual(@as(usize, 1), writes.commit_calls);
+    try std.testing.expectEqual(@as(usize, 1), writes.acknowledge_calls);
+    try server.runSessionMaintenanceOnce();
+    try std.testing.expectEqual(@as(usize, 1), writes.commit_calls);
+    try std.testing.expectEqual(@as(usize, 1), writes.acknowledge_calls);
+
+    var retry = try executeHttpxTestRequest(&server, .{ .method = .POST, .uri = commit_uri, .content_type = "application/json", .body = body });
+    defer retry.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), retry.status);
+    try std.testing.expectEqual(@as(usize, 1), writes.commit_calls);
 }
 
 test "api http server enforces configured savepoint limits and exposes remaining capacity" {
@@ -36050,6 +36165,8 @@ test "api http server keeps session maintenance off internal request paths" {
     var owner = try ApiHttpServer.initWithConfig(
         alloc,
         .{
+            .internal_service_secret = "0123456789abcdef0123456789abcdef",
+            .internal_service_issuer = "session-maintenance-test",
             .session_store_path = session_path,
             .session_router = owner_router.iface(),
             .session_owner_lease_ttl_ns = 50 * std.time.ns_per_ms,
@@ -36072,9 +36189,17 @@ test "api http server keeps session maintenance off internal request paths" {
     defer parsed_begin.deinit();
     _ = try distributed_txn.parseTxnIdHex(parsed_begin.value.transaction_id);
     owner.last_session_lease_renew_ns.store(0, .release);
+    const token = try internal_service_auth.tokenAlloc(alloc, .{
+        .secret = owner.cfg.internal_service_secret.?,
+        .issuer = "session-maintenance-test",
+        .subject = "node:test",
+    }, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+    defer alloc.free(token);
+    const headers = [_]http_common.RequestHeader{.{ .name = internal_service_auth.header_name, .value = token }};
     var internal_resp = try executeHttpxTestRequest(&owner, .{
         .method = .GET,
         .uri = "/internal/v1/groups/7/db/median-key",
+        .headers = &headers,
         .body = "",
     });
     defer internal_resp.deinit(alloc);
