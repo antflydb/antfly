@@ -72,9 +72,8 @@ work-log entries reads sensibly end to end.
    native and Metal, including windowed long documents (see
    `zig/pkg/inference/models/gliner2/GLINER25.md` for the evidence and
    bounds); `dogfood` defaults `-extract-model` to it and requests
-   `long_document: {mode: "window"}`. `antflydb/gliner2-base-v1` is a
-   smaller fallback (`-extract-model antflydb/gliner2-base-v1`). An
-   unqualified boundary checkpoint answers `MODEL_NOT_QUALIFIED`.
+   `long_document: {mode: "window"}`. An unqualified checkpoint answers
+   `MODEL_NOT_QUALIFIED`.
 
    In-process inference budgets (host, backend, combined, KV, scratch) are
    derived from the host memory policy the way `antfly inference run` derives
