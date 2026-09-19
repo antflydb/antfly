@@ -4576,7 +4576,10 @@ pub fn storageOwnerOpen(
         .durable_completion_enabled = if (owner_context) |context| context.durable_completion_enabled else false,
         .durable_completion_authority = if (request.completion_installation != null) .raft_apply else if (owner_context) |context| context.durable_completion_authority else .none,
         .completion_pool_config = completion_config,
-        .table_storage = switch (request.dense_embedding_storage) {
+        // A validated installation reopens the complete persisted policy.
+        // The dense-storage selector alone omits transaction recovery fields;
+        // installCompletion below checks the full desired settings exactly.
+        .table_storage = if (completion_config != null) null else switch (request.dense_embedding_storage) {
             .persisted => null,
             .primary_lsm => .{ .dense_embeddings = .primary_lsm },
             .vector_store => .{ .dense_embeddings = .vector_store },

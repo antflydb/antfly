@@ -52,6 +52,7 @@ const table_writes = @import("antfly_source_root").antfly_sources.table_writes;
 const transaction_recovery_source = @import("transaction_recovery_source.zig");
 const common_config = @import("../common/config.zig");
 const scraping = @import("antfly_scraping");
+const completion_capsule = @import("../common/completion_installation_capsule.zig");
 
 pub const ProvisionedKernelOwnerSource = struct {
     alloc: std.mem.Allocator,
@@ -79,6 +80,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     entries: std.ArrayListUnmanaged(*Entry) = .empty,
     completion_installations: std.AutoHashMapUnmanaged(u64, *CompletionInstallation) = .empty,
     completion_installation_preparations: usize = 0,
+    completion_filesystem_io: ?std.Io = null,
 
     publications: std.ArrayListUnmanaged(*PendingPublication) = .empty,
     owner_cache_hits: std.atomic.Value(u64) = .init(0),
@@ -90,6 +92,8 @@ pub const ProvisionedKernelOwnerSource = struct {
         settings_json: []u8,
         settings: @import("../common/table_storage.zig").Settings,
         active: bool = false,
+        metadata_authorized: bool = false,
+        identity_mismatch: bool = false,
         state: enum { installing, failed, backed } = .installing,
     };
 
@@ -2466,12 +2470,23 @@ pub const ProvisionedKernelOwnerSource = struct {
         const entry = try self.alloc.create(Entry);
         errdefer self.alloc.destroy(entry);
         try self.ensureContextConfigured();
+        // Native completion scopes retain absolute file names. Use the same
+        // borrowed filesystem as installation, including when DATA was started
+        // with a relative spelling of an existing replica root.
+        const canonical_path = if (self.completion_filesystem_io) |io| blk: {
+            try @import("../common/fs_paths.zig").createDirPathPortable(io, path);
+            break :blk if (std.fs.path.isAbsolute(path))
+                try std.Io.Dir.realPathFileAbsoluteAlloc(io, path, self.alloc)
+            else
+                try std.Io.Dir.cwd().realPathFileAlloc(io, path, self.alloc);
+        } else null;
+        defer if (canonical_path) |owned| self.alloc.free(owned);
         var owner = try client.Owner.open(.{
             .context = self.context.handle,
             .completion_installation = if (installation) |record| &record.binding else null,
             .completion_read_schema_json = if (installation) |record| .fromSlice(record.read_schema_json) else .{},
             .completion_settings_json = if (installation) |record| .fromSlice(record.settings_json) else .{},
-            .path = abi.BorrowedBytes.fromSlice(path),
+            .path = abi.BorrowedBytes.fromSlice(canonical_path orelse path),
             .table_name = abi.BorrowedBytes.fromSlice(table_name),
             .group_id = group_id,
             .lsm_root_generation = descriptor.lsm_root_generation,
@@ -3593,6 +3608,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         registered: bool = false,
         capacity_reserved: bool = true,
         already_backed: bool = false,
+        filesystem_io: ?std.Io = null,
 
         pub fn deinit(self: *@This()) void {
             lock(&self.source.mutex);
@@ -3617,8 +3633,17 @@ pub const ProvisionedKernelOwnerSource = struct {
             if (self.source.quiescing) return error.CompletionAdmissionUnavailable;
             const group_id = self.record.binding.identity.group_id;
             if (self.source.completion_installations.get(group_id)) |existing| {
-                if (existing.state != .backed or !std.meta.eql(existing.binding, self.record.binding)) return error.CompletionAdmissionUnavailable;
-                if (self.record.active) existing.active = true;
+                if (existing.state != .backed or existing.identity_mismatch or !std.meta.eql(existing.binding, self.record.binding) or
+                    !std.meta.eql(existing.settings, self.record.settings)) return error.CompletionAdmissionUnavailable;
+                if (self.record.metadata_authorized) {
+                    if (existing.active and !self.record.active) {
+                        existing.identity_mismatch = true;
+                        existing.metadata_authorized = false;
+                        return error.CompletionProfileChanged;
+                    }
+                    existing.metadata_authorized = true;
+                    if (self.record.active) existing.active = true;
+                }
                 self.already_backed = true;
                 self.source.completion_installation_preparations -= 1;
                 self.capacity_reserved = false;
@@ -3638,7 +3663,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         pub fn finish(self: *@This()) !void {
             if (self.already_backed) return;
             if (!self.registered) return error.CompletionAdmissionUnavailable;
-            return self.source.finishCompletionInstallation(self.record.binding.identity.group_id, self.table_name, self.descriptor, self.record, self.schema_json, self.indexes_json) catch |err| {
+            return self.source.finishCompletionInstallation(self.filesystem_io orelse return error.CompletionAdmissionUnavailable, self.record.binding.identity.group_id, self.table_name, self.descriptor, self.record, self.schema_json, self.indexes_json) catch |err| {
                 lock(&self.source.mutex);
                 self.record.state = .failed;
                 self.source.mutex.unlock();
@@ -3660,13 +3685,40 @@ pub const ProvisionedKernelOwnerSource = struct {
             return error.CompletionProfileChanged;
         if (!std.mem.eql(u8, &try @import("../common/completion_catalog_digest.zig").digest(alloc, descriptor.schema_json, read_schema_json, descriptor.indexes_json), &binding.schema_catalog_digest))
             return error.CompletionProfileChanged;
+        return try self.prepareCompletionDescriptor(alloc, descriptor, table_name, binding, schema_json, read_schema_json, indexes_json, settings, active, true);
+    }
+
+    /// The caller obtained this value only from a validated local capsule. No
+    /// catalog projection or metadata access is performed on the restart path.
+    pub fn prepareCompletionRestoration(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, io: std.Io, value: completion_capsule.Value) !PreparedCompletionInstallation {
+        const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, value.binding.identity.group_id });
+        errdefer alloc.free(path);
+        try completion_capsule.validateRoot(alloc, io, path, value);
+        const schema = try alloc.dupe(u8, value.schema_json);
+        errdefer alloc.free(schema);
+        const indexes = try alloc.dupe(u8, value.indexes_json);
+        errdefer alloc.free(indexes);
+        const descriptor: LoadedDescriptor = .{
+            .path = path,
+            .schema_json = schema,
+            .indexes_json = indexes,
+            .table_storage = value.settings,
+            .generation = value.root_generation,
+            .identity = .{ .table_id = value.binding.table_id, .range_id = value.binding.range_id, .shard_id = value.shard_id },
+        };
+        var prepared = try self.prepareCompletionDescriptor(alloc, descriptor, value.table_name, value.binding, value.schema_json, value.read_schema_json, value.indexes_json, value.settings, false, false);
+        prepared.filesystem_io = io;
+        return prepared;
+    }
+
+    fn prepareCompletionDescriptor(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, descriptor: LoadedDescriptor, table_name: []const u8, binding: abi.completion_pool.InstallBinding, schema_json: []const u8, read_schema_json: []const u8, indexes_json: []const u8, settings: @import("../common/table_storage.zig").Settings, active: bool, authorized: bool) !PreparedCompletionInstallation {
         const record = try self.alloc.create(CompletionInstallation);
         errdefer self.alloc.destroy(record);
         const read_copy = try self.alloc.dupe(u8, read_schema_json);
         errdefer self.alloc.free(read_copy);
         const settings_json = try std.json.Stringify.valueAlloc(self.alloc, settings, .{});
         errdefer self.alloc.free(settings_json);
-        record.* = .{ .binding = binding, .read_schema_json = read_copy, .settings_json = settings_json, .settings = settings, .active = active };
+        record.* = .{ .binding = binding, .read_schema_json = read_copy, .settings_json = settings_json, .settings = settings, .active = active, .metadata_authorized = authorized };
         lock(&self.mutex);
         defer self.mutex.unlock();
         if (self.completion_installations.count() + self.completion_installation_preparations >= 1024)
@@ -3676,10 +3728,70 @@ pub const ProvisionedKernelOwnerSource = struct {
         return .{ .source = self, .alloc = alloc, .descriptor = descriptor, .record = record, .table_name = table_name, .schema_json = schema_json, .indexes_json = indexes_json };
     }
 
-    fn finishCompletionInstallation(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8, descriptor: LoadedDescriptor, record: *CompletionInstallation, schema_json: []const u8, indexes_json: []const u8) !void {
+    pub fn completionInstallationPresent(self: *ProvisionedKernelOwnerSource, group_id: u64) bool {
+        // Contention must not manufacture a legacy absence.
+        if (!self.mutex.tryLock()) return true;
+        defer self.mutex.unlock();
+        return self.completion_installations.contains(group_id);
+    }
+
+    pub fn completionBackingIdentityMatches(self: *ProvisionedKernelOwnerSource, identity: abi.completion_pool.Identity) bool {
+        if (!self.mutex.tryLock()) return false;
+        defer self.mutex.unlock();
+        const record = self.completion_installations.get(identity.group_id) orelse return false;
+        return record.state == .backed and std.meta.eql(record.binding.identity, identity);
+    }
+
+    pub fn completionAdmissionAuthorized(self: *ProvisionedKernelOwnerSource, group_id: u64) bool {
+        return self.completionAuthorization(group_id, true);
+    }
+
+    pub fn completionInstallationAuthorized(self: *ProvisionedKernelOwnerSource, group_id: u64) bool {
+        return self.completionAuthorization(group_id, false);
+    }
+
+    fn completionAuthorization(self: *ProvisionedKernelOwnerSource, group_id: u64, require_active: bool) bool {
+        if (!self.mutex.tryLock()) return false;
+        defer self.mutex.unlock();
+        const record = self.completion_installations.get(group_id) orelse return false;
+        return !self.quiescing and record.state == .backed and (!require_active or record.active) and record.metadata_authorized and !record.identity_mismatch;
+    }
+
+    /// A verified authority mismatch fences new work without releasing backing
+    /// or disturbing accepted/prepared recovery. A later cache cannot undo it.
+    pub fn fenceCompletionAuthorization(self: *ProvisionedKernelOwnerSource, group_id: u64) void {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.completion_installations.get(group_id)) |record| {
+            record.metadata_authorized = false;
+            record.identity_mismatch = true;
+        }
+    }
+
+    fn finishCompletionInstallation(self: *ProvisionedKernelOwnerSource, io: std.Io, group_id: u64, table_name: []const u8, descriptor: LoadedDescriptor, record: *CompletionInstallation, schema_json: []const u8, indexes_json: []const u8) !void {
+        lock(&self.mutex);
+        self.completion_filesystem_io = io;
+        self.mutex.unlock();
         var lease = try self.acquireDescriptorOnce(group_id, table_name, descriptor.path, descriptor.view(), .completion_install, .resident);
         defer lease.deinit();
         try lease.owner().installCompletion(.{ .binding = record.binding, .schema_json = .fromSlice(schema_json), .read_schema_json = .fromSlice(record.read_schema_json), .indexes_json = .fromSlice(indexes_json), .settings_json = .fromSlice(record.settings_json) });
+        // Native install is still hidden behind state.installing. Persist the
+        // complete restart configuration before any provider can accept work.
+        var capsule: completion_capsule.Value = .{
+            .binding = record.binding,
+            .table_name = table_name,
+            .shard_id = descriptor.identity.shard_id,
+            .root_generation = descriptor.generation,
+            .settings = record.settings,
+            .schema_json = schema_json,
+            .read_schema_json = record.read_schema_json,
+            .indexes_json = indexes_json,
+            .canonical_root_digest = undefined,
+            .root_identity_digest = undefined,
+            .receipt_digest = undefined,
+        };
+        try completion_capsule.bindRoot(self.alloc, io, descriptor.path, &capsule);
+        try completion_capsule.publish(self.alloc, io, descriptor.path, capsule);
         lock(&self.mutex);
         record.state = .backed;
         self.mutex.unlock();
@@ -3718,6 +3830,7 @@ pub const ProvisionedKernelOwnerSource = struct {
 
     fn attestCompletionBacking(raw: ?*anyopaque, group_id: u64, node_id: u64, output: *abi.completion_pool.NativeAttestation) callconv(.c) abi.Status {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(raw orelse return .invalid_argument));
+        if (!self.completionInstallationAuthorized(group_id)) return .completion_admission_unavailable;
         var lease = self.installedCompletionOwner(group_id) catch |err| return kernel_error_identity.statusFromError(err);
         defer lease.deinit();
         output.* = lease.owner().attestCompletionBacking(group_id, node_id) catch |err| return kernel_error_identity.statusFromError(err);
@@ -5041,4 +5154,186 @@ test "workload admission restored owner callback snapshot waits for one-time run
     try std.testing.expectEqual(abi.Status.ok, sink.upsert_batch_fn.?(sink.callback_ctx, &entries, entries.len));
     try std.testing.expectEqual(@as(u8, 1), retained.promotion_owner_fn.?(retained.promotion_owner_ctx, 7));
     try std.testing.expectEqual(@as(usize, 6), fixture.calls);
+}
+
+test "workload admission completion capsule restores a real compiled owner without catalog or new admission" {
+    const alloc = std.testing.allocator;
+    const Source = ProvisionedKernelOwnerSource;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const relative_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer alloc.free(relative_root);
+    const root = try std.Io.Dir.cwd().realPathFileAlloc(io, relative_root, alloc);
+    defer alloc.free(root);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-2/table-db", .{root});
+    defer alloc.free(path);
+    const settings: @import("../common/table_storage.zig").Settings = .{ .transaction_recovery = .{
+        .protocol_version = 1,
+        .max_count = 4,
+        .max_bytes = 1024 * 1024,
+        .max_transaction_bytes = 64 * 1024,
+        .completion_protocol_version = 1,
+        .profile_version = 1,
+    } };
+    var binding: abi.completion_pool.InstallBinding = .{
+        .identity = .{ .group_id = 2, .node_id = 7, .capacity = 4, .generation = 1, .incarnation = @splat(15), .policy_digest = @import("../metadata/completion_activation.zig").policyDigest(settings.transaction_recovery.?) },
+        .table_id = 1,
+        .range_id = 3,
+    };
+    binding.schema_catalog_digest = try @import("../common/completion_catalog_digest.zig").digest(alloc, "", "", "{}");
+    var canonical: ?[]u8 = null;
+    defer if (canonical) |bytes| alloc.free(bytes);
+    var accepted_identity: abi.completion_pool.Progress = undefined;
+    {
+        var context: client.Context = .{};
+        defer context.deinit();
+        try context.ensureWith(.{ .transaction_completion_bytes = 1024 * 1024, .durable_completion_enabled = 1 });
+        var source = Source.init(alloc, root, table_catalog.emptyCatalogSource(), read_gate.unavailableReadSafetyBarrier());
+        defer source.deinit();
+        _ = source.withStorageContextHandle(context.handle);
+        // Model the authenticated installer's already validated descriptor.
+        // The production helper obtains this from the coherent signed catalog.
+        const descriptor: Source.LoadedDescriptor = .{
+            .path = try alloc.dupe(u8, path),
+            .schema_json = try alloc.dupe(u8, ""),
+            .indexes_json = try alloc.dupe(u8, "{}"),
+            .generation = table_reads.backend_current_root_generation,
+            .table_storage = settings,
+            .identity = .{ .table_id = 1, .shard_id = 2, .range_id = 3 },
+        };
+        var prepared = try source.prepareCompletionDescriptor(alloc, descriptor, "docs", binding, "", "", "{}", settings, true, true);
+        defer prepared.deinit();
+        prepared.filesystem_io = io;
+        try prepared.begin();
+        var hidden: abi.completion_pool.Lease = undefined;
+        const provider = source.completionProvider();
+        try std.testing.expectEqual(abi.Status.completion_admission_unavailable, provider.acquire(provider.context, 2, 7, &hidden));
+        try prepared.finish();
+        var capsule = (try completion_capsule.load(alloc, io, path)).?;
+        defer capsule.deinit();
+        try std.testing.expectEqualDeep(binding, capsule.value.binding);
+        try std.testing.expect(source.completionAdmissionAuthorized(2));
+        try std.testing.expectEqual(abi.Status.ok, provider.acquire(provider.context, 2, 7, &hidden));
+        defer hidden.vtable.release(hidden.context);
+        var owner_lease = try source.installedCompletionOwner(2);
+        defer owner_lease.deinit();
+        var compiled = try owner_lease.owner().compileReplicatedCompletion("docs",
+            \\{"inserts":{"doc":{"value":2}},"_timestamp_ns":"100","sync_level":"write"}
+        , 0, 0);
+        defer compiled.deinit();
+        canonical = try alloc.dupe(u8, compiled.bytes());
+        const payloads = [_]abi.completion_pool.Bytes{.{ .ptr = canonical.?.ptr, .len = canonical.?.len }};
+        const proposal: abi.completion_pool.Check = .{ .kind = .proposal, .new_work_allowed = 1, .state = .{ .term = 1, .applied_term_known = 1 }, .proposals = .{ .ptr = &payloads, .len = 1 } };
+        var checked: abi.completion_pool.CheckResult = undefined;
+        try std.testing.expectEqual(abi.Status.ok, hidden.vtable.check(hidden.context, &proposal, &checked));
+        hidden.vtable.proposal_result(hidden.context, &.{ .state = proposal.state, .first_index = 1, .last_index = 1, .payloads = proposal.proposals });
+        var pending: abi.completion_pool.DurableCells = .{};
+        try std.testing.expectEqual(abi.Status.ok, hidden.vtable.durable_cells.?(hidden.context, &pending));
+        try std.testing.expectEqual(@as(u32, 1), pending.count);
+        try std.testing.expectEqual(@as(u8, 0), pending.cells[0].prepared);
+        accepted_identity = pending.cells[0].identity;
+        try std.testing.expectError(error.NotFound, owner_lease.owner().lookupJson("docs", "{\"key\":\"doc\",\"include_all_fields\":true}"));
+    }
+    // Close and recreate both the registry and compiled context. No service
+    // keys, cached catalog, HTTP executor or external metadata source exists.
+    var context: client.Context = .{};
+    defer context.deinit();
+    try context.ensureWith(.{ .transaction_completion_bytes = 1024 * 1024, .durable_completion_enabled = 0 });
+    var source = Source.init(alloc, relative_root, table_catalog.emptyCatalogSource(), read_gate.unavailableReadSafetyBarrier());
+    defer source.deinit();
+    _ = source.withStorageContextHandle(context.handle);
+    var capsule = (try completion_capsule.load(alloc, io, path)).?;
+    defer capsule.deinit();
+    var prepared = try source.prepareCompletionRestoration(alloc, io, capsule.value);
+    defer prepared.deinit();
+    try prepared.begin();
+    try prepared.finish();
+    try std.testing.expect(!source.completionAdmissionAuthorized(2));
+    try std.testing.expect(!source.completionInstallationAuthorized(2));
+    const provider = source.completionProvider();
+    var lease: abi.completion_pool.Lease = undefined;
+    try std.testing.expectEqual(abi.Status.ok, provider.acquire(provider.context, 2, 7, &lease));
+    defer lease.vtable.release(lease.context);
+    var cells: abi.completion_pool.DurableCells = .{};
+    try std.testing.expectEqual(abi.Status.ok, lease.vtable.durable_cells.?(lease.context, &cells));
+    try std.testing.expectEqual(@as(u32, 1), cells.count);
+    try std.testing.expectEqualDeep(accepted_identity, cells.cells[0].identity);
+    try std.testing.expectEqual(@as(u8, 0), cells.cells[0].prepared);
+    var durable_log: abi.completion_pool.DurableLog = .{ .mode = .startup_complete, .last_index = 1, .commit_index = 1, .count = 1 };
+    durable_log.observations[0] = .{ .expected = accepted_identity, .observed_term = 1, .observed_digest = accepted_identity.payload_digest, .present = 1 };
+    try std.testing.expectEqual(abi.Status.ok, lease.vtable.reconcile_durable.?(lease.context, &durable_log));
+    // Replay uses the restored ownership with new admission disabled. The
+    // authoritative log observation above certifies the exact retained entry.
+    try std.testing.expectEqual(abi.Status.ok, lease.vtable.apply_accepted.?(lease.context, 1, 1, .{ .ptr = canonical.?.ptr, .len = canonical.?.len }));
+    try std.testing.expectEqual(abi.Status.ok, lease.vtable.apply_accepted.?(lease.context, 1, 1, .{ .ptr = canonical.?.ptr, .len = canonical.?.len }));
+    var owner_lease = try source.installedCompletionOwner(2);
+    defer owner_lease.deinit();
+    var document = try owner_lease.owner().lookupJson("docs", "{\"key\":\"doc\",\"include_all_fields\":true}");
+    defer document.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, document.bytes(), "\"value\":2") != null);
+    var progress: abi.completion_pool.Progress = undefined;
+    try std.testing.expectEqual(abi.Status.ok, lease.vtable.progress.?(lease.context, &progress));
+    try std.testing.expectEqualDeep(accepted_identity, progress);
+    var evidence: abi.completion_pool.NativeAttestation = .{};
+    try std.testing.expectEqual(abi.Status.completion_admission_unavailable, provider.attest.?(provider.context, 2, 7, &evidence));
+    try std.testing.expectError(error.TableNotFound, source.loadDescriptor(alloc, 2, "docs"));
+    // A copied capsule cannot authorize a different root or native identity.
+    var changed = capsule.value;
+    changed.root_identity_digest[0] ^= 1;
+    try std.testing.expectError(error.CompletionProfileChanged, source.prepareCompletionRestoration(alloc, io, changed));
+}
+
+test "workload admission completion capsule reconciliation cannot erase an identity fence" {
+    const alloc = std.testing.allocator;
+    var source = ProvisionedKernelOwnerSource.init(alloc, "/unused", undefined, undefined);
+    defer source.completion_installations.deinit(alloc);
+    var installed: ProvisionedKernelOwnerSource.CompletionInstallation = .{
+        .binding = .{ .identity = .{ .group_id = 7 } },
+        .read_schema_json = &.{},
+        .settings_json = &.{},
+        .settings = .{},
+        .state = .backed,
+    };
+    try source.completion_installations.put(alloc, 7, &installed);
+    try std.testing.expect(source.completionInstallationPresent(7));
+    try std.testing.expect(!source.completionInstallationPresent(8));
+    try std.testing.expect(source.completionBackingIdentityMatches(installed.binding.identity));
+    var wrong_identity = installed.binding.identity;
+    wrong_identity.generation += 1;
+    try std.testing.expect(!source.completionBackingIdentityMatches(wrong_identity));
+    ProvisionedKernelOwnerSource.lock(&source.mutex);
+    try std.testing.expect(source.completionInstallationPresent(8));
+    source.mutex.unlock();
+    try std.testing.expect(!source.completionAdmissionAuthorized(7));
+    var authenticated = installed;
+    authenticated.metadata_authorized = true;
+    var prepared: ProvisionedKernelOwnerSource.PreparedCompletionInstallation = .{
+        .source = &source,
+        .alloc = alloc,
+        .descriptor = undefined,
+        .record = &authenticated,
+        .table_name = "docs",
+        .schema_json = "",
+        .indexes_json = "{}",
+    };
+    source.completion_installation_preparations = 1;
+    try prepared.begin();
+    try std.testing.expect(source.completionInstallationAuthorized(7));
+    try std.testing.expect(!source.completionAdmissionAuthorized(7)); // pending may attest but not admit
+    authenticated.active = true;
+    prepared.capacity_reserved = true;
+    source.completion_installation_preparations = 1;
+    try prepared.begin();
+    try std.testing.expect(source.completionAdmissionAuthorized(7));
+    source.fenceCompletionAuthorization(7);
+    try std.testing.expect(!source.completionAdmissionAuthorized(7));
+    try std.testing.expect(!source.completionInstallationAuthorized(7));
+    prepared.capacity_reserved = true;
+    source.completion_installation_preparations = 1;
+    try std.testing.expectError(error.CompletionAdmissionUnavailable, prepared.begin());
+    try std.testing.expectEqual(@as(usize, 1), source.completion_installation_preparations);
+    try std.testing.expect(installed.state == .backed);
 }
