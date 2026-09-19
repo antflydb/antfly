@@ -535,18 +535,20 @@ A serverless deployment uses an independent secret namespace:
 }
 ```
 
-`gs://` and `file://` are also supported. Storage access uses independently
-provisioned workload identity/environment credentials. The bucket must already
-exist; `file://` uses the `native-secrets` bucket directory below its root.
-Providers must guarantee linearizable reads and conditional writes; an S3-compatible
-endpoint with eventual consistency is not supported. The embedded adapter requires
-an explicit `linearizable_cas` capability assertion. No secret lives beneath a
-table prefix, so table deletion and table backup cleanup cannot delete secrets.
-Serverless workers receive the same resolver as request handlers. Serverless
-`/secrets` (also `/db/v1/secrets`) administration requires a separate bearer token
-of at least 32 bytes, configured through `ANTFLY_SECRET_ADMIN_TOKEN`, even when
-other serverless routes are exposed through a trusted ingress. Terminate public
-TLS at that ingress. Without the token, administration is disabled.
+`gs://` and `file://` are also supported. S3 uses the same refreshable bootstrap
+credential provider as serverless storage, including profiles, web identity and
+task/instance roles. Storage access uses independently provisioned workload
+identity/environment credentials. The bucket must already exist; `file://` uses
+the `native-secrets` bucket directory below its root. Providers must guarantee
+linearizable reads and conditional writes; an S3-compatible endpoint with
+eventual consistency is not supported. The embedded adapter requires an explicit
+`linearizable_cas` capability assertion. No secret lives beneath a table prefix,
+so table deletion and table backup cleanup cannot delete secrets. Serverless
+workers receive the same resolver as request handlers. Serverless `/secrets`
+(also `/db/v1/secrets`) administration requires a separate bearer token of at
+least 32 bytes, configured through `ANTFLY_SECRET_ADMIN_TOKEN`, even when other
+serverless routes are exposed through a trusted ingress. Terminate public TLS at
+that ingress. Without the token, administration is disabled.
 
 The mounted keyring is a JSON object with `active` and `keys`, where each key has
 an immutable `id` and a 64-character hexadecimal `key`. For example:
@@ -569,22 +571,29 @@ a new key and changes `active`; retain old key IDs until their records and backu
 have been resealed or retired. Replacing bytes under an existing ID is invalid.
 A missing keyring or missing retained key is an availability error.
 
-Both adapters store **AFSC v1**, a bounded collection of AFSE envelopes: 4-byte
-`AFSC` magic, u16 version, u16 scope length, u64 scope revision, u32 entry count
-(all little endian), scope bytes, then u32 length + AFSE bytes for each entry.
-Entries are sorted by name; duplicate names, invalid framing, unexpected scope,
-and entry revisions above the collection revision are rejected. The initial
-limits are 1,024 entries and 8 MiB per scope, retaining the common 1 MiB value limit.
-An empty collection retains its revision to prevent delete/recreate ABA.
+Both adapters write **AFSC v2** (and can read AFSC v1), a bounded collection of
+AFSE envelopes: 4-byte `AFSC` magic, u16 version, u16 scope length, u64 scope
+revision, u32 entry count (all little endian), a random 16-byte publication ID,
+scope bytes, then u32 length + AFSE bytes for each entry. AFSC v1 omits the
+publication ID. Every mutation, including delete, gets a new ID so concurrent
+identical operations have distinct commit evidence. Entries are sorted by name;
+duplicate names, invalid framing, unexpected scope, and entry revisions above
+the collection revision are rejected. The initial limits are 1,024 entries and 8
+MiB per scope, retaining the common 1 MiB value limit. An empty collection
+retains its revision to prevent delete/recreate ABA.
 
 Distributed publication uses metadata transition tag 60 and a private
 `native_secrets_v1` namespace. Encryption happens before proposal. Apply checks
 the expected scope revision and atomically publishes ciphertext; a losing CAS is
-a deterministic no-op. Raft snapshot/export/import of internal metadata retains
-this namespace. Public table enumeration does not expose it. **Upgrade every
-metadata replica before enabling the distributed backend**; old binaries cannot
-apply the new transition or restore its snapshot projection. Disabling the
-configuration does not make persisted state downgrade-compatible.
+a deterministic no-op. Followers forward the encrypted proposal through Raft and
+wait for the exact collection to become visible behind a read barrier. A
+different publication at the proposed revision proves a CAS conflict; a later
+revision or timeout yields `OutcomeUnknown`, since it may have superseded our
+commit. Raft snapshot/export/import of internal metadata retains this namespace.
+Public table enumeration does not expose it. **Upgrade every metadata replica
+before enabling the distributed backend**; old binaries cannot apply the new
+transition or restore its snapshot projection. Disabling the configuration does
+not make persisted state downgrade-compatible.
 
 Serverless stores the collection at
 `<prefix>/secrets/v1/<hex SHA-256(scope)>/collection`. One conditional PUT publishes
@@ -600,13 +609,15 @@ API PUT responses expose the committed entry revision and never the value.
 
 ### Bootstrap, caching, and rollout
 
-Startup becomes two phases: obtain storage access, node identity, and key-provider
-access from workload identity, mounted sources, or the host application; then open
-native storage and resolve application secrets. Bootstrap credentials cannot
-reference the store they unlock. Operational provider registry, inference
-connection, external-I/O credential, and remote-content references are retained
-until use; bootstrap settings still resolve before the native store opens. The existing `environment` switch controls
-resolver fallback, not cloud workload identity or the encryption provider.
+Startup becomes two phases: obtain storage access, node identity, and
+key-provider access from workload identity, mounted sources, or the host
+application; then open native storage and resolve application secrets. Bootstrap
+credentials cannot reference the store they unlock. Operational provider
+registry, inference API/S3 credentials, inference and web-search connection
+credentials, external-I/O credentials, and remote-content references are
+retained until use; bootstrap settings still resolve before the native store
+opens. The existing `environment` switch controls resolver fallback, not cloud
+workload identity or the encryption provider.
 
 API mutation success means durable publication, not that all workers have already
 refreshed. Return a committed revision, expose observed revisions, and allow

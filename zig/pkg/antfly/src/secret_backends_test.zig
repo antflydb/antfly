@@ -459,11 +459,164 @@ test "secret backend startup keeps operational references before native attachme
     defer facade.deinit();
     var cfg = try config.Config.parseFromSliceWithSecrets(alloc,
         \\{"secrets":{"native":{"backend":"distributed","keyring_path":"bootstrap-keyring"},"environment":false},
-        \\ "connections":{"provider":{"kind":"inference","capabilities":["models.generate"],"inference":{"provider":"openai","api_key":"${secret:provider.key}"}}}}
+        \\ "inference":{"api_url":"http://localhost:8080","api_key":"${secret:provider.key}","s3_credentials":{"access_key_id":"${secret:s3.id}","secret_access_key":"${secret:s3.key}"}},
+        \\ "connections":{"provider":{"kind":"inference","capabilities":["models.generate"],"inference":{"provider":"openai","api_key":"${secret:provider.key}"}},"search":{"kind":"web_search","provider":"exa","capabilities":["web.search"],"web_search":{"api_key":"${secret:search.key}"}}}}
     , &facade);
     defer cfg.deinit();
+    try std.testing.expectEqualStrings("${secret:provider.key}", cfg.inference.api_key.?);
+    try std.testing.expectEqualStrings("${secret:s3.key}", cfg.inference.s3_credentials.?.secret_access_key.?);
+    try std.testing.expectEqualStrings("${secret:search.key}", cfg.connections.get("search").?.web_search.?.api_key.?);
     try std.testing.expectEqualStrings("${secret:provider.key}", cfg.connections.get("provider").?.inference.?.api_key.?);
     try std.testing.expectError(error.Unavailable, facade.list(alloc));
     try std.testing.expectError(error.InvalidConfig, secrets.Config.validate(.{ .native = .{ .backend = .distributed } }));
     try std.testing.expectError(error.InvalidConfig, secrets.Config.validate(.{ .native = .{ .backend = .distributed, .keyring_path = "${secret:cyclic}" } }));
+}
+
+test "secret backend publication identities distinguish competing deletes and read legacy collections" {
+    var empty = try collection.decode(alloc, "scope", null);
+    defer empty.deinit(alloc);
+    var keys = TestProvider{};
+    const envelope = try record.seal(alloc, std.testing.io, keys.provider(), .{ .scope = "scope", .key = "token", .revision = 1 }, "value");
+    defer alloc.free(envelope);
+    const initial = try collection.replace(alloc, std.testing.io, "scope", empty, "token", envelope);
+    defer alloc.free(initial);
+    var previous = try collection.decode(alloc, "scope", initial);
+    defer previous.deinit(alloc);
+    const first = try collection.replace(alloc, std.testing.io, "scope", previous, "token", null);
+    defer alloc.free(first);
+    const second = try collection.replace(alloc, std.testing.io, "scope", previous, "token", null);
+    defer alloc.free(second);
+    try std.testing.expect(!std.mem.eql(u8, first, second));
+    // AFSC v1 has the same fixed fields but no publication identity.
+    const legacy = try std.mem.concat(alloc, u8, &.{ first[0..20], first[36..] });
+    defer alloc.free(legacy);
+    std.mem.writeInt(u16, legacy[4..6], 1, .little);
+    var decoded = try collection.decode(alloc, "scope", legacy);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 2), decoded.revision);
+    try std.testing.expectEqualStrings("scope", try collection.storedScope(legacy));
+}
+
+test "secret backend S3 opening uses refreshable bootstrap credential sources" {
+    const support = @import("serverless/object_store_support.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "credentials", .data = "[native-test]\naws_access_key_id = native-access\naws_secret_access_key = native-secret\naws_session_token = native-session\n" });
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "credentials", alloc);
+    defer alloc.free(path);
+    var opened = try support.OpenedObjectStore.initS3UriWithS3AndOpenOptions(alloc, "secrets", "prefix", .{
+        .endpoint = "http://127.0.0.1:1",
+        .credential_source = .{ .profile = .{ .name = "native-test", .shared_credentials_file = path } },
+    }, .{ .ensure_bucket = false });
+    defer opened.deinit();
+    // The exact constructor used by native startup must also install a
+    // provider when no explicit options or static environment keys exist.
+    var defaults = try support.OpenedObjectStore.initRemoteUriWithS3AndOpenOptions(alloc, "s3://secrets/prefix", "unused", null, .{ .ensure_bucket = false });
+    defer defaults.deinit();
+    try std.testing.expect(defaults.s3_client.?.cfg.credential_provider != null);
+    const provider = opened.s3_client.?.cfg.credential_provider orelse return error.TestUnexpectedResult;
+    var credentials = try provider.get(alloc);
+    defer credentials.deinit(alloc);
+    try std.testing.expectEqualStrings("native-access", credentials.access_key_id);
+    try std.testing.expectEqualStrings("native-session", credentials.session_token.?);
+    var static = try support.OpenedObjectStore.initS3UriWithS3AndOpenOptions(alloc, "secrets", "prefix", .{
+        .endpoint = "http://127.0.0.1:1",
+        .access_key_id = "explicit",
+        .secret_access_key = "explicit-secret",
+    }, .{ .ensure_bucket = false });
+    defer static.deinit();
+    try std.testing.expect(static.s3_client.?.cfg.credential_provider == null);
+}
+
+test "secret backend follower API forwards encrypted PUT and DELETE through Raft" {
+    const runtime = @import("metadata/runtime.zig");
+    const time = @import("antfly_platform").time;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    var servers: [2]runtime.Server = undefined;
+    var facades: [2]secrets.FileStore = undefined;
+    var natives: [2]distributed.Store = undefined;
+    var keys: [2]TestProvider = .{ .{}, .{} };
+    var initialized: usize = 0;
+    defer for (0..initialized) |i| {
+        servers[i].deinit();
+        natives[i].deinit();
+        facades[i].deinit();
+    };
+    // Membership must be known to the descriptor factory before replicas open.
+    // Replace the placeholder transport addresses after binding ephemeral ports.
+    var peers = [_]runtime.MetadataClusterPeer{
+        .{ .node_id = 1, .raft_url = "http://127.0.0.1:1" },
+        .{ .node_id = 2, .raft_url = "http://127.0.0.1:1" },
+    };
+    for (0..2) |i| {
+        facades[i] = try secrets.FileStore.initConfiguredWithIo(alloc, std.testing.io, .{ .native = .{ .backend = .distributed, .scope = "scope", .keyring_path = "host-provider" }, .environment = false });
+        errdefer facades[i].deinit();
+        servers[i] = try runtime.Server.init(alloc, .{
+            .replica_root_dir = try std.fmt.allocPrint(a, "{s}/{d}/replicas", .{ root, i }),
+            .replica_catalog_path = try std.fmt.allocPrint(a, "{s}/{d}/catalog", .{ root, i }),
+            .snapshot_root_dir = try std.fmt.allocPrint(a, "{s}/{d}/snapshots", .{ root, i }),
+            .local_node_id = i + 1,
+            .metadata_group_id = 1,
+            .metadata_cluster_peers = &peers,
+            .secret_store = &facades[i],
+            .api_server_cfg = .{ .auth_enabled = false, .secret_store = &facades[i] },
+        });
+        errdefer servers[i].deinit();
+        natives[i] = try distributed.Store.init(alloc, std.testing.io, "scope", keys[i].provider(), .{ .service = servers[i].server.svc });
+        const handle = natives[i].nativeStore();
+        facades[i].attachNative(handle.source, handle.writer);
+        initialized += 1;
+    }
+    for (0..2) |i| {
+        try servers[i].start();
+        peers[i] = .{ .node_id = i + 1, .raft_url = try servers[i].baseUri(a), .orchestration_url = try servers[i].adminBaseUri(a) };
+    }
+    for (0..2) |i| try servers[i].bootstrapCluster(1, i + 1, &peers);
+    const Progress = struct {
+        servers: *[2]runtime.Server,
+        stop: std.atomic.Value(bool) = .init(false),
+        failed: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) void {
+            while (!self.stop.load(.acquire)) {
+                for (self.servers) |*server| server.runRaftRoundOnly() catch {
+                    self.failed.store(true, .release);
+                    return;
+                };
+                time.sleepNs(10 * std.time.ns_per_ms);
+            }
+        }
+    };
+    try servers[0].server.svc.campaignMetadataGroup();
+    var progress = Progress{ .servers = &servers };
+    const thread = try std.Thread.spawn(.{}, Progress.run, .{&progress});
+    defer {
+        progress.stop.store(true, .release);
+        thread.join();
+    }
+    const deadline = time.monotonicNs() + 10 * std.time.ns_per_s;
+    while (servers[0].server.svc.localMetadataLeadershipTerm() == null and time.monotonicNs() < deadline) time.sleepNs(10 * std.time.ns_per_ms);
+    try std.testing.expect(servers[0].server.svc.localMetadataLeadershipTerm() != null);
+    try std.testing.expect(servers[1].server.svc.localMetadataLeadershipTerm() == null);
+    const uri = try std.fmt.allocPrint(a, "{s}/db/v1/secrets/token", .{peers[1].orchestration_url.?});
+    var executor = @import("common/http/std_http_executor.zig").StdHttpExecutor.init(alloc, .{});
+    defer executor.deinit();
+    var put = try executor.executor().execute(alloc, .{ .method = .PUT, .uri = uri, .body = "{\"value\":\"follower-write\"}", .content_type = "application/json", .timeout_ms = 10_000 });
+    defer put.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), put.status);
+    var found = try natives[0].source().resolve(alloc, "scope", "token", .{ .min_revision = 1 });
+    defer found.deinit(alloc);
+    try std.testing.expectEqualStrings("follower-write", found.value.?.secret.bytes);
+    var deleted = try executor.executor().execute(alloc, .{ .method = .DELETE, .uri = uri, .timeout_ms = 10_000 });
+    defer deleted.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 204), deleted.status);
+    var absent = try natives[0].source().resolve(alloc, "scope", "token", .{ .min_revision = 2 });
+    defer absent.deinit(alloc);
+    try std.testing.expect(absent.value == null);
+    try std.testing.expect(servers[1].server.svc.localMetadataLeadershipTerm() == null);
+    try std.testing.expect(!progress.failed.load(.acquire));
 }

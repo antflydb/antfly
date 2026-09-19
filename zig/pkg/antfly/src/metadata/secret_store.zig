@@ -7,6 +7,7 @@ const std = @import("std");
 const collection = @import("../common/secret_collection.zig");
 const contract = @import("../common/secret_contract.zig");
 const service_mod = @import("service.zig");
+const time = @import("antfly_platform").time;
 
 pub const Store = collection.Store(Backend);
 pub const max_command_bytes = collection.max_bytes + 8;
@@ -16,9 +17,7 @@ pub const Publication = struct { expected_revision: u64, scope: []const u8, byte
 pub fn decodePublication(alloc: std.mem.Allocator, command: []const u8) !Publication {
     if (command.len < 28 or command.len > max_command_bytes) return error.CorruptInput;
     const bytes = command[8..];
-    const len = std.mem.readInt(u16, bytes[6..8], .little);
-    if (len > bytes.len - 20) return error.CorruptInput;
-    const scope = bytes[20..][0..len];
+    const scope = try collection.storedScope(bytes);
     var view = try collection.decode(alloc, scope, bytes);
     defer view.deinit(alloc);
     const expected = std.mem.readInt(u64, command[0..8], .little);
@@ -66,21 +65,31 @@ pub const Backend = struct {
         self.service.lockCatalogMutation();
         defer self.service.unlockCatalogMutation();
         try self.service.ensureLinearizableRead();
-        const term = self.service.localMetadataLeadershipTerm() orelse return error.Unavailable;
         const store = self.service.projectedStore() orelse return error.Unavailable;
         const current = try store.getSecretCollection(alloc, self.service.metadata_group_id, scope);
         defer if (current) |b| alloc.free(b);
         var view = try collection.decode(alloc, scope, current);
         defer view.deinit(alloc);
         if (view.revision != before.revision) return error.Conflict;
-        _ = self.service.proposeTransitionCommandAndWaitAppliedInTerm(.{ .publish_secret_collection = encoded }, term) catch return error.OutcomeUnknown;
-        // A committed log entry may have lost its deterministic CAS. A later
-        // leader may also supersede this commit before observation. Never turn
-        // an ambiguous accepted proposal into a safely retryable failure.
-        const applied = store.getSecretCollection(alloc, self.service.metadata_group_id, scope) catch return error.OutcomeUnknown;
-        defer if (applied) |b| alloc.free(b);
-        if (applied) |b| {
-            if (std.mem.eql(u8, b, bytes)) return;
+        // Raft forwards this ciphertext CAS from followers to the current
+        // leader. Do not require a local leader receipt or replay an ambiguous
+        // proposal. AFSC's random publication ID also distinguishes deletes.
+        self.service.proposeTransitionCommand(.{ .publish_secret_collection = encoded }) catch return error.OutcomeUnknown;
+        const deadline = time.monotonicNs() +| 5 * std.time.ns_per_s;
+        while (time.monotonicNs() < deadline) {
+            self.service.ensureLinearizableReadWithContext(.{ .deadline_ns = deadline }) catch return error.OutcomeUnknown;
+            const applied = store.getSecretCollection(alloc, self.service.metadata_group_id, scope) catch return error.OutcomeUnknown;
+            defer if (applied) |b| alloc.free(b);
+            if (applied) |b| {
+                if (std.mem.eql(u8, b, bytes)) return;
+            }
+            var observed = collection.decode(alloc, scope, applied) catch return error.OutcomeUnknown;
+            defer observed.deinit(alloc);
+            // At exactly the proposed revision, a different publication proves
+            // this CAS lost. A later revision could have overwritten our commit.
+            if (observed.revision == before.revision + 1) return error.Conflict;
+            if (observed.revision > before.revision + 1) return error.OutcomeUnknown;
+            time.sleepNs(std.time.ns_per_ms);
         }
         return error.OutcomeUnknown;
     }

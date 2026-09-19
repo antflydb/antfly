@@ -2137,7 +2137,7 @@ test "opaque metadata secret collection preserves binary ciphertext across owner
     defer alloc.free(envelope);
     var before = try collections.decode(alloc, "scope", null);
     defer before.deinit(alloc);
-    const collection = try collections.replace(alloc, "scope", before, "token", envelope);
+    const collection = try collections.replace(alloc, std.testing.io, "scope", before, "token", envelope);
     defer alloc.free(collection);
     // Transition tag 60 contains expected-revision (0) followed by AFSC.
     const transition = try alloc.alloc(u8, 6 + 4 + 8 + collection.len);

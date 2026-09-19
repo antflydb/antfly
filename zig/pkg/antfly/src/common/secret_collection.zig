@@ -10,7 +10,26 @@ const Allocator = std.mem.Allocator;
 
 pub const max_bytes = 8 * 1024 * 1024;
 pub const max_entries = 1024;
-const header_bytes = 20;
+const legacy_header_bytes = 20;
+const header_bytes = 36;
+
+fn headerSize(raw: []const u8) !usize {
+    if (raw.len < legacy_header_bytes or raw.len > max_bytes or !std.mem.eql(u8, raw[0..4], "AFSC")) return error.CorruptInput;
+    const size: usize = switch (std.mem.readInt(u16, raw[4..6], .little)) {
+        1 => legacy_header_bytes,
+        2 => header_bytes,
+        else => return error.UnsupportedVersion,
+    };
+    if (raw.len < size) return error.CorruptInput;
+    return size;
+}
+
+pub fn storedScope(raw: []const u8) ![]const u8 {
+    const size = try headerSize(raw);
+    const len = std.mem.readInt(u16, raw[6..8], .little);
+    if (len > raw.len - size) return error.CorruptInput;
+    return raw[size..][0..len];
+}
 
 pub const Snapshot = struct {
     bytes: ?[]u8 = null,
@@ -46,16 +65,15 @@ pub const View = struct {
 pub fn decode(alloc: Allocator, scope: []const u8, bytes: ?[]const u8) !View {
     try contract.validateName(scope);
     const raw = bytes orelse return .{ .revision = 0, .entries = try alloc.alloc(Entry, 0) };
-    if (raw.len < header_bytes or raw.len > max_bytes or !std.mem.eql(u8, raw[0..4], "AFSC")) return error.CorruptInput;
-    if (std.mem.readInt(u16, raw[4..6], .little) != 1) return error.UnsupportedVersion;
+    const size = try headerSize(raw);
     const scope_len = std.mem.readInt(u16, raw[6..8], .little);
     const revision = std.mem.readInt(u64, raw[8..16], .little);
     const count = std.mem.readInt(u32, raw[16..20], .little);
-    if (revision == 0 or count > max_entries or scope_len > raw.len - header_bytes) return error.CorruptInput;
-    if (!std.mem.eql(u8, scope, raw[header_bytes..][0..scope_len])) return error.CorruptInput;
+    if (revision == 0 or count > max_entries or scope_len > raw.len - size) return error.CorruptInput;
+    if (!std.mem.eql(u8, scope, raw[size..][0..scope_len])) return error.CorruptInput;
     const entries = try alloc.alloc(Entry, count);
     errdefer alloc.free(entries);
-    var offset: usize = header_bytes + scope_len;
+    var offset: usize = size + scope_len;
     for (entries, 0..) |*entry, i| {
         if (raw.len - offset < 4) return error.CorruptInput;
         const len = std.mem.readInt(u32, raw[offset..][0..4], .little);
@@ -72,7 +90,7 @@ pub fn decode(alloc: Allocator, scope: []const u8, bytes: ?[]const u8) !View {
     return .{ .revision = revision, .entries = entries };
 }
 
-pub fn replace(alloc: Allocator, scope: []const u8, previous: View, key: []const u8, envelope: ?[]const u8) ![]u8 {
+pub fn replace(alloc: Allocator, io: std.Io, scope: []const u8, previous: View, key: []const u8, envelope: ?[]const u8) ![]u8 {
     const revision = std.math.add(u64, previous.revision, 1) catch return error.Unavailable;
     const count = previous.entries.len - @as(usize, if (previous.find(key) != null) 1 else 0) + @as(usize, if (envelope != null) 1 else 0);
     if (count > max_entries) return error.ResourceRequestTooLarge;
@@ -84,7 +102,10 @@ pub fn replace(alloc: Allocator, scope: []const u8, previous: View, key: []const
     errdefer out.deinit(alloc);
     var header: [header_bytes]u8 = undefined;
     @memcpy(header[0..4], "AFSC");
-    std.mem.writeInt(u16, header[4..6], 1, .little);
+    std.mem.writeInt(u16, header[4..6], 2, .little);
+    // Distinguish even identical concurrent deletes when observing forwarded
+    // Raft publication. Only the exact prepared attempt may report success.
+    try io.randomSecure(header[20..36]);
     std.mem.writeInt(u16, header[6..8], @intCast(scope.len), .little);
     std.mem.writeInt(u64, header[8..16], revision, .little);
     std.mem.writeInt(u32, header[16..20], @intCast(count), .little);
@@ -223,7 +244,7 @@ pub fn Store(comptime Backend: type) type {
                 const revision = std.math.add(u64, previous.revision, 1) catch return error.Unavailable;
                 const envelope = if (value) |plaintext| try record.seal(alloc, self.io, self.provider, .{ .scope = scope, .key = key, .revision = revision }, plaintext) else null;
                 defer if (envelope) |bytes| alloc.free(bytes);
-                const bytes = try replace(alloc, scope, previous, key, envelope);
+                const bytes = try replace(alloc, self.io, scope, previous, key, envelope);
                 defer alloc.free(bytes);
                 self.backend.publish(alloc, scope, snapshot, bytes) catch |err| switch (err) {
                     error.Conflict => continue,
