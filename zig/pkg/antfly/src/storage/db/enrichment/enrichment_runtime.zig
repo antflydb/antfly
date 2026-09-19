@@ -3955,6 +3955,16 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             return RuntimeError.EnrichmentWorkerFailed;
     }
 
+    /// Explicit drains have no visibility deadline, but must still report
+    /// terminal request failures rather than treating parked repair debt as success.
+    pub fn catchUpUntilForDrain(self: *@This(), sequence: u64) !void {
+        if (sequence == 0) return;
+        const after = self.applied_sequence;
+        try self.catchUpUntil(sequence);
+        if (terminalFailurePendingInRange(self, terminalFailureEnvelopeSnapshot(self), after, sequence))
+            return RuntimeError.EnrichmentWorkerFailed;
+    }
+
     pub fn catchUpUntil(self: *@This(), sequence: u64) !void {
         try self.catchUpUntilGuarded(sequence, .{});
     }
@@ -4653,6 +4663,22 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
                 );
             }
         }
+    }
+
+    /// Run without a visibility deadline while preserving the wait API's
+    /// durable terminal-failure check, including already-applied prefixes.
+    pub fn catchUpUntilForDrain(self: *EnrichmentRuntime, sequence: u64) !void {
+        if (sequence == 0) return;
+        const io = (self.io_impl orelse return error.MissingBackendRuntimeIo).io();
+        self.mutex.lockUncancelable(io);
+        const after = self.applied_sequence;
+        self.mutex.unlock(io);
+        try self.catchUpUntil(sequence);
+        self.mutex.lockUncancelable(io);
+        const envelope = terminalFailureEnvelopeSnapshot(self);
+        self.mutex.unlock(io);
+        if (terminalFailurePendingInRange(self, envelope, after, sequence))
+            return RuntimeError.EnrichmentWorkerFailed;
     }
 
     pub fn catchUpUntil(self: *EnrichmentRuntime, sequence: u64) !void {
@@ -29254,4 +29280,36 @@ test "extractSourceText with template and scrubHtml helper" {
     const result = try extractSourceText(alloc, .{}, doc, request) orelse return error.TestUnexpectedResult;
     defer alloc.free(result);
     try std.testing.expectEqualStrings("HelloWorld", result);
+}
+
+test "enrichment terminal failure envelope is preserved by unbounded drains" {
+    var io_impl = Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    var runtime = EnrichmentRuntime{
+        .alloc = std.testing.allocator,
+        .io_impl = .{ .borrowed = io_impl.io() },
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{},
+        .ownership = undefined,
+        .applied_sequence = 10,
+        .target_sequence = 10,
+        .terminal_failure_min_sequence = 10,
+        .terminal_failure_max_sequence = 10,
+    };
+    // Terminal request failures do not fail the worker; applied alone cannot
+    // distinguish successfully generated output from durable repair debt.
+    try std.testing.expectError(error.EnrichmentWorkerFailed, runtime.waitForApplied(10));
+    try std.testing.expectError(error.EnrichmentWorkerFailed, runtime.catchUpUntilForDrain(10));
+    try runtime.catchUpUntilForDrain(9);
+    runtime.terminal_failure_min_sequence = 0;
+    runtime.terminal_failure_max_sequence = 0;
+    try runtime.catchUpUntilForDrain(10);
 }

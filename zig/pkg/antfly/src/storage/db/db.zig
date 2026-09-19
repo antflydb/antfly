@@ -27860,6 +27860,11 @@ pub const DB = struct {
         truncate_replay: bool = true,
         wait_for_enrichment_retries: bool = false,
         cancellation: types.CancellationToken = .none,
+        /// Run the foreground enrichment catch-up pass to full completion
+        /// instead of bounding it at the request-visibility default
+        /// (`sync_wait_timeout_ms`, 5 minutes). Only `runUntilIdle` sets
+        /// this; see `runEnrichmentUntilForDrainUnbounded`.
+        unbounded_enrichment_wait: bool = false,
     };
 
     fn runDerivedUntilWithOptions(self: *DB, sequence: u64, options: ReplayDrainOptions) !void {
@@ -27950,9 +27955,39 @@ pub const DB = struct {
         }
     }
 
+    /// Unlike `runEnrichmentUntilWithVisibilityDeadline`, never substitutes
+    /// the request-visibility default (`sync_wait_timeout_ms`, 5 minutes)
+    /// when no deadline is supplied, even when `optional_runtime_workers_enabled`
+    /// -- worker-mode's `waitForAppliedWithVisibilityDeadline` only passively
+    /// waits for a separate background worker to make progress and bounds
+    /// that wait unconditionally when `deadline_ns` is null. `runUntilIdle`
+    /// (Lite's synchronous ingest drain, in particular) never supplies a
+    /// deadline and must run the foreground catch-up pass itself until the
+    /// full enrichment backlog clears, however long that legitimately takes,
+    /// not silently truncate at 5 minutes and surface a slow-but-progressing
+    /// drain as a hard failure. Scoped to `runUntilIdle`'s own drain call
+    /// (via `ReplayDrainOptions.unbounded_enrichment_wait`) rather than
+    /// `runEnrichmentUntilWithVisibilityDeadline` generally: other callers
+    /// (plain `runEnrichmentUntil`, `runMaintenanceUntil`, request-visibility
+    /// barriers) still rely on the passive bounded wait deferring to that
+    /// background worker, and forcing them through inline foreground
+    /// execution instead changed observable enrichment-worker ownership
+    /// behavior (see the `TestLiteHostedPauseResumeGeneratedEnrichment`
+    /// regression this scoping fixes).
+    fn runEnrichmentUntilForDrainUnbounded(self: *DB, sequence: u64) !void {
+        if (sequence == 0) return;
+        const runtime = self.enrichment_runtime orelse return;
+        runtime.notifySequence(sequence);
+        try runtime.catchUpUntilForDrain(sequence);
+    }
+
     fn runEnrichmentUntilForDrain(self: *DB, sequence: u64, options: ReplayDrainOptions) !void {
         while (true) {
-            self.runEnrichmentUntilWithCancellation(sequence, options.cancellation) catch |err| switch (err) {
+            const outcome = if (options.unbounded_enrichment_wait and options.cancellation.ptr == null)
+                self.runEnrichmentUntilForDrainUnbounded(sequence)
+            else
+                self.runEnrichmentUntilWithCancellation(sequence, options.cancellation);
+            outcome catch |err| switch (err) {
                 error.EnrichmentRetryInProgress => {
                     if (!options.wait_for_enrichment_retries) return err;
                     sleepNs(25 * std.time.ns_per_ms);
@@ -29185,7 +29220,10 @@ pub const DB = struct {
     }
 
     pub fn runUntilIdle(self: *DB) !void {
-        try self.runUntilIdleWithReplayDrainOptions(.{ .wait_for_enrichment_retries = true });
+        try self.runUntilIdleWithReplayDrainOptions(.{
+            .wait_for_enrichment_retries = true,
+            .unbounded_enrichment_wait = true,
+        });
     }
 
     /// Resident managed writers already have an asynchronous enrichment owner.
@@ -92648,6 +92686,8 @@ test "db foreign inference provider failure releases enrichment waiter as termin
         error.EnrichmentWorkerFailed,
         db.enrichment_runtime.?.waitForApplied(sequence),
     );
+
+    try std.testing.expectError(error.EnrichmentWorkerFailed, db.runUntilIdle());
 
     const stats = db.enrichment_runtime.?.stats();
     try std.testing.expectEqual(sequence, stats.applied_sequence);
