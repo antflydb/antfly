@@ -18,6 +18,7 @@ const resources = @import("../resource_manager.zig");
 const abi = @import("kernel_owner_abi").completion_pool;
 const wal = @import("wal.zig");
 const Allocator = std.mem.Allocator;
+pub const maintenance = @import("completion_maintenance.zig");
 
 pub const max_slots = completion.max_slots;
 pub const accepted_filenames = [_][]const u8{

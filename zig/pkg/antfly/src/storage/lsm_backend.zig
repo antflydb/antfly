@@ -26,6 +26,7 @@ const lsm_table_file = @import("lsm/table_file.zig");
 const state_mod = @import("lsm_backend/state.zig");
 const completion_allocator = @import("lsm_backend/completion_allocator.zig");
 pub const completion_pool_mod = @import("lsm_backend/completion_pool.zig");
+pub const completion_maintenance_mod = @import("lsm_backend/completion_maintenance.zig");
 const completion_runtime = @import("lsm_backend/completion_runtime.zig");
 pub const completion_slot_codec = @import("lsm_backend/completion_slot.zig");
 const repository_mod = @import("lsm_backend/repository.zig");
