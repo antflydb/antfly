@@ -704,6 +704,86 @@ pub const TxnManager = struct {
         try self.initTransactionWithParticipantsCreatedAt(txn_id, timestamp, timestamp, participants);
     }
 
+    pub const ControlInput = struct {
+        txn_id: TxnId,
+        action: union(enum) {
+            resolve_metadata: struct { status: TxnStatus, timestamp: u64 },
+            acknowledge: []const u8,
+            cleanup: struct { cutoff: u64, retained_cutoff: u64 },
+        },
+    };
+
+    /// Compile the real metadata-only decision, acknowledgement, and cleanup
+    /// implementations without publishing any primary state. Prepared document
+    /// resolution continues to use its preowned outcome template. This produces
+    /// a physical candidate only: a distinct retained control owner must supply
+    /// acceptance authority and future completion capacity before DATA uses it.
+    pub fn compileControlMutation(
+        self: *TxnManager,
+        alloc: Allocator,
+        snapshot: *backend_erased.ReadTxn,
+        input: ControlInput,
+        authority: @import("completion_candidate.zig").Authority,
+        input_digest: [32]u8,
+        profile_fence: []const u8,
+        additional_dependencies: []const []const u8,
+    ) ![]u8 {
+        var overlay = try completion_compiler.Overlay.init(alloc, snapshot, .{ .max_operations = 256, .max_bytes = 256 * 1024 });
+        defer overlay.deinit();
+        var private: TxnManager = .{ .store = overlay.store(), .owns_store = false, .alloc = alloc, .completion_limits = self.completion_limits };
+        if (private.completion_limits.enabled() and try private.completionUsage() == null)
+            return error.TransactionRecoveryReconciliationRequired;
+        if (try private.hasHAOutbox(input.txn_id)) return error.UnsupportedCompletionProfile;
+        const record: ?TxnRecord = private.loadTransactionRecord(input.txn_id) catch |err| switch (err) {
+            error.TxnNotFound => null,
+            else => return err,
+        };
+        switch (input.action) {
+            .resolve_metadata => |resolve| {
+                if (resolve.status == .pending or resolve.timestamp == 0) return error.InvalidArgument;
+                const current = record orelse return error.TxnNotFound;
+                // Every supported intent producer advances the record revision.
+                // Certify that point dependency and the admission sidecar; never
+                // infer an empty intent prefix merely because a scan is absent.
+                if (!current.prepared_known or current.prepared or current.intent_revision != 0 or current.replay_sequence != 0)
+                    return error.UnsupportedCompletionProfile;
+                if (try private.loadIntentAdmission(alloc, input.txn_id)) |admission| {
+                    if (admission.count != 0 or admission.bytes != 0) return error.UnsupportedCompletionProfile;
+                }
+                _ = try private.resolveIntentsWithExtraBatch(input.txn_id, resolve.status, resolve.timestamp, .{
+                    .known_intent_keys = &.{},
+                    .expected_intent_revision = 0,
+                });
+            },
+            .acknowledge => |participant| {
+                const current = record orelse return error.TxnNotFound;
+                if (current.status == .pending or !current.intents_resolved_known or !current.intents_resolved)
+                    return error.UnsupportedCompletionProfile;
+                try private.markParticipantResolved(input.txn_id, participant);
+            },
+            .cleanup => |cleanup| {
+                if (record) |current| {
+                    if (current.status != .pending) {
+                        if (!current.intents_resolved_known or !current.intents_resolved)
+                            return error.UnsupportedCompletionProfile;
+                        _ = try private.cleanupTransactionMetadataIfEligible(input.txn_id, cleanup.cutoff, cleanup.retained_cutoff);
+                    }
+                    // A pending record cannot be cleaned regardless of its
+                    // intents. Its certified record alone proves the no-op.
+                } else _ = try private.cleanupTransactionMetadataIfEligible(input.txn_id, cleanup.cutoff, cleanup.retained_cutoff);
+            },
+        }
+        if (overlay.log.count == 0) {
+            // Even a no-op may be assigned a new consensus identity. Preserve
+            // the exact point state; an absent cleanup must not invent a record.
+            const key = makeRecordKey(input.txn_id);
+            if (record != null) {
+                try overlay.log.put(&key, try snapshot.get(&key));
+            } else try overlay.log.delete(&key);
+        }
+        return @import("completion_candidate.zig").encodeMutationPlan(alloc, authority, input_digest, profile_fence, lsm_backend.Backend.durable_completion_limits, snapshot, &overlay.log, overlay.baseline_reads.items, additional_dependencies);
+    }
+
     pub fn initTransactionWithParticipantsCreatedAt(
         self: *TxnManager,
         txn_id: TxnId,
@@ -3091,6 +3171,104 @@ fn rebindCompiledTemplateForTest(template: *completion_compiler.Template, timest
         });
         std.mem.writeInt(u64, target[binding.offset..][0..8], value, if (binding.byte_order == .little) .little else .big);
     };
+}
+
+test "workload admission completion compiler metadata controls match actual decision acknowledgements and cleanup" {
+    const alloc = std.testing.allocator;
+    const candidate = @import("completion_candidate.zig");
+    const entry_codec = @import("lsm_backend/completion_entry.zig");
+    const authority: candidate.Authority = .{
+        .group_id = 9,
+        .incarnation = @splat(3),
+        .policy_digest = @splat(4),
+        .schema_catalog_digest = @splat(5),
+        .previous_term = 2,
+        .previous_index = 17,
+    };
+    const Check = struct {
+        fn step(manager: *TxnManager, input: TxnManager.ControlInput) !void {
+            const before = try backend_scan.scanPrefix(alloc, &manager.store, "");
+            defer backend_scan.freeResults(alloc, before);
+            const wire = blk: {
+                var snapshot = try manager.store.beginRead();
+                defer snapshot.abort();
+                const first = try manager.compileControlMutation(alloc, &snapshot, input, authority, @splat(6), "control-test", &.{});
+                errdefer alloc.free(first);
+                const duplicate = try manager.compileControlMutation(alloc, &snapshot, input, authority, @splat(6), "control-test", &.{});
+                defer alloc.free(duplicate);
+                try std.testing.expectEqualSlices(u8, first, duplicate);
+                break :blk first;
+            };
+            defer alloc.free(wire);
+            var plan = try completion_mutations.Plan.init(alloc, .{ .max_operations = 256, .max_bytes = 256 * 1024 });
+            defer plan.deinit();
+            // Compilation must leave the complete store unchanged, including
+            // shared completion counters and participant metadata.
+            try expectResolutionInspectionMatchesStore(alloc, before, &plan, &manager.store);
+            var decoded = try entry_codec.decode(alloc, wire);
+            defer decoded.deinit();
+            try std.testing.expectEqual(.mutation, decoded.entry.kind);
+            try std.testing.expect(decoded.decoded_descriptor.descriptor.commit.len == 0 and decoded.decoded_descriptor.descriptor.abort.len == 0);
+            for (decoded.entry.prepare_operations) |op| {
+                try std.testing.expectEqual(@as(usize, 0), op.bindings.len);
+                switch (op.kind) {
+                    .put => try plan.put(op.key, op.value),
+                    .delete => try plan.delete(op.key),
+                }
+            }
+            switch (input.action) {
+                .resolve_metadata => |value| _ = try manager.resolveIntentsWithExtraBatch(input.txn_id, value.status, value.timestamp, .{ .known_intent_keys = &.{}, .expected_intent_revision = 0 }),
+                .acknowledge => |participant| try manager.markParticipantResolved(input.txn_id, participant),
+                .cleanup => |value| _ = try manager.cleanupTransactionMetadataIfEligible(input.txn_id, value.cutoff, value.retained_cutoff),
+            }
+            try expectResolutionInspectionMatchesStore(alloc, before, &plan, &manager.store);
+        }
+    };
+    for ([_]TxnStatus{ .committed, .aborted }) |status| {
+        for ([_]bool{ false, true }) |prepared| {
+            var backend = lsm_backend.Backend.init(alloc, .{});
+            defer backend.close();
+            var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+            defer store.close();
+            var manager = try TxnManager.init(alloc, &store);
+            defer manager.deinit();
+            manager.completion_limits = .{ .max_count = 4, .max_bytes = 1024 * 1024, .max_transaction_bytes = 64 * 1024 };
+            const id: TxnId = @splat(201);
+            const participants = [_][]const u8{ "coordinator", "left", "right" };
+            try manager.initTransactionWithParticipantsCreatedAtRoleAndRetention(id, 100, 90, &participants, true, true);
+            try Check.step(&manager, .{ .txn_id = id, .action = .{ .cleanup = .{ .cutoff = 1000, .retained_cutoff = 1000 } } });
+            const decision: TxnManager.ControlInput = .{ .txn_id = id, .action = .{ .resolve_metadata = .{ .status = status, .timestamp = 200 } } };
+            if (prepared) {
+                try manager.writeIntents(id, &.{.{ .key = "doc", .value = "value" }}, &.{});
+                {
+                    var snapshot = try manager.store.beginRead();
+                    defer snapshot.abort();
+                    try std.testing.expectError(error.UnsupportedCompletionProfile, manager.compileControlMutation(alloc, &snapshot, decision, authority, @splat(6), "control-test", &.{}));
+                }
+                // Document outcomes keep their existing prepared owner. Only
+                // subsequent acknowledgement metadata uses this compiler.
+                try manager.resolveIntents(id, status, 200);
+            } else {
+                try Check.step(&manager, decision);
+                try Check.step(&manager, decision);
+            }
+            {
+                var snapshot = try manager.store.beginRead();
+                defer snapshot.abort();
+                try std.testing.expectError(error.InvalidParticipant, manager.compileControlMutation(alloc, &snapshot, .{ .txn_id = id, .action = .{ .acknowledge = "not-enlisted" } }, authority, @splat(6), "control-test", &.{}));
+            }
+            for (participants) |participant| {
+                const ack: TxnManager.ControlInput = .{ .txn_id = id, .action = .{ .acknowledge = participant } };
+                try Check.step(&manager, ack);
+                try Check.step(&manager, ack);
+            }
+            try std.testing.expectEqual(@as(u64, 0), (try manager.completionUsage()).?.count);
+            try Check.step(&manager, .{ .txn_id = id, .action = .{ .cleanup = .{ .cutoff = 100, .retained_cutoff = 100 } } });
+            try Check.step(&manager, .{ .txn_id = id, .action = .{ .cleanup = .{ .cutoff = 1000, .retained_cutoff = 1000 } } });
+            try Check.step(&manager, .{ .txn_id = id, .action = .{ .cleanup = .{ .cutoff = 1000, .retained_cutoff = 1000 } } });
+            try std.testing.expectError(error.TxnNotFound, manager.loadTransactionRecord(id));
+        }
+    }
 }
 
 test "workload admission completion compiler prepares privately and matches both real outcomes after rebinding" {

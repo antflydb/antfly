@@ -85,6 +85,18 @@ prerequisites are implemented and verified.
   abort-before-prepare, metadata-only coordinator decisions, and named ACKs
   after local resolution still need retained control ownership. Named prepares
   remain restricted and production activation remains disabled.
+- The metadata-control compiler now runs actual transaction-manager decision,
+  acknowledgement, and cleanup logic on the bounded read-only overlay. It
+  handles abort-before-prepare and metadata-only commit, terminal named ACKs
+  after both prepared and unprepared outcomes, duplicate controls, retained
+  terminal history, and already-absent cleanup without inventing a record.
+  The owning gate passed 31 tests, including complete physical-state comparison
+  against independently applied control operations for commit/abort and
+  prepared/unprepared lifecycles, unchanged backing state during compilation,
+  repeatable candidate bytes, and rejection of prepared document resolution
+  or unlisted participants. This is physical-plan compilation, not completed
+  control reservation: DATA routing and replay-free publication must wait for
+  independent control ownership retained from begin through the final ACK.
 - The owning durable-completion gate subsequently passed 29 tests, including
   six actual child-process kills: document and named-begin mutations stopped
   after acceptance, primary WAL append, and manifest publication. The parent
