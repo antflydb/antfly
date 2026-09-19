@@ -182,7 +182,16 @@ fn writeOriginalReplayHintEntries(txn: anytype, sequence: u64, mask: u8, payload
     }
 }
 
-fn writeReplayEntries(alloc: Allocator, txn: anytype, sequence: u64, payload: []const u8) !void {
+/// Emit the ordered physical puts used by a replay append without opening a
+/// transaction. The sink supplies `put(key, value) !void` and must consume or
+/// copy both borrowed slices before returning. No sink reference is retained.
+/// The caller owns atomicity: a failure can follow earlier successful puts.
+/// Rejects a sequence without a representable successor before emitting puts.
+/// Invalid hint headers emit only the all-lane record; failed record decoding
+/// preserves the existing original-payload lane fallback, including on OOM.
+/// This enumerator neither reserves resources nor certifies completion.
+pub fn emitReplayMutations(alloc: Allocator, txn: anytype, sequence: u64, payload: []const u8) !void {
+    if (sequence == std.math.maxInt(u64)) return error.InvalidReplaySequence;
     try txn.put(internal_keys.replay_meta_init_key[0..], "");
     const next_raw = encodeReplayNextSequence(sequence + 1);
     try txn.put(internal_keys.replay_meta_next_sequence_key[0..], next_raw[0..]);
@@ -894,7 +903,7 @@ pub const DocStore = struct {
             }
 
             pub fn setReplayOpaque(self: @This(), sequence: u64, payload: []const u8) !void {
-                try writeReplayEntries(self.alloc, self, sequence, payload);
+                try emitReplayMutations(self.alloc, self, sequence, payload);
             }
         };
 
@@ -3664,6 +3673,107 @@ test "docstore lmdb replay rows use replay keyspace" {
         std.testing.allocator.free(remaining);
     }
     try std.testing.expectEqual(@as(usize, 0), remaining.len);
+}
+
+test "docstore replay mutation sink matches physical apply and preserves ordered failure" {
+    const alloc = std.testing.allocator;
+    const Collector = struct {
+        items: std.ArrayListUnmanaged(OwnedKVPair) = .empty,
+        fail_at: ?usize = null,
+        calls: usize = 0,
+
+        pub fn put(self: *@This(), key: []const u8, value: []const u8) !void {
+            const index = self.calls;
+            self.calls += 1;
+            if (self.fail_at == index) return error.InjectedSinkFailure;
+            const owned_key = try std.testing.allocator.dupe(u8, key);
+            errdefer std.testing.allocator.free(owned_key);
+            const owned_value = try std.testing.allocator.dupe(u8, value);
+            errdefer std.testing.allocator.free(owned_value);
+            try self.items.append(std.testing.allocator, .{ .key = owned_key, .value = owned_value });
+        }
+
+        fn deinit(self: *@This()) void {
+            for (self.items.items) |entry| {
+                std.testing.allocator.free(entry.key);
+                std.testing.allocator.free(entry.value);
+            }
+            self.items.deinit(std.testing.allocator);
+        }
+    };
+    const hints = [_]change_journal_mod.TargetHint{ .full_text, .dense_vector, .sparse_vector, .algebraic };
+    var rejected: Collector = .{};
+    defer rejected.deinit();
+    try std.testing.expectError(error.InvalidReplaySequence, emitReplayMutations(alloc, &rejected, std.math.maxInt(u64), "opaque"));
+    try std.testing.expectEqual(@as(usize, 0), rejected.calls);
+    const binary_key = "doc:\x00\xff:bounded";
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    var expected_count: usize = 0;
+    for ([_]u64{ 7, 8 }, 0..) |sequence, fixture| {
+        const payload = try change_journal_mod.encodeRecord(alloc, .{
+            .sequence = sequence,
+            .changed_doc_keys = &.{binary_key},
+            .overwritten_doc_keys = &.{binary_key},
+            .target_hints = if (fixture == 0) &.{} else &hints,
+        });
+        defer alloc.free(payload);
+        var collected: Collector = .{};
+        defer collected.deinit();
+        try emitReplayMutations(alloc, &collected, sequence, payload);
+        try std.testing.expectEqual(@as(usize, if (fixture == 0) 4 else 12), collected.items.items.len);
+        try std.testing.expectEqualSlices(u8, &internal_keys.replay_meta_init_key, collected.items.items[0].key);
+        try std.testing.expectEqualSlices(u8, &internal_keys.replay_meta_next_sequence_key, collected.items.items[1].key);
+        try std.testing.expectEqual(sequence + 1, std.mem.readInt(u64, collected.items.items[1].value[0..8], .little));
+        try std.testing.expectEqualSlices(u8, &internal_keys.replayEntryKey(internal_keys.replay_all_kind, sequence), collected.items.items[2].key);
+        try std.testing.expectEqualSlices(u8, payload, collected.items.items[2].value);
+        try std.testing.expectEqualSlices(u8, &internal_keys.replayLatestSequenceKey(internal_keys.replay_all_kind), collected.items.items[3].key);
+        if (fixture != 0) for (hints, 0..) |hint, i| {
+            const entry = collected.items.items[4 + i * 2];
+            try std.testing.expectEqualSlices(u8, &internal_keys.replayEntryKey(replayHintOrdinal(hint), sequence), entry.key);
+            try std.testing.expectEqualSlices(u8, &internal_keys.replayLatestSequenceKey(replayHintOrdinal(hint)), collected.items.items[5 + i * 2].key);
+            var decoded = try change_journal_mod.decodeRecord(alloc, entry.value);
+            defer decoded.deinit();
+            try std.testing.expectEqual(sequence, decoded.record.sequence);
+            try std.testing.expectEqualSlices(change_journal_mod.TargetHint, &.{hint}, decoded.record.target_hints);
+            try std.testing.expectEqualSlices(u8, binary_key, decoded.record.changed_doc_keys[0]);
+            try std.testing.expectEqualSlices(u8, binary_key, decoded.record.overwritten_doc_keys[0]);
+        };
+
+        // Read every physical row back from the real DocStore path. Count all
+        // replay keys as well, so extra expansion cannot hide behind point gets.
+        try store.putBatchWithReplay(null, &.{}, &.{}, .{ .sequence = sequence, .payload = payload });
+        for (collected.items.items) |entry| {
+            const value = try store.get(alloc, entry.key);
+            defer alloc.free(value);
+            try std.testing.expectEqualSlices(u8, entry.value, value);
+        }
+        expected_count += collected.items.items.len - (if (fixture == 0) @as(usize, 0) else 3);
+        const physical = try store.scanPrefix(alloc, &.{internal_keys.replay_namespace});
+        defer {
+            for (physical) |entry| {
+                alloc.free(entry.key);
+                alloc.free(entry.value);
+            }
+            alloc.free(physical);
+        }
+        try std.testing.expectEqual(expected_count, physical.len);
+        try std.testing.expectEqual(sequence + 1, store.nextReplaySequence(1));
+
+        for (0..collected.items.items.len) |failure_index| {
+            var failed: Collector = .{ .fail_at = failure_index };
+            defer failed.deinit();
+            try std.testing.expectError(error.InjectedSinkFailure, emitReplayMutations(alloc, &failed, sequence, payload));
+            try std.testing.expectEqual(failure_index + 1, failed.calls);
+            try std.testing.expectEqual(failure_index, failed.items.items.len);
+            for (failed.items.items, collected.items.items[0..failure_index]) |actual, expected| {
+                try std.testing.expectEqualSlices(u8, expected.key, actual.key);
+                try std.testing.expectEqualSlices(u8, expected.value, actual.value);
+            }
+        }
+    }
 }
 
 test "docstore indexes replay rows by hint and truncates them" {
