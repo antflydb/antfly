@@ -9,14 +9,17 @@ from ...models.inference_error import InferenceError
 from ...models.inference_rerank_request import InferenceRerankRequest
 from ...models.inference_rerank_response import InferenceRerankResponse
 from ...models.inference_transient_capacity_error import InferenceTransientCapacityError
-from ...types import Response
+from ...types import UNSET, Response, Unset
 
 
 def _get_kwargs(
     *,
     body: InferenceRerankRequest,
+    accept: str | Unset = UNSET,
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
+    if not isinstance(accept, Unset):
+        headers["Accept"] = accept
 
     _kwargs: dict[str, Any] = {
         "method": "post",
@@ -85,6 +88,7 @@ def sync_detailed(
     *,
     client: AuthenticatedClient | Client,
     body: InferenceRerankRequest,
+    accept: str | Unset = UNSET,
 ) -> Response[InferenceError | InferenceRerankResponse | InferenceTransientCapacityError]:
     """Rerank prompts by relevance
 
@@ -116,6 +120,7 @@ def sync_detailed(
     `lib/reranking` package which handles rendering before calling this endpoint.
 
     Args:
+        accept (str | Unset):
         body (InferenceRerankRequest):
 
     Raises:
@@ -128,6 +133,7 @@ def sync_detailed(
 
     kwargs = _get_kwargs(
         body=body,
+        accept=accept,
     )
 
     response = client.get_httpx_client().request(
@@ -141,6 +147,7 @@ def sync(
     *,
     client: AuthenticatedClient | Client,
     body: InferenceRerankRequest,
+    accept: str | Unset = UNSET,
 ) -> InferenceError | InferenceRerankResponse | InferenceTransientCapacityError | None:
     """Rerank prompts by relevance
 
@@ -172,6 +179,7 @@ def sync(
     `lib/reranking` package which handles rendering before calling this endpoint.
 
     Args:
+        accept (str | Unset):
         body (InferenceRerankRequest):
 
     Raises:
@@ -185,6 +193,7 @@ def sync(
     return sync_detailed(
         client=client,
         body=body,
+        accept=accept,
     ).parsed
 
 
@@ -192,6 +201,7 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient | Client,
     body: InferenceRerankRequest,
+    accept: str | Unset = UNSET,
 ) -> Response[InferenceError | InferenceRerankResponse | InferenceTransientCapacityError]:
     """Rerank prompts by relevance
 
@@ -223,6 +233,7 @@ async def asyncio_detailed(
     `lib/reranking` package which handles rendering before calling this endpoint.
 
     Args:
+        accept (str | Unset):
         body (InferenceRerankRequest):
 
     Raises:
@@ -235,6 +246,7 @@ async def asyncio_detailed(
 
     kwargs = _get_kwargs(
         body=body,
+        accept=accept,
     )
 
     response = await client.get_async_httpx_client().request(**kwargs)
@@ -246,6 +258,7 @@ async def asyncio(
     *,
     client: AuthenticatedClient | Client,
     body: InferenceRerankRequest,
+    accept: str | Unset = UNSET,
 ) -> InferenceError | InferenceRerankResponse | InferenceTransientCapacityError | None:
     """Rerank prompts by relevance
 
@@ -277,6 +290,7 @@ async def asyncio(
     `lib/reranking` package which handles rendering before calling this endpoint.
 
     Args:
+        accept (str | Unset):
         body (InferenceRerankRequest):
 
     Raises:
@@ -291,5 +305,6 @@ async def asyncio(
         await asyncio_detailed(
             client=client,
             body=body,
+            accept=accept,
         )
     ).parsed
