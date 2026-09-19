@@ -221,6 +221,7 @@ comptime {
     _ = @import("lite/native.zig");
     _ = @import("lite/paths.zig");
     _ = @import("lite/restore_staging.zig");
+    _ = @import("lite/secret_store.zig");
     _ = @import("local_write.zig");
     _ = @import("lmdb.zig");
     _ = @import("lmdb_backend.zig");
