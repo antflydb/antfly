@@ -262,7 +262,14 @@ fn listFileNamesAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8) !
     else
         try std.fmt.allocPrint(allocator, "{s}/", .{directory});
     defer allocator.free(prefix);
-    var cursor = try self.docs.file.indexCatalogDirectoryCursor(checkpoint, prefix);
+    // Only scoped stores validate every path component. The unscoped adapter
+    // also accepts repeated/trailing separators, whose dirname semantics can
+    // make a raw descendant key an immediate file. Preserve those keys through
+    // the general prefix cursor rather than skipping their byte ranges.
+    var cursor = if (self.namespace_prefix.len != 0)
+        try self.docs.file.indexCatalogDirectoryCursor(checkpoint, prefix)
+    else
+        try self.docs.file.indexCatalogCursor(checkpoint, prefix);
     defer cursor.deinit();
     var names = std.ArrayListUnmanaged([]u8).empty;
     errdefer {
@@ -1199,7 +1206,7 @@ test "lite native directory cursor skips large subtrees and preserves boundary f
     {
         var docs = try docstore.Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io });
         defer docs.close();
-        var indexes = Store.init(alloc, &docs);
+        var indexes = Store.initWithNamespace(alloc, &docs, "/a");
         const storage = indexes.storage();
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
@@ -1220,7 +1227,8 @@ test "lite native directory cursor skips large subtrees and preserves boundary f
         try std.testing.expectEqual(expected.len, names.len);
         for (expected, names) |want, got| try std.testing.expectEqualStrings(want, got);
         try std.testing.expect(docs.file.test_page_reads.load(.monotonic) - reads <= 40);
-        const root_names = try storage.listFileNamesAlloc(alloc, "/");
+        var unscoped = Store.init(alloc, &docs);
+        const root_names = try unscoped.storage().listFileNamesAlloc(alloc, "/");
         defer StorageIo.freeFileNames(alloc, root_names);
         try std.testing.expectEqual(@as(usize, 2), root_names.len);
         try std.testing.expectEqualStrings("a", root_names[0]);
@@ -1240,7 +1248,7 @@ test "lite native directory cursor skips large subtrees and preserves boundary f
     }
     var reopened = try docstore.Store.open(alloc, path, true);
     defer reopened.close();
-    var indexes = Store.init(alloc, &reopened);
+    var indexes = Store.initWithNamespace(alloc, &reopened, "/a");
     const names = try indexes.storage().listFileNamesAlloc(alloc, "/a");
     defer StorageIo.freeFileNames(alloc, names);
     try std.testing.expectEqual(@as(usize, 5), names.len);
@@ -1313,5 +1321,67 @@ test "lite native atomic imports batch writes and preserve publication on failed
     const buffered = (try reopened.file.getIndexCatalogRecordAlloc(alloc, "/buffered")).?;
     defer alloc.free(buffered);
     try std.testing.expectEqualSlices(u8, bytes[0..32000], buffered);
+    try std.testing.expect((try reopened.file.check()).valid);
+}
+
+test "lite native unscoped listings preserve accepted non-normalized keys" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "unscoped-path-listing.aflite");
+    defer alloc.free(path);
+    const keys = [_][]const u8{
+        "/a//file",
+        "/a/file/",
+        // '!' sorts before '/', so a descendant can precede the trailing
+        // separator alias. Merely trimming the first encountered key would
+        // still skip the alias when jumping over this subtree.
+        "/a/dir/!nested",
+        "/a/dir//",
+        "/a/dir/nested",
+        "/a/dir0",
+        "/a/normal",
+    };
+    const expected = [_][]const u8{ "file", "dir", "dir0", "file", "renamed" };
+    {
+        var docs = try docstore.Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io });
+        defer docs.close();
+        var indexes = Store.init(alloc, &docs);
+        const storage = indexes.storage();
+        for (keys) |key| try storage.writeFileAbsolute(key, key);
+        try storage.renameAbsolute("/a/normal", "/a/renamed/");
+        var writer = try storage.beginAtomicWrite(alloc, "/a//file");
+        var active = true;
+        defer if (active) writer.abort();
+        try writer.appendSlice("updated");
+        active = false;
+        try writer.finish();
+        const names = try storage.listFileNamesAlloc(alloc, "/a/");
+        defer StorageIo.freeFileNames(alloc, names);
+        try std.testing.expectEqual(expected.len, names.len);
+        for (expected, names) |want, got| try std.testing.expectEqualStrings(want, got);
+        const renamed = try storage.readFileAlloc(alloc, "/a/renamed/", 100);
+        defer alloc.free(renamed);
+        try std.testing.expectEqualStrings("/a/normal", renamed);
+        // The production namespace contract rejects these aliases; it is
+        // what makes subtree skipping safe for the scoped adapter.
+        var scoped = Store.initWithNamespace(alloc, &docs, "/a");
+        for ([_][]const u8{ "/a//other", "/a/other/", "/a/other//" }) |key|
+            try std.testing.expectError(error.InvalidNativeIndexPath, scoped.storage().writeFileAbsolute(key, "invalid"));
+    }
+    var reopened = try docstore.Store.open(alloc, path, true);
+    defer reopened.close();
+    var indexes = Store.init(alloc, &reopened);
+    const storage = indexes.storage();
+    const names = try storage.listFileNamesAlloc(alloc, "/a");
+    defer StorageIo.freeFileNames(alloc, names);
+    try std.testing.expectEqual(expected.len, names.len);
+    for (expected, names) |want, got| try std.testing.expectEqualStrings(want, got);
+    const updated = try storage.readFileAlloc(alloc, "/a//file", 100);
+    defer alloc.free(updated);
+    try std.testing.expectEqualStrings("updated", updated);
+    const trailing = try storage.readFileAlloc(alloc, "/a/file/", 100);
+    defer alloc.free(trailing);
+    try std.testing.expectEqualStrings("/a/file/", trailing);
     try std.testing.expect((try reopened.file.check()).valid);
 }

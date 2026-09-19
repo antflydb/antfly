@@ -2061,8 +2061,11 @@ pub const NativeFile = struct {
         return try self.catalogCursor(checkpoint, .index, prefix);
     }
 
-    /// The borrowed prefix must end at a directory separator. Nested
-    /// subtrees are skipped using B-tree seeks within the same checkpoint.
+    /// Requires canonical file keys with no empty path components. The
+    /// borrowed prefix must end at a directory separator. Callers accepting
+    /// repeated/trailing separators must use indexCatalogCursor and dirname
+    /// filtering instead: such byte ranges can contain immediate files.
+    /// Nested subtrees are skipped within the same checkpoint.
     pub fn indexCatalogDirectoryCursor(self: *NativeFile, checkpoint: CheckpointSlot, prefix: []const u8) !CatalogCursor {
         if (prefix.len == 0 or prefix[prefix.len - 1] != '/') return error.InvalidNativeIndexPath;
         var cursor = try self.catalogCursor(checkpoint, .index, prefix);

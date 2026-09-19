@@ -112,9 +112,12 @@ The implementation now consists of:
   work. Directory listing and subtree deletion seek the live catalog tree at a
   path prefix instead of replaying mutation history. Listing pins a checkpoint
   and holds the generation read lock, allowing ordinary commits to continue.
-  Immediate-file listings seek past each nested directory's exclusive prefix
-  bound before reading descendant catalog records. Listing work depends on
-  direct files and directory prefixes encountered, not nested file count.
+  In validated namespaces, immediate-file listings seek past each nested
+  directory's exclusive prefix bound before reading descendant catalog records.
+  Listing work depends on direct files and directory prefixes encountered, not
+  nested file count. The unscoped adapter retains its accepted repeated/trailing
+  separators and uses a general prefix scan with dirname filtering, so existing
+  logical keys keep their listing behavior without normalization or migration.
   External catalog values use a 64-way immutable extent tree with byte lengths
   on each child. Appends retain one unfinished node per height, fill the partial
   tail leaf, and seal suffix subtrees once. Existing full subtrees remain
