@@ -482,6 +482,8 @@ pub const IdentityVisibilityState = struct {
 };
 
 pub const DBCore = struct {
+    /// Stable for the published DB lifetime; manager mutations borrow this fence.
+    completion_eligibility: @import("completion_eligibility.zig").Fence = .{},
     alloc: Allocator,
     path: []u8,
     root_generation: u64,
@@ -680,6 +682,8 @@ pub const DBCore = struct {
     }
 
     pub fn updateRange(self: *DBCore, byte_range: types.ByteRange) !void {
+        var completion_transition = try self.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         try self.index_manager.validateRangeTransition(byte_range);
         const start = try self.alloc.dupe(u8, byte_range.start);
         errdefer self.alloc.free(start);
@@ -725,11 +729,15 @@ pub const DBCore = struct {
     }
 
     pub fn setSplitState(self: *DBCore, state: ?shard_mod.SplitState) !void {
+        var completion_transition = try self.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         try self.shard_manager.setSplitState(state);
         self.refreshIndexRange();
     }
 
     pub fn prepareSplit(self: *DBCore, split_key: []const u8) !void {
+        var completion_transition = try self.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         try self.shard_manager.prepareSplit(split_key);
     }
 
@@ -750,12 +758,16 @@ pub const DBCore = struct {
     }
 
     pub fn completeSplitTransition(self: *DBCore, new_shard_id: u64, split_key: []const u8) !void {
+        var completion_transition = try self.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         try self.shard_manager.split(new_shard_id, split_key);
         self.refreshIndexRange();
         try range_state_mod.saveRange(self.store, self.shard_manager.getByteRange());
     }
 
     pub fn finalizeSplitState(self: *DBCore) !void {
+        var completion_transition = try self.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         try self.shard_manager.finalizeSplit();
         self.refreshIndexRange();
         try range_state_mod.saveRange(self.store, self.shard_manager.getByteRange());
@@ -1333,6 +1345,8 @@ pub const DBCore = struct {
         metadata_deletes: []const []const u8,
         reconciled_row_count: ?u64,
     ) !bool {
+        var completion_transition = try self.completion_eligibility.beginTransition();
+        defer completion_transition.deinit();
         if (prepared.combined_writes.len != metadata_writes.len + 1)
             return error.InvalidSchemaUpdateRequest;
         if (!prepared.publication.?.isCurrent()) return error.PreparedGenerationChanged;

@@ -5917,9 +5917,9 @@ pub const DataServer = struct {
             _ = apply_sm.write_source.withRaftBatcher(if (self.data_raft != null) self.localRaftBatcher() else null);
         }
         const promotion_leadership = self.promotionLeadershipSource();
-        _ = self.write_source.withPromotionLeadershipSource(promotion_leadership);
+        _ = try self.write_source.withPromotionLeadershipSource(promotion_leadership);
         if (self.data_raft_apply) |apply_sm| {
-            _ = apply_sm.write_source.withPromotionLeadershipSource(promotion_leadership);
+            _ = try apply_sm.write_source.withPromotionLeadershipSource(promotion_leadership);
         }
 
         // Cross-shard entity-resolution blocking: wrap the routing-aware read
@@ -5929,9 +5929,9 @@ pub const DataServer = struct {
         // later read-source mutations remain visible.
         self.distributed_candidate_source = .{ .reads = self.read_source.source(), .catalog_binding = .{ .ptr = self, .bind_fn = bindSystemCatalogTables } };
         const candidate_source = self.distributed_candidate_source.?.candidateSource();
-        _ = self.write_source.withResolutionCandidateSource(candidate_source);
+        _ = try self.write_source.withResolutionCandidateSource(candidate_source);
         if (self.data_raft_apply) |apply_sm| {
-            _ = apply_sm.write_source.withResolutionCandidateSource(candidate_source);
+            _ = try apply_sm.write_source.withResolutionCandidateSource(candidate_source);
         }
 
         // The promoter's cross-shard entity sink: wrap the routing-aware write
@@ -5942,9 +5942,9 @@ pub const DataServer = struct {
         // 2PC only when the entity set spans multiple shards.
         self.distributed_entity_sink = .{ .writes = self.write_source.source(), .atomic_batch_required = true, .catalog_binding = .{ .ptr = self, .bind_fn = bindSystemCatalogTables } };
         const entity_sink = self.distributed_entity_sink.?.entitySink();
-        _ = self.write_source.withEntitySink(entity_sink);
+        _ = try self.write_source.withEntitySink(entity_sink);
         if (self.data_raft_apply) |apply_sm| {
-            _ = apply_sm.write_source.withEntitySink(entity_sink);
+            _ = try apply_sm.write_source.withEntitySink(entity_sink);
         }
         if (comptime linked_storage) {
             _ = self.kernel_owner_source.?.withRuntimeHooks(

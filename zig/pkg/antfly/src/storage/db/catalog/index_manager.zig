@@ -1293,6 +1293,10 @@ const SplitSide = enum {
 };
 
 pub const IndexManager = struct {
+    pub fn beginCompletionTransition(self: *IndexManager) !?@import("../completion_eligibility.zig").Fence.Transition {
+        return if (self.completion_eligibility) |fence| try fence.beginTransition() else null;
+    }
+
     pub fn tryAcquireCatalogRead(self: *IndexManager) bool {
         const closed: u32 = @as(u32, 1) << 31;
         var observed = self.published_dense_admission.load(.monotonic);
@@ -1314,6 +1318,10 @@ pub const IndexManager = struct {
     const retired_lsm_owner_overflow_name = "__retired_owner_overflow__";
     /// Stable-address lifetime admission shared by DB searches and background
     /// publishers. The high bit closes admission during structural changes.
+    /// Attached by DB before publication; standalone managers have no durable
+    /// completion authority. Never change this pointer after publication.
+    completion_eligibility: ?*@import("../completion_eligibility.zig").Fence = null,
+
     published_dense_admission: std.atomic.Value(u32) = .init(0),
     alloc: Allocator,
     base_path: []u8,
@@ -5321,6 +5329,8 @@ pub const IndexManager = struct {
     /// gate after rebuild. No-op when there are no algebraic indexes, no schema,
     /// or the capability fingerprint is unchanged.
     pub fn reloadAlgebraicSchemaConfigs(self: *IndexManager, schema_json: []const u8) !void {
+        var completion_transition = try self.beginCompletionTransition();
+        defer if (completion_transition) |*transition| transition.deinit();
         if (schema_json.len == 0) return;
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
@@ -10848,6 +10858,8 @@ pub const IndexManager = struct {
     /// while avoiding the parallel loader's fallible directory-preparation
     /// pass after the primary-store generation has already been published.
     pub fn loadForRestore(self: *IndexManager, store: anytype) !void {
+        var completion_transition = try self.beginCompletionTransition();
+        defer if (completion_transition) |*transition| transition.deinit();
         // Restore targets are required to be pristine. Make the activation
         // attempt transactional at the in-memory catalog boundary so a
         // top-level allocation/backend failure can be retried without
@@ -10887,6 +10899,8 @@ pub const IndexManager = struct {
     }
 
     fn loadWithBackfill(self: *IndexManager, store: anytype, allow_backfill: bool, read_only: bool) !void {
+        var completion_transition = try self.beginCompletionTransition();
+        defer if (completion_transition) |*transition| transition.deinit();
         const load_started_ns = nowNs();
         self.bindPrimaryStore(store, read_only);
         self.clearStatusOnlyIndexConfigs();
@@ -10957,6 +10971,8 @@ pub const IndexManager = struct {
     }
 
     pub fn loadCatalogOnly(self: *IndexManager, store: anytype) !void {
+        var completion_transition = try self.beginCompletionTransition();
+        defer if (completion_transition) |*transition| transition.deinit();
         self.bindPrimaryStoreForStatus(store);
         self.clearFailedIndexLoads();
         try self.loadEnrichmentCatalog(store);
@@ -11244,6 +11260,8 @@ pub const IndexManager = struct {
         allow_backfill: bool,
         admission: ?AtomicCatalogMutation,
     ) !void {
+        var completion_transition = try self.beginCompletionTransition();
+        defer if (completion_transition) |*transition| transition.deinit();
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
         self.bindPrimaryStore(store, false);
@@ -11333,6 +11351,8 @@ pub const IndexManager = struct {
     }
 
     pub fn addAllNoBackfill(self: *IndexManager, store: anytype, configs: []const types.IndexConfig) !void {
+        var completion_transition = try self.beginCompletionTransition();
+        defer if (completion_transition) |*transition| transition.deinit();
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
         self.bindPrimaryStore(store, false);
@@ -11394,6 +11414,8 @@ pub const IndexManager = struct {
     }
 
     pub fn registerShadowIndex(self: *IndexManager, store: anytype, cfg: types.IndexConfig) !void {
+        var completion_transition = try self.beginCompletionTransition();
+        defer if (completion_transition) |*transition| transition.deinit();
         // Algebraic projections live in the logical document store rather than
         // the manager's physical index directory. Replaying them through a
         // shadow manager would mutate the primary projection a second time;
@@ -11412,6 +11434,8 @@ pub const IndexManager = struct {
     }
 
     pub fn registerReplacementIndex(self: *IndexManager, store: anytype, cfg: types.IndexConfig) !void {
+        var completion_transition = try self.beginCompletionTransition();
+        defer if (completion_transition) |*transition| transition.deinit();
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
         self.bindPrimaryStore(store, false);
@@ -11434,6 +11458,8 @@ pub const IndexManager = struct {
     }
 
     pub fn addEnrichment(self: *IndexManager, store: anytype, cfg: types.EnrichmentConfig) !void {
+        var completion_transition = try self.beginCompletionTransition();
+        defer if (completion_transition) |*transition| transition.deinit();
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
         var internal = try enrichmentFromPublic(self.alloc, cfg);
@@ -11459,6 +11485,8 @@ pub const IndexManager = struct {
     };
 
     pub fn upsertEnrichment(self: *IndexManager, store: anytype, cfg: types.EnrichmentConfig) !EnrichmentUpsertResult {
+        var completion_transition = try self.beginCompletionTransition();
+        defer if (completion_transition) |*transition| transition.deinit();
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
         var internal = try enrichmentFromPublic(self.alloc, cfg);
@@ -11505,6 +11533,8 @@ pub const IndexManager = struct {
     }
 
     pub fn removeEnrichment(self: *IndexManager, store: anytype, kind: types.EnrichmentKind, name: []const u8) !bool {
+        var completion_transition = try self.beginCompletionTransition();
+        defer if (completion_transition) |*transition| transition.deinit();
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
         const internal_kind = publicEnrichmentKindToInternal(kind);
@@ -11574,6 +11604,8 @@ pub const IndexManager = struct {
     }
 
     pub fn addResolver(self: *IndexManager, store: anytype, cfg: resolver_catalog.ResolverConfig) !void {
+        var completion_transition = try self.beginCompletionTransition();
+        defer if (completion_transition) |*transition| transition.deinit();
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
         if (self.getResolver(cfg.name) != null) return error.ResolverAlreadyExists;
@@ -11590,6 +11622,8 @@ pub const IndexManager = struct {
     /// changes ask the caller to re-resolve existing extraction artifacts because
     /// their incremental replay hints will not fire on their own.
     pub fn upsertResolver(self: *IndexManager, store: anytype, cfg: resolver_catalog.ResolverConfig) !ResolverUpsertResult {
+        var completion_transition = try self.beginCompletionTransition();
+        defer if (completion_transition) |*transition| transition.deinit();
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
         for (self.resolvers.items) |*entry| {
@@ -11619,6 +11653,8 @@ pub const IndexManager = struct {
     }
 
     pub fn removeResolver(self: *IndexManager, store: anytype, name: []const u8) !bool {
+        var completion_transition = try self.beginCompletionTransition();
+        defer if (completion_transition) |*transition| transition.deinit();
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
         for (self.resolvers.items, 0..) |*entry, i| {
@@ -12304,6 +12340,8 @@ pub const IndexManager = struct {
         name: []const u8,
         atomic_mutation: ?AtomicCatalogMutation,
     ) !bool {
+        var completion_transition = try self.beginCompletionTransition();
+        defer if (completion_transition) |*transition| transition.deinit();
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
         if (self.get(name) == null) return false;
@@ -12466,6 +12504,8 @@ pub const IndexManager = struct {
     }
 
     pub fn reopenQuarantinedIndexForArtifactRebuild(self: *IndexManager, store: anytype, name: []const u8) !types.IndexKind {
+        var completion_transition = try self.beginCompletionTransition();
+        defer if (completion_transition) |*transition| transition.deinit();
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
 
@@ -12537,6 +12577,8 @@ pub const IndexManager = struct {
         expected_previous_pointer: ?[]const u8,
         replacement: *DetachedIndex,
     ) !?DetachedIndex {
+        var completion_transition = try self.beginCompletionTransition();
+        defer if (completion_transition) |*transition| transition.deinit();
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
         self.bindPrimaryStore(store, false);

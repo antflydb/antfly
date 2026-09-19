@@ -2178,9 +2178,9 @@ pub const ProvisionedTableWriteCache = struct {
         fn detachRuntimeHooks(self: *Entry) void {
             if (comptime control_only_storage_sources) return;
             self.db.setQueryVisibilityHook(null);
-            self.db.setResolutionCandidateSource(null);
-            self.db.setEntitySink(null);
-            self.db.setPromotionOwner(null);
+            self.db.setResolutionCandidateSource(null) catch unreachable;
+            self.db.setEntitySink(null) catch unreachable;
+            self.db.setPromotionOwner(null) catch unreachable;
             self.promotion_owner_state = .{};
         }
 
@@ -2358,17 +2358,22 @@ pub const ProvisionedTableWriteCache = struct {
         }
     };
 
-    fn applyRuntimeHooksToDb(self: *ProvisionedTableWriteCache, db: *db_mod.DB, group_id: u64, owner_state: ?*PromotionOwnerState) void {
-        db.setResolutionCandidateSource(self.resolution_candidate_source);
-        db.setEntitySink(self.entity_sink);
+    fn applyRuntimeHooksToDb(self: *ProvisionedTableWriteCache, db: *db_mod.DB, group_id: u64, owner_state: ?*PromotionOwnerState) !void {
+        var transition = if (self.resolution_candidate_source != null or self.entity_sink != null or self.promotion_leadership_source != null)
+            try db.core.completion_eligibility.beginTransition()
+        else
+            null;
+        defer if (transition) |*guard| guard.deinit();
+        try db.setResolutionCandidateSource(self.resolution_candidate_source);
+        try db.setEntitySink(self.entity_sink);
         if (owner_state) |state| {
             state.* = .{
                 .group_id = group_id,
                 .leadership_source = self.promotion_leadership_source,
             };
-            db.setPromotionOwner(state.owner());
+            try db.setPromotionOwner(state.owner());
         } else {
-            db.setPromotionOwner(null);
+            try db.setPromotionOwner(null);
         }
     }
 
@@ -2422,13 +2427,13 @@ pub const ProvisionedTableWriteCache = struct {
         cached.deinit(self.alloc);
     }
 
-    fn refreshRuntimeHooksLocked(self: *ProvisionedTableWriteCache) void {
+    fn refreshRuntimeHooksLocked(self: *ProvisionedTableWriteCache) !void {
         if (comptime control_only_storage_sources) {
             std.debug.assert(self.entries.items.len == 0);
             return;
         }
         for (self.entries.items) |entry| {
-            self.applyRuntimeHooksToDb(&entry.db, entry.group_id, &entry.promotion_owner_state);
+            try self.applyRuntimeHooksToDb(&entry.db, entry.group_id, &entry.promotion_owner_state);
         }
     }
 
@@ -2533,36 +2538,48 @@ pub const ProvisionedTableWriteCache = struct {
         candidate_source: ?db_mod.CandidateSource,
         entity_sink_value: ?db_mod.EntitySink,
         leadership_source: ?PromotionLeadershipSourceContract,
-    ) void {
+    ) !void {
         if (self.runtimeHooksEqual(candidate_source, entity_sink_value, leadership_source)) return;
+        const previous_resolution_candidate_source = self.resolution_candidate_source;
+        errdefer self.resolution_candidate_source = previous_resolution_candidate_source;
         self.resolution_candidate_source = candidate_source;
+        const previous_entity_sink = self.entity_sink;
+        errdefer self.entity_sink = previous_entity_sink;
         self.entity_sink = entity_sink_value;
+        const previous_promotion_leadership_source = self.promotion_leadership_source;
+        errdefer self.promotion_leadership_source = previous_promotion_leadership_source;
         self.promotion_leadership_source = leadership_source;
-        self.refreshRuntimeHooksLocked();
+        try self.refreshRuntimeHooksLocked();
     }
 
-    pub fn setResolutionCandidateSource(self: *ProvisionedTableWriteCache, source: ?db_mod.CandidateSource) void {
+    pub fn setResolutionCandidateSource(self: *ProvisionedTableWriteCache, source: ?db_mod.CandidateSource) !void {
         self.lockOpenMutex();
         defer self.unlockOpenMutex();
         if (candidateSourcesEqual(self.resolution_candidate_source, source)) return;
+        const previous_resolution_candidate_source = self.resolution_candidate_source;
+        errdefer self.resolution_candidate_source = previous_resolution_candidate_source;
         self.resolution_candidate_source = source;
-        self.refreshRuntimeHooksLocked();
+        try self.refreshRuntimeHooksLocked();
     }
 
-    pub fn setEntitySink(self: *ProvisionedTableWriteCache, sink: ?db_mod.EntitySink) void {
+    pub fn setEntitySink(self: *ProvisionedTableWriteCache, sink: ?db_mod.EntitySink) !void {
         self.lockOpenMutex();
         defer self.unlockOpenMutex();
         if (entitySinksEqual(self.entity_sink, sink)) return;
+        const previous_entity_sink = self.entity_sink;
+        errdefer self.entity_sink = previous_entity_sink;
         self.entity_sink = sink;
-        self.refreshRuntimeHooksLocked();
+        try self.refreshRuntimeHooksLocked();
     }
 
-    pub fn setPromotionLeadershipSource(self: *ProvisionedTableWriteCache, source: ?PromotionLeadershipSourceContract) void {
+    pub fn setPromotionLeadershipSource(self: *ProvisionedTableWriteCache, source: ?PromotionLeadershipSourceContract) !void {
         self.lockOpenMutex();
         defer self.unlockOpenMutex();
         if (promotionLeadershipSourcesEqual(self.promotion_leadership_source, source)) return;
+        const previous_promotion_leadership_source = self.promotion_leadership_source;
+        errdefer self.promotion_leadership_source = previous_promotion_leadership_source;
         self.promotion_leadership_source = source;
-        self.refreshRuntimeHooksLocked();
+        try self.refreshRuntimeHooksLocked();
     }
 
     fn setHAWriteGate(self: *ProvisionedTableWriteCache, gate: ?db_mod.HAWriteGate) !void {
@@ -3155,7 +3172,7 @@ pub const ProvisionedTableWriteCache = struct {
             .active_leases = 1,
             .bulk_ingest_session_open = start_bulk_session,
         };
-        self.applyRuntimeHooksToDb(&owned_entry.db, group_id, &owned_entry.promotion_owner_state);
+        try self.applyRuntimeHooksToDb(&owned_entry.db, group_id, &owned_entry.promotion_owner_state);
         try owned_entry.db.activateResolverReplayRuntimes();
         try self.entries.append(self.alloc, owned_entry);
         // Artifact-issue mutations invalidate their compact status summary in
@@ -3525,7 +3542,7 @@ pub const ProvisionedTableWriteCache = struct {
             .active_leases = 1,
             .bulk_ingest_session_open = start_bulk_session,
         };
-        self.applyRuntimeHooksToDb(&owned_entry.db, group_id, &owned_entry.promotion_owner_state);
+        try self.applyRuntimeHooksToDb(&owned_entry.db, group_id, &owned_entry.promotion_owner_state);
         try owned_entry.db.activateResolverReplayRuntimes();
         prepared.schema_json = null;
         errdefer owned_entry.deinit(self.alloc, self.backend_runtime);
@@ -3584,7 +3601,7 @@ pub const ProvisionedTableWriteCache = struct {
             .allow_generation_adoption = true,
             .allow_active_generation_adoption = true,
         };
-        self.applyRuntimeHooksToDb(&owned_entry.db, group_id, &owned_entry.promotion_owner_state);
+        try self.applyRuntimeHooksToDb(&owned_entry.db, group_id, &owned_entry.promotion_owner_state);
         try owned_entry.db.activateResolverReplayRuntimes();
         errdefer owned_entry.deinit(self.alloc, self.backend_runtime);
 
@@ -8458,27 +8475,33 @@ pub const ProvisionedTableWriteSource = struct {
     pub fn withResolutionCandidateSource(
         self: *ProvisionedTableWriteSource,
         resolution_candidate_source: ?db_mod.CandidateSource,
-    ) *ProvisionedTableWriteSource {
+    ) !*ProvisionedTableWriteSource {
+        const previous_resolution_candidate_source = self.resolution_candidate_source;
+        errdefer self.resolution_candidate_source = previous_resolution_candidate_source;
         self.resolution_candidate_source = resolution_candidate_source;
-        self.syncRuntimeHooksToCaches();
+        try self.syncRuntimeHooksToCaches();
         return self;
     }
 
     pub fn withEntitySink(
         self: *ProvisionedTableWriteSource,
         entity_sink: ?db_mod.EntitySink,
-    ) *ProvisionedTableWriteSource {
+    ) !*ProvisionedTableWriteSource {
+        const previous_entity_sink = self.entity_sink;
+        errdefer self.entity_sink = previous_entity_sink;
         self.entity_sink = entity_sink;
-        self.syncRuntimeHooksToCaches();
+        try self.syncRuntimeHooksToCaches();
         return self;
     }
 
     pub fn withPromotionLeadershipSource(
         self: *ProvisionedTableWriteSource,
         leadership_source: ?PromotionLeadershipSource,
-    ) *ProvisionedTableWriteSource {
+    ) !*ProvisionedTableWriteSource {
+        const previous_promotion_leadership_source = self.promotion_leadership_source;
+        errdefer self.promotion_leadership_source = previous_promotion_leadership_source;
         self.promotion_leadership_source = leadership_source;
-        self.syncRuntimeHooksToCaches();
+        try self.syncRuntimeHooksToCaches();
         return self;
     }
 
@@ -8577,23 +8600,23 @@ pub const ProvisionedTableWriteSource = struct {
         self.clearAllDirtyWriteTables();
     }
 
-    fn syncRuntimeHooksToCaches(self: *ProvisionedTableWriteSource) void {
+    fn syncRuntimeHooksToCaches(self: *ProvisionedTableWriteSource) !void {
         if (comptime control_only_storage_sources) return;
-        if (self.write_cache) |cache| self.syncRuntimeHooksToCache(cache);
+        if (self.write_cache) |cache| try self.syncRuntimeHooksToCache(cache);
         if (self.startup_write_cache) |cache| {
-            if (self.write_cache != cache) self.syncRuntimeHooksToCache(cache);
+            if (self.write_cache != cache) try self.syncRuntimeHooksToCache(cache);
         }
     }
 
     fn syncRuntimeHooksToCache(
         self: *ProvisionedTableWriteSource,
         cache: *ProvisionedTableWriteCache,
-    ) void {
+    ) !void {
         cache.lockOpenMutex();
         defer cache.unlockOpenMutex();
         lockAtomic(&self.local_db_mutex);
         defer self.local_db_mutex.unlock();
-        cache.setRuntimeHooksLocked(
+        try cache.setRuntimeHooksLocked(
             self.resolution_candidate_source,
             self.entity_sink,
             self.promotion_leadership_source,
@@ -8606,14 +8629,19 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         group_id: u64,
         owner_state: *ProvisionedTableWriteCache.PromotionOwnerState,
-    ) void {
-        db.setResolutionCandidateSource(self.resolution_candidate_source);
-        db.setEntitySink(self.entity_sink);
+    ) !void {
+        var transition = if (self.resolution_candidate_source != null or self.entity_sink != null or self.promotion_leadership_source != null)
+            try db.core.completion_eligibility.beginTransition()
+        else
+            null;
+        defer if (transition) |*guard| guard.deinit();
+        try db.setResolutionCandidateSource(self.resolution_candidate_source);
+        try db.setEntitySink(self.entity_sink);
         owner_state.* = .{
             .group_id = group_id,
             .leadership_source = self.promotion_leadership_source,
         };
-        db.setPromotionOwner(owner_state.owner());
+        try db.setPromotionOwner(owner_state.owner());
         // Cold repair owners must report the same durable pending/clear edges
         // as resident writers. DB.close() clears this hook with a callback
         // barrier before table_name leaves the caller's scope.
@@ -12875,7 +12903,7 @@ pub const ProvisionedTableWriteSource = struct {
         cache.inference_api_url = self.inference_api_url;
         cache.secret_store = self.secret_store;
         cache.remote_content = self.remote_content;
-        self.syncRuntimeHooksToCache(cache);
+        try self.syncRuntimeHooksToCache(cache);
 
         const start_ns = platform_time.monotonicNs();
         const deadline_ns = start_ns +| replicated_apply_writer_open_timeout_ns;
@@ -12999,7 +13027,7 @@ pub const ProvisionedTableWriteSource = struct {
         cache.antfly_provider = self.antfly_provider;
         cache.inference_api_url = self.inference_api_url;
         cache.remote_content = self.remote_content;
-        self.syncRuntimeHooksToCache(cache);
+        try self.syncRuntimeHooksToCache(cache);
         const identity_namespace = if (managed_open_options.identity_namespace_override) |namespace|
             namespace
         else if (preloaded_metadata) |metadata|
@@ -15026,7 +15054,7 @@ pub const ProvisionedTableWriteSource = struct {
                 };
             errdefer if (uncached_db) |*owned| owned.close();
             try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, &uncached_db.?);
-            self.applyRuntimeHooksToUncachedDb(&uncached_db.?, table_name, group_id, &uncached_promotion_owner_state);
+            try self.applyRuntimeHooksToUncachedDb(&uncached_db.?, table_name, group_id, &uncached_promotion_owner_state);
             break :db_blk &uncached_db.?;
         };
         defer if (uncached_db) |*owned| owned.close();
@@ -56371,7 +56399,7 @@ fn implementationTests() type {
 
             var leadership = PoisonLeadership{};
             var write_cache = ProvisionedTableWriteCache.init(alloc);
-            write_cache.setPromotionLeadershipSource(leadership.source());
+            try write_cache.setPromotionLeadershipSource(leadership.source());
 
             var cached = try write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, 0, "docs");
             try std.testing.expect(cached.db.promotion_runtime != null);
@@ -62098,6 +62126,45 @@ fn implementationTests() type {
             defer alloc.free(row);
             try std.testing.expectEqualStrings("{\"amount\":3}", row);
             try std.testing.expectEqual(@as(u32, 2), db.core.schema.?.version);
+        }
+
+        test "workload admission completion eligibility serving cache rejects repeated hook transitions" {
+            const alloc = std.testing.allocator;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/completion-hook-fence", .{tmp.sub_path});
+            defer alloc.free(path);
+            var entry = ProvisionedTableWriteCache.Entry{
+                .group_id = 7,
+                .lsm_root_generation = 0,
+                .table_name = @constCast("docs"),
+                .managed_config_fingerprint = @splat(0),
+                .db = try db_mod.DB.open(alloc, path, .{ .start_optional_runtimes = false, .start_index_workers = false }),
+            };
+            defer entry.db.close();
+            defer entry.detachRuntimeHooks();
+            var cache = ProvisionedTableWriteCache.init(alloc);
+            defer cache.deinit();
+            try cache.entries.append(alloc, &entry);
+            // The test owns the stack entry and DB, not the cache.
+            defer cache.entries.clearRetainingCapacity();
+            const Leadership = struct {
+                fn local(_: *anyopaque, _: u64) bool {
+                    return false;
+                }
+            };
+            var context: u8 = 0;
+            const leadership: ProvisionedTableWriteCache.PromotionLeadershipSource = .{ .ptr = &context, .vtable = &.{ .is_local_leader = Leadership.local } };
+            try entry.db.core.completion_eligibility.begin(@splat(1));
+            for (0..2) |_| {
+                try std.testing.expectError(error.PreparedCompletionActive, cache.setPromotionLeadershipSource(leadership));
+                try std.testing.expect(cache.promotion_leadership_source == null);
+                try std.testing.expect(entry.db.promotion_owner == null);
+            }
+            try entry.db.core.completion_eligibility.retire(@splat(1));
+            try cache.setPromotionLeadershipSource(leadership);
+            try std.testing.expect(entry.db.promotion_owner != null);
+            try std.testing.expect(!entry.db.promotion_owner.?.isLocalOwner());
         }
 
         test "portable file restore rejects documents without identity coverage" {
