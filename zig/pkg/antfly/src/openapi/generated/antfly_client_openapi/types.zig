@@ -32412,6 +32412,10 @@ pub const SecretEntry = struct {
     /// Secret name (e.g., openai.api_key)
     key: []const u8,
     status: SecretStatus,
+    /// Name of the winning source, or environment.
+    source: ?[]const u8 = null,
+    /// Whether this key has an Antfly-managed override that can be deleted.
+    managed: ?bool = null,
     /// Corresponding environment variable name (e.g., OPENAI_API_KEY)
     env_var: ?[]const u8 = null,
     created_at: ?[]const u8 = null,
@@ -32421,6 +32425,8 @@ pub const SecretEntry = struct {
     pub const openApiFieldMetadata = .{
         .{ "key", "key", false },
         .{ "status", "status", false },
+        .{ "source", "source", true },
+        .{ "managed", "managed", true },
         .{ "env_var", "env_var", true },
         .{ "created_at", "created_at", true },
         .{ "updated_at", "updated_at", true },
@@ -32440,6 +32446,14 @@ pub const SecretEntry = struct {
         try jw.write(self.key);
         try jw.objectField("status");
         try jw.write(self.status);
+        if (self.source) |value| {
+            try jw.objectField("source");
+            try jw.write(value);
+        }
+        if (self.managed) |value| {
+            try jw.objectField("managed");
+            try jw.write(value);
+        }
         if (self.env_var) |value| {
             try jw.objectField("env_var");
             try jw.write(value);
@@ -32457,7 +32471,34 @@ pub const SecretEntry = struct {
 };
 
 pub const SecretList = struct {
+    /// Whether this server has a native store for secret API writes.
+    writable: ?bool = null,
     secrets: []const SecretEntry,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "writable", "writable", true },
+        .{ "secrets", "secrets", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.writable) |value| {
+            try jw.objectField("writable");
+            try jw.write(value);
+        }
+        try jw.objectField("secrets");
+        try jw.write(self.secrets);
+        try jw.endObject();
+    }
 };
 
 /// Source of the secret configuration

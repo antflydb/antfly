@@ -3236,13 +3236,14 @@ pub fn parseStorageKernelDocumentArtifactManifestsResponse(alloc: std.mem.Alloca
 }
 
 pub fn encodeQueryRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest) ![]u8 {
-    return try encodeQueryRequestWithGraphWireMode(alloc, req, false);
+    return try encodeQueryRequestWithGraphWireMode(alloc, req, false, false);
 }
 
 pub fn encodeQueryRequestWithGraphWireMode(
     alloc: std.mem.Allocator,
     req: db_mod.types.SearchRequest,
     allow_legacy_graph: bool,
+    include_aggregations: bool,
 ) ![]u8 {
     if (searchRequestHasUnserializableResolvedDocFilter(req)) return error.UnsupportedQueryRequest;
     if (req.dense != null and req.dense_queries.len > 0) return error.UnsupportedQueryRequest;
@@ -3259,6 +3260,11 @@ pub fn encodeQueryRequestWithGraphWireMode(
     try out.append(alloc, '{');
     var first = true;
     const has_named_embeddings = req.dense_queries.len > 0 or req.sparse_queries.len > 0;
+
+    if (include_aggregations and req.aggregations_json.len != 0) {
+        try appendJsonFieldName(alloc, &out, &first, "aggregations");
+        try out.appendSlice(alloc, req.aggregations_json);
+    }
 
     if (!req.include_all_fields) {
         try appendJsonFieldNames(alloc, &out, &first, "fields", req.fields);
@@ -3434,7 +3440,9 @@ pub fn encodeStorageKernelQueryRequest(alloc: std.mem.Allocator, req: db_mod.typ
     // The compiled storage boundary remains in-process and must preserve the
     // deprecated public graph dialect for single-group compatibility. Generic
     // inter-node shard forwarding continues to reject that stateful dialect.
-    return try encodeQueryRequestWithGraphWireMode(alloc, req, true);
+    // Complete physical queries also own aggregation. Raw shard calls retain
+    // these search semantics and defer finalization through execution options.
+    return try encodeQueryRequestWithGraphWireMode(alloc, req, true, true);
 }
 
 pub const StorageKernelLookupWireRequest = struct {

@@ -133,6 +133,36 @@ def test_aggregations_remain_exact_during_concurrent_inserts(stateful_api):
 
 
 @pytest.mark.e2e_resource("antfly_process")
+@pytest.mark.parametrize("num_shards", [1, 3])
+def test_aggregation_pages_cover_all_matches(stateful_api, num_shards):
+    name = f"aggregation_pages_{num_shards}_{time.time_ns()}"
+    stateful_api.create_table(name, num_shards=num_shards)
+    stateful_api.batch_write(
+        name,
+        inserts={f"doc-{age}": {"age": age} for age in (18, 20, 22, 24)},
+        sync_level="full_index",
+    )
+    for limit in (0, 1):
+        for kind in ("stats", "terms"):
+            response = stateful_api.query_table(
+                name,
+                {
+                    "limit": limit,
+                    "aggregations": {"age": {"type": kind, "field": "age"}},
+                },
+            )["responses"][0]
+            assert response["status"] == 200, response
+            assert len(response["hits"]["hits"]) == limit, response
+            age = response["aggregations"]["age"]
+            if kind == "stats":
+                assert age["count"] == 4 and age["sum"] == 84, response
+            else:
+                assert {int(b["key"]): b["doc_count"] for b in age["buckets"]} == {
+                    value: 1 for value in (18, 20, 22, 24)
+                }, response
+
+
+@pytest.mark.e2e_resource("antfly_process")
 def test_aggregation_full_result_budget(monkeypatch, request):
     if os.environ.get("ANTFLY_STATEFUL_URL"):
         pytest.skip("Changing the server budget requires a locally started process")

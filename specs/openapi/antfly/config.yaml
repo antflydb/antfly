@@ -6,6 +6,59 @@ info:
 
 components:
   schemas:
+    SecretsConfig:
+      type: object
+      additionalProperties: false
+      description: |
+        Startup-only secret resolver configuration. Native overrides win, followed
+        by sources in array order, then environment variables. Omitting this
+        section preserves legacy secret-store flags and deployment defaults.
+        Do not combine this section with legacy secret-store flags.
+      properties:
+        native:
+          $ref: "#/components/schemas/NativeSecretStoreConfig"
+        sources:
+          type: array
+          description: Read-only sources, highest priority first.
+          items:
+            $ref: "#/components/schemas/SecretSourceConfig"
+        environment:
+          type: boolean
+          default: true
+          description: Enable environment fallback for secret references and discovery.
+    NativeSecretStoreConfig:
+      type: object
+      additionalProperties: false
+      required: [path]
+      description: |
+        Antfly-managed override store. Currently file-backed and node-local;
+        this setting does not replicate secrets between nodes. Without native,
+        secret API writes are disabled.
+      properties:
+        name:
+          type: string
+          default: native
+          description: Unique source name; environment is reserved.
+        path:
+          type: string
+          minLength: 1
+          description: Literal file path, relative to the process working directory if not absolute.
+    SecretSourceConfig:
+      type: object
+      additionalProperties: false
+      required: [name, type, path]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          description: Unique source name; environment is reserved.
+        type:
+          type: string
+          enum: [file]
+        path:
+          type: string
+          minLength: 1
+          description: Literal path to an externally managed secret file. Never written by the API.
     Config:
       type: object
       properties:
@@ -32,6 +85,8 @@ components:
           $ref: "#/components/schemas/McpConfig"
         backup:
           $ref: "#/components/schemas/BackupConfig"
+        secrets:
+          $ref: "#/components/schemas/SecretsConfig"
         storage:
           $ref: "#/components/schemas/StorageConfig"
         transaction_sessions:
