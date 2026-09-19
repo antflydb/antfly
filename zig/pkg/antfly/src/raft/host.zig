@@ -1754,6 +1754,7 @@ pub const HttpHost = struct {
 
 pub fn mergeRuntimeHooks(base: RuntimeHooks, overlay: RuntimeHooks) RuntimeHooks {
     var merged = base;
+    if (overlay.completion_admission != null) merged.completion_admission = overlay.completion_admission;
     if (overlay.transport != null) merged.transport = overlay.transport;
     if (overlay.snapshot_transport != null) merged.snapshot_transport = overlay.snapshot_transport;
     if (overlay.group_storage != null) merged.group_storage = overlay.group_storage;

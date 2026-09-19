@@ -2110,6 +2110,21 @@ test "multi raft backpressure rejects async ready before cloning messages" {
     };
     try std.testing.expectEqual(false, try process_result);
     try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
+    try std.testing.expect(host.group(135).?.hasReady());
+
+    // Message ownership allocation also occurs before accepting the async
+    // frontier. A failed copy must leave the same durable work retryable.
+    backpressure.allow = true;
+    const clone_result = blk: {
+        host.alloc = failing.allocator();
+        defer host.alloc = original_alloc;
+        break :blk host.processReady(135);
+    };
+    try std.testing.expectError(error.OutOfMemory, clone_result);
+    try std.testing.expect(host.group(135).?.hasReady());
+    try std.testing.expectEqual(@as(core.types.Index, 0), store.hard_state.commit_index);
+    try std.testing.expect(try host.processReady(135));
+    try std.testing.expectEqual(@as(core.types.Index, 1), store.hard_state.commit_index);
 }
 
 test "multi raft limit backpressure denies oversized snapshot ready" {
