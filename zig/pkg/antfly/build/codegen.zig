@@ -254,7 +254,7 @@ pub fn addOpenApiSourceSteps(
             .{ "../shared/generating.yaml", "antfly_generating_openapi" },
             .{ "websearch.yaml", "antfly_websearch_openapi" },
         }),
-        addGeneratedModule(b, openapi_build, openapi_codegen, b.path("../specs/openapi/inference/api.yaml"), "inference_api", inference_generated_root ++ "/inference_api", "types,server", &.{
+        addGeneratedModule(b, openapi_build, openapi_codegen, b.path("../specs/openapi/inference/api.yaml"), "inference_api", inference_generated_root ++ "/inference_api", "types,server,client", &.{
             .{ "../shared/generating.yaml", "antfly_generating_openapi" },
             .{ "../shared/chunking.yaml", "antfly_chunking_api_openapi" },
             .{ "../ai/extraction.yaml", "antfly_extraction_openapi" },

@@ -1640,6 +1640,17 @@ pub fn build(b: *std.Build) void {
     const test_webgpu_browser_step = b.step("test-webgpu-browser", "Run Chromium WebGPU shader-family browser smoke");
     test_webgpu_browser_step.dependOn(&run_webgpu_browser_smoke.step);
 
+    // The inference client wrapper is a package of its own; without a test
+    // target Zig never analyses its method bodies, which is how a helper
+    // reading a field the generated response does not have went unnoticed.
+    if (client_mod) |mod| {
+        const inference_client_tests = b.addTest(.{ .root_module = mod });
+        const run_inference_client_tests = b.addRunArtifact(inference_client_tests);
+        const inference_client_test_step = b.step("test-inference-client", "Run the inference client wrapper tests");
+        inference_client_test_step.dependOn(&run_inference_client_tests.step);
+        if (b.top_level_steps.get("test")) |top| top.step.dependOn(&run_inference_client_tests.step);
+    }
+
     const linalg_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path(b.fmt("{s}/lib/linalg/src/mod.zig", .{shared_lib_root})),

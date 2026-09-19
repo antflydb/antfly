@@ -73,6 +73,15 @@ pub const Client = struct {
 
     /// Embed text inputs and return dense f32 vectors (binary format).
     /// This is the most efficient path — avoids JSON serialization of float arrays.
+    ///
+    /// Known broken, and older than the transcription helper below it: the
+    /// generated client parses every response as JSON and returns the parsed
+    /// value, so there is no `body` to hand to the binary decoder and this
+    /// does not compile when called. Reaching an octet-stream endpoint needs
+    /// a raw HTTP call rather than the generated one, so the fix is a change
+    /// to the generator, not to this file. `embedSparseBinary` below has the
+    /// same problem; neither is referenced by the package's tests, which is
+    /// why the build stays green.
     pub fn embedBinary(self: *Client, model: []const u8, inputs: []const []const u8) !DenseEmbeddings {
         var resp = try self.raw.createEmbedding(.{
             .model = model,
@@ -138,12 +147,12 @@ pub const Client = struct {
         if (resp.status_code < 200 or resp.status_code >= 300) {
             return error.TranscribeRequestFailed;
         }
-        const body = resp.body orelse return error.EmptyResponse;
-        const parsed = try std.json.parseFromSlice(api.TranscribeResponse, self.allocator, body, .{
-            .ignore_unknown_fields = true,
-        });
-        errdefer parsed.deinit();
+        const parsed = resp.data orelse return error.EmptyResponse;
         if (parsed.value.data.len == 0) return error.EmptyResponse;
+        // The transcript outlives the response it arrived in, so the caller
+        // takes the parsed payload and the deferred cleanup is left with
+        // nothing to free.
+        resp.data = null;
         return .{ .parsed = parsed };
     }
 
@@ -158,4 +167,64 @@ test "client module compiles" {
     _ = RawClient;
     _ = Types;
     _ = Binary;
+    // Referencing the methods themselves is what forces Zig to analyse
+    // their bodies; naming the type alone leaves them unchecked, which is
+    // how transcribe came to read a field the response does not have.
+    _ = &Client.transcribe;
+    _ = &Client.listModels;
+    _ = &Transcription.text;
+    _ = &Transcription.segments;
+}
+
+test "transcribe returns the transcript and owns it after the response is freed" {
+    const allocator = std.testing.allocator;
+    const httpx = @import("httpx");
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    const body =
+        "{\"object\":\"list\",\"data\":[{\"object\":\"transcription\",\"index\":0," ++
+        "\"text\":\"hello there\",\"language\":\"en\",\"duration_ms\":900," ++
+        "\"segments\":[{\"text\":\"hello there\",\"start_ms\":0,\"end_ms\":900,\"words\":[]," ++
+        "\"speaker\":\"SPEAKER_00\"}],\"speakers\":[\"SPEAKER_00\"]}]," ++
+        "\"model\":\"openai/whisper-tiny\",\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":2,\"total_tokens\":2}}";
+
+    var server = try httpx.TestServer.start(allocator, io, &.{.{
+        .method = .POST,
+        .path = "/transcribe",
+        .respond = .{ .body = body },
+    }});
+    defer server.deinit();
+    const endpoint = try std.fmt.allocPrint(allocator, "{s}", .{server.baseUrl()});
+    defer allocator.free(endpoint);
+    var http = httpx.Client.initWithConfig(allocator, io, .{ .keep_alive = false });
+    defer http.deinit();
+
+    var result: ?Transcription = null;
+    defer if (result) |*value| value.deinit();
+    var run_err: ?anyerror = null;
+    var group = std.Io.Group.init;
+    const Fiber = struct {
+        fn run(a: std.mem.Allocator, h: *httpx.Client, url: []const u8, out: *?Transcription, err_out: *?anyerror) std.Io.Cancelable!void {
+            var client = Client.init(a, h, url);
+            defer client.deinit();
+            out.* = client.transcribe("openai/whisper-tiny", "fake audio", null) catch |err| {
+                err_out.* = err;
+                return;
+            };
+        }
+    };
+    try group.concurrent(io, Fiber.run, .{ allocator, &http, endpoint, &result, &run_err });
+    try server.handleOne();
+    group.await(io) catch {};
+    if (run_err) |err| return err;
+
+    // The transcript is readable after the HTTP response it arrived in has
+    // been freed, which is the whole point of taking ownership of it.
+    const transcription = &result.?;
+    try std.testing.expectEqualStrings("hello there", transcription.text());
+    const segments = transcription.segments();
+    try std.testing.expectEqual(@as(usize, 1), segments.len);
+    try std.testing.expectEqualStrings("SPEAKER_00", segments[0].speaker.?);
 }
