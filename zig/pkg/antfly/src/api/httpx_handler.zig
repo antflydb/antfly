@@ -9968,11 +9968,19 @@ test "httpx antfly routes require auth and enforce admin middleware" {
 
     const batch_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/docs/batch", .{base_url});
     defer alloc.free(batch_url);
-    const batch_headers = [_][2][]const u8{
+    // Keep the repeated forbidden-response ownership regression without doing
+    // 100 password KDFs. The first request still exercises Basic auth; the
+    // remainder use a real restricted API key through the same middleware.
+    var reader_key = try auth.manager.createApiKey("reader", "forbidden-batch", &read_permission, &.{}, null);
+    defer reader_key.deinit(alloc);
+    const key_auth = try std.fmt.allocPrint(alloc, "ApiKey {s}", .{reader_key.encoded});
+    defer alloc.free(key_auth);
+    var batch_headers = [_][2][]const u8{
         .{ "authorization", reader_auth },
         .{ "content-type", "application/json" },
     };
-    for (0..100) |_| {
+    for (0..100) |request_index| {
+        batch_headers[0][1] = if (request_index == 0) reader_auth else key_auth;
         var denied_batch = try requestWithRetry(
             &client,
             client_io.io(),
