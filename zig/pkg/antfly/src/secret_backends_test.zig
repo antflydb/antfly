@@ -268,13 +268,36 @@ test "secret backend runtime facade encrypted delivery grants replay freshness a
     };
     var handler = Handler{};
     var api = api_mod.ServerlessHttpServer.init(alloc, .{ .secret_store = &facade, .secret_admin_token = "admin-token-at-least-32-bytes-long" }, &handler);
-    var denied = try api.handle(.{ .method = .PUT, .uri = "/secrets/token", .body = "{\"value\":\"rotated\"}" });
+    var http_runtime = try api_mod.HttpxRuntime.start(alloc, std.testing.io, &api);
+    defer http_runtime.deinit();
+    var wire = @import("common/http/std_http_executor.zig").StdHttpExecutor.init(alloc, .{});
+    defer wire.deinit();
+    const token_uri = try std.fmt.allocPrint(alloc, "{s}/db/v1/secrets/token", .{http_runtime.base_uri});
+    defer alloc.free(token_uri);
+    const list_uri = try std.fmt.allocPrint(alloc, "{s}/db/v1/secrets", .{http_runtime.base_uri});
+    defer alloc.free(list_uri);
+    var denied = try wire.executor().execute(alloc, .{ .method = .PUT, .uri = token_uri, .body = "{\"value\":\"rotated\"}", .timeout_ms = 10_000 });
     defer denied.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 401), denied.status);
-    var accepted = try api.handle(.{ .method = .PUT, .uri = "/secrets/token", .body = "{\"value\":\"rotated\"}", .authorization = "Bearer admin-token-at-least-32-bytes-long" });
+    try std.testing.expectEqualStrings("application/json", denied.content_type.?);
+    try std.testing.expectEqualStrings("no-store", denied.header("Cache-Control").?);
+    var accepted = try wire.executor().execute(alloc, .{ .method = .PUT, .uri = token_uri, .body = "{\"value\":\"rotated\"}", .authorization = "Bearer admin-token-at-least-32-bytes-long", .timeout_ms = 10_000 });
     defer accepted.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), accepted.status);
+    try std.testing.expectEqualStrings("application/json", accepted.content_type.?);
+    try std.testing.expectEqualStrings("no-store", accepted.header("Cache-Control").?);
     try std.testing.expect(std.mem.indexOf(u8, accepted.body, "rotated") == null);
+    var listed = try wire.executor().execute(alloc, .{ .method = .GET, .uri = list_uri, .authorization = "Bearer admin-token-at-least-32-bytes-long", .timeout_ms = 10_000 });
+    defer listed.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), listed.status);
+    try std.testing.expectEqualStrings("application/json", listed.content_type.?);
+    try std.testing.expectEqualStrings("no-store", listed.header("Cache-Control").?);
+    var parsed = try std.json.parseFromSlice(struct { secrets: []struct { key: []const u8 }, writable: bool }, alloc, listed.body, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.writable);
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.secrets.len);
+    try std.testing.expect(std.mem.indexOf(u8, listed.body, "rotated") == null);
+    try std.testing.expect(std.mem.indexOf(u8, listed.body, "do-not-deliver") == null);
     var rotated = try remote.source().resolve(alloc, "scope", "token", .{ .min_revision = 4 });
     defer rotated.deinit(alloc);
     try std.testing.expectEqualStrings("rotated", rotated.value.?.secret.bytes);
@@ -356,9 +379,26 @@ test "secret backend live metadata API commits Raft and authenticated data deliv
     var response = try executor.executor().execute(alloc, .{ .method = .PUT, .uri = uri, .body = "{\"value\":\"from-api\"}", .content_type = "application/json", .timeout_ms = 10_000 });
     defer response.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), response.status);
-    var remote = delivery.Remote{ .alloc = alloc, .io = std.testing.io, .scope = "scope", .config = .{ .name = "data-1", .credential_path = credential_path, .urls = &.{base} }, .executor = executor.executor(), .internal_service = .{ .secret = service_secret, .issuer = "secret-test" } };
+    const CheckedDelivery = struct {
+        inner: http.RequestExecutor,
+        checked: bool = false,
+        fn execute(ptr: *anyopaque, a: std.mem.Allocator, req: http.HttpRequest) !http.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            var reply = try self.inner.execute(a, req);
+            errdefer reply.deinit(a);
+            if (reply.status == 200) {
+                try std.testing.expectEqualStrings("application/octet-stream", reply.content_type.?);
+                try std.testing.expectEqualStrings("no-store", reply.header("Cache-Control").?);
+                self.checked = true;
+            }
+            return reply;
+        }
+    };
+    var checked_delivery = CheckedDelivery{ .inner = executor.executor() };
+    var remote = delivery.Remote{ .alloc = alloc, .io = std.testing.io, .scope = "scope", .config = .{ .name = "data-1", .credential_path = credential_path, .urls = &.{base} }, .executor = .{ .ptr = &checked_delivery, .vtable = &.{ .execute = CheckedDelivery.execute } }, .internal_service = .{ .secret = service_secret, .issuer = "secret-test" } };
     var read = try remote.source().resolve(alloc, "scope", "token", .{ .min_revision = 1 });
     defer read.deinit(alloc);
+    try std.testing.expect(checked_delivery.checked);
     try std.testing.expectEqualStrings("from-api", read.value.?.secret.bytes);
     try std.testing.expectError(error.Unauthorized, remote.source().resolve(alloc, "scope", "forbidden", .{}));
     remote.internal_service = null;

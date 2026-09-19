@@ -205,7 +205,8 @@ pub const ServerlessHttpServer = struct {
             _ = ctx.status(response.status);
             try ctx.setHeader("Cache-Control", "no-store");
             try ctx.setHeader("Content-Type", response.content_type orelse "application/json");
-            return ctx.text(response.body);
+            _ = ctx.response.body(response.body);
+            return ctx.response.build();
         }
         const method: serverless_http_routes.HttpMethod = switch (ctx.request.method) {
             .GET => .get,

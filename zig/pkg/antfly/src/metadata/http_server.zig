@@ -1830,7 +1830,8 @@ pub const MetadataHttpServer = struct {
         defer ctx.allocator.free(encrypted);
         try ctx.setHeader("Cache-Control", "no-store");
         try ctx.setHeader("Content-Type", "application/octet-stream");
-        return ctx.text(encrypted);
+        _ = ctx.response.body(encrypted);
+        return ctx.response.build();
     }
 
     fn metadataSystemCatalog(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
