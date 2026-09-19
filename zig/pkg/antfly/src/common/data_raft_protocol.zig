@@ -21,7 +21,10 @@
 /// watermarks cannot be mistaken for omitted replication work.
 /// Version 5 transfers authoritative merge artifacts through durable replay.
 /// Version 6 fences merge copy attempts across donor leadership changes.
-pub const batch_protocol_version: u16 = 6;
+/// Version 7 carries native-backed canonical completion entries. Capability
+/// alone never grants admission; an installed retained pool is also required.
+pub const batch_protocol_version: u16 = 7;
+pub const batch_completion_protocol_version: u16 = 7;
 pub const batch_timestamp_protocol_version: u16 = 1;
 pub const batch_activation_barrier_protocol_version: u16 = 2;
 pub const batch_merge_transition_protocol_version: u16 = 3;

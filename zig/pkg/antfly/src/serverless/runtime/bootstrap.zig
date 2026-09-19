@@ -461,6 +461,7 @@ pub const OwnedStack = struct {
         if (cfg.read_execution.protected.enabled() or cfg.read_execution.max_scan_state_bytes != 0) return error.UnsupportedReadExecutionPolicy;
         if (cfg.node_config) |node_config| {
             if (node_config.admission.transaction_completion_bytes != 0) return error.UnsupportedTransactionCompletionPolicy;
+            if (node_config.admission.durable_transaction_completion.enabled) return error.UnsupportedTransactionCompletionPolicy;
             if (node_config.admission.remote_attempt_worker.max_attempts != 0 or
                 node_config.admission.remote_attempt_coordinator.max_attempts != 0)
                 return error.RemoteAttemptDurabilityRequired;

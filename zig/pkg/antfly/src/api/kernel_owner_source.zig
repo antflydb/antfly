@@ -75,9 +75,21 @@ pub const ProvisionedKernelOwnerSource = struct {
     mutex: std.atomic.Mutex = .unlocked,
     quiescing: bool = false,
     entries: std.ArrayListUnmanaged(*Entry) = .empty,
+    completion_installations: std.AutoHashMapUnmanaged(u64, *CompletionInstallation) = .empty,
+    completion_installation_preparations: usize = 0,
+
     publications: std.ArrayListUnmanaged(*PendingPublication) = .empty,
     owner_cache_hits: std.atomic.Value(u64) = .init(0),
     owner_cache_misses: std.atomic.Value(u64) = .init(0),
+
+    const CompletionInstallation = struct {
+        binding: abi.completion_pool.InstallBinding,
+        read_schema_json: []u8,
+        settings_json: []u8,
+        settings: @import("../common/table_storage.zig").Settings,
+        active: bool = false,
+        state: enum { installing, failed, backed } = .installing,
+    };
 
     const PendingPublication = struct {
         group_id: u64,
@@ -117,7 +129,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         }
     };
 
-    const LeaseAdmission = enum { shared, exclusive, exclusive_if_idle };
+    const LeaseAdmission = enum { shared, exclusive, exclusive_if_idle, completion_install };
 
     const Entry = struct {
         group_id: u64,
@@ -309,6 +321,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     /// operation families for its full group lifecycle.
     pub fn deinit(self: *ProvisionedKernelOwnerSource) void {
         lock(&self.mutex);
+        self.quiescing = true;
         for (self.entries.items) |entry| {
             std.debug.assert(entry.active_users == 0 and !entry.closing);
             entry.retired = true;
@@ -317,6 +330,13 @@ pub const ProvisionedKernelOwnerSource = struct {
         std.debug.assert(self.publications.items.len == 0);
         self.publications.deinit(self.alloc);
         self.entries.deinit(self.alloc);
+        var installations = self.completion_installations.valueIterator();
+        while (installations.next()) |record| {
+            self.alloc.free(record.*.read_schema_json);
+            self.alloc.free(record.*.settings_json);
+            self.alloc.destroy(record.*);
+        }
+        self.completion_installations.deinit(self.alloc);
         self.entries = .empty;
         self.mutex.unlock();
         if (self.owns_context) self.context.deinit();
@@ -651,8 +671,12 @@ pub const ProvisionedKernelOwnerSource = struct {
     pub fn retireAll(self: *ProvisionedKernelOwnerSource) usize {
         lock(&self.mutex);
         defer self.mutex.unlock();
-        const count = self.entries.items.len;
-        for (self.entries.items) |entry| entry.retired = true;
+        var count: usize = 0;
+        for (self.entries.items) |entry| {
+            if (self.installationPinsOwnerLocked(entry.group_id)) continue;
+            entry.retired = true;
+            count += 1;
+        }
         self.drainRetiredLocked(null, null);
         return count;
     }
@@ -665,6 +689,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         var count: usize = 0;
         for (self.entries.items) |entry| {
             if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
+            if (self.installationPinsOwnerLocked(entry.group_id)) continue;
             count += 1;
             entry.retired = true;
         }
@@ -682,6 +707,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     fn registerPublication(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8) !*PendingPublication {
         lock(&self.mutex);
         defer self.mutex.unlock();
+        if (self.installationPinsOwnerLocked(group_id)) return error.PreparedCompletionActive;
         if (self.publicationPendingLocked(group_id, table_name)) return error.StorageBusy;
         const publication = try self.alloc.create(PendingPublication);
         errdefer self.alloc.destroy(publication);
@@ -741,10 +767,15 @@ pub const ProvisionedKernelOwnerSource = struct {
         unreachable;
     }
 
+    fn installationPinsOwnerLocked(self: *const ProvisionedKernelOwnerSource, group_id: u64) bool {
+        return !self.quiescing and self.completion_installations.contains(group_id);
+    }
+
     fn drainRetiredLocked(self: *ProvisionedKernelOwnerSource, group_id: ?u64, table_name: ?[]const u8) void {
         while (true) {
             const index = for (self.entries.items, 0..) |entry, i| {
                 if (!entry.retired or entry.closing or entry.active_users != 0) continue;
+                if (self.installationPinsOwnerLocked(entry.group_id)) continue;
                 if (group_id) |id| if (entry.group_id != id) continue;
                 if (table_name) |name| if (!std.mem.eql(u8, entry.table_name, name)) continue;
                 break i;
@@ -806,6 +837,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             {
                 lock(&self.mutex);
                 defer self.mutex.unlock();
+                if (self.installationPinsOwnerLocked(group_id)) return error.PreparedCompletionActive;
                 for (self.entries.items) |entry| {
                     if (entry.group_id == group_id and std.mem.eql(u8, entry.table_name, table_name)) entry.retired = true;
                 }
@@ -1577,7 +1609,9 @@ pub const ProvisionedKernelOwnerSource = struct {
         // Keep the closing owner registered until all storage work has drained.
         // A concurrent open or cleanup must not mistake a removed pointer for
         // permission to reopen, move, or delete the same physical root.
+        const quiescing = self.quiescing;
         self.mutex.unlock();
+        if (quiescing) entry.owner.quiesce() catch @panic("storage owner quiesce boundary failed");
         entry.owner.deinit();
         lock(&self.mutex);
         for (self.entries.items, 0..) |candidate, current_index| {
@@ -1605,7 +1639,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         entry.active_users -= 1;
         if (entry.active_users == 0 and entry.transient_retirement_pending and !entry.resident)
             entry.retired = true;
-        if (!entry.retired or entry.active_users != 0) return;
+        if (!entry.retired or entry.active_users != 0 or self.installationPinsOwnerLocked(entry.group_id)) return;
         for (self.entries.items, 0..) |candidate, index| {
             if (candidate != entry) continue;
             self.destroyEntryAtIndexLocked(index);
@@ -2330,6 +2364,10 @@ pub const ProvisionedKernelOwnerSource = struct {
         if (!self.mutex.tryLock()) return error.StorageKernelOwnerTransitionRequired;
         defer self.mutex.unlock();
         if (self.quiescing) return error.Canceled;
+        const installation = self.completion_installations.get(group_id);
+        if (installation) |record| {
+            if (admission != .completion_install and (record.state != .backed or !record.active)) return error.CompletionAdmissionUnavailable;
+        }
         // Return to the caller rather than waiting with a descriptor captured
         // before publication; a retry must acquire the new catalog descriptor.
         if (self.publicationPendingLocked(group_id, table_name)) return error.StorageReadTemporarilyUnavailable;
@@ -2338,6 +2376,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name)) continue;
             if (entry.closing) return error.StorageKernelOwnerTransitionRequired;
             if (entry.retired or entry.generation != descriptor.lsm_root_generation or !entry.identity.eql(descriptor.identity)) {
+                if (self.installationPinsOwnerLocked(group_id)) return error.PreparedCompletionActive;
                 entry.retired = true;
                 if (entry.active_users == 0) {
                     stale_index = index;
@@ -2345,10 +2384,18 @@ pub const ProvisionedKernelOwnerSource = struct {
                 }
                 return error.StorageKernelOwnerTransitionRequired;
             }
+            if (installation) |record| {
+                if (record.state == .backed and record.active and
+                    std.mem.eql(u8, entry.schema_json, descriptor.schema_json) and
+                    std.mem.eql(u8, entry.indexes_json, descriptor.indexes_json) and
+                    std.meta.eql(@as(?@import("../common/table_storage.zig").Settings, record.settings), descriptor.table_storage))
+                    entry.table_storage = descriptor.table_storage;
+            }
             if (!std.mem.eql(u8, entry.schema_json, descriptor.schema_json) or
                 !std.mem.eql(u8, entry.indexes_json, descriptor.indexes_json) or
                 !std.meta.eql(entry.table_storage, descriptor.table_storage))
             {
+                if (self.installationPinsOwnerLocked(group_id)) return error.PreparedCompletionActive;
                 // Catalog definition changes do not necessarily publish a new
                 // physical root generation. An API lease is not the only DB
                 // activity: index reconciliation may have handed durable work
@@ -2388,6 +2435,9 @@ pub const ProvisionedKernelOwnerSource = struct {
         try self.ensureContextConfigured();
         var owner = try client.Owner.open(.{
             .context = self.context.handle,
+            .completion_installation = if (installation) |record| &record.binding else null,
+            .completion_read_schema_json = if (installation) |record| .fromSlice(record.read_schema_json) else .{},
+            .completion_settings_json = if (installation) |record| .fromSlice(record.settings_json) else .{},
             .path = abi.BorrowedBytes.fromSlice(path),
             .table_name = abi.BorrowedBytes.fromSlice(table_name),
             .group_id = group_id,
@@ -3492,6 +3542,191 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer lease.deinit();
         var response = try lease.owner().replicatedBatchJson(table_name, request_json);
         defer response.deinit();
+    }
+
+    /// Provider for existing native owners. Installation and catalog discovery
+    /// happen outside Raft callbacks, before these references can be acquired.
+    /// Called only with authenticated metadata output, outside DATA Raft
+    /// serialization. Failure remains represented in the registry so guard
+    /// acquisition cannot downgrade this group to legacy operation.
+    pub const PreparedCompletionInstallation = struct {
+        source: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        descriptor: LoadedDescriptor,
+        record: *CompletionInstallation,
+        table_name: []const u8,
+        schema_json: []const u8,
+        indexes_json: []const u8,
+        registered: bool = false,
+        capacity_reserved: bool = true,
+        already_backed: bool = false,
+
+        pub fn deinit(self: *@This()) void {
+            lock(&self.source.mutex);
+            if (self.capacity_reserved) self.source.completion_installation_preparations -= 1;
+            if (self.registered and self.record.state == .installing) self.record.state = .failed;
+            self.source.mutex.unlock();
+            self.descriptor.deinit(self.alloc);
+            if (!self.registered) {
+                self.source.alloc.free(self.record.read_schema_json);
+                self.source.alloc.free(self.record.settings_json);
+                self.source.alloc.destroy(self.record);
+            }
+            self.* = undefined;
+        }
+
+        /// Allocation-free publication under DATA Raft serialization. The
+        /// caller first proves its accepted frontier fully applied, then this
+        /// barrier prevents a concurrent legacy proposal during physical setup.
+        pub fn begin(self: *@This()) !void {
+            if (!self.source.mutex.tryLock()) return error.CompletionAdmissionUnavailable;
+            defer self.source.mutex.unlock();
+            if (self.source.quiescing) return error.CompletionAdmissionUnavailable;
+            const group_id = self.record.binding.identity.group_id;
+            if (self.source.completion_installations.get(group_id)) |existing| {
+                if (existing.state != .backed or !std.meta.eql(existing.binding, self.record.binding)) return error.CompletionAdmissionUnavailable;
+                if (self.record.active) existing.active = true;
+                self.already_backed = true;
+                self.source.completion_installation_preparations -= 1;
+                self.capacity_reserved = false;
+                return;
+            }
+            for (self.source.entries.items) |entry| {
+                if (entry.group_id == group_id and (entry.active_users != 0 or entry.closing or entry.exclusive_pending))
+                    return error.CompletionAdmissionUnavailable;
+            }
+            // Capacity was reserved while preparing, before DATA took its lock.
+            self.source.completion_installations.putAssumeCapacity(group_id, self.record);
+            self.source.completion_installation_preparations -= 1;
+            self.capacity_reserved = false;
+            self.registered = true;
+        }
+
+        pub fn finish(self: *@This()) !void {
+            if (self.already_backed) return;
+            if (!self.registered) return error.CompletionAdmissionUnavailable;
+            return self.source.finishCompletionInstallation(self.record.binding.identity.group_id, self.table_name, self.descriptor, self.record, self.schema_json, self.indexes_json) catch |err| {
+                lock(&self.source.mutex);
+                self.record.state = .failed;
+                self.source.mutex.unlock();
+                return err;
+            };
+        }
+    };
+
+    pub fn prepareCompletionInstallation(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, binding: abi.completion_pool.InstallBinding, schema_json: []const u8, read_schema_json: []const u8, indexes_json: []const u8, settings: @import("../common/table_storage.zig").Settings, active: bool, restore_existing: bool) !PreparedCompletionInstallation {
+        // Fresh production installation stays closed until ordinary begin,
+        // decision, and acknowledgement entries have protected admission too.
+        // Do not publish a barrier that could strand legacy transaction debt.
+        if (!restore_existing) return error.CompletionAdmissionUnavailable;
+        if (binding.identity.group_id != group_id) return error.CompletionAdmissionUnavailable;
+        var descriptor = try self.loadDescriptor(alloc, group_id, table_name);
+        errdefer descriptor.deinit(alloc);
+        if (descriptor.identity.table_id != binding.table_id or descriptor.identity.range_id != binding.range_id)
+            return error.CompletionProfileChanged;
+        if (!std.mem.eql(u8, &try @import("../common/completion_catalog_digest.zig").digest(alloc, descriptor.schema_json, read_schema_json, descriptor.indexes_json), &binding.schema_catalog_digest))
+            return error.CompletionProfileChanged;
+        const record = try self.alloc.create(CompletionInstallation);
+        errdefer self.alloc.destroy(record);
+        const read_copy = try self.alloc.dupe(u8, read_schema_json);
+        errdefer self.alloc.free(read_copy);
+        const settings_json = try std.json.Stringify.valueAlloc(self.alloc, settings, .{});
+        errdefer self.alloc.free(settings_json);
+        record.* = .{ .binding = binding, .read_schema_json = read_copy, .settings_json = settings_json, .settings = settings, .active = active };
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.completion_installations.count() + self.completion_installation_preparations >= 1024)
+            return error.CompletionAdmissionUnavailable;
+        try self.completion_installations.ensureUnusedCapacity(self.alloc, @intCast(self.completion_installation_preparations + 1));
+        self.completion_installation_preparations += 1;
+        return .{ .source = self, .alloc = alloc, .descriptor = descriptor, .record = record, .table_name = table_name, .schema_json = schema_json, .indexes_json = indexes_json };
+    }
+
+    fn finishCompletionInstallation(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8, descriptor: LoadedDescriptor, record: *CompletionInstallation, schema_json: []const u8, indexes_json: []const u8) !void {
+        var lease = try self.acquireDescriptorOnce(group_id, table_name, descriptor.path, descriptor.view(), .completion_install, .resident);
+        defer lease.deinit();
+        try lease.owner().installCompletion(.{ .binding = record.binding, .schema_json = .fromSlice(schema_json), .read_schema_json = .fromSlice(record.read_schema_json), .indexes_json = .fromSlice(indexes_json), .settings_json = .fromSlice(record.settings_json) });
+        lock(&self.mutex);
+        record.state = .backed;
+        self.mutex.unlock();
+    }
+
+    pub fn completionProvider(self: *ProvisionedKernelOwnerSource) abi.completion_pool.Provider {
+        return .{ .context = self, .acquire = acquireCompletionBacking, .attest = attestCompletionBacking };
+    }
+
+    /// Borrow an already installed owner only. This path runs under DATA Raft
+    /// serialization and must not perform catalog refresh, root open, or install.
+    fn installedCompletionOwner(self: *ProvisionedKernelOwnerSource, group_id: u64) !Lease {
+        if (!self.mutex.tryLock()) return error.CompletionAdmissionUnavailable;
+        defer self.mutex.unlock();
+        if (self.quiescing) return error.CompletionAdmissionUnavailable;
+        const installation = self.completion_installations.get(group_id) orelse return error.NotFound;
+        if (installation.state != .backed) return error.CompletionAdmissionUnavailable;
+        var found: ?*Entry = null;
+        for (self.entries.items) |entry| {
+            if (entry.group_id != group_id or entry.retired or entry.closing) continue;
+            if (entry.exclusive_active or entry.exclusive_pending or found != null) return error.CompletionAdmissionUnavailable;
+            found = entry;
+        }
+        const entry = found orelse return error.CompletionAdmissionUnavailable;
+        entry.active_users += 1;
+        return .{ .source = self, .entry = entry };
+    }
+
+    fn acquireCompletionBacking(raw: ?*anyopaque, group_id: u64, node_id: u64, output: *abi.completion_pool.Lease) callconv(.c) abi.Status {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(raw orelse return .invalid_argument));
+        var lease = self.installedCompletionOwner(group_id) catch |err| return kernel_error_identity.statusFromError(err);
+        defer lease.deinit();
+        output.* = lease.owner().acquireCompletionLease(group_id, node_id) catch |err| return kernel_error_identity.statusFromError(err);
+        return .ok;
+    }
+
+    fn attestCompletionBacking(raw: ?*anyopaque, group_id: u64, node_id: u64, output: *abi.completion_pool.NativeAttestation) callconv(.c) abi.Status {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(raw orelse return .invalid_argument));
+        var lease = self.installedCompletionOwner(group_id) catch |err| return kernel_error_identity.statusFromError(err);
+        defer lease.deinit();
+        output.* = lease.owner().attestCompletionBacking(group_id, node_id) catch |err| return kernel_error_identity.statusFromError(err);
+        return .ok;
+    }
+
+    /// Pins owner configuration and input outside DATA Raft's lock. Only the
+    /// synchronous storage-kernel compiler runs under proposal ordering.
+    pub const CompletionCompiler = struct {
+        lease: Lease,
+        alloc: std.mem.Allocator,
+        request_json: []u8,
+        table_name: []const u8,
+
+        pub fn compile(self: *CompletionCompiler, previous: db_types.RaftAppliedEntryIdentity) !client.Response {
+            return self.lease.owner().compileReplicatedCompletion(self.table_name, self.request_json, previous.term, previous.index);
+        }
+        pub fn deinit(self: *CompletionCompiler) void {
+            self.lease.deinit();
+            self.alloc.free(self.request_json);
+            self.* = undefined;
+        }
+    };
+
+    pub fn prepareCompletionCompiler(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_types.BatchRequest) !CompletionCompiler {
+        const request_json = try table_writes.encodeStorageKernelBatchRequest(alloc, req);
+        errdefer alloc.free(request_json);
+        return .{ .lease = try self.acquire(group_id, table_name), .alloc = alloc, .request_json = request_json, .table_name = table_name };
+    }
+
+    pub fn compileReplicatedCompletionGroupLocal(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_types.BatchRequest,
+        previous: db_types.RaftAppliedEntryIdentity,
+    ) !client.Response {
+        const request_json = try table_writes.encodeStorageKernelBatchRequest(alloc, req);
+        defer alloc.free(request_json);
+        var lease = try self.acquire(group_id, table_name);
+        defer lease.deinit();
+        return lease.owner().compileReplicatedCompletion(table_name, request_json, previous.term, previous.index);
     }
 
     fn txnBeginGroupLocal(
@@ -4615,4 +4850,101 @@ test "workload admission provisioned routed reads translate fence clock domains"
     fence.admission_deadline_ns = null;
     try source.validateRoutedRead(std.testing.allocator, fence, 2, "docs");
     try std.testing.expect(fixture.last_deadline == null);
+}
+
+test "workload admission completion installation registry never downgrades failed or missing backing" {
+    var source = ProvisionedKernelOwnerSource.init(std.testing.allocator, "/unused", undefined, undefined);
+    defer source.completion_installations.deinit(std.testing.allocator);
+    try std.testing.expectError(error.NotFound, source.installedCompletionOwner(7));
+    var record: ProvisionedKernelOwnerSource.CompletionInstallation = .{
+        .binding = .{},
+        .read_schema_json = &.{},
+        .settings_json = &.{},
+        .settings = .{},
+    };
+    try source.completion_installations.put(std.testing.allocator, 7, &record);
+    try std.testing.expectError(error.CompletionAdmissionUnavailable, source.installedCompletionOwner(7));
+    record.state = .failed;
+    try std.testing.expectError(error.CompletionAdmissionUnavailable, source.installedCompletionOwner(7));
+    record.state = .backed;
+    record.active = true;
+    try std.testing.expectError(error.CompletionAdmissionUnavailable, source.installedCompletionOwner(7));
+    source.quiescing = true;
+    try std.testing.expectError(error.CompletionAdmissionUnavailable, source.installedCompletionOwner(8));
+}
+
+test "workload admission completion installation barrier consumes reserved capacity without allocation" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var source = ProvisionedKernelOwnerSource.init(failing.allocator(), "/unused", undefined, undefined);
+    defer source.completion_installations.deinit(failing.allocator());
+    try source.completion_installations.ensureUnusedCapacity(failing.allocator(), 2);
+    source.completion_installation_preparations = 2;
+    var first: ProvisionedKernelOwnerSource.CompletionInstallation = .{
+        .binding = .{ .identity = .{ .group_id = 7 } },
+        .read_schema_json = &.{},
+        .settings_json = &.{},
+        .settings = .{},
+    };
+    var second = first;
+    second.binding.identity.group_id = 8;
+    var first_prepared: ProvisionedKernelOwnerSource.PreparedCompletionInstallation = .{
+        .source = &source,
+        .alloc = failing.allocator(),
+        .descriptor = undefined,
+        .record = &first,
+        .table_name = "docs",
+        .schema_json = "",
+        .indexes_json = "",
+    };
+    var second_prepared = first_prepared;
+    second_prepared.record = &second;
+    failing.fail_index = failing.alloc_index;
+    try first_prepared.begin();
+    try second_prepared.begin();
+    try std.testing.expectEqual(@as(usize, 0), source.completion_installation_preparations);
+    try std.testing.expectEqual(@as(u32, 2), source.completion_installations.count());
+    try std.testing.expectError(error.CompletionAdmissionUnavailable, source.installedCompletionOwner(7));
+    first.state = .failed;
+    try std.testing.expectError(error.CompletionAdmissionUnavailable, source.installedCompletionOwner(7));
+    // A second preparation cannot clear the failed barrier or consume its own
+    // outstanding reservation until the caller explicitly cancels it.
+    var duplicate = first;
+    duplicate.state = .installing;
+    var duplicate_prepared = first_prepared;
+    duplicate_prepared.record = &duplicate;
+    duplicate_prepared.registered = false;
+    duplicate_prepared.capacity_reserved = true;
+    source.completion_installation_preparations = 1;
+    try std.testing.expectError(error.CompletionAdmissionUnavailable, duplicate_prepared.begin());
+    try std.testing.expectEqual(@as(usize, 1), source.completion_installation_preparations);
+    try std.testing.expectEqual(@as(usize, 0), failing.alloc_index - failing.fail_index);
+}
+
+test "workload admission fresh completion installation rejection preserves legacy admission" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var source = ProvisionedKernelOwnerSource.init(failing.allocator(), "/unused", undefined, undefined);
+    try std.testing.expectError(error.CompletionAdmissionUnavailable, source.prepareCompletionInstallation(failing.allocator(), 7, "docs", .{ .identity = .{ .group_id = 7 } }, "", "", "{}", .{}, false, false));
+    try std.testing.expectEqual(@as(u32, 0), source.completion_installations.count());
+    try std.testing.expectEqual(@as(usize, 0), source.completion_installation_preparations);
+    try std.testing.expectError(error.NotFound, source.installedCompletionOwner(7));
+    try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
+}
+
+test "workload admission completion installation pins owner through ordinary retirement" {
+    const alloc = std.testing.allocator;
+    var source = ProvisionedKernelOwnerSource.init(alloc, "/unused", undefined, undefined);
+    defer source.entries.deinit(alloc);
+    defer source.completion_installations.deinit(alloc);
+    var record: ProvisionedKernelOwnerSource.CompletionInstallation = .{ .binding = .{}, .read_schema_json = &.{}, .settings_json = &.{}, .settings = .{}, .state = .backed, .active = true };
+    try source.completion_installations.put(alloc, 7, &record);
+    var entry: ProvisionedKernelOwnerSource.Entry = .{ .group_id = 7, .table_name = @constCast("docs"), .generation = 1, .identity = .{ .table_id = 1, .range_id = 2, .shard_id = 7 }, .schema_json = &.{}, .indexes_json = &.{}, .owner = undefined };
+    try source.entries.append(alloc, &entry);
+    try std.testing.expectEqual(@as(usize, 0), source.retireAll());
+    try std.testing.expectEqual(@as(usize, 0), source.retireTable("docs"));
+    try std.testing.expect(!entry.retired);
+    try std.testing.expectError(error.PreparedCompletionActive, source.registerPublication(7, "docs"));
+    try std.testing.expectError(error.PreparedCompletionActive, source.acquireDescriptorOnce(7, "docs", "/unused", .{ .lsm_root_generation = 2, .identity = entry.identity }, .shared, .resident));
+    try std.testing.expectEqual(@as(usize, 1), source.entries.items.len);
+    source.quiescing = true;
+    try std.testing.expect(!source.installationPinsOwnerLocked(7));
 }

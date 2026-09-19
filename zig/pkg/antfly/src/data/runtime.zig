@@ -81,7 +81,9 @@ const resource_manager_mod = @import("../storage/resource_manager.zig");
 const kernel_owner_client = @import("../storage/kernel_owner_client.zig");
 const kernel_owner_descriptor = @import("../storage/kernel_owner_descriptor.zig");
 const data_apply_client = @import("../storage/data_raft_apply_client.zig");
+const completion_admission_bridge = @import("completion_admission_bridge.zig");
 const completion_pool_abi = @import("kernel_owner_abi").completion_pool;
+const completion_entry_protocol = @import("../common/completion_entry_protocol.zig");
 const index_manager_mod = @import("../storage/db/catalog/index_manager.zig");
 const change_journal_mod = @import("../storage/db/derived/change_journal.zig");
 const doc_identity = @import("../storage/db/doc_identity.zig");
@@ -1080,6 +1082,75 @@ const DataDescriptorFactory = struct {
     peer_sets: std.AutoHashMapUnmanaged(u64, []u64) = .empty,
     initial_voter_sets: std.AutoHashMapUnmanaged(u64, []u64) = .empty,
     group_stores: std.AutoHashMapUnmanaged(u64, *raft_engine.core.MemoryStorage) = .empty,
+    completion_installer: ?CompletionInstaller = null,
+    next_completion_probe: usize = 0,
+
+    const CompletionInstaller = struct {
+        source: *antfly.public_api.ProvisionedKernelOwnerSource,
+        metadata: *RemoteMetadataSource,
+        filesystem_io: std.Io,
+        node_id: u64,
+        enabled: bool,
+        qualified_wal: bool,
+
+        fn install(self: *CompletionInstaller, group_id: u64, live_host: ?*antfly.raft.Host, live_mutex: ?*std.atomic.Mutex) !void {
+            const alloc = self.metadata.alloc;
+            const marker = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db/completion-installation.guard", .{ self.source.replica_root_dir, group_id });
+            defer alloc.free(marker);
+            const has_receipt = receipt: {
+                _ = std.Io.Dir.cwd().statFile(self.filesystem_io, marker, .{ .follow_symlinks = false }) catch |err| switch (err) {
+                    error.FileNotFound => break :receipt false,
+                    else => return err,
+                };
+                break :receipt true;
+            };
+            if (!self.enabled and !has_receipt) return;
+            if (!self.qualified_wal) return error.CompletionAdmissionUnavailable;
+            const client = @import("../metadata/completion_installation_client.zig");
+            const deadline_ns = @import("antfly_platform").time.monotonicNs() +| 5 * std.time.ns_per_s;
+            var snapshot = try self.metadata.fetchSnapshotWithBudget(.{
+                .deadline_ns = self.metadata.awakeNs() +| 5 * std.time.ns_per_s,
+                .io = self.metadata.io,
+            });
+            defer freeAdminSnapshotOwned(alloc, &snapshot);
+            const incarnation = snapshot.status.metadata_incarnation orelse return error.MetadataIncarnationUnavailable;
+            const table_name = DataServer.snapshotTableNameForGroup(&snapshot, group_id) orelse return error.TableNotFound;
+            const range = findRangeByGroupId(snapshot.ranges, group_id) orelse return error.CompletionAdmissionUnavailable;
+            const table = findTableById(snapshot.tables, range.table_id) orelse return error.TableNotFound;
+            var nonce: u128 = 0;
+            try self.metadata.io.randomSecure(std.mem.asBytes(&nonce));
+            if (nonce == 0) return error.CompletionAdmissionUnavailable;
+            lockAtomic(&self.metadata.cache_mutex);
+            const uri_index = self.metadata.preferred_authority_uri_index;
+            self.metadata.cache_mutex.unlock();
+            const result = try client.fetch(alloc, self.metadata.httpExecutor(), self.metadata.base_uris[uri_index], .{
+                .primary = self.metadata.internal_service_secret orelse return error.CompletionAdmissionUnavailable,
+                .issuer = self.metadata.internal_service_issuer orelse return error.CompletionAdmissionUnavailable,
+            }, .{ .requester = self.node_id, .group_id = group_id, .cluster_incarnation = incarnation, .nonce = nonce }, .{
+                .deadline_ns = deadline_ns,
+            });
+            defer result.deinit();
+            const response = result.value();
+            const binding = try client.binding(response) orelse {
+                if (has_receipt) return error.CompletionAdmissionUnavailable;
+                return;
+            };
+            var settings = table.storage;
+            settings.transaction_recovery = response.installation.?.policy;
+            var prepared = try self.source.prepareCompletionInstallation(alloc, group_id, table_name, binding, response.schema_json, response.read_schema_json, response.indexes_json, settings, response.installation.?.phase == .active, has_receipt);
+            defer prepared.deinit();
+            if (live_host) |host| {
+                const mutex = live_mutex orelse return error.CompletionAdmissionUnavailable;
+                lockAtomic(mutex);
+                defer mutex.unlock();
+                const status = host.raftStatus(group_id) orelse return error.CompletionAdmissionUnavailable;
+                if (status.applied_index != status.hard.commit_index or status.applied_index != status.last_index)
+                    return error.CompletionAdmissionUnavailable;
+                try prepared.begin();
+            } else try prepared.begin();
+            try prepared.finish();
+        }
+    };
 
     fn init(alloc: std.mem.Allocator, fallback_store: *raft_engine.core.MemoryStorage) DataDescriptorFactory {
         return .{ .alloc = alloc, .fallback_store = fallback_store };
@@ -1161,6 +1232,7 @@ const DataDescriptorFactory = struct {
 
     fn buildDescriptor(ptr: *anyopaque, record: antfly.raft.catalog.ReplicaRecord) !raft_engine.runtime.ReplicaDescriptor {
         const self: *DataDescriptorFactory = @ptrCast(@alignCast(ptr));
+        if (self.completion_installer) |*installer| try installer.install(record.group_id, null, null);
         const peer_source = self.peer_sets.get(record.group_id) orelse &[_]u64{record.local_node_id};
         const peers = try self.alloc.dupe(raft_engine.core.types.NodeId, peer_source);
         errdefer self.alloc.free(peers);
@@ -1297,6 +1369,7 @@ const RaftTableApplyStateMachine = struct {
     /// direct writes, Raft apply, HA replay, and snapshot publication so those
     /// paths cannot open competing physical DB owners.
     kernel_owner_source: ?*antfly.public_api.ProvisionedKernelOwnerSource = null,
+    completion_host: ?*antfly.raft.Host = null,
     applied_mutex: std.atomic.Mutex = .unlocked,
     applied_indexes: std.AutoHashMapUnmanaged(u64, u64) = .empty,
     retry_apply_checkpoints: std.AutoHashMapUnmanaged(u64, RetryApplyCheckpoint) = .empty,
@@ -1339,11 +1412,21 @@ const RaftTableApplyStateMachine = struct {
             catalog,
             backend_runtime,
         );
-        return .{
+        var self: RaftTableApplyStateMachine = .{
             .alloc = alloc,
             .write_source = write_source,
             .read_barriers = .init(alloc, incarnation),
         };
+        errdefer self.deinit();
+        const max_groups = dataRaftRuntimeConfig().max_groups;
+        try self.applied_indexes.ensureTotalCapacity(alloc, max_groups);
+        try self.read_barriers.reserveGroupCapacity(max_groups);
+        return self;
+    }
+
+    fn bindCompletionHost(raw: *anyopaque, host: ?*antfly.raft.Host) void {
+        const self: *RaftTableApplyStateMachine = @ptrCast(@alignCast(raw));
+        self.completion_host = host;
     }
 
     fn deinit(self: *RaftTableApplyStateMachine) void {
@@ -1823,6 +1906,55 @@ const RaftTableApplyStateMachine = struct {
             self.publishReadStates(group_id, read_states);
             return;
         }
+        if (snapshot == null and committed_entries.len == 1 and committed_entries[0].entry_type == .normal and committed_entries[0].data.len == 0) {
+            // The outer sink authenticates direct-WAL noops before calling us.
+            // Other providers have already done their ordinary projection.
+            try self.publishAppliedReady(group_id, 0, committed_entries, committed_entries[0].index);
+            self.read_barriers.observeReadStates(group_id, read_states);
+            self.publishReadStates(group_id, read_states);
+            return;
+        }
+        if (self.completion_host) |host| {
+            if (try host.completionProgress(group_id)) |progress| {
+                if (snapshot == null and committed_entries.len == 1 and committed_entries[0].index <= progress.index) {
+                    // The wrapper verified this covered entry against the
+                    // durable Raft log before calling us. Native publication
+                    // certifies its prefix; only volatile bookkeeping remains.
+                    try self.publishAppliedReady(group_id, 0, committed_entries, committed_entries[0].index);
+                    self.read_barriers.observeReadStates(group_id, read_states);
+                    self.publishReadStates(group_id, read_states);
+                    return;
+                }
+            }
+        }
+        // The outer DATA wrapper isolates each protected entry before any
+        // shadow projection. Accepted ownership, not payload flags, selects
+        // this path for both canonical prepare and retained terminal resolve.
+        for (committed_entries) |entry| {
+            if (entry.entry_type != .normal) continue;
+            const owned = if (self.completion_host) |host|
+                try host.ownsCompletionAccepted(group_id, entry.term, entry.index, entry.data)
+            else
+                false;
+            if (!owned) {
+                if (completion_entry_protocol.looksLike(entry.data)) return error.CompletionAdmissionUnavailable;
+                continue;
+            }
+            if (snapshot != null or committed_entries.len != 1) return error.CompletionAdmissionUnavailable;
+            const host = self.completion_host.?;
+            try host.applyCompletionAccepted(group_id, entry.term, entry.index, entry.data);
+            const progress = try host.completionProgress(group_id) orelse return error.CompletionAdmissionUnavailable;
+            if (progress.index < entry.index or progress.term == 0) return error.CompletionAdmissionUnavailable;
+            if (progress.index == entry.index and (progress.term != entry.term or
+                !std.mem.eql(u8, &progress.payload_digest, &completion_entry_protocol.payloadDigest(entry.data))))
+                return error.CompletionAdmissionUnavailable;
+            // No retry checkpoint allocation: native receipt makes re-entry
+            // idempotent, and group/read publication maps were reserved at init.
+            try self.publishAppliedReady(group_id, 0, committed_entries, entry.index);
+            self.read_barriers.observeReadStates(group_id, read_states);
+            self.publishReadStates(group_id, read_states);
+            return;
+        }
         const snapshot_index: u64 = if (snapshot) |value| value.metadata.index else 0;
         var last_index: u64 = snapshot_index;
         var completed_index = try self.prepareRetryApplyCheckpoint(group_id, snapshot, committed_entries);
@@ -2277,27 +2409,38 @@ pub const HealthSource = struct {
         try writeResourceMetrics(writer, &self.data_server.provisioned_storage.resource_manager);
         if (comptime linked_storage) {
             if (self.data_server.kernel_owner_source) |source| {
-                if (source.contextMetrics()) |metrics| try writeDenseExecutionMetrics(writer, .{
-                    .max_runnable_tasks = metrics.dense_max_runnable_tasks,
-                    .max_outstanding_tasks = metrics.dense_max_outstanding_tasks,
-                    .max_queued_tasks = metrics.dense_max_queued_tasks,
-                    .max_wait_ms = metrics.dense_max_wait_ms,
-                    .max_working_bytes = metrics.dense_max_working_bytes,
-                    .max_suspended_io = metrics.dense_max_suspended_io,
-                    .suspended_io = metrics.dense_suspended_io,
-                    .working_bytes = metrics.dense_working_bytes,
-                    .all_reads = metrics.dense_all_reads != 0,
-                    .bounded_runnable = metrics.read_bounded_runnable,
-                    .bounded_outstanding = metrics.read_bounded_outstanding,
-                    .transition_outstanding = metrics.read_transition_outstanding,
-                    .transition_bytes = metrics.read_transition_bytes,
+                if (source.contextMetrics()) |metrics| {
+                    try writeDurableCompletionPolicyMetrics(writer, metrics.durable_completion_enabled != 0, metrics.durable_completion_authority);
+                    try writeDenseExecutionMetrics(writer, .{
+                        .max_runnable_tasks = metrics.dense_max_runnable_tasks,
+                        .max_outstanding_tasks = metrics.dense_max_outstanding_tasks,
+                        .max_queued_tasks = metrics.dense_max_queued_tasks,
+                        .max_wait_ms = metrics.dense_max_wait_ms,
+                        .max_working_bytes = metrics.dense_max_working_bytes,
+                        .max_suspended_io = metrics.dense_max_suspended_io,
+                        .suspended_io = metrics.dense_suspended_io,
+                        .working_bytes = metrics.dense_working_bytes,
+                        .all_reads = metrics.dense_all_reads != 0,
+                        .bounded_runnable = metrics.read_bounded_runnable,
+                        .bounded_outstanding = metrics.read_bounded_outstanding,
+                        .transition_outstanding = metrics.read_transition_outstanding,
+                        .transition_bytes = metrics.read_transition_bytes,
 
-                    .runnable = metrics.dense_runnable,
-                    .outstanding = metrics.dense_outstanding,
-                    .queued = metrics.dense_queued,
-                }) else |_| {}
+                        .runnable = metrics.dense_runnable,
+                        .outstanding = metrics.dense_outstanding,
+                        .queued = metrics.dense_queued,
+                    });
+                } else |_| {
+                    try health_metrics.appendPromMetric(writer, "antfly_durable_completion_policy_sample_available", "gauge", "Whether runtime-owned completion policy was sampled", 0);
+                }
+            } else {
+                try health_metrics.appendPromMetric(writer, "antfly_durable_completion_policy_sample_available", "gauge", "Whether runtime-owned completion policy was sampled", 0);
             }
-        } else try writeDenseExecutionMetrics(writer, self.data_server.provisioned_storage.resource_manager.denseExecutionStats());
+        } else {
+            const resources = &self.data_server.provisioned_storage.resource_manager;
+            try writeDurableCompletionPolicyMetrics(writer, resources.durable_completion_enabled, @intFromEnum(resources.durable_completion_authority));
+            try writeDenseExecutionMetrics(writer, resources.denseExecutionStats());
+        }
         try writeLsmCacheMetrics(writer, if (comptime linked_storage)
             self.data_server.storageOwnerLsmCacheStatsBestEffort()
         else
@@ -3002,6 +3145,12 @@ fn asyncMutexMetricValue(stats: antfly.db.types.DBMutexStats, field: AsyncMutexM
         .hold_ns => stats.hold_ns,
         .max_hold_ns => stats.max_hold_ns,
     };
+}
+
+fn writeDurableCompletionPolicyMetrics(writer: anytype, enabled: bool, authority: u8) !void {
+    try health_metrics.appendPromMetric(writer, "antfly_durable_completion_policy_sample_available", "gauge", "Whether runtime-owned completion policy was sampled", 1);
+    try health_metrics.appendPromMetric(writer, "antfly_durable_completion_new_admission_enabled", "gauge", "Configured permission for new reserved prepares; table policy and runtime authority are checked separately", @intFromBool(enabled));
+    try health_metrics.appendPromMetric(writer, "antfly_durable_completion_runtime_authority", "gauge", "Trusted completion authority: 0 none, 1 standalone local, 2 proven Raft apply; not a count of prepared obligations", authority);
 }
 
 fn writeDenseExecutionMetrics(writer: *std.Io.Writer, stats: resource_manager_mod.DenseExecution.Stats) !void {
@@ -3857,6 +4006,14 @@ pub const DataServerConfig = struct {
     /// peer traffic on the same borrowed `std.Io` as the rest of a composed
     /// runtime instead of constructing an implicit Threaded executor.
     data_raft_request_executor: ?antfly.common.http.RequestExecutor = null,
+    /// Trusted data-module shim for the native group-pool owner, never built
+    /// from request/config booleans. Cross-kernel calls MUST use stable status
+    /// ABI; raw anyerror Provider/Guard callbacks cannot cross compiled owners.
+    /// Missing backing fails closed for physical-completion tables.
+    data_raft_completion_provider: ?raft_engine.runtime.completion_admission_iface.Provider = null,
+    /// Owned native pool installation precedes DB authority binding and group
+    /// admission. This callback only acquires a reference to that installation.
+    data_raft_completion_native_provider: ?completion_pool_abi.Provider = null,
     /// Zero selects bounded synchronous peer delivery. Production defaults to
     /// asynchronous workers; deterministic composed runtimes can remove those
     /// continuously-ready actors without changing the Raft wire protocol.
@@ -5669,7 +5826,22 @@ pub const DataServer = struct {
     /// Call this when you want to use the API server with an external
     /// httpx.Server instead of the built-in StdHttpListener.
     fn ensureKernelOwnerSource(self: *DataServer) !*antfly.public_api.ProvisionedKernelOwnerSource {
-        if (self.kernel_owner_source) |owner_source| return owner_source;
+        if (self.kernel_owner_source) |owner_source| {
+            _ = owner_source.withReadSafetyBarrier(self.read_source.read_safety_barrier);
+            _ = owner_source.withTransactionRecoverySource(self.write_source.transactionRecoverySource());
+            _ = owner_source.withRuntimeStatusCache(&self.provisioned_storage.runtime_status_cache);
+            // An early completion owner already has immutable runtime hooks.
+            // Do not retrofit a migration provider into live physical handles.
+            if (owner_source.entries.items.len == 0)
+                _ = owner_source.withNativeMigrationPolicy(self.provisioned_storage.denseNativeMigrationPolicySource());
+            _ = owner_source.withGroupVisibleRootGeneration(self.provisioned_storage.groupVisibleRootGenerationSource());
+            _ = self.read_source.withLocalReadSource(owner_source.readSource());
+            self.read_source.resident_db = null;
+            _ = self.write_source.withLocalWriteSource(owner_source.writeSource());
+            _ = self.write_source.withStorageSnapshotSource(owner_source.snapshotSource());
+            _ = self.write_source.withStorageMaintenanceSource(owner_source.maintenanceSource());
+            return owner_source;
+        }
         const owner_source = try self.alloc.create(antfly.public_api.ProvisionedKernelOwnerSource);
         owner_source.* = antfly.public_api.ProvisionedKernelOwnerSource.init(
             self.alloc,
@@ -5758,6 +5930,11 @@ pub const DataServer = struct {
     pub fn initApiServer(self: *DataServer) !void {
         if (self.http_server != null) return;
         if (comptime !linked_storage) {
+            const authority = self.api_server_cfg.durable_completion_authority;
+            if (authority == .raft_apply or (authority == .standalone_local and
+                (!self.api_server_cfg.deployment_mode.isStandalone() or self.data_raft != null or
+                    self.ha_cfg.admin_context != null or self.ha_cfg.standby_owner != null or self.ha_cfg.internal_primary != null))) return error.InvalidConfig;
+            try self.provisioned_storage.resource_manager.configureDurableCompletion(self.api_server_cfg.durable_transaction_completion.enabled, authority);
             try self.provisioned_storage.resource_manager.configureTransactionCompletion(self.api_server_cfg.transaction_completion_bytes);
             try self.provisioned_storage.resource_manager.configureDenseExecution(self.api_server_cfg.dense_execution);
             try self.provisioned_storage.resource_manager.configureReadExecution(self.api_server_cfg.read_execution);
@@ -9873,6 +10050,14 @@ pub const DataServer = struct {
         };
     }
 
+    fn requiresCanonicalCompletion(req: antfly.db.types.BatchRequest, storage: ?antfly.common.table_storage.Settings) bool {
+        const transaction = req.transaction orelse return false;
+        if (transaction != .prepare) return false;
+        const settings = storage orelse return false;
+        const policy = settings.transaction_recovery orelse return false;
+        return policy.completion_protocol_version != 0 or policy.profile_version != 0;
+    }
+
     fn proposeRaftBatchGroupWithLeaderWait(
         self: *DataServer,
         alloc: std.mem.Allocator,
@@ -9884,7 +10069,7 @@ pub const DataServer = struct {
     ) !void {
         const raft = self.data_raft orelse return error.UnsupportedOperation;
         var proposal_req = req;
-        const required_protocol_version = requiredRaftBatchProtocolVersion(req);
+        var required_protocol_version = requiredRaftBatchProtocolVersion(req);
         const deadline_ns = @min(route.admission_deadline_ns orelse std.math.maxInt(u64), self.dataRaftMonotonicNs() +| leader_wait_ns);
         try ensureDataRaftBatchRouteActive(route);
         try self.reachDataRequestLifecycle(.{
@@ -9917,6 +10102,8 @@ pub const DataServer = struct {
             try ensureDataRaftBatchRouteActive(route);
             const preflighted_local_leader = raft.host.http_host.host.isLocalLeader(group_id);
             var storage_owner_descriptor: ?antfly.public_api.ProvisionedKernelOwnerSource.LoadedDescriptor = null;
+            var completion_compiler: ?antfly.public_api.ProvisionedKernelOwnerSource.CompletionCompiler = null;
+            defer if (completion_compiler) |*compiler| compiler.deinit();
             defer if (storage_owner_descriptor) |*descriptor| descriptor.deinit(alloc);
             var protocol_preflight: DataRaftBatchProtocolPreflight = .{};
             var protocol_activation_entry: ?*DataRaftProtocolActivationEntry = null;
@@ -9937,6 +10124,12 @@ pub const DataServer = struct {
                     if (try source_store.currentMergeSourceState(alloc, group_id)) |merge_source| {
                         if (merge_source.phase == .finalized) return error.MergeSourceFenced;
                     }
+                }
+                if (comptime linked_storage) {
+                    const owner_source = try self.ensureKernelOwnerSource();
+                    storage_owner_descriptor = try owner_source.loadDescriptor(alloc, group_id, table_name);
+                    if (requiresCanonicalCompletion(req, storage_owner_descriptor.?.view().table_storage))
+                        required_protocol_version = data_raft_batch.completion_protocol_version;
                 }
                 const activation_entry = try self.dataRaftProtocolActivationEntry(group_id);
                 protocol_activation_entry = activation_entry;
@@ -10025,8 +10218,11 @@ pub const DataServer = struct {
                 }
                 try admission_source.preflightDenseRepairWriteAdmission(group_id, table_name);
                 if (comptime linked_storage) {
-                    const owner_source = try self.ensureKernelOwnerSource();
-                    storage_owner_descriptor = try owner_source.loadDescriptor(alloc, group_id, table_name);
+                    if (requiresCanonicalCompletion(req, storage_owner_descriptor.?.view().table_storage)) {
+                        proposal_req = raftBatchRequestForProtocol(req, true, self.dataRaftRealtimeNs());
+                        const owner_source = try self.ensureKernelOwnerSource();
+                        completion_compiler = try owner_source.prepareCompletionCompiler(alloc, group_id, table_name, proposal_req);
+                    }
                 }
             }
 
@@ -10108,6 +10304,8 @@ pub const DataServer = struct {
                             }
                         }
                         if (active_protocol_version < required_protocol_version) {
+                            if (required_protocol_version >= data_raft_batch.completion_protocol_version)
+                                return error.CompletionAdmissionUnavailable;
                             if (required_protocol_version >= data_raft_batch.merge_copy_attempt_protocol_version)
                                 return error.RaftBatchMergeProtocolUnavailable;
                             if (required_protocol_version >= data_raft_batch.split_delta_predecessor_protocol_version)
@@ -10115,22 +10313,35 @@ pub const DataServer = struct {
                             if (required_protocol_version >= data_raft_batch.merge_transition_protocol_version)
                                 return error.RaftBatchMergeProtocolUnavailable;
                         }
-                        proposal_req = raftBatchRequestForProtocol(
+                        if (completion_compiler == null) proposal_req = raftBatchRequestForProtocol(
                             req,
                             active_protocol_version >= data_raft_batch.timestamp_protocol_version,
                             self.dataRaftRealtimeNs(),
                         );
                         const proposal_term = status.hard.current_term;
-                        const encoded = if (comptime linked_storage)
-                            try data_raft_batch.encodeWithStorageOwnerDescriptor(
-                                alloc,
-                                table_name,
-                                proposal_req,
-                                storage_owner_descriptor.?.view(),
-                            )
-                        else
-                            try data_raft_batch.encode(alloc, table_name, proposal_req);
-                        defer alloc.free(encoded);
+                        var candidate: ?kernel_owner_client.Response = null;
+                        defer if (candidate) |*owned| owned.deinit();
+                        const encoded: []const u8 = encoded: {
+                            if (comptime linked_storage) {
+                                if (requiresCanonicalCompletion(proposal_req, storage_owner_descriptor.?.view().table_storage)) {
+                                    // Capture and proposal share DATA serialization. A
+                                    // candidate compiled against a moving frontier is
+                                    // never sent to Raft; native guard rechecks it too.
+                                    const current = raft.host.http_host.host.raftStatus(group_id) orelse return error.LeaderUnavailable;
+                                    if (current.applied_index != current.hard.commit_index or current.applied_index != current.last_index)
+                                        return error.CompletionAdmissionUnavailable;
+                                    const previous_term = if (current.applied_index == 0) 0 else try raft.host.http_host.host.raftTermAt(group_id, current.applied_index);
+                                    const compiler = if (completion_compiler) |*value| value else return error.CompletionAdmissionUnavailable;
+                                    candidate = try compiler.compile(.{
+                                        .term = previous_term,
+                                        .index = current.applied_index,
+                                    });
+                                    break :encoded candidate.?.bytes();
+                                }
+                                break :encoded try data_raft_batch.encodeWithStorageOwnerDescriptor(alloc, table_name, proposal_req, storage_owner_descriptor.?.view());
+                            } else break :encoded try data_raft_batch.encode(alloc, table_name, proposal_req);
+                        };
+                        defer if (candidate == null) alloc.free(encoded);
                         var accepted_index: ?u64 = null;
                         raft.host.http_host.proposeWithReceipt(group_id, encoded, &accepted_index) catch |err| {
                             if (accepted_index) |index| {
@@ -15595,6 +15806,25 @@ pub const DataServer = struct {
         const factory = self.data_raft_factory orelse return;
         const registration = self.store_registration orelse return;
         const metadata_epoch = snapshot.status.metadata_epoch;
+        if (factory.completion_installer) |*installer| {
+            // Pending activation does not change routed table policy. Query
+            // locally assigned groups even on otherwise unchanged catalog rounds.
+            var inspected: usize = 0;
+            while (inspected < snapshot.ranges.len) : (inspected += 1) {
+                const position = factory.next_completion_probe % snapshot.ranges.len;
+                factory.next_completion_probe = (position + 1) % snapshot.ranges.len;
+                const group = snapshot.ranges[position].group_id;
+                lockAtomic(&self.data_raft_mutex);
+                const hosted = raft.host.http_host.host.raftStatus(group) != null;
+                self.data_raft_mutex.unlock();
+                if (hosted) {
+                    // One bounded signed lookup per round; new group attach
+                    // always performs its own check before joining.
+                    try installer.install(group, raft.host.http_host.host, &self.data_raft_mutex);
+                    break;
+                }
+            }
+        }
 
         // Compare the inputs that built the admitted plan, including remote
         // member rows and split bootstrap voters. This allocation-free check
@@ -19909,6 +20139,7 @@ pub const DataServer = struct {
                 const reads = cfg.api_server_cfg.read_execution;
                 const context_request: @import("kernel_owner_abi").ContextRequest = .{
                     .transaction_completion_bytes = cfg.api_server_cfg.transaction_completion_bytes,
+                    .durable_completion_enabled = @intFromBool(cfg.api_server_cfg.durable_transaction_completion.enabled),
                     .dense_max_runnable_tasks = dense.max_runnable_tasks,
                     .dense_max_outstanding_tasks = dense.max_outstanding_tasks,
                     .dense_max_queued_tasks = dense.max_queued_tasks,
@@ -19965,6 +20196,24 @@ pub const DataServer = struct {
             cfg.api_server_cfg.internal_service_issuer,
         );
         errdefer remote_metadata.deinit();
+        remote_metadata.completion_backing_provider = cfg.data_raft_completion_provider;
+        remote_metadata.completion_native_provider = cfg.data_raft_completion_native_provider;
+
+        var early_owner_source: ?*antfly.public_api.ProvisionedKernelOwnerSource = null;
+        errdefer if (early_owner_source) |source| {
+            source.deinit();
+            alloc.destroy(source);
+        };
+        if (comptime linked_storage) {
+            if (cfg.enable_data_raft and storage_kernel_context != null) {
+                const source = try alloc.create(antfly.public_api.ProvisionedKernelOwnerSource);
+                source.* = antfly.public_api.ProvisionedKernelOwnerSource.init(alloc, cfg.replica_root_dir, remote_metadata.catalogSource(), antfly.raft.read_gate.unavailableReadSafetyBarrier());
+                _ = source.withStorageContextHandle(storage_kernel_context.?.handle);
+                _ = source.withRemoteContent(cfg.api_server_cfg.remote_content);
+                early_owner_source = source;
+                if (remote_metadata.completion_native_provider == null) remote_metadata.completion_native_provider = source.completionProvider();
+            }
+        }
 
         var data_raft_store: ?*raft_engine.core.MemoryStorage = null;
         errdefer if (data_raft_store) |store| {
@@ -19996,6 +20245,14 @@ pub const DataServer = struct {
 
                 data_raft_factory = try alloc.create(DataDescriptorFactory);
                 data_raft_factory.?.* = DataDescriptorFactory.init(alloc, data_raft_store.?);
+                if (early_owner_source) |source| data_raft_factory.?.completion_installer = .{
+                    .source = source,
+                    .metadata = remote_metadata,
+                    .filesystem_io = raft_backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable,
+                    .node_id = registration.node_id,
+                    .enabled = cfg.api_server_cfg.durable_transaction_completion.enabled,
+                    .qualified_wal = cfg.data_raft_state_backend == .wal,
+                };
 
                 data_raft_apply = blk: {
                     const apply_sm = try alloc.create(RaftTableApplyStateMachine);
@@ -20006,6 +20263,7 @@ pub const DataServer = struct {
                         remote_metadata.catalogSource(),
                         raft_backend_runtime,
                     );
+                    if (early_owner_source) |source| apply_sm.attachKernelOwnerSource(source);
                     break :blk apply_sm;
                 };
 
@@ -20046,8 +20304,10 @@ pub const DataServer = struct {
                             .listener_disabled = cfg.data_raft_listener_external,
                             .host = .{
                                 .descriptor_factory = data_raft_factory.?.iface(),
+                                .ready_observer = .{ .ptr = data_raft_apply.?, .set_host = RaftTableApplyStateMachine.bindCompletionHost },
                                 .runtime_hooks = .{
                                     .state_machine = data_raft_apply.?.stateMachine(),
+                                    .completion_admission = remote_metadata.completionAdmissionProvider(),
                                 },
                             },
                         },
@@ -20072,6 +20332,7 @@ pub const DataServer = struct {
         const server = DataServer{
             .alloc = alloc,
             .remote_metadata = remote_metadata,
+            .kernel_owner_source = early_owner_source,
             .data_raft = data_raft,
             .data_raft_factory = data_raft_factory,
             .data_raft_store = data_raft_store,
@@ -20598,6 +20859,156 @@ const RemoteMetadataSource = struct {
         lifecycle_linearizable_snapshot_calls: std.atomic.Value(u64) = .init(0),
     } else struct {};
 
+    const CompletionGuard = struct {
+        metadata: *RemoteMetadataSource,
+        group_id: u64,
+        node_id: u64,
+        storage: raft_engine.core.Storage,
+        required_policy: ?antfly.common.table_storage.TransactionRecovery = null,
+        new_work_allowed: bool = true,
+        routed_policy_visible: bool = false,
+        native_policy_digest: ?[32]u8 = null,
+        backing: ?raft_engine.runtime.completion_admission_iface.Guard = null,
+
+        fn prepareBacking(self: *@This()) !void {
+            // Pending activation installs native guards before making the
+            // physical policy routable. Acquire only an existing pool; a
+            // missing pool is compatible with an untouched legacy group.
+            if (self.backing == null) if (self.metadata.completion_native_provider) |provider| {
+                var lease: completion_pool_abi.Lease = undefined;
+                const result = provider.acquire(provider.context, self.group_id, self.node_id, &lease);
+                if (result != .not_found) {
+                    try kernel_owner_client.statusToError(result);
+                    errdefer lease.vtable.release(lease.context);
+                    self.backing = try completion_admission_bridge.Bridge.createWithStorage(self.metadata.alloc, lease, self.group_id, self.node_id, self.storage);
+                    self.native_policy_digest = lease.identity.policy_digest;
+                }
+            };
+            self.routed_policy_visible = false;
+            // Copy just the bounded policy under the catalog lock; no catalog
+            // clone, network refresh or ordinary allocation on each Raft step.
+            lockAtomic(&self.metadata.cache_mutex);
+            const observed = blk: {
+                const snapshot = self.metadata.cached_snapshot orelse break :blk null;
+                const range = findRangeByGroupId(snapshot.ranges, self.group_id) orelse break :blk null;
+                const table = findTableById(snapshot.tables, range.table_id) orelse break :blk null;
+                break :blk @as(?antfly.common.table_storage.Settings, table.storage);
+            };
+            self.metadata.cache_mutex.unlock();
+            if (observed) |settings| {
+                if (settings.transaction_recovery) |policy| {
+                    if (policy.completion_protocol_version != 0) {
+                        self.routed_policy_visible = true;
+                        if (self.native_policy_digest) |digest| {
+                            if (!std.meta.eql(digest, @import("../metadata/completion_activation.zig").policyDigest(policy))) self.new_work_allowed = false;
+                        }
+                        if (self.required_policy) |existing| {
+                            if (!std.meta.eql(existing, policy)) self.new_work_allowed = false;
+                        } else self.required_policy = policy;
+                    }
+                }
+                if (self.required_policy == null) return;
+                if (!std.meta.eql(self.required_policy, settings.transaction_recovery)) self.new_work_allowed = false;
+            } else if (self.required_policy == null and self.backing == null) return error.CompletionAdmissionUnavailable;
+            // Once activated, cache eviction or removal of the public setting
+            // cannot release or bypass already accepted completion ownership.
+            if (self.backing == null) {
+                if (self.metadata.completion_native_provider != null) {
+                    return error.CompletionAdmissionUnavailable;
+                } else {
+                    const provider = self.metadata.completion_backing_provider orelse return error.CompletionAdmissionUnavailable;
+                    self.backing = try provider.attach(self.group_id, self.node_id, self.storage);
+                }
+            }
+        }
+
+        fn check(ptr: *anyopaque, status: raft_engine.core.Status, event: raft_engine.runtime.completion_admission_iface.Check, new_work_allowed: bool) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try self.prepareBacking();
+            const backing = self.backing orelse return;
+            // The native owner distinguishes fresh prepare from terminal retry,
+            // even when both arrive as new Raft proposals. Never block all
+            // proposals merely because admission policy changed: recovery still
+            // needs to propose decisions and acknowledgements.
+            try backing.checkAdmission(status, event, new_work_allowed and self.new_work_allowed and self.routed_policy_visible);
+        }
+
+        fn admitInbound(ptr: *anyopaque, status: raft_engine.core.Status, message: raft_engine.core.Message, new_work_allowed: bool) !usize {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try self.prepareBacking();
+            const backing = self.backing orelse return message.entries.len;
+            return try backing.admitInbound(status, message, new_work_allowed and self.new_work_allowed and self.routed_policy_visible);
+        }
+
+        fn proposalResult(ptr: *anyopaque, status: raft_engine.core.Status, result: raft_engine.runtime.completion_admission_iface.ProposalResult) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.backing) |backing| backing.proposalResult(status, result);
+        }
+
+        fn applyAccepted(ptr: *anyopaque, term: u64, index: u64, canonical: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            // Accepted apply cannot reacquire a pool or consult the catalog.
+            const backing = self.backing orelse return error.MissingCompletionAdmissionGuard;
+            try backing.applyAccepted(term, index, canonical);
+        }
+        fn completionProgress(ptr: *anyopaque) !?raft_engine.runtime.completion_admission_iface.Progress {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const backing = self.backing orelse return null;
+            return try backing.progress();
+        }
+        fn hasBacking(ptr: *anyopaque) bool {
+            const self: *CompletionGuard = @ptrCast(@alignCast(ptr));
+            return self.backing != null;
+        }
+        fn ownsAccepted(ptr: *anyopaque, term: u64, index: u64, payload: []const u8) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const backing = self.backing orelse return false;
+            return try backing.ownsAccepted(term, index, payload);
+        }
+
+        fn detach(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.backing) |backing| backing.detach();
+            self.metadata.alloc.destroy(self);
+        }
+    };
+
+    fn completionAdmissionProvider(self: *RemoteMetadataSource) raft_engine.runtime.completion_admission_iface.Provider {
+        return .{ .ptr = self, .vtable = &.{ .attach = attachCompletionGuard, .restored_progress = restoredCompletionProgress, .reconcile_durable = reconcileCompletionDurableLog } };
+    }
+
+    fn restoredCompletionProgress(ptr: *anyopaque, group_id: u64, node_id: u64) !?raft_engine.runtime.completion_admission_iface.Progress {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        const provider = self.completion_native_provider orelse return null;
+        var lease: completion_pool_abi.Lease = undefined;
+        const result = provider.acquire(provider.context, group_id, node_id, &lease);
+        if (result == .not_found) return null;
+        try kernel_owner_client.statusToError(result);
+        defer lease.vtable.release(lease.context);
+        try completion_admission_bridge.Bridge.validateIdentity(lease.identity, group_id, node_id);
+        return try completion_admission_bridge.Bridge.leaseProgress(lease);
+    }
+
+    fn reconcileCompletionDurableLog(ptr: *anyopaque, group_id: u64, node_id: u64, log: raft_engine.runtime.completion_admission_iface.DurableLog) !void {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        const provider = self.completion_native_provider orelse return;
+        var lease: completion_pool_abi.Lease = undefined;
+        const result = provider.acquire(provider.context, group_id, node_id, &lease);
+        if (result == .not_found) return;
+        try kernel_owner_client.statusToError(result);
+        defer lease.vtable.release(lease.context);
+        try completion_admission_bridge.Bridge.validateIdentity(lease.identity, group_id, node_id);
+        try completion_admission_bridge.Bridge.reconcileLease(lease, log);
+    }
+
+    fn attachCompletionGuard(ptr: *anyopaque, group_id: u64, node_id: u64, storage: raft_engine.core.Storage) !raft_engine.runtime.completion_admission_iface.Guard {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        const guard = try self.alloc.create(CompletionGuard);
+        guard.* = .{ .metadata = self, .group_id = group_id, .node_id = node_id, .storage = storage };
+        return .{ .ptr = guard, .vtable = &.{ .check = CompletionGuard.check, .inbound_prefix = CompletionGuard.admitInbound, .proposal_result = CompletionGuard.proposalResult, .apply_accepted = CompletionGuard.applyAccepted, .progress = CompletionGuard.completionProgress, .owns_accepted = CompletionGuard.ownsAccepted, .has_backing = CompletionGuard.hasBacking, .detach = CompletionGuard.detach } };
+    }
+
+    completion_backing_provider: ?raft_engine.runtime.completion_admission_iface.Provider = null,
     completion_native_provider: ?completion_pool_abi.Provider = null,
     supports_runtime_reference: std.atomic.Value(bool) = .init(false),
     alloc: std.mem.Allocator,
@@ -25880,6 +26291,7 @@ pub fn runFromIterator(
         try context.ensureWith(.{
             .auth_storage_path = .fromSlice(if (auth_enabled) resolved.auth_store_root_dir else ""),
             .transaction_completion_bytes = admission.transaction_completion_bytes,
+            .durable_completion_enabled = @intFromBool(admission.durable_transaction_completion.enabled),
             .dense_max_runnable_tasks = dense.max_runnable_tasks,
             .dense_max_outstanding_tasks = dense.max_outstanding_tasks,
             .dense_max_queued_tasks = dense.max_queued_tasks,
@@ -25993,6 +26405,7 @@ pub fn runFromIterator(
             .remote_attempt_worker = if (loaded_config) |*cfg| cfg.admission.remote_attempt_worker else .{},
             .remote_attempt_coordinator = if (loaded_config) |*cfg| cfg.admission.remote_attempt_coordinator else .{},
             .transaction_completion_bytes = if (loaded_config) |*cfg| cfg.admission.transaction_completion_bytes else 0,
+            .durable_transaction_completion = if (loaded_config) |*cfg| cfg.admission.durable_transaction_completion else .{},
             .write_admission_waiting = if (loaded_config) |*cfg| cfg.admission.write.waiting else .{},
             .graph_execution_limits = if (loaded_config) |*cfg| cfg.graph_execution else .{},
             .write_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.write.max_concurrent_requests else antfly.common.config.default_write_max_concurrent_requests,
@@ -45566,6 +45979,20 @@ fn implementationTests() type {
             try std.testing.expectEqual(@as(usize, 0), retired.write.retained_bytes);
         }
 
+        test "workload admission completion diagnostics distinguish recovery authority from new admission" {
+            var resources = resource_manager_mod.ResourceManager.init(.{});
+            defer resources.deinit(std.testing.allocator);
+            try resources.configureDurableCompletion(false, .standalone_local);
+            var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+            defer output.deinit();
+            try writeDurableCompletionPolicyMetrics(&output.writer, resources.durable_completion_enabled, @intFromEnum(resources.durable_completion_authority));
+            for ([_][]const u8{
+                "antfly_durable_completion_policy_sample_available 1\n",
+                "antfly_durable_completion_new_admission_enabled 0\n",
+                "antfly_durable_completion_runtime_authority 1\n",
+            }) |sample| try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), sample) != null);
+        }
+
         test "workload admission cache metrics emit unique sample identities" {
             var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
             defer output.deinit();
@@ -47956,6 +48383,181 @@ fn implementationTests() type {
             try std.testing.expectEqual(@as(u64, 2), refreshed.items[0].stats.source_doc_count);
             try std.testing.expectEqual(@as(usize, 1), refreshed.items[0].stats.indexes.len);
         }
+
+        test "workload admission data completion guard latches policy and requires owned backing" {
+            const alloc = std.testing.allocator;
+            const Stub = struct {
+                fn execute(_: *anyopaque, _: std.mem.Allocator, _: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
+                    return error.UnexpectedNetworkRequest;
+                }
+            };
+            const Backing = struct {
+                admitted: bool = false,
+                refs: usize = 0,
+                checks: usize = 0,
+                recovery_only_checks: usize = 0,
+                fn attach(ptr: *anyopaque, group_id: u64, node_id: u64, _: raft_engine.core.Storage) !raft_engine.runtime.completion_admission_iface.Guard {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqual(@as(u64, 77), group_id);
+                    try std.testing.expectEqual(@as(u64, 1), node_id);
+                    if (!self.admitted) return error.CompletionAdmissionUnavailable;
+                    self.refs += 1;
+                    return .{ .ptr = self, .vtable = &.{ .check = check, .proposal_result = proposalResult, .detach = detach } };
+                }
+                fn check(ptr: *anyopaque, _: raft_engine.core.Status, _: raft_engine.runtime.completion_admission_iface.Check, new_work_allowed: bool) !void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expect(self.refs > 0);
+                    self.checks += 1;
+                    if (!new_work_allowed) self.recovery_only_checks += 1;
+                }
+                fn proposalResult(_: *anyopaque, _: raft_engine.core.Status, _: raft_engine.runtime.completion_admission_iface.ProposalResult) void {}
+                fn detach(ptr: *anyopaque) void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.refs -= 1;
+                }
+            };
+            var stub: u8 = 0;
+            var remote = try RemoteMetadataSource.initWithRequestExecutors(alloc, &.{"http://metadata.invalid"}, &.{.{ .ptr = &stub, .vtable = &.{ .execute = Stub.execute } }}, std.testing.io);
+            defer remote.deinit();
+            var storage = raft_engine.core.MemoryStorage.init(alloc);
+            defer storage.deinit();
+            var backing = Backing{};
+            const status: raft_engine.core.Status = .{ .id = 1, .group_id = 77, .soft = .{}, .hard = .{}, .conf_state = .{} };
+            const guard = try remote.completionAdmissionProvider().attach(77, 1, storage.storage());
+            var guard_live = true;
+            defer if (guard_live) guard.detach();
+            try std.testing.expectError(error.CompletionAdmissionUnavailable, guard.check(status, .campaign));
+            var tables = [_]antfly.metadata.TableRecord{.{ .table_id = 42, .name = "docs" }};
+            var ranges = [_]antfly.metadata.RangeRecord{.{ .group_id = 77, .table_id = 42, .start_key = "" }};
+            const snapshot: antfly.metadata_api.AdminSnapshot = .{
+                .status = .{ .metadata_group_id = 9, .metrics = .{} },
+                .tables = &tables,
+                .ranges = &ranges,
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+            remote.cached_snapshot = try cloneAdminSnapshotOwned(alloc, snapshot);
+            try guard.check(status, .campaign);
+            remote.cached_snapshot.?.tables[0].storage.transaction_recovery = .{
+                .protocol_version = 1,
+                .max_count = 4,
+                .max_bytes = 4194304,
+                .max_transaction_bytes = 1048576,
+                .completion_protocol_version = 1,
+                .profile_version = 1,
+            };
+            try std.testing.expectError(error.CompletionAdmissionUnavailable, guard.check(status, .campaign));
+            remote.completion_backing_provider = .{ .ptr = &backing, .vtable = &.{ .attach = Backing.attach } };
+            try std.testing.expectError(error.CompletionAdmissionUnavailable, guard.check(status, .campaign));
+            try std.testing.expectEqual(@as(usize, 0), backing.refs);
+            backing.admitted = true;
+            try guard.check(status, .campaign);
+            try std.testing.expectEqual(@as(usize, 1), backing.refs);
+            // Removing the setting cannot turn a previously required native lease
+            // into a legacy bypass or release accepted obligations.
+            remote.cached_snapshot.?.tables[0].storage.transaction_recovery = null;
+            try guard.check(status, .campaign);
+            freeAdminSnapshotOwned(alloc, &remote.cached_snapshot.?);
+            remote.cached_snapshot = null;
+            try guard.check(status, .campaign);
+            try std.testing.expectEqual(@as(usize, 3), backing.checks);
+            try std.testing.expectEqual(@as(usize, 2), backing.recovery_only_checks);
+            guard.detach();
+            guard_live = false;
+            try std.testing.expectEqual(@as(usize, 0), backing.refs);
+            // A prior legacy observation must not cache absence across the installer's
+            // under-Raft-lock registry barrier.
+            const Native = struct {
+                phase: enum { absent, installing, installed } = .absent,
+                acquires: usize = 0,
+                checks: usize = 0,
+                releases: usize = 0,
+                fn acquire(ptr: ?*anyopaque, group: u64, node: u64, out: *completion_pool_abi.Lease) callconv(.c) @import("kernel_owner_abi").Status {
+                    const self: *@This() = @ptrCast(@alignCast(ptr.?));
+                    self.acquires += 1;
+                    switch (self.phase) {
+                        .absent => return .not_found,
+                        .installing => return .completion_admission_unavailable,
+                        .installed => {},
+                    }
+                    out.* = .{ .identity = .{ .group_id = group, .node_id = node, .capacity = 4, .generation = 1, .incarnation = @splat(8), .policy_digest = @splat(9) }, .context = self, .vtable = &.{ .check = check, .proposal_result = result, .release = release } };
+                    return .ok;
+                }
+                fn check(ptr: ?*anyopaque, request: *const completion_pool_abi.Check, out: *completion_pool_abi.CheckResult) callconv(.c) @import("kernel_owner_abi").Status {
+                    const self: *@This() = @ptrCast(@alignCast(ptr.?));
+                    if (request.new_work_allowed != 0) return .internal;
+                    self.checks += 1;
+                    out.* = .{};
+                    return .ok;
+                }
+                fn result(_: ?*anyopaque, _: *const completion_pool_abi.ProposalResult) callconv(.c) void {}
+                fn release(ptr: ?*anyopaque) callconv(.c) void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr.?));
+                    self.releases += 1;
+                }
+            };
+            var native = Native{};
+            remote.completion_native_provider = .{ .context = &native, .acquire = Native.acquire };
+            remote.cached_snapshot = try cloneAdminSnapshotOwned(alloc, snapshot);
+            const installed_guard = try remote.completionAdmissionProvider().attach(77, 1, storage.storage());
+            var installed_live = true;
+            defer if (installed_live) installed_guard.detach();
+            try installed_guard.check(status, .{ .proposal = &.{"ordinary"} });
+            try std.testing.expect(!installed_guard.hasBacking());
+            native.phase = .installing;
+            try std.testing.expectError(error.CompletionAdmissionUnavailable, installed_guard.check(status, .{ .proposal = &.{"ordinary"} }));
+            try std.testing.expect(!installed_guard.hasBacking());
+            native.phase = .installed;
+            try installed_guard.check(status, .campaign);
+            try std.testing.expect(installed_guard.hasBacking());
+            try installed_guard.check(status, .campaign);
+            try std.testing.expectEqual(@as(usize, 3), native.acquires);
+            try std.testing.expectEqual(@as(usize, 2), native.checks);
+            installed_guard.detach();
+            installed_live = false;
+            try std.testing.expectEqual(@as(usize, 1), native.releases);
+        }
+
+        test "workload admission completion attestation DATA rejects absent runtime without publishing output" {
+            var output: completion_pool_abi.Attestation = .{};
+            output.term = 99;
+            try std.testing.expectEqual(@import("kernel_owner_abi").Status.completion_admission_unavailable, DataServer.completionAttestationSnapshot(null, 7, &output));
+            try std.testing.expectEqual(@as(u64, 99), output.term);
+            // Only the fields inspected before the absent-group return are initialized.
+            var server: DataServer = undefined;
+            server.data_raft_mutex = .unlocked;
+            server.data_raft = null;
+            try std.testing.expectEqual(@import("kernel_owner_abi").Status.completion_admission_unavailable, DataServer.completionAttestationSnapshot(&server, 7, &output));
+            try std.testing.expect(server.data_raft_mutex.tryLock());
+            defer server.data_raft_mutex.unlock();
+            // The HTTP issuer must not queue behind a group owner or invent evidence.
+            try std.testing.expectEqual(@import("kernel_owner_abi").Status.completion_admission_unavailable, DataServer.completionAttestationSnapshot(&server, 7, &output));
+            try std.testing.expectEqual(@as(u64, 99), output.term);
+        }
+
+        test "workload admission canonical proposal selection follows authoritative table policy" {
+            const prepare: antfly.db.types.BatchRequest = .{ .transaction = .{ .prepare = .{ .txn_id = @splat(7), .topology_epoch = 1 } } };
+            var settings: antfly.common.table_storage.Settings = .{ .transaction_recovery = .{
+                .protocol_version = 1,
+                .max_count = 4,
+                .max_bytes = 65536,
+                .max_transaction_bytes = 4096,
+            } };
+            try std.testing.expect(!DataServer.requiresCanonicalCompletion(prepare, null));
+            try std.testing.expect(!DataServer.requiresCanonicalCompletion(prepare, settings));
+            settings.transaction_recovery.?.completion_protocol_version = 1;
+            settings.transaction_recovery.?.profile_version = 1;
+            try std.testing.expect(DataServer.requiresCanonicalCompletion(prepare, settings));
+            try std.testing.expect(!DataServer.requiresCanonicalCompletion(.{}, settings));
+            // Unknown future/malformed policy is never silently downgraded to the
+            // legacy logical prepare format; the canonical compiler rejects it.
+            settings.transaction_recovery.?.completion_protocol_version = 2;
+            try std.testing.expect(DataServer.requiresCanonicalCompletion(prepare, settings));
+            try std.testing.expectEqual(@as(u16, 7), data_raft_batch.completion_protocol_version);
+            try std.testing.expect(data_raft_batch.protocol_version >= data_raft_batch.completion_protocol_version);
+        }
     };
     return Suite;
 }
@@ -47965,21 +48567,4 @@ comptime {
         _ = consumer_tests;
         _ = implementation_tests;
     }
-}
-
-test "workload admission completion attestation DATA rejects absent runtime without publishing output" {
-    var output: completion_pool_abi.Attestation = .{};
-    output.term = 99;
-    try std.testing.expectEqual(@import("kernel_owner_abi").Status.completion_admission_unavailable, DataServer.completionAttestationSnapshot(null, 7, &output));
-    try std.testing.expectEqual(@as(u64, 99), output.term);
-    // Only the fields inspected before the absent-group return are initialized.
-    var server: DataServer = undefined;
-    server.data_raft_mutex = .unlocked;
-    server.data_raft = null;
-    try std.testing.expectEqual(@import("kernel_owner_abi").Status.completion_admission_unavailable, DataServer.completionAttestationSnapshot(&server, 7, &output));
-    try std.testing.expect(server.data_raft_mutex.tryLock());
-    defer server.data_raft_mutex.unlock();
-    // The HTTP issuer must not queue behind a group owner or invent evidence.
-    try std.testing.expectEqual(@import("kernel_owner_abi").Status.completion_admission_unavailable, DataServer.completionAttestationSnapshot(&server, 7, &output));
-    try std.testing.expectEqual(@as(u64, 99), output.term);
 }

@@ -3003,6 +3003,8 @@ pub fn runFromIterator(
     // primary-local sidecar that is not part of the continuous HA WAL.
     try validateHARole(cli);
     const ha_role_requested = haPrimaryRequested(cli) or haStandbyRequested(cli);
+    const durable_completion_authority = @import("../common/durable_completion_policy.zig").standaloneAuthority(storage_engine == .local, ha_role_requested, lite_fsync);
+    if ((if (loaded_config) |*cfg| cfg.admission.durable_transaction_completion.enabled else false) and durable_completion_authority == .none) return error.UnsupportedCompletionBackend;
     const ha_mutation_guard_enabled = haContinuousMutationGuardEnabled(cli);
 
     const resolved = try resolvePaths(alloc, cli, if (loaded_config) |*cfg| cfg else null);
@@ -3023,6 +3025,8 @@ pub fn runFromIterator(
         const reads = if (loaded_config) |*cfg| cfg.admission.read_execution else (antfly.common.config.Config.AdmissionConfig{}).read_execution;
         try storage_kernel_context.ensureWith(.{
             .transaction_completion_bytes = if (loaded_config) |*cfg| cfg.admission.transaction_completion_bytes else 0,
+            .durable_completion_enabled = @intFromBool(if (loaded_config) |*cfg| cfg.admission.durable_transaction_completion.enabled else false),
+            .durable_completion_authority = @intFromEnum(durable_completion_authority),
             .storage_kind = if (lite_path != null) .lite else .directory,
             .no_sync = @intFromBool(!lite_fsync),
             .storage_path = .fromSlice(lite_path orelse ""),
@@ -3623,6 +3627,8 @@ pub fn runFromIterator(
             .remote_attempt_worker = if (loaded_config) |*cfg| cfg.admission.remote_attempt_worker else .{},
             .remote_attempt_coordinator = if (loaded_config) |*cfg| cfg.admission.remote_attempt_coordinator else .{},
             .transaction_completion_bytes = if (loaded_config) |*cfg| cfg.admission.transaction_completion_bytes else 0,
+            .durable_transaction_completion = if (loaded_config) |*cfg| cfg.admission.durable_transaction_completion else .{},
+            .durable_completion_authority = durable_completion_authority,
             .write_admission_waiting = if (loaded_config) |*cfg| cfg.admission.write.waiting else .{},
             .graph_execution_limits = if (loaded_config) |*cfg| cfg.graph_execution else .{},
             .write_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.write.max_concurrent_requests else antfly.common.config.default_write_max_concurrent_requests,
