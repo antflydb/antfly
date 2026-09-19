@@ -4295,9 +4295,50 @@ pub const ProvisionedTableReadSource = struct {
         var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
         var pinned: RoutePinnedCatalog = undefined;
         var routed: ProvisionedTableReadSource = undefined;
-        try self.bindRouteFence(table_name, fence, &route_storage, &pinned, &routed);
-        return try lookupGroupLocal(&routed, alloc, group_id, table_name, key, opts, consistency);
+        var retry = RoutedLookupCapacityRetry.init(self.catalog, fence, opts);
+        try self.bindRouteFence(table_name, retry.fence, &route_storage, &pinned, &routed);
+        return try retry.run(lookupGroupLocal, .{ &routed, alloc, group_id, table_name, key, retry.opts, consistency });
     }
+
+    const RoutedLookupCapacityRetry = struct {
+        budget: table_catalog.RoutingBudget,
+        fence: metadata_api.CatalogRouteFence,
+        opts: db_mod.types.LookupOptions,
+
+        fn init(catalog: table_catalog.CatalogSource, fence: metadata_api.CatalogRouteFence, opts: db_mod.types.LookupOptions) @This() {
+            // Convert both clocks once. A caller without a deadline gets the
+            // same five-second bound as the default data read barrier.
+            const deadline = earliestDeadline(lookupRoutingDeadline(catalog, opts), catalog.routeFenceDeadline(fence)) orelse
+                catalog.budget(null).nowNs() +| @as(u64, metadata_api.catalog_route_default_deadline_ms) * std.time.ns_per_ms;
+            var result: @This() = .{ .budget = catalog.budget(deadline), .fence = fence, .opts = opts };
+            result.fence.admission_deadline_ns = deadline;
+            result.fence.admission_deadline_io = catalog.io;
+            result.opts.execution_deadline_ns = deadline;
+            result.opts.execution_io = catalog.io;
+            return result;
+        }
+
+        fn checkpoint(self: *const @This()) !void {
+            try self.fence.admission_cancellation.check();
+            if (self.opts.cancellation) |token| try token.check();
+            if (self.budget.nowNs() >= self.budget.deadline_ns.?) return error.DeadlineExceeded;
+        }
+
+        fn run(self: *@This(), comptime invoke: anytype, args: anytype) !?LookupResponse {
+            while (true) {
+                try self.checkpoint();
+                return @call(.auto, invoke, args) catch |err| {
+                    if (err != error.ConcurrencyUnavailable) return err;
+                    // Each failed read has unwound its admission and temporary
+                    // state before waiting. Never retry a different fence or
+                    // assign the request a fresh deadline.
+                    try self.checkpoint();
+                    try self.budget.sleepNs(@min(10 * std.time.ns_per_ms, self.budget.deadline_ns.? -| self.budget.nowNs()));
+                    continue;
+                };
+            }
+        }
+    };
 
     fn documentArtifactManifestGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, doc_key: []const u8, artifact_name: []const u8, consistency: raft_mod.ReadConsistency) !?db_mod.types.DocumentArtifactManifest {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
@@ -6158,10 +6199,7 @@ pub const HostedProvisionedTableReadSource = struct {
     ) !?LookupResponse {
         return switch (route) {
             .local => (try self.groupLocalSourceForGroup(alloc, group_id, table_name, .{ .deadline_ns = opts.execution_deadline_ns, .io = opts.execution_io }, opts.cancellation)).lookupGroupLocal(alloc, group_id, table_name, key, opts, consistency),
-            .remote => |remote| lookupRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, key, opts, consistency) catch |err| switch (err) {
-                error.UnexpectedHttpStatus => null,
-                else => err,
-            },
+            .remote => |remote| lookupRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, key, opts, consistency),
         };
     }
 
@@ -6208,12 +6246,7 @@ pub const HostedProvisionedTableReadSource = struct {
             }
             const base_uri = (try self.router.withBudget(.fromRequest(opts)).nodeBaseUriForGroup(alloc, group_id, node_id)) orelse continue;
             defer alloc.free(base_uri);
-            if (lookupRemote(self.internalExecutor(), alloc, base_uri, group_id, table_name, key, opts, consistency)) |result| {
-                return result;
-            } else |err| switch (err) {
-                error.UnexpectedHttpStatus => continue,
-                else => return err,
-            }
+            if (try lookupRemote(self.internalExecutor(), alloc, base_uri, group_id, table_name, key, opts, consistency)) |result| return result;
         }
         return null;
     }
@@ -14387,7 +14420,10 @@ fn lookupRemote(
         read_consistency,
         timeout_ms,
         cancellation,
-    ) catch |err| return normalizeDistributedReadTransportError(err);
+    ) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return normalizeDistributedReadTransportError(err),
+    };
     defer result.deinit(alloc);
     try checkLookupOptionsActive(opts);
     return try controlledLookupResponseAlloc(
@@ -16454,6 +16490,70 @@ fn consumerTests() type {
                 };
                 try std.testing.expectError(expected, lookupRemote(source, std.testing.allocator, "http://127.0.0.1:1", 7, "entities", "person/ada_lovelace", .{}, .read_index));
                 try std.testing.expectEqual(@as(usize, 1), executor.calls);
+            }
+        }
+
+        test "remote lookup transport failures preserve read availability without retrying on HTTP statuses" {
+            const Fixture = struct {
+                status: u16,
+                calls: usize = 0,
+                fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.calls += 1;
+                    const headers = try alloc.alloc(http_common.Header, 1);
+                    headers[0] = .{
+                        .name = try alloc.dupe(u8, metadata_api.catalog_route_fence_ack_header),
+                        .value = try alloc.dupe(u8, metadata_api.catalog_route_fence_ack_value),
+                    };
+                    return .{
+                        .status = self.status,
+                        .headers = headers,
+                        .body = try alloc.dupe(u8, switch (self.status) {
+                            200 => "{\"marker\":\"kept\"}",
+                            404 => "not found",
+                            503 => "storage read temporarily unavailable",
+                            else => "RuntimeBoundaryFailure",
+                        }),
+                    };
+                }
+                fn fence(_: *anyopaque, group_id: u64) !?metadata_api.CatalogRouteFence {
+                    return .{
+                        .metadata_group_id = 1,
+                        .catalog_revision = 1,
+                        .table_id = 1,
+                        .topology_epoch = 1,
+                        .route = .{ .group_id = group_id, .range_id = group_id, .identity_namespace = .{ .table_id = 1, .shard_id = group_id, .range_id = group_id } },
+                    };
+                }
+                fn admin(_: *anyopaque) !metadata_api.AdminSnapshot {
+                    return error.UnexpectedAdminSnapshot;
+                }
+                fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+            };
+            const alloc = std.testing.allocator;
+            for ([_]u16{ 200, 404, 400, 429, 500, 502, 503, 504 }) |status_code| {
+                var fixture = Fixture{ .status = status_code };
+                const executor: http_common.RequestExecutor = .{ .ptr = &fixture, .vtable = &.{ .execute = Fixture.execute } };
+                const catalog: table_catalog.CatalogSource = .{ .ptr = &fixture, .vtable = &.{ .route_fence = Fixture.fence, .admin_snapshot = Fixture.admin, .free_admin_snapshot = Fixture.free } };
+                var hosted = HostedProvisionedTableReadSource.init("unused", catalog, undefined, undefined, executor);
+                for ([_]bool{ false, true }) |through_route| {
+                    const result = if (through_route)
+                        hosted.lookupViaRoute(alloc, .{ .remote = .{ .node_id = 2, .base_uri = @constCast("http://peer.invalid") } }, 7, "docs", "a", .{}, .read_index)
+                    else
+                        lookupRemote(executor, alloc, "http://peer.invalid", 7, "docs", "a", .{}, .read_index);
+                    switch (status_code) {
+                        200 => {
+                            var response = (try result).?;
+                            defer response.deinit(alloc);
+                            try std.testing.expectEqualStrings("{\"marker\":\"kept\"}", response.json);
+                        },
+                        404 => try std.testing.expect((try result) == null),
+                        503 => try std.testing.expectError(error.StorageReadTemporarilyUnavailable, result),
+                        504 => try std.testing.expectError(error.Timeout, result),
+                        else => try std.testing.expectError(error.UnexpectedHttpStatus, result),
+                    }
+                }
+                try std.testing.expectEqual(@as(usize, 2), fixture.calls);
             }
         }
 
@@ -19400,6 +19500,91 @@ fn consumerTests() type {
                 error.UnexpectedCatalogCall,
                 source.source().lookup(alloc, "docs", "doc:a", .{}, .stale),
             );
+        }
+
+        test "workload admission routed lookup executor retries preserve both cancellation and original deadline" {
+            const Fake = struct {
+                calls: usize = 0,
+                failures: usize = 2,
+                failure: anyerror = error.ConcurrencyUnavailable,
+                cancel: ?*std.atomic.Value(bool) = null,
+                fn lookup(self: *@This()) !?LookupResponse {
+                    self.calls += 1;
+                    if (self.cancel) |signal| signal.store(true, .release);
+                    if (self.calls <= self.failures) return self.failure;
+                    return .{ .json = try std.testing.allocator.dupe(u8, "present"), .version = 1 };
+                }
+            };
+            var clock = try @import("vopr").vopr_io.VoprIo.init(.{ .monotonic_ns = 100 * std.time.ns_per_s });
+            defer clock.deinit();
+            var request_clock = try @import("vopr").vopr_io.VoprIo.init(.{ .monotonic_ns = 7 * std.time.ns_per_s });
+            defer request_clock.deinit();
+            // This fixture calls the helper synchronously, outside VOPR's
+            // fiber scheduler. Advance its clock directly for each bounded
+            // sleep instead of asking VOPR to suspend a nonexistent task.
+            var clock_vtable = clock.io().vtable.*;
+            clock_vtable.sleep = struct {
+                fn sleep(ptr: ?*anyopaque, timeout: std.Io.Timeout) std.Io.Cancelable!void {
+                    const source: *@import("vopr").vopr_io.VoprIo = @ptrCast(@alignCast(ptr.?));
+                    const duration = switch (timeout) {
+                        .duration => |value| value.raw.toNanoseconds(),
+                        else => return error.Canceled,
+                    };
+                    source.advance(@intCast(duration)) catch return error.Canceled;
+                }
+            }.sleep;
+            const clock_io: std.Io = .{ .userdata = clock.io().userdata, .vtable = &clock_vtable };
+            const catalog: table_catalog.CatalogSource = .{ .ptr = undefined, .vtable = undefined, .io = @import("../runtime_io_abi.zig").Borrow.init(&clock_io) };
+            const fence: metadata_api.CatalogRouteFence = .{
+                .metadata_group_id = 9,
+                .metadata_incarnation = "11111111111111111111111111111111".*,
+                .catalog_revision = 1,
+                .table_id = 7,
+                .topology_epoch = 1,
+                .route = .{ .group_id = 7001, .range_id = 11, .identity_namespace = .{ .table_id = 7, .shard_id = 7001, .range_id = 11 } },
+                .admission_deadline_ns = 8 * std.time.ns_per_s,
+                .admission_deadline_io = @import("../runtime_io_abi.zig").Borrow.init(&request_clock.io()),
+            };
+            var fake: Fake = .{};
+            var retry = ProvisionedTableReadSource.RoutedLookupCapacityRetry.init(catalog, fence, .{});
+            try std.testing.expectEqual(@as(u64, 101 * std.time.ns_per_s), retry.budget.deadline_ns.?);
+            var found = (try retry.run(Fake.lookup, .{&fake})).?;
+            defer found.deinit(std.testing.allocator);
+            try std.testing.expectEqualStrings("present", found.json);
+            try std.testing.expectEqual(@as(usize, 3), fake.calls);
+            try std.testing.expectEqual(@as(u64, 101 * std.time.ns_per_s), retry.budget.deadline_ns.?);
+
+            const now = catalog.budget(null).nowNs();
+            retry = ProvisionedTableReadSource.RoutedLookupCapacityRetry.init(catalog, fence, .{
+                .execution_deadline_ns = now + 25 * std.time.ns_per_ms,
+                .execution_io = catalog.io,
+            });
+            fake = .{ .failures = std.math.maxInt(usize) };
+            try std.testing.expectError(error.DeadlineExceeded, retry.run(Fake.lookup, .{&fake}));
+            try std.testing.expectEqual(now + 25 * std.time.ns_per_ms, catalog.budget(null).nowNs());
+            try std.testing.expectEqual(@as(usize, 3), fake.calls);
+
+            for ([_]bool{ false, true }) |cancel_fence| {
+                var cancellation = std.atomic.Value(bool).init(false);
+                retry = ProvisionedTableReadSource.RoutedLookupCapacityRetry.init(catalog, fence, .{});
+                if (cancel_fence) retry.fence.admission_cancellation = db_mod.types.CancellationToken.fromAtomic(&cancellation) else retry.opts.cancellation = db_mod.types.CancellationToken.fromAtomic(&cancellation);
+                fake = .{ .failures = std.math.maxInt(usize), .cancel = &cancellation };
+                try std.testing.expectError(error.Canceled, retry.run(Fake.lookup, .{&fake}));
+                try std.testing.expectEqual(@as(usize, 1), fake.calls);
+            }
+            retry = ProvisionedTableReadSource.RoutedLookupCapacityRetry.init(catalog, fence, .{});
+            fake = .{ .failure = error.UnexpectedReadFailure };
+            try std.testing.expectError(error.UnexpectedReadFailure, retry.run(Fake.lookup, .{&fake}));
+            try std.testing.expectEqual(@as(usize, 1), fake.calls);
+
+            var unbounded = fence;
+            unbounded.admission_deadline_ns = null;
+            retry = ProvisionedTableReadSource.RoutedLookupCapacityRetry.init(catalog, unbounded, .{});
+            const default_deadline = catalog.budget(null).nowNs() + 5 * std.time.ns_per_s;
+            try std.testing.expectEqual(default_deadline, retry.budget.deadline_ns.?);
+            fake = .{ .failures = std.math.maxInt(usize) };
+            try std.testing.expectError(error.DeadlineExceeded, retry.run(Fake.lookup, .{&fake}));
+            try std.testing.expectEqual(default_deadline, catalog.budget(null).nowNs());
         }
 
         test "fanout planner uses io cap and request shape" {

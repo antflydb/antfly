@@ -745,3 +745,32 @@ checks outside the sealed receipts. This establishes observed signed transport
 ordering plus sampled coordinator accounting for these local faults; it does
 not prove application consumption of every observed response, every durable
 decision crash boundary, or performance/Cloud qualification.
+
+### Native saturation after catalog admission retry
+
+`4689cf405c` retries local executor admission exhaustion only for read-only
+catalog calls, preserving their original deadline and cancellation budget.
+The owning gate passed 2/2 with actual exit zero and no leaks
+(`/tmp/workload-catalog-executor-retry-final.log`), including real one-worker
+exhaustion/recovery, deadline expiry, cancellation and unknown-error propagation.
+
+The next clean Debug build (`/tmp/workload-dispatch-4689-production-debug-receipt.json`)
+has SHA-256 `5e6dbf5e451ca5afd25ab25896279257abab1bc8735841fb07a9fca8f6a93c5d`.
+Its native run remains **failed**, preserved at
+`/tmp/workload-dispatch-4689cf405c-receipts` (22/22 checksums verified, all three
+processes exited zero). Initial, saturated and post-probe metric gates passed:
+32 query/request tasks active, no queued queries, and exact task capacity 50.
+Both excess general requests received the required structured 429. GET and HEAD
+health/readiness probes returned 200, and authenticated recovery discovery
+returned a nonce-bound protocol-3 proof verified live. All 32 clients remained
+pending throughout the 0.524-second probe interval. Executor and connection
+dispatch rejection counters stayed zero; permit rejections increased by two.
+
+Completion exposed a second product failure: 29 reads returned the exact
+document, while three returned HTTP 404 `not found`. The data process logged
+three untransportable `lookup_group_local_routed` errors with cause
+`ConcurrencyUnavailable`. The forwarding path treated unexpected HTTP statuses
+as absence. The run did not reach its final idle/recovery gate and does not
+qualify the full policy. The harness diagnostic fix `b82cf608b6` now reports the
+status and bounded body excerpt instead of masking non-JSON failures with a
+JSON decoding exception; it changes no acceptance threshold.
