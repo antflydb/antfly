@@ -687,3 +687,61 @@ native completion entry racing a draining close (`5511c11024`, native gate 6/6,
 leaks. The API bridge now preserves HEAD fallback for a selected GET route,
 leaving the host method unchanged for transport body suppression; its new
 regression and malformed-path classifier cases are part of the final API gate.
+
+The final API gate at `70e2476501` passed 143 metadata/storage and 235 runtime
+tests, one optional Wasmtime skip, no failures/leaks, actual exit zero
+(`/tmp/workload-dispatch-api-final.log`). The standalone gate passed 133/133,
+including the changed listener sizing (`/tmp/workload-dispatch-standalone-config.log`).
+The Python qualification harness gate passed 86 with one optional skip
+(`/tmp/workload-dispatch-python-final-loopback.log`); the initial sandbox run
+could not bind loopback sockets and is not a product failure.
+
+### Native task saturation exposed catalog executor exhaustion
+
+The clean frozen Debug build of `70e24765012e27790a80784ca514f41c4fdbef55`
+exited zero (`/tmp/workload-dispatch-70e-production-debug-receipt.json`). Binary
+`/tmp/workload-dispatch-70e2476501-antfly` has SHA-256
+`c4ca1ea38cc4ef8c9cea4071547c2cf93f28e70791f267975e5d81ef2adc6bb1`.
+
+The first native task-partition run failed qualification, actual exit one;
+preserved evidence is `/tmp/workload-dispatch-70e2476501-receipts` (22 checksums
+verified, all three owned processes exited zero). The generator dispatched all
+32 requests within the existing 100 ms bound, but 14 returned HTTP 500
+`RuntimeBoundaryFailure` in 5–10 ms. API logs contain exactly 14 untransportable
+`system_catalog` callback errors with cause `ConcurrencyUnavailable`. The other
+18 requests remained active and later returned the exact document. Listener
+task capacity/reservation was the expected 50; permit, executor and connection
+rejection counters stayed zero. The test correctly refused to claim saturation
+or protected-lane progress. No acceptance threshold was relaxed.
+
+The metadata client's four instances share the bounded API executor. Local
+request-task admission exhaustion escaped the read-only catalog retry loop as
+an untransportable terminal error. This is a separate nested execution-capacity
+failure from the earlier 32-task public listener limit. The failed receipt is
+not evidence of historical benchmark attribution or optimized performance.
+
+### Distributed reconciliation after protected dispatch integration
+
+The same frozen `70e2476501` Debug binary passed the local response-loss and
+worker/API restart scenario, actual exit zero:
+`/tmp/workload-reconciliation-70e2476501-capture-receipts`. All 19 requests met
+their assertions; 21 receipt checksums verified, with no schedule violations,
+unknown writes or cleanup errors. The earlier run without bounded response
+capture also passed and remains at
+`/tmp/workload-reconciliation-70e2476501-receipts`.
+
+The independent proof verifier checked 17 signed exchanges (four discovery,
+four fence, nine terminal), including three intentionally dropped terminal
+responses. After API restart it observed complete fence delivery for generation
+2 before the next generation-3 request on the same relay. Worker restart kept
+its namespace and increased its epoch; API restart preserved the worker's
+namespace and epoch. Thirty-five fresh metric samples had maximum source age
+0.301 seconds. All five owned process IDs were absent after cleanup: the two
+fault-injected predecessors were killed as planned, and the three final
+processes exited zero.
+
+`/tmp/workload-reconciliation-70e2476501-proof-verification.json` records the
+checks outside the sealed receipts. This establishes observed signed transport
+ordering plus sampled coordinator accounting for these local faults; it does
+not prove application consumption of every observed response, every durable
+decision crash boundary, or performance/Cloud qualification.
