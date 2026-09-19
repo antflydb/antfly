@@ -613,15 +613,31 @@ func (c *InferenceClient) RewriteText(ctx context.Context, model string, inputs 
 	return resp.JSON200, nil
 }
 
+// TranscribeConfig carries the optional settings of a transcription request.
+type TranscribeConfig struct {
+	// Language is an ISO 639-1 code. Empty lets the model detect it.
+	Language string
+	// Diarization labels each segment with the speaker who said it
+	// (SPEAKER_00, SPEAKER_01, ...) and lists the speakers found. The local
+	// provider needs its speaker model pulled; see the transcription guide.
+	Diarization bool
+}
+
 // Transcribe transcribes audio to text using a speech-to-text model.
 // The audio should be base64-encoded audio data (WAV, MP3, FLAC, etc.).
 // Model must name the transcriber explicitly so local and distributed routing agree.
 // Language is optional - if empty, the model will auto-detect.
 func (c *InferenceClient) Transcribe(ctx context.Context, model string, audio []byte, language string) (*oapi.InferenceTranscribeResponse, error) {
+	return c.TranscribeWithConfig(ctx, model, audio, TranscribeConfig{Language: language})
+}
+
+// TranscribeWithConfig transcribes audio with the optional settings in cfg.
+func (c *InferenceClient) TranscribeWithConfig(ctx context.Context, model string, audio []byte, cfg TranscribeConfig) (*oapi.InferenceTranscribeResponse, error) {
 	req := oapi.InferenceTranscribeRequest{
-		Model:    model,
-		Audio:    audio,
-		Language: language,
+		Model:       model,
+		Audio:       audio,
+		Language:    cfg.Language,
+		Diarization: cfg.Diarization,
 	}
 
 	resp, err := c.client.TranscribeAudioWithResponse(ctx, req)

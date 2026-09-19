@@ -1037,6 +1037,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "table contract rejects unknown fields in closed nested index objects",
         "table contract treats nullable nested index fields as omitted",
         "table contract preserves artifact-backed public full text indexes",
+        "table contract accepts the transcriber enrichment shorthand",
         "table contract rejects invalid inline artifact enrichments before admission",
         "table contract normalizes public artifact enrichment request",
         "restore admission rejects an embedding artifact catalog without an executable producer",
