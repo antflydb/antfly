@@ -43,9 +43,26 @@ pub const CreateOptions = struct {
     io: ?std.Io = null,
 };
 
+const MutationRequest = struct {
+    context: *anyopaque,
+    apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void,
+    next: ?*MutationRequest = null,
+    done: bool = false,
+    leader: bool = false,
+    durable: bool = true,
+    result: anyerror!void = {},
+};
+
+const ReadGeneration = struct {
+    file: native.NativeFile,
+    references: usize = 0,
+    retired: bool = false,
+};
+
 pub const Store = struct {
     allocator: Allocator,
     file: native.NativeFile,
+    read_generation: ?*ReadGeneration = null,
     read_only: bool = false,
     /// Guarded by mutex. Secret publication failures fence every adapter until reopen.
     secret_store_uncertain: bool = false,
@@ -53,6 +70,11 @@ pub const Store = struct {
     writer_mutex: std.Io.Mutex = .init,
     writer_ready: std.Io.Condition = .init,
     generation_lock: std.Io.RwLock = .init,
+    commit_mutex: std.Io.Mutex = .init,
+    commit_ready: std.Io.Condition = .init,
+    commit_head: ?*MutationRequest = null,
+    commit_tail: ?*MutationRequest = null,
+    commit_draining: bool = false,
     writer_active: bool = false,
     writer_ticketed: bool = false,
     next_writer_ticket: u64 = 0,
@@ -105,8 +127,45 @@ pub const Store = struct {
     }
 
     pub fn close(self: *Store) void {
+        if (self.read_generation) |generation| std.debug.assert(generation.references == 0);
+        self.retireReadGeneration();
         self.file.close();
         self.* = undefined;
+    }
+
+    // Called with mutex held. A generation owns a separate read descriptor,
+    // so publication can retire the old inode without interrupting snapshots.
+    fn pinReadGeneration(self: *Store) !*ReadGeneration {
+        if (self.read_generation == null) {
+            const generation = try self.allocator.create(ReadGeneration);
+            errdefer self.allocator.destroy(generation);
+            generation.* = .{ .file = try native.NativeFile.openWithIo(self.allocator, self.file.runtime(), self.file.path, .{ .read_only = true, .resource_manager = self.resource_manager }) };
+            self.read_generation = generation;
+        }
+        const generation = self.read_generation.?;
+        generation.references += 1;
+        return generation;
+    }
+
+    fn retireReadGeneration(self: *Store) void {
+        const generation = self.read_generation orelse return;
+        self.read_generation = null;
+        generation.retired = true;
+        if (generation.references == 0) {
+            generation.file.close();
+            self.allocator.destroy(generation);
+        }
+    }
+
+    fn releaseReadGeneration(self: *Store, generation: *ReadGeneration) void {
+        lockStore(self);
+        defer self.mutex.unlock();
+        std.debug.assert(generation.references > 0);
+        generation.references -= 1;
+        if (generation.references == 0 and generation.retired) {
+            generation.file.close();
+            self.allocator.destroy(generation);
+        }
     }
 
     pub fn backendStore(self: *Store) NativeBackendStore {
@@ -131,16 +190,75 @@ pub const Store = struct {
     }
 
     pub fn vacuumWithCancel(self: *Store, cancel: ?*const @import("../maintenance.zig").CancelToken) !native.VacuumReport {
-        try self.reserveWriterSlot();
-        defer self.releaseWriterSlot();
-
+        if (self.read_only) return error.ReadOnly;
         const io = self.file.runtime();
-        self.generation_lock.lockUncancelable(io);
-        defer self.generation_lock.unlock(io);
-
-        lockStore(self);
-        defer self.mutex.unlock();
-        return try self.file.vacuumWithCancel(cancel);
+        var capture = native.ChangeCapture{};
+        defer capture.deinit(self.allocator);
+        var source = blk: {
+            lockStore(self);
+            defer self.mutex.unlock();
+            if (self.file.change_capture != null) return error.FileBusy;
+            if (self.file.checkpoint_publication_uncertain or self.secret_store_uncertain) return error.OutcomeUnknown;
+            var snapshot = try native.NativeFile.openWithIo(self.allocator, io, self.file.path, .{ .read_only = true, .no_sync = self.file.no_sync });
+            snapshot.header = self.file.header;
+            self.file.change_capture = &capture;
+            break :blk snapshot;
+        };
+        defer source.close();
+        defer {
+            lockStore(self);
+            self.file.change_capture = null;
+            self.mutex.unlock();
+        }
+        var image = try source.prepareVacuum(cancel);
+        defer image.deinit();
+        image.prepared.no_sync = true;
+        for (0..8) |_| {
+            if (cancel) |token| try token.check();
+            // Flush the large copy/catch-up outside foreground locks. Only
+            // the final header and rename remain in the publication window.
+            if (!self.file.no_sync) try image.prepared.file.sync(io);
+            const reserved = blk: {
+                self.reserveWriterSlot() catch |err| switch (err) {
+                    error.FileBusy => break :blk false,
+                    else => return err,
+                };
+                break :blk true;
+            };
+            if (reserved) {
+                defer self.releaseWriterSlot();
+                self.generation_lock.lockUncancelable(io);
+                defer self.generation_lock.unlock(io);
+                lockStore(self);
+                defer self.mutex.unlock();
+                if (capture.overflow) return error.FileBusy;
+                if (capture.count == 0) {
+                    if (self.file.checkpoint_publication_uncertain or self.secret_store_uncertain) return error.OutcomeUnknown;
+                    image.report.before_size = (try self.file.file.stat(io)).size;
+                    image.report.reclaimed_bytes = image.report.before_size -| image.report.after_size;
+                    image.prepared.no_sync = self.file.no_sync;
+                    try image.prepared.preparePublicationSequence(self.file.activeCheckpoint().commit_sequence + 1);
+                    const old_handle = self.file.file.handle;
+                    defer if (self.file.file.handle != old_handle) self.retireReadGeneration();
+                    try self.file.publishVacuum(&image);
+                    return image.report;
+                }
+            }
+            var changes = native.ChangeCapture{};
+            defer changes.deinit(self.allocator);
+            var latest = blk: {
+                lockStore(self);
+                defer self.mutex.unlock();
+                if (capture.overflow) return error.FileBusy;
+                var snapshot = try native.NativeFile.openWithIo(self.allocator, io, self.file.path, .{ .read_only = true, .no_sync = true });
+                snapshot.header = self.file.header;
+                std.mem.swap(native.ChangeCapture, &changes, &capture);
+                break :blk snapshot;
+            };
+            defer latest.close();
+            try latest.applyCapturedChanges(&image.prepared, &changes, &image.report, cancel);
+        }
+        return error.FileBusy;
     }
 
     /// Publishes an offline, fully finalized store generation while fencing
@@ -151,7 +269,7 @@ pub const Store = struct {
         try self.reserveWriterSlot();
         defer self.releaseWriterSlot();
 
-        const io = self.file.io_impl.io();
+        const io = self.file.runtime();
         self.generation_lock.lockUncancelable(io);
         defer self.generation_lock.unlock(io);
 
@@ -161,9 +279,74 @@ pub const Store = struct {
         defer prepared.mutex.unlock();
         // Portable archives omit secrets. Check at publication while reserving
         // the writer slot so a secret committed during preparation cannot be lost.
+        if (self.file.change_capture != null) return error.FileBusy;
         if (self.secret_store_uncertain or self.file.checkpoint_publication_uncertain) return error.OutcomeUnknown;
         if (try self.file.hasSecretState()) return error.LiteImportTargetNotEmpty;
+        const old_handle = self.file.file.handle;
+        defer if (self.file.file.handle != old_handle) self.retireReadGeneration();
         return try self.file.replaceWithPreparedGeneration(&prepared.file);
+    }
+
+    /// Synchronous group commit. Callbacks run in queue order under the store
+    /// mutex, and every member completes only after the shared checkpoint is
+    /// durable. Requests arriving during I/O form the next bounded group.
+    /// A failed group publishes none of its mutations (or reports an uncertain
+    /// publication to all its members). Callback-owned buffers stay borrowed.
+    pub fn submitMutation(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void) !void {
+        return self.submitMutationWithDurability(context, apply, true);
+    }
+
+    pub fn submitMutationWithDurability(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool) !void {
+        if (self.read_only) return error.ReadOnly;
+        const io = self.file.runtime();
+        var request = MutationRequest{ .context = context, .apply = apply, .durable = durable };
+        self.commit_mutex.lockUncancelable(io);
+        if (self.commit_tail) |tail| tail.next = &request else self.commit_head = &request;
+        self.commit_tail = &request;
+        if (self.commit_draining) {
+            while (!request.done and !request.leader) self.commit_ready.waitUncancelable(io, &self.commit_mutex);
+            if (request.done) {
+                self.commit_mutex.unlock(io);
+                return request.result;
+            }
+        }
+        self.commit_draining = true;
+        const head = self.commit_head.?;
+        var tail = head;
+        var count: usize = 1;
+        while (count < 64) : (count += 1) tail = tail.next orelse break;
+        self.commit_head = tail.next;
+        if (self.commit_head == null) self.commit_tail = null;
+        tail.next = null;
+        self.commit_mutex.unlock(io);
+        const result = self.applyMutationGroup(head);
+        self.commit_mutex.lockUncancelable(io);
+        var current: ?*MutationRequest = head;
+        while (current) |item| {
+            item.result = result;
+            item.done = true;
+            current = item.next;
+        }
+        if (self.commit_head) |next| next.leader = true else self.commit_draining = false;
+        self.commit_ready.broadcast(io);
+        self.commit_mutex.unlock(io);
+        return request.result;
+    }
+
+    fn applyMutationGroup(self: *Store, head: *MutationRequest) !void {
+        lockStore(self);
+        defer self.mutex.unlock();
+        if (self.secret_store_uncertain) return error.OutcomeUnknown;
+        try self.file.beginTransaction();
+        errdefer self.file.abortTransaction();
+        var current: ?*MutationRequest = head;
+        var durable = false;
+        while (current) |item| {
+            durable = durable or item.durable;
+            try item.apply(item.context, &self.file);
+            current = item.next;
+        }
+        try self.file.commitTransactionWithDurability(durable);
     }
 
     pub fn reserveWriterSlot(self: *Store) !void {
@@ -527,6 +710,17 @@ const RuntimeStore = struct {
     }
 };
 
+const PendingTree = std.Treap([]const u8, struct {
+    fn compare(a: []const u8, b: []const u8) std.math.Order {
+        return std.mem.order(u8, a, b);
+    }
+}.compare);
+
+const PendingNode = struct {
+    tree: PendingTree.Node = undefined,
+    ordinal: usize,
+};
+
 const PendingMutation = struct {
     key: []u8,
     value: ?[]u8 = null,
@@ -536,12 +730,13 @@ pub const Txn = struct {
     allocator: Allocator,
     store: ?*Store = null,
     pending: std.ArrayListUnmanaged(PendingMutation) = .empty,
-    pending_generation: u64 = 0,
+    pending_tree: PendingTree = .{},
+    pending_count: usize = 0,
     read_only: bool = true,
     writer_reserved: bool = false,
     prefix: []const u8 = "",
     owned_reads: std.ArrayListUnmanaged([]u8) = .empty,
-    generation_read_locked: bool = false,
+    read_generation: ?*ReadGeneration = null,
     checkpoint: native.CheckpointSlot = .{},
 
     pub fn openRead(store: *Store) !Txn {
@@ -550,9 +745,6 @@ pub const Txn = struct {
 
     pub fn openReadWithPrefix(store: *Store, prefix: []const u8) !Txn {
         try validatePrefix(prefix);
-        const io = store.file.runtime();
-        store.generation_lock.lockSharedUncancelable(io);
-        errdefer store.generation_lock.unlockShared(io);
         lockStore(store);
         defer store.mutex.unlock();
         const checkpoint = store.file.activeCheckpoint();
@@ -561,7 +753,7 @@ pub const Txn = struct {
             .store = store,
             .read_only = true,
             .prefix = prefix,
-            .generation_read_locked = true,
+            .read_generation = try store.pinReadGeneration(),
             .checkpoint = checkpoint,
         };
     }
@@ -621,27 +813,34 @@ pub const Txn = struct {
     }
 
     pub fn commit(self: *Txn) !void {
+        if (self.read_only) return error.ReadOnly;
         const store = self.store orelse return error.ReadOnly;
         const allocator = self.allocator;
-        var mutations = try allocator.alloc(native.DocumentMutation, self.pending.items.len);
+        var mutations = try allocator.alloc(native.DocumentMutation, self.pending_count);
         defer allocator.free(mutations);
-        for (self.pending.items, 0..) |pending, i| {
-            mutations[i] = .{
-                .key = pending.key,
-                .value = pending.value orelse "",
-                .is_delete = pending.value == null,
-            };
+        var node = self.pending_tree.getMin();
+        var i: usize = 0;
+        while (node) |current| : (i += 1) {
+            const pending = self.pending.items[pendingNode(current).ordinal];
+            mutations[i] = .{ .key = pending.key, .value = pending.value orelse "", .is_delete = pending.value == null };
+            node = current.next();
         }
 
-        lockStore(store);
-        defer store.mutex.unlock();
+        const Commit = struct {
+            mutations: []const native.DocumentMutation,
+            fn apply(ptr: *anyopaque, file: *native.NativeFile) !void {
+                const context: *@This() = @ptrCast(@alignCast(ptr));
+                try file.putDocumentBatch(context.mutations);
+            }
+        };
+        var context = Commit{ .mutations = mutations };
         errdefer {
             if (self.writer_reserved) {
                 store.releaseWriterSlot();
                 self.writer_reserved = false;
             }
         }
-        try store.file.putDocumentBatch(mutations);
+        try store.submitMutation(&context, Commit.apply);
         if (self.writer_reserved) {
             store.releaseWriterSlot();
             self.writer_reserved = false;
@@ -655,21 +854,52 @@ pub const Txn = struct {
     pub fn get(self: *Txn, key: []const u8) ![]const u8 {
         const lookup_key = try self.prefixedKey(key);
         defer if (self.prefix.len > 0) self.allocator.free(lookup_key);
-        if (self.pending.items.len > 0) {
-            var i = self.pending.items.len;
-            while (i > 0) {
-                i -= 1;
-                const pending = self.pending.items[i];
-                if (!std.mem.eql(u8, pending.key, lookup_key)) continue;
-                return pending.value orelse error.NotFound;
-            }
+        if (self.pending_tree.getEntryFor(lookup_key).node) |node| {
+            return self.pending.items[pendingNode(node).ordinal].value orelse error.NotFound;
         }
-        const store = self.store orelse return error.InvalidTransactionState;
-        const value = try store.file.getDocumentAtCheckpointAlloc(self.allocator, self.checkpoint, lookup_key);
+        const file = try self.readFile();
+        const value = try file.getDocumentAtCheckpointAlloc(self.allocator, self.checkpoint, lookup_key);
         const owned = value orelse return error.NotFound;
         errdefer self.allocator.free(owned);
         try self.owned_reads.append(self.allocator, owned);
         return owned;
+    }
+
+    pub fn getManySorted(self: *Txn, keys: []const []const u8, values: []?[]const u8) !void {
+        if (keys.len != values.len) return error.InvalidBatch;
+        @memset(values, null);
+        for (keys, 0..) |key, i| {
+            if (i > 0 and std.mem.order(u8, keys[i - 1], key) == .gt) return error.InvalidBatch;
+        }
+        const file = try self.readFile();
+        const alloc = self.allocator;
+        var misses: std.ArrayList([]const u8) = .empty;
+        defer {
+            if (self.prefix.len > 0) for (misses.items) |key| alloc.free(key);
+            misses.deinit(alloc);
+        }
+        var positions: std.ArrayList(usize) = .empty;
+        defer positions.deinit(alloc);
+        try misses.ensureTotalCapacity(alloc, keys.len);
+        try positions.ensureTotalCapacity(alloc, keys.len);
+        for (keys, 0..) |key, i| {
+            const full = try self.prefixedKey(key);
+            if (self.pending_tree.getEntryFor(full).node) |node| {
+                if (self.prefix.len > 0) alloc.free(full);
+                values[i] = self.pending.items[pendingNode(node).ordinal].value;
+            } else {
+                misses.appendAssumeCapacity(full);
+                positions.appendAssumeCapacity(i);
+            }
+        }
+        const loaded = try alloc.alloc(?[]const u8, misses.items.len);
+        defer alloc.free(loaded);
+        try self.owned_reads.ensureUnusedCapacity(alloc, misses.items.len);
+        try file.getDocumentsAtCheckpointAlloc(alloc, self.checkpoint, misses.items, loaded);
+        for (loaded, positions.items) |value, i| {
+            values[i] = value;
+            if (value) |bytes| self.owned_reads.appendAssumeCapacity(@constCast(bytes));
+        }
     }
 
     pub fn put(self: *Txn, key: []const u8, value: []const u8) !void {
@@ -681,8 +911,7 @@ pub const Txn = struct {
         errdefer self.allocator.free(owned_key);
         const owned_value = try self.allocator.dupe(u8, value);
         errdefer self.allocator.free(owned_value);
-        try self.pending.append(self.allocator, .{ .key = owned_key, .value = owned_value });
-        self.pending_generation +%= 1;
+        try self.appendPending(.{ .key = owned_key, .value = owned_value });
     }
 
     pub fn delete(self: *Txn, key: []const u8) !void {
@@ -692,8 +921,25 @@ pub const Txn = struct {
         else
             try std.mem.concat(self.allocator, u8, &.{ self.prefix, key });
         errdefer self.allocator.free(owned_key);
-        try self.pending.append(self.allocator, .{ .key = owned_key });
-        self.pending_generation +%= 1;
+        try self.appendPending(.{ .key = owned_key });
+    }
+
+    fn pendingNode(node: *PendingTree.Node) *PendingNode {
+        return @fieldParentPtr("tree", node);
+    }
+
+    // Versions remain owned until transaction teardown: get() borrows values.
+    // Only the final version of each key is indexed and written at commit.
+    fn appendPending(self: *Txn, mutation: PendingMutation) !void {
+        var entry = self.pending_tree.getEntryFor(mutation.key);
+        const node = if (entry.node) |existing| pendingNode(existing) else try self.allocator.create(PendingNode);
+        errdefer if (entry.node == null) self.allocator.destroy(node);
+        try self.pending.append(self.allocator, mutation);
+        node.ordinal = self.pending.items.len - 1;
+        if (entry.node == null) {
+            entry.set(&node.tree);
+            self.pending_count += 1;
+        }
     }
 
     pub fn setReplayOpaque(self: *Txn, sequence: u64, payload: []const u8) !void {
@@ -701,14 +947,19 @@ pub const Txn = struct {
     }
 
     pub fn openCursor(self: *Txn) !Cursor {
-        const store = self.store orelse return error.InvalidTransactionState;
         return .{
             .txn = self,
-            .index_cursor = native.DocumentIndexCursor.init(&store.file, self.checkpoint),
+            .index_cursor = native.DocumentIndexCursor.init(try self.readFile(), self.checkpoint),
         };
     }
 
     fn freePending(self: *Txn) void {
+        while (self.pending_tree.getMin()) |node| {
+            var entry = self.pending_tree.getEntryForExisting(node);
+            entry.set(null);
+            self.allocator.destroy(pendingNode(node));
+        }
+        self.pending_count = 0;
         for (self.pending.items) |pending| {
             self.allocator.free(pending.key);
             if (pending.value) |value| self.allocator.free(value);
@@ -723,11 +974,17 @@ pub const Txn = struct {
         self.owned_reads = .empty;
     }
 
+    fn readFile(self: *Txn) !*native.NativeFile {
+        if (self.read_generation) |generation| return &generation.file;
+        const store = self.store orelse return error.InvalidTransactionState;
+        return &store.file;
+    }
+
     fn releaseGenerationReadLock(self: *Txn) void {
-        if (!self.generation_read_locked) return;
+        const generation = self.read_generation orelse return;
         const store = self.store orelse return;
-        store.generation_lock.unlockShared(store.file.runtime());
-        self.generation_read_locked = false;
+        self.read_generation = null;
+        store.releaseReadGeneration(generation);
     }
 
     fn releaseWriterSlot(self: *Txn) void {
@@ -748,10 +1005,6 @@ fn validatePrefix(prefix: []const u8) !void {
 }
 
 pub const Cursor = struct {
-    const OverlayEntry = struct {
-        key: []const u8,
-        value: ?[]const u8,
-    };
     const Direction = enum { forward, backward };
 
     txn: *Txn,
@@ -759,8 +1012,6 @@ pub const Cursor = struct {
     current_key: ?[]u8 = null,
     upper_bound: ?[]const u8 = null,
     owned_value: ?[]u8 = null,
-    overlay: []OverlayEntry = &.{},
-    overlay_generation: u64 = std.math.maxInt(u64),
     disk_candidate: ?native.DocumentIndexEntry = null,
     last_direction: ?Direction = null,
 
@@ -769,15 +1020,12 @@ pub const Cursor = struct {
         if (self.disk_candidate) |*candidate| candidate.deinit(self.txn.allocator);
         if (self.current_key) |key| self.txn.allocator.free(key);
         if (self.owned_value) |value| self.txn.allocator.free(value);
-        if (self.overlay.len > 0) self.txn.allocator.free(self.overlay);
         self.current_key = null;
         self.owned_value = null;
         self.disk_candidate = null;
-        self.overlay = &.{};
     }
 
     pub fn first(self: *Cursor) !backend_adapter.Entry {
-        try self.ensureOverlay();
         self.clearBufferedDisk();
         const disk = if (self.txn.prefix.len == 0)
             try self.index_cursor.first()
@@ -787,7 +1035,6 @@ pub const Cursor = struct {
     }
 
     pub fn last(self: *Cursor) !backend_adapter.Entry {
-        try self.ensureOverlay();
         self.clearBufferedDisk();
         if (self.upper_bound) |upper_bound| {
             const upper = try self.txn.prefixedKey(upper_bound);
@@ -801,7 +1048,7 @@ pub const Cursor = struct {
         if (self.txn.prefix.len == 0) {
             return try self.resolveMerged(
                 try self.index_cursor.last(),
-                if (self.overlay.len == 0) null else self.overlay.len - 1,
+                self.txn.pending_tree.getMax(),
                 .backward,
             );
         } else {
@@ -816,7 +1063,6 @@ pub const Cursor = struct {
     }
 
     pub fn next(self: *Cursor) !backend_adapter.Entry {
-        try self.ensureOverlay();
         const current = self.current_key orelse return error.NotFound;
         const disk = if (self.last_direction == .forward)
             self.takeBufferedDisk() orelse try self.index_cursor.next()
@@ -828,7 +1074,6 @@ pub const Cursor = struct {
     }
 
     pub fn prev(self: *Cursor) !backend_adapter.Entry {
-        try self.ensureOverlay();
         const current = self.current_key orelse return error.NotFound;
         const disk = if (self.last_direction == .backward)
             self.takeBufferedDisk() orelse try self.index_cursor.prev()
@@ -840,7 +1085,6 @@ pub const Cursor = struct {
     }
 
     pub fn seekAtOrAfter(self: *Cursor, key: []const u8) !backend_adapter.Entry {
-        try self.ensureOverlay();
         const lookup_key = try self.txn.prefixedKey(key);
         defer if (self.txn.prefix.len > 0) self.txn.allocator.free(lookup_key);
         self.clearBufferedDisk();
@@ -852,7 +1096,6 @@ pub const Cursor = struct {
     }
 
     pub fn seekAtOrBefore(self: *Cursor, key: []const u8) !backend_adapter.Entry {
-        try self.ensureOverlay();
         const lookup_key = try self.txn.prefixedKey(key);
         defer if (self.txn.prefix.len > 0) self.txn.allocator.free(lookup_key);
         self.clearBufferedDisk();
@@ -883,10 +1126,10 @@ pub const Cursor = struct {
     fn resolveMerged(
         self: *Cursor,
         initial_disk: ?native.DocumentIndexEntry,
-        initial_overlay_index: ?usize,
+        initial_overlay_index: ?*PendingTree.Node,
         direction: Direction,
     ) !backend_adapter.Entry {
-        const store = self.txn.store orelse return error.InvalidTransactionState;
+        const file = try self.txn.readFile();
         var disk = initial_disk;
         errdefer if (disk) |*candidate| candidate.deinit(self.txn.allocator);
         var overlay_index = initial_overlay_index;
@@ -900,7 +1143,7 @@ pub const Cursor = struct {
                 }
             }
             const overlay_candidate = if (overlay_index) |index| blk: {
-                const candidate = self.overlay[index];
+                const candidate = self.txn.pending.items[Txn.pendingNode(index).ordinal];
                 if (!self.keyInRange(candidate.key)) {
                     overlay_index = null;
                     break :blk null;
@@ -937,7 +1180,7 @@ pub const Cursor = struct {
             if (disk) |indexed| {
                 var consumed = indexed;
                 disk = null;
-                const value = store.file.documentValueAtIndexEntryAlloc(self.txn.allocator, self.txn.checkpoint, consumed) catch |err| {
+                const value = file.documentValueAtIndexEntryAlloc(self.txn.allocator, self.txn.checkpoint, consumed) catch |err| {
                     consumed.deinit(self.txn.allocator);
                     return err;
                 };
@@ -950,63 +1193,36 @@ pub const Cursor = struct {
         }
     }
 
-    fn ensureOverlay(self: *Cursor) !void {
-        if (self.overlay_generation == self.txn.pending_generation) return;
-        const alloc = self.txn.allocator;
-        const indices = try alloc.alloc(usize, self.txn.pending.items.len);
-        defer alloc.free(indices);
-        for (indices, 0..) |*index, i| index.* = i;
-        std.mem.sort(usize, indices, self.txn, struct {
-            fn lessThan(txn: *Txn, lhs: usize, rhs: usize) bool {
-                const order = std.mem.order(u8, txn.pending.items[lhs].key, txn.pending.items[rhs].key);
-                return order == .lt or (order == .eq and lhs < rhs);
-            }
-        }.lessThan);
-
-        var rebuilt = std.ArrayListUnmanaged(OverlayEntry).empty;
-        defer rebuilt.deinit(alloc);
-        var i: usize = 0;
-        while (i < indices.len) {
-            var latest = indices[i];
-            i += 1;
-            while (i < indices.len and std.mem.eql(u8, self.txn.pending.items[latest].key, self.txn.pending.items[indices[i]].key)) : (i += 1) {
-                latest = indices[i];
-            }
-            const mutation = self.txn.pending.items[latest];
-            try rebuilt.append(alloc, .{ .key = mutation.key, .value = mutation.value });
+    fn overlayAtOrAfter(self: *const Cursor, key: []const u8, strict: bool) ?*PendingTree.Node {
+        var node = self.txn.pending_tree.root;
+        var result: ?*PendingTree.Node = null;
+        while (node) |current| {
+            const order = std.mem.order(u8, current.key, key);
+            if (order == .gt or (!strict and order == .eq)) {
+                result = current;
+                node = current.children[0];
+            } else node = current.children[1];
         }
-        const owned = try rebuilt.toOwnedSlice(alloc);
-        if (self.overlay.len > 0) alloc.free(self.overlay);
-        self.overlay = owned;
-        self.overlay_generation = self.txn.pending_generation;
+        return result;
     }
 
-    fn overlayAtOrAfter(self: *const Cursor, key: []const u8, strict: bool) ?usize {
-        var left: usize = 0;
-        var right = self.overlay.len;
-        while (left < right) {
-            const mid = left + (right - left) / 2;
-            const order = std.mem.order(u8, self.overlay[mid].key, key);
-            if (order == .lt or (strict and order == .eq)) left = mid + 1 else right = mid;
+    fn overlayAtOrBefore(self: *const Cursor, key: []const u8, strict: bool) ?*PendingTree.Node {
+        var node = self.txn.pending_tree.root;
+        var result: ?*PendingTree.Node = null;
+        while (node) |current| {
+            const order = std.mem.order(u8, current.key, key);
+            if (order == .lt or (!strict and order == .eq)) {
+                result = current;
+                node = current.children[1];
+            } else node = current.children[0];
         }
-        return if (left < self.overlay.len) left else null;
+        return result;
     }
 
-    fn overlayAtOrBefore(self: *const Cursor, key: []const u8, strict: bool) ?usize {
-        var left: usize = 0;
-        var right = self.overlay.len;
-        while (left < right) {
-            const mid = left + (right - left) / 2;
-            const order = std.mem.order(u8, self.overlay[mid].key, key);
-            if (order == .lt or (!strict and order == .eq)) left = mid + 1 else right = mid;
-        }
-        return if (left == 0) null else left - 1;
-    }
-
-    fn advanceOverlayIndex(self: *const Cursor, index: usize, direction: Direction) ?usize {
+    fn advanceOverlayIndex(_: *const Cursor, node: *PendingTree.Node, direction: Direction) ?*PendingTree.Node {
         return switch (direction) {
-            .forward => if (index + 1 < self.overlay.len) index + 1 else null,
-            .backward => if (index > 0) index - 1 else null,
+            .forward => node.next(),
+            .backward => node.prev(),
         };
     }
 
@@ -1878,4 +2094,303 @@ test "lite native docstore cold writes and large disk-index cursors stay bounded
     var verify = try store.beginRead();
     defer verify.abort();
     try std.testing.expectEqualStrings("v2", try verify.get("doc:00000"));
+}
+
+test "lite transaction indexed overlay preserves borrowed versions and sorted multi reads" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "indexed-overlay.aflite");
+    defer alloc.free(path);
+    var store = try Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io });
+    defer store.close();
+    var seed = try store.beginWrite();
+    try seed.put("a", "disk-a");
+    try seed.put("c", "disk-c");
+    try seed.commit();
+    var txn = try store.beginWrite();
+    errdefer txn.abort();
+    try txn.put("a", "first");
+    const borrowed = try txn.get("a");
+    var cursor = try txn.openCursor();
+    {
+        defer cursor.close();
+        for (0..4096) |i| {
+            var buf: [32]u8 = undefined;
+            const key = try std.fmt.bufPrint(&buf, "b{d:0>6}", .{i});
+            try std.testing.expectError(error.NotFound, txn.get(key));
+            try txn.put(key, "value");
+            const entry = try cursor.seekAtOrAfter(key);
+            try std.testing.expectEqualStrings(key, entry.key);
+        }
+        try txn.delete("c");
+        try txn.put("a", "final");
+        try std.testing.expectEqualStrings("first", borrowed);
+        const keys = [_][]const u8{ "a", "a", "b000012", "c", "missing" };
+        var values: [keys.len]?[]const u8 = undefined;
+        try txn.getManySorted(&keys, &values);
+        try std.testing.expectEqualStrings("final", values[0].?);
+        try std.testing.expectEqualStrings("final", values[1].?);
+        try std.testing.expectEqualStrings("value", values[2].?);
+        try std.testing.expect(values[3] == null and values[4] == null);
+    }
+    try std.testing.expectEqual(@as(usize, 4098), txn.pending_count);
+    try txn.commit();
+    var read = try store.beginRead();
+    defer read.abort();
+    const keys = [_][]const u8{ "a", "b000000", "b000001", "b000002", "b004095", "c", "missing" };
+    var values: [keys.len]?[]const u8 = undefined;
+    try read.getManySorted(&keys, &values);
+    try std.testing.expectEqualStrings("final", values[0].?);
+    for (values[1..5]) |value| try std.testing.expectEqualStrings("value", value.?);
+    try std.testing.expect(values[5] == null and values[6] == null);
+}
+
+test "lite online vacuum retires generations without waiting for pinned readers" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "reader-generation-vacuum.aflite");
+    defer alloc.free(path);
+    var store = try Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io });
+    defer store.close();
+    var write = try store.beginWrite();
+    try write.put("doc", "old");
+    try write.commit();
+    var pinned = try store.beginRead();
+    defer pinned.abort();
+    write = try store.beginWrite();
+    try write.put("doc", "new");
+    try write.commit();
+    _ = try store.vacuum();
+    try std.testing.expect(pinned.read_generation.?.retired);
+    try std.testing.expectEqualStrings("old", try pinned.get("doc"));
+    var fresh = try store.beginRead();
+    defer fresh.abort();
+    try std.testing.expectEqualStrings("new", try fresh.get("doc"));
+    try std.testing.expect((try store.file.check()).valid);
+}
+
+test "lite group commit hands leadership to a bounded queued group" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "queued-group-commit.aflite");
+    defer alloc.free(path);
+    var store = try Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io });
+    defer store.close();
+    const Gate = struct {
+        started: std.atomic.Value(bool) = .init(false),
+        proceed: std.atomic.Value(bool) = .init(false),
+    };
+    const Worker = struct {
+        store: *Store,
+        gate: *Gate,
+        id: usize,
+        result: anyerror!void = {},
+        fn apply(ptr: *anyopaque, file: *native.NativeFile) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.id == 0) {
+                self.gate.started.store(true, .release);
+                while (!self.gate.proceed.load(.acquire)) std.Thread.yield() catch {};
+            }
+            var buf: [32]u8 = undefined;
+            const key = try std.fmt.bufPrint(&buf, "queued-{d}", .{self.id});
+            try file.putIndexCatalogRecord(key, "committed");
+        }
+        fn run(self: *@This()) void {
+            self.result = self.store.submitMutation(self, apply);
+        }
+    };
+    var gate = Gate{};
+    var workers: [9]Worker = undefined;
+    var threads: [9]std.Thread = undefined;
+    var spawned: usize = 0;
+    defer {
+        gate.proceed.store(true, .release);
+        for (threads[0..spawned]) |thread| thread.join();
+    }
+    for (&workers, 0..) |*worker, i| {
+        worker.* = .{ .store = &store, .gate = &gate, .id = i };
+        threads[i] = try std.Thread.spawn(.{}, Worker.run, .{worker});
+        spawned += 1;
+        if (i == 0) while (!gate.started.load(.acquire)) std.Thread.yield() catch {};
+    }
+    while (true) {
+        store.commit_mutex.lockUncancelable(std.testing.io);
+        var queued: usize = 0;
+        var item = store.commit_head;
+        while (item) |request| {
+            queued += 1;
+            item = request.next;
+        }
+        store.commit_mutex.unlock(std.testing.io);
+        if (queued == 8) break;
+        std.Thread.yield() catch {};
+    }
+    gate.proceed.store(true, .release);
+    for (threads[0..spawned]) |thread| thread.join();
+    spawned = 0;
+    for (workers) |worker| try worker.result;
+    try std.testing.expectEqual(@as(u64, 2), store.file.activeCheckpoint().commit_sequence);
+    for (0..workers.len) |i| {
+        var buf: [32]u8 = undefined;
+        const key = try std.fmt.bufPrint(&buf, "queued-{d}", .{i});
+        const value = (try store.file.getIndexCatalogRecordAlloc(alloc, key)).?;
+        defer alloc.free(value);
+        try std.testing.expectEqualStrings("committed", value);
+    }
+}
+
+test "lite failed commit group discards every root and allows a clean retry" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "failed-commit-group.aflite");
+    defer alloc.free(path);
+    var store = try Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io });
+    defer store.close();
+    const Context = struct {
+        fail: bool,
+        fn apply(ptr: *anyopaque, file: *native.NativeFile) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.fail) return error.InjectedGroupFailure;
+            try file.putDocument("doc", "unpublished");
+            try file.putIndexCatalogRecord("index", "unpublished");
+        }
+    };
+    var good = Context{ .fail = false };
+    var bad = Context{ .fail = true };
+    var second = MutationRequest{ .context = &bad, .apply = Context.apply };
+    var first = MutationRequest{ .context = &good, .apply = Context.apply, .next = &second };
+    try std.testing.expectError(error.InjectedGroupFailure, store.applyMutationGroup(&first));
+    try std.testing.expect((try store.file.getDocumentAlloc(alloc, "doc")) == null);
+    try std.testing.expect((try store.file.getIndexCatalogRecordAlloc(alloc, "index")) == null);
+    try std.testing.expect((try store.file.check()).valid);
+    try store.submitMutation(&good, Context.apply);
+    const value = (try store.file.getDocumentAlloc(alloc, "doc")).?;
+    defer alloc.free(value);
+    try std.testing.expectEqualStrings("unpublished", value);
+    try std.testing.expect((try store.file.check()).valid);
+}
+
+test "lite online vacuum catches foreground commits while its copy is blocked" {
+    const Gate = struct {
+        var live_handle: std.Io.File.Handle = undefined;
+        var armed: std.atomic.Value(bool) = .init(false);
+        var started: std.atomic.Value(bool) = .init(false);
+        var proceed: std.atomic.Value(bool) = .init(false);
+        fn sync(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+            if (armed.load(.acquire) and file.handle != live_handle and armed.swap(false, .acq_rel)) {
+                started.store(true, .release);
+                while (!proceed.load(.acquire)) std.Thread.yield() catch {};
+            }
+            return std.Options.debug_io.vtable.fileSync(userdata, file);
+        }
+    };
+    const Worker = struct {
+        store: *Store,
+        result: anyerror!void = {},
+        fn run(self: *@This()) void {
+            _ = self.store.vacuum() catch |err| {
+                self.result = err;
+                return;
+            };
+        }
+    };
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "foreground-vacuum.aflite");
+    defer alloc.free(path);
+    var vtable = std.Options.debug_io.vtable.*;
+    vtable.fileSync = Gate.sync;
+    const io = std.Io{ .userdata = std.Options.debug_io.userdata, .vtable = &vtable };
+    var store = try Store.createWithOptions(alloc, path, .{ .io = io });
+    defer store.close();
+    Gate.live_handle = store.file.file.handle;
+    var write = try store.beginWrite();
+    try write.put("doc", "before");
+    try write.commit();
+    var reader = try store.beginRead();
+    defer reader.abort();
+    var worker = Worker{ .store = &store };
+    Gate.started.store(false, .release);
+    Gate.proceed.store(false, .release);
+    Gate.armed.store(true, .release);
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    var joined = false;
+    defer {
+        Gate.proceed.store(true, .release);
+        if (!joined) thread.join();
+        Gate.armed.store(false, .release);
+    }
+    while (!Gate.started.load(.acquire)) std.Thread.yield() catch {};
+    write = try store.beginWrite();
+    try write.put("doc", "during copy");
+    try write.put("new", "also during copy");
+    try write.commit();
+    Gate.proceed.store(true, .release);
+    thread.join();
+    joined = true;
+    try worker.result;
+    try std.testing.expectEqualStrings("before", try reader.get("doc"));
+    var fresh = try store.beginRead();
+    defer fresh.abort();
+    try std.testing.expectEqualStrings("during copy", try fresh.get("doc"));
+    try std.testing.expectEqualStrings("also during copy", try fresh.get("new"));
+    try std.testing.expect((try store.file.check()).valid);
+}
+
+test "lite grouped durability failures recover all roots at one checkpoint" {
+    const Fault = struct {
+        var remaining: usize = 0;
+        fn sync(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+            if (remaining != 0) {
+                remaining -= 1;
+                if (remaining == 0) return error.InputOutput;
+            }
+            return std.Options.debug_io.vtable.fileSync(userdata, file);
+        }
+        fn apply(_: *anyopaque, file: *native.NativeFile) !void {
+            try file.putDocument("doc", "after");
+            try file.putIndexCatalogRecord("index", "after");
+            try file.putCatalogRecord("meta", "after");
+        }
+    };
+    const alloc = std.testing.allocator;
+    var vtable = std.Options.debug_io.vtable.*;
+    vtable.fileSync = Fault.sync;
+    const io = std.Io{ .userdata = std.Options.debug_io.userdata, .vtable = &vtable };
+    for (1..4) |barrier| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try testPath(alloc, tmp, "group-sync-failure.aflite");
+        defer alloc.free(path);
+        {
+            var store = try Store.createWithOptions(alloc, path, .{ .io = io });
+            defer store.close();
+            try store.file.putDocument("doc", "before");
+            try store.file.putIndexCatalogRecord("index", "before");
+            try store.file.putCatalogRecord("meta", "before");
+            Fault.remaining = barrier;
+            defer Fault.remaining = 0;
+            var context: u8 = 0;
+            try std.testing.expectError(error.InputOutput, store.submitMutation(&context, Fault.apply));
+            try std.testing.expectEqual(@as(usize, 0), Fault.remaining);
+            if (barrier > 1) try std.testing.expectError(error.OutcomeUnknown, store.submitMutation(&context, Fault.apply));
+        }
+        var reopened = try Store.open(alloc, path, true);
+        defer reopened.close();
+        const doc = (try reopened.file.getDocumentAlloc(alloc, "doc")).?;
+        defer alloc.free(doc);
+        const index = (try reopened.file.getIndexCatalogRecordAlloc(alloc, "index")).?;
+        defer alloc.free(index);
+        const meta = (try reopened.file.getCatalogRecordAlloc(alloc, "meta")).?;
+        defer alloc.free(meta);
+        try std.testing.expect(std.mem.eql(u8, doc, "before") or std.mem.eql(u8, doc, "after"));
+        try std.testing.expectEqualStrings(doc, index);
+        try std.testing.expectEqualStrings(doc, meta);
+        try std.testing.expect((try reopened.file.check()).valid);
+    }
 }

@@ -172,20 +172,32 @@ fn writeFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8) !v
     try writeFileReserved(self, path, contents);
 }
 
+const CatalogWrite = struct {
+    kind: enum { put, append, rename, delete, sync },
+    path: []const u8,
+    value: []const u8 = "",
+    fn apply(ptr: *anyopaque, file: *native.NativeFile) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        switch (self.kind) {
+            .put => try file.putIndexCatalogRecord(self.path, self.value),
+            .append => try file.appendIndexCatalogRecord(self.path, self.value),
+            .rename => try file.renameIndexCatalogRecord(self.path, self.value),
+            .delete => try file.deleteIndexCatalogRecord(self.path),
+            .sync => try file.sync(),
+        }
+    }
+};
+
 fn writeFileReserved(self: *Store, path: []const u8, contents: []const u8) !void {
-    lockStore(self.docs);
-    defer self.docs.mutex.unlock();
-    try self.docs.file.putIndexCatalogRecord(path, contents);
+    var mutation = CatalogWrite{ .kind = .put, .path = path, .value = contents };
+    try self.docs.submitMutation(&mutation, CatalogWrite.apply);
 }
 
 fn appendFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8, sync: bool) !void {
-    _ = sync;
     const self: *Store = @ptrCast(@alignCast(ptr));
     try validateIndexPath(self, path);
-    lockStore(self.docs);
-    defer self.docs.mutex.unlock();
-
-    try self.docs.file.appendIndexCatalogRecord(path, contents);
+    var mutation = CatalogWrite{ .kind = .append, .path = path, .value = contents };
+    try self.docs.submitMutationWithDurability(&mutation, CatalogWrite.apply, sync);
 }
 
 fn beginAtomicWrite(ptr: *anyopaque, allocator: Allocator, path: []const u8) !AtomicWriteSink {
@@ -199,26 +211,36 @@ fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !
     const self: *Store = @ptrCast(@alignCast(ptr));
     try validateIndexPath(self, old_path);
     try validateIndexPath(self, new_path);
-    lockStore(self.docs);
-    defer self.docs.mutex.unlock();
-
-    try self.docs.file.renameIndexCatalogRecord(old_path, new_path);
+    var mutation = CatalogWrite{ .kind = .rename, .path = old_path, .value = new_path };
+    try self.docs.submitMutation(&mutation, CatalogWrite.apply);
 }
 
 fn deleteFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
     const self: *Store = @ptrCast(@alignCast(ptr));
     try validateIndexPath(self, path);
-    lockStore(self.docs);
-    defer self.docs.mutex.unlock();
-    try self.docs.file.deleteIndexCatalogRecord(path);
+    var mutation = CatalogWrite{ .kind = .delete, .path = path };
+    try self.docs.submitMutation(&mutation, CatalogWrite.apply);
 }
 
 fn deleteTree(ptr: *anyopaque, path: []const u8) !void {
     const self: *Store = @ptrCast(@alignCast(ptr));
     const directory = if (std.mem.eql(u8, path, "/")) path else std.mem.trimEnd(u8, path, "/");
     try validateIndexPath(self, directory);
-    lockStore(self.docs);
-    defer self.docs.mutex.unlock();
+    const Context = struct {
+        store: *Store,
+        path: []const u8,
+        fn apply(context: *anyopaque, _: *native.NativeFile) !void {
+            const request: *@This() = @ptrCast(@alignCast(context));
+            try deleteTreeLocked(request.store, request.path);
+        }
+    };
+    var request = Context{ .store = self, .path = directory };
+    try self.docs.submitMutation(&request, Context.apply);
+}
+
+fn deleteTreeLocked(self: *Store, path: []const u8) !void {
+    const directory = if (std.mem.eql(u8, path, "/")) path else std.mem.trimEnd(u8, path, "/");
+    try validateIndexPath(self, directory);
 
     var mutations = std.ArrayListUnmanaged(native.CatalogMutation).empty;
     defer {
@@ -290,9 +312,8 @@ fn listFileNamesAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8) !
 fn syncContentsAbsolute(ptr: *anyopaque, path: []const u8) !void {
     const self: *Store = @ptrCast(@alignCast(ptr));
     try validateIndexPath(self, path);
-    lockStore(self.docs);
-    defer self.docs.mutex.unlock();
-    try self.docs.file.sync();
+    var mutation = CatalogWrite{ .kind = .sync, .path = path };
+    try self.docs.submitMutation(&mutation, CatalogWrite.apply);
 }
 
 fn syncParentAbsolute(ptr: *anyopaque, path: []const u8) !void {
@@ -474,12 +495,15 @@ const NativeAtomicWriteSink = struct {
         defer self.deinit();
         if (self.failure) |err| return err;
         if (self.file != null) try self.flush();
-        lockStore(self.storage.docs);
-        defer self.storage.docs.mutex.unlock();
+        try self.storage.docs.submitMutation(self, publish);
+    }
+
+    fn publish(ptr: *anyopaque, destination: *native.NativeFile) !void {
+        const self: *NativeAtomicWriteSink = @ptrCast(@alignCast(ptr));
         if (self.file) |file| {
-            try self.storage.docs.file.putIndexCatalogRecordFromFile(self.path, file, self.persisted, self.write_options);
+            try destination.putIndexCatalogRecordFromFile(self.path, file, self.persisted, self.write_options);
         } else {
-            try self.storage.docs.file.putIndexCatalogRecordWithOptions(self.path, self.buffer[0..self.buffered], self.write_options);
+            try destination.putIndexCatalogRecordWithOptions(self.path, self.buffer[0..self.buffered], self.write_options);
         }
     }
 
@@ -1145,7 +1169,7 @@ test "lite native cold atomic writes preserve hot pages with bounded cache admis
         defer hot_pages.deinit(alloc);
         var cached = docs.file.page_cache.pages.iterator();
         while (cached.next()) |entry| {
-            if (entry.value_ptr.*[4] == @intFromEnum(native.PageKind.value)) try hot_pages.append(alloc, entry.key_ptr.*);
+            if (entry.value_ptr.bytes[4] == @intFromEnum(native.PageKind.value)) try hot_pages.append(alloc, entry.key_ptr.*);
         }
         try std.testing.expect(hot_pages.items.len > 0);
 
@@ -1164,7 +1188,7 @@ test "lite native cold atomic writes preserve hot pages with bounded cache admis
             cached = docs.file.page_cache.pages.iterator();
             var payload_pages: usize = 0;
             while (cached.next()) |entry| {
-                if (entry.value_ptr.*[4] == @intFromEnum(native.PageKind.value)) payload_pages += 1;
+                if (entry.value_ptr.bytes[4] == @intFromEnum(native.PageKind.value)) payload_pages += 1;
             }
             try std.testing.expectEqual(hot_pages.items.len, payload_pages);
             try std.testing.expect(docs.file.page_cache.pages.contains(docs.file.activeCheckpoint().index_catalog_root_page));
@@ -1182,7 +1206,7 @@ test "lite native cold atomic writes preserve hot pages with bounded cache admis
         var payload_pages: usize = 0;
         cached = docs.file.page_cache.pages.iterator();
         while (cached.next()) |entry| {
-            if (entry.value_ptr.*[4] == @intFromEnum(native.PageKind.value)) payload_pages += 1;
+            if (entry.value_ptr.bytes[4] == @intFromEnum(native.PageKind.value)) payload_pages += 1;
         }
         try std.testing.expect(payload_pages > hot_pages.items.len);
         for (hot_pages.items) |id| try std.testing.expect(docs.file.page_cache.pages.contains(id));
