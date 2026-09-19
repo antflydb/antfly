@@ -2684,6 +2684,12 @@ fn validateCommandCompletionPolicy(service: anytype, command: metadata_storage.T
 fn validateCompletionActivationEvidence(service: anytype, bytes: []const u8) !void {
     var record = try completion_activation.decode(service.alloc, bytes);
     defer record.deinit();
+    if (!@import("../common/durable_completion_policy.zig").replicated_activation_supported) {
+        const store = service.projectedStore() orelse return error.MissingMetadataStore;
+        var existing = (try store.getCompletionActivation(service.alloc, service.metadata_group_id, record.value.table_id)) orelse return error.CompletionAdmissionUnavailable;
+        defer existing.deinit();
+        if (!existing.value.sameIntent(record.value)) return error.CompletionAdmissionPolicyChanged;
+    }
     if (record.value.phase == .active) {
         if (comptime @hasField(@TypeOf(service.*), "completion_activation_verified")) {
             const verified = service.completion_activation_verified orelse return error.CompletionAdmissionUnavailable;
@@ -2692,6 +2698,17 @@ fn validateCompletionActivationEvidence(service: anytype, bytes: []const u8) !vo
             if (!std.meta.eql(digest, verified)) return error.CompletionAdmissionUnavailable;
         } else return error.CompletionAdmissionUnavailable;
     }
+}
+
+/// Implementation gating happens before even a protocol-upgrade proposal.
+/// Existing durable intents remain readable/resumable; none can be created
+/// while their production installation cannot finish.
+fn requireCompletionActivationAvailable(service: anytype, table_id: u64, policy: @import("../common/table_storage.zig").TransactionRecovery) !void {
+    if (@import("../common/durable_completion_policy.zig").replicated_activation_supported) return;
+    const store = service.projectedStore() orelse return error.MissingMetadataStore;
+    var existing = (try store.getCompletionActivation(service.alloc, service.metadata_group_id, table_id)) orelse return error.CompletionAdmissionUnavailable;
+    defer existing.deinit();
+    if (!std.meta.eql(existing.value.policy, policy)) return error.CompletionAdmissionPolicyChanged;
 }
 
 fn validateStorageDecoderActivation(service: anytype, raft_status: raft_engine.core.Status, required_version: u16, peers: []const ReallocationProtocolPeer) !void {
@@ -5674,6 +5691,7 @@ pub const MetadataService = struct {
 
     pub fn beginCompletionActivation(self: *MetadataService, request: api_operation.RequestContext, table_id: u64, policy: @import("../common/table_storage.zig").TransactionRecovery) !std.json.Parsed(completion_activation.Record) {
         try request.ensureActive();
+        try requireCompletionActivationAvailable(self, table_id, policy);
         const readiness = try self.ensureTableTopologyProtocolReadyWithContext(request, metadata_topology_protocol.completion_storage_version);
         try self.validateTableTopologyProtocolReadinessWithContext(request, readiness);
         self.lockCatalogMutation();
@@ -8685,6 +8703,7 @@ pub const MetadataHttpService = struct {
 
     fn beginCompletionActivationExpected(self: *MetadataHttpService, request: api_operation.RequestContext, table_id: u64, policy: @import("../common/table_storage.zig").TransactionRecovery, expected_definition: ?metadata_table_manager.TableDefinitionFingerprint) !std.json.Parsed(completion_activation.Record) {
         try request.ensureActive();
+        try requireCompletionActivationAvailable(self, table_id, policy);
         const readiness = try self.ensureTableTopologyProtocolReadyWithContext(request, metadata_topology_protocol.completion_storage_version);
         try self.validateTableTopologyProtocolReadinessWithContext(request, readiness);
         self.lockCatalogMutation();
@@ -21247,8 +21266,20 @@ test "workload admission table storage rejects proposals before decoder activati
     defer std.testing.allocator.free(upgraded_bytes);
     const upgraded_receipt = try svc.proposeTransitionCommandWithReceipt(.{ .activate_topology_protocol = upgraded_bytes });
     try svc.waitForTransitionApplied(upgraded_receipt);
+    const range_receipt = try svc.proposeTransitionCommandWithReceipt(.{ .upsert_range = .{ .group_id = 3101, .range_id = 1, .table_id = active.table_id, .start_key = "" } });
+    try svc.waitForTransitionApplied(range_receipt);
+    const projection = svc.projectedStore().?;
+    // This is an otherwise eligible metadata plan. Read-only capture is
+    // allowed, but public begin cannot create a permanent pending fence while
+    // production installation is not implemented.
+    const candidate = try projection.captureCompletionActivation(std.testing.allocator, svc.metadata_group_id, active.table_id, physical.storage.transaction_recovery.?);
+    defer std.testing.allocator.free(candidate);
     const before_capacity = try store.storage().lastIndex();
     try std.testing.expectError(error.DeadlineExceeded, svc.beginCompletionActivation(.{ .deadline_ns = 0 }, physical.table_id, physical.storage.transaction_recovery.?));
+    try std.testing.expectError(error.CompletionAdmissionUnavailable, svc.beginCompletionActivation(.{}, physical.table_id, physical.storage.transaction_recovery.?));
+    try std.testing.expectError(error.CompletionAdmissionUnavailable, svc.proposeTransitionCommandWithReceipt(.{ .apply_completion_activation = candidate }));
+    try std.testing.expect((try projection.getCompletionActivation(std.testing.allocator, svc.metadata_group_id, active.table_id)) == null);
+    try std.testing.expectEqual(@as(u32, 0), (try projection.getTableTransitionFence(svc.metadata_group_id, active.table_id)).active_count);
     try std.testing.expectError(error.CompletionAdmissionUnavailable, svc.activateCompletionPolicy(.{}, physical.table_id));
     try std.testing.expectError(error.CompletionAdmissionUnavailable, svc.proposeTransitionCommand(physical_commands[0]));
     try std.testing.expectError(error.CompletionAdmissionUnavailable, svc.proposeTransitionCommandWithReceipt(physical_commands[0]));
@@ -21289,7 +21320,17 @@ fn validateCompletionActivationPeer(proof: completion_attestation.Proof, expecte
 test "workload admission completion activation requires every applying member and matching membership" {
     const FakeService = struct {
         alloc: std.mem.Allocator = std.testing.allocator,
+        metadata_group_id: u64 = 9,
         completion_activation_verified: ?[32]u8 = null,
+        prior: ?[]const u8 = null,
+        fn projectedStore(self: *@This()) ?*@This() {
+            return self;
+        }
+        fn getCompletionActivation(self: *@This(), alloc: std.mem.Allocator, group_id: u64, table_id: u64) !?std.json.Parsed(completion_activation.Record) {
+            try std.testing.expectEqual(self.metadata_group_id, group_id);
+            try std.testing.expectEqual(@as(u64, 1), table_id);
+            return try completion_activation.decode(alloc, self.prior orelse return null);
+        }
     };
     var fake = FakeService{};
     const forged: completion_activation.Record = .{
@@ -21306,7 +21347,16 @@ test "workload admission completion activation requires every applying member an
     };
     const forged_bytes = try completion_activation.encode(std.testing.allocator, forged);
     defer std.testing.allocator.free(forged_bytes);
+    var prior = forged;
+    prior.phase = .pending;
+    prior.evidence_digest = @splat(0);
+    const prior_bytes = try completion_activation.encode(std.testing.allocator, prior);
+    defer std.testing.allocator.free(prior_bytes);
+    fake.prior = prior_bytes;
+    try requireCompletionActivationAvailable(&fake, 1, prior.policy);
     try std.testing.expectError(error.CompletionAdmissionUnavailable, validateCompletionActivationEvidence(&fake, forged_bytes));
+    fake.prior = null;
+    try std.testing.expectError(error.CompletionAdmissionUnavailable, requireCompletionActivationAvailable(&fake, 1, prior.policy));
     var proof: completion_attestation.Proof = .{ .request = .{ .requester = 9, .node_id = 1, .group_id = 7, .nonce = 5, .incarnation = @splat(1), .policy_digest = @splat(2), .generation = 3 }, .capacity = 4, .accepted = 4, .prepared = 4, .term = 1, .commit_index = 9, .applied_index = 9, .last_index = 9, .leader_id = 1, .membership = .{ .voters = 2, .learners = 1 } };
     proof.membership.nodes[0..3].* = .{ 1, 2, 3 };
     try validateCompletionActivationPeer(proof, &.{ 1, 2, 3 }, null);
