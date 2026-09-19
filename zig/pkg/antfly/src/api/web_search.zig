@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const httpx = @import("httpx");
+const exa = @import("exa_api").types;
 const api = @import("antfly_websearch_openapi");
 const generating_api = @import("antfly_generating_api_openapi");
 const metadata = @import("antfly_metadata_openapi");
@@ -173,16 +174,16 @@ pub fn requestBody(arena: std.mem.Allocator, config: Config, query: []const u8) 
     var limit = std.json.ObjectMap.empty;
     try limit.put(arena, "maxCharacters", .{ .integer = max_text_bytes });
     const content_limit: std.json.Value = .{ .object = limit };
-    return std.json.Stringify.valueAlloc(arena, .{
+    return std.json.Stringify.valueAlloc(arena, exa.SearchRequest{
         .query = query,
         .type = config.search_type,
-        .numResults = config.max_results,
+        .num_results = @intCast(config.max_results),
         .moderation = config.safe_search,
-        .userLocation = config.region,
-        .startPublishedDate = config.start_published_date,
-        .endPublishedDate = config.end_published_date,
-        .includeDomains = if (config.include_domains.len > 0) config.include_domains else null,
-        .excludeDomains = if (config.exclude_domains.len > 0) config.exclude_domains else null,
+        .user_location = config.region,
+        .start_published_date = config.start_published_date,
+        .end_published_date = config.end_published_date,
+        .include_domains = if (config.include_domains.len > 0) config.include_domains else null,
+        .exclude_domains = if (config.exclude_domains.len > 0) config.exclude_domains else null,
         .contents = .{
             .text = if (config.include_content) content_limit else std.json.Value{ .bool = false },
             .highlights = if (config.include_highlights) content_limit else std.json.Value{ .bool = false },
@@ -246,24 +247,20 @@ fn domainMatches(host: []const u8, configured_domain: []const u8) bool {
 
 pub fn parseResults(arena: std.mem.Allocator, config: Config, body: []const u8) ![]const metadata.QueryHit {
     if (body.len > max_response_bytes) return error.InvalidWebSearchResponse;
-    const Response = struct {
-        results: []const struct {
-            url: []const u8,
-            title: ?[]const u8 = null,
-            text: ?[]const u8 = null,
-            highlights: ?[]const []const u8 = null,
-            publishedDate: ?[]const u8 = null,
-            author: ?[]const u8 = null,
-            score: ?f32 = null,
-        },
-    };
-    const response = std.json.parseFromSliceLeaky(Response, arena, body, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch return error.InvalidWebSearchResponse;
+    const response = std.json.parseFromSliceLeaky(exa.SearchResponse, arena, body, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch return error.InvalidWebSearchResponse;
+    // Upstream makes these fields optional, but retrieval requires a results
+    // array and source URLs before treating the response as evidence.
+    const results = response.results orelse return error.InvalidWebSearchResponse;
     var hits = std.ArrayListUnmanaged(metadata.QueryHit).empty;
     var seen = std.StringHashMapUnmanaged(void).empty;
-    for (response.results) |item| {
+    for (results) |item| {
+        if (item.url == null) return error.InvalidWebSearchResponse;
+    }
+    for (results) |item| {
+        const url = item.url.?;
         if (hits.items.len >= config.max_results) break;
-        if (item.url.len == 0 or item.url.len > 8192 or seen.contains(item.url)) continue;
-        const uri = std.Uri.parse(item.url) catch continue;
+        if (url.len == 0 or url.len > 8192 or seen.contains(url)) continue;
+        const uri = std.Uri.parse(url) catch continue;
         if ((!std.mem.eql(u8, uri.scheme, "https") and !std.mem.eql(u8, uri.scheme, "http")) or uri.host == null or uri.user != null or uri.password != null) continue;
         const host = (try canonicalHost(arena, uri.host.?.percent_encoded)) orelse continue;
         var allowed = config.include_domains.len == 0;
@@ -274,10 +271,10 @@ pub fn parseResults(arena: std.mem.Allocator, config: Config, body: []const u8) 
             allowed = false;
         };
         if (!allowed) continue;
-        try seen.put(arena, item.url, {});
+        try seen.put(arena, url, {});
         var source = std.json.ArrayHashMap(std.json.Value){};
         try source.map.put(arena, "provider", .{ .string = "exa" });
-        try source.map.put(arena, "url", .{ .string = item.url });
+        try source.map.put(arena, "url", .{ .string = url });
         if (item.title) |title| try source.map.put(arena, "title", .{ .string = bounded(title, 1024) });
         if (config.include_content) if (item.text) |value| try source.map.put(arena, "text", .{ .string = bounded(value, max_text_bytes) });
         if (config.include_highlights) if (item.highlights) |values| {
@@ -291,11 +288,12 @@ pub fn parseResults(arena: std.mem.Allocator, config: Config, body: []const u8) 
             }
             try source.map.put(arena, "highlights", .{ .array = highlights });
         };
-        if (item.publishedDate) |date| try source.map.put(arena, "published_at", .{ .string = bounded(date, 64) });
-        if (item.author) |author| try source.map.put(arena, "author", .{ .string = bounded(author, 512) });
+        if (item.published_date.valueOrNull()) |date| try source.map.put(arena, "published_at", .{ .string = bounded(date, 64) });
+        if (item.author.valueOrNull()) |author| try source.map.put(arena, "author", .{ .string = bounded(author, 512) });
+        const score: f32 = if (item.score.valueOrNull()) |value| @floatCast(value) else 1 / @as(f32, @floatFromInt(hits.items.len + 1));
         try hits.append(arena, .{
-            ._id = try std.fmt.allocPrint(arena, "web:{s}", .{item.url}),
-            ._score = if (item.score) |score| if (std.math.isFinite(score)) score else 0 else 1 / @as(f32, @floatFromInt(hits.items.len + 1)),
+            ._id = try std.fmt.allocPrint(arena, "web:{s}", .{url}),
+            ._score = if (std.math.isFinite(score)) score else 0,
             ._source = source,
         });
     }
@@ -385,4 +383,36 @@ test "Exa domain policy checks decoded hostnames and DNS root dots" {
     try std.testing.expectEqualStrings("https://outside.example/ok", excluded[0]._source.?.map.get("url").?.string);
     const included = try parseResults(a, .{ .include_domains = &.{"EXAMPLE.com."} }, body);
     try std.testing.expectEqual(@as(usize, 3), included.len);
+}
+
+test "Exa generated wire types preserve optional metadata and required evidence" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const body =
+        \\{"requestId":"test","searchType":"neural","results":[{"url":"https://example.com/one","publishedDate":null,"author":null,"score":null},{"url":"https://example.com/two","publishedDate":"2026-01-01","author":"Author","score":0.75},{"url":"https://example.com/three","score":1e100}],"costDollars":{"total":0.005},"futureField":true}
+    ;
+    const hits = try parseResults(a, .{}, body);
+    try std.testing.expectEqual(@as(usize, 3), hits.len);
+    try std.testing.expectEqual(@as(f32, 1), hits[0]._score);
+    try std.testing.expect(!hits[0]._source.?.map.contains("published_at"));
+    try std.testing.expect(!hits[0]._source.?.map.contains("author"));
+    try std.testing.expectEqualStrings("2026-01-01", hits[1]._source.?.map.get("published_at").?.string);
+    try std.testing.expectEqualStrings("Author", hits[1]._source.?.map.get("author").?.string);
+    try std.testing.expectEqual(@as(f32, 0.75), hits[1]._score);
+    try std.testing.expectEqual(@as(f32, 0), hits[2]._score);
+    try std.testing.expectEqual(@as(usize, 0), (try parseResults(a, .{}, "{\"results\":[]}")).len);
+    for ([_][]const u8{ "{}", "{\"results\":null}", "{\"results\":[{}]}", "{\"results\":[{\"url\":null}]}" }) |invalid| {
+        try std.testing.expectError(error.InvalidWebSearchResponse, parseResults(a, .{}, invalid));
+    }
+
+    const request = (try std.json.parseFromSliceLeaky(std.json.Value, a, try requestBody(a, .{ .region = "US", .safe_search = false }, "evidence"), .{})).object;
+    try std.testing.expectEqualStrings("US", request.get("userLocation").?.string);
+    try std.testing.expectEqual(@as(i64, 5), request.get("numResults").?.integer);
+    try std.testing.expect(!request.get("moderation").?.bool);
+    try std.testing.expect(!request.get("contents").?.object.get("text").?.bool);
+    try std.testing.expect(!request.get("contents").?.object.get("highlights").?.bool);
+    try std.testing.expect(!request.contains("startPublishedDate"));
+    try std.testing.expect(!request.contains("includeDomains"));
+    try std.testing.expect(!request.contains("user_location"));
 }

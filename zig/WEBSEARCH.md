@@ -9,6 +9,18 @@ citations, provider display rules, and agent-tool behavior.
 
 ## Retrieval Agent: Exa
 
+Exa's provider wire types are generated from `zig/specs/exa-openapi.yaml`,
+vendored from `exa-labs/openapi-spec` at commit
+`57d917823aa0cec02385104dc3bb795cdf5d7da8`. The source URL and revision are recorded
+in the file header. Like OpenAI, Exa has a checked-in Zig types module under
+`pkg/antfly/src/openapi/generated/exa_api`; `make generate` regenerates it and
+`make zig-openapi-check` detects drift. The build exposes the upstream inline
+search request and response schemas as named components without changing their
+fields. The adapter uses those generated types for serialization and parsing;
+connection policy, credentials, response limits, and citation normalization stay
+in the adapter. To update, replace the vendored spec from a pinned upstream
+revision, update its header and this revision, then regenerate and test.
+
 The Zig retrieval agent executes Exa searches in agentic mode. Configure a named
 connection on the server:
 

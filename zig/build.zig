@@ -284,6 +284,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const generating_api_openapi_mod = openapi_modules.generating_api;
     const extraction_openapi_mod = openapi_modules.extraction;
     const openai_api_mod = openapi_modules.openai_api;
+    const exa_api_mod = openapi_modules.exa_api;
 
     // Handlebars template engine
     const handlebars_dep = b.dependency("handlebars", .{ .target = target, .optimize = optimize });
@@ -752,6 +753,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .font = font_mod,
         .pdf = pdf_mod,
         .openai_api = openai_api_mod,
+        .exa_api = exa_api_mod,
         .handlebars = handlebars_mod,
         .inference_server = inference_server_mod,
         .prometheus = prometheus_mod,
