@@ -5672,6 +5672,10 @@ export interface components {
             /** @description Secret name (e.g., openai.api_key) */
             key: string;
             status: components["schemas"]["SecretStatus"];
+            /** @description Name of the winning source, or environment. */
+            source?: string;
+            /** @description Whether this key has an Antfly-managed override that can be deleted. */
+            managed?: boolean;
             /** @description Corresponding environment variable name (e.g., OPENAI_API_KEY) */
             env_var?: string;
             /** Format: date-time */
@@ -5680,6 +5684,8 @@ export interface components {
             updated_at?: string;
         };
         SecretList: {
+            /** @description Whether this server has a native store for secret API writes. */
+            writable?: boolean;
             secrets: components["schemas"]["SecretEntry"][];
         };
         SecretWriteRequest: {
@@ -10926,6 +10932,65 @@ export interface components {
              */
             max_document_pages?: number;
         };
+        /**
+         * @description The STT provider to use.
+         * @enum {string}
+         */
+        STTProvider: "openai" | "vertex" | "antfly";
+        /**
+         * @description Speech-to-text provider for the `transcriber` enrichment shorthand.
+         *
+         *     Carries the provider's STT configuration (`provider`, `model`, `api_url`, `api_key`, ...) plus the transcription options below. The fields are declared inline rather than composed from `STTConfig` so that a generated client can leave an option out: a composed schema makes a typed client serialize every field, and a `max_download_bytes` of zero would reject every recording.
+         *
+         *     **Example:**
+         *     ```yaml
+         *     name: call_transcripts
+         *     kind: asset
+         *     field: recording_url
+         *     transcriber:
+         *       provider: antfly
+         *       model: openai/whisper-base
+         *       language_code: en
+         *       timestamps: true
+         *     ```
+         */
+        TranscriberEnrichmentConfig: {
+            provider: components["schemas"]["STTProvider"];
+            /** @description Model name, as the provider names it (e.g. 'openai/whisper-base' for antfly, 'whisper-1' for openai). */
+            model?: string;
+            /**
+             * Format: uri
+             * @description Antfly inference API URL. Falls back to ANTFLY_INFERENCE_URL.
+             */
+            api_url?: string;
+            /**
+             * Format: uri
+             * @description OpenAI API base URL. Falls back to OPENAI_BASE_URL.
+             */
+            base_url?: string;
+            /** @description Provider API key. Falls back to the provider's environment variable. */
+            api_key?: string;
+            /** @description Google Cloud project ID for the vertex provider. Falls back to GOOGLE_CLOUD_PROJECT. */
+            project_id?: string;
+            /** @description Google Cloud location for the vertex provider. */
+            location?: string;
+            /** @description Path to an ADC credential JSON file for the vertex provider. Falls back to the default ADC chain. */
+            credentials_path?: string;
+            /** @description Spoken language hint (ISO 639-1, e.g. 'en'). Omit for automatic detection where the provider supports it. */
+            language_code?: string;
+            /**
+             * @description Request timestamped transcript segments so chunks carry recording offsets. Providers without segment timing return plain text.
+             * @default true
+             */
+            timestamps?: boolean;
+            /**
+             * @description Request speaker labels on transcript segments where the provider supports them.
+             * @default false
+             */
+            diarization?: boolean;
+            /** @description Largest recording fetched from a URL, in bytes. Defaults to 128 MiB, which covers a one hour voice memo or podcast. */
+            max_download_bytes?: number;
+        };
         /** @description Inline managed enrichment definition. Enrichments materialize generated artifacts before indexing and may target source rows or previously generated artifact streams. */
         EnrichmentConfig: {
             /** @description Stable generated artifact name. */
@@ -10958,6 +11023,8 @@ export interface components {
             producer_json?: string;
             /** @description Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity. */
             execution?: components["schemas"]["ExecutionPolicy"];
+            /** @description Typed shorthand for a transcription asset enrichment. Only valid with kind=asset and without producer_json; Antfly expands it into a document_extraction producer whose audio route transcribes each recording with this speech-to-text provider. The produced units carry the transcript text, provider confidence, and per-phrase time offsets, and chunk enrichments that consume them emit _start_time_ms/_end_time_ms on every chunk. With diarization: true the phrases also carry who spoke them, and a chunk that does not straddle a turn emits _speaker. content_type defaults to application/json. */
+            transcriber?: components["schemas"]["TranscriberEnrichmentConfig"];
         };
         /** @description Textual artifact stream consumed by a full-text index, with an optional source-local projection. */
         FullTextArtifactIndexSource: {
@@ -15901,7 +15968,7 @@ export interface components {
             model: string;
             /**
              * Format: byte
-             * @description Base64-encoded audio data (WAV, MP3, FLAC, etc.). Clips longer than 30 s are transcribed in windows cut at pauses; silent clips return an empty transcript.
+             * @description Base64-encoded audio data (WAV, MP3, AAC/M4A, MP4/MOV audio, Ogg/Opus, WebM/Matroska, FLAC, etc.). Clips longer than 30 s are transcribed in windows cut at pauses; silent clips return an empty transcript.
              */
             audio: string;
             /**
@@ -15909,6 +15976,8 @@ export interface components {
              * @example en
              */
             language?: string;
+            /** @description Label each segment with a speaker. Runs a local speaker-embedding model (pull `csukuangfj/speaker-embedding-models:3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx`) and clusters phrases by voice; labels are `SPEAKER_00`, `SPEAKER_01`, ... in order of first appearance. */
+            diarization?: boolean;
         };
         InferenceTranscribeResponse: {
             /**
@@ -15937,6 +16006,12 @@ export interface components {
              * @example en
              */
             language?: string;
+            /** @description Decoded clip duration in milliseconds. */
+            duration_ms?: number;
+            /** @description Timestamped phrases in clip order, so a transcript can be indexed and linked back to a moment in the recording. Clips longer than 30 s are transcribed in windows; segment offsets are relative to the whole clip. */
+            segments?: components["schemas"]["InferenceDictationSegment"][];
+            /** @description Speaker labels found by diarization, in order of first appearance. Present only when `diarization` was requested. */
+            speakers?: string[];
         };
         /**
          * @description How the cleanup pass rewrites the transcript. `clean` removes fillers
@@ -16000,6 +16075,8 @@ export interface components {
             end_ms: number;
             /** @description Word spans estimated inside the phrase by distributing its duration over word lengths. */
             words: components["schemas"]["InferenceDictationWord"][];
+            /** @description Speaker label from diarization (`SPEAKER_00`, ...). Absent without diarization or when the phrase had no usable audio. */
+            speaker?: string;
         };
         InferenceDictationTranscript: {
             /** @description Raw transcript before cleanup. */
@@ -23572,7 +23649,14 @@ export interface operations {
     generateEmbeddings: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /**
+                 * @description Set to `application/vnd.antfly.numeric.v1` to receive the values as a binary
+                 *     frame instead of JSON, which avoids serializing every float as text. Any
+                 *     other value, or none, returns the JSON body.
+                 */
+                Accept?: string;
+            };
             path?: never;
             cookie?: never;
         };
@@ -23589,6 +23673,7 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["InferenceEmbedResponse"];
+                    "application/vnd.antfly.numeric.v1": string;
                 };
             };
             /** @description Invalid request */
@@ -23714,7 +23799,14 @@ export interface operations {
     rerankMultimodalPrompts: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /**
+                 * @description Set to `application/vnd.antfly.numeric.v1` to receive the values as a binary
+                 *     frame instead of JSON, which avoids serializing every float as text. Any
+                 *     other value, or none, returns the JSON body.
+                 */
+                Accept?: string;
+            };
             path?: never;
             cookie?: never;
         };
@@ -23731,6 +23823,7 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["InferenceRerankResponse"];
+                    "application/vnd.antfly.numeric.v1": string;
                 };
             };
             /** @description Invalid request or unsupported model */
@@ -23803,7 +23896,14 @@ export interface operations {
     rerankPrompts: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /**
+                 * @description Set to `application/vnd.antfly.numeric.v1` to receive the values as a binary
+                 *     frame instead of JSON, which avoids serializing every float as text. Any
+                 *     other value, or none, returns the JSON body.
+                 */
+                Accept?: string;
+            };
             path?: never;
             cookie?: never;
         };
@@ -23820,6 +23920,7 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["InferenceRerankResponse"];
+                    "application/vnd.antfly.numeric.v1": string;
                 };
             };
             /** @description Invalid request */
@@ -24953,7 +25054,14 @@ export interface operations {
     createEmbedding: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /**
+                 * @description Set to `application/vnd.antfly.numeric.v1` to receive the values as a binary
+                 *     frame instead of JSON, which avoids serializing every float as text. Any
+                 *     other value, or none, returns the JSON body.
+                 */
+                Accept?: string;
+            };
             path?: never;
             cookie?: never;
         };
@@ -24970,6 +25078,7 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["InferenceEmbedResponse"];
+                    "application/vnd.antfly.numeric.v1": string;
                 };
             };
             /** @description Invalid request */

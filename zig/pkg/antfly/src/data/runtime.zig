@@ -25508,8 +25508,8 @@ pub fn runFromIterator(
     var secret_store_initialized = false;
     defer if (secret_store_initialized) secret_store.deinit();
 
-    if (cli.secret_store_paths.items.len > 0) {
-        secret_store = try initLayeredSecretStore(alloc, setup_io.io(), cli.secret_store_paths.items);
+    if (try antfly.common.secrets.initFromConfigPathWithIo(alloc, setup_io.io(), cli.config_path, cli.secret_store_paths.items)) |configured_store| {
+        secret_store = configured_store;
         secret_store_initialized = true;
     }
 
@@ -27327,9 +27327,12 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
 
         fn drive(self: *@This(), index: usize) void {
             defer self.driver_done[index] = true;
+            // Ten virtual milliseconds still drives Raft faster than its
+            // production 100 ms cadence, without polling each node 1,200 times
+            // while public operations wait on their own retry deadlines.
             while (!self.stop_driver) {
                 if (!self.nodeIsRunning(index) or self.driver_paused[index]) {
-                    self.io.sleep(.fromMilliseconds(1), .awake) catch |err| {
+                    self.io.sleep(.fromMilliseconds(10), .awake) catch |err| {
                         self.driver_failure = err;
                         self.stop_driver = true;
                         return;
@@ -27345,7 +27348,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
                 };
                 self.driver_active[index] = false;
                 self.driver_rounds[index] += 1;
-                self.io.sleep(.fromMilliseconds(1), .awake) catch |err| {
+                self.io.sleep(.fromMilliseconds(10), .awake) catch |err| {
                     self.driver_failure = err;
                     self.stop_driver = true;
                     return;
@@ -28348,7 +28351,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
         };
         try vopr_io.scheduler().executeReady(selected.id, &events, alloc);
         transitions += 1;
-        if (transitions > 400_000) {
+        if (transitions > 8_000) {
             std.log.err(
                 "multi-owner DataServer VOPR transition budget stage={} donor_leader={?} receiver_leader={?} now_ns={} rounds={any}",
                 .{
@@ -28425,6 +28428,10 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
         return err;
     }
     if (replay_failure) |err| return err;
+    // Work contracts cover record and replay without a wall-clock timeout.
+    // The 1 ms polling regression exceeded 1,200 rounds per node; the 10 ms
+    // cadence needs about 190 while retaining the complete transition history.
+    for (shared.driver_rounds) |rounds| try std.testing.expect(rounds <= 400);
     const observation = shared.observation orelse return error.MissingMergeObservation;
     try std.testing.expectEqual(.finalized, observation.donor.phase);
     try std.testing.expectEqual(.finalized, observation.receiver.phase);

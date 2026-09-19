@@ -660,6 +660,17 @@ pub fn collectArtifactEnrichmentsFromValueWithOptions(
                     defer parsed.deinit();
                     var owned = try db_mod.types.EnrichmentConfig.clone(alloc, parsed.value);
                     errdefer owned.deinit(alloc);
+                    if (item.object.get("transcriber")) |transcriber| {
+                        // The typed shorthand replaces producer_json rather
+                        // than layering on it, and only an asset stream can
+                        // hold transcripts.
+                        if (owned.kind != .asset or owned.producer_json.len > 0) return error.InvalidEnrichmentConfig;
+                        owned.producer_json = enrichment_config_validation.transcriberShorthandProducerJsonAlloc(alloc, transcriber) catch |err| switch (err) {
+                            error.OutOfMemory => return err,
+                            else => return error.InvalidEnrichmentConfig,
+                        };
+                        if (owned.content_type.len == 0) owned.content_type = try alloc.dupe(u8, "application/json");
+                    }
                     if (owned.kind == .embedding) {
                         if (embedding_producer_json) |raw| {
                             if (owned.producer_json.len > 0) alloc.free(owned.producer_json);
@@ -8008,6 +8019,32 @@ fn consumerTests() type {
             defer db_mod.types.freeEnrichmentConfigs(std.testing.allocator, effective);
             try std.testing.expectEqual(@as(usize, 1), effective.len);
             try std.testing.expect(std.mem.indexOf(u8, effective[0].producer_json, "https://inference.example/ai/v1") != null);
+        }
+
+        test "transcriber enrichment shorthand expands into a document extraction producer" {
+            const configs = try collectArtifactEnrichmentsFromTableIndexesJson(std.testing.allocator,
+                \\{"enrichments":[{"name":"call_transcripts","kind":"asset","field":"recording_url","transcriber":{"provider":"antfly","model":"openai/whisper-base","language_code":"en","timestamps":true}},{"name":"call_chunks","kind":"chunk","field":"text","source_artifact_name":"call_transcripts","chunk_size":256}]}
+            );
+            defer db_mod.types.freeEnrichmentConfigs(std.testing.allocator, configs);
+            try std.testing.expectEqual(@as(usize, 2), configs.len);
+            try std.testing.expectEqualStrings("application/json", configs[0].content_type);
+            try std.testing.expectEqualStrings(
+                "{\"type\":\"document_extraction\",\"config\":{\"transcription\":{\"enabled\":true,\"config\":{\"provider\":\"antfly\",\"model\":\"openai/whisper-base\",\"language_code\":\"en\",\"timestamps\":true}}}}",
+                configs[0].producer_json,
+            );
+            try validateArtifactEnrichmentConfigs(std.testing.allocator, configs);
+
+            // A chunk stream cannot hold transcripts, and the shorthand does
+            // not combine with a hand-written producer.
+            try std.testing.expectError(error.InvalidEnrichmentConfig, collectArtifactEnrichmentsFromTableIndexesJson(std.testing.allocator,
+                \\{"enrichments":[{"name":"t","kind":"chunk","field":"url","chunk_size":8,"transcriber":{"provider":"antfly","model":"m"}}]}
+            ));
+            try std.testing.expectError(error.InvalidEnrichmentConfig, collectArtifactEnrichmentsFromTableIndexesJson(std.testing.allocator,
+                \\{"enrichments":[{"name":"t","kind":"asset","field":"url","producer_json":"{\"type\":\"reader\",\"config\":{}}","transcriber":{"provider":"antfly","model":"m"}}]}
+            ));
+            try std.testing.expectError(error.InvalidEnrichmentConfig, collectArtifactEnrichmentsFromTableIndexesJson(std.testing.allocator,
+                \\{"enrichments":[{"name":"t","kind":"asset","field":"url","transcriber":{"model":"m"}}]}
+            ));
         }
 
         test "index metadata rejects artifact enrichment deletion with dependents" {

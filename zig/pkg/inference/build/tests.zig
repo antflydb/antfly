@@ -130,6 +130,12 @@ pub fn create(ctx: Context) Suite {
         run_tests.addArgs(&.{ "--test-filter", filter });
     }
     build_test_filters.addRuntimeControls(run_tests, ctx.args orelse &.{});
+    // Focused inference invocations retain their historical reachability;
+    // the default gates assign these tests to the shared finetuning owner.
+    if (selected_test_filters.len == 0) {
+        for (@import("finetune/tests.zig").inference_overlap_filters) |filter|
+            run_tests.addArgs(&.{ "--skip-test-filter", filter });
+    }
     return .{
         .tests = tests,
         .selected_test_filters = selected_test_filters,

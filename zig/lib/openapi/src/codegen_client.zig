@@ -119,6 +119,10 @@ pub const ClientGenerator = struct {
         self.w.indent();
         try self.w.line("status_code: u16,", .{});
         try self.w.line("data: ?std.json.Parsed(T) = null,", .{});
+        try self.w.line("/// Set instead of `data` when the server answered a negotiated", .{});
+        try self.w.line("/// request in a format other than JSON; `content_type` says which.", .{});
+        try self.w.line("bytes: ?[]const u8 = null,", .{});
+        try self.w.line("content_type: ?[]const u8 = null,", .{});
         try self.w.line("err_body: ?[]const u8 = null,", .{});
         try self.w.line("allocator: std.mem.Allocator,", .{});
         try self.w.blank();
@@ -126,6 +130,8 @@ pub const ClientGenerator = struct {
         try self.w.line("pub fn deinit(self: *@This()) void {{", .{});
         self.w.indent();
         try self.w.line("if (self.data) |*d| d.deinit();", .{});
+        try self.w.line("if (self.bytes) |b| self.allocator.free(b);", .{});
+        try self.w.line("if (self.content_type) |ct| self.allocator.free(ct);", .{});
         try self.w.line("if (self.err_body) |b| self.allocator.free(b);", .{});
         self.w.dedent();
         try self.w.line("}}", .{});
@@ -155,8 +161,36 @@ pub const ClientGenerator = struct {
         self.w.dedent();
         try self.w.line("}}", .{});
 
+        try self.w.blank();
+
+        try self.w.docComment("Same as `fromResponse`, for an operation whose success response the");
+        try self.w.docComment("caller can negotiate: a JSON body is parsed into `data`, and any other");
+        try self.w.docComment("media type is kept verbatim in `bytes` with its `content_type`.");
+        try self.w.line("pub fn fromNegotiatedResponse(allocator: std.mem.Allocator, resp: *httpx.Response) !@This() {{", .{});
+        self.w.indent();
+        try self.w.line("const negotiated = resp.contentType();", .{});
+        try self.w.line("// An empty or JSON body, and every failure, stay on the typed path.", .{});
+        try self.w.line("if (!resp.ok() or resp.body == null or negotiated == null or isJsonContentType(negotiated.?)) return fromResponse(allocator, resp);", .{});
+        try self.w.line("defer resp.deinit();", .{});
+        try self.w.line("const owned = try allocator.dupe(u8, resp.body.?);", .{});
+        try self.w.line("errdefer allocator.free(owned);", .{});
+        try self.w.line("const owned_type = try allocator.dupe(u8, negotiated.?);", .{});
+        try self.w.line("return .{{ .status_code = resp.status.code, .bytes = owned, .content_type = owned_type, .allocator = allocator }};", .{});
+        self.w.dedent();
+        try self.w.line("}}", .{});
+
         self.w.dedent();
         try self.w.line("}};", .{});
+        self.w.dedent();
+        try self.w.line("}}", .{});
+
+        try self.w.blank();
+        try self.w.docComment("Whether a response media type carries a JSON body.");
+        try self.w.line("fn isJsonContentType(content_type: []const u8) bool {{", .{});
+        self.w.indent();
+        try self.w.line("const essence = std.mem.trim(u8, std.mem.sliceTo(content_type, ';'), \" \\t\");", .{});
+        try self.w.line("if (std.ascii.eqlIgnoreCase(essence, \"application/json\")) return true;", .{});
+        try self.w.line("return std.ascii.endsWithIgnoreCase(essence, \"+json\");", .{});
         self.w.dedent();
         try self.w.line("}}", .{});
     }
@@ -195,6 +229,9 @@ pub const ClientGenerator = struct {
 
         // Detect streaming/binary response
         const is_raw = shared.isStreamingOrBinaryResponse(op);
+        // A response the caller can negotiate keeps its typed JSON form and
+        // gains the bytes when the server answers in the other format.
+        const is_negotiated = shared.hasNegotiatedResponse(op);
 
         // Determine response type
         const response_type = if (is_raw) null else try shared.getSuccessResponseType(self.arena, self.resolver, self.type_gen, op);
@@ -326,7 +363,10 @@ pub const ClientGenerator = struct {
             try self.w.line("defer resp.deinit();", .{});
             try self.w.line("return .{{ .status_code = resp.status.code, .body = if (resp.body) |b| (self.allocator.dupe(u8, b) catch null) else null, .content_type = if (resp.contentType()) |ct| (self.allocator.dupe(u8, ct) catch null) else null, .allocator = self.allocator }};", .{});
         } else {
-            try self.w.line("return ApiResponse({s}).fromResponse(self.allocator, &resp);", .{response_type.?});
+            try self.w.line("return ApiResponse({s}).{s}(self.allocator, &resp);", .{
+                response_type.?,
+                if (is_negotiated) "fromNegotiatedResponse" else "fromResponse",
+            });
         }
 
         self.w.dedent();
@@ -438,6 +478,13 @@ pub const ClientGenerator = struct {
     }
 };
 
+/// The generated source of one method, from its signature to the next one.
+fn methodBody(generated: []const u8, signature: []const u8) []const u8 {
+    const start = std.mem.indexOf(u8, generated, signature) orelse return "";
+    const next = std.mem.indexOfPos(u8, generated, start + signature.len, "pub fn ") orelse generated.len;
+    return generated[start..next];
+}
+
 fn encodedPathParamName(allocator: Allocator, name: []const u8) ![]u8 {
     const prefixed = try std.fmt.allocPrint(allocator, "encoded_{s}", .{name});
     return naming.zigFieldName(allocator, prefixed);
@@ -527,6 +574,82 @@ test "client generator preserves optional request body semantics" {
     try std.testing.expect(std.mem.indexOf(u8, generated, "const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);") != null);
     try std.testing.expect(std.mem.indexOf(u8, generated, "pub fn optionalBinaryBody(self: *@This(), body: ?[]const u8)") != null);
     try std.testing.expect(std.mem.indexOf(u8, generated, ".body = value") != null);
+}
+
+test "client generator keeps json typed and bytes available for a negotiated response" {
+    const alloc = std.testing.allocator;
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    // A response the caller negotiates: JSON by default, a packed frame when
+    // the request asks for one. Both forms have to reach the caller, so the
+    // operation keeps its typed JSON and gains the bytes.
+    var negotiated_content = std.StringArrayHashMapUnmanaged(types.MediaType){};
+    try negotiated_content.put(arena, "application/json", .{
+        .schema = .{ .schema = .{ .schema_type = .{ .single = "string" } } },
+    });
+    try negotiated_content.put(arena, "application/vnd.antfly.numeric.v1", .{
+        .schema = .{ .schema = .{ .schema_type = .{ .single = "string" } } },
+    });
+    var negotiated_responses = std.StringArrayHashMapUnmanaged(types.ResponseOrRef){};
+    try negotiated_responses.put(arena, "200", .{ .response = .{
+        .description = "Values",
+        .content = negotiated_content,
+    } });
+
+    var json_content = std.StringArrayHashMapUnmanaged(types.MediaType){};
+    try json_content.put(arena, "application/json", .{
+        .schema = .{ .schema = .{ .schema_type = .{ .single = "string" } } },
+    });
+    var json_responses = std.StringArrayHashMapUnmanaged(types.ResponseOrRef){};
+    try json_responses.put(arena, "200", .{ .response = .{
+        .description = "Values",
+        .content = json_content,
+    } });
+
+    // A streaming response has no JSON form to keep, so it stays raw.
+    var stream_content = std.StringArrayHashMapUnmanaged(types.MediaType){};
+    try stream_content.put(arena, "text/event-stream", .{});
+    var stream_responses = std.StringArrayHashMapUnmanaged(types.ResponseOrRef){};
+    try stream_responses.put(arena, "200", .{ .response = .{
+        .description = "Events",
+        .content = stream_content,
+    } });
+
+    var doc = types.OpenApiDoc{
+        .openapi = "3.0.3",
+        .info = .{ .title = "Test", .version = "1.0" },
+    };
+    try doc.paths.put(arena, "/negotiated", .{
+        .post = .{ .operation_id = "negotiatedValues", .responses = negotiated_responses },
+    });
+    try doc.paths.put(arena, "/json", .{
+        .post = .{ .operation_id = "jsonValues", .responses = json_responses },
+    });
+    try doc.paths.put(arena, "/stream", .{
+        .post = .{ .operation_id = "streamValues", .responses = stream_responses },
+    });
+
+    var resolver = Resolver.init(arena, &doc);
+    var w = SourceWriter.init(arena);
+    var type_gen = TypeGenerator.init(arena, &w, &resolver);
+    var generator = ClientGenerator.init(arena, &w, &resolver, &type_gen);
+    try generator.generate(&doc);
+
+    const generated = w.toSlice();
+    try std.testing.expect(std.mem.indexOf(u8, generated, "bytes: ?[]const u8 = null,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "pub fn fromNegotiatedResponse(") != null);
+    // The negotiated operation uses it; a JSON-only one is untouched.
+    const negotiated_body = methodBody(generated, "pub fn negotiatedValues(");
+    const json_body = methodBody(generated, "pub fn jsonValues(");
+    const stream_body = methodBody(generated, "pub fn streamValues(");
+    try std.testing.expect(std.mem.indexOf(u8, negotiated_body, "fromNegotiatedResponse(self.allocator") != null);
+    // A JSON-only operation is untouched: same call as before this existed.
+    try std.testing.expect(std.mem.indexOf(u8, json_body, "fromResponse(self.allocator") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json_body, "fromNegotiatedResponse") == null);
+    // Streaming stays raw: there is no JSON form to keep.
+    try std.testing.expect(std.mem.indexOf(u8, stream_body, "!RawResponse") != null);
 }
 
 test "client generator percent-encodes path parameters" {

@@ -8020,7 +8020,7 @@ const MutationRoute = struct {
 // A bounded, transaction-local authoritative sum. It is never reconstructed
 // from a normalized cosine centroid or retained across external revisions.
 // Any intervening mutation (including a destination append or merge) invalidates
-// the entry. Only consecutive removals from the same unchanged source use it.
+// the entry. Removals may interleave across sources when their versions match.
 const RelocationCentroidCache = struct {
     leaf_id: u64 = 0,
     version: u64 = 0,
@@ -11214,8 +11214,11 @@ pub fn batchInsertWithMetadataTxnOptions(
     var deferred_ancestor_centroid_refresh_ids = std.ArrayListUnmanaged(u64).empty;
     defer deferred_ancestor_centroid_refresh_ids.deinit(self.alloc);
     var membership_changed = options.recompute_coalesced_centroids;
-    var centroid_cache: RelocationCentroidCache = .{};
-    defer centroid_cache.deinit(self.alloc);
+    // Bound temporary sums independently of batch size. A direct-mapped cache
+    // retains interleaved source leaves without weakening mutation-version
+    // checks; collisions simply rebuild. At 1536 dimensions this is 192 KiB.
+    var centroid_cache: [16]RelocationCentroidCache = @splat(.{});
+    defer for (&centroid_cache) |*entry| entry.deinit(self.alloc);
     for (items) |item| {
         var route: ?MutationRoute = null;
         self.write_profile.insert_calls += 1;
@@ -11249,7 +11252,7 @@ pub fn batchInsertWithMetadataTxnOptions(
                 const leaf_id = try posting.CentroidDirectory.findPosting(self, txn, self.metadata.root_node, effective_transformed, allow_quantized_routing);
                 self.write_profile.insert_find_leaf_ns += elapsedSinceU64Fixed(find_leaf_start);
                 self.write_profile.insert_find_leaf_calls += 1;
-                route = .{ .existing_leaf = existing_leaf_id, .target_leaf = leaf_id, .centroid_cache = if (options.skip_vector_store and options.defer_quantized_rebuild) &centroid_cache else null };
+                route = .{ .existing_leaf = existing_leaf_id, .target_leaf = leaf_id, .centroid_cache = if (options.skip_vector_store and options.defer_quantized_rebuild) &centroid_cache[existing_leaf_id % centroid_cache.len] else null };
                 if (existing_leaf_id == leaf_id) {
                     if (try tryCoalesceExistingVectorInLeafTxnOptions(
                         self,

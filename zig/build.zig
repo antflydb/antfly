@@ -91,6 +91,7 @@ pub fn build(b: *std.Build) void {
 }
 
 pub const Artifacts = struct {
+    inference_steps: @import("pkg/inference/build/integration.zig").Steps,
     runtime: antfly_runtime_build.AddRuntimeResult,
     inference: inference_runtime_build.Graph,
     wasm: *std.Build.Step.Compile,
@@ -945,7 +946,7 @@ pub fn create(b: *std.Build) ?Artifacts {
             .optimize = optimize,
             .link_libc = true,
         }),
-        .filters = &.{ "request gate", "request watchdog", "request task admission", "successful H1 requests do not wait" },
+        .filters = &.{ "request gate", "request watchdog", "request task admission", "request cancellation before socket publication", "successful H1 requests do not wait" },
     });
     const run_httpx_client_lifecycle_tests = b.addRunArtifact(httpx_client_lifecycle_tests);
     b.step("lib-httpx-client-lifecycle-test", "Run HTTP client admission, release, and shutdown contracts").dependOn(&run_httpx_client_lifecycle_tests.step);
@@ -1530,6 +1531,22 @@ pub fn create(b: *std.Build) ?Artifacts {
         6 * 1024 * 1024 * 1024,
     );
 
+    // The VOPR workflow also selects focused and build-only roots that need
+    // not be reachable from `test`. Account for every compile/run before the
+    // cgroup-aware wrapper admits parallel work; preserve measured claims.
+    for ([_][]const u8{
+        "antfly-raft-transport-test",  "standby-vopr-test",                "vopr-runtime-test",
+        "restore-admission-vopr-test", "vopr-determinism-audit",           "vopr-build",
+        "antfly",                      "antfly-storage-owner-source-test",
+    }) |name| {
+        assignDefaultAggregateMaxRss(
+            b,
+            &b.top_level_steps.get(name).?.step,
+            @as(usize, if (target.result.os.tag == .macos) 10 else 7) * 1024 * 1024 * 1024,
+            6 * 1024 * 1024 * 1024,
+        );
+    }
+
     const hbc_trace_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/tools/hbc_trace.zig"),
         .target = target,
@@ -1578,5 +1595,5 @@ pub fn create(b: *std.Build) ?Artifacts {
         &b.top_level_steps.get("inference-test").?.step,
         &b.top_level_steps.get("inference-finetune-test").?.step,
     });
-    return .{ .runtime = runtime, .inference = inference_graph, .wasm = wasm.artifact };
+    return .{ .runtime = runtime, .inference = inference_graph, .wasm = wasm.artifact, .inference_steps = inference_steps };
 }

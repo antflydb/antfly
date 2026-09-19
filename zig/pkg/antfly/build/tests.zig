@@ -559,7 +559,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const lib_managed_embedder_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{ "managed embedder", "antfly embed request", "antfly embed round trip", "antfly sparse embed round trip", "antfly numeric", "antfly provider preserves explicit distributed admission denial", "legacy numeric" },
+        .filters = &.{ "managed embedder", "antfly embed request", "antfly embed round trip", "antfly sparse embed round trip", "antfly numeric", "antfly provider preserves explicit distributed admission denial" },
     });
     const run_lib_managed_embedder_tests = addFilteredTestRunArtifact(b, lib_managed_embedder_tests);
     const lib_managed_embedder_test_step = b.step("antfly-inference-managed-embedder-test", "Run managed embedder contract and provider tests");
@@ -623,7 +623,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const lib_common_secrets_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{ "file secret store", "remote content runtime" },
+        .filters = &.{ "file secret store", "remote content runtime", "secret contract", "secret record" },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -1037,6 +1037,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "table contract rejects unknown fields in closed nested index objects",
         "table contract treats nullable nested index fields as omitted",
         "table contract preserves artifact-backed public full text indexes",
+        "table contract accepts the transcriber enrichment shorthand",
         "table contract rejects invalid inline artifact enrichments before admission",
         "table contract normalizes public artifact enrichment request",
         "restore admission rejects an embedding artifact catalog without an executable producer",
@@ -1148,6 +1149,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "native text sort planner ignores fully deleted legacy segments for index sort coverage",
         "text field sort uses sorted segment membership path when index sort matches",
         "text projected source load rejects expired deadline before stored load",
+        "text projected source batch preserves selection and cleans up failed hydration",
         "native numeric sort rejects non-finite doc values",
         "mixed numeric concrete sort keys share one cursor domain",
         "native sort coverage diagnostics classify physical doc value failures",
@@ -1578,6 +1580,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_lite_native_tests = addFilteredTestRunArtifact(b, lite_native_tests);
     const lite_native_test_step = b.step("lite-native-test", "Run Lite native backend tests");
     lite_native_test_step.dependOn(&run_lite_native_tests.step);
+    const lite_benchmark = b.addTest(.{
+        .root_module = lite_native_test_mod,
+        .filters = &.{"lite throughput benchmark"},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_lite_benchmark = b.addRunArtifact(lite_benchmark);
+    run_lite_benchmark.addArgs(&.{ "--test-filter", "lite throughput benchmark" });
+    run_lite_benchmark.setEnvironmentVariable("ANTFLY_LITE_BENCH", "1");
+    b.step("lite-native-benchmark", "Benchmark native Lite transaction, commit, and sorted read scaling").dependOn(&run_lite_benchmark.step);
 
     const cmd_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/cmd_test.zig"),
@@ -2625,6 +2636,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const vopr_cli = b.addTest(.{
         .name = "vopr",
         .root_module = vopr_cli_mod,
+        // The command runner invokes only this entrypoint. Exclude unrelated
+        // imported unit tests from compilation while retaining test facilities
+        // and every scenario reachable from the command dispatcher.
+        .filters = &.{"VOPR command entrypoint"},
         .test_runner = .{
             .path = b.path("pkg/antfly/src/vopr/cli_runner.zig"),
             .mode = .simple,
@@ -4260,7 +4275,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const docstore_test_step = b.step("docstore-test", "Run storage/docstore unit tests");
     docstore_test_step.dependOn(&run_docstore_unit_tests.step);
 
-    const vector_payload_bench_mod = makeLmdbModule(b, "pkg/antfly/src/vector_payload_bench.zig", target, .ReleaseFast, build_options, lmdb_engine_mod, platform_mod, hash_mod);
+    const vector_payload_bench_mod = makeLmdbModule(b, "pkg/antfly/src/vector_payload_bench.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
     vector_payload_bench_mod.addImport("bloom", bloom_mod);
     vector_payload_bench_mod.addImport("antfly_vectorindex", vectorindex_mod);
     vector_payload_bench_mod.addImport("antfly-json", json_mod);

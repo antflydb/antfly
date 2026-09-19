@@ -9822,6 +9822,8 @@ pub const EnrichmentConfig = struct {
     producer_json: ?[]const u8 = null,
     /// Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity.
     execution: ?ExecutionPolicy = null,
+    /// Typed shorthand for a transcription asset enrichment. Only valid with kind=asset and without producer_json; Antfly expands it into a document_extraction producer whose audio route transcribes each recording with this speech-to-text provider. The produced units carry the transcript text, provider confidence, and per-phrase time offsets, and chunk enrichments that consume them emit _start_time_ms/_end_time_ms on every chunk. With diarization: true the phrases also carry who spoke them, and a chunk that does not straddle a turn emits _speaker. content_type defaults to application/json.
+    transcriber: ?TranscriberEnrichmentConfig = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -9839,6 +9841,7 @@ pub const EnrichmentConfig = struct {
         .{ "content_type", "content_type", true },
         .{ "producer_json", "producer_json", true },
         .{ "execution", "execution", true },
+        .{ "transcriber", "transcriber", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -9901,6 +9904,10 @@ pub const EnrichmentConfig = struct {
         }
         if (self.execution) |value| {
             try jw.objectField("execution");
+            try jw.write(value);
+        }
+        if (self.transcriber) |value| {
+            try jw.objectField("transcriber");
             try jw.write(value);
         }
         try jw.endObject();
@@ -21754,6 +21761,42 @@ pub const InferenceDictationSegment = struct {
     end_ms: i64,
     /// Word spans estimated inside the phrase by distributing its duration over word lengths.
     words: []const InferenceDictationWord,
+    /// Speaker label from diarization (`SPEAKER_00`, ...). Absent without diarization or when the phrase had no usable audio.
+    speaker: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "text", "text", false },
+        .{ "start_ms", "start_ms", false },
+        .{ "end_ms", "end_ms", false },
+        .{ "words", "words", false },
+        .{ "speaker", "speaker", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("text");
+        try jw.write(self.text);
+        try jw.objectField("start_ms");
+        try jw.write(self.start_ms);
+        try jw.objectField("end_ms");
+        try jw.write(self.end_ms);
+        try jw.objectField("words");
+        try jw.write(self.words);
+        if (self.speaker) |value| {
+            try jw.objectField("speaker");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// How the cleanup pass rewrites the transcript. `clean` removes fillers and fixes punctuation while keeping the speaker's wording; `formal` and `casual` also adjust register; `verbatim` skips the generator and returns the raw transcript.
@@ -24255,6 +24298,12 @@ pub const InferenceTranscribeObject = struct {
     text: []const u8,
     /// Detected or forced language
     language: ?[]const u8 = null,
+    /// Decoded clip duration in milliseconds.
+    duration_ms: ?i64 = null,
+    /// Timestamped phrases in clip order, so a transcript can be indexed and linked back to a moment in the recording. Clips longer than 30 s are transcribed in windows; segment offsets are relative to the whole clip.
+    segments: ?[]const InferenceDictationSegment = null,
+    /// Speaker labels found by diarization, in order of first appearance. Present only when `diarization` was requested.
+    speakers: ?[]const []const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -24262,6 +24311,9 @@ pub const InferenceTranscribeObject = struct {
         .{ "index", "index", false },
         .{ "text", "text", false },
         .{ "language", "language", true },
+        .{ "duration_ms", "duration_ms", true },
+        .{ "segments", "segments", true },
+        .{ "speakers", "speakers", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -24284,6 +24336,18 @@ pub const InferenceTranscribeObject = struct {
             try jw.objectField("language");
             try jw.write(value);
         }
+        if (self.duration_ms) |value| {
+            try jw.objectField("duration_ms");
+            try jw.write(value);
+        }
+        if (self.segments) |value| {
+            try jw.objectField("segments");
+            try jw.write(value);
+        }
+        if (self.speakers) |value| {
+            try jw.objectField("speakers");
+            try jw.write(value);
+        }
         try jw.endObject();
     }
 };
@@ -24291,16 +24355,19 @@ pub const InferenceTranscribeObject = struct {
 pub const InferenceTranscribeRequest = struct {
     /// Explicit name of the transcriber model from models_dir/transcribers/. Required so direct and distributed execution resolve the same model.
     model: []const u8,
-    /// Base64-encoded audio data (WAV, MP3, FLAC, etc.). Clips longer than 30 s are transcribed in windows cut at pauses; silent clips return an empty transcript.
+    /// Base64-encoded audio data (WAV, MP3, AAC/M4A, MP4/MOV audio, Ogg/Opus, WebM/Matroska, FLAC, etc.). Clips longer than 30 s are transcribed in windows cut at pauses; silent clips return an empty transcript.
     audio: []const u8,
     /// Force specific language for transcription (optional, model-dependent)
     language: ?[]const u8 = null,
+    /// Label each segment with a speaker. Runs a local speaker-embedding model (pull `csukuangfj/speaker-embedding-models:3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx`) and clusters phrases by voice; labels are `SPEAKER_00`, `SPEAKER_01`, ... in order of first appearance.
+    diarization: ?bool = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "model", "model", false },
         .{ "audio", "audio", false },
         .{ "language", "language", true },
+        .{ "diarization", "diarization", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -24319,6 +24386,10 @@ pub const InferenceTranscribeRequest = struct {
         try jw.write(self.audio);
         if (self.language) |value| {
             try jw.objectField("language");
+            try jw.write(value);
+        }
+        if (self.diarization) |value| {
+            try jw.objectField("diarization");
             try jw.write(value);
         }
         try jw.endObject();
@@ -32333,6 +32404,35 @@ pub const SSEToolMode = struct {
     }
 };
 
+/// The STT provider to use.
+pub const STTProvider = enum {
+    openai,
+    vertex,
+    antfly,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .openai => "openai",
+            .vertex => "vertex",
+            .antfly => "antfly",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "openai", .openai },
+            .{ "vertex", .vertex },
+            .{ "antfly", .antfly },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Request to scan keys in a table within a key range. If no range is specified, scans all keys in the table.
 pub const ScanKeysRequest = struct {
     /// Start of the key range to scan (exclusive by default). Can be a full key or a prefix. If not specified, starts from the beginning of the table.
@@ -32412,6 +32512,10 @@ pub const SecretEntry = struct {
     /// Secret name (e.g., openai.api_key)
     key: []const u8,
     status: SecretStatus,
+    /// Name of the winning source, or environment.
+    source: ?[]const u8 = null,
+    /// Whether this key has an Antfly-managed override that can be deleted.
+    managed: ?bool = null,
     /// Corresponding environment variable name (e.g., OPENAI_API_KEY)
     env_var: ?[]const u8 = null,
     created_at: ?[]const u8 = null,
@@ -32421,6 +32525,8 @@ pub const SecretEntry = struct {
     pub const openApiFieldMetadata = .{
         .{ "key", "key", false },
         .{ "status", "status", false },
+        .{ "source", "source", true },
+        .{ "managed", "managed", true },
         .{ "env_var", "env_var", true },
         .{ "created_at", "created_at", true },
         .{ "updated_at", "updated_at", true },
@@ -32440,6 +32546,14 @@ pub const SecretEntry = struct {
         try jw.write(self.key);
         try jw.objectField("status");
         try jw.write(self.status);
+        if (self.source) |value| {
+            try jw.objectField("source");
+            try jw.write(value);
+        }
+        if (self.managed) |value| {
+            try jw.objectField("managed");
+            try jw.write(value);
+        }
         if (self.env_var) |value| {
             try jw.objectField("env_var");
             try jw.write(value);
@@ -32457,7 +32571,34 @@ pub const SecretEntry = struct {
 };
 
 pub const SecretList = struct {
+    /// Whether this server has a native store for secret API writes.
+    writable: ?bool = null,
     secrets: []const SecretEntry,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "writable", "writable", true },
+        .{ "secrets", "secrets", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.writable) |value| {
+            try jw.objectField("writable");
+            try jw.write(value);
+        }
+        try jw.objectField("secrets");
+        try jw.write(self.secrets);
+        try jw.endObject();
+    }
 };
 
 /// Source of the secret configuration
@@ -35951,6 +36092,108 @@ pub const TransactionStageWriteRequest = struct {
 pub const TransactionStatusResponse = struct {
     status: []const u8,
     transaction_id: []const u8,
+};
+
+/// Speech-to-text provider for the `transcriber` enrichment shorthand. Carries the provider's STT configuration (`provider`, `model`, `api_url`, `api_key`, ...) plus the transcription options below. The fields are declared inline rather than composed from `STTConfig` so that a generated client can leave an option out: a composed schema makes a typed client serialize every field, and a `max_download_bytes` of zero would reject every recording. **Example:** ```yaml name: call_transcripts kind: asset field: recording_url transcriber: provider: antfly model: openai/whisper-base language_code: en timestamps: true ```
+pub const TranscriberEnrichmentConfig = struct {
+    provider: STTProvider,
+    /// Model name, as the provider names it (e.g. 'openai/whisper-base' for antfly, 'whisper-1' for openai).
+    model: ?[]const u8 = null,
+    /// Antfly inference API URL. Falls back to ANTFLY_INFERENCE_URL.
+    api_url: ?[]const u8 = null,
+    /// OpenAI API base URL. Falls back to OPENAI_BASE_URL.
+    base_url: ?[]const u8 = null,
+    /// Provider API key. Falls back to the provider's environment variable.
+    api_key: ?[]const u8 = null,
+    /// Google Cloud project ID for the vertex provider. Falls back to GOOGLE_CLOUD_PROJECT.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location for the vertex provider.
+    location: ?[]const u8 = null,
+    /// Path to an ADC credential JSON file for the vertex provider. Falls back to the default ADC chain.
+    credentials_path: ?[]const u8 = null,
+    /// Spoken language hint (ISO 639-1, e.g. 'en'). Omit for automatic detection where the provider supports it.
+    language_code: ?[]const u8 = null,
+    /// Request timestamped transcript segments so chunks carry recording offsets. Providers without segment timing return plain text.
+    timestamps: ?bool = null,
+    /// Request speaker labels on transcript segments where the provider supports them.
+    diarization: ?bool = null,
+    /// Largest recording fetched from a URL, in bytes. Defaults to 128 MiB, which covers a one hour voice memo or podcast.
+    max_download_bytes: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
+        .{ "model", "model", true },
+        .{ "api_url", "api_url", true },
+        .{ "base_url", "base_url", true },
+        .{ "api_key", "api_key", true },
+        .{ "project_id", "project_id", true },
+        .{ "location", "location", true },
+        .{ "credentials_path", "credentials_path", true },
+        .{ "language_code", "language_code", true },
+        .{ "timestamps", "timestamps", true },
+        .{ "diarization", "diarization", true },
+        .{ "max_download_bytes", "max_download_bytes", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.api_url) |value| {
+            try jw.objectField("api_url");
+            try jw.write(value);
+        }
+        if (self.base_url) |value| {
+            try jw.objectField("base_url");
+            try jw.write(value);
+        }
+        if (self.api_key) |value| {
+            try jw.objectField("api_key");
+            try jw.write(value);
+        }
+        if (self.project_id) |value| {
+            try jw.objectField("project_id");
+            try jw.write(value);
+        }
+        if (self.location) |value| {
+            try jw.objectField("location");
+            try jw.write(value);
+        }
+        if (self.credentials_path) |value| {
+            try jw.objectField("credentials_path");
+            try jw.write(value);
+        }
+        if (self.language_code) |value| {
+            try jw.objectField("language_code");
+            try jw.write(value);
+        }
+        if (self.timestamps) |value| {
+            try jw.objectField("timestamps");
+            try jw.write(value);
+        }
+        if (self.diarization) |value| {
+            try jw.objectField("diarization");
+            try jw.write(value);
+        }
+        if (self.max_download_bytes) |value| {
+            try jw.objectField("max_download_bytes");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// In-place document transformation using MongoDB-style operators. Transforms are applied atomically at the storage layer, eliminating read-modify-write races. **Important:** Transform results are NOT validated against the table schema. This improves performance but means it's possible to create invalid documents. Use with care and ensure your operations maintain schema compliance.

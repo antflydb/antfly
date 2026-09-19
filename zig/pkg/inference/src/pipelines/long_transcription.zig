@@ -59,6 +59,10 @@ pub const Segment = struct {
     end_ms: u64,
     /// Word spans estimated inside the phrase; see `whisper_timestamps.splitWords`.
     words: []Word,
+    /// Speaker cluster from local diarization (`speaker_embedding.zig`), in
+    /// order of first appearance; null when diarization was off or the
+    /// phrase had no usable audio.
+    speaker_index: ?u8 = null,
 };
 
 pub fn freeSegments(allocator: std.mem.Allocator, segments: []Segment) void {

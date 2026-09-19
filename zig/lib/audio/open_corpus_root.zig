@@ -126,6 +126,7 @@ fn formatName(format: EncodedFormat) []const u8 {
         .aiff => "aiff",
         .caf => "caf",
         .au => "au",
+        .webm => "webm",
     };
 }
 

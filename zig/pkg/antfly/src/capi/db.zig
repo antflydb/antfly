@@ -1005,8 +1005,12 @@ fn parseEnrichmentKind(kind: []const u8) ?db_mod.types.EnrichmentKind {
 }
 
 fn graphFreeEdges(alloc: Allocator, edges: []graph_mod.Edge) void {
+    // GraphIndex.freeEdges already frees both each edge's owned fields and
+    // the slice itself. Freeing `edges` again here double-frees it: harmless
+    // for the len==0 case (many allocators no-op an empty-slice free), but a
+    // real heap corruption once a query returns actual edges -- see
+    // antfly_db_get_edges_json below, the only caller.
     graph_mod.GraphIndex.freeEdges(alloc, edges);
-    alloc.free(edges);
 }
 
 fn traversalFreeResults(alloc: Allocator, results: []traversal_mod.TraversalResult) void {
@@ -11622,6 +11626,64 @@ pub export fn antfly_db_get_edges_json(
     return .ok;
 }
 
+test "capi get edges json does not double free a non-empty edge slice" {
+    // Exercise the edge cleanup helper with the testing allocator as well as
+    // the public C ABI, which uses the C allocator for its handle and results.
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, test_tmp.path(), "capi-get-edges-double-free");
+    defer alloc.free(path);
+    var handle_ptr: ?*anyopaque = null;
+    cleanupTestDir(path);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open(path, &handle_ptr));
+    defer cleanupTestDir(path);
+    defer antfly_db_close(handle_ptr);
+
+    const index_config = "{\"name\":\"gr_edges_v1\",\"kind\":\"graph\",\"config_json\":\"{}\"}";
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(handle_ptr, .{
+        .ptr = index_config.ptr,
+        .len = index_config.len,
+    }));
+
+    // Before any edges exist, getEdges returns an empty slice: freeing it
+    // twice never crashed, which is exactly why this bug went unnoticed.
+    var empty_out: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_get_edges_json(handle_ptr, .{
+        .ptr = "gr_edges_v1",
+        .len = "gr_edges_v1".len,
+    }, .{ .ptr = "doc:edge-source", .len = "doc:edge-source".len }, .{}, 2, &empty_out));
+    antfly_db_buffer_free(empty_out.ptr, empty_out.len);
+
+    const source_doc =
+        \\{"title":"source","_edges":{"gr_edges_v1":{"links":[{"target":"doc:edge-target","weight":1.0}]}}}
+    ;
+    const batch_json = "{\"inserts\":{\"doc:edge-source\":" ++ source_doc ++ ",\"doc:edge-target\":{\"title\":\"target\"}},\"sync_level\":\"write\"}";
+    var batch_out: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch_json(handle_ptr, .{
+        .ptr = batch_json.ptr,
+        .len = batch_json.len,
+    }, &batch_out));
+    defer antfly_db_buffer_free(batch_out.ptr, batch_out.len);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_run_until_idle(handle_ptr));
+
+    {
+        const edges = try asHandle(handle_ptr).?.db.getEdges(alloc, "gr_edges_v1", "doc:edge-source", "", .both);
+        defer graphFreeEdges(alloc, edges);
+        try std.testing.expectEqual(@as(usize, 1), edges.len);
+    }
+
+    // Read the same non-empty result through the public C ABI.
+    var out: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_get_edges_json(handle_ptr, .{
+        .ptr = "gr_edges_v1",
+        .len = "gr_edges_v1".len,
+    }, .{ .ptr = "doc:edge-source", .len = "doc:edge-source".len }, .{}, 2, &out));
+    defer antfly_db_buffer_free(out.ptr, out.len);
+    try std.testing.expect(out.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, out.ptr.?[0..out.len], "edge_type") != null);
+}
+
 pub export fn antfly_db_traverse_edges_json(
     handle_ptr: ?*anyopaque,
     request_json: capi.Slice,
@@ -12621,10 +12683,17 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_stats_json(concurrent_status_handle, &concurrent_status));
     defer antfly_db_buffer_free(concurrent_status.ptr, concurrent_status.len);
     try std.testing.expect(std.mem.indexOf(u8, concurrent_status.ptr.?[0..concurrent_status.len], "\"doc_count\":") != null);
-    var blocked_vacuum: capi.Buffer = .{ .ptr = scratch[0..].ptr, .len = scratch.len };
-    try std.testing.expectEqual(capi.ErrorCode.busy, antfly_lite_vacuum_json(src_handle, &blocked_vacuum));
-    try std.testing.expect(blocked_vacuum.ptr == null);
-    try std.testing.expectEqual(@as(usize, 0), blocked_vacuum.len);
+    var online_vacuum: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_vacuum_json(src_handle, &online_vacuum));
+    defer antfly_db_buffer_free(online_vacuum.ptr, online_vacuum.len);
+    try std.testing.expect(online_vacuum.len > 0);
+    var retired_reader_lookup: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_lookup_json(concurrent_readonly_handle, .{
+        .ptr = "doc:capi-pinned",
+        .len = "doc:capi-pinned".len,
+    }, &retired_reader_lookup));
+    defer antfly_db_buffer_free(retired_reader_lookup.ptr, retired_reader_lookup.len);
+    try std.testing.expect(std.mem.indexOf(u8, retired_reader_lookup.ptr.?[0..retired_reader_lookup.len], "\"pinned-before\"") != null);
     antfly_db_close(concurrent_status_handle);
     concurrent_status_handle = null;
     antfly_db_close(concurrent_readonly_handle);
