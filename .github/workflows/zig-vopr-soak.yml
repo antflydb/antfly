@@ -133,7 +133,7 @@ jobs:
           use-cache: false
       - name: Restore the pinned runner for this revision
         id: runner_cache
-        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/vopr-cached-runner/vopr.tar.gz
           key: vopr-runner-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.head_sha || github.sha }}
@@ -174,7 +174,7 @@ jobs:
           tar -C zig/zig-out/bin -czf "$RUNNER_TEMP/vopr-cached-runner/vopr.tar.gz" vopr
       - name: Preserve the runner layout for subsequent campaigns
         if: steps.runner_cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/vopr-cached-runner/vopr.tar.gz
           key: vopr-runner-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.head_sha || github.sha }}
@@ -221,7 +221,7 @@ jobs:
           path: ${{ runner.temp }}/runner
       - run: tar -C "$RUNNER_TEMP/runner" -xzf "$RUNNER_TEMP/runner/vopr.tar.gz"
       - name: Restore merged corpus from earlier runs
-        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/vopr-corpus-retained
           key: vopr-corpus-v2-${{ github.ref_name }}--${{ matrix.scenario }}--${{ needs.build.outputs.binary_sha256 }}--${{ github.run_id }}-${{ github.run_attempt }}
@@ -316,7 +316,7 @@ jobs:
         with:
           version: ${{ steps.toolchain.outputs.zig_version }}
           use-cache: false
-      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
       - name: Build production executable and qualify owner publication
         id: production-build
         working-directory: zig
@@ -495,7 +495,7 @@ jobs:
           if-no-files-found: error
 
       - name: Publish corpus for the next scheduled run
-        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/vopr-corpus-retained
           key: vopr-corpus-v2-${{ github.ref_name }}--${{ matrix.scenario }}--${{ needs.build.outputs.binary_sha256 }}--${{ github.run_id }}-${{ github.run_attempt }}
