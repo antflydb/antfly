@@ -992,3 +992,97 @@ for 1.035 seconds. All three processes exited zero without forced cleanup and
 their PIDs were absent afterward; all 35 proxy connections closed without error.
 Discovery signatures were verified live; redacted credentials preclude repeating
 that HMAC check offline. The audit left the receipts unchanged.
+
+## Durable local completion integration
+
+This stage adds pre-prepare physical reservation, protected SST/manifest drain,
+and reservation restoration before WAL replay for the explicit internal local
+overwrite profile. It does not enable the public or replicated mandatory-write
+policy. The [implementation limits](WORKLOAD_LSM_COMPLETION.md) describe the
+accepted profile and fixed resource envelope.
+
+The DB/compiler checkpoint in
+`/tmp/workload-completion-db-checkpoint5.log` exited zero with 18/18 tests passed,
+no skips, failures or leaks. These tests exercise the real prepare/resolve
+machinery, changed and equal overwrites, intervening ledger updates and writes,
+terminal retries after a newer write, failed reservation followed by abort,
+pending and uncertain-decision restart, explicit local authority, persisted
+catalog validation, descriptor corruption and compiler allocation failures.
+
+Native fault coverage includes both outcomes, allocation and FD exhaustion after
+prepare, old readers retaining their original allocation owner, maximum compiled
+shape and cumulative foreground growth, restart with insufficient capacity,
+many small WAL segments, clean/corrupt/torn guards, direct mutation exclusion,
+and ordinary descriptor headroom. Recovery tests interrupt every protected WAL
+reset boundary and repeatedly interrupt cleanup after manifest publication at
+the maximum admitted run count. A later acknowledged ordinary write survives a
+second reopen without reapplying completion templates.
+
+The first full Debug integration run in
+`/tmp/workload-completion-final-debug.log` exited one because the new maximum-run
+test fixture called an internal flush without holding its required mutex. The
+fixture now uses the public locking checkpoint and holds the mutex around its
+other internal calls. That failed run is retained as a predecessor, not a passing
+gate.
+
+The second Debug run in `/tmp/workload-completion-final-debug2.log` passed
+190/191 prerequisite tests with zero leaks, including the repeated manifest
+recovery and serving-cache transition regressions. Its low-FD fixture failed
+during open. Investigation also found that checking total FD capacity ignored
+lifetime locks, startup headroom and the two-descriptor ordinary WAL append.
+Reservation now requires four usable transient slots before retaining its pair;
+the corrected fixture distinguishes two, three and four usable slots after open.
+The failed run did not execute the main test artifact through the combined gate.
+Running that already compiled main artifact separately recorded 283 passed, one
+optional Wasmtime skip and the same single FD-fixture failure, with zero leaks
+and zero unexpected logged errors, in
+`/tmp/workload-completion-main-debug-diagnostic.log`. This diagnostic predates
+the FD correction and is not the final gate.
+
+The corrected full Debug command exited zero:
+
+```sh
+zig build antfly-workload-admission-test -j1 \
+  --cache-dir /tmp/zig-local-cache --global-cache-dir /tmp/zig-global-cache
+```
+
+`/tmp/workload-completion-final-debug3.log` records 192/192 prerequisite tests
+and 285 main tests passed, one optional Wasmtime skip, zero failures and zero
+leaks. All six logged errors were expected. The serving-cache transition test
+was discovered and passed in both artifacts. The corrected FD-capacity fixture,
+shared-pool headroom regression and repeated maximum-run recovery all passed.
+The checked descriptor/compiler is committed as `fa23313dd4`, native integration
+as `fa8aae0428`, and the opt-in DB integration as `f4e52eb15f`.
+`/tmp/workload-completion-final-debug3-receipt.json` records the actual exit and
+both test binary hashes.
+
+The combined ReleaseSafe gate also exited zero with 39/39 passed, no skips,
+failures or leaks, in `/tmp/workload-completion-final-release-safe.log`:
+
+```sh
+zig build lsm-backend-test -Doptimize=ReleaseSafe -j1 \
+  --cache-dir /tmp/zig-local-cache --global-cache-dir /tmp/zig-global-cache -- \
+  --test-filter 'workload admission durable DB completion' \
+  --test-filter 'workload admission completion compiler' \
+  --test-filter 'workload admission completion slot' \
+  --test-filter 'workload admission completion profile' \
+  --test-filter 'workload admission completion empty catalog' \
+  --test-filter 'workload admission lsm durable slot' \
+  --test-filter 'lsm protected WAL reset' \
+  --test-filter 'native completion scope' \
+  --test-filter 'native WAL completion scope' \
+  --test-filter 'workload admission retained backlog' \
+  --test-filter 'workload admission backlog cancellation'
+```
+
+The production Debug build of `f4e52eb15f517dc8297d2fa4198b4355cbb42479` exited
+zero with `zig build antfly -Doptimize=Debug -j1`. Only the three documentation
+files were dirty. The built binary has SHA-256
+`0cd894067a4d130783094e23d74b37990764e26ba06a95db08ad3a280cdd9adb`.
+`/tmp/workload-durable-completion-production-debug-receipt.json` records the
+command, source state, actual exit and binary/log hashes. This is a production
+compilation check, not a new runtime benchmark.
+
+These are bounded local correctness and fault-injection checks. They do not
+establish throughput, p99 latency, a process-wide memory cap, replicated capacity
+compatibility or optimized Cloud package qualification.

@@ -147,9 +147,10 @@ ReleaseSafe, with zero failures, skips or leaks. From `zig/`, run
 `zig build lsm-backend-test -j1` (or add `-Doptimize=ReleaseSafe`), followed by
 `-- --test-filter 'workload admission lsm' --test-filter 'observer metadata pin' --test-filter 'lsm WAL uncertainty' --test-filter 'lsm backend write stats separate'`.
 
-## Next stage: one durable transaction completion slot
+## Durable transaction slot requirements
 
-This is proposed work, not an implemented guarantee or an activation instruction.
+The requirements below preceded the implementation described in the final section.
+They are not a public activation instruction.
 The accepted scheduling design requires completion resources and durable recovery
 information before an irrevocable vote or decision. Calling the one-shot helper
 at resolution does not meet that requirement: its memory, manifest, WAL and FD
@@ -265,5 +266,98 @@ DocStore adapters preserve that capability without acquiring the same gate twice
 Unknown providers fail closed. Ordinary batches remain concurrent, and this gate
 does not establish cancellation, bounded progress or physical completion credit.
 
-The durable slot, prepare-time resource reservation, protected SST/manifest drain,
-restart restoration and activation proofs above remain the next integration work.
+At this foundation stage, durable slot integration remained open. The following
+section describes the implemented internal integration and its limits.
+
+## Durable local slot implementation
+
+The next integration stage implements `DB.prepareDurableCompletion` and
+`DB.resolveDurableCompletion` behind the internal
+`OpenOptions.allow_local_durable_completion` opt-in. The default is false; no
+HTTP, Cloud, Raft, or public transaction configuration enables it. The supported
+profile is one local transaction overwriting one existing schemaless document
+with a JSON object containing only scalar fields, at most 64 KiB of encoded data,
+a key of at most 1 KiB, and complete live identity mappings. An exact, bounded
+inspection of the target's stored records rejects attached artifacts;
+schema, indexes, relational storage, external payloads, named participants and
+HA outboxes remain excluded. Unsupported work fails before the prepare vote.
+These profile ceilings also remain subject to the compiled plan and slot limits;
+a document below the ceiling can still exceed the available reservation.
+
+The compiler runs the real transaction prepare and resolution machinery against
+an isolated, bounded overlay. It persists copied commit and abort mutations with
+explicit timestamp, replay-sequence and shared-ledger bindings. Resolution reads
+the current decision, intent revision and shared accounting under the backend's
+writer gate. It never overwrites intervening ledger changes with sampled values.
+Derived replay admission also retains a vector slot across unrelated writes;
+byte credit alone was insufficient to guarantee its eventual publication.
+
+Before the actual atomic prepare batch, the native backend obtains two physical
+slabs (32 MiB scratch and 4 MiB publication), an 8 MiB future-WAL accounting
+contribution, two retained native FD permits, exact permitted file paths, and
+observer metadata pins. Initial reservation requires four usable transient FD
+slots after lifetime locks and startup headroom: two retained for completion and
+two for the ordinary WAL append that publishes prepare. Acquisition checks both
+pairs atomically before retaining one, so concurrent durable reservations cannot
+consume each other's remaining prepare capacity. Slab/context overhead is
+charged in addition to their payload capacities. The encoded descriptor fixes the
+resource shape and is bounded to 256 operations across both outcomes and 256 KiB
+total. One protected SST is bounded to 16 MiB. These conservative internal limits
+are correctness bounds, not qualified product defaults; they reserve neither filesystem free
+space nor successful device I/O.
+
+Ordinary writes retain their own admission. While the slot lives, they cannot
+flush or rotate the manifest underneath it, alter its control records, or exceed
+the bounded foreground envelope: 256 KiB current mutable data, 2,048 cumulative
+appended entries, 128 records and 1 MiB cumulative WAL. Repeated overwrites count
+against these cumulative bounds. Structural transition guards cover schema,
+indexes, identity/range, storage migration, runtime hooks and generation exchange.
+A guard on both live and incoming generation roots prevents offline publication
+from bypassing this exclusion.
+
+Resolution binds a private delta using already owned memory, appends the atomic
+completion WAL record, and merges that delta with the current bounded mutable
+into one protected SST. A synced manifest edit publishes both completion and
+intervening writes. Run metadata and pinned readers retain their originating slab
+until their final reference disappears. Ordinary allocation failure, lower memory
+limits and lower FD limits cannot revoke the retained completion bundle. Device
+errors or an uncertain publication retain the durable handoff and fence mutation
+until recovery.
+
+`completion-slot.guard` is a checked copy of the descriptor, synced before
+prepare. The real prepare batch stores the descriptor alongside intents and
+`prepared=true`. The completion WAL record atomically retires that descriptor
+and writes an applied marker. Startup reconstructs physical ownership from the
+guard before WAL replay or foreground admission. A prepared slot remains pending;
+an applied marker causes a protected flush of the already replayed state, never
+another application of the templates. If the manifest already proves completion,
+restart only finishes checkpoint/guard cleanup; repeated crashes do not create
+additional SSTs. A torn prepare with no complete descriptor
+can retire only after its valid prefix is durably preserved. Tail repair requires
+exact evidence that the discarded bytes belong to the current segment and cannot
+truncate a different or earlier damaged segment. A malformed guard
+fails closed and is retained.
+
+Retirement requires the SST and manifest, a protected WAL reset, and durable
+guard removal. Reset first excludes old segments with a durable checkpoint cut,
+then truncates the first segment and deletes the old extent before reusing its
+numbering. Recovery finishes an interrupted cut before accepting new writes,
+including a cut made before the guard was created. This avoids replaying an old
+WAL prefix over a completed transaction or appending onto orphaned old segments.
+
+Restoration uses `Backend.openInto` at a stable address, as the production
+backend owner already does. The value-returning helper rejects guard-bearing
+roots because moving a backend would invalidate pinned observer identities.
+Insufficient restart capacity fails opening without dropping the guard or its
+obligation. Pending slots close through their durable handoff rather than an
+ordinary flush after releasing their protected resources.
+
+A pending decision has no age-based abort. Uncertain completion requires reopen
+before mutation resumes. The profile binds the canonical root and durable
+identity/value state; moving or copying a root is not an authorized transfer of
+the obligation. Physical completion covers the protected storage boundary;
+ordinary postcommit visibility callbacks retain their existing behavior.
+
+The broader mandatory-completion policy remains disabled. Multi-participant
+coordination, replicated admission compatibility, other document/index profiles,
+and optimized workload qualification remain separate work.

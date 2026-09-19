@@ -590,19 +590,26 @@ where a post-reopen acknowledged write made the next reopen fail.
 The [internal LSM completion stages](WORKLOAD_LSM_COMPLETION.md) now include a
 native one-shot point-batch helper that seals memory, WAL encoding, descriptor
 ownership and accounting before append/publication. It remains internal and
-performs ordinary admission before sealing. It is not a prepare-now/commit-later
-transaction guarantee: exact physical plans, durable certificates, pre-admitted
-SST/manifest completion, restart restoration and production transaction wiring
-remain required.
+performs ordinary admission before sealing. That helper alone does not provide a
+prepare-now/commit-later transaction guarantee. The separate durable integration
+below supplies those mechanisms for one restricted internal profile.
 
-The next completion foundation adds bounded resolution-mutation inspection and a
-private observer for the initial local inline-overwrite profile. Both remain
-internal observations without durable authority. Completion accounting now uses
-explicit backend-shared serialization: ordinary native LSM batch publication did
-not protect independent managers' shared read/modify/write totals. Native ABI 12
-fences the added storage capability callback. These changes do not activate a
-mandatory-completion transaction policy; the durable slot and restart proof remain
-open in the completion design.
+Completion accounting uses explicit backend-shared serialization: ordinary native
+LSM batch publication did not protect independent managers' shared read/modify/write
+totals. The internal local inline-overwrite path now compiles exact bounded
+mutations before prepare, reserves native memory/WAL/FD/flush ownership, persists a
+checked descriptor and recovery guard, and restores that ownership before replay
+and admission. It merges completion with bounded intervening writes, preserves
+reader-held allocation ownership, and checkpoints the WAL before retiring the
+guard. Structural transitions and generation publication cannot bypass a live
+slot. Native ABI 13 and storage failure ABI 57 cover the changed native contract
+and exact startup failures.
+
+This path requires an explicit internal local-authority opt-in and a verified
+empty persisted index/enrichment/resolver catalog. Public and replicated
+mandatory-completion policies remain disabled. Other write/index profiles,
+replicated capacity compatibility, and performance qualification remain open;
+see the [completion implementation and limits](WORKLOAD_LSM_COMPLETION.md).
 
 ## Remaining design phases
 
