@@ -91,11 +91,22 @@ jobs:
         id: toolchain
         uses: ./.github/actions/load-toolchain-policy
       - name: Install build tools
-        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils
-      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils file
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
         with:
-          version: ${{ steps.toolchain.outputs.zig_version }}
-          use-cache: false
+          nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/${{ steps.toolchain.outputs.zig_nixpkgs_revision }}.tar.gz
+      - name: Install glibc-linked Zig
+        env:
+          ZIG_VERSION: ${{ steps.toolchain.outputs.zig_version }}
+          ZIG_NIX_ATTRIBUTE: ${{ steps.toolchain.outputs.zig_nix_attribute }}
+        run: |
+          zig_path="$(nix-build '<nixpkgs>' -A "$ZIG_NIX_ATTRIBUTE" --no-out-link)"
+          test "$("$zig_path/bin/zig" version)" = "$ZIG_VERSION"
+          compiler_description="$(file "$zig_path/bin/zig")"
+          echo "$compiler_description"
+          grep -q 'dynamically linked' <<<"$compiler_description"
+          echo "$zig_path/bin" >> "$GITHUB_PATH"
       - name: Test soak orchestration
         run: |
           python3 -m unittest discover -s scripts/ci -p test_zig_vopr_soak.py
@@ -126,11 +137,22 @@ jobs:
         id: toolchain
         uses: ./.github/actions/load-toolchain-policy
       - name: Install build tools
-        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils
-      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils file
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
         with:
-          version: ${{ steps.toolchain.outputs.zig_version }}
-          use-cache: false
+          nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/${{ steps.toolchain.outputs.zig_nixpkgs_revision }}.tar.gz
+      - name: Install glibc-linked Zig
+        env:
+          ZIG_VERSION: ${{ steps.toolchain.outputs.zig_version }}
+          ZIG_NIX_ATTRIBUTE: ${{ steps.toolchain.outputs.zig_nix_attribute }}
+        run: |
+          zig_path="$(nix-build '<nixpkgs>' -A "$ZIG_NIX_ATTRIBUTE" --no-out-link)"
+          test "$("$zig_path/bin/zig" version)" = "$ZIG_VERSION"
+          compiler_description="$(file "$zig_path/bin/zig")"
+          echo "$compiler_description"
+          grep -q 'dynamically linked' <<<"$compiler_description"
+          echo "$zig_path/bin" >> "$GITHUB_PATH"
       - name: Restore the pinned runner for this revision
         id: runner_cache
         uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
@@ -313,11 +335,22 @@ jobs:
         id: toolchain
         uses: ./.github/actions/load-toolchain-policy
       - name: Install build tools and native debugger
-        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb
-      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils file gdb
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
         with:
-          version: ${{ steps.toolchain.outputs.zig_version }}
-          use-cache: false
+          nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/${{ steps.toolchain.outputs.zig_nixpkgs_revision }}.tar.gz
+      - name: Install glibc-linked Zig
+        env:
+          ZIG_VERSION: ${{ steps.toolchain.outputs.zig_version }}
+          ZIG_NIX_ATTRIBUTE: ${{ steps.toolchain.outputs.zig_nix_attribute }}
+        run: |
+          zig_path="$(nix-build '<nixpkgs>' -A "$ZIG_NIX_ATTRIBUTE" --no-out-link)"
+          test "$("$zig_path/bin/zig" version)" = "$ZIG_VERSION"
+          compiler_description="$(file "$zig_path/bin/zig")"
+          echo "$compiler_description"
+          grep -q 'dynamically linked' <<<"$compiler_description"
+          echo "$zig_path/bin" >> "$GITHUB_PATH"
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
       - name: Build production executable and qualify owner publication
         id: production-build

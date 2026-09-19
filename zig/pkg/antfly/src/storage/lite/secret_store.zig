@@ -98,15 +98,16 @@ pub const Store = struct {
         defer self.docs.mutex.unlock();
         const revision = try self.head();
         if (revision < options.min_revision) return error.Unavailable;
-        const rows = try self.docs.file.snapshotCatalogRecordsAlloc(alloc);
-        defer native.NativeFile.freeSnapshotCatalogRecords(alloc, rows);
+        var rows = try self.docs.file.metadataCatalogCursor(self.docs.file.activeCheckpoint(), &(self.prefix ++ "entries/".*));
+        defer rows.deinit();
         var entries: std.ArrayList(contract.Metadata) = .empty;
         errdefer {
             for (entries.items) |entry| alloc.free(entry.key);
             entries.deinit(alloc);
         }
-        for (rows) |row| {
-            if (!std.mem.startsWith(u8, row.key, &(self.prefix ++ "entries/".*))) continue;
+        while (try rows.nextRecordAlloc(alloc)) |row| {
+            defer alloc.free(row.key);
+            defer alloc.free(row.value);
             const entry = try decodeEntry(row.value, revision);
             if (!std.mem.eql(u8, row.key, &self.entryKey(entry.key))) return error.CorruptInput;
             const view = try record.decode(entry.envelope);
@@ -641,4 +642,33 @@ test "lite secrets portable import rejects live secrets and retained scope revis
     try std.testing.expectEqual(@as(u64, 2), (try store.source().refresh("scope")).revision);
     try std.testing.expectEqual(@as(u64, 3), (try store.nativeStore().?.writer.put("scope", "key", "recreated", .absent)).revision);
     try expectValue(&store, "key", "recreated", 3);
+}
+
+test "lite secret metadata listing seeks its scope without loading unrelated catalogs" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp);
+    defer alloc.free(path);
+    var docs = try docstore.Store.create(alloc, path, true);
+    defer docs.close();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const mutations = try arena.allocator().alloc(native.CatalogMutation, 2048);
+    for (mutations, 0..) |*mutation, i| mutation.* = .{
+        .key = try std.fmt.allocPrint(arena.allocator(), "unrelated-{d:0>6}", .{i}),
+        .value = "unrelated-metadata-value",
+    };
+    try docs.file.putCatalogBatch(mutations);
+    var provider = TestProvider{};
+    var store = try Store.init(alloc, &docs, "scope", provider.provider());
+    defer store.deinit();
+    _ = try store.nativeStore().?.writer.put("scope", "token", "secret", .absent);
+    const before = docs.file.test_page_reads.load(.monotonic);
+    try std.testing.expect(try docs.file.hasSecretState());
+    var listing = try store.source().listMetadata(alloc, "scope", .{});
+    defer listing.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), listing.entries.len);
+    try std.testing.expectEqualStrings("token", listing.entries[0].key);
+    try std.testing.expect(docs.file.test_page_reads.load(.monotonic) - before <= 24);
 }

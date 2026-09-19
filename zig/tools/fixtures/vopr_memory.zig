@@ -18,6 +18,12 @@ pub fn build(b: *std.Build) void {
 
 fn check(step: *std.Build.Step, visited: *std.AutoHashMap(*std.Build.Step, void)) void {
     if ((visited.getOrPut(step) catch @panic("OOM")).found_existing) return;
+    if (step.cast(std.Build.Step.Compile)) |artifact| {
+        if (std.mem.eql(u8, artifact.name, "vopr")) {
+            if (artifact.filters.len != 1 or !std.mem.eql(u8, artifact.filters[0], "VOPR command entrypoint"))
+                @panic("VOPR command build includes unrelated unit tests");
+        }
+    }
     if (step.id == .compile or step.id == .run) {
         if (step.max_rss == 0) std.debug.panic("unbudgeted VOPR work: {s}", .{step.name});
         if (step.max_rss > 22 * 1024 * 1024 * 1024)
