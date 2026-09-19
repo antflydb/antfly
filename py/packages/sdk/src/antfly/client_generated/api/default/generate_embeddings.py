@@ -9,14 +9,17 @@ from ...models.inference_embed_request import InferenceEmbedRequest
 from ...models.inference_embed_response import InferenceEmbedResponse
 from ...models.inference_error import InferenceError
 from ...models.inference_transient_capacity_error import InferenceTransientCapacityError
-from ...types import Response
+from ...types import UNSET, Response, Unset
 
 
 def _get_kwargs(
     *,
     body: InferenceEmbedRequest,
+    accept: str | Unset = UNSET,
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
+    if not isinstance(accept, Unset):
+        headers["Accept"] = accept
 
     _kwargs: dict[str, Any] = {
         "method": "post",
@@ -100,6 +103,7 @@ def sync_detailed(
     *,
     client: AuthenticatedClient | Client,
     body: InferenceEmbedRequest,
+    accept: str | Unset = UNSET,
 ) -> Response[InferenceEmbedResponse | InferenceError | InferenceTransientCapacityError]:
     """Create embeddings (alias of `/embeddings`)
 
@@ -112,6 +116,7 @@ def sync_detailed(
     URL byte potential is reserved before fetch; inline sources use their actual encoded size.
 
     Args:
+        accept (str | Unset):
         body (InferenceEmbedRequest): OpenAI-compatible embedding request with inference
             multimodal content-part extension
 
@@ -125,6 +130,7 @@ def sync_detailed(
 
     kwargs = _get_kwargs(
         body=body,
+        accept=accept,
     )
 
     response = client.get_httpx_client().request(
@@ -138,6 +144,7 @@ def sync(
     *,
     client: AuthenticatedClient | Client,
     body: InferenceEmbedRequest,
+    accept: str | Unset = UNSET,
 ) -> InferenceEmbedResponse | InferenceError | InferenceTransientCapacityError | None:
     """Create embeddings (alias of `/embeddings`)
 
@@ -150,6 +157,7 @@ def sync(
     URL byte potential is reserved before fetch; inline sources use their actual encoded size.
 
     Args:
+        accept (str | Unset):
         body (InferenceEmbedRequest): OpenAI-compatible embedding request with inference
             multimodal content-part extension
 
@@ -164,6 +172,7 @@ def sync(
     return sync_detailed(
         client=client,
         body=body,
+        accept=accept,
     ).parsed
 
 
@@ -171,6 +180,7 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient | Client,
     body: InferenceEmbedRequest,
+    accept: str | Unset = UNSET,
 ) -> Response[InferenceEmbedResponse | InferenceError | InferenceTransientCapacityError]:
     """Create embeddings (alias of `/embeddings`)
 
@@ -183,6 +193,7 @@ async def asyncio_detailed(
     URL byte potential is reserved before fetch; inline sources use their actual encoded size.
 
     Args:
+        accept (str | Unset):
         body (InferenceEmbedRequest): OpenAI-compatible embedding request with inference
             multimodal content-part extension
 
@@ -196,6 +207,7 @@ async def asyncio_detailed(
 
     kwargs = _get_kwargs(
         body=body,
+        accept=accept,
     )
 
     response = await client.get_async_httpx_client().request(**kwargs)
@@ -207,6 +219,7 @@ async def asyncio(
     *,
     client: AuthenticatedClient | Client,
     body: InferenceEmbedRequest,
+    accept: str | Unset = UNSET,
 ) -> InferenceEmbedResponse | InferenceError | InferenceTransientCapacityError | None:
     """Create embeddings (alias of `/embeddings`)
 
@@ -219,6 +232,7 @@ async def asyncio(
     URL byte potential is reserved before fetch; inline sources use their actual encoded size.
 
     Args:
+        accept (str | Unset):
         body (InferenceEmbedRequest): OpenAI-compatible embedding request with inference
             multimodal content-part extension
 
@@ -234,5 +248,6 @@ async def asyncio(
         await asyncio_detailed(
             client=client,
             body=body,
+            accept=accept,
         )
     ).parsed
