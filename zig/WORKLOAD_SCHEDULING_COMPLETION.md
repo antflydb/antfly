@@ -20,18 +20,56 @@ this requested implementation/correctness scope.
 
 ## Current work
 
-- Item 1: introduce explicit single-phase canonical mutations; extend the real
-  physical compiler, native reservation/application and DATA proposal routing.
-- Item 2: implement format-cost certificates, separated retained/transient
-  capacity and checked arithmetic headroom.
-- Item 3: persist and restore a trusted installation capsule before acceptance.
-- Item 8: close streamed-response deadline ownership gaps and continue the
-  distributed/client contract audit.
+- Item 1: retain separate durable control ownership from begin through the final
+  acknowledgement, then connect its preowned compiler and DATA proposal path.
+  Ordinary writes and initial begin application already have canonical plans.
+- Item 2: extend the pooled allocation/output/counter certificates to the entire
+  control lifetime, including interleaved owners and reader-retained versions.
+- Item 3: extend the existing trusted local capsule restoration to these new
+  control obligations and their durable-log reconciliation.
+- Item 8: finish bounded owner acquisition and independently owned background
+  open/recovery handoff, including deadline clock translation and cold owners.
 
 The existing prepare/resolve and local restart tests remain useful component
 evidence. They do not prove the rows above. Production activation must not be
 enabled until its write, capacity, restoration and replicated recovery
 prerequisites are implemented and verified.
+
+### Retained control resources and immutable owner format
+
+The physical resource component now provides a reusable proposal buffer and
+critical compiler scope separate from monotonic publication backing and WAL
+credit. The real transaction-manager compiler uses that scope for metadata
+decisions and ACKs. It releases shared compiler scratch before invoking native
+admission, so admission can reuse the workspace without invalidating the proposal.
+Rejected captures consume neither publication capacity nor WAL credit. WAL credit
+transfers to the backend before an append attempt and stays there after uncertain
+I/O; reader-held publication allocations outlive the resource handle.
+
+A fixed 256-byte immutable native control-owner record binds group, incarnation,
+policy, schema, generation, transaction, exact accepted BEGIN identity, and the
+ordered participant encoding's digest/count/length. Its separate 48-byte receipt
+is retained after terminal owner deletion. These are codec and resource building
+blocks: persisting/restoring owners, connecting their acceptance/application, and
+retaining them through final ACK remain open. No consensus authority follows
+from constructing a resource handle or decoding a checksummed record.
+
+Canonical initial mutations and both outcome templates now reject writes to
+native ownership namespaces, including the new owner and receipt keys. Public
+control sizing also reports distinct maximum key and record sizes, checked against
+the actual 192-participant commit/abort compiler output rather than treating a
+large participant-list value as an SST key bound.
+
+The owning Debug durable-completion gate passed 38/38 tests, zero skips, failures,
+or leaks, with actual process exit 0. This includes repeated canceled captures,
+all construction allocation failures, a live publication reader after owner
+release, actual decision/three-ACK compilation with ordinary allocation and
+admission denied, exhausted ordinary compiler epochs, record corruption and
+identity mismatch, and forged native rows in prepare/commit/abort plans. Snapshot
+acquisition and durable publication are outside the compiler-only proof. Command
+from `zig/`: `zig build antfly-durable-completion-test -j1 --cache-dir
+.zig-cache/workload-local --global-cache-dir .zig-cache/workload-global`.
+Evidence: `/tmp/workload-control-resources2.log`.
 
 ## Current integration evidence and boundaries
 

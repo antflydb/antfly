@@ -148,6 +148,8 @@ pub const CompletionControlBudget = struct {
     operations: u64,
     payload_bytes: u64,
     max_mutation_payload_bytes: u64,
+    max_key_bytes: u64,
+    max_record_payload_bytes: u64,
     wal_bytes: u64,
 
     fn add(a: u64, b: u64) !u64 {
@@ -195,6 +197,13 @@ pub const CompletionControlBudget = struct {
         // Native WAL v1: 16-byte record header, four-byte row count, and
         // 16-byte row headers. Include the longest supported namespace, docs.
         const wal_bytes = try add(payload, try add(try mul(mutations, 20), try mul(operations, 16 + "docs".len)));
+        var max_key_bytes: u64 = 0;
+        inline for (.{ records_prefix, participants_prefix, resolved_participants_prefix, completion_prefix, intent_admission_prefix, intent_keys_prefix, schema_leases_prefix }) |prefix|
+            max_key_bytes = @max(max_key_bytes, prefix.len + @sizeOf(TxnId));
+        max_key_bytes = @max(max_key_bytes, completion_summary_key.len);
+        // Keep the largest key distinct from cumulative/list payload sizes:
+        // SST bound metadata stores keys, not the participant-list values.
+        const max_record_payload_bytes = @max(max_key_bytes, @max(record, @max(summary, @max(credit_key + 16, try add(@max(participants_key, resolved_key), list_bytes)))));
         return .{
             .participant_list_bytes = list_bytes,
             .acknowledgement_list_bytes = acknowledgement_lists,
@@ -202,6 +211,8 @@ pub const CompletionControlBudget = struct {
             .operations = operations,
             .payload_bytes = payload,
             .max_mutation_payload_bytes = @max(begin, @max(decision, if (count == 0) 0 else try add(ack_fixed, list_bytes))),
+            .max_key_bytes = max_key_bytes,
+            .max_record_payload_bytes = max_record_payload_bytes,
             .wal_bytes = wal_bytes,
         };
     }
@@ -857,6 +868,48 @@ pub const TxnManager = struct {
             } else try overlay.log.delete(&key);
         }
         return @import("completion_candidate.zig").encodeMutationPlan(alloc, authority, input_digest, profile_fence, lsm_backend.Backend.durable_completion_limits, snapshot, &overlay.log, overlay.baseline_reads.items, additional_dependencies);
+    }
+
+    /// Capture with physical control backing retained before the transaction's
+    /// promise. The proposal callback borrows bytes after compilation releases
+    /// the shared native workspace, allowing admission to reenter it. This seam
+    /// deliberately grants no authority to propose or acknowledge consensus.
+    pub fn withReservedControlMutation(
+        self: *TxnManager,
+        held: *@import("lsm_backend/completion_control_resources.zig").Resources,
+        snapshot: *backend_erased.ReadTxn,
+        input: ControlInput,
+        authority: @import("completion_candidate.zig").Authority,
+        input_digest: [32]u8,
+        profile_fence: []const u8,
+        additional_dependencies: []const []const u8,
+        comptime T: type,
+        context: anytype,
+        comptime candidate: anytype,
+    ) !T {
+        if (!std.mem.eql(u8, &held.txn_id, &input.txn_id)) return error.InvalidArgument;
+        const Capture = struct {
+            manager: *TxnManager,
+            snapshot: *backend_erased.ReadTxn,
+            input: ControlInput,
+            authority: @import("completion_candidate.zig").Authority,
+            digest: [32]u8,
+            fence: []const u8,
+            dependencies: []const []const u8,
+
+            fn compile(capture: @This(), alloc: Allocator) ![]u8 {
+                return capture.manager.compileControlMutation(alloc, capture.snapshot, capture.input, capture.authority, capture.digest, capture.fence, capture.dependencies);
+            }
+        };
+        return held.withCandidate(T, Capture{
+            .manager = self,
+            .snapshot = snapshot,
+            .input = input,
+            .authority = authority,
+            .digest = input_digest,
+            .fence = profile_fence,
+            .dependencies = additional_dependencies,
+        }, Capture.compile, context, candidate);
     }
 
     pub fn initTransactionWithParticipantsCreatedAt(
@@ -3248,6 +3301,92 @@ fn rebindCompiledTemplateForTest(template: *completion_compiler.Template, timest
     };
 }
 
+test "workload admission completion compiler captures actual controls with preowned memory across retries" {
+    const alloc = std.testing.allocator;
+    const domains = @import("lsm_backend/completion_allocator.zig");
+    const resources = @import("resource_manager.zig");
+    const control = @import("lsm_backend/completion_control_resources.zig");
+    var backing = std.testing.FailingAllocator.init(alloc, .{});
+    var resource_manager = resources.ResourceManager.init(.{ .identity_allocator = alloc });
+    defer resource_manager.deinit(alloc);
+    var compiler = try domains.CompilerWorkspace.init(backing.allocator(), &resource_manager, 32 * 1024 * 1024);
+    defer compiler.deinit() catch unreachable;
+    const id: TxnId = @splat(203);
+    const held = try control.Resources.create(backing.allocator(), &resource_manager, &compiler, id, .{
+        .publication_bytes = 1024 * 1024,
+        .wal_bytes = 1024 * 1024,
+    });
+    defer held.destroy();
+    var backend = lsm_backend.Backend.init(backing.allocator(), .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(backing.allocator(), try backend.runtimeStore(backing.allocator(), .{}));
+    defer store.close();
+    var manager = try TxnManager.init(backing.allocator(), &store);
+    defer manager.deinit();
+    manager.completion_limits = .{ .max_count = 4, .max_bytes = 1024 * 1024 };
+    const participants = [_][]const u8{ "coordinator", "left", "right" };
+    try manager.initTransactionWithParticipantsCreatedAtRoleAndRetention(id, 100, 90, &participants, true, false);
+    const authority: @import("completion_candidate.zig").Authority = .{
+        .group_id = 9,
+        .incarnation = @splat(3),
+        .policy_digest = @splat(4),
+        .schema_catalog_digest = @splat(5),
+        .previous_term = 2,
+        .previous_index = 17,
+    };
+    const Capture = struct {
+        expected: []const u8,
+        reject: bool,
+        compiler: *domains.CompilerWorkspace,
+
+        fn reenter(_: void, _: Allocator) !void {}
+        fn proposal(capture: @This(), wire: []const u8) !void {
+            try std.testing.expectEqualSlices(u8, capture.expected, wire);
+            try capture.compiler.withCompletion(void, {}, reenter);
+            if (capture.reject) return error.NotProposed;
+        }
+    };
+    compiler.generation = std.math.maxInt(u64);
+    const initial_publication = held.publication.remainingBytes();
+    const initial_wal = held.wal_credit;
+    for (0..participants.len + 1) |step| {
+        const input: TxnManager.ControlInput = .{
+            .txn_id = id,
+            .action = if (step == 0) .{ .resolve_metadata = .{ .status = .committed, .timestamp = 200 } } else .{ .acknowledge = participants[step - 1] },
+        };
+        {
+            // Acquisition is intentionally outside this compiler-only proof.
+            // The DATA bridge still must provide a bounded acquired snapshot.
+            var snapshot = try manager.store.beginRead();
+            defer snapshot.abort();
+            const expected = try manager.compileControlMutation(alloc, &snapshot, input, authority, @splat(6), "control-resource-test", &.{});
+            defer alloc.free(expected);
+            backing.fail_index = backing.alloc_index;
+            backing.resize_fail_index = backing.resize_index;
+            resource_manager.memory.budget.hard_limit_bytes = 1;
+            defer {
+                backing.fail_index = std.math.maxInt(usize);
+                backing.resize_fail_index = std.math.maxInt(usize);
+                resource_manager.memory.budget.hard_limit_bytes = 0;
+            }
+            var capture: Capture = .{ .expected = expected, .reject = true, .compiler = &compiler };
+            for (0..16) |_| try std.testing.expectError(error.NotProposed, manager.withReservedControlMutation(held, &snapshot, input, authority, @splat(6), "control-resource-test", &.{}, void, capture, Capture.proposal));
+            capture.reject = false;
+            try manager.withReservedControlMutation(held, &snapshot, input, authority, @splat(6), "control-resource-test", &.{}, void, capture, Capture.proposal);
+            var wrong_owner = input;
+            wrong_owner.txn_id = @splat(204);
+            try std.testing.expectError(error.InvalidArgument, manager.withReservedControlMutation(held, &snapshot, wrong_owner, authority, @splat(6), "control-resource-test", &.{}, void, capture, Capture.proposal));
+            try std.testing.expectEqual(initial_publication, held.publication.remainingBytes());
+            try std.testing.expectEqual(initial_wal, held.wal_credit);
+            try std.testing.expect(!backing.has_induced_failure);
+        }
+        // Real publication supplies the next compiler baseline. Application's
+        // durable control-owner integration is a separate, still-open stage.
+        if (step == 0) try manager.resolveIntents(id, .committed, 200) else try manager.markParticipantResolved(id, participants[step - 1]);
+    }
+    try std.testing.expectEqualDeep(CompletionUsage{}, (try manager.completionUsage()).?);
+}
+
 test "workload admission completion compiler lifetime control budget covers real WAL rewrites and admission" {
     const alloc = std.testing.allocator;
     const codec = @import("lsm_backend/completion_entry.zig");
@@ -3265,6 +3404,8 @@ test "workload admission completion compiler lifetime control budget covers real
         operations: u64 = 0,
         payload: u64 = 0,
         largest: u64 = 0,
+        largest_key: u64 = 0,
+        largest_record: u64 = 0,
         wal_bytes: u64 = 0,
 
         const Rows = struct {
@@ -3283,7 +3424,11 @@ test "workload admission completion compiler lifetime control budget covers real
             defer entry.deinit();
             const operations = entry.entry.prepare_operations;
             var payload: u64 = 0;
-            for (operations) |op| payload += op.key.len + op.value.len;
+            for (operations) |op| {
+                payload += op.key.len + op.value.len;
+                self.largest_key = @max(self.largest_key, op.key.len);
+                self.largest_record = @max(self.largest_record, op.key.len + op.value.len);
+            }
             self.mutations += 1;
             self.operations += operations.len;
             self.payload += payload;
@@ -3368,6 +3513,8 @@ test "workload admission completion compiler lifetime control budget covers real
         try std.testing.expect(totals.operations <= budget.operations);
         try std.testing.expect(totals.payload <= budget.payload_bytes);
         try std.testing.expect(totals.largest <= budget.max_mutation_payload_bytes);
+        try std.testing.expect(totals.largest_key <= budget.max_key_bytes);
+        try std.testing.expect(totals.largest_record <= budget.max_record_payload_bytes);
         try std.testing.expect(totals.wal_bytes <= budget.wal_bytes);
         // Demonstrate the previous charge actually undercounted encoded writes,
         // rather than merely comparing two versions of the sizing formula.

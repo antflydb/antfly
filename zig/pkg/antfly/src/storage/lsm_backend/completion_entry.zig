@@ -73,15 +73,20 @@ fn checksum(bytes: []const u8) [32]u8 {
 fn validateOperation(op: slot.Operation) !void {
     if (op.key.len == 0 or op.bindings.len != 0 or (op.kind == .delete and op.value.len != 0))
         return error.InvalidCompletionSlot;
-    if (std.mem.eql(u8, op.key, group_progress_key)) return error.InvalidCompletionSlot;
-    // Native ownership records cannot be selected or overwritten by a leader's
-    // canonical operation list. Accepted apply appends its own indexed records.
-    inline for (.{ "\x00\x00__metadata__:completion_slot_v1", "\x00\x00__metadata__:completion_applied_v1", receipt_prefix }) |prefix| {
-        if (std.mem.startsWith(u8, op.key, prefix)) return error.InvalidCompletionSlot;
-    }
+    try validateNativeOwnershipKey(op.key);
     // The authoritative marker is appended exactly once by accepted apply.
     if (std.mem.eql(u8, op.key, &@import("../internal_keys.zig").raft_document_applied_entry_key))
         return error.InvalidCompletionSlot;
+}
+
+fn validateNativeOwnershipKey(key: []const u8) !void {
+    if (std.mem.eql(u8, key, group_progress_key)) return error.InvalidCompletionSlot;
+    // Native ownership records cannot be selected or overwritten by a leader's
+    // canonical operation list. Accepted apply appends its own indexed records.
+    const control = @import("completion_control_record.zig");
+    inline for (.{ "\x00\x00__metadata__:completion_slot_v1", "\x00\x00__metadata__:completion_applied_v1", receipt_prefix, control.owner_prefix, control.receipt_prefix }) |prefix| {
+        if (std.mem.startsWith(u8, key, prefix)) return error.InvalidCompletionSlot;
+    }
 }
 
 fn validateKind(kind: protocol.Kind, descriptor: slot.Descriptor) !void {
@@ -89,6 +94,10 @@ fn validateKind(kind: protocol.Kind, descriptor: slot.Descriptor) !void {
     // its ownership ambiguous and could publish progress before all effects.
     if (kind == .mutation and (descriptor.commit.len != 0 or descriptor.abort.len != 0))
         return error.InvalidCompletionSlot;
+    // Outcome templates are also supplied by the leader. Their dynamic public
+    // applied marker is allowed, but native ownership remains replica-owned.
+    for ([_][]const slot.Operation{ descriptor.commit, descriptor.abort }) |operations|
+        for (operations) |op| try validateNativeOwnershipKey(op.key);
 }
 
 pub fn encode(allocator: Allocator, entry: Entry) ![]u8 {
@@ -486,4 +495,35 @@ test "workload admission completion entry baseline binds absence empty values an
     try std.testing.expectError(error.InvalidCompletionSlot, encode(allocator, entry));
     entry.baseline_keys = &.{ "row", "absent" };
     try std.testing.expectError(error.InvalidCompletionSlot, encode(std.testing.failing_allocator, entry));
+}
+
+test "workload admission completion compiler cannot forge native transaction control ownership" {
+    const control = @import("completion_control_record.zig");
+    const alloc = std.testing.allocator;
+    const descriptor = try fixtureDescriptor(alloc);
+    defer alloc.free(descriptor);
+    const owner_key = control.ownerKey(@splat(7));
+    const receipt_key = control.receiptKey(@splat(7));
+    for ([_][]const u8{ &owner_key, &receipt_key }) |private_key| {
+        var input = fixture(descriptor);
+        input.prepare_operations = &.{.{ .kind = .put, .key = private_key, .value = "forged" }};
+        // Full sorted baseline coverage makes this an otherwise valid plan;
+        // rejection must come from native ownership, not a missing dependency.
+        input.baseline_keys = &.{ private_key, "intent", "row" };
+        try std.testing.expectError(error.InvalidCompletionSlot, encode(std.testing.failing_allocator, input));
+        input.prepare_operations = &.{.{ .kind = .delete, .key = private_key }};
+        try std.testing.expectError(error.InvalidCompletionSlot, encode(std.testing.failing_allocator, input));
+        var decoded = try slot.decode(alloc, descriptor, .{});
+        defer decoded.deinit();
+        for ([_]bool{ false, true }) |commit| {
+            var outcome = decoded.descriptor;
+            const forged: []const slot.Operation = &.{.{ .kind = .delete, .key = private_key }};
+            if (commit) outcome.commit = forged else outcome.abort = forged;
+            const wire = try slot.encode(alloc, outcome, .{});
+            defer alloc.free(wire);
+            input = fixture(wire);
+            input.baseline_keys = &.{ private_key, "\x00binary\xffkey", "absent", "intent", "read-only", "row" };
+            try std.testing.expectError(error.InvalidCompletionSlot, encode(alloc, input));
+        }
+    }
 }
