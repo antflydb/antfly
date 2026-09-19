@@ -62,6 +62,8 @@ pub const ProvisionedKernelOwnerSource = struct {
     transaction_recovery_source: ?transaction_recovery_source.Source = null,
     document_child_range_dispatch_source: ?table_write_source.TableWriteSource = null,
     resolution_candidate_source: ?runtime_callbacks.CandidateSource = null,
+    deferred_runtime_hooks: bool = false,
+    runtime_hooks_ready: std.atomic.Value(bool) = .init(false),
     entity_sink: ?runtime_callbacks.EntitySink = null,
     runtime_status_cache: ?*runtime_status.TableRuntimeSnapshotCache = null,
     native_migration_policy: ?runtime_callbacks.DenseNativeMigrationPolicySource = null,
@@ -253,19 +255,44 @@ pub const ProvisionedKernelOwnerSource = struct {
         return self;
     }
 
-    /// Runtime callbacks are retained by every compiled owner and therefore
-    /// must be installed before the first owner is opened.
+    /// Install stable callback trampolines before restoring any owner. They
+    /// refuse work until startup publishes the actual DATA callback targets.
+    pub fn withDeferredRuntimeHooks(self: *ProvisionedKernelOwnerSource) *ProvisionedKernelOwnerSource {
+        std.debug.assert(self.entries.items.len == 0);
+        std.debug.assert(!self.runtime_hooks_ready.load(.acquire));
+        self.deferred_runtime_hooks = true;
+        return self;
+    }
+
+    /// Publication is one-time: existing workers acquire the latch before
+    /// reading these fields, and a retry may only supply identical targets.
     pub fn withRuntimeHooks(
         self: *ProvisionedKernelOwnerSource,
         candidate_source: ?runtime_callbacks.CandidateSource,
         entity_sink: ?runtime_callbacks.EntitySink,
         leadership_source: ?table_writes.PromotionLeadershipSource,
-    ) *ProvisionedKernelOwnerSource {
-        std.debug.assert(self.entries.items.len == 0);
+    ) !*ProvisionedKernelOwnerSource {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.quiescing) return error.Canceled;
+        if (self.runtime_hooks_ready.load(.acquire)) {
+            if (!std.meta.eql(self.resolution_candidate_source, candidate_source) or
+                !std.meta.eql(self.entity_sink, entity_sink) or
+                !std.meta.eql(self.promotion_leadership_source, leadership_source))
+                return error.PreparedCompletionActive;
+            return self;
+        }
+        if (!self.deferred_runtime_hooks and self.entries.items.len != 0)
+            return error.PreparedCompletionActive;
         self.resolution_candidate_source = candidate_source;
         self.entity_sink = entity_sink;
         self.promotion_leadership_source = leadership_source;
+        self.runtime_hooks_ready.store(true, .release);
         return self;
+    }
+
+    fn runtimeHooksAvailable(self: *const ProvisionedKernelOwnerSource) bool {
+        return !self.deferred_runtime_hooks or self.runtime_hooks_ready.load(.acquire);
     }
 
     /// HA policy stays in distributed control. The compiled owner performs the
@@ -1963,6 +1990,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         consume: abi.ResolutionCandidateConsumeFn,
     ) callconv(.c) abi.Status {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr orelse return .invalid_argument));
+        if (!self.runtimeHooksAvailable()) return .completion_admission_unavailable;
         const source = self.resolution_candidate_source orelse return .invalid_argument;
         const value = source.get(self.alloc, table.slice(), key.slice()) catch |err|
             return kernel_error_identity.statusFromError(err);
@@ -1980,6 +2008,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         consume: abi.ResolutionCandidateConsumeFn,
     ) callconv(.c) abi.Status {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr orelse return .invalid_argument));
+        if (!self.runtimeHooksAvailable()) return .completion_admission_unavailable;
         const source = self.resolution_candidate_source orelse return .invalid_argument;
         var bridge = CandidateConsumerBridge{ .ctx = consume_ctx, .consume = consume };
         source.scanPrefix(
@@ -2004,6 +2033,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         consume: abi.ResolutionCandidateConsumeFn,
     ) callconv(.c) abi.Status {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr orelse return .invalid_argument));
+        if (!self.runtimeHooksAvailable()) return .completion_admission_unavailable;
         const source = self.resolution_candidate_source orelse return .invalid_argument;
         if (embedding_len > 0 and embedding_ptr == null) return .invalid_argument;
         const embedding = if (embedding_len == 0)
@@ -2032,6 +2062,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         doc_json: abi.BorrowedBytes,
     ) callconv(.c) abi.Status {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr orelse return .invalid_argument));
+        if (!self.runtimeHooksAvailable()) return .completion_admission_unavailable;
         const sink = self.entity_sink orelse return .invalid_argument;
         sink.upsert(self.alloc, table.slice(), key.slice(), doc_json.slice()) catch |err|
             return kernel_error_identity.statusFromError(err);
@@ -2044,6 +2075,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         entry_count: u64,
     ) callconv(.c) abi.Status {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr orelse return .invalid_argument));
+        if (!self.runtimeHooksAvailable()) return .completion_admission_unavailable;
         const sink = self.entity_sink orelse return .invalid_argument;
         if (entry_count > 0 and entries_ptr == null) return .invalid_argument;
         const encoded = if (entry_count == 0) &.{} else entries_ptr.?[0..@intCast(entry_count)];
@@ -2064,6 +2096,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         group_id: u64,
     ) callconv(.c) u8 {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr orelse return 0));
+        if (!self.runtimeHooksAvailable()) return 0;
         const source = self.promotion_leadership_source orelse return 1;
         return @intFromBool(source.isLocalLeader(group_id));
     }
@@ -2083,19 +2116,19 @@ pub const ProvisionedKernelOwnerSource = struct {
         return .{
             .native_authority_ctx = if (self.native_migration_policy != null) self else null,
             .native_authority_fn = if (self.native_migration_policy != null) nativeAuthorityPermitted else null,
-            .resolution_candidates = if (self.resolution_candidate_source != null) .{
+            .resolution_candidates = if (self.deferred_runtime_hooks or self.resolution_candidate_source != null) .{
                 .callback_ctx = self,
                 .get_fn = resolutionCandidateGet,
                 .scan_prefix_fn = resolutionCandidateScanPrefix,
                 .nearest_fn = resolutionCandidateNearest,
             } else .{},
-            .entity_sink = if (self.entity_sink != null) .{
+            .entity_sink = if (self.deferred_runtime_hooks or self.entity_sink != null) .{
                 .callback_ctx = self,
                 .upsert_fn = entityUpsert,
                 .upsert_batch_fn = entityUpsertBatch,
             } else .{},
-            .promotion_owner_ctx = if (self.promotion_leadership_source != null) self else null,
-            .promotion_owner_fn = if (self.promotion_leadership_source != null) promotionOwner else null,
+            .promotion_owner_ctx = if (self.deferred_runtime_hooks or self.promotion_leadership_source != null) self else null,
+            .promotion_owner_fn = if (self.deferred_runtime_hooks or self.promotion_leadership_source != null) promotionOwner else null,
         };
     }
 
@@ -3618,7 +3651,8 @@ pub const ProvisionedKernelOwnerSource = struct {
         // Fresh production installation stays closed until ordinary begin,
         // decision, and acknowledgement entries have protected admission too.
         // Do not publish a barrier that could strand legacy transaction debt.
-        if (!restore_existing) return error.CompletionAdmissionUnavailable;
+        if (!@import("../common/durable_completion_policy.zig").replicated_activation_supported and !restore_existing)
+            return error.CompletionAdmissionUnavailable;
         if (binding.identity.group_id != group_id) return error.CompletionAdmissionUnavailable;
         var descriptor = try self.loadDescriptor(alloc, group_id, table_name);
         errdefer descriptor.deinit(alloc);
@@ -4330,7 +4364,7 @@ test "storage owner quiesce drains leases and promotion callbacks before context
     var callback = Callback{};
     // Release on any failed assertion before source.deinit joins the worker.
     defer callback.released.store(true, .release);
-    _ = source.withRuntimeHooks(null, null, .{ .ptr = &callback, .vtable = &.{ .is_local_leader = Callback.isLeader } });
+    _ = try source.withRuntimeHooks(null, null, .{ .ptr = &callback, .vtable = &.{ .is_local_leader = Callback.isLeader } });
     const descriptor = descriptor_contract.Descriptor{
         .lsm_root_generation = 0,
         .identity = .{ .table_id = 7, .shard_id = 7001, .range_id = 7001 },
@@ -4947,4 +4981,64 @@ test "workload admission completion installation pins owner through ordinary ret
     try std.testing.expectEqual(@as(usize, 1), source.entries.items.len);
     source.quiescing = true;
     try std.testing.expect(!source.installationPinsOwnerLocked(7));
+}
+
+test "workload admission restored owner callback snapshot waits for one-time runtime publication" {
+    const Fixture = struct {
+        calls: usize = 0,
+        fn get(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const u8) !?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return try alloc.dupe(u8, "entity");
+        }
+        fn scan(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: runtime_callbacks.CandidateSource.ScanOptions, ctx: *anyopaque, consume_fn: runtime_callbacks.CandidateSource.Consume) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try consume_fn(ctx, "key", "entity");
+        }
+        fn nearest(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, _: runtime_callbacks.CandidateSource.NearestQuery, ctx: *anyopaque, consume_fn: runtime_callbacks.CandidateSource.Consume) !void {
+            try scan(ptr, alloc, table, "", .{}, ctx, consume_fn);
+        }
+        fn upsert(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+        }
+        fn leader(ptr: *anyopaque, _: u64) bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return true;
+        }
+        fn consume(_: ?*anyopaque, _: abi.BorrowedBytes, value: abi.BorrowedBytes) callconv(.c) abi.Status {
+            return if (std.mem.eql(u8, value.slice(), "entity")) .ok else .internal;
+        }
+    };
+    var fixture = Fixture{};
+    var source = ProvisionedKernelOwnerSource.init(std.testing.allocator, "/unused", table_catalog.emptyCatalogSource(), read_gate.unavailableReadSafetyBarrier());
+    defer source.deinit();
+    _ = source.withDeferredRuntimeHooks();
+    // A compiled owner retains this value before DATA/API callback targets exist.
+    const retained = source.runtimeHooksConfig();
+    const candidates = retained.resolution_candidates;
+    const sink = retained.entity_sink;
+    const entries = [_]abi.EntityUpsert{.{ .table = .fromSlice("t"), .key = .fromSlice("k"), .doc_json = .fromSlice("{}") }};
+    try std.testing.expectEqual(abi.Status.completion_admission_unavailable, candidates.get_fn.?(candidates.callback_ctx, .{}, .{}, null, Fixture.consume));
+    try std.testing.expectEqual(abi.Status.completion_admission_unavailable, candidates.scan_prefix_fn.?(candidates.callback_ctx, .{}, .{}, 1, null, Fixture.consume));
+    try std.testing.expectEqual(abi.Status.completion_admission_unavailable, candidates.nearest_fn.?(candidates.callback_ctx, .{}, .{}, null, 0, 1, null, Fixture.consume));
+    try std.testing.expectEqual(abi.Status.completion_admission_unavailable, sink.upsert_fn.?(sink.callback_ctx, .{}, .{}, .{}));
+    try std.testing.expectEqual(abi.Status.completion_admission_unavailable, sink.upsert_batch_fn.?(sink.callback_ctx, &entries, entries.len));
+    try std.testing.expectEqual(@as(u8, 0), retained.promotion_owner_fn.?(retained.promotion_owner_ctx, 7));
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+    const candidate_source: runtime_callbacks.CandidateSource = .{ .ptr = &fixture, .vtable = &.{ .get = Fixture.get, .scan_prefix = Fixture.scan, .nearest = Fixture.nearest } };
+    const entity_sink: runtime_callbacks.EntitySink = .{ .ptr = &fixture, .vtable = &.{ .upsert = Fixture.upsert } };
+    const leadership: table_writes.PromotionLeadershipSource = .{ .ptr = &fixture, .vtable = &.{ .is_local_leader = Fixture.leader } };
+    _ = try source.withRuntimeHooks(candidate_source, entity_sink, leadership);
+    _ = try source.withRuntimeHooks(candidate_source, entity_sink, leadership);
+    try std.testing.expectError(error.PreparedCompletionActive, source.withRuntimeHooks(null, null, null));
+    try std.testing.expectEqual(abi.Status.ok, candidates.get_fn.?(candidates.callback_ctx, .{}, .{}, null, Fixture.consume));
+    try std.testing.expectEqual(abi.Status.ok, candidates.scan_prefix_fn.?(candidates.callback_ctx, .{}, .{}, 1, null, Fixture.consume));
+    try std.testing.expectEqual(abi.Status.ok, candidates.nearest_fn.?(candidates.callback_ctx, .{}, .{}, null, 0, 1, null, Fixture.consume));
+    try std.testing.expectEqual(abi.Status.ok, sink.upsert_fn.?(sink.callback_ctx, .{}, .{}, .{}));
+    try std.testing.expectEqual(abi.Status.ok, sink.upsert_batch_fn.?(sink.callback_ctx, &entries, entries.len));
+    try std.testing.expectEqual(@as(u8, 1), retained.promotion_owner_fn.?(retained.promotion_owner_ctx, 7));
+    try std.testing.expectEqual(@as(usize, 6), fixture.calls);
 }

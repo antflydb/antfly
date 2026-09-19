@@ -6165,13 +6165,6 @@ pub const DataServer = struct {
         if (self.data_raft_apply) |apply_sm| {
             _ = try apply_sm.write_source.withEntitySink(entity_sink);
         }
-        if (comptime linked_storage) {
-            _ = self.kernel_owner_source.?.withRuntimeHooks(
-                candidate_source,
-                entity_sink,
-                promotion_leadership,
-            );
-        }
         self.syncInferenceRuntimeConfig();
         // Request allocations must share identity with the process allocator
         // used by DB internals (c_allocator when libc is linked): search hits
@@ -6196,6 +6189,16 @@ pub const DataServer = struct {
         self.http_server.?.bindIncomingGraphRoutes(self.read_source.source());
         _ = self.read_source.withRemoteAttemptCoordinator(coordinator_port);
         antfly.public_api.kernel_bridge.setAntflyProvider(&self.http_server.?, self.read_source.antfly_provider);
+        // Restored workers retain the early trampolines, but may only enter
+        // DATA/API after every fallible initialization step above succeeded.
+        if (comptime linked_storage) {
+            _ = self.kernel_owner_source.?.withRuntimeHooks(candidate_source, entity_sink, promotion_leadership) catch |err| {
+                _ = self.read_source.withRemoteAttemptCoordinator(null);
+                self.http_server.?.deinit();
+                self.http_server = null;
+                return err;
+            };
+        }
     }
 
     pub fn applyHAReplicationRecord(self: *DataServer, record: antfly.hot_standby.replication_record.RecordView) !void {
@@ -20199,17 +20202,20 @@ pub const DataServer = struct {
         remote_metadata.completion_backing_provider = cfg.data_raft_completion_provider;
         remote_metadata.completion_native_provider = cfg.data_raft_completion_native_provider;
 
+        const effective_storage_context = cfg.storage_kernel_context_handle orelse
+            if (storage_kernel_context) |context| context.handle else null;
         var early_owner_source: ?*antfly.public_api.ProvisionedKernelOwnerSource = null;
         errdefer if (early_owner_source) |source| {
             source.deinit();
             alloc.destroy(source);
         };
         if (comptime linked_storage) {
-            if (cfg.enable_data_raft and storage_kernel_context != null) {
+            if (cfg.enable_data_raft and effective_storage_context != null) {
                 const source = try alloc.create(antfly.public_api.ProvisionedKernelOwnerSource);
                 source.* = antfly.public_api.ProvisionedKernelOwnerSource.init(alloc, cfg.replica_root_dir, remote_metadata.catalogSource(), antfly.raft.read_gate.unavailableReadSafetyBarrier());
-                _ = source.withStorageContextHandle(storage_kernel_context.?.handle);
                 _ = source.withRemoteContent(cfg.api_server_cfg.remote_content);
+                _ = source.withStorageContextHandle(effective_storage_context.?);
+                _ = source.withDeferredRuntimeHooks();
                 early_owner_source = source;
                 if (remote_metadata.completion_native_provider == null) remote_metadata.completion_native_provider = source.completionProvider();
             }
@@ -20311,7 +20317,7 @@ pub const DataServer = struct {
                                 },
                             },
                         },
-                        .data_apply_storage_context = if (storage_kernel_context) |context| context.handle else null,
+                        .data_apply_storage_context = effective_storage_context,
                     }, .{}, .{
                         .transition_runtime = null,
                     });
@@ -20333,6 +20339,7 @@ pub const DataServer = struct {
             .alloc = alloc,
             .remote_metadata = remote_metadata,
             .kernel_owner_source = early_owner_source,
+            .borrowed_storage_kernel_context = cfg.storage_kernel_context_handle,
             .data_raft = data_raft,
             .data_raft_factory = data_raft_factory,
             .data_raft_store = data_raft_store,
