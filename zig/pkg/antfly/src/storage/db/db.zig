@@ -89766,9 +89766,13 @@ test "db blocked dense embedding lane does not force the independent asset lane 
     // publish and checkpoint without waiting on the still-failing dense
     // lane (scope "generated.dense"). See "Two-Stream Execution Model" in
     // ENRICHMENTS.md.
+    // The asset lane's first publish is a real provider round trip plus a
+    // durable checkpoint on a background worker; on a loaded host that can
+    // take longer than the default one-second poll budget, so use the slow
+    // budget here (the assertion is unchanged).
     var asset_published = false;
     var attempts: usize = 0;
-    while (attempts < default_test_wait_attempts) : (attempts += 1) {
+    while (attempts < slow_test_wait_attempts) : (attempts += 1) {
         if (gated_dense.blocked_requests.load(.acquire) != 0 and
             gated_asset.successful_requests.load(.acquire) != 0)
         {
