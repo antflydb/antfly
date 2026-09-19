@@ -1491,6 +1491,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "api http client round-trips public status and internal capability routes",
         "api http client requires explicit not-proposed marker and tracks delivery phase",
         "workload admission coordinator late terminal",
+        "stable distributed transaction retry resumes a durable commit decision",
         "index activation client preserves progress and transport classifications",
         "api http retryable embedding failures provide retry guidance",
         "api http server obtains query embedding policy from resource manager",

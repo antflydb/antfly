@@ -75,3 +75,56 @@ testing a separate shutdown-order fix. It is not qualified by this API test.
 Existing join fan-out tests cover bounded concurrency, partial worker error,
 complete drain and cancellation before launch; inflight cancellation with mixed
 signed-terminal/unknown results still needs broader qualification.
+
+## Transaction retry and recovery handoffs
+
+A stable-ID retry can observe an authoritative committed coordinator record and
+then receive a conflicting, missing, or malformed response to its resolution
+retry. The coordinator previously entered abort cleanup in those branches.
+The same problem occurred after a transport failure followed by a contradictory
+aborted status. Committed evidence now remains authoritative: these inconsistent
+replies stop further dispatch and leave propagation pending. Callers configured
+to report post-commit failures receive `CommitPropagationIncomplete`; callers
+requesting structured outcomes retain `committed` with `propagation_pending`.
+No abort or follower acknowledgement is authorized by the later reply.
+
+The existing stable-ID regression now exercises these four failure schedules
+under both reporting policies, asserting one coordinator resolve, no abort,
+no re-prepare, and no follower resolve. Its exact owning API inventory filter is
+`stable distributed transaction retry resumes a durable commit decision`.
+
+The broader module inventory remains distinct from this regression:
+
+| Schedule | Source coverage | Still required |
+| --- | --- | --- |
+| Pre-decision transport failure and replica rediscovery | `hosted participant rediscovery retries only pre-decision leader unavailability` distinguishes proven not-sent/not-proposed from unknown timeout/reset and checks forged/legacy response handling. | Real peers across mixed versions, shutdown during dispatch, delayed server queue followed by abort recovery. |
+| Ambiguous coordinator commit | Same-ID retry, bounded unresolved retry, and one absolute recovery deadline tests; no new transaction ID or opposite decision after uncertainty. | Process loss between status, retry, durable participant resolution, and acknowledgement; real leader replacement. |
+| Partial participant fanout | Bounded concurrency, attempted-participant contact mask, durable abort before acknowledgement of untouched participants. Submitted tasks are joined before their arenas and slot arrays are released, including I/O cancellation. | Inflight cancellation/shutdown in each fanout phase, delayed replies during cleanup, and native ownership transfer under resource exhaustion. |
+| Post-commit visibility and acknowledgement | `distributed txn coordinator never aborts after durable commit decision` covers pending visibility, terminal repair, propagation and acknowledgement errors. | Retained coordinator/participant records across actual restart and all new protected record kinds. |
+| End-to-end caller deadline | Hosted begin/prepare each preserve one deadline across replica attempts; ambiguous-decision recovery uses a separate bounded deadline and deliberately ignores client cancellation. | `ExecuteOptions` has no transaction-wide original deadline. Later participant waves receive fresh operation budgets; abort/ack cleanup lacks one shared absolute deadline. This slice does not claim whole-request deadline propagation. |
+
+The source inventory above is not a claim that all existing tests were rerun.
+Most transaction tests are not in the curated `antfly-api-test` compile inventory;
+passing only a runtime filter without adding the owning compile filter can select
+zero tests. The exact new regression is included explicitly. Broader qualification
+must first establish test discovery, then run the named schedules and real fault
+fixtures; item 8 remains open.
+
+Validation of the monotonic-decision fix: owning API gate 1/1 passed, 0 skipped,
+0 failed, 0 leaks, actual exit 0. This one test includes the existing successful
+resume and all eight injected failure/reporting-policy combinations. Log:
+`/tmp/workload-transaction-monotonic-decision2.log`. Reproduce from `zig/`:
+
+```sh
+zig build antfly-api-test -j1 --cache-dir /tmp/zig-local-cache \
+  --global-cache-dir /tmp/zig-global-cache -- \
+  --test-filter 'stable distributed transaction retry resumes a durable commit decision'
+```
+
+The initial gate exited 1 before running tests because of a native callback
+return-type integration error and a test-local optional-error comparison. Both
+were corrected before the successful owning gate; this was not a before-fix
+runtime reproduction. The separate runtime owner's subsequent DATA gate also
+passed 6/6, including the retained-owner shutdown ordering regression
+(`/tmp/workload-completion-capsule-data1.log`); that evidence remains narrower
+than the multi-peer shutdown schedules listed above.

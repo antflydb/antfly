@@ -1321,6 +1321,7 @@ fn executeMultiTableCommitOnce(
             .sync_level = coordinator_sync_level,
         }, options.post_commit_cancellation) catch |err| switch (err) {
             error.DecisionConflict => {
+                if (resume_committed) return resumedCommitPropagationFailure(participants.items, options);
                 if (trace_writer) |tw| {
                     tw.traceEvent(&.{
                         .name = "ResolveDecisionConflict",
@@ -1335,6 +1336,7 @@ fn executeMultiTableCommitOnce(
                 return .{ .conflict = participantDecisionConflict(participant, .resolve) };
             },
             error.TxnNotFound, error.InvalidTxnRecord => {
+                if (resume_committed) return resumedCommitPropagationFailure(participants.items, options);
                 if (trace_writer) |tw| {
                     tw.traceEvent(&.{
                         .name = "ResolveTornTransactionState",
@@ -1397,6 +1399,7 @@ fn executeMultiTableCommitOnce(
                         return error.CommitDecisionUnknown;
                     },
                     .aborted => {
+                        if (resume_committed) return resumedCommitPropagationFailure(participants.items, options);
                         abort_on_error = false;
                         try abortParticipants(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len);
                         return .{ .conflict = participantDecisionConflict(participant, .resolve) };
@@ -1505,6 +1508,21 @@ fn executeMultiTableCommitOnce(
     }
 
     return .{ .committed = result };
+}
+
+// Authoritative committed evidence is monotonic. A later inconsistent retry
+// response cannot authorize abort, nor can it certify this attempt's requested
+// decision metadata for further participant propagation. Leave durable recovery
+// enlisted and preserve the known committed outcome for ephemeral callers.
+fn resumedCommitPropagationFailure(participants: []const ParticipantTxn, options: ExecuteOptions) !CommitOutcome {
+    std.debug.assert(participants.len != 0);
+    if (options.report_post_commit_failure) return error.CommitPropagationIncomplete;
+    return .{ .committed = .{
+        .participant_count = participants.len,
+        .coordinator_group_id = participants[0].group_id,
+        .coordinator_table_name = participants[0].table_name,
+        .propagation_pending = true,
+    } };
 }
 
 const coordinator_resolution_timeout_ns: u64 = 5 * std.time.ns_per_s;
@@ -4427,6 +4445,8 @@ fn consumerTests() type {
                 prepare_calls: usize = 0,
                 resolve_calls: usize = 0,
                 status_calls: usize = 0,
+                resolve_error: ?anyerror = null,
+                abort_calls: usize = 0,
 
                 fn worker(self: *@This()) ParticipantWorker {
                     return .{
@@ -4436,6 +4456,7 @@ fn consumerTests() type {
                             .prepare_group = prepare,
                             .resolve_group = resolve,
                             .status_group = status,
+                            .status_group_until = statusUntil,
                         },
                     };
                 }
@@ -4455,14 +4476,22 @@ fn consumerTests() type {
                 fn resolve(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, req: TxnResolveRequest) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     self.resolve_calls += 1;
+                    if (req.status == .aborted) self.abort_calls += 1;
                     try std.testing.expectEqual(db_mod.types.TxnStatus.committed, req.status);
+                    if (self.resolve_error) |err| return err;
                     try std.testing.expectEqual(@as(u64, 0), req.topology_epoch);
                 }
 
                 fn status(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     self.status_calls += 1;
+                    if (self.status_calls > 1 and (if (self.resolve_error) |err| err == error.ConnectionResetByPeer else false)) return .aborted;
                     return .committed;
+                }
+
+                fn statusUntil(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, deadline_ns: u64) !db_mod.types.TxnStatus {
+                    try ensureDecisionRecoveryDeadline(deadline_ns);
+                    return status(ptr, alloc, group_id, table_name, txn_id);
                 }
             };
 
@@ -4497,6 +4526,44 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(usize, 1), recorder.status_calls);
             try std.testing.expectEqual(@as(usize, 0), recorder.prepare_calls);
             try std.testing.expectEqual(@as(usize, 2), recorder.resolve_calls);
+
+            // A committed status was already observed. Even a subsequent
+            // conflicting/missing/corrupt coordinator response cannot authorize
+            // abort or dispatch follower decisions with unconfirmed metadata.
+            for ([_]anyerror{ error.DecisionConflict, error.TxnNotFound, error.InvalidTxnRecord, error.ConnectionResetByPeer }) |retry_error| {
+                for ([_]bool{ true, false }) |report_failure| {
+                    recorder = .{ .resolve_error = retry_error };
+                    const resumed = executeMultiTableCommitWithOptions(
+                        std.testing.allocator,
+                        FakeCatalog.iface(),
+                        recorder.worker(),
+                        txn_id,
+                        10_000,
+                        10_001,
+                        &.{.{ .table_name = "docs", .writes = &.{
+                            .{ .key = "doc:a", .value = "{}" },
+                            .{ .key = "doc:z", .value = "{}" },
+                        } }},
+                        .write,
+                        null,
+                        .{ .retain_terminal = true, .report_post_commit_failure = report_failure },
+                    );
+                    if (report_failure) {
+                        try std.testing.expectError(error.CommitPropagationIncomplete, resumed);
+                    } else {
+                        const committed = try resumed;
+                        try std.testing.expect(committed == .committed);
+                        try std.testing.expect(committed.committed.propagation_pending);
+                        try std.testing.expectEqual(@as(usize, 2), committed.committed.participant_count);
+                        try std.testing.expectEqual(@as(?u64, 7001), committed.committed.coordinator_group_id);
+                    }
+                    try std.testing.expectEqual(@as(usize, 1), recorder.begin_calls);
+                    try std.testing.expectEqual(@as(usize, if (retry_error == error.ConnectionResetByPeer) 2 else 1), recorder.status_calls);
+                    try std.testing.expectEqual(@as(usize, 0), recorder.prepare_calls);
+                    try std.testing.expectEqual(@as(usize, 1), recorder.resolve_calls);
+                    try std.testing.expectEqual(@as(usize, 0), recorder.abort_calls);
+                }
+            }
         }
 
         test "distributed txn coordinator aborts only participants that may have begun" {
