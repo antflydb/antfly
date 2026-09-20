@@ -4863,6 +4863,24 @@ fn validateExtractionResult(alloc: Allocator, item: std.json.Value, typed: extra
         try extractionOptionalNumber(raw, "score", false);
         if (classification.score) |score| if (!std.math.isFinite(score)) return error.InvalidExtractorResponse;
     };
+    if (typed.decisions) |decisions| for (item.object.get("decisions").?.array.items, decisions) |raw, decision| {
+        if (!v2) return error.InvalidExtractorResponse;
+        _ = try extractionString(raw, "name");
+        _ = try extractionString(raw, "label");
+        try extractionStringChoice(raw, "type", &.{ "choice", "score", "boolean" });
+        try extractionStringChoice(raw, "confidence_method", &.{ "normalized_inverse_entropy", "max_probability" });
+        _ = try extractionNumber(raw.object.get("confidence") orelse return error.InvalidExtractorResponse, true);
+        _ = try extractionNumber(raw.object.get("act_probability") orelse return error.InvalidExtractorResponse, true);
+        try extractionOptionalNumber(raw, "true_probability", true);
+        if (raw.object.get("expected_value")) |value| if (try extractionNumber(value, false) < 0) return error.InvalidExtractorResponse;
+        if (decision.expected_value) |value| if (!std.math.isFinite(value)) return error.InvalidExtractorResponse;
+        const probabilities = raw.object.get("probabilities") orelse return error.InvalidExtractorResponse;
+        if (probabilities != .array or probabilities.array.items.len < 2) return error.InvalidExtractorResponse;
+        for (probabilities.array.items) |probability| {
+            _ = try extractionString(probability, "label");
+            _ = try extractionNumber(probability.object.get("probability") orelse return error.InvalidExtractorResponse, true);
+        }
+    };
     if (typed.relations) |relations| for (item.object.get("relations").?.array.items, relations) |raw, relation| {
         _ = try extractionString(raw, "type");
         try extractionOptionalNumber(raw, "score", false);
@@ -7656,4 +7674,19 @@ test "asset producer runtime never batches an extractor that advertises max_item
     try std.testing.expectEqual(@as(usize, 3), results.len);
     try std.testing.expectEqual(@as(usize, 3), local.extract_calls);
     try std.testing.expectEqual(@as(usize, 1), local.max_inputs_seen);
+}
+
+test "laya enrichment preserves typed decisions and rejects invalid probabilities" {
+    const a = std.testing.allocator;
+    const payload =
+        \\{"object":"extraction","model":"laya","schema_version":2,"data":[{"classifications":[{"name":"tool","label":"search","score":0.75}],"decisions":[{"name":"tool","type":"choice","label":"search","probabilities":[{"label":"search","probability":0.75},{"label":"none","probability":0.25}],"confidence":0.1887,"confidence_method":"normalized_inverse_entropy","act_probability":0.8}]}]}
+    ;
+    const expected = extracting.ResponseExpectation{ .model = "laya", .item_count = 1, .schema_version = 2 };
+    const result = try extractionResultJsonAlloc(a, payload, expected, null, false);
+    defer a.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"decisions\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"probability\":0.75") != null);
+    const invalid = try std.mem.replaceOwned(u8, a, payload, "\"probability\":0.75", "\"probability\":1.5");
+    defer a.free(invalid);
+    try std.testing.expectError(error.InvalidExtractorResponse, extractionResultJsonAlloc(a, invalid, expected, null, false));
 }

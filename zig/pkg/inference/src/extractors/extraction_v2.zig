@@ -301,7 +301,7 @@ pub fn parseOptions(value: Value) !Options {
     return options;
 }
 
-fn textContent(allocator: Allocator, value: Value, limit: usize) ![]const u8 {
+pub fn textContent(allocator: Allocator, value: Value, limit: usize) ![]const u8 {
     if (value == .string) {
         const text = try string(value);
         if (text.len > limit) return error.ExtractionTextLimitExceeded;
@@ -421,6 +421,7 @@ pub fn errorDetails(err: anyerror) ?ErrorDetails {
     // Keep a closed allowlist: corrupt model routing, invalid native output,
     // allocation and cancellation errors must never be relabeled client input.
     return switch (err) {
+        error.InvalidLayaQuestion => .{ .status = 400, .code = "INVALID_EXTRACTION_SCHEMA", .message = "Laya requires named single, ordinal, or boolean questions with instructions and 2 to 20 distinct labels; boolean labels must be false, true" },
         error.LongDocumentClassificationSearchExhausted, error.LongDocumentJointSearchExhausted, error.LongDocumentRecordSearchExhausted => .{ .status = 422, .code = "EXTRACTION_SEARCH_EXHAUSTED", .message = "bounded document-level extraction search did not complete with an accepted feasible result" },
         error.LongDocumentClassificationInfeasible, error.LongDocumentJointInfeasible, error.LongDocumentRequiredRecordFieldMissing, error.AmbiguousLongDocumentRecordOccurrence => .{ .status = 422, .code = "EXTRACTION_CONSTRAINTS_INFEASIBLE", .message = "document-level extraction could not satisfy the requested record or graph constraints" },
         error.LongDocumentWindowLimitExceeded, error.LongDocumentWorkLimitExceeded, error.LongDocumentCandidateLimitExceeded, error.LongDocumentTextLimitExceeded, error.LongDocumentJointIdentityLimitExceeded => .{ .status = 413, .code = "EXTRACTION_LIMIT_EXCEEDED", .message = "document-level extraction exceeds its configured window, candidate, work, or output limit" },

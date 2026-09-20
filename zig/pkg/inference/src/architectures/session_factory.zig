@@ -678,6 +678,9 @@ pub fn createNativeSessionWithTaskOverride(allocator: std.mem.Allocator, model_p
     var store = try tensor_store_mod.openFromManifest(allocator, mf);
     var store_owned = true;
     errdefer if (store_owned) store.deinit();
+    if (arch_config == .modern_bert) {
+        if (arch_config.modern_bert.laya) |config| try @import("../models/laya.zig").validateWeights(store, config, arch_config.modern_bert);
+    }
     if (arch_config == .gliner_boundary) {
         try validateNativeBoundaryWeights(allocator, mf, arch_config.gliner_boundary, store);
         // Reduced bundles retain their declared quantized storage. FP32
@@ -1999,6 +2002,9 @@ fn createGpuHostedSessionWithTaskOverride(
 
     const resident_prefix: []const u8 = if (mf.safetensors_path != null or mf.safetensors_index_path != null or mf.gguf_path != null) blk: {
         tensor_store = try tensor_store_mod.openFromManifest(allocator, mf);
+        if (arch_config == .modern_bert) {
+            if (arch_config.modern_bert.laya) |config| try @import("../models/laya.zig").validateWeights(tensor_store.?, config, arch_config.modern_bert);
+        }
         if (arch_config == .gliner_boundary) {
             try validateNativeBoundaryWeights(allocator, mf, arch_config.gliner_boundary, tensor_store.?);
             boundary_identity = try captureBoundaryIdentity(&mf, tensor_store.?);
@@ -3377,6 +3383,8 @@ pub fn ggufInspectionSupportsBackend(report: GgufInspectionReport, backend: Back
 
 fn normalizeWeightKey(store_kind: tensor_store_mod.StoreKind, arch_config: ArchConfig, key: []const u8, buf: *[256]u8) ![]const u8 {
     if (arch_config == .modern_bert) {
+        if (arch_config.modern_bert.laya != null and std.mem.startsWith(u8, key, "encoder."))
+            return std.fmt.bufPrint(buf, "model.{s}", .{key["encoder.".len..]}) catch return error.NameTooLong;
         if (std.mem.startsWith(u8, key, "model.")) return key;
         return std.fmt.bufPrint(buf, "model.{s}", .{key}) catch return error.NameTooLong;
     }
@@ -7843,6 +7851,12 @@ test "gliner boundary persistent Metal owner observation rejects foreign cold an
     }
 }
 
+pub fn getLayaConfig(session: Session) ?@import("../models/laya.zig").Config {
+    if (session.vtable != &arch_vtable) return null;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    return if (self.arch_config == .modern_bert) self.arch_config.modern_bert.laya else null;
+}
+
 /// Whether the architecture can produce a resident [batch, seq, hidden]
 /// text-encoder output for the embedding pipeline. Keep this separate from
 /// GenericEncoderArchConfig: ModernBERT supports ordinary inference, but not
@@ -8058,6 +8072,16 @@ fn archRunImpl(
             return result;
         },
         .modern_bert => |cfg| {
+            if (cfg.laya) |laya| {
+                if (inputs.len != 4) return error.InvalidLayaInputs;
+                const bi = try parseBertRunInputs(inputs[0..2]);
+                const kinds = try validateI64Matrix(inputs[2], .{ bi.batch, 1 });
+                const markers = try validateI64Matrix(inputs[3], null);
+                if (markers.shape[0] != bi.batch) return error.InvalidLayaInputs;
+                const hidden = try modern_bert_arch.forwardCT(&cb, allocator, cfg, bi.input_ids, bi.attention_mask, bi.batch, bi.seq_len);
+                defer cb.free(hidden);
+                return @import("laya_head.zig").forward(&cb, allocator, laya, hidden, bi.attention_mask, kinds.values, markers.values, bi.batch, bi.seq_len, markers.shape[1], cfg.hidden_size);
+            }
             if (self.task != .generic) return error.UnsupportedArchitectureTask;
             const bert_inputs = try parseBertRunInputs(inputs);
             const hidden = try modern_bert_arch.forward(
@@ -9047,7 +9071,18 @@ fn archRunGeometry(ptr: *anyopaque, inputs: @import("../backends/session.zig").S
             if (self.task == .classifier) output_seq = 1;
             break :blk if (self.task == .classifier or self.task == .extractor) cfg.num_labels else cfg.hidden_size;
         },
-        .modern_bert => |cfg| cfg.hidden_size,
+        .modern_bert => |cfg| blk: {
+            if (cfg.laya) |laya| {
+                if (inputs.len() != 4) return error.InvalidLayaInputs;
+                const markers = inputs.get(3);
+                if (markers.shape.len != 2 or markers.shape[1] < 2 or markers.shape[1] > 20 or input_seq > laya.max_len) return error.InvalidLayaInputs;
+                const count: usize = @intCast(markers.shape[1]);
+                output_seq = 1;
+                workspace_bytes = try std.math.mul(usize, 2, try whisperStageWorkspace(batch, input_seq, input_seq, cfg.hidden_size, @max(cfg.num_attention_heads, cfg.hidden_size / 64), cfg.hidden_size * 4));
+                break :blk count + laya.n_act;
+            }
+            break :blk cfg.hidden_size;
+        },
         .nomic_bert => |cfg| cfg.hidden_size,
         .t5 => |cfg| cfg.d_model,
         .gpt => |cfg| blk: {
@@ -9075,7 +9110,8 @@ fn archRunGeometry(ptr: *anyopaque, inputs: @import("../backends/session.zig").S
     };
     const elements = std.math.mul(usize, batch, std.math.mul(usize, output_seq, width) catch return error.ResourceLimitExceeded) catch return error.ResourceLimitExceeded;
     const bytes = std.math.mul(usize, elements, @sizeOf(f32)) catch return error.ResourceLimitExceeded;
-    return .{ .sequence = sequence, .output_bytes = std.math.add(usize, bytes, 3 * @sizeOf(i64)) catch return error.ResourceLimitExceeded, .workspace_bytes = workspace_bytes };
+    const shape_elements: usize = if (self.arch_config == .modern_bert and self.arch_config.modern_bert.laya != null) 4 else 3;
+    return .{ .sequence = sequence, .output_bytes = std.math.add(usize, bytes, shape_elements * @sizeOf(i64)) catch return error.ResourceLimitExceeded, .workspace_bytes = workspace_bytes };
 }
 
 fn whisperStageWorkspace(batch: usize, queries: usize, keys: usize, hidden: usize, heads: usize, ffn: usize) !usize {
@@ -9131,6 +9167,12 @@ fn archIndependentBatchRows(ptr: *anyopaque, inputs: []const Tensor) bool {
 
 fn archInputInfo(ptr: *anyopaque) []const TensorInfo {
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
+    if (self.arch_config == .modern_bert and self.arch_config.modern_bert.laya != null) return &.{
+        .{ .name = "input_ids", .dtype = .i64, .shape = &.{ -1, -1 } },
+        .{ .name = "attention_mask", .dtype = .i64, .shape = &.{ -1, -1 } },
+        .{ .name = "qtype", .dtype = .i64, .shape = &.{ -1, 1 } },
+        .{ .name = "marker_pos", .dtype = .i64, .shape = &.{ -1, -1 } },
+    };
     return switch (self.arch_config) {
         .clip => &.{
             .{ .name = "input_ids", .dtype = .i64, .shape = &.{ -1, -1 } },
@@ -9159,6 +9201,10 @@ fn archInputInfo(ptr: *anyopaque) []const TensorInfo {
 
 fn archOutputInfo(ptr: *anyopaque) []const TensorInfo {
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
+    if (self.arch_config == .modern_bert and self.arch_config.modern_bert.laya != null) return &.{
+        .{ .name = "logits", .dtype = .f32, .shape = &.{ -1, -1 } },
+        .{ .name = "action_logits", .dtype = .f32, .shape = &.{ -1, -1 } },
+    };
     if (self.task == .classifier and self.arch_config == .gpt and
         isQwen3GenerativeRerankerFamily(self.arch_config.gpt.family))
     {

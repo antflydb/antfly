@@ -1025,6 +1025,38 @@ pub fn loadFromDir(allocator: std.mem.Allocator, model_dir_path: []const u8) !Mo
     return loadFromCatalog(allocator, &catalog);
 }
 
+/// Probe an explicit Antfly capability without opening architecture or tokenizer
+/// sidecars. Executor dispatch must leave unrelated models' preflight ordering
+/// and bounded allocations to their own executor. Managed publication receipts
+/// remain authoritative for the declaration file.
+pub fn hasDeclaredCapability(allocator: std.mem.Allocator, model_dir_path: []const u8, capability: []const u8) !bool {
+    if (std.mem.endsWith(u8, model_dir_path, ".gguf")) return false;
+    const bytes = try readOptionalMetadataFile(allocator, model_dir_path, "model_manifest.json") orelse return false;
+    defer allocator.free(bytes);
+    var manifest = ModelManifest{ .allocator = allocator };
+    defer manifest.deinit();
+    try parseModelManifestJson(&manifest, allocator, bytes);
+    return manifest.hasCapability(capability);
+}
+
+test "declared capability probe does not parse architecture or tokenizer sidecars" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(path);
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "not JSON" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = "not JSON" });
+    try std.testing.expect(!try hasDeclaredCapability(a, path, "typed_decisions"));
+    try tmp.dir.writeFile(io, .{ .sub_path = "model_manifest.json", .data = "{\"type\":\"recognizer\",\"capabilities\":[\"classification\"]}" });
+    try std.testing.expect(!try hasDeclaredCapability(a, path, "typed_decisions"));
+    try tmp.dir.writeFile(io, .{ .sub_path = "model_manifest.json", .data = "{\"type\":\"classifier\",\"capabilities\":[\"typed_decisions\"]}" });
+    try std.testing.expect(try hasDeclaredCapability(a, path, "typed_decisions"));
+    try tmp.dir.writeFile(io, .{ .sub_path = "model_manifest.json", .data = "{\"capabilities\":false}" });
+    try std.testing.expectError(error.InvalidModelManifest, hasDeclaredCapability(a, path, "typed_decisions"));
+}
+
 /// Load a private pull staging directory from its validated artifact plan.
 /// This API must only be used while holding the corresponding pull lock.
 pub fn loadFromManagedPlanDir(allocator: std.mem.Allocator, model_dir_path: []const u8) !ModelManifest {

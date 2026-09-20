@@ -17,8 +17,15 @@ tests=(
   e2e/antfly/test_backup_restore.py::test_three_by_three_cluster_backup_restore_through_metadata_public_api
   e2e/antfly/test_metadata_mutation_discovery.py::test_backup_restore_discovers_leader_past_stalled_status
 )
+profiles=(normal constrained)
+if [[ -n "${ANTFLY_E2E_REGRESSION_PROFILE:-}" ]]; then
+  case "$ANTFLY_E2E_REGRESSION_PROFILE" in
+    normal|constrained) profiles=("$ANTFLY_E2E_REGRESSION_PROFILE") ;;
+    *) echo "invalid cluster restore profile: $ANTFLY_E2E_REGRESSION_PROFILE" >&2; exit 2 ;;
+  esac
+fi
 result=0
-for profile in normal constrained; do
+for profile in "${profiles[@]}"; do
   nofile_limit=""
   if [[ "$profile" == constrained ]]; then nofile_limit=256; fi
   if ANTFLY_E2E_NOFILE_LIMIT="$nofile_limit" \

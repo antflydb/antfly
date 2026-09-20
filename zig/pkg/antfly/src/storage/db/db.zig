@@ -28526,6 +28526,9 @@ pub const DB = struct {
     const artifact_repair_metadata_poll_ns: u64 = 5 * std.time.ns_per_s;
     const artifact_repair_metadata_active_poll_ns: u64 = 100 * std.time.ns_per_ms;
 
+    // Retry deadlines and comparisons belong to the runtime's awake clock.
+    // On Darwin its origin differs from POSIX MONOTONIC; borrowed runtimes
+    // may also provide virtual time. Never compare these to platform clocks.
     fn independentMaintenanceNowNs(self: *DB) u64 {
         const io = self.backend_runtime.io() orelse return platform_time.monotonicNs();
         return @intCast(@max(0, std.Io.Clock.awake.now(io).nanoseconds));
@@ -71616,13 +71619,64 @@ test "relational columnar maintenance survives unrelated artifact corruption and
     defer alloc.free(ready);
     try db.core.store.putBatch(&.{}, &.{ready});
     try std.testing.expect(db.artifactRepairMetadataWorkerStep() != null);
-    try std.testing.expect(db.artifact_metadata_retry_after_ns > platform_time.monotonicNs());
+    try std.testing.expect(db.artifact_metadata_retry_after_ns > db.independentMaintenanceNowNs());
     try std.testing.expect(db.relational_column_maintenance.blocks_written.load(.monotonic) > 0);
     const retry = db.artifact_metadata_retry_after_ns;
     try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"n\":2}" }} });
     try std.testing.expect(db.artifactRepairMetadataWorkerStep() != null);
     try std.testing.expectEqual(retry, db.artifact_metadata_retry_after_ns);
     try std.testing.expect(db.relational_column_maintenance.ranges_compacted.load(.monotonic) > 0);
+    db.artifact_repair_metadata_stop.store(true, .release);
+    try std.testing.expect(db.artifactRepairMetadataWorkerStep() == null);
+}
+
+test "relational columnar artifact backoff uses the owner clock through suppression and expiry" {
+    const alloc = std.testing.allocator;
+    var clock = try @import("vopr").vopr_io.VoprIo.init(.{ .monotonic_ns = 100 * std.time.ns_per_s });
+    defer clock.deinit();
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{
+        .backend = .manual,
+        .borrowed_io = .{ .general = clock.io() },
+    });
+    defer runtime.deinit();
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .backend_runtime = runtime.ptr(),
+        .executor = .{ .backend = .manual },
+        .primary_backend = .{ .mem = .{} },
+        .physical_root_mode = .external_backend,
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    const columns = [_]schema_mod.RelationalColumn{.{ .name = "n", .path = "n", .column_type = .integer }};
+    try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+    try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"n\":1}" }} });
+    const issue = try internal_keys.artifactRepairIssueKeyAlloc(alloc, "bad", "embedding", "bad");
+    defer alloc.free(issue);
+    try db.core.store.put(issue, "malformed");
+    const ready = try internal_keys.artifactRepairSummaryReadyKeyAlloc(alloc);
+    defer alloc.free(ready);
+    try db.core.store.putBatch(&.{}, &.{ready});
+    try std.testing.expect(db.artifactRepairMetadataWorkerStep() != null);
+    try std.testing.expect(db.artifact_metadata_retry_after_ns > db.independentMaintenanceNowNs());
+    try std.testing.expect(db.relational_column_maintenance.blocks_written.load(.monotonic) > 0);
+    const retry = db.artifact_metadata_retry_after_ns;
+    try std.testing.expectEqual(clock.monotonic_ns + DB.artifact_repair_metadata_poll_ns, retry);
+    clock.monotonic_ns = retry - 1;
+    try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"n\":2}" }} });
+    try std.testing.expect(db.artifactRepairMetadataWorkerStep() != null);
+    try std.testing.expectEqual(retry, db.artifact_metadata_retry_after_ns);
+    try std.testing.expect(db.relational_column_maintenance.ranges_compacted.load(.monotonic) > 0);
+    // At the exact deadline the malformed issue is retried and gets a new
+    // deadline. No wall-clock sleeping or comparison across clock domains.
+    clock.monotonic_ns = retry;
+    try std.testing.expect(db.artifactRepairMetadataWorkerStep() != null);
+    try std.testing.expectEqual(retry + DB.artifact_repair_metadata_poll_ns, db.artifact_metadata_retry_after_ns);
     db.artifact_repair_metadata_stop.store(true, .release);
     try std.testing.expect(db.artifactRepairMetadataWorkerStep() == null);
 }
