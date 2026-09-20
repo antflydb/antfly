@@ -8836,7 +8836,7 @@ pub const Node = struct {
         return .{ .allocator = allocator, .json = try allocator.dupe(u8, json) };
     }
 
-    fn tryExtractLayaV2(self: *Node, scratch: std.mem.Allocator, request_json: []const u8, control: ?InferenceExecutionControl, response_limit: ?usize) !?[]u8 {
+    fn tryExtractLayaV2(self: *Node, scratch: std.mem.Allocator, request_json: []const u8, control: ?InferenceExecutionControl, response_limit: ?usize, failure: *extraction_v2.FailureContext) !?[]u8 {
         try extraction_v2.scanJsonEnvelope(request_json, .{});
         const parsed = try std.json.parseFromSlice(std.json.Value, scratch, request_json, .{ .duplicate_field_behavior = .@"error" });
         defer parsed.deinit();
@@ -8851,9 +8851,14 @@ pub const Node = struct {
             else => return err,
         };
         defer scratch.free(path);
-        var manifest = try manifest_mod.loadListingFromDir(scratch, path);
-        defer manifest.deinit();
-        if (!manifest.hasCapability("typed_decisions")) return null;
+        // A listing load reads architecture sidecars before capabilities. That
+        // would run GLiNER model preflight too early, before its schema checks
+        // and model-stage failure context. Laya imports declare this capability.
+        const is_laya = manifest_mod.hasDeclaredCapability(scratch, path, "typed_decisions") catch |err| {
+            failure.* = .{ .stage = "model" };
+            return err;
+        };
+        if (!is_laya) return null;
         const laya = @import("../extractors/laya.zig");
         var arena = std.heap.ArenaAllocator.init(scratch);
         defer arena.deinit();
@@ -8890,7 +8895,7 @@ pub const Node = struct {
         allocation_failure: *ExtractionAllocationFailure,
     ) ![]u8 {
         // Each architecture retains its own schema validation and qualification.
-        if (try self.tryExtractLayaV2(scratch, request_json, control, response_limit)) |json| return json;
+        if (try self.tryExtractLayaV2(scratch, request_json, control, response_limit, failure)) |json| return json;
         const regex = @import("../pipelines/extraction_regex.zig");
         var validators = regex.Context.init(scratch, .{
             .compile_options = .{ .control = control },
