@@ -16,6 +16,19 @@ The public API has no query-level `tree_search`, `graph_navigation`, or
 intentional API change, with no compatibility/deprecation period. Internally,
 ranked tree execution reuses the existing traversal and result extraction.
 
+## Query refinement
+
+Classification and evaluation may refine `semantic_search` text or the text of
+an ordinary query's top-level `full_text_search.match`. Match refinement keeps
+its field, analyzer, operator, and boost. Explicit query strings (for example,
+`{"query":"body:raft AND status:active"}`), terms, phrases, and compound query
+nodes retain their syntax and predicates. Generated natural-language questions
+are not valid replacements for those expressions.
+
+Use `{"match":"raft","field":"body"}` when a lexical query should accept
+text refinement. A query with no refinable text slot skips refinement retries,
+preserving its tool budget for other candidate queries.
+
 ## Complete agentic tree request
 
 ```json
