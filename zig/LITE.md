@@ -59,9 +59,10 @@ The implementation now consists of:
 - `storage/lite/native.zig` owns the native revision-3 header, alternating checkpoint roots,
   page allocation, free map, crash recovery, integrity checks, stable snapshots,
   and atomic vacuum replacement. Document commits publish a namespace-head
-  directory and per-namespace page links in the same checkpoint, so a cold
-  table snapshot walks that table's history rather than the global document
-  log. Namespace heads use a copy-on-write catalog B+ tree, so updates and
+  directory and per-namespace page links in the same checkpoint for mutation
+  and integrity bookkeeping. Materialized document snapshots seek the pinned
+  live-key index and reuse a record reader, so reads scale with live results
+  rather than overwritten history. Namespace heads use a copy-on-write catalog B+ tree, so updates and
   cold writes touch only the requested namespaces and their tree paths. Batches
   collect distinct namespaces, share a sorted tree traversal to resolve their
   heads, and group record references by physical page before decoding them.
@@ -183,10 +184,12 @@ The implementation now consists of:
   cold-written data normally.
   Native external-value writes encode directly into an operation-owned 64 KiB
   page buffer. Staged imports, buffered external values, appends, document chains,
-  and vacuum copies coalesce consecutive page IDs into positional writes;
-  fragmented free-page runs flush separately. Value-chain writers retain only
+  and vacuum copies stage pages by address and coalesce contiguous runs into
+  positional writes. When the buffer fills, it drains the earliest contiguous
+  run and retains later pages so late packed-record pages can fill their gaps.
+  Fragmented free-page runs flush separately. Value-chain writers retain only
   one next-page ID. A completed tree is flushed before its root can be read or
-  published. A failed flush admits no pages and poisons its batch; abort drops
+  published. A failed flush admits none of its requested pages and poisons its batch; abort drops
   pending bytes without an implicit retry. Cache policy is applied per page
   after a successful write.
   Positional page writes extend the file directly, without per-page stat or
@@ -1122,8 +1125,10 @@ the revision-3 encoding and immutable checkpoint semantics.
 An already assembled large batch is consumed synchronously from the caller's
 buffers with one index edit, avoiding another owned staging copy. Sorted updates
 retain a bounded tree frontier, including deletion-rebalance neighbors, rather
-than every touched node. Unsorted edits and initial document-index construction
-still use scratch proportional to the batch; the 1,024-key / 1 MiB bounds apply
+than every touched node. Sorted initial document batches stream each key's
+last mutation directly into the bulk index builder, preserving tombstones and
+last-write-wins semantics without retaining all index entries. Unsorted batches
+retain scratch proportional to their size; the 1,024-key / 1 MiB bounds apply
 to mutations retained across calls.
 Reaching either staging limit flushes privately without ending the transaction;
 abort discards all flushed and pending changes together.
@@ -1291,8 +1296,9 @@ inline-cache preparation, including private publication followed by rollback.
 Batched namespace resolution reduces a 16,384-namespace update from 49,348
 logical page reads to 449 with caching disabled. Physical grouping keeps packed
 record reads bounded after interleaved namespace updates and a cold reopen.
-A 65,536-document initial batch in one namespace uses 3,175,368 bytes of peak
-temporary native heap instead of 6,451,968 bytes. Regressions cover read and
+A sorted 65,536-document initial batch in one namespace uses 27,199 bytes of
+peak temporary native heap instead of 6,451,968 bytes. At 16,384 and 131,072
+documents it uses 18,944 and 27,229 bytes, excluding caller-owned input. Regressions cover read and
 heap bounds, repeated mutations in input order, missing namespaces, external
 index keys, pinned checkpoints, and allocation-failure rollback in packed and
 unpacked v3 files.
@@ -1309,10 +1315,13 @@ With 16,384 short-key documents and caching disabled, a one-key batch uses 13
 allocations instead of 279, a full batch uses 16,396 instead of 33,599, and an
 index cursor scan uses 16,391 instead of 33,385. After warming its traversal
 buffers, each seek allocates only its returned key. A one-document snapshot
-among 16,384 namespaces now resolves its head directly through the namespace
-index: five logical reads, seven allocations, and 4,140 bytes of peak temporary
-heap, down from 255 reads, 49,881 allocations, and 1,402,790 bytes. Legacy
-namespace directories retain their existing fallback. Regressions cover
+among 16,384 namespaces seeks the pinned document index: three logical reads,
+16 allocations, and 14,226 bytes of peak temporary heap, down from 255 reads,
+49,881 allocations, and 1,402,790 bytes. The cursor retains bounded traversal
+scratch and reads external values from the same checkpoint. Legacy indexed
+tombstones remain excluded. With one live key after 16,384 versions, a snapshot
+uses two reads and 11 allocations rather than 16,387 reads and 32,779 allocations.
+Arbitrary byte prefixes stop at the first nonmatching key. Regressions cover
 allocation bounds, dense and sparse overflow reads, packed and unpacked v3
 records, pinned roots, malformed pages, and allocation-failure recovery.
 
@@ -1340,3 +1349,11 @@ advances preserve packed-record filling and buffered writes. Regressions cover
 sparse-write bounds, multi-level deletion, mixed inline/overflow keys, duplicate
 mutations, pinned roots, packed/unpacked v3, collision handling, allocation
 failures, and rollback after partial writes.
+
+The bounded page-addressed buffer also preserves coalescing across streamed
+index nodes and late packed-record pages. For 65,536 sorted document updates,
+page-write calls fall from 1,203 to 83 while 1,221 written pages and 411 reads
+remain unchanged. For catalog updates, calls fall from 1,223 to 99 with 1,434
+written pages unchanged. Regressions cover out-of-order pages, duplicate
+staged addresses, partial-run failures without cache admission, sorted initial
+ingest under a 512 KiB native heap budget, and pinned snapshots after overwrites.
