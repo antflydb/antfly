@@ -350,8 +350,8 @@ test('every expensive worker is gated, pins its checkout, and disables automatic
 test('policy validates the executing workflow even when a release predates the controller', () => {
   const text=fs.readFileSync(path.resolve(__dirname,'../workflows/pr-ci-policy.yml'),'utf8');
   assert.match(text,/ref: \$\{\{ github.workflow_sha \}\}\n\s+path: trusted-ci/);
-  assert.match(text,/name: Test executing CI policy\n\s+working-directory: trusted-ci\n\s+run: node --test \.github\/scripts\/pr-ci.test.cjs/);
-  assert.match(text,/name: Test proposed CI policy when present\n\s+if: \$\{\{ hashFiles\('\.github\/scripts\/pr-ci.test.cjs'\) != '' \}\}\n\s+run: node --test \.github\/scripts\/pr-ci.test.cjs/);
+  assert.match(text,/name: Test executing CI policy\n\s+working-directory: trusted-ci\n\s+run: node --test \.github\/scripts\/\*\.test\.cjs/);
+  assert.match(text,/name: Test proposed CI policy when present\n\s+if: \$\{\{ hashFiles\('\.github\/scripts\/pr-ci.test.cjs'\) != '' \}\}\n\s+run: node --test \.github\/scripts\/\*\.test\.cjs/);
 });
 
 // The live rollout first creates an action_required check before an approval.
