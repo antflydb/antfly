@@ -179,11 +179,14 @@ resolver/promoter runtime (`storage/db/resolution_runtime.zig`,
 }
 ```
 
-Field names in the `resolvers` block follow the shapes exercised in
-`e2e/antfly/test_resolution.py`; exact routing-by-label syntax needs API
-review if it does not already exist. Everything downstream — durable edge
-artifacts, generation binding, visibility inheritance, replay, split/merge —
-is the existing autograph machinery, unchanged.
+One shape note from implementation: `source_artifact` is required and
+singular per resolver, so the events/catch-all pair above is declared per
+artifact in practice — a labeled `event` resolver plus a catch-all where an
+artifact carries both classes, each with its own `resolution_artifact` (see
+`examples/epstein/autoschema.go` for the working four-resolver layout over
+three artifacts). Everything downstream — durable edge artifacts, generation
+binding, visibility inheritance, replay, split/merge — is the existing
+autograph machinery, unchanged.
 
 Fuzzy resolution ("A. Lovelace" vs "Ada Lovelace") upgrades later by swapping
 the deterministic resolver for the matcher-scorer configuration with
@@ -297,7 +300,7 @@ Missing for HippoRAG2/AutoSchemaKG-style retrieval:
 |---|-----|--------|
 | 1 | Neighbor context for conceptualizer producers | DONE: `neighbor_context` on asset enrichments (`enrichment/neighbor_context.zig`) — deterministic adjacency block in the producer input, participates in skip-state hash; generator/extractor producers only |
 | 2 | Seeded personalized PageRank | DONE: personalized teleport kernel (`graph/metrics.zig`), `GraphMetricRead.seed_nodes`+`damping` (max 128 seeds, fresh-only fail-closed, serverless fails closed) |
-| 3 | Retrieval-agent seeding/rerank orchestration + wire-layer plumbing (`query_contract`, top-k, `graph_metric_rerank`, distributed fan-out) | in progress |
+| 3 | Retrieval-agent seeding/rerank orchestration + wire-layer plumbing | DONE: `seed_nodes`+`damping` on `graph_metric`/`graph_metric_rerank` wire shapes; personalized top-k and rerank readers; serverless and cross-shard personalized requests fail closed (422); the retrieval agent auto-seeds a fresh rerank from literal graph-search start keys and degrades to unseeded when none resolve |
 | 4 | Promoter upserts trigger enrichments on entity/event tables | verified by construction (promotion writes through routed `TableWriteSource`); e2e cascade coverage pending |
 | 5 | Resolver routing-by-label | DONE: `labels` on `GraphResolverConfig`; labeled siblings disjoint (admission), catch-alls skip sibling-claimed labels at runtime, `{{ hash }}` key-template helper for event keys |
 

@@ -1462,6 +1462,8 @@ func loadCmd(args []string) error {
 	artifactExtractorModel := fs.String("artifact-extractor-model", DefaultAutographModel, "Antfly model for artifact relation extraction")
 	artifactLabels := fs.String("artifact-labels", DefaultEntityLabels, "Artifact extractor entity labels (comma-separated)")
 	artifactRelationLabels := fs.String("artifact-relation-labels", DefaultRelationLabels, "Artifact extractor relation labels (comma-separated)")
+	autoschema := fs.Bool("autoschema", false, "Provision the AutoSchemaKG pipeline: entity/event extraction, resolution, and conceptualization (requires --create-table)")
+	autoschemaModel := fs.String("autoschema-model", DefaultAutoschemaModel, "Antfly generative model shared by the AutoSchemaKG extractors and conceptualizer")
 
 	if err := fs.Parse(args); err != nil {
 		return fmt.Errorf("failed to parse flags: %w", err)
@@ -1512,6 +1514,20 @@ func loadCmd(args []string) error {
 				return fmt.Errorf("failed to create artifact graph index request: %w", err)
 			}
 			indexes[*artifactGraphIndex] = *graphRequest
+		}
+		if *autoschema {
+			if err := provisionAutoschemaTables(ctx, client, *autoschemaModel, *inferenceURL); err != nil {
+				return fmt.Errorf("failed to provision autoschema tables: %w", err)
+			}
+			kgIndex, err := createAutoschemaKnowledgeGraphIndex(*autoschemaModel, *inferenceURL)
+			if err != nil {
+				return fmt.Errorf("failed to create knowledge graph index config: %w", err)
+			}
+			kgRequest, err := antfly.NewCreateIndexRequest(kgIndex)
+			if err != nil {
+				return fmt.Errorf("failed to create knowledge graph index request: %w", err)
+			}
+			indexes[AutoschemaKnowledgeGraphIndex] = *kgRequest
 		}
 
 		err = client.CreateTable(ctx, *tableName, antfly.CreateTableRequest{
@@ -1580,6 +1596,8 @@ func syncCmd(args []string) error {
 	artifactExtractorModel := fs.String("artifact-extractor-model", DefaultAutographModel, "Antfly model for artifact relation extraction")
 	artifactLabels := fs.String("artifact-labels", DefaultEntityLabels, "Artifact extractor entity labels (comma-separated)")
 	artifactRelationLabels := fs.String("artifact-relation-labels", DefaultRelationLabels, "Artifact extractor relation labels (comma-separated)")
+	autoschema := fs.Bool("autoschema", false, "Provision the AutoSchemaKG pipeline: entity/event extraction, resolution, and conceptualization (requires --create-table)")
+	autoschemaModel := fs.String("autoschema-model", DefaultAutoschemaModel, "Antfly generative model shared by the AutoSchemaKG extractors and conceptualizer")
 	noHeaderFooter := fs.Bool("no-header-footer-detection", false, "Disable header/footer detection (faster)")
 	noMirroredRepair := fs.Bool("no-mirrored-text-repair", false, "Disable mirrored text repair (faster)")
 	var zipPaths StringSliceFlag
@@ -1637,6 +1655,20 @@ func syncCmd(args []string) error {
 				return fmt.Errorf("failed to create artifact graph index request: %w", err)
 			}
 			indexes[*artifactGraphIndex] = *graphRequest
+		}
+		if *autoschema {
+			if err := provisionAutoschemaTables(ctx, client, *autoschemaModel, *inferenceURL); err != nil {
+				return fmt.Errorf("failed to provision autoschema tables: %w", err)
+			}
+			kgIndex, err := createAutoschemaKnowledgeGraphIndex(*autoschemaModel, *inferenceURL)
+			if err != nil {
+				return fmt.Errorf("failed to create knowledge graph index config: %w", err)
+			}
+			kgRequest, err := antfly.NewCreateIndexRequest(kgIndex)
+			if err != nil {
+				return fmt.Errorf("failed to create knowledge graph index request: %w", err)
+			}
+			indexes[AutoschemaKnowledgeGraphIndex] = *kgRequest
 		}
 
 		err = client.CreateTable(ctx, *tableName, antfly.CreateTableRequest{
@@ -2264,7 +2296,7 @@ func createEmbeddingIndex(embeddingModel, inferenceURL, chunkerModel string, tar
 		Type: antfly.IndexTypeEmbeddings,
 	}
 
-	embedder, err := antfly.NewEmbedderConfig(antfly.AntflyEmbedderConfig{
+	embedder, err := antfly.NewIndexEmbedderConfig(antfly.AntflyEmbedderConfig{
 		Model: embeddingModel,
 	})
 	if err != nil {
@@ -2542,12 +2574,12 @@ func truncateContent(content string, maxLen int) string {
 // pages of batchSize entries. The input file must have keys in sorted order
 // (as produced by writeJSONSorted) so that sequential pages form valid
 // non-overlapping ranges for linear merge.
-func streamJSONPages(r io.Reader, batchSize int) iter.Seq[map[string]any] {
+func streamJSONPages(r io.Reader, batchSize int) iter.Seq[antfly.LinearMergeRecords] {
 	return streamJSONPagesWithLimit(r, batchSize, 0)
 }
 
-func streamJSONPagesWithLimit(r io.Reader, batchSize int, limit int) iter.Seq[map[string]any] {
-	return func(yield func(map[string]any) bool) {
+func streamJSONPagesWithLimit(r io.Reader, batchSize int, limit int) iter.Seq[antfly.LinearMergeRecords] {
+	return func(yield func(antfly.LinearMergeRecords) bool) {
 		dec := json.NewDecoder(bufio.NewReaderSize(r, 256*1024))
 		dec.UseNumber()
 
@@ -2557,7 +2589,7 @@ func streamJSONPagesWithLimit(r io.Reader, batchSize int, limit int) iter.Seq[ma
 			return
 		}
 
-		page := make(map[string]any, batchSize)
+		page := make(antfly.LinearMergeRecords, batchSize)
 		loaded := 0
 		for dec.More() {
 			// Read key
@@ -2576,14 +2608,18 @@ func streamJSONPagesWithLimit(r io.Reader, batchSize int, limit int) iter.Seq[ma
 				return
 			}
 
-			value = normalizePreparedRecordForLoad(value)
-			page[key] = value
+			record, ok := normalizePreparedRecordForLoad(value).(map[string]any)
+			if !ok {
+				// Linear merge records must be JSON objects.
+				return
+			}
+			page[key] = record
 			loaded++
 			if len(page) >= batchSize {
 				if !yield(page) {
 					return
 				}
-				page = make(map[string]any, batchSize)
+				page = make(antfly.LinearMergeRecords, batchSize)
 			}
 			if limit > 0 && loaded >= limit {
 				break
