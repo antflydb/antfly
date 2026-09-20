@@ -10620,7 +10620,14 @@ fn flushDeferredGeneratedWork(
     clearWorkerChunkCache(runtime.alloc, chunk_cache);
     clearRequestPlanCache(runtime.alloc, request_plan_cache);
     if (deferred_retry_error) |err| {
-        restoreDeferredRequestRetryAuthorization(runtime, deferred_retry_fingerprint);
+        // A retryable request error can propagate without a recorded failure
+        // fingerprint (activeRequestRetryBudgetAllowsYield admits fingerprint
+        // 0 as "no identity yet", e.g. MissingToolCall raised while
+        // post-processing a successful generation response). There is no
+        // request authorization to restore in that case; asserting nonzero
+        // here turned a malformed model reply into a kernel panic.
+        if (deferred_retry_fingerprint != 0)
+            restoreDeferredRequestRetryAuthorization(runtime, deferred_retry_fingerprint);
         return err;
     }
 }
@@ -11023,7 +11030,10 @@ fn flushAssetProducerBatch(
         start = end;
     }
     if (deferred_retry_error) |err| {
-        restoreDeferredRequestRetryAuthorization(runtime, deferred_retry_fingerprint);
+        // See flushDeferredGeneratedWork: fingerprint 0 means the retryable
+        // failure carried no request identity, so there is nothing to restore.
+        if (deferred_retry_fingerprint != 0)
+            restoreDeferredRequestRetryAuthorization(runtime, deferred_retry_fingerprint);
         return err;
     }
 }

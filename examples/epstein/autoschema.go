@@ -181,14 +181,18 @@ func autoschemaConceptToolParameters() map[string]any {
 // autoschemaGeneratorProducerJSON serializes a forced-tool-call generator
 // producer following the pattern proven by artifactProducerConfig: pinned
 // tool_choice, tool_output "arguments", additionalProperties:false schema.
-func autoschemaGeneratorProducerJSON(model, inferenceAPIURL, prompt, toolName, toolDescription string, parameters map[string]any) (string, error) {
+// The extraction instructions travel in the enrichment source template, not
+// here: the generator producer's canonical config contract has no `prompt`
+// field (the rendered source_text IS the prompt; see asset_producer_runtime
+// `.source_text = "prompt"` fixtures and generatorConfigFromValue's strict
+// envelope parse, which rejects unknown config fields).
+func autoschemaGeneratorProducerJSON(model, inferenceAPIURL, toolName, toolDescription string, parameters map[string]any) (string, error) {
 	producer := map[string]any{
 		"type": "generator",
 		"config": map[string]any{
 			"provider":    "antfly",
 			"model":       model,
 			"api_url":     inferenceAPIURL,
-			"prompt":      prompt,
 			"tool_output": "arguments",
 			"tool_name":   toolName,
 			"tool_choice": map[string]any{
@@ -276,7 +280,6 @@ func autoschemaExtractionEnrichments(model, inferenceAPIURL string) ([]antfly.En
 		producerJSON, err := autoschemaGeneratorProducerJSON(
 			model,
 			inferenceAPIURL,
-			pass.prompt,
 			autoschemaExtractionToolName,
 			pass.description,
 			autoschemaExtractionToolParameters(pass.labelSchema, pass.relationTypeSchema),
@@ -285,9 +288,11 @@ func autoschemaExtractionEnrichments(model, inferenceAPIURL string) ([]antfly.En
 			return nil, err
 		}
 		enrichments = append(enrichments, antfly.EnrichmentConfig{
-			Name:         pass.name,
-			Kind:         antfly.EnrichmentKindAsset,
-			Field:        "content",
+			Name: pass.name,
+			Kind: antfly.EnrichmentKindAsset,
+			// The rendered template is the generator's prompt: stage
+			// instructions followed by the document text.
+			Template:     pass.prompt + "\n\nDocument:\n{{ content }}",
 			ContentType:  "application/json",
 			ProducerJson: producerJSON,
 		})
@@ -346,6 +351,16 @@ func createAutoschemaKnowledgeGraphIndex(model, inferenceURL string) (*antfly.In
 
 	cfg := antfly.GraphIndexConfig{
 		Sources: sources,
+		// Named pagerank metric for HippoRAG-style retrieval: query-seeded
+		// personalized reads reference it by name with metric_freshness=fresh
+		// (seed_nodes + damping on the graph_metric query).
+		Metrics: map[string]oapi.GraphMetricConfig{
+			"ppr": {
+				Kind:    oapi.GraphMetricConfigKindPagerank,
+				Enabled: true,
+				Damping: 0.85,
+			},
+		},
 		EdgeTypes: []antfly.EdgeTypeConfig{
 			{Name: "mentions"},
 			{Name: "participates_in"},
@@ -434,7 +449,6 @@ func createAutoschemaTaxonomyIndex(model, inferenceURL string) (*antfly.IndexCon
 	producerJSON, err := autoschemaGeneratorProducerJSON(
 		model,
 		inferenceAPIURL,
-		autoschemaConceptPrompt,
 		autoschemaConceptToolName,
 		"Emit three or more abstract concept phrases for the entity, each linked by an is_a relation.",
 		autoschemaConceptToolParameters(),
@@ -484,9 +498,10 @@ func createAutoschemaTaxonomyIndex(model, inferenceURL string) (*antfly.IndexCon
 		{
 			Name: AutoschemaConceptAsset,
 			Kind: antfly.EnrichmentKindAsset,
-			// Promoted entity documents carry entity_type, canonical_name,
-			// and aliases (see promotion_runtime.zig).
-			Template:     "{{ canonical_name }} ({{ entity_type }})",
+			// The rendered template is the generator's prompt: concept
+			// instructions followed by the promoted entity document's
+			// fields (entity_type, canonical_name; see promotion_runtime.zig).
+			Template:     autoschemaConceptPrompt + "\n\nEntity: {{ canonical_name }} ({{ entity_type }})",
 			ContentType:  "application/json",
 			ProducerJson: producerJSON,
 			NeighborContext: oapi.EnrichmentNeighborContextConfig{

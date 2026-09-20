@@ -58911,6 +58911,13 @@ fn materializeMentionEdgesForResolutionKey(
     }
 
     const cfg = resolverConfigForResolution(index_manager, source.artifact_name, parsed_key.artifact_name) orelse {
+        // A multi-source graph pairs every changed resolution key with every
+        // mention-edge source. A resolution artifact owned by a different
+        // source's resolver (e.g. label-routed autoschema layouts with one
+        // resolver pair per extraction artifact) is that sibling source's to
+        // materialize, not a missing contract; only a resolution artifact no
+        // resolver owns fails closed.
+        if (resolverConfigForResolutionArtifact(index_manager, parsed_key.artifact_name) != null) return;
         if (options.require_resolution_contract) return error.MissingResolverArtifactContract;
         return;
     };

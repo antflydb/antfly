@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"encoding/json"
 	"testing"
 
@@ -50,9 +51,10 @@ func producerToolParameters(t *testing.T, producer map[string]any, wantTool stri
 	if cfg["tool_output"] != "arguments" || cfg["tool_name"] != wantTool {
 		t.Fatalf("unexpected tool output config: %#v", cfg)
 	}
-	prompt, _ := cfg["prompt"].(string)
-	if prompt == "" {
-		t.Fatalf("prompt missing from producer config: %#v", cfg)
+	// Instructions live in the enrichment source template, never here: the
+	// canonical generator contract rejects a `prompt` config field.
+	if cfg["prompt"] != nil {
+		t.Fatalf("producer config must not carry a prompt field: %#v", cfg)
 	}
 	choice, ok := cfg["tool_choice"].(map[string]any)
 	if !ok {
@@ -131,8 +133,16 @@ func TestCreateAutoschemaKnowledgeGraphIndexConfig(t *testing.T) {
 		if enrichment["name"] != wantAssets[i] {
 			t.Fatalf("enrichments[%d] = %v, want %s", i, enrichment["name"], wantAssets[i])
 		}
-		if enrichment["kind"] != "asset" || enrichment["field"] != "content" || enrichment["content_type"] != "application/json" {
+		if enrichment["kind"] != "asset" || enrichment["content_type"] != "application/json" {
 			t.Fatalf("unexpected enrichment declaration: %#v", enrichment)
+		}
+		// The rendered template IS the generator prompt: stage instructions
+		// followed by the document content. The producer config must NOT
+		// carry a `prompt` key (the canonical generator contract rejects
+		// unknown fields with UnknownField at enrichment time).
+		template, _ := enrichment["template"].(string)
+		if !strings.Contains(template, "{{ content }}") || len(template) < 200 {
+			t.Fatalf("enrichment template must embed instructions and {{ content }}: %q", template)
 		}
 		byName[enrichment["name"].(string)] = enrichment
 	}
