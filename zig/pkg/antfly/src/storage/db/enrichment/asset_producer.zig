@@ -994,7 +994,9 @@ test "asset producer bounds invocation contract resolution allocations" {
         }
 
         fn memory(_: *anyopaque, alloc: Allocator, _: []const Request) !inference_work.InvocationMemoryPlan {
-            _ = try alloc.alloc(u8, 8192);
+            // Resolution is bounded by the fixed planning floor for a tiny
+            // request, so an allocation just past it must be refused.
+            _ = try alloc.alloc(u8, invocation_resolution_floor_bytes + 1);
             return .{
                 .attachment_transport = .borrowed_binary,
                 .fixed_bytes = 1,
