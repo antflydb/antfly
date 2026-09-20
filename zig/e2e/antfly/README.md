@@ -146,8 +146,8 @@ Approved PR CI dispatches its workflow from the default branch, then checks out
 the PR revision. Changes to the lane matrix or runner-local temporary directory
 must land on the default branch before they affect PR runs; changes to the test
 code and scripts are exercised from the PR revision.
-PR revisions predating the shard plugin retain their full suite in the ordinary
-lane; the extra recovery lanes explicitly defer to that coverage.
+PR branches must merge main to obtain the required shard helper before running
+the new workflow. Missing helpers fail CI rather than skipping recovery coverage.
 
 To reproduce a recovery lane from the repository root without rebuilding:
 

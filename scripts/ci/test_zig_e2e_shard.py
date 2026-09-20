@@ -110,17 +110,19 @@ class ShardTests(unittest.TestCase):
             self.assertIn("scripts/ci/zig_e2e_shard.py", pathspecs)
             self.assertIn("scripts/ci/test_zig_e2e_shard.py", pathspecs)
 
-    def test_older_prs_keep_complete_ordinary_lane_coverage(self):
+    def test_prs_without_required_sharding_fail_closed(self):
         root = Path(__file__).resolve().parents[2]
         workflow = (root / ".github/workflows/zig-tests.yml").read_text()
         self.assertIn(
-            '"$ANTFLY_E2E_SUITE" == antfly-recovery-* && ! -f scripts/ci/zig_e2e_shard.py',
+            '"$ANTFLY_E2E_SUITE" == antfly* && ! -f scripts/ci/zig_e2e_shard.py',
             workflow,
         )
-        self.assertIn(
-            "matrix.suite == 'antfly' && hashFiles('scripts/ci/test_zig_e2e_shard.py') != ''",
-            workflow,
-        )
+        guard = workflow.split('if [[ "$ANTFLY_E2E_SUITE" == antfly*', 1)[1].split(
+            "fi", 1
+        )[0]
+        self.assertIn("Merge origin/main", guard)
+        self.assertIn("exit 1", guard)
+        self.assertNotIn("exit 0", guard)
 
 
 if __name__ == "__main__":

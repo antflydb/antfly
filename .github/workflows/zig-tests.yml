@@ -1460,7 +1460,7 @@ jobs:
           -run '^TestInferenceRuntimeContract$' -count=1 -v -timeout=20m
 
       - name: Test exhaustive E2E shard partition
-        if: matrix.suite == 'antfly' && hashFiles('scripts/ci/test_zig_e2e_shard.py') != ''
+        if: matrix.suite == 'antfly'
         run: python3 -m unittest discover -s scripts/ci -p test_zig_e2e_shard.py
 
       - name: Run base E2E
@@ -1470,11 +1470,9 @@ jobs:
           ANTFLY_E2E_SHARD: ${{ matrix.shard }}
           ANTFLY_E2E_PRESERVE_ROOT_ON_FAILURE: "1"
         run: |
-          # This workflow comes from main, but scripts come from the approved
-          # PR. Older PRs still run their entire suite in the ordinary lane.
-          if [[ "$ANTFLY_E2E_SUITE" == antfly-recovery-* && ! -f scripts/ci/zig_e2e_shard.py ]]; then
-            echo "PR predates recovery sharding; coverage runs in the antfly lane."
-            exit 0
+          if [[ "$ANTFLY_E2E_SUITE" == antfly* && ! -f scripts/ci/zig_e2e_shard.py ]]; then
+            echo "::error::Merge origin/main into this PR to obtain the required E2E shard helper."
+            exit 1
           fi
           taskset -c ${{ steps.e2e_cpus.outputs.list }} scripts/ci/zig-e2e-base-linux.sh
 
