@@ -99,7 +99,13 @@ The implementation now consists of:
 - `storage/lite/docstore.zig` provides ordered document transactions, pinned
   snapshots, replay lanes, and prefix-bounded logical namespaces. Point reads
   and ordered seeks traverse the checkpoint's disk-resident B+ tree in
-  `O(log N)` pages. A cursor retains one decoded root-to-leaf path, its current
+  `O(log N)` pages. Warm point reads binary-search validated immutable page
+  views instead of rescanning every slot. Encoded bytes and decoded offsets
+  share the page cache's byte budget and CLOCK eviction; active readers pin
+  evicted views until release, and their memory remains accounted. Page reuse,
+  rollback, and vacuum invalidate residency, and integrity checks bypass views
+  as well as encoded pages. Overflow keys use per-reader reusable scratch.
+  A cursor retains one decoded root-to-leaf path, its current
   key, and its current value, so sequential next/previous traversal is
   amortized `O(1)` and cold-scan memory remains bounded by tree height and the
   page cache rather than live-key count or document payload volume. Overflow

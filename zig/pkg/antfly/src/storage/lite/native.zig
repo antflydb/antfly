@@ -237,6 +237,7 @@ const IndexReadFrame = struct {
         var low: usize = 0;
         var high = self.offsets.items.len;
         while (low < high) {
+            if (builtin.is_test) _ = file.test_index_comparisons.fetchAdd(1, .monotonic);
             const mid = low + (high - low) / 2;
             const order = std.mem.order(u8, try self.key(file, checkpoint, mid), wanted);
             if (order == .lt or (upper and order == .eq)) low = mid + 1 else high = mid;
@@ -1454,7 +1455,19 @@ const PageCache = struct {
     const default_link_limit_bytes: usize = 16 * 1024 * 1024;
     const link_entry_overhead: usize = @sizeOf(PageLinkInfo) + @sizeOf(u64);
 
-    const CachedPage = struct { bytes: []u8, credit: u8, metadata: bool };
+    // Promotion shares the encoded page with an immutable decoded view. Pins
+    // permit overflow-key I/O without holding the cache mutex; eviction drops
+    // residency immediately, but charges pinned storage until its last reader
+    // releases it. Cursor positions and overflow scratch are never shared.
+    const IndexView = struct {
+        frame: IndexReadFrame,
+        references: usize = 1,
+
+        fn size(self: *const IndexView) usize {
+            return @sizeOf(IndexView) + self.frame.raw.?.len + self.frame.offsets.capacity * @sizeOf(u16);
+        }
+    };
+    const CachedPage = struct { bytes: []u8, credit: u8, metadata: bool, index: ?*IndexView = null };
     mutex: std.atomic.Mutex = .unlocked,
     pages: std.AutoArrayHashMapUnmanaged(u64, CachedPage) = .empty,
     clock_hand: usize = 0,
@@ -1488,6 +1501,74 @@ const PageCache = struct {
         return true;
     }
 
+    fn acquireIndex(self: *PageCache, allocator: Allocator, page_id: u64) !?*IndexView {
+        platform_sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        const before_bytes = self.total_bytes;
+        defer if (self.total_bytes != before_bytes) self.refreshPageResourceUsageLocked();
+        if (self.clearPagesForHardPressureLocked(allocator)) return null;
+        const cached = self.pages.getPtr(page_id) orelse return null;
+        if (cached.index) |view| {
+            cached.credit = 3;
+            view.references += 1;
+            return view;
+        }
+        const payload = try decodePagePayload(cached.bytes, .document_index);
+        const view = allocator.create(IndexView) catch return null;
+        view.* = .{ .frame = .{} };
+        var promoted = false;
+        defer if (!promoted) {
+            view.frame.deinit(allocator);
+            allocator.destroy(view);
+        };
+        view.frame.decode(allocator, payload) catch |err| switch (err) {
+            error.OutOfMemory => return null,
+            else => return err,
+        };
+        const extra = @sizeOf(IndexView) + view.frame.offsets.capacity * @sizeOf(u16);
+        if (extra > self.limit_bytes or cached.bytes.len > self.limit_bytes - extra) return null;
+        self.evictPagesToExceptLocked(allocator, self.limit_bytes - extra, page_id);
+        if (self.total_bytes > self.limit_bytes - extra) return null;
+        // Eviction can move the map entry. No I/O or unlock occurs between
+        // validation and publication, so this view describes these exact bytes.
+        const resident = self.pages.getPtr(page_id).?;
+        view.frame.raw = resident.bytes;
+        view.references = 2; // cache and caller
+        resident.index = view;
+        resident.credit = 3;
+        self.total_bytes += extra;
+        promoted = true;
+        self.refreshPageResourceUsageLocked();
+        _ = self.clearPagesForHardPressureLocked(allocator);
+        return view;
+    }
+
+    fn releaseIndex(self: *PageCache, allocator: Allocator, view: *IndexView) void {
+        platform_sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        const before_bytes = self.total_bytes;
+        self.releaseIndexLocked(allocator, view);
+        if (self.total_bytes != before_bytes) self.refreshPageResourceUsageLocked();
+    }
+
+    fn releaseIndexLocked(self: *PageCache, allocator: Allocator, view: *IndexView) void {
+        std.debug.assert(view.references > 0);
+        view.references -= 1;
+        if (view.references != 0) return;
+        self.total_bytes -= view.size();
+        view.frame.deinit(allocator);
+        allocator.destroy(view);
+    }
+
+    fn freePageLocked(self: *PageCache, allocator: Allocator, page: CachedPage) void {
+        if (page.index) |view| {
+            self.releaseIndexLocked(allocator, view);
+        } else {
+            self.total_bytes -= page.bytes.len;
+            allocator.free(page.bytes);
+        }
+    }
+
     fn attachResourceManager(self: *PageCache, manager: *resource_manager_mod.ResourceManager) void {
         platform_sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
@@ -1501,13 +1582,13 @@ const PageCache = struct {
         defer self.mutex.unlock();
         // Replacement must invalidate the old bytes even if admission fails.
         if (self.pages.fetchSwapRemove(page_id)) |old| {
-            self.total_bytes -= old.value.bytes.len;
-            allocator.free(old.value.bytes);
+            self.freePageLocked(allocator, old.value);
         }
         defer self.refreshPageResourceUsageLocked();
         if (self.clearPagesForHardPressureLocked(allocator)) return;
         if (page.len > self.limit_bytes) return;
         self.evictPagesToLocked(allocator, self.limit_bytes - page.len);
+        if (self.total_bytes > self.limit_bytes - page.len) return;
         const owned = allocator.dupe(u8, page) catch return;
         const metadata = page.len >= page_header_size and switch (page[4]) {
             @intFromEnum(PageKind.document_index), @intFromEnum(PageKind.catalog_index), @intFromEnum(PageKind.value_extent) => true,
@@ -1523,15 +1604,23 @@ const PageCache = struct {
     }
 
     fn evictPagesToLocked(self: *PageCache, allocator: Allocator, target: usize) void {
+        self.evictPagesToExceptLocked(allocator, target, null);
+    }
+
+    fn evictPagesToExceptLocked(self: *PageCache, allocator: Allocator, target: usize, protected: ?u64) void {
         while (self.total_bytes > target and self.pages.count() != 0) {
             if (self.clock_hand >= self.pages.count()) self.clock_hand = 0;
+            if (protected != null and self.pages.keys()[self.clock_hand] == protected.?) {
+                if (self.pages.count() == 1) break;
+                self.clock_hand += 1;
+                continue;
+            }
             const entry = &self.pages.values()[self.clock_hand];
             if (entry.credit != 0) {
                 entry.credit -= 1;
                 self.clock_hand += 1;
             } else {
-                self.total_bytes -= entry.bytes.len;
-                allocator.free(entry.bytes);
+                self.freePageLocked(allocator, entry.*);
                 self.pages.swapRemoveAt(self.clock_hand);
             }
         }
@@ -1607,8 +1696,7 @@ const PageCache = struct {
         var removed_page = false;
         var removed_links = false;
         if (self.pages.fetchSwapRemove(page_id)) |entry| {
-            self.total_bytes -= entry.value.bytes.len;
-            allocator.free(entry.value.bytes);
+            self.freePageLocked(allocator, entry.value);
             removed_page = true;
         }
         if (self.links.fetchRemove(page_id)) |entry| {
@@ -1652,10 +1740,9 @@ const PageCache = struct {
     }
 
     fn clearPagesLocked(self: *PageCache, allocator: Allocator) void {
-        for (self.pages.values()) |page| allocator.free(page.bytes);
+        for (self.pages.values()) |page| self.freePageLocked(allocator, page);
         self.clock_hand = 0;
         self.pages.clearRetainingCapacity();
-        self.total_bytes = 0;
     }
 
     fn clearLinksLocked(self: *PageCache, allocator: Allocator) void {
@@ -1906,6 +1993,8 @@ pub const NativeFile = struct {
     test_value_read_bytes: if (builtin.is_test) std.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
     test_value_read_calls: if (builtin.is_test) std.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
     test_page_reads: if (builtin.is_test) std.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
+    test_index_view_hits: if (builtin.is_test) std.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
+    test_index_comparisons: if (builtin.is_test) std.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
     test_page_writes: if (builtin.is_test) std.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
 
     test_page_write_calls: if (builtin.is_test) std.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
@@ -3833,8 +3922,15 @@ pub const NativeFile = struct {
         var depth: usize = 0;
         while (page_id != 0) : (depth += 1) {
             if (depth > 64) return error.InvalidDocumentIndex;
+            if (page_id >= checkpoint.page_count) return error.InvalidPageId;
+            if (try self.probeCachedDocumentIndex(page_id, checkpoint, key, &view)) |probe| {
+                if (builtin.is_test) _ = self.test_page_reads.fetchAdd(1, .monotonic);
+                if (probe.leaf) return probe.page;
+                page_id = probe.page orelse return error.InvalidDocumentIndex;
+                continue;
+            }
             const raw = try decodePagePayload(try self.readPageInto(page_id, checkpoint, &scratch), .document_index);
-            const probe = probeDocumentIndexNode(raw, key) catch |err| switch (err) {
+            const probe = (try self.probeCachedDocumentIndex(page_id, checkpoint, key, &view)) orelse (probeDocumentIndexNode(raw, key) catch |err| switch (err) {
                 error.ExternalIndexKey => blk: {
                     try view.decode(self.allocator, raw);
                     const low = try view.bound(self, checkpoint, key, view.kind == .internal);
@@ -3845,11 +3941,35 @@ pub const NativeFile = struct {
                     break :blk IndexProbe{ .leaf = false, .page = view.pointer(low) };
                 },
                 else => return err,
-            };
+            });
             if (probe.leaf) return probe.page;
             page_id = probe.page orelse return error.InvalidDocumentIndex;
         }
         return null;
+    }
+
+    fn probeCachedDocumentIndex(self: *NativeFile, page_id: u64, checkpoint: CheckpointSlot, key: []const u8, scratch: *IndexReadFrame) !?IndexProbe {
+        if (!self.page_cache_enabled.load(.monotonic) or self.page_cache_bypass.load(.monotonic) != 0) return null;
+        const cached = (try self.page_cache.acquireIndex(self.allocator, page_id)) orelse return null;
+        defer self.page_cache.releaseIndex(self.allocator, cached);
+        if (builtin.is_test) _ = self.test_index_view_hits.fetchAdd(1, .monotonic);
+        // Only the caller's overflow scratch is mutable. The pin protects raw
+        // bytes and offsets across eviction, replacement, and recursive reads.
+        var view = cached.frame;
+        view.overflow = scratch.overflow;
+        view.overflow_reference = scratch.overflow_reference;
+        view.overflow_key = scratch.overflow_key;
+        defer {
+            scratch.overflow = view.overflow;
+            scratch.overflow_reference = view.overflow_reference;
+            scratch.overflow_key = view.overflow_key;
+        }
+        const low = try view.bound(self, checkpoint, key, view.kind == .internal);
+        if (view.kind == .leaf) {
+            const matches = low < view.offsets.items.len and std.mem.eql(u8, try view.key(self, checkpoint, low), key);
+            return .{ .leaf = true, .page = if (matches) view.pointer(low) else null };
+        }
+        return .{ .leaf = false, .page = view.pointer(low) };
     }
 
     pub fn documentValueAtIndexEntryAlloc(self: *NativeFile, allocator: Allocator, checkpoint: CheckpointSlot, indexed: DocumentIndexEntry) !?[]u8 {
@@ -8956,7 +9076,7 @@ test "lite native unchanged small index records do not publish checkpoints" {
     try std.testing.expectError(error.ReadOnly, reader.putIndexCatalogRecord("control", "other"));
 }
 
-test "lite native catalog point lookups skip history without allocating" {
+test "lite native warm catalog point lookups skip history without allocating" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -8969,6 +9089,11 @@ test "lite native catalog point lookups skip history without allocating" {
     for (0..32) |i| try file.putIndexCatalogRecord("noise", std.mem.asBytes(&i));
     try file.putIndexCatalogRecord("deleted", "value");
     try file.deleteIndexCatalogRecord("deleted");
+
+    // Cold admission builds the retained slot view once. Warm probes must
+    // allocate neither traversal scratch nor another decoded key array.
+    _ = try file.getCatalogRecordSizeFromRootAtCheckpoint(.index, "target", file.activeCheckpoint());
+    _ = try file.getCatalogRecordSizeFromRootAtCheckpoint(.index, "target", pinned);
 
     var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
     file.allocator = failing.allocator();
@@ -13261,4 +13386,208 @@ test "lite grouped snapshots preserve allocator ownership pinned values and mixe
         try std.testing.expectEqual(@as(usize, 1), current.len);
         try std.testing.expectEqualStrings("new", current[0].value);
     }
+}
+
+test "lite validated index views bound warm point work and preserve checkpoint results" {
+    const a = std.testing.allocator;
+    for ([_]bool{ true, false }) |packed_records| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try testPath(a, tmp, "validated-views.aflite");
+        defer a.free(path);
+        var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+        defer file.close();
+        file.header.packed_records = packed_records;
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const count = 4096;
+        const batch = try arena.allocator().alloc(DocumentMutation, count);
+        for (batch, 0..) |*m, i| m.* = .{ .key = try std.fmt.allocPrint(arena.allocator(), "key-{d:0>8}", .{i}), .value = "old" };
+        try file.putDocumentBatch(batch);
+        const checkpoint = file.activeCheckpoint();
+        const references = try a.alloc(?u64, count);
+        defer a.free(references);
+        file.page_cache_enabled.store(false, .monotonic);
+        for (batch, references) |m, *reference| reference.* = try file.lookupDocumentIndexPage(checkpoint, m.key);
+        file.page_cache_enabled.store(true, .monotonic);
+        for (batch, references) |m, reference| try std.testing.expectEqual(reference, try file.lookupDocumentIndexPage(checkpoint, m.key));
+        const hits = file.test_index_view_hits.load(.monotonic);
+        const comparisons = file.test_index_comparisons.load(.monotonic);
+        for (0..count) |i| {
+            const index = (i * 4051) % count;
+            try std.testing.expectEqual(references[index], try file.lookupDocumentIndexPage(checkpoint, batch[index].key));
+        }
+        try std.testing.expect(file.test_index_view_hits.load(.monotonic) - hits >= count * 2);
+        try std.testing.expect(file.test_index_comparisons.load(.monotonic) - comparisons < count * 24);
+        try std.testing.expectEqual(@as(?u64, null), try file.lookupDocumentIndexPage(checkpoint, "absent"));
+        var invalid_checkpoint = checkpoint;
+        invalid_checkpoint.page_count = checkpoint.document_index_root_page;
+        try std.testing.expectError(error.InvalidPageId, file.lookupDocumentIndexPage(invalid_checkpoint, batch[0].key));
+        try file.putDocument(batch[0].key, "new");
+        const old = (try file.getDocumentAtCheckpointAlloc(a, checkpoint, batch[0].key)).?;
+        defer a.free(old);
+        const current = (try file.getDocumentAlloc(a, batch[0].key)).?;
+        defer a.free(current);
+        try std.testing.expectEqualStrings("old", old);
+        try std.testing.expectEqualStrings("new", current);
+        try std.testing.expect((try file.check()).valid);
+    }
+}
+
+test "lite validated index views retain evicted pins and account replacement storage" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "pinned-view.aflite");
+    defer a.free(path);
+    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+    defer file.close();
+    try file.putDocument("key", "value");
+    const checkpoint = file.activeCheckpoint();
+    _ = try file.lookupDocumentIndexPage(checkpoint, "key");
+    const page = checkpoint.document_index_root_page;
+    const view = (try file.page_cache.acquireIndex(a, page)).?;
+    const expected_pointer = view.frame.pointer(0);
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    file.page_cache.attachResourceManager(&manager);
+    // Replacement can happen while an old reader is comparing an overflow
+    // key. The old bytes stay alive and charged after their cache entry leaves.
+    file.page_cache.clear(a);
+    try std.testing.expectEqual(view.size(), file.page_cache.total_bytes);
+    try std.testing.expectEqual(view.size(), manager.sliceStats(.lite_native_page_cache).used_bytes);
+    file.page_cache.put(a, page, view.frame.raw.?);
+    const newer = (try file.page_cache.acquireIndex(a, page)).?;
+    try std.testing.expect(newer != view);
+    try std.testing.expectEqual(expected_pointer, newer.frame.pointer(0));
+    file.page_cache.discardFrom(a, page);
+    try std.testing.expectEqual(view.size() + newer.size(), file.page_cache.total_bytes);
+    file.page_cache.releaseIndex(a, newer);
+    try std.testing.expectEqual(expected_pointer, view.frame.pointer(0));
+    file.page_cache.limit_bytes = view.size();
+    file.page_cache.put(a, page, view.frame.raw.?);
+    try std.testing.expect(!file.page_cache.pages.contains(page));
+    file.page_cache.releaseIndex(a, view);
+    try std.testing.expectEqual(@as(usize, 0), file.page_cache.total_bytes);
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lite_native_page_cache).used_bytes);
+}
+
+test "lite validated index views bypass integrity checks and support overflow keys" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "overflow-view.aflite");
+    defer a.free(path);
+    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+    defer file.close();
+    var key: [600]u8 = @splat('x');
+    var other: [600]u8 = @splat('y');
+    try file.putDocumentBatch(&.{ .{ .key = &key, .value = "one" }, .{ .key = &other, .value = "two" } });
+    for (0..3) |_| {
+        const value = (try file.getDocumentAlloc(a, &other)).?;
+        defer a.free(value);
+        try std.testing.expectEqualStrings("two", value);
+    }
+    const before = file.test_index_view_hits.load(.monotonic);
+    try std.testing.expect(before > 0);
+    const page = file.activeCheckpoint().document_index_root_page;
+    try file.file.writePositionalAll(file.runtimeIo(), "X", page * default_page_size + page_header_size);
+    const report = try file.check();
+    try std.testing.expect(!report.valid);
+    try std.testing.expectEqualStrings("page_checksum_mismatch", report.issue.?);
+    try std.testing.expectEqual(before, file.test_index_view_hits.load(.monotonic));
+    _ = file.page_cache_bypass.fetchAdd(1, .monotonic);
+    defer _ = file.page_cache_bypass.fetchSub(1, .monotonic);
+    try std.testing.expectError(error.NativePageChecksumMismatch, file.lookupDocumentIndexPage(file.activeCheckpoint(), &other));
+}
+
+test "lite validated index views survive concurrent overflow reads and eviction" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "concurrent-views.aflite");
+    defer a.free(path);
+    var file = try NativeFile.create(a, path);
+    defer file.close();
+    var key: [600]u8 = @splat('x');
+    try file.putDocument(&key, "value");
+    const Runner = struct {
+        fn run(f: *NativeFile, k: []const u8, failed: *std.atomic.Value(bool)) void {
+            for (0..200) |_| {
+                const value = f.getDocumentAlloc(f.allocator, k) catch {
+                    failed.store(true, .monotonic);
+                    return;
+                };
+                if (value) |bytes| {
+                    defer f.allocator.free(bytes);
+                    if (!std.mem.eql(u8, bytes, "value")) failed.store(true, .monotonic);
+                } else failed.store(true, .monotonic);
+            }
+        }
+    };
+    var failed = std.atomic.Value(bool).init(false);
+    var threads: [4]std.Thread = undefined;
+    var started: usize = 0;
+    defer for (threads[0..started]) |thread| thread.join();
+    for (&threads) |*thread| {
+        thread.* = try std.Thread.spawn(.{}, Runner.run, .{ &file, &key, &failed });
+        started += 1;
+    }
+    for (0..200) |_| file.page_cache.clear(a);
+    for (threads[0..started]) |thread| thread.join();
+    started = 0;
+    try std.testing.expect(!failed.load(.monotonic));
+    file.page_cache.clear(a);
+    try std.testing.expectEqual(@as(usize, 0), file.page_cache.total_bytes);
+}
+
+test "lite validated index view admission handles every allocation failure" {
+    const a = std.testing.allocator;
+    var keys = [_][]u8{@constCast("key")};
+    var pointers = [_]u64{7};
+    const payload = try encodeDocumentIndexNode(a, .{ .kind = .leaf, .keys = &keys, .pointers = &pointers });
+    defer a.free(payload);
+    var raw: [4096]u8 = undefined;
+    encodePage(&raw, .document_index, payload);
+    const Runner = struct {
+        fn run(allocator: Allocator, page: []const u8) !void {
+            var cache = PageCache{};
+            defer cache.deinit(allocator);
+            cache.put(allocator, 1, page);
+            // Admission is best effort in production. Report a skipped
+            // admission to the failure-sweep harness after checking cleanup.
+            const view = (try cache.acquireIndex(allocator, 1)) orelse return error.OutOfMemory;
+            defer cache.releaseIndex(allocator, view);
+            cache.remove(allocator, 1);
+            try std.testing.expectEqual(@as(u64, 7), view.frame.pointer(0));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Runner.run, .{&raw});
+}
+
+test "lite validated index views release residency under shared hard pressure" {
+    const a = std.testing.allocator;
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.lite_native_page_cache)] = .{ .soft_limit_bytes = 8192, .hard_limit_bytes = 16384 };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "view-pressure.aflite");
+    defer a.free(path);
+    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true, .resource_manager = &manager });
+    defer file.close();
+    try file.putDocument("key", "value");
+    const checkpoint = file.activeCheckpoint();
+    const expected = try file.lookupDocumentIndexPage(checkpoint, "key");
+    const view = (try file.page_cache.acquireIndex(a, checkpoint.document_index_root_page)).?;
+    var external: u64 = 0;
+    manager.observeUsage(.lite_native_page_cache, &external, 32768);
+    defer manager.observeUsage(.lite_native_page_cache, &external, 0);
+    try std.testing.expectEqual(@as(?*PageCache.IndexView, null), try file.page_cache.acquireIndex(a, checkpoint.document_index_root_page));
+    try std.testing.expectEqual(view.size(), file.page_cache.total_bytes);
+    try std.testing.expectEqual(expected.?, view.frame.pointer(0));
+    try std.testing.expectEqual(expected, try file.lookupDocumentIndexPage(checkpoint, "key"));
+    try std.testing.expectEqual(view.size() + external, manager.sliceStats(.lite_native_page_cache).used_bytes);
+    file.page_cache.releaseIndex(a, view);
+    try std.testing.expectEqual(external, manager.sliceStats(.lite_native_page_cache).used_bytes);
 }
