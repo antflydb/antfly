@@ -119,6 +119,35 @@ fn resolverConsumesArtifact(resolvers: []const ResolverConfig, source_artifact_k
     return resolverForArtifactKind(resolvers, source_artifact_kind, artifact_name) != null;
 }
 
+/// Labels claimed by sibling resolvers on the same source artifact. A
+/// catch-all resolver (empty `labels`) must skip these so each mention is
+/// resolved exactly once while extraction labels stay open-vocabulary. Only
+/// the returned outer slice is allocated (label strings are borrowed from the
+/// sibling configs); free it with `gpa`. Labeled resolvers need no exclusions
+/// (admission keeps sibling label sets disjoint), so this returns empty for
+/// them without allocating.
+fn siblingClaimedLabelsAlloc(
+    gpa: std.mem.Allocator,
+    resolvers: []const ResolverConfig,
+    cfg: *const ResolverConfig,
+) ![]const []const u8 {
+    if (cfg.labels.len > 0) return &.{};
+    var claimed = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer claimed.deinit(gpa);
+    for (resolvers) |*sibling| {
+        if (sibling == cfg) continue;
+        if (!std.mem.eql(u8, sibling.source_artifact, cfg.source_artifact)) continue;
+        if (!sibling.source_artifact_kind.matches(cfg.source_artifact_kind) and
+            !cfg.source_artifact_kind.matches(sibling.source_artifact_kind)) continue;
+        for (sibling.labels) |label| try claimed.append(gpa, label);
+    }
+    return try claimed.toOwnedSlice(gpa);
+}
+
+fn freeSiblingClaimedLabels(gpa: std.mem.Allocator, labels: []const []const u8) void {
+    if (labels.len > 0) gpa.free(labels);
+}
+
 const ParsedSourceArtifactKey = struct {
     doc_key: []u8,
     artifact_name: []u8,
@@ -182,11 +211,14 @@ pub fn resolveExtraction(
     candidates: []const []const resolver_lib.Candidate,
 ) !?ResolutionOutput {
     const cfg = resolverForArtifact(resolvers, artifact_name) orelse return null;
+    const sibling_excludes = try siblingClaimedLabelsAlloc(gpa, resolvers, cfg);
+    defer freeSiblingClaimedLabels(gpa, sibling_excludes);
 
     var resolver = try resolver_lib.Resolver.initFromParts(
         gpa,
         cfg.table,
         cfg.key_template,
+        .{ .labels = cfg.labels, .exclude_labels = sibling_excludes },
         cfg.type_must_match,
         cfg.scorer_json,
     );
@@ -194,6 +226,7 @@ pub fn resolveExtraction(
 
     var parsed = try resolver_lib.parseExtractionEntities(gpa, extraction_bytes);
     defer parsed.deinit();
+    parsed.entities = resolver.filterEntitiesByLabel(parsed.entities);
 
     var resolution = try resolver.resolve(gpa, cfg.config_generation, parsed.entities, candidates);
     defer resolution.deinit();
@@ -233,11 +266,12 @@ pub fn processChangedExtraction(
     defer parsed.deinit(gpa);
 
     const cfg = resolverForArtifactKind(resolvers, parsed.source_artifact_kind, parsed.artifact_name) orelse return null;
-    return try processChangedExtractionWithConfig(gpa, cfg, store, provider, changed_key, candidate_source, embedder, .immediate);
+    return try processChangedExtractionWithConfig(gpa, resolvers, cfg, store, provider, changed_key, candidate_source, embedder, .immediate);
 }
 
 fn processChangedExtractionWithConfig(
     gpa: std.mem.Allocator,
+    resolvers: []const ResolverConfig,
     cfg: *const ResolverConfig,
     store: resolver_lib.ArtifactStore,
     provider: ?resolver_lib.CandidateProvider,
@@ -254,10 +288,13 @@ fn processChangedExtractionWithConfig(
     defer if (candidate_batch) |batch| batch.deinit(gpa);
     const batch_source = if (candidate_batch) |batch| batch.source else null;
 
+    const sibling_excludes = try siblingClaimedLabelsAlloc(gpa, resolvers, cfg);
+    defer freeSiblingClaimedLabels(gpa, sibling_excludes);
     var resolver = try resolver_lib.Resolver.initFromParts(
         gpa,
         cfg.table,
         cfg.key_template,
+        .{ .labels = cfg.labels, .exclude_labels = sibling_excludes },
         cfg.type_must_match,
         cfg.scorer_json,
     );
@@ -394,7 +431,7 @@ fn processChangedExtractionForAllResolvers(
     var processed: usize = 0;
     for (resolvers) |*cfg| {
         if (!resolverMatchesArtifact(cfg, parsed.source_artifact_kind, parsed.artifact_name)) continue;
-        const outcome = (try processChangedExtractionWithConfig(gpa, cfg, store, provider, changed_key, candidate_source, embedder, .deferred)) orelse continue;
+        const outcome = (try processChangedExtractionWithConfig(gpa, resolvers, cfg, store, provider, changed_key, candidate_source, embedder, .deferred)) orelse continue;
         processed += 1;
         switch (outcome.result) {
             .written => {
@@ -3735,7 +3772,7 @@ test "SourceCandidateProvider bulk exact keys retain duplicates missing candidat
         }
     };
     var fake: Bulk = .{};
-    var resolver = try resolver_lib.Resolver.initFromParts(alloc, "entities", "{{ lower _entity.label }}/{{ slug _entity.text }}", false, "");
+    var resolver = try resolver_lib.Resolver.initFromParts(alloc, "entities", "{{ lower _entity.label }}/{{ slug _entity.text }}", .{}, false, "");
     defer resolver.deinit();
     var provider = SourceCandidateProvider{
         .source = .{ .ptr = &fake, .vtable = &.{ .get = Bulk.get, .get_many = Bulk.getMany } },
@@ -3947,7 +3984,7 @@ test "SourceCandidateProvider shares prefix scans and negatively caches redirect
         }
     };
     var fake = Fake{};
-    var resolver = try resolver_lib.Resolver.initFromParts(alloc, "entities", "{{ lower _entity.label }}/{{ slug _entity.text }}", false, "");
+    var resolver = try resolver_lib.Resolver.initFromParts(alloc, "entities", "{{ lower _entity.label }}/{{ slug _entity.text }}", .{}, false, "");
     defer resolver.deinit();
     var provider = SourceCandidateProvider{ .source = .{ .ptr = &fake, .vtable = &.{ .get = Fake.get, .get_many = Fake.getMany, .scan_prefix = Fake.scan } }, .resolver = &resolver, .table = "entities", .mode = .prefix, .ann_index_name = "", .candidate_limit = 2 };
     const entities = [_]resolver_lib.ExtractedEntity{.{ .local_id = "one", .label = "person", .text = "Ada" }} ** 100;

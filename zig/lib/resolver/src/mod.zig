@@ -159,6 +159,16 @@ pub const Resolver = struct {
     arena: std.heap.ArenaAllocator,
     table: []const u8,
     key_template: []const u8,
+    /// Mention labels this resolver consumes; empty is a catch-all. Lets
+    /// several resolvers partition one extraction artifact by label (e.g.
+    /// `event` mentions to an events table, everything else to entities).
+    labels: []const []const u8,
+    /// Mention labels this resolver must NOT consume. For a catch-all resolver
+    /// sharing a source artifact with labeled siblings, the runtime derives
+    /// this from the siblings' claimed labels so extraction labels stay
+    /// open-vocabulary (unlisted labels fall through to the catch-all instead
+    /// of being dropped).
+    exclude_labels: []const []const u8,
     type_must_match: bool,
     scorer: ?matcher.Scorer,
 
@@ -186,6 +196,25 @@ pub const Resolver = struct {
             if (v == .bool) type_must_match = v.bool;
         }
 
+        var labels: []const []const u8 = &.{};
+        if (obj.get("labels")) |lv| {
+            if (lv != .array) return error.InvalidConfig;
+            const owned = try a.alloc([]const u8, lv.array.items.len);
+            for (lv.array.items, 0..) |item, i| {
+                owned[i] = try a.dupe(u8, jsonString(item) orelse return error.InvalidConfig);
+            }
+            labels = owned;
+        }
+        var exclude_labels: []const []const u8 = &.{};
+        if (obj.get("exclude_labels")) |lv| {
+            if (lv != .array) return error.InvalidConfig;
+            const owned = try a.alloc([]const u8, lv.array.items.len);
+            for (lv.array.items, 0..) |item, i| {
+                owned[i] = try a.dupe(u8, jsonString(item) orelse return error.InvalidConfig);
+            }
+            exclude_labels = owned;
+        }
+
         var scorer: ?matcher.Scorer = null;
         errdefer if (scorer) |*s| s.deinit();
         if (obj.get("scorer")) |sv| {
@@ -196,6 +225,8 @@ pub const Resolver = struct {
             .arena = arena,
             .table = table,
             .key_template = key_template,
+            .labels = labels,
+            .exclude_labels = exclude_labels,
             .type_must_match = type_must_match,
             .scorer = scorer,
         };
@@ -204,10 +235,20 @@ pub const Resolver = struct {
     /// Build a resolver directly from its parts (the durable catalog config),
     /// parsing `scorer_json` if present. An empty `scorer_json` means a purely
     /// deterministic resolver that mints canonical keys from `key_template`.
+    /// Label routing for `initFromParts`: which mention labels this resolver
+    /// consumes (`labels` allowlist, empty = catch-all) and which it must skip
+    /// (`exclude_labels`, typically the labels claimed by sibling resolvers on
+    /// the same source artifact).
+    pub const LabelRouting = struct {
+        labels: []const []const u8 = &.{},
+        exclude_labels: []const []const u8 = &.{},
+    };
+
     pub fn initFromParts(
         gpa: std.mem.Allocator,
         table: []const u8,
         key_template: []const u8,
+        routing: LabelRouting,
         type_must_match: bool,
         scorer_json: []const u8,
     ) !Resolver {
@@ -216,6 +257,18 @@ pub const Resolver = struct {
         const a = arena.allocator();
         const owned_table = try a.dupe(u8, table);
         const owned_template = try a.dupe(u8, key_template);
+        var owned_labels: []const []const u8 = &.{};
+        if (routing.labels.len > 0) {
+            const out = try a.alloc([]const u8, routing.labels.len);
+            for (routing.labels, 0..) |l, i| out[i] = try a.dupe(u8, l);
+            owned_labels = out;
+        }
+        var owned_excludes: []const []const u8 = &.{};
+        if (routing.exclude_labels.len > 0) {
+            const out = try a.alloc([]const u8, routing.exclude_labels.len);
+            for (routing.exclude_labels, 0..) |l, i| out[i] = try a.dupe(u8, l);
+            owned_excludes = out;
+        }
 
         var scorer: ?matcher.Scorer = null;
         errdefer if (scorer) |*s| s.deinit();
@@ -227,9 +280,34 @@ pub const Resolver = struct {
             .arena = arena,
             .table = owned_table,
             .key_template = owned_template,
+            .labels = owned_labels,
+            .exclude_labels = owned_excludes,
             .type_must_match = type_must_match,
             .scorer = scorer,
         };
+    }
+
+    /// Whether this resolver consumes mentions with the given label; exclusions
+    /// win, then an empty `labels` set consumes everything else.
+    pub fn consumesLabel(self: *const Resolver, label: []const u8) bool {
+        for (self.exclude_labels) |l| if (std.mem.eql(u8, l, label)) return false;
+        if (self.labels.len == 0) return true;
+        for (self.labels) |l| if (std.mem.eql(u8, l, label)) return true;
+        return false;
+    }
+
+    /// In-place compaction of `entities` down to the mentions this resolver
+    /// consumes. Returns the kept prefix. Used before candidate blocking so
+    /// filtered mentions never pay for embedding backfill or candidate search.
+    pub fn filterEntitiesByLabel(self: *const Resolver, entities: []ExtractedEntity) []ExtractedEntity {
+        if (self.labels.len == 0 and self.exclude_labels.len == 0) return entities;
+        var kept: usize = 0;
+        for (entities) |entity| {
+            if (!self.consumesLabel(entity.label)) continue;
+            entities[kept] = entity;
+            kept += 1;
+        }
+        return entities[0..kept];
     }
 
     pub fn deinit(self: *Resolver) void {
@@ -464,7 +542,21 @@ fn applyHelper(
         try appendSlug(a, out, value);
         return;
     }
+    if (std.mem.eql(u8, helper, "hash")) {
+        try appendStableHash(a, out, value);
+        return;
+    }
     return error.InvalidTemplate;
+}
+
+/// 16 lowercase hex chars of xxhash64 (fixed seed 0) over the raw value.
+/// Deterministic across replays and platforms so re-extraction of the same
+/// normalized text (e.g. an event sentence) mints the same canonical key.
+fn appendStableHash(a: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
+    const digest = std.hash.XxHash64.hash(0, value);
+    var buf: [16]u8 = undefined;
+    const hex = std.fmt.bufPrint(&buf, "{x:0>16}", .{digest}) catch unreachable;
+    try out.appendSlice(a, hex);
 }
 
 /// lowercased, alphanumeric runs separated by single '_', no leading/trailing
@@ -867,6 +959,12 @@ pub const ResolutionStage = struct {
         var parsed = try parseExtractionEntities(gpa, extraction.?);
         defer parsed.deinit();
 
+        // Label routing: drop mentions this resolver does not consume before
+        // any per-mention work (embedding backfill, candidate blocking). The
+        // sibling resolver that owns those labels resolves them from the same
+        // extraction artifact into its own resolution artifact.
+        parsed.entities = self.resolver.filterEntitiesByLabel(parsed.entities);
+
         // Backfill name embeddings for mentions that arrived without one, using
         // the parse arena so the vectors outlive scoring. Embedding failures are
         // non-fatal: the mention simply scores without a vector.
@@ -956,12 +1054,12 @@ pub const ResolutionStage = struct {
 const testing = std.testing;
 
 test "initFromParts builds a deterministic resolver and one with a scorer" {
-    var deterministic = try Resolver.initFromParts(testing.allocator, "entities", "{{ slug _entity.text }}", true, "");
+    var deterministic = try Resolver.initFromParts(testing.allocator, "entities", "{{ slug _entity.text }}", .{}, true, "");
     defer deterministic.deinit();
     try testing.expectEqualStrings("entities", deterministic.table);
     try testing.expect(deterministic.scorer == null);
 
-    var scored = try Resolver.initFromParts(testing.allocator, "entities", "{{ slug _entity.text }}", false,
+    var scored = try Resolver.initFromParts(testing.allocator, "entities", "{{ slug _entity.text }}", .{}, false,
         \\{ "comparisons": [ { "name": "n", "left": "canonical_text", "right": "canonical_name",
         \\  "levels": [ { "when": "exact", "weight": 8.0 }, { "else": true, "weight": -6.0 } ] } ],
         \\  "combine": { "bias": -3.0 }, "decision": { "match": 0.9 } }
@@ -994,6 +1092,28 @@ test "deterministic resolver mints a canonical key for each entity" {
     try testing.expectEqualStrings("person/ada_lovelace", res.entities[0].doc_ref.key);
     try testing.expectEqual(Decision.new, res.entities[0].decision);
     try testing.expectEqualStrings("org/antfly_inc", res.entities[1].doc_ref.key);
+}
+
+test "hash helper mints a stable event key from normalized text" {
+    var resolver = try Resolver.parse(testing.allocator,
+        \\{ "table": "events", "key_template": "event/{{ hash _entity.text }}" }
+    );
+    defer resolver.deinit();
+
+    const entities = [_]ExtractedEntity{
+        .{ .local_id = "v0", .label = "event", .text = "Ada Lovelace writes the first program" },
+        .{ .local_id = "v1", .label = "event", .text = "Ada Lovelace writes the first program" },
+        .{ .local_id = "v2", .label = "event", .text = "Babbage designs the Analytical Engine" },
+    };
+    var res = try resolver.resolve(testing.allocator, 1, &entities, &[_][]const Candidate{});
+    defer res.deinit();
+
+    try testing.expectEqual(@as(usize, 3), res.entities.len);
+    // "event/" + 16 hex chars, identical text -> identical key, replay-stable.
+    try testing.expectEqual(@as(usize, "event/".len + 16), res.entities[0].doc_ref.key.len);
+    try testing.expect(std.mem.startsWith(u8, res.entities[0].doc_ref.key, "event/"));
+    try testing.expectEqualStrings(res.entities[0].doc_ref.key, res.entities[1].doc_ref.key);
+    try testing.expect(!std.mem.eql(u8, res.entities[0].doc_ref.key, res.entities[2].doc_ref.key));
 }
 
 test "resolver links a mention to a matching candidate" {
@@ -1211,6 +1331,56 @@ test "resolution stage writes, then skips when unchanged" {
     try testing.expectEqualStrings("new", ents[0].object.get("decision").?.string);
 }
 
+test "label-routed resolvers partition one extraction artifact" {
+    // The AutoSchemaKG event/entity split: one artifact carries both event
+    // mentions and entity mentions; an `event`-labeled resolver and a
+    // catch-all... the catch-all consumes everything, so the entity resolver
+    // must not double-resolve events. Partition = event resolver takes
+    // label "event"; the entity resolver lists the entity labels explicitly.
+    const kg_extraction =
+        \\{ "entities": [
+        \\  { "id": "e0", "label": "person", "text": "Ada Lovelace" },
+        \\  { "id": "v0", "label": "event", "text": "Ada Lovelace writes the first program" }
+        \\] }
+    ;
+
+    var event_resolver = try Resolver.parse(testing.allocator,
+        \\{ "table": "events", "key_template": "event/{{ hash _entity.text }}", "labels": ["event"] }
+    );
+    defer event_resolver.deinit();
+    var entity_resolver = try Resolver.parse(testing.allocator,
+        \\{ "table": "entities", "key_template": "{{ lower _entity.label }}/{{ slug _entity.text }}", "labels": ["person", "org"] }
+    );
+    defer entity_resolver.deinit();
+
+    var map = MapStore{ .alloc = testing.allocator };
+    defer map.deinit();
+    try map.store().put("ext:doc1", kg_extraction);
+
+    const event_stage = ResolutionStage{ .resolver = &event_resolver, .config_generation = 1 };
+    const entity_stage = ResolutionStage{ .resolver = &entity_resolver, .config_generation = 1 };
+    try testing.expectEqual(RunResult.written, try event_stage.run(testing.allocator, map.store(), null, "ext:doc1", "res:events"));
+    try testing.expectEqual(RunResult.written, try entity_stage.run(testing.allocator, map.store(), null, "ext:doc1", "res:entities"));
+
+    const events_res = (try map.store().get(testing.allocator, "res:events")).?;
+    defer testing.allocator.free(events_res);
+    var events_parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, events_res, .{});
+    defer events_parsed.deinit();
+    const event_ents = events_parsed.value.object.get("entities").?.array.items;
+    try testing.expectEqual(@as(usize, 1), event_ents.len);
+    try testing.expectEqualStrings("v0", event_ents[0].object.get("local_id").?.string);
+    try testing.expectEqualStrings("events", event_ents[0].object.get("doc_ref").?.object.get("table").?.string);
+
+    const entities_res = (try map.store().get(testing.allocator, "res:entities")).?;
+    defer testing.allocator.free(entities_res);
+    var entities_parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, entities_res, .{});
+    defer entities_parsed.deinit();
+    const entity_ents = entities_parsed.value.object.get("entities").?.array.items;
+    try testing.expectEqual(@as(usize, 1), entity_ents.len);
+    try testing.expectEqualStrings("e0", entity_ents[0].object.get("local_id").?.string);
+    try testing.expectEqualStrings("person/ada_lovelace", entity_ents[0].object.get("doc_ref").?.object.get("key").?.string);
+}
+
 test "resolution stage clears the artifact when the source is gone" {
     var resolver = try Resolver.parse(testing.allocator,
         \\{ "table": "entities", "key_template": "{{ slug _entity.text }}" }
@@ -1311,7 +1481,7 @@ const FixedOverride = struct {
 };
 
 test "a human-curation override replaces the resolver's decision for a mention" {
-    var resolver = try Resolver.initFromParts(testing.allocator, "entities", "{{ slug _entity.text }}", true, "");
+    var resolver = try Resolver.initFromParts(testing.allocator, "entities", "{{ slug _entity.text }}", .{}, true, "");
     defer resolver.deinit();
 
     var map = MapStore{ .alloc = testing.allocator };
@@ -1579,7 +1749,7 @@ test "deterministic resolution skips candidate and embedding IO but retains dest
         }
     };
     var ports: Ports = .{};
-    var resolver = try Resolver.initFromParts(alloc, "entities", "{{ slug _entity.text }}", false, "");
+    var resolver = try Resolver.initFromParts(alloc, "entities", "{{ slug _entity.text }}", .{}, false, "");
     defer resolver.deinit();
     var store = MapStore{ .alloc = alloc };
     defer store.deinit();

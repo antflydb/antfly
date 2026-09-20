@@ -11555,9 +11555,38 @@ pub const IndexManager = struct {
         return existing.eql(cfg);
     }
 
+    fn resolverLabelSetsEqual(a: []const []const u8, b: []const []const u8) bool {
+        if (a.len != b.len) return false;
+        for (a, b) |as, bs| if (!std.mem.eql(u8, as, bs)) return false;
+        return true;
+    }
+
+    /// Label-routing admission: labeled resolvers sharing a source artifact
+    /// must claim disjoint label sets, otherwise the mention partition is
+    /// ambiguous. Catch-alls (empty `labels`) are unrestricted — multiple
+    /// catch-alls per artifact remain admitted for compatibility with
+    /// intentional double-resolution setups, and each catch-all skips the
+    /// labels claimed by labeled siblings at runtime. Caller holds the
+    /// catalog mutex.
+    fn resolverLabelRoutingConflicts(self: *const IndexManager, cfg: resolver_catalog.ResolverConfig) bool {
+        if (cfg.labels.len == 0) return false;
+        for (self.resolvers.items) |entry| {
+            if (std.mem.eql(u8, entry.name, cfg.name)) continue;
+            if (entry.labels.len == 0) continue;
+            if (!std.mem.eql(u8, entry.source_artifact, cfg.source_artifact)) continue;
+            if (!entry.source_artifact_kind.matches(cfg.source_artifact_kind) and
+                !cfg.source_artifact_kind.matches(entry.source_artifact_kind)) continue;
+            for (entry.labels) |claimed| {
+                if (cfg.resolvesLabel(claimed)) return true;
+            }
+        }
+        return false;
+    }
+
     fn resolverMaterialConfigChanged(existing: resolver_catalog.ResolverConfig, next: resolver_catalog.ResolverConfig) bool {
         return !std.mem.eql(u8, existing.table, next.table) or
             !std.mem.eql(u8, existing.key_template, next.key_template) or
+            !resolverLabelSetsEqual(existing.labels, next.labels) or
             existing.type_must_match != next.type_must_match or
             !std.mem.eql(u8, existing.scorer_json, next.scorer_json) or
             !std.mem.eql(u8, existing.candidate_search, next.candidate_search) or
@@ -11577,6 +11606,7 @@ pub const IndexManager = struct {
         defer self.catalog_mutex.unlockExclusive();
         if (self.getResolver(cfg.name) != null) return error.ResolverAlreadyExists;
         if (self.resolverResolutionArtifactInUse(cfg.resolution_artifact, null)) return error.ResolverArtifactAlreadyExists;
+        if (self.resolverLabelRoutingConflicts(cfg)) return error.ResolverLabelRoutingConflict;
 
         const checkpoint = self.resolvers.items.len;
         errdefer self.truncateResolvers(checkpoint);
@@ -11598,6 +11628,7 @@ pub const IndexManager = struct {
             if (entry.source_artifact_kind != cfg.source_artifact_kind) return error.ResolverSourceArtifactImmutable;
             if (!std.mem.eql(u8, entry.resolution_artifact, cfg.resolution_artifact)) return error.ResolverArtifactImmutable;
             if (self.resolverResolutionArtifactInUse(cfg.resolution_artifact, cfg.name)) return error.ResolverArtifactAlreadyExists;
+            if (self.resolverLabelRoutingConflicts(cfg)) return error.ResolverLabelRoutingConflict;
             const material_changed = resolverMaterialConfigChanged(entry.*, cfg);
             var previous = entry.*;
             entry.* = try resolver_catalog.ResolverConfig.clone(self.alloc, cfg);
@@ -11610,6 +11641,7 @@ pub const IndexManager = struct {
             return if (material_changed) .updated_backfill_required else .updated_no_backfill;
         }
         if (self.resolverResolutionArtifactInUse(cfg.resolution_artifact, null)) return error.ResolverArtifactAlreadyExists;
+        if (self.resolverLabelRoutingConflicts(cfg)) return error.ResolverLabelRoutingConflict;
         const checkpoint = self.resolvers.items.len;
         errdefer self.truncateResolvers(checkpoint);
         try self.resolvers.append(self.alloc, try resolver_catalog.ResolverConfig.clone(self.alloc, cfg));

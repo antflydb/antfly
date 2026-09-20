@@ -423,6 +423,11 @@ fn edgeTypeFieldValueMatches(field: []const u8, value: std.json.Value) bool {
 }
 
 fn graphResolverFieldValueMatches(field: []const u8, value: std.json.Value) bool {
+    if (std.mem.eql(u8, field, "labels")) {
+        if (value != .array) return false;
+        for (value.array.items) |item| if (!isNonEmptyString(item)) return false;
+        return true;
+    }
     if (std.mem.eql(u8, field, "type_must_match")) return isBool(value);
     if (std.mem.eql(u8, field, "candidate_limit") or
         std.mem.eql(u8, field, "name_embedding_dims") or
@@ -599,6 +604,7 @@ pub fn isAllowedGraphResolverField(field: []const u8) bool {
         std.mem.eql(u8, field, "source_artifact_kind") or
         std.mem.eql(u8, field, "resolution_artifact") or
         std.mem.eql(u8, field, "key_template") or
+        std.mem.eql(u8, field, "labels") or
         std.mem.eql(u8, field, "type_must_match") or
         std.mem.eql(u8, field, "scorer_json") or
         std.mem.eql(u8, field, "candidate_search") or

@@ -284,6 +284,17 @@ components:
           default: asset
         resolution_artifact: { type: string }
         key_template: { type: string }
+        labels:
+          type: array
+          items: { type: string }
+          description: >-
+            Mention labels this resolver consumes; empty consumes every label
+            (catch-all). Labeled resolvers sharing a source artifact must claim
+            disjoint label sets, and every catch-all on that artifact skips the
+            labels claimed by labeled siblings, so extraction labels stay
+            open-vocabulary while each mention routes to exactly one labeled
+            resolver (label-routed tables, e.g. event mentions to an events
+            table).
         type_must_match: { type: boolean, default: true }
         scorer_json: { type: string }
         candidate_search:
