@@ -132,9 +132,10 @@ The implementation now consists of:
   references against the new generation; integrity checks prove that the
   referenced records remain reachable in the checkpoint. Updates retain encoded
   key references and resolve only comparison keys, including during splits.
-  A transaction-local tree editor decodes each visited node once and writes
-  each surviving changed node once at commit, avoiding intermediate tree
-  versions during catalog and document batches.
+  A transaction-local tree editor shares changed paths across catalog and
+  document batches. Sorted batches seal and release completed subtrees, keeping
+  the active frontier and adjacent rebalance siblings. Unsorted batches retain
+  their touched nodes until finalization. All pages remain private until commit.
   Deleting a catalog key removes it from the current tree using copy-on-write
   merging and redistribution. Historical records and older checkpoint roots
   remain intact, but retired filenames no longer accumulate directory-scan
@@ -1119,9 +1120,11 @@ four frontier slots are occupied flushes private state without publishing or
 ending the transaction. These changes retain
 the revision-3 encoding and immutable checkpoint semantics.
 An already assembled large batch is consumed synchronously from the caller's
-buffers with one index edit, avoiding another owned staging copy. Its existing
-batch editor uses scratch proportional to the supplied batch; the 1,024-key /
-1 MiB bounds apply to mutations retained across calls.
+buffers with one index edit, avoiding another owned staging copy. Sorted updates
+retain a bounded tree frontier, including deletion-rebalance neighbors, rather
+than every touched node. Unsorted edits and initial document-index construction
+still use scratch proportional to the batch; the 1,024-key / 1 MiB bounds apply
+to mutations retained across calls.
 Reaching either staging limit flushes privately without ending the transaction;
 abort discards all flushed and pending changes together.
 
@@ -1312,3 +1315,28 @@ heap, down from 255 reads, 49,881 allocations, and 1,402,790 bytes. Legacy
 namespace directories retain their existing fallback. Regressions cover
 allocation bounds, dense and sparse overflow reads, packed and unpacked v3
 records, pinned roots, malformed pages, and allocation-failure recovery.
+
+Integrity coverage scans the index once and walks history newest first. It stores
+hash buckets of record references, resolving every candidate collision with a
+complete key comparison, and requires each indexed reference to name the newest
+record for its key. Missing live keys, stale references, extra entries, and
+legacy tombstone references retain their existing validation rules. History,
+namespace-link, and leaf-record audits reuse packed-page readers while checks
+continue bypassing the page cache to validate on-disk checksums.
+
+With caching disabled and 16,384 short-key documents, complete integrity checks
+use 1,279 logical reads instead of 98,811. With 16,384 distinct namespaces, they
+use 2,127 instead of 164,780. Neither workload performs per-record point probes.
+These bounds describe the packed, ordered fixtures; overwritten or physically
+scattered history can require additional record reads for exact comparisons.
+
+Sorted document updates use 98,923 bytes of peak temporary native heap at 16,384
+documents, 209,341 at 65,536, and 210,033 at 131,072, down from 3,274,182,
+14,251,272, and 26,493,930 respectively. Caller-owned input is excluded. Per-node
+ownership, geometric reclamation of dead arena allocations, and retention of
+rebalance neighbors keep update and delete scratch tied to the frontier.
+Private pages are flushed before a rebalance rereads them; ordinary frontier
+advances preserve packed-record filling and buffered writes. Regressions cover
+sparse-write bounds, multi-level deletion, mixed inline/overflow keys, duplicate
+mutations, pinned roots, packed/unpacked v3, collision handling, allocation
+failures, and rollback after partial writes.
