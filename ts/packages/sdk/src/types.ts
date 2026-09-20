@@ -456,6 +456,8 @@ export type AgentStep = components["schemas"]["AgentStep"];
 export type AgentStepKind = components["schemas"]["AgentStepKind"];
 export type AgentStepStatus = components["schemas"]["AgentStepStatus"];
 export type WebSearchConfig = components["schemas"]["WebSearchConfig"];
+export type WebSearchProviderConfig = components["schemas"]["WebSearchProviderConfig"];
+export type ExaSearchConfig = components["schemas"]["ExaSearchConfig"];
 export type FetchConfig = components["schemas"]["FetchConfig"];
 
 // Eval types

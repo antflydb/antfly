@@ -261,6 +261,20 @@ pub fn addOpenApiSourceSteps(
             .{ "../ai/extraction.yaml", "antfly_extraction_openapi" },
         }),
         addGeneratedModule(b, openapi_build, openapi_codegen, b.path("specs/openai-openapi.yaml"), "openai_api", antfly_generated_root ++ "/openai_api", "types", &.{}),
+        .{
+            .directory = openapi_build.addGeneratedDirectory(b, .{
+                .compiler = openapi_codegen,
+                .scripts_root = b.path("../scripts"),
+                .spec = b.path("specs/exa-openapi.yaml"),
+                .package_name = "exa_api",
+                .generate = "types",
+                .schema_aliases = &.{
+                    .{ "SearchRequest", "/paths/~1search/post/requestBody/content/application~1json/schema" },
+                    .{ "SearchResponse", "/components/responses/SearchResponse/content/application~1json/schema" },
+                },
+            }),
+            .destination = antfly_generated_root ++ "/exa_api",
+        },
     };
 
     // Assemble complete owner trees so removing a module from this inventory
@@ -321,6 +335,7 @@ pub const CommittedModules = struct {
     generating_api: *std.Build.Module,
     extraction: *std.Build.Module,
     openai_api: *std.Build.Module,
+    exa_api: *std.Build.Module,
 };
 
 fn committedModule(b: *std.Build, options: CommittedOptions, name: []const u8, httpx: bool) *std.Build.Module {
@@ -428,6 +443,7 @@ pub fn createCommittedModules(b: *std.Build, options: CommittedOptions) Committe
     common_openapi_mod.addImport("antfly_inference_config_openapi", inference_config_openapi_mod);
 
     const openai_api_mod = committedModule(b, options, "openai_api", true);
+    const exa_api_mod = committedModule(b, options, "exa_api", true);
     public_openapi_mod.addImport("antfly-json", options.json);
     client_openapi_mod.addImport("antfly-json", options.json);
     metadata_openapi_mod.addImport("antfly-json", options.json);
@@ -461,5 +477,6 @@ pub fn createCommittedModules(b: *std.Build, options: CommittedOptions) Committe
         .generating_api = generating_api_openapi_mod,
         .extraction = extraction_openapi_mod,
         .openai_api = openai_api_mod,
+        .exa_api = exa_api_mod,
     };
 }

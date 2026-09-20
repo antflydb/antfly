@@ -77,6 +77,7 @@ from .bool_field_query import BoolFieldQuery
 from .boolean_query import BooleanQuery
 from .brave_search_config import BraveSearchConfig
 from .brave_search_config_freshness import BraveSearchConfigFreshness
+from .brave_search_config_provider import BraveSearchConfigProvider
 from .calendar_interval import CalendarInterval
 from .capability import Capability
 from .cardinality_mode import CardinalityMode
@@ -265,6 +266,7 @@ from .evaluator_name import EvaluatorName
 from .evaluator_score import EvaluatorScore
 from .evaluator_score_metadata import EvaluatorScoreMetadata
 from .exa_search_config import ExaSearchConfig
+from .exa_search_config_provider import ExaSearchConfigProvider
 from .exa_search_config_search_type import ExaSearchConfigSearchType
 from .exact_sort_error import ExactSortError
 from .exact_sort_error_error import ExactSortErrorError
@@ -893,6 +895,7 @@ from .linear_merge_result import LinearMergeResult
 from .linkup_search_config import LinkupSearchConfig
 from .linkup_search_config_depth import LinkupSearchConfigDepth
 from .linkup_search_config_output_type import LinkupSearchConfigOutputType
+from .linkup_search_config_provider import LinkupSearchConfigProvider
 from .list_document_artifact_manifests_detail import ListDocumentArtifactManifestsDetail
 from .list_restore_jobs_phase import ListRestoreJobsPhase
 from .list_restore_jobs_scope import ListRestoreJobsScope
@@ -1114,6 +1117,7 @@ from .secret_store_status import SecretStoreStatus
 from .secret_write_request import SecretWriteRequest
 from .semantic_query_mode import SemanticQueryMode
 from .serper_search_config import SerperSearchConfig
+from .serper_search_config_provider import SerperSearchConfigProvider
 from .serper_search_config_search_type import SerperSearchConfigSearchType
 from .serper_search_config_time_period import SerperSearchConfigTimePeriod
 from .set_row_filter_body import SetRowFilterBody
@@ -1188,6 +1192,7 @@ from .table_storage_unreadable_error import TableStorageUnreadableError
 from .table_storage_unreadable_error_code import TableStorageUnreadableErrorCode
 from .tablespace_catalog_record import TablespaceCatalogRecord
 from .tavily_search_config import TavilySearchConfig
+from .tavily_search_config_provider import TavilySearchConfigProvider
 from .tavily_search_config_search_depth import TavilySearchConfigSearchDepth
 from .template_field_mapping import TemplateFieldMapping
 from .template_field_mapping_missing_null_policy import TemplateFieldMappingMissingNullPolicy
@@ -1266,12 +1271,14 @@ from .vertex_generator_config_provider import VertexGeneratorConfigProvider
 from .vertex_reranker_config import VertexRerankerConfig
 from .vertex_reranker_config_provider import VertexRerankerConfigProvider
 from .vertex_search_config import VertexSearchConfig
+from .vertex_search_config_provider import VertexSearchConfigProvider
 from .vertex_search_config_service import VertexSearchConfigService
 from .web_search_config import WebSearchConfig
 from .web_search_connection import WebSearchConnection
 from .web_search_provider import WebSearchProvider
 from .wildcard_query import WildcardQuery
 from .you_search_config import YouSearchConfig
+from .you_search_config_provider import YouSearchConfigProvider
 
 __all__ = (
     "AdvanceTableStorageMigrationBody",
@@ -1351,6 +1358,7 @@ __all__ = (
     "BoolFieldQuery",
     "BraveSearchConfig",
     "BraveSearchConfigFreshness",
+    "BraveSearchConfigProvider",
     "CalendarInterval",
     "Capability",
     "CardinalityMode",
@@ -1540,6 +1548,7 @@ __all__ = (
     "ExactSortErrorError",
     "ExactSortErrorStatus",
     "ExaSearchConfig",
+    "ExaSearchConfigProvider",
     "ExaSearchConfigSearchType",
     "ExecuteGraphMetricActionAction",
     "ExecuteNamespaceTableGraphMetricActionAction",
@@ -2157,6 +2166,7 @@ __all__ = (
     "LinkupSearchConfig",
     "LinkupSearchConfigDepth",
     "LinkupSearchConfigOutputType",
+    "LinkupSearchConfigProvider",
     "ListDocumentArtifactManifestsDetail",
     "ListRestoreJobsPhase",
     "ListRestoreJobsScope",
@@ -2376,6 +2386,7 @@ __all__ = (
     "SecretWriteRequest",
     "SemanticQueryMode",
     "SerperSearchConfig",
+    "SerperSearchConfigProvider",
     "SerperSearchConfigSearchType",
     "SerperSearchConfigTimePeriod",
     "SetRowFilterBody",
@@ -2450,6 +2461,7 @@ __all__ = (
     "TableStorageUnreadableError",
     "TableStorageUnreadableErrorCode",
     "TavilySearchConfig",
+    "TavilySearchConfigProvider",
     "TavilySearchConfigSearchDepth",
     "TemplateFieldMapping",
     "TemplateFieldMappingMissingNullPolicy",
@@ -2528,10 +2540,12 @@ __all__ = (
     "VertexRerankerConfig",
     "VertexRerankerConfigProvider",
     "VertexSearchConfig",
+    "VertexSearchConfigProvider",
     "VertexSearchConfigService",
     "WebSearchConfig",
     "WebSearchConnection",
     "WebSearchProvider",
     "WildcardQuery",
     "YouSearchConfig",
+    "YouSearchConfigProvider",
 )
