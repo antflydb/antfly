@@ -70,6 +70,7 @@ const distributed_txn = @import("distributed_txn.zig");
 const distributed_txn_contract = @import("distributed_txn_contract.zig");
 const distributed_graph = @import("distributed_graph.zig");
 const retrieval_agent = @import("retrieval_agent.zig");
+const web_search = @import("web_search.zig");
 const generating_runtime = @import("../generating/mod.zig");
 const query_api = @import("query.zig");
 const query_contract = @import("query_contract.zig");
@@ -3367,13 +3368,23 @@ pub const AntflyApiHandler = struct {
         return inferenceInvokeResponse(ctx, &result);
     }
 
+    fn secretFailure(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        return switch (err) {
+            error.Conflict => ctx.status(409).text("secret revision conflict"),
+            error.ResourceRequestTooLarge => ctx.status(413).text("native secret collection limit exceeded"),
+            error.InvalidArgument, error.InvalidSecretKey => ctx.status(400).text("invalid secret request"),
+            error.OutcomeUnknown => ctx.status(503).text("secret write outcome unknown; inspect the committed revision before retrying"),
+            else => ctx.status(503).text("secret source unavailable"),
+        };
+    }
+
     pub fn listSecrets(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = ctx.allocator;
         const listed = if (self.api_server.cfg.secret_store) |secret_store|
-            try secret_store.list(alloc)
+            secret_store.list(alloc) catch |err| return secretFailure(ctx, err)
         else
             try common_secrets.listEnvironmentSecrets(alloc);
         defer common_secrets.freeListedSecrets(alloc, listed);
@@ -3410,7 +3421,7 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(400);
                 return ctx.text("invalid secret key");
             },
-            else => return err,
+            else => return secretFailure(ctx, err),
         };
         defer listed.deinit(alloc);
         return ctx.openApiJson(http_server_mod.makeSecretEntry(listed));
@@ -3428,7 +3439,7 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(503);
             return ctx.text("secret management requires secrets.native");
         }
-        if (!(try secret_store.delete(key))) {
+        if (!(secret_store.delete(key) catch |err| return secretFailure(ctx, err))) {
             _ = ctx.status(404);
             return ctx.text("not found");
         }
@@ -4768,10 +4779,26 @@ pub const AntflyApiHandler = struct {
                         .build_query = buildQuery,
                         .authorize_query = authorizeQuery,
                         .run_query = runQuery,
+                        .prepare_web_search = prepareWebSearch,
+                        .web_search = searchWeb,
                         .scan_key_page = runScanKeyPage,
                         .probe_incoming_edges = probeIncomingEdges,
                     },
                 };
+            }
+
+            fn prepareWebSearch(ptr: *anyopaque, arena: std.mem.Allocator, options: web_search.Options) !web_search.Config {
+                const runner: *@This() = @ptrCast(@alignCast(ptr));
+                return web_search.resolve(arena, runner.server.cfg.node_config, options);
+            }
+
+            fn searchWeb(ptr: *anyopaque, arena: std.mem.Allocator, config: web_search.Config, query: []const u8) ![]const metadata_openapi.QueryHit {
+                const runner: *@This() = @ptrCast(@alignCast(ptr));
+                try runner.request_context.check();
+                var client = httpx.Client.initWithConfig(arena, runner.request_context.io, .{ .retry_policy = .{ .max_retries = 0 } });
+                defer client.deinit();
+                const cancellation = if (runner.request_context.cancellation) |token| httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn) else null;
+                return web_search.search(arena, &client, runner.server.cfg.secret_store, config, query, runner.request_context.deadline_ns orelse (platform_time.monotonicNs() +| config.timeout_ms * std.time.ns_per_ms), cancellation);
             }
 
             fn buildQuery(ptr: *anyopaque, a: std.mem.Allocator, request: metadata_openapi.QueryBuilderRequest, generator: query_builder_agent.GenerationRunner) !metadata_openapi.QueryBuilderResult {

@@ -1675,6 +1675,7 @@ pub fn configureStorageKernelOwnerDb(
     indexes_json: []const u8,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
     antfly_provider: ?managed_embedder.AntflyProvider,
+    secret_store: ?*common_secrets.FileStore,
     remote_content: ?*const scraping.RemoteContentConfig,
     installed: ?*OwnerManagedConfig,
 ) !void {
@@ -1690,7 +1691,7 @@ pub fn configureStorageKernelOwnerDb(
             null,
             null,
             table_name,
-            null,
+            secret_store,
             remote_content,
         );
         _ = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, db, indexes_json, .{
@@ -1739,7 +1740,7 @@ pub fn repairStorageKernelRestoreDb(
     indexes_json: []const u8,
     cancellation: db_mod.types.CancellationToken,
 ) !void {
-    try configureStorageKernelOwnerDb(alloc, db, "", schema_json, indexes_json, null, null, null, null);
+    try configureStorageKernelOwnerDb(alloc, db, "", schema_json, indexes_json, null, null, null, null, null);
     const io = db.backend_runtime.filesystemIo() orelse std.Io.Threaded.global_single_threaded.io();
     var repair_cancellation = db_mod.types.RepairCancellation{ .token = cancellation };
     var attempts: usize = 0;

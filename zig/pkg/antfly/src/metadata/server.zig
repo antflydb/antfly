@@ -209,6 +209,7 @@ pub const MetadataServer = struct {
                 alloc,
                 .{
                     .internal_service_auth_capability = cfg.api_server_cfg.internal_service_auth_capability,
+                    .secret_store = cfg.api_server_cfg.secret_store,
                 },
                 metadata_http_server.AdminSource.fromMetadataHttpService(svc),
             );

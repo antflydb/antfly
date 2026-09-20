@@ -103,6 +103,7 @@ const public_limits = @import("public_limits.zig");
 const query_builder_agent = @import("query_builder_agent.zig");
 const request_admission_policy = @import("request_admission_policy.zig");
 const retrieval_agent = @import("retrieval_agent.zig");
+const web_search = @import("web_search.zig");
 const distributed_graph = @import("distributed_graph.zig");
 const distributed_join = @import("distributed_join.zig");
 const distributed_txn = @import("distributed_txn.zig");
@@ -6975,10 +6976,24 @@ pub const ApiHttpServer = struct {
                         .authorize_query = authorizeQuery,
                         .build_query = buildQuery,
                         .run_query = runQuery,
+                        .prepare_web_search = prepareWebSearch,
+                        .web_search = searchWeb,
                         .scan_key_page = scanKeyPage,
                         .probe_incoming_edges = probeIncomingEdges,
                     },
                 };
+            }
+
+            fn prepareWebSearch(ptr: *anyopaque, arena: std.mem.Allocator, options: web_search.Options) !web_search.Config {
+                const runner: *@This() = @ptrCast(@alignCast(ptr));
+                return web_search.resolve(arena, runner.server.cfg.node_config, options);
+            }
+
+            fn searchWeb(ptr: *anyopaque, arena: std.mem.Allocator, config: web_search.Config, query: []const u8) ![]const metadata_openapi.QueryHit {
+                const runner: *@This() = @ptrCast(@alignCast(ptr));
+                var client = httpx.Client.initWithConfig(arena, runner.server.inferenceIo(), .{ .retry_policy = .{ .max_retries = 0 } });
+                defer client.deinit();
+                return web_search.search(arena, &client, runner.server.cfg.secret_store, config, query, runner.deadline_ns, null);
             }
 
             fn authorizeQuery(
@@ -7227,10 +7242,24 @@ pub const ApiHttpServer = struct {
                     .vtable = &.{
                         .build_query = buildQuery,
                         .run_query = runQuery,
+                        .prepare_web_search = prepareWebSearch,
+                        .web_search = searchWeb,
                         .scan_key_page = scanKeyPage,
                         .probe_incoming_edges = probeIncomingEdges,
                     },
                 };
+            }
+
+            fn prepareWebSearch(ptr: *anyopaque, arena: std.mem.Allocator, options: web_search.Options) !web_search.Config {
+                const runner: *@This() = @ptrCast(@alignCast(ptr));
+                return web_search.resolve(arena, runner.server.cfg.node_config, options);
+            }
+
+            fn searchWeb(ptr: *anyopaque, arena: std.mem.Allocator, config: web_search.Config, query: []const u8) ![]const metadata_openapi.QueryHit {
+                const runner: *@This() = @ptrCast(@alignCast(ptr));
+                var client = httpx.Client.initWithConfig(arena, runner.server.inferenceIo(), .{ .retry_policy = .{ .max_retries = 0 } });
+                defer client.deinit();
+                return web_search.search(arena, &client, runner.server.cfg.secret_store, config, query, runner.deadline_ns, null);
             }
 
             fn buildQuery(ptr: *anyopaque, a: std.mem.Allocator, request: metadata_openapi.QueryBuilderRequest, generator: query_builder_agent.GenerationRunner) !metadata_openapi.QueryBuilderResult {
@@ -22360,6 +22389,7 @@ pub fn makeSecretEntry(listed: common_secrets.ListedSecret) metadata_openapi.Sec
     return .{
         .source = listed.source orelse if (listed.status == .configured_env) "environment" else null,
         .managed = listed.managed,
+        .revision = listed.revision,
         .key = listed.key,
         .status = mapSecretStatus(listed.status),
         .env_var = listed.env_var,

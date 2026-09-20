@@ -4409,4 +4409,3 @@ components:
         total_tokens:
           type: integer
           description: Total tokens used
-

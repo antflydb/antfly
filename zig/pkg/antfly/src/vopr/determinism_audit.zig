@@ -33,6 +33,7 @@ const replayable_sources = [_]Source{
     .{ .path = "vopr/capi_lite_lifecycle.zig", .bytes = @embedFile("capi_lite_lifecycle.zig") },
     .{ .path = "vopr/composed_query.zig", .bytes = @embedFile("composed_query.zig") },
     .{ .path = "vopr/config_extension_lifecycle.zig", .bytes = @embedFile("config_extension_lifecycle.zig") },
+    .{ .path = "vopr/secrets.zig", .bytes = @embedFile("secrets.zig") },
     .{ .path = "vopr/data_server.zig", .bytes = @embedFile("data_server.zig") },
     .{ .path = "vopr/db_index_races.zig", .bytes = @embedFile("db_index_races.zig") },
     .{ .path = "vopr/distributed_query.zig", .bytes = @embedFile("distributed_query.zig") },

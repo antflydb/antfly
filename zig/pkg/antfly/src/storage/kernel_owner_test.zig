@@ -2119,3 +2119,45 @@ test "opaque WAL rejects custom simulation hooks even without a context pointer"
     try std.testing.expectError(error.UnsupportedKernelWalOptions, wal_client.WAL.open("/unused", wal_client.WalOptions{ .clock = .{ .now_ns_fn = Hooks.now, .sleep_ns_fn = Hooks.sleep } }));
     try std.testing.expectError(error.UnsupportedKernelWalOptions, wal_client.WAL.open("/unused", TestWalOptions{ .commit_scheduler = .{ .wait_ns_fn = Hooks.wait } }));
 }
+
+test "opaque metadata secret collection preserves binary ciphertext across owner ABI" {
+    const alloc = std.testing.allocator;
+    const records = @import("../common/secret_record.zig");
+    const collections = @import("../common/secret_collection.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "keyring.json", .data = "{\"active\":\"test\",\"keys\":[{\"id\":\"test\",\"key\":\"1111111111111111111111111111111111111111111111111111111111111111\"}]}" });
+    const keyring_path = try tmp.dir.realPathFileAlloc(std.testing.io, "keyring.json", alloc);
+    defer alloc.free(keyring_path);
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(path);
+    var keys = @import("../common/secret_keyring.zig").Keyring{ .alloc = alloc, .io = std.testing.io, .path = keyring_path };
+    const identity = records.Identity{ .scope = "scope", .key = "token", .revision = 1 };
+    const envelope = try records.seal(alloc, std.testing.io, keys.provider(), identity, "\x00\xff\xfe\x01");
+    defer alloc.free(envelope);
+    var before = try collections.decode(alloc, "scope", null);
+    defer before.deinit(alloc);
+    const collection = try collections.replace(alloc, std.testing.io, "scope", before, "token", envelope);
+    defer alloc.free(collection);
+    // Transition tag 60 contains expected-revision (0) followed by AFSC.
+    const transition = try alloc.alloc(u8, 6 + 4 + 8 + collection.len);
+    defer alloc.free(transition);
+    @memcpy(transition[0..6], "afmd1\x3c");
+    std.mem.writeInt(u32, transition[6..10], @intCast(8 + collection.len), .little);
+    std.mem.writeInt(u64, transition[10..18], 0, .little);
+    @memcpy(transition[18..], collection);
+    const committed = try @import("../raft/state_machine/mod.zig").encodeCommittedEntries(alloc, &.{.{ .term = 1, .index = 1, .entry_type = .normal, .data = transition }});
+    defer alloc.free(committed);
+    var store = try metadata_apply_client.RaftApplyStore.init(alloc, .{ .root_dir = path });
+    defer store.deinit();
+    try std.testing.expect((try store.getSecretCollection(alloc, 91, "scope")) == null);
+    try store.snapshotBuilder().applyBatch(.{ .group_id = 91, .commit_index = 1, .entries_bytes = committed });
+    const recovered = (try store.getSecretCollection(alloc, 91, "scope")).?;
+    defer alloc.free(recovered);
+    try std.testing.expectEqualSlices(u8, collection, recovered);
+    var decoded = try collections.decode(alloc, "scope", recovered);
+    defer decoded.deinit(alloc);
+    var opened = try records.open(alloc, keys.provider(), identity, decoded.entries[0].envelope);
+    defer opened.deinit(alloc);
+    try std.testing.expectEqualSlices(u8, "\x00\xff\xfe\x01", opened.bytes);
+}
