@@ -313,5 +313,8 @@ def test_laya_decision_roundtrip_preserves_boolean_zero_probability():
         "inputs": [{"content": "hello"}],
     }
     response = client_with_transport(lambda _: httpx.Response(200, json=payload)).extract_v2(request)
-    assert response.data[0].decisions[0].true_probability == 0
-    assert response.data[0].decisions[0].to_dict() == decision
+    decisions = response.data[0].decisions
+    assert not isinstance(decisions, Unset)
+    assert len(decisions) == 1
+    assert decisions[0].true_probability == 0
+    assert decisions[0].to_dict() == decision
