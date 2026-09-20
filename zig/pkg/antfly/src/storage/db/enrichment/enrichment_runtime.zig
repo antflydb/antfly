@@ -6358,7 +6358,7 @@ test "chunked dense terminal failure is recorded once per parent request" {
         .{ .request = second_request, .parent_doc_key = "doc:2", .source_field = "body", .artifact_name = "dense_v1", .chunk_key = &third_key, .source_hash = 3 },
     };
 
-    try recordUniqueChunkedDenseRequestErrors(&runtime, null, &items, error.InvalidEmbeddingResponse);
+    try recordUniqueChunkedDenseRequestErrors(&runtime, null, &items, error.InvalidEmbeddingResponse, 1);
 
     try std.testing.expectEqual(@as(usize, 2), failure_capture.count);
     try std.testing.expectEqualStrings("doc:2", failure_capture.failure.?.doc_key);
@@ -6444,6 +6444,7 @@ test "malformed chunked dense batch is isolated without failing the worker" {
     defer window.deinit();
     var malformed = MalformedBatchEmbedder{};
 
+    var scope = FailureScope{};
     const complete = try flushChunkedDenseItems(
         &runtime,
         malformed.interface(),
@@ -6454,6 +6455,7 @@ test "malformed chunked dense batch is isolated without failing the worker" {
         &items,
         &window,
         false,
+        &scope,
     );
 
     try std.testing.expect(!complete);
