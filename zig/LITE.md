@@ -1293,3 +1293,22 @@ temporary native heap instead of 6,451,968 bytes. Regressions cover read and
 heap bounds, repeated mutations in input order, missing namespaces, external
 index keys, pinned checkpoints, and allocation-failure rollback in packed and
 unpacked v3 files.
+
+Read-only index traversals retain validated page views and slot offsets rather
+than copying every inline key. Batch reads, namespace-head resolution, and
+cursors reuse buffers by tree depth; overflow keys are resolved lazily into
+bounded scratch buffers. Sorted batches advance from the previous separator
+and skip larger gaps with a bounded search. Record readers reuse their physical
+page buffers. Returned cursor keys and batch values remain independently owned;
+failed refills invalidate the active cursor path and permit a fresh seek.
+
+With 16,384 short-key documents and caching disabled, a one-key batch uses 13
+allocations instead of 279, a full batch uses 16,396 instead of 33,599, and an
+index cursor scan uses 16,391 instead of 33,385. After warming its traversal
+buffers, each seek allocates only its returned key. A one-document snapshot
+among 16,384 namespaces now resolves its head directly through the namespace
+index: five logical reads, seven allocations, and 4,140 bytes of peak temporary
+heap, down from 255 reads, 49,881 allocations, and 1,402,790 bytes. Legacy
+namespace directories retain their existing fallback. Regressions cover
+allocation bounds, dense and sparse overflow reads, packed and unpacked v3
+records, pinned roots, malformed pages, and allocation-failure recovery.
