@@ -230,12 +230,27 @@ pub const Store = struct {
         var image = try source.prepareVacuum(cancel);
         defer image.deinit();
         image.prepared.no_sync = true;
-        for (0..8) |_| {
+        // Opportunistic rounds: publish only when the writer slot happens to
+        // be free and nothing changed since the last catch-up; otherwise
+        // catch the image up to the captured changes outside every
+        // foreground lock and try again. The final round instead takes its
+        // fair ticketed turn at the writer slot, drains the residual changes
+        // while holding it (no mutation can start in between), and publishes.
+        // Without that, a background writer that is merely busy at each
+        // opportunistic attempt -- for example full-text maintenance after a
+        // burst of writes -- made an explicit vacuum fail with FileBusy on a
+        // slow host even though nothing prevented it from completing.
+        const max_rounds = 8;
+        for (0..max_rounds) |round| {
             if (cancel) |token| try token.check();
+            const final_round = round + 1 == max_rounds;
             // Flush the large copy/catch-up outside foreground locks. Only
             // the final header and rename remain in the publication window.
             if (!self.file.no_sync) try image.prepared.file.sync(io);
-            const reserved = blk: {
+            const reserved = if (final_round) blk: {
+                try self.reserveWriterSlotYielding();
+                break :blk true;
+            } else blk: {
                 self.reserveWriterSlot() catch |err| switch (err) {
                     error.FileBusy => break :blk false,
                     else => return err,
@@ -244,6 +259,10 @@ pub const Store = struct {
             };
             if (reserved) {
                 defer self.releaseWriterSlot();
+                if (final_round and capture.count > 0) {
+                    try self.applyResidualVacuumChanges(&image, &capture, cancel);
+                    if (!self.file.no_sync) try image.prepared.file.sync(io);
+                }
                 self.generation_lock.lockUncancelable(io);
                 defer self.generation_lock.unlock(io);
                 lockStore(self);
@@ -261,22 +280,38 @@ pub const Store = struct {
                     return image.report;
                 }
             }
-            var changes = native.ChangeCapture{};
-            defer changes.deinit(self.allocator);
-            var latest = blk: {
-                lockStore(self);
-                defer self.mutex.unlock();
-                if (capture.overflow) return error.FileBusy;
-                var snapshot = try native.NativeFile.openWithIo(self.allocator, io, self.file.path, .{ .read_only = true, .no_sync = true, .resource_manager = self.resource_manager });
-                snapshot.page_cache_policy = .metadata_only;
-                snapshot.header = self.file.header;
-                std.mem.swap(native.ChangeCapture, &changes, &capture);
-                break :blk snapshot;
-            };
-            defer latest.close();
-            try latest.applyCapturedChanges(&image.prepared, &changes, &image.report, cancel);
+            if (final_round) break;
+            try self.applyResidualVacuumChanges(&image, &capture, cancel);
         }
         return error.FileBusy;
+    }
+
+    /// Catch the prepared vacuum image up to every change captured since the
+    /// last catch-up. Takes the store mutex only to snapshot the live header
+    /// and swap the capture out; the copy itself runs outside foreground
+    /// locks (or, on the final round, while the caller holds the writer slot
+    /// so no further mutation can be captured behind it).
+    fn applyResidualVacuumChanges(
+        self: *Store,
+        image: *native.VacuumImage,
+        capture: *native.ChangeCapture,
+        cancel: ?*const @import("../maintenance.zig").CancelToken,
+    ) !void {
+        const io = self.file.runtime();
+        var changes = native.ChangeCapture{};
+        defer changes.deinit(self.allocator);
+        var latest = blk: {
+            lockStore(self);
+            defer self.mutex.unlock();
+            if (capture.overflow) return error.FileBusy;
+            var snapshot = try native.NativeFile.openWithIo(self.allocator, io, self.file.path, .{ .read_only = true, .no_sync = true, .resource_manager = self.resource_manager });
+            snapshot.page_cache_policy = .metadata_only;
+            snapshot.header = self.file.header;
+            std.mem.swap(native.ChangeCapture, &changes, capture);
+            break :blk snapshot;
+        };
+        defer latest.close();
+        try latest.applyCapturedChanges(&image.prepared, &changes, &image.report, cancel);
     }
 
     /// Publishes an offline, fully finalized store generation while fencing

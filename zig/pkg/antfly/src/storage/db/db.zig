@@ -89788,10 +89788,20 @@ test "db blocked dense embedding lane does not force the independent asset lane 
     // lane, which never completed a batch, has none: this is only true of
     // the per-stream design. Under the historical single shared cursor, no
     // cursor would exist under either scope until *both* lanes published.
-    const assets_cursor = try enrichment_state.loadReplayCursor(alloc, db.enrichment_runtime.?.store, "generated.assets");
-    try std.testing.expect(assets_cursor != null);
-    var owned_assets_cursor = assets_cursor.?;
-    owned_assets_cursor.deinit(alloc);
+    // The producer's success is observed before the lane has flushed its
+    // window and saved the cursor, so wait for the checkpoint itself.
+    var assets_cursor_seen = false;
+    attempts = 0;
+    while (attempts < slow_test_wait_attempts) : (attempts += 1) {
+        if (try enrichment_state.loadReplayCursor(alloc, db.enrichment_runtime.?.store, "generated.assets")) |cursor| {
+            var owned = cursor;
+            owned.deinit(alloc);
+            assets_cursor_seen = true;
+            break;
+        }
+        sleepPollInterval();
+    }
+    try std.testing.expect(assets_cursor_seen);
 
     gated_dense.allowAll();
     try db.runUntilIdle();
