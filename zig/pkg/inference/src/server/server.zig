@@ -8836,6 +8836,52 @@ pub const Node = struct {
         return .{ .allocator = allocator, .json = try allocator.dupe(u8, json) };
     }
 
+    fn tryExtractLayaV2(self: *Node, scratch: std.mem.Allocator, request_json: []const u8, control: ?InferenceExecutionControl, response_limit: ?usize, failure: *extraction_v2.FailureContext) !?[]u8 {
+        try extraction_v2.scanJsonEnvelope(request_json, .{});
+        const parsed = try std.json.parseFromSlice(std.json.Value, scratch, request_json, .{ .duplicate_field_behavior = .@"error" });
+        defer parsed.deinit();
+        if (parsed.value != .object) return null;
+        const name = parsed.value.object.get("model") orelse return null;
+        if (name != .string or name.string.len == 0) return null;
+        var owned_io: ?std.Io.Threaded = null;
+        defer if (owned_io) |*io_impl| io_impl.deinit();
+        const io = self.inferenceIo(scratch, null, &owned_io);
+        const path = self.resolveRequestModelPath(scratch, io, name.string, "extractors") catch |err| switch (err) {
+            error.ModelNotFound => return null,
+            else => return err,
+        };
+        defer scratch.free(path);
+        // A listing load reads architecture sidecars before capabilities. That
+        // would run GLiNER model preflight too early, before its schema checks
+        // and model-stage failure context. Laya imports declare this capability.
+        const is_laya = manifest_mod.hasDeclaredCapability(scratch, path, "typed_decisions") catch |err| {
+            failure.* = .{ .stage = "model" };
+            return err;
+        };
+        if (!is_laya) return null;
+        const laya = @import("../extractors/laya.zig");
+        var arena = std.heap.ArenaAllocator.init(scratch);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        const request = try laya.parse(allocator, parsed.value);
+        const contract = try resolvedInferenceExecutorContractFromDir(self, allocator, path, "extract");
+        try validateLayaExecutorInvocation(allocator, contract, request);
+        const effective = control orelse InferenceExecutionControl{};
+        try effective.check();
+        var handle = try self.model_manager.acquireFromDirWithControl(path, effective);
+        defer handle.release();
+        const loaded = handle.get();
+        const config = session_factory.getLayaConfig(loaded.session) orelse return error.UnsupportedExtractionModel;
+        if (loaded.session.backend() != .native and loaded.session.backend() != .metal) return error.UnsupportedExtractionBackend;
+        const mutex = loaded.targetInferenceExecutionMutex();
+        if (mutex) |lock| try effective.lock(lock);
+        defer if (mutex) |lock| lock.unlock();
+        const result = try @import("../pipelines/laya.zig").executeWithScratch(allocator, scratch, loaded.session, loaded.getTokenizer(), config, request.tasks, effective, contract.batch.max_input_tokens_per_item);
+        const bytes = try laya.response(allocator, request, result, @min(64 * 1024 * 1024, response_limit orelse 64 * 1024 * 1024));
+        try effective.check();
+        return try scratch.dupe(u8, bytes);
+    }
+
     fn extractV2InMemory(
         self: *Node,
         scratch: std.mem.Allocator,
@@ -8848,6 +8894,8 @@ pub const Node = struct {
         working_bytes: usize,
         allocation_failure: *ExtractionAllocationFailure,
     ) ![]u8 {
+        // Each architecture retains its own schema validation and qualification.
+        if (try self.tryExtractLayaV2(scratch, request_json, control, response_limit, failure)) |json| return json;
         const regex = @import("../pipelines/extraction_regex.zig");
         var validators = regex.Context.init(scratch, .{
             .compile_options = .{ .control = control },
@@ -21470,7 +21518,7 @@ fn taskMatchesModelListing(
     if (std.mem.eql(u8, task, "extractors") and
         model_caps.modelSupportsCapability(model_kind, gliner_model_type, capabilities, "classification"))
     {
-        return !std.mem.eql(u8, model_kind, "classifier") or zero_shot_classification;
+        return !std.mem.eql(u8, model_kind, "classifier") or zero_shot_classification or model_caps.hasCapability(capabilities, "typed_decisions");
     }
     if (tasks.len > 0) {
         const singular_task: ?[]const u8 = if (std.mem.eql(u8, task, "embedders"))
@@ -22750,6 +22798,76 @@ fn validateTextExecutorInvocation(
         .schema_bytes = schema_bytes,
         .has_text = items.len > 0 or additional_text_bytes_per_item > 0,
     });
+}
+
+fn validateLayaExecutorInvocation(
+    allocator: std.mem.Allocator,
+    contract: ResolvedInferenceExecutorContract,
+    request: @import("../extractors/laya.zig").Request,
+) !void {
+    const texts = try allocator.alloc([]const u8, request.tasks.len);
+    defer allocator.free(texts);
+    var max_candidates: usize = 0;
+    var schema_text_bytes: usize = 0;
+    for (request.tasks, texts) |task, *text| {
+        text.* = task.text;
+        max_candidates = @max(max_candidates, task.question.labels.len);
+        var question_bytes = task.question.instruction.len;
+        for (task.question.labels, task.question.descriptions) |label, description| question_bytes += label.len + description.len;
+        schema_text_bytes = @max(schema_text_bytes, question_bytes);
+    }
+    // The executor advertises input items, not expanded questions. Parsing
+    // independently enforces 64 questions per input and 512 per request.
+    try validateTextExecutorInvocation(contract, request.items.len, texts, schema_text_bytes, 0, max_candidates, request.schema_bytes);
+}
+
+test "laya extraction validates input and question limits independently" {
+    const laya = @import("../extractors/laya.zig");
+    const contract = ResolvedInferenceExecutorContract{
+        .task = "extract",
+        .batch = .{
+            .mode = .serial_compatibility,
+            .preferred_items = 1,
+            .max_items = 128,
+            .max_encoded_media_bytes = 0,
+            .max_decoded_pixels = null,
+            .max_media_parts_per_item = 0,
+            .per_item_failures = false,
+        },
+        .accepts_text = true,
+        .accepts_image = false,
+        .accepts_audio = false,
+        .accepts_document = false,
+    };
+    const cases = [_]struct { inputs: usize, questions: usize, expected_error: ?anyerror = null }{
+        .{ .inputs = 64, .questions = 3 },
+        .{ .inputs = 128, .questions = 4 },
+        .{ .inputs = 8, .questions = 64 },
+        .{ .inputs = 129, .questions = 1, .expected_error = error.ExtractionRequestLimitExceeded },
+        .{ .inputs = 103, .questions = 5, .expected_error = error.ExtractionRequestLimitExceeded },
+        .{ .inputs = 1, .questions = 65, .expected_error = error.InvalidLayaQuestion },
+    };
+    for (cases) |case| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const inputs = try a.alloc(struct { content: []const u8 = "hello" }, case.inputs);
+        @memset(inputs, .{});
+        const questions = try a.alloc(struct { name: []const u8, instruction: []const u8 = "choose", labels: []const []const u8 = &.{ "yes", "no" } }, case.questions);
+        for (questions, 0..) |*question, i| question.* = .{ .name = try std.fmt.allocPrint(a, "q{d}", .{i}) };
+        const body = try std.json.Stringify.valueAlloc(a, .{ .model = "laya", .schema_version = 2, .inputs = inputs, .schema = .{ .classifications = questions } }, .{});
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+        if (case.expected_error) |expected| {
+            try std.testing.expectError(expected, laya.parse(a, parsed.value));
+            continue;
+        }
+        const request = try laya.parse(a, parsed.value);
+        try std.testing.expectEqual(case.inputs * case.questions, request.tasks.len);
+        try validateLayaExecutorInvocation(a, contract, request);
+        var lower_limit = contract;
+        lower_limit.batch.max_items = case.inputs - 1;
+        try std.testing.expectError(error.InferenceBatchTooLarge, validateLayaExecutorInvocation(a, lower_limit, request));
+    }
 }
 
 fn minOptionalLimit(current: ?usize, requested: usize) ?usize {
@@ -33382,4 +33500,98 @@ test "boundary qualification model listings reject raw explicit tasks and capabi
     }
     try std.testing.expect(!taskMatchesModelListing("extractors", "extractor", "gliner2.5", &.{}, &.{}, false));
     try std.testing.expect(taskMatchesModelListing("extractors", "recognizer", "gliner2", &.{"extract"}, &.{"labels"}, true));
+}
+
+test "laya extraction v2 serves typed decisions over HTTP and embedded calls" {
+    const root = platform.env.getenv("ANTFLY_LAYA_QUALIFICATION") orelse platform.env.getenv("ANTFLY_LAYA_REFERENCE") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var node = try Node.init(a, .{ .models_dir = root, .allow_unknown_models = true, .max_concurrent_requests = 1, .process_termination_available = true });
+    defer node.deinit();
+    try node.attachIo(std.testing.io);
+    const backend: backends_mod.BackendType = if (platform.env.getenv("ANTFLY_LAYA_METAL") != null) .metal else .native;
+    node.session_manager.required_backend = backend;
+    node.model_manager.session_manager.required_backend = backend;
+    const body =
+        \\{"model":"model","schema_version":2,"inputs":[{"content":"please find the document"}],"schema":{"classifications":[{"name":"tool","mode":"single","instruction":"which tool is needed?","labels":["search","fetch","none"]},{"name":"urgency","mode":"ordinal","instruction":"urgency?","labels":["low","medium","high"]},{"name":"needed","mode":"boolean","instruction":"is search needed?","labels":["false","true"]}]}}
+    ;
+    var direct = try node.extractV2DirectJsonWithControl(a, body, null);
+    defer direct.deinit();
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, direct.json, .{});
+    defer parsed.deinit();
+    const item = parsed.value.object.get("data").?.array.items[0].object;
+    try std.testing.expect(!item.contains("id"));
+    const decisions = item.get("decisions").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), decisions.len);
+    try std.testing.expectEqualStrings("normalized_inverse_entropy", decisions[0].object.get("confidence_method").?.string);
+    try std.testing.expect(decisions[1].object.contains("expected_value"));
+    try std.testing.expect(decisions[2].object.contains("true_probability"));
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/extract");
+    defer request.deinit();
+    request.body = body;
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try node.extractJSON(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    try std.testing.expectEqualStrings(direct.json, response.body.?);
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    // 64 public inputs expand into 192 questions, exceeding the executor's
+    // 128-input ceiling only if questions are incorrectly counted as inputs.
+    const repeated_inputs = [_]struct { content: []const u8 }{.{ .content = "please find the document" }} ** 64;
+    const original_request = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+    defer original_request.deinit();
+    const expanded_body = try std.json.Stringify.valueAlloc(a, .{ .model = "model", .schema_version = 2, .inputs = repeated_inputs, .schema = original_request.value.object.get("schema").? }, .{});
+    defer a.free(expanded_body);
+    var expanded_result = try node.extractV2DirectJsonWithControl(a, expanded_body, null);
+    defer expanded_result.deinit();
+    const expanded_parsed = try std.json.parseFromSlice(std.json.Value, a, expanded_result.json, .{});
+    defer expanded_parsed.deinit();
+    const expanded_items = expanded_parsed.value.object.get("data").?.array.items;
+    try std.testing.expectEqual(@as(usize, 64), expanded_items.len);
+    for (expanded_items) |expanded_item| {
+        const expanded_decisions = expanded_item.object.get("decisions").?.array.items;
+        try std.testing.expectEqual(decisions.len, expanded_decisions.len);
+        for (decisions, expanded_decisions) |expected, actual| {
+            try std.testing.expectEqualStrings(expected.object.get("name").?.string, actual.object.get("name").?.string);
+            try std.testing.expectEqualStrings(expected.object.get("label").?.string, actual.object.get("label").?.string);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    const invalid = try std.mem.replaceOwned(u8, a, body, "\"mode\":\"boolean\"", "\"mode\":\"multi\"");
+    defer a.free(invalid);
+    try std.testing.expectError(error.UnsupportedExtractionFeature, node.extractV2DirectJsonWithControl(a, invalid, null));
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    const shared_schema = "{\"classifications\":[{\"name\":\"tool\",\"instruction\":\"which tool is needed?\",\"labels\":[\"search\",\"fetch\",\"none\"]}]}";
+    const input_rows = [_][]const u8{
+        "{\"id\":\"first\",\"content\":\"please find the document\"}",
+        "{\"id\":\"second\",\"content\":\"urgent\",\"schema\":{\"classifications\":[{\"name\":\"needed\",\"mode\":\"boolean\",\"instruction\":\"is search needed?\",\"labels\":[\"false\",\"true\"]}]}}",
+        "{\"id\":\"third\",\"content\":\"hello world\"}",
+    };
+    const batch_body = try std.fmt.allocPrint(a, "{{\"model\":\"model\",\"schema_version\":2,\"schema\":{s},\"inputs\":[{s},{s},{s}]}}", .{ shared_schema, input_rows[0], input_rows[1], input_rows[2] });
+    defer a.free(batch_body);
+    var batch_result = try node.extractV2DirectJsonWithControl(a, batch_body, null);
+    defer batch_result.deinit();
+    const BatchResponse = struct { data: []const struct { id: []const u8, decisions: []const struct { name: []const u8, label: []const u8, probabilities: []const struct { probability: f32 } } } };
+    const batch_parsed = try std.json.parseFromSlice(BatchResponse, a, batch_result.json, .{ .ignore_unknown_fields = true });
+    defer batch_parsed.deinit();
+    try std.testing.expectEqual(input_rows.len, batch_parsed.value.data.len);
+    for (input_rows, batch_parsed.value.data) |input, actual| {
+        const single_body = try std.fmt.allocPrint(a, "{{\"model\":\"model\",\"schema_version\":2,\"schema\":{s},\"inputs\":[{s}]}}", .{ shared_schema, input });
+        defer a.free(single_body);
+        var single = try node.extractV2DirectJsonWithControl(a, single_body, null);
+        defer single.deinit();
+        const single_parsed = try std.json.parseFromSlice(BatchResponse, a, single.json, .{ .ignore_unknown_fields = true });
+        defer single_parsed.deinit();
+        const expected = single_parsed.value.data[0];
+        try std.testing.expectEqualStrings(expected.id, actual.id);
+        try std.testing.expectEqual(expected.decisions.len, actual.decisions.len);
+        for (expected.decisions, actual.decisions) |want, got| {
+            try std.testing.expectEqualStrings(want.name, got.name);
+            try std.testing.expectEqualStrings(want.label, got.label);
+            for (want.probabilities, got.probabilities) |p, q| try std.testing.expectApproxEqAbs(p.probability, q.probability, 5e-4);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    try std.testing.expect(taskMatchesModelListing("extractors", "classifier", "", &.{"extract"}, &.{"typed_decisions"}, false));
+    try std.testing.expect(!taskMatchesModelListing("classifiers", "classifier", "", &.{"extract"}, &.{"typed_decisions"}, false));
 }

@@ -43881,6 +43881,47 @@ test "metal native decoder runtime f16 linear matches host reference" {
     }
 }
 
+test "metal native f16 host linear preserves rows across the tiled dispatch threshold" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+    var provider = try @import("metal_native_provider.zig").MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const a = std.testing.allocator;
+    const dim = 128;
+    const weight = try a.alloc(f16, dim * dim);
+    defer a.free(weight);
+    @memset(weight, 0);
+    for (0..dim) |i| weight[i * dim + i] = 1;
+    var bias = try MetalTensor.ownedCloneFrom(&([_]f32{0.25} ** dim), &.{dim});
+    defer bias.deinit();
+    var dummy = [_]f32{0};
+    var stats: ops.NativeQuantTimingStats = .{};
+    try std.testing.expect(try decoderRuntimePrepareLinear(&provider, .{
+        .slot = 0,
+        .weight = MetalTensor.borrowed(&dummy, 1, &.{0}),
+        .bias = bias,
+        .quantized_storage = null,
+        .in_dim = dim,
+        .out_dim = dim,
+        .retain_dense_fallback = false,
+        .dense_f16_bytes = std.mem.sliceAsBytes(weight),
+    }, &stats));
+    for ([_]usize{ 127, 128, 129, 256 }) |rows| {
+        const data = try a.alloc(f32, rows * dim);
+        defer a.free(data);
+        for (data, 0..) |*value, i| value.* = @as(f32, @floatFromInt(i % 113)) / 16;
+        // Host input deliberately exercises the fallback used by Laya's
+        // gathered marker scorer, rather than the device-only MPS route.
+        var input = try MetalTensor.ownedCloneFrom(data, &.{ @intCast(rows), dim });
+        defer input.deinit();
+        var output = (try decoderRuntimeApplyLinear(&provider, .{ .slot = 0, .input = input, .in_dim = dim, .out_dim = dim })) orelse return error.UnexpectedNull;
+        defer output.deinit();
+        const actual = try tensorHostSlice(&output);
+        try std.testing.expectEqual(data.len, actual.len);
+        for (data, actual) |want, got| try std.testing.expectApproxEqAbs(want + 0.25, got, 1e-5);
+    }
+}
+
 test "metal native decoder runtime f16 BERT fused paths match decomposed device ops" {
     if (!build_options.enable_metal) return error.SkipZigTest;
     if (!metalDeviceAvailable()) return error.SkipZigTest;
