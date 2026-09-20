@@ -1085,11 +1085,35 @@ fn litePhysicalIndexConfigJson(
 /// be filtered out here even though `managed_embedder.zig`'s embedder
 /// scanner only ever recognizes a dense_vector/sparse_vector entry.
 /// `liteManagedEmbeddingIndexConfigJson` passes every other kind through
-/// unchanged. Caller owns the returned slice.
+/// unchanged.
+///
+/// Also appends every *standalone* catalog enrichment from `db.listEnrichments`
+/// -- one registered directly through `antfly_db_add_enrichment_json` with no
+/// index nesting the same declaration in its own config (see
+/// `registerLiteIndexEnrichments`). Without this, a `kind:"asset"` extractor
+/// or a `kind:"chunk"` enrichment added standalone is accepted into the
+/// catalog (`db.addEnrichment` validates and stores it) but never gets an
+/// asset producer or chunk provider wired up: `indexesJsonNeedsAssetProducer`/
+/// `indexesJsonHasGeneratedEnrichment` only ever saw the index catalog, so a
+/// document's pending generated-enrichment work for that name stays "accepted"
+/// forever with nothing servicing it (a stall, surfaced as
+/// `error.RunUntilIdleNoProgress` from `antfly_db_run_until_idle`). Each
+/// standalone entry is appended under a `"$enrichment:<kind>:<name>"` key --
+/// reserved so it cannot collide with a real index name -- as an object shaped
+/// `{"kind":<kind>,"producer_json":<...>}` (only when non-empty), which is
+/// exactly the shape the two scanners above already recognize wherever it
+/// appears in the merged tree. `managed_embedder.zig`'s own scanners
+/// (`parseManagedEmbeddingEntry`, `addArtifactBackedManagedEmbeddingEntries`)
+/// only ever look at top-level entries carrying `"type":"embeddings"`, and
+/// this shape carries no `"type"` or `"enrichments"` key, so it is inert to
+/// them and to `LiteSemanticResolver`'s query-time resolution. Caller owns the
+/// returned slice.
 fn liteMergedIndexesJsonAlloc(handle: *Handle) ![]u8 {
     const alloc = handle.alloc;
     const configs = try handle.db.listIndexes(alloc);
     defer db_mod.types.freeIndexConfigs(alloc, configs);
+    const enrichments = try handle.db.listEnrichments(alloc);
+    defer db_mod.types.freeEnrichmentConfigs(alloc, enrichments);
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(alloc);
@@ -1106,8 +1130,157 @@ fn liteMergedIndexesJsonAlloc(handle: *Handle) ![]u8 {
         defer alloc.free(entry_config_json);
         try buf.appendSlice(alloc, entry_config_json);
     }
+    for (enrichments) |cfg| {
+        if (wrote_any) try buf.append(alloc, ',');
+        wrote_any = true;
+        const merged_key = try std.fmt.allocPrint(alloc, "$enrichment:{s}:{s}", .{ @tagName(cfg.kind), cfg.name });
+        defer alloc.free(merged_key);
+        const escaped_key = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(merged_key, .{})});
+        defer alloc.free(escaped_key);
+        try buf.appendSlice(alloc, escaped_key);
+        try buf.append(alloc, ':');
+        const entry_json = try liteEnrichmentCatalogEntryJsonAlloc(alloc, cfg);
+        defer alloc.free(entry_json);
+        try buf.appendSlice(alloc, entry_json);
+    }
     try buf.append(alloc, '}');
     return try buf.toOwnedSlice(alloc);
+}
+
+/// Builds the `{"kind":<kind>,"producer_json":<...>}`-shaped object
+/// `liteMergedIndexesJsonAlloc` nests under each standalone catalog
+/// enrichment's reserved `"$enrichment:<kind>:<name>"` key. `producer_json`
+/// is included only for an `asset` enrichment that carries one (the field
+/// `objectIsModelBackedAssetEnrichment` inspects); `kind:"chunk"` needs no
+/// further fields since `jsonValueHasGeneratedEnrichment` treats any
+/// `"kind":"chunk"` object as a generated-enrichment marker regardless of
+/// its other fields. A standalone `embedding` enrichment (always paired with
+/// an owning dense/sparse index's own `"type":"embeddings"` config, already
+/// merged in above) carries neither marker and is included only for listing
+/// symmetry; it is inert to every scanner.
+fn liteEnrichmentCatalogEntryJsonAlloc(alloc: Allocator, cfg: db_mod.types.EnrichmentConfig) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(alloc);
+    const kind_json = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(@tagName(cfg.kind), .{})});
+    defer alloc.free(kind_json);
+    try buf.appendSlice(alloc, "{\"kind\":");
+    try buf.appendSlice(alloc, kind_json);
+    if (cfg.producer_json.len > 0) {
+        const producer_json_json = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(cfg.producer_json, .{})});
+        defer alloc.free(producer_json_json);
+        try buf.appendSlice(alloc, ",\"producer_json\":");
+        try buf.appendSlice(alloc, producer_json_json);
+    }
+    try buf.append(alloc, '}');
+    return try buf.toOwnedSlice(alloc);
+}
+
+test "capi lite merged indexes JSON discovers a standalone asset extractor and chunk enrichment with no owning index" {
+    // Regression test for db.zig:1091 (pre-fix): `liteMergedIndexesJsonAlloc`
+    // only read `handle.db.listIndexes`, so a `kind:"asset"` extractor or a
+    // `kind:"chunk"` enrichment registered directly through
+    // `antfly_db_add_enrichment_json` -- with no index nesting the same
+    // declaration in its own config (see `registerLiteIndexEnrichments`) --
+    // was accepted into the catalog but invisible to
+    // `local_write.indexesJsonNeedsAssetProducer`/`indexesJsonHasGeneratedEnrichment`.
+    // `refreshLiteManagedEmbeddingRuntime` always resolved an empty producer
+    // set for it, so `ManagedDbEnrichmentSet.enabled()` stayed false and the
+    // enrichment runtime never serviced that name's pending work at all.
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
+    const alloc = std.testing.allocator;
+    const path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-standalone-enrichment-discovery");
+    defer alloc.free(path);
+    cleanupTestFile(path);
+    defer cleanupTestFile(path);
+
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(path, &handle));
+    defer antfly_db_close(handle);
+
+    // Standalone `chunk` enrichment: no index anywhere nests this declaration.
+    const chunk_enrichment_json =
+        \\{"name":"standalone_chunks_v1","kind":"chunk","field":"body","chunk_size":64,"chunk_overlap":8}
+    ;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_enrichment_json(handle, .{
+        .ptr = chunk_enrichment_json,
+        .len = chunk_enrichment_json.len,
+    }));
+
+    // Standalone `asset` enrichment with a model-backed (non-"copy") extractor
+    // producer: also nested nowhere.
+    const asset_enrichment_json =
+        \\{"name":"standalone_extract_v1","kind":"asset","field":"body","producer_json":"{\"type\":\"extractor\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-extract\"}}"}
+    ;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_enrichment_json(handle, .{
+        .ptr = asset_enrichment_json,
+        .len = asset_enrichment_json.len,
+    }));
+
+    const owned_handle = asHandle(handle).?;
+    const merged_json = try liteMergedIndexesJsonAlloc(owned_handle);
+    defer std.heap.c_allocator.free(merged_json);
+
+    try std.testing.expect(std.mem.indexOf(u8, merged_json, "$enrichment:chunk:standalone_chunks_v1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, merged_json, "$enrichment:asset:standalone_extract_v1") != null);
+
+    // Before the fix these both returned false: neither scanner ever saw a
+    // "kind":"asset"/"chunk" object anywhere in the merged JSON.
+    try std.testing.expect(try local_write.indexesJsonHasGeneratedEnrichment(alloc, merged_json));
+    try std.testing.expect(try local_write.indexesJsonNeedsAssetProducer(alloc, merged_json));
+}
+
+test "capi lite run until idle drains a standalone chunk enrichment with no owning index" {
+    // End-to-end reproduction of the same gap: before the fix, a standalone
+    // `kind:"chunk"` catalog enrichment left `generated=false` in
+    // `local_write.createManagedDbEnrichments`'s scan of the merged JSON, so
+    // `ManagedDbEnrichmentSet.enabled()` (dense/sparse/asset_runtime all null,
+    // `generated` false) stayed false and `refreshLiteManagedEmbeddingRuntime`
+    // never created an enrichment runtime at all. A document's pending chunk
+    // work for that name was accepted (the catalog entry validates and
+    // stores) but nothing ever serviced it, so `antfly_db_run_until_idle`
+    // would return `.stalled` (`error.RunUntilIdleNoProgress`) instead of
+    // draining. A fixed-size, non-semantic chunker (`chunk_size`/
+    // `chunk_overlap`, no `chunker_json`) needs no embedder or extractor
+    // provider at all (`chunker_mod.chunkText` in enrichment_runtime.zig), so
+    // this reproduces and proves the fix end to end without any local model.
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
+    const alloc = std.testing.allocator;
+    const path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-standalone-chunk-drain");
+    defer alloc.free(path);
+    cleanupTestFile(path);
+    defer cleanupTestFile(path);
+
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(path, &handle));
+    defer antfly_db_close(handle);
+
+    const enrichment_json =
+        \\{"name":"standalone_chunks_v1","kind":"chunk","field":"body","chunk_size":16,"chunk_overlap":4}
+    ;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_enrichment_json(handle, .{
+        .ptr = enrichment_json,
+        .len = enrichment_json.len,
+    }));
+
+    const batch_json = "{\"inserts\":{\"doc:capi-standalone-chunk\":{\"body\":\"antfly lite chunks this document body text into overlapping windows for later retrieval\"}},\"sync_level\":\"write\"}";
+    var batch_out: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch_json(handle, .{
+        .ptr = batch_json.ptr,
+        .len = batch_json.len,
+    }, &batch_out));
+    defer antfly_db_buffer_free(batch_out.ptr, batch_out.len);
+
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_run_until_idle(handle));
+
+    const owned_handle = asHandle(handle).?;
+    const drained = owned_handle.db.pendingWorkStats();
+    try std.testing.expectEqual(@as(u64, 0), drained.enrichment.error_count);
+    try std.testing.expectEqual(@as(u64, 0), drained.enrichment.fatal_error_count);
+    try std.testing.expect(!drained.enrichment.stalled);
+    try std.testing.expectEqual(drained.enrichment.target_sequence, drained.enrichment.applied_sequence);
+    try std.testing.expect(drained.enrichment.target_sequence > 0);
 }
 
 fn refreshLiteManagedEmbeddingRuntime(handle: *Handle) !void {

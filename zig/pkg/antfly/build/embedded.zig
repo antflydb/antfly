@@ -430,6 +430,8 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi lite drains an antfly embedder with no api_url through the embedded inference provider",
         "capi get edges json does not double free a non-empty edge slice",
         "run until idle no-progress error maps to a dedicated stalled ABI code, not internal",
+        "capi lite merged indexes JSON discovers a standalone asset extractor and chunk enrichment with no owning index",
+        "capi lite run until idle drains a standalone chunk enrichment with no owning index",
     };
     const capi_tests = b.addTest(.{
         .root_module = capi_mod,

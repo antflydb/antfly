@@ -2416,3 +2416,92 @@ func TestLiteNativeGraphEdgesDoNotDoubleFree(t *testing.T) {
 		}
 	}
 }
+
+// TestLiteNativeStandaloneAssetEnrichmentDrainsWithoutOwningIndex reproduces
+// the review finding against capi/db.zig's liteMergedIndexesJsonAlloc
+// (~line 1091): before the fix, that helper only read handle.db.listIndexes,
+// so a "kind":"asset" extractor registered directly through
+// AddEnrichmentJSON -- with no index nesting the same declaration in its own
+// config, unlike TestLiteNativeGraphEdgesFromExtractionArtifact's graph index
+// above -- was accepted into the catalog (AddEnrichmentJSON succeeds) but
+// invisible to local_write.indexesJsonNeedsAssetProducer: the merged JSON fed
+// to createManagedDbEnrichments never carried a "kind":"asset" marker, so
+// ManagedDbEnrichmentSet.asset_runtime stayed nil and (with no dense/sparse
+// producer and generated=false) the whole enrichment runtime stayed disabled.
+// The document's pending asset work was accepted but nothing ever produced
+// it, so RunUntilIdleStatus would report the enrichment stalled forever
+// instead of draining. Reuses newFakeAntflyExtractServer so this exercises a
+// real extraction round trip end to end, not just discovery bookkeeping.
+func TestLiteNativeStandaloneAssetEnrichmentDrainsWithoutOwningIndex(t *testing.T) {
+	server := newFakeAntflyExtractServer(t)
+
+	path := filepath.Join(t.TempDir(), "standalone-asset-enrichment.aflite")
+	db, err := CreateWithOptions(path, OpenOptions{
+		Mode:                     OpenModeWriter,
+		Profile:                  ProfileNative,
+		RemoteProviderConfigured: true,
+	})
+	if err != nil {
+		t.Fatalf("create native remote-provider Lite database: %v", err)
+	}
+	defer db.Close()
+
+	producerJSON, err := json.Marshal(map[string]any{
+		"type": "extractor",
+		"config": map[string]any{
+			"provider": "antfly",
+			"model":    "fake-extractor",
+			"api_url":  server.URL,
+			"schema": map[string]any{
+				"entities":  []string{"component"},
+				"relations": []map[string]any{{"type": "depends_on"}},
+			},
+			"options": map[string]any{
+				"include_confidence": true,
+				"include_spans":      true,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal extractor producer config: %v", err)
+	}
+	enrichment, err := json.Marshal(map[string]any{
+		"name":          "standalone_relations_v1",
+		"kind":          "asset",
+		"field":         "body",
+		"content_type":  "application/json",
+		"producer_json": string(producerJSON),
+	})
+	if err != nil {
+		t.Fatalf("marshal standalone asset enrichment: %v", err)
+	}
+	// No AddIndexJSON call anywhere: this enrichment is registered standalone,
+	// exactly like TestLiteHostedPauseResumeGeneratedEnrichment's chunk case,
+	// but for the asset/extractor discovery path this test targets.
+	if err := db.AddEnrichmentJSON(enrichment); err != nil {
+		t.Fatalf("add standalone asset enrichment: %v", err)
+	}
+
+	if err := db.Batch([]WriteIntent{
+		{Key: "doc:vopr-design", Value: []byte(`{"title":"VOPR design","body":"VOPR depends on antfly-core for storage."}`)},
+	}, 1); err != nil {
+		t.Fatalf("batch write document: %v", err)
+	}
+
+	if _, err := db.RunUntilIdleStatus(); err != nil {
+		t.Fatalf("run until idle: %v", err)
+	}
+
+	pending, err := db.PendingWorkStats()
+	if err != nil {
+		t.Fatalf("pending work stats: %v", err)
+	}
+	var enrichmentStats enrichmentPendingWorkStatus
+	if err := json.Unmarshal(pending.Enrichment, &enrichmentStats); err != nil {
+		t.Fatalf("decode enrichment pending work: %v; raw=%s", err, pending.Enrichment)
+	}
+	if enrichmentStats.ErrorCount != 0 || enrichmentStats.FatalErrorCount != 0 || enrichmentStats.Stalled ||
+		enrichmentStats.TargetSequence == 0 || enrichmentStats.TargetSequence != enrichmentStats.AppliedSequence {
+		t.Fatalf("standalone asset enrichment did not drain cleanly: %#v", enrichmentStats)
+	}
+}
