@@ -293,13 +293,13 @@ Missing for HippoRAG2/AutoSchemaKG-style retrieval:
 
 ## Engine Gaps
 
-| # | Gap | Scope |
-|---|-----|-------|
-| 1 | Neighbor context for conceptualizer producers (sampled adjacent nodes + relations in the producer input) | small: producer input option on graph-sourced enrichments |
-| 2 | Seeded personalized PageRank kernel variant + `graph_metric.seed_nodes` exposure | modest: kernel + OpenAPI + serverless reader |
-| 3 | Retrieval-agent seeding/rerank orchestration | modest: agent logic only |
-| 4 | Verify promoter upserts trigger enrichments on entity/event tables (load-bearing assumption for stage 3) | verification; fix if cascade is suppressed |
-| 5 | Resolver routing-by-label syntax, if not already expressible | API review |
+| # | Gap | Status |
+|---|-----|--------|
+| 1 | Neighbor context for conceptualizer producers | DONE: `neighbor_context` on asset enrichments (`enrichment/neighbor_context.zig`) — deterministic adjacency block in the producer input, participates in skip-state hash; generator/extractor producers only |
+| 2 | Seeded personalized PageRank | DONE: personalized teleport kernel (`graph/metrics.zig`), `GraphMetricRead.seed_nodes`+`damping` (max 128 seeds, fresh-only fail-closed, serverless fails closed) |
+| 3 | Retrieval-agent seeding/rerank orchestration + wire-layer plumbing (`query_contract`, top-k, `graph_metric_rerank`, distributed fan-out) | in progress |
+| 4 | Promoter upserts trigger enrichments on entity/event tables | verified by construction (promotion writes through routed `TableWriteSource`); e2e cascade coverage pending |
+| 5 | Resolver routing-by-label | DONE: `labels` on `GraphResolverConfig`; labeled siblings disjoint (admission), catch-alls skip sibling-claimed labels at runtime, `{{ hash }}` key-template helper for event keys |
 
 ## Phases
 
