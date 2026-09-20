@@ -3038,6 +3038,86 @@ pub const NativeFile = struct {
         return decodeNamespaceHead(entry, checkpoint);
     }
 
+    // One borrowed key per touched namespace. Collect before writing so map
+    // storage and lookup scratch scale with namespaces, not document count,
+    // and repeated mutations can update stable head pointers in input order.
+    fn prepareNamespaceHeads(self: *NativeFile, checkpoint: CheckpointSlot, roots: CatalogRoots, mutations: []const DocumentMutation) !NamespaceDirectory {
+        var heads = NamespaceDirectory.empty;
+        errdefer heads.deinit(self.allocator);
+        var last: ?[]const u8 = null;
+        for (mutations) |mutation| {
+            const namespace = documentNamespace(mutation.key);
+            if (last) |previous| if (std.mem.eql(u8, previous, namespace)) continue;
+            const entry = try heads.getOrPut(self.allocator, namespace);
+            if (!entry.found_existing) entry.value_ptr.* = 0;
+            last = namespace;
+        }
+        if (roots.indexed) {
+            try self.loadNamespaceHeadsAtCheckpoint(checkpoint, roots.index, &heads);
+        } else {
+            var it = heads.iterator();
+            while (it.next()) |entry| entry.value_ptr.* = self.namespace_directory_cache.get(entry.key_ptr.*) orelse 0;
+        }
+        return heads;
+    }
+
+    fn sortedNamespaceKeysAlloc(allocator: Allocator, heads: *const NamespaceDirectory) ![][]const u8 {
+        const keys = try allocator.alloc([]const u8, heads.count());
+        var it = heads.keyIterator();
+        for (keys) |*key| key.* = it.next().?.*;
+        std.mem.sort([]const u8, keys, {}, struct {
+            fn less(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.lessThan(u8, a, b);
+            }
+        }.less);
+        return keys;
+    }
+
+    fn loadNamespaceHeadsAtCheckpoint(self: *NativeFile, checkpoint: CheckpointSlot, index: u64, heads: *NamespaceDirectory) !void {
+        if (heads.count() == 0 or index == 0) return;
+        if (heads.count() == 1) {
+            var it = heads.iterator();
+            const entry = it.next().?;
+            entry.value_ptr.* = try self.namespaceHeadAtCheckpoint(checkpoint, index, entry.key_ptr.*);
+            return;
+        }
+        const keys = try sortedNamespaceKeysAlloc(self.allocator, heads);
+        defer self.allocator.free(keys);
+        const references = try self.allocator.alloc(u64, keys.len);
+        defer self.allocator.free(references);
+        @memset(references, 0);
+        var indexed = checkpoint;
+        indexed.document_index_root_page = index;
+        // Share the sorted multi-read traversal with documents: each relevant
+        // tree node is decoded once, even when many keys share its path.
+        try self.readDocumentBatchNode(indexed, index, keys, references, 0);
+        // Key order and physical order diverge after independent updates.
+        // Reorder both borrowed keys and references together so every packed
+        // record page is fetched/decoded once, without a third ordering array.
+        const PhysicalOrder = struct {
+            keys: [][]const u8,
+            references: []u64,
+            pub fn lessThan(ctx: @This(), a: usize, b: usize) bool {
+                const pa = physicalPage(ctx.references[a]);
+                const pb = physicalPage(ctx.references[b]);
+                return pa < pb or (pa == pb and ctx.references[a] < ctx.references[b]);
+            }
+            pub fn swap(ctx: @This(), a: usize, b: usize) void {
+                std.mem.swap([]const u8, &ctx.keys[a], &ctx.keys[b]);
+                std.mem.swap(u64, &ctx.references[a], &ctx.references[b]);
+            }
+        };
+        std.sort.pdqContext(0, keys.len, PhysicalOrder{ .keys = keys, .references = references });
+        var reader = RecordPageReader{};
+        defer reader.deinit(self.allocator);
+        for (keys, references) |key, reference| {
+            if (reference == 0) continue;
+            const entry = try decodeCatalogEntry(try reader.read(self, self.allocator, checkpoint, reference, .catalog));
+            if (!std.mem.eql(u8, entry.key, key)) return error.InvalidNamespaceDirectory;
+            heads.getPtr(key).?.* = try decodeNamespaceHead(entry, checkpoint);
+        }
+    }
+
     fn decodeNamespaceHead(entry: CatalogEntry, checkpoint: CheckpointSlot) !u64 {
         if (entry.is_delete or entry.external_value_root_page != 0 or entry.value.len != 8 or
             (entry.key.len > 0 and entry.key[entry.key.len - 1] != 0)) return error.InvalidNamespaceDirectory;
@@ -3067,15 +3147,8 @@ pub const NativeFile = struct {
                 return .{ .page = page, .indexed = false };
             }
         }
-        const keys = try self.allocator.alloc([]const u8, heads.count());
+        const keys = try sortedNamespaceKeysAlloc(self.allocator, heads);
         defer self.allocator.free(keys);
-        var it = heads.keyIterator();
-        for (keys) |*key| key.* = it.next().?.*;
-        std.mem.sort([]const u8, keys, {}, struct {
-            fn less(_: void, a: []const u8, b: []const u8) bool {
-                return std.mem.lessThan(u8, a, b);
-            }
-        }.less);
         const bulk = roots.index == 0;
         var builder = DocumentIndexBulkBuilder{ .owner = self, .file = self.file, .next_page_id = &pages.next_page_id };
         defer builder.deinit();
@@ -3186,6 +3259,8 @@ pub const NativeFile = struct {
         if (previous.document_root_page != 0 and
             (if (namespace_roots.indexed) namespace_roots.index == 0 else self.namespace_directory_cache.count() == 0))
             return error.InvalidNamespaceDirectory;
+        var changed_heads = try self.prepareNamespaceHeads(previous, namespace_roots, mutations);
+        defer changed_heads.deinit(self.allocator);
         var next_root_page = previous.document_root_page;
         var next_index_root_page = previous.document_index_root_page;
         const bulk_build_initial_index = next_index_root_page == 0;
@@ -3199,12 +3274,6 @@ pub const NativeFile = struct {
         page_allocator.pack_records = self.header.packed_records and (mutations.len > 1 or self.transaction_pages != null);
         var editor = IndexEditor.init(self, previous, next_index_root_page);
         defer editor.deinit();
-        var changed_heads = NamespaceDirectory.empty;
-        defer changed_heads.deinit(self.allocator);
-        try changed_heads.ensureTotalCapacity(
-            self.allocator,
-            std.math.cast(u32, mutations.len) orelse return error.RecordTooLarge,
-        );
 
         for (mutations, 0..) |mutation, ordinal| {
             var external_value_root_page: u64 = mutation.external_value_root_page;
@@ -3213,13 +3282,12 @@ pub const NativeFile = struct {
             }
 
             const namespace = documentNamespace(mutation.key);
-            const previous_namespace_page = changed_heads.get(namespace) orelse
-                (if (namespace_roots.indexed) try self.namespaceHeadAtCheckpoint(previous, namespace_roots.index, namespace) else self.namespace_directory_cache.get(namespace) orelse 0);
+            const namespace_head = changed_heads.getPtr(namespace).?;
             var payload = std.ArrayListUnmanaged(u8).empty;
             defer payload.deinit(self.allocator);
             try encodeDocumentEntry(self.allocator, &payload, .{
                 .previous_page = next_root_page,
-                .previous_namespace_page = previous_namespace_page,
+                .previous_namespace_page = namespace_head.*,
                 .key = mutation.key,
                 .value = mutation.value,
                 .is_delete = mutation.is_delete,
@@ -3241,14 +3309,7 @@ pub const NativeFile = struct {
             } else {
                 try editor.put(mutation.key, page_id);
             }
-            if (changed_heads.getPtr(namespace)) |head| {
-                head.* = page_id;
-            } else {
-                // Mutation keys remain live for the duration of this commit;
-                // ownership is acquired only for namespaces newly entering
-                // the durable materialized cache below.
-                changed_heads.putAssumeCapacity(namespace, page_id);
-            }
+            namespace_head.* = page_id;
         }
 
         if (bulk_build_initial_index) {
@@ -11783,4 +11844,152 @@ test "lite inline namespace cache prepares ownership before publication under OO
     try std.testing.expectEqualStrings("before", old);
     try std.testing.expectEqual(@as(u32, 2), file.namespace_directory_cache.count());
     try std.testing.expect((try file.check()).valid);
+}
+
+test "lite namespace batch reads share tree paths and physically regroup packed records" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "namespace-batch-reads.aflite");
+    defer a.free(path);
+    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+    defer file.close();
+    file.page_cache_enabled.store(false, .monotonic);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const count = 16384;
+    const batch = try arena.allocator().alloc(DocumentMutation, count);
+    for (batch, 0..) |*m, i| m.* = .{ .key = try std.fmt.allocPrint(arena.allocator(), "ns-{d:0>8}\x00key", .{i}), .value = "old" };
+    try file.putDocumentBatch(batch);
+    const pinned = file.activeCheckpoint();
+    for (batch) |*m| m.value = "new";
+    const before = file.test_page_reads.load(.monotonic);
+    try file.putDocumentBatch(batch);
+    try std.testing.expect(file.test_page_reads.load(.monotonic) - before < 700);
+    // Interleaved namespace updates make key order alternate between physical
+    // pages. A reader that only follows sorted keys would reread each bundle.
+    const group = try arena.allocator().alloc(DocumentMutation, count / 8);
+    for (0..8) |phase| {
+        for (group, 0..) |*m, i| m.* = .{ .key = batch[i * 8 + phase].key, .value = "interleaved" };
+        try file.putDocumentBatch(group);
+    }
+    file.close();
+    file = try NativeFile.openWithIo(a, std.testing.io, path, .{ .no_sync = true });
+    file.page_cache_enabled.store(false, .monotonic);
+    const cold_before = file.test_page_reads.load(.monotonic);
+    try file.putDocumentBatch(batch);
+    try std.testing.expect(file.test_page_reads.load(.monotonic) - cold_before < 700);
+    const old = (try file.getDocumentAtCheckpointAlloc(a, pinned, batch[0].key)).?;
+    defer a.free(old);
+    try std.testing.expectEqualStrings("old", old);
+    const current = (try file.getDocumentAlloc(a, batch[count - 1].key)).?;
+    defer a.free(current);
+    try std.testing.expectEqualStrings("new", current);
+    try std.testing.expect((try file.check()).valid);
+}
+
+test "lite namespace batch tracking memory depends on namespaces not documents" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "namespace-batch-memory.aflite");
+    defer a.free(path);
+    var budget = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+    var file = try NativeFile.createWithIo(budget.allocator(), std.testing.io, path, .{ .no_sync = true });
+    defer file.close();
+    file.page_cache_enabled.store(false, .monotonic);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const batch = try arena.allocator().alloc(DocumentMutation, 65536);
+    for (batch, 0..) |*m, i| m.* = .{ .key = try std.fmt.allocPrint(arena.allocator(), "single\x00key-{d:0>8}", .{i}), .value = "v" };
+    const baseline = budget.live;
+    budget.peak = baseline;
+    budget.limit = baseline + 4 * 1024 * 1024;
+    defer budget.limit = std.math.maxInt(usize);
+    // Includes the document index builder, not just the namespace map.
+    try file.beginTransaction();
+    errdefer file.abortTransaction();
+    try file.putDocumentBatch(batch);
+    try file.commitTransaction();
+    try std.testing.expect(budget.peak - baseline < 4 * 1024 * 1024);
+    budget.limit = std.math.maxInt(usize);
+    try std.testing.expect((try file.check()).valid);
+}
+
+test "lite namespace batch resolution preserves mutation order and aborts allocation failures" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |packed_records| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try testPath(a, tmp, "namespace-batch-ownership.aflite");
+        defer a.free(path);
+        var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+        defer file.close();
+        file.header.packed_records = packed_records;
+        var header: [header_size]u8 = undefined;
+        encodeHeader(&header, file.header);
+        try file.file.writePositionalAll(std.testing.io, &header, 0);
+        file.page_cache_enabled.store(false, .monotonic);
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const seed = try arena.allocator().alloc(DocumentMutation, 48);
+        for (seed, 0..) |*m, i| m.* = .{ .key = try std.fmt.allocPrint(arena.allocator(), "ns-{d:0>8}\x00key", .{i}), .value = "old" };
+        var long_key: [1804]u8 = @splat('z');
+        long_key[1800] = 0;
+        try file.putDocumentBatch(seed);
+        try file.putDocumentBatch(&.{ .{ .key = "plain", .value = "old" }, .{ .key = &long_key, .value = "old" } });
+        const pinned = file.activeCheckpoint();
+        const size = (try file.file.stat(std.testing.io)).size;
+        const mutations = [_]DocumentMutation{
+            .{ .key = seed[5].key, .value = "intermediate" },
+            .{ .key = "added\x00key", .value = "first" },
+            .{ .key = seed[7].key, .is_delete = true },
+            .{ .key = &long_key, .value = "long final" },
+            .{ .key = seed[5].key, .is_delete = true },
+            .{ .key = "plain", .value = "root final" },
+            .{ .key = "added\x00key", .value = "new final" },
+            .{ .key = seed[5].key, .value = "final" },
+        };
+        var exhausted = false;
+        for (0..2048) |index| {
+            var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = index });
+            file.allocator = failing.allocator();
+            defer file.allocator = a;
+            try file.beginTransaction();
+            defer if (file.transaction_header != null) file.abortTransaction();
+            const Attempt = struct {
+                fn run(f: *NativeFile, batch: []const DocumentMutation) !void {
+                    try f.putDocumentBatch(batch);
+                    _ = try f.materializeTransactionCheckpoint();
+                }
+            };
+            if (Attempt.run(&file, &mutations)) |_| {
+                exhausted = !failing.has_induced_failure;
+            } else |err| {
+                try std.testing.expect(failing.has_induced_failure);
+                try std.testing.expect(err == error.OutOfMemory or err == error.WriteFailed);
+            }
+            file.abortTransaction();
+            try std.testing.expectEqualDeep(pinned, file.activeCheckpoint());
+            try std.testing.expectEqual(size, (try file.file.stat(std.testing.io)).size);
+            if (exhausted) break;
+        }
+        try std.testing.expect(exhausted);
+        try std.testing.expect((try file.check()).valid);
+        try file.putDocumentBatch(&mutations);
+        const keys = [_][]const u8{ seed[5].key, "added\x00key", &long_key, "plain" };
+        const expected = [_][]const u8{ "final", "new final", "long final", "root final" };
+        for (keys, expected) |key, value| {
+            const got = (try file.getDocumentAlloc(a, key)).?;
+            defer a.free(got);
+            try std.testing.expectEqualStrings(value, got);
+        }
+        try std.testing.expectEqual(@as(?[]u8, null), try file.getDocumentAlloc(a, seed[7].key));
+        const old = (try file.getDocumentAtCheckpointAlloc(a, pinned, seed[5].key)).?;
+        defer a.free(old);
+        try std.testing.expectEqualStrings("old", old);
+        try std.testing.expect((try file.check()).valid);
+        _ = try file.vacuum();
+        try std.testing.expect((try file.check()).valid);
+    }
 }

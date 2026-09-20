@@ -62,7 +62,11 @@ The implementation now consists of:
   directory and per-namespace page links in the same checkpoint, so a cold
   table snapshot walks that table's history rather than the global document
   log. Namespace heads use a copy-on-write catalog B+ tree, so updates and
-  cold writes touch only the requested namespaces and their tree paths. Tiny
+  cold writes touch only the requested namespaces and their tree paths. Batches
+  collect distinct namespaces, share a sorted tree traversal to resolve their
+  heads, and group record references by physical page before decoding them.
+  Tracking memory scales with distinct namespaces rather than document count;
+  one-namespace batches retain the point-lookup fast path. Tiny
   directories (at most 32 namespaces fitting one page) retain the existing
   inline snapshot encoding without extra tree pages. Their bounded cache retains
   namespace keys across mutations, reserving new ownership before checkpoint
@@ -1280,3 +1284,12 @@ small document commits, retaining the inline directory cache restores the
 single-namespace path to 3,821 allocations and reduces the 32-namespace path
 from 11,821 to 4,421. Failure sweeps cover directory-loading ownership and
 inline-cache preparation, including private publication followed by rollback.
+
+Batched namespace resolution reduces a 16,384-namespace update from 49,348
+logical page reads to 449 with caching disabled. Physical grouping keeps packed
+record reads bounded after interleaved namespace updates and a cold reopen.
+A 65,536-document initial batch in one namespace uses 3,175,368 bytes of peak
+temporary native heap instead of 6,451,968 bytes. Regressions cover read and
+heap bounds, repeated mutations in input order, missing namespaces, external
+index keys, pinned checkpoints, and allocation-failure rollback in packed and
+unpacked v3 files.
