@@ -21257,7 +21257,7 @@ const RemoteMetadataSource = struct {
             if (now_ns >= deadline_ns)
                 return replay_proof_error;
             const index = (start_index + attempt) % self.base_uris.len;
-            // A slow or unavailable status endpoint cannot consume the whole
+            // A slow or unavailable topology endpoint cannot consume the whole
             // mutation budget. Give every remaining endpoint a turn and
             // reserve one share for delivery to the discovered authority.
             const discovery_budget = antfly.metadata_http_client.RequestBudget{
@@ -21268,7 +21268,7 @@ const RemoteMetadataSource = struct {
             defer arena.deinit();
             const scratch = arena.allocator();
             var metadata_client = self.metadataClient(scratch);
-            const status = metadata_client.fetchStatusWithBudget(self.base_uris[index], discovery_budget) catch |err| {
+            const status = metadata_client.fetchMutationTopologyWithBudget(self.base_uris[index], discovery_budget) catch |err| {
                 if (self.awakeNs() >= deadline_ns)
                     return replay_proof_error;
                 last_pre_admission_err = if (err == error.Timeout) error.NotLeader else err;
@@ -21350,7 +21350,7 @@ const RemoteMetadataSource = struct {
         fn observe(
             self: *MetadataMutationEndpointDiscovery,
             index: usize,
-            status: antfly.metadata_api.MetadataStatus,
+            status: anytype,
         ) ?usize {
             if (metadataMutationEndpointReportsLocalLeader(status)) return index;
             std.debug.assert(self.fallback_count < self.fallback_indices.len);
@@ -21364,7 +21364,7 @@ const RemoteMetadataSource = struct {
         }
     };
 
-    fn metadataMutationEndpointReportsLocalLeader(status: antfly.metadata_api.MetadataStatus) bool {
+    fn metadataMutationEndpointReportsLocalLeader(status: anytype) bool {
         const leader_id = status.metadata_raft_leader_id orelse return false;
         return leader_id == status.metadata_raft_local_node_id and
             std.mem.eql(u8, status.metadata_raft_role, "leader");
@@ -29097,6 +29097,7 @@ fn consumerTests() type {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     self.probes += 1;
                     try std.testing.expectEqual(.GET, request.method);
+                    try std.testing.expect(std.mem.endsWith(u8, request.uri, "/metadata/v1/runtime-topology"));
                     const first = std.mem.startsWith(u8, request.uri, "http://stalled.test/");
                     if (self.mode == .slow_all or (first and self.mode != .affinity_changed)) {
                         self.clock.monotonic_ns += @as(u64, request.timeout_ms.?) * std.time.ns_per_ms;

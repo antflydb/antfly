@@ -186,8 +186,8 @@ pub const MetadataStatus = struct {
 /// Detach the only borrowed field from JSON parser and HTTP response storage.
 /// Unknown roles fail closed and remain compatible with older clients.
 pub fn stabilizeMetadataStatus(
-    status: MetadataStatus,
-) MetadataStatus {
+    status: anytype,
+) @TypeOf(status) {
     var stable = status;
     const stable_roles = [_][]const u8{
         "absent",
