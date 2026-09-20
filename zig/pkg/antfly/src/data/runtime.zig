@@ -17422,10 +17422,14 @@ pub const DataServer = struct {
                     .target_index_name = schema_index_name,
                     .advance_index_repairs = schema_index_name != null,
                     .index_repair_options = .{
-                        .admission_deadline_ns = schema_yield.catalogDeadline(),
+                        // Restore/startup advances bounded durable phases; it is
+                        // not a schema-index build quantum. Applying the 25 ms
+                        // slice to its remote descriptor fetch can starve every
+                        // attempt when catalog latency exceeds that slice.
+                        .admission_deadline_ns = if (schema_index_name != null) schema_yield.catalogDeadline() else null,
                         .target_index_name = schema_index_name,
                         .cancel_check = .{ .ptr = &schema_fence, .is_requested = SchemaRepairFence.cancelled },
-                        .yield_check = .{ .ptr = &schema_yield, .is_requested = IndexRepairYieldFence.requested },
+                        .yield_check = if (schema_index_name != null) .{ .ptr = &schema_yield, .is_requested = IndexRepairYieldFence.requested } else null,
                         .activation_check = .{ .ptr = &schema_fence, .is_current_owner = SchemaRepairFence.current },
                         .owner_epoch = schema_fence.ownership_generation,
                         .capacity_domain_id = registration.store_id,

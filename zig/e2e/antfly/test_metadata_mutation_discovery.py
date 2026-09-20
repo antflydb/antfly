@@ -15,6 +15,7 @@
 """A stalled metadata status endpoint must not hide a reachable leader."""
 
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -50,6 +51,11 @@ def stalled_metadata_status(monkeypatch):
                 stopped.wait(30.0)
                 self.close_connection = True
                 return
+            # Descriptor admission is remote I/O, not an index-build quantum.
+            # Keep it slower than the 25 ms repair slice so restore must make
+            # progress even when catalog requests have ordinary network latency.
+            if enabled.is_set() and self.path.startswith("/internal/v2/catalog/"):
+                time.sleep(0.05)
             body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
             with requests.request(
                 self.command,
@@ -73,8 +79,12 @@ def stalled_metadata_status(monkeypatch):
                         self.send_header(key, value)
                 self.send_header("Content-Length", str(len(response.content)))
                 self.send_header("Connection", "close")
-                self.end_headers()
-                self.wfile.write(response.content)
+                try:
+                    self.end_headers()
+                    self.wfile.write(response.content)
+                except (BrokenPipeError, ConnectionResetError):
+                    # Bounded/fanned-out catalog callers may abandon a response.
+                    self.close_connection = True
 
         do_GET = forward
         do_POST = forward
