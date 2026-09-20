@@ -61,7 +61,7 @@ jobs:
           persist-credentials: false
       - name: Test executing CI policy
         working-directory: trusted-ci
-        run: node --test .github/scripts/pr-ci.test.cjs
+        run: node --test .github/scripts/*.test.cjs
       - name: Test proposed CI policy when present
         if: ${{ hashFiles('.github/scripts/pr-ci.test.cjs') != '' }}
-        run: node --test .github/scripts/pr-ci.test.cjs
+        run: node --test .github/scripts/*.test.cjs
