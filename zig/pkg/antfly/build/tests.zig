@@ -4277,6 +4277,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     storage_vopr_runtime_test_mod.addImport("antfly_platform", platform_mod);
     storage_vopr_runtime_test_mod.addImport("antfly_hash", hash_mod);
+    storage_vopr_runtime_test_mod.addImport("antfly_pdf", pdf_mod);
     const storage_vopr_runtime_tests = b.addTest(.{
         .root_module = storage_vopr_runtime_test_mod,
     });
@@ -4612,6 +4613,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     db_test_mod.addImport("antfly_transcribing", transcribing_db_test_stub_mod);
     db_test_mod.addImport("httpx", httpx_mod);
     db_test_mod.addImport("antfly_pdf", pdf_mod);
+    db_test_mod.addImport("objectstore", antfly_imports.objectstore);
     db_test_mod.addImport("antfly_image", image_mod);
     db_test_mod.addImport("antfly_font", font_mod);
     db_test_mod.addImport("structlog", structlog_mod);

@@ -937,3 +937,20 @@ def test_live_server_request_failure_includes_endpoint_and_output_tail():
         assert "model initialization still running" in diagnostic
     finally:
         server.output.close()
+
+
+def test_diarization_missing_dependency_pulls_speaker_model(monkeypatch):
+    monkeypatch.setenv("ANTFLY_INFERENCE_DOWNLOAD", "1")
+    pulled = []
+    monkeypatch.setattr(models, "ensure_model", lambda spec: pulled.append(spec))
+    response = requests.Response()
+    response.status_code = 422
+    response.headers["content-type"] = "application/json"
+    response._content = b'{"error":"SPEAKER_MODEL_UNAVAILABLE"}'
+    payload = {"model": "openai/whisper-tiny", "diarization": True}
+    assert models.maybe_pull_missing_model("/ai/v1/transcribe", payload, response)
+    assert pulled == [models.SPEAKER_MODEL]
+    assert not models.maybe_pull_missing_model("/ai/v1/transcribe", {"model": "openai/whisper-tiny"}, response)
+    monkeypatch.setenv("ANTFLY_INFERENCE_DOWNLOAD", "0")
+    assert not models.maybe_pull_missing_model("/ai/v1/transcribe", payload, response)
+    assert pulled == [models.SPEAKER_MODEL]
