@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const system_catalog = @import("../system_catalog/domain.zig");
 const extension_domain = @import("mod.zig");
 const indexes_api = @import("../api/indexes.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
@@ -477,6 +478,7 @@ fn installOnServiceAttempt(
     if (!request.dry_run) {
         const members = try catalog.listMembersForExtension(alloc, extension_name);
         defer catalog.freeMembers(alloc, members);
+        try bindStorageMemberTables(service, alloc, &snapshot, members);
         const dependencies = try catalog.listDependenciesForExtension(alloc, extension_name);
         defer catalog.freeDependencies(alloc, dependencies);
         const table_upserts = try planStorageMemberDeltaAlloc(alloc, &snapshot, &.{}, members);
@@ -549,6 +551,7 @@ fn updateOnServiceAttempt(
         defer if (old_dependencies.len > 0) alloc.free(old_dependencies);
         const new_members = try catalog.listMembersForExtension(alloc, extension_name);
         defer catalog.freeMembers(alloc, new_members);
+        try bindStorageMemberTables(service, alloc, &snapshot, new_members);
         const new_dependencies = try catalog.listDependenciesForExtension(alloc, extension_name);
         defer catalog.freeDependencies(alloc, new_dependencies);
         const table_upserts = try planStorageMemberDeltaAlloc(alloc, &snapshot, old_members, new_members);
@@ -740,6 +743,30 @@ fn validateNewStorageMembers(snapshot: *const metadata_api.AdminSnapshot, new_me
         if (member.object_kind != .index and member.object_kind != .enrichment) continue;
         const table_name = extensionMemberTableName(member) orelse return error.UnsupportedExtensionScope;
         if (tables_api.findTableByName(snapshot, table_name) == null) return error.TableNotFound;
+    }
+}
+
+// Persist physical table identities for storage members while retaining the
+// public extension scope. Catalog mutation serialization keeps resolution and
+// the snapshot consistent; table preconditions fence the eventual proposal.
+fn bindStorageMemberTables(service: anytype, alloc: std.mem.Allocator, snapshot: *const metadata_api.AdminSnapshot, members: []extension_domain.ExtensionMember) !void {
+    const ServiceType = switch (@typeInfo(@TypeOf(service))) {
+        .pointer => |pointer| pointer.child,
+        else => @TypeOf(service),
+    };
+    if (!@hasDecl(ServiceType, "projectedStore")) return;
+    const store = service.projectedStore() orelse return error.MissingMetadataStore;
+    for (members) |*member| {
+        if (member.object_kind != .index and member.object_kind != .enrichment) continue;
+        const name = extensionMemberTableName(member.*) orelse return error.UnsupportedExtensionScope;
+        if (tables_api.findTableByName(snapshot, name) != null) continue;
+        const identity = (try store.resolveSystemCatalogIdentity(alloc, service.metadata_group_id, try system_catalog.Target.literal(name))) orelse return error.TableNotFound;
+        defer identity.deinit(alloc);
+        const table = tables_api.findTableByName(snapshot, identity.name) orelse return error.TableNotFound;
+        if (table.table_id != identity.table_id) return error.ExtensionLifecycleConflict;
+        const physical_name = try alloc.dupe(u8, identity.name);
+        if (member.table_name.len > 0) alloc.free(member.table_name);
+        member.table_name = physical_name;
     }
 }
 
@@ -1285,4 +1312,51 @@ test "extension lifecycle verification rejects a committed no-op and accepts the
         .merge_transitions = &.{},
     };
     try std.testing.expect(lifecycleDeltaApplied(&replaced, replacement_delta));
+}
+
+test "extension lifecycle binds public scope to durable table identity" {
+    const FakeStore = struct {
+        fn resolveSystemCatalogIdentity(_: *@This(), alloc: std.mem.Allocator, _: u64, target: system_catalog.Target) !?system_catalog.ResolvedTable {
+            try std.testing.expectEqualStrings("docs", target.table);
+            return .{ .table_id = 7, .name = try alloc.dupe(u8, "table:physical") };
+        }
+    };
+    const Service = struct {
+        store: FakeStore = .{},
+        metadata_group_id: u64 = 1,
+        fn projectedStore(self: *@This()) ?*FakeStore {
+            return &self.store;
+        }
+    };
+    var service: Service = .{};
+    var tables = [_]metadata_table_manager.TableRecord{.{
+        .table_id = 7,
+        .name = "table:physical",
+        .indexes_json = "{}",
+        .placement_role = "data",
+    }};
+    var snapshot = metadata_api.AdminSnapshot{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = &tables,
+        .ranges = &.{},
+        .stores = &.{},
+        .placement_intents = &.{},
+        .split_transitions = &.{},
+        .merge_transitions = &.{},
+    };
+    var members = [_]extension_domain.ExtensionMember{.{
+        .extension_name = "memoryaf",
+        .scope = .{ .kind = .table, .table_name = "docs" },
+        .object_kind = .index,
+        .object_name = "memory_search",
+        .table_name = try std.testing.allocator.dupe(u8, "docs"),
+    }};
+    defer std.testing.allocator.free(members[0].table_name);
+    try bindStorageMemberTables(&service, std.testing.allocator, &snapshot, &members);
+    try std.testing.expectEqualStrings("table:physical", members[0].table_name);
+    try std.testing.expectEqualStrings("docs", members[0].scope.table_name);
+    try validateNewStorageMembers(&snapshot, &members);
+    // An update of a bound member keeps its physical identity.
+    try bindStorageMemberTables(&service, std.testing.allocator, &snapshot, &members);
+    try std.testing.expectEqualStrings("table:physical", members[0].table_name);
 }
