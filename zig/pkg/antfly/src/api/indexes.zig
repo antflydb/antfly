@@ -465,6 +465,7 @@ fn validateArtifactIndexReferences(
         const context = cfg.neighbor_context orelse continue;
         if (!graphIndexExists(root.object, context.graph_index)) return error.InvalidEnrichmentConfig;
     }
+    try validateGraphResolverLabelRouting(alloc, root.object);
     var it = root.object.iterator();
     while (it.next()) |entry| {
         if (std.mem.eql(u8, entry.key_ptr.*, "enrichments")) continue;
@@ -506,6 +507,46 @@ fn validateArtifactIndexReferences(
                     if (artifact != .string or !graphArtifactConfigExists(object, configs, artifact.string))
                         return error.InvalidEnrichmentConfig;
                 }
+            }
+        }
+    }
+}
+
+/// Labeled resolvers sharing a source artifact must claim disjoint label
+/// sets, or the mention partition is ambiguous. The durable catalog enforces
+/// this at registration too, but registration runs during asynchronous shard
+/// provisioning; closing it here keeps the failure a synchronous 4xx on
+/// create/update instead of a provisioning stall. Checked across every graph
+/// index in the request because resolvers are table-scoped, not index-scoped.
+fn validateGraphResolverLabelRouting(alloc: std.mem.Allocator, indexes: std.json.ObjectMap) !void {
+    var seen = std.ArrayListUnmanaged(struct { source_artifact: []const u8, label: []const u8 }).empty;
+    defer seen.deinit(alloc);
+
+    var it = indexes.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.* != .object) continue;
+        const object = entry.value_ptr.object;
+        const type_value = object.get("type") orelse continue;
+        if (type_value != .string or !std.mem.eql(u8, type_value.string, "graph")) continue;
+        const resolvers = object.get("resolvers") orelse continue;
+        if (resolvers != .array) continue;
+        for (resolvers.array.items) |resolver| {
+            if (resolver != .object) continue;
+            const source_artifact = resolver.object.get("source_artifact") orelse continue;
+            if (source_artifact != .string) continue;
+            const labels = resolver.object.get("labels") orelse continue;
+            if (labels != .array) continue;
+            for (labels.array.items) |label| {
+                if (label != .string) continue;
+                for (seen.items) |claimed| {
+                    if (std.mem.eql(u8, claimed.source_artifact, source_artifact.string) and
+                        std.mem.eql(u8, claimed.label, label.string))
+                        return error.InvalidEnrichmentConfig;
+                }
+                try seen.append(alloc, .{
+                    .source_artifact = source_artifact.string,
+                    .label = label.string,
+                });
             }
         }
     }
