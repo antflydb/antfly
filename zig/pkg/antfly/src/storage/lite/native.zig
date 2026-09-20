@@ -861,7 +861,8 @@ const IndexEditor = struct {
         const separator = node.keys.items[at];
         const key_start = at + @as(usize, if (node.kind == .internal) 1 else 0);
         const link_start = key_start;
-        for (node.keys.items[key_start..]) |key| try right.keys.append(self.nodeAllocator(right), try self.retainKey(right, key));
+        try right.keys.ensureTotalCapacity(self.nodeAllocator(right), node.keys.items.len - key_start);
+        for (node.keys.items[key_start..]) |key| right.keys.appendAssumeCapacity(try self.retainKey(right, key));
         try right.links.appendSlice(self.nodeAllocator(right), node.links.items[link_start..]);
         node.sealed_before = 0;
         node.keys.items.len = at;
@@ -934,7 +935,8 @@ const IndexEditor = struct {
         if (left.kind != right.kind) return error.InvalidDocumentIndex;
         const alloc = self.nodeAllocator(left);
         if (left.kind == .internal) try left.keys.append(alloc, try self.retainKey(left, parent.keys.items[left_index]));
-        for (right.keys.items) |key| try left.keys.append(alloc, try self.retainKey(left, key));
+        try left.keys.ensureUnusedCapacity(alloc, right.keys.items.len);
+        for (right.keys.items) |key| left.keys.appendAssumeCapacity(try self.retainKey(left, key));
         try left.links.appendSlice(alloc, right.links.items);
         left.dirty = true;
         left.sealed_before = 0;
@@ -959,7 +961,7 @@ const IndexEditor = struct {
         if (depth > 64) return error.InvalidDocumentIndex;
         const node = link.node orelse return link.page;
         if (!node.dirty) return node.page;
-        const alloc = self.file.allocator;
+        const alloc = if (self.streaming_pages != null) self.file.allocator else self.arena.allocator();
         const pointers = try alloc.alloc(u64, node.links.items.len);
         defer alloc.free(pointers);
         for (node.links.items, 0..) |*child, i| pointers[i] = if (node.kind == .leaf) child.page else try self.flush(child, pages, depth + 1);
@@ -2310,7 +2312,6 @@ pub const NativeFile = struct {
         try pages.writePage(record, .catalog, payload.items);
         var editor = IndexEditor.init(self, previous, roots.index);
         defer editor.deinit();
-
         try editor.put(key, record);
         const index = try editor.finish(pages);
         var next = previous;
@@ -12745,5 +12746,26 @@ test "lite scan integrity allocation failures preserve reusable file state" {
         }
     };
     try std.testing.checkAllAllocationFailures(a, Runner.run, .{&file});
+    try std.testing.expect((try file.check()).valid);
+}
+
+test "lite single key edits retain arena allocation bounds" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "single-key-allocations.aflite");
+    defer a.free(path);
+    var counter = std.testing.FailingAllocator.init(a, .{});
+    var file = try NativeFile.createWithIo(counter.allocator(), std.testing.io, path, .{ .no_sync = true });
+    defer file.close();
+    file.page_cache_enabled.store(false, .monotonic);
+    const before = counter.alloc_index;
+    for (0..200) |i| {
+        var key: [32]u8 = undefined;
+        try file.putDocument(try std.fmt.bufPrint(&key, "ns\x00key-{d:0>8}", .{i}), "v");
+    }
+    // The unsorted/single-key editor still shares an arena for flush scratch;
+    // three independent scratch allocations per leaf violate this bound.
+    try std.testing.expect(counter.alloc_index - before < 4200);
     try std.testing.expect((try file.check()).valid);
 }

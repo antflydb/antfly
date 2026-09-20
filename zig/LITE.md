@@ -1283,9 +1283,9 @@ appends, not just the number of calls. A fragmented 1 MiB value now reads
 excluding catalog lookup and the root probe). Repeated small range reads need
 no value-page I/O after warming under the normal cache policy; metadata-only
 readers retain extent metadata while leaving payloads uncached. Across 200
-small document commits, retaining the inline directory cache restores the
-single-namespace path to 3,821 allocations and reduces the 32-namespace path
-from 11,821 to 4,421. Failure sweeps cover directory-loading ownership and
+small document commits, the single-namespace path uses 3,621 allocations.
+Retaining the inline directory cache reduces the 32-namespace path from
+11,821 to 4,421. Failure sweeps cover directory-loading ownership and
 inline-cache preparation, including private publication followed by rollback.
 
 Batched namespace resolution reduces a 16,384-namespace update from 49,348
