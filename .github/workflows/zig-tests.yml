@@ -616,9 +616,9 @@ jobs:
         if: needs.changes.outputs.zig_tests == 'true'
         run: |
           # The checks above compile and run several standalone test binaries
-          # into the same job-local cache. Remove their completed outputs
-          # before the aggregate unit suite so late test partitions do not
-          # fail with NoSpaceLeft while retaining compiler/dependency objects.
+          # into the same job-local cache. Release completed test link inputs
+          # before the aggregate unit suite so late partitions retain disk
+          # headroom without invalidating cached executables.
           cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
           du -sh "$cache"
           python3 zig/tools/prune_completed_test_cache.py "$cache"
@@ -1011,8 +1011,8 @@ jobs:
 
       - name: Release completed phase compiler cache
         run: |
-          # The preceding build has finished. Release its large test outputs
-          # while keeping compiler, dependency, and generator artifacts warm.
+          # The preceding build has finished. Release its large test link inputs
+          # while retaining cached executables, dependencies, and generators.
           cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
           du -sh "$cache"
           python3 zig/tools/prune_completed_test_cache.py "$cache"
@@ -1045,8 +1045,8 @@ jobs:
       # fixed maintenance seed is already part of the zig-base unit aggregate.
       - name: Release completed phase compiler cache
         run: |
-          # The preceding build has finished. Release its large test outputs
-          # while keeping compiler, dependency, and generator artifacts warm.
+          # The preceding build has finished. Release its large test link inputs
+          # while retaining cached executables, dependencies, and generators.
           cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
           du -sh "$cache"
           python3 zig/tools/prune_completed_test_cache.py "$cache"
@@ -1087,8 +1087,8 @@ jobs:
       # no graph-specific CLI or promotion matrix is built here.
       - name: Release completed phase compiler cache
         run: |
-          # The preceding build has finished. Release its large test outputs
-          # while keeping compiler, dependency, and generator artifacts warm.
+          # The preceding build has finished. Release its large test link inputs
+          # while retaining cached executables, dependencies, and generators.
           cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
           du -sh "$cache"
           python3 zig/tools/prune_completed_test_cache.py "$cache"

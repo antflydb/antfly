@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const system_catalog = @import("../system_catalog/domain.zig");
 const schema_mod = @import("../schema/mod.zig");
 
 pub const wasmtime_runtime = @import("wasmtime_runtime.zig");
@@ -429,7 +430,10 @@ pub const ExtensionMember = struct {
         if (self.shape_kind != null and self.object_kind != .data_shape) return error.MemberShapeKindWithoutDataShape;
         if (self.shape_name.len > 0) try requireObjectName(self.shape_name);
         if (self.scope.kind == .table and self.table_name.len != 0 and !std.mem.eql(u8, self.scope.table_name, self.table_name)) {
-            return error.MemberTableOutsideScope;
+            // The scope remains the public admission identity. Lifecycle
+            // planning binds table_name to an immutable storage identity before
+            // persistence; restore and Raft apply validate that bound shape.
+            system_catalog.validateStorageName(self.table_name) catch return error.MemberTableOutsideScope;
         }
         try validateJsonObject("member.owner_metadata_json", self.owner_metadata_json);
     }
@@ -1314,6 +1318,10 @@ fn memberFromObjectAlloc(
     install: InstallManifest,
     object: ExtensionObjectDecl,
 ) !ExtensionMember {
+    // Package declarations contain public names, never trusted routing IDs.
+    // Enforce scope before lifecycle planning resolves the storage binding.
+    if (scope.kind == .table and object.table_name.len != 0 and
+        !std.mem.eql(u8, scope.table_name, object.table_name)) return error.MemberTableOutsideScope;
     const table_name = if (object.table_name.len > 0)
         object.table_name
     else if (scope.kind == .table)
@@ -2429,4 +2437,30 @@ test "extension catalog updates configures disables and enables extension" {
     const members = try catalog.listMembersForExtension(std.testing.allocator, "memoryaf");
     defer catalog.freeMembers(std.testing.allocator, members);
     try std.testing.expectEqual(@as(usize, 2), members.len);
+}
+
+test "extension lifecycle bound members retain public scope without accepting package scope escapes" {
+    const physical = "table:0123456789abcdef0123456789abcdef";
+    const scope: ExtensionScope = .{ .kind = .table, .table_name = "docs" };
+    try (ExtensionMember{
+        .extension_name = "ext",
+        .scope = scope,
+        .object_kind = .index,
+        .object_name = "search",
+        .table_name = physical,
+    }).validate();
+    try std.testing.expectError(error.MemberTableOutsideScope, memberFromObjectAlloc(
+        std.testing.allocator,
+        "ext",
+        scope,
+        .{},
+        .{ .kind = .index, .name = "search", .table_name = physical },
+    ));
+    try std.testing.expectError(error.MemberTableOutsideScope, (ExtensionMember{
+        .extension_name = "ext",
+        .scope = scope,
+        .object_kind = .index,
+        .object_name = "search",
+        .table_name = "other",
+    }).validate());
 }

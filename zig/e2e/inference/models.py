@@ -957,11 +957,15 @@ def response_indicates_missing_model(response) -> bool:
 def maybe_pull_missing_model(path: str, payload: dict | None, response) -> bool:
     if not inference_download_enabled():
         return False
-    diarization = path == "/ai/v1/transcribe" and bool(payload and payload.get("diarization"))
+    diarization = path == "/ai/v1/transcribe" and bool(
+        payload and payload.get("diarization")
+    )
     missing_speaker = False
     if diarization and response.status_code == 422:
         try:
-            missing_speaker = response.json().get("error") == "SPEAKER_MODEL_UNAVAILABLE"
+            missing_speaker = (
+                response.json().get("error") == "SPEAKER_MODEL_UNAVAILABLE"
+            )
         except ValueError:
             pass
     if not missing_speaker and not response_indicates_missing_model(response):

@@ -757,8 +757,7 @@ fn bindStorageMemberTables(service: anytype, alloc: std.mem.Allocator, snapshot:
     if (!@hasDecl(ServiceType, "projectedStore")) return;
     const store = service.projectedStore() orelse return error.MissingMetadataStore;
     for (members) |*member| {
-        if (member.object_kind != .index and member.object_kind != .enrichment) continue;
-        const name = extensionMemberTableName(member.*) orelse return error.UnsupportedExtensionScope;
+        const name = extensionMemberTableName(member.*) orelse continue;
         if (tables_api.findTableByName(snapshot, name) != null) continue;
         const identity = (try store.resolveSystemCatalogIdentity(alloc, service.metadata_group_id, try system_catalog.Target.literal(name))) orelse return error.TableNotFound;
         defer identity.deinit(alloc);
@@ -1318,7 +1317,7 @@ test "extension lifecycle binds public scope to durable table identity" {
     const FakeStore = struct {
         fn resolveSystemCatalogIdentity(_: *@This(), alloc: std.mem.Allocator, _: u64, target: system_catalog.Target) !?system_catalog.ResolvedTable {
             try std.testing.expectEqualStrings("docs", target.table);
-            return .{ .table_id = 7, .name = try alloc.dupe(u8, "table:physical") };
+            return .{ .table_id = 7, .name = try alloc.dupe(u8, "table:0123456789abcdef0123456789abcdef") };
         }
     };
     const Service = struct {
@@ -1331,7 +1330,7 @@ test "extension lifecycle binds public scope to durable table identity" {
     var service: Service = .{};
     var tables = [_]metadata_table_manager.TableRecord{.{
         .table_id = 7,
-        .name = "table:physical",
+        .name = "table:0123456789abcdef0123456789abcdef",
         .indexes_json = "{}",
         .placement_role = "data",
     }};
@@ -1353,10 +1352,11 @@ test "extension lifecycle binds public scope to durable table identity" {
     }};
     defer std.testing.allocator.free(members[0].table_name);
     try bindStorageMemberTables(&service, std.testing.allocator, &snapshot, &members);
-    try std.testing.expectEqualStrings("table:physical", members[0].table_name);
+    try std.testing.expectEqualStrings("table:0123456789abcdef0123456789abcdef", members[0].table_name);
     try std.testing.expectEqualStrings("docs", members[0].scope.table_name);
+    try members[0].validate();
     try validateNewStorageMembers(&snapshot, &members);
     // An update of a bound member keeps its physical identity.
     try bindStorageMemberTables(&service, std.testing.allocator, &snapshot, &members);
-    try std.testing.expectEqualStrings("table:physical", members[0].table_name);
+    try std.testing.expectEqualStrings("table:0123456789abcdef0123456789abcdef", members[0].table_name);
 }

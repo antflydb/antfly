@@ -1199,7 +1199,7 @@ fn ExtensionHostContext(comptime Server: type, comptime Identity: type) type {
             const table_name = try ctx.resolveTableName(table);
             const body = try extensionBatchBodyAlloc(alloc, writes_json);
             defer alloc.free(body);
-            return try ctx.server.executeExtensionHostBatch(alloc, table_name, body);
+            return try ctx.server.executeExtensionHostBatch(alloc, table_name, body, ctx.authenticated_identity);
         }
 
         fn aiEmbed(ptr: ?*anyopaque, alloc: std.mem.Allocator, _: []const u8, text: []const u8) anyerror![]f32 {

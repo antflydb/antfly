@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 # Copyright 2026 Antfly, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""Release completed Zig test artifacts between sequential CI build phases.
+"""Release disposable Zig test link inputs between sequential CI build phases.
 
 Call only when no build or test using this job-local cache is running. Keep
-compiler intermediates, generated sources, tools, small tests, and global dependencies.
+executables, generated sources, tools, small objects, and global dependencies.
+Zig can report a cache hit without checking that its executable still exists;
+removing an output directory leaves a live manifest pointing at a missing binary.
+Only completed test link inputs are disposable. A cache miss recompiles them.
 """
 
 import argparse
 import os
 from pathlib import Path
 import re
-import shutil
 
 
 def prune(cache: Path, min_bytes: int = 64 * 1024 * 1024) -> int:
@@ -30,15 +32,27 @@ def prune(cache: Path, min_bytes: int = 64 * 1024 * 1024) -> int:
             continue
         for output in artifact.iterdir():
             name = output.name.removesuffix(".exe")
-            if (name == "test" or name.endswith("-tests")) and (
-                not output.is_symlink()
+            if not (
+                (name == "test" or name.endswith("-tests"))
+                and not output.is_symlink()
                 and output.is_file()
                 and os.access(output, os.X_OK)
-                and output.stat().st_size >= min_bytes
             ):
-                shutil.rmtree(artifact)
-                removed += 1
-                break
+                continue
+            # Zig 0.16 names its completed compilation-unit link input _zcu.o;
+            # older builds use .o. Keep the final executable and any unknown
+            # siblings, including debug information and generator outputs.
+            pruned = False
+            for suffix in ("_zcu.o", ".o", "_zcu.obj", ".obj"):
+                link_input = artifact / (name + suffix)
+                if (
+                    not link_input.is_symlink()
+                    and link_input.is_file()
+                    and link_input.stat().st_size >= min_bytes
+                ):
+                    link_input.unlink()
+                    pruned = True
+            removed += int(pruned)
     return removed
 
 
@@ -46,4 +60,4 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("cache", type=Path)
     args = parser.parse_args()
-    print(f"Removed {prune(args.cache)} completed test artifact directories")
+    print(f"Pruned link inputs from {prune(args.cache)} completed test artifacts")
