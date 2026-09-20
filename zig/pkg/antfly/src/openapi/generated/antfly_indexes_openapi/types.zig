@@ -1519,6 +1519,7 @@ pub const CreatedEnrichmentConfig = struct {
     chunker_json: ?[]const u8 = null,
     full_text_index: ?bool = null,
     content_type: ?[]const u8 = null,
+    neighbor_context: ?EnrichmentNeighborContextConfig = null,
     execution: ?ExecutionPolicy = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -1535,6 +1536,7 @@ pub const CreatedEnrichmentConfig = struct {
         .{ "chunker_json", "chunker_json", true },
         .{ "full_text_index", "full_text_index", true },
         .{ "content_type", "content_type", true },
+        .{ "neighbor_context", "neighbor_context", true },
         .{ "execution", "execution", true },
     };
 
@@ -1590,6 +1592,10 @@ pub const CreatedEnrichmentConfig = struct {
         }
         if (self.content_type) |value| {
             try jw.objectField("content_type");
+            try jw.write(value);
+        }
+        if (self.neighbor_context) |value| {
+            try jw.objectField("neighbor_context");
             try jw.write(value);
         }
         if (self.execution) |value| {
@@ -3521,6 +3527,8 @@ pub const EnrichmentConfig = struct {
     content_type: ?[]const u8 = null,
     /// Write-only serialized producer configuration. For managed embedding enrichments Antfly stores a canonical semantic producer identity here; credentials and execution policy are excluded.
     producer_json: ?[]const u8 = null,
+    /// Optional bounded sample of the document's graph neighbors appended to the producer input. Only valid on asset enrichments whose producer consumes rendered prompt text (generator or extractor); producers that treat the source as a media locator (copy, reader, transcriber, document_extraction) reject it. Only same-shard graph state is sampled; a graph index without local state for a document yields empty neighbors at runtime while the graph index reference itself is validated at admission.
+    neighbor_context: ?EnrichmentNeighborContextConfig = null,
     /// Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity.
     execution: ?ExecutionPolicy = null,
     /// Typed shorthand for a transcription asset enrichment. Only valid with kind=asset and without producer_json; Antfly expands it into a document_extraction producer whose audio route transcribes each recording with this speech-to-text provider. The produced units carry the transcript text, provider confidence, and per-phrase time offsets, and chunk enrichments that consume them emit _start_time_ms/_end_time_ms on every chunk. With diarization: true the phrases also carry who spoke them, and a chunk that does not straddle a turn emits _speaker. content_type defaults to application/json.
@@ -3541,6 +3549,7 @@ pub const EnrichmentConfig = struct {
         .{ "full_text_index", "full_text_index", true },
         .{ "content_type", "content_type", true },
         .{ "producer_json", "producer_json", true },
+        .{ "neighbor_context", "neighbor_context", true },
         .{ "execution", "execution", true },
         .{ "transcriber", "transcriber", true },
     };
@@ -3603,6 +3612,10 @@ pub const EnrichmentConfig = struct {
             try jw.objectField("producer_json");
             try jw.write(value);
         }
+        if (self.neighbor_context) |value| {
+            try jw.objectField("neighbor_context");
+            try jw.write(value);
+        }
         if (self.execution) |value| {
             try jw.objectField("execution");
             try jw.write(value);
@@ -3641,6 +3654,53 @@ pub const EnrichmentKind = enum {
             .{ "embedding", .embedding },
         });
         return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Bounded sample of the document's same-shard graph neighbors appended to an asset producer's rendered input as a compact JSON block ({"neighbors":[{"edge_type":...,"direction":...,"target":...,"weight":...}]}), ordered by edge type then target key. A conceptualizer enrichment on an entities table can thereby ground its abstractions in adjacent facts ("started_by -> John Andrew Rice"). The sampled block participates in the producer's skip state, so a changed adjacency re-runs the producer.
+pub const EnrichmentNeighborContextConfig = struct {
+    /// Name of a graph index on the same table whose local state is sampled. Validated at admission; cross-shard neighbors are not sampled.
+    graph_index: []const u8,
+    /// Edge types to sample. Empty admits every edge type.
+    edge_types: ?[]const []const u8 = null,
+    /// Adjacency orientation to sample relative to the document.
+    direction: ?[]const u8 = null,
+    /// Maximum neighbors rendered into the producer input, applied after deterministic ordering.
+    limit: ?u32 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "graph_index", "graph_index", false },
+        .{ "edge_types", "edge_types", true },
+        .{ "direction", "direction", true },
+        .{ "limit", "limit", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("graph_index");
+        try jw.write(self.graph_index);
+        if (self.edge_types) |value| {
+            try jw.objectField("edge_types");
+            try jw.write(value);
+        }
+        if (self.direction) |value| {
+            try jw.objectField("direction");
+            try jw.write(value);
+        }
+        if (self.limit) |value| {
+            try jw.objectField("limit");
+            try jw.write(value);
+        }
+        try jw.endObject();
     }
 };
 
@@ -6209,6 +6269,10 @@ pub const GraphMetricQuery = struct {
     top_k: ?i32 = null,
     /// Whether the latest published generation may be stale or must match the graph edge generation.
     metric_freshness: ?[]const u8 = null,
+    /// Node keys receiving all teleport mass for query-seeded personalized PageRank (HippoRAG-style retrieval). Only valid for pagerank metrics and requires metric_freshness=fresh: personalized scores are computed at query time from the current edge snapshot, while published generations are global-only, so seeded reads against published freshness are rejected. Seed keys absent from the graph are skipped; if none resolve, ranking degenerates to global PageRank.
+    seed_nodes: ?[]const []const u8 = null,
+    /// Damping override for query-seeded personalized PageRank (typical HippoRAG-style retrieval uses 0.9). Only valid together with seed_nodes; omitted reads keep the metric's configured damping.
+    damping: ?f64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -6217,6 +6281,8 @@ pub const GraphMetricQuery = struct {
         .{ "metric", "metric", false },
         .{ "top_k", "top_k", true },
         .{ "metric_freshness", "metric_freshness", true },
+        .{ "seed_nodes", "seed_nodes", true },
+        .{ "damping", "damping", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -6245,6 +6311,14 @@ pub const GraphMetricQuery = struct {
             try jw.objectField("metric_freshness");
             try jw.write(value);
         }
+        if (self.seed_nodes) |value| {
+            try jw.objectField("seed_nodes");
+            try jw.write(value);
+        }
+        if (self.damping) |value| {
+            try jw.objectField("damping");
+            try jw.write(value);
+        }
         try jw.endObject();
     }
 };
@@ -6265,6 +6339,10 @@ pub const GraphMetricRerank = struct {
     missing_score: ?f64 = null,
     /// Whether stale published generations are acceptable or the metric must be fresh.
     metric_freshness: ?[]const u8 = null,
+    /// Node keys receiving all teleport mass for a query-seeded personalized PageRank blend (HippoRAG-style retrieval). Only valid for pagerank metrics and requires metric_freshness=fresh: the blended feature scores are computed at query time from the current edge snapshot, while published generations are global-only, so seeded blends against published freshness are rejected. Seed keys absent from the graph are skipped; if none resolve, the blend degenerates to global PageRank.
+    seed_nodes: ?[]const []const u8 = null,
+    /// Damping override for the query-seeded personalized PageRank blend. Only valid together with seed_nodes; omitted blends keep the metric's configured damping.
+    damping: ?f64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -6275,6 +6353,8 @@ pub const GraphMetricRerank = struct {
         .{ "weight", "weight", true },
         .{ "missing_score", "missing_score", true },
         .{ "metric_freshness", "metric_freshness", true },
+        .{ "seed_nodes", "seed_nodes", true },
+        .{ "damping", "damping", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -6309,6 +6389,14 @@ pub const GraphMetricRerank = struct {
         }
         if (self.metric_freshness) |value| {
             try jw.objectField("metric_freshness");
+            try jw.write(value);
+        }
+        if (self.seed_nodes) |value| {
+            try jw.objectField("seed_nodes");
+            try jw.write(value);
+        }
+        if (self.damping) |value| {
+            try jw.objectField("damping");
             try jw.write(value);
         }
         try jw.endObject();
@@ -7404,6 +7492,8 @@ pub const GraphResolverConfig = struct {
     source_artifact_kind: ?[]const u8 = null,
     resolution_artifact: []const u8,
     key_template: []const u8,
+    /// Mention labels this resolver consumes; empty consumes every label (catch-all). Labeled resolvers sharing a source artifact must claim disjoint label sets, and every catch-all on that artifact skips the labels claimed by labeled siblings, so extraction labels stay open-vocabulary while each mention routes to exactly one labeled resolver (label-routed tables, e.g. event mentions to an events table).
+    labels: ?[]const []const u8 = null,
     type_must_match: ?bool = null,
     scorer_json: ?[]const u8 = null,
     candidate_search: ?[]const u8 = null,
@@ -7425,6 +7515,7 @@ pub const GraphResolverConfig = struct {
         .{ "source_artifact_kind", "source_artifact_kind", true },
         .{ "resolution_artifact", "resolution_artifact", false },
         .{ "key_template", "key_template", false },
+        .{ "labels", "labels", true },
         .{ "type_must_match", "type_must_match", true },
         .{ "scorer_json", "scorer_json", true },
         .{ "candidate_search", "candidate_search", true },
@@ -7463,6 +7554,10 @@ pub const GraphResolverConfig = struct {
         try jw.write(self.resolution_artifact);
         try jw.objectField("key_template");
         try jw.write(self.key_template);
+        if (self.labels) |value| {
+            try jw.objectField("labels");
+            try jw.write(value);
+        }
         if (self.type_must_match) |value| {
             try jw.objectField("type_must_match");
             try jw.write(value);

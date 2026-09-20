@@ -8847,9 +8847,9 @@ export interface components {
              *     ```
              */
             reranker?: components["schemas"]["RerankerConfig"];
-            /** @description Direct top-k read from a published graph metric generation. Results are returned in graph_metric_results under the requested name or the metric name when no explicit name is supplied. */
+            /** @description Direct top-k read from a published graph metric generation. Results are returned in graph_metric_results under the requested name or the metric name when no explicit name is supplied. Supplying seed_nodes switches a pagerank metric to query-seeded personalized PageRank computed at query time; that form requires metric_freshness=fresh because published generations are global-only. */
             graph_metric?: components["schemas"]["GraphMetricQuery"];
-            /** @description Blend a published graph metric feature into ordinary search hit scores. Requests may require either any published generation or a generation that is fresh with respect to graph writes. */
+            /** @description Blend a published graph metric feature into ordinary search hit scores. Requests may require either any published generation or a generation that is fresh with respect to graph writes. Supplying seed_nodes switches a pagerank metric to a query-seeded personalized PageRank blend computed at query time; that form requires metric_freshness=fresh. Retrieval-agent queries that combine graph_queries with a fresh graph_metric_rerank are seeded automatically from their literal traversal start-node keys. */
             graph_metric_rerank?: components["schemas"]["GraphMetricRerank"];
             analyses?: components["schemas"]["Analyses"];
             /**
@@ -10922,6 +10922,25 @@ export interface components {
          * @enum {string}
          */
         EnrichmentKind: "chunk" | "asset" | "embedding";
+        /** @description Bounded sample of the document's same-shard graph neighbors appended to an asset producer's rendered input as a compact JSON block ({"neighbors":[{"edge_type":...,"direction":...,"target":...,"weight":...}]}), ordered by edge type then target key. A conceptualizer enrichment on an entities table can thereby ground its abstractions in adjacent facts ("started_by -> John Andrew Rice"). The sampled block participates in the producer's skip state, so a changed adjacency re-runs the producer. */
+        EnrichmentNeighborContextConfig: {
+            /** @description Name of a graph index on the same table whose local state is sampled. Validated at admission; cross-shard neighbors are not sampled. */
+            graph_index: string;
+            /** @description Edge types to sample. Empty admits every edge type. */
+            edge_types?: string[];
+            /**
+             * @description Adjacency orientation to sample relative to the document.
+             * @default both
+             * @enum {string}
+             */
+            direction?: "out" | "in" | "both";
+            /**
+             * Format: uint32
+             * @description Maximum neighbors rendered into the producer input, applied after deterministic ordering.
+             * @default 8
+             */
+            limit?: number;
+        };
         /** @description Non-semantic execution policy for one producer or index maintenance operation. These fields tune how work is batched and do not change generated artifact identity. */
         ExecutionPolicy: {
             /** @description Maximum items to process in one batch for this operation. */
@@ -11026,6 +11045,8 @@ export interface components {
             content_type?: string;
             /** @description Write-only serialized producer configuration. For managed embedding enrichments Antfly stores a canonical semantic producer identity here; credentials and execution policy are excluded. */
             producer_json?: string;
+            /** @description Optional bounded sample of the document's graph neighbors appended to the producer input. Only valid on asset enrichments whose producer consumes rendered prompt text (generator or extractor); producers that treat the source as a media locator (copy, reader, transcriber, document_extraction) reject it. Only same-shard graph state is sampled; a graph index without local state for a document yields empty neighbors at runtime while the graph index reference itself is validated at admission. */
+            neighbor_context?: components["schemas"]["EnrichmentNeighborContextConfig"];
             /** @description Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity. */
             execution?: components["schemas"]["ExecutionPolicy"];
             /** @description Typed shorthand for a transcription asset enrichment. Only valid with kind=asset and without producer_json; Antfly expands it into a document_extraction producer whose audio route transcribes each recording with this speech-to-text provider. The produced units carry the transcript text, provider confidence, and per-phrase time offsets, and chunk enrichments that consume them emit _start_time_ms/_end_time_ms on every chunk. With diarization: true the phrases also carry who spoke them, and a chunk that does not straddle a turn emits _speaker. content_type defaults to application/json. */
@@ -11631,6 +11652,8 @@ export interface components {
             source_artifact_kind?: "asset" | "chunk" | "any";
             resolution_artifact: string;
             key_template: string;
+            /** @description Mention labels this resolver consumes; empty consumes every label (catch-all). Labeled resolvers sharing a source artifact must claim disjoint label sets, and every catch-all on that artifact skips the labels claimed by labeled siblings, so extraction labels stay open-vocabulary while each mention routes to exactly one labeled resolver (label-routed tables, e.g. event mentions to an events table). */
+            labels?: string[];
             /** @default true */
             type_must_match?: boolean;
             scorer_json?: string;
@@ -12014,6 +12037,7 @@ export interface components {
             /** @default false */
             full_text_index?: boolean;
             content_type?: string;
+            neighbor_context?: components["schemas"]["EnrichmentNeighborContextConfig"];
             execution?: components["schemas"]["ExecutionPolicy"];
         };
         /** @description Fields returned for every newly created index. Provider credentials are write-only and are never returned. */
@@ -14668,6 +14692,13 @@ export interface components {
              * @enum {string}
              */
             metric_freshness?: "published" | "fresh";
+            /** @description Node keys receiving all teleport mass for query-seeded personalized PageRank (HippoRAG-style retrieval). Only valid for pagerank metrics and requires metric_freshness=fresh: personalized scores are computed at query time from the current edge snapshot, while published generations are global-only, so seeded reads against published freshness are rejected. Seed keys absent from the graph are skipped; if none resolve, ranking degenerates to global PageRank. */
+            seed_nodes?: string[];
+            /**
+             * Format: double
+             * @description Damping override for query-seeded personalized PageRank (typical HippoRAG-style retrieval uses 0.9). Only valid together with seed_nodes; omitted reads keep the metric's configured damping.
+             */
+            damping?: number;
         };
         /** @description Blends a published graph metric into hit scores. Multi-shard tables require a globally coordinated metric snapshot and otherwise return graph_metric_global_materialization_required. */
         GraphMetricRerank: {
@@ -14704,6 +14735,13 @@ export interface components {
              * @enum {string}
              */
             metric_freshness?: "published" | "fresh";
+            /** @description Node keys receiving all teleport mass for a query-seeded personalized PageRank blend (HippoRAG-style retrieval). Only valid for pagerank metrics and requires metric_freshness=fresh: the blended feature scores are computed at query time from the current edge snapshot, while published generations are global-only, so seeded blends against published freshness are rejected. Seed keys absent from the graph are skipped; if none resolve, the blend degenerates to global PageRank. */
+            seed_nodes?: string[];
+            /**
+             * Format: double
+             * @description Damping override for the query-seeded personalized PageRank blend. Only valid together with seed_nodes; omitted blends keep the metric's configured damping.
+             */
+            damping?: number;
         };
         /** @description User-visible graph alias or named result under Antfly graph identifier policy v1 (Unicode 15.0.0). Identifiers are exact UTF-8 strings and are not normalized. Ordinary internal ASCII spaces are allowed. The value must not equal `*`, begin with `$`, have leading or trailing spaces, contain non-ASCII Unicode White_Space, or contain Unicode Cc control or Cf format code points. UTF-8 encoding is limited to 512 bytes. */
         GraphIdentifier: string;

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar
+from typing import Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 
@@ -25,6 +25,10 @@ class GraphResolverConfig:
         key_template (str):
         source_artifact_kind (GraphResolverConfigSourceArtifactKind | Unset):  Default:
             GraphResolverConfigSourceArtifactKind.ASSET.
+        labels (list[str] | Unset): Mention labels this resolver consumes; empty consumes every label (catch-all).
+            Labeled resolvers sharing a source artifact must claim disjoint label sets, and every catch-all on that artifact
+            skips the labels claimed by labeled siblings, so extraction labels stay open-vocabulary while each mention
+            routes to exactly one labeled resolver (label-routed tables, e.g. event mentions to an events table).
         type_must_match (bool | Unset):  Default: True.
         scorer_json (str | Unset):
         candidate_search (GraphResolverConfigCandidateSearch | Unset):
@@ -45,6 +49,7 @@ class GraphResolverConfig:
     resolution_artifact: str
     key_template: str
     source_artifact_kind: GraphResolverConfigSourceArtifactKind | Unset = GraphResolverConfigSourceArtifactKind.ASSET
+    labels: list[str] | Unset = UNSET
     type_must_match: bool | Unset = True
     scorer_json: str | Unset = UNSET
     candidate_search: GraphResolverConfigCandidateSearch | Unset = UNSET
@@ -72,6 +77,10 @@ class GraphResolverConfig:
         source_artifact_kind: str | Unset = UNSET
         if not isinstance(self.source_artifact_kind, Unset):
             source_artifact_kind = self.source_artifact_kind.value
+
+        labels: list[str] | Unset = UNSET
+        if not isinstance(self.labels, Unset):
+            labels = self.labels
 
         type_must_match = self.type_must_match
 
@@ -114,6 +123,8 @@ class GraphResolverConfig:
         )
         if source_artifact_kind is not UNSET:
             field_dict["source_artifact_kind"] = source_artifact_kind
+        if labels is not UNSET:
+            field_dict["labels"] = labels
         if type_must_match is not UNSET:
             field_dict["type_must_match"] = type_must_match
         if scorer_json is not UNSET:
@@ -161,6 +172,8 @@ class GraphResolverConfig:
         else:
             source_artifact_kind = GraphResolverConfigSourceArtifactKind(_source_artifact_kind)
 
+        labels = cast(list[str], d.pop("labels", UNSET))
+
         type_must_match = d.pop("type_must_match", UNSET)
 
         scorer_json = d.pop("scorer_json", UNSET)
@@ -202,6 +215,7 @@ class GraphResolverConfig:
             resolution_artifact=resolution_artifact,
             key_template=key_template,
             source_artifact_kind=source_artifact_kind,
+            labels=labels,
             type_must_match=type_must_match,
             scorer_json=scorer_json,
             candidate_search=candidate_search,

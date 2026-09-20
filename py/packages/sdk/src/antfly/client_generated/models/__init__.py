@@ -245,6 +245,8 @@ from .embeddings_index_stats_promotion import EmbeddingsIndexStatsPromotion
 from .embeddings_index_stats_resolution import EmbeddingsIndexStatsResolution
 from .enrichment_config import EnrichmentConfig
 from .enrichment_kind import EnrichmentKind
+from .enrichment_neighbor_context_config import EnrichmentNeighborContextConfig
+from .enrichment_neighbor_context_config_direction import EnrichmentNeighborContextConfigDirection
 from .enrichment_runtime_status import EnrichmentRuntimeStatus
 from .enrichment_runtime_status_active_phase import EnrichmentRuntimeStatusActivePhase
 from .enrichment_runtime_status_stall_reason import EnrichmentRuntimeStatusStallReason
@@ -1473,6 +1475,8 @@ __all__ = (
     "EmbeddingType3",
     "EnrichmentConfig",
     "EnrichmentKind",
+    "EnrichmentNeighborContextConfig",
+    "EnrichmentNeighborContextConfigDirection",
     "EnrichmentRuntimeStatus",
     "EnrichmentRuntimeStatusActivePhase",
     "EnrichmentRuntimeStatusStallReason",
