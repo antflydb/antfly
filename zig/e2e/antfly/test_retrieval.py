@@ -75,17 +75,26 @@ def _post_until_hit_ids(
     expected_ids: list[str],
     timeout_s: float = 30.0,
 ) -> dict:
+    last_response = None
+
+    def matching_response():
+        nonlocal last_response
+        last_response = backup_api.post("/agents/retrieval", payload)
+        return last_response if _hit_ids(last_response) == expected_ids else None
+
     result = wait_until(
-        lambda: (
-            response
-            if _hit_ids(response := backup_api.post("/agents/retrieval", payload))
-            == expected_ids
-            else None
-        ),
+        matching_response,
         timeout_s=timeout_s,
         interval_s=0.5,
     )
-    assert result is not None
+    assert result is not None, json.dumps(
+        {
+            "expected_ids": expected_ids,
+            "last_ids": _hit_ids(last_response) if last_response is not None else None,
+            "last_response": last_response,
+        },
+        sort_keys=True,
+    )
     return result
 
 
@@ -1982,7 +1991,14 @@ def test_retrieval_agent_bounded_agentic_can_fallback_after_a_weak_multi_hit_fir
         )
 
 
-def test_retrieval_agent_bounded_agentic_can_decompose_queries(backup_api):
+@pytest.mark.parametrize(
+    "lexical_query",
+    [{"query": "body:raft"}, {"match": "raft", "field": "body"}],
+    ids=["query-syntax", "match-text"],
+)
+def test_retrieval_agent_bounded_agentic_can_decompose_queries(
+    backup_api, lexical_query
+):
     table_name = f"retrieval_agentic_decompose_{time.time_ns()}"
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
@@ -2014,7 +2030,7 @@ def test_retrieval_agent_bounded_agentic_can_decompose_queries(backup_api):
             "queries": [
                 {
                     "table": table_name,
-                    "full_text_search": {"query": "body:raft"},
+                    "full_text_search": lexical_query,
                     "limit": 5,
                 },
                 {
