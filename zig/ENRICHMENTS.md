@@ -238,10 +238,15 @@ every lane-side helper takes the identity from the scope
 progress to the scope's request, unless that request is the one that
 deferred a retry, so a sibling's success cannot clear another request's
 debt. When a lane's quantum ends with its deferred retryable error, the
-error and the identity travel together in a `LaneOutcome`; `LanePipeline`
-installs that identity as the runtime's active retry identity on the scanner
-thread, and only for the outcome whose error is actually returned to the
-supervisor (a scan-time error keeps the scanner's own identity untouched).
+error and the identity travel together in a `LaneOutcome`. Every place that
+finishes lane work -- a dispatch draining a lane's previous quantum or
+running one inline, and the end-of-pass drain -- first selects which of the
+two lanes' outcomes the supervisor will see (`selectLaneOutcome`, asset
+before dense) and only then installs that outcome's identity as the runtime's
+active retry identity on the scanner thread. Installing identities as lanes
+are drained would let the dense lane's identity overwrite the asset lane's
+while the asset error is the one returned; a scan-time error keeps the
+scanner's own identity untouched.
 
 Shared runtime sets touched from both lanes and the scanner
 (`published_generated_artifacts`, `isolated_failed_indexes`,

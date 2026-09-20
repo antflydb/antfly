@@ -11048,6 +11048,12 @@ const LaneOutcome = struct {
     result: anyerror!void,
     retry_fingerprint: u64,
 
+    const ok: LaneOutcome = .{ .result = {}, .retry_fingerprint = 0 };
+
+    fn failed(err: anyerror) LaneOutcome {
+        return .{ .result = err, .retry_fingerprint = 0 };
+    }
+
     fn of(scope: *const FailureScope, result: anyerror!void) LaneOutcome {
         const retry_fingerprint: u64 = if (result) |_| 0 else |err| blk: {
             const deferred = scope.retry_error orelse break :blk 0;
@@ -11065,6 +11071,32 @@ const LaneOutcome = struct {
 /// whose error is actually returned to the supervisor.
 fn adoptLaneRetryIdentity(runtime: *EnrichmentRuntime, outcome: LaneOutcome) void {
     if (outcome.retry_fingerprint != 0) restoreDeferredRequestRetryAuthorization(runtime, outcome.retry_fingerprint);
+}
+
+/// The one outcome of a pair the supervisor will see, with the historical
+/// asset-then-dense error priority. Selection happens before any identity is
+/// installed: installing each lane's identity as it is drained would let the
+/// dense lane's identity overwrite the asset lane's while the asset error is
+/// the one returned, charging the wrong request's retry budget.
+fn selectLaneOutcome(asset: LaneOutcome, dense: LaneOutcome) LaneOutcome {
+    if (asset.result) |_| {} else |_| return asset;
+    return dense;
+}
+
+test "lane outcome selection keeps the returned error's own identity" {
+    const asset_failed = LaneOutcome{ .result = error.EmbedRateLimited, .retry_fingerprint = 41 };
+    const dense_failed = LaneOutcome{ .result = error.EmbedRateLimited, .retry_fingerprint = 42 };
+    // Both previous quanta failed: the asset error is returned, so the
+    // asset request's identity must be the one installed, not the dense
+    // lane's (which was drained second).
+    const both = selectLaneOutcome(asset_failed, dense_failed);
+    try std.testing.expectError(error.EmbedRateLimited, both.result);
+    try std.testing.expectEqual(@as(u64, 41), both.retry_fingerprint);
+    const dense_only = selectLaneOutcome(LaneOutcome.ok, dense_failed);
+    try std.testing.expectEqual(@as(u64, 42), dense_only.retry_fingerprint);
+    const neither = selectLaneOutcome(LaneOutcome.ok, LaneOutcome.ok);
+    try neither.result;
+    try std.testing.expectEqual(@as(u64, 0), neither.retry_fingerprint);
 }
 
 const LanePipeline = struct {
@@ -11085,27 +11117,10 @@ const LanePipeline = struct {
         return .{ .runtime = runtime };
     }
 
-    /// Await and free the asset lane's in-flight quantum, if any. A no-op
-    /// when nothing is in flight. Runs on the scanner thread: when the lane
-    /// failed with a deferred retry, its identity is installed here as the
-    /// runtime's active retry identity (see `FailureScope`), so the error
-    /// this returns is accounted against the request that actually failed.
-    fn drainAsset(self: *LanePipeline) !void {
-        const outcome = self.awaitAsset() orelse return;
-        adoptLaneRetryIdentity(self.runtime, outcome);
-        return outcome.result;
-    }
-
-    /// Await and free the dense lane's in-flight quantum, if any; see
-    /// `drainAsset` for the identity contract.
-    fn drainDense(self: *LanePipeline) !void {
-        const outcome = self.awaitDense() orelse return;
-        adoptLaneRetryIdentity(self.runtime, outcome);
-        return outcome.result;
-    }
-
     /// Await and free the asset lane's in-flight quantum without installing
-    /// its identity; null when nothing is in flight.
+    /// its identity; null when nothing is in flight. Identities are installed
+    /// only after `selectLaneOutcome` has chosen the error the supervisor
+    /// sees (`drainAll`, `dispatchDeferredGeneratedWork`).
     fn awaitAsset(self: *LanePipeline) ?LaneOutcome {
         const inflight = self.asset_inflight orelse return null;
         self.asset_inflight = null;
@@ -11140,14 +11155,11 @@ const LanePipeline = struct {
     /// priority over a drain error, and in that case the scanner's own active
     /// identity must survive the drain untouched.
     fn drainAll(self: *LanePipeline, adopt_identity: bool) !void {
-        const asset = self.awaitAsset();
-        const dense = self.awaitDense();
-        if (asset) |outcome| outcome.result catch |err| {
-            if (adopt_identity) adoptLaneRetryIdentity(self.runtime, outcome);
-            return err;
-        };
-        if (dense) |outcome| outcome.result catch |err| {
-            if (adopt_identity) adoptLaneRetryIdentity(self.runtime, outcome);
+        const asset = self.awaitAsset() orelse LaneOutcome.ok;
+        const dense = self.awaitDense() orelse LaneOutcome.ok;
+        const selected = selectLaneOutcome(asset, dense);
+        selected.result catch |err| {
+            if (adopt_identity) adoptLaneRetryIdentity(self.runtime, selected);
             return err;
         };
     }
@@ -11155,31 +11167,36 @@ const LanePipeline = struct {
     /// Dispatch this quantum's asset-producer work, if any, without
     /// awaiting it. A previous in-flight asset quantum (bounded to one) is
     /// awaited and freed first.
+    ///
+    /// Returns the outcome of whatever this call had to finish -- the
+    /// previous quantum it drained, or the quantum it ran inline -- without
+    /// installing its identity; the caller selects between both lanes'
+    /// outcomes first.
     fn dispatchAsset(
         self: *LanePipeline,
         deferred_assets: *std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest),
         applied_sequence: u64,
         group: ?enrichment_worker.PendingDocumentGroup,
-    ) !void {
-        if (deferred_assets.items.len == 0) return;
-        try self.drainAsset();
+    ) LaneOutcome {
+        if (deferred_assets.items.len == 0) return LaneOutcome.ok;
+        if (self.awaitAsset()) |previous| previous.result catch return previous;
 
         const runtime = self.runtime;
-        const lane = try prepareAssetLane(runtime, deferred_assets, applied_sequence, group);
+        const lane = prepareAssetLane(runtime, deferred_assets, applied_sequence, group) catch |err| return LaneOutcome.failed(err);
         const io = concurrencyIo(runtime);
         if (io.concurrent(AssetExecutionLane.run, .{lane})) |future| {
             self.asset_inflight = .{ .lane = lane, .future = future };
-            return;
+            return LaneOutcome.ok;
         } else |_| {
             // This Io backend does not support concurrency (for example a
             // deterministic single-flow simulation harness). Run inline;
             // correctness is unaffected, only the cross-quantum overlap is
             // lost for this backend.
             const result = AssetExecutionLane.run(lane);
-            adoptLaneRetryIdentity(runtime, LaneOutcome.of(&lane.scope, result));
+            const outcome = LaneOutcome.of(&lane.scope, result);
             lane.deinitOwned();
             runtime.alloc.destroy(lane);
-            return result;
+            return outcome;
         }
     }
 
@@ -11193,22 +11210,22 @@ const LanePipeline = struct {
         chunk_cache: *std.ArrayListUnmanaged(WorkerChunkCacheEntry),
         applied_sequence: u64,
         group: ?enrichment_worker.PendingDocumentGroup,
-    ) !void {
-        if (deferred_plain_dense.items.len == 0 and deferred_chunked_dense.items.len == 0) return;
-        try self.drainDense();
+    ) LaneOutcome {
+        if (deferred_plain_dense.items.len == 0 and deferred_chunked_dense.items.len == 0) return LaneOutcome.ok;
+        if (self.awaitDense()) |previous| previous.result catch return previous;
 
         const runtime = self.runtime;
-        const lane = try prepareDenseLane(runtime, deferred_plain_dense, deferred_chunked_dense, chunk_cache, applied_sequence, group);
+        const lane = prepareDenseLane(runtime, deferred_plain_dense, deferred_chunked_dense, chunk_cache, applied_sequence, group) catch |err| return LaneOutcome.failed(err);
         const io = concurrencyIo(runtime);
         if (io.concurrent(DenseExecutionLane.run, .{lane})) |future| {
             self.dense_inflight = .{ .lane = lane, .future = future };
-            return;
+            return LaneOutcome.ok;
         } else |_| {
             const result = DenseExecutionLane.run(lane);
-            adoptLaneRetryIdentity(runtime, LaneOutcome.of(&lane.scope, result));
+            const outcome = LaneOutcome.of(&lane.scope, result);
             lane.deinitOwned();
             runtime.alloc.destroy(lane);
-            return result;
+            return outcome;
         }
     }
 };
@@ -11254,8 +11271,8 @@ fn dispatchDeferredGeneratedWork(
     // fails) so a fatal error in one lane never prevents the sibling lane's
     // own quantum from being attempted and durably published; see the
     // "Two-Stream Execution Model" doc comment above.
-    const asset_result = pipeline.dispatchAsset(deferred_assets, applied_sequence, group);
-    const dense_result = pipeline.dispatchDense(deferred_plain_dense, deferred_chunked_dense, chunk_cache, applied_sequence, group);
+    const asset_outcome = pipeline.dispatchAsset(deferred_assets, applied_sequence, group);
+    const dense_outcome = pipeline.dispatchDense(deferred_plain_dense, deferred_chunked_dense, chunk_cache, applied_sequence, group);
 
     // Every request queued for this quantum has now either been cloned into
     // whichever lane(s) dispatch created, or freed by a failed dispatch
@@ -11268,12 +11285,16 @@ fn dispatchDeferredGeneratedWork(
     clearRequestPlanCache(runtime.alloc, request_plan_cache);
 
     // Preserve the historical error priority (assets, then dense) for
-    // whichever representative error a lane returns.
-    asset_result catch |err| {
-        dense_result catch {};
+    // whichever representative error a lane returns, and install only the
+    // returned error's request identity: each dispatch may have drained a
+    // failed previous quantum, and installing identities as they drained
+    // would let the dense lane's overwrite the asset lane's while the asset
+    // error is the one the supervisor charges.
+    const selected = selectLaneOutcome(asset_outcome, dense_outcome);
+    selected.result catch |err| {
+        adoptLaneRetryIdentity(runtime, selected);
         return err;
     };
-    try dense_result;
 }
 
 /// Shared quantum-scanning loop for both foreground catch-up entry points
