@@ -61,8 +61,10 @@ The implementation now consists of:
   and atomic vacuum replacement. Document commits publish a namespace-head
   directory and per-namespace page links in the same checkpoint for mutation
   and integrity bookkeeping. Materialized document snapshots seek the pinned
-  live-key index and reuse a record reader, so reads scale with live results
-  rather than overwritten history. Namespace heads use a copy-on-write catalog B+ tree, so updates and
+  live-key index, group record references by physical page, and reuse a record
+  reader, so reads scale with live pages rather than overwritten history or
+  key-to-page disorder. Output keys are allocated once through the caller's
+  allocator and transferred from the cursor; results remain in key order. Namespace heads use a copy-on-write catalog B+ tree, so updates and
   cold writes touch only the requested namespaces and their tree paths. Batches
   collect distinct namespaces, share a sorted tree traversal to resolve their
   heads, and group record references by physical page before decoding them.
@@ -1296,9 +1298,9 @@ inline-cache preparation, including private publication followed by rollback.
 Batched namespace resolution reduces a 16,384-namespace update from 49,348
 logical page reads to 449 with caching disabled. Physical grouping keeps packed
 record reads bounded after interleaved namespace updates and a cold reopen.
-A sorted 65,536-document initial batch in one namespace uses 27,199 bytes of
+A sorted 65,536-document initial batch in one namespace uses 28,849 bytes of
 peak temporary native heap instead of 6,451,968 bytes. At 16,384 and 131,072
-documents it uses 18,944 and 27,229 bytes, excluding caller-owned input. Regressions cover read and
+documents it uses 22,347 and 28,879 bytes, excluding caller-owned input. Regressions cover read and
 heap bounds, repeated mutations in input order, missing namespaces, external
 index keys, pinned checkpoints, and allocation-failure rollback in packed and
 unpacked v3 files.
@@ -1316,7 +1318,7 @@ allocations instead of 279, a full batch uses 16,396 instead of 33,599, and an
 index cursor scan uses 16,391 instead of 33,385. After warming its traversal
 buffers, each seek allocates only its returned key. A one-document snapshot
 among 16,384 namespaces seeks the pinned document index: three logical reads,
-16 allocations, and 14,226 bytes of peak temporary heap, down from 255 reads,
+16 allocations, and 14,459 bytes of peak temporary heap, down from 255 reads,
 49,881 allocations, and 1,402,790 bytes. The cursor retains bounded traversal
 scratch and reads external values from the same checkpoint. Legacy indexed
 tombstones remain excluded. With one live key after 16,384 versions, a snapshot
@@ -1357,3 +1359,21 @@ remain unchanged. For catalog updates, calls fall from 1,223 to 99 with 1,434
 written pages unchanged. Regressions cover out-of-order pages, duplicate
 staged addresses, partial-run failures without cache admission, sorted initial
 ingest under a 512 KiB native heap budget, and pinned snapshots after overwrites.
+
+Document, catalog, namespace, and vacuum record writers share reusable encoding
+scratch owned by their page allocator. The bulk builder copies inline leaf keys
+into one fixed page-sized slab; parent separators retain independent ownership
+before that slab is reused. A sorted 65,536-document ingest now makes 858 native
+allocations rather than 131,928, excluding caller-owned input. At 16,384 documents
+it makes 238 rather than 33,004. Peak scratch remains bounded by page size and
+tree height; packed and unpacked revision-3 layouts are unchanged.
+
+Materialized snapshots retain one temporary reference per indexed result, group
+records by physical page, and sort the owned output back into key order. On a
+65,536-document fixture inserted out of key order with caching disabled, reads
+fall from 65,945 to 1,181 and allocations from 196,640 to 131,120. The ordered
+fixture also takes 1,181 reads. Metadata storage scales with the requested live
+result set, never its historical versions; legacy indexed tombstones are filtered
+before returning. Regressions cover allocation churn, scattered pages, distinct
+file/output allocators, pinned external values, mixed tombstones, and exhaustive
+allocation-failure cleanup.
