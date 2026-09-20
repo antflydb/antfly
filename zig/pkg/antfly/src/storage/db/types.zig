@@ -2001,6 +2001,14 @@ pub const GraphMetricQuery = struct {
     metric_name: []const u8,
     top_k: u32 = 10,
     freshness: GraphMetricFreshness = .published,
+    /// Query-seeded personalized PageRank: teleport mass restricted to these
+    /// node keys. The ranking is computed at query time from the current edge
+    /// snapshot, so seeds require freshness=fresh; published generations are
+    /// global-only. Seed keys absent from the graph are skipped, not errors.
+    seed_nodes: []const []const u8 = &.{},
+    /// Damping override for personalized reads. Null keeps the metric's
+    /// configured damping. Only valid together with seed_nodes.
+    damping: ?f64 = null,
 };
 
 pub const NamedGraphMetricQuery = struct {
@@ -2016,6 +2024,12 @@ pub const GraphMetricRerank = struct {
     base_weight: f64 = 1.0,
     weight: f64 = 1.0,
     missing_score: f64 = 0.0,
+    /// Query-seeded personalized PageRank blend: metric feature scores are
+    /// computed at query time with teleport mass restricted to these node
+    /// keys. Requires freshness=fresh; published generations are global-only.
+    seed_nodes: []const []const u8 = &.{},
+    /// Damping override for personalized blends. Only valid with seed_nodes.
+    damping: ?f64 = null,
 };
 
 pub const graph_metric_rerank_max_candidates: u32 = 10_000;

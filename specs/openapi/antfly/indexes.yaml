@@ -5217,6 +5217,32 @@ components:
             - fresh
           default: published
           description: Whether stale published generations are acceptable or the metric must be fresh.
+        seed_nodes:
+          type: array
+          maxItems: 128
+          items:
+            type: string
+            minLength: 1
+          description: >-
+            Node keys receiving all teleport mass for a query-seeded
+            personalized PageRank blend (HippoRAG-style retrieval). Only valid
+            for pagerank metrics and requires metric_freshness=fresh: the
+            blended feature scores are computed at query time from the current
+            edge snapshot, while published generations are global-only, so
+            seeded blends against published freshness are rejected. Seed keys
+            absent from the graph are skipped; if none resolve, the blend
+            degenerates to global PageRank.
+        damping:
+          type: number
+          format: double
+          minimum: 0
+          exclusiveMinimum: true
+          maximum: 1
+          exclusiveMaximum: true
+          description: >-
+            Damping override for the query-seeded personalized PageRank blend.
+            Only valid together with seed_nodes; omitted blends keep the
+            metric's configured damping.
     GraphMetricResult:
       type: object
       required:

@@ -8252,7 +8252,12 @@ components:
           description: >-
             Blend a published graph metric feature into ordinary search hit
             scores. Requests may require either any published generation or a
-            generation that is fresh with respect to graph writes.
+            generation that is fresh with respect to graph writes. Supplying
+            seed_nodes switches a pagerank metric to a query-seeded
+            personalized PageRank blend computed at query time; that form
+            requires metric_freshness=fresh. Retrieval-agent queries that
+            combine graph_queries with a fresh graph_metric_rerank are seeded
+            automatically from their literal traversal start-node keys.
         analyses:
           $ref: "#/components/schemas/Analyses"
         graph_queries:

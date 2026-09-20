@@ -29,6 +29,7 @@ const query_contract = @import("query_contract.zig");
 const query_builder_agent = @import("query_builder_agent.zig");
 const json_helpers = @import("json_helpers.zig");
 const wildcard_mod = @import("../search/wildcard.zig");
+const graph_query_mod = @import("../graph/query.zig");
 
 const AgentDecision = metadata_openapi.AgentDecision;
 const AgentQuestion = metadata_openapi.AgentQuestion;
@@ -6574,9 +6575,88 @@ fn encodeQueryValueForRetrievalQueryWithText(
         );
     }
 
+    // HippoRAG-style personalization: a graph search combined with an
+    // explicitly fresh graph_metric_rerank opts this query into seeding the
+    // metric from its literal traversal start-node keys — the resolved query
+    // entities. The generated rerank wire type predates seed personalization,
+    // so seeds are injected into the encoded object. Queries without literal
+    // start keys keep their unseeded (global) rerank behavior; seeding never
+    // fails the retrieval.
+    const seed_keys = try collectSeedMetricRerankKeys(arena, query_request);
+
     // This is an internal request hop, so keep the canonical wire compact and
     // preserve the public absent-vs-null contract for optional fields.
-    return try std.json.Stringify.valueAlloc(alloc, query_request, .{ .emit_null_optional_fields = false });
+    const encoded = try std.json.Stringify.valueAlloc(alloc, query_request, .{ .emit_null_optional_fields = false });
+    if (seed_keys.len == 0) return encoded;
+    defer alloc.free(encoded);
+    return try injectSeedNodesIntoEncodedQuery(alloc, arena, encoded, seed_keys);
+}
+
+/// Literal graph-search start keys for personalized metric seeding. Returns
+/// an empty slice unless the query both runs graph searches and requests a
+/// fresh graph_metric_rerank: personalization requires fresh reads, so a
+/// published-freshness rerank keeps its global scores untouched.
+fn collectSeedMetricRerankKeys(
+    arena: std.mem.Allocator,
+    query_request: QueryRequest,
+) ![]const []const u8 {
+    const rerank = query_request.graph_metric_rerank orelse return &.{};
+    if (!std.mem.eql(u8, rerank.metric_freshness orelse "published", "fresh")) return &.{};
+    const graph_queries = query_request.graph_queries orelse return &.{};
+
+    var keys = std.ArrayListUnmanaged([]const u8).empty;
+    for (graph_queries.map.values()) |graph_query| {
+        switch (graph_query) {
+            .graph_traverse_query => |traverse| switch (traverse.traverse.start) {
+                .graph_key_node_selector => |selector| {
+                    for (selector.keys) |key| try appendUniqueSeedKey(arena, &keys, key);
+                },
+                else => {},
+            },
+            .graph_shortest_path_query => |path| {
+                try appendUniqueSeedKey(arena, &keys, path.shortest_path.from.key);
+                try appendUniqueSeedKey(arena, &keys, path.shortest_path.to.key);
+            },
+            .graph_k_shortest_paths_query => |paths| {
+                try appendUniqueSeedKey(arena, &keys, paths.k_shortest_paths.from.key);
+                try appendUniqueSeedKey(arena, &keys, paths.k_shortest_paths.to.key);
+            },
+            .graph_match_query => {},
+        }
+    }
+    return keys.items;
+}
+
+fn appendUniqueSeedKey(
+    arena: std.mem.Allocator,
+    keys: *std.ArrayListUnmanaged([]const u8),
+    key: []const u8,
+) !void {
+    if (key.len == 0) return;
+    // Deterministic first-seen truncation keeps the seed set inside the
+    // engine's bounded per-read limit instead of erroring the retrieval.
+    if (keys.items.len >= graph_query_mod.graph_metric_seed_limit) return;
+    for (keys.items) |existing| if (std.mem.eql(u8, existing, key)) return;
+    try keys.append(arena, key);
+}
+
+fn injectSeedNodesIntoEncodedQuery(
+    alloc: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    encoded: []const u8,
+    seed_keys: []const []const u8,
+) ![]u8 {
+    var parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, encoded, .{}) catch
+        return error.InvalidRetrievalAgentRequest;
+    if (parsed != .object) return error.InvalidRetrievalAgentRequest;
+    const rerank_value = parsed.object.getPtr("graph_metric_rerank") orelse
+        return error.InvalidRetrievalAgentRequest;
+    if (rerank_value.* != .object) return error.InvalidRetrievalAgentRequest;
+    var seeds = std.json.Array.init(arena);
+    try seeds.ensureTotalCapacity(seed_keys.len);
+    for (seed_keys) |key| seeds.appendAssumeCapacity(.{ .string = key });
+    try rerank_value.object.put(arena, "seed_nodes", .{ .array = seeds });
+    return try std.json.Stringify.valueAlloc(alloc, parsed, .{});
 }
 
 fn canonicalQueryRequestFromRetrieval(request: RetrievalQueryRequest) QueryRequest {
@@ -7900,6 +7980,69 @@ test "retrieval agent installs canonical mandatory predicates once" {
 
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, encoded, "\"tenant\""));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, encoded, "\"classification\""));
+}
+
+fn encodeSeedMetricRerankFixture(alloc: std.mem.Allocator, raw_json: []const u8) ![]u8 {
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    var raw = try std.json.parseFromSlice(std.json.Value, alloc, raw_json, .{});
+    defer raw.deinit();
+    var declared = try parseJsonBody(RetrievalQueryRequest, alloc, raw_json);
+    defer declared.deinit();
+    const queries = [_]RetrievalQueryRequest{declared.value};
+    const mandatory = try buildMandatoryPredicates(arena, &queries, &.{});
+
+    return try encodeQueryValueForRetrievalQuery(
+        alloc,
+        ValidationOnlyRunner.iface(),
+        raw.value,
+        declared.value,
+        mandatory[0],
+        &.{},
+        null,
+        0,
+        .initial,
+    );
+}
+
+test "retrieval agent seeds fresh graph metric rerank from graph search start nodes" {
+    const alloc = std.testing.allocator;
+    const encoded = try encodeSeedMetricRerankFixture(alloc,
+        \\{"table":"docs","graph_queries":{"related":{"index":"graph_idx","traverse":{"start":{"keys":["doc:a","doc:b","doc:a"]}}}},"graph_metric_rerank":{"index":"graph_idx","metric":"rank","metric_freshness":"fresh"},"limit":5}
+    );
+    defer alloc.free(encoded);
+    // Literal traversal start keys become the deduplicated teleport seeds of
+    // the fresh metric rerank.
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"seed_nodes\":[\"doc:a\",\"doc:b\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"metric_freshness\":\"fresh\"") != null);
+}
+
+test "retrieval agent skips metric seeding without fresh rerank or literal start keys" {
+    const alloc = std.testing.allocator;
+
+    // A rerank left at published freshness keeps its global blend untouched.
+    const published = try encodeSeedMetricRerankFixture(alloc,
+        \\{"table":"docs","graph_queries":{"related":{"index":"graph_idx","traverse":{"start":{"keys":["doc:a"]}}}},"graph_metric_rerank":{"index":"graph_idx","metric":"rank"},"limit":5}
+    );
+    defer alloc.free(published);
+    try std.testing.expect(std.mem.indexOf(u8, published, "seed_nodes") == null);
+
+    // A fresh rerank without literal start keys degrades to the unseeded
+    // request instead of failing the retrieval.
+    const unresolved = try encodeSeedMetricRerankFixture(alloc,
+        \\{"table":"docs","graph_queries":{"related":{"index":"graph_idx","traverse":{"start":{"result_ref":"$query_results","limit":4}}}},"graph_metric_rerank":{"index":"graph_idx","metric":"rank","metric_freshness":"fresh"},"limit":5}
+    );
+    defer alloc.free(unresolved);
+    try std.testing.expect(std.mem.indexOf(u8, unresolved, "seed_nodes") == null);
+
+    // Without any graph search there is nothing to seed from.
+    const no_graph = try encodeSeedMetricRerankFixture(alloc,
+        \\{"table":"docs","graph_metric_rerank":{"index":"graph_idx","metric":"rank","metric_freshness":"fresh"},"limit":5}
+    );
+    defer alloc.free(no_graph);
+    try std.testing.expect(std.mem.indexOf(u8, no_graph, "seed_nodes") == null);
 }
 
 test "retrieval contains filter treats wildcard operators as literals" {

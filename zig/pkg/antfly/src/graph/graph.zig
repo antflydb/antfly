@@ -18407,6 +18407,120 @@ pub const GraphIndex = struct {
         return .{ .requested = seed_nodes.len, .matched = matched };
     }
 
+    /// Point-lookup companion to personalizedPageRankColumnInto that carries
+    /// the metric's status snapshot, mirroring the published score snapshot
+    /// used by metric rerank. The scores themselves are computed fresh from
+    /// the current edge snapshot, so no publication is required.
+    pub fn personalizedPageRankScoreSnapshotAlloc(
+        self: *GraphIndex,
+        metric_name: []const u8,
+        seed_nodes: []const []const u8,
+        damping: ?f64,
+        nodes: []const []const u8,
+    ) !GraphMetricScoreSnapshot {
+        var status = blk: {
+            var txn = try self.beginReadReverseTxn();
+            defer txn.abort();
+            break :blk try self.graphMetricSnapshotStatusInTxn(metric_name, &txn, .query);
+        };
+        errdefer status.deinit(self.alloc);
+        const scores = try self.alloc.alloc(?f64, nodes.len);
+        errdefer self.alloc.free(scores);
+        _ = try self.personalizedPageRankColumnInto(self.alloc, metric_name, seed_nodes, damping, nodes, scores);
+        return .{ .status = status, .scores = scores };
+    }
+
+    /// Ranked view of a query-seeded personalized PageRank computed fresh
+    /// from the current edge snapshot. Unlike published top-K reads this
+    /// requires no published generation; the attached status still reports
+    /// the metric's materialization state for observability. Ordering is
+    /// deterministic: score descending with node key ascending tie-breaks.
+    pub fn personalizedPageRankTopKSnapshotAlloc(
+        self: *GraphIndex,
+        metric_name: []const u8,
+        seed_nodes: []const []const u8,
+        damping: ?f64,
+        limit: usize,
+    ) !GraphMetricTopKSnapshot {
+        if (limit > graph_metric_rank_entry_limit) return error.InvalidGraphMetricTopK;
+        const cfg = self.metricConfig(metric_name) orelse return error.MetricNotReady;
+        if (cfg.kind != .pagerank) return error.UnsupportedGraphMetric;
+        if (damping) |value| {
+            if (!std.math.isFinite(value) or value <= 0 or value >= 1) return error.InvalidQueryRequest;
+        }
+        var status = blk: {
+            var txn = try self.beginReadReverseTxn();
+            defer txn.abort();
+            break :blk try self.graphMetricSnapshotStatusInTxn(metric_name, &txn, .query);
+        };
+        errdefer status.deinit(self.alloc);
+
+        var graph_nodes = std.ArrayListUnmanaged(PageRankNode).empty;
+        defer {
+            self.freePageRankNodes(graph_nodes.items);
+            graph_nodes.deinit(self.alloc);
+        }
+        var graph_edges = std.ArrayListUnmanaged(PageRankEdge).empty;
+        defer graph_edges.deinit(self.alloc);
+        try self.collectPageRankGraph(cfg.edge_filter, &graph_nodes, &graph_edges);
+
+        var ordinals = std.StringHashMapUnmanaged(u32).empty;
+        defer ordinals.deinit(self.alloc);
+        try ordinals.ensureTotalCapacity(self.alloc, @intCast(graph_nodes.items.len));
+        for (graph_nodes.items, 0..) |node, i| ordinals.putAssumeCapacity(node.key, @intCast(i));
+
+        const seed_ordinals = try self.alloc.alloc(u32, seed_nodes.len);
+        defer self.alloc.free(seed_ordinals);
+        var matched: usize = 0;
+        for (seed_nodes) |seed| {
+            if (ordinals.get(seed)) |ordinal| {
+                seed_ordinals[matched] = ordinal;
+                matched += 1;
+            }
+        }
+
+        var result = try metric_kernels.personalizedPageRankAlloc(self.alloc, graph_nodes.items.len, graph_edges.items, seed_ordinals[0..matched], .{
+            .damping = damping orelse cfg.damping,
+            .tolerance = cfg.tolerance,
+            .max_iterations = cfg.max_iterations,
+            .max_nodes = @max(graph_nodes.items.len, 1),
+            .max_edges = @max(graph_edges.items.len, 1),
+        });
+        defer result.deinit(self.alloc);
+
+        const order = try self.alloc.alloc(u32, graph_nodes.items.len);
+        defer self.alloc.free(order);
+        for (order, 0..) |*slot, i| slot.* = @intCast(i);
+        const OrderContext = struct {
+            nodes: []const PageRankNode,
+            scores: []const f64,
+
+            fn lessThan(ctx: @This(), a: u32, b: u32) bool {
+                return graphMetricScoreComesBefore(
+                    .{ .node = ctx.nodes[a].key, .score = ctx.scores[a] },
+                    .{ .node = ctx.nodes[b].key, .score = ctx.scores[b] },
+                );
+            }
+        };
+        std.mem.sort(u32, order, OrderContext{ .nodes = graph_nodes.items, .scores = result.scores }, OrderContext.lessThan);
+
+        const take = @min(limit, graph_nodes.items.len);
+        const scores = try self.alloc.alloc(GraphMetricScore, take);
+        var initialized: usize = 0;
+        errdefer {
+            for (scores[0..initialized]) |*score| score.deinit(self.alloc);
+            self.alloc.free(scores);
+        }
+        for (order[0..take], scores) |ordinal, *out| {
+            out.* = .{
+                .node = try self.alloc.dupe(u8, graph_nodes.items[ordinal].key),
+                .score = result.scores[ordinal],
+            };
+            initialized += 1;
+        }
+        return .{ .status = status, .scores = scores };
+    }
+
     pub fn graphMetricColumnsSnapshotAlloc(
         self: *GraphIndex,
         metric_names: []const []const u8,

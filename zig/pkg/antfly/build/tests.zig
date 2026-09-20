@@ -4775,6 +4775,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "query parser accepts direct graph metric reads",
         "query parser accepts graph metric rerank",
         "api query contract bounds graph metric top k",
+        "api query contract admits personalized graph metric seed fields",
+        "api query contract rejects malformed personalized graph metric shapes",
         "api query contract uses portable graph metric filter operators",
         "api query contract rejects oversized and duplicate graph metric clauses",
         "query encoder emits graph metric results",

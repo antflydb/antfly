@@ -35933,17 +35933,32 @@ pub const DB = struct {
     fn applyGraphMetricRerank(self: *DB, result: *types.SearchResult, req: types.SearchRequest) !void {
         const rerank = req.graph_metric_rerank orelse return;
         if (req.count_only) return error.UnsupportedQueryRequest;
+        if (rerank.damping != null and rerank.seed_nodes.len == 0) return error.InvalidQueryRequest;
         const entry = self.core.graphIndex(rerank.index_name) orelse return error.IndexNotFound;
         const node_ids = try result.alloc.alloc([]const u8, result.hits.len);
         defer result.alloc.free(node_ids);
         for (result.hits, 0..) |hit, i| node_ids[i] = hit.id;
-        var score_snapshot = try entry.index.graphMetricScoreSnapshotWithPolicyAlloc(rerank.metric_name, node_ids, .{
+        var score_snapshot = if (rerank.seed_nodes.len != 0) blk: {
+            // Personalized blends are computed fresh from the current edge
+            // snapshot; a published generation would silently return
+            // unpersonalized scores, so seeds require fresh and skip the
+            // publication requirements below.
+            if (rerank.freshness != .fresh) return error.GraphMetricPersonalizationRequiresFresh;
+            break :blk try entry.index.personalizedPageRankScoreSnapshotAlloc(
+                rerank.metric_name,
+                rerank.seed_nodes,
+                rerank.damping,
+                node_ids,
+            );
+        } else try entry.index.graphMetricScoreSnapshotWithPolicyAlloc(rerank.metric_name, node_ids, .{
             .require_published = true,
             .require_fresh = rerank.freshness == .fresh,
         });
         defer score_snapshot.deinit(entry.index.alloc);
-        if (score_snapshot.status.published_generation == 0) return error.MetricNotReady;
-        if (rerank.freshness == .fresh and score_snapshot.status.state != .fresh) return error.MetricStale;
+        if (rerank.seed_nodes.len == 0) {
+            if (score_snapshot.status.published_generation == 0) return error.MetricNotReady;
+            if (rerank.freshness == .fresh and score_snapshot.status.state != .fresh) return error.MetricStale;
+        }
 
         var result_status = try cloneGraphMetricStatusFromGraph(result.alloc, score_snapshot.status);
         errdefer result_status.deinit(result.alloc);
@@ -36003,12 +36018,25 @@ pub const DB = struct {
         named: types.NamedGraphMetricQuery,
     ) !types.GraphMetricResult {
         const entry = self.core.graphIndex(named.query.index_name) orelse return error.IndexNotFound;
-        var metric_snapshot = try entry.index.graphMetricTopKSnapshotAlloc(
+        if (named.query.damping != null and named.query.seed_nodes.len == 0) return error.InvalidQueryRequest;
+        var metric_snapshot = if (named.query.seed_nodes.len != 0) blk: {
+            // Personalized rankings are computed fresh from the current edge
+            // snapshot; published generations are global-only, so seeded
+            // reads against published freshness fail closed and the fresh
+            // publication-state check below does not apply.
+            if (named.query.freshness != .fresh) return error.GraphMetricPersonalizationRequiresFresh;
+            break :blk try entry.index.personalizedPageRankTopKSnapshotAlloc(
+                named.query.metric_name,
+                named.query.seed_nodes,
+                named.query.damping,
+                named.query.top_k,
+            );
+        } else try entry.index.graphMetricTopKSnapshotAlloc(
             named.query.metric_name,
             named.query.top_k,
         );
         defer metric_snapshot.deinit(entry.index.alloc);
-        if (named.query.freshness == .fresh and metric_snapshot.status.state != .fresh) return error.MetricStale;
+        if (named.query.seed_nodes.len == 0 and named.query.freshness == .fresh and metric_snapshot.status.state != .fresh) return error.MetricStale;
 
         const raw_scores = metric_snapshot.scores;
         const scores = try alloc.alloc(types.GraphMetricScore, raw_scores.len);
