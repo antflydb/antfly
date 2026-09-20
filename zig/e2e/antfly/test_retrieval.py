@@ -2005,8 +2005,10 @@ def test_retrieval_agent_bounded_agentic_can_decompose_queries(backup_api):
     )
     assert batch["inserted"] == 2
 
-    result = _post_until_hit_ids(
-        backup_api,
+    # full_index is the visibility barrier. Repeating an identical deterministic
+    # plan cannot repair incorrect decomposition and only masks it as a timeout.
+    result = backup_api.post(
+        "/agents/retrieval",
         {
             "query": "Compare raft consensus and active document status",
             "stream": False,
@@ -2024,12 +2026,11 @@ def test_retrieval_agent_bounded_agentic_can_decompose_queries(backup_api):
                 },
             ],
         },
-        ["doc:a", "doc:b"],
     )
     assert result["tool_calls_made"] == 2
     assert result["classification"]["strategy"] == "decompose"
     assert result["strategy_used"] == "hybrid"
-    assert _hit_ids(result) == ["doc:a", "doc:b"]
+    assert _hit_ids(result) == ["doc:a", "doc:b"], result
 
 
 def test_retrieval_agent_can_require_clarification_and_continue(backup_api):

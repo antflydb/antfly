@@ -112,6 +112,9 @@ pub const TableApi = struct {
         GraphMetricMaterializationRejected,
         NotFound,
         Conflict,
+        UniqueConstraintViolation,
+        ForeignKeyParentMissing,
+        ForeignKeyReferenced,
         MethodNotAllowed,
         Backpressured,
         DenseRepairBackpressure,
@@ -1675,6 +1678,11 @@ fn executeOwnedTableBatch(alloc: std.mem.Allocator, table_name: []const u8, batc
         },
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
         error.Conflict => return .{ .status = 409, .body = try alloc.dupe(u8, "batch transaction conflicted") },
+        error.UniqueConstraintViolation, error.ForeignKeyParentMissing, error.ForeignKeyReferenced => return .{
+            .status = 409,
+            .json = true,
+            .body = try std.json.Stringify.valueAlloc(alloc, .{ .@"error" = @errorName(err) }, .{}),
+        },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
         error.Backpressured => return .{
             .status = 429,

@@ -2052,7 +2052,7 @@ pub const ApiHttpClient = struct {
         switch (response.status) {
             201, 202 => return response,
             else => {
-                const err = remotePublicBatchError(response.status, response.body);
+                const err = remotePublicBatchError(self.alloc, response.status, response.body);
                 response.deinit(self.alloc);
                 return err;
             },
@@ -2537,7 +2537,17 @@ pub const ApiHttpClient = struct {
             {
                 return error.RaftBatchWriteOutcomeUnknown;
             }
-            if (resp.status == 409) return remoteGroupConflictError(resp.body);
+            // Only a matching typed rejection proves a terminal validation
+            // result. An unknown-outcome header above always takes precedence;
+            // an unexpected HTTP status remains an ambiguous forwarded write.
+            const row_errors = @import("relational_row_errors.zig");
+            if (row_errors.decode(resp.body)) |reason| {
+                if (resp.status == row_errors.status(reason)) return reason;
+            }
+            if (resp.status == 409) {
+                if (@import("relational_integrity_errors.zig").decode(resp.body)) |reason| return reason;
+                return remoteGroupConflictError(resp.body);
+            }
             if (resp.status == 429 and std.mem.eql(u8, std.mem.trim(u8, resp.body, " \t\r\n"), "RetainedEffectsFull")) {
                 if (forwarding == null or (outcome != null and std.mem.eql(u8, outcome.?, internal_batch_forwarding.outcome_not_proposed_v1)))
                     return error.RetainedEffectsFull;
@@ -3975,10 +3985,22 @@ fn remoteGraphEdgesError(body: []const u8) anyerror {
     return error.UnexpectedHttpStatus;
 }
 
-fn remotePublicBatchError(status: u16, body: []const u8) anyerror {
+fn remotePublicBatchError(alloc: std.mem.Allocator, status: u16, body: []const u8) anyerror {
     const message = std.mem.trim(u8, body, " \t\r\n");
     switch (status) {
         409 => {
+            // Preserve terminal constraint identity across a public HTTP hop;
+            // these failures must never become generic retryable conflicts.
+            if (message.len != 0 and message[0] == '{') {
+                if (std.json.parseFromSlice(struct { @"error": ?[]const u8 = null }, alloc, message, .{ .ignore_unknown_fields = true })) |parsed| {
+                    defer parsed.deinit();
+                    if (parsed.value.@"error") |name| {
+                        inline for (.{ error.UniqueConstraintViolation, error.ForeignKeyParentMissing, error.ForeignKeyReferenced }) |constraint| {
+                            if (std.mem.eql(u8, name, @errorName(constraint))) return constraint;
+                        }
+                    }
+                } else |_| {}
+            }
             if (std.mem.eql(u8, message, "batch transaction conflicted")) return error.Conflict;
             if (std.mem.eql(u8, message, "write outcome unknown")) return error.RaftBatchWriteOutcomeUnknown;
             if (std.mem.eql(u8, message, "standby is read-only")) return error.HAReadOnlyStandby;
@@ -4321,14 +4343,23 @@ fn consumerTests() type {
         }
 
         test "api http client preserves public batch retry safety classifications" {
-            try std.testing.expectEqual(error.Conflict, remotePublicBatchError(409, "batch transaction conflicted"));
-            try std.testing.expectEqual(error.RaftBatchWriteOutcomeUnknown, remotePublicBatchError(409, "write outcome unknown"));
+            const alloc = std.testing.allocator;
+            inline for (.{ error.UniqueConstraintViolation, error.ForeignKeyParentMissing, error.ForeignKeyReferenced }) |constraint| {
+                const body = try std.json.Stringify.valueAlloc(alloc, .{ .@"error" = @errorName(constraint) }, .{});
+                defer alloc.free(body);
+                try std.testing.expectEqual(constraint, remotePublicBatchError(alloc, 409, body));
+                try std.testing.expectEqual(error.UnexpectedHttpStatus, remotePublicBatchError(alloc, 503, body));
+            }
+            try std.testing.expectEqual(error.UnexpectedHttpStatus, remotePublicBatchError(alloc, 409, "{\"code\":\"transaction_outcome_unknown\",\"retryable\":false}"));
+            try std.testing.expectEqual(error.Conflict, remotePublicBatchError(alloc, 409, "batch transaction conflicted"));
+            try std.testing.expectEqual(error.RaftBatchWriteOutcomeUnknown, remotePublicBatchError(alloc, 409, "write outcome unknown"));
             try std.testing.expectEqual(error.CommitDecisionUnknown, remotePublicBatchError(
+                alloc,
                 500,
                 "transaction outcome is unknown; do not retry this stateless batch",
             ));
-            try std.testing.expectEqual(error.LeaderUnavailable, remotePublicBatchError(503, "write unavailable"));
-            try std.testing.expectEqual(error.HAReadOnlyStandby, remotePublicBatchError(409, "standby is read-only"));
+            try std.testing.expectEqual(error.LeaderUnavailable, remotePublicBatchError(alloc, 503, "write unavailable"));
+            try std.testing.expectEqual(error.HAReadOnlyStandby, remotePublicBatchError(alloc, 409, "standby is read-only"));
         }
 
         test "api http client preserves remote transaction decision conflicts" {

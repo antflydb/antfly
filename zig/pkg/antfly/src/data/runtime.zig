@@ -10603,15 +10603,62 @@ pub const DataServer = struct {
     fn distributedReadExecutor(self: *DataServer) !antfly.common.http.RequestExecutor {
         if (self.distributed_read_http_executor == null) {
             const runtime = self.backend_runtime orelse return error.BackendRuntimeUnavailable;
-            const io = runtime.apiNetworkIo() orelse runtime.apiIo() orelse return error.HttpRuntimeUnavailable;
+            var lane = runtime.acquireRequestForwardLane() catch |err| switch (err) {
+                error.RequestForwardCapacityUnavailable => return error.StorageReadTemporarilyUnavailable,
+                else => return err,
+            };
+            defer lane.release();
             const executor = try self.alloc.create(antfly.common.http.IoHttpExecutor);
-            // Public read fan-out owns a reusable client on the API network
-            // lane. The Raft StdHttpExecutor requires a concrete Threaded Io
-            // and cannot represent borrowed runtimes such as VoprIo.
-            executor.* = antfly.common.http.IoHttpExecutor.init(self.alloc, io, .{ .keep_alive = true });
+            // Query/API workers synchronously await these requests. The HTTP
+            // client needs nested request/connect/socket watchdog tasks, so it
+            // must not compete with callers on the API lane. Reuse the bounded
+            // forwarding lane and one keep-alive client; reserve the complete
+            // task graph for each request below, before any bytes are sent.
+            executor.* = antfly.common.http.IoHttpExecutor.init(self.alloc, lane.io(), .{ .keep_alive = true });
             self.distributed_read_http_executor = executor;
         }
-        return self.distributed_read_http_executor.?.executor();
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .execute = executeDistributedRead,
+                .execute_stream = executeDistributedReadStream,
+            },
+            .realtime_ns_fn = distributedReadRealtimeNs,
+            .clock_io = self.distributed_read_http_executor.?.executor().clock_io,
+        };
+    }
+
+    fn acquireDistributedReadLane(self: *DataServer, request: antfly.common.http.HttpRequest) !backend_runtime_mod.BackendRuntime.RequestForwardLaneLease {
+        if (request.delivery_tracker) |tracker| tracker.markNotSent();
+        if (request.cancellation) |cancellation| if (cancellation.isCancelled()) return error.Cancelled;
+        if (request.timeout_ms == 0) return error.Timeout;
+        const runtime = self.backend_runtime orelse return error.BackendRuntimeUnavailable;
+        return runtime.acquireRequestForwardLane() catch |err| switch (err) {
+            // Preserve local admission provenance until the caller can drain
+            // sibling reads and reduce its own fanout. This request sent no
+            // bytes; remote availability failures use a different error.
+            error.RequestForwardCapacityUnavailable => error.ConcurrencyUnavailable,
+            else => err,
+        };
+    }
+
+    fn executeDistributedRead(ptr: *anyopaque, alloc: std.mem.Allocator, request: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        var lane = try self.acquireDistributedReadLane(request);
+        defer lane.release();
+        return self.distributed_read_http_executor.?.executor().execute(alloc, request);
+    }
+
+    fn executeDistributedReadStream(ptr: *anyopaque, alloc: std.mem.Allocator, request: antfly.common.http.HttpRequest, writer: antfly.common.http.StreamWriter) !bool {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        var lane = try self.acquireDistributedReadLane(request);
+        defer lane.release();
+        return (try self.distributed_read_http_executor.?.executor().executeStream(alloc, request, writer)).?;
+    }
+
+    fn distributedReadRealtimeNs(ptr: *anyopaque) i128 {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.distributed_read_http_executor.?.executor().realtimeNs().?;
     }
 
     fn dataRaftMonotonicNs(self: *DataServer) u64 {
@@ -31081,6 +31128,7 @@ fn consumerTests() type {
             defer server.deinit();
 
             const control_io = server.dataRaftIo().?;
+            const read_executor = try server.distributedReadExecutor();
             var release: std.Io.Event = .unset;
             const Worker = struct {
                 fn run(io: std.Io, event: *std.Io.Event) void {
@@ -31141,6 +31189,51 @@ fn consumerTests() type {
             try serving.await(std.testing.io);
             try std.testing.expectEqual(@as(usize, 1), peer.route_hits[0]);
 
+            // Strong reads (including FK preflight) await peer lookups from
+            // API workers. Fill that lane completely and prove the peer HTTP
+            // task graph uses the separately admitted forwarding lane.
+            const api_io = backend_runtime.ptr().apiIo().?;
+            var api_release: std.Io.Event = .unset;
+            var api_tasks: [@import("../common/threaded_io_limits.zig").backend_runtime_api]std.Io.Future(void) = undefined;
+            var api_started: usize = 0;
+            defer {
+                api_release.set(api_io);
+                for (api_tasks[0..api_started]) |*task| task.await(api_io);
+            }
+            for (&api_tasks) |*task| {
+                task.* = try api_io.concurrent(Worker.run, .{ api_io, &api_release });
+                api_started += 1;
+            }
+            try std.testing.expectError(error.ConcurrencyUnavailable, api_io.concurrent(Worker.run, .{ api_io, &api_release }));
+            var read_peer = try httpx.TestServer.start(alloc, std.testing.io, &.{.{
+                .method = .GET,
+                .path = "/lookup",
+                .respond = .{ .status = 200, .body = "{\"id\":7}" },
+                .max_uses = 1,
+            }});
+            defer read_peer.deinit();
+            var read_serving = try std.testing.io.concurrent(httpx.TestServer.handleOne, .{&read_peer});
+            defer read_serving.cancel(std.testing.io) catch {};
+            const read_uri = try std.fmt.allocPrint(alloc, "{s}/lookup", .{read_peer.baseUrl()});
+            defer alloc.free(read_uri);
+            var unisolated = antfly.common.http.IoHttpExecutor.init(alloc, api_io, .{});
+            defer unisolated.deinit();
+            try std.testing.expectError(error.ConcurrencyUnavailable, unisolated.executor().execute(alloc, .{
+                .method = .GET,
+                .uri = read_uri,
+                .timeout_ms = 5000,
+            }));
+            try std.testing.expectEqual(@as(usize, 0), read_peer.route_hits[0]);
+            var read_response = try read_executor.execute(alloc, .{
+                .method = .GET,
+                .uri = read_uri,
+                .timeout_ms = 5000,
+            });
+            defer read_response.deinit(alloc);
+            try std.testing.expectEqualStrings("{\"id\":7}", read_response.body);
+            try read_serving.await(std.testing.io);
+            try std.testing.expectEqual(@as(usize, 1), read_peer.route_hits[0]);
+
             raft_release.set(raft_io);
             for (raft_tasks[0..raft_started]) |*task| task.await(raft_io);
             raft_started = 0;
@@ -31158,6 +31251,24 @@ fn consumerTests() type {
             for (&forward_tasks) |*task| {
                 task.* = try forward_io.concurrent(Worker.run, .{ forward_io, &forward_release });
                 forward_started += 1;
+            }
+            var rejected_delivery: antfly.common.http.http_common.RequestDeliveryTracker = .{};
+            try std.testing.expectError(error.ConcurrencyUnavailable, read_executor.execute(alloc, .{
+                .method = .GET,
+                .uri = read_uri,
+                .timeout_ms = 5000,
+                .delivery_tracker = &rejected_delivery,
+            }));
+            try std.testing.expectEqual(antfly.common.http.http_common.RequestDeliveryTracker.State.not_sent, rejected_delivery.load());
+            try std.testing.expectEqual(@as(usize, 1), read_peer.route_hits[0]);
+            {
+                // First-use initialization must expose the same availability
+                // condition as an already initialized client's admission.
+                const retained_client = server.distributed_read_http_executor;
+                server.distributed_read_http_executor = null;
+                defer server.distributed_read_http_executor = retained_client;
+                try std.testing.expectError(error.StorageReadTemporarilyUnavailable, server.distributedReadExecutor());
+                try std.testing.expect(server.distributed_read_http_executor == null);
             }
             var consensus_peer = try httpx.TestServer.start(alloc, std.testing.io, &.{.{
                 .method = .POST,
@@ -31231,6 +31342,10 @@ fn consumerTests() type {
                 .backend_runtime = backend_runtime.ptr(),
             };
             defer server.deinit();
+
+            const read_executor = try server.distributedReadExecutor();
+            try std.testing.expectEqual(@as(u64, @intCast(std.Io.Clock.awake.now(io).nanoseconds)), read_executor.monotonicNs());
+            try std.testing.expectEqual(@as(i128, std.Io.Clock.real.now(io).nanoseconds), read_executor.realtimeNs().?);
 
             try server.requestProvisionedCacheWarmup();
             try std.testing.expect(server.provisioned_warmup_active.load(.acquire));

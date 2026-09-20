@@ -23984,16 +23984,21 @@ pub const DB = struct {
     };
     var test_snapshot_fence_hook: ?SnapshotFenceTestHook = null;
 
-    fn ensurePrimaryOnlySnapshotLocked(self: *DB) !void {
-        if (self.source_vectors.load(.acquire) == null) return;
+    fn primaryOnlySnapshotSupportedLocked(self: *DB) !bool {
+        if (self.table_storage.dense_embeddings != .primary_lsm) return false;
+        if (self.source_vectors.load(.acquire) == null) return true;
         // Cancellation retains the source object for already-admitted readers
         // and background retirement. Its presence is not published authority:
         // a terminal cancelled job has removed all candidate roots and kept
         // every live artifact inline in the primary store.
-        var job = (try vector_migration.load(self.alloc, self.core.store)) orelse return error.VectorStoreLifecycleUnsupported;
+        var job = (try vector_migration.load(self.alloc, self.core.store)) orelse return false;
         defer job.deinit();
-        if (self.table_storage.dense_embeddings != .primary_lsm or job.value.phase != .cancelled)
-            return error.VectorStoreLifecycleUnsupported;
+        try self.validateVectorMigrationIdentity(job.value);
+        return job.value.phase == .cancelled;
+    }
+
+    fn ensurePrimaryOnlySnapshotLocked(self: *DB) !void {
+        if (!try self.primaryOnlySnapshotSupportedLocked()) return error.VectorStoreLifecycleUnsupported;
     }
 
     fn ensurePrimaryOnlySnapshot(self: *DB) !void {
@@ -27587,7 +27592,8 @@ pub const DB = struct {
             .catalog_digest = digest,
             .next_epoch = try @import("relational_integrity_topology.zig").nextEpoch(&read),
             .backup_seal_supported = self.primary_backend == .lsm and self.physical_root_mode == .filesystem_managed and
-                nativeRestoreStoragePublicationCompatible(self.primary_lsm_storage) and self.source_vectors.load(.acquire) == null and self.backend_runtime.filesystemIo() != null,
+                nativeRestoreStoragePublicationCompatible(self.primary_lsm_storage) and self.backend_runtime.filesystemIo() != null and
+                try self.primaryOnlySnapshotSupportedLocked(),
         };
     }
 
@@ -37205,6 +37211,13 @@ pub const DB = struct {
             var artifacts_cursor = try read.openCursor();
             defer artifacts_cursor.close();
             const projections = next.rows_complete;
+            var write_plan = if (!projections) try self.core.index_manager.acquireWritePlanSnapshot() else null;
+            defer if (write_plan) |*view| view.release();
+            var generated_embeddings: std.StringHashMapUnmanaged(void) = .empty;
+            if (write_plan) |view| for (view.plan().generated_templates) |request| {
+                if (request.kind == .dense_embedding or request.kind == .sparse_embedding)
+                    try generated_embeddings.put(owned, requestEmbeddingName(request), {});
+            };
             const continuation = if (projections) &next.projection_cursor else &next.artifact_cursor;
             // Skipped records retain only one continuation and one record's
             // scratch data, never one allocation per scan step in the page.
@@ -37231,11 +37244,25 @@ pub const DB = struct {
                 if (artifacts.items.len == max_rows or examined_artifacts == 1024 or
                     (examined_artifacts != 0 and monotonicTimeNs() >= artifact_deadline)) break;
                 if (if (projections) isMergeArtifactKey(row.key) else isRestoreArtifactKey(row.key)) {
-                    const size = std.math.add(usize, row.key.len, row.value.len) catch return error.TransactionTooLarge;
-                    if (size > 16 * 1024 * 1024) return error.TransactionTooLarge;
-                    if (artifacts.items.len != 0 and artifact_bytes + size > 16 * 1024 * 1024) break;
+                    if (row.key.len > 16 * 1024 * 1024 or row.value.len > 16 * 1024 * 1024 - row.key.len) return error.TransactionTooLarge;
                     const owner = (try internal_keys.decodeDocumentComponentAlloc(scratch, row.key)) orelse return error.InvalidRestoreStagingCommand;
                     if (!self.core.byteRange().contains(owner)) return error.RestoreStagingScopeChanged;
+                    if (!projections and (internal_keys.isEmbeddingArtifactKey(row.key) or internal_keys.isDerivedEmbeddingArtifactKey(row.key)) and
+                        !(try enrichment_artifact_codec.decodeHeader(row.value)).flags.has_source_hash)
+                    {
+                        const embedding = (try artifact_ids.decodeEmbeddingArtifactIdentityAlloc(scratch, row.key)) orelse return error.InvalidRestoreStagingCommand;
+                        if (generated_embeddings.contains(embedding.embedding_name)) {
+                            // Portable vectors lack producer provenance. A
+                            // managed producer must regenerate them, even when
+                            // this hidden owner's optional runtime is absent.
+                            // External vectors have no producer and remain data.
+                            continuation_buffer.clearRetainingCapacity();
+                            try continuation_buffer.appendSlice(alloc, row.key);
+                            continuation.* = continuation_buffer.items;
+                            examined_artifacts += 1;
+                            continue;
+                        }
+                    }
                     const value = if (internal_keys.isGraphEdgeArtifactKey(row.key)) graph: {
                         const edge = (try internal_keys.parseGraphEdgeArtifactKeyAlloc(scratch, row.key)) orelse return error.InvalidRestoreStagingCommand;
                         const index = self.core.index_manager.graphIndex(edge.index_name);
@@ -37254,9 +37281,26 @@ pub const DB = struct {
                             examined_artifacts += 1;
                             continue;
                         }
-                        break :graph try enrichment_artifact_codec.encodePortableUnboundGraphEdgeAlloc(owned, decoded.weight, decoded.created_at, decoded.updated_at, decoded.metadata_json);
-                    } else try owned.dupe(u8, row.value);
-                    try artifacts.append(owned, .{ .key = try owned.dupe(u8, row.key), .value = value });
+                        break :graph try enrichment_artifact_codec.encodePortableUnboundGraphEdgeAlloc(scratch, decoded.weight, decoded.created_at, decoded.updated_at, decoded.metadata_json);
+                    } else if (projections) current: {
+                        // Row preparation may regenerate (or remove) a portable
+                        // cache entry. Project the target's current artifact,
+                        // never overwrite it with an archived generated value.
+                        break :current self.core.store.get(scratch, row.key) catch |err| switch (err) {
+                            error.NotFound => {
+                                continuation_buffer.clearRetainingCapacity();
+                                try continuation_buffer.appendSlice(alloc, row.key);
+                                continuation.* = continuation_buffer.items;
+                                examined_artifacts += 1;
+                                continue;
+                            },
+                            else => return err,
+                        };
+                    } else row.value;
+                    const size = std.math.add(usize, row.key.len, value.len) catch return error.TransactionTooLarge;
+                    if (size > 16 * 1024 * 1024) return error.TransactionTooLarge;
+                    if (artifacts.items.len != 0 and artifact_bytes + size > 16 * 1024 * 1024) break;
+                    try artifacts.append(owned, .{ .key = try owned.dupe(u8, row.key), .value = try owned.dupe(u8, value) });
                     artifact_bytes += size;
                 }
                 continuation_buffer.clearRetainingCapacity();
@@ -133145,11 +133189,19 @@ test "db snapshot exports logical store only for durable lsm primary backend" {
 }
 
 test "db scoped native restore imports cached artifacts before rows across restart" {
-    try testScopedNativeArtifactRestore(false);
-    try testScopedNativeArtifactRestore(true);
+    try testScopedNativeArtifactRestore(false, false, false);
+    try testScopedNativeArtifactRestore(true, false, false);
 }
 
-fn testScopedNativeArtifactRestore(standby: bool) !void {
+test "db scoped restore projects regenerated target vectors instead of archived values" {
+    try testScopedNativeArtifactRestore(false, true, false);
+}
+
+test "db scoped restore rejects unverified generated vectors without a producer runtime" {
+    try testScopedNativeArtifactRestore(false, false, true);
+}
+
+fn testScopedNativeArtifactRestore(standby: bool, replace_generated: bool, unverified_generated: bool) !void {
     const alloc = std.testing.allocator;
     const staging = @import("restore_staging.zig");
     var source_tmp = try TestDirectory.init("native-artifact-source");
@@ -133198,6 +133250,17 @@ fn testScopedNativeArtifactRestore(standby: bool) !void {
             .sync_level = .full_index,
         });
         try source.runUntilIdle();
+        if (unverified_generated) {
+            // Portable archives carry logical vector values, not native
+            // producer fingerprints. They cannot satisfy managed coverage.
+            const value = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, null, &.{ 1, 0, 0 });
+            defer alloc.free(value);
+            for ([_][]const u8{ "doc", "other" }) |key| {
+                const artifact = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, key, "whole_vector");
+                defer alloc.free(artifact);
+                try source.core.store.put(artifact, value);
+            }
+        }
         // Native manifests retain each committed index incarnation, not its
         // original zero-generation creation request.
         preserved_indexes = try source.listIndexes(alloc);
@@ -133247,7 +133310,24 @@ fn testScopedNativeArtifactRestore(standby: bool) !void {
     try std.testing.expectEqual(@as(?u64, 0), try range_cardinality.load(alloc, target.core.store));
     var index_number: u64 = 1;
     var artifact_pages: usize = 0;
+    var replaced = false;
     while (true) : (index_number += 1) {
+        if (replace_generated and !replaced) {
+            var progress = (try target.restoreStagingStatus(alloc)).?;
+            defer progress.deinit();
+            if (progress.value.rows_complete) {
+                // Model a successful producer completion after logical import
+                // and before the final replay of archived artifact keys.
+                const key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "whole_vector");
+                defer alloc.free(key);
+                const before = try target.core.store.get(alloc, key);
+                defer alloc.free(before);
+                const value = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, try enrichment_artifact_codec.sourceHash(before), &.{ 0, 1, 0 });
+                defer alloc.free(value);
+                try target.core.store.put(key, value);
+                replaced = true;
+            }
+        }
         var page = try target.prepareRestoreStagingPage(alloc, scope, &source, if (standby) 1 else 128, .none);
         defer page.deinit();
         const batch = page.batch orelse break;
@@ -133276,7 +133356,7 @@ fn testScopedNativeArtifactRestore(standby: bool) !void {
     try std.testing.expect(artifact_pages >= 1);
     try std.testing.expectEqual(source_calls, counting.calls);
     try std.testing.expectEqual(@as(u64, 6), target.core.index_manager.denseIndex("semantic").?.index.stats().active_count);
-    try std.testing.expectEqual(@as(u64, 2), target.core.index_manager.denseIndex("whole_document").?.index.stats().active_count);
+    try std.testing.expectEqual(@as(u64, if (unverified_generated) 0 else 2), target.core.index_manager.denseIndex("whole_document").?.index.stats().active_count);
     try std.testing.expectEqual(@as(u64, 1), target.core.index_manager.denseIndex("explicit").?.index.stats().active_count);
     const stats = try target.stats(alloc);
     defer types.freeDBStats(alloc, stats);
@@ -133287,6 +133367,14 @@ fn testScopedNativeArtifactRestore(standby: bool) !void {
     for (stats.indexes) |item| {
         if (!std.mem.eql(u8, item.name, "semantic") and !std.mem.eql(u8, item.name, "whole_document")) continue;
         covered += 1;
+        if (unverified_generated and std.mem.eql(u8, item.name, "whole_document")) {
+            try std.testing.expectEqual(@as(u64, 0), item.coverage_produced_count);
+            try std.testing.expectEqual(@as(u64, 0), item.coverage_skipped_count);
+            try std.testing.expectEqual(@as(u64, 0), item.coverage_terminal_failed_count);
+            try std.testing.expect(stats.source_doc_count > item.coverage_produced_count + item.coverage_skipped_count + item.coverage_terminal_failed_count);
+            try std.testing.expectEqual(@as(u64, 0), item.publication_target_count);
+            continue;
+        }
         try std.testing.expect(item.coverage_summary_ready);
         try std.testing.expectEqual(@as(u64, 2), item.coverage_produced_count);
         try std.testing.expectEqual(@as(u64, 0), item.coverage_skipped_count);
@@ -133295,6 +133383,22 @@ fn testScopedNativeArtifactRestore(standby: bool) !void {
         try std.testing.expectEqual(@as(u64, if (std.mem.eql(u8, item.name, "semantic")) 6 else 2), item.publication_target_count);
     }
     try std.testing.expectEqual(@as(usize, 2), covered);
+    if (unverified_generated) {
+        const key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "whole_vector");
+        defer alloc.free(key);
+        try std.testing.expectError(error.NotFound, target.core.store.get(alloc, key));
+        return;
+    }
+    if (replace_generated) {
+        try std.testing.expect(replaced);
+        const key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "whole_vector");
+        defer alloc.free(key);
+        const value = try target.core.store.get(alloc, key);
+        defer alloc.free(value);
+        const vector = try enrichment_artifact_codec.decodeDenseEmbeddingAlloc(alloc, value);
+        defer alloc.free(vector);
+        try std.testing.expectEqualSlices(f32, &.{ 0, 1, 0 }, vector);
+    }
     try std.testing.expect(target.core.artifact_cleanup_maybe.load(.acquire));
     try std.testing.expect(target.core.identity_namespace.eql(target_options.identity_namespace.?));
     var quanta: usize = 0;
@@ -136641,6 +136745,59 @@ test "source vector migration consolidates ANN serving while preserving queries 
     var result = try db.search(alloc, .{ .index_name = "replacement", .dense = .{ .vector = &.{ 1, 0, 0 }, .k = 2 }, .limit = 2 });
     defer result.deinit();
     try std.testing.expectEqual(@as(u32, 2), result.total_hits);
+}
+
+test "source vector migration cancellation restores sealed backup capability without reopening" {
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("migration-backup-capability");
+    defer tmp.cleanup();
+    // Snapshot siblings remain within this test's owned temporary root.
+    const path = try std.fmt.allocPrint(alloc, "{s}/db", .{std.mem.span(tmp.path().ptr)});
+    defer alloc.free(path);
+    const options: OpenOptions = .{
+        .primary_backend = .{ .lsm = .{} },
+        .table_storage = .{ .dense_embeddings = .primary_lsm },
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+    };
+    var db = try DB.open(alloc, path, options);
+    defer db.close();
+    try db.addIndex(.{ .name = "model", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"external\":true}" });
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"text\":\"alpha\",\"_embeddings\":{\"model\":[1,0,0]}}" }}, .sync_level = .full_index });
+    try std.testing.expect((try db.relationalTopologyIdentity()).backup_seal_supported);
+    const request: vector_migration.contract.Request = .{ .job_id = "cancel", .mode = .online, .budget = .{ .disk_reserve_bytes = 0 } };
+    try db.startVectorMigration(request);
+    try db.advanceVectorMigration(request.job_id);
+    try std.testing.expect(!(try db.relationalTopologyIdentity()).backup_seal_supported);
+    try std.testing.expectError(error.VectorStoreLifecycleUnsupported, db.snapshotNative("active"));
+    try db.cancelVectorMigration(request.job_id);
+    try std.testing.expect(!(try db.relationalTopologyIdentity()).backup_seal_supported);
+    for (0..128) |_| {
+        var job = (try vector_migration.load(alloc, db.core.store)).?;
+        defer job.deinit();
+        if (job.value.phase == .cancelled) break;
+        try db.advanceVectorMigration(request.job_id);
+    } else return error.VectorMigrationDidNotFinish;
+    // Readers may still retain the candidate object. The durable cancelled
+    // receipt and primary ownership, not pointer lifetime, authorize capture.
+    try std.testing.expect(db.source_vectors.load(.acquire) != null);
+    try std.testing.expect((try db.relationalTopologyIdentity()).backup_seal_supported);
+    try std.testing.expect(try db.snapshotNative("cancelled") > 0);
+    db.close();
+    db = try DB.open(alloc, path, options);
+    try std.testing.expect(db.source_vectors.load(.acquire) == null);
+    try std.testing.expect((try db.relationalTopologyIdentity()).backup_seal_supported);
+
+    try db.startVectorMigration(.{ .job_id = "publish", .mode = .online, .budget = .{ .disk_reserve_bytes = 0 } });
+    for (0..128) |_| {
+        var job = (try vector_migration.load(alloc, db.core.store)).?;
+        defer job.deinit();
+        if (job.value.phase == .ready) break;
+        try db.advanceVectorMigration("publish");
+    } else return error.VectorMigrationDidNotFinish;
+    try db.publishVectorMigration("publish");
+    try std.testing.expect(!(try db.relationalTopologyIdentity()).backup_seal_supported);
+    try std.testing.expectError(error.VectorStoreLifecycleUnsupported, db.snapshotNative("published"));
 }
 
 test "source vector migration budget rejection is retryable and cancellation survives restart" {

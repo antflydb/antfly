@@ -220,6 +220,11 @@ const fusion_mod = @import("../search/fusion.zig");
 /// not become an unknown runtime defect or a successful empty/partial result.
 fn normalizeDistributedReadTransportError(err: anyerror) anyerror {
     return switch (err) {
+        // Local request/watchdog admission is also an availability outcome.
+        // No read result exists; never turn saturation into a missing row or
+        // retry it here outside the caller's request budget.
+        error.ConcurrencyUnavailable,
+        error.ResourceTemporarilyUnavailable,
         error.RemoteUnavailable,
         error.ConnectionFailed,
         error.AddressUnavailable,
@@ -5730,7 +5735,11 @@ pub const HostedProvisionedTableReadSource = struct {
             }
         }
         var response = client.executeRequest(routed_request) catch |err|
-            return normalizeDistributedReadTransportError(err);
+            // Preserve local admission through the authenticated routing
+            // wrapper as well as the outer lookup decoder. Primary prefetch
+            // can drain its siblings before retrying this unsent request;
+            // genuine transport failures remain ordinary unavailability.
+            return if (err == error.ConcurrencyUnavailable) err else normalizeDistributedReadTransportError(err);
         errdefer response.deinit(alloc);
         if (encoded_fence != null) {
             const ack = response.header(metadata_api.catalog_route_fence_ack_header) orelse {
@@ -14469,7 +14478,12 @@ fn lookupRemote(
         opts.restore_staging_scope,
         opts.restore_staging_plan_id,
         opts.include_primary_digest,
-    ) catch |err| return normalizeDistributedReadTransportError(err);
+    ) catch |err| return if (err == error.ConcurrencyUnavailable)
+        // Keep proven local scheduling pressure distinct from unavailable
+        // peers/consistency failures for admission-aware primary prefetch.
+        err
+    else
+        normalizeDistributedReadTransportError(err);
     defer result.deinit(alloc);
     try checkLookupOptionsActive(opts);
     return try controlledLookupResponseAlloc(
@@ -16769,6 +16783,8 @@ fn consumerTests() type {
         }
 
         test "distributed query transport failures become one retryable availability condition" {
+            try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedQueryOperationalError(error.ConcurrencyUnavailable));
+            try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedQueryOperationalError(error.ResourceTemporarilyUnavailable));
             try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedQueryOperationalError(error.AddressUnavailable));
             try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedQueryOperationalError(error.SendFailed));
             try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedQueryOperationalError(error.ConnectionResetByPeer));
@@ -16782,26 +16798,67 @@ fn consumerTests() type {
         }
 
         test "remote lookup transport failures preserve read availability without retrying" {
+            const Catalog = struct {
+                fn routeFence(_: *anyopaque, group_id: u64) !?metadata_api.CatalogRouteFence {
+                    return .{
+                        .metadata_group_id = 1,
+                        .catalog_revision = 2,
+                        .table_id = 7,
+                        .topology_epoch = 3,
+                        .route = .{
+                            .group_id = group_id,
+                            .range_id = 71,
+                            .identity_namespace = .{ .table_id = 7, .shard_id = group_id, .range_id = 71 },
+                        },
+                    };
+                }
+            };
             const Executor = struct {
                 failure: anyerror,
                 calls: usize = 0,
+                routed: bool = false,
 
                 fn execute(ptr: *anyopaque, _: std.mem.Allocator, request: http_common.HttpRequest) anyerror!http_common.HttpResponse {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     self.calls += 1;
                     try std.testing.expectEqual(http_common.Method.GET, request.method);
+                    if (self.routed) {
+                        var fenced = false;
+                        var authenticated = false;
+                        for (request.headers) |header| {
+                            if (std.ascii.eqlIgnoreCase(header.name, metadata_api.catalog_route_fence_header)) fenced = true;
+                            if (std.ascii.eqlIgnoreCase(header.name, @import("internal_service_auth.zig").header_name)) authenticated = true;
+                        }
+                        try std.testing.expect(fenced);
+                        try std.testing.expect(authenticated);
+                    }
                     return self.failure;
                 }
             };
-            for ([_]anyerror{ error.AddressUnavailable, error.ConnectionRefused, error.ConnectionResetByPeer, error.NetworkUnreachable, error.Canceled, error.Timeout, error.InternalFailure }) |failure| {
+            for ([_]anyerror{ error.ConcurrencyUnavailable, error.ResourceTemporarilyUnavailable, error.AddressUnavailable, error.ConnectionRefused, error.ConnectionResetByPeer, error.NetworkUnreachable, error.Canceled, error.Timeout, error.InternalFailure }) |failure| {
                 var executor = Executor{ .failure = failure };
                 const source: http_common.RequestExecutor = .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } };
                 const expected = switch (failure) {
-                    error.Canceled, error.Timeout, error.InternalFailure => failure,
+                    error.ConcurrencyUnavailable, error.Canceled, error.Timeout, error.InternalFailure => failure,
                     else => error.StorageReadTemporarilyUnavailable,
                 };
                 try std.testing.expectError(expected, lookupRemote(source, std.testing.allocator, "http://127.0.0.1:1", 7, "entities", "person/ada_lovelace", .{}, .read_index));
                 try std.testing.expectEqual(@as(usize, 1), executor.calls);
+                // The production hosted source inserts authentication and a
+                // catalog-fence wrapper before reaching the same transport.
+                // Exercise that layer: testing lookupRemote alone would miss
+                // a premature loss of local-admission provenance inside it.
+                var hosted = HostedProvisionedTableReadSource{
+                    .replica_root_dir = "",
+                    .catalog = .{ .ptr = undefined, .vtable = &.{ .admin_snapshot = undefined, .free_admin_snapshot = undefined, .route_fence = Catalog.routeFence } },
+                    .read_safety_barrier = undefined,
+                    .router = undefined,
+                    .executor = source,
+                    .internal_service_secret = "test-internal-service-secret",
+                };
+                executor.routed = true;
+                try std.testing.expectError(expected, lookupRemote(hosted.internalExecutor(), std.testing.allocator, "http://127.0.0.1:1", 7, "entities", "person/ada_lovelace", .{}, .read_index));
+                try std.testing.expectEqual(@as(usize, 2), executor.calls);
             }
         }
 

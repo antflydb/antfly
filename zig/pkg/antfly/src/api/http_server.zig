@@ -11929,6 +11929,9 @@ pub const ApiHttpServer = struct {
         defer if (retained_preparation) |*prepared| prepared.deinit();
         const outcome = (self.commitPublicTableBatchWithIntegrity(alloc, source, &tables, req.sync_level, request, &retained_preparation) catch |err| switch (err) {
             error.RelationalIndexKeyTooLarge => return error.RelationalIndexKeyTooLarge,
+            error.UniqueConstraintViolation => return error.UniqueConstraintViolation,
+            error.ForeignKeyParentMissing => return error.ForeignKeyParentMissing,
+            error.ForeignKeyReferenced => return error.ForeignKeyReferenced,
             error.Forbidden => return error.Forbidden,
             error.InvalidBatchRequest,
             error.RelationalCheckViolation,
@@ -11951,9 +11954,6 @@ pub const ApiHttpServer = struct {
             error.DecisionConflict,
             error.TxnNotFound,
             error.InvalidTxnRecord,
-            error.ForeignKeyParentMissing,
-            error.ForeignKeyReferenced,
-            error.UniqueConstraintViolation,
             error.ForeignKeyMatchFullViolation,
             error.ForeignKeyActionInProgress,
             error.ForeignKeyActionConflict,
@@ -12073,6 +12073,13 @@ pub const ApiHttpServer = struct {
                     return error.CommittedRepairRequired;
             },
             .conflict => |conflict| {
+                // Constraint rejection is terminal validation evidence, not an
+                // optimistic abort that clients may safely retry unchanged.
+                if (conflict.reason) |reason| return switch (reason) {
+                    .unique_constraint_violation => error.UniqueConstraintViolation,
+                    .foreign_key_parent_missing => error.ForeignKeyParentMissing,
+                    .foreign_key_referenced => error.ForeignKeyReferenced,
+                };
                 if (batch_conflict_diagnostic_gate.admit(platform_time.monotonicNs()))
                     std.log.warn("public batch rejected phase={s} table={s} group={d} reason={s} retryable={} message={s}", .{
                         if (conflict.phase) |phase| @tagName(phase) else "coordinator",
@@ -12125,6 +12132,7 @@ pub const ApiHttpServer = struct {
             error.StorageBusy,
             error.StorageReadTemporarilyUnavailable,
             error.RestoreStagingInProgress,
+            error.ConcurrencyUnavailable,
             => return error.StorageReadTemporarilyUnavailable,
             error.ModelNotFound => return error.ModelNotFound,
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
@@ -12425,6 +12433,7 @@ pub const ApiHttpServer = struct {
                 error.PersistentDescriptorAdmissionExhausted,
                 error.StorageBusy,
                 error.StorageReadTemporarilyUnavailable,
+                error.ConcurrencyUnavailable,
                 => return error.StorageReadTemporarilyUnavailable,
                 error.Timeout => return error.Timeout,
                 error.Cancelled => return error.Cancelled,
@@ -12499,6 +12508,7 @@ pub const ApiHttpServer = struct {
             error.PersistentDescriptorAdmissionExhausted,
             error.StorageBusy,
             error.StorageReadTemporarilyUnavailable,
+            error.ConcurrencyUnavailable,
             => return error.StorageReadTemporarilyUnavailable,
             error.Timeout => return error.Timeout,
             error.Cancelled => return error.Cancelled,
@@ -12602,6 +12612,7 @@ pub const ApiHttpServer = struct {
             error.PersistentDescriptorAdmissionExhausted,
             error.StorageBusy,
             error.StorageReadTemporarilyUnavailable,
+            error.ConcurrencyUnavailable,
             => return error.StorageReadTemporarilyUnavailable,
             error.Timeout => return error.Timeout,
             error.Cancelled => return error.Cancelled,
@@ -18060,7 +18071,7 @@ pub const ApiHttpServer = struct {
             error.HAReadRequiresPrimary, error.ReadRequiresPrimary => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .read_requires_primary),
             error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .standby_read_unavailable),
             error.DistributedQueryUnavailable => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .distributed_query_unavailable),
-            error.StorageBusy, error.PersistentDescriptorAdmissionExhausted, error.StorageReadTemporarilyUnavailable => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .storage_read_temporarily_unavailable),
+            error.StorageBusy, error.PersistentDescriptorAdmissionExhausted, error.StorageReadTemporarilyUnavailable, error.ConcurrencyUnavailable => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .storage_read_temporarily_unavailable),
             error.InvalidManifest,
             error.InvalidTableFile,
             error.TableBlockChecksumMismatch,
@@ -35972,6 +35983,7 @@ test "api http server routes table batches through the batch commit hook" {
         commit_error: ?anyerror = null,
         repair_outcome: bool = false,
         legacy_visibility_pending_outcome: bool = false,
+        conflict_outcome: ?distributed_txn.CommitConflict = null,
 
         fn source(self: *@This()) table_writes.TableWriteSource {
             return .{
@@ -36023,6 +36035,7 @@ test "api http server routes table batches through the batch commit hook" {
             try std.testing.expectEqualStrings("doc:gone", tables[0].deletes[0]);
             try std.testing.expectEqual(db_mod.types.SyncLevel.write, sync_level);
             if (self.commit_error) |err| return err;
+            if (self.conflict_outcome) |conflict| return .{ .conflict = conflict };
             if (self.repair_outcome) return .{ .committed = .{
                 .participant_count = 2,
                 .visibility_repair_required = true,
@@ -36145,6 +36158,27 @@ test "api http server routes table batches through the batch commit hook" {
     defer busy_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 503), busy_resp.status);
     try std.testing.expectEqual(@as(usize, 12), writes.batch_commit_calls);
+
+    writes.commit_error = null;
+    writes.legacy_visibility_pending_outcome = false;
+    inline for (.{ error.UniqueConstraintViolation, error.ForeignKeyParentMissing, error.ForeignKeyReferenced }, .{ .unique_constraint_violation, .foreign_key_parent_missing, .foreign_key_referenced }) |constraint, reason| {
+        for ([_]bool{ false, true }) |distributed| {
+            writes.commit_error = if (distributed) null else constraint;
+            writes.conflict_outcome = if (distributed) .{ .table_name = "docs", .key = "", .message = "constraint rejected", .reason = reason, .retryable = false } else null;
+            var rejected = try executeHttpxTestRequest(&server, .{ .method = .POST, .uri = "/tables/docs/batch", .content_type = "application/json", .body = batch_body });
+            defer rejected.deinit(std.testing.allocator);
+            try std.testing.expectEqual(@as(u16, 409), rejected.status);
+            var payload = try std.json.parseFromSlice(struct { @"error": []const u8 }, std.testing.allocator, rejected.body, .{});
+            defer payload.deinit();
+            try std.testing.expectEqualStrings(@errorName(constraint), payload.value.@"error");
+        }
+    }
+    writes.commit_error = null;
+    writes.conflict_outcome = .{ .table_name = "docs", .key = "", .message = "participant unavailable", .retryable = true };
+    var conflicted = try executeHttpxTestRequest(&server, .{ .method = .POST, .uri = "/tables/docs/batch", .content_type = "application/json", .body = batch_body });
+    defer conflicted.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 409), conflicted.status);
+    try std.testing.expectEqualStrings("batch transaction conflicted", conflicted.body);
 }
 
 test "api http server serves table batch transforms" {

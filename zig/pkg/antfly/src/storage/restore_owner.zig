@@ -308,6 +308,14 @@ pub fn executeResident(alloc: std.mem.Allocator, target: *db.DB, env: Environmen
         return .{ .phase = phase, .rows = before.value.rows, .receipt = before.value.receipt() };
     };
     if (before.value.phase == .canceled or before.value.phase == .published) return error.RestoreStagingScopeChanged;
+    if (input.action == .begin and before.value.phase != .reserved) {
+        // The caller already obtained a ReadIndex barrier and an exact owner
+        // lease. This matching durable scope proves admission, even when its
+        // original reply was lost. Re-proposing begin would only append another
+        // Raft entry/outbox record for every bounded snapshot page.
+        if (!input.scope.target_namespace.eql(target.core.identity_namespace)) return error.RestoreStagingScopeChanged;
+        return .{ .phase = before.value.phase, .rows = before.value.rows, .receipt = before.value.receipt(), .rewrite = before.value.rewrite };
+    }
     var tail_next: u32 = 0;
     var source_next_offset: u64 = 0;
     switch (input.action) {
@@ -480,7 +488,16 @@ test "restore owner verified decoder rewrite history compiles once across produc
     };
     var apply: Apply = .{ .target = &target, .scope = scope.digest(), .evict_on_index = 1 + rows.len / 8 };
     const env: Environment = .{ .io = io, .runtime = &runtime, .location_options = .{}, .cache_path = try std.fmt.allocPrint(a, "{s}/decoder", .{root}), .proposer = .{ .ptr = &apply, .propose = Apply.propose } };
-    _ = try executeResident(alloc, &target, env, .{ .scope = scope, .action = .begin }, .{});
+    apply.lose_reply = true;
+    try std.testing.expectError(error.InjectedReplyLoss, executeResident(alloc, &target, env, .{ .scope = scope, .action = .begin }, .{}));
+    try std.testing.expectEqual(@as(u64, 1), apply.index);
+    const replayed_begin = try executeResident(alloc, &target, env, .{ .scope = scope, .action = .begin }, .{});
+    try std.testing.expectEqual(staging.Phase.importing, replayed_begin.phase);
+    try std.testing.expectEqual(@as(u64, 1), apply.index);
+    var wrong_scope = scope;
+    wrong_scope.plan_digest[0] ^= 1;
+    try std.testing.expectError(error.RestoreStagingScopeChanged, executeResident(alloc, &target, env, .{ .scope = wrong_scope, .action = .begin }, .{}));
+    try std.testing.expectEqual(@as(u64, 1), apply.index);
     // Seed the durable boundary after an empty snapshot; every measured tail
     // page below uses the production owner handler and real LSM apply path.
     {

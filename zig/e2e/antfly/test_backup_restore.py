@@ -366,22 +366,140 @@ def _create_cluster_table_when_admitted(
 def _seed_cluster_docs_when_writable(
     cluster, session: requests.Session, table_name: str, docs: dict, *, timeout_s=30.0
 ) -> dict | None:
+    return _batch_cluster_docs_when_writable(
+        cluster, session, table_name, inserts=docs, timeout_s=timeout_s
+    )
+
+
+def _constraint_probe_outcome(response, expected_error):
+    reasons = {
+        "UniqueConstraintViolation": "unique_constraint_violation",
+        "ForeignKeyParentMissing": "foreign_key_parent_missing",
+        "ForeignKeyReferenced": "foreign_key_referenced",
+    }
+    reason = reasons[expected_error]
+    text = response.text.strip()
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = None
+    if response.status_code == 409:
+        if text == expected_error:
+            return True
+        if isinstance(payload, dict):
+            # Unknown/committed outcomes never become successful constraint
+            # evidence, even if an incidental message names the constraint.
+            if payload.get("code") not in (None, reason) or payload.get(
+                "status"
+            ) not in (None, "aborted", "conflict"):
+                raise AssertionError(f"uncertain constraint probe: {text}")
+            if payload.get("error") == expected_error:
+                return True
+            conflict = payload.get("conflict")
+            if isinstance(conflict, dict) and payload.get("status") in (
+                "aborted",
+                "conflict",
+            ):
+                if (
+                    conflict.get("reason") == reason
+                    and conflict.get("retryable") is False
+                ):
+                    return True
+                if (
+                    payload.get("status") == "aborted"
+                    and conflict.get("reason") is None
+                    and conflict.get("retryable") is True
+                    and conflict.get("kind")
+                    in (
+                        "transaction_conflict",
+                        "optimistic_conflict",
+                        "participant_unavailable",
+                    )
+                ):
+                    return False
+        if text == "batch transaction conflicted":
+            return False
+    if response.status_code == 503 and text == "write unavailable":
+        return False
+    raise AssertionError(
+        f"expected {expected_error}, got {response.status_code}: {text}"
+    )
+
+
+def _assert_constraint_rejected(
+    cluster, session, table, inserts, expected_error, *, timeout_s=90.0
+):
+    deadline = time.monotonic() + timeout_s
+    observations = []
+
+    def rejected():
+        cluster.assert_processes_alive()
+        # No transport-exception retry: an invalid write might have committed
+        # if enforcement regressed and only its response was lost.
+        try:
+            response = session.post(
+                f"{cluster.data_api_urls[0]}/tables/{table}/batch",
+                json={"inserts": inserts},
+                timeout=max(0.001, min(20.0, deadline - time.monotonic())),
+            )
+        except requests.RequestException as exc:
+            # wait_until also serves read-only polling and understands some
+            # retryable HTTPError responses. Do not inherit that for writes.
+            raise AssertionError(f"constraint probe transport failed: {exc}") from exc
+        observations.append(f"{response.status_code}: {response.text[:1024]}")
+        del observations[:-8]
+        return _constraint_probe_outcome(response, expected_error)
+
+    try:
+        assert wait_until(rejected, timeout_s=timeout_s, interval_s=0.5), (
+            f"constraint did not return {expected_error}"
+        )
+    except (AssertionError, requests.RequestException) as exc:
+        raise AssertionError(
+            f"constraint probe failed: {exc}; observations={observations}\n"
+            f"{cluster.debug_logs()}"
+        ) from exc
+
+
+def _batch_cluster_docs_when_writable(
+    cluster,
+    session: requests.Session,
+    table_name: str,
+    *,
+    inserts: dict | None = None,
+    deletes: tuple[str, ...] = (),
+    timeout_s=30.0,
+) -> dict | None:
     # Replication status is an observation, not a lease on the data leader or
-    # its routing catalog. Seed through the write API's admission contract.
+    # its routing catalog. Mutate through the write API's admission contract.
     # Only explicit pre-commit rejection permits a fresh batch attempt. An
-    # uncertain transaction is never replayed: require every expected document
-    # to become visible before treating setup as complete.
+    # uncertain transaction is never replayed: observe every expected effect
+    # before returning. Callers still verify cross-table cascades separately.
+    docs = inserts or {}
+    assert docs or deletes, "expected a nonempty batch"
+    assert not docs.keys() & set(deletes), "ambiguous insert/delete expectation"
+    mutation = {"sync_level": "write"}
+    if docs:
+        mutation["inserts"] = docs
+    if deletes:
+        mutation["deletes"] = list(deletes)
     deadline = time.monotonic() + timeout_s
     last_response: requests.Response | None = None
 
     def attempt() -> dict | None:
         nonlocal last_response
         cluster.assert_processes_alive()
-        last_response = session.post(
-            f"{cluster.data_api_urls[0]}/tables/{table_name}/batch",
-            json={"inserts": docs, "sync_level": "write"},
-            timeout=max(0.001, deadline - time.monotonic()),
-        )
+        try:
+            last_response = session.post(
+                f"{cluster.data_api_urls[0]}/tables/{table_name}/batch",
+                json=mutation,
+                timeout=max(0.001, deadline - time.monotonic()),
+            )
+        except requests.RequestException as exc:
+            # A transport exception has no proven non-admission outcome.
+            # In particular, adapters/hooks may raise HTTPError themselves;
+            # do not let wait_until apply its broader read-only retry policy.
+            raise AssertionError(f"batch transport failed: {exc}") from exc
         if (
             last_response.status_code == 503
             and last_response.text.strip() == "write unavailable"
@@ -407,7 +525,12 @@ def _seed_cluster_docs_when_writable(
         return _check_response(last_response)
 
     try:
-        batch = wait_until(attempt, timeout_s=timeout_s, interval_s=0.1)
+        batch = wait_until(
+            attempt,
+            timeout_s=timeout_s,
+            interval_s=0.1,
+            ready_when=lambda result: result is not None,
+        )
         assert batch is not None, f"table {table_name} did not become writable"
         if batch.get("code") == "transaction_outcome_unknown":
 
@@ -426,23 +549,35 @@ def _seed_cluster_docs_when_writable(
                     )
                     if actual != expected:
                         return False
+                for key in deletes:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                    try:
+                        response = session.get(
+                            f"{cluster.data_api_urls[0]}/tables/{table_name}/documents/{key}",
+                            timeout=min(10.0, remaining),
+                        )
+                    except requests.RequestException:
+                        return False
+                    # An unavailable read is not evidence of deletion.
+                    if response.status_code != 404:
+                        return False
                 return True
 
-            assert docs and wait_until(
+            assert wait_until(
                 committed,
                 timeout_s=max(0.0, deadline - time.monotonic()),
                 interval_s=0.1,
-            ), "uncertain seed transaction did not commit every expected document"
-            print(
-                "backup seed commit confirmed by document reads; batch was not replayed"
-            )
+            ), "uncertain transaction did not expose every expected document mutation"
+            print("batch effects confirmed by document reads; batch was not replayed")
             return None
         return batch
     except (AssertionError, requests.RequestException) as exc:
         # Preserve routing and proposal diagnostics for unresolved outcomes
         # before teardown removes this six-process cluster.
         raise AssertionError(
-            f"backup table {table_name} seed failed: {exc}; "
+            f"table {table_name} batch failed: {exc}; "
             f"last_status={last_response.status_code if last_response is not None else None}; "
             f"last_headers={dict(last_response.headers) if last_response is not None else None}; "
             f"last_response={last_response.text if last_response is not None else None}\n"
@@ -1665,6 +1800,55 @@ def test_three_by_three_online_merge_explicitly_disabled(
     _exercise_online_document_merge(three_by_three_backup_cluster, expect_online=False)
 
 
+def _seed_online_merge_setup_docs(cluster, session, table_name, documents):
+    # Initial corpus construction is not the transaction under test. Bound
+    # its per-request UNIQUE/FK planning and routed ReadIndex fanout instead of
+    # repeatedly restarting one large prepare when placement is converging.
+    # Faulted retained-tail writes below intentionally remain atomic batches.
+    batch = {}
+    for key, value in documents.items():
+        batch[key] = value
+        if len(batch) == 8:
+            _seed_cluster_docs_when_writable(cluster, session, table_name, batch)
+            batch = {}
+    if batch:
+        _seed_cluster_docs_when_writable(cluster, session, table_name, batch)
+
+
+@pytest.mark.parametrize("count", [0, 1, 8, 9, 35, 36])
+def test_online_merge_setup_batches_preserve_complete_corpus(monkeypatch, count):
+    documents = {f"key:{i}": {"id": i} for i in range(count)}
+    calls = []
+
+    def seed(cluster, session, table, batch):
+        assert (cluster, session, table) == ("cluster", "session", "rows")
+        calls.append(batch)
+
+    monkeypatch.setitem(globals(), "_seed_cluster_docs_when_writable", seed)
+    _seed_online_merge_setup_docs("cluster", "session", "rows", documents)
+    assert all(1 <= len(batch) <= 8 for batch in calls)
+    assert [item for batch in calls for item in batch.items()] == list(
+        documents.items()
+    )
+    assert len(calls) == (count + 7) // 8
+
+
+def test_online_merge_setup_batches_stop_on_ambiguous_failure(monkeypatch):
+    calls = []
+
+    def seed(_cluster, _session, _table, batch):
+        calls.append(batch)
+        raise AssertionError("transaction outcome unknown")
+
+    monkeypatch.setitem(globals(), "_seed_cluster_docs_when_writable", seed)
+    with pytest.raises(AssertionError, match="transaction outcome unknown"):
+        _seed_online_merge_setup_docs(
+            None, None, "rows", {f"key:{i}": {"id": i} for i in range(36)}
+        )
+    assert len(calls) == 1
+    assert len(calls[0]) == 8
+
+
 def _exercise_online_document_merge(
     cluster,
     *,
@@ -1726,7 +1910,7 @@ def _exercise_online_document_merge(
     _seed_cluster_docs_when_writable(
         cluster, session, table_name, {"0:large": documents["0:large"]}
     )
-    _seed_cluster_docs_when_writable(
+    _seed_online_merge_setup_docs(
         cluster,
         session,
         table_name,

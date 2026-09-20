@@ -326,6 +326,22 @@ test "relational integrity portable decoder resumes bounded row pages across LSM
     var rows: [300]@import("types.zig").BatchWrite = undefined;
     for (&rows, 0..) |*row, i| row.* = .{ .key = try std.fmt.allocPrint(a, "row-{d:0>4}", .{i}), .value = "{\"id\":1}" };
     try source.batch(.{ .writes = &rows, .timestamp_ns = 900 });
+    const keys = @import("../internal_keys.zig");
+    const codec = @import("enrichment/artifact_codec.zig");
+    const dense = try codec.encodeDenseEmbeddingAlloc(a, 123, &.{ 1, 0, 0 });
+    var artifacts: std.ArrayList(@import("../docstore.zig").KVPair) = .empty;
+    for (rows) |row| try artifacts.append(a, .{ .key = try keys.embeddingArtifactKeyForDocumentAlloc(a, row.key, "dense"), .value = dense });
+    const sparse_key = try keys.embeddingArtifactKeyForDocumentAlloc(a, rows[0].key, "sparse");
+    const chunk_key = try keys.chunkArtifactKeyAlloc(a, rows[0].key, "chunks", 1);
+    const asset_key = try keys.documentUnitArtifactKeyAlloc(a, rows[0].key, "assets", "page");
+    const edge_key = try keys.graphEdgeArtifactKeyAlloc(a, rows[0].key, "links", "related", rows[1].key);
+    try artifacts.appendSlice(a, &.{
+        .{ .key = sparse_key, .value = try codec.encodeSparseEmbeddingAlloc(a, 456, &.{ 3, 7 }, &.{ 0.5, 1 }) },
+        .{ .key = chunk_key, .value = "{\"body\":\"chunk\"}" },
+        .{ .key = asset_key, .value = "{\"text\":\"page\"}" },
+        .{ .key = edge_key, .value = try codec.encodeGraphEdgeAlloc(a, null, 42, 0.5, 11, 22, "{}") },
+    });
+    try source.core.store.putBatch(artifacts.items, &.{});
     const identity = try source.relationalTopologyIdentity();
     const fence: @import("relational_integrity_topology.zig").Fence = .{ .role = .backup_snapshot, .transition_id = 55, .attempt = 1, .owner_group_id = 601, .peer_group_id = 601, .namespace = namespace, .catalog_digest = identity.catalog_digest, .admission_epoch = identity.next_epoch };
     try source.applyRelationalTopologyControl(.{ .fence = fence, .action = .begin }, null);
@@ -358,7 +374,20 @@ test "relational integrity portable decoder resumes bounded row pages across LSM
                 const key = try @import("../internal_keys.zig").documentKeyAlloc(a, row.key);
                 const value = try store.get(a, key);
                 try std.testing.expectEqualStrings(row.value, value);
+                const artifact_value = try store.get(a, try keys.embeddingArtifactKeyForDocumentAlloc(a, row.key, "dense"));
+                try std.testing.expect(!(try codec.decodeHeader(artifact_value)).flags.has_source_hash);
+                try std.testing.expectEqualSlices(f32, &.{ 1, 0, 0 }, try codec.decodeDenseEmbeddingAlloc(a, artifact_value));
             }
+            const sparse_value = try store.get(a, sparse_key);
+            try std.testing.expect(!(try codec.decodeHeader(sparse_value)).flags.has_source_hash);
+            const sparse = try codec.decodeSparseEmbeddingAlloc(a, sparse_value);
+            try std.testing.expectEqualSlices(u32, &.{ 3, 7 }, sparse.indices);
+            try std.testing.expectEqualSlices(f32, &.{ 0.5, 1 }, sparse.values);
+            try std.testing.expectEqualStrings("{\"body\":\"chunk\"}", try store.get(a, chunk_key));
+            try std.testing.expectEqualStrings("{\"text\":\"page\"}", try store.get(a, asset_key));
+            const edge_value = try store.get(a, edge_key);
+            try std.testing.expect(codec.isPortableUnboundGraphEdge(edge_value));
+            try std.testing.expectEqual(@as(f64, 0.5), (try codec.decodeGraphEdgeAlloc(a, edge_value)).weight);
             break;
         }
     } else return error.RestoreWorkerDidNotConverge;

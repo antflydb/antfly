@@ -2044,7 +2044,7 @@ pub const AntflyApiHandler = struct {
             error.TopologyChanged => textResponse(ctx, 409, "topology changed"),
             error.IdentityReadGenerationChanged => textResponse(ctx, 409, "identity read generation changed"),
             error.GroupLeaderUnavailable => textResponse(ctx, 503, "group leader unavailable"),
-            error.StorageBusy, error.StorageReadTemporarilyUnavailable => textResponse(ctx, 503, "storage read temporarily unavailable"),
+            error.StorageBusy, error.StorageReadTemporarilyUnavailable, error.ConcurrencyUnavailable => textResponse(ctx, 503, "storage read temporarily unavailable"),
             error.Unavailable => textResponse(ctx, 503, "temporarily unavailable"),
             error.Canceled => textResponse(ctx, 408, "request canceled"),
             error.DeadlineExceeded => textResponse(ctx, 504, "request deadline exceeded"),
@@ -2792,7 +2792,7 @@ pub const AntflyApiHandler = struct {
             error.NotFound => textResponse(ctx, 404, "not found"),
             error.Canceled => textResponse(ctx, 408, "request canceled"),
             error.DeadlineExceeded => textResponse(ctx, 504, "request deadline exceeded"),
-            else => textResponse(ctx, 500, "internal server error"),
+            else => internalBatchFailureResponse(ctx, err),
         };
         _ = ctx.status(201);
         return ctx.json(.{
@@ -2800,6 +2800,17 @@ pub const AntflyApiHandler = struct {
             .deleted = result.deleted,
             .transformed = result.transformed,
         });
+    }
+
+    fn internalBatchFailureResponse(ctx: *httpx.Context, err: internal_group_operations.Error) !httpx.Response {
+        // A Raft apply can reject validation after proposal. Preserve its typed
+        // reason, without claiming the operation was never proposed. The
+        // coordinator still has to establish an authoritative abort.
+        if (@import("relational_row_errors.zig").classify(err)) |reason|
+            return textResponse(ctx, @import("relational_row_errors.zig").status(reason), @errorName(reason));
+        if (@import("relational_integrity_errors.zig").classify(err)) |reason|
+            return textResponse(ctx, 409, @errorName(reason));
+        return textResponse(ctx, 500, "internal server error");
     }
 
     fn retainedPressureResponse(ctx: *httpx.Context, batch: bool) !httpx.Response {
@@ -3168,7 +3179,7 @@ pub const AntflyApiHandler = struct {
                 try ctx.setHeader(internal_batch_forwarding.outcome_header, internal_batch_forwarding.outcome_not_proposed_v1);
                 break :blk textResponse(ctx, if (err == error.Canceled) 408 else 504, @errorName(err));
             },
-            else => textResponse(ctx, 500, "internal server error"),
+            else => internalBatchFailureResponse(ctx, err),
         };
         _ = ctx.status(201);
         return ctx.json(.{ .inserted = result.inserted, .deleted = result.deleted, .transformed = result.transformed });
@@ -4394,6 +4405,7 @@ pub const AntflyApiHandler = struct {
             error.CatalogRoutingSnapshotTimeout,
             error.ReadIndexUnavailable,
             error.StorageReadTemporarilyUnavailable,
+            error.ConcurrencyUnavailable,
             error.NotLeader,
             error.LeaderUnavailable,
             => blk: {
@@ -6705,6 +6717,7 @@ pub const AntflyApiHandler = struct {
                 error.LsmRootWriterAlreadyOpen,
                 error.ResidentDbRetryRequired,
                 error.StorageReadTemporarilyUnavailable,
+                error.ConcurrencyUnavailable,
                 error.GenerationTransitionActive,
                 => {
                     var response = try public_table_http.storageReadTemporarilyUnavailableOwnedResponse(alloc);
@@ -6805,6 +6818,7 @@ pub const AntflyApiHandler = struct {
             error.LsmRootWriterAlreadyOpen,
             error.ResidentDbRetryRequired,
             error.StorageReadTemporarilyUnavailable,
+            error.ConcurrencyUnavailable,
             error.RestoreStagingInProgress,
             error.GenerationTransitionActive,
             => {
@@ -8355,6 +8369,76 @@ test "typed internal HTTP errors preserve conflict semantics" {
     try std.testing.expectEqual(@as(u16, 409), stale_cursor.status);
     try std.testing.expectEqualStrings("HierarchyCursorStale", stale_cursor.message);
     try std.testing.expect(AntflyApiHandler.sharedInternalHttpErrorSpec(error.NotFound) == null);
+}
+
+test "internal routed batch preserves typed validation across the HTTP forwarding hop" {
+    const FailureWriter = struct {
+        failure: anyerror,
+        calls: usize = 0,
+
+        fn write(ptr: *anyopaque, _: std.mem.Allocator, _: internal_group_operations.RoutedBatchAuthority, _: u64, _: []const u8, _: db_mod.types.BatchRequest, _: internal_batch_forwarding.Context, _: operation_contract.RequestContext) anyerror!?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return self.failure;
+        }
+    };
+    const WireResponse = struct {
+        status: u16,
+        body: []const u8,
+        unknown: bool = false,
+
+        fn execute(ptr: *anyopaque, allocator: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return @import("http_route_helpers.zig").textResponseWithHeaders(allocator, self.status, self.body, if (self.unknown) &.{
+                .{ .name = internal_batch_forwarding.outcome_header, .value = internal_batch_forwarding.outcome_unknown_v1 },
+            } else &.{});
+        }
+    };
+    const alloc = std.testing.allocator;
+    const body = try batch_api.encodeBatchRequest(alloc, .{
+        .transaction = .{ .prepare = .{ .txn_id = @splat(7), .topology_epoch = 2 } },
+    });
+    defer alloc.free(body);
+    const params = [_]httpx.RouteParam{
+        .{ .name = "group_id", .value = "7" },
+        .{ .name = "table_name", .value = "docs" },
+    };
+    const forwarding: internal_batch_forwarding.Context = .{ .remaining_ms = 1000, .forwards_remaining = 1, .campaign_allowed = false };
+    for ([_]anyerror{ error.UniqueConstraintViolation, error.ForeignKeyParentMissing, error.ForeignKeyReferenced, error.PreparedReadSetChanged, error.RelationalExpressionOverflow }) |failure| {
+        var writer = FailureWriter{ .failure = failure };
+        var source = AuthStatusSource{};
+        var api_server = ApiHttpServer.init(alloc, .{
+            .routed_raft_batch_writer = .{ .ptr = &writer, .write_fn = FailureWriter.write },
+        }, source.iface(), null, null);
+        defer api_server.deinit();
+        var handler = AntflyApiHandler{ .api_server = &api_server };
+        var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/internal/v1/groups/7/tables/docs/batch-routed-v1");
+        defer request.deinit();
+        request.body = body;
+        try request.setHeader(internal_batch_forwarding.remaining_ms_header, "1000");
+        try request.setHeader(internal_batch_forwarding.forwards_remaining_header, "1");
+        try request.setHeader(internal_batch_forwarding.campaign_allowed_header, "false");
+        var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+        defer ctx.deinit();
+        ctx.params = &params;
+        var response = try handler.internalGroupRoutedBatch(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(usize, 1), writer.calls);
+        try std.testing.expectEqual(@as(u16, if (failure == error.RelationalExpressionOverflow) 400 else 409), response.status.code);
+        try std.testing.expectEqualStrings(@errorName(failure), response.body.?);
+        try std.testing.expect(response.header(internal_batch_forwarding.outcome_header) == null);
+
+        var wire = WireResponse{ .status = response.status.code, .body = response.body.? };
+        var client = http_client.ApiHttpClient.init(alloc, .{ .ptr = &wire, .vtable = &.{ .execute = WireResponse.execute } });
+        try std.testing.expectError(failure, client.fetchGroupBatchWithForwarding("http://127.0.0.1", 7, "docs", body, 1000, forwarding, null, null));
+        // A contradictory unknown marker or unexpected status must never be
+        // downgraded into a definite abort merely because its body is typed.
+        wire.unknown = true;
+        try std.testing.expectError(error.RaftBatchWriteOutcomeUnknown, client.fetchGroupBatchWithForwarding("http://127.0.0.1", 7, "docs", body, 1000, forwarding, null, null));
+        wire.unknown = false;
+        wire.status = 500;
+        try std.testing.expectError(error.UnexpectedHttpStatus, client.fetchGroupBatchWithForwarding("http://127.0.0.1", 7, "docs", body, 1000, forwarding, null, null));
+    }
 }
 
 test "internal transaction HTTP size rejection is actionable without claiming not proposed" {
@@ -10784,7 +10868,7 @@ test "httpx antfly reads preserve availability and terminal failures" {
 
     const alloc = std.testing.allocator;
     var status_source = LookupStatusSource{};
-    for ([_]anyerror{ error.TableNotFound, error.GenerationTransitionActive, error.StorageBusy, error.StorageReadTemporarilyUnavailable, error.ReadIndexTimeout, error.DeadlineExceeded, error.CorruptInput }) |failure| {
+    for ([_]anyerror{ error.TableNotFound, error.GenerationTransitionActive, error.StorageBusy, error.StorageReadTemporarilyUnavailable, error.ConcurrencyUnavailable, error.ReadIndexTimeout, error.DeadlineExceeded, error.CorruptInput }) |failure| {
         var reads = MissingTableReads{ .failure = failure };
         const missing = failure == error.TableNotFound;
         const deadline = failure == error.DeadlineExceeded;

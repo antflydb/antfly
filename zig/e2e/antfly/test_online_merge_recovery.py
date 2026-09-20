@@ -588,7 +588,7 @@ def test_online_fk_merge_preserves_shadow_claims_and_retained_references(
         children.update(
             {f"z:child:{row['id']}": {"id": row["id"]} for row in rows.values()}
         )
-        backups._seed_cluster_docs_when_writable(owner, session, child, children)
+        backups._seed_online_merge_setup_docs(owner, session, child, children)
 
     def interrupt(owner, table_id, donor, receiver, table, rows):
         assert wait_until(fault.observed, timeout_s=90, interval_s=0.1), (
@@ -683,9 +683,7 @@ def test_online_fk_merge_preserves_shadow_claims_and_retained_references(
                 )
 
             assert wait_until(ready_parent, timeout_s=90), cluster.debug_logs()
-            backups._seed_cluster_docs_when_writable(
-                cluster, session, parent, documents
-            )
+            backups._seed_online_merge_setup_docs(cluster, session, parent, documents)
         children.update(documents)
     backups._exercise_online_document_merge(
         cluster,
@@ -718,25 +716,24 @@ def test_online_fk_merge_preserves_shadow_claims_and_retained_references(
         # Probe every live tuple: routing hashes spread claims over all source
         # ranges, so row-only preservation cannot accidentally satisfy this.
         for row in documents.values():
-            duplicate = session.post(
-                f"{cluster.data_api_urls[0]}/tables/{parent}/batch",
-                json={"inserts": {"8:duplicate": {"id": row["id"]}}},
-                timeout=20,
+            backups._assert_constraint_rejected(
+                cluster,
+                session,
+                parent,
+                {"8:duplicate": {"id": row["id"]}},
+                "UniqueConstraintViolation",
             )
-            assert duplicate.status_code == 409, duplicate.text
-        orphan = session.post(
-            f"{cluster.data_api_urls[0]}/tables/{child}/batch",
-            json={"inserts": {"8:orphan": {"id": 999999}}},
-            timeout=20,
+        backups._assert_constraint_rejected(
+            cluster,
+            session,
+            child,
+            {"8:orphan": {"id": 999999}},
+            "ForeignKeyParentMissing",
         )
-        assert orphan.status_code == 409, orphan.text
         # Imported references must also drive a new post-cutover action job.
-        cascade = session.post(
-            f"{cluster.data_api_urls[0]}/tables/{parent}/batch",
-            json={"deletes": ["0:small"], "sync_level": "write"},
-            timeout=30,
+        backups._batch_cluster_docs_when_writable(
+            cluster, session, parent, deletes=("0:small",)
         )
-        assert cascade.status_code in (200, 201, 202), cascade.text
         cascade_child = "0:small" if merge_child else "z:child:2"
         assert wait_until(
             lambda: (

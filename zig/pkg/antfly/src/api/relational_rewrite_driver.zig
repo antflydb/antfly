@@ -131,8 +131,10 @@ pub fn step(host: anytype, job: *std.json.Parsed(stages.Job), worker: *jobs.JobS
     var pending = false;
     switch (progress.phase) {
         .snapshot => {
-            _ = try host.executeRestoreOwner(alloc, target.table.name, range.group_id, .{ .scope = scope, .action = .begin }, context);
-            const before = try host.executeRestoreOwner(alloc, target.table.name, range.group_id, .{ .scope = scope, .action = .status }, context);
+            // Begin returns the same durable progress as status, including on
+            // exact-scope replay after a lost reply. Do not pay for another
+            // owner ReadIndex round trip before every bounded snapshot page.
+            const before = try host.executeRestoreOwner(alloc, target.table.name, range.group_id, .{ .scope = scope, .action = .begin }, context);
             if (!(before.rewrite orelse return error.RestoreStagingScopeChanged).snapshot_complete) {
                 const receipt = for (target.source_artifacts) |item| {
                     if (item.target_group_id == range.group_id) break item;
@@ -234,6 +236,8 @@ test "rewrite shared job driver resumes lost scheduling receipts and fences whol
         imported: [2]bool = @splat(false),
         fences: usize = 0,
         final_cuts: usize = 0,
+        snapshot_started: bool = false,
+        snapshot_complete: bool = false,
         pub fn executeRewriteSource(self: *@This(), alloc: std.mem.Allocator, _: []const u8, request: wire.Request, _: operation.RequestContext) ![]u8 {
             const ordinal: usize = @intCast(request.scope.fence.owner_group_id - 301);
             try request.validate();
@@ -292,7 +296,12 @@ test "rewrite shared job driver resumes lost scheduling receipts and fences whol
             const ordinal: usize = @intCast(group - 401);
             const target = &self.targets[ordinal];
             switch (request.action) {
-                .begin, .status => {},
+                .begin => self.snapshot_started = true,
+                .status => {
+                    // Snapshot pages must use the durable progress returned
+                    // by begin, not issue a redundant status/ReadIndex RPC.
+                    try std.testing.expect(self.snapshot_complete);
+                },
                 .import_page => {
                     if (request.source_chunk != null) {
                         target.rewrite.?.snapshot_complete = true;
@@ -340,6 +349,7 @@ test "rewrite shared job driver resumes lost scheduling receipts and fences whol
         worker.rewrite_progress = fixture.restore_job_store.progress;
         fixture.restore_job_store.lose_checkpoint = iteration % 7 == 0;
         const before = worker.rewrite_progress;
+        fixture.snapshot_complete = before.phase != .snapshot;
         step(&fixture, &job, &worker, .{}) catch |err| {
             if (err != error.RestoreStagingYield) return err;
             try std.testing.expectEqualDeep(before, worker.rewrite_progress);
@@ -348,5 +358,6 @@ test "rewrite shared job driver resumes lost scheduling receipts and fences whol
         if (job.value.state == .validating) break;
     } else return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(usize, 2), fixture.final_cuts);
+    try std.testing.expect(fixture.snapshot_started);
     for (fixture.targets) |target| try std.testing.expectEqual(.imported, target.phase);
 }

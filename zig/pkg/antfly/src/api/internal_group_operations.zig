@@ -403,6 +403,7 @@ pub const Operations = struct {
             error.LeaderUnavailable, error.GroupLeaderUnavailable, error.MetadataSnapshotUnavailable => return error.GroupLeaderUnavailable,
             else => {
                 if (@import("relational_row_errors.zig").classify(err)) |reason| return reason;
+                if (@import("relational_integrity_errors.zig").classify(err)) |reason| return reason;
                 std.log.err("group-local Raft batch failed group_id={} table={s} err={s}", .{
                     group_id,
                     table_name,
@@ -581,6 +582,7 @@ pub const Operations = struct {
             error.LeaderUnavailable, error.GroupLeaderUnavailable, error.MetadataSnapshotUnavailable => return error.GroupLeaderUnavailable,
             else => {
                 if (@import("relational_row_errors.zig").classify(err)) |reason| return reason;
+                if (@import("relational_integrity_errors.zig").classify(err)) |reason| return reason;
                 std.log.err("routed Raft batch failed group_id={} table={s} err={s}", .{
                     group_id,
                     table_name,
@@ -1987,6 +1989,10 @@ fn consumerTests() type {
             }
             // None of the rejected requests reached the proposal callback.
             try std.testing.expectEqual(@as(usize, 9), state.calls);
+            for ([_]anyerror{ error.UniqueConstraintViolation, error.ForeignKeyParentMissing, error.ForeignKeyReferenced, error.PreparedReadSetChanged }) |failure| {
+                state.visibility_error = failure;
+                try std.testing.expectError(failure, operations.routedBatch(std.testing.allocator, request, 17, "documents", .{}, forwarding));
+            }
         }
 
         test "typed internal query workers preserve identity generation validation" {

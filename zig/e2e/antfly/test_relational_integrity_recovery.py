@@ -14,12 +14,12 @@
 
 """Real routed UNIQUE/FK recovery, using owner-link faults and durable Raft."""
 
+import json
 import time
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 import requests
-
 import test_backup_restore as backups
 import test_online_merge_recovery as merge_faults
 from helpers import wait_until
@@ -29,16 +29,147 @@ owner_link_fault = merge_faults.owner_link_fault
 
 
 @pytest.mark.parametrize(
+    "expected,reason",
+    [
+        ("UniqueConstraintViolation", "unique_constraint_violation"),
+        ("ForeignKeyParentMissing", "foreign_key_parent_missing"),
+        ("ForeignKeyReferenced", "foreign_key_referenced"),
+    ],
+)
+@pytest.mark.parametrize("shape", ["direct", "json", "distributed"])
+def test_constraint_probe_requires_exact_constraint_reason(expected, reason, shape):
+    response = requests.Response()
+    response.status_code = 409
+    if shape == "direct":
+        body = expected
+    elif shape == "json":
+        body = json.dumps({"error": expected})
+    else:
+        body = json.dumps(
+            {"status": "aborted", "conflict": {"reason": reason, "retryable": False}}
+        )
+    response._content = body.encode()
+    assert backups._constraint_probe_outcome(response, expected) is True
+    wrong = (
+        "ForeignKeyParentMissing"
+        if expected == "UniqueConstraintViolation"
+        else "UniqueConstraintViolation"
+    )
+    with pytest.raises(AssertionError):
+        backups._constraint_probe_outcome(response, wrong)
+
+
+@pytest.mark.parametrize(
+    "status,body,retry",
+    [
+        (409, "batch transaction conflicted", True),
+        (503, "write unavailable", True),
+        (
+            409,
+            '{"status":"aborted","conflict":{"kind":"participant_unavailable","retryable":true}}',
+            True,
+        ),
+        (
+            409,
+            '{"status":"aborted","conflict":{"kind":"optimistic_conflict","retryable":true}}',
+            True,
+        ),
+        (
+            409,
+            '{"status":"conflict","conflict":{"kind":"participant_unavailable","retryable":true}}',
+            False,
+        ),
+        (409, '{"code":"transaction_outcome_unknown","retryable":false}', False),
+        (409, "write outcome unknown", False),
+        (409, "unrecognized conflict", False),
+        (503, '{"error":"UniqueConstraintViolation"}', False),
+        (
+            503,
+            "write committed locally; standby durability acknowledgment pending",
+            False,
+        ),
+        (503, '{"retryable":true,"message":"service unavailable"}', False),
+        (504, "request deadline exceeded", False),
+        (201, '{"inserted":1}', False),
+        (202, '{"status":"committed_pending"}', False),
+        (
+            409,
+            '{"code":"transaction_outcome_unknown","error":"UniqueConstraintViolation"}',
+            False,
+        ),
+        (
+            409,
+            '{"status":"committed","conflict":{"reason":"unique_constraint_violation","retryable":false}}',
+            False,
+        ),
+    ],
+)
+def test_constraint_probe_never_accepts_or_retries_uncertain_outcomes(
+    status, body, retry
+):
+    response = requests.Response()
+    response.status_code = status
+    response._content = body.encode()
+    if retry:
+        assert (
+            backups._constraint_probe_outcome(response, "UniqueConstraintViolation")
+            is False
+        )
+    else:
+        with pytest.raises(AssertionError):
+            backups._constraint_probe_outcome(response, "UniqueConstraintViolation")
+
+
+@pytest.mark.parametrize(
+    "failure", [requests.ConnectionError, requests.Timeout, requests.HTTPError]
+)
+def test_constraint_probe_does_not_replay_lost_responses(failure):
+    class Cluster:
+        data_api_urls = ("http://unused.invalid",)
+
+        @staticmethod
+        def assert_processes_alive():
+            pass
+
+        @staticmethod
+        def debug_logs():
+            return ""
+
+    class Session:
+        calls = 0
+
+        def post(self, *_args, **_kwargs):
+            self.calls += 1
+            response = requests.Response()
+            response.status_code = 503
+            response._content = b'{"retryable":true}'
+            raise failure("response lost", response=response)
+
+    session = Session()
+    with pytest.raises(AssertionError, match="response lost"):
+        backups._assert_constraint_rejected(
+            Cluster(), session, "rows", {"bad": {"id": 1}}, "UniqueConstraintViolation"
+        )
+    assert session.calls == 1
+
+
+@pytest.mark.parametrize("mutation", ["insert", "delete"])
+@pytest.mark.parametrize(
     "status,body,retry",
     [
         (503, "write unavailable", True),
         (409, "batch transaction conflicted", True),
         (409, "unique constraint violation", False),
         (503, "transaction outcome unknown", False),
+        (503, '{"retryable":true,"message":"service unavailable"}', False),
+        (503, "doc identity unavailable", False),
+        (503, "write committed locally; standby acknowledgment pending", False),
         (500, "internal error", False),
     ],
 )
-def test_integrity_seed_only_retries_explicit_precommit_abort(status, body, retry):
+def test_integrity_seed_only_retries_explicit_precommit_abort(
+    status, body, retry, mutation
+):
     class Cluster:
         data_api_urls = ("http://unused.invalid",)
 
@@ -63,17 +194,108 @@ def test_integrity_seed_only_retries_explicit_precommit_abort(status, body, retr
             return response
 
     session = Session()
+    batch = (
+        {"inserts": {"key": {"id": 1}}}
+        if mutation == "insert"
+        else {"deletes": ("key",)}
+    )
     if retry:
-        assert backups._seed_cluster_docs_when_writable(
-            Cluster(), session, "rows", {"key": {"id": 1}}, timeout_s=1
+        assert backups._batch_cluster_docs_when_writable(
+            Cluster(), session, "rows", **batch, timeout_s=1
         ) == {"inserted": 1}
         assert session.calls == 2
     else:
         with pytest.raises(AssertionError):
-            backups._seed_cluster_docs_when_writable(
-                Cluster(), session, "rows", {"key": {"id": 1}}, timeout_s=1
+            backups._batch_cluster_docs_when_writable(
+                Cluster(), session, "rows", **batch, timeout_s=1
             )
         assert session.calls == 1
+
+
+@pytest.mark.parametrize("mutation", ["insert", "delete"])
+@pytest.mark.parametrize(
+    "failure", [requests.ConnectionError, requests.Timeout, requests.HTTPError]
+)
+def test_integrity_batch_does_not_replay_transport_exceptions(failure, mutation):
+    class Cluster:
+        data_api_urls = ("http://unused.invalid",)
+
+        @staticmethod
+        def assert_processes_alive():
+            pass
+
+        @staticmethod
+        def debug_logs():
+            return ""
+
+    class Session:
+        calls = 0
+
+        def post(self, *_args, **_kwargs):
+            self.calls += 1
+            response = requests.Response()
+            response.status_code = 503
+            response._content = b'{"retryable":true}'
+            raise failure("response lost", response=response)
+
+    session = Session()
+    batch = (
+        {"inserts": {"key": {"id": 1}}}
+        if mutation == "insert"
+        else {"deletes": ("key",)}
+    )
+    with pytest.raises(AssertionError, match="batch transport failed: response lost"):
+        backups._batch_cluster_docs_when_writable(
+            Cluster(), session, "rows", **batch, timeout_s=0.1
+        )
+    assert session.calls == 1
+
+
+@pytest.mark.parametrize("read_status", [404, 503])
+def test_integrity_unknown_delete_is_observed_not_replayed(read_status):
+    class Cluster:
+        data_api_urls = ("http://unused.invalid",)
+
+        @staticmethod
+        def assert_processes_alive():
+            pass
+
+        @staticmethod
+        def debug_logs():
+            return ""
+
+    class Session:
+        calls = 0
+
+        def post(self, *_args, **kwargs):
+            self.calls += 1
+            assert kwargs["json"] == {"deletes": ["key"], "sync_level": "write"}
+            response = requests.Response()
+            response.status_code = 409
+            response._content = (
+                b'{"code":"transaction_outcome_unknown","retryable":false}'
+            )
+            return response
+
+        def get(self, *_args, **_kwargs):
+            response = requests.Response()
+            response.status_code = read_status
+            return response
+
+    session = Session()
+    if read_status == 404:
+        assert (
+            backups._batch_cluster_docs_when_writable(
+                Cluster(), session, "rows", deletes=("key",), timeout_s=0.1
+            )
+            is None
+        )
+    else:
+        with pytest.raises(AssertionError, match="uncertain transaction"):
+            backups._batch_cluster_docs_when_writable(
+                Cluster(), session, "rows", deletes=("key",), timeout_s=0.1
+            )
+    assert session.calls == 1
 
 
 def test_transaction_fault_requires_observed_durable_coordinator_decision():
@@ -145,32 +367,6 @@ def _schema(parent=None):
             }
         ]
     return result
-
-
-def _assert_constraint_rejected(cluster, session, table, inserts):
-    observations = []
-
-    def rejected():
-        try:
-            response = session.post(
-                f"{cluster.data_api_urls[0]}/tables/{table}/batch",
-                json={"inserts": inserts},
-                timeout=20,
-            )
-        except requests.RequestException as exc:
-            observations.append(str(exc))
-            return False
-        observations.append(f"{response.status_code}: {response.text[:1024]}")
-        if response.status_code == 409:
-            return True
-        # A recovered cluster can still be electing individual group leaders.
-        # A success is always a correctness failure, never retried or hidden.
-        assert response.status_code in (503, 504), response.text
-        return False
-
-    assert wait_until(rejected, timeout_s=90, interval_s=0.5), (
-        f"constraint never rejected the invalid write: {observations[-8:]}\n{cluster.debug_logs()}"
-    )
 
 
 @pytest.mark.parametrize(
@@ -310,16 +506,23 @@ def test_fk_cascade_recovers_claims_references_and_rows(
             cluster, session, parent, {"z:replacement": {"id": 17}}
         )
         backups._seed_cluster_docs_when_writable(cluster, session, child, children)
-        _assert_constraint_rejected(
-            cluster, session, parent, {"8:duplicate": {"id": 17}}
+        backups._assert_constraint_rejected(
+            cluster,
+            session,
+            parent,
+            {"8:duplicate": {"id": 17}},
+            "UniqueConstraintViolation",
         )
-        _assert_constraint_rejected(cluster, session, child, {"8:orphan": {"id": 999}})
-        final = session.post(
-            f"{cluster.data_api_urls[0]}/tables/{parent}/batch",
-            json={"deletes": ["z:replacement"], "sync_level": "write"},
-            timeout=30,
+        backups._assert_constraint_rejected(
+            cluster,
+            session,
+            child,
+            {"8:orphan": {"id": 999}},
+            "ForeignKeyParentMissing",
         )
-        assert final.status_code in (200, 201, 202), final.text
+        backups._batch_cluster_docs_when_writable(
+            cluster, session, parent, deletes=("z:replacement",)
+        )
         parent_keys.append("z:replacement")
         assert wait_until(all_absent, timeout_s=60), cluster.debug_logs()
 
@@ -470,24 +673,37 @@ def test_schema_rewrite_recovers_dependency_cohort(
                 )
                 assert response.status_code == 200, response.text
                 assert response.json()["g"] == row["x"] * 3, response.text
-        orphan = session.post(
-            f"{cluster.data_api_urls[0]}/tables/{child}/batch",
-            json={"inserts": {"8:orphan": {"id": 999}}},
-            timeout=20,
+        backups._assert_constraint_rejected(
+            cluster,
+            session,
+            child,
+            {"8:orphan": {"id": 999}},
+            "ForeignKeyParentMissing",
         )
-        assert orphan.status_code == 409, orphan.text
-        duplicate = session.post(
-            f"{cluster.data_api_urls[0]}/tables/{parent}/batch",
-            json={"inserts": {"8:duplicate": {"id": 1, "x": 2}}},
-            timeout=20,
+        backups._assert_constraint_rejected(
+            cluster,
+            session,
+            parent,
+            {"8:duplicate": {"id": 1, "x": 2}},
+            "UniqueConstraintViolation",
         )
-        assert duplicate.status_code == 409, duplicate.text
-        deleted = session.post(
-            f"{cluster.data_api_urls[0]}/tables/{parent}/batch",
-            json={"deletes": ["0:parent"], "sync_level": "write"},
-            timeout=30,
+        backups._batch_cluster_docs_when_writable(
+            cluster, session, parent, deletes=("0:parent",)
         )
-        assert deleted.status_code in (200, 201, 202), deleted.text
-        for base in cluster.data_api_urls:
-            missing = session.get(f"{base}/tables/{child}/documents/0:child", timeout=5)
-            assert missing.status_code == 404, missing.text
+
+        def cascade_visible():
+            # An unknown parent-delete outcome is observed, never replayed.
+            # Its dependent action must also finish on every routed frontend.
+            for base in cluster.data_api_urls:
+                try:
+                    missing = session.get(
+                        f"{base}/tables/{child}/documents/0:child", timeout=5
+                    )
+                except requests.RequestException:
+                    return False
+                assert missing.status_code in (200, 404, 503, 504), missing.text
+                if missing.status_code != 404:
+                    return False
+            return True
+
+        assert wait_until(cascade_visible, timeout_s=60), cluster.debug_logs()

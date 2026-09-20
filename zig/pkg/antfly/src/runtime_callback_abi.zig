@@ -242,6 +242,10 @@ test "boundary dispatcher preserves local calls and maps cross-unit calls" {
             return error.StorageReadTemporarilyUnavailable;
         }
 
+        fn concurrencyUnavailable(_: *u32) anyerror!void {
+            return error.ConcurrencyUnavailable;
+        }
+
         fn topologyUpgradeRequired(_: *u32) anyerror!void {
             return error.TableTopologyProtocolUpgradeRequired;
         }
@@ -316,6 +320,10 @@ test "boundary dispatcher preserves local calls and maps cross-unit calls" {
     try std.testing.expectError(
         error.StorageReadTemporarilyUnavailable,
         TestBoundary.call("retryable_fail", &callbacks.foreignDispatch, &callbacks.storageReadUnavailable, .{&base}),
+    );
+    try std.testing.expectError(
+        error.ConcurrencyUnavailable,
+        TestBoundary.call("retryable_fail", &callbacks.foreignDispatch, &callbacks.concurrencyUnavailable, .{&base}),
     );
     try std.testing.expectError(
         error.TableTopologyProtocolUpgradeRequired,

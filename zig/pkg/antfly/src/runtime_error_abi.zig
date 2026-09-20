@@ -628,6 +628,7 @@ pub const Detail = enum(c_int) {
     table_lifecycle_conflict,
     http_connection_closing,
     raft_batch_write_transport_outcome_unknown,
+    concurrency_unavailable,
 };
 
 pub const Status = extern struct {
@@ -906,6 +907,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.PersistentDescriptorAdmissionExhausted => status(.retryable, .persistent_descriptor_admission_exhausted),
         error.ResourceRequestTooLarge => status(.invalid_argument, .resource_request_too_large),
         error.ResourceTemporarilyUnavailable => status(.retryable, .resource_temporarily_unavailable),
+        error.ConcurrencyUnavailable => status(.retryable, .concurrency_unavailable),
         error.RestoreJobPersistenceUnavailable => status(.unavailable, .restore_job_persistence_unavailable),
         error.Backpressured => status(.retryable, .backpressured),
         error.DenseRepairBackpressure => status(.retryable, .dense_repair_backpressure),
@@ -1262,6 +1264,7 @@ pub fn errorFromStatus(value: Status) anyerror {
 
 fn detailErrorName(comptime detail: Detail) []const u8 {
     return switch (detail) {
+        .concurrency_unavailable => "ConcurrencyUnavailable",
         .table_topology_protocol_upgrade_required => "TableTopologyProtocolUpgradeRequired",
         .database_not_found => "DatabaseNotFound",
         .namespace_not_found => "NamespaceNotFound",
@@ -1879,6 +1882,7 @@ test "stable status preserves public boundary semantics" {
     try std.testing.expectEqual(error.ExtensionOwnedObject, errorFromStatus(statusFromError(error.ExtensionOwnedObject)));
     try std.testing.expectEqual(error.ResourceRequestTooLarge, errorFromStatus(statusFromError(error.ResourceRequestTooLarge)));
     try std.testing.expectEqual(error.ResourceTemporarilyUnavailable, errorFromStatus(statusFromError(error.ResourceTemporarilyUnavailable)));
+    try std.testing.expectEqual(error.ConcurrencyUnavailable, errorFromStatus(statusFromError(error.ConcurrencyUnavailable)));
     try std.testing.expectEqual(error.QueueFull, errorFromStatus(statusFromError(error.QueueFull)));
     try std.testing.expectEqual(error.ResourceLimitExceeded, errorFromStatus(statusFromError(error.ResourceLimitExceeded)));
     try std.testing.expectEqual(error.GraphQueryModeUnsupported, errorFromStatus(statusFromError(error.GraphQueryModeUnsupported)));
@@ -1957,6 +1961,15 @@ test "stable status has a C layout" {
     try std.testing.expectEqual(@sizeOf(c_int) * 2, @sizeOf(Status));
     try std.testing.expectEqual(@as(usize, 0), @offsetOf(Status, "code"));
     try std.testing.expectEqual(@sizeOf(c_int), @offsetOf(Status, "detail"));
+}
+
+test "scheduler admission detail appends without renumbering existing wire outcomes" {
+    try std.testing.expectEqual(@as(c_int, 559), @intFromEnum(Detail.http_connection_closing));
+    try std.testing.expectEqual(@as(c_int, 560), @intFromEnum(Detail.raft_batch_write_transport_outcome_unknown));
+    try std.testing.expectEqual(@as(c_int, 561), @intFromEnum(Detail.concurrency_unavailable));
+    const wire = statusFromError(error.ConcurrencyUnavailable);
+    try std.testing.expectEqual(@intFromEnum(Code.retryable), wire.code);
+    try std.testing.expectEqual(error.ConcurrencyUnavailable, errorFromStatus(wire));
 }
 
 test "unknown wire values fail closed" {

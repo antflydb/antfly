@@ -2110,7 +2110,8 @@ fn importStagedFilePage(alloc: Allocator, store: *DocStore, io: std.Io, file: st
         else => return err,
     };
     const cached = if (cache_bytes) |bytes| (try std.json.parseFromSlice(CohortCachedBlock, owned, bytes, .{})).value else null;
-    const use_cache = object.kind == .document_batch and cached != null and cached.?.ordinal == state.ordinal;
+    const import_artifacts = proof == .cohort and isCohortArtifactBlock(object.kind);
+    const use_cache = (object.kind == .document_batch or import_artifacts) and cached != null and cached.?.ordinal == state.ordinal;
     const block: backup_codec.Block = .{ .block_type = object.kind, .payload = if (use_cache)
         try store.get(alloc, try cohortPageKey(owned, state.row / 128))
     else
@@ -2167,6 +2168,50 @@ fn importStagedFilePage(alloc: Allocator, store: *DocStore, io: std.Io, file: st
         try writes.append(owned, .{ .key = cohort_import_checkpoint_key, .value = try std.json.Stringify.valueAlloc(owned, state, .{}) });
         try cancellation.check();
         try validateAndImportDocumentEntries(alloc, store, selected, &archive, writes.items);
+    } else if (import_artifacts) {
+        if (!archive.saw_cohort) return error.BackupIntegrityFailure;
+        if (!use_cache) {
+            if (state.row != 0) return error.InvalidRestoreSourceCheckpoint;
+            // Only logical, document-owned artifacts cross the restore boundary.
+            // In particular, never import source identities or index projections.
+            const entries = try decodeCohortArtifacts(owned, block.block_type, block.payload);
+            var offset: usize = 0;
+            while (offset < entries.len or offset == 0) {
+                try cancellation.check();
+                const end = @min(entries.len, offset + 128);
+                try writes.append(owned, .{ .key = try cohortPageKey(owned, @intCast(offset / 128)), .value = try backup_codec.encodeKeyValueBatch(owned, entries[offset..end]) });
+                offset = end;
+                if (end == entries.len) break;
+            }
+            try writes.append(owned, .{ .key = cohort_import_cache_key, .value = try std.json.Stringify.valueAlloc(owned, CohortCachedBlock{ .ordinal = state.ordinal, .rows = @intCast(entries.len) }, .{}) });
+            try store.putBatch(writes.items, &.{});
+            try store.sync(true);
+            return false;
+        }
+        const entries = try backup_codec.decodeKeyValueBatch(owned, block.payload);
+        const local_start = state.row % 128;
+        if (state.row > cached.?.rows or local_start > entries.len or entries.len > 128) return error.InvalidRestoreSourceCheckpoint;
+        const end = @min(entries.len, local_start + max_rows);
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        for (entries[local_start..end]) |entry| {
+            try cancellation.check();
+            if ((try seen.getOrPut(owned, entry.key)).found_existing) return error.InvalidBackupRequest;
+            const existing = store.get(owned, entry.key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            if (existing != null) return error.InvalidBackupRequest;
+            try writes.append(owned, .{ .key = entry.key, .value = entry.value });
+        }
+        state.row += @intCast(end - local_start);
+        if (state.row == cached.?.rows) {
+            state.row = 0;
+            state.ordinal += 1;
+        }
+        if (state.ordinal == state.object_count) state.phase = .layouts;
+        try writes.append(owned, .{ .key = cohort_import_checkpoint_key, .value = try std.json.Stringify.valueAlloc(owned, state, .{}) });
+        try cancellation.check();
+        try store.putBatch(writes.items, &.{});
     } else {
         if (state.row != 0) return error.InvalidRestoreSourceCheckpoint;
         if (block.block_type == .metadata_batch) {
@@ -2199,6 +2244,53 @@ fn importStagedFilePage(alloc: Allocator, store: *DocStore, io: std.Io, file: st
     }
     try store.sync(true);
     return false;
+}
+
+fn isCohortArtifactBlock(kind: backup_codec.BlockType) bool {
+    return switch (kind) {
+        .embedding_batch, .sparse_batch, .edge_batch, .chunk_batch, .artifact_batch => true,
+        else => false,
+    };
+}
+
+/// The allocator is the bounded object decoder's arena. Portable embeddings
+/// deliberately have no producer hash: configured producers must regenerate
+/// them; external vectors remain authoritative user data.
+fn decodeCohortArtifacts(alloc: Allocator, kind: backup_codec.BlockType, payload: []const u8) ![]backup_codec.KeyValueEntry {
+    var entries: std.ArrayListUnmanaged(backup_codec.KeyValueEntry) = .empty;
+    switch (kind) {
+        .embedding_batch => {
+            const decoded = try backup_codec.decodeEmbeddingBatch(alloc, payload);
+            for (decoded.entries) |entry| try entries.append(alloc, .{
+                .key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, entry.doc_key, decoded.index_name),
+                .value = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, null, entry.vector),
+            });
+        },
+        .sparse_batch => {
+            const decoded = try backup_codec.decodeSparseBatch(alloc, payload);
+            for (decoded.entries) |entry| try entries.append(alloc, .{
+                .key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, entry.doc_key, decoded.index_name),
+                .value = try enrichment_artifact_codec.encodeSparseEmbeddingAlloc(alloc, null, entry.indices, entry.values),
+            });
+        },
+        .edge_batch => {
+            const decoded = try decodeEdgeBatch(alloc, payload);
+            for (decoded.entries) |entry| try entries.append(alloc, .{
+                .key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, entry.source_key, decoded.index_name, entry.edge_type, entry.target_key),
+                .value = try graphArtifactValueFromPortableEdgeValueAlloc(alloc, entry.value),
+            });
+        },
+        .chunk_batch, .artifact_batch => {
+            const decoded = try backup_codec.decodeKeyValueBatch(alloc, payload);
+            for (decoded) |entry| {
+                const ref = (try artifact_ids.decodeArtifactPublicIdAlloc(alloc, entry.key)) orelse return error.InvalidBackupRequest;
+                if (ref.kind != (if (kind == .chunk_batch) db_types.ArtifactKind.chunk else .asset)) return error.InvalidBackupRequest;
+                try entries.append(alloc, .{ .key = try artifact_ids.internalKeyForArtifactRefAlloc(alloc, ref), .value = entry.value });
+            }
+        },
+        else => return error.InvalidBackupRequest,
+    }
+    return entries.toOwnedSlice(alloc);
 }
 
 /// Import AFB data into the DocStore.

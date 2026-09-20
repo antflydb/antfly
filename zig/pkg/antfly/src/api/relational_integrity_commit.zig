@@ -431,7 +431,25 @@ const Builder = struct {
             for (batch, 0..) |key, index| tasks.async(io, Slot.run, .{ &slots[index], self.source, table.name, key, self.control });
             tasks.await(io) catch return error.Cancelled;
             try self.control.ensureActive();
-            for (slots[0..batch.len]) |slot| if (slot.failure) |err| return err;
+            // Drain the complete wave before retrying rejected local
+            // admissions. Keep successful observations; restarting the wave
+            // would recreate the same overload and repeat its read barriers.
+            // Genuine network, consistency and cancellation failures are not
+            // admission evidence and must never enter this fallback.
+            for (slots[0..batch.len]) |slot| if (slot.failure) |err| {
+                if (err != error.ConcurrencyUnavailable) return err;
+            };
+            for (batch, slots[0..batch.len]) |key, *slot| if (slot.failure != null) {
+                try self.control.ensureActive();
+                _ = slot.arena.reset(.retain_capacity);
+                slot.failure = null;
+                Slot.run(slot, self.source, table.name, key, self.control);
+                try self.control.ensureActive();
+                // One serial attempt is sufficient to eliminate self-induced
+                // pressure. Persistent external overload stays bounded and
+                // is reported through normal precommit availability mapping.
+                if (slot.failure) |err| return err;
+            };
             for (batch, slots[0..batch.len]) |key, slot| {
                 var owned = slot.row;
                 if (owned) |*row| {
@@ -1103,7 +1121,7 @@ pub fn prepareWithCoverageControlled(alloc: Allocator, source: reads.TableReadSo
 /// the distributed commit call itself. Preserve that distinction at the API.
 fn preparationError(err: anyerror) anyerror {
     return switch (err) {
-        error.ReadIndexTimeout, error.CatalogRoutingSnapshotTimeout, error.Timeout, error.NotLeader, error.GroupLeaderUnavailable, error.LeaderUnavailable, error.DistributedQueryUnavailable => blk: {
+        error.ReadIndexTimeout, error.CatalogRoutingSnapshotTimeout, error.Timeout, error.NotLeader, error.GroupLeaderUnavailable, error.LeaderUnavailable, error.DistributedQueryUnavailable, error.StorageReadTemporarilyUnavailable, error.ConcurrencyUnavailable, error.ResourceTemporarilyUnavailable => blk: {
             if (preparation_diagnostic_gate.admit(@import("antfly_platform").time.monotonicNs()))
                 std.log.warn("relational preparation read deferred class={s}", .{@errorName(err)});
             break :blk error.IntegrityCatalogUnavailable;
@@ -1125,7 +1143,7 @@ fn prepareWithCoverageOnce(alloc: Allocator, source: reads.TableReadSource, meta
 }
 
 test "distributed txn integrity preparation read barrier failure is precommit unavailability" {
-    inline for (.{ error.ReadIndexTimeout, error.CatalogRoutingSnapshotTimeout, error.Timeout, error.NotLeader, error.GroupLeaderUnavailable, error.LeaderUnavailable, error.DistributedQueryUnavailable }) |err| {
+    inline for (.{ error.ReadIndexTimeout, error.CatalogRoutingSnapshotTimeout, error.Timeout, error.NotLeader, error.GroupLeaderUnavailable, error.LeaderUnavailable, error.DistributedQueryUnavailable, error.StorageReadTemporarilyUnavailable, error.ConcurrencyUnavailable, error.ResourceTemporarilyUnavailable }) |err| {
         try std.testing.expectEqual(error.IntegrityCatalogUnavailable, preparationError(err));
     }
     try std.testing.expectEqual(error.PreDecisionDeadlineExceeded, preparationError(error.DeadlineExceeded));
@@ -1431,6 +1449,101 @@ test "distributed txn preparation pins one routing view and releases it" {
         try std.testing.expectEqual(@as(usize, 2), fixture.lookups);
     }
     try std.testing.expectEqual(@as(usize, 1), fixture.releases);
+}
+
+test "distributed txn primary prefetch retries only local admission after draining the wave" {
+    const Mode = enum { recover, persistent, unavailable, transport, mixed, canceled, deadline };
+    const Fixture = struct {
+        mode: Mode,
+        calls: [8]std.atomic.Value(usize) = @splat(.init(0)),
+        finished: std.atomic.Value(usize) = .init(0),
+        canceled: std.atomic.Value(bool) = .init(false),
+        now_ns: std.atomic.Value(u64) = .init(10),
+
+        fn now(ptr: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            return .{ .nanoseconds = self.now_ns.load(.acquire) };
+        }
+
+        fn lookup(ptr: *anyopaque, alloc: Allocator, _: []const u8, key: []const u8, opts: types.LookupOptions, consistency: @import("../raft/read_gate.zig").ReadConsistency) !?reads.LookupResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const index = key[0] - 'a';
+            const attempt = self.calls[index].fetchAdd(1, .monotonic);
+            defer _ = self.finished.fetchAdd(1, .release);
+            try std.testing.expectEqual(.read_index, consistency);
+            try std.testing.expect(opts.include_primary_digest);
+            try std.testing.expectEqual(@as(?u64, 50), opts.execution_deadline_ns);
+            try std.testing.expect(opts.execution_io != null);
+            try std.testing.expect(opts.cancellation != null);
+            if (attempt != 0) try std.testing.expect(self.finished.load(.acquire) >= 8);
+            if (index == 1) {
+                if (attempt == 0) switch (self.mode) {
+                    .unavailable => return error.StorageReadTemporarilyUnavailable,
+                    .transport => return error.ConnectionResetByPeer,
+                    .canceled => self.canceled.store(true, .release),
+                    .deadline => self.now_ns.store(60, .release),
+                    else => {},
+                };
+                if (attempt == 0 or self.mode == .persistent) return error.ConcurrencyUnavailable;
+            }
+            if (index == 3 and attempt == 0) {
+                if (self.mode == .mixed) return error.StorageReadTemporarilyUnavailable;
+                if (self.mode == .recover or self.mode == .persistent) return error.ConcurrencyUnavailable;
+            }
+            return .{ .json = try alloc.dupe(u8, "{}"), .version = 7, .expected_content_digest = @splat(3) };
+        }
+    };
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    inline for (std.meta.tags(Mode)) |mode| {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        var fixture: Fixture = .{ .mode = mode };
+        var clock_vtable = std.testing.io.vtable.*;
+        clock_vtable.now = Fixture.now;
+        const clock: std.Io = .{ .userdata = &fixture, .vtable = &clock_vtable };
+        var table: Loaded = undefined;
+        table.name = "rows";
+        var builder: Builder = .{
+            .alloc = arena.allocator(),
+            .metadata = &.{},
+            .source = .{ .ptr = &fixture, .vtable = &.{ .lookup = Fixture.lookup, .scan = undefined, .query = undefined } },
+            .control = .{
+                .fanout_io = @import("../runtime_io_abi.zig").Borrow.init(&io),
+                .deadline_io = @import("../runtime_io_abi.zig").Borrow.init(&clock),
+                .deadline_ns = 50,
+                .cancellation = types.CancellationToken.fromAtomic(&fixture.canceled),
+            },
+        };
+        defer builder.deinit();
+        const keys = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h" };
+        if (mode == .recover) {
+            try builder.preloadWork(&table, &keys);
+            try std.testing.expectEqual(keys.len, builder.work.items.len);
+            for (keys, builder.work.items) |key, work| {
+                try std.testing.expectEqualStrings(key, work.key);
+                try std.testing.expectEqualStrings("{}", work.before.?.json);
+                try std.testing.expectEqual(@as(u64, 7), work.observed_version);
+            }
+        } else {
+            const expected = switch (mode) {
+                .persistent => error.ConcurrencyUnavailable,
+                .unavailable, .mixed => error.StorageReadTemporarilyUnavailable,
+                .transport => error.ConnectionResetByPeer,
+                .canceled => error.Canceled,
+                .deadline => error.DeadlineExceeded,
+                .recover => unreachable,
+            };
+            try std.testing.expectError(expected, builder.preloadWork(&table, &keys));
+            try std.testing.expectEqual(@as(usize, 0), builder.work.items.len);
+        }
+        for (&fixture.calls, 0..) |*calls, index| {
+            const retried = (mode == .recover and (index == 1 or index == 3)) or (mode == .persistent and index == 1);
+            try std.testing.expectEqual(@as(usize, if (retried) 2 else 1), calls.load(.acquire));
+        }
+    }
 }
 
 test "distributed txn primary prefetch owns observations and drains failed batches" {
