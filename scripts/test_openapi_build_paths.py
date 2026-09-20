@@ -15,6 +15,7 @@
 """Build outputs and depfiles share the build runner's working directory."""
 
 from contextlib import nullcontext
+import json
 import subprocess
 import sys
 import tempfile
@@ -30,9 +31,59 @@ from jsonschema import Draft4Validator
 with patch.object(sys, "path", [str(Path(__file__).resolve().parent), *sys.path]):
     import join_openapi
     import join_public_openapi
+    import yaml_to_json
 
 
 class OpenApiBuildPathsTest(unittest.TestCase):
+    def test_vendored_exa_inline_schemas_generate_named_types(self):
+        root = Path(__file__).resolve().parent.parent
+        spec = root / "zig/specs/exa-openapi.yaml"
+        original = spec.read_bytes()
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "exa.json"
+            yaml_to_json.main(
+                [
+                    str(spec),
+                    str(output),
+                    "--schema-alias",
+                    "SearchRequest=/paths/~1search/post/requestBody/content/application~1json/schema",
+                    "--schema-alias",
+                    "SearchResponse=/components/responses/SearchResponse/content/application~1json/schema",
+                ]
+            )
+            document = json.loads(output.read_text())
+            schemas = document["components"]["schemas"]
+            self.assertEqual(
+                schemas["SearchRequest"],
+                document["paths"]["/search"]["post"]["requestBody"]["content"][
+                    "application/json"
+                ]["schema"],
+            )
+            self.assertEqual(
+                schemas["SearchResponse"],
+                document["components"]["responses"]["SearchResponse"]["content"][
+                    "application/json"
+                ]["schema"],
+            )
+            self.assertEqual(spec.read_bytes(), original)
+
+    def test_schema_alias_rejects_missing_targets_and_component_collisions(self):
+        root = Path(__file__).resolve().parent.parent
+        with tempfile.TemporaryDirectory() as tmp:
+            for alias in (
+                "SearchRequest=/missing/schema",
+                "CommonRequest=/components/schemas/ContentsRequest",
+            ):
+                with self.subTest(alias=alias), self.assertRaises(SystemExit):
+                    yaml_to_json.main(
+                        [
+                            str(root / "zig/specs/exa-openapi.yaml"),
+                            str(Path(tmp) / "exa.json"),
+                            "--schema-alias",
+                            alias,
+                        ]
+                    )
+
     def test_openrouter_generator_schema_matches_single_model_runtime(self):
         root = Path(__file__).resolve().parent.parent
         source = yaml.safe_load(

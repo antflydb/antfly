@@ -31,6 +31,7 @@ pub const AntflyRootImports = struct {
     indexes_openapi: *std.Build.Module,
     sort_openapi: *std.Build.Module,
     generating_api_openapi: *std.Build.Module,
+    websearch_openapi: *std.Build.Module,
     eval_openapi: *std.Build.Module,
     query_openapi: *std.Build.Module,
     admin_openapi: *std.Build.Module,
@@ -85,6 +86,7 @@ pub const AntflyRootImports = struct {
     font: *std.Build.Module,
     pdf: *std.Build.Module,
     openai_api: *std.Build.Module,
+    exa_api: *std.Build.Module,
     handlebars: *std.Build.Module,
     inference_server: *std.Build.Module,
     prometheus: *std.Build.Module,
@@ -102,6 +104,7 @@ pub const AntflyRootImports = struct {
         .{ .name = "antfly_indexes_openapi", .field = "indexes_openapi" },
         .{ .name = "antfly_sort_openapi", .field = "sort_openapi" },
         .{ .name = "antfly_generating_api_openapi", .field = "generating_api_openapi" },
+        .{ .name = "antfly_websearch_openapi", .field = "websearch_openapi" },
         .{ .name = "antfly_eval_openapi", .field = "eval_openapi" },
         .{ .name = "antfly_query_openapi", .field = "query_openapi" },
         .{ .name = "antfly_admin_openapi", .field = "admin_openapi" },
@@ -156,6 +159,7 @@ pub const AntflyRootImports = struct {
         .{ .name = "antfly_font", .field = "font" },
         .{ .name = "antfly_pdf", .field = "pdf" },
         .{ .name = "openai_api", .field = "openai_api" },
+        .{ .name = "exa_api", .field = "exa_api" },
         .{ .name = "handlebars", .field = "handlebars" },
         .{ .name = "inference_server", .field = "inference_server" },
         .{ .name = "prometheus", .field = "prometheus" },
@@ -239,8 +243,17 @@ pub const AntflyRootImports = struct {
         "vectorindex",
     };
     const api_imports = .{
-        "a2a", "casbin",      "eval_openapi",   "generating_api_openapi", "generating_openapi",
-        "mcp", "raft_engine", "schema_openapi", "usermgr_openapi",
+        "exa_api",
+        "websearch_openapi",
+        "a2a",
+        "casbin",
+        "eval_openapi",
+        "generating_api_openapi",
+        "generating_openapi",
+        "mcp",
+        "raft_engine",
+        "schema_openapi",
+        "usermgr_openapi",
     };
 
     pub fn configureStorage(self: @This(), b: *std.Build, mod: *std.Build.Module, link_libc: bool) void {

@@ -214,6 +214,10 @@ type (
 	AgentStepKind       = oapi.AgentStepKind
 	AgentStepStatus     = oapi.AgentStepStatus
 
+	// Provider-specific web search options
+	WebSearchProviderConfig = oapi.WebSearchProviderConfig
+	ExaSearchConfig         = oapi.ExaSearchConfig
+
 	// Query Builder types
 	QueryBuilderRequest = oapi.QueryBuilderRequest
 	QueryBuilderResult  = oapi.QueryBuilderResult
