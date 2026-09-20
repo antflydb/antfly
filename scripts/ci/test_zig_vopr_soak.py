@@ -215,10 +215,12 @@ class SoakTests(unittest.TestCase):
                 )
                 self.assertEqual(result.returncode, 124)
                 self.assertTrue(heartbeat.exists(), "server must have started")
-                self.assertTrue(finished.exists(), "inner supervisor must finish cleanup")
+                self.assertTrue(
+                    finished.exists(), "inner supervisor must finish cleanup"
+                )
                 self.assertEqual(finished.read_text(), "130")
                 stopped = heartbeat.read_text()
-                time.sleep(.1)
+                time.sleep(0.1)
                 self.assertEqual(heartbeat.read_text(), stopped)
             finally:
                 if pid_file.exists():
