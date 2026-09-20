@@ -7671,9 +7671,23 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const buf = toBuf(tensor);
         if (buf.boundary_i32_storage) {
-            if (target != .i32) return error.UnsupportedResidentTrainingPrimitive;
             const source = try self.residentTrainingTensor(tensor, .i32, .{});
-            return self.residentTrainingReshape(tensor, source.shape(), .{}, false);
+            if (target == .i32) return self.residentTrainingReshape(tensor, source.shape(), .{}, false);
+            // Imported graphs cast integer attention masks to floating point.
+            // Convert values explicitly; reinterpreting their device bytes as
+            // f32 would silently corrupt the mask.
+            switch (target) {
+                .f32, .f16, .bf16, .f64 => {
+                    const values = try self.allocator.alloc(i32, source.elemCount());
+                    defer self.allocator.free(values);
+                    try source.downloadBytesInto(std.mem.sliceAsBytes(values));
+                    const floats = try self.allocator.alloc(f32, values.len);
+                    defer self.allocator.free(floats);
+                    for (values, floats) |value, *out| out.* = @floatFromInt(value);
+                    return fromFloat32ShapeOp(self, floats, source.shape());
+                },
+                else => return error.UnsupportedResidentTrainingPrimitive,
+            }
         }
         if (buf.quantized_storage != null) return null;
         const metal_tensor = buf.metal_tensor orelse return null;
@@ -9120,6 +9134,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn lessThanConsumeLeftOp(ctx: *anyopaque, a: CT, b: CT) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (toBuf(a).boundary_i32_storage or toBuf(b).boundary_i32_storage) return null;
         return self.binaryConsumeIntoPreferred(a, b, .less_than);
     }
 
@@ -11605,7 +11620,20 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn primGatherOp(ctx: *anyopaque, input: CT, indices: CT, axis: u8, input_shape: []const i64) anyerror!CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
-        if (toBuf(indices).boundary_i32_storage) return self.residentTrainingGather(input, indices, input_shape, axis, .{});
+        if (toBuf(indices).boundary_i32_storage) {
+            if (toBuf(input).resident_owner != null)
+                return self.residentTrainingGather(input, indices, input_shape, axis, .{});
+            // Imported ONNX weights use ordinary inference handles, while
+            // input IDs are exact device i32 tensors. Admit the weight into
+            // this context before using the integer-index gather kernel.
+            var device = try self.ownedDeviceMetalTensorFromCt(input);
+            const resident = self.ctFromOwnedMetalTensor(device) catch |err| {
+                device.deinit();
+                return err;
+            };
+            defer freeOp(self, resident);
+            return self.residentTrainingGather(resident, indices, input_shape, axis, .{});
+        }
         if (toBuf(input).boundary_i32_storage) return error.UnsupportedResidentTrainingPrimitive;
         const input_buf = toBuf(input);
         const indices_buf = toBuf(indices);
@@ -11916,6 +11944,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn lessThanOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        // ONNX mask comparisons may consume exact integer inputs. Ordinary
+        // floating-point kernels cannot reinterpret their device storage.
+        if (toBuf(a).boundary_i32_storage or toBuf(b).boundary_i32_storage) {
+            const lhs = try self.exactIntegerAsFloat(a);
+            defer if (lhs) |value| freeOp(self, value);
+            const rhs = try self.exactIntegerAsFloat(b);
+            defer if (rhs) |value| freeOp(self, value);
+            return lessThanOp(self, lhs orelse a, rhs orelse b);
+        }
         if (try self.tryFlatDeviceBinaryRuntimeOp(a, b, .less_than)) |device_result| return device_result;
         const a_len = bufElemCount(toBuf(a));
         const b_len = bufElemCount(toBuf(b));
@@ -11931,6 +11968,22 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (try metal_runtime.decoderRuntimeApplyLessThan(self.provider_impl, lhs, rhs)) |tensor| return self.ctFromOwnedMetalTensor(tensor);
         }
         return self.hostFallbackBinary(a, b, null, null, .less_than);
+    }
+
+    fn exactIntegerAsFloat(self: *MetalCompute, input: CT) !?CT {
+        if (!toBuf(input).boundary_i32_storage) return null;
+        const source = try self.residentTrainingTensor(input, .i32, .{});
+        const values = try self.allocator.alloc(i32, source.elemCount());
+        defer self.allocator.free(values);
+        try source.downloadBytesInto(std.mem.sliceAsBytes(values));
+        const floats = try self.allocator.alloc(f32, values.len);
+        defer self.allocator.free(floats);
+        for (values, floats) |value, *out| {
+            out.* = @floatFromInt(value);
+            if (@as(f64, out.*) != @as(f64, @floatFromInt(value)))
+                return error.UnsupportedTensorType;
+        }
+        return fromFloat32ShapeOp(self, floats, source.shape());
     }
 
     fn whereSelectOp(ctx: *anyopaque, cond: CT, on_true: CT, on_false: CT) anyerror!CT {
@@ -39042,4 +39095,38 @@ test "strict GLiNER boundary scope workspace OOM cancellation and oversized prod
     try std.testing.expectEqual(oversized_before.workspace_oversized_products + 1, oversized_after.workspace_oversized_products);
     try std.testing.expectEqual(before.device_owned_live_bytes, metal_tensor_mod.memoryStatsSnapshot().device_owned_live_bytes);
     try borrow.finish();
+}
+
+test "metal_compute: imported weights accept exact integer gather indices" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var weights = testMetalWeightStoreInit(allocator);
+    defer weights.lazy_weights.deinit(allocator);
+    var compute = try MetalCompute.init(allocator, &weights, null);
+    defer compute.deinit();
+    var cb = compute.computeBackend();
+    const table = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6 }, &.{ 3, 2 });
+    defer cb.free(table);
+    const indices = (try cb.fromInt32Shape(&.{ 2, 0 }, &.{ 1, 2 })) orelse return error.SkipZigTest;
+    defer cb.free(indices);
+    const output = try cb.primGather(table, indices, 0, &.{ 3, 2 });
+    defer cb.free(output);
+    const actual = try cb.toFloat32(output, allocator);
+    defer allocator.free(actual);
+    try std.testing.expectEqualSlices(f32, &.{ 5, 6, 1, 2 }, actual);
+    const shape = try cb.tensorShape(output, allocator);
+    defer allocator.free(shape);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 2, 2 }, shape);
+
+    const converted = (try cb.tryConvertDType(indices, .f32)) orelse return error.TestUnexpectedResult;
+    defer cb.free(converted);
+    const values = try cb.toFloat32(converted, allocator);
+    defer allocator.free(values);
+    try std.testing.expectEqualSlices(f32, &.{ 2, 0 }, values);
+    const comparison = try cb.primLessThan(indices, converted);
+    defer cb.free(comparison);
+    const compared = try cb.toFloat32(comparison, allocator);
+    defer allocator.free(compared);
+    try std.testing.expectEqualSlices(f32, &.{ 0, 0 }, compared);
 }

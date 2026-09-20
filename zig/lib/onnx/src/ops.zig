@@ -1576,7 +1576,9 @@ fn convertGather(builder: *Builder, node: *const NodeProto, inputs: []const Node
 }
 
 fn convertConcat(builder: *Builder, node: *const NodeProto, inputs: []const NodeId) ConvertError!NodeId {
-    if (inputs.len < 2) return error.MissingInput;
+    // ONNX permits one or more inputs. SentenceTransformers exports a
+    // single-input Concat when exactly one pooling mode is enabled.
+    if (inputs.len == 0) return error.MissingInput;
     const axis_raw = getInt(node.attributes, "axis", 0);
 
     var concat_rank: u8 = 0;
@@ -3369,13 +3371,27 @@ fn convertGatherElements(builder: *Builder, node: *const NodeProto, inputs: []co
 // ── Phase 3: CumSum ─────────────────────────────────────────────────
 
 fn convertCumSum(builder: *Builder, node: *const NodeProto, inputs: []const NodeId) ConvertError!NodeId {
-    _ = node;
-    _ = builder;
-
-    // CumSum can't be efficiently decomposed without scan primitive.
-    // Return input as-is for now — models that need cumsum will need
-    // a scan primitive added to inference.
-    return inputs[0];
+    if (inputs.len != 2 or inputs[1] == null_node) return error.MissingInput;
+    const shape = builder.graph.node(inputs[0]).output_shape;
+    var buffer: [1]f32 = undefined;
+    const axis_values = materializeConstantValues(builder, inputs[1], &buffer) orelse return error.ConstantMaterializationFailed;
+    if (axis_values.len != 1 or !std.math.isFinite(axis_values[0]) or
+        axis_values[0] < -@as(f32, @floatFromInt(shape.rank())) or
+        axis_values[0] >= @as(f32, @floatFromInt(shape.rank()))) return error.InvalidAttribute;
+    const axis: i64 = @intFromFloat(axis_values[0]);
+    const exclusive = getInt(node.attributes, "exclusive", 0);
+    const reverse = getInt(node.attributes, "reverse", 0);
+    if (exclusive < 0 or exclusive > 1 or reverse < 0 or reverse > 1) return error.InvalidAttribute;
+    return builder.graph.addNode(.{
+        .op = .{ .cumulative_sum = .{
+            .axis = @intCast(if (axis < 0) axis + shape.rank() else axis),
+            .exclusive = exclusive == 1,
+            .reverse = reverse == 1,
+        } },
+        .output_shape = shape,
+        .inputs = .{ inputs[0], null_node, null_node, null_node },
+        .num_inputs = 1,
+    });
 }
 
 // ── Phase 3: DequantizeLinear ───────────────────────────────────────
@@ -7293,6 +7309,18 @@ test "convertNode broadcast Sub scalar" {
 
 // ── Coverage Tests: Error Handling ──────────────────────────────────
 
+test "convertNode Concat with one input preserves the pooling tensor" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+    const x = try b.parameter("cls", Shape.init(.f32, &.{ -1, 1024 }));
+    var attrs = [_]AttributeProto{.{ .name = "axis", .i = 1 }};
+    const node = NodeProto{ .op_type = "Concat", .attributes = &attrs };
+    const result = try convertNode(allocator, &b, &node, &.{x}, null);
+    try std.testing.expectEqual(x, result);
+}
+
 test "convertNode Concat missing inputs" {
     const allocator = std.testing.allocator;
     var g = Graph.init(allocator);
@@ -8246,4 +8274,18 @@ test "OpType.fromString recognizes control flow ops" {
     try std.testing.expect(OpType.fromString("If") == .If);
     try std.testing.expect(OpType.fromString("Loop") == .Loop);
     try std.testing.expect(OpType.fromString("Scan") == .Scan);
+}
+
+test "CumSum preserves dynamic shape and rejects a runtime axis" {
+    const allocator = std.testing.allocator;
+    var graph = Graph.init(allocator);
+    defer graph.deinit();
+    var builder = Builder.init(&graph);
+    const input = try builder.parameter("mask", Shape.init(.i64, &.{ -1, -1 }));
+    const axis = try builder.scalarConst(.i64, -1);
+    const output = try convertNode(allocator, &builder, &.{ .op_type = "CumSum" }, &.{ input, axis }, null);
+    try std.testing.expectEqual(@as(u8, 1), graph.node(output).op.cumulative_sum.axis);
+    try std.testing.expectEqualDeep(graph.node(input).output_shape, graph.node(output).output_shape);
+    const runtime_axis = try builder.parameter("axis", Shape.init(.i64, &.{}));
+    try std.testing.expectError(error.ConstantMaterializationFailed, convertNode(allocator, &builder, &.{ .op_type = "CumSum" }, &.{ input, runtime_axis }, null));
 }

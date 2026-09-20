@@ -124,7 +124,7 @@ These artifacts were checked for a meaningful result, not merely a successful re
 | Dense embedding | `BAAI/bge-base-en-v1.5` | dim 768, unit norm |
 | Dense embedding | `BAAI/bge-large-en-v1.5` | dim 1024; relevant 0.86 vs irrelevant 0.35 |
 | Dense embedding | `mixedbread-ai/mxbai-embed-large-v1` | dim 1024; relevant 0.885 vs irrelevant 0.312 |
-| Dense embedding | `BAAI/bge-m3` | dim 1024, unit norm; Metal output parity with the qualified PyTorch MPS checkpoint |
+| Dense embedding | `BAAI/bge-m3` | dim 1024, unit norm; ONNX and safetensors CPU/Metal parity against the official ONNX Runtime export |
 | Dense embedding | `sentence-transformers/all-MiniLM-L6-v2` | dim 384; relevant 0.824 vs irrelevant −0.007 |
 | Sparse embedding | `sparse-encoder-testing/splade-bert-tiny-nq-onnx` | 90 non-zero terms |
 | Reranking | `mixedbread-ai/mxbai-rerank-base-v1` | relevant 0.9997 vs irrelevant 0.0003 |
@@ -136,7 +136,7 @@ These artifacts were checked for a meaningful result, not merely a successful re
 | Transcription | `openai/whisper-tiny` | transcribes recorded speech |
 | Generation | Gemma 3, Gemma 4, Llama 3.x, Qwen3 dense GGUF | see below |
 
-`BAAI/bge-m3` resolves to the official immutable safetensors revision `84790c1a606f60d06c6932e4ecdd174b466d84ac`, because the repository's current `main` revision no longer publishes `model.safetensors`. The managed receipt and install-directory identity retain the full `safetensors@<commit>` variant. The local embeddings API exposes BGE-M3's normalized 1024-dimensional dense vector; its sparse lexical weights and ColBERT token vectors require separate response contracts and are not exposed by the dense embeddings endpoint.
+`bge-m3` and `BAAI/bge-m3` resolve to the official repository at `main`, whose current supported artifact is ONNX. A pull records the immutable commit it resolved. The historical safetensors checkpoint remains available explicitly as `BAAI/bge-m3:safetensors@84790c1a606f60d06c6932e4ecdd174b466d84ac`; community GGUF conversions also require an explicit repository reference. See [Model Downloads](/docs/guides/model-downloads) for the format qualification and commands. The local embeddings API exposes BGE-M3's normalized 1024-dimensional dense vector; its sparse lexical weights and ColBERT token vectors require separate response contracts and are not exposed by the dense embeddings endpoint.
 
 ### Generation Families
 

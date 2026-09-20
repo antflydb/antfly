@@ -1353,11 +1353,9 @@ fn validateImportedGraph(graph: *const Graph, stage: []const u8) !void {
 }
 
 fn validateRuntimeShapeBackend(graph: *const Graph, backend_type: BackendType) !void {
-    // Runtime-bound Slice is currently validated end-to-end only by the native
-    // imported graph runtime. Other graph backends still plan downstream ops
-    // from declared shapes, so accepting these graphs can turn a dynamic
-    // sequence dimension into an UnsupportedShape failure during execution.
-    if (backend_type == .native or backend_type == .onnx) return;
+    // Native and Metal execute imported Slice and its consumers using runtime
+    // dimensions. Other graph backends still require static downstream shapes.
+    if (backend_type == .native or backend_type == .onnx or backend_type == .metal) return;
 
     for (graph.nodes.items, 0..) |node, node_id| {
         const attrs = switch (node.op) {
@@ -1374,7 +1372,7 @@ fn validateRuntimeShapeBackend(graph: *const Graph, backend_type: BackendType) !
     }
 }
 
-test "runtime-bound ONNX slices use the native imported graph backend" {
+test "runtime-bound ONNX slices admit native and Metal imported graph backends" {
     var graph = Graph.init(std.testing.allocator);
     defer graph.deinit();
 
@@ -1387,7 +1385,7 @@ test "runtime-bound ONNX slices use the native imported graph backend" {
 
     try validateRuntimeShapeBackend(&graph, .native);
     try validateRuntimeShapeBackend(&graph, .onnx);
-    try std.testing.expectError(error.UnsupportedDynamicOnnxGraphBackend, validateRuntimeShapeBackend(&graph, .metal));
+    try validateRuntimeShapeBackend(&graph, .metal);
     try std.testing.expectError(error.UnsupportedDynamicOnnxGraphBackend, validateRuntimeShapeBackend(&graph, .wasm));
 }
 

@@ -827,7 +827,26 @@ const ArtifactCatalog = struct {
     }
 
     fn find(self: *const ArtifactCatalog, relative_path: []const u8) ?*const managed_receipt.ValidatedArtifact {
-        if (self.receipt) |*receipt| return receipt.find(relative_path);
+        if (self.receipt) |*receipt| {
+            if (receipt.parsed.value.source) |source| {
+                if (source.selected_format != null and std.mem.eql(u8, source.selected_format.?, "onnx") and
+                    std.mem.indexOfScalar(u8, relative_path, '/') == null and
+                    !std.mem.eql(u8, relative_path, "model_manifest.json") and
+                    !std.mem.endsWith(u8, relative_path, ".onnx"))
+                {
+                    // Export-local tokenizer/configuration takes precedence;
+                    // resolve only files authenticated by the managed receipt.
+                    for (receipt.artifacts) |artifact| {
+                        if (!std.mem.endsWith(u8, artifact.path, ".onnx")) continue;
+                        const directory = std.fs.path.dirname(artifact.path) orelse continue;
+                        var path_buf: [4096]u8 = undefined;
+                        const local = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ directory, relative_path }) catch continue;
+                        if (receipt.find(local)) |found| return found;
+                    }
+                }
+            }
+            return receipt.find(relative_path);
+        }
         return null;
     }
 
@@ -6997,4 +7016,36 @@ test "boundary qualification listings cannot substitute for consumed identity an
     try std.testing.expect(manifest.hasSupportedGlinerRuntime());
     try std.testing.expect(manifest.hasTask("extract"));
     try std.testing.expect(!manifest.mayLoadQualifiedGlinerBoundaryRuntime());
+}
+
+test "managed ONNX export uses its own configuration and tokenizer" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "onnx");
+    const paths = [_][]const u8{ "config.json", "tokenizer.json", "onnx/model.onnx", "onnx/config.json", "onnx/tokenizer.json", "onnx/tokenizer_config.json" };
+    const bodies = [_][]const u8{ "{\"hidden_size\":4}", "{}", "onnx", "{\"model_type\":\"xlm-roberta\",\"hidden_size\":8}", "{}", "{}" };
+    var artifacts: [paths.len]managed_receipt.ArtifactReceipt = undefined;
+    for (paths, bodies, 0..) |path, body, i| {
+        try tmp.dir.writeFile(io, .{ .sub_path = path, .data = body });
+        artifacts[i] = .{ .path = path, .size = body.len };
+    }
+    const receipt = try std.json.Stringify.valueAlloc(allocator, managed_receipt.DownloadReceipt{
+        .version = 2,
+        .source = .{ .owner = "BAAI", .name = "bge-m3", .variant = "onnx", .selected_format = "onnx" },
+        .artifacts = &artifacts,
+    }, .{});
+    defer allocator.free(receipt);
+    try tmp.dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = receipt });
+    const model_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(model_dir);
+    var manifest = try loadFromDir(allocator, model_dir);
+    defer manifest.deinit();
+    try std.testing.expectEqual(@as(u32, 8), manifest.hidden_size);
+    try std.testing.expect(std.mem.endsWith(u8, manifest.config_path.?, "onnx/config.json"));
+    try std.testing.expect(std.mem.endsWith(u8, manifest.tokenizer_json_path.?, "onnx/tokenizer.json"));
+    var listing = try loadListingFromDir(allocator, model_dir);
+    defer listing.deinit();
+    try std.testing.expect(std.mem.endsWith(u8, listing.config_path.?, "onnx/config.json"));
 }

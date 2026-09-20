@@ -1581,6 +1581,17 @@ fn fillShapeDims(graph: *const Graph, node_id: NodeId, buf: *[8]i64) []const i64
     return buf[0..rank];
 }
 
+fn reductionInputShape(cb: *const ComputeBackend, input: CT, graph: *const Graph, node_id: NodeId, buf: *[8]i64) ![]const i64 {
+    const declared = fillShapeDims(graph, node_id, buf);
+    if (!hasNegativeDim(declared)) return declared;
+    const actual = try cb.tensorShape(input, graph.allocator);
+    defer graph.allocator.free(actual);
+    // Flat-only backends still resolve a single symbolic extent themselves.
+    if (actual.len != declared.len or hasNegativeDim(actual)) return declared;
+    @memcpy(buf[0..actual.len], actual);
+    return buf[0..actual.len];
+}
+
 fn runtimeOrDeclaredShape(state: *const ExecState, graph: *const Graph, node_id: NodeId, buf: *[8]i64) []const i64 {
     if (state.runtime_shapes) |runtime_shapes| {
         if (node_id < runtime_shapes.len) {
@@ -3499,17 +3510,17 @@ pub fn executeNode(
 
         .reduce_sum => |attrs| {
             var sbuf: [8]i64 = undefined;
-            const in_shape = fillShapeDims(graph, ins[0], &sbuf);
+            const in_shape = try reductionInputShape(cb, V.get(ins[0]), graph, ins[0], &sbuf);
             return cb.primReduceSum(V.get(ins[0]), attrs.axes[0..attrs.num_axes], in_shape);
         },
         .reduce_max => |attrs| {
             var sbuf: [8]i64 = undefined;
-            const in_shape = fillShapeDims(graph, ins[0], &sbuf);
+            const in_shape = try reductionInputShape(cb, V.get(ins[0]), graph, ins[0], &sbuf);
             return cb.primReduceMax(V.get(ins[0]), attrs.axes[0..attrs.num_axes], in_shape);
         },
         .reduce_mean => |attrs| {
             var sbuf: [8]i64 = undefined;
-            const in_shape = fillShapeDims(graph, ins[0], &sbuf);
+            const in_shape = try reductionInputShape(cb, V.get(ins[0]), graph, ins[0], &sbuf);
             return cb.primReduceMean(V.get(ins[0]), attrs.axes[0..attrs.num_axes], in_shape);
         },
         .argmax => |attrs| {
@@ -3922,7 +3933,15 @@ pub fn executeNode(
                     return fused;
                 }
             }
-            const result = try cb.primGather(V.get(ins[0]), V.get(ins[1]), attrs.axis, in_shape);
+            // A scalar index removes the selected axis. Some imported scalar
+            // constants use a one-element storage vector; restore rank zero
+            // before dispatch so the backend does not retain an extra axis.
+            const scalar_indices = if (graph.node(ins[1]).output_shape.rank() == 0)
+                try cb.primReshape(V.get(ins[1]), &.{})
+            else
+                null;
+            defer if (scalar_indices) |value| cb.free(value);
+            const result = try cb.primGather(V.get(ins[0]), scalar_indices orelse V.get(ins[1]), attrs.axis, in_shape);
             return result;
         },
         .slice => |attrs| {
@@ -3951,6 +3970,38 @@ pub fn executeNode(
                 return err;
             };
             return result;
+        },
+        .cumulative_sum => |attrs| {
+            // Like runtime shape/range evaluation, use the actual tensor
+            // dimensions. BGE uses this small scan for dynamic position IDs.
+            const alloc = graph.allocator;
+            const shape = try cb.tensorShape(V.get(ins[0]), alloc);
+            defer alloc.free(shape);
+            if (attrs.axis >= shape.len or shape.len > 8) return error.InvalidTensorShape;
+            var dims: [8]i32 = undefined;
+            var outer: usize = 1;
+            var inner: usize = 1;
+            for (shape, 0..) |dim, i| {
+                if (dim < 0 or dim > std.math.maxInt(i32)) return error.InvalidTensorShape;
+                dims[i] = @intCast(dim);
+                if (i < attrs.axis) outer = try std.math.mul(usize, outer, @intCast(dim));
+                if (i > attrs.axis) inner = try std.math.mul(usize, inner, @intCast(dim));
+            }
+            const width: usize = @intCast(shape[attrs.axis]);
+            const data = try cb.toFloat32(V.get(ins[0]), alloc);
+            defer alloc.free(data);
+            if (data.len != try std.math.mul(usize, try std.math.mul(usize, outer, width), inner)) return error.InvalidTensorShape;
+            for (0..outer) |batch| for (0..inner) |channel| {
+                var sum: f32 = 0;
+                for (0..width) |step| {
+                    const index = (batch * width + (if (attrs.reverse) width - 1 - step else step)) * inner + channel;
+                    const value = data[index];
+                    if (attrs.exclusive) data[index] = sum;
+                    sum += value;
+                    if (!attrs.exclusive) data[index] = sum;
+                }
+            };
+            return cb.fromFloat32Shape(data, dims[0..shape.len]);
         },
         .shape_of => |attrs| {
             const tmp_alloc = std.heap.page_allocator;
@@ -6339,6 +6390,41 @@ test "runtime shape drives symbolic reduce" {
     try std.testing.expectEqualSlices(f32, &.{ 22, 26, 30, 70, 74, 78 }, actual);
 }
 
+test "runtime shape drives symbolic reductions on Metal" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var builder = ml.graph.Builder.init(&g);
+    const x = try builder.parameter("x", Shape.init(.f32, &.{ -1, -1, 3 }));
+    const index = try builder.scalarConst(.i64, 0);
+    const cls = try g.addNode(.{
+        .op = .{ .gather = .{ .axis = 1 } },
+        .output_shape = Shape.init(.f32, &.{ -1, 3 }),
+        .inputs = .{ x, index, null_node, null_node },
+        .num_inputs = 2,
+    });
+    try g.markOutput(try builder.reduceSum(cls, &.{1}));
+    try g.markOutput(try builder.reduceMax(cls, &.{1}));
+    try g.markOutput(try builder.reduceMean(cls, &.{1}));
+    var weights = @import("../ops/gpu_hosted_store.zig").WeightStore{ .allocator = allocator, .prefix = "", .lazy_weights = .empty };
+    defer weights.lazy_weights.deinit(allocator);
+    var compute = try @import("../ops/metal_compute.zig").MetalCompute.init(allocator, &weights, null);
+    defer compute.deinit();
+    var cb = compute.computeBackend();
+    const input = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 }, &.{ 2, 2, 3 });
+    defer cb.free(input);
+    var result = try execute(allocator, &g, &cb, .{ .runtime_inputs = &.{.{ .node_id = x, .value = input }} });
+    defer result.deinit(&cb);
+    const expected = [_][2]f32{ .{ 6, 24 }, .{ 3, 9 }, .{ 2, 8 } };
+    for (result.outputs, expected) |output, values| {
+        const actual = try cb.toFloat32(output, allocator);
+        defer allocator.free(actual);
+        try std.testing.expectEqualSlices(f32, &values, actual);
+    }
+}
+
 test "runtime shape drives symbolic slice" {
     const allocator = std.testing.allocator;
 
@@ -7047,4 +7133,40 @@ test "reshape restores batched flattened projection shape before gather" {
         43, 44, 45,
         46, 47, 48,
     }, actual);
+}
+
+test "runtime CumSum scans dynamic axes including reverse exclusive and padding" {
+    const allocator = std.testing.allocator;
+    for ([_]bool{ false, true }) |reverse| for ([_]bool{ false, true }) |exclusive| {
+        var g = Graph.init(allocator);
+        defer g.deinit();
+        var builder = ml.graph.Builder.init(&g);
+        const x = try builder.parameter("x", Shape.init(.f32, &.{ -1, -1 }));
+        const out = try g.addNode(.{
+            .op = .{ .cumulative_sum = .{ .axis = 1, .reverse = reverse, .exclusive = exclusive } },
+            .output_shape = Shape.init(.f32, &.{ -1, -1 }),
+            .inputs = .{ x, ml.graph.null_node, ml.graph.null_node, ml.graph.null_node },
+            .num_inputs = 1,
+        });
+        try g.markOutput(out);
+        var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+        var compute = NativeCompute.init(allocator, &ws, null);
+        defer compute.deinit();
+        var cb = compute.computeBackend();
+        const input = [_]f32{ 1, 1, 1, 0, 2, 3, 4, 5 };
+        const tensor = try cb.fromFloat32Shape(&input, &.{ 2, 4 });
+        defer cb.free(tensor);
+        var result = try execute(allocator, &g, &cb, .{ .runtime_inputs = &.{.{ .node_id = x, .value = tensor }} });
+        defer result.deinit(&cb);
+        const actual = try cb.toFloat32(result.outputs[0], allocator);
+        defer allocator.free(actual);
+        for (0..2) |batch| for (0..4) |position| {
+            var expected: f32 = 0;
+            for (0..4) |source| {
+                const included = if (reverse) source > position or (!exclusive and source == position) else source < position or (!exclusive and source == position);
+                if (included) expected += input[batch * 4 + source];
+            }
+            try std.testing.expectEqual(expected, actual[batch * 4 + position]);
+        };
+    };
 }

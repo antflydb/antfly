@@ -100,7 +100,7 @@ preload configuration are treated as unspecified in both JSON and CLI output.
 
 ## Pulling Models
 
-Models come from HuggingFace by their full `owner/name` reference; a bare name without an owner is rejected. The `hf:` prefix is accepted.
+Models come from Hugging Face by their full `owner/name` reference or a documented friendly alias such as `bge-m3`. Unknown bare names are rejected. The `hf:` prefix is accepted. Append `@revision` to request a branch, tag, or commit; omit it to use `main`. Each pull resolves one immutable snapshot for all files. See [Model Downloads](/docs/guides/model-downloads) for format selection and revision examples.
 
 ```bash
 antfly inference pull hf:BAAI/bge-small-en-v1.5 --tasks embed

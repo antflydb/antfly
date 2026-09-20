@@ -1,0 +1,103 @@
+---
+title: Model Downloads
+sidebar: concepts
+order: 4
+description: Model revisions, artifact formats, dependencies, and reproducible local installs
+---
+
+`antfly inference pull` accepts a Hugging Face repository or a documented friendly
+alias. Revision and format are independent:
+
+```sh
+antfly inference pull BAAI/bge-m3
+antfly inference pull BAAI/bge-m3@main
+antfly inference pull BAAI/bge-m3:onnx@main
+antfly inference pull owner/model:onnx@release/v2
+antfly inference pull 'BAAI/bge-m3:safetensors@84790c1a606f60d06c6932e4ecdd174b466d84ac'
+antfly inference pull gpustack/bge-m3-GGUF:gguf:Q8_0
+```
+
+Omitting the revision means `main`. Branches, tags, and commit hashes are accepted.
+At the start of each explicit pull, the Hub's metadata resolves that request to
+one immutable commit. Metadata, weights, tokenizer, and configuration all come
+from that snapshot, even if the branch changes while the transfer is running.
+The completion receipt records the requested revision, resolved commit, and
+selected format. Repeating a pull resolves moving refs again and reuses only
+verified files; inference uses the installed snapshot without network refresh.
+
+Friendly aliases work in pull and inference. `bge-m3` resolves to `BAAI/bge-m3`;
+it does not substitute an older revision or a community conversion. Explicit
+format and revision suffixes also work on aliases, such as `bge-m3:onnx@main`.
+Qualified multi-repository Qwen bundle aliases continue to select their declared
+immutable bundles. Use a canonical repository reference for an ordinary Hub
+snapshot instead of a curated bundle.
+
+## Format selection
+
+An explicit `:gguf`, `:gguf:Q8_0`, `:safetensors`, or `:onnx` request either selects
+that format or reports the available formats. An unknown variant is an error.
+`:f32` and `:i8` retain their ONNX meanings. There is no implicit fallback from
+an explicit ONNX request to safetensors.
+
+Automatic selection chooses one artifact set: GGUF first, then safetensors,
+then ONNX. `:hybrid` explicitly requests both ONNX and safetensors when available.
+Selection depends on repository artifacts, not the machine that downloads them.
+Architecture/operator support and the CPU, Metal, CUDA, or ONNX Runtime execution
+backend are checked when loading the model; a downloadable file is not a claim
+that every backend can execute it.
+
+Safetensors shards are selected from the index's `weight_map`, including arbitrary
+shard names. ONNX external data is discovered from initializers, tensor attributes,
+nested graphs, sparse tensors, and functions. Missing references and paths that
+escape the model root fail the pull before publication. Directory structure is
+preserved. For managed ONNX exports, export-local configuration and tokenizer
+files take precedence over repository-root equivalents.
+
+Size and digest checks, bounded downloads, resumable staging, and atomic
+publication remain in force. A failed pull leaves the previously installed model
+available. Do not work around a mismatch by disabling verification or changing the
+expected size.
+
+PyTorch `.bin`/`.pt`, TensorFlow, and Flax weights are not executable formats for
+this pull path. Use an explicitly converted, supported artifact set; pull does not
+execute repository code or automatically convert framework checkpoints.
+
+## BGE-M3
+
+The official repository's current `main` contains ONNX and PyTorch weights, but no
+GGUF or safetensors. Automatic selection therefore uses its ONNX export. The
+historical safetensors reference above remains available explicitly; community
+GGUF repositories must also be selected explicitly.
+
+The embedding qualification covers dense, normalized CLS embeddings. The presence
+of `sparse_linear.pt` or `colbert_linear.pt` in the upstream repository does not
+advertise sparse or multi-vector support for the selected dense export.
+
+The [M4 Max qualification report](https://github.com/antflydb/antfly/blob/main/zig/pkg/inference/scripts/embedder/bge-m3/QUALIFICATION.md)
+records accuracy, batching, CPU/Metal parity, and latency for the three formats.
+Imported ONNX currently runs faster on CPU than Metal on that machine;
+safetensors and GGUF benefit from Metal. These measurements cover short inputs,
+not long-context or large-batch throughput.
+
+Run the small downloader suite from `zig/` with:
+
+```sh
+zig build inference-registry-test -Doptimize=ReleaseFast
+```
+
+The CPU/Metal format qualification uses an independent ONNX Runtime oracle and
+compares token IDs, normalized embeddings, mixed-length batching, and throughput:
+
+```sh
+# From zig/:
+zig build inference-build-bge-m3-benchmark -Doptimize=ReleaseFast
+
+# From the repository root; directories must contain completed model pulls:
+uv run --script zig/pkg/inference/scripts/embedder/bge-m3/qualify_formats.py \
+  --binary zig/zig-out/bin/antfly-inference-bge-m3-e2e-bench \
+  --oracle-dir /path/to/official-bge-m3 \
+  --model onnx=/path/to/official-bge-m3 \
+  --model safetensors=/path/to/pinned-bge-m3 \
+  --model gguf=/path/to/bge-m3-gguf \
+  --output /tmp/bge-m3-qualification.json
+```

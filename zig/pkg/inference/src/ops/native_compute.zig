@@ -4016,6 +4016,13 @@ fn matmulRhsSourceTensorChunked(
         return error.UnsupportedTensorType;
     }
 
+    // Imported ONNX initializers already have row-major [K,N] f32 storage.
+    // Pass that directly to BLAS instead of copying and transposing every
+    // model weight on every request. Reduced/unaligned storage stays bounded.
+    if (borrowTensorF32IfAligned(rhs_tensor)) |rhs| {
+        return self.dispatchSgemm(m, n, k, 1.0, lhs, rhs, 1.0, output);
+    }
+
     const target_weight_bytes: usize = 8 * 1024 * 1024;
     const k_block = @max(@as(usize, 1), @min(k, target_weight_bytes / (@max(@as(usize, 1), n) * @sizeOf(f32))));
     const lhs_block = try self.allocator.alloc(f32, m * k_block);

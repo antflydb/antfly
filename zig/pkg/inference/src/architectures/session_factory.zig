@@ -6847,7 +6847,11 @@ fn makeComputeBackend(
                 NativeCompute.initWithIo(allocator, &self.backend_data.native, run_budget, io_handle)
             else
                 NativeCompute.init(allocator, &self.backend_data.native, run_budget);
-            if (self.arch_config == .gliner_boundary) compute.quantized_activation_policy = .strict_f32;
+            // Encoder embeddings must not change when a request changes the
+            // matrix shape (single input versus a padded batch). Keep quantized
+            // weights, but use the same f32 activation arithmetic as Metal.
+            if (self.arch_config == .gliner_boundary or self.arch_config == .bert)
+                compute.quantized_activation_policy = .strict_f32;
             compute.borrow_bf16_linear_weights = self.arch_config == .gpt and self.arch_config.gpt.family == .qwen3;
             break :blk compute.computeBackend();
         },

@@ -2865,7 +2865,7 @@ fn fuseSDPA(allocator: std.mem.Allocator, work: *Graph) !PairFusionResult {
     const count = work.nodeCount();
 
     for (0..count) |i| {
-        const n = work.node(@intCast(i));
+        const n = work.node(@intCast(i)).*;
 
         // Anchor: final dot_general(probs, V)
         const dg_attrs = switch (n.op) {
@@ -2916,7 +2916,7 @@ fn fuseSDPA(allocator: std.mem.Allocator, work: *Graph) !PairFusionResult {
 
         // K^T = transpose(K), optionally wrapped in the same scalar scaling
         // patterns as Q.
-        const scaled_kt = findScaledTransposeTensor(work, kt_id);
+        const scaled_kt = try findScaledTransposeTensor(work, kt_id);
         const k_id = scaled_kt.k_id;
         if (k_id == null_node) continue;
 
@@ -3224,7 +3224,7 @@ fn canonicalizeAttentionK(graph: *const Graph, id: NodeId) NodeId {
     return id;
 }
 
-fn findScaledTransposeTensor(graph: *const Graph, id: NodeId) ScaledTransposeTensor {
+fn findScaledTransposeTensor(graph: *Graph, id: NodeId) !ScaledTransposeTensor {
     if (id == null_node or id >= graph.nodeCount()) return .{ .k_id = id };
     const prescaled = findPrescaledTensor(graph, id);
     var base_id = prescaled.base_id;
@@ -3244,6 +3244,21 @@ fn findScaledTransposeTensor(graph: *const Graph, id: NodeId) ScaledTransposeTen
     const n = graph.node(base_id);
     if (std.meta.activeTag(n.op) != .transpose) {
         return .{ .k_id = null_node, .scale = prescaled.scale };
+    }
+    const rank = n.output_shape.rank();
+    const attrs = n.op.transpose;
+    if (rank == 4 and attrs.num_axes == 4 and std.mem.eql(u8, attrs.perm[0..4], &.{ 0, 2, 3, 1 })) {
+        // Exporters compose [B,S,H,D] -> [B,H,S,D] -> [B,H,D,S].
+        // Removing that entire transpose would feed token-major K to SDPA.
+        // Undo only the final matrix transpose, retaining the head layout.
+        var builder = Builder.init(graph);
+        const key = try builder.transpose(n.inputs[0], &.{ 0, 2, 1, 3 });
+        return .{ .k_id = key, .scale = prescaled.scale };
+    }
+    if (rank < 2 or attrs.num_axes != rank) return .{ .k_id = null_node, .scale = prescaled.scale };
+    for (0..rank) |axis| {
+        const expected = if (axis == rank - 2) rank - 1 else if (axis == rank - 1) rank - 2 else axis;
+        if (attrs.perm[axis] != expected) return .{ .k_id = null_node, .scale = prescaled.scale };
     }
     return .{ .k_id = canonicalizeAttentionK(graph, n.inputs[0]), .scale = prescaled.scale };
 }
@@ -5630,4 +5645,19 @@ test "retained training dots preserve other permutations and reject malformed co
     try std.testing.expect(std.meta.eql(before, graph.node(bad).*));
     try std.testing.expect(!retainTrainingDotStorage(&graph, x));
     try std.testing.expect(!retainTrainingDotStorage(&graph, null_node));
+}
+
+test "SDPA key fusion preserves a composed token to head transpose" {
+    var graph = Graph.init(std.testing.allocator);
+    defer graph.deinit();
+    var builder = Builder.init(&graph);
+    const token_keys = try builder.parameter("key", Shape.init(.f32, &.{ -1, -1, 16, 64 }));
+    const transposed_keys = try builder.transpose(token_keys, &.{ 0, 2, 3, 1 });
+    const match = try findScaledTransposeTensor(&graph, transposed_keys);
+    const key = graph.node(match.k_id);
+    try std.testing.expectEqual(token_keys, key.inputs[0]);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 2, 1, 3 }, key.op.transpose.perm[0..4]);
+    try std.testing.expectEqualDeep(Shape.init(.f32, &.{ -1, 16, -1, 64 }), key.output_shape);
+    const unsupported = try builder.transpose(token_keys, &.{ 2, 0, 3, 1 });
+    try std.testing.expectEqual(null_node, (try findScaledTransposeTensor(&graph, unsupported)).k_id);
 }

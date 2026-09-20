@@ -1898,10 +1898,30 @@ fn unigramTokenizerJsonFromGguf(
         else
             "]},\"pre_tokenizer\":{\"type\":\"Metaspace\",\"replacement\":\"\\u2581\",\"prepend_scheme\":\"never\",\"split\":true},\"added_tokens\":[",
     );
-    // ponytail: precompiled SentencePiece normalization is intentionally left
-    // to a future shared normalizer; ordinary normalized UTF-8 needs no copy.
     try appendSpecialTokensFromMetadata(&tokenizer_json, allocator, parsed, tokens, token_types);
-    try tokenizer_json.appendSlice(allocator, "]}");
+    try tokenizer_json.appendSlice(allocator, "]");
+    if (findMetadataEntry(parsed, "tokenizer.ggml.precompiled_charsmap") != null) {
+        const map = try getRequiredMetadataArray(parsed, "tokenizer.ggml.precompiled_charsmap", .u8);
+        if (map.values.len > 12 * 1024 * 1024) return error.InvalidTokenizerMetadata;
+        if (map.values.len > 0) {
+            const bytes = try allocator.alloc(u8, map.values.len);
+            defer allocator.free(bytes);
+            for (map.values, bytes) |value, *byte| byte.* = switch (value) {
+                .u8 => |v| v,
+                else => return error.InvalidTokenizerMetadata,
+            };
+            const encoded = try allocator.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.len));
+            defer allocator.free(encoded);
+            _ = std.base64.standard.Encoder.encode(encoded, bytes);
+            try tokenizer_json.appendSlice(allocator, ",\"normalizer\":{\"type\":\"Sequence\",\"normalizers\":[{\"type\":\"Precompiled\",\"precompiled_charsmap\":");
+            try appendJsonString(&tokenizer_json, allocator, encoded);
+            try tokenizer_json.appendSlice(allocator, "}");
+            if (gguf_metadata.View.init(parsed).getBool("tokenizer.ggml.remove_extra_whitespaces") orelse true)
+                try tokenizer_json.appendSlice(allocator, ",{\"type\":\"Replace\",\"pattern\":{\"Regex\":\" {2,}\"},\"content\":\" \"}");
+            try tokenizer_json.appendSlice(allocator, "]}");
+        }
+    }
+    try tokenizer_json.appendSlice(allocator, "}");
     return tokenizer_json.toOwnedSlice(allocator);
 }
 
@@ -2795,7 +2815,13 @@ pub const LoadedModel = struct {
                 .last => .last,
             },
             .text_prefix = self.manifest.embedding_profile.document.prefix,
+            // Admission wrappers and imported ONNX sessions do not expose the
+            // native architecture vtable. Use declared encoder semantics too,
+            // otherwise a short BGE-M3 request is padded to its full 8K window.
+            // The pipeline still preserves explicitly fixed input dimensions.
             .trim_padding_to_batch_max = isJinaStyleEmbeddingManifest(&self.manifest) or
+                @import("../models/bert.zig").isBertModel(self.manifest.config_model_arch) or
+                self.manifest.bert_model_type == .roberta or
                 generic_encoder != null or
                 session_factory.supportsResidentTextEncoder(self.session),
             .resident_qwen3_embedding = isJinaStyleEmbeddingManifest(&self.manifest),
@@ -7187,7 +7213,11 @@ pub const ModelManager = struct {
                     // separate pathname check leaves a replacement window.
                     try man.verifyBoundarySidecar("tokenizer.json", bytes);
                     break :blk try hf_tokenizer.HfTokenizer.loadFromBytesWithOptions(self.allocator, bytes, .{ .strict_unigram_normalizer = true });
-                } else try loadHuggingFaceTokenizerFromDirOrGguf(self.allocator, model_dir, man.gguf_path);
+                } else try loadHuggingFaceTokenizerFromDirOrGguf(
+                    self.allocator,
+                    if (man.tokenizer_json_path) |path| std.fs.path.dirname(path) orelse model_dir else model_dir,
+                    man.gguf_path,
+                );
                 try hf_tok.?.configureBpeCache(self.tokenizer_cache_config);
                 try hf_tok.?.configureParallelBpe(
                     self.tokenizer_parallel_bpe_config,
@@ -12791,4 +12821,36 @@ test "model manager teardown supervised child fixture" {
     }
     std.debug.print("teardown-fixture cleanup-returned\n", .{});
     return error.ExpectedTeardownWatchdogExit;
+}
+
+test "GGUF Unigram tokenizer consumes its embedded normalization map" {
+    const allocator = std.testing.allocator;
+    const bytes = try buildTestGgufWithT5Tokenizer(allocator);
+    defer allocator.free(bytes);
+    var parsed = try gguf_format.parse(allocator, bytes);
+    defer parsed.deinit(allocator);
+    // Minimal Darts map H -> h; the fixture's vocabulary contains 'hello'.
+    var map: [4 + 256 * 4 + 2]u8 = @splat(0);
+    std.mem.writeInt(u32, map[0..4], 256 * 4, .little);
+    std.mem.writeInt(u32, map[4..8], 1 << 10, .little);
+    std.mem.writeInt(u32, map[4 + 73 * 4 ..][0..4], 'H' | (1 << 8) | ((73 ^ 2) << 10), .little);
+    std.mem.writeInt(u32, map[4 + 2 * 4 ..][0..4], 0x80000000, .little);
+    map[4 + 256 * 4] = 'h';
+    const map_values = try allocator.alloc(gguf_format.MetadataValue, map.len);
+    defer allocator.free(map_values);
+    for (map, map_values) |byte, *value| value.* = .{ .u8 = byte };
+    const original = parsed.metadata;
+    const metadata = try allocator.alloc(gguf_format.MetadataEntry, original.len + 1);
+    defer allocator.free(metadata);
+    @memcpy(metadata[0..original.len], original);
+    metadata[original.len] = .{ .key = "tokenizer.ggml.precompiled_charsmap", .value = .{ .array = .{ .element_type = .u8, .values = map_values } } };
+    parsed.metadata = metadata;
+    defer parsed.metadata = original;
+    const tokenizer_json = try unigramTokenizerJsonFromGguf(allocator, &parsed);
+    defer allocator.free(tokenizer_json);
+    const tok = try hf_tokenizer.HfTokenizer.loadFromBytes(allocator, tokenizer_json);
+    defer tok.deinitSelf();
+    const ids = try tok.tokenizer().encode(allocator, "Hello world");
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(i32, &.{ 4, 5 }, ids);
 }
