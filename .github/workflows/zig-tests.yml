@@ -1469,7 +1469,12 @@ jobs:
           ANTFLY_E2E_SUITE: ${{ matrix.suite }}
           ANTFLY_E2E_SHARD: ${{ matrix.shard }}
           ANTFLY_E2E_PRESERVE_ROOT_ON_FAILURE: "1"
-        run: taskset -c ${{ steps.e2e_cpus.outputs.list }} scripts/ci/zig-e2e-base-linux.sh
+        run: |
+          if [[ "$ANTFLY_E2E_SUITE" == antfly* && ! -f scripts/ci/zig_e2e_shard.py ]]; then
+            echo "::error::Merge origin/main into this PR to obtain the required E2E shard helper."
+            exit 1
+          fi
+          taskset -c ${{ steps.e2e_cpus.outputs.list }} scripts/ci/zig-e2e-base-linux.sh
 
       - name: Run inference config contract with a real CPU model
         if: matrix.suite == 'inference'
