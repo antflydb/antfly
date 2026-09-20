@@ -311,18 +311,131 @@ def _create_cluster_table_when_admitted(
     deadline = time.monotonic() + timeout_s
     attempts = 0
     last_response: requests.Response | None = None
+    last_observation: requests.Response | None = None
+    table_url = f"{cluster.data_api_urls[0]}/tables/{table_name}"
+
+    def canonical_schema(value):
+        # Only backend-managed generation and documented omitted defaults are
+        # normalized. Do not use a subset match: an unexpected FK, default,
+        # generated expression, or document property changes the contract.
+        # tables.zig installs this dynamic document schema when create omits
+        # schema. Omission is not equivalent to an arbitrary empty schema.
+        result = (
+            dict(value)
+            if value is not None
+            else {
+                "default_type": "doc",
+                "document_schemas": {
+                    "doc": {
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": True,
+                            "x-antfly-dynamic-indexing": {"mode": "infer_types"},
+                        }
+                    },
+                },
+            }
+        )
+        result.pop("version", None)
+        mode = result.setdefault("storage_mode", "document")
+        result.setdefault("enforce_types", mode == "relational")
+        for field in (
+            "column_defaults",
+            "generated_columns",
+            "checks",
+            "unique_constraints",
+            "foreign_keys",
+            "relational_indexes",
+            "dynamic_templates",
+            "index_sort",
+        ):
+            if result.get(field) is None:
+                result[field] = []
+        result.setdefault("default_type", "")
+        result.setdefault("document_schemas", {})
+        result.setdefault("ttl", None)
+        result.setdefault("ttl_field", "_timestamp")
+        result.setdefault("ttl_duration_ns", 0)
+        return result
+
+    def verify_observed_definition(table):
+        # This fixture currently creates schema/description/shard definitions.
+        # Fail closed if it grows a request option whose response projection we
+        # have not modeled, instead of treating a partial match as admission.
+        assert set(definition) <= {"num_shards", "description", "schema"}, (
+            "cannot reconcile unknown table create with unsupported definition fields"
+        )
+        assert table.get("name") == table_name, "observed table name mismatch"
+        if "num_shards" in definition:
+            assert (
+                isinstance(table.get("shards"), dict)
+                and len(table["shards"]) == definition["num_shards"]
+            ), "observed table shard count mismatch"
+        assert (table.get("description") or "") == definition.get("description", ""), (
+            "observed table description mismatch"
+        )
+        assert canonical_schema(table.get("schema")) == canonical_schema(
+            definition.get("schema")
+        ), "observed table schema mismatch"
+
+    def observe_table():
+        nonlocal last_observation
+        cluster.assert_processes_alive()
+        remaining = deadline - time.monotonic()
+        assert remaining > 0, "table create observation deadline exceeded"
+        last_observation = session.get(table_url, timeout=remaining)
+        cluster.assert_processes_alive()
+        return last_observation
+
     try:
+        # Test-owned names must be absent before this mutation. An existing
+        # matching table is not evidence that our uncertain create succeeded.
+        # This helper requires exclusive fixture ownership of its unique name.
+        while True:
+            existing = observe_table()
+            if existing.status_code == 404:
+                break
+            assert existing.status_code != 200, "table already exists before create"
+            if existing.status_code != 503:
+                _check_response(existing)
+                raise AssertionError("unexpected table absence observation")
+            time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
         while True:
             cluster.assert_processes_alive()
             remaining = deadline - time.monotonic()
             assert remaining > 0, "table create admission deadline exceeded"
             attempts += 1
             last_response = session.post(
-                f"{cluster.data_api_urls[0]}/tables/{table_name}",
+                table_url,
                 json=definition,
                 timeout=remaining,
             )
             cluster.assert_processes_alive()
+            if (
+                last_response.status_code == 409
+                and last_response.headers.get("X-Antfly-Raft-Mutation-Outcome")
+                == "unknown-v1"
+                and last_response.headers.get(
+                    "X-Antfly-Metadata-Mutation-Not-Admitted", ""
+                ).lower()
+                != "true"
+            ):
+                # A durable proposal may have committed. Never send another
+                # POST, even when visibility is delayed or reads are shed.
+                while True:
+                    try:
+                        observed = observe_table()
+                    except (requests.Timeout, requests.ConnectionError):
+                        observed = None
+                    if observed is not None:
+                        if observed.status_code == 200:
+                            table = _check_response(observed)
+                            verify_observed_definition(table)
+                            return table
+                        if observed.status_code not in (404, 503):
+                            _check_response(observed)
+                            raise AssertionError("unexpected table create observation")
+                    time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
             retryable = False
             if (
                 last_response.status_code == 503
@@ -359,6 +472,8 @@ def _create_cluster_table_when_admitted(
             f"last_status={last_response.status_code if last_response is not None else None}; "
             f"last_headers={dict(last_response.headers) if last_response is not None else None}; "
             f"last_response={last_response.text if last_response is not None else None}\n"
+            f"last_observation_status={last_observation.status_code if last_observation is not None else None}; "
+            f"last_observation={last_observation.text if last_observation is not None else None}\n"
             f"{cluster.debug_logs()}"
         ) from exc
 

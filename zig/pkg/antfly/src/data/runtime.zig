@@ -49793,6 +49793,8 @@ fn implementationTests() type {
                 "seed-standby-structural-busy-5",
                 capture_binding,
             ));
+            try std.testing.expect(primary.slot("standby-structural-busy") == null);
+            try std.testing.expect(!server.ha_seed_capture_active.load(.acquire));
             active_group_operation.deinit();
 
             server.lsm_maintenance_active.store(true, .release);
@@ -49804,6 +49806,8 @@ fn implementationTests() type {
                 "seed-standby-busy-6",
                 capture_binding,
             ));
+            try std.testing.expect(primary.slot("standby-busy") == null);
+            try std.testing.expect(!server.ha_seed_capture_active.load(.acquire));
             server.lsm_maintenance_active.store(false, .release);
 
             server.ha_cfg.seed_snapshot_provider = seed_snapshot_provider.iface();
