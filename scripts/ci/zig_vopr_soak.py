@@ -19,7 +19,7 @@ def write_json(path, value):
     temporary.replace(path)
 
 
-def run_process(command, *, stdout, timeout=13800, grace=30):
+def run_process(command, *, stdout, timeout=13800, grace=30, clean_descendants=False):
     """Reserve time for evidence upload, including when a child ignores TERM."""
     started = time.monotonic()
     previous = {}
@@ -69,6 +69,25 @@ def run_process(command, *, stdout, timeout=13800, grace=30):
                 process.wait()
             code = 124 if status == "timeout" else 130
     finally:
+        if clean_descendants and process is not None:
+            # A successful/failed parent may leave servers behind as well.
+            # Own the whole session until it is quiescent before collecting files.
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            else:
+                deadline = time.monotonic() + grace
+                while time.monotonic() < deadline:
+                    try:
+                        os.killpg(process.pid, 0)
+                    except ProcessLookupError:
+                        break
+                    time.sleep(0.05)
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
         for signum, handler in previous.items():
             signal.signal(signum, handler)
     result = subprocess.CompletedProcess(command, code)
