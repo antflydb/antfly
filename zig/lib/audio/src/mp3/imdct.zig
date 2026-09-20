@@ -57,10 +57,15 @@ pub fn hybridShortBlock(input: []const f32, output: []f32) !void {
     }
 }
 
+/// The IMDCT in the specification carries no normalization of its own; the
+/// synthesis filterbank downstream expects this one, and both block sizes have
+/// to carry the same one. Deriving it from the transform length instead made
+/// short blocks three times as loud as the long blocks around them.
+const imdct_scale: f32 = 2.0 / 18.0;
+
 fn inverseMdctGeneric(comptime n: usize, input: []const f32, output: []f32) void {
     const pi = std.math.pi;
     const n_f = @as(f32, @floatFromInt(n));
-    const scale = 2.0 / n_f;
 
     for (0..(n * 2)) |sample_index| {
         const sample_term = @as(f32, @floatFromInt((2 * sample_index) + 1 + n));
@@ -72,7 +77,7 @@ fn inverseMdctGeneric(comptime n: usize, input: []const f32, output: []f32) void
             sum += input[coeff_index] * @cos(angle);
         }
 
-        output[sample_index] = sum * scale;
+        output[sample_index] = sum * imdct_scale;
     }
 }
 

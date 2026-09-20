@@ -846,7 +846,8 @@ test "compute LSF part2 info for long blocks" {
     const part2 = try computePart2Info(header, info, 0, .{ false, false, false, false });
     try std.testing.expectEqual([4]u8{ 1, 3, 2, 1 }, part2.slen);
     try std.testing.expectEqual([4]u8{ 6, 5, 5, 5 }, part2.partition_scalefactor_bands);
-    try std.testing.expectEqual(@as(usize, 31), part2.bit_length);
+    // Six bands of one bit, five of three, five of two and five of one.
+    try std.testing.expectEqual(@as(usize, 36), part2.bit_length);
 }
 
 test "compute LSF part2 info for short blocks" {
@@ -877,9 +878,11 @@ test "compute LSF part2 info for short blocks" {
         .count1table_select = false,
     };
     const part2 = try computePart2Info(header, info, 0, .{ false, false, false, false });
-    try std.testing.expectEqual([4]u8{ 2, 3, 0, 3 }, part2.slen);
+    // scalefac_compress 215 splits as 13 over the first two partitions and
+    // (215 & 0xf) >> 2 = 1 then 215 & 3 = 3 over the last two.
+    try std.testing.expectEqual([4]u8{ 2, 3, 1, 3 }, part2.slen);
     try std.testing.expectEqual([4]u8{ 9, 9, 9, 9 }, part2.partition_scalefactor_bands);
-    try std.testing.expectEqual(@as(usize, 72), part2.bit_length);
+    try std.testing.expectEqual(@as(usize, 81), part2.bit_length);
 }
 
 test "decode raw scalefactors consumes synthetic long-block part2 payload" {
@@ -888,9 +891,11 @@ test "decode raw scalefactors consumes synthetic long-block part2 payload" {
         .slen = .{ 1, 2, 0, 1 },
         .partition_scalefactor_bands = .{ 2, 1, 2, 1 },
     };
+    // 1, 0 from the first partition's one-bit bands, 0b01 from the second's
+    // two-bit band, two implicit zeros where slen is zero, then one more bit.
     const scalefactors = try decodeRawScalefactors(&.{0b10010010}, 0, part2);
     try std.testing.expectEqual(@as(usize, 6), scalefactors.count);
-    try std.testing.expectEqualSlices(u8, &.{ 1, 0, 2, 0, 0, 1 }, scalefactors.values[0..scalefactors.count]);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 0, 1, 0, 0, 0 }, scalefactors.values[0..scalefactors.count]);
 }
 
 test "expand long-block scalefactors fills 21 long bands" {

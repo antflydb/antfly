@@ -1999,6 +1999,20 @@ pub fn build(b: *std.Build) void {
         "side info parsing rejects a sample rate the band tables do not cover",
         "mpeg2.5 8 kHz decodes with its own long bands, not the 48 kHz fallback",
     };
+    // The curated filters below keep individual tests addressable, but a
+    // filtered run analyzes only what the filter names, which is how whole
+    // codec suites went years without running. This one runs the lot.
+    const audio_module_tests_all = b.addTest(.{
+        .name = "audio-internals-all",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(b.fmt("{s}/lib/audio/audio_module_test_root.zig", .{shared_lib_root})),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    audio_module_tests_all.root_module.link_libc = true;
+    audio_module_test_step.dependOn(&b.addRunArtifact(audio_module_tests_all).step);
+
     for (audio_module_test_filters, 0..) |filter, filter_index| {
         const audio_module_tests = b.addTest(.{
             .name = b.fmt("audio-internal-{d}", .{filter_index}),
