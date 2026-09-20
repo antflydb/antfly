@@ -34,7 +34,9 @@ When adding new vectors here:
 
 - Prefer public-domain or permissively licensed MP3 conformance vectors.
 - Record expected sample rate and comparison tolerances next to the vector
-  metadata in code.
+  metadata in code, including `expected_samples` where a reference decoder
+  agrees on the exact length: a frame quietly dropped or duplicated changes
+  that even when the audio that survives still sounds right.
 - Keep expected sample counts and any explicit fail-closed semantics per vector
   in the checked-in metadata instead of weakening global checks.
 

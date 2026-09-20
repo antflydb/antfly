@@ -1987,6 +1987,11 @@ pub fn build(b: *std.Build) void {
         // MP3 low sampling frequencies: the checked-in corpus is what keeps a
         // 24 kHz or 22.05 kHz file from reaching a band table that has no
         // entry for it, which used to abort the whole process.
+        "checked-in mp3 conformance corpus passes through zig backend",
+        "checked-in mp3 conformance corpus passes through facade backend selection",
+        "a silent frame keeps its place in the timeline",
+        "a truncated final frame decodes from the reservoir",
+        "a leading vbr tag frame is metadata, not a frame of silence",
         "low sampling frequency mp3 fixtures decode instead of aborting",
         "low sampling frequency short scalefactor band tables cover mpeg2 and mpeg2.5",
         "8 kHz long scalefactor bands are its own table, not the 48 kHz fallback",

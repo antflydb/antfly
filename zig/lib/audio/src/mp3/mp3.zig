@@ -46,6 +46,9 @@ pub const FramePayload = struct {
     header: bitstream.FrameHeader,
     side_info: bitstream.SideInfo,
     has_complete_main_data: bool,
+    /// A leading Xing/Info/VBRI frame. It carries encoder metadata rather than
+    /// audio, and is the only empty frame that must not become output.
+    is_vbr_tag: bool = false,
     granules: []GranulePayload,
 
     pub fn deinit(self: *FramePayload, allocator: std.mem.Allocator) void {
@@ -116,6 +119,7 @@ pub const FrameDecodePlan = struct {
     header: bitstream.FrameHeader,
     side_info: bitstream.SideInfo,
     has_complete_main_data: bool,
+    is_vbr_tag: bool = false,
     granules: []GranuleDecodePlan,
 
     pub fn deinit(self: *FrameDecodePlan, allocator: std.mem.Allocator) void {
@@ -328,7 +332,10 @@ pub fn decodeInterleavedSupportedPrefix(
         if (channel_count == 0 or channel_count > hybrid_states.len) return error.Mp3PureZigUnimplemented;
         if (plan.granules.len != granule_count * channel_count) return error.Mp3PureZigUnimplemented;
         if (!plan.has_complete_main_data) continue;
-        if (!planHasAudioPayload(plan)) continue;
+        // An empty granule is a silent granule, and silence still occupies its
+        // place in the timeline: skipping it shortens the clip and pulls every
+        // later sample earlier. Only the leading VBR tag frame is not audio.
+        if (plan.is_vbr_tag) continue;
 
         for (0..granule_count) |gr| {
             var decoded_channels: [2]GranulePcmAttempt = undefined;
@@ -511,9 +518,17 @@ pub fn decodeInterleavedSupportedPrefix(
     };
 }
 
-fn planHasAudioPayload(plan: FrameDecodePlan) bool {
-    for (plan.granules) |granule| {
-        if (granule.info.part2_3_length != 0) return true;
+/// Whether a frame carries a Xing/Info/VBRI header instead of audio. Encoders
+/// put one in the first frame, with empty granules, to describe the stream.
+fn isVbrTagFrame(side_info: bitstream.SideInfo, main_data_bytes: []const u8) bool {
+    for (0..@as(usize, side_info.granule_count)) |gr| {
+        for (0..@as(usize, side_info.channel_count)) |ch| {
+            if (side_info.granules[gr][ch].part2_3_length != 0) return false;
+        }
+    }
+    const window = main_data_bytes[0..@min(main_data_bytes.len, 40)];
+    for ([_][]const u8{ "Xing", "Info", "VBRI" }) |signature| {
+        if (std.mem.indexOf(u8, window, signature) != null) return true;
     }
     return false;
 }
@@ -530,13 +545,14 @@ pub fn collectFramePayloads(allocator: std.mem.Allocator, mp3_bytes: []const u8)
     }
 
     var frame_index: usize = 0;
-    while (true) {
+    frames: while (true) {
         const frame = frames.next() catch |err| switch (err) {
             error.Mp3TruncatedFrame => if (payloads.items.len > 0) break else return err,
             else => return err,
         } orelse break;
 
         const side_info = try frame.parseSideInfo();
+        const is_vbr_tag = frame_index == 0 and isVbrTagFrame(side_info, frame.main_data_bytes);
         try reservoir.appendSlice(allocator, frame.main_data_bytes);
 
         const main_data_begin = side_info.main_data_begin;
@@ -576,6 +592,10 @@ pub fn collectFramePayloads(allocator: std.mem.Allocator, mp3_bytes: []const u8)
                 const required_bytes = end_bit + 7;
                 if (required_bytes / 8 > frame_data.len) {
                     allocator.free(granules);
+                    // The stream stopped mid-frame and the reservoir does not
+                    // hold what the frame still needs: end the stream here
+                    // rather than failing the frames that did arrive.
+                    if (frame.truncated and payloads.items.len > 0) break :frames;
                     return error.Mp3InsufficientMainData;
                 }
 
@@ -600,6 +620,7 @@ pub fn collectFramePayloads(allocator: std.mem.Allocator, mp3_bytes: []const u8)
             .header = frame.header,
             .side_info = side_info,
             .has_complete_main_data = main_data_begin <= frame_data_start,
+            .is_vbr_tag = is_vbr_tag,
             .granules = granules,
         });
 
@@ -649,6 +670,7 @@ pub fn collectFrameDecodePlans(allocator: std.mem.Allocator, mp3_bytes: []const 
             .header = payload.header,
             .side_info = payload.side_info,
             .has_complete_main_data = payload.has_complete_main_data,
+            .is_vbr_tag = payload.is_vbr_tag,
             .granules = try allocator.alloc(GranuleDecodePlan, payload.granules.len),
         };
         for (plans[i].granules) |*granule| granule.* = default_granule_decode_plan;
@@ -1554,6 +1576,10 @@ const Mp3ConformanceCase = struct {
     mp3_bytes: []const u8,
     expected_sample_rate: u32,
     min_samples: usize,
+    /// Exact output length, where a reference decoder agrees on it. A frame
+    /// silently dropped or duplicated changes this even when the audio that
+    /// survives still sounds right, which a lower bound cannot catch.
+    expected_samples: ?usize = null,
 };
 
 /// MPEG-2 and MPEG-2.5 clips whose every frame carries short blocks. Each of
@@ -1565,36 +1591,42 @@ const lsf_conformance_cases = [_]Mp3ConformanceCase{
         .mp3_bytes = @embedFile("../../testdata/mp3-corpus/lsf-short-22050.mp3"),
         .expected_sample_rate = 22050,
         .min_samples = 22050,
+        .expected_samples = 23616,
     },
     .{
         .name = "lsf-short-24000",
         .mp3_bytes = @embedFile("../../testdata/mp3-corpus/lsf-short-24000.mp3"),
         .expected_sample_rate = 24000,
         .min_samples = 24000,
+        .expected_samples = 25344,
     },
     .{
         .name = "lsf-short-12000",
         .mp3_bytes = @embedFile("../../testdata/mp3-corpus/lsf-short-12000.mp3"),
         .expected_sample_rate = 12000,
         .min_samples = 12000,
+        .expected_samples = 13248,
     },
     .{
         .name = "lsf-short-11025",
         .mp3_bytes = @embedFile("../../testdata/mp3-corpus/lsf-short-11025.mp3"),
         .expected_sample_rate = 11025,
         .min_samples = 11025,
+        .expected_samples = 12672,
     },
     .{
         .name = "lsf-short-8000",
         .mp3_bytes = @embedFile("../../testdata/mp3-corpus/lsf-short-8000.mp3"),
         .expected_sample_rate = 8000,
         .min_samples = 8000,
+        .expected_samples = 9216,
     },
     .{
         .name = "lsf-tone-8000",
         .mp3_bytes = @embedFile("../../testdata/mp3-corpus/lsf-tone-8000.mp3"),
         .expected_sample_rate = 8000,
         .min_samples = 8000,
+        .expected_samples = 9216,
     },
 };
 
@@ -1604,36 +1636,42 @@ const checked_in_conformance_cases = [_]Mp3ConformanceCase{
         .mp3_bytes = @embedFile("../../testdata/tone.mp3"),
         .expected_sample_rate = 16000,
         .min_samples = 16000,
+        .expected_samples = 17280,
     },
     .{
         .name = "l3-compl",
         .mp3_bytes = @embedFile("../../testdata/mp3-corpus/l3-compl.bit"),
         .expected_sample_rate = 48000,
         .min_samples = 249984,
+        .expected_samples = 249984,
     },
     .{
         .name = "l3-si",
         .mp3_bytes = @embedFile("../../testdata/mp3-corpus/l3-si.bit"),
         .expected_sample_rate = 44100,
         .min_samples = 135936,
+        .expected_samples = 135936,
     },
     .{
         .name = "l3-si_huff",
         .mp3_bytes = @embedFile("../../testdata/mp3-corpus/l3-si_huff.bit"),
         .expected_sample_rate = 44100,
-        .min_samples = 85248,
+        .min_samples = 86400,
+        .expected_samples = 86400,
     },
     .{
         .name = "l3-he_free",
         .mp3_bytes = @embedFile("../../testdata/mp3-corpus/l3-he_free.bit"),
         .expected_sample_rate = 44100,
         .min_samples = 78336,
+        .expected_samples = 78336,
     },
     .{
         .name = "l3-he_mode",
         .mp3_bytes = @embedFile("../../testdata/mp3-corpus/l3-he_mode.bit"),
         .expected_sample_rate = 44100,
         .min_samples = 147456,
+        .expected_samples = 147456,
     },
 };
 
@@ -1643,6 +1681,7 @@ fn assertConformanceCaseWithBackend(case: Mp3ConformanceCase, backend: mp3.Backe
 
     try std.testing.expectEqual(case.expected_sample_rate, decoded.sample_rate);
     try std.testing.expect(decoded.samples.len >= case.min_samples);
+    if (case.expected_samples) |expected| try std.testing.expectEqual(expected, decoded.samples.len);
 }
 
 /// Share of a clip's energy that sits at `frequency`, after skipping the
@@ -1666,6 +1705,76 @@ fn toneEnergyShare(samples: []const f32, sample_rate: u32, frequency: f64) f64 {
     if (energy == 0) return 0;
     const power = (cos_sum * cos_sum + sin_sum * sin_sum) * 2.0 / @as(f64, @floatFromInt(measured.len));
     return power / energy;
+}
+
+test "a silent frame keeps its place in the timeline" {
+    // l3-si goes quiet for five frames partway through. Dropping them used to
+    // shorten the clip and pull everything after it earlier, which is the kind
+    // of shift that moves every later transcript timestamp.
+    const fixture = @embedFile("../../testdata/mp3-corpus/l3-si.bit");
+    const plans = try collectFrameDecodePlans(std.testing.allocator, fixture);
+    defer {
+        for (plans) |*plan| plan.deinit(std.testing.allocator);
+        std.testing.allocator.free(plans);
+    }
+
+    var silent_frames: usize = 0;
+    for (plans) |plan| {
+        var carries_audio = false;
+        for (plan.granules) |granule| {
+            if (granule.info.part2_3_length != 0) carries_audio = true;
+        }
+        if (!carries_audio and !plan.is_vbr_tag) silent_frames += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 5), silent_frames);
+
+    const decoded = try mp3.decodeMono(std.testing.allocator, fixture);
+    defer std.testing.allocator.free(decoded.samples);
+    try std.testing.expectEqual(plans.len * 1152, decoded.samples.len);
+}
+
+test "a truncated final frame decodes from the reservoir" {
+    // l3-compl ends 23 bytes into a 192 byte frame. Layer III keeps most of a
+    // frame's main data in earlier frames, so the audio is all there.
+    const fixture = @embedFile("../../testdata/mp3-corpus/l3-compl.bit");
+    var frames = bitstream.FrameIterator.init(fixture);
+    var count: usize = 0;
+    var truncated: usize = 0;
+    while (try frames.next()) |frame| {
+        count += 1;
+        if (frame.truncated) {
+            truncated += 1;
+            try std.testing.expect(frame.frame_bytes.len < try frame.header.frameLengthBytes());
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 217), count);
+    try std.testing.expectEqual(@as(usize, 1), truncated);
+
+    const decoded = try mp3.decodeMono(std.testing.allocator, fixture);
+    defer std.testing.allocator.free(decoded.samples);
+    try std.testing.expectEqual(@as(usize, 217 * 1152), decoded.samples.len);
+
+    // The last frame is audio, not the silence a dropped frame would leave.
+    var energy: f64 = 0;
+    for (decoded.samples[decoded.samples.len - 1152 ..]) |sample| energy += @as(f64, sample) * @as(f64, sample);
+    try std.testing.expect(energy > 0.01);
+}
+
+test "a leading vbr tag frame is metadata, not a frame of silence" {
+    const fixture = @embedFile("../../testdata/tone.mp3");
+    const plans = try collectFrameDecodePlans(std.testing.allocator, fixture);
+    defer {
+        for (plans) |*plan| plan.deinit(std.testing.allocator);
+        std.testing.allocator.free(plans);
+    }
+
+    try std.testing.expect(plans.len > 1);
+    try std.testing.expect(plans[0].is_vbr_tag);
+    for (plans[1..]) |plan| try std.testing.expect(!plan.is_vbr_tag);
+
+    const decoded = try mp3.decodeMono(std.testing.allocator, fixture);
+    defer std.testing.allocator.free(decoded.samples);
+    try std.testing.expectEqual((plans.len - 1) * 576, decoded.samples.len);
 }
 
 test "low sampling frequency mp3 fixtures decode instead of aborting" {
@@ -1701,6 +1810,7 @@ fn assertConformanceCaseThroughFacade(case: Mp3ConformanceCase) !void {
 
     try std.testing.expectEqual(case.expected_sample_rate, decoded.sample_rate);
     try std.testing.expect(decoded.samples.len >= case.min_samples);
+    if (case.expected_samples) |expected| try std.testing.expectEqual(expected, decoded.samples.len);
 }
 
 test "inspect stream finds first frame in fixture" {
