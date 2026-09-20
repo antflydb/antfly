@@ -19,6 +19,12 @@ class WebSearchConfig:
     Each provider has specific configuration requirements. Use the appropriate
     provider-specific config or set common options at the top level.
 
+    Omitted options inherit the named connection when one is supplied.
+    Inline configurations preserve omission; clients must not materialize
+    defaults as overrides. Without a connection, the server applies provider
+    defaults (Exa: 5 results, 10000 ms timeout, safe search enabled, content
+    and highlights disabled, and auto search).
+
     **Environment Variables (fallbacks):**
     - EXA_API_KEY
     - SERPER_API_KEY
@@ -49,14 +55,13 @@ class WebSearchConfig:
             serving_config (str | Unset): Agent Search serving config ID for provider vertex. Defaults to default_config.
             credentials_path (str | Unset): Service account JSON path for provider vertex. Shared Vertex credential field;
                 see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
-            max_results (int | Unset): Maximum number of search results to return Default: 5.
-            timeout_ms (int | Unset): Request timeout in milliseconds Default: 10000.
-            safe_search (bool | Unset): Enable safe search filtering Default: True.
+            max_results (int | Unset): Maximum number of search results to return
+            timeout_ms (int | Unset): Request timeout in milliseconds
+            safe_search (bool | Unset): Enable safe search filtering
             language (str | Unset): Preferred language for results (e.g., 'en', 'es', 'fr') Example: en.
             region (str | Unset): Preferred region for results (e.g., 'us', 'uk', 'de') Example: us.
-            include_content (bool | Unset): Ask the provider to return extracted page content when supported Default: False.
-            include_highlights (bool | Unset): Ask the provider to return highlighted passages when supported Default:
-                False.
+            include_content (bool | Unset): Ask the provider to return extracted page content when supported
+            include_highlights (bool | Unset): Ask the provider to return highlighted passages when supported
     """
 
     provider: WebSearchProvider
@@ -67,13 +72,13 @@ class WebSearchConfig:
     data_store: str | Unset = UNSET
     serving_config: str | Unset = UNSET
     credentials_path: str | Unset = UNSET
-    max_results: int | Unset = 5
-    timeout_ms: int | Unset = 10000
-    safe_search: bool | Unset = True
+    max_results: int | Unset = UNSET
+    timeout_ms: int | Unset = UNSET
+    safe_search: bool | Unset = UNSET
     language: str | Unset = UNSET
     region: str | Unset = UNSET
-    include_content: bool | Unset = False
-    include_highlights: bool | Unset = False
+    include_content: bool | Unset = UNSET
+    include_highlights: bool | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:

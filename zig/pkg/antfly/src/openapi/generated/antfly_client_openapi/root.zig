@@ -781,6 +781,7 @@ pub const VertexSearchConfig = types.VertexSearchConfig;
 pub const WebSearchConfig = types.WebSearchConfig;
 pub const WebSearchConnection = types.WebSearchConnection;
 pub const WebSearchProvider = types.WebSearchProvider;
+pub const WebSearchProviderConfig = types.WebSearchProviderConfig;
 pub const WildcardQuery = types.WildcardQuery;
 pub const YouSearchConfig = types.YouSearchConfig;
 pub const AlgebraicIndexStatsIndexType = types.AlgebraicIndexStatsIndexType;
