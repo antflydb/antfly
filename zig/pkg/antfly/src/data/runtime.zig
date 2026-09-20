@@ -34676,9 +34676,19 @@ fn consumerTests() type {
                 .metrics = .{},
             });
 
+            const topology = antfly.metadata_api.stabilizeMetadataRuntimeTopology(.{
+                .metadata_group_id = 1,
+                .metadata_raft_local_node_id = 2,
+                .metadata_raft_leader_id = 2,
+                .metadata_raft_role = source_role,
+            });
             try std.testing.expect(status.metadata_raft_role.ptr != source_role.ptr);
+            try std.testing.expect(topology.metadata_raft_role.ptr != source_role.ptr);
             @memset(source_role, 'x');
             try std.testing.expectEqualStrings("leader", status.metadata_raft_role);
+            try std.testing.expectEqualStrings("leader", topology.metadata_raft_role);
+            try std.testing.expectEqual(@as(u64, 2), topology.metadata_raft_local_node_id);
+            try std.testing.expectEqual(@as(?u64, 2), topology.metadata_raft_leader_id);
             const future = antfly.metadata_api.stabilizeMetadataStatus(.{
                 .metadata_group_id = 1,
                 .metadata_raft_role = "future_role",
@@ -34686,6 +34696,11 @@ fn consumerTests() type {
             });
             try std.testing.expectEqualStrings("unknown", future.metadata_raft_role);
             try std.testing.expect(future.metadata_raft_role.ptr != "future_role".ptr);
+            const future_topology = antfly.metadata_api.stabilizeMetadataRuntimeTopology(.{
+                .metadata_group_id = 1,
+                .metadata_raft_role = "future_role",
+            });
+            try std.testing.expectEqualStrings("unknown", future_topology.metadata_raft_role);
         }
 
         test "data runtime health metrics include replay debt and provisioned warmup counters" {

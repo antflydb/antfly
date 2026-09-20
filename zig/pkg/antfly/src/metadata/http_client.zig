@@ -184,7 +184,7 @@ pub const MetadataHttpClient = struct {
         const topology = try std.json.parseFromSlice(metadata_api.MetadataRuntimeTopology, self.alloc, response.body, .{ .ignore_unknown_fields = true });
         defer topology.deinit();
         try ensureRequestBudget(budget);
-        return metadata_api.stabilizeMetadataStatus(topology.value);
+        return metadata_api.stabilizeMetadataRuntimeTopology(topology.value);
     }
 
     pub fn fetchTableTopologyProtocolStatusWithBudget(
@@ -1589,8 +1589,10 @@ pub const MetadataHttpClient = struct {
         // Value-returning endpoints must not borrow response or parser memory.
         // Status has one string field; canonicalize it before either owner is
         // released, including parser-owned storage for escaped JSON strings.
-        if (T == metadata_api.MetadataStatus or T == metadata_api.MetadataRuntimeTopology)
+        if (T == metadata_api.MetadataStatus)
             return metadata_api.stabilizeMetadataStatus(parsed.value);
+        if (T == metadata_api.MetadataRuntimeTopology)
+            return metadata_api.stabilizeMetadataRuntimeTopology(parsed.value);
         return parsed.value;
     }
 
