@@ -1556,6 +1556,48 @@ const Mp3ConformanceCase = struct {
     min_samples: usize,
 };
 
+/// MPEG-2 and MPEG-2.5 clips whose every frame carries short blocks. Each of
+/// these aborted the process before the low sampling frequency scalefactor
+/// band tables existed, so they are the regression guard for that crash.
+const lsf_conformance_cases = [_]Mp3ConformanceCase{
+    .{
+        .name = "lsf-short-22050",
+        .mp3_bytes = @embedFile("../../testdata/mp3-corpus/lsf-short-22050.mp3"),
+        .expected_sample_rate = 22050,
+        .min_samples = 22050,
+    },
+    .{
+        .name = "lsf-short-24000",
+        .mp3_bytes = @embedFile("../../testdata/mp3-corpus/lsf-short-24000.mp3"),
+        .expected_sample_rate = 24000,
+        .min_samples = 24000,
+    },
+    .{
+        .name = "lsf-short-12000",
+        .mp3_bytes = @embedFile("../../testdata/mp3-corpus/lsf-short-12000.mp3"),
+        .expected_sample_rate = 12000,
+        .min_samples = 12000,
+    },
+    .{
+        .name = "lsf-short-11025",
+        .mp3_bytes = @embedFile("../../testdata/mp3-corpus/lsf-short-11025.mp3"),
+        .expected_sample_rate = 11025,
+        .min_samples = 11025,
+    },
+    .{
+        .name = "lsf-short-8000",
+        .mp3_bytes = @embedFile("../../testdata/mp3-corpus/lsf-short-8000.mp3"),
+        .expected_sample_rate = 8000,
+        .min_samples = 8000,
+    },
+    .{
+        .name = "lsf-tone-8000",
+        .mp3_bytes = @embedFile("../../testdata/mp3-corpus/lsf-tone-8000.mp3"),
+        .expected_sample_rate = 8000,
+        .min_samples = 8000,
+    },
+};
+
 const checked_in_conformance_cases = [_]Mp3ConformanceCase{
     .{
         .name = "tone",
@@ -1601,6 +1643,56 @@ fn assertConformanceCaseWithBackend(case: Mp3ConformanceCase, backend: mp3.Backe
 
     try std.testing.expectEqual(case.expected_sample_rate, decoded.sample_rate);
     try std.testing.expect(decoded.samples.len >= case.min_samples);
+}
+
+/// Share of a clip's energy that sits at `frequency`, after skipping the
+/// decoder's start-up window. A clip decoded with the wrong scalefactor bands
+/// scatters its energy instead of keeping it in the tone it was encoded from.
+fn toneEnergyShare(samples: []const f32, sample_rate: u32, frequency: f64) f64 {
+    const skip = @min(samples.len, 1152);
+    const measured = samples[skip..];
+    if (measured.len == 0) return 0;
+
+    var cos_sum: f64 = 0;
+    var sin_sum: f64 = 0;
+    var energy: f64 = 0;
+    for (measured, 0..) |sample, index| {
+        const seconds = @as(f64, @floatFromInt(index)) / @as(f64, @floatFromInt(sample_rate));
+        const angle = 2.0 * std.math.pi * frequency * seconds;
+        cos_sum += @as(f64, sample) * @cos(angle);
+        sin_sum += @as(f64, sample) * @sin(angle);
+        energy += @as(f64, sample) * @as(f64, sample);
+    }
+    if (energy == 0) return 0;
+    const power = (cos_sum * cos_sum + sin_sum * sin_sum) * 2.0 / @as(f64, @floatFromInt(measured.len));
+    return power / energy;
+}
+
+test "low sampling frequency mp3 fixtures decode instead of aborting" {
+    for (lsf_conformance_cases) |case| {
+        try assertConformanceCaseWithBackend(case, .zig);
+        try assertConformanceCaseThroughFacade(case);
+
+        const decoded = try mp3.decodeMono(std.testing.allocator, case.mp3_bytes);
+        defer std.testing.allocator.free(decoded.samples);
+        for (decoded.samples) |sample| {
+            try std.testing.expect(std.math.isFinite(sample));
+            try std.testing.expect(@abs(sample) <= 1.0);
+        }
+    }
+}
+
+test "mpeg2.5 8 kHz decodes with its own long bands, not the 48 kHz fallback" {
+    const fixture = @embedFile("../../testdata/mp3-corpus/lsf-tone-8000.mp3");
+    const decoded = try mp3.decodeMono(std.testing.allocator, fixture);
+    defer std.testing.allocator.free(decoded.samples);
+    try std.testing.expectEqual(@as(u32, 8000), decoded.sample_rate);
+
+    // The fixture is a single 440 Hz tone. Decoded with the 8 kHz bands it
+    // keeps about 0.78 of its energy there; decoded with the MPEG-1 48 kHz
+    // bands this rate used to fall back to, about 0.10 of it, which a sample
+    // count check cannot see.
+    try std.testing.expect(toneEnergyShare(decoded.samples, decoded.sample_rate, 440.0) > 0.5);
 }
 
 fn assertConformanceCaseThroughFacade(case: Mp3ConformanceCase) !void {

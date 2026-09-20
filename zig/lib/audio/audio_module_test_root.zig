@@ -27,6 +27,15 @@ const conformance = @import("src/conformance.zig");
 const flac = @import("src/flac.zig");
 const imdct = @import("src/imdct.zig");
 const mp3 = @import("src/mp3.zig");
+// The codec files behind the MP3 facade are only analyzed when something
+// references them, and a filtered run analyzes nothing that does, so their
+// tests were unreachable from this root until they were named here.
+const mp3_backend = @import("src/mp3/mp3.zig");
+const mp3_bitstream = @import("src/mp3/bitstream.zig");
+const mp3_huffman = @import("src/mp3/huffman.zig");
+const mp3_imdct = @import("src/mp3/imdct.zig");
+const mp3_requantize = @import("src/mp3/requantize.zig");
+const mp3_synthesis = @import("src/mp3/synthesis.zig");
 const mp4 = @import("src/mp4.zig");
 const ogg = @import("src/ogg.zig");
 const opus = @import("src/opus.zig");
@@ -47,6 +56,12 @@ test {
     _ = flac;
     _ = imdct;
     _ = mp3;
+    _ = mp3_backend;
+    _ = mp3_bitstream;
+    _ = mp3_huffman;
+    _ = mp3_imdct;
+    _ = mp3_requantize;
+    _ = mp3_synthesis;
     _ = mp4;
     _ = ogg;
     _ = opus;

@@ -1984,6 +1984,15 @@ pub fn build(b: *std.Build) void {
         "decode real silk and hybrid opus fixtures to interleaved pcm",
         "mdct backward produces a bounded sinusoid for a single coefficient",
         "fixed point helpers match the reference definitions",
+        // MP3 low sampling frequencies: the checked-in corpus is what keeps a
+        // 24 kHz or 22.05 kHz file from reaching a band table that has no
+        // entry for it, which used to abort the whole process.
+        "low sampling frequency mp3 fixtures decode instead of aborting",
+        "low sampling frequency short scalefactor band tables cover mpeg2 and mpeg2.5",
+        "8 kHz long scalefactor bands are its own table, not the 48 kHz fallback",
+        "every sample rate a frame header can carry has well formed band tables",
+        "side info parsing rejects a sample rate the band tables do not cover",
+        "mpeg2.5 8 kHz decodes with its own long bands, not the 48 kHz fallback",
     };
     for (audio_module_test_filters, 0..) |filter, filter_index| {
         const audio_module_tests = b.addTest(.{

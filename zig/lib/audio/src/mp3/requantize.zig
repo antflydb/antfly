@@ -791,6 +791,7 @@ pub fn scalefactorBandLong(sample_rate: u32) []const usize {
         32000 => &.{ 0, 4, 8, 12, 16, 20, 24, 30, 36, 44, 54, 66, 82, 102, 126, 156, 194, 240, 296, 364, 448, 550, 576 },
         24000 => &.{ 0, 6, 12, 18, 24, 30, 36, 44, 54, 66, 80, 96, 114, 136, 162, 194, 232, 278, 330, 394, 464, 540, 576 },
         22050, 16000, 12000, 11025 => &.{ 0, 6, 12, 18, 24, 30, 36, 44, 54, 66, 80, 96, 116, 140, 168, 200, 238, 284, 336, 396, 464, 522, 576 },
+        8000 => &.{ 0, 12, 24, 36, 48, 60, 72, 88, 108, 132, 160, 192, 232, 280, 336, 400, 476, 566, 568, 570, 572, 574, 576 },
         else => &.{ 0, 4, 8, 12, 16, 20, 24, 30, 36, 42, 50, 60, 72, 88, 106, 128, 156, 190, 230, 276, 330, 384, 576 },
     };
 }
@@ -800,8 +801,18 @@ pub fn scalefactorBandShort(sample_rate: u32) []const usize {
         44100 => &.{ 0, 4, 8, 12, 16, 22, 30, 40, 52, 66, 84, 106, 136, 192 },
         48000 => &.{ 0, 4, 8, 12, 16, 22, 28, 38, 50, 64, 80, 100, 126, 192 },
         32000 => &.{ 0, 4, 8, 12, 16, 22, 30, 42, 58, 78, 104, 138, 180, 192 },
-        16000 => &.{ 0, 4, 8, 12, 18, 26, 36, 48, 62, 80, 104, 134, 174, 192 },
-        else => @panic("unsupported short-band sample rate"),
+        // MPEG-2 (ISO 13818-3) and MPEG-2.5 low sampling frequencies. 11025 and
+        // 12000 share the 16000 table, and 8000 has its own, which is why a
+        // decoder that only knows the MPEG-1 rates cannot guess these.
+        22050 => &.{ 0, 4, 8, 12, 18, 24, 32, 42, 56, 74, 100, 132, 174, 192 },
+        24000 => &.{ 0, 4, 8, 12, 18, 26, 36, 48, 62, 80, 104, 136, 180, 192 },
+        16000, 12000, 11025 => &.{ 0, 4, 8, 12, 18, 26, 36, 48, 62, 80, 104, 134, 174, 192 },
+        8000 => &.{ 0, 8, 16, 24, 36, 52, 72, 96, 124, 160, 162, 164, 166, 192 },
+        // Every rate a frame header can carry is covered above. An unknown one
+        // is rejected when the header is parsed rather than reaching here, so
+        // that one unreadable file fails its own request instead of taking the
+        // process down with it.
+        else => &.{ 0, 4, 8, 12, 16, 22, 30, 40, 52, 66, 84, 106, 136, 192 },
     };
 }
 
@@ -1225,6 +1236,46 @@ test "mpeg1 short scalefactor band tables are available for 44.1/48/32 kHz" {
     try std.testing.expectEqualSlices(usize, &.{ 0, 4, 8, 12, 16, 22, 30, 40, 52, 66, 84, 106, 136, 192 }, scalefactorBandShort(44100));
     try std.testing.expectEqualSlices(usize, &.{ 0, 4, 8, 12, 16, 22, 28, 38, 50, 64, 80, 100, 126, 192 }, scalefactorBandShort(48000));
     try std.testing.expectEqualSlices(usize, &.{ 0, 4, 8, 12, 16, 22, 30, 42, 58, 78, 104, 138, 180, 192 }, scalefactorBandShort(32000));
+}
+
+test "low sampling frequency short scalefactor band tables cover mpeg2 and mpeg2.5" {
+    try std.testing.expectEqualSlices(usize, &.{ 0, 4, 8, 12, 18, 24, 32, 42, 56, 74, 100, 132, 174, 192 }, scalefactorBandShort(22050));
+    try std.testing.expectEqualSlices(usize, &.{ 0, 4, 8, 12, 18, 26, 36, 48, 62, 80, 104, 136, 180, 192 }, scalefactorBandShort(24000));
+    try std.testing.expectEqualSlices(usize, &.{ 0, 4, 8, 12, 18, 26, 36, 48, 62, 80, 104, 134, 174, 192 }, scalefactorBandShort(16000));
+    // 11025 and 12000 share the 16000 table; guessing either of its neighbours
+    // decodes short blocks into noise instead of audio.
+    try std.testing.expectEqualSlices(usize, scalefactorBandShort(16000), scalefactorBandShort(12000));
+    try std.testing.expectEqualSlices(usize, scalefactorBandShort(16000), scalefactorBandShort(11025));
+    try std.testing.expectEqualSlices(usize, &.{ 0, 8, 16, 24, 36, 52, 72, 96, 124, 160, 162, 164, 166, 192 }, scalefactorBandShort(8000));
+}
+
+test "8 kHz long scalefactor bands are its own table, not the 48 kHz fallback" {
+    try std.testing.expectEqualSlices(
+        usize,
+        &.{ 0, 12, 24, 36, 48, 60, 72, 88, 108, 132, 160, 192, 232, 280, 336, 400, 476, 566, 568, 570, 572, 574, 576 },
+        scalefactorBandLong(8000),
+    );
+}
+
+test "every sample rate a frame header can carry has well formed band tables" {
+    // The decoder rejects rates outside this set before a granule is decoded,
+    // so this is the complete set the tables have to answer for.
+    for ([_]u32{ 44100, 48000, 32000, 22050, 24000, 16000, 12000, 11025, 8000 }) |rate| {
+        try std.testing.expect(bitstream.supportsSampleRate(rate));
+
+        const long = scalefactorBandLong(rate);
+        try std.testing.expectEqual(@as(usize, 23), long.len);
+        try std.testing.expectEqual(@as(usize, 0), long[0]);
+        try std.testing.expectEqual(@as(usize, 576), long[long.len - 1]);
+        for (long[1..], 0..) |edge, index| try std.testing.expect(edge > long[index]);
+
+        const short = scalefactorBandShort(rate);
+        try std.testing.expectEqual(@as(usize, 14), short.len);
+        try std.testing.expectEqual(@as(usize, 0), short[0]);
+        try std.testing.expectEqual(@as(usize, 192), short[short.len - 1]);
+        for (short[1..], 0..) |edge, index| try std.testing.expect(edge > short[index]);
+    }
+    try std.testing.expect(!bitstream.supportsSampleRate(7350));
 }
 
 test "requantize mixed big values keeps first 36 samples long and reorders remainder short" {

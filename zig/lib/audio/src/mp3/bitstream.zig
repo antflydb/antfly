@@ -248,6 +248,7 @@ const default_granule_channel = GranuleChannelInfo{
 
 pub fn parseLayer3SideInfo(header: FrameHeader, side_info_bytes: []const u8) !SideInfo {
     if (header.layer != .layer3) return error.Mp3UnsupportedLayer;
+    if (!supportsSampleRate(header.sample_rate)) return error.Mp3UnsupportedSampleRate;
     if (side_info_bytes.len != header.sideInfoLengthBytes()) return error.Mp3InvalidSideInfoLength;
 
     var reader = BitReader{ .bytes = side_info_bytes };
@@ -514,6 +515,17 @@ pub fn looksLikeSync(first: u8, second: u8) bool {
     return (second & 0xE0) == 0xE0;
 }
 
+/// Every rate a Layer III header can carry, each of which has long and short
+/// scalefactor band tables in `requantize.zig`. Rejecting anything else before
+/// a granule is decoded keeps one unreadable file from reaching a table lookup
+/// that has no answer for it.
+pub fn supportsSampleRate(sample_rate: u32) bool {
+    return switch (sample_rate) {
+        44100, 48000, 32000, 22050, 24000, 16000, 12000, 11025, 8000 => true,
+        else => false,
+    };
+}
+
 fn sampleRate(version: MpegVersion, sample_rate_index: u2) u32 {
     const table = switch (version) {
         .mpeg1 => [_]u32{ 44100, 48000, 32000 },
@@ -633,6 +645,24 @@ test "joint stereo helpers reflect mode extension bits" {
     try std.testing.expectEqual(ChannelMode.joint_stereo, intensity_only.channel_mode);
     try std.testing.expect(!intensity_only.usesMsStereo());
     try std.testing.expect(intensity_only.usesIntensityStereo());
+}
+
+test "side info parsing rejects a sample rate the band tables do not cover" {
+    // Every rate a header can carry is supported, so this stands in for a
+    // future rate arriving before its tables do: the frame fails its own
+    // request instead of reaching a lookup with no answer for it.
+    const header = FrameHeader{
+        .version = .mpeg2,
+        .layer = .layer3,
+        .has_crc = false,
+        .free_format = false,
+        .bitrate_kbps = 64,
+        .sample_rate = 7350,
+        .padding = false,
+        .channel_mode = .mono,
+    };
+    const side_info_bytes = [_]u8{0} ** 9;
+    try std.testing.expectError(error.Mp3UnsupportedSampleRate, parseLayer3SideInfo(header, &side_info_bytes));
 }
 
 test "skip id3v2 header" {
