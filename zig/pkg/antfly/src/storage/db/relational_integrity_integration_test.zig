@@ -359,11 +359,18 @@ test "relational integrity portable decoder resumes bounded row pages across LSM
     const size = (try file.stat(std.testing.io)).size;
     var calls: usize = 0;
     while (calls < 200) : (calls += 1) {
-        var backend = try @import("../lsm_backend.zig").Backend.open(alloc, decoded_path, .{ .read_runtime = @import("../lsm_backend/storage_io.zig").ReadRuntime.init(std.testing.io) });
-        defer backend.close();
+        var options = @import("config.zig").portable_decoder_lsm_options_default;
+        options.read_runtime = @import("../lsm_backend/storage_io.zig").ReadRuntime.init(std.testing.io);
+        var backend = try @import("../lsm_backend.zig").Backend.open(alloc, decoded_path, options);
+        // Exactly the private decoder policy: each page's explicit sync, not
+        // commit-time sync or graceful-close flushing, protects its checkpoint.
+        defer backend.abandonAfterCrash();
         var store = try @import("../docstore.zig").DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{ .name = "docs" }));
         defer store.close();
+        const flushes_before = backend.write_stats.flushes;
         const done = try portable.importCohortFilePage(alloc, &store, std.testing.io, file, size, proof, @splat(7), 17, .none);
+        try std.testing.expectEqual(@as(u64, 0), backend.write_stats.wal_sync_records);
+        try std.testing.expectEqual(flushes_before, backend.write_stats.flushes);
         try std.testing.expectError(error.RestoreStagingScopeChanged, portable.importCohortFilePage(alloc, &store, std.testing.io, file, size, proof, @splat(8), 17, .none));
         if (done) {
             try std.testing.expect(try portable.importCohortFilePage(alloc, &store, std.testing.io, file, size, proof, @splat(7), 17, .none));

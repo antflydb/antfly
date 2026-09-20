@@ -2008,6 +2008,18 @@ pub fn importSourceCopyFilePage(alloc: Allocator, store: *DocStore, io: std.Io, 
     return importStagedFilePage(alloc, store, io, file, size, .{ .source_copy = proof }, scope, max_rows, cancellation);
 }
 
+/// Rows and their cursor share a transaction. Make that transaction recoverable
+/// before acknowledging the page, without flushing/compacting the LSM for each
+/// small manifest, schema or row step. Physical decoder publication has its own
+/// final barrier. Preserve force-sync semantics for the direct LMDB adapter.
+fn syncImportCheckpoint(store: *DocStore) !void {
+    if (store.kind == .runtime) {
+        try store.syncReplayState();
+    } else {
+        try store.sync(true);
+    }
+}
+
 fn importStagedFilePage(alloc: Allocator, store: *DocStore, io: std.Io, file: std.Io.File, size: u64, proof: StagedImportProof, scope: [32]u8, max_rows: usize, cancellation: @import("../common/cancellation.zig").CancellationToken) !bool {
     if (max_rows == 0 or max_rows > 128) return error.InvalidBackupRequest;
     try cancellation.check();
@@ -2069,7 +2081,7 @@ fn importStagedFilePage(alloc: Allocator, store: *DocStore, io: std.Io, file: st
         }
         const encoded = try std.json.Stringify.valueAlloc(owned, state, .{});
         try store.putBatch(&.{.{ .key = cohort_import_checkpoint_key, .value = encoded }}, &.{});
-        try store.sync(true);
+        try syncImportCheckpoint(store);
         return state.phase == .done;
     }
     var raw = backup_codec.FileReader.init(io, file, size);
@@ -2099,7 +2111,7 @@ fn importStagedFilePage(alloc: Allocator, store: *DocStore, io: std.Io, file: st
         state.footer_offset = reader.trailer.?.footer_offset;
         try locators.append(owned, .{ .key = cohort_import_checkpoint_key, .value = try std.json.Stringify.valueAlloc(owned, state, .{}) });
         try store.putBatch(locators.items, &.{});
-        try store.sync(true);
+        try syncImportCheckpoint(store);
         return false;
     }
     if (state.ordinal >= state.object_count or state.footer_offset >= size) return error.InvalidRestoreSourceCheckpoint;
@@ -2137,7 +2149,7 @@ fn importStagedFilePage(alloc: Allocator, store: *DocStore, io: std.Io, file: st
             }
             try writes.append(owned, .{ .key = cohort_import_cache_key, .value = try std.json.Stringify.valueAlloc(owned, CohortCachedBlock{ .ordinal = state.ordinal, .rows = @intCast(entries.len) }, .{}) });
             try store.putBatch(writes.items, &.{});
-            try store.sync(true);
+            try syncImportCheckpoint(store);
             return false;
         }
         const local_start = state.row % 128;
@@ -2185,7 +2197,7 @@ fn importStagedFilePage(alloc: Allocator, store: *DocStore, io: std.Io, file: st
             }
             try writes.append(owned, .{ .key = cohort_import_cache_key, .value = try std.json.Stringify.valueAlloc(owned, CohortCachedBlock{ .ordinal = state.ordinal, .rows = @intCast(entries.len) }, .{}) });
             try store.putBatch(writes.items, &.{});
-            try store.sync(true);
+            try syncImportCheckpoint(store);
             return false;
         }
         const entries = try backup_codec.decodeKeyValueBatch(owned, block.payload);
@@ -2242,7 +2254,7 @@ fn importStagedFilePage(alloc: Allocator, store: *DocStore, io: std.Io, file: st
         try cancellation.check();
         try store.putBatch(writes.items, &.{});
     }
-    try store.sync(true);
+    try syncImportCheckpoint(store);
     return false;
 }
 

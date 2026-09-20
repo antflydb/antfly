@@ -308,6 +308,17 @@ pub fn executeResident(alloc: std.mem.Allocator, target: *db.DB, env: Environmen
         return .{ .phase = phase, .rows = before.value.rows, .receipt = before.value.receipt() };
     };
     if (before.value.phase == .canceled or before.value.phase == .published) return error.RestoreStagingScopeChanged;
+    // Snapshot import is an idempotent advance operation, not a read followed
+    // by a separate begin RPC. The compiled proposer captures at most ONE
+    // batch: on a reserved owner this turn only admits the scope, and the
+    // returned committed receipt lets the next turn transfer/import its data.
+    // Never attempt source IO before that admission has durably committed.
+    const admit_snapshot = input.action == .import_page and input.source != null and before.value.phase == .reserved;
+    if (input.action == .import_page and input.source != null and
+        before.value.rewrite != null and before.value.rewrite.?.snapshot_complete)
+    {
+        return .{ .phase = before.value.phase, .rows = before.value.rows, .receipt = before.value.receipt(), .rewrite = before.value.rewrite };
+    }
     if (input.action == .begin and before.value.phase != .reserved) {
         // The caller already obtained a ReadIndex barrier and an exact owner
         // lease. This matching durable scope proves admission, even when its
@@ -321,6 +332,10 @@ pub fn executeResident(alloc: std.mem.Allocator, target: *db.DB, env: Environmen
     switch (input.action) {
         .begin => try env.proposer.propose(env.proposer.ptr, .{ .restore_staging = .{ .begin = input.scope } }, context),
         .import_page => import: {
+            if (admit_snapshot) {
+                try env.proposer.propose(env.proposer.ptr, .{ .restore_staging = .{ .begin = input.scope } }, context);
+                break :import;
+            }
             if (input.rewrite_finish) |receipt| {
                 try receipt.validate(input.scope.rewrite.?);
                 var page = try @import("db/relational_rewrite_staging.zig").prepareFinish(target, alloc, input.scope, receipt.cut);
@@ -646,14 +661,22 @@ test "restore owner verified decoder peer rewrite certificate chunks survive reo
     };
     var apply: Apply = .{ .target = &target, .scope_digest = scope.digest() };
     const env: Environment = .{ .io = std.testing.io, .runtime = &runtime, .location_options = .{}, .cache_path = cache_path, .source_byte_budget = transfer.max_chunk_bytes, .proposer = .{ .ptr = &apply, .propose = Apply.propose } };
-    _ = try executeResident(alloc, &target, env, .{ .scope = scope, .action = .begin }, .{});
     var request: Request = .{ .scope = scope, .action = .import_page, .source = .{ .location = "", .artifact = artifact, .peer_descriptor = descriptor }, .rewrite = .{ .preserve_document = true, .source_schemas = &.{schema_json}, .target_schema = schema_json, .program_digest = program.identity } };
     var canceled = std.atomic.Value(bool).init(true);
     try std.testing.expectError(error.Canceled, executeResident(alloc, &target, env, request, .{ .cancellation = .fromAtomic(&canceled) }));
     var wrong = request;
     wrong.source.?.peer_descriptor.?.certificate.cut.applied_index += 1;
     try std.testing.expectError(error.RestoreStagingScopeChanged, executeResident(alloc, &target, env, wrong, .{}));
+    // First import admits exactly one durable command without opening the
+    // source. Replaying an ambiguously acknowledged admission advances the
+    // same scope instead of adding a second begin to Raft.
+    const admitted = try executeResident(alloc, &target, env, request, .{});
+    try std.testing.expectEqual(.importing, admitted.phase);
+    try std.testing.expect(!admitted.rewrite.?.snapshot_complete);
+    try std.testing.expectEqual(@as(u64, 1), apply.index);
+    try std.testing.expectEqual(@as(u64, 0), target.rewrite_program_cache.compilations);
     var response = try executeResident(alloc, &target, env, request, .{});
+    try std.testing.expectEqual(@as(u64, 1), apply.index);
     try std.testing.expectEqual(@as(u64, 1), target.rewrite_program_cache.compilations);
     try std.testing.expectEqual(@as(u64, 0), response.source_next_offset);
     var chunk_count: usize = 0;
@@ -720,6 +743,12 @@ test "restore owner verified decoder peer rewrite certificate chunks survive reo
         if (response.rewrite.?.snapshot_complete) break;
     } else return error.TestUnexpectedResult;
     try std.testing.expect(saw_publication_crash);
+    const snapshot_index = apply.index;
+    target.rewrite_program_cache.evict(env.io);
+    const replay = try executeResident(alloc, &target, env, request, .{});
+    try std.testing.expect(replay.rewrite.?.snapshot_complete);
+    try std.testing.expectEqual(snapshot_index, apply.index);
+    try std.testing.expectEqual(@as(u64, 1), target.rewrite_program_cache.compilations);
     const copied = (try target.get(alloc, "a")).?;
     defer alloc.free(copied);
     try std.testing.expectEqualSlices(u8, document, copied);

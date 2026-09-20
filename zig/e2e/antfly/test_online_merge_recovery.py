@@ -54,6 +54,7 @@ class OwnerLinkFault:
         # Never change matching, forwarding, or decision tracking below.
         self.failed_owner_responses = deque(maxlen=128)
         self.owner_progress = deque(maxlen=32)
+        self.owner_timings = {}
 
     @staticmethod
     def transaction_identity(body):
@@ -76,6 +77,23 @@ class OwnerLinkFault:
     def observe_response(self, index, body, response):
         with self.lock:
             path = body.get("_fault_path", "")
+            if "/internal/" in path and hasattr(response, "elapsed"):
+                operation = body.get("operation", {})
+                label = path.rsplit("/", 1)[-1]
+                if label == "restore-owner":
+                    label += ":" + str(body.get("action"))
+                elif label == "online-merge-io":
+                    label += ":" + next(iter(operation), "unknown")
+                label = label[:128]
+                if label not in self.owner_timings and len(self.owner_timings) >= 32:
+                    label = "other"
+                elapsed = response.elapsed.total_seconds()
+                count, total, maximum = self.owner_timings.get(label, (0, 0.0, 0.0))
+                self.owner_timings[label] = (
+                    count + 1,
+                    total + elapsed,
+                    max(maximum, elapsed),
+                )
             if response.status_code == 200 and path.endswith("/restore-owner"):
                 try:
                     value = response.json()
@@ -212,6 +230,30 @@ def test_owner_link_failed_response_diagnostics_survive_heal_and_stay_bounded():
     assert fault.failed_responses() == observations
     assert not fault.observed()
     assert not fault.transaction_observations
+
+
+def test_owner_link_timings_are_bounded_and_group_requests_by_operation():
+    from datetime import timedelta
+
+    response = requests.Response()
+    response.status_code = 503
+    response._content = b"unavailable"
+    response.elapsed = timedelta(milliseconds=250)
+    fault = OwnerLinkFault("publication")
+    for group in range(100):
+        fault.observe_response(
+            0,
+            {
+                "_fault_path": f"/internal/v1/groups/{group}/tables/rows/restore-owner",
+                "action": "import_page",
+            },
+            response,
+        )
+    assert fault.owner_timings == {"restore-owner:import_page": (100, 25.0, 0.25)}
+    for operation in range(100):
+        fault.observe_response(0, {"_fault_path": f"/internal/{operation}"}, response)
+    assert len(fault.owner_timings) <= 33
+    assert "other" in fault.owner_timings
 
 
 def set_command_option(command, option, value):
@@ -372,6 +414,7 @@ def owner_link_fault(request, monkeypatch):
             yield fault
         finally:
             print(f"restore owner progress: {list(fault.owner_progress)}")
+            print(f"restore owner timings (count/total/max seconds): {fault.owner_timings}")
 
 
 @pytest.fixture

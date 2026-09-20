@@ -131,24 +131,21 @@ pub fn step(host: anytype, job: *std.json.Parsed(stages.Job), worker: *jobs.JobS
     var pending = false;
     switch (progress.phase) {
         .snapshot => {
-            // Begin returns the same durable progress as status, including on
-            // exact-scope replay after a lost reply. Do not pay for another
-            // owner ReadIndex round trip before every bounded snapshot page.
-            const before = try host.executeRestoreOwner(alloc, target.table.name, range.group_id, .{ .scope = scope, .action = .begin }, context);
-            if (!(before.rewrite orelse return error.RestoreStagingScopeChanged).snapshot_complete) {
-                const receipt = for (target.source_artifacts) |item| {
-                    if (item.target_group_id == range.group_id) break item;
-                } else return error.RestoreSourceProofMissing;
-                const published = source_status.progress.?.published_certificate orelse return error.RestoreSourceProofMissing;
-                const descriptor: artifact.Descriptor = .{ .scope = source_scope, .certificate = published, .total_bytes = receipt.artifact_size_bytes };
-                var request: owners.Request = .{ .scope = scope, .action = .import_page, .rewrite = target.rewrite, .source = .{ .location = "", .artifact = receipt, .peer_descriptor = descriptor } };
-                var response = try host.executeRestoreOwner(alloc, target.table.name, range.group_id, request, context);
-                if (!response.rewrite.?.snapshot_complete and response.source_next_offset < descriptor.total_bytes) {
-                    request.source_chunk = try readSource(host, artifact.ReadResponse, alloc, target.table.name, .{ .scope = source_scope, .operation = .{ .artifact = .{ .read = .{ .descriptor = descriptor, .offset = response.source_next_offset } } } }, context);
-                    response = try host.executeRestoreOwner(alloc, target.table.name, range.group_id, request, context);
-                }
-                pending = !response.rewrite.?.snapshot_complete;
+            // Import admits a reserved owner and returns authoritative progress
+            // itself. A separate begin/status probe on every page duplicates
+            // the owner and metadata ReadIndex barriers, including after replay.
+            const receipt = for (target.source_artifacts) |item| {
+                if (item.target_group_id == range.group_id) break item;
+            } else return error.RestoreSourceProofMissing;
+            const published = source_status.progress.?.published_certificate orelse return error.RestoreSourceProofMissing;
+            const descriptor: artifact.Descriptor = .{ .scope = source_scope, .certificate = published, .total_bytes = receipt.artifact_size_bytes };
+            var request: owners.Request = .{ .scope = scope, .action = .import_page, .rewrite = target.rewrite, .source = .{ .location = "", .artifact = receipt, .peer_descriptor = descriptor } };
+            var response = try host.executeRestoreOwner(alloc, target.table.name, range.group_id, request, context);
+            if (!response.rewrite.?.snapshot_complete and response.source_next_offset < descriptor.total_bytes) {
+                request.source_chunk = try readSource(host, artifact.ReadResponse, alloc, target.table.name, .{ .scope = source_scope, .operation = .{ .artifact = .{ .read = .{ .descriptor = descriptor, .offset = response.source_next_offset } } } }, context);
+                response = try host.executeRestoreOwner(alloc, target.table.name, range.group_id, request, context);
             }
+            pending = !response.rewrite.?.snapshot_complete;
         },
         .catchup => {
             const status = try host.executeRestoreOwner(alloc, target.table.name, range.group_id, .{ .scope = scope, .action = .status }, context);
@@ -296,13 +293,14 @@ test "rewrite shared job driver resumes lost scheduling receipts and fences whol
             const ordinal: usize = @intCast(group - 401);
             const target = &self.targets[ordinal];
             switch (request.action) {
-                .begin => self.snapshot_started = true,
+                .begin => return error.TestUnexpectedResult,
                 .status => {
                     // Snapshot pages must use the durable progress returned
-                    // by begin, not issue a redundant status/ReadIndex RPC.
+                    // by import, not issue a redundant status/ReadIndex RPC.
                     try std.testing.expect(self.snapshot_complete);
                 },
                 .import_page => {
+                    if (request.source != null) self.snapshot_started = true;
                     if (request.source_chunk != null) {
                         target.rewrite.?.snapshot_complete = true;
                     } else if (request.rewrite_tail != null) {

@@ -5,4 +5,5 @@ pub const antfly_sources = @import("source_owner_physical.zig");
 
 test {
     _ = @import("storage/restore_owner.zig");
+    _ = @import("storage/db/relational_integrity_integration_test.zig");
 }

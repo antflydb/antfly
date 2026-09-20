@@ -138,7 +138,13 @@ pub fn stepPortableDecoder(alloc: std.mem.Allocator, io: std.Io, artifact: std.I
         !std.mem.eql(u8, &try source.digest(alloc), &scope.source_descriptor_digest)) return error.RestoreSourceProofMissing;
     const files = try std.fmt.allocPrint(alloc, "{s}/files", .{root});
     defer alloc.free(files);
-    var backend = try @import("../storage/lsm_backend.zig").Backend.open(alloc, files, .{ .read_runtime = @import("../storage/lsm_backend/storage_io.zig").ReadRuntime.init(io) });
+    // The importer synchronizes each page's rows AND restart checkpoint before
+    // returning. This private decoder does not serve reads or acknowledge user
+    // writes: commit-time full durability would sync the very same WAL twice
+    // per page, burning the slice budget on redundant disk barriers.
+    var options = @import("../storage/db/config.zig").portable_decoder_lsm_options_default;
+    options.read_runtime = @import("../storage/lsm_backend/storage_io.zig").ReadRuntime.init(io);
+    var backend = try @import("../storage/lsm_backend.zig").Backend.open(alloc, files, options);
     defer backend.close();
     var store = try @import("../storage/docstore.zig").DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{ .name = "docs" }));
     defer store.close();
