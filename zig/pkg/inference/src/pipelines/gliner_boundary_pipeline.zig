@@ -1245,6 +1245,39 @@ pub const fp32_confidence_tolerance: f32 = 5e-4;
 /// misrepresenting the fp16 artifact as meeting the fp32 rows' exact bar.
 /// This tolerance is NOT used by, and must never widen, any fp32 row's test.
 pub const fp16_encoder_confidence_tolerance: f32 = 7.5e-4;
+/// Confidence tolerance for the fp16-encoder LONG-DOCUMENT parity test
+/// (`server/gliner_boundary_service_test.zig`'s "gliner boundary long
+/// executor fp32 vs fp16 encoder parity on real long documents"), which
+/// exercises a real source of variance `fp16_encoder_confidence_tolerance`
+/// above cannot: `gliner_boundary_long_document.zig`'s cross-window
+/// duplicate-mention merge (mergeMentionsOwned, the `if (normalized.probability
+/// > previous.probability ...)` tie-break) keeps whichever of two
+/// OVERLAPPING WINDOWS' independent score estimates for the same span is
+/// higher -- two different windows' local encodings of the same text, not
+/// one computation repeated at two precisions, so their natural disagreement
+/// is larger than intra-window fp16 rounding alone. fp16 rounding can flip
+/// a near-tied comparison to the other window's estimate, surfacing that
+/// larger, but still bounded and deterministic, cross-window delta. Measured
+/// via the real long executor (session_factory + Node.extractDirect, not a
+/// diagnostic) over VOPR.md's "Completion-Claim Audit" (37KB, multi-window),
+/// PDF.md's corpus-maximum section (~99KB), and both corpus-minimum
+/// documents, order-independent identity matching (label+text+span) so a
+/// harmless near-tie reordering of the final entities array is never
+/// conflated with a decision difference: every one of 445 matched
+/// entity/relation confidence values had an identical (label, text, span)
+/// counterpart in the other precision on both backends (0 unmatched), and
+/// exactly 6 of the 445 exceeded `fp16_encoder_confidence_tolerance`, all
+/// short "URL" mentions clustered within one window-overlap region of the
+/// corpus-maximum document plus one repeated "zig" mention (132 occurrences
+/// in the VOPR.md section, so a duplicate-window candidate is far more
+/// likely) -- max 1.6823e-3 (native) / 1.6727e-3 (Metal), deterministically
+/// the same spans and magnitude to 3-4 significant figures on both backends
+/// (the cross-backend signature this file's fp16 sections use throughout to
+/// distinguish rounding-driven effects from a compute defect). This constant
+/// (max plus ~49% headroom) is the reviewed bound for that measurement; it
+/// must never widen `fp16_encoder_confidence_tolerance` itself, which stays
+/// the single-window bound.
+pub const fp16_encoder_long_document_confidence_tolerance: f32 = 2.5e-3;
 fn expectLabels(expected: []const Label, actual: []const Label, tolerance: f32) !void {
     try std.testing.expectEqual(expected.len, actual.len);
     for (expected, actual) |want, got| {

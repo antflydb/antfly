@@ -27,6 +27,7 @@ const gliner_qualification = @import("../models/gliner_boundary_qualification.zi
 const boundary_bundle = @import("../models/gliner_boundary_bundle.zig");
 const safetensors_mod = @import("../models/safetensors.zig");
 const managed_receipt = @import("managed_receipt.zig");
+const c_file = @import("../util/c_file.zig");
 pub const download = @import("download.zig");
 pub const qwen3vl_catalog = @import("qwen3vl_catalog.zig");
 pub const qwen3_embedding_catalog = @import("qwen3_embedding_catalog.zig");
@@ -1051,10 +1052,31 @@ fn appendUniqueOwnedString(
 /// unrecognized architecture, or parse failure fails closed to `false`
 /// rather than erroring the whole pull; a genuinely broken download is
 /// caught by the normal artifact validation elsewhere.
+///
+/// A directory produced by `antfly-inference-gliner25-convert` carries its
+/// own `gliner_boundary_bundle` receipt (`antfly_inference_bundle.json`),
+/// which is the only source of truth for which precision its `model.gguf`
+/// actually stores -- the manifest's `gguf_path` alone does not say. A plain
+/// HuggingFace pull never writes that receipt and is always the published
+/// fp32 `model.safetensors` checkpoint, so its identity is derived from that
+/// file directly, unchanged from before this function recognized converted
+/// bundles.
 fn boundaryIdentityIsQualified(allocator: std.mem.Allocator, manifest: *const manifest_mod.ModelManifest) bool {
     if (manifest.gliner_architecture != .boundary) return false;
     const config = manifest.gliner_boundary_config orelse return false;
     const sidecars = manifest.boundarySidecarDigests() catch return false;
+    if (manifest.gliner_boundary_bundle) |receipt| {
+        const weight_path = manifest.gguf_path orelse return false;
+        var region = c_file.MmapRegion.init(allocator, weight_path) catch return false;
+        defer region.deinit();
+        const identity = boundary_bundle.Identity{
+            .backbone = config.backbone,
+            .precision = receipt.value.precision,
+            .weight = boundary_bundle.Digest.of(region.data),
+            .sidecars = sidecars,
+        };
+        return gliner_qualification.hasQualifiedIdentity(identity);
+    }
     const weight_path = manifest.safetensors_path orelse return false;
     var reader = safetensors_mod.MMapReader.openFileAbsolute(allocator, weight_path) catch return false;
     defer reader.deinit();
@@ -1432,7 +1454,14 @@ fn manifestTypeFromTasks(tasks: []const []const u8, fallback: manifest_mod.Model
     return fallback;
 }
 
-fn synthesizePulledModelManifestJson(
+/// Synthesize `model_manifest.json` contents for an already-published,
+/// fully-materialized model directory (as opposed to
+/// `synthesizePulledModelManifestJsonFromPlan`, which reads a `pull`
+/// transaction's staging plan). Exported so a local conversion tool (for
+/// example `gliner25-convert`, which never goes through `pull`'s network/
+/// staging path) can synthesize the same reviewed-identity-gated manifest
+/// for a directory it just finished writing to disk.
+pub fn synthesizePulledModelManifestJson(
     allocator: std.mem.Allocator,
     dest_dir: []const u8,
     tasks_csv: ?[]const u8,

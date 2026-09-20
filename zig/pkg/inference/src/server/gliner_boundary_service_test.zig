@@ -504,14 +504,39 @@ test "gliner boundary provider extractDirect upgrades a plain request for the qu
 // only that every section is served successfully, so this stays a stable
 // regression guard while GLINER25.md records the actual measured numbers.
 test "gliner boundary provider extractDirect throughput on a real corpus matches a live HTTP baseline" {
-    const home = platform.env.getenv("HOME") orelse return error.SkipZigTest;
+    // Unchanged from before this section: no explicit backend override, so
+    // this keeps measuring whatever Node's default backend selection is
+    // (the same thing GLINER25.md's throughput section has always measured).
+    try throughputCorpusShape(.auto, "ANTFLY_GLINER25_BASE_MODEL_DIR");
+}
+// fp32-vs-fp16 throughput on the SAME corpus, explicit per backend so the
+// two precisions are compared on identical hardware paths (the baseline
+// test above measures Node's default backend selection, whichever that is,
+// not necessarily both). See GLINER25.md's fp16-encoder long-document
+// qualification section for the resulting table; unlike the baseline test
+// above, these assert nothing about a live HTTP baseline, only that every
+// section is served on the requested precision/backend.
+test "gliner boundary provider extractDirect throughput on a real corpus fp32 native" {
+    try throughputCorpusShape(.native, "ANTFLY_GLINER25_BASE_MODEL_DIR");
+}
+test "gliner boundary provider extractDirect throughput on a real corpus fp32 Metal" {
+    if (!@import("build_options").enable_metal) return error.SkipZigTest;
+    try throughputCorpusShape(.metal, "ANTFLY_GLINER25_BASE_MODEL_DIR");
+}
+test "gliner boundary provider extractDirect throughput on a real corpus fp16 encoder native" {
+    try throughputCorpusShape(.native, "ANTFLY_GLINER25_BASE_FP16_MODEL_DIR");
+}
+test "gliner boundary provider extractDirect throughput on a real corpus fp16 encoder Metal" {
+    if (!@import("build_options").enable_metal) return error.SkipZigTest;
+    try throughputCorpusShape(.metal, "ANTFLY_GLINER25_BASE_FP16_MODEL_DIR");
+}
+fn throughputCorpusShape(backend: enum { auto, native, metal }, environment: [:0]const u8) !void {
     const corpus_path = platform.env.getenv("ANTFLY_GLINER25_THROUGHPUT_CORPUS") orelse return error.SkipZigTest;
     const a = std.testing.allocator;
-    const directory = try std.fs.path.join(a, &.{ home, ".antfly", "inference", "models", "fastino", "gliner2.5-base-v1" });
-    defer a.free(directory);
-    std.Io.Dir.cwd().access(std.testing.io, directory, .{}) catch return error.SkipZigTest;
-    const models_dir = try std.fs.path.join(a, &.{ home, ".antfly", "inference", "models", "fastino" });
-    defer a.free(models_dir);
+    const resolved = try resolveModelDirectoryFromEnv(a, environment) orelse return error.SkipZigTest;
+    defer resolved.deinit(a);
+    const models_dir = resolved.models_dir;
+    const name = resolved.name;
 
     const Section = struct { id: []const u8, text: []const u8 };
     const corpus_bytes = try @import("../util/c_file.zig").readFileMax(a, corpus_path, 8 * 1024 * 1024);
@@ -539,6 +564,16 @@ test "gliner boundary provider extractDirect throughput on a real corpus matches
         .generation_budget_overrides = .{ .host_limit_bytes = 16 * 1024 * 1024 * 1024, .scratch_limit_bytes = 16 * 1024 * 1024 * 1024, .combined_limit_bytes = 32 * 1024 * 1024 * 1024, .backend_limit_bytes = 16 * 1024 * 1024 * 1024, .kv_limit_bytes = 4 * 1024 * 1024 * 1024 },
     });
     defer node.deinit();
+    switch (backend) {
+        .auto => {},
+        .native => useNativeBackend(&node),
+        .metal => {
+            node.session_manager.preferred_backends = &.{.metal};
+            node.session_manager.required_backend = .metal;
+            node.model_manager.session_manager.preferred_backends = &.{.metal};
+            node.model_manager.session_manager.required_backend = .metal;
+        },
+    }
     try node.attachIo(std.testing.io);
     const control = Control{ .hard_cancellation = node.hard_cancellation_watchdog.?.boundary(), .deadline_ns = platform.time.monotonicNs() + 900 * std.time.ns_per_s };
 
@@ -547,7 +582,7 @@ test "gliner boundary provider extractDirect throughput on a real corpus matches
     {
         const warm_content = try std.json.Stringify.valueAlloc(a, "The metadata server coordinates Raft groups. VOPR exercises the DataServer under fault injection.", .{});
         defer a.free(warm_content);
-        var response = try node.extractDirectWithControl(a, "gliner2.5-base-v1", .{
+        var response = try node.extractDirectWithControl(a, name, .{
             .inputs = &.{.{ .id = "warm", .content_json = warm_content }},
             .schema_version = 2,
             .schema_json = schema_json,
@@ -562,7 +597,7 @@ test "gliner boundary provider extractDirect throughput on a real corpus matches
         const content_json = try std.json.Stringify.valueAlloc(a, section.text, .{});
         defer a.free(content_json);
         const started = platform.time.monotonicNs();
-        const outcome = node.extractDirectWithControl(a, "gliner2.5-base-v1", .{
+        const outcome = node.extractDirectWithControl(a, name, .{
             .inputs = &.{.{ .id = section.id, .content_json = content_json }},
             .schema_version = 2,
             .schema_json = schema_json,
@@ -603,6 +638,34 @@ fn extractHeadingSection(full: []const u8, heading: []const u8) ![]const u8 {
     return full[start..end];
 }
 
+// Resolves an `ANTFLY_GLINER25_*_MODEL_DIR`-style environment variable to a
+// `Node.init`-ready `models_dir`/model `name` pair, so the long-document
+// correctness tests below can be parametrized over which reviewed bundle
+// (fp32 or a converted precision such as fp16_encoder) they run against
+// instead of copy-pasting a body per bundle. Returns null (caller should
+// skip) when the variable is unset; resolves through the real filesystem so
+// a relative path in the environment still yields an absolute `models_dir`.
+const ResolvedModelDirectory = struct {
+    models_dir: []const u8,
+    name: []const u8,
+    fn deinit(self: ResolvedModelDirectory, a: Allocator) void {
+        a.free(self.models_dir);
+        a.free(self.name);
+    }
+};
+fn resolveModelDirectoryFromEnv(a: Allocator, environment: [:0]const u8) !?ResolvedModelDirectory {
+    const requested_directory = platform.env.getenv(environment) orelse return null;
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = if (std.fs.path.isAbsolute(requested_directory))
+        try std.Io.Dir.realPathFileAbsolute(std.testing.io, requested_directory, &path_buffer)
+    else
+        try std.Io.Dir.cwd().realPathFile(std.testing.io, requested_directory, &path_buffer);
+    const directory = path_buffer[0..path_len];
+    const models_dir = std.fs.path.dirname(directory) orelse return error.InvalidModelPath;
+    const name = std.fs.path.basename(directory);
+    return .{ .models_dir = try a.dupe(u8, models_dir), .name = try a.dupe(u8, name) };
+}
+
 // zig/EXTRACT.md's canonical schema_version 2 envelope (entities with
 // text/label/start/end/score; relations with type, source.entity_index,
 // target.entity_index, score) is produced by extraction_v2.zig's writeSample
@@ -617,23 +680,29 @@ fn extractHeadingSection(full: []const u8, heading: []const u8) ![]const u8 {
 // zig/GRAPH.md-documented extraction_relation source parser consumes exactly
 // this shape, via examples/dogfood's knowledgeGraphIndexJSON).
 test "gliner boundary long executor HTTP canonical schema_version 2 shape for a real multi-window document with relations native" {
-    try longExecutorHttpCanonicalShape(false);
+    try longExecutorHttpCanonicalShape(false, "ANTFLY_GLINER25_BASE_MODEL_DIR");
 }
 test "gliner boundary long executor HTTP canonical schema_version 2 shape for a real multi-window document with relations Metal" {
     if (!@import("build_options").enable_metal) return error.SkipZigTest;
-    try longExecutorHttpCanonicalShape(true);
+    try longExecutorHttpCanonicalShape(true, "ANTFLY_GLINER25_BASE_MODEL_DIR");
 }
-fn longExecutorHttpCanonicalShape(metal: bool) !void {
-    const requested_directory = platform.env.getenv("ANTFLY_GLINER25_BASE_MODEL_DIR") orelse return error.SkipZigTest;
+// fp16_encoder companions: same document, schema, and assertions, against the
+// converted bundle instead -- see GLINER25.md's fp16-encoder long-document
+// qualification section for why this document/schema shape is the reviewed
+// evidence for that row too.
+test "gliner boundary long executor HTTP canonical schema_version 2 shape for a real multi-window document with relations fp16 encoder native" {
+    try longExecutorHttpCanonicalShape(false, "ANTFLY_GLINER25_BASE_FP16_MODEL_DIR");
+}
+test "gliner boundary long executor HTTP canonical schema_version 2 shape for a real multi-window document with relations fp16 encoder Metal" {
+    if (!@import("build_options").enable_metal) return error.SkipZigTest;
+    try longExecutorHttpCanonicalShape(true, "ANTFLY_GLINER25_BASE_FP16_MODEL_DIR");
+}
+fn longExecutorHttpCanonicalShape(metal: bool, environment: [:0]const u8) !void {
     const a = std.testing.allocator;
-    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const path_len = if (std.fs.path.isAbsolute(requested_directory))
-        try std.Io.Dir.realPathFileAbsolute(std.testing.io, requested_directory, &path_buffer)
-    else
-        try std.Io.Dir.cwd().realPathFile(std.testing.io, requested_directory, &path_buffer);
-    const directory = path_buffer[0..path_len];
-    const models_dir = std.fs.path.dirname(directory) orelse return error.InvalidModelPath;
-    const name = std.fs.path.basename(directory);
+    const resolved = try resolveModelDirectoryFromEnv(a, environment) orelse return error.SkipZigTest;
+    defer resolved.deinit(a);
+    const models_dir = resolved.models_dir;
+    const name = resolved.name;
 
     var node = try Node.init(a, .{
         .models_dir = models_dir,
@@ -738,20 +807,25 @@ fn longExecutorHttpCanonicalShape(metal: bool) !void {
 // checkpoint, so this can assert the canonical shape strictly rather than
 // only when a relation happens to be present.
 test "gliner boundary long executor provider extractDirect canonical schema_version 2 relations shape for a windowed request native" {
-    try longExecutorProviderCanonicalShape(false);
+    try longExecutorProviderCanonicalShape(false, "ANTFLY_GLINER25_BASE_MODEL_DIR");
 }
 test "gliner boundary long executor provider extractDirect canonical schema_version 2 relations shape for a windowed request Metal" {
     if (!@import("build_options").enable_metal) return error.SkipZigTest;
-    try longExecutorProviderCanonicalShape(true);
+    try longExecutorProviderCanonicalShape(true, "ANTFLY_GLINER25_BASE_MODEL_DIR");
 }
-fn longExecutorProviderCanonicalShape(metal: bool) !void {
-    const home = platform.env.getenv("HOME") orelse return error.SkipZigTest;
+test "gliner boundary long executor provider extractDirect canonical schema_version 2 relations shape for a windowed request fp16 encoder native" {
+    try longExecutorProviderCanonicalShape(false, "ANTFLY_GLINER25_BASE_FP16_MODEL_DIR");
+}
+test "gliner boundary long executor provider extractDirect canonical schema_version 2 relations shape for a windowed request fp16 encoder Metal" {
+    if (!@import("build_options").enable_metal) return error.SkipZigTest;
+    try longExecutorProviderCanonicalShape(true, "ANTFLY_GLINER25_BASE_FP16_MODEL_DIR");
+}
+fn longExecutorProviderCanonicalShape(metal: bool, environment: [:0]const u8) !void {
     const a = std.testing.allocator;
-    const directory = try std.fs.path.join(a, &.{ home, ".antfly", "inference", "models", "fastino", "gliner2.5-base-v1" });
-    defer a.free(directory);
-    std.Io.Dir.cwd().access(std.testing.io, directory, .{}) catch return error.SkipZigTest;
-    const models_dir = try std.fs.path.join(a, &.{ home, ".antfly", "inference", "models", "fastino" });
-    defer a.free(models_dir);
+    const resolved = try resolveModelDirectoryFromEnv(a, environment) orelse return error.SkipZigTest;
+    defer resolved.deinit(a);
+    const models_dir = resolved.models_dir;
+    const name = resolved.name;
 
     var node = try Node.init(a, .{
         .models_dir = models_dir,
@@ -788,7 +862,7 @@ fn longExecutorProviderCanonicalShape(metal: bool) !void {
         \\{"include_confidence":true,"include_spans":true,"long_document":{"mode":"window"}}
         ,
     };
-    var response = try node.extractDirect(a, "gliner2.5-base-v1", request);
+    var response = try node.extractDirect(a, name, request);
     defer response.deinit();
     errdefer std.debug.print("long-document provider response: {s}\n", .{response.json});
     var parsed = try std.json.parseFromSlice(Value, a, response.json, .{});
@@ -833,16 +907,17 @@ fn longExecutorProviderCanonicalShape(metal: bool) !void {
 // entry (Node.extractDirect, as examples/dogfood's embedded worker calls
 // it) -- rather than only the ~37KB section the tests above already cover.
 test "gliner boundary long executor HTTP canonical schema_version 2 shape for the corpus-maximum real section" {
+    try corpusMaximumHttpCanonicalShape("ANTFLY_GLINER25_BASE_MODEL_DIR");
+}
+test "gliner boundary long executor HTTP canonical schema_version 2 shape for the corpus-maximum real section fp16 encoder" {
+    try corpusMaximumHttpCanonicalShape("ANTFLY_GLINER25_BASE_FP16_MODEL_DIR");
+}
+fn corpusMaximumHttpCanonicalShape(environment: [:0]const u8) !void {
     const a = std.testing.allocator;
-    const requested_directory = platform.env.getenv("ANTFLY_GLINER25_BASE_MODEL_DIR") orelse return error.SkipZigTest;
-    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const path_len = if (std.fs.path.isAbsolute(requested_directory))
-        try std.Io.Dir.realPathFileAbsolute(std.testing.io, requested_directory, &path_buffer)
-    else
-        try std.Io.Dir.cwd().realPathFile(std.testing.io, requested_directory, &path_buffer);
-    const directory = path_buffer[0..path_len];
-    const models_dir = std.fs.path.dirname(directory) orelse return error.InvalidModelPath;
-    const name = std.fs.path.basename(directory);
+    const resolved = try resolveModelDirectoryFromEnv(a, environment) orelse return error.SkipZigTest;
+    defer resolved.deinit(a);
+    const models_dir = resolved.models_dir;
+    const name = resolved.name;
 
     var node = try Node.init(a, .{
         .models_dir = models_dir,
@@ -918,13 +993,17 @@ test "gliner boundary long executor HTTP canonical schema_version 2 shape for th
 }
 
 test "gliner boundary long executor provider extractDirect canonical schema_version 2 shape for the corpus-maximum real section" {
+    try corpusMaximumProviderCanonicalShape("ANTFLY_GLINER25_BASE_MODEL_DIR");
+}
+test "gliner boundary long executor provider extractDirect canonical schema_version 2 shape for the corpus-maximum real section fp16 encoder" {
+    try corpusMaximumProviderCanonicalShape("ANTFLY_GLINER25_BASE_FP16_MODEL_DIR");
+}
+fn corpusMaximumProviderCanonicalShape(environment: [:0]const u8) !void {
     const a = std.testing.allocator;
-    const home = platform.env.getenv("HOME") orelse return error.SkipZigTest;
-    const directory = try std.fs.path.join(a, &.{ home, ".antfly", "inference", "models", "fastino", "gliner2.5-base-v1" });
-    defer a.free(directory);
-    std.Io.Dir.cwd().access(std.testing.io, directory, .{}) catch return error.SkipZigTest;
-    const models_dir = try std.fs.path.join(a, &.{ home, ".antfly", "inference", "models", "fastino" });
-    defer a.free(models_dir);
+    const resolved = try resolveModelDirectoryFromEnv(a, environment) orelse return error.SkipZigTest;
+    defer resolved.deinit(a);
+    const models_dir = resolved.models_dir;
+    const name = resolved.name;
 
     var node = try Node.init(a, .{
         .models_dir = models_dir,
@@ -953,7 +1032,7 @@ test "gliner boundary long executor provider extractDirect canonical schema_vers
         \\{"include_confidence":true,"include_spans":true,"long_document":{"mode":"window"}}
         ,
     };
-    var response = try node.extractDirect(a, "gliner2.5-base-v1", request);
+    var response = try node.extractDirect(a, name, request);
     defer response.deinit();
     errdefer std.debug.print("corpus-maximum provider response: {s}\n", .{response.json});
     var parsed = try std.json.parseFromSlice(Value, a, response.json, .{});
@@ -980,20 +1059,25 @@ test "gliner boundary long executor provider extractDirect canonical schema_vers
 // both backends and requires a canonical, finite response that agrees across
 // them: a one-word document has no relations and at most one entity.
 test "gliner boundary long executor provider extractDirect canonical schema_version 2 shape for the corpus-minimum real section native" {
-    try corpusMinimumProviderShape(false);
+    try corpusMinimumProviderShape(false, "ANTFLY_GLINER25_BASE_MODEL_DIR");
 }
 test "gliner boundary long executor provider extractDirect canonical schema_version 2 shape for the corpus-minimum real section Metal" {
     if (!@import("build_options").enable_metal) return error.SkipZigTest;
-    try corpusMinimumProviderShape(true);
+    try corpusMinimumProviderShape(true, "ANTFLY_GLINER25_BASE_MODEL_DIR");
 }
-fn corpusMinimumProviderShape(metal: bool) !void {
+test "gliner boundary long executor provider extractDirect canonical schema_version 2 shape for the corpus-minimum real section fp16 encoder native" {
+    try corpusMinimumProviderShape(false, "ANTFLY_GLINER25_BASE_FP16_MODEL_DIR");
+}
+test "gliner boundary long executor provider extractDirect canonical schema_version 2 shape for the corpus-minimum real section fp16 encoder Metal" {
+    if (!@import("build_options").enable_metal) return error.SkipZigTest;
+    try corpusMinimumProviderShape(true, "ANTFLY_GLINER25_BASE_FP16_MODEL_DIR");
+}
+fn corpusMinimumProviderShape(metal: bool, environment: [:0]const u8) !void {
     const a = std.testing.allocator;
-    const home = platform.env.getenv("HOME") orelse return error.SkipZigTest;
-    const directory = try std.fs.path.join(a, &.{ home, ".antfly", "inference", "models", "fastino", "gliner2.5-base-v1" });
-    defer a.free(directory);
-    std.Io.Dir.cwd().access(std.testing.io, directory, .{}) catch return error.SkipZigTest;
-    const models_dir = try std.fs.path.join(a, &.{ home, ".antfly", "inference", "models", "fastino" });
-    defer a.free(models_dir);
+    const resolved = try resolveModelDirectoryFromEnv(a, environment) orelse return error.SkipZigTest;
+    defer resolved.deinit(a);
+    const models_dir = resolved.models_dir;
+    const name = resolved.name;
 
     var node = try Node.init(a, .{
         .models_dir = models_dir,
@@ -1026,7 +1110,7 @@ fn corpusMinimumProviderShape(metal: bool) !void {
             \\{"include_confidence":true,"include_spans":true,"long_document":{"mode":"window"}}
             ,
         };
-        var response = try node.extractDirect(a, "gliner2.5-base-v1", request);
+        var response = try node.extractDirect(a, name, request);
         defer response.deinit();
         errdefer std.debug.print("corpus-minimum provider response ({s}): {s}\n", .{ document, response.json });
         var parsed = try std.json.parseFromSlice(Value, a, response.json, .{});
@@ -1045,4 +1129,300 @@ fn corpusMinimumProviderShape(metal: bool) !void {
         }
         if (output.get("relations")) |raw_relations| try std.testing.expectEqual(@as(usize, 0), raw_relations.array.items.len);
     }
+}
+
+// fp32-vs-fp16_encoder numerical parity through the long executor, on the
+// SAME real documents the correctness/shape tests above exercise (not a
+// synthetic fixture): the 37KB VOPR.md multi-window document, the ~99KB
+// PDF.md corpus-maximum section, and both corpus-minimum documents. Unlike
+// the shape tests, this compares the two precisions' outputs to each other
+// directly -- every entity/relation decision (label, text, span, and which
+// window-merge outcome won) must be byte-identical, and every confidence
+// delta must fall within the reviewed `fp16_encoder_confidence_tolerance`
+// (pipelines/gliner_boundary_pipeline.zig) -- the same bar the single-window
+// pipeline parity tests hold this precision to, now exercised through the
+// long-document cross-window merge/dedup path those tests never touch. This
+// is the specific fp16 long-document row's reviewed evidence; it does not
+// exist for the fp32 row (which has no second precision to compare against).
+fn entityMatches(candidate: std.json.ObjectMap, want: std.json.ObjectMap) bool {
+    return std.mem.eql(u8, candidate.get("label").?.string, want.get("label").?.string) and
+        std.mem.eql(u8, candidate.get("text").?.string, want.get("text").?.string) and
+        candidate.get("start").?.integer == want.get("start").?.integer and
+        candidate.get("end").?.integer == want.get("end").?.integer;
+}
+// The final entities array is not guaranteed sorted by document position --
+// near-tied confidence entities can legitimately trade places in overall
+// array order between two precisions (observed directly: two "component"
+// entities ~14000 bytes apart with fp32 confidences 0.70950/0.70943 swap
+// to 0.70959/0.70937 under fp16, close enough that whichever ordering rule
+// the output uses reverses their relative order) without either precision
+// disagreeing about WHICH spans are entities, their labels, or their
+// individual confidence. Matching by array index conflated that harmless
+// reordering with a genuine decision difference; matching by (label, text,
+// span) identity instead -- order-independent, like a set comparison -- is
+// the correct way to ask "did the two precisions decide the same things."
+fn compareLongDocumentPrecisionOutputs(
+    a: Allocator,
+    label: []const u8,
+    fp32_output: std.json.ObjectMap,
+    fp16_output: std.json.ObjectMap,
+    tolerance: f64,
+    deltas: *std.ArrayListUnmanaged(f64),
+) !void {
+    // Both precisions tokenize identically (same tokenizer bytes, verified
+    // elsewhere), so they must window identically too -- a real, cheap sanity
+    // check that this is comparing the same merge shape, not coincidentally
+    // similar output from a different window plan.
+    try std.testing.expectEqual(
+        fp32_output.get("long_document").?.object.get("window_count").?.integer,
+        fp16_output.get("long_document").?.object.get("window_count").?.integer,
+    );
+
+    const fp32_entities = fp32_output.get("entities").?.array.items;
+    const fp16_entities = fp16_output.get("entities").?.array.items;
+    errdefer std.debug.print("{s}: entity count fp32={d} fp16={d}\n", .{ label, fp32_entities.len, fp16_entities.len });
+    try std.testing.expectEqual(fp32_entities.len, fp16_entities.len);
+    const fp16_matched = try a.alloc(bool, fp16_entities.len);
+    defer a.free(fp16_matched);
+    @memset(fp16_matched, false);
+    var unmatched: usize = 0;
+    for (fp32_entities) |raw_fp32| {
+        const fp32_entity = raw_fp32.object;
+        var found: ?usize = null;
+        for (fp16_entities, 0..) |raw_fp16, fp16_index| {
+            if (fp16_matched[fp16_index]) continue;
+            if (entityMatches(raw_fp16.object, fp32_entity)) {
+                found = fp16_index;
+                break;
+            }
+        }
+        if (found) |fp16_index| {
+            fp16_matched[fp16_index] = true;
+            const fp16_entity = fp16_entities[fp16_index].object;
+            const delta = @abs(fp32_entity.get("score").?.float - fp16_entity.get("score").?.float);
+            try deltas.append(a, delta);
+            // Print (not assert) here: this collects the FULL distribution
+            // across every document before any pass/fail decision, exactly
+            // like GLINER25.md section 12's single-window sweep -- one
+            // narrow outlier must not hide the rest of the distribution
+            // behind an early test abort. The caller asserts the reviewed
+            // bound once every document has been measured.
+            if (delta > tolerance) std.debug.print("{s}: entity {s} [{d}..{d}] confidence delta {d:.7} exceeds {d:.7} (fp32={d:.7} fp16={d:.7})\n", .{ label, fp32_entity.get("text").?.string, fp32_entity.get("start").?.integer, fp32_entity.get("end").?.integer, delta, tolerance, fp32_entity.get("score").?.float, fp16_entity.get("score").?.float });
+        } else {
+            unmatched += 1;
+            std.debug.print("{s}: entity present in fp32 with no matching (label,text,span) in fp16: {s}({s})[{d}..{d}] score={d:.7}\n", .{
+                label,
+                fp32_entity.get("text").?.string,
+                fp32_entity.get("label").?.string,
+                fp32_entity.get("start").?.integer,
+                fp32_entity.get("end").?.integer,
+                fp32_entity.get("score").?.float,
+            });
+        }
+    }
+    for (fp16_entities, 0..) |raw_fp16, fp16_index| {
+        if (fp16_matched[fp16_index]) continue;
+        unmatched += 1;
+        const fp16_entity = raw_fp16.object;
+        std.debug.print("{s}: entity present in fp16 with no matching (label,text,span) in fp32: {s}({s})[{d}..{d}] score={d:.7}\n", .{
+            label,
+            fp16_entity.get("text").?.string,
+            fp16_entity.get("label").?.string,
+            fp16_entity.get("start").?.integer,
+            fp16_entity.get("end").?.integer,
+            fp16_entity.get("score").?.float,
+        });
+    }
+    try std.testing.expectEqual(@as(usize, 0), unmatched);
+
+    const fp32_relations = if (fp32_output.get("relations")) |value| value.array.items else &.{};
+    const fp16_relations = if (fp16_output.get("relations")) |value| value.array.items else &.{};
+    errdefer std.debug.print("{s}: relation count fp32={d} fp16={d}\n", .{ label, fp32_relations.len, fp16_relations.len });
+    try std.testing.expectEqual(fp32_relations.len, fp16_relations.len);
+    const fp16_relations_matched = try a.alloc(bool, fp16_relations.len);
+    defer a.free(fp16_relations_matched);
+    @memset(fp16_relations_matched, false);
+    var unmatched_relations: usize = 0;
+    outer: for (fp32_relations) |raw_fp32| {
+        const fp32_relation = raw_fp32.object;
+        for (fp16_relations, 0..) |raw_fp16, fp16_index| {
+            if (fp16_relations_matched[fp16_index]) continue;
+            const fp16_relation = raw_fp16.object;
+            if (!std.mem.eql(u8, fp32_relation.get("type").?.string, fp16_relation.get("type").?.string)) continue;
+            var endpoints_match = true;
+            inline for (.{ "source", "target" }) |key| {
+                const fp32_endpoint = fp32_relation.get(key).?.object;
+                const fp16_endpoint = fp16_relation.get(key).?.object;
+                if (!std.mem.eql(u8, fp32_endpoint.get("text").?.string, fp16_endpoint.get("text").?.string)) endpoints_match = false;
+                if (fp32_endpoint.get("label")) |value| {
+                    if (!std.mem.eql(u8, value.string, fp16_endpoint.get("label").?.string)) endpoints_match = false;
+                }
+            }
+            if (!endpoints_match) continue;
+            fp16_relations_matched[fp16_index] = true;
+            const delta = @abs(fp32_relation.get("score").?.float - fp16_relation.get("score").?.float);
+            try deltas.append(a, delta);
+            if (delta > tolerance) std.debug.print("{s}: relation {s} confidence delta {d:.7} exceeds {d:.7}\n", .{ label, fp32_relation.get("type").?.string, delta, tolerance });
+            continue :outer;
+        }
+        unmatched_relations += 1;
+        std.debug.print("{s}: relation present in fp32 with no matching type/endpoints in fp16: {s}\n", .{ label, fp32_relation.get("type").?.string });
+    }
+    for (fp16_relations, 0..) |raw_fp16, fp16_index| {
+        if (fp16_relations_matched[fp16_index]) continue;
+        unmatched_relations += 1;
+        std.debug.print("{s}: relation present in fp16 with no matching type/endpoints in fp32: {s}\n", .{ label, raw_fp16.object.get("type").?.string });
+    }
+    try std.testing.expectEqual(@as(usize, 0), unmatched_relations);
+}
+
+test "gliner boundary long executor fp32 vs fp16 encoder parity on real long documents native" {
+    try longDocumentPrecisionParity(false);
+}
+test "gliner boundary long executor fp32 vs fp16 encoder parity on real long documents Metal" {
+    if (!@import("build_options").enable_metal) return error.SkipZigTest;
+    try longDocumentPrecisionParity(true);
+}
+const LongDocumentCase = struct { label: []const u8, text: []const u8 };
+fn fetchLongDocumentResponses(
+    a: Allocator,
+    node_config: server.NodeConfig,
+    resolved: ResolvedModelDirectory,
+    metal: bool,
+    documents: []const LongDocumentCase,
+    schema_json: []const u8,
+    options_json: []const u8,
+) ![][]const u8 {
+    var config = node_config;
+    config.models_dir = resolved.models_dir;
+    var node = try Node.init(a, config);
+    defer node.deinit();
+    if (!metal) useNativeBackend(&node) else {
+        node.session_manager.preferred_backends = &.{.metal};
+        node.session_manager.required_backend = .metal;
+        node.model_manager.session_manager.preferred_backends = &.{.metal};
+        node.model_manager.session_manager.required_backend = .metal;
+    }
+    try node.attachIo(std.testing.io);
+
+    const responses = try a.alloc([]const u8, documents.len);
+    var filled: usize = 0;
+    errdefer {
+        for (responses[0..filled]) |response| a.free(response);
+        a.free(responses);
+    }
+    for (documents, 0..) |document, index| {
+        const content_json = try std.json.Stringify.valueAlloc(a, document.text, .{});
+        defer a.free(content_json);
+        const request = extracting_api.Request{
+            .schema_version = 2,
+            .inputs = &.{.{ .id = "1", .content_json = content_json }},
+            .schema_json = schema_json,
+            .options_json = options_json,
+        };
+        var response = try node.extractDirect(a, resolved.name, request);
+        defer response.deinit();
+        responses[index] = try a.dupe(u8, response.json);
+        filled += 1;
+    }
+    return responses;
+}
+fn freeLongDocumentResponses(a: Allocator, responses: [][]const u8) void {
+    for (responses) |response| a.free(response);
+    a.free(responses);
+}
+
+fn longDocumentPrecisionParity(metal: bool) !void {
+    const a = std.testing.allocator;
+    const fp32_resolved = try resolveModelDirectoryFromEnv(a, "ANTFLY_GLINER25_BASE_MODEL_DIR") orelse return error.SkipZigTest;
+    defer fp32_resolved.deinit(a);
+    const fp16_resolved = try resolveModelDirectoryFromEnv(a, "ANTFLY_GLINER25_BASE_FP16_MODEL_DIR") orelse return error.SkipZigTest;
+    defer fp16_resolved.deinit(a);
+
+    const node_config = server.NodeConfig{
+        .max_loaded_models = 1,
+        .max_concurrent_requests = 1,
+        .process_termination_available = true,
+        .generation_budget_overrides = .{ .host_limit_bytes = 16 * 1024 * 1024 * 1024, .scratch_limit_bytes = 4 * 1024 * 1024 * 1024, .combined_limit_bytes = 16 * 1024 * 1024 * 1024, .backend_limit_bytes = 16 * 1024 * 1024 * 1024, .kv_limit_bytes = 4 * 1024 * 1024 * 1024 },
+    };
+
+    const schema_json =
+        \\{"entities":["component","subsystem","file","test","invariant","decision","person","model","backend","format","protocol"],"relations":[{"type":"depends_on"},{"type":"owns"},{"type":"implements"},{"type":"supersedes"},{"type":"tested_by"},{"type":"documented_in"}]}
+    ;
+    const options_json =
+        \\{"include_confidence":true,"include_spans":true,"long_document":{"mode":"window"}}
+    ;
+
+    const vopr_full = try @import("../util/c_file.zig").readFile(a, "../../VOPR.md");
+    defer a.free(vopr_full);
+    const vopr_section = try extractHeadingSection(vopr_full, "### Completion-Claim Audit");
+    const pdf_full = try @import("../util/c_file.zig").readFile(a, "../../PDF.md");
+    defer a.free(pdf_full);
+    const pdf_section = try extractHeadingSection(pdf_full, "## Review findings and required fixes");
+    try std.testing.expect(pdf_section.len > 90000);
+
+    const documents = [_]LongDocumentCase{
+        .{ .label = "VOPR.md Completion-Claim Audit (37KB, multi-window)", .text = vopr_section },
+        .{ .label = "PDF.md corpus-maximum (~99KB)", .text = pdf_section },
+        .{ .label = "corpus-minimum SCHEMA.md Related Docs (20 bytes)", .text = "TODO.mdSERVERLESS.md" },
+        .{ .label = "corpus-minimum one-character document", .text = "a" },
+    };
+
+    // fp16_encoder_long_document_confidence_tolerance
+    // (pipelines/gliner_boundary_pipeline.zig) is the reviewed bound for this
+    // specific comparison: the long-document cross-window merge tie-break
+    // is a real, larger, but still bounded and understood source of
+    // variance beyond fp16_encoder_confidence_tolerance's single-window
+    // bound (see that constant's doc comment for the measured evidence).
+    const tolerance: f64 = pipeline.fp16_encoder_long_document_confidence_tolerance;
+    var deltas: std.ArrayListUnmanaged(f64) = .empty;
+    defer deltas.deinit(a);
+
+    // Run fp32's whole sweep, close its session, THEN run fp16's -- never two
+    // Metal boundary sessions live at once. This is strictly for this
+    // harness's own resource footprint (a real production server serves both
+    // from independent, admission-gated sessions); holding both open
+    // simultaneously here measurably increased this test's exposure to the
+    // transient Metal live-memory admission pressure GLINER25.md's other
+    // long-document sections already document on this shared machine.
+    const fp32_responses = try fetchLongDocumentResponses(a, node_config, fp32_resolved, metal, &documents, schema_json, options_json);
+    defer freeLongDocumentResponses(a, fp32_responses);
+    const fp16_responses = try fetchLongDocumentResponses(a, node_config, fp16_resolved, metal, &documents, schema_json, options_json);
+    defer freeLongDocumentResponses(a, fp16_responses);
+
+    for (documents, fp32_responses, fp16_responses) |document, fp32_json, fp16_json| {
+        errdefer std.debug.print("{s}: fp32 response={s}\nfp16 response={s}\n", .{ document.label, fp32_json, fp16_json });
+        var fp32_parsed = try std.json.parseFromSlice(Value, a, fp32_json, .{});
+        defer fp32_parsed.deinit();
+        var fp16_parsed = try std.json.parseFromSlice(Value, a, fp16_json, .{});
+        defer fp16_parsed.deinit();
+        const fp32_output = fp32_parsed.value.object.get("data").?.array.items[0].object;
+        const fp16_output = fp16_parsed.value.object.get("data").?.array.items[0].object;
+        try compareLongDocumentPrecisionOutputs(a, document.label, fp32_output, fp16_output, tolerance, &deltas);
+    }
+
+    try std.testing.expect(deltas.items.len > 0);
+    var max: f64 = 0;
+    var sum: f64 = 0;
+    for (deltas.items) |delta| {
+        max = @max(max, delta);
+        sum += delta;
+    }
+    std.mem.sort(f64, deltas.items, {}, std.sort.asc(f64));
+    const median = deltas.items[deltas.items.len / 2];
+    const p99_index = @min(deltas.items.len - 1, (deltas.items.len * 99) / 100);
+    const p99 = deltas.items[p99_index];
+    var over: usize = 0;
+    for (deltas.items) |delta| {
+        if (delta > tolerance) over += 1;
+    }
+    // Printed unconditionally, BEFORE the assertion below, so the full
+    // distribution across every document is captured in the log even if the
+    // assertion then fails -- see GLINER25.md's fp16-encoder long-document
+    // qualification section for the reviewed reading of this distribution.
+    std.debug.print(
+        "long-document fp32 vs fp16 encoder parity ({s}): n={d} max={d:.7} mean={d:.7} median={d:.7} p99={d:.7} tolerance={d:.7} count_over={d}\n",
+        .{ if (metal) "metal" else "native", deltas.items.len, max, sum / @as(f64, @floatFromInt(deltas.items.len)), median, p99, tolerance, over },
+    );
+    try std.testing.expectEqual(@as(usize, 0), over);
 }

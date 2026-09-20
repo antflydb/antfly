@@ -391,19 +391,144 @@ const fastino_gliner25_base_v1_long_document_lengths = LengthContract{
     .padded_sequence_tokens = .{ .min = 103, .max = 5708 },
 };
 
+// fastino/gliner2.5-base-v1, same HuggingFace revision, converted via
+// `antfly-inference-gliner25-convert --precision fp16_encoder` (encoder
+// matrices narrowed to F16; every bias, normalization, relative-position
+// table, and the whole extraction head stay FP32 -- see
+// gliner_boundary_artifact.zig's `role()`). Reviewed 2026-09-19 for the
+// native and Metal backends, single-window only. Evidence:
+//
+//  - Identity: `antfly-inference-gliner25-convert` run twice into independent
+//    output directories produced byte-identical `model.gguf` files
+//    (independently reproduced with `shasum -a 256`, not just the tool's own
+//    receipt); the four sidecars are copied verbatim from the pinned fp32
+//    checkpoint and carry the identical digests as `fastino_gliner25_base_v1`
+//    above (`gliner_boundary_bundle.validate` enforces this on every load).
+//    The bundle's own receipt independently records its exact fp32
+//    `model.safetensors` source digest.
+//  - Correctness: `pipelines/gliner_boundary_pipeline.zig`'s "... converted
+//    fp16 encoder base checkpoint all inference tasks native/metal" open the
+//    converted bundle through the SAME `session_factory.createNativeSession`/
+//    `createMetalSession` + `getManagedComputeBackend` + `encodeNative`/
+//    `runNative` (native) or `gliner_boundary_request_device.run` (Metal)
+//    path production requests use (not a raw-safetensors harness, and not
+//    `gliner25-bundle-check`'s informal diagnostic), and assert all ten
+//    canonical fixtures with the same `expectSample` comparator the fp32
+//    pinned tests use.
+//  - Reviewed tolerance decision: an independent `gliner25-bundle-check`
+//    sweep of every one of the 62 comparable confidence values across all
+//    ten canonical fixtures, both backends (not just the values `expectSample`
+//    happens to assert), found 61/62 within the fp32 rows' 5e-4 bound; the
+//    62nd (`entity_attributes`, idx 1) is 5.909e-4 (Metal) / 5.911e-4
+//    (native) -- deterministically the SAME fixture, value, and magnitude to
+//    six decimal places on both backends despite independent native/Metal
+//    matmul kernels, which is the signature of fp16 weight-rounding noise
+//    propagated through the encoder, not a backend-specific compute defect
+//    (confirmed by code audit: both backends' F16 matmul upcasts each weight
+//    element to f32 before multiply-accumulate --
+//    zig/lib/linalg/src/mod.zig's `sgemmTransBF16Weights*` and
+//    `metal_kernels.m`'s `termite_apply_linear_f16_multi_row_reduce` --  and
+//    every boundary activation/attention/softmax/layernorm op runs through a
+//    strictly-FP32 pipeline on both backends regardless of weight precision).
+//    Next-largest deltas are 3.1e-4, 2.3e-4, 2.2e-4, comfortably inside
+//    tolerance; mean 5.7e-5, median 2.2e-5 across all 62 values. Every one of
+//    the 62 values' associated decision -- entity/relation set, label, and
+//    span -- is byte-identical to the fp32 reference on every fixture, both
+//    backends: only the confidence float itself ever differs. This is the
+//    reviewed basis for `pipelines/gliner_boundary_pipeline.zig`'s
+//    `fp16_encoder_confidence_tolerance = 7.5e-4` (measured max plus
+//    headroom), which is the qualified bound for this row's evidence, not a
+//    tolerance bump made for its own sake.
+//  - Geometry: re-running `../../extractors/gliner_boundary_qualification.zig`'s
+//    geometry-measuring test with `ANTFLY_GLINER25_BASE_MODEL_DIR` pointed at
+//    the converted fp16 bundle directory instead of the pinned fp32 one
+//    reproduces `fastino_gliner25_base_v1_lengths` byte-for-byte (the test
+//    reads only the tokenizer and JSON config, both byte-identical to the
+//    fp32 pins), so no new geometry measurement was needed for this row.
+//
+// See zig/pkg/inference/models/gliner2/GLINER25.md's fp16-encoder
+// qualification sections for the full record.
+const fastino_gliner25_base_v1_fp16_encoder = bundle.Identity{
+    .backbone = .base,
+    .precision = .fp16_encoder,
+    .weight = .{ .size_bytes = 407861568, .sha256 = "1dce97cb1727e3b4e4c8242e88b46ad5f8f31801c2c9d24919393a8816a92d11".* },
+    .sidecars = .{
+        .{ .size_bytes = 3150, .sha256 = "0eb92d00584d613aab32b2178f84a85176b62c87ae3689ce9084e83f6eba64d1".* },
+        .{ .size_bytes = 857, .sha256 = "d36a845b9f25dcaf1ec45a1c4bdf65ea4ac20596537e14530ec9f660a63aeca4".* },
+        .{ .size_bytes = 8341713, .sha256 = "cbc8ae6037812709c9c26f2a160f8dc48b0440bcb79c8141804259ae2d6adac3".* },
+        .{ .size_bytes = 645, .sha256 = "0bf3ea0873234bd9bfdd3853c440395009ac6365a925b91654daed5396d655e1".* },
+    },
+};
+
+// Long-document windowed execution for fastino_gliner25_base_v1_fp16_encoder,
+// reviewed 2026-09-19. examples/dogfood requests windowing unconditionally
+// (index_config.go's knowledgeGraphIndexJSON), and essentially every real
+// section its corpus produces needs it (section 3/9's LengthContract),
+// so a single-window-only fp16 row cannot serve real dogfood traffic.
+// Evidence, following exactly the pattern the fp32 long-document row above
+// used:
+//
+//  - Geometry: re-running the long-document geometry-measuring test in
+//    ../../extractors/gliner_boundary_qualification.zig with
+//    ANTFLY_GLINER25_BASE_MODEL_DIR pointed at the converted fp16 bundle
+//    directory reproduces fastino_gliner25_base_v1_long_document_lengths
+//    byte-for-byte at both the 1024- and 4096-word sweeps (the test reads
+//    only the tokenizer/JSON config and runs the planner, never model
+//    weights, so this is a valid substitution). The row below reuses that
+//    fp32 LengthContract and feature set unchanged.
+//  - Correctness/shape: the same long-executor canonical-shape tests the
+//    fp32 row's evidence used, parametrized over ANTFLY_GLINER25_BASE_FP16_MODEL_DIR
+//    instead of ANTFLY_GLINER25_BASE_MODEL_DIR (server/gliner_boundary_service_test.zig's
+//    resolveModelDirectoryFromEnv) rather than copy-pasted: the 37KB VOPR.md
+//    "Completion-Claim Audit" multi-window document through both the HTTP
+//    handler and the in-process provider entry (native and Metal), the
+//    ~99KB PDF.md corpus-maximum section through both entries (native, the
+//    same backend the fp32 row's corpus-maximum evidence used), and the
+//    corpus-minimum documents (20-byte SCHEMA.md section, 1-byte document)
+//    through the provider entry on both backends -- all pass with the
+//    canonical schema_version 2 envelope, zero head/tail keys, and (for the
+//    multi-window/corpus-maximum documents) window_count confirming the
+//    merge path actually ran.
+//  - fp32-vs-fp16 parity through the long executor (not required of the
+//    fp32 row itself, but specific evidence for qualifying a second
+//    precision against it): "gliner boundary long executor fp32 vs fp16
+//    encoder parity on real long documents" in
+//    server/gliner_boundary_service_test.zig runs the SAME VOPR.md,
+//    PDF.md-max, and corpus-minimum documents through both bundles on both
+//    backends and matches every entity/relation decision (label, text,
+//    span) between precisions order-independently by identity (a near-tied
+//    pair can legitimately trade places in the final array without being a
+//    decision difference), then requires every matched confidence delta to
+//    fall within the reviewed fp16_encoder_long_document_confidence_tolerance
+//    = 2.5e-3 (pipelines/gliner_boundary_pipeline.zig) -- deliberately wider
+//    than the single-window fp16_encoder_confidence_tolerance, because the
+//    long executor's cross-window duplicate-mention tie-break can surface a
+//    genuinely larger, but still bounded and deterministic, disagreement
+//    between two different windows' independent estimates for the same
+//    span. See that constant's doc comment and GLINER25.md's fp16-encoder
+//    long-document qualification section for the measured delta
+//    distribution and root cause.
+//
+// See zig/pkg/inference/models/gliner2/GLINER25.md's fp16-encoder
+// qualification sections for the full record.
+
 const production_entries: []const Entry = &.{
     .{ .identity = fastino_gliner25_base_v1, .backend = .native, .features = fastino_gliner25_base_v1_features, .lengths = fastino_gliner25_base_v1_lengths },
     .{ .identity = fastino_gliner25_base_v1, .backend = .metal, .features = fastino_gliner25_base_v1_features, .lengths = fastino_gliner25_base_v1_lengths },
     .{ .identity = fastino_gliner25_base_v1, .backend = .native, .features = fastino_gliner25_base_v1_long_document_features, .lengths = fastino_gliner25_base_v1_long_document_lengths },
     .{ .identity = fastino_gliner25_base_v1, .backend = .metal, .features = fastino_gliner25_base_v1_long_document_features, .lengths = fastino_gliner25_base_v1_long_document_lengths },
+    .{ .identity = fastino_gliner25_base_v1_fp16_encoder, .backend = .native, .features = fastino_gliner25_base_v1_features, .lengths = fastino_gliner25_base_v1_lengths },
+    .{ .identity = fastino_gliner25_base_v1_fp16_encoder, .backend = .metal, .features = fastino_gliner25_base_v1_features, .lengths = fastino_gliner25_base_v1_lengths },
+    .{ .identity = fastino_gliner25_base_v1_fp16_encoder, .backend = .native, .features = fastino_gliner25_base_v1_long_document_features, .lengths = fastino_gliner25_base_v1_long_document_lengths },
+    .{ .identity = fastino_gliner25_base_v1_fp16_encoder, .backend = .metal, .features = fastino_gliner25_base_v1_long_document_features, .lengths = fastino_gliner25_base_v1_long_document_lengths },
 };
 
 comptime {
     // Each entry's five digests are hex-validated one character at a time
     // (validDigest); the default 1000-branch comptime quota covers roughly
-    // three entries' worth of that work at 64 hex characters each. Four
-    // reviewed rows (single-window + long-document, native + Metal) need
-    // more room than the default.
+    // three entries' worth of that work at 64 hex characters each. Eight
+    // reviewed rows (fp32 and fp16_encoder, each single-window +
+    // long-document, each native + Metal) need more room than the default.
     @setEvalBranchQuota(1 << 14);
     if (!validEntries(production_entries)) @compileError("invalid GLiNER2.5 runtime qualification policy");
 }

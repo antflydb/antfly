@@ -180,3 +180,33 @@ extraction -- see GLINER25.md's long-document section for the reviewed
 document-size bound and feature coverage. A request outside the reviewed
 bound, or for a task combination not yet measured with windowing, still fails
 closed instead of silently truncating or misbehaving.
+
+### Selecting a reduced-precision GLiNER2.5 checkpoint
+
+`antfly inference pull fastino/gliner2.5-base-v1` always produces the
+published fp32 checkpoint (there is no upstream fp16 artifact to pull) and
+that remains the default: it is the only precision qualified for both
+single-window and long-document requests. A reviewed `fp16_encoder`
+conversion (encoder matrices narrowed to F16; every bias, normalization
+parameter, and the extraction head stay FP32) is qualified for
+**single-window requests only** -- see GLINER25.md's fp16-encoder
+qualification section for the root-cause analysis, tolerance evidence, and
+why long-document is not yet qualified for it. To produce and select it:
+
+```sh
+antfly-inference-gliner25-convert \
+  --model-dir ~/.antfly/inference/models/fastino/gliner2.5-base-v1 \
+  --output-dir ~/.antfly/inference/models/fastino/gliner2.5-base-v1-fp16 \
+  --precision fp16_encoder
+```
+
+Conversion writes its own `model_manifest.json` as part of the same atomic
+publish (gated on the same reviewed-identity check `pull` uses), so the
+resulting directory is immediately selectable as
+`fastino/gliner2.5-base-v1-fp16` wherever a model name is accepted -- no
+separate `pull` or manifest-authoring step. A request against it outside
+the single-window bound (or for `long_document`) fails closed with
+`error.UnsupportedGlinerBoundaryRuntime`, the same fail-closed behavior as
+any other unreviewed request shape. Converting to any other precision
+(`q8_0`, `q4_k`, `q4_0`) produces a normal, byte-verified bundle with an
+empty `tasks` list until a future reviewer qualifies it the same way.

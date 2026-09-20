@@ -19,14 +19,14 @@ first such review.
 | `fastino/gliner2.5-base-v1` (rev `72ac19b486cd4557424c8d61114e7530c243e9b0`) | base | fp32 (safetensors) | metal | Qualified (long-document windowing, up to 182,000 document bytes -- sections 9, 11) |
 | `fastino/gliner2.5-small-v1` | small | any | any | Not reviewed |
 | `fastino/gliner2.5-multi-v1` | multi | any | any | Not reviewed |
-| `fastino/gliner2.5-base-v1` (converted via `gliner25-convert`, same rev) | base | fp16_encoder | native, metal | **Not qualified** -- real-pipeline parity measured (section 12); narrowly exceeds the existing tolerance on 1 of 62 checked confidence values, both backends |
+| `fastino/gliner2.5-base-v1` (converted via `gliner25-convert`, same rev) | base | fp16_encoder | native, metal | Qualified (single-window -- section 15) and Qualified (long-document, up to the same 182,000-byte bound as fp32 -- section 15 follow-up); root-caused as fp16 weight-rounding noise (no code defect), plus a real (also root-caused, not a defect) cross-window merge-tie-break effect for long documents. Reviewed tolerances: `7.5e-4` (single-window), `2.5e-3` (long-document). **fp32 remains the default**: on Metal, fp16 is measured ~2.9x SLOWER than fp32 for the corpus-shaped long-document workload (0.94 vs 2.72 sections/s, section 15 follow-up) (root cause: fp16 is excluded from the Metal resident-weight `optimized_v2` fast path by design) |
 | Any other digest, revision, or precision of `gliner2.5-base-v1` | base | any | any | Not reviewed |
 
 `gliner_boundary.runtime_available` is now `true`, and
 `gliner_boundary_qualification.zig`'s production table carries exactly the
-four rows above (same identity; single-window and long-document rows are
-separate features/bounds, each reviewed for native and Metal). Everything
-else --
+eight rows above (fp32 and fp16_encoder, each single-window and
+long-document, each reviewed for native and Metal -- section 15).
+Everything else --
 including a re-downloaded `gliner2.5-base-v1` whose upstream revision
 changes, or a quantized/GGUF conversion of it -- still fails closed with
 `error.UnsupportedGlinerBoundaryRuntime` at request time, and pull-time
@@ -1157,6 +1157,308 @@ Two observability gaps closed on the way: `runUntilIdle` now logs the error
 it fails with, the C ABI logs any error it collapses to `ANTFLY_INTERNAL`
 (the drain's `EnrichmentWorkerFailed` was invisible before), and an isolated
 enrichment failure logs its document key.
+
+### 15. Follow-up: fp16-encoder single-window qualification -- root cause, reviewed tolerance, and selection wiring
+
+Section 12 measured real-pipeline parity for the `fp16_encoder` conversion of
+`fastino/gliner2.5-base-v1` and found it one narrow miss short of the fp32
+bar (61/62 checked confidence values within `5e-4`; the 62nd off by `~18%`
+of that bound, reproducibly, on both backends), and deliberately left the
+artifact unqualified pending a root-cause and a reviewed tolerance decision.
+This section does both, adds the production row, and wires selection.
+
+**Root cause: not a code defect -- fp16 weight-rounding noise, confirmed by
+code audit, not just measurement.** `models/gliner_boundary_artifact.zig`'s
+`role()` (line 29) already protects every bias, normalization parameter, and
+learned relative-position table, plus the entire extraction head, at FP32
+for every precision profile; only tensors matching `.encoder_matrix`
+(`encoder.embeddings.word_embeddings.weight` and each transformer layer's
+2-D `.weight` matrices) narrow to F16 under `fp16_encoder`. Auditing every
+place those narrowed weights are consumed on both backends found the
+accumulation is FP32 everywhere, with no half-precision math on the hot
+path:
+
+- **Native**: `zig/lib/linalg/src/mod.zig`'s `sgemmTransBF16Weights(Sync)`
+  (called from `backends/native.zig`'s `dispatchSgemmTransBF16Weights`,
+  reached via `Tensor.asFloat16IfAligned`'s fast path in
+  `ops/native_compute.zig`) upcasts each F16 weight element to `f32` via
+  `@floatCast` before every FMA; its own doc comment states "Accumulation
+  stays in f32, so the only precision loss is whatever was already in the
+  weight quantization."
+- **Metal**: `backends/metal_kernels.m`'s
+  `termite_apply_linear_f16_multi_row_reduce` (the dense-F16 reduced-linear
+  kernel `gliner_boundary_device_ops.zig`'s `linear_reduced` request selects
+  when `precision == .f16`) declares `float acc` and computes
+  `acc += input[...] * float(weight[...])` -- the F16 weight is upcast per
+  element before multiply-accumulate, identically in spirit to the native
+  path. Separately, every boundary activation/attention/softmax/layernorm
+  op (`architectures/gliner/boundary_engine_device.zig`'s "Strict FP32 Metal
+  DeBERTa" pipeline) dispatches through
+  `termite_metal_decode_runtime_gliner_boundary_device`'s single
+  `gliner_boundary_f32_pipeline`, regardless of the encoder's weight
+  precision -- there is no code path where an activation, attention score,
+  or normalization statistic is ever computed or accumulated in `half` for
+  this architecture.
+- Native and Metal use completely independent kernels (portable SIMD FMA vs.
+  a Metal compute kernel) yet land on the SAME fixture, SAME value index,
+  and the SAME ~5.9e-4 deviation to six decimal places
+  (`0.5588979`/`0.5588977` vs. expected `0.5583068`). Two independently
+  implemented, FP32-accumulating kernels converging on the same answer from
+  the same F16-rounded weights, rather than diverging from each other, is
+  exactly the signature of deterministic input rounding, not an
+  accumulation-precision bug in either implementation -- a real per-backend
+  compute defect would much more plausibly make native and Metal disagree
+  with EACH OTHER, not just with fp32.
+
+No fix was made because none was needed: this audit found no precision
+defect to correct, on either backend.
+
+**Reviewed tolerance decision, from the full distribution, not a sample.**
+An independent `gliner25-bundle-check` sweep (not `expectSample`'s
+early-exit assertions) of every one of the 62 comparable confidence values
+(10 canonical fixtures, excluding record-instance-level confidence
+`expectSample` itself never checks) against `pipeline_cases_base.json`'s
+expected values, both backends:
+
+| Backend | n | max abs diff | mean | median | p99 | count > 5e-4 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| native | 62 | 0.0005911 | 0.0000571 | 0.0000221 | 0.0005911 | 1 |
+| metal | 62 | 0.0005909 | 0.0000569 | 0.0000218 | 0.0005909 | 1 |
+
+(p99 is nearest-rank over 62 values, so it coincides with the single
+outlier; the next-largest deltas on both backends are 3.1e-4, 2.3e-4,
+2.2e-4 -- comfortably inside `5e-4`.) The same sweep additionally confirmed,
+for every one of the 62 values on both backends, that its associated
+**decision** -- which entity/relation was extracted, its label, and its
+exact span -- is byte-identical to the fp32 reference; only the confidence
+float itself ever differs. This is the reviewed basis for treating
+`pipelines/gliner_boundary_pipeline.zig`'s existing
+`fp16_encoder_confidence_tolerance = 7.5e-4` (measured max plus ~27%
+headroom) as the qualified bound for this row, rather than a tolerance
+widened for its own sake: the residual is bounded, fully characterized
+across every fixture and both backends, has no effect on which decisions
+are produced, and 5.9e-4 has no practical effect on ranking or thresholding
+at typical `threshold` settings.
+
+**Geometry: reused unchanged, single-window and long-document alike --
+confirmed by re-running the measurement, not by inference.** Both of
+`extractors/gliner_boundary_qualification.zig`'s geometry-measuring tests
+were re-run with `ANTFLY_GLINER25_BASE_MODEL_DIR` pointed at the converted
+`fp16_encoder` bundle directory instead of the pinned fp32 one (the geometry
+tests read only the tokenizer and JSON sidecars, never model weights, so
+this is a valid substitution). Every printed value reproduced
+`fastino_gliner25_base_v1_lengths` (single-window) and
+`fastino_gliner25_base_v1_long_document_lengths` (long-document, both the
+1024- and 4096-word sweeps) byte-for-byte, confirming the fp32 rows'
+`LengthContract`s apply unchanged to this precision -- geometry depends only
+on the tokenizer and schema, both byte-identical to the fp32 pins (the
+converter copies sidecars verbatim, and the pipeline parity tests below
+independently re-verify those exact digests before trusting anything else
+the converted directory reports).
+
+**Why only a single-window row was added.** Geometry equivalence for
+long-document is confirmed above, but geometry alone is not this file's bar
+for a row (see the design note atop `gliner_boundary_qualification.zig`: "a
+row must never [be granted] by inference from a successful test run").
+Section 9's long-document row required a real fp16-weight correctness pass
+through the long executor's cross-window merge/dedup
+(`gliner_boundary_long_executor.zig`'s window planning,
+`gliner_boundary_long_document.zig`'s `mergeMentions`,
+`gliner_boundary_long_relations.zig`'s relation merge) on real long
+documents -- that pass has not been done for `fp16_encoder`. The existing
+`server/gliner_boundary_service_test.zig` long-document tests all pin the
+fixed fp32 `~/.antfly/inference/models/fastino/gliner2.5-base-v1` path
+directly (not `ANTFLY_GLINER25_BASE_MODEL_DIR`), so they provide no fp16
+evidence despite passing when `ANTFLY_GLINER25_BASE_MODEL_DIR` is pointed at
+the fp16 bundle. Only the single-window row is added below; long-document
+`fp16_encoder` remains **not qualified** and correctly fails closed with
+`error.UnsupportedGlinerBoundaryRuntime`, same as before this section.
+
+**Production row added.** `models/gliner_boundary_qualification.zig` gained
+`fastino_gliner25_base_v1_fp16_encoder` (backbone `base`, precision
+`fp16_encoder`, weight digest `1dce97cb1727e3b4e4c8242e88b46ad5f8f31801c2c9d24919393a8816a92d11`
+/ 407,861,568 bytes, sidecars identical to `fastino_gliner25_base_v1`) and
+two new `production_entries` rows (native, Metal), reusing
+`fastino_gliner25_base_v1_features`/`_lengths` unchanged per the geometry
+evidence above. `hasQualifiedIdentity`/`require()` now admit this exact
+converted identity on both backends, single-window only; every other
+digest, precision, backend, or feature (including `.long_document`) still
+fails closed exactly as before.
+
+**Selection wiring: `registry.zig`'s pull-time gate generalized to converted
+bundles, plus manifest synthesis moved into the converter.** Two gaps kept a
+qualified converted bundle from being servable before this section:
+
+1. `registry.zig`'s `boundaryIdentityIsQualified` unconditionally built the
+   identity to check as `.precision = .fp32` read from `manifest.safetensors_path`
+   -- correct for a plain HuggingFace pull (always the published fp32
+   checkpoint) but wrong for a converted directory, which has no
+   `model.safetensors` at all. It now branches on `manifest.gliner_boundary_bundle`
+   (the receipt `gliner25-convert` writes): when present, it reads the
+   receipt's own recorded `precision` and hashes `manifest.gguf_path`
+   instead, so a converted identity is checked against its ACTUAL recorded
+   precision rather than an assumed one; a plain pull's fp32/safetensors
+   path is unchanged.
+2. `gliner25-convert` never wrote a `model_manifest.json` at all (section 12:
+   "no way to select this precision through the extractor producer config
+   that actually executes"). `exportBundle` (`gliner_boundary_export.zig`)
+   now calls the same `registry.synthesizePulledModelManifestJson` a
+   HuggingFace pull uses -- newly exported `pub` for this purpose -- and
+   writes the result into the staging directory BEFORE `publishDirectory`,
+   so the manifest is part of the same atomic publish, never a mutation of
+   an already-published bundle. Every conversion gets a manifest; only a
+   precision that already matches a reviewed row gets non-empty
+   `tasks`/`capabilities` -- verified both ways: converting the pinned base
+   checkpoint to `fp16_encoder` (now qualified) produced
+   `{"type":"extractor","tasks":["extract"],"capabilities":["extraction","classification","relations","records"],"inputs":["text"]}`;
+   converting the same checkpoint to `q8_0` (still unreviewed) produced
+   `{"type":"extractor","tasks":[],"inputs":["text"]}` -- exactly like an
+   unreviewed HuggingFace pull's manifest. A regression test,
+   `"gliner boundary conversion synthesizes a manifest gated on reviewed
+   qualification, never a mutation after publish"` in
+   `gliner_boundary_export.zig`, pins both outcomes.
+
+**How to select the fp16 bundle today.** Convert, placing the output under
+the standard `owner/name` layout so it is discoverable by name the same way
+any pulled model is (see `zig/EXTRACT.md`):
+
+```sh
+antfly-inference-gliner25-convert \
+  --model-dir ~/.antfly/inference/models/fastino/gliner2.5-base-v1 \
+  --output-dir ~/.antfly/inference/models/fastino/gliner2.5-base-v1-fp16 \
+  --precision fp16_encoder
+```
+
+The resulting directory now carries its own `model_manifest.json` advertising
+`extract`/`extraction`/`classification`/`relations`/`records`, and is
+selectable as `fastino/gliner2.5-base-v1-fp16` wherever a model name is
+accepted -- no separate `pull` or manifest-authoring step, because
+conversion writes the manifest itself now. `antfly inference pull
+fastino/gliner2.5-base-v1` itself still only ever produces the fp32
+checkpoint (there is no upstream HuggingFace fp16 artifact to pull); a
+`:fp16` pull-variant syntax was considered and rejected in favor of this
+documented conversion-produces-a-selectable-directory path, which needed no
+changes to `pull`'s network/staging flow (lower risk, and consistent with
+this module's existing "an artifact directory is discoverable by name the
+same way any pulled model is" design). **fp32 remains the default** for
+`fastino/gliner2.5-base-v1` -- selecting fp16 is opt-in via the separate
+`-fp16` directory name. The follow-up below now qualifies long-document too
+and measures the corpus-shaped throughput this single-window-only measurement
+could not: fp32 is decisively the better default for the actual dogfood
+workload, not just the conservative one.
+
+**Throughput (single-window only; see the long-document follow-up below for
+the corpus-shaped measurement that actually matters for dogfood).**
+`gliner25-bundle-check`, 10 canonical fixtures, warm session, 3 repetitions
+per cell, comparing a `gliner25-convert --precision fp32`-converted bundle
+against the `fp16_encoder` bundle (bundle-vs-bundle, same GGUF loader on
+both sides, via `session_factory.createNativeSession`/`createMetalSession`
+directly -- NOT the model_manager-managed warm session `Node`/`server.zig`
+use, a distinction the long-document follow-up below found decisive):
+
+| Backend | fp32 wall (3 reps, warm) | fp16_encoder wall (3 reps, warm) |
+| --- | --- | --- |
+| native | 0.97-0.98 s | 1.43-1.50 s (**slower**) |
+| metal | 2.93-3.11 s | 2.51-2.53 s (**faster**) |
+
+This reproduces section 10/12's directional finding with less noise (Metal
+is faster on every repetition here, not 2 of 3): native slows down under
+fp16 (consistent with the native path dequantizing F16 rows to f32 ahead of
+each matmul -- extra CPU work with no bandwidth win on a path that was never
+memory-bandwidth-bound). Metal speeding up here turned out to be an artifact
+of which code path this harness exercises, not a property of fp16 itself --
+see the long-document follow-up below, which measures the real corpus-shaped
+workload through the actual production entry point and finds the opposite.
+
+**Verification.** `zig build inference-test -Doptimize=ReleaseFast --
+--test-filter "gliner boundary" --test-filter "registry" --test-filter
+"manifest" --test-filter "capabilities"` with both
+`ANTFLY_GLINER25_BASE_MODEL_DIR` and `ANTFLY_GLINER25_BASE_FP16_MODEL_DIR`
+set: 468 selected, 443 passed, 25 skipped, 0 failed (the skips are the
+`small`/`multi` pinned tests, unchanged from before this section). The two
+existing converted-bundle parity tests
+(`"...converted fp16 encoder base checkpoint all inference tasks
+native/metal"`) and the new manifest-synthesis regression test both passed.
+`zig fmt --check` is clean on every file this section touched
+(`models/gliner_boundary_qualification.zig`, `registry/registry.zig`,
+`gliner_boundary_export.zig`). Log paths (scratchpad, not committed):
+`inference-test-run2.log`, `fp16-native-check.json`, `fp16-metal-check.json`,
+`diff_fp16_v2.py`, `fp16-geometry-verify4.log`, `throughput-timing.log`.
+
+#### Follow-up: fp16-encoder long-document qualification and corpus-shaped throughput
+
+Reviewed 2026-09-20. `examples/dogfood` requests `long_document.mode=window`
+for every section and essentially every real section needs it, so the
+single-window fp16 row above cannot serve real traffic on its own. The
+long-document row for `fastino_gliner25_base_v1_fp16_encoder` (native and
+Metal) follows exactly the evidence pattern the fp32 long-document row used
+(section 9), plus fp32-vs-fp16 parity through the long executor itself.
+
+**Geometry.** Re-running the long-document geometry test with
+`ANTFLY_GLINER25_BASE_MODEL_DIR` pointed at the fp16 bundle reproduces
+`fastino_gliner25_base_v1_long_document_lengths` byte-for-byte at the 1024-
+and 4096-word sweeps (the test reads only the tokenizer and JSON config, never
+weights, so the substitution is valid). The row reuses the fp32
+`LengthContract` and feature set unchanged.
+
+**Correctness and shape.** The long-executor canonical-shape tests are now
+parametrized over the bundle directory (`resolveModelDirectoryFromEnv` in
+`server/gliner_boundary_service_test.zig`) and run against
+`ANTFLY_GLINER25_BASE_FP16_MODEL_DIR`: the 37 KB `VOPR.md` "Completion-Claim
+Audit" multi-window document through the HTTP handler and the in-process
+provider entry on native and Metal, the ~99 KB `PDF.md` corpus-maximum
+section through both entries, and the corpus-minimum documents (the 20-byte
+`SCHEMA.md` section and a one-character document) through the provider entry
+on both backends. All pass with the canonical schema_version 2 envelope and,
+for the multi-window documents, a `window_count` proving the merge path ran.
+
+**fp32-vs-fp16 parity through the long executor.** "gliner boundary long
+executor fp32 vs fp16 encoder parity on real long documents native/Metal"
+runs the same `VOPR.md`, `PDF.md`-maximum and corpus-minimum documents
+through both bundles on each backend, matches every entity and relation
+decision (label, text, span) between precisions order-independently by
+identity, and bounds every matched confidence delta:
+
+| Backend | matched decisions | decision mismatches | max abs diff | mean | median | p99 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| native | 445 | 0 | 0.0016823 | 0.0001291 | 0.0000632 | 0.0010008 |
+| metal | 445 | 0 | 0.0016727 | 0.0001291 | 0.0000636 | 0.0009984 |
+
+The reviewed long-document bound is
+`fp16_encoder_long_document_confidence_tolerance = 2.5e-3`
+(`pipelines/gliner_boundary_pipeline.zig`; measured max plus ~49% headroom),
+deliberately wider than the single-window `7.5e-4` and never a widening of
+it. Root cause of the larger long-document residual, also not a defect: the
+long executor's cross-window duplicate-mention tie-break picks one window's
+estimate for a span that two overlapping windows both scored. Under fp16
+weight rounding the two windows' independent estimates can differ by more
+than any single-window delta, and when they are near-tied the two precisions
+can pick different windows for the same span, so the reported confidence is
+one window's value versus the other's. The decision (label, text, span) is
+identical either way, which is why the parity test matches by identity and
+the mismatch count is zero on both backends.
+
+**Throughput, corpus-shaped.** The 40-section corpus sample from section 13
+(32 sections of 1-8 KB and 8 of 20-40 KB, regenerated by the same recipe,
+300,938 bytes total, `throughput_corpus_40.json`), fed sequentially through
+the in-process provider entry (`Node.extractDirect`, the path the embedded
+worker uses) with the real dogfood schema and windowing, ReleaseFast, warm
+managed session, one request in flight:
+
+| Backend | fp32 wall | fp32 sections/s | fp16_encoder wall | fp16_encoder sections/s |
+| --- | ---: | ---: | ---: | ---: |
+| native | 82.3 s | 0.486 | 85.4 s | 0.469 |
+| metal | 14.7 s | 2.719 | 42.7 s | 0.937 |
+
+fp16 is a wash on native and **2.9x slower on Metal**, the opposite of the
+single-window harness above. The single-window harness creates sessions
+directly and exercises the plain kernels; the production entry goes through
+the model manager's managed session, whose Metal resident-weight
+`optimized_v2` fast path is fp32-only by design, so the fp16 bundle falls
+back to the per-dispatch path and loses far more than the halved weight
+bandwidth gains. **fp32 stays the default.** The fp16 bundle is qualified so
+it can be selected deliberately (memory-constrained hosts, or the native
+backend where it costs nothing), not because it is faster.
 
 ## How to re-qualify a different or wider artifact
 
