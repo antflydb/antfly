@@ -1421,6 +1421,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "table contract preserves typed artifact-backed graph configuration",
         "created index configs normalize single-source input forms",
         "merged index metadata validates artifact consumer references",
+        "index metadata closes neighbor context graph index references at admission",
         "graph config accepts canonical single-source mappings without a discriminator",
         "created graph index response projects closed nested schemas",
         "index encoders expose graph sources once in normalized config",

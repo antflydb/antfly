@@ -26,6 +26,7 @@ const shard_mod = @import("../shard.zig");
 const transactions_mod = @import("../transactions.zig");
 const reranking_mod = @import("antfly_reranking");
 const doc_identity_mod = @import("doc_identity.zig");
+const enrichment_neighbor_context = @import("enrichment/neighbor_context.zig");
 const graph_edge_types = @import("graph_edge_types.zig");
 const resource_manager_mod = @import("../resource_manager.zig");
 const index_repair_status = @import("../../common/index_repair_status.zig");
@@ -543,6 +544,7 @@ pub const EnrichmentConfig = struct {
     full_text_index: bool = false,
     content_type: []const u8 = "",
     producer_json: []const u8 = "",
+    neighbor_context: ?EnrichmentNeighborContextConfig = null,
     execution: ?EnrichmentExecutionConfig = null,
 
     pub fn clone(alloc: Allocator, cfg: EnrichmentConfig) !EnrichmentConfig {
@@ -561,6 +563,7 @@ pub const EnrichmentConfig = struct {
             .full_text_index = cfg.full_text_index,
             .content_type = if (cfg.content_type.len > 0) try alloc.dupe(u8, cfg.content_type) else "",
             .producer_json = if (cfg.producer_json.len > 0) try alloc.dupe(u8, cfg.producer_json) else "",
+            .neighbor_context = if (cfg.neighbor_context) |context| try EnrichmentNeighborContextConfig.clone(alloc, context) else null,
             .execution = cfg.execution,
         };
     }
@@ -574,6 +577,46 @@ pub const EnrichmentConfig = struct {
         if (self.chunker_json.len > 0) alloc.free(self.chunker_json);
         if (self.content_type.len > 0) alloc.free(self.content_type);
         if (self.producer_json.len > 0) alloc.free(self.producer_json);
+        if (self.neighbor_context) |*context| context.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+/// Bounded same-shard graph adjacency sampled into an asset producer's
+/// rendered input. Only valid on asset enrichments whose producer consumes
+/// rendered text; bounds and the graph index reference are enforced at
+/// admission while a missing runtime state fails open with empty neighbors.
+pub const EnrichmentNeighborContextConfig = struct {
+    graph_index: []const u8 = "",
+    edge_types: []const []const u8 = &.{},
+    direction: enrichment_neighbor_context.Direction = .both,
+    limit: u32 = enrichment_neighbor_context.default_limit,
+
+    pub fn clone(alloc: Allocator, cfg: EnrichmentNeighborContextConfig) !EnrichmentNeighborContextConfig {
+        const graph_index = if (cfg.graph_index.len > 0) try alloc.dupe(u8, cfg.graph_index) else "";
+        errdefer if (graph_index.len > 0) alloc.free(graph_index);
+        const edge_types = try alloc.alloc([]const u8, cfg.edge_types.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (edge_types[0..initialized]) |edge_type| alloc.free(edge_type);
+            alloc.free(edge_types);
+        }
+        for (cfg.edge_types, 0..) |edge_type, i| {
+            edge_types[i] = try alloc.dupe(u8, edge_type);
+            initialized += 1;
+        }
+        return .{
+            .graph_index = graph_index,
+            .edge_types = edge_types,
+            .direction = cfg.direction,
+            .limit = cfg.limit,
+        };
+    }
+
+    pub fn deinit(self: *EnrichmentNeighborContextConfig, alloc: Allocator) void {
+        if (self.graph_index.len > 0) alloc.free(self.graph_index);
+        for (self.edge_types) |edge_type| alloc.free(edge_type);
+        if (self.edge_types.len > 0) alloc.free(self.edge_types);
         self.* = undefined;
     }
 };
@@ -599,6 +642,12 @@ pub fn enrichmentConfigHash(cfg: EnrichmentConfig) u64 {
     hashBool(&hasher, cfg.full_text_index);
     hashLengthPrefixedBytes(&hasher, cfg.content_type);
     hashLengthPrefixedBytes(&hasher, cfg.producer_json);
+    if (cfg.neighbor_context) |context| {
+        hashLengthPrefixedBytes(&hasher, context.graph_index);
+        for (context.edge_types) |edge_type| hashLengthPrefixedBytes(&hasher, edge_type);
+        hashLengthPrefixedBytes(&hasher, @tagName(context.direction));
+        hashU32(&hasher, context.limit);
+    }
     return hasher.final();
 }
 

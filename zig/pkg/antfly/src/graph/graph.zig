@@ -18247,6 +18247,7 @@ pub const GraphIndex = struct {
     /// eventual row selection is empty. Never reopen between query stages.
     pub const GraphMetricReadSession = struct {
         alloc: Allocator,
+        graph_index: *GraphIndex,
         txn: backend_erased.ReadTxn,
         statuses: []GraphMetricStatus,
         prefixes: []?[]const u8,
@@ -18274,6 +18275,26 @@ pub const GraphIndex = struct {
             const read_stats = try score_read.populate(alloc, &self.txn, prefixes, nodes, columns);
             self.reads.keys += read_stats.keys;
             self.reads.batches += read_stats.batches;
+        }
+
+        /// Query-seeded personalized PageRank column. Computed fresh from the
+        /// current edge snapshot (never from a published generation), so this
+        /// read deliberately ignores the session's pinned publication
+        /// prefixes; the metric must still be one of the session's declared
+        /// dependencies so status reporting stays coherent.
+        pub fn readPersonalizedColumn(
+            self: *@This(),
+            alloc: Allocator,
+            metric_name: []const u8,
+            seed_nodes: []const []const u8,
+            damping: ?f64,
+            nodes: []const []const u8,
+            column: []?f64,
+        ) !void {
+            for (self.statuses) |status| {
+                if (std.mem.eql(u8, status.name, metric_name)) break;
+            } else return error.InvalidQueryRequest;
+            _ = try self.graph_index.personalizedPageRankColumnInto(alloc, metric_name, seed_nodes, damping, nodes, column);
         }
     };
 
@@ -18310,7 +18331,80 @@ pub const GraphIndex = struct {
                 prefix.* = try graphMetricKeyWithAllocator(alloc, &.{ name, "score", generation });
             }
         }
-        return .{ .alloc = alloc, .txn = txn, .statuses = statuses, .prefixes = prefixes };
+        return .{ .alloc = alloc, .graph_index = self, .txn = txn, .statuses = statuses, .prefixes = prefixes };
+    }
+
+    /// How many personalized seed keys resolved against the metric topology.
+    /// Unresolved seeds are skipped by design: retrieval queries seed with
+    /// best-effort entity resolutions and must not fail when one misses.
+    pub const PersonalizedSeedResolution = struct {
+        requested: usize,
+        matched: usize,
+
+        pub fn skipped(self: @This()) usize {
+            return self.requested - self.matched;
+        }
+    };
+
+    /// Query-seeded personalized PageRank over the current edge snapshot:
+    /// teleport mass restricted to the seed nodes (uniform per seed), with an
+    /// optional per-query damping override. This is a fresh read-side
+    /// computation — published generations remain global-only. When no seed
+    /// resolves the ranking degenerates to global PageRank, mirroring the
+    /// kernel's empty-seed contract. Requested nodes absent from the topology
+    /// score null, matching published column reads.
+    pub fn personalizedPageRankColumnInto(
+        self: *GraphIndex,
+        alloc: Allocator,
+        metric_name: []const u8,
+        seed_nodes: []const []const u8,
+        damping: ?f64,
+        nodes: []const []const u8,
+        column: []?f64,
+    ) !PersonalizedSeedResolution {
+        if (column.len != nodes.len) return error.InvalidQueryRequest;
+        const cfg = self.metricConfig(metric_name) orelse return error.MetricNotReady;
+        if (cfg.kind != .pagerank) return error.UnsupportedGraphMetric;
+        if (damping) |value| {
+            if (!std.math.isFinite(value) or value <= 0 or value >= 1) return error.InvalidQueryRequest;
+        }
+
+        var graph_nodes = std.ArrayListUnmanaged(PageRankNode).empty;
+        defer {
+            self.freePageRankNodes(graph_nodes.items);
+            graph_nodes.deinit(self.alloc);
+        }
+        var graph_edges = std.ArrayListUnmanaged(PageRankEdge).empty;
+        defer graph_edges.deinit(self.alloc);
+        try self.collectPageRankGraph(cfg.edge_filter, &graph_nodes, &graph_edges);
+
+        var ordinals = std.StringHashMapUnmanaged(u32).empty;
+        defer ordinals.deinit(alloc);
+        try ordinals.ensureTotalCapacity(alloc, @intCast(graph_nodes.items.len));
+        for (graph_nodes.items, 0..) |node, i| ordinals.putAssumeCapacity(node.key, @intCast(i));
+
+        const seed_ordinals = try alloc.alloc(u32, seed_nodes.len);
+        defer alloc.free(seed_ordinals);
+        var matched: usize = 0;
+        for (seed_nodes) |seed| {
+            if (ordinals.get(seed)) |ordinal| {
+                seed_ordinals[matched] = ordinal;
+                matched += 1;
+            }
+        }
+
+        var result = try metric_kernels.personalizedPageRankAlloc(alloc, graph_nodes.items.len, graph_edges.items, seed_ordinals[0..matched], .{
+            .damping = damping orelse cfg.damping,
+            .tolerance = cfg.tolerance,
+            .max_iterations = cfg.max_iterations,
+            .max_nodes = @max(graph_nodes.items.len, 1),
+            .max_edges = @max(graph_edges.items.len, 1),
+        });
+        defer result.deinit(alloc);
+        for (nodes, column) |key, *out| {
+            out.* = if (ordinals.get(key)) |ordinal| result.scores[ordinal] else null;
+        }
+        return .{ .requested = seed_nodes.len, .matched = matched };
     }
 
     pub fn graphMetricColumnsSnapshotAlloc(

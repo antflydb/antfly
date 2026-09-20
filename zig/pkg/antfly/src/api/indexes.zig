@@ -458,6 +458,13 @@ fn validateArtifactIndexReferences(
     configs: []const db_mod.types.EnrichmentConfig,
 ) !void {
     if (root != .object) return error.InvalidEnrichmentConfig;
+    // Neighbor context references a graph index by name and must be closed at
+    // admission: the runtime intentionally fails open with empty neighbors, so
+    // an unresolved reference would silently sample nothing forever.
+    for (configs) |cfg| {
+        const context = cfg.neighbor_context orelse continue;
+        if (!graphIndexExists(root.object, context.graph_index)) return error.InvalidEnrichmentConfig;
+    }
     var it = root.object.iterator();
     while (it.next()) |entry| {
         if (std.mem.eql(u8, entry.key_ptr.*, "enrichments")) continue;
@@ -502,6 +509,13 @@ fn validateArtifactIndexReferences(
             }
         }
     }
+}
+
+fn graphIndexExists(indexes: std.json.ObjectMap, name: []const u8) bool {
+    const index = indexes.get(name) orelse return false;
+    if (index != .object) return false;
+    const type_value = index.object.get("type") orelse return false;
+    return type_value == .string and std.mem.eql(u8, type_value.string, "graph");
 }
 
 fn graphArtifactConfigExists(
@@ -722,7 +736,24 @@ fn artifactEnrichmentConfigsEqual(
         a.full_text_index == b.full_text_index and
         std.mem.eql(u8, a.content_type, b.content_type) and
         try enrichment_config_validation.producerJsonValuesEqual(alloc, a.producer_json, b.producer_json) and
+        neighborContextConfigsEqual(a.neighbor_context, b.neighbor_context) and
         std.meta.eql(a.execution, b.execution);
+}
+
+fn neighborContextConfigsEqual(
+    a: ?db_mod.types.EnrichmentNeighborContextConfig,
+    b: ?db_mod.types.EnrichmentNeighborContextConfig,
+) bool {
+    const lhs = a orelse return b == null;
+    const rhs = b orelse return false;
+    if (!std.mem.eql(u8, lhs.graph_index, rhs.graph_index) or
+        lhs.direction != rhs.direction or
+        lhs.limit != rhs.limit or
+        lhs.edge_types.len != rhs.edge_types.len) return false;
+    for (lhs.edge_types, rhs.edge_types) |lhs_type, rhs_type| {
+        if (!std.mem.eql(u8, lhs_type, rhs_type)) return false;
+    }
+    return true;
 }
 
 fn artifactEnrichmentLessThan(_: void, lhs: db_mod.types.EnrichmentConfig, rhs: db_mod.types.EnrichmentConfig) bool {
@@ -7890,6 +7921,43 @@ fn consumerTests() type {
             try validateArtifactEnrichmentsForTableIndexesJson(
                 std.testing.allocator,
                 "{\"enrichments\":[{\"name\":\"chunks\",\"kind\":\"chunk\",\"field\":\"text\",\"source_artifact_name\":\"units\",\"chunk_size\":512},{\"name\":\"units\",\"kind\":\"asset\",\"field\":\"url\"}]}",
+            );
+        }
+
+        test "index metadata closes neighbor context graph index references at admission" {
+            const conceptualizer =
+                \\{"name":"conceptualize_v1","kind":"asset","field":"name","producer_json":"{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\"}}","neighbor_context":{"graph_index":"taxonomy","edge_types":["started_by"],"direction":"out","limit":8}}
+            ;
+            // The referenced graph index exists on the same table: admitted.
+            const valid = try std.fmt.allocPrint(
+                std.testing.allocator,
+                "{{\"taxonomy\":{{\"type\":\"graph\"}},\"enrichments\":[{s}]}}",
+                .{conceptualizer},
+            );
+            defer std.testing.allocator.free(valid);
+            try validateArtifactEnrichmentsForTableIndexesJson(std.testing.allocator, valid);
+            // An unknown graph index is rejected at admission because the
+            // runtime fails open with empty neighbors.
+            const dangling = try std.fmt.allocPrint(
+                std.testing.allocator,
+                "{{\"enrichments\":[{s}]}}",
+                .{conceptualizer},
+            );
+            defer std.testing.allocator.free(dangling);
+            try std.testing.expectError(
+                error.InvalidEnrichmentConfig,
+                validateArtifactEnrichmentsForTableIndexesJson(std.testing.allocator, dangling),
+            );
+            // A same-named index of another kind does not satisfy the reference.
+            const wrong_kind = try std.fmt.allocPrint(
+                std.testing.allocator,
+                "{{\"taxonomy\":{{\"type\":\"full_text\"}},\"enrichments\":[{s}]}}",
+                .{conceptualizer},
+            );
+            defer std.testing.allocator.free(wrong_kind);
+            try std.testing.expectError(
+                error.InvalidEnrichmentConfig,
+                validateArtifactEnrichmentsForTableIndexesJson(std.testing.allocator, wrong_kind),
             );
         }
 

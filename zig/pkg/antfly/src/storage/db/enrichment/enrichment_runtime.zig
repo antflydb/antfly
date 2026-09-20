@@ -31,11 +31,14 @@ const hierarchy_navigation = @import("../../hierarchy_navigation.zig");
 const resource_manager_mod = @import("../../resource_manager.zig");
 const change_journal_mod = @import("../derived/change_journal.zig");
 const graph_asset_state = @import("../graph_asset_state.zig");
+const graph_mod = @import("../../../graph/graph.zig");
 const graph_edge_contender = @import("../graph_edge_contender.zig");
 const graph_state_name = @import("../graph_state_name.zig");
 const replay_source_mod = @import("../derived/replay_source.zig");
 const derived_types = @import("../derived/derived_types.zig");
 const enrichment_types = @import("enrichment_types.zig");
+const enrichment_config_validation = @import("config_validation.zig");
+const enrichment_neighbor_context = @import("neighbor_context.zig");
 const enrichment_artifact_codec = @import("artifact_codec.zig");
 const enrichment_worker = @import("enrichment_worker.zig");
 const enrichment_lease = @import("enrichment_lease.zig");
@@ -10649,7 +10652,7 @@ fn processAsset(
         runtime.alloc.free(text_indexes);
     }
 
-    const source_text = try extractAssetSourceValue(runtime.alloc, runtime.config, raw, request) orelse {
+    var source_text = try extractAssetSourceValue(runtime.alloc, runtime.config, raw, request) orelse {
         const state_key = try assetStateKeyAlloc(runtime.alloc, request.doc_key, artifact_name);
         defer runtime.alloc.free(state_key);
         if (producer_cfg.type == .document_extraction) {
@@ -10683,7 +10686,7 @@ fn processAsset(
         return;
     }
 
-    const source_parts_json = if (producer_cfg.type != .copy and request.source_template.len > 0)
+    var source_parts_json = if (producer_cfg.type != .copy and request.source_template.len > 0)
         try renderSourcePartsJson(runtime.alloc, runtime.config, raw, request)
     else
         null;
@@ -10704,6 +10707,31 @@ fn processAsset(
         try materializeGraphAssetForRuntime(runtime, request, source_text, raw, window);
         recordArtifactBytes(runtime, .asset, source_text.len);
         return;
+    }
+
+    // Neighbor context is producer input: compose it before the skip-state
+    // value below is computed so a changed adjacency re-runs the producer
+    // exactly like a changed source field. Only this shard's local graph
+    // state is sampled; a graph index without state for the document renders
+    // empty neighbors (fail open at runtime — admission closed the reference).
+    // Admission also restricts the option to prompt-consuming producers, and
+    // the guard here keeps a legacy catalog from ever corrupting a reader or
+    // transcriber media locator.
+    if (request.neighbor_context_json.len > 0 and
+        enrichment_config_validation.producerConsumesPromptText(producer_cfg.type))
+    {
+        if (try neighborContextBlockAlloc(runtime, request)) |block| {
+            defer runtime.alloc.free(block);
+            const combined = try std.mem.join(runtime.alloc, "\n", &.{ source_text, block });
+            runtime.alloc.free(@constCast(source_text));
+            source_text = combined;
+            if (source_parts_json) |parts| {
+                if (try appendNeighborContextTextPartAlloc(runtime.alloc, parts, block)) |amended| {
+                    runtime.alloc.free(parts);
+                    source_parts_json = amended;
+                }
+            }
+        }
     }
 
     const state_key = try assetStateKeyAlloc(runtime.alloc, request.doc_key, artifact_name);
@@ -10745,6 +10773,70 @@ fn processAsset(
     key_owned = false;
     state_key_owned = false;
     state_value_owned = false;
+}
+
+/// Sample the document's same-shard adjacency from the graph index named by
+/// the request's neighbor-context configuration and render the deterministic
+/// producer-input block. Cross-shard neighbors are intentionally out of
+/// scope: only the graph state colocated with this enrichment runtime is
+/// consulted. Returns null only when the stored configuration cannot be
+/// parsed, which the catalog already rejects at admission.
+fn neighborContextBlockAlloc(
+    runtime: *EnrichmentRuntime,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+) !?[]u8 {
+    var config = enrichment_neighbor_context.parseConfigJson(runtime.alloc, request.neighbor_context_json) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return null,
+    };
+    defer config.deinit(runtime.alloc);
+
+    var neighbors = std.ArrayListUnmanaged(enrichment_neighbor_context.NeighborEdge).empty;
+    defer neighbors.deinit(runtime.alloc);
+    var edges: []graph_mod.Edge = &.{};
+    defer graph_mod.GraphIndex.freeEdges(runtime.alloc, edges);
+    if (runtime.index_manager.graphIndex(config.graph_index)) |entry| {
+        const direction: graph_mod.EdgeDirection = switch (config.direction) {
+            .out => .out,
+            .in => .in,
+            .both => .both,
+        };
+        edges = entry.index.getEdgesByTypes(runtime.alloc, request.doc_key, config.edge_types, direction) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            // Unreadable local graph state renders empty neighbors rather
+            // than parking the producer behind a sidecar dependency.
+            else => &.{},
+        };
+        try neighbors.ensureTotalCapacity(runtime.alloc, edges.len);
+        for (edges) |edge| {
+            const outgoing = std.mem.eql(u8, edge.source, request.doc_key);
+            neighbors.appendAssumeCapacity(.{
+                .edge_type = edge.edge_type,
+                .orientation = if (outgoing) .out else .in,
+                .neighbor = if (outgoing) edge.target else edge.source,
+                .weight = edge.weight,
+            });
+        }
+    }
+    return try enrichment_neighbor_context.renderNeighborsBlockAlloc(runtime.alloc, neighbors.items, config.limit);
+}
+
+/// Producers whose rendered template produced content parts consume the parts
+/// instead of `source_text`, so the neighbor block must also travel as a
+/// trailing text part. Non-array parts payloads keep the text-only route.
+fn appendNeighborContextTextPartAlloc(alloc: Allocator, parts_json: []const u8, block: []const u8) !?[]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, parts_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return null,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .array) return null;
+    const scratch = parsed.arena.allocator();
+    var object = std.json.ObjectMap.empty;
+    try object.put(scratch, "type", .{ .string = "text" });
+    try object.put(scratch, "text", .{ .string = block });
+    try parsed.value.array.append(.{ .object = object });
+    return try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
 }
 
 // Planning retains only borrowed requests. Materialization owns at most one
@@ -28573,6 +28665,155 @@ test "asset preparation is lazy and byte bounded across retryable provider batch
     try std.testing.expectEqual(@as(u64, 5), harness.publications);
     try std.testing.expectEqual(requestFailureFingerprint(request), runtime.retry_failure_fingerprint);
     try std.testing.expectEqual(@as(u32, 1), runtime.retry_failure_count);
+}
+
+test "asset producer neighbor context samples local graph adjacency into the input and skip state" {
+    const alloc = std.testing.allocator;
+    const DB = @import("../mod.zig").DB;
+    const doc_key = "entities/org/black_mountain_college";
+
+    const Harness = struct {
+        calls: usize = 0,
+        publications: u64 = 0,
+        last_input: std.ArrayListUnmanaged(u8) = .empty,
+
+        fn produce(ptr: *anyopaque, a: Allocator, request: asset_producer_mod.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            self.last_input.clearRetainingCapacity();
+            try self.last_input.appendSlice(std.testing.allocator, request.source_text);
+            return try a.dupe(u8, "{\"entities\":[{\"id\":\"c1\",\"label\":\"concept\",\"text\":\"college\"}]}");
+        }
+        fn canBatch(_: *anyopaque, _: Allocator, _: []const asset_producer_mod.Request) !bool {
+            return false;
+        }
+        fn write(
+            ptr: *anyopaque,
+            _: derived_types.DerivedBatch,
+            _: []const GeneratedArtifactPromotion,
+            _: []const []const u8,
+            _: ?GeneratedWriteFence,
+        ) !GeneratedRecordCommit {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.publications += 1;
+            return .{ .sequence = self.publications };
+        }
+        fn notify(_: *anyopaque, _: u64) void {}
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const db_path = try std.fmt.bufPrint(&db_path_buf, ".zig-cache/tmp/{s}/graph-db", .{tmp.sub_path});
+    var db = try DB.open(alloc, db_path, .{});
+    defer db.close();
+    try db.addIndex(.{ .name = "taxonomy", .kind = .graph, .config_json = "{}" });
+    try db.batch(.{ .graph_writes = &.{
+        .{ .index_name = "taxonomy", .source = doc_key, .target = "entities/person/john_andrew_rice", .edge_type = "started_by", .weight = 0.98 },
+        .{ .index_name = "taxonomy", .source = doc_key, .target = "entities/place/north_carolina", .edge_type = "located_in", .weight = 0.5 },
+    }, .sync_level = .full_index });
+
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer store.deinit();
+    var erased_store = try backend_erased.storeFrom(alloc, store);
+    defer erased_store.deinit();
+    var harness = Harness{};
+    defer harness.last_input.deinit(std.testing.allocator);
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .io_impl = null,
+        .store = erased_store,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = db.core.index_manager,
+        .write_ctx = &harness,
+        .write_fn = Harness.write,
+        .notify_ctx = &harness,
+        .notify_fn = Harness.notify,
+        .config = .{ .asset_producer = .{ .ptr = &harness, .vtable = &.{
+            .produce = Harness.produce,
+            .can_produce_batch = Harness.canBatch,
+            .invocation_memory_for_requests = testInvocationMemoryForRequests,
+        } }, .inline_retry_max_attempts = 1 },
+        .ownership = undefined,
+    };
+    defer clearPublishedGeneratedArtifacts(&runtime);
+    defer clearIsolatedFailedIndexes(&runtime);
+    var window = GeneratedReplayWindow{ .alloc = alloc };
+    defer window.deinit();
+
+    const doc_store_key = try internal_keys.documentKeyAlloc(alloc, doc_key);
+    defer alloc.free(doc_store_key);
+    try storePutPrivateBatchWithRetry(&runtime, &runtime.store, &.{
+        .{ .key = doc_store_key, .value = "{\"name\":\"Black Mountain College\"}" },
+    }, &.{});
+
+    const request: enrichment_types.GeneratedEnrichmentRequest = .{
+        .kind = .asset,
+        .index_name = "conceptualize_v1",
+        .artifact_name = "conceptualize_v1",
+        .doc_key = doc_key,
+        .source_field = "name",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}",
+        .neighbor_context_json = "{\"graph_index\":\"taxonomy\",\"direction\":\"out\",\"limit\":8}",
+        .sequence = 3,
+    };
+    var prepared_sources = PreparedDocumentSourceCache.init(&runtime);
+    defer prepared_sources.deinit();
+
+    const runOnce = struct {
+        fn run(rt: *EnrichmentRuntime, req: enrichment_types.GeneratedEnrichmentRequest, sources: *PreparedDocumentSourceCache, win: *GeneratedReplayWindow) !void {
+            var batch = PreparedAssetBatch{};
+            defer batch.deinit(rt.alloc);
+            try processAsset(rt, req, &batch, sources, win);
+            try batch.flush(rt, win);
+            try std.testing.expect(batch.retry_error == null);
+        }
+    }.run;
+
+    // The producer input is the rendered source plus the deterministic
+    // neighbor block sampled from the taxonomy graph index.
+    try runOnce(&runtime, request, &prepared_sources, &window);
+    try std.testing.expectEqual(@as(usize, 1), harness.calls);
+    try std.testing.expectEqualStrings(
+        "Black Mountain College\n{\"neighbors\":[" ++
+            "{\"edge_type\":\"located_in\",\"direction\":\"out\",\"target\":\"entities/place/north_carolina\",\"weight\":0.5}," ++
+            "{\"edge_type\":\"started_by\",\"direction\":\"out\",\"target\":\"entities/person/john_andrew_rice\",\"weight\":0.98}]}",
+        harness.last_input.items,
+    );
+
+    // Unchanged source and adjacency skip the producer by state hash.
+    try runOnce(&runtime, request, &prepared_sources, &window);
+    try std.testing.expectEqual(@as(usize, 1), harness.calls);
+
+    // A changed adjacency changes the skip state exactly like a changed
+    // source field: the producer re-runs and sees the new neighbor in
+    // deterministic order.
+    try db.batch(.{ .graph_writes = &.{
+        .{ .index_name = "taxonomy", .source = doc_key, .target = "entities/person/josef_albers", .edge_type = "influenced", .weight = 0.75 },
+    }, .sync_level = .full_index });
+    try runOnce(&runtime, request, &prepared_sources, &window);
+    try std.testing.expectEqual(@as(usize, 2), harness.calls);
+    try std.testing.expectEqualStrings(
+        "Black Mountain College\n{\"neighbors\":[" ++
+            "{\"edge_type\":\"influenced\",\"direction\":\"out\",\"target\":\"entities/person/josef_albers\",\"weight\":0.75}," ++
+            "{\"edge_type\":\"located_in\",\"direction\":\"out\",\"target\":\"entities/place/north_carolina\",\"weight\":0.5}," ++
+            "{\"edge_type\":\"started_by\",\"direction\":\"out\",\"target\":\"entities/person/john_andrew_rice\",\"weight\":0.98}]}",
+        harness.last_input.items,
+    );
+
+    // A request without neighbor context keeps its input untouched even when
+    // graph indexes exist for the table.
+    var plain = request;
+    plain.artifact_name = "plain_v1";
+    plain.index_name = "plain_v1";
+    plain.neighbor_context_json = "";
+    try runOnce(&runtime, plain, &prepared_sources, &window);
+    try std.testing.expectEqual(@as(usize, 3), harness.calls);
+    try std.testing.expectEqualStrings("Black Mountain College", harness.last_input.items);
 }
 
 test "asset batch fallback keeps the logical request retry budget" {

@@ -430,6 +430,7 @@ components:
         chunker_json: { type: string }
         full_text_index: { type: boolean, default: false }
         content_type: { type: string }
+        neighbor_context: { $ref: "#/components/schemas/EnrichmentNeighborContextConfig" }
         execution: { $ref: "#/components/schemas/ExecutionPolicy" }
     CreatedEmbeddingsIndexConfig:
       type: object
@@ -667,12 +668,47 @@ components:
           type: string
           writeOnly: true
           description: "Write-only serialized producer configuration. For managed embedding enrichments Antfly stores a canonical semantic producer identity here; credentials and execution policy are excluded."
+        neighbor_context:
+          $ref: "#/components/schemas/EnrichmentNeighborContextConfig"
+          description: "Optional bounded sample of the document's graph neighbors appended to the producer input. Only valid on asset enrichments whose producer consumes rendered prompt text (generator or extractor); producers that treat the source as a media locator (copy, reader, transcriber, document_extraction) reject it. Only same-shard graph state is sampled; a graph index without local state for a document yields empty neighbors at runtime while the graph index reference itself is validated at admission."
         execution:
           $ref: "#/components/schemas/ExecutionPolicy"
           description: "Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity."
         transcriber:
           $ref: "#/components/schemas/TranscriberEnrichmentConfig"
           description: "Typed shorthand for a transcription asset enrichment. Only valid with kind=asset and without producer_json; Antfly expands it into a document_extraction producer whose audio route transcribes each recording with this speech-to-text provider. The produced units carry the transcript text, provider confidence, and per-phrase time offsets, and chunk enrichments that consume them emit _start_time_ms/_end_time_ms on every chunk. With diarization: true the phrases also carry who spoke them, and a chunk that does not straddle a turn emits _speaker. content_type defaults to application/json."
+    EnrichmentNeighborContextConfig:
+      type: object
+      additionalProperties: false
+      required:
+        - graph_index
+      description: "Bounded sample of the document's same-shard graph neighbors appended to an asset producer's rendered input as a compact JSON block ({\"neighbors\":[{\"edge_type\":...,\"direction\":...,\"target\":...,\"weight\":...}]}), ordered by edge type then target key. A conceptualizer enrichment on an entities table can thereby ground its abstractions in adjacent facts (\"started_by -> John Andrew Rice\"). The sampled block participates in the producer's skip state, so a changed adjacency re-runs the producer."
+      properties:
+        graph_index:
+          type: string
+          minLength: 1
+          description: "Name of a graph index on the same table whose local state is sampled. Validated at admission; cross-shard neighbors are not sampled."
+        edge_types:
+          x-go-type-skip-optional-pointer: true
+          type: array
+          items:
+            type: string
+            minLength: 1
+          description: "Edge types to sample. Empty admits every edge type."
+        direction:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          enum: [out, in, both]
+          default: both
+          description: "Adjacency orientation to sample relative to the document."
+        limit:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint32
+          minimum: 1
+          maximum: 64
+          default: 8
+          description: "Maximum neighbors rendered into the producer input, applied after deterministic ordering."
     TranscriberEnrichmentConfig:
       description: |-
         Speech-to-text provider for the `transcriber` enrichment shorthand.
@@ -5108,6 +5144,32 @@ components:
             - fresh
           default: published
           description: Whether the latest published generation may be stale or must match the graph edge generation.
+        seed_nodes:
+          type: array
+          maxItems: 128
+          items:
+            type: string
+            minLength: 1
+          description: >-
+            Node keys receiving all teleport mass for query-seeded personalized
+            PageRank (HippoRAG-style retrieval). Only valid for pagerank
+            metrics and requires metric_freshness=fresh: personalized scores
+            are computed at query time from the current edge snapshot, while
+            published generations are global-only, so seeded reads against
+            published freshness are rejected. Seed keys absent from the graph
+            are skipped; if none resolve, ranking degenerates to global
+            PageRank.
+        damping:
+          type: number
+          format: double
+          minimum: 0
+          exclusiveMinimum: true
+          maximum: 1
+          exclusiveMaximum: true
+          description: >-
+            Damping override for query-seeded personalized PageRank (typical
+            HippoRAG-style retrieval uses 0.9). Only valid together with
+            seed_nodes; omitted reads keep the metric's configured damping.
     GraphMetricRerank:
       type: object
       description: >-
