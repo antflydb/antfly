@@ -65,7 +65,7 @@ def _is_ha_transition_busy(response: requests.Response) -> bool:
     return response.status_code == 503 and response.content == HA_TRANSITION_BUSY_BODY
 
 
-def _is_ha_post_admission_busy(path: str, response: requests.Response) -> bool:
+def _is_ha_post_not_admitted(path: str, response: requests.Response) -> bool:
     # These exact errors precede route dispatch or capture's backup_start.
     # A capture can otherwise have committed even when its reply is lost: never
     # infer replay safety from HTTP 503 alone or retry transport exceptions.
@@ -372,7 +372,7 @@ class HAStandaloneNode:
                 payload,
                 request_timeout_s=max(0.001, min(10.0, deadline - time.monotonic())),
             )
-            if not _is_ha_post_admission_busy(path, response):
+            if not _is_ha_post_not_admitted(path, response):
                 return self._check(response)
             remaining = deadline - time.monotonic()
             if remaining <= 0:

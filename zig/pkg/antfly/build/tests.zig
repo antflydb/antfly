@@ -470,6 +470,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "restore staging cohort proof binds every source identity and durable seal",
             "restore staging partial selection is dependency closed across both schema generations",
             "retryable restore contention durably requeues progress and honors cancellation",
+            "restore cooperative continuation",
             "restore ownership loss requeues only the exact running attempt",
             "replicated restore mutations are rejected after leadership term changes",
             "restore dispatch recovery retains worker ownership when begin fails",

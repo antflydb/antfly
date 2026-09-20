@@ -19559,6 +19559,10 @@ pub const ApiHttpServer = struct {
         if (self.sharedApiIo()) |io| self.restore_retry_wakeup_event.set(io);
     }
 
+    fn wakeRequeuedRestoreJobs(self: *ApiHttpServer) void {
+        wakeRestoreRetry(self);
+    }
+
     fn signalRestoreBackoffWaiters(self: *ApiHttpServer) void {
         const io = self.sharedApiIo() orelse return;
         platform_sync.lockYielding(&self.restore_schedule_mutex);
@@ -19671,8 +19675,7 @@ pub const ApiHttpServer = struct {
                 if (restoreJobErrorIsFenced(err)) return error.RestoreJobFenced;
                 const retry = try self.restore_job_store.retryRunning(self.alloc, state, @errorName(err), if (err == error.RestoreStagingYield) 10 * std.time.ns_per_ms else restoreRepositoryRetryDelayNs(state.job_id, state.attempt_id));
                 self.alloc.free(retry);
-                self.signalRestoreRetryWakeup();
-                try self.ensureRestoreRetryWakeup();
+                self.wakeRequeuedRestoreJobs();
                 return;
             };
             defer self.alloc.free(result);
@@ -19713,8 +19716,7 @@ pub const ApiHttpServer = struct {
                         if (restoreJobErrorIsRetryable(err)) {
                             const encoded = try self.restore_job_store.retryRunning(self.alloc, state, @errorName(err), if (err == error.RestoreStagingYield) 10 * std.time.ns_per_ms else restoreRepositoryRetryDelayNs(state.job_id, state.attempt_id));
                             self.alloc.free(encoded);
-                            self.signalRestoreRetryWakeup();
-                            try self.ensureRestoreRetryWakeup();
+                            self.wakeRequeuedRestoreJobs();
                             return;
                         }
                         const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(err));
@@ -19789,8 +19791,7 @@ pub const ApiHttpServer = struct {
                                     retry_delay_ns,
                                 );
                                 self.alloc.free(retried);
-                                self.signalRestoreRetryWakeup();
-                                try self.ensureRestoreRetryWakeup();
+                                self.wakeRequeuedRestoreJobs();
                                 return;
                             }
                             const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(err));
@@ -19854,8 +19855,7 @@ pub const ApiHttpServer = struct {
                         retry_delay_ns,
                     );
                     self.alloc.free(retried);
-                    self.signalRestoreRetryWakeup();
-                    try self.ensureRestoreRetryWakeup();
+                    self.wakeRequeuedRestoreJobs();
                     return;
                 }
                 if (restoreJobErrorIsFenced(err)) {
@@ -20403,6 +20403,38 @@ const RestoreJobWork = struct {
         self.server.alloc.destroy(self);
     }
 };
+
+fn wakeRestoreRetry(host: anytype) void {
+    host.signalRestoreRetryWakeup();
+    // Work already belongs to the FIFO. Timer admission is not execution
+    // failure: completion and the supervisor retry it without terminalizing
+    // a healthy durable job when the executor is temporarily full.
+    host.ensureRestoreRetryWakeup() catch |err| {
+        std.log.warn("restore retry wakeup admission deferred err={s}", .{@errorName(err)});
+    };
+}
+
+test "restore retry wakeup admission failure cannot escape as execution failure" {
+    const Fixture = struct {
+        signals: usize = 0,
+        attempts: usize = 0,
+        failure: ?anyerror = null,
+        fn signalRestoreRetryWakeup(self: *@This()) void {
+            self.signals += 1;
+        }
+        fn ensureRestoreRetryWakeup(self: *@This()) !void {
+            self.attempts += 1;
+            if (self.failure) |err| return err;
+        }
+    };
+    var fixture: Fixture = .{};
+    for ([_]?anyerror{ error.OutOfMemory, error.ConcurrencyUnavailable, null }) |failure| {
+        fixture.failure = failure;
+        wakeRestoreRetry(&fixture);
+    }
+    try std.testing.expectEqual(@as(usize, 3), fixture.signals);
+    try std.testing.expectEqual(@as(usize, 3), fixture.attempts);
+}
 
 fn restoreJobErrorIsFenced(err: anyerror) bool {
     return err == error.RestoreJobFenced or
