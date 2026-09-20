@@ -185,10 +185,20 @@ pub const MetadataStatus = struct {
 
 /// Detach the only borrowed field from JSON parser and HTTP response storage.
 /// Unknown roles fail closed and remain compatible with older clients.
-pub fn stabilizeMetadataStatus(
-    status: MetadataStatus,
-) MetadataStatus {
+pub fn stabilizeMetadataStatus(status: MetadataStatus) MetadataStatus {
     var stable = status;
+    stable.metadata_raft_role = stableMetadataRaftRole(status.metadata_raft_role);
+    return stable;
+}
+
+/// Preserve the topology wire type while detaching its borrowed role string.
+pub fn stabilizeMetadataRuntimeTopology(topology: MetadataRuntimeTopology) MetadataRuntimeTopology {
+    var stable = topology;
+    stable.metadata_raft_role = stableMetadataRaftRole(topology.metadata_raft_role);
+    return stable;
+}
+
+fn stableMetadataRaftRole(value: []const u8) []const u8 {
     const stable_roles = [_][]const u8{
         "absent",
         "unknown",
@@ -199,13 +209,9 @@ pub fn stabilizeMetadataStatus(
         "leader",
     };
     for (stable_roles) |role| {
-        if (std.mem.eql(u8, role, status.metadata_raft_role)) {
-            stable.metadata_raft_role = role;
-            return stable;
-        }
+        if (std.mem.eql(u8, role, value)) return role;
     }
-    stable.metadata_raft_role = "unknown";
-    return stable;
+    return "unknown";
 }
 
 pub const MetadataHead = struct {

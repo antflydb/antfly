@@ -159,6 +159,34 @@ pub const MetadataHttpClient = struct {
         return try self.getJsonValueWithBudget(metadata_api.MetadataStatus, base_uri, routes.Routes.status, budget);
     }
 
+    /// Leader discovery needs only identity and live Raft topology. The full
+    /// diagnostic status walks the projected catalog and can exhaust a short
+    /// discovery slice even while the leader is available for mutations.
+    pub fn fetchMutationTopologyWithBudget(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        budget: RequestBudget,
+    ) !metadata_api.MetadataRuntimeTopology {
+        const uri = try join(self.alloc, base_uri, routes.Routes.runtime_topology);
+        defer self.alloc.free(uri);
+        var response = try self.executeWithRetryBudget(.{
+            .method = .GET,
+            .uri = uri,
+            .timeout_ms = default_request_timeout_ms,
+        }, budget);
+        defer response.deinit(self.alloc);
+        // Older peers can still participate. Parse only routing fields and
+        // retain the original absolute deadline across the compatibility read.
+        if (response.status == 404 or response.status == 405) {
+            return self.getJsonValueWithBudget(metadata_api.MetadataRuntimeTopology, base_uri, routes.Routes.status, budget);
+        }
+        if (response.status < 200 or response.status >= 300) return error.UnexpectedHttpStatus;
+        const topology = try std.json.parseFromSlice(metadata_api.MetadataRuntimeTopology, self.alloc, response.body, .{ .ignore_unknown_fields = true });
+        defer topology.deinit();
+        try ensureRequestBudget(budget);
+        return metadata_api.stabilizeMetadataRuntimeTopology(topology.value);
+    }
+
     pub fn fetchTableTopologyProtocolStatusWithBudget(
         self: *MetadataHttpClient,
         base_uri: []const u8,
@@ -1603,6 +1631,8 @@ pub const MetadataHttpClient = struct {
         // released, including parser-owned storage for escaped JSON strings.
         if (T == metadata_api.MetadataStatus)
             return metadata_api.stabilizeMetadataStatus(parsed.value);
+        if (T == metadata_api.MetadataRuntimeTopology)
+            return metadata_api.stabilizeMetadataRuntimeTopology(parsed.value);
         return parsed.value;
     }
 
@@ -4189,4 +4219,41 @@ test "system catalog direct read carries identity and deadline without a discove
     try std.testing.expectError(error.Timeout, client.readSystemCatalog("http://metadata.invalid", .snapshot, 0, null));
     try std.testing.expectError(error.InvalidCatalogMutation, client.readSystemCatalog("http://metadata.invalid", .{ .mutate = .{ .mutation = .{ .action = .create, .kind = .database, .name = "denied" } } }, 25, null));
     try std.testing.expectEqual(@as(usize, 2), executor.calls);
+}
+
+test "metadata mutation topology avoids diagnostics and owns parsed roles across compatibility fallback" {
+    const a = std.testing.allocator;
+    const Executor = struct {
+        missing: bool,
+        status_code: u16 = 200,
+        compact_calls: usize = 0,
+        diagnostic_calls: usize = 0,
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (std.mem.endsWith(u8, request.uri, routes.Routes.runtime_topology)) {
+                self.compact_calls += 1;
+                if (self.missing) return .{ .status = 404, .body = try alloc.dupe(u8, "missing") };
+            } else {
+                try std.testing.expect(self.missing);
+                try std.testing.expect(std.mem.endsWith(u8, request.uri, routes.Routes.status));
+                self.diagnostic_calls += 1;
+            }
+            return .{ .status = self.status_code, .body = try alloc.dupe(u8,
+                \\{"metadata_group_id":9,"metadata_incarnation":"11111111111111111111111111111111","metadata_raft_local_node_id":2,"metadata_raft_role":"le\u0061der","metadata_raft_leader_id":2,"unrelated_diagnostics":[1,2,3]}
+            ) };
+        }
+    };
+    for ([_]bool{ false, true }) |missing| {
+        var executor = Executor{ .missing = missing };
+        var client = MetadataHttpClient.init(a, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
+        const result = try client.fetchMutationTopologyWithBudget("http://metadata.invalid", .{ .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s });
+        try std.testing.expectEqualStrings("leader", result.metadata_raft_role);
+        try std.testing.expectEqual(@as(u64, 2), result.metadata_raft_leader_id.?);
+        try std.testing.expectEqual(@as(usize, 1), executor.compact_calls);
+        try std.testing.expectEqual(@as(usize, @intFromBool(missing)), executor.diagnostic_calls);
+    }
+    var unavailable = Executor{ .missing = false, .status_code = 503 };
+    var client = MetadataHttpClient.init(a, .{ .ptr = &unavailable, .vtable = &.{ .execute = Executor.execute } });
+    try std.testing.expectError(error.UnexpectedHttpStatus, client.fetchMutationTopologyWithBudget("http://metadata.invalid", .{ .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s }));
+    try std.testing.expectEqual(@as(usize, 0), unavailable.diagnostic_calls);
 }
