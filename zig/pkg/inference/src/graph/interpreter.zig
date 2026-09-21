@@ -34,6 +34,7 @@ const contracts = @import("backend_contracts.zig");
 const transpose_utils = @import("transpose_utils.zig");
 const buffer_plan_mod = @import("buffer_plan.zig");
 const runtime_slice = @import("runtime_slice.zig");
+const runtime_shape_values = @import("runtime_shape_values.zig");
 
 const Graph = ml.graph.Graph;
 const Node = ml.graph.Node;
@@ -4015,17 +4016,39 @@ pub fn executeNode(
             const count = end - start;
             const exact_shape = [_]i64{@intCast(count)};
             if (try cb.fromConstantBytes(std.mem.sliceAsBytes(actual[start..end]), .i64, &exact_shape)) |tensor| return tensor;
-            const data = try tmp_alloc.alloc(f32, count);
-            defer tmp_alloc.free(data);
-            for (0..count) |i| {
-                data[i] = @floatFromInt(actual[start + i]);
+            return error.UnsupportedTensorType;
+        },
+        .size_of => {
+            const tmp_alloc = std.heap.page_allocator;
+            const actual = try cb.tensorShape(V.get(ins[0]), tmp_alloc);
+            defer tmp_alloc.free(actual);
+            var count: i64 = 1;
+            for (actual) |dim| {
+                if (dim < 0) return error.InvalidTensorShape;
+                count = std.math.mul(i64, count, dim) catch return error.InvalidTensorShape;
             }
-
-            const shape = [_]i32{@intCast(count)};
-            return cb.fromFloat32Shape(data, &shape);
+            return fromIntegerValues(cb, &.{count}, .i64);
         },
         .range => {
             const tmp_alloc = std.heap.page_allocator;
+
+            const out_dtype = graph.node(node_id).output_shape.dtype;
+            if (isIntegerDType(out_dtype)) {
+                var start_buf: [8]i64 = undefined;
+                var limit_buf: [8]i64 = undefined;
+                var delta_buf: [8]i64 = undefined;
+                const start_data = try runtime_shape_values.read(cb, V.get(ins[0]), &start_buf);
+                const limit_data = try runtime_shape_values.read(cb, V.get(ins[1]), &limit_buf);
+                const delta_data = try runtime_shape_values.read(cb, V.get(ins[2]), &delta_buf);
+                if (start_data.len != 1 or limit_data.len != 1 or delta_data.len != 1) return error.InvalidTensorShape;
+                const count = try integerRangeCount(start_data[0], limit_data[0], delta_data[0]);
+                var range_values: [4096]i64 = undefined;
+                for (0..count) |i| {
+                    const value = @as(i128, start_data[0]) + @as(i128, @intCast(i)) * @as(i128, delta_data[0]);
+                    range_values[i] = std.math.cast(i64, value) orelse return error.InvalidTensorShape;
+                }
+                return fromIntegerValues(cb, range_values[0..count], out_dtype);
+            }
 
             const start_data = try cb.toFloat32(V.get(ins[0]), tmp_alloc);
             defer tmp_alloc.free(start_data);
@@ -4263,6 +4286,43 @@ pub fn executeNode(
             return error.UnsupportedPrimitiveOp;
         },
     };
+}
+
+fn isIntegerDType(dtype: ml.graph.DType) bool {
+    return switch (dtype) {
+        .i8, .i16, .i32, .i64, .u8, .bool_ => true,
+        else => false,
+    };
+}
+
+fn integerRangeCount(start: i64, limit: i64, delta: i64) !usize {
+    if (delta == 0) return error.InvalidAttribute;
+    const distance: i128 = if (delta > 0)
+        @as(i128, limit) - @as(i128, start)
+    else
+        @as(i128, start) - @as(i128, limit);
+    if (distance <= 0) return 0;
+    const step: i128 = if (delta > 0) @as(i128, delta) else -@as(i128, delta);
+    const count = std.math.cast(usize, @divTrunc(distance + step - 1, step)) orelse return error.InvalidTensorShape;
+    if (count > 4096) return error.InvalidTensorShape;
+    return count;
+}
+
+fn fromIntegerValues(cb: *const ComputeBackend, values: []const i64, dtype: ml.graph.DType) !CT {
+    const allocator = std.heap.page_allocator;
+    const bytes = try allocator.alloc(u8, values.len * dtype.byteSize());
+    defer allocator.free(bytes);
+    for (values, 0..) |value, i| switch (dtype) {
+        .i64 => std.mem.writeInt(i64, bytes[i * 8 ..][0..8], value, .little),
+        .i32 => std.mem.writeInt(i32, bytes[i * 4 ..][0..4], std.math.cast(i32, value) orelse return error.InvalidTensorShape, .little),
+        .i16 => std.mem.writeInt(i16, bytes[i * 2 ..][0..2], std.math.cast(i16, value) orelse return error.InvalidTensorShape, .little),
+        .i8 => bytes[i] = @bitCast(std.math.cast(i8, value) orelse return error.InvalidTensorShape),
+        .u8 => bytes[i] = std.math.cast(u8, value) orelse return error.InvalidTensorShape,
+        .bool_ => bytes[i] = if (value == 0) 0 else if (value == 1) 1 else return error.InvalidTensorShape,
+        else => return error.UnsupportedTensorType,
+    };
+    const shape = [_]i64{@intCast(values.len)};
+    return (try cb.fromConstantBytes(bytes, dtype, &shape)) orelse error.UnsupportedTensorType;
 }
 
 fn executeGatherElements(
@@ -7656,6 +7716,19 @@ fn checkIntegerShapePipeline(cb: *const ComputeBackend, comptime metal: bool) !v
     defer a.free(raw.payload.bytes);
     try std.testing.expectEqual(.i64, raw.dtype);
     try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]i64{ 3, 4 }), raw.payload.bytes);
+
+    var size_graph = Graph.init(a);
+    defer size_graph.deinit();
+    var size_builder = ml.graph.Builder.init(&size_graph);
+    const size_input = try size_builder.parameter("size_input", Shape.init(.f32, &.{ -1, 3 }));
+    const size = try size_graph.addNode(.{ .op = .{ .size_of = {} }, .output_shape = Shape.scalar(.i64), .inputs = .{ size_input, null_node, null_node, null_node }, .num_inputs = 1 });
+    try size_graph.markOutput(size);
+    var size_result = try execute(a, &size_graph, cb, .{ .runtime_inputs = &.{.{ .node_id = size_input, .value = input }} });
+    defer size_result.deinit(cb);
+    const size_raw = (try cb.exportTensorData(size_result.outputs[0], a)).?;
+    defer a.free(size_raw.payload.bytes);
+    try std.testing.expectEqual(.i64, size_raw.dtype);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]i64{6}), size_raw.payload.bytes);
 }
 
 test "native exact integer shape pipeline" {
@@ -7677,6 +7750,56 @@ test "Metal exact integer shape pipeline" {
     defer compute.deinit();
     const cb = compute.computeBackend();
     try checkIntegerShapePipeline(&cb, true);
+}
+
+fn checkExactIntegerRange(cb: *const ComputeBackend, comptime metal: bool) !void {
+    const a = std.testing.allocator;
+    var graph = Graph.init(a);
+    defer graph.deinit();
+    var b = ml.graph.Builder.init(&graph);
+    const start = try b.parameter("start", Shape.scalar(.i64));
+    const limit = try b.parameter("limit", Shape.scalar(.i64));
+    const delta = try b.parameter("delta", Shape.scalar(.i64));
+    const range = try graph.addNode(.{ .op = .{ .range = {} }, .output_shape = Shape.init(.i64, &.{-1}), .inputs = .{ start, limit, delta, null_node }, .num_inputs = 3 });
+    try graph.markOutput(range);
+    const start_value = (try cb.fromConstantBytes(std.mem.sliceAsBytes(&[_]i64{9007199254740993}), .i64, &.{})).?;
+    defer cb.free(start_value);
+    const limit_value = (try cb.fromConstantBytes(std.mem.sliceAsBytes(&[_]i64{9007199254740996}), .i64, &.{})).?;
+    defer cb.free(limit_value);
+    const delta_value = (try cb.fromConstantBytes(std.mem.sliceAsBytes(&[_]i64{1}), .i64, &.{})).?;
+    defer cb.free(delta_value);
+    var result = try execute(a, &graph, cb, .{ .runtime_inputs = &.{
+        .{ .node_id = start, .value = start_value },
+        .{ .node_id = limit, .value = limit_value },
+        .{ .node_id = delta, .value = delta_value },
+    } });
+    defer result.deinit(cb);
+    if (metal) try std.testing.expect(@import("../ops/metal_compute.zig").MetalCompute.debugHasDeviceTensor(cb, result.outputs[0]));
+    const raw = (try cb.exportTensorData(result.outputs[0], a)).?;
+    defer a.free(raw.payload.bytes);
+    try std.testing.expectEqual(.i64, raw.dtype);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]i64{ 9007199254740993, 9007199254740994, 9007199254740995 }), raw.payload.bytes);
+}
+
+test "native exact integer Range" {
+    const a = std.testing.allocator;
+    var ws = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var native = NativeCompute.init(a, &ws, null);
+    defer native.deinit();
+    const cb = native.computeBackend();
+    try checkExactIntegerRange(&cb, false);
+}
+
+test "Metal exact integer Range" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var weights = @import("../ops/gpu_hosted_store.zig").WeightStore{ .allocator = a, .prefix = "", .lazy_weights = .empty };
+    defer weights.lazy_weights.deinit(a);
+    var compute = try @import("../ops/metal_compute.zig").MetalCompute.init(a, &weights, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    try checkExactIntegerRange(&cb, true);
 }
 
 fn checkTypedSelections(cb: *const ComputeBackend, comptime metal: bool) !void {

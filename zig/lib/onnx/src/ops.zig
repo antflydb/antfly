@@ -2406,11 +2406,11 @@ fn convertShape(builder: *Builder, node: *const NodeProto, input: NodeId) Conver
     const end: usize = @intCast(end_i);
     const rank: usize = end - start;
     var has_dynamic = false;
-    var dims_f32: [8]f32 = .{0} ** 8;
+    var dims: [8]i64 = .{0} ** 8;
     for (0..rank) |i| {
         const dim = in_shape.dim(@intCast(start + i));
         if (dim < 0) has_dynamic = true;
-        dims_f32[i] = @floatFromInt(dim);
+        dims[i] = dim;
     }
     if (has_dynamic or nodeHasRuntimeDependentShape(builder, input, 0)) {
         return builder.graph.addNode(.{
@@ -2423,8 +2423,8 @@ fn convertShape(builder: *Builder, node: *const NodeProto, input: NodeId) Conver
             .num_inputs = 1,
         });
     }
-    const out_shape = Shape.init(.f32, &.{@intCast(rank)});
-    return builder.tensorConst(dims_f32[0..rank], out_shape);
+    const out_shape = Shape.init(.i64, &.{@intCast(rank)});
+    return builder.tensorConstBytes(std.mem.sliceAsBytes(dims[0..rank]), out_shape);
 }
 
 fn convertConstantOfShape(allocator: std.mem.Allocator, builder: *Builder, node: *const NodeProto, inputs: []const NodeId) ConvertError!NodeId {
@@ -2559,8 +2559,31 @@ fn convertRange(allocator: std.mem.Allocator, builder: *Builder, node: *const No
     _ = allocator;
     _ = node;
     if (inputs.len < 3) return error.MissingInput;
-    // Range(start, limit, delta) → 1-D tensor
-    // Materialize start/limit/delta from constants (may be behind Cast/Reshape)
+    // Range(start, limit, delta) → 1-D tensor.  Shape programs use integer
+    // ranges, so never send their values through f32 while folding them.
+    const out_dtype = builder.graph.node(inputs[0]).output_shape.dtype;
+    if (isIntegerDType(out_dtype)) {
+        const start = materializeIntegerScalar(builder, inputs[0]);
+        const limit = materializeIntegerScalar(builder, inputs[1]);
+        const delta = materializeIntegerScalar(builder, inputs[2]);
+        if (start != null and limit != null and delta != null) {
+            const count = try integerRangeCount(start.?, limit.?, delta.?);
+            var values: [4096]i64 = undefined;
+            for (0..count) |i| {
+                const value = @as(i128, start.?) + @as(i128, @intCast(i)) * @as(i128, delta.?);
+                values[i] = std.math.cast(i64, value) orelse return error.ShapeMismatch;
+            }
+            return integerTensorConst(builder, values[0..count], out_dtype);
+        }
+        return builder.graph.addNode(.{
+            .op = .{ .range = {} },
+            .output_shape = Shape.init(out_dtype, &.{@as(i64, -1)}),
+            .inputs = .{ inputs[0], inputs[1], inputs[2], null_node },
+            .num_inputs = 3,
+        });
+    }
+
+    // Floating-point Range remains a floating-point program.
     var start_buf: [1]f32 = undefined;
     var limit_buf: [1]f32 = undefined;
     var delta_buf: [1]f32 = undefined;
@@ -2574,11 +2597,9 @@ fn convertRange(allocator: std.mem.Allocator, builder: *Builder, node: *const No
 
     // If any value is dynamic (-1) or not materializable, emit a parameter
     // so the caller provides position IDs at runtime (common GPT-2 pattern).
-    const is_dynamic = (start == null or limit == null or delta == null or
-        start.? < 0 or limit.? < 0 or delta.? < 0);
+    const is_dynamic = start == null or limit == null or delta == null;
 
     if (is_dynamic) {
-        const out_dtype = builder.graph.node(inputs[0]).output_shape.dtype;
         return builder.graph.addNode(.{
             .op = .{ .range = {} },
             .output_shape = Shape.init(out_dtype, &.{@as(i64, -1)}),
@@ -2593,7 +2614,11 @@ fn convertRange(allocator: std.mem.Allocator, builder: *Builder, node: *const No
 
     if (d == 0) return error.InvalidAttribute;
 
-    const count: usize = @intFromFloat(@ceil((l - s) / d));
+    const raw_count = @ceil((l - s) / d);
+    const count: usize = if (raw_count <= 0) 0 else blk: {
+        if (!std.math.isFinite(raw_count) or raw_count > @as(f32, @floatFromInt(std.math.maxInt(usize)))) return error.ShapeMismatch;
+        break :blk @intFromFloat(raw_count);
+    };
     if (count > 4096) return error.ShapeMismatch; // sanity limit
 
     // Build constant data
@@ -2602,7 +2627,7 @@ fn convertRange(allocator: std.mem.Allocator, builder: *Builder, node: *const No
         buf[i] = s + @as(f32, @floatFromInt(i)) * d;
     }
 
-    const out_shape = Shape.init(.f32, &.{@as(i64, @intCast(count))});
+    const out_shape = Shape.init(out_dtype, &.{@as(i64, @intCast(count))});
     return builder.tensorConst(buf[0..count], out_shape);
 }
 
@@ -4128,9 +4153,16 @@ fn convertIsNaN(builder: *Builder, input: NodeId) ConvertError!NodeId {
 
 fn convertSize(builder: *Builder, input: NodeId) ConvertError!NodeId {
     const in_shape = builder.graph.node(input).output_shape;
-    const count = in_shape.numElements() orelse std.math.maxInt(i32);
-    const out_shape = Shape.init(.f32, &.{1});
-    return builder.tensorConst(&.{@as(f32, @floatFromInt(count))}, out_shape);
+    const out_shape = Shape.scalar(.i64);
+    if (in_shape.numElements()) |count| {
+        return builder.tensorConstBytes(std.mem.sliceAsBytes(&[_]i64{count}), out_shape);
+    }
+    return builder.graph.addNode(.{
+        .op = .{ .size_of = {} },
+        .output_shape = out_shape,
+        .inputs = .{ input, null_node, null_node, null_node },
+        .num_inputs = 1,
+    });
 }
 
 // ── Phase 4: ArgMax, ArgMin ────────────────────────────────────────
@@ -5397,6 +5429,95 @@ fn clampF32ToI64(v: f32) i64 {
     return @intFromFloat(v);
 }
 
+fn isIntegerDType(dtype: ml.graph.DType) bool {
+    return switch (dtype) {
+        .i8, .i16, .i32, .i64, .u8, .bool_ => true,
+        else => false,
+    };
+}
+
+/// Materialize a scalar integer control value without narrowing i64 constants
+/// through f32. Shape expressions commonly place Cast or Reshape between the
+/// initializer and the consumer, so those value-preserving nodes are followed.
+fn materializeIntegerScalar(builder: *Builder, node_id: NodeId) ?i64 {
+    if (node_id == null_node) return null;
+    const n = builder.graph.node(node_id);
+    switch (n.op) {
+        .constant => |attrs| {
+            if (attrs.data_len != 1) return null;
+            return switch (n.output_shape.dtype) {
+                .i8 => builder.graph.constantDataAs(i8, attrs.data_offset, attrs.data_len)[0],
+                .i16 => builder.graph.constantDataAs(i16, attrs.data_offset, attrs.data_len)[0],
+                .i32 => builder.graph.constantDataAs(i32, attrs.data_offset, attrs.data_len)[0],
+                .i64 => builder.graph.constantDataAs(i64, attrs.data_offset, attrs.data_len)[0],
+                .u8, .bool_ => builder.graph.constantDataAs(u8, attrs.data_offset, attrs.data_len)[0],
+                else => null,
+            };
+        },
+        .reshape, .convert_dtype => {
+            const inputs = n.getInputs();
+            return if (inputs.len == 1) materializeIntegerScalar(builder, inputs[0]) else null;
+        },
+        .add, .sub, .mul, .div => {
+            const inputs = n.getInputs();
+            if (inputs.len != 2) return null;
+            const lhs = materializeIntegerScalar(builder, inputs[0]) orelse return null;
+            const rhs = materializeIntegerScalar(builder, inputs[1]) orelse return null;
+            return switch (n.op) {
+                .add => std.math.add(i64, lhs, rhs) catch null,
+                .sub => std.math.sub(i64, lhs, rhs) catch null,
+                .mul => std.math.mul(i64, lhs, rhs) catch null,
+                .div => if (rhs == 0 or (lhs == std.math.minInt(i64) and rhs == -1)) null else @divTrunc(lhs, rhs),
+                else => unreachable,
+            };
+        },
+        else => return null,
+    }
+}
+
+fn integerRangeCount(start: i64, limit: i64, delta: i64) ConvertError!usize {
+    if (delta == 0) return error.InvalidAttribute;
+    const distance: i128 = if (delta > 0)
+        @as(i128, limit) - @as(i128, start)
+    else
+        @as(i128, start) - @as(i128, limit);
+    if (distance <= 0) return 0;
+    const step: i128 = if (delta > 0) @as(i128, delta) else -@as(i128, delta);
+    const count_i128 = @divTrunc(distance + step - 1, step);
+    const count = std.math.cast(usize, count_i128) orelse return error.ShapeMismatch;
+    if (count > 4096) return error.ShapeMismatch;
+    return count;
+}
+
+fn integerTensorConst(builder: *Builder, values: []const i64, dtype: ml.graph.DType) ConvertError!NodeId {
+    const shape = Shape.init(dtype, &.{@as(i64, @intCast(values.len))});
+    switch (dtype) {
+        .i64 => return builder.tensorConstBytes(std.mem.sliceAsBytes(values), shape),
+        .i32 => {
+            var data: [4096]i32 = undefined;
+            for (values, 0..) |value, i| data[i] = std.math.cast(i32, value) orelse return error.ShapeMismatch;
+            return builder.tensorConstBytes(std.mem.sliceAsBytes(data[0..values.len]), shape);
+        },
+        .i16 => {
+            var data: [4096]i16 = undefined;
+            for (values, 0..) |value, i| data[i] = std.math.cast(i16, value) orelse return error.ShapeMismatch;
+            return builder.tensorConstBytes(std.mem.sliceAsBytes(data[0..values.len]), shape);
+        },
+        .i8 => {
+            var data: [4096]i8 = undefined;
+            for (values, 0..) |value, i| data[i] = std.math.cast(i8, value) orelse return error.ShapeMismatch;
+            return builder.tensorConstBytes(std.mem.sliceAsBytes(data[0..values.len]), shape);
+        },
+        .u8 => {
+            var data: [4096]u8 = undefined;
+            for (values, 0..) |value, i| data[i] = std.math.cast(u8, value) orelse return error.ShapeMismatch;
+            return builder.tensorConstBytes(std.mem.sliceAsBytes(data[0..values.len]), shape);
+        },
+        .bool_ => return error.InvalidAttribute,
+        else => return error.InvalidAttribute,
+    }
+}
+
 fn materializeConstantNodeValues(
     graph: *const Graph,
     n: *const ml.graph.Node,
@@ -5707,6 +5828,7 @@ test "convertNode Shape materializes dims" {
     // Should be a 1-D tensor with 3 elements
     try std.testing.expectEqual(@as(u8, 1), out_shape.rank());
     try std.testing.expectEqual(@as(i64, 3), out_shape.dim(0));
+    try std.testing.expectEqual(.i64, out_shape.dtype);
 }
 
 test "convertNode Shape folds a reshape built from constant expressions" {
@@ -6386,9 +6508,40 @@ test "convertNode Size" {
     const node = NodeProto{ .op_type = "Size" };
     const result = try convertNode(allocator, &b, &node, &.{x}, null);
     const out_shape = g.node(result).output_shape;
-    try std.testing.expectEqual(@as(u8, 1), out_shape.rank());
+    try std.testing.expectEqual(@as(u8, 0), out_shape.rank());
     // Should be a constant with value 24
     try std.testing.expect(std.meta.activeTag(g.node(result).op) == .constant);
+    try std.testing.expectEqual(.i64, out_shape.dtype);
+}
+
+test "convertNode Size keeps dynamic input sizes at runtime" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+    const x = try b.parameter("x", Shape.init(.f32, &.{ -1, 3 }));
+    const result = try convertNode(allocator, &b, &.{ .op_type = "Size" }, &.{x}, null);
+    try std.testing.expect(std.meta.activeTag(g.node(result).op) == .size_of);
+    try std.testing.expectEqual(.i64, g.node(result).output_shape.dtype);
+    try std.testing.expectEqual(@as(u8, 0), g.node(result).output_shape.rank());
+}
+
+test "convertNode Range folds signed i64 controls exactly" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+    const start = try b.tensorConstBytes(std.mem.sliceAsBytes(&[_]i64{9007199254740993}), Shape.scalar(.i64));
+    const limit = try b.tensorConstBytes(std.mem.sliceAsBytes(&[_]i64{9007199254740996}), Shape.scalar(.i64));
+    const delta = try b.tensorConstBytes(std.mem.sliceAsBytes(&[_]i64{1}), Shape.scalar(.i64));
+    const result = try convertNode(allocator, &b, &.{ .op_type = "Range" }, &.{ start, limit, delta }, null);
+    const out = g.node(result);
+    const attrs = switch (out.op) {
+        .constant => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(.i64, out.output_shape.dtype);
+    try std.testing.expectEqualSlices(i64, &.{ 9007199254740993, 9007199254740994, 9007199254740995 }, g.constantDataAs(i64, attrs.data_offset, attrs.data_len));
 }
 
 test "convertNode Einsum matmul" {
