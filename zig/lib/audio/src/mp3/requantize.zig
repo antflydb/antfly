@@ -525,7 +525,7 @@ pub fn requantizeBigValuePairsShort(
     var source_sample: usize = 0;
 
     if (info.mixed_block_flag) {
-        const long_samples = @min(total_samples, 36);
+        const long_samples = @min(total_samples, mixedBlockLongSamples(sample_rate));
         var mixed_long_scales = BandScalePlan{
             .long_band_count = band_scales.long_band_count,
         };
@@ -627,9 +627,10 @@ fn requantizeCount1QuadsShort(
     var quad_index: usize = 0;
     var value_index: usize = 0;
 
-    if (info.mixed_block_flag and source_sample < 36) {
+    const mixed_long_samples = mixedBlockLongSamples(sample_rate);
+    if (info.mixed_block_flag and source_sample < mixed_long_samples) {
         const long_progress = try requantizeCount1QuadsLong(sample_rate, band_scales, source_sample, quads, out_coefficients);
-        if (long_progress.samples_decoded < 36) return long_progress;
+        if (long_progress.samples_decoded < mixed_long_samples) return long_progress;
         source_sample = long_progress.samples_decoded;
         const consumed_values = source_sample - start_sample;
         quad_index = consumedValuesToQuadIndex(consumed_values);
@@ -699,10 +700,11 @@ pub fn reorderShortCoefficients(
     var band_start_index: usize = 0;
 
     if (info.mixed_block_flag) {
-        @memcpy(reordered[0..36], coefficients[0..36]);
-        source_offset = 36;
-        dest_offset = 36;
-        band_start_index = 3;
+        const long_samples = mixedBlockLongSamples(sample_rate);
+        @memcpy(reordered[0..long_samples], coefficients[0..long_samples]);
+        source_offset = long_samples;
+        dest_offset = long_samples;
+        band_start_index = mixed_short_band_start;
     }
 
     for (band_start_index..12) |band| {
@@ -794,6 +796,16 @@ pub fn scalefactorBandLong(sample_rate: u32) []const usize {
         8000 => &.{ 0, 12, 24, 36, 48, 60, 72, 88, 108, 132, 160, 192, 232, 280, 336, 400, 476, 566, 568, 570, 572, 574, 576 },
         else => &.{ 0, 4, 8, 12, 16, 20, 24, 30, 36, 42, 50, 60, 72, 88, 106, 128, 156, 190, 230, 276, 330, 384, 576 },
     };
+}
+
+/// Mixed blocks transform their lowest bands with long windows and the rest
+/// with short ones. The switch happens at the third short scalefactor band,
+/// counted across all three windows: 36 samples at every rate except 8 kHz,
+/// whose wider bands put it at 72.
+pub const mixed_short_band_start: usize = 3;
+
+pub fn mixedBlockLongSamples(sample_rate: u32) usize {
+    return 3 * scalefactorBandShort(sample_rate)[mixed_short_band_start];
 }
 
 pub fn scalefactorBandShort(sample_rate: u32) []const usize {
@@ -1281,6 +1293,83 @@ test "every sample rate a frame header can carry has well formed band tables" {
         for (short[1..], 0..) |edge, index| try std.testing.expect(edge > short[index]);
     }
     try std.testing.expect(!bitstream.supportsSampleRate(7350));
+}
+
+test "the mixed block boundary follows the band tables, and widens at 8 kHz" {
+    // ffmpeg puts it the same way: "if switched mode, we handle the 36 first
+    // samples as long blocks. For 8000Hz, we handle the 72 first exponents as
+    // long blocks."
+    for ([_]u32{ 44100, 48000, 32000, 22050, 24000, 16000, 12000, 11025 }) |rate| {
+        try std.testing.expectEqual(@as(usize, 36), mixedBlockLongSamples(rate));
+    }
+    try std.testing.expectEqual(@as(usize, 72), mixedBlockLongSamples(8000));
+
+    // The same boundary seen from the long table: eight bands for MPEG-1 and
+    // six for the low sampling frequencies, which is where the scalefactors
+    // for a mixed block stop being long.
+    for ([_]u32{ 44100, 48000, 32000 }) |rate| {
+        try std.testing.expectEqual(mixedBlockLongSamples(rate), scalefactorBandLong(rate)[8]);
+    }
+    for ([_]u32{ 22050, 24000, 16000, 12000, 11025, 8000 }) |rate| {
+        try std.testing.expectEqual(mixedBlockLongSamples(rate), scalefactorBandLong(rate)[6]);
+    }
+}
+
+test "an 8 kHz mixed block keeps 72 coefficients on long gains" {
+    const info = bitstream.GranuleChannelInfo{
+        .part2_3_length = 100,
+        .big_values = 48,
+        .global_gain = 210,
+        .scalefac_compress = 215,
+        .window_switching_flag = true,
+        .block_type = 2,
+        .mixed_block_flag = true,
+        .table_select = .{ 5, 6, 0 },
+        .subblock_gain = .{ 0, 0, 0 },
+        .region0_count = 8,
+        .region1_count = 12,
+        .preflag = false,
+        .scalefac_scale = false,
+        .count1table_select = false,
+    };
+    // Long bands carry gain 1, short bands gain 4. Every coefficient the long
+    // window owns has to come back at its own value, and the first short one
+    // at four times its own.
+    var scales = BandScalePlan{
+        .long_band_count = 6,
+        .short_band_start = mixed_short_band_start,
+        .short_band_count = 10,
+    };
+    for (0..6) |band| scales.long[band] = 1.0;
+    for (mixed_short_band_start..13) |band| {
+        scales.short[0][band] = 4.0;
+        scales.short[1][band] = 4.0;
+        scales.short[2][band] = 4.0;
+    }
+
+    var pairs: [48]huffman.DecodedPair = undefined;
+    for (0..48) |i| pairs[i] = .{ .x = 1, .y = 1 };
+    var coeffs = [_]f32{0} ** 128;
+    const progress = try requantizeBigValuePairs(
+        .{
+            .version = .mpeg25,
+            .layer = .layer3,
+            .has_crc = false,
+            .free_format = false,
+            .bitrate_kbps = 32,
+            .sample_rate = 8000,
+            .padding = false,
+            .channel_mode = .mono,
+        },
+        info,
+        &pairs,
+        scales,
+        &coeffs,
+    );
+
+    try std.testing.expect(progress.samples_decoded > 72);
+    for (coeffs[0..72]) |coefficient| try std.testing.expectApproxEqAbs(@as(f32, 1.0), coefficient, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 4.0), coeffs[72], 0.0001);
 }
 
 test "requantize mixed big values keeps first 36 samples long and reorders remainder short" {
