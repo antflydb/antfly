@@ -83,19 +83,33 @@ class PruneTests(unittest.TestCase):
             self.assertTrue(output.exists())
             self.assertTrue(link_input.exists())
 
+    def test_preserves_executable_without_link_inputs(self):
+        # A self-hosted backend can emit only the executable.
+        with tempfile.TemporaryDirectory() as root:
+            cache = Path(root)
+            artifact = cache / "o" / ("d" * 32)
+            artifact.mkdir(parents=True)
+            executable = artifact / "test"
+            executable.write_bytes(b"self-hosted executable")
+            executable.chmod(0o755)
+            self.assertEqual(prune(cache, min_bytes=0), 0)
+            self.assertEqual(executable.read_bytes(), b"self-hosted executable")
+
     @unittest.skipUnless(
         shutil.which("zig"), "Zig is required for the cache-hit regression"
     )
     def test_zig_cache_hit_and_source_rebuild_after_pruning(self):
         with tempfile.TemporaryDirectory() as root:
             project = Path(root)
+            # The self-hosted Linux Debug backend emits no disposable object.
+            # Select LLVM so this integration test actually exercises pruning.
             (project / "build.zig").write_text(
                 'const std = @import("std");\n'
                 "pub fn build(b: *std.Build) void {\n"
                 " const t = b.addTest(.{ .root_module = b.createModule(.{\n"
                 '  .root_source_file = b.path("test.zig"),\n'
                 "  .target = b.graph.host, .optimize = .Debug,\n"
-                " }) });\n"
+                " }), .use_llvm = true });\n"
                 ' b.step("test", "run").dependOn(&b.addRunArtifact(t).step);\n'
                 "}\n"
             )

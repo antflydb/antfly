@@ -15298,6 +15298,7 @@ pub const ApiHttpServer = struct {
         table_name: []const u8,
         body: []const u8,
         authenticated_identity: ?AuthenticatedIdentity,
+        expected_storage_name: ?[]const u8,
     ) ![]u8 {
         comptime std.debug.assert(request_admission_policy.extensionHostOperationClass(.batch) == .write);
         if (!self.tryAcquireWrite()) return error.RequestAdmissionExhausted;
@@ -15305,7 +15306,7 @@ pub const ApiHttpServer = struct {
         if (authenticated_identity) |identity| if (!permissionsAllow(identity.permissions, .table, table_name, .write)) return error.Forbidden;
         var catalog_identity = try cloneCatalogIdentity(self.alloc, authenticated_identity);
         defer if (catalog_identity) |*owned| owned.deinit(self.alloc);
-        const physical = try self.resolveCatalogNameAlloc(self.alloc, .{}, table_name, &catalog_identity);
+        const physical = try self.resolveExtensionHostTableAlloc(table_name, expected_storage_name, &catalog_identity);
         defer self.alloc.free(physical);
         var response = try public_table_http.handleTableBatch(self.alloc, physical, body, self.tableApi(.{}));
         defer response.deinit(self.alloc);
@@ -15319,6 +15320,7 @@ pub const ApiHttpServer = struct {
         table_name: []const u8,
         body: []const u8,
         authenticated_identity: ?AuthenticatedIdentity,
+        expected_storage_name: ?[]const u8,
     ) ![]u8 {
         var diagnostic_context: query_request_diagnostics.Context = .{};
         const diagnostic_scope = query_request_diagnostics.Scope.init(&diagnostic_context);
@@ -15330,7 +15332,7 @@ pub const ApiHttpServer = struct {
         if (authenticated_identity) |identity| if (!permissionsAllow(identity.permissions, .table, table_name, .read)) return error.Forbidden;
         var catalog_identity = try cloneCatalogIdentity(self.alloc, authenticated_identity);
         defer if (catalog_identity) |*owned| owned.deinit(self.alloc);
-        const physical = try self.resolveCatalogNameAlloc(self.alloc, .{}, table_name, &catalog_identity);
+        const physical = try self.resolveExtensionHostTableAlloc(table_name, expected_storage_name, &catalog_identity);
         defer self.alloc.free(physical);
         const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, catalog_identity, physical);
         defer if (row_filter_json) |value| self.alloc.free(value);
@@ -15351,6 +15353,27 @@ pub const ApiHttpServer = struct {
         );
         defer query_response.deinit(self.alloc);
         return try result_alloc.dupe(u8, query_response.json);
+    }
+
+    fn resolveExtensionHostTableAlloc(
+        self: *ApiHttpServer,
+        public_name: []const u8,
+        expected_storage_name: ?[]const u8,
+        identity: *?AuthenticatedIdentity,
+    ) ![]u8 {
+        const physical = self.resolveCatalogNameAlloc(self.alloc, .{}, public_name, identity) catch |err| {
+            if (err == error.TableNotFound and expected_storage_name != null)
+                return error.ExtensionTableBindingChanged;
+            return err;
+        };
+        errdefer self.alloc.free(physical);
+        // Public names remain the authorization boundary, but they can be
+        // renamed or reused. Never route an installed member to a different
+        // storage identity. Subsequent operations use this immutable name.
+        if (expected_storage_name) |expected| {
+            if (!std.mem.eql(u8, expected, physical)) return error.ExtensionTableBindingChanged;
+        }
+        return physical;
     }
 
     pub fn resolveCatalogRestoreNameAlloc(self: *ApiHttpServer, alloc: std.mem.Allocator, context: api_operation.RequestContext, name: []const u8, identity: *?AuthenticatedIdentity, idempotency_key: ?[]const u8) ![]u8 {

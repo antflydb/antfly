@@ -771,6 +771,23 @@ pub const ExtensionCatalog = struct {
             .grants = current.granted_capabilities,
         }, current.installed_at_epoch_ms);
         errdefer plan.deinit(self.alloc);
+        // Version upgrades rebuild members from the public manifest. Retain
+        // the installed table identity, including for newly added members,
+        // instead of resolving a possibly renamed or reused public name.
+        if (current.scope.kind == .table) {
+            var bound_table: ?[]const u8 = null;
+            for (self.members.items) |member| {
+                if (!std.mem.eql(u8, member.extension_name, extension_name) or member.table_name.len == 0) continue;
+                if (bound_table) |bound| {
+                    if (!std.mem.eql(u8, bound, member.table_name)) return error.ExtensionLifecycleConflict;
+                } else bound_table = member.table_name;
+            }
+            if (bound_table) |bound| for (plan.members) |*member| {
+                const owned = try self.alloc.dupe(u8, bound);
+                if (member.table_name.len > 0) self.alloc.free(member.table_name);
+                member.table_name = owned;
+            };
+        }
         try self.members.ensureUnusedCapacity(self.alloc, plan.members.len);
         var dependency_rows = try self.planDependencyRowsAlloc(extension_name, target.*);
         defer {
@@ -2374,7 +2391,7 @@ test "extension catalog rejects grants not requested by package" {
     ));
 }
 
-test "extension catalog updates configures disables and enables extension" {
+test "extension lifecycle updates preserve durable bindings for existing and new members" {
     var catalog = ExtensionCatalog.init(std.testing.allocator);
     defer catalog.deinit();
 
@@ -2427,6 +2444,10 @@ test "extension catalog updates configures disables and enables extension" {
     try catalog.configureInstalled("memoryaf", .{ .config_json = "{\"ttl_days\":60}" });
     try std.testing.expectEqualStrings("{\"ttl_days\":60}", catalog.installed.items[0].config_json);
 
+    const physical = "table:0123456789abcdef0123456789abcdef";
+    const bound = try std.testing.allocator.dupe(u8, physical);
+    std.testing.allocator.free(catalog.members.items[0].table_name);
+    catalog.members.items[0].table_name = bound;
     const updated = try catalog.updateManifestOnly("memoryaf", .{ .target_version = "1.1.0" });
     defer freeInstalledExtension(std.testing.allocator, updated);
     try std.testing.expectEqualStrings("1.1.0", updated.package_version);
@@ -2437,6 +2458,10 @@ test "extension catalog updates configures disables and enables extension" {
     const members = try catalog.listMembersForExtension(std.testing.allocator, "memoryaf");
     defer catalog.freeMembers(std.testing.allocator, members);
     try std.testing.expectEqual(@as(usize, 2), members.len);
+    for (members) |member| {
+        try std.testing.expectEqualStrings(physical, member.table_name);
+        try std.testing.expectEqualStrings("memories", member.scope.table_name);
+    }
 }
 
 test "extension lifecycle bound members retain public scope without accepting package scope escapes" {

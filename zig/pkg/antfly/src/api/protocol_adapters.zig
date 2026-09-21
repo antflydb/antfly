@@ -1145,6 +1145,7 @@ fn callExtensionMcpTool(alloc: std.mem.Allocator, server: anytype, authenticated
             .server = server,
             .authenticated_identity = authenticated_identity,
             .installed = installed,
+            .expected_storage_name = if (tool.member.table_name.len != 0) tool.member.table_name else null,
         };
         if (wasmtime_runtime.invokeExtensionWithOptions(alloc, binding.runtime(), tool_name, request_json, .{
             .package_store_root = server.cfg.extension_package_store_dir,
@@ -1155,6 +1156,12 @@ fn callExtensionMcpTool(alloc: std.mem.Allocator, server: anytype, authenticated
                 .ai_embed = ExtensionHostContext(@TypeOf(server), @TypeOf(authenticated_identity)).aiEmbed,
             },
         })) |body| {
+            // A guest may swallow a host error and claim the write succeeded.
+            // A stale table binding must remain an error at the MCP boundary.
+            if (host_context.binding_failed) {
+                alloc.free(body);
+                return try mcpError(alloc, "extension table binding is no longer current");
+            }
             return try mcpResultFromExtensionJson(alloc, body);
         } else |err| switch (err) {
             error.WasmtimeUnavailable,
@@ -1183,23 +1190,34 @@ fn ExtensionHostContext(comptime Server: type, comptime Identity: type) type {
         server: Server,
         authenticated_identity: Identity,
         installed: *const extension_domain.InstalledExtension,
+        expected_storage_name: ?[]const u8,
+        binding_failed: bool = false,
+
+        fn noteBindingFailure(ctx: *@This(), err: anyerror) void {
+            switch (err) {
+                error.ExtensionTableBindingChanged, error.ExtensionTableBindingMissing => ctx.binding_failed = true,
+                else => {},
+            }
+        }
 
         fn dbQuery(ptr: ?*anyopaque, alloc: std.mem.Allocator, table: []const u8, query_json: []const u8) anyerror![]u8 {
             const ctx = hostContext(ptr);
+            errdefer |err| ctx.noteBindingFailure(err);
             try ctx.requireCapability("db:read");
             const table_name = try ctx.resolveTableName(table);
             const body = try extensionQueryBodyAlloc(alloc, query_json);
             defer alloc.free(body);
-            return try ctx.server.executeExtensionHostQuery(alloc, table_name, body, ctx.authenticated_identity);
+            return try ctx.server.executeExtensionHostQuery(alloc, table_name, body, ctx.authenticated_identity, ctx.expected_storage_name);
         }
 
         fn dbWrite(ptr: ?*anyopaque, alloc: std.mem.Allocator, table: []const u8, writes_json: []const u8) anyerror![]u8 {
             const ctx = hostContext(ptr);
+            errdefer |err| ctx.noteBindingFailure(err);
             try ctx.requireCapability("db:write");
             const table_name = try ctx.resolveTableName(table);
             const body = try extensionBatchBodyAlloc(alloc, writes_json);
             defer alloc.free(body);
-            return try ctx.server.executeExtensionHostBatch(alloc, table_name, body, ctx.authenticated_identity);
+            return try ctx.server.executeExtensionHostBatch(alloc, table_name, body, ctx.authenticated_identity, ctx.expected_storage_name);
         }
 
         fn aiEmbed(ptr: ?*anyopaque, alloc: std.mem.Allocator, _: []const u8, text: []const u8) anyerror![]f32 {
@@ -1235,6 +1253,8 @@ fn ExtensionHostContext(comptime Server: type, comptime Identity: type) type {
         }
 
         fn resolveTableName(ctx: *@This(), requested: []const u8) ![]const u8 {
+            if (ctx.installed.scope.kind == .table and ctx.expected_storage_name == null)
+                return error.ExtensionTableBindingMissing;
             return switch (ctx.installed.scope.kind) {
                 .table => ctx.installed.scope.table_name,
                 .cluster => requested,
