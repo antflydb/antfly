@@ -1,5 +1,71 @@
 # Zig E2E flakes
 
+## 2026-09-21: catalog reporter startup preceded protocol readiness
+
+[Issue #828](https://github.com/antflydb/antfly/issues/828) records
+[run 35549453714's catalog failure](https://github.com/antflydb/antfly/actions/runs/35549453714/job/106186967472).
+`test_large_inventory_uses_bounded_control_and_diagnostic_transfers` failed at
+synthetic reporter registration with HTTP 500 / `RuntimeStatusProtocolUnavailable`.
+The retained diagnostics show leader node 2 with protocol ready/activated version
+0 and one failed probe, while followers report ready version 17. HTTP readiness
+and ordinary data-node registration therefore did not establish the leader's
+ability to persist the synthetic reporter's required dense-native status profile.
+The probe also checks incarnation compatibility; a peer advertising version 17
+alone does not prove readiness. The evidence does not establish an activation
+state-machine defect.
+
+Inspection of `origin/main` at `a032858819bd89ffcb31e5dcf7e76699babfdc3b`
+confirmed the missing fixture barrier and the HTTP 500 classification. An
+unchanged macOS ARM64 Debug binary passed one isolated case and twelve cases
+across four independent workers; the original HTTP 500 did not recur naturally.
+A deterministic fixture regression supplies an unready leader followed by a
+ready one: the original fixture yields immediately and fails the assertion;
+the corrected fixture waits before exposing the cluster.
+
+Catalog setup now observes a leader with a metadata incarnation and the named
+V17 ready profile, with a bounded deadline and retained setup-failure diagnostics.
+It does not require activation to have already committed: the subsequent
+registration can commit it. Unknown future version numbers do not satisfy the
+profile by numeric ordering. Status-read connection failures and HTTP 503 can be
+polled; HTTP 500 propagates. Reporter writes, inventory assertions, transfer
+admission assertions, and their deadlines are unchanged. Production node
+mutation responses classify unavailable protocol as HTTP 503, without claiming
+whole-request non-admission: node registration may have committed before store
+admission fails.
+
+The catalog fixture was also missing its process-resource declaration. The normal
+four-worker runner classified these six-node clusters as lightweight and bypassed
+the two-process-slot limit. The fixture now declares `antfly_process` using the
+existing scheduler API. Eleven readiness regressions, 62 scheduler tests, and the
+focused Zig HTTP-classification regression pass. The final complete catalog and
+readiness modules pass all 19 tests with four pytest workers and two process slots.
+
+Retain the unsuccessful stress runs too. An earlier four-worker catalog soak
+passed 39/40 cases (20/20 normal, 19/20 at `nofile=256`); its failure was a later
+diagnostic snapshot admission returning `snapshot transfer capacity exhausted`,
+after reporter registration succeeded. While that soak and TLA/build work ran,
+the broader catalog module passed 16/18 cases: a data-node `ReadFailed` after
+deliberate leader termination and a full-text count of 2001 instead of 2002 were
+the failures. The unchanged binary subsequently passed those two cases, which
+does not establish that these failures are unrelated or pre-existing. The final
+module pass after resource classification does not prove their runtime causes.
+
+Evidence is in `.benchmark-results/issue-828/` in `.worktrees/issue-828-flakes`:
+`catalog-readiness-negative.log`, `catalog-fixed-soak.log`, `fixed-soak/`,
+`catalog-fixed-module.log`, `catalog-baseline-extra.log`, and
+`catalog-fixed-final-module.log`, with JUnit reports and preserved failure roots.
+The fixed native Debug server SHA-256 is
+`5b1b38811386f099ffc7aae7815ed1a15a6a2671997e5e9f088b9e121ac8a331`;
+the unchanged server is
+`9e22dada7c087f6bda5726c6846494098498d2a2ba5e2d122e010b933476d6a5`.
+Native Linux ARC qualification remains a CI gate.
+
+Reproduce with `scripts/ci/zig-e2e-catalog-soak.sh`, `SKIP_BUILD=1`, an absolute
+`ANTFLY_BIN`, and a fresh absolute `ANTFLY_E2E_REGRESSION_REPORT_DIR`. It runs both
+normal and 256-FD profiles; worker and repeat counts use
+`ANTFLY_E2E_REGRESSION_WORKERS` and `ANTFLY_E2E_REGRESSION_REPEATS`. Use the normal
+`scripts/ci/zig-antfly-e2e-pytest.sh` runner for module-level parallel scheduling.
+
 ## 2026-09-18: concurrent aggregations stalled hydration and raced primary generations
 
 [Run 35304355356, Antfly E2E](https://github.com/antflydb/antfly/actions/runs/35304355356/job/105482406606)

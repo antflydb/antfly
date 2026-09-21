@@ -869,6 +869,15 @@ jobs:
           ANTFLY_TLA_TRACE_VALIDATE: ${{ needs.changes.outputs.trace_validate }}
         run: scripts/ci/zig-tla-verify.sh
 
+      - name: Retain TLA trace evidence
+        if: always() && !cancelled()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tla-traces-${{ github.job }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/antfly-tla-traces/
+          if-no-files-found: ignore
+          retention-days: 14
+
   zig-full-tests:
     if: >-
       ${{ !cancelled() &&
@@ -1044,6 +1053,15 @@ jobs:
           ANTFLY_TLA_MODEL_CHECK: "true"
           ANTFLY_TLA_TRACE_VALIDATE: "true"
         run: scripts/ci/zig-tla-verify.sh
+
+      - name: Retain TLA trace evidence
+        if: always() && !cancelled()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tla-traces-${{ github.job }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/antfly-tla-traces/
+          if-no-files-found: ignore
+          retention-days: 14
 
       # Includes index-maintenance and index-ownership replay campaigns. The
       # fixed maintenance seed is already part of the zig-base unit aggregate.

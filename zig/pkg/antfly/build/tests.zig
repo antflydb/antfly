@@ -1772,7 +1772,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const recall_test_step = b.step("antfly-storage-vectorindex-recall-test", "Run HBC vector recall quality tests");
 
-    const raft_unit_default_filters = [_][]const u8{"raft."};
+    const raft_unit_default_filters = [_][]const u8{ "raft.", "trace files preserve overlapping producers" };
     const raft_unit_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = selectTestFilters(b, &raft_unit_default_filters),

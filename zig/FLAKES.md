@@ -4,6 +4,53 @@ See also the [E2E flake history](e2e/FLAKES.md). Record the original evidence,
 reproduction conditions, deterministic regression, and before/after results;
 a passing soak alone does not establish a failure's cause.
 
+## 2026-09-21: TLA trace producers truncated each other's output
+
+[Issue #828](https://github.com/antflydb/antfly/issues/828) records
+[run 35549453714's Raft validation failure](https://github.com/antflydb/antfly/actions/runs/35549453714/job/106181715054):
+282 Raft tests passed, but the 434-line trace failed JSON parsing at line 6.
+The original raw trace was not retained, so its exact bytes cannot be recovered.
+
+The defect remains on `origin/main` at `a032858819bd89ffcb31e5dcf7e76699babfdc3b`.
+`antfly-raft-test` launches multiple executables. Three emit traces, each opening
+the same `ANTFLY_TRACE_FILE` with `O_TRUNC` and an independent file offset.
+Twelve unchanged native macOS ARM64 Debug runs with `-j8` produced valid JSON,
+but retained only 445 events. Running the producers separately produced
+445 + 42 + 5 = 492 events: successful parsing concealed lost evidence.
+
+A controlled overlap of the unchanged producer executables reproduced malformed
+line 6. Pause the Raft producer after its file reaches 2,030 bytes, run the restore
+producer (which truncates it and writes 725 bytes), then resume the first
+producer. Both exit successfully; its old offset creates a NUL-filled hole after
+the restore producer's five lines. The production segmenter rejects line 6 with
+`invalid JSON trace event: Expecting value`. This establishes a producer-ownership
+bug with the reported signature, without asserting byte-for-byte identity with
+the missing CI artifact.
+
+CI extraction now owns a fresh run directory and each process exclusively creates
+its own PID-and-sequence file. PID reuse cannot overwrite earlier evidence.
+Raft and transaction loggers also share the mutex protecting their common
+buffered writer. Raft segmentation gives each input its own output directory,
+so equally named segments from different producers cannot overwrite one another.
+Invalid JSON remains fatal; existing model eligibility rules are unchanged.
+Both TLA CI jobs retain the raw directory as an artifact after success or failure.
+
+The owning Raft suite includes a regression that interleaves two producer
+identities, reuses one identity, resumes the original descriptor, and checks
+every file's exact contents. The fixed aggregate retains all 492 Raft events.
+Six fresh extraction/validation runs through `scripts/ci/zig-tla-verify.sh` pass,
+each validating 18 Raft and 22 transaction model segments. Run from the repository
+root with `ANTFLY_TLA_TRACE_VALIDATE=true` and a fresh
+`ANTFLY_TLA_TRACE_DIR`; extraction uses the bounded Zig build wrapper.
+
+Local raw traces, producer commands, negative-control output, and validation logs
+are under `.benchmark-results/issue-828/` in `.worktrees/issue-828-flakes`.
+In particular, `raft-overlap-before-2.ndjson`, `trace-overlap-result-2.log`, and
+`negative-segment.log` retain the corruption; `tla-script/` and `tla-repeat/`
+retain all fixed producers. These are native macOS results, not Linux ARC
+qualification. The separate catalog readiness evidence is recorded in the
+[E2E history](e2e/FLAKES.md#2026-09-21-catalog-reporter-startup-preceded-protocol-readiness).
+
 The later [Antfly E2E failures](e2e/FLAKES.md#2026-09-18-concurrent-aggregations-stalled-hydration-and-raced-primary-generations)
 add full-text hydration contention, aggregation generation races, and overlapping transaction session recovery;
 their deterministic regressions and native soak evidence are recorded there.
