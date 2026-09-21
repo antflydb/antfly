@@ -1,8 +1,8 @@
 package main
 
 import (
-	"strings"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	antfly "github.com/antflydb/antfly/go/pkg/sdk"

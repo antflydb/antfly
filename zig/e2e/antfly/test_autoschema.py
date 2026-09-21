@@ -169,9 +169,7 @@ def test_label_routed_autograph_promotes_events_and_entities(resolution_cluster)
     # would have minted `event/ada_lovelace` from the person mention.)
     absent_deadline = _new_e2e_deadline()
     assert _lookup_absent(api, "entities", EVENT_KEY, deadline=absent_deadline)
-    assert _lookup_absent(
-        api, "events", "event/ada_lovelace", deadline=absent_deadline
-    )
+    assert _lookup_absent(api, "events", "event/ada_lovelace", deadline=absent_deadline)
 
 
 def test_overlapping_labeled_resolvers_rejected_at_admission(resolution_cluster):
