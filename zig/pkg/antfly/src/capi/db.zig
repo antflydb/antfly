@@ -13492,6 +13492,13 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_stats_json(concurrent_status_handle, &concurrent_status));
     defer antfly_db_buffer_free(concurrent_status.ptr, concurrent_status.len);
     try std.testing.expect(std.mem.indexOf(u8, concurrent_status.ptr.?[0..concurrent_status.len], "\"doc_count\":") != null);
+    // Every fresh Lite database now carries the default full-text index,
+    // whose maintenance for the writes above runs in the background. Bring
+    // that work to idle before the vacuum and the physical-tail probes that
+    // follow: the online vacuum waits its turn for the writer slot, but the
+    // junk bytes appended below are only a stable tail if no later
+    // checkpoint extends the file past them.
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_run_until_idle(src_handle));
     var online_vacuum: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_vacuum_json(src_handle, &online_vacuum));
     defer antfly_db_buffer_free(online_vacuum.ptr, online_vacuum.len);
