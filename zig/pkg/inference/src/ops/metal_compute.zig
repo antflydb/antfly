@@ -11449,7 +11449,16 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn primBroadcastInDimOp(ctx: *anyopaque, input: CT, target_shape: []const i64, broadcast_axes: []const u8, input_shape: []const i64) anyerror!CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const input_buf = toBuf(input);
-        if (input_buf.integer_storage) return error.UnsupportedResidentTrainingPrimitive;
+        if (input_buf.integer_storage) {
+            const mt = input_buf.metal_tensor orelse return error.UnsupportedTensorType;
+            var shape: [8]i64 = undefined;
+            for (mt.shape(), 0..) |dim, i| shape[i] = dim;
+            const plan = try @import("binary_broadcast.zig").SelectionPlan.broadcast(input_buf.logical_shape orelse shape[0..mt.shape().len], target_shape, broadcast_axes);
+            const output = try metal_runtime.decoderRuntimeSelectTypedDevice(self.provider_impl, .{ mt, mt, mt }, plan, true) orelse return error.UnsupportedTensorType;
+            const result = try self.ctFromOwnedMetalTensor(output);
+            toBuf(result).integer_bounds = input_buf.integer_bounds;
+            return result;
+        }
         if (input_buf.quantized_storage != null) return error.UnsupportedTensorType;
         if (target_shape.len > metal_tensor_mod.max_dims or input_shape.len > metal_tensor_mod.max_dims) return error.UnsupportedShape;
 
@@ -12051,69 +12060,36 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return self.hostFallbackBinary(a, b, null, null, .less_than);
     }
 
+    fn selectionOperand(self: *MetalCompute, input: CT) !MetalTensor {
+        const buf = toBuf(input);
+        if (buf.integer_storage) {
+            const mt = buf.metal_tensor orelse return error.UnsupportedTensorType;
+            if (buf.logical_shape) |shape| {
+                const dims = try self.i32ShapeFromI64(shape);
+                defer self.allocator.free(dims);
+                return mt.retainedView(0, mt.deviceByteLen(), dims);
+            }
+            return mt.retainedCopy();
+        }
+        return self.ownedDeviceMetalTensorFromCt(input);
+    }
+
     fn whereSelectOp(ctx: *anyopaque, cond: CT, on_true: CT, on_false: CT) anyerror!CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
-        if (!disableRuntimeElementwise()) {
-            const cond_buf = toBuf(cond);
-            const true_buf = toBuf(on_true);
-            const false_buf = toBuf(on_false);
-            if (cond_buf.quantized_storage == null and true_buf.quantized_storage == null and false_buf.quantized_storage == null) {
-                if (try self.deviceWhereOperand(cond_buf)) |cond_mt_owned| {
-                    var cond_mt = cond_mt_owned;
-                    defer cond_mt.deinit();
-                    if (try self.deviceWhereOperand(true_buf)) |true_mt_owned| {
-                        var true_mt = true_mt_owned;
-                        defer true_mt.deinit();
-                        if (try self.deviceWhereOperand(false_buf)) |false_mt_owned| {
-                            var false_mt = false_mt_owned;
-                            defer false_mt.deinit();
-                            if (try metal_runtime.decoderRuntimeApplyWhereSelect(
-                                self.provider_impl,
-                                cond_mt,
-                                true_mt,
-                                false_mt,
-                            )) |tensor| {
-                                return self.ctFromOwnedMetalTensor(tensor);
-                            }
-                        }
-                    }
-                }
-                if (cond_buf.metal_tensor) |*cond_metal| {
-                    if (true_buf.metal_tensor) |*true_metal| {
-                        if (false_buf.metal_tensor) |*false_metal| {
-                            device_path: {
-                                if (!cond_metal.isDevice() or !true_metal.isDevice() or !false_metal.isDevice()) break :device_path;
-                                const target_count = if (cond_metal.elemCount() > 1)
-                                    cond_metal.elemCount()
-                                else if (true_metal.elemCount() > 1)
-                                    true_metal.elemCount()
-                                else
-                                    false_metal.elemCount();
-                                if (target_count == 0) break :device_path;
-                                if ((cond_metal.elemCount() != target_count and cond_metal.elemCount() != 1) or
-                                    (true_metal.elemCount() != target_count and true_metal.elemCount() != 1) or
-                                    (false_metal.elemCount() != target_count and false_metal.elemCount() != 1)) break :device_path;
-                                var cond_mt = try cond_metal.retainedCopy();
-                                defer cond_mt.deinit();
-                                var true_mt = try true_metal.retainedCopy();
-                                defer true_mt.deinit();
-                                var false_mt = try false_metal.retainedCopy();
-                                defer false_mt.deinit();
-                                if (try metal_runtime.decoderRuntimeApplyWhereSelect(
-                                    self.provider_impl,
-                                    cond_mt,
-                                    true_mt,
-                                    false_mt,
-                                )) |tensor| {
-                                    return self.ctFromOwnedMetalTensor(tensor);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        return self.hostFallbackWhereSelect(cond, on_true, on_false);
+        var c = try self.selectionOperand(cond);
+        defer c.deinit();
+        var t = try self.selectionOperand(on_true);
+        defer t.deinit();
+        var f = try self.selectionOperand(on_false);
+        defer f.deinit();
+        var shapes: [3][8]i64 = undefined;
+        const inputs = [3]MetalTensor{ c, t, f };
+        for (inputs, 0..) |input, operand| for (input.shape(), 0..) |dim, axis| {
+            shapes[operand][axis] = dim;
+        };
+        const plan = try @import("binary_broadcast.zig").SelectionPlan.where(shapes[0][0..c.shape().len], shapes[1][0..t.shape().len], shapes[2][0..f.shape().len]);
+        const output = try metal_runtime.decoderRuntimeSelectTypedDevice(self.provider_impl, inputs, plan, false) orelse return error.UnsupportedTensorType;
+        return self.ctFromOwnedMetalTensor(output);
     }
 
     fn reduceSumOp(ctx: *anyopaque, input: CT, axes: []const u8, input_shape: []const i64) anyerror!CT {

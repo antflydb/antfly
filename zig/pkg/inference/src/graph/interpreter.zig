@@ -1963,8 +1963,44 @@ fn resolveSingleInferredDim(dims: []i64, input_numel: usize) bool {
     return known_product == input_numel;
 }
 
+/// Shape tensors are control data: transfer only their small payload, preserving
+/// integer widths instead of converting dimensions through floating point.
+fn readRuntimeShape(cb: *const ComputeBackend, input: CT, out: *[8]i64) ![]const i64 {
+    const allocator = std.heap.page_allocator;
+    const shape = try cb.tensorShape(input, allocator);
+    defer allocator.free(shape);
+    const count = safeElementCountFromDims(shape) orelse return error.InvalidTensorShape;
+    if (count > out.len) return error.InvalidTensorShape;
+    switch (try cb.tensorDType(input)) {
+        .i8, .i16, .i32, .i64, .u8, .bool_ => {
+            const exported = (try cb.exportTensorData(input, allocator)) orelse return error.UnsupportedTensorType;
+            defer allocator.free(exported.payload.bytes);
+            const bytes = exported.payload.bytes;
+            if (bytes.len != count * exported.dtype.byteSize()) return error.InvalidTensorShape;
+            for (out[0..count], 0..) |*dim, i| dim.* = switch (exported.dtype) {
+                .i8 => @as(i8, @bitCast(bytes[i])),
+                .u8, .bool_ => bytes[i],
+                .i16 => std.mem.readInt(i16, bytes[i * 2 ..][0..2], .little),
+                .i32 => std.mem.readInt(i32, bytes[i * 4 ..][0..4], .little),
+                .i64 => std.mem.readInt(i64, bytes[i * 8 ..][0..8], .little),
+                else => return error.UnsupportedTensorType,
+            };
+        },
+        else => {
+            const values = try cb.toFloat32(input, allocator);
+            defer allocator.free(values);
+            if (values.len != count) return error.InvalidTensorShape;
+            for (values, 0..) |value, i| {
+                if (!std.math.isFinite(value) or @trunc(value) != value or value < -9223372036854775808.0 or value >= 9223372036854775808.0) return error.InvalidTensorShape;
+                out[i] = @intFromFloat(value);
+            }
+        },
+    }
+    return out[0..count];
+}
+
 fn resolveOnnxRuntimeReshapeDims(
-    shape_values: []const f32,
+    shape_values: []const i64,
     actual_input_shape: []const i64,
     allow_zero: bool,
     out: *[8]i64,
@@ -1975,14 +2011,7 @@ fn resolveOnnxRuntimeReshapeDims(
     var inferred_axis: ?usize = null;
     var known_product: usize = 1;
     for (shape_values, 0..) |value, axis| {
-        const rounded = @round(value);
-        if (!std.math.isFinite(rounded) or @abs(value - rounded) > 1e-3 or
-            rounded < @as(f32, @floatFromInt(std.math.minInt(i32))) or
-            rounded > @as(f32, @floatFromInt(std.math.maxInt(i32))))
-        {
-            return error.InvalidTensorShape;
-        }
-        var dim: i64 = @intFromFloat(rounded);
+        var dim = value;
         if (dim == 0 and !allow_zero) {
             if (axis >= actual_input_shape.len or actual_input_shape[axis] <= 0) return error.InvalidTensorShape;
             dim = actual_input_shape[axis];
@@ -3549,8 +3578,8 @@ pub fn executeNode(
                     if (ins.len < 2 or ins[1] == null_node) return error.MissingRuntimeInput;
                     const actual = try cb.tensorShape(input_value, std.heap.page_allocator);
                     defer std.heap.page_allocator.free(actual);
-                    const shape_values = try cb.toFloat32(V.get(ins[1]), std.heap.page_allocator);
-                    defer std.heap.page_allocator.free(shape_values);
+                    var shape_buf: [8]i64 = undefined;
+                    const shape_values = try readRuntimeShape(cb, V.get(ins[1]), &shape_buf);
                     break :blk try resolveOnnxRuntimeReshapeDims(shape_values, actual, attrs.allow_zero, &resolved_dims);
                 }
                 const actual = cb.tensorShape(input_value, std.heap.page_allocator) catch break :blk dims[0..rank];
@@ -3640,18 +3669,15 @@ pub fn executeNode(
             // any statically materializable values in target_shape and keeps
             // the original shape input as input 1 for dynamic shape graphs.
             if (ins.len > 1 and ins[1] != null_node) {
-                const shape_values = try cb.toFloat32(V.get(ins[1]), std.heap.page_allocator);
-                defer std.heap.page_allocator.free(shape_values);
+                var shape_buf: [8]i64 = undefined;
+                const shape_values = try readRuntimeShape(cb, V.get(ins[1]), &shape_buf);
                 if (shape_values.len > 0 and shape_values.len <= target_dims.len) {
                     rank = shape_values.len;
                     const actual_input_shape = cb.tensorShape(V.get(ins[0]), std.heap.page_allocator) catch null;
                     defer if (actual_input_shape) |actual| std.heap.page_allocator.free(actual);
                     const effective_input_shape = actual_input_shape orelse in_shape;
                     for (0..rank) |d| {
-                        const rounded = @round(shape_values[d]);
-                        if (!std.math.isFinite(rounded) or @abs(shape_values[d] - rounded) > 1e-3)
-                            return error.InvalidTensorShape;
-                        var target_dim: i64 = @intFromFloat(rounded);
+                        var target_dim = shape_values[d];
                         const aligned_input_axis = if (d + effective_input_shape.len >= rank)
                             d + effective_input_shape.len - rank
                         else
@@ -3660,12 +3686,10 @@ pub fn executeNode(
                             effective_input_shape[aligned_input_axis]
                         else
                             1;
-                        if (target_dim <= 0) {
-                            const declared = if (d < attrs.target_shape.rank()) attrs.target_shape.dim(@intCast(d)) else -1;
-                            target_dim = if (declared > 0) declared else if (input_dim > 0) input_dim else 1;
-                        } else if (target_dim == 1 and input_dim > 1) {
+                        if (target_dim < 0) return error.InvalidTensorShape;
+                        if (target_dim == 1) {
                             target_dim = input_dim;
-                        } else if (input_dim > 1 and target_dim != input_dim) {
+                        } else if (input_dim != 1 and target_dim != input_dim) {
                             return error.ShapeMismatch;
                         }
                         target_dims[d] = target_dim;
@@ -3687,12 +3711,10 @@ pub fn executeNode(
                 }
                 const declared_numel = safeNumel(in_shape);
                 if (target_known and declared_numel != null and declared_numel.? != target_numel) {
-                    const data = try cb.toFloat32(V.get(ins[0]), std.heap.page_allocator);
-                    defer std.heap.page_allocator.free(data);
-                    if (data.len == target_numel) {
-                        var target_i32: [8]i32 = undefined;
-                        for (target_dims[0..rank], 0..) |d, i| target_i32[i] = @intCast(d);
-                        return cb.fromFloat32Shape(data, target_i32[0..rank]);
+                    const actual = try cb.tensorShape(V.get(ins[0]), std.heap.page_allocator);
+                    defer std.heap.page_allocator.free(actual);
+                    if (safeNumel(actual) == target_numel) {
+                        return cb.primReshape(V.get(ins[0]), target_dims[0..rank]);
                     }
                 }
             }
@@ -7601,6 +7623,123 @@ test "Metal exact integer multidimensional broadcasting" {
         defer a.free(shape);
         try std.testing.expectEqualSlices(i64, &.{ 2, 3 }, shape);
     }
+}
+
+fn checkTypedSelections(cb: *const ComputeBackend, comptime metal: bool) !void {
+    const a = std.testing.allocator;
+    const mask = (try cb.fromConstantBytes(&.{ 1, 0 }, .bool_, &.{ 2, 1 })).?;
+    defer cb.free(mask);
+    const ones = try cb.fromFloat32Shape(&.{ 1, 2, 3 }, &.{3});
+    defer cb.free(ones);
+    const zeros = try cb.fromFloat32Shape(&.{0}, &.{});
+    defer cb.free(zeros);
+    const floats = try cb.primWhereSelect(mask, ones, zeros);
+    defer cb.free(floats);
+    const values = try cb.toFloat32(floats, a);
+    defer a.free(values);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 0, 0, 0 }, values);
+    const bools = try cb.primWhereSelect(mask, mask, mask);
+    defer cb.free(bools);
+    const bool_bytes = (try cb.exportTensorData(bools, a)).?;
+    defer a.free(bool_bytes.payload.bytes);
+    try std.testing.expectEqual(.bool_, bool_bytes.dtype);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 0 }, bool_bytes.payload.bytes);
+    inline for (.{ i8, i16, i32, i64, u8 }) |T| {
+        const dtype = @field(ml.graph.DType, @typeName(T));
+        const large: T = if (T == i64) 9007199254740993 else std.math.maxInt(T);
+        const x = (try cb.fromConstantBytes(std.mem.sliceAsBytes(&[_]T{ large, 2 }), dtype, &.{ 2, 1 })).?;
+        defer cb.free(x);
+        const expanded = try cb.primBroadcastInDim(x, &.{ 2, 3 }, &.{ 0, 1 }, &.{ 2, 1 });
+        defer cb.free(expanded);
+        if (metal) try std.testing.expect(@import("../ops/metal_compute.zig").MetalCompute.debugHasDeviceTensor(cb, expanded));
+        const raw = (try cb.exportTensorData(expanded, a)).?;
+        defer a.free(raw.payload.bytes);
+        try std.testing.expectEqualStrings(@tagName(dtype), @tagName(raw.dtype));
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]T{ large, large, large, 2, 2, 2 }), raw.payload.bytes);
+        const transposed = try cb.primBroadcastInDim(x, &.{ 3, 2 }, &.{ 1, 0 }, &.{ 2, 1 });
+        defer cb.free(transposed);
+        const traw = (try cb.exportTensorData(transposed, a)).?;
+        defer a.free(traw.payload.bytes);
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]T{ large, 2, large, 2, large, 2 }), traw.payload.bytes);
+        const y = (try cb.fromConstantBytes(std.mem.sliceAsBytes(&[_]T{ 3, 4, 5 }), dtype, &.{3})).?;
+        defer cb.free(y);
+        const integer_condition = (try cb.fromConstantBytes(std.mem.sliceAsBytes(&[_]T{ large, 0 }), dtype, &.{ 2, 1 })).?;
+        defer cb.free(integer_condition);
+        const integer_selected = try cb.primWhereSelect(integer_condition, x, y);
+        defer cb.free(integer_selected);
+        const integer_raw = (try cb.exportTensorData(integer_selected, a)).?;
+        defer a.free(integer_raw.payload.bytes);
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]T{ large, large, large, 3, 4, 5 }), integer_raw.payload.bytes);
+        // Match the importer's explicit broadcast lowering, using parameters
+        // so graph execution cannot constant-fold the regression away.
+        for ([_]bool{ false, true }) |dynamic| {
+            var g = Graph.init(a);
+            defer g.deinit();
+            var builder = ml.graph.Builder.init(&g);
+            const gx = try builder.parameter("x", Shape.init(dtype, &.{ 2, 1 }));
+            const gy = try builder.parameter("y", Shape.init(dtype, &.{3}));
+            const gc = try builder.parameter("condition", Shape.init(.bool_, &.{3}));
+            var attrs = ml.graph.node.BroadcastAttrs{ .target_shape = Shape.init(dtype, &.{ 2, 3 }) };
+            attrs.broadcast_axes = .{ 0, 1, 0, 0, 0, 0, 0, 0 };
+            attrs.num_axes = 2;
+            const shape_node = try builder.parameter("shape", Shape.init(.i64, &.{2}));
+            const gb = try g.addNode(.{ .op = .{ .broadcast_in_dim = attrs }, .output_shape = attrs.target_shape, .inputs = .{ gx, if (dynamic) shape_node else null_node, null_node, null_node }, .num_inputs = if (dynamic) 2 else 1 });
+            const gw = try g.addNode(.{ .op = .{ .where_select = {} }, .output_shape = attrs.target_shape, .inputs = .{ gc, gb, gy, null_node }, .num_inputs = 3 });
+            try g.markOutput(gw);
+            const condition = (try cb.fromConstantBytes(&.{ 1, 0, 1 }, .bool_, &.{3})).?;
+            defer cb.free(condition);
+            const shape_tensor = (try cb.fromConstantBytes(std.mem.sliceAsBytes(&[_]i64{ 2, 3 }), .i64, &.{2})).?;
+            defer cb.free(shape_tensor);
+            var result = try execute(a, &g, cb, .{ .runtime_inputs = &.{ .{ .node_id = gx, .value = x }, .{ .node_id = gy, .value = y }, .{ .node_id = gc, .value = condition }, .{ .node_id = shape_node, .value = shape_tensor } } });
+            defer result.deinit(cb);
+            if (metal) try std.testing.expect(@import("../ops/metal_compute.zig").MetalCompute.debugHasDeviceTensor(cb, result.outputs[0]));
+            const graph_raw = (try cb.exportTensorData(result.outputs[0], a)).?;
+            defer a.free(graph_raw.payload.bytes);
+            try std.testing.expectEqualStrings(@tagName(dtype), @tagName(graph_raw.dtype));
+            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]T{ large, 4, large, 2, 4, 2 }), graph_raw.payload.bytes);
+        }
+        inline for (.{ false, true }) |float_condition| {
+            const c = if (float_condition) try cb.fromFloat32Shape(&.{ 1, 0, 1 }, &.{3}) else (try cb.fromConstantBytes(&.{ 1, 0, 1 }, .bool_, &.{3})).?;
+            defer cb.free(c);
+            const out = try cb.primWhereSelect(c, x, y);
+            defer cb.free(out);
+            const bytes = (try cb.exportTensorData(out, a)).?;
+            defer a.free(bytes.payload.bytes);
+            try std.testing.expectEqualStrings(@tagName(dtype), @tagName(bytes.dtype));
+            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]T{ large, 4, large, 2, 4, 2 }), bytes.payload.bytes);
+            const shape = try cb.tensorShape(out, a);
+            defer a.free(shape);
+            try std.testing.expectEqualSlices(i64, &.{ 2, 3 }, shape);
+        }
+        try std.testing.expectError(error.ShapeMismatch, cb.primBroadcastInDim(x, &.{ 3, 3 }, &.{ 0, 1 }, &.{ 2, 1 }));
+        try std.testing.expectError(error.InvalidTensorShape, cb.primBroadcastInDim(x, &.{ 2, 3 }, &.{ 0, 0 }, &.{ 2, 1 }));
+        const empty = try cb.primBroadcastInDim(x, &.{ 2, 0 }, &.{ 0, 1 }, &.{ 2, 1 });
+        defer cb.free(empty);
+        const empty_raw = (try cb.exportTensorData(empty, a)).?;
+        defer a.free(empty_raw.payload.bytes);
+        try std.testing.expectEqual(@as(usize, 0), empty_raw.payload.bytes.len);
+    }
+}
+
+test "native shape-aware typed selections" {
+    const a = std.testing.allocator;
+    var ws = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var native = NativeCompute.init(a, &ws, null);
+    defer native.deinit();
+    const cb = native.computeBackend();
+    try checkTypedSelections(&cb, false);
+}
+
+test "Metal shape-aware typed selections" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var weights = @import("../ops/gpu_hosted_store.zig").WeightStore{ .allocator = a, .prefix = "", .lazy_weights = .empty };
+    defer weights.lazy_weights.deinit(a);
+    var compute = try @import("../ops/metal_compute.zig").MetalCompute.init(a, &weights, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    try checkTypedSelections(&cb, true);
 }
 
 test "Metal i64 arithmetic and mixed comparisons never round through float" {

@@ -1047,6 +1047,7 @@ typedef struct termite_metal_decode_runtime {
     id<MTLComputePipelineState> cumulative_sum_i16_pipeline;
     id<MTLComputePipelineState> cumulative_sum_u8_pipeline;
     id<MTLComputePipelineState> integer_binary_pipeline;
+    id<MTLComputePipelineState> select_typed_pipeline;
     id<MTLComputePipelineState> gather_typed_pipeline;
     id<MTLComputePipelineState> cast_typed_pipeline;
     id<MTLComputePipelineState> cumulative_sum_i32_pipeline;
@@ -10573,6 +10574,13 @@ static NSString *termite_metal_shader_source(void) {
            "    if (a < -9223372036854775808.0f) return true;\n"
            "    long integral = long(a);\n"
            "    return integral < b || (integral == b && a < float(integral));\n"
+           "}\n"
+           "kernel void termite_select_typed(device const uchar *c [[buffer(0)]], device const uchar *t [[buffer(1)]], device const uchar *f [[buffer(2)]], device uchar *out [[buffer(3)]], constant uint *p [[buffer(4)]], uint gid [[thread_position_in_grid]]) {\n"
+           "  if (gid >= p[0]) return; uint rem = gid; uint3 ix = uint3(0);\n"
+           "  if (p[1] == 1) ix = gid * uint3(p[13], p[21], p[29]); else for (uint a = 0; a < p[1]; ++a) { uint coord = rem / p[5+a]; rem %= p[5+a]; ix += coord * uint3(p[13+a], p[21+a], p[29+a]); }\n"
+           "  device const uchar *src; uint index;\n"
+           "  if (p[2]) { src = c; index = ix.x; } else { bool take = p[3] == 0 ? ((device const float *)c)[ix.x] != 0.0f : termite_read_integer(c, p[3], ix.x) != 0; src = take ? t : f; index = take ? ix.y : ix.z; }\n"
+           "  switch (p[4]) { case 8: ((device ulong *)out)[gid] = ((device const ulong *)src)[index]; break; case 4: ((device uint *)out)[gid] = ((device const uint *)src)[index]; break; case 2: ((device ushort *)out)[gid] = ((device const ushort *)src)[index]; break; default: out[gid] = src[index]; }\n"
            "}\n"
            "kernel void termite_integer_binary(device const uchar *lhs [[buffer(0)]], device const uchar *rhs [[buffer(1)]], device uchar *output [[buffer(2)]], constant uint *p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
            "    if (gid >= p[0]) return;\n"
@@ -25771,6 +25779,7 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         runtime->convert_dtype_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_convert_dtype_f32");
         runtime->cumulative_sum_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_cumulative_sum_f32");
         runtime->integer_binary_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_integer_binary");
+        runtime->select_typed_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_select_typed");
         runtime->gather_typed_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_gather_typed");
         runtime->cast_typed_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_cast_typed");
         runtime->cumulative_sum_i32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_cumulative_sum_i32");
@@ -26646,6 +26655,7 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->convert_dtype_f32_pipeline = nil;
     runtime->cumulative_sum_f32_pipeline = nil;
     runtime->integer_binary_pipeline = nil;
+    runtime->select_typed_pipeline = nil;
     runtime->gather_typed_pipeline = nil;
     runtime->cast_typed_pipeline = nil;
     runtime->cumulative_sum_i32_pipeline = nil;
@@ -45085,6 +45095,45 @@ int termite_metal_decode_runtime_cumulative_sum_f32_device(
         [encoder setBytes:params length:sizeof(params) atIndex:2];
         [encoder dispatchThreadgroups:MTLSizeMake(outer * inner, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         if (!planned_encoder) [encoder endEncoding];
+        return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -10);
+    }
+}
+
+int termite_metal_decode_runtime_select_typed_device(termite_metal_decode_runtime *runtime,
+    void *cond_handle, size_t cond_offset, size_t cond_bytes,
+    void *true_handle, size_t true_offset, size_t true_bytes,
+    void *false_handle, size_t false_offset, size_t false_bytes,
+    void *output_handle, size_t output_offset, size_t output_bytes, const uint32_t *params) {
+    if (!runtime || !cond_handle || !true_handle || !false_handle || !output_handle || !params) return -1;
+    @autoreleasepool {
+        id<MTLBuffer> c = (__bridge id<MTLBuffer>)cond_handle;
+        id<MTLBuffer> t = (__bridge id<MTLBuffer>)true_handle;
+        id<MTLBuffer> f = (__bridge id<MTLBuffer>)false_handle;
+        id<MTLBuffer> out = (__bridge id<MTLBuffer>)output_handle;
+        if (cond_offset > c.length || cond_bytes > c.length - cond_offset ||
+            true_offset > t.length || true_bytes > t.length - true_offset ||
+            false_offset > f.length || false_bytes > f.length - false_offset ||
+            output_offset > out.length || output_bytes > out.length - output_offset) return -2;
+        id<MTLComputePipelineState> pipeline = runtime->select_typed_pipeline;
+        if (pipeline == nil) return -3;
+        if (termite_metal_decode_runtime_prepare_planned_compute_ternary_accesses(runtime,
+            c, cond_offset, cond_bytes, t, true_offset, true_bytes, f, false_offset, false_bytes,
+            out, output_offset, output_bytes, -9) != 0) return -9;
+        bool frame_owned = true;
+        id<MTLCommandBuffer> command_buffer = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);
+        if (command_buffer == nil) return -8;
+        id<MTLComputeCommandEncoder> encoder = runtime->active_planned_compute_encoder;
+        BOOL planned = encoder != nil;
+        if (!planned) encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
+        if (encoder == nil) return -9;
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:c offset:cond_offset atIndex:0];
+        [encoder setBuffer:t offset:true_offset atIndex:1];
+        [encoder setBuffer:f offset:false_offset atIndex:2];
+        [encoder setBuffer:out offset:output_offset atIndex:3];
+        [encoder setBytes:params length:37 * sizeof(uint32_t) atIndex:4];
+        [encoder dispatchThreads:MTLSizeMake(params[0], 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(pipeline, params[0]), 1, 1)];
+        if (!planned) [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -10);
     }
 }

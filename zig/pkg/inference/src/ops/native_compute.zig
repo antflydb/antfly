@@ -6836,6 +6836,7 @@ fn canConsumeWhereSelectBranch(
 
 fn whereSelectConsumeTrueOp(ctx: *anyopaque, cond: CT, on_true: CT, on_false: CT) anyerror!?CT {
     _ = ctx;
+    if (integerSource(cond) != null or integerSource(on_true) != null or integerSource(on_false) != null) return null;
     var c_shape_symbolic_buf: [8]i64 = undefined;
     var t_shape_symbolic_buf: [8]i64 = undefined;
     var f_shape_symbolic_buf: [8]i64 = undefined;
@@ -6925,6 +6926,7 @@ fn whereSelectConsumeTrueOp(ctx: *anyopaque, cond: CT, on_true: CT, on_false: CT
 
 fn whereSelectConsumeFalseOp(ctx: *anyopaque, cond: CT, on_true: CT, on_false: CT) anyerror!?CT {
     _ = ctx;
+    if (integerSource(cond) != null or integerSource(on_true) != null or integerSource(on_false) != null) return null;
     var c_shape_symbolic_buf: [8]i64 = undefined;
     var t_shape_symbolic_buf: [8]i64 = undefined;
     var f_shape_symbolic_buf: [8]i64 = undefined;
@@ -37442,6 +37444,7 @@ fn lessThanOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
 
 fn whereSelectOp(ctx: *anyopaque, cond: CT, on_true: CT, on_false: CT) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    if (integerSource(cond) != null or integerSource(on_true) != null or integerSource(on_false) != null) return exactWhereSelect(self, cond, on_true, on_false);
     var c_shape_symbolic_buf: [8]i64 = undefined;
     var t_shape_symbolic_buf: [8]i64 = undefined;
     var f_shape_symbolic_buf: [8]i64 = undefined;
@@ -38063,6 +38066,21 @@ fn primTransposeOp(ctx: *anyopaque, input: CT, perm: []const u8, input_shape: []
 
 fn primBroadcastInDimOp(ctx: *anyopaque, input: CT, target_shape: []const i64, broadcast_axes: []const u8, input_shape: []const i64) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    if (integerSource(input)) |source| {
+        const plan = try @import("binary_broadcast.zig").SelectionPlan.broadcast(storedOrDeclaredShape(input, input_shape), target_shape, broadcast_axes);
+        if (plan.counts[0] != try integerTensorCount(source)) return error.ShapeMismatch;
+        if (plan.identity()) return copyIntegerTensorWithShape(self, source, plan.shape[0..plan.rank]);
+        const width = source.dtype.byteSize();
+        const bytes = try self.allocator.alloc(u8, try std.math.mul(usize, plan.count, width));
+        var transferred = false;
+        defer if (!transferred) self.allocator.free(bytes);
+        for (0..plan.count) |i| {
+            const offset = plan.offsets(i)[0] * width;
+            @memcpy(bytes[i * width ..][0..width], source.data[offset..][0..width]);
+        }
+        transferred = true;
+        return takeOwnedIntegerBytes(self, bytes, source.dtype, plan.shape[0..plan.rank]);
+    }
     const input_buf = toBuf(input);
     const out_rank = target_shape.len;
     const effective_input_shape = storedOrDeclaredShape(input, input_shape);
@@ -39031,6 +39049,63 @@ fn cumulativeSumOp(ctx: *anyopaque, input: CT, axis: u8, exclusive: bool, revers
     errdefer self.computeBackend().free(output);
     scanAxis(f32, data, outer, width, inner, exclusive, reverse);
     return self.withLogicalShape(output, shape);
+}
+
+fn exactWhereSelect(self: *NativeCompute, cond: CT, yes: CT, no: CT) !CT {
+    const dtype: tensor_mod.DType = if (integerSource(yes)) |source| source.dtype else .f32;
+    const false_dtype: tensor_mod.DType = if (integerSource(no)) |source| source.dtype else .f32;
+    if (dtype != false_dtype) return error.UnsupportedTensorType;
+    var views: [3]?WeightF32View = @splat(null);
+    defer for (&views) |*view| {
+        if (view.*) |v| if (v.owned) |owned| self.allocator.free(owned);
+    };
+    var shapes: [3][]const i64 = undefined;
+    var flat: [3][1]i64 = undefined;
+    var bytes: [3][]const u8 = undefined;
+    var counts: [3]usize = undefined;
+    for ([_]CT{ cond, yes, no }, 0..) |input, i| {
+        if (integerSource(input)) |source| {
+            counts[i] = try integerTensorCount(source);
+            bytes[i] = source.data;
+        } else {
+            views[i] = try denseTensorView(self, input);
+            counts[i] = views[i].?.data.len;
+            bytes[i] = std.mem.sliceAsBytes(views[i].?.data);
+        }
+        flat[i][0] = @intCast(counts[i]);
+        shapes[i] = tensorStoredShape(input) orelse &flat[i];
+    }
+    const plan = try @import("binary_broadcast.zig").SelectionPlan.where(shapes[0], shapes[1], shapes[2]);
+    if (!std.mem.eql(usize, &counts, &plan.counts)) return error.ShapeMismatch;
+    const condition = if (integerSource(cond) != null) try IndexReader.init(cond) else null;
+    const width = if (integerSource(yes)) |source| source.dtype.byteSize() else @sizeOf(f32);
+    const output = try self.allocator.alloc(u8, try std.math.mul(usize, plan.count, width));
+    var transferred = false;
+    defer if (!transferred) self.allocator.free(output);
+    for (0..plan.count) |i| {
+        const offsets = plan.offsets(i);
+        const take_true = if (condition) |reader| try reader.at(offsets[0]) != 0 else views[0].?.data[offsets[0]] != 0;
+        const branch: usize = if (take_true) 1 else 2;
+        @memcpy(output[i * width ..][0..width], bytes[branch][offsets[branch] * width ..][0..width]);
+    }
+    if (dtype == .f32) {
+        const data = try self.allocator.alloc(f32, plan.count);
+        @memcpy(std.mem.sliceAsBytes(data), output);
+        const result = try self.makeOwnedBuf(data);
+        errdefer freeTensor(self, result);
+        return self.withLogicalShape(result, plan.shape[0..plan.rank]);
+    }
+    transferred = true;
+    return takeOwnedIntegerBytes(self, output, dtype, plan.shape[0..plan.rank]);
+}
+
+/// Takes ownership on success and failure, avoiding a second output copy.
+fn takeOwnedIntegerBytes(self: *NativeCompute, data: []u8, dtype: tensor_mod.DType, shape: []const i64) !CT {
+    const owned_shape = self.allocator.dupe(i64, shape) catch |err| {
+        self.allocator.free(data);
+        return err;
+    };
+    return self.makeBufWithOwnedSourceTensor(.{ .data = data, .dtype = dtype, .shape = owned_shape, .name = "", .allocator = self.allocator, .owns_data = true, .owns_shape = true });
 }
 
 fn integerSource(input: CT) ?*const tensor_mod.Tensor {
