@@ -79,6 +79,7 @@ pub const sparse = @import("sparse/sparse.zig");
 // Inference clients (Antfly, OpenAI/Ollama)
 pub const inference = @import("inference/mod.zig");
 pub const table_schema = @import("schema/mod.zig");
+pub const capi_dependencies = @import("capi_dependencies.zig");
 pub const image = @import("antfly_image");
 pub const font = @import("antfly_font");
 pub const pdf = @import("antfly_pdf");

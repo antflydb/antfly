@@ -40,8 +40,10 @@ cd "$repo_root/zig"
 if (( workers > 1 )); then
   # Isolation groups preserve shared fixture lifecycles; independent tests are
   # scheduled longest-first without exceeding the Antfly process budget.
-  exec uv run --project e2e/antfly pytest -q --continue-on-collection-errors \
+  # Keep test identities visible even if the job is cancelled before pytest's
+  # final summary; quiet progress dots hide the failing or stalled scenario.
+  exec uv run --project e2e/antfly pytest -v --tb=short --continue-on-collection-errors \
     -n "$workers" --dist=loadgroup --e2e-process-slots "$process_slots" "$@"
 fi
 
-exec uv run --project e2e/antfly pytest -q --continue-on-collection-errors "$@"
+exec uv run --project e2e/antfly pytest -v --tb=short --continue-on-collection-errors "$@"

@@ -71,6 +71,7 @@ pub const ManagedDbOpenMode = enum {
     status_only,
 };
 
+pub const RestoreTerminalAdmission = enum { none, ha_replay, cancel_recovery };
 pub const StartupCatchUpMetadata = struct {
     pub const MetadataSource = enum { supplied, local_persisted };
     pub const IdentityValidation = enum {
@@ -89,6 +90,7 @@ pub const StartupCatchUpMetadata = struct {
     /// advance at most one admitted intent.
     advance_index_repairs: bool = false,
     index_repair_options: db_mod.types.ArtifactRepairRunOptions = .{},
+    restore_reservation: ?struct { plan_id: [16]u8, plan_digest: [32]u8, byte_range: db_mod.types.ByteRange, scope: ?@import("../storage/db/restore_staging_contract.zig").Scope = null, indexes_json: []const u8 = "{}", read_schema_json: []const u8 = "", terminal_admission: RestoreTerminalAdmission = .none } = null,
 };
 
 pub fn indexesJsonNeedsAssetProducer(alloc: std.mem.Allocator, indexes_json: []const u8) !bool {

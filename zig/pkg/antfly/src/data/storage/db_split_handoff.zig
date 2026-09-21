@@ -396,36 +396,58 @@ pub const Destination = struct {
     }
 
     pub fn deleteDocsInRange(self: *Destination, alloc: std.mem.Allocator, byte_range: db_types.ByteRange) !void {
+        if (byte_range.end.len != 0 and std.mem.order(u8, byte_range.start, byte_range.end) != .lt) return error.InvalidRange;
         const lower = try internal_keys.documentRangeLowerAlloc(alloc, byte_range.start);
         defer alloc.free(lower);
         const upper = if (byte_range.end.len > 0) try internal_keys.documentRangeUpperAlloc(alloc, byte_range.end) else null;
         defer if (upper) |buf| alloc.free(buf);
-
-        const docs = try self.db.core.scanStoreRange(alloc, lower, if (upper) |buf| buf else "");
-        defer {
-            for (docs) |kv| {
-                alloc.free(kv.key);
-                alloc.free(kv.value);
+        var after: ?[]u8 = null;
+        defer if (after) |key| alloc.free(key);
+        // Transition owners are quiescent/exclusively leased. Each page releases
+        // its snapshot before the ordinary mutation transaction, which removes
+        // primary, every index generation, identity and catalog effects together.
+        // Bound physical visits too: a row with many artifacts must not turn a
+        // page into an unbounded scan. Never copy or decode primary row values.
+        while (true) {
+            try self.io_impl.io().checkCancel();
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const page_alloc = arena.allocator();
+            var deletes: std.ArrayList([]const u8) = .empty;
+            var next: ?[]const u8 = null;
+            var exhausted = true;
+            {
+                var read = try self.db.core.store.beginReadTxn();
+                defer read.abort();
+                var cursor = try read.openPhysicalCursorAdapter();
+                defer cursor.close();
+                var item = try cursor.seekAtOrAfter(after orelse lower);
+                if (item) |entry| if (after != null and std.mem.eql(u8, entry.key, after.?)) {
+                    item = try cursor.next();
+                };
+                var visited: usize = 0;
+                var key_bytes: usize = 0;
+                while (item) |entry| : (item = try cursor.next()) {
+                    if (upper) |end| if (std.mem.order(u8, entry.key, end) != .lt) break;
+                    if (!std.mem.startsWith(u8, entry.key, &.{internal_keys.user_namespace})) break;
+                    // One maximum-sized document key is always admitted; all
+                    // subsequent keys must fit the page's one-MiB byte budget.
+                    if (visited == 256 or (visited != 0 and entry.key.len > 1024 * 1024 -| key_bytes)) {
+                        exhausted = false;
+                        break;
+                    }
+                    visited += 1;
+                    key_bytes +|= entry.key.len;
+                    next = try page_alloc.dupe(u8, entry.key);
+                    if (try internal_keys.decodeStoredDocumentRowKeyAlloc(page_alloc, entry.key)) |key|
+                        try deletes.append(page_alloc, key);
+                }
             }
-            alloc.free(docs);
-        }
-
-        var deletes = std.ArrayListUnmanaged([]const u8).empty;
-        defer {
-            for (deletes.items) |key| alloc.free(@constCast(key));
-            deletes.deinit(alloc);
-        }
-
-        for (docs) |kv| {
-            const doc_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(alloc, kv.key)) orelse continue;
-            errdefer alloc.free(doc_key);
-            try deletes.append(alloc, doc_key);
-        }
-
-        if (deletes.items.len > 0) {
-            try self.db.batch(.{
-                .deletes = deletes.items,
-            });
+            if (deletes.items.len != 0) try self.db.batch(.{ .deletes = deletes.items });
+            if (exhausted) return;
+            const continued = try alloc.dupe(u8, next orelse return error.InvalidState);
+            if (after) |key| alloc.free(key);
+            after = continued;
         }
     }
 };
@@ -1032,9 +1054,12 @@ pub const MergeCoordinator = struct {
             }
         } else {
             // Offline coordinators consume an already reconciled projection.
-            const entries = try self.donor.groupState(self.alloc, self.donor_group_id);
-            defer shard_state_store.freeGroupStateEntries(self.alloc, entries);
-            try self.receiver.applyMergeBootstrap(self.alloc, donor_range, entries);
+            // Use the same bounded pages as replicated transfer: materializing
+            // groupState here otherwise makes an offline recovery allocate the
+            // entire donor corpus, even though the live-owner path is bounded.
+            try self.receiver.db.updateRange(mergeRanges(self.receiver.getRange(), donor_range));
+            try self.receiver.deleteDocsInRange(self.alloc, donor_range);
+            try self.copyProjectedDonorDocuments(self.alloc, donor_range);
         }
 
         if (self.donor_lease) |lease| {
@@ -1063,6 +1088,37 @@ pub const MergeCoordinator = struct {
         self.bootstrap_applied_index = donor_applied_index;
         try self.persistMergeState();
         return donor_applied_index;
+    }
+
+    fn copyProjectedDonorDocuments(self: *MergeCoordinator, work_alloc: std.mem.Allocator, donor_range: db_types.ByteRange) !void {
+        var after_key: ?[]u8 = null;
+        defer if (after_key) |key| self.alloc.free(key);
+        while (true) {
+            try self.receiver.io_impl.io().checkCancel();
+            var arena = std.heap.ArenaAllocator.init(work_alloc);
+            defer arena.deinit();
+            const page_alloc = arena.allocator();
+            var page = try self.donor.groupStatePageInRange(
+                page_alloc,
+                self.donor_group_id,
+                .{ .start = donor_range.start, .end = donor_range.end },
+                after_key,
+                128,
+                1024 * 1024,
+            );
+            defer page.deinit(page_alloc);
+            if (page.entries.len == 0) {
+                if (!page.exhausted) return error.MergeSourceProjectionNotReady;
+                break;
+            }
+            const writes = try page_alloc.alloc(db_types.BatchWrite, page.entries.len);
+            for (page.entries, 0..) |entry, i| writes[i] = .{ .key = entry.key, .value = entry.value };
+            try self.receiver.db.batch(.{ .writes = writes });
+            const next = try self.alloc.dupe(u8, page.entries[page.entries.len - 1].key);
+            if (after_key) |key| self.alloc.free(key);
+            after_key = next;
+            if (page.exhausted) break;
+        }
     }
 
     fn copyDonorArtifacts(self: *MergeCoordinator, donor_db: *db_mod.DB, donor_range: db_types.ByteRange) !void {
@@ -2190,6 +2246,97 @@ test "db merge coordinator copies committed outcomes without replaying transform
     defer alloc.free(preserved);
     try std.testing.expectEqualStrings("{}", preserved);
     try std.testing.expectEqual(@as(usize, 0), try coord.catchUp());
+}
+
+test "db merge coordinator offline copy bounds memory and retries partial pages after reopen" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const donor_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/merge-paged-donor", .{tmp.sub_path});
+    defer alloc.free(donor_root);
+    const receiver_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/merge-paged-receiver", .{tmp.sub_path});
+    defer alloc.free(receiver_root);
+    const Helpers = struct {
+        fn apply(store: *data_store.RaftApplyStore, index: u64, request: db_types.BatchRequest) !void {
+            const a = std.testing.allocator;
+            const encoded = try data_raft_batch.encode(a, "docs", request);
+            defer a.free(encoded);
+            const entries = try raft_state_machine.encodeCommittedEntries(a, &.{.{ .term = 1, .index = index, .entry_type = .normal, .data = encoded }});
+            defer a.free(entries);
+            try store.snapshotBuilder().applyBatch(.{ .group_id = 141, .commit_index = index, .entries_bytes = entries });
+        }
+    };
+    const payload = try alloc.alloc(u8, 32 * 1024);
+    defer alloc.free(payload);
+    @memset(payload, 'x');
+    const value = try std.fmt.allocPrint(alloc, "{{\"payload\":\"{s}\"}}", .{payload});
+    defer alloc.free(value);
+    {
+        var donor = try data_store.RaftApplyStore.init(alloc, .{ .root_dir = donor_root });
+        defer donor.deinit();
+        const entries = try raft_state_machine.encodeCommittedEntries(alloc, &.{.{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:doc:m:doc:z") }});
+        defer alloc.free(entries);
+        try donor.snapshotBuilder().applyBatch(.{ .group_id = 141, .commit_index = 1, .entries_bytes = entries });
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        var writes: [256]db_types.BatchWrite = undefined;
+        for (&writes, 0..) |*write, i| write.* = .{
+            .key = try std.fmt.allocPrint(arena.allocator(), "doc:m{d:0>4}", .{i}),
+            .value = value,
+        };
+        try Helpers.apply(&donor, 2, .{ .writes = &writes });
+        // Install malformed historical projection data through the raw
+        // projection fixture, rather than an invalid JSON batch envelope.
+        const malformed = try raft_state_machine.encodeCommittedEntries(alloc, &.{.{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("put:doc:m0129=invalid-json") }});
+        defer alloc.free(malformed);
+        try donor.snapshotBuilder().applyBatch(.{ .group_id = 141, .commit_index = 3, .entries_bytes = malformed });
+    }
+    {
+        var receiver = try Destination.init(alloc, .{ .root_dir = receiver_root });
+        defer receiver.deinit();
+        try receiver.db.updateRange(.{ .start = "doc:a", .end = "doc:m" });
+        try receiver.db.batch(.{ .writes = &.{.{ .key = "doc:b", .value = "{}" }} });
+    }
+    const config: MergeConfig = .{
+        .donor_root_dir = donor_root,
+        .receiver_root_dir = receiver_root,
+        .donor_group_id = 141,
+        .receiver_group_id = 142,
+    };
+    {
+        var coord = try MergeCoordinator.init(alloc, config);
+        defer coord.deinit();
+        try coord.acceptDonorRange();
+        try std.testing.expectError(error.SyntaxError, coord.ensureReceiverBootstrapped());
+        try std.testing.expect(!coord.bootstrap_complete);
+        // At least one committed page precedes the malformed later row; no
+        // completion watermark may certify that partially populated receiver.
+        const copied = (try coord.receiver.get(alloc, "doc:m0000")) orelse return error.TestExpectedEqual;
+        defer alloc.free(copied);
+        try std.testing.expectEqualStrings(value, copied);
+        try std.testing.expectEqual(@as(u64, 0), coord.bootstrap_applied_index);
+        try Helpers.apply(coord.donor, 4, .{ .writes = &.{.{ .key = "doc:m0129", .value = value }} });
+    }
+    {
+        var coord = try MergeCoordinator.init(alloc, config);
+        defer coord.deinit();
+        try std.testing.expect(!coord.bootstrap_complete);
+        // Eight MiB of source JSON must fit into four MiB of reusable caller
+        // scratch. This runs the production page loop, not a mock page source.
+        const scratch = try alloc.alloc(u8, 4 * 1024 * 1024);
+        defer alloc.free(scratch);
+        var fixed = std.heap.FixedBufferAllocator.init(scratch);
+        try coord.copyProjectedDonorDocuments(fixed.allocator(), .{ .start = "doc:m", .end = "doc:z" });
+        try std.testing.expect(try coord.ensureReceiverBootstrapped());
+        try std.testing.expectEqual(@as(u64, 2), coord.copy_attempt.sequence);
+        try std.testing.expectEqual(@as(u64, 4), coord.bootstrap_applied_index);
+        const copied = (try coord.receiver.get(alloc, "doc:m0255")) orelse return error.TestExpectedEqual;
+        defer alloc.free(copied);
+        try std.testing.expectEqualStrings(value, copied);
+        const preserved = (try coord.receiver.get(alloc, "doc:b")) orelse return error.TestExpectedEqual;
+        defer alloc.free(preserved);
+        try std.testing.expectEqualStrings("{}", preserved);
+    }
 }
 
 test "db merge coordinator bootstraps receiver for donor range" {

@@ -412,6 +412,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     capi_package_test_step.dependOn(&run_cabi_packaging_tests.step);
 
     const capi_default_filters = [_][]const u8{
+        "capi relational expression errors preserve public status semantics",
         "capi artifact decode and lookup json",
         "capi lite opens exports imports checks and vacuums aflite",
         "capi zero buffer helper wipes bytes before free",

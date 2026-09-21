@@ -24,6 +24,7 @@ pub const Kind = enum {
     embeddings,
     graph,
     algebraic,
+    relational,
 };
 
 /// Closed object shapes used by CreatedIndex responses. Public response
@@ -60,6 +61,12 @@ pub const CreatedObjectShape = enum {
     chunker_audio,
     index_execution,
     execution_policy,
+    relational_keys,
+    relational_key,
+    relational_predicates,
+    relational_predicate,
+    relational_expression,
+    relational_expression_args,
 };
 
 pub fn parseKind(value: []const u8) ?Kind {
@@ -67,10 +74,12 @@ pub fn parseKind(value: []const u8) ?Kind {
     if (std.mem.eql(u8, value, "embeddings")) return .embeddings;
     if (std.mem.eql(u8, value, "graph")) return .graph;
     if (std.mem.eql(u8, value, "algebraic")) return .algebraic;
+    if (std.mem.eql(u8, value, "relational")) return .relational;
     return null;
 }
 
 pub fn isAllowedConfigField(kind: Kind, field: []const u8) bool {
+    if (kind == .relational and std.mem.eql(u8, field, "enrichments")) return false;
     if (isCommonField(field)) return true;
     return switch (kind) {
         .full_text => std.mem.eql(u8, field, "mem_only") or
@@ -107,6 +116,7 @@ pub fn isAllowedConfigField(kind: Kind, field: []const u8) bool {
             std.mem.eql(u8, field, "algebraic_planning") or
             std.mem.eql(u8, field, "resolvers"),
         .algebraic => std.mem.eql(u8, field, "derive_from_schema"),
+        .relational => std.mem.eql(u8, field, "keys") or std.mem.eql(u8, field, "include_columns") or std.mem.eql(u8, field, "where"),
     };
 }
 
@@ -143,6 +153,8 @@ pub fn isAllowedCreatedProviderField(field: []const u8) bool {
 }
 
 pub fn createdObjectShapeForRootField(kind: Kind, field: []const u8) CreatedObjectShape {
+    if (kind == .relational and std.mem.eql(u8, field, "keys")) return .relational_keys;
+    if (kind == .relational and std.mem.eql(u8, field, "where")) return .relational_predicates;
     if (std.mem.eql(u8, field, "enrichments")) return .enrichments;
     if (std.mem.eql(u8, field, "sources")) return switch (kind) {
         .graph => .graph_sources,
@@ -185,6 +197,9 @@ pub fn createdObjectShapeForArrayItem(parent: CreatedObjectShape) CreatedObjectS
         .graph_sources => .graph_source,
         .edge_types => .edge_type,
         .graph_resolvers => .graph_resolver,
+        .relational_keys => .relational_key,
+        .relational_predicates => .relational_predicate,
+        .relational_expression_args => .relational_expression,
         else => parent,
     };
 }
@@ -193,11 +208,26 @@ pub fn createdValueMatchesShape(shape: CreatedObjectShape, value: std.json.Value
     return switch (shape) {
         .unrestricted => true,
         .enrichments, .artifact_sources, .full_text_sources, .graph_sources, .edge_types, .graph_resolvers => value == .array,
+        .relational_keys => value == .array and value.array.items.len > 0 and value.array.items.len <= 32,
+        .relational_predicates => value == .array and value.array.items.len <= 256,
+        .relational_expression => @import("relational_expression_contract.zig").valid(value),
+        .relational_expression_args => value == .array and value.array.items.len > 0 and value.array.items.len <= 32,
         else => value == .object and createdObjectHasRequiredFields(shape, value.object),
     };
 }
 
 fn createdObjectHasRequiredFields(shape: CreatedObjectShape, object: std.json.ObjectMap) bool {
+    if (shape == .relational_key) {
+        const column = object.get("column");
+        const expression = object.get("expression");
+        if ((column != null) == (expression != null)) return false;
+        if (column) |name| {
+            if (!isNonEmptyString(name) or object.contains("result_type")) return false;
+        } else {
+            if (!@import("relational_expression_contract.zig").valid(expression.?)) return false;
+            if (!@import("relational_expression_contract.zig").validType(object.get("result_type") orelse return false)) return false;
+        }
+    }
     const required_fields: []const []const u8 = switch (shape) {
         .provider, .chunker => &.{"provider"},
         .enrichment => &.{ "name", "kind" },
@@ -209,6 +239,9 @@ fn createdObjectHasRequiredFields(shape: CreatedObjectShape, object: std.json.Ob
         .edge_type => &.{"name"},
         .graph_resolver => &.{ "name", "table", "source_artifact", "resolution_artifact", "key_template" },
         .graph_bounded_traversal => &.{"law"},
+        .relational_key, .relational_expression, .relational_expression_args => &.{},
+        .relational_predicate => &.{ "column", "op" },
+        .relational_keys, .relational_predicates => &.{},
         .graph_metrics, .graph_metric, .graph_metric_filter => &.{},
         .unrestricted, .enrichments, .artifact_sources, .full_text_sources, .graph_sources, .edge_types, .graph_resolvers, .graph_nodes, .graph_edge, .graph_context, .graph_algebraic_planning, .chunker_text, .chunker_audio, .index_execution, .execution_policy => &.{},
     };
@@ -221,6 +254,8 @@ fn createdObjectHasRequiredFields(shape: CreatedObjectShape, object: std.json.Ob
 
 pub fn createdObjectShapeForChild(parent: CreatedObjectShape, field: []const u8) CreatedObjectShape {
     return switch (parent) {
+        .relational_key => if (std.mem.eql(u8, field, "expression")) .relational_expression else .unrestricted,
+        .relational_expression => if (std.mem.eql(u8, field, "args")) .relational_expression_args else .unrestricted,
         .graph_metrics => .graph_metric,
         .graph_metric => if (std.mem.eql(u8, field, "edge_filter")) .graph_metric_filter else .unrestricted,
         .enrichment => if (std.mem.eql(u8, field, "execution")) .execution_policy else .unrestricted,
@@ -252,6 +287,10 @@ pub fn createdObjectShapeForChild(parent: CreatedObjectShape, field: []const u8)
 
 pub fn isAllowedCreatedObjectField(shape: CreatedObjectShape, field: []const u8) bool {
     return switch (shape) {
+        .relational_keys, .relational_predicates, .relational_expression_args => false,
+        .relational_key => std.mem.eql(u8, field, "column") or std.mem.eql(u8, field, "expression") or std.mem.eql(u8, field, "result_type") or std.mem.eql(u8, field, "direction") or std.mem.eql(u8, field, "nulls") or std.mem.eql(u8, field, "collation"),
+        .relational_expression => std.mem.eql(u8, field, "op") or std.mem.eql(u8, field, "type") or std.mem.eql(u8, field, "column") or std.mem.eql(u8, field, "value") or std.mem.eql(u8, field, "args") or std.mem.eql(u8, field, "collation"),
+        .relational_predicate => std.mem.eql(u8, field, "column") or std.mem.eql(u8, field, "op") or std.mem.eql(u8, field, "value") or std.mem.eql(u8, field, "collation"),
         .graph_metrics => field.len > 0 and std.mem.indexOfScalar(u8, field, 0) == null,
         .graph_metric => std.mem.eql(u8, field, "enabled") or std.mem.eql(u8, field, "kind") or
             std.mem.eql(u8, field, "refresh") or std.mem.eql(u8, field, "damping") or
@@ -289,7 +328,8 @@ pub fn rootFieldValueMatches(kind: Kind, field: []const u8, value: std.json.Valu
     if (std.mem.eql(u8, field, "name") or
         std.mem.eql(u8, field, "type") or
         std.mem.eql(u8, field, "description")) return isString(value);
-    if (std.mem.eql(u8, field, "version")) return isInteger(value);
+    if (std.mem.eql(u8, field, "version")) return isInteger(value) or
+        (kind == .relational and value == .number_string and std.mem.eql(u8, value.number_string, "0"));
     if (std.mem.eql(u8, field, "enrichments")) return value == .array;
     if (std.mem.eql(u8, field, "sources")) return value == .array;
 
@@ -330,13 +370,43 @@ pub fn rootFieldValueMatches(kind: Kind, field: []const u8, value: std.json.Valu
         else
             isString(value),
         .algebraic => isBool(value),
+        .relational => if (std.mem.eql(u8, field, "include_columns")) includesValid(value) else if (std.mem.eql(u8, field, "where")) createdValueMatchesShape(.relational_predicates, value) else createdValueMatchesShape(.relational_keys, value),
     };
+}
+
+fn includesValid(value: std.json.Value) bool {
+    if (value != .array or value.array.items.len > 256) return false;
+    for (value.array.items) |column| if (column != .string or column.string.len == 0) return false;
+    return true;
 }
 
 /// Verify the JSON representation of a member in a closed CreatedIndex
 /// object. `full_text_index` is the sole intentionally dynamic subtree.
 pub fn createdFieldValueMatches(shape: CreatedObjectShape, field: []const u8, value: std.json.Value) bool {
     return switch (shape) {
+        .relational_keys, .relational_predicates, .relational_expression_args => false,
+        .relational_expression => blk: {
+            if (std.mem.eql(u8, field, "value")) break :blk value != .array and value != .object;
+            if (std.mem.eql(u8, field, "args")) break :blk createdValueMatchesShape(.relational_expression_args, value);
+            if (std.mem.eql(u8, field, "type")) break :blk @import("relational_expression_contract.zig").validType(value);
+            if (!isNonEmptyString(value)) break :blk false;
+            if (std.mem.eql(u8, field, "op")) break :blk std.meta.stringToEnum(@import("antfly_schema_openapi").RelationalExpressionOp, value.string) != null;
+            break :blk true;
+        },
+        .relational_predicate => blk: {
+            if (std.mem.eql(u8, field, "value")) break :blk value != .array and value != .object;
+            if (!isNonEmptyString(value)) break :blk false;
+            if (std.mem.eql(u8, field, "op")) break :blk std.meta.stringToEnum(@import("antfly_schema_openapi").RelationalComparisonOp, value.string) != null;
+            break :blk true;
+        },
+        .relational_key => blk: {
+            if (std.mem.eql(u8, field, "expression")) break :blk @import("relational_expression_contract.zig").valid(value);
+            if (std.mem.eql(u8, field, "result_type")) break :blk @import("relational_expression_contract.zig").validType(value);
+            if (!isNonEmptyString(value)) break :blk false;
+            if (std.mem.eql(u8, field, "direction")) break :blk std.mem.eql(u8, value.string, "asc") or std.mem.eql(u8, value.string, "desc");
+            if (std.mem.eql(u8, field, "nulls")) break :blk std.mem.eql(u8, value.string, "default") or std.mem.eql(u8, value.string, "first") or std.mem.eql(u8, value.string, "last");
+            break :blk true;
+        },
         .graph_metrics => value == .object,
         .graph_metric => graphMetricFieldValueMatches(field, value),
         .graph_metric_filter => if (std.mem.eql(u8, field, "types"))

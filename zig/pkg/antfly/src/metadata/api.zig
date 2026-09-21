@@ -398,6 +398,10 @@ pub const catalog_route_fence_protocol_current: u16 = 1;
 pub const catalog_route_fence_header = "X-Antfly-Catalog-Route-Fence";
 pub const catalog_route_fence_ack_header = "X-Antfly-Catalog-Route-Fence-Ack";
 pub const catalog_route_fence_ack_value = "1";
+/// Separate from routing acknowledgement: emitted only after a successful
+/// fenced read-index lookup proves the logical key absent.
+pub const read_index_absence_header = "X-Antfly-Read-Index-Absence";
+pub const read_index_absence_value = "1";
 pub const catalog_route_deadline_ms_header = "X-Antfly-Catalog-Route-Deadline-Ms";
 pub const catalog_route_default_deadline_ms: u32 = 5_000;
 pub const catalog_route_max_deadline_ms: u32 = 30_000;
@@ -1190,6 +1194,9 @@ pub fn captureMergeObservations(
     var out = std.ArrayListUnmanaged(transition_state.MergeObservationRecord).empty;
     errdefer out.deinit(alloc);
     for (merge_transitions) |record| {
+        // The online controller's durable state is already in the transition
+        // record. Ordinary runtime observations are not its authority.
+        if (record.online != null) continue;
         const observation = (source.observeMergeTransition(record.transition_id) catch |err| {
             std.log.warn("merge transition snapshot observation failed transition_id={d} err={s}", .{ record.transition_id, @errorName(err) });
             continue;

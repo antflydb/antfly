@@ -808,6 +808,8 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         mutable_source_entry_bytes: ?[]u8 = null,
         mutable_entry_cursor: State.EntryCursor = .{},
         current_key: ?[]const u8 = null,
+        test_full_forward_seek: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
+        test_seek_sources: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {},
         current_visible_source: ?usize = null,
         upper_bound: ?[]const u8 = null,
         backend_locked: bool = false,
@@ -1070,10 +1072,37 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         pub fn seekAtOrAfter(self: *@This(), key: []const u8) !?backend_adapter.Entry {
-            try self.initForwardPositions(key, true);
+            const restart = if (comptime builtin.is_test) self.test_full_forward_seek else false;
+            if (!restart and self.current_key != null) {
+                const current = self.current_key.?;
+                if (std.mem.order(u8, key, current) != .lt) {
+                    try self.skipForwardTo(key);
+                } else {
+                    try self.initForwardPositions(key, true);
+                }
+            } else {
+                try self.initForwardPositions(key, true);
+            }
             const entry = try self.selectVisibleForward();
             self.current_key = if (entry) |e| e.key else null;
             return entry;
+        }
+
+        /// Monotone seeks only move sources that precede the requested key.
+        /// The heap already proves every other source is at or beyond it;
+        /// those sources retain their block, position, and heap membership.
+        /// Stabilize the target because it may alias a source's borrowed key.
+        fn skipForwardTo(self: *@This(), target: []const u8) !void {
+            if (self.source_heap_len == 0) return;
+            if (std.mem.order(u8, self.source_entries[self.source_heap[0]].?.key, target) != .lt) return;
+            const stable_target = try self.allocator.dupe(u8, target);
+            defer self.allocator.free(stable_target);
+            while (self.source_heap_len != 0) {
+                const source = self.source_heap[0];
+                if (std.mem.order(u8, self.source_entries[source].?.key, stable_target) != .lt) break;
+                try self.setSourceAtOrAfter(source, stable_target, true);
+                self.updateForwardHeapSource(source);
+            }
         }
 
         pub fn seekAtOrBefore(self: *@This(), key: []const u8) !?backend_adapter.Entry {
@@ -1439,6 +1468,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn setSourceAtOrAfter(self: *@This(), source_index: usize, target: []const u8, inclusive: bool) !void {
+            if (comptime builtin.is_test) self.test_seek_sources += 1;
             if (source_index == 0 and comptime MutableType == ActiveMemTable) {
                 try self.setMutableSourceAtOrAfter(target, inclusive);
                 return;

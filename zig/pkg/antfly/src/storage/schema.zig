@@ -238,7 +238,7 @@ pub const TableSchema = struct {
 // Schema storage key
 // ============================================================================
 
-const schema_key = "\x00\x00__metadata__:schema";
+pub const schema_key = "\x00\x00__metadata__:schema";
 const schema_version_prefix = "\x00\x00__metadata__:schema_v";
 
 // ============================================================================
@@ -1280,6 +1280,78 @@ pub fn saveEncodedSchemaWithMetadata(
     metadata_writes: []const docstore.KVPair,
     metadata_deletes: []const []const u8,
 ) !bool {
+    return saveEncodedSchemaWithMetadataAndStage(store, alloc, schema_version, data, metadata_writes, metadata_deletes, null);
+}
+
+/// A prepared participant may CAS/stage schema-dependent metadata after the
+/// schema puts, but before the SAME transaction commits. The caller publishes
+/// its already-compiled runtime state only after this function succeeds.
+/// Prove an idempotent metadata installation without acquiring write authority.
+/// A participant must expose the same effects without its mutation gate. The
+/// adapter stops at the first differing effect, so it never needs an overlay.
+pub fn encodedSchemaMetadataUnchanged(
+    store: anytype,
+    alloc: Allocator,
+    schema_version: u32,
+    data: []const u8,
+    metadata_writes: []const docstore.KVPair,
+    metadata_deletes: []const []const u8,
+    participant: anytype,
+) !bool {
+    var runtime = try initRuntimeStore(alloc, store);
+    defer runtime.deinit();
+    var probe = try runtime.store.beginRead();
+    defer probe.abort();
+    const Compare = struct {
+        probe: *@TypeOf(probe),
+
+        pub fn get(self: @This(), key: []const u8) ![]const u8 {
+            return self.probe.get(key);
+        }
+        pub fn openCursor(self: @This()) !backend_erased.Cursor {
+            return self.probe.openCursor();
+        }
+        pub fn put(self: @This(), key: []const u8, value: []const u8) !void {
+            const existing = self.get(key) catch |err| switch (err) {
+                error.NotFound => return error.SchemaMetadataChanged,
+                else => return err,
+            };
+            if (!std.mem.eql(u8, existing, value)) return error.SchemaMetadataChanged;
+        }
+        pub fn delete(self: @This(), key: []const u8) !void {
+            _ = self.get(key) catch |err| switch (err) {
+                error.NotFound => return,
+                else => return err,
+            };
+            return error.SchemaMetadataChanged;
+        }
+        fn compare(self: *@This(), version: u32, encoded: []const u8, writes: []const docstore.KVPair, deletes: []const []const u8, stage: @TypeOf(participant), allocator: Allocator) !void {
+            try self.put(schema_key, encoded);
+            const version_key = try schemaVersionKeyAlloc(allocator, version);
+            defer allocator.free(version_key);
+            try self.put(version_key, encoded);
+            for (writes) |write| try self.put(write.key, write.value);
+            for (deletes) |key| try self.delete(key);
+            try stage.stageChanges(self);
+        }
+    };
+    var comparison = Compare{ .probe = &probe };
+    comparison.compare(schema_version, data, metadata_writes, metadata_deletes, participant, alloc) catch |err| switch (err) {
+        error.SchemaMetadataChanged => return false,
+        else => return err,
+    };
+    return true;
+}
+
+pub fn saveEncodedSchemaWithMetadataAndStage(
+    store: anytype,
+    alloc: Allocator,
+    schema_version: u32,
+    data: []const u8,
+    metadata_writes: []const docstore.KVPair,
+    metadata_deletes: []const []const u8,
+    participant: anytype,
+) !bool {
     if (data.len < 12 or !std.mem.eql(u8, data[0..4], "ASCH") or
         std.mem.readInt(u32, data[8..12], .little) != schema_version)
         return error.InvalidSchema;
@@ -1326,7 +1398,9 @@ pub fn saveEncodedSchemaWithMetadata(
         };
         break :changed_blk true;
     };
-    if (!schema_changed and metadata_writes.len == 0 and metadata_deletes.len == 0) return false;
+    if (comptime @TypeOf(participant) == @TypeOf(null)) {
+        if (!schema_changed and metadata_writes.len == 0 and metadata_deletes.len == 0) return false;
+    }
 
     var txn = try runtime.store.beginWrite();
     errdefer txn.abort();
@@ -1344,6 +1418,7 @@ pub fn saveEncodedSchemaWithMetadata(
         error.NotFound => {},
         else => return err,
     };
+    if (comptime @TypeOf(participant) != @TypeOf(null)) _ = try participant.stage(&txn);
     try txn.commit();
     return schema_changed;
 }
@@ -2880,6 +2955,58 @@ test "schema and generation metadata commit in one transaction" {
 
     try std.testing.expect(!try saveSchemaWithMetadata(&store, alloc, loaded, &.{}, &.{public_key}));
     try std.testing.expectError(error.NotFound, store.get(alloc, public_key));
+}
+
+test "relational index system schema rehydration proves every durable effect" {
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, "schema-rehydration-proof");
+    defer alloc.free(path);
+    defer cleanupTestDir(path);
+    var store = try DocStore.open(alloc, path, .{});
+    defer store.close();
+    const active_public = "\x00\x00__metadata__:schema_json_test";
+    const participant_key = "\x00\x00__metadata__:participant_test";
+    const absent_key = "\x00\x00__metadata__:absent_test";
+    const outbox_key = "\x00\x00__metadata__:ha_outbox_test";
+    const value = "durable";
+    const table_schema = TableSchema{ .version = 9, .default_type = "doc" };
+    const writes = [_]docstore.KVPair{
+        .{ .key = active_public, .value = value },
+        .{ .key = participant_key, .value = value },
+    };
+    _ = try saveSchemaWithMetadata(&store, alloc, table_schema, &writes, &.{});
+    const encoded = try serializeSchema(alloc, table_schema);
+    defer alloc.free(encoded);
+    const Participant = struct {
+        bytes: []const u8 = value,
+        remove: []const u8 = absent_key,
+        pub fn stageChanges(self: @This(), txn: anytype) !void {
+            // Exercise the full read-only interface used by catalog effects.
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            try txn.put(participant_key, self.bytes);
+            try txn.delete(self.remove);
+        }
+    };
+    try std.testing.expect(try encodedSchemaMetadataUnchanged(&store, alloc, 9, encoded, &writes, &.{absent_key}, Participant{}));
+    try std.testing.expect(!try encodedSchemaMetadataUnchanged(&store, alloc, 9, encoded, &writes, &.{}, Participant{ .bytes = "changed" }));
+    try std.testing.expect(!try encodedSchemaMetadataUnchanged(&store, alloc, 9, encoded, &writes, &.{}, Participant{ .remove = participant_key }));
+    try std.testing.expect(!try encodedSchemaMetadataUnchanged(&store, alloc, 9, encoded, &.{.{ .key = outbox_key, .value = value }}, &.{}, Participant{}));
+    try std.testing.expect(!try encodedSchemaMetadataUnchanged(&store, alloc, 9, encoded, &writes, &.{active_public}, Participant{}));
+    const retained = try store.get(alloc, participant_key);
+    defer alloc.free(retained);
+    try std.testing.expectEqualStrings(value, retained);
+    try std.testing.expectError(error.NotFound, store.get(alloc, outbox_key));
+    try store.put(outbox_key, value);
+    try std.testing.expect(try encodedSchemaMetadataUnchanged(&store, alloc, 9, encoded, &.{.{ .key = outbox_key, .value = value }}, &.{}, Participant{}));
+    try std.testing.expect(!try encodedSchemaMetadataUnchanged(&store, alloc, 9, encoded, &.{.{ .key = outbox_key, .value = "new event" }}, &.{}, Participant{}));
+    try store.delete(participant_key);
+    try std.testing.expect(!try encodedSchemaMetadataUnchanged(&store, alloc, 9, encoded, &.{}, &.{}, Participant{}));
+    try store.put(participant_key, value);
+    const versioned_key = try schemaVersionKeyAlloc(alloc, 9);
+    defer alloc.free(versioned_key);
+    try store.delete(versioned_key);
+    try std.testing.expect(!try encodedSchemaMetadataUnchanged(&store, alloc, 9, encoded, &writes, &.{}, Participant{}));
 }
 
 test "schema preserves versioned history in DocStore" {
