@@ -42496,7 +42496,7 @@ pub const DB = struct {
 
     pub fn beginIndexCatalogBarrierForVopr(self: *DB) bool {
         if (!builtin.is_test) return false;
-        const previous = self.published_dense_admission.fetchOr(published_dense_catalog_closed, .acq_rel);
+        const previous = self.core.index_manager.published_dense_admission.fetchOr(published_dense_catalog_closed, .acq_rel);
         return previous & published_dense_catalog_closed == 0;
     }
 

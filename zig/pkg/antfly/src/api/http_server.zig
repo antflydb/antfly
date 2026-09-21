@@ -17103,11 +17103,18 @@ pub const ApiHttpServer = struct {
         result_alloc: std.mem.Allocator,
         table_name: []const u8,
         body: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+        expected_storage_name: ?[]const u8,
     ) ![]u8 {
         comptime std.debug.assert(request_admission_policy.extensionHostOperationClass(.batch) == .write);
         if (!self.tryAcquireWrite()) return error.RequestAdmissionExhausted;
         defer self.releaseWrite();
-        var response = try public_table_http.handleTableBatch(self.alloc, table_name, body, self.tableApi(.{}));
+        if (authenticated_identity) |identity| if (!permissionsAllow(identity.permissions, .table, table_name, .write)) return error.Forbidden;
+        var catalog_identity = try cloneCatalogIdentity(self.alloc, authenticated_identity);
+        defer if (catalog_identity) |*owned| owned.deinit(self.alloc);
+        const physical = try self.resolveExtensionHostTableAlloc(table_name, expected_storage_name, &catalog_identity);
+        defer self.alloc.free(physical);
+        var response = try public_table_http.handleTableBatch(self.alloc, physical, body, self.tableApi(.{}));
         defer response.deinit(self.alloc);
         if (response.status < 200 or response.status >= 300) return error.ExtensionHostApiFailed;
         return try result_alloc.dupe(u8, response.body);
@@ -17119,6 +17126,7 @@ pub const ApiHttpServer = struct {
         table_name: []const u8,
         body: []const u8,
         authenticated_identity: ?AuthenticatedIdentity,
+        expected_storage_name: ?[]const u8,
     ) ![]u8 {
         var diagnostic_context: query_request_diagnostics.Context = .{};
         const diagnostic_scope = query_request_diagnostics.Scope.init(&diagnostic_context);
@@ -17127,7 +17135,12 @@ pub const ApiHttpServer = struct {
         comptime std.debug.assert(request_admission_policy.extensionHostOperationClass(.query) == .query);
         if (!self.tryAcquireQuery()) return error.RequestAdmissionExhausted;
         defer self.releaseQuery();
-        const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, table_name);
+        if (authenticated_identity) |identity| if (!permissionsAllow(identity.permissions, .table, table_name, .read)) return error.Forbidden;
+        var catalog_identity = try cloneCatalogIdentity(self.alloc, authenticated_identity);
+        defer if (catalog_identity) |*owned| owned.deinit(self.alloc);
+        const physical = try self.resolveExtensionHostTableAlloc(table_name, expected_storage_name, &catalog_identity);
+        defer self.alloc.free(physical);
+        const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, catalog_identity, physical);
         defer if (row_filter_json) |value| self.alloc.free(value);
         const source = self.table_reads orelse return error.TableNotFound;
         db_mod.resetLastSortRejectionDiagnostic();
@@ -17135,10 +17148,10 @@ pub const ApiHttpServer = struct {
         var query_response = try self.executePublicTableQueryDispatchWithReadinessRetry(
             self.alloc,
             source,
-            table_name,
+            physical,
             body,
             row_filter_json,
-            authenticated_identity,
+            catalog_identity,
             null,
             null,
             null,
@@ -17146,6 +17159,27 @@ pub const ApiHttpServer = struct {
         );
         defer query_response.deinit(self.alloc);
         return try result_alloc.dupe(u8, query_response.json);
+    }
+
+    fn resolveExtensionHostTableAlloc(
+        self: *ApiHttpServer,
+        public_name: []const u8,
+        expected_storage_name: ?[]const u8,
+        identity: *?AuthenticatedIdentity,
+    ) ![]u8 {
+        const physical = self.resolveCatalogNameAlloc(self.alloc, .{}, public_name, identity) catch |err| {
+            if (err == error.TableNotFound and expected_storage_name != null)
+                return error.ExtensionTableBindingChanged;
+            return err;
+        };
+        errdefer self.alloc.free(physical);
+        // Public names remain the authorization boundary, but they can be
+        // renamed or reused. Never route an installed member to a different
+        // storage identity. Subsequent operations use this immutable name.
+        if (expected_storage_name) |expected| {
+            if (!std.mem.eql(u8, expected, physical)) return error.ExtensionTableBindingChanged;
+        }
+        return physical;
     }
 
     pub fn resolveCatalogRestoreNameAlloc(self: *ApiHttpServer, alloc: std.mem.Allocator, context: api_operation.RequestContext, name: []const u8, identity: *?AuthenticatedIdentity, idempotency_key: ?[]const u8) ![]u8 {
@@ -28860,7 +28894,7 @@ test "extension lifecycle materializes table index and enrichment members" {
                 .objects = &.{
                     .{ .kind = .generated_artifact, .name = "memory_embedding", .shape = "memory_embedding", .config_json = "{\"kind\":\"embedding\",\"source_shape\":\"memory_record\"}" },
                     .{ .kind = .index, .name = "memory_text", .config_json = "{\"type\":\"full_text\"}" },
-                    .{ .kind = .enrichment, .name = "memory_embed", .config_json = "{\"name\":\"memory_embed\",\"kind\":\"embedding\",\"field\":\"body\",\"expected_dims\":384}" },
+                    .{ .kind = .enrichment, .name = "memory_chunks", .config_json = "{\"name\":\"memory_chunks\",\"kind\":\"chunk\",\"field\":\"body\",\"chunk_size\":512}" },
                     .{ .kind = .mcp_tool, .name = "recall" },
                 },
             },
@@ -28874,9 +28908,11 @@ test "extension lifecycle materializes table index and enrichment members" {
         upsert_table_count: usize = 0,
         installed_upserts: usize = 0,
         member_upserts: usize = 0,
+        projected: extension_domain.ExtensionCatalog = extension_domain.ExtensionCatalog.init(std.testing.allocator),
 
         fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             if (self.upserted_indexes_json) |indexes_json| alloc.free(indexes_json);
+            self.projected.deinit();
         }
 
         fn tableSlice(self: *@This()) []metadata_table_manager.TableRecord {
@@ -28895,6 +28931,8 @@ test "extension lifecycle materializes table index and enrichment members" {
                 .stores = @constCast(self.empty_stores[0..]),
                 .placement_intents = @constCast(self.empty_placements[0..]),
                 .extension_packages = @constCast(self.packageSlice()),
+                .installed_extensions = self.projected.installed.items,
+                .extension_members = self.projected.members.items,
                 .split_transitions = @constCast(self.empty_splits[0..]),
                 .merge_transitions = @constCast(self.empty_merges[0..]),
             };
@@ -28909,14 +28947,18 @@ test "extension lifecycle materializes table index and enrichment members" {
         }
 
         pub fn proposeTransitionCommand(self: *@This(), command: anytype) !void {
-            const Command = @TypeOf(command);
-            if (@hasField(Command, "apply_extension_lifecycle")) {
-                const delta = command.apply_extension_lifecycle;
+            try std.testing.expect(command == .apply_extension_lifecycle_v2);
+            {
+                const delta = command.apply_extension_lifecycle_v2;
+                try std.testing.expectEqual(@as(usize, 1), delta.expected_tables.len);
                 self.upsert_table_count += delta.upsert_tables.len;
                 if (delta.upsert_tables.len > 0) {
                     if (self.upserted_indexes_json) |indexes_json| std.testing.allocator.free(indexes_json);
                     self.upserted_indexes_json = try std.testing.allocator.dupe(u8, delta.upsert_tables[0].indexes_json);
+                    self.table_record.indexes_json = self.upserted_indexes_json.?;
                 }
+                for (delta.upsert_installed_extensions) |record| try self.projected.upsertInstalled(record);
+                for (delta.upsert_extension_members) |record| try self.projected.upsertMember(record);
                 self.installed_upserts += delta.upsert_installed_extensions.len;
                 self.member_upserts += delta.upsert_extension_members.len;
             }
@@ -28935,8 +28977,8 @@ test "extension lifecycle materializes table index and enrichment members" {
     try std.testing.expect(std.mem.indexOf(u8, service.upserted_indexes_json.?, "\"memory_text\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, service.upserted_indexes_json.?, "\"full_text\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, service.upserted_indexes_json.?, "\"enrichments\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, service.upserted_indexes_json.?, "\"memory_embed\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, service.upserted_indexes_json.?, "\"expected_dims\":384") != null);
+    try std.testing.expect(std.mem.indexOf(u8, service.upserted_indexes_json.?, "\"memory_chunks\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, service.upserted_indexes_json.?, "\"chunk_size\":512") != null);
     try std.testing.expectEqual(@as(usize, 1), service.installed_upserts);
     try std.testing.expectEqual(@as(usize, 6), service.member_upserts);
 }
@@ -28946,7 +28988,7 @@ test "extension lifecycle drops extension-owned table index and enrichment membe
         table_record: metadata_table_manager.TableRecord = .{
             .table_id = 7,
             .name = "memories",
-            .indexes_json = "{\"memory_text\":{\"type\":\"full_text\"},\"manual\":{\"type\":\"full_text\"},\"enrichments\":[{\"name\":\"memory_embed\",\"kind\":\"embedding\",\"field\":\"body\",\"expected_dims\":384},{\"name\":\"manual_embed\",\"kind\":\"embedding\",\"field\":\"summary\",\"expected_dims\":384}]}",
+            .indexes_json = "{\"memory_text\":{\"type\":\"full_text\"},\"manual\":{\"type\":\"full_text\"},\"enrichments\":[{\"name\":\"memory_chunks\",\"kind\":\"chunk\",\"field\":\"body\",\"chunk_size\":512},{\"name\":\"manual_chunks\",\"kind\":\"chunk\",\"field\":\"summary\",\"chunk_size\":512}]}",
             .placement_role = "data",
         },
         installed_record: extension_domain.InstalledExtension = .{
@@ -28970,9 +29012,9 @@ test "extension lifecycle drops extension-owned table index and enrichment membe
                 .extension_name = "memoryaf",
                 .scope = .{ .kind = .table, .table_name = "memories" },
                 .object_kind = .enrichment,
-                .object_name = "memory_embed",
+                .object_name = "memory_chunks",
                 .table_name = "memories",
-                .owner_metadata_json = "{\"name\":\"memory_embed\",\"kind\":\"embedding\",\"field\":\"body\",\"expected_dims\":384}",
+                .owner_metadata_json = "{\"name\":\"memory_chunks\",\"kind\":\"chunk\",\"field\":\"body\",\"chunk_size\":512}",
             },
         },
         empty_ranges: [0]metadata_table_manager.RangeRecord = .{},
@@ -28994,11 +29036,11 @@ test "extension lifecycle drops extension-owned table index and enrichment membe
         }
 
         fn installedSlice(self: *@This()) []extension_domain.InstalledExtension {
-            return @as([*]extension_domain.InstalledExtension, @ptrCast(&self.installed_record))[0..1];
+            return if (self.installed_removes == 0) @as([*]extension_domain.InstalledExtension, @ptrCast(&self.installed_record))[0..1] else &.{};
         }
 
         fn memberSlice(self: *@This()) []extension_domain.ExtensionMember {
-            return self.member_records[0..];
+            return if (self.member_removes == 0) self.member_records[0..] else &.{};
         }
 
         pub fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
@@ -29024,13 +29066,15 @@ test "extension lifecycle drops extension-owned table index and enrichment membe
         }
 
         pub fn proposeTransitionCommand(self: *@This(), command: anytype) !void {
-            const Command = @TypeOf(command);
-            if (@hasField(Command, "apply_extension_lifecycle")) {
-                const delta = command.apply_extension_lifecycle;
+            try std.testing.expect(command == .apply_extension_lifecycle_v2);
+            {
+                const delta = command.apply_extension_lifecycle_v2;
+                try std.testing.expectEqual(@as(usize, 1), delta.expected_tables.len);
                 self.upsert_table_count += delta.upsert_tables.len;
                 if (delta.upsert_tables.len > 0) {
                     if (self.upserted_indexes_json) |indexes_json| std.testing.allocator.free(indexes_json);
                     self.upserted_indexes_json = try std.testing.allocator.dupe(u8, delta.upsert_tables[0].indexes_json);
+                    self.table_record.indexes_json = self.upserted_indexes_json.?;
                 }
                 self.installed_removes += delta.remove_installed_extensions.len;
                 self.member_removes += delta.remove_extension_members.len;
@@ -29045,9 +29089,9 @@ test "extension lifecycle drops extension-owned table index and enrichment membe
     try std.testing.expectEqual(@as(usize, 1), service.upsert_table_count);
     try std.testing.expect(service.upserted_indexes_json != null);
     try std.testing.expect(std.mem.indexOf(u8, service.upserted_indexes_json.?, "\"memory_text\"") == null);
-    try std.testing.expect(std.mem.indexOf(u8, service.upserted_indexes_json.?, "\"memory_embed\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, service.upserted_indexes_json.?, "\"memory_chunks\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, service.upserted_indexes_json.?, "\"manual\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, service.upserted_indexes_json.?, "\"manual_embed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, service.upserted_indexes_json.?, "\"manual_chunks\"") != null);
     try std.testing.expectEqual(@as(usize, 1), service.installed_removes);
     try std.testing.expectEqual(@as(usize, 2), service.member_removes);
 }

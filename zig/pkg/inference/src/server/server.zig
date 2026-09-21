@@ -12414,6 +12414,17 @@ pub const Node = struct {
             return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = internalErrorMessage("BACKEND_ERROR", err) });
         };
         config.prefill_chunk_size = prefill_admission.max_chunk_rows;
+        const isolated_generation = canIsolateGeneration(backend_kind, effective_compiled_partition_backend != null, draft_model_for_generation != null, config.prompt_cache_enabled, want_stream);
+        // Whole-request native owners cannot hold the model gate while waiting
+        // for a turn belonging to an isolated peer that needs that same gate.
+        if (backend_kind == .native and !isolated_generation) {
+            if (native_generate_lease) |lease| {
+                model.native_generate_coordinator.?.release(lease);
+                native_generate_lease = null;
+            }
+        }
+        // Choose the owner before borrowing a plan: releasing the coordinator
+        // lease also frees its plan. Whole-request execution owns its plan below.
         var standalone_prefill_plan: ?runtime.scheduler.native_generate.PrefillChunkPlan = null;
         defer if (standalone_prefill_plan) |*plan| plan.deinit(ctx.allocator);
         const prefill_plan_applicable = !generation.messagesHaveImages(messages.items) and
@@ -12542,15 +12553,6 @@ pub const Node = struct {
             else if (first_locked_model == model) draft_model else model
         else
             null;
-        const isolated_generation = canIsolateGeneration(backend_kind, effective_compiled_partition_backend != null, draft_model_for_generation != null, config.prompt_cache_enabled, want_stream);
-        // Whole-request native owners cannot hold the model gate while waiting
-        // for a turn belonging to an isolated peer that needs that same gate.
-        if (backend_kind == .native and !isolated_generation) {
-            if (native_generate_lease) |lease| {
-                model.native_generate_coordinator.?.release(lease);
-                native_generate_lease = null;
-            }
-        }
         if (!isolated_generation) {
             execution_control.lock(first_locked_model.nativeGenerationMutex()) catch |err|
                 return inferenceFailureResponse(ctx, err);
@@ -19802,8 +19804,16 @@ fn directExtractionMediaShape(
     attachments: []const extracting_api.Attachment,
 ) !RequestMediaAdmissionShape {
     var shape: RequestMediaAdmissionShape = .{};
-    for (inputs) |input| try addDirectExtractionContentMediaShape(allocator, &shape, input.content_json);
-    for (attachments) |attachment| shape.addBorrowed(attachment.bytes.len, true);
+    var text_count: usize = 0;
+    for (inputs, 0..) |input, index| {
+        const images_before = shape.image_count;
+        try addDirectExtractionContentMediaShape(allocator, &shape, input.content_json);
+        for (attachments) |attachment| if (attachment.input_index == index) {
+            shape.addBorrowed(attachment.bytes.len, true);
+        };
+        if (shape.image_count == images_before) text_count += 1;
+    }
+    try validateExtractionInputKinds(text_count, shape.image_count);
     return shape;
 }
 
@@ -33375,6 +33385,24 @@ test "admission rejection metrics retain unclamped requested units" {
         writer.writer.buffered(),
         "antfly_admission_inference_rejected_units_total 9\n",
     ) != null);
+}
+
+test "structured extract rejects mixed inputs before resolving a missing model" {
+    const allocator = std.testing.allocator;
+    var node = try Node.init(allocator, .{});
+    defer node.deinit();
+    var request = try httpx.Request.init(allocator, .POST, "/ai/v1/extract");
+    defer request.deinit();
+    request.body =
+        \\{"model":"missing-model","inputs":[{"content":"hello"},{"content":[{"type":"image_url","image_url":{"url":"https://invalid.example/image.png"}}]}],"schema":{"structures":{"answer":{"fields":{"value":"string"}}}}}
+    ;
+    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try node.extract(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 400), response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "INVALID_REQUEST") != null);
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
 }
 
 test "structured extract maps weighted admission exhaustion to retryable capacity" {

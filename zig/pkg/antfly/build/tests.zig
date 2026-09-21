@@ -1655,10 +1655,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     secret_backend_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const secret_backend_tests = b.addTest(.{
         .root_module = secret_backend_test_mod,
+        // ReleaseSafe on macOS peaks above the aggregate 10 GiB estimate.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 13 else 7) * 1024 * 1024 * 1024,
         .filters = &.{"secret backend"},
-        // This integration artifact links metadata and storage together; the
-        // merged macOS Debug compile peaks around 11.3 GB.
-        .max_rss = if (target.result.os.tag == .macos) 13 * 1024 * 1024 * 1024 else 0,
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     const run_secret_backend_tests = addFilteredTestRunArtifact(b, secret_backend_tests);
@@ -3062,6 +3061,22 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     );
     full_cluster_vopr_test_step.dependOn(&run_full_cluster_vopr_tests.step);
 
+    const extension_lifecycle_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "extension lifecycle", "wasmtime v45" },
+        .max_rss = full_cluster_vopr_max_rss,
+    });
+    b.step("extension-lifecycle-test", "Test extension catalog identity, lifecycle, and Wasmtime ABI contracts")
+        .dependOn(&b.addRunArtifact(extension_lifecycle_tests).step);
+
+    const resource_pressure_vopr_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{"full cluster VOPR exact replays resource pressure recovery"},
+        .max_rss = full_cluster_vopr_max_rss,
+    });
+    b.step("full-cluster-resource-pressure-vopr-test", "Replay public admission denial and recovery under node memory pressure")
+        .dependOn(&b.addRunArtifact(resource_pressure_vopr_tests).step);
+
     const production_cluster_service_rate_vopr_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{"full cluster production service rates compose heal and exact replay"},
@@ -3344,6 +3359,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_baseline_vopr_tests = b.addRunArtifact(production_cluster_baseline_vopr_tests);
+    b.step("production-cluster-baseline-vopr-test", "Exact-replay the production DataServer baseline").dependOn(&run_production_cluster_baseline_vopr_tests.step);
     const production_cluster_bounded_vopr_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{"full cluster production data plane VOPR bounded cutoff exact replay"},
@@ -4391,6 +4407,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     storage_vopr_runtime_test_mod.addImport("antfly_platform", platform_mod);
     storage_vopr_runtime_test_mod.addImport("antfly_hash", hash_mod);
+    storage_vopr_runtime_test_mod.addImport("antfly_pdf", pdf_mod);
     const storage_vopr_runtime_tests = b.addTest(.{
         .root_module = storage_vopr_runtime_test_mod,
     });
@@ -4741,6 +4758,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     db_test_mod.addImport("antfly_transcribing", transcribing_db_test_stub_mod);
     db_test_mod.addImport("httpx", httpx_mod);
     db_test_mod.addImport("antfly_pdf", pdf_mod);
+    db_test_mod.addImport("objectstore", antfly_imports.objectstore);
     db_test_mod.addImport("antfly_image", image_mod);
     db_test_mod.addImport("antfly_font", font_mod);
     db_test_mod.addImport("structlog", structlog_mod);
