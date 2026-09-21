@@ -49,6 +49,10 @@ that format or reports the available formats. An unknown variant is an error.
 `:f32` and `:i8` retain their ONNX meanings. There is no implicit fallback from
 an explicit ONNX request to safetensors.
 
+The legacy `:native` selector is an alias for `:auto`, including revision suffixes
+such as `:native@main`. It selects artifacts and does not force an execution
+backend. Receipts retain the requested selector and record the selected format.
+
 Automatic selection chooses one artifact set: GGUF first, then safetensors,
 then ONNX. `:hybrid` explicitly requests both ONNX and safetensors when available.
 Selection depends on repository artifacts, not the machine that downloads them.

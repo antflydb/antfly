@@ -1892,7 +1892,11 @@ pub fn downloadModel(
         std.mem.indexOfScalar(u8, payload_variant, '/') == null;
     // Prefer one complete native artifact set, then ONNX. Explicit hybrid is
     // the opt-in to fetching more than one format.
-    const auto_detect = std.mem.eql(u8, payload_variant, "auto");
+    // `native` predates format-specific selection and was accepted as auto.
+    // Keep that exact compatibility alias; it is not an artifact format or
+    // an execution-backend requirement. Unknown variants remain errors.
+    const auto_detect = std.mem.eql(u8, payload_variant, "auto") or
+        std.mem.eql(u8, payload_variant, "native");
     if (!auto_detect and !want_gguf and !want_onnx and !want_safetensors and !want_hybrid and !want_mmproj and !want_named_onnx)
         return error.InvalidModelVariant;
 
@@ -4922,6 +4926,7 @@ fn exerciseHubSnapshot(mode: []const u8, variant: []const u8, expected_format: ?
     try std.testing.expectEqualStrings("0123456789abcdef0123456789abcdef01234567", source.resolved_revision.?);
     try std.testing.expectEqualStrings((try parseVariantRevision(variant)).revision orelse "main", source.requested_revision.?);
     try std.testing.expectEqualStrings(expected_format.?, source.selected_format.?);
+    try std.testing.expectEqualStrings(variant, source.variant);
     if (std.mem.eql(u8, expected_format.?, "gguf")) {
         try std.testing.expect(receipt.find("onnx/model.onnx") == null);
         try std.testing.expect(receipt.find("custom.safetensors") == null);
@@ -4932,6 +4937,7 @@ fn exerciseHubSnapshot(mode: []const u8, variant: []const u8, expected_format: ?
     } else if (std.mem.eql(u8, expected_format.?, "safetensors")) {
         try std.testing.expect(receipt.find("custom.safetensors") != null);
         try std.testing.expect(receipt.find("model-00001-of-00001.safetensors") == null);
+        try std.testing.expect(receipt.find("onnx/model.onnx") == null);
     }
     const log = try tmp.dir.readFileAlloc(io, "requests.log", allocator, .limited(64 * 1024));
     defer allocator.free(log);
@@ -4957,4 +4963,12 @@ test "Hub snapshot enforces explicit formats and rejects missing or unsafe depen
     try exerciseHubSnapshot("missing-dependency", "onnx", null, error.MissingModelArtifact);
     try exerciseHubSnapshot("unsafe-dependency", "onnx", null, error.InvalidModelArtifactPath);
     try exerciseHubSnapshot("missing-commit", "auto", null, error.InvalidHubRevision);
+}
+
+test "Hub snapshot native compatibility alias selects one artifact format" {
+    try exerciseHubSnapshot("all", "native", "gguf", null);
+    try exerciseHubSnapshot("safetensors-only", "native@feature/export", "safetensors", null);
+    try exerciseHubSnapshot("onnx-only", "native@v1.0", "onnx", null);
+    try exerciseHubSnapshot("all", "nativ", null, error.InvalidModelVariant);
+    try exerciseHubSnapshot("onnx-only", "gguf", null, error.NoModelFilesFound);
 }
