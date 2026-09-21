@@ -66,7 +66,7 @@ const (
 		"Call the emit_graph tool exactly once: list each entity under \"entities\" with a unique id, a " +
 		"short lowercase label such as person, organization, or location, and its text; list each relation " +
 		"under \"relations\" with a short verb phrase as its type, the source and target entity ids, and a " +
-		"short evidence span from the passage. Here is the passage:"
+		"short evidence span from the passage. Extract only what the passage itself states: never invent entities, events, or relations that are not present, and never reuse examples from these instructions. If the passage is empty, unreadable, or contains nothing to extract, call the tool with empty \"entities\" and \"relations\" arrays. Here is the passage:"
 
 	autoschemaEntityEventPrompt = "Please analyze and summarize the participation relations between the " +
 		"events and entities in the following passage. Each event is a single independent sentence written " +
@@ -75,7 +75,7 @@ const (
 		"\"entities\" with label \"event\" and its text set to the normalized simple sentence describing the " +
 		"event; list each participating entity with a short lowercase label and its text; for every entity " +
 		"that participates in an event, add a relation of type \"participates_in\" from the entity id to the " +
-		"event id, with a short evidence span from the passage. Here is the passage:"
+		"event id, with a short evidence span from the passage. Extract only what the passage itself states: never invent entities, events, or relations that are not present, and never reuse examples from these instructions. If the passage is empty, unreadable, or contains nothing to extract, call the tool with empty \"entities\" and \"relations\" arrays. Here is the passage:"
 
 	autoschemaEventEventPrompt = "Please analyze and summarize the relationships between the events in the " +
 		"following passage. Each event is a single independent sentence. Identify temporal and causal " +
@@ -84,7 +84,7 @@ const (
 		"ellipses. Call the emit_graph tool exactly once: list each event under \"entities\" with label " +
 		"\"event\" and its text set to the simple sentence describing the event; list each temporal or " +
 		"causal relation under \"relations\" with the source and target event ids and a short evidence span " +
-		"from the passage. Here is the passage:"
+		"from the passage. Extract only what the passage itself states: never invent entities, events, or relations that are not present, and never reuse examples from these instructions. If the passage is empty, unreadable, or contains nothing to extract, call the tool with empty \"entities\" and \"relations\" arrays. Here is the passage:"
 
 	autoschemaConceptPrompt = "You are given an entity from a knowledge graph (its canonical name and type, " +
 		"followed by a JSON block of its sampled graph neighbors when available). Produce three or more " +

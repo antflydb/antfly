@@ -48504,6 +48504,11 @@ fn appendPrecomputedGraphSourceArtifactKey(
                 relationalColumns(self) != null,
             );
             defer if (raw_doc) |doc_value| self.alloc.free(doc_value);
+            // No endpoint-resolution lookup here: this renders inside batch
+            // apply, where an extra store read is not safe, and resolution
+            // artifacts rarely exist at first artifact write anyway. The
+            // resolution-artifact replay re-renders these edges canonically
+            // once resolution lands (see materializeGraphSourceArtifactsForIndex).
             const graph_writes = try graphWritesFromArtifactValueAlloc(
                 self.alloc,
                 graph_entry.config.name,
@@ -48512,6 +48517,7 @@ fn appendPrecomputedGraphSourceArtifactKey(
                 source,
                 graphArtifactContentType(self.core.index_manager, source.artifact_name),
                 raw_doc,
+                null,
                 graph_asset_state.effectiveEdgeLimit(graph_entry.max_edges_per_document),
             );
             defer freeGraphWrites(self.alloc, graph_writes);
@@ -58217,6 +58223,9 @@ fn materializeGraphArtifactValuePaged(
 
     var parsed_artifact = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
     defer parsed_artifact.deinit();
+    const endpoint_resolutions = try graphEndpointResolutionsJsonAlloc(alloc, store, index_manager, artifact_ref.document_id, source.artifact_name);
+    defer if (endpoint_resolutions) |value| alloc.free(value);
+    if (endpoint_resolutions) |res_raw| try injectGraphEndpointResolutions(&parsed_artifact, res_raw);
     const raw_doc = try storeDocumentValueForGraphSource(
         alloc,
         store,
@@ -58362,6 +58371,32 @@ fn materializeGraphSourceArtifactsForIndex(
                 };
             }
             for (changed.items) |key| try changed_set.put(alloc, key, {});
+            // Relation edges materialize when the extraction artifact is
+            // written, which is before its resolution artifacts exist, so
+            // their first render carries local-id endpoints. A landed
+            // resolution re-renders the owning extraction artifact with
+            // canonical endpoints (graphEndpointResolutionsJsonAlloc); the
+            // existing replacement semantics retire the stale local-id
+            // edges. Depth-one recursion: the synthesized key is an asset
+            // artifact, never another resolution key.
+            if (try resolutionOwningAssetArtifactKeyAlloc(alloc, index_manager, artifact_key)) |asset_key| {
+                defer alloc.free(asset_key);
+                const rerendered = try materializeGraphSourceArtifactsForIndex(alloc, store, index_manager, &.{asset_key}, index_name, options);
+                defer alloc.free(rerendered);
+                var idx: usize = 0;
+                errdefer for (rerendered[idx..]) |key| alloc.free(key);
+                while (idx < rerendered.len) {
+                    const key = rerendered[idx];
+                    if (changed_set.contains(key)) {
+                        alloc.free(key);
+                        idx += 1;
+                        continue;
+                    }
+                    try changed.append(alloc, key);
+                    idx += 1;
+                    try changed_set.put(alloc, key, {});
+                }
+            }
             continue;
         }
         var artifact_ref = (try decodeArtifactRefIfKnownAlloc(alloc, artifact_key)) orelse continue;
@@ -58397,6 +58432,8 @@ fn materializeGraphSourceArtifactsForIndex(
                 if (options.repair_ctx) |ctx| ctx.relational_base_rows else false,
             );
             defer if (raw_doc) |doc_value| alloc.free(doc_value);
+            const endpoint_resolutions = try graphEndpointResolutionsJsonAlloc(alloc, store, index_manager, artifact_ref.document_id, source.artifact_name);
+            defer if (endpoint_resolutions) |res_raw| alloc.free(res_raw);
             const graph_writes = graphWritesFromArtifactValueAlloc(
                 alloc,
                 index_name,
@@ -58405,6 +58442,7 @@ fn materializeGraphSourceArtifactsForIndex(
                 source,
                 graphArtifactContentType(index_manager, source.artifact_name),
                 raw_doc,
+                endpoint_resolutions,
                 options.max_relation_items,
             ) catch |err| switch (err) {
                 error.OutOfMemory => return err,
@@ -59447,10 +59485,12 @@ fn graphWritesFromArtifactValueAlloc(
     source: index_manager_mod.GraphArtifactSource,
     artifact_content_type: []const u8,
     raw_doc: ?[]const u8,
+    endpoint_resolutions_raw: ?[]const u8,
     edge_limit: usize,
 ) ![]types.GraphEdgeWrite {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
     defer parsed.deinit();
+    if (endpoint_resolutions_raw) |res_raw| try injectGraphEndpointResolutions(&parsed, res_raw);
     var parsed_doc = if (raw_doc) |doc| try std.json.parseFromSlice(std.json.Value, alloc, doc, .{}) else null;
     defer if (parsed_doc) |*doc| doc.deinit();
     const doc_value: ?std.json.Value = if (parsed_doc) |doc| doc.value else null;
@@ -59941,20 +59981,134 @@ fn jsonEndpointDocumentId(value: std.json.Value) ?[]const u8 {
     };
 }
 
+/// The asset artifact key of the extraction artifact whose resolver owns the
+/// given resolution artifact key, or null when no resolver owns it (the
+/// materializer treats unowned resolution artifacts per its own contract
+/// options). Caller frees the returned key.
+fn resolutionOwningAssetArtifactKeyAlloc(
+    alloc: Allocator,
+    index_manager: *index_manager_mod.IndexManager,
+    resolution_key: []const u8,
+) !?[]u8 {
+    const parsed_key = (try internal_keys.parseResolutionArtifactKeyAlloc(alloc, resolution_key)) orelse return null;
+    defer alloc.free(parsed_key.doc_key);
+    defer alloc.free(parsed_key.artifact_name);
+    const cfg = resolverConfigForResolutionArtifact(index_manager, parsed_key.artifact_name) orelse return null;
+    return try internal_keys.artifactNamedPrefixAlloc(alloc, parsed_key.doc_key, "asset", cfg.source_artifact);
+}
+
+/// Canonical endpoint resolutions for one document's extraction artifact:
+/// {"<local_id>": {"key": "<canonical key>", "table": "<home table>"}, ...}
+/// built from every resolver consuming the source artifact (label-routed
+/// layouts split one artifact's mentions across several resolution
+/// artifacts). Null when no resolver has resolved anything yet — relation
+/// endpoints then render local ids, and the resolution-artifact replay
+/// re-renders them canonically once resolution lands.
+fn graphEndpointResolutionsJsonAlloc(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    index_manager: *index_manager_mod.IndexManager,
+    doc_key: []const u8,
+    source_artifact_name: []const u8,
+) !?[]u8 {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var map: std.json.ObjectMap = .empty;
+
+    for (index_manager.resolvers.items) |*cfg| {
+        if (!std.mem.eql(u8, cfg.source_artifact, source_artifact_name)) continue;
+        const res_key = try internal_keys.resolutionArtifactKeyAlloc(a, doc_key, cfg.resolution_artifact);
+        const raw = store.get(a, res_key) catch |err| switch (err) {
+            error.NotFound => continue,
+            else => return err,
+        };
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{}) catch continue;
+        if (parsed != .object) continue;
+        const entities = parsed.object.get("entities") orelse continue;
+        if (entities != .array) continue;
+        for (entities.array.items) |entity| {
+            if (entity != .object) continue;
+            const local_id = jsonStringField(entity, "local_id") orelse continue;
+            const doc_ref = entity.object.get("doc_ref") orelse continue;
+            if (doc_ref != .object) continue;
+            const key = jsonStringField(doc_ref, "key") orelse continue;
+            if (key.len == 0) continue;
+            var ref: std.json.ObjectMap = .empty;
+            try ref.put(a, "key", .{ .string = key });
+            if (jsonStringField(doc_ref, "table")) |table| try ref.put(a, "table", .{ .string = table });
+            try map.put(a, local_id, .{ .object = ref });
+        }
+    }
+    if (map.count() == 0) return null;
+    return try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = map }, .{});
+}
+
+/// Attach canonical endpoint resolutions to a parsed extraction artifact as
+/// its "_entities" map, which findGraphArtifactEntity consults ahead of the
+/// artifact's own entities. Best-effort: malformed resolutions leave the
+/// artifact untouched (relation endpoints then fall back to local ids).
+fn injectGraphEndpointResolutions(parsed: *std.json.Parsed(std.json.Value), resolutions_raw: []const u8) !void {
+    if (parsed.value != .object) return;
+    const a = parsed.arena.allocator();
+    const res = std.json.parseFromSliceLeaky(std.json.Value, a, resolutions_raw, .{}) catch return;
+    if (res != .object) return;
+    try parsed.value.object.put(a, "_entities", res);
+}
+
 fn jsonEndpointDocumentIdResolved(value: std.json.Value, artifact_value: std.json.Value) ?[]const u8 {
-    return jsonEndpointDocumentId(value) orelse if (resolveGraphEndpointEntity(value, artifact_value)) |entity| jsonEndpointDocumentId(entity) else null;
+    // A relation endpoint referencing an extraction entity (a plain string
+    // like "e0" matching the artifact's entities, or {entity_id}/
+    // {entity_index}) renders the entity's canonical identity — fields on
+    // the entity entry itself or an injected "_entities" resolution map (see
+    // injectGraphEndpointResolutions) — or nothing at all: before resolution
+    // there is no durable node for a local mention, and rendering the local
+    // id would strand an orphan edge that no later replay retires. The
+    // resolution-artifact replay re-renders the artifact once canonical keys
+    // exist. Endpoints matching no extraction entity keep the legacy
+    // string-passthrough external-node behavior.
+    if (resolveGraphEndpointEntity(value, artifact_value)) |entity| {
+        return canonicalEntityDocumentId(entity);
+    }
+    return jsonEndpointDocumentId(value);
+}
+
+/// Canonical document identity of an extraction entity: unlike
+/// jsonEndpointDocumentId this never falls back to the entity's local
+/// id/local_id, which identifies a mention within one artifact, not a node.
+fn canonicalEntityDocumentId(entity: std.json.Value) ?[]const u8 {
+    if (entity != .object) return null;
+    if (jsonStringField(entity, "document_id") orelse jsonStringField(entity, "doc_key") orelse jsonStringField(entity, "key")) |id| return id;
+    if (entity.object.get("doc_ref")) |doc_ref| return jsonEndpointDocumentId(doc_ref);
+    return null;
 }
 
 fn resolveGraphEndpointEntity(value: std.json.Value, artifact_value: std.json.Value) ?std.json.Value {
-    if (value != .object) return null;
-    if (jsonIntegerField(value, "entity_index")) |entity_index| return graphArtifactEntityAtIndex(artifact_value, entity_index);
-    const entity_id = jsonStringField(value, "entity_id") orelse jsonStringField(value, "id") orelse jsonStringField(value, "local_id") orelse return null;
-    return findGraphArtifactEntity(artifact_value, entity_id);
+    switch (value) {
+        .string => return findGraphArtifactEntity(artifact_value, value.string),
+        .object => {
+            if (jsonIntegerField(value, "entity_index")) |entity_index| return graphArtifactEntityAtIndex(artifact_value, entity_index);
+            const entity_id = jsonStringField(value, "entity_id") orelse jsonStringField(value, "id") orelse jsonStringField(value, "local_id") orelse return null;
+            return findGraphArtifactEntity(artifact_value, entity_id);
+        },
+        else => return null,
+    }
 }
 
 fn findGraphArtifactEntity(artifact_value: std.json.Value, entity_id: []const u8) ?std.json.Value {
     if (artifact_value != .object) return null;
-    const entities = artifact_value.object.get("_entities") orelse artifact_value.object.get("entities") orelse return null;
+    // The injected "_entities" resolution map wins, but a mention it does not
+    // cover (partial resolution) still matches the artifact's own entities so
+    // the canonical-only endpoint rule can drop it instead of leaking its
+    // local id as a node.
+    if (artifact_value.object.get("_entities")) |resolved| {
+        if (findGraphArtifactEntityIn(resolved, entity_id)) |entity| return entity;
+    }
+    const entities = artifact_value.object.get("entities") orelse return null;
+    return findGraphArtifactEntityIn(entities, entity_id);
+}
+
+fn findGraphArtifactEntityIn(entities: std.json.Value, entity_id: []const u8) ?std.json.Value {
     return switch (entities) {
         .array => |array| blk: {
             for (array.items) |entity| {
@@ -80476,6 +80630,7 @@ test "graph artifact materializer rejects non-finite mapped weights" {
             source,
             "application/json",
             null,
+            null,
             1,
         ));
     }
@@ -80495,8 +80650,50 @@ test "graph artifact parser enforces its independent raw item safety limit" {
         source,
         "application/json",
         null,
+        null,
         1,
     ));
+}
+
+test "graph relation endpoints canonicalize through injected resolutions" {
+    const alloc = std.testing.allocator;
+    const source = index_manager_mod.GraphArtifactSource{
+        .artifact_name = @constCast("kg_v1"),
+        .format = .extraction_graph,
+    };
+    const raw =
+        \\{"entities":[
+        \\  {"id":"e0","label":"person","text":"Ada Lovelace"},
+        \\  {"id":"v0","label":"event","text":"Ada writes the first program"}
+        \\],"relations":[
+        \\  {"type":"participates_in","source":"e0","target":"v0"},
+        \\  {"type":"mentions_external","source":"e0","target":"ext-node"}
+        \\]}
+    ;
+
+    // Without resolutions, an endpoint referencing an extraction entity is
+    // dropped (no durable node exists yet; the resolution replay re-renders
+    // it canonically), while an endpoint matching no entity keeps the legacy
+    // external-node string passthrough.
+    {
+        const writes = try graphWritesFromArtifactValueAlloc(alloc, "kg", "doc:a", raw, source, "application/json", null, null, 100);
+        defer freeGraphWrites(alloc, writes);
+        try std.testing.expectEqual(@as(usize, 1), writes.len);
+        try std.testing.expectEqualStrings("ext-node", writes[0].target);
+    }
+
+    // With resolutions injected, resolved local ids render the resolver's
+    // canonical keys; external endpoints keep the passthrough.
+    {
+        const resolutions =
+            \\{"v0":{"key":"event/7f3a","table":"events"}}
+        ;
+        const writes = try graphWritesFromArtifactValueAlloc(alloc, "kg", "doc:a", raw, source, "application/json", null, resolutions, 100);
+        defer freeGraphWrites(alloc, writes);
+        try std.testing.expectEqual(@as(usize, 2), writes.len);
+        try std.testing.expectEqualStrings("event/7f3a", writes[0].target);
+        try std.testing.expectEqualStrings("ext-node", writes[1].target);
+    }
 }
 
 test "db graph visible edge limit applies after identity deduplication" {

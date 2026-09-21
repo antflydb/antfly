@@ -11047,6 +11047,17 @@ fn flushAssetProducerBatchItems(
     setActiveFailureFingerprint(runtime, assetProducerBatchFailureFingerprint(items));
     yieldToInteractiveGeneration(runtime);
 
+    // A generator asset producer running a local LLM (e.g. autoschema triple
+    // extraction, zig/AUTOSCHEMA.md) can spend minutes in provider code —
+    // past the ordinary lease TTL, exactly like the remote OCR/transcription
+    // producers guarded in the document-extraction path. Keep the tenure
+    // alive through the batch; transaction fences below remain the final
+    // authority if renewal is lost. Without this, every slow generation lost
+    // the fence, was discarded, and retried until the worker retired.
+    var producer_lease_guard = RuntimeLeaseHeartbeatGuard.init(runtime);
+    try producer_lease_guard.start();
+    defer producer_lease_guard.stop();
+
     const producer = runtime.config.asset_producer orelse return error.MissingAssetProducer;
     const requests = try runtime.alloc.alloc(asset_producer_mod.Request, items.len);
     defer runtime.alloc.free(requests);
