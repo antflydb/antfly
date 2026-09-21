@@ -840,6 +840,7 @@ fn printUsage(usage_name: []const u8) void {
         \\  --models-dir <dir>    AI models directory (default: ~/.antfly/inference/models)
         \\  --ml-dir <dir>        Traditional ML directory for URL pulls (default: ~/.antfly/inference/ml)
         \\  variants          <model-ref>:gguf, <model-ref>:gguf:Q4_K, <model-ref>:onnx, <model-ref>:hybrid, <model-ref>:safetensors; append @<branch|tag|commit> to any format
+        \\                    :native is a compatibility alias for :auto; it does not force a backend
         \\                    default :gguf now prefers smaller GGUF quants; use :gguf:Q... for larger files
         \\  CLIP/CLAP v0.2    {s} pull antflydb/clipclap:gguf:Q4_K
         \\

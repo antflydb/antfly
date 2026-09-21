@@ -4,7 +4,7 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     http:#www.apache.org/licenses/LICENSE-2.0
+#     http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -62,6 +62,13 @@ MODE = sys.argv[2]
 if MODE == "onnx-only":
     FILES = {
         k: v for k, v in FILES.items() if k.startswith("onnx/") or k == "config.json"
+    }
+if MODE == "safetensors-only":
+    FILES = {
+        k: v
+        for k, v in FILES.items()
+        if k.endswith(".safetensors")
+        or k in {"config.json", "model.safetensors.index.json"}
     }
 if MODE == "missing-dependency":
     del FILES["onnx/Constant_7_attr__value"]
