@@ -6792,6 +6792,9 @@ fn divideConsumeLeftOp(_: *anyopaque, a: CT, b: CT) anyerror!?CT {
 }
 
 fn lessThanConsumeLeftOp(_: *anyopaque, a: CT, b: CT) anyerror!?CT {
+    // An f32 lhs may be donated with an integer rhs. Decline before any
+    // numeric-view materialization so the exact comparison handles both.
+    if (integerSource(a) != null or integerSource(b) != null) return null;
     if (try applyShapeAwareBinaryConsumeLeft(a, b, .lt)) |result| return result;
     const a_buf = ownedDenseBufWithMaxSharedRefs(a, 2) orelse return null;
     const a_data = a_buf.data;
@@ -37421,6 +37424,7 @@ fn primErfOp(ctx: *anyopaque, a: CT) anyerror!CT {
 
 fn lessThanOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    if (integerSource(a) != null or integerSource(b) != null) return exactLessThan(self, a, b);
     if (try applyShapeAwareBinaryOp(self, a, b, .lt)) |result| {
         return result;
     }
@@ -38898,6 +38902,59 @@ fn scanAxis(comptime T: type, values: []align(1) T, outer: usize, width: usize, 
             if (!exclusive) values[index] = sum;
         }
     };
+}
+
+/// Compare without promoting the integer to floating point, even at i64's
+/// limits. A finite in-range f32's truncated integer part fits exactly in i64.
+fn integerFloatLess(integer: i64, floating: f32, reverse: bool) bool {
+    if (std.math.isNan(floating)) return false;
+    if (floating >= 9223372036854775808.0) return !reverse;
+    if (floating < -9223372036854775808.0) return reverse;
+    const integral: i64 = @intFromFloat(floating);
+    const integral_float: f32 = @floatFromInt(integral);
+    return if (reverse)
+        integral < integer or (integral == integer and floating < integral_float)
+    else
+        integer < integral or (integer == integral and floating > integral_float);
+}
+
+fn exactLessThan(self: *NativeCompute, a: CT, b: CT) !CT {
+    const lhs = if (integerSource(a) != null) try IndexReader.init(a) else null;
+    const rhs = if (integerSource(b) != null) try IndexReader.init(b) else null;
+    const lf = if (lhs == null) try denseTensorView(self, a) else null;
+    defer if (lf) |view| if (view.owned) |owned| self.allocator.free(owned);
+    const rf = if (rhs == null) try denseTensorView(self, b) else null;
+    defer if (rf) |view| if (view.owned) |owned| self.allocator.free(owned);
+    const ln = if (lhs) |reader| reader.len else lf.?.data.len;
+    const rn = if (rhs) |reader| reader.len else rf.?.data.len;
+    const lflat = [_]i64{@intCast(ln)};
+    const rflat = [_]i64{@intCast(rn)};
+    const plan = try @import("binary_broadcast.zig").Plan.init(tensorStoredShape(a) orelse &lflat, tensorStoredShape(b) orelse &rflat);
+    if (plan.lhs_count != ln or plan.rhs_count != rn) return error.ShapeMismatch;
+    const data = try self.allocator.alloc(f32, plan.count);
+    const result = try self.makeOwnedBuf(data);
+    errdefer freeTensor(self, result);
+    // Select the operand kinds once. Flat/scalar maps avoid divisions and
+    // coalesced axes keep general broadcasting bounded without input copies.
+    if (lhs) |left| {
+        if (rhs) |right| {
+            for (data, 0..) |*value, i| {
+                const offsets = plan.offsets(i);
+                value.* = @floatFromInt(@intFromBool(try left.at(offsets.lhs) < try right.at(offsets.rhs)));
+            }
+        } else {
+            for (data, 0..) |*value, i| {
+                const offsets = plan.offsets(i);
+                value.* = @floatFromInt(@intFromBool(integerFloatLess(try left.at(offsets.lhs), rf.?.data[offsets.rhs], false)));
+            }
+        }
+    } else {
+        for (data, 0..) |*value, i| {
+            const offsets = plan.offsets(i);
+            value.* = @floatFromInt(@intFromBool(integerFloatLess(try rhs.?.at(offsets.rhs), lf.?.data[offsets.lhs], true)));
+        }
+    }
+    return self.withLogicalShape(result, plan.shape[0..plan.rank]);
 }
 
 fn integerBinaryOp(self: *NativeCompute, a: CT, b: CT, comptime kind: enum { add, subtract, multiply }) !CT {

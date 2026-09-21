@@ -7470,6 +7470,104 @@ fn checkExactIntegerBroadcasts(cb: *const ComputeBackend, metal: bool) !void {
     try std.testing.expectError(error.ShapeMismatch, cb.multiply(square, flat));
 }
 
+fn checkExactComparisons(cb: *const ComputeBackend) !void {
+    const a = std.testing.allocator;
+    inline for (.{ i8, i16, i32, i64, u8, bool }) |Left| {
+        inline for (.{ i8, i16, i32, i64, u8, bool }) |Right| {
+            const L = if (Left == bool) u8 else Left;
+            const R = if (Right == bool) u8 else Right;
+            const ld: ml.graph.DType = if (Left == bool) .bool_ else @field(ml.graph.DType, @typeName(Left));
+            const rd: ml.graph.DType = if (Right == bool) .bool_ else @field(ml.graph.DType, @typeName(Right));
+            const lv = [_]L{ if (Left == bool) 0 else std.math.minInt(L), if (Left == bool) 1 else std.math.maxInt(L) };
+            const rv = [_]R{ 0, 1, if (Right == bool) 0 else std.math.maxInt(R) };
+            const lhs = (try cb.fromConstantBytes(std.mem.sliceAsBytes(&lv), ld, &.{ 2, 1 })).?;
+            defer cb.free(lhs);
+            const rhs = (try cb.fromConstantBytes(std.mem.sliceAsBytes(&rv), rd, &.{3})).?;
+            defer cb.free(rhs);
+            const out = try cb.primLessThan(lhs, rhs);
+            defer cb.free(out);
+            const values = try cb.toFloat32(out, a);
+            defer a.free(values);
+            const shape = try cb.tensorShape(out, a);
+            defer a.free(shape);
+            try std.testing.expectEqualSlices(i64, &.{ 2, 3 }, shape);
+            for (lv, 0..) |l, i| for (rv, 0..) |r, j| {
+                try std.testing.expectEqual(@as(f32, if (@as(i64, l) < @as(i64, r)) 1 else 0), values[i * 3 + j]);
+            };
+        }
+    }
+    const iv = [_]i64{ 9007199254740993, 9007199254740994, -9007199254740993, std.math.minInt(i64), std.math.maxInt(i64), 0 };
+    const lhs = (try cb.fromConstantBytes(std.mem.sliceAsBytes(&iv), .i64, &.{ 6, 1 })).?;
+    defer cb.free(lhs);
+    const rhs = (try cb.fromConstantBytes(std.mem.sliceAsBytes(&iv), .i64, &.{6})).?;
+    defer cb.free(rhs);
+    const exact = try cb.primLessThan(lhs, rhs);
+    defer cb.free(exact);
+    const exact_values = try cb.toFloat32(exact, a);
+    defer a.free(exact_values);
+    for (iv, 0..) |l, i| for (iv, 0..) |r, j| {
+        try std.testing.expectEqual(@as(f32, if (l < r) 1 else 0), exact_values[i * 6 + j]);
+    };
+    const fv = [_]f32{ -std.math.inf(f32), -9223372036854775808.0, -9007199254740992, -0.5, 0, 0.5, 9007199254740992, 9223372036854775808.0, std.math.inf(f32), std.math.nan(f32) };
+    const floats = try cb.fromFloat32Shape(&fv, &.{10});
+    defer cb.free(floats);
+    for ([_]bool{ false, true }) |swap| {
+        const out = try cb.primLessThan(if (swap) floats else lhs, if (swap) lhs else floats);
+        defer cb.free(out);
+        const values = try cb.toFloat32(out, a);
+        defer a.free(values);
+        const shape = try cb.tensorShape(out, a);
+        defer a.free(shape);
+        try std.testing.expectEqualSlices(i64, &.{ 6, 10 }, shape);
+        for (iv, 0..) |integer, i| for (fv, 0..) |floating, j| {
+            // f128 exactly represents every i64 and f32: independent oracle.
+            const wide: f128 = @floatFromInt(integer);
+            const float_wide: f128 = floating;
+            const expected: f32 = if (if (swap) float_wide < wide else wide < float_wide) 1 else 0;
+            try std.testing.expectEqual(expected, values[i * 10 + j]);
+        };
+    }
+    const empty = (try cb.fromConstantBytes(&.{}, .i64, &.{ 0, 1 })).?;
+    defer cb.free(empty);
+    const empty_out = try cb.primLessThan(empty, rhs);
+    defer cb.free(empty_out);
+    const shape = try cb.tensorShape(empty_out, a);
+    defer a.free(shape);
+    try std.testing.expectEqualSlices(i64, &.{ 0, 6 }, shape);
+    try std.testing.expectError(error.ShapeMismatch, cb.primLessThan(rhs, floats));
+}
+
+test "native exact comparisons preserve integer precision and broadcasting" {
+    const a = std.testing.allocator;
+    var ws = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var native = NativeCompute.init(a, &ws, null);
+    defer native.deinit();
+    const cb = native.computeBackend();
+    try checkExactComparisons(&cb);
+    const floating = try cb.fromFloat32Shape(&.{9007199254740992}, &.{1});
+    defer cb.free(floating);
+    const integer = (try cb.fromConstantBytes(std.mem.sliceAsBytes(&[_]i64{9007199254740993}), .i64, &.{1})).?;
+    defer cb.free(integer);
+    try std.testing.expectEqual(@as(?CT, null), try cb.lessThanConsumeLeft(floating, integer));
+    const out = try cb.primLessThan(floating, integer);
+    defer cb.free(out);
+    const values = try cb.toFloat32(out, a);
+    defer a.free(values);
+    try std.testing.expectEqualSlices(f32, &.{1}, values);
+}
+
+test "Metal exact comparisons match native precision and broadcasting" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var weights = @import("../ops/gpu_hosted_store.zig").WeightStore{ .allocator = a, .prefix = "", .lazy_weights = .empty };
+    defer weights.lazy_weights.deinit(a);
+    var compute = try @import("../ops/metal_compute.zig").MetalCompute.init(a, &weights, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    try checkExactComparisons(&cb);
+}
+
 test "native exact integer multidimensional broadcasting" {
     const a = std.testing.allocator;
     var ws = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
