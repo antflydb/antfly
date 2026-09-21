@@ -95,6 +95,7 @@ pub fn supportsMetalEagerGraph(op: OpCode) bool {
         .transpose,
         .broadcast_in_dim,
         .gather,
+        .cumulative_sum,
         .scatter_add,
         .slice,
         .concat_prim,
@@ -322,6 +323,10 @@ fn metalEagerGraphNodeHasSupportedResidentShape(query: CapabilityQuery) bool {
         .reduce_sum, .reduce_max, .reduce_mean => metalReduceHasResidentShape(query),
         .broadcast_in_dim => metalBroadcastHasResidentShape(query),
         .gather => metalGatherHasResidentShape(query),
+        .cumulative_sum => |attrs| blk: {
+            const shape = nodeInputShape(query, 0) orelse break :blk false;
+            break :blk attrs.axis < shape.rank() and shapeHasConcreteElements(shape) and (shape.dtype == .f32 or shape.dtype == .i32 or shape.dtype == .i64);
+        },
         .scatter_add => metalScatterAddHasResidentShape(query),
         .slice => metalSliceHasResidentShape(query),
         .argmax => metalArgmaxHasResidentShape(query),

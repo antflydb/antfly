@@ -307,6 +307,7 @@ pub const ModelManifest = struct {
     bert_layer_norm_eps: f32 = 1e-12,
     bert_model_type: bert.ModelType = .bert,
     bert_pad_token_id: i64 = 0,
+    bert_position_embedding_offset: u32 = 0,
     config_model_arch: []const u8 = "",
 
     // Pipeline config
@@ -371,6 +372,7 @@ pub const ModelManifest = struct {
         const config = bert.Config{
             .max_position_embeddings = self.max_position_embeddings,
             .pad_token_id = self.bert_pad_token_id,
+            .position_embedding_offset = self.bert_position_embedding_offset,
             .position_id_mode = position_id_mode,
         };
         return config.maxSequenceLength();
@@ -1751,6 +1753,7 @@ fn applyGgufTokenizerMetadata(
             manifest.bert_layer_norm_eps = config.layer_norm_eps;
             manifest.bert_model_type = config.model_type;
             manifest.bert_pad_token_id = config.pad_token_id;
+            manifest.bert_position_embedding_offset = config.position_embedding_offset;
         }
         if (!manifest.model_manifest_declarations.pooling) {
             if (view.getU64("bert.pooling_type")) |pooling_type| {

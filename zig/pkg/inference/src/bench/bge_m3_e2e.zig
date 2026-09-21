@@ -62,6 +62,7 @@ const Options = struct {
     managed_only: bool = false,
     pull_ref: ?[]const u8 = null,
     text_offset: usize = 0,
+    texts_path: ?[]const u8 = null,
     show_help: bool = false,
     kernel_jit: kernel_jit.Config = .{},
     kernel_jit_mode_explicit: bool = false,
@@ -208,9 +209,18 @@ pub fn main(init: std.process.Init) !void {
     const managed_texts = try allocator.alloc([]const u8, opts.batch);
     defer allocator.free(managed_texts);
     @memset(managed_texts, managed_text);
+    var custom_texts: ?std.json.Parsed([]const []const u8) = null;
+    defer if (custom_texts) |*parsed| parsed.deinit();
+    if (opts.texts_path) |path| {
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(init.io, path, allocator, .limited(4 * 1024 * 1024));
+        defer allocator.free(bytes);
+        custom_texts = try std.json.parseFromSlice([]const []const u8, allocator, bytes, .{ .allocate = .alloc_always });
+        if (custom_texts.?.value.len == 0) return error.EmptyTextCorpus;
+    }
     if (opts.managed_only) {
         const texts = [_][]const u8{ "What is BGE-M3?", "A multilingual embedding model supports retrieval across languages and document lengths.", "你好，世界！", "Bonjour, comment fonctionne la recherche sémantique ?" };
-        for (managed_texts, 0..) |*text, i| text.* = texts[(i + opts.text_offset) % texts.len];
+        const corpus = if (custom_texts) |parsed| parsed.value else &texts;
+        for (managed_texts, 0..) |*text, i| text.* = corpus[(i + opts.text_offset) % corpus.len];
     }
     const cold_embeddings = node.embedDenseTextsFromPathWithExecutionControl(
         allocator,
@@ -264,6 +274,7 @@ pub fn main(init: std.process.Init) !void {
             tokens[i] = try allocator.dupe(i32, encoded.ids[0..length]);
         }
         defer for (tokens) |row| allocator.free(row);
+        const graph_before = backends.imported_onnx_session.executionStats(model.session);
         const warm_times = try allocator.alloc(f64, opts.measure_iters);
         defer allocator.free(warm_times);
         for (warm_times) |*time| {
@@ -281,6 +292,8 @@ pub fn main(init: std.process.Init) !void {
             .embeddings = warm_embeddings,
             .cold_ms = nsToMs(cold_managed.total_ns),
             .warm_ms = warm_times,
+            .graph_before = graph_before,
+            .graph_after = backends.imported_onnx_session.executionStats(model.session),
         }, .{});
         defer allocator.free(record);
         std.debug.print("{s}\n", .{record});
@@ -655,6 +668,8 @@ fn parseArgs(init: std.process.Init) !Options {
             opts.validate_specialized_attention = true;
         } else if (std.mem.eql(u8, arg, "--tune-generated-kernels")) {
             opts.tune_generated_kernels = true;
+        } else if (std.mem.eql(u8, arg, "--texts-json")) {
+            opts.texts_path = args.next() orelse return error.MissingTextCorpus;
         } else if (std.mem.eql(u8, arg, "--text-offset")) {
             opts.text_offset = try std.fmt.parseInt(usize, args.next() orelse return error.MissingTextOffset, 10);
         } else if (std.mem.eql(u8, arg, "--pull-ref")) {
@@ -756,7 +771,7 @@ fn nsToMs(ns: u64) f64 {
 
 fn printUsage() void {
     std.debug.print(
-        "usage: zig build bench-bge-m3-e2e -Doptimize=ReleaseFast -- --model-dir <bge-m3.gguf|dir> [--model-sha SHA256] [--fixture src/bench/testdata/bge_m3_tokens.json] [--backend metal|cuda|native] [--batch N] [--seq-len 16|128|200|256] [--warmup-iters N] [--measure-iters N] [--validate-specialized-attention] [--tune-generated-kernels] [--print-embeddings] [--managed-only] [--kernel-jit-mode off|shadow|on|required] [--kernel-jit-cache-dir PATH]\n",
+        "usage: zig build bench-bge-m3-e2e -Doptimize=ReleaseFast -- --model-dir <bge-m3.gguf|dir> [--model-sha SHA256] [--fixture src/bench/testdata/bge_m3_tokens.json] [--backend metal|cuda|native] [--batch N] [--seq-len 16|128|200|256] [--warmup-iters N] [--measure-iters N] [--validate-specialized-attention] [--tune-generated-kernels] [--print-embeddings] [--managed-only] [--texts-json PATH] [--text-offset N] [--kernel-jit-mode off|shadow|on|required] [--kernel-jit-cache-dir PATH]\n",
         .{},
     );
 }

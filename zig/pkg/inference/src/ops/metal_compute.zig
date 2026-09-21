@@ -4833,6 +4833,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     pub fn trainingUploadF32(self: *MetalCompute, data: []const f32, shape: []const i32) !CT {
+        return self.importResidentF32(data, shape);
+    }
+
+    /// Session-owned imported weights and inputs bypass the optional eager
+    /// upload policy. The returned handle owns its storage until freed.
+    pub fn importResidentF32(self: *MetalCompute, data: []const f32, shape: []const i32) !CT {
         var device_tensor = try self.deviceTensorFromF32Slice(data, shape);
         errdefer device_tensor.deinit();
         return self.ctFromOwnedMetalTensor(device_tensor);
@@ -7667,6 +7673,17 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
     }
 
+    fn cumulativeSumOp(ctx: *anyopaque, tensor: CT, axis: u8, exclusive: bool, reverse: bool) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const buf = toBuf(tensor);
+        var source = if (buf.boundary_i32_storage) try (try self.residentTrainingTensor(tensor, .i32, .{})).retainedCopy() else (try self.deviceWhereOperand(buf)) orelse return null;
+        defer source.deinit();
+        const output = (try metal_runtime.decoderRuntimeCumulativeSumF32Device(self.provider_impl, source, axis, exclusive, reverse, buf.boundary_i32_storage)) orelse return null;
+        const result = try self.ctFromOwnedMetalTensor(output);
+        toBuf(result).boundary_i32_storage = buf.boundary_i32_storage;
+        return result;
+    }
+
     fn convertDTypeOp(ctx: *anyopaque, tensor: CT, target: ops.GraphDType) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const buf = toBuf(tensor);
@@ -7678,13 +7695,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             // f32 would silently corrupt the mask.
             switch (target) {
                 .f32, .f16, .bf16, .f64 => {
-                    const values = try self.allocator.alloc(i32, source.elemCount());
-                    defer self.allocator.free(values);
-                    try source.downloadBytesInto(std.mem.sliceAsBytes(values));
-                    const floats = try self.allocator.alloc(f32, values.len);
-                    defer self.allocator.free(floats);
-                    for (values, floats) |value, *out| out.* = @floatFromInt(value);
-                    return fromFloat32ShapeOp(self, floats, source.shape());
+                    const converted = (try metal_runtime.decoderRuntimeConvertDTypeF32Device(self.provider_impl, source, 3)) orelse return error.UnsupportedResidentTrainingPrimitive;
+                    return self.ctFromOwnedMetalTensor(converted);
                 },
                 else => return error.UnsupportedResidentTrainingPrimitive,
             }
@@ -11947,11 +11959,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         // ONNX mask comparisons may consume exact integer inputs. Ordinary
         // floating-point kernels cannot reinterpret their device storage.
         if (toBuf(a).boundary_i32_storage or toBuf(b).boundary_i32_storage) {
-            const lhs = try self.exactIntegerAsFloat(a);
-            defer if (lhs) |value| freeOp(self, value);
-            const rhs = try self.exactIntegerAsFloat(b);
-            defer if (rhs) |value| freeOp(self, value);
-            return lessThanOp(self, lhs orelse a, rhs orelse b);
+            const lhs_int = toBuf(a).boundary_i32_storage;
+            const rhs_int = toBuf(b).boundary_i32_storage;
+            var lhs = if (lhs_int) try (try self.residentTrainingTensor(a, .i32, .{})).retainedCopy() else (try self.deviceWhereOperand(toBuf(a))) orelse return error.UnsupportedTensorType;
+            defer lhs.deinit();
+            var rhs = if (rhs_int) try (try self.residentTrainingTensor(b, .i32, .{})).retainedCopy() else (try self.deviceWhereOperand(toBuf(b))) orelse return error.UnsupportedTensorType;
+            defer rhs.deinit();
+            const output = (try metal_runtime.decoderRuntimeLessThanTyped(self.provider_impl, lhs, rhs, lhs_int, rhs_int)) orelse return error.UnsupportedTensorType;
+            return self.ctFromOwnedMetalTensor(output);
         }
         if (try self.tryFlatDeviceBinaryRuntimeOp(a, b, .less_than)) |device_result| return device_result;
         const a_len = bufElemCount(toBuf(a));
@@ -11968,22 +11983,6 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (try metal_runtime.decoderRuntimeApplyLessThan(self.provider_impl, lhs, rhs)) |tensor| return self.ctFromOwnedMetalTensor(tensor);
         }
         return self.hostFallbackBinary(a, b, null, null, .less_than);
-    }
-
-    fn exactIntegerAsFloat(self: *MetalCompute, input: CT) !?CT {
-        if (!toBuf(input).boundary_i32_storage) return null;
-        const source = try self.residentTrainingTensor(input, .i32, .{});
-        const values = try self.allocator.alloc(i32, source.elemCount());
-        defer self.allocator.free(values);
-        try source.downloadBytesInto(std.mem.sliceAsBytes(values));
-        const floats = try self.allocator.alloc(f32, values.len);
-        defer self.allocator.free(floats);
-        for (values, floats) |value, *out| {
-            out.* = @floatFromInt(value);
-            if (@as(f64, out.*) != @as(f64, @floatFromInt(value)))
-                return error.UnsupportedTensorType;
-        }
-        return fromFloat32ShapeOp(self, floats, source.shape());
     }
 
     fn whereSelectOp(ctx: *anyopaque, cond: CT, on_true: CT, on_false: CT) anyerror!CT {
@@ -30278,6 +30277,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.fromFloat32Shape = fromFloat32ShapeOp;
         vt.fromInt32Shape = fromInt32ShapeOp;
         vt.convertDType = convertDTypeOp;
+        vt.cumulativeSum = cumulativeSumOp;
         vt.glinerBoundaryDevice = glinerBoundaryDeviceOp;
         vt.glinerBoundaryScope = glinerBoundaryScopeOp;
         vt.glinerBoundaryResidentPreparation = glinerBoundaryResidentPreparationOp;
@@ -39129,4 +39129,55 @@ test "metal_compute: imported weights accept exact integer gather indices" {
     const compared = try cb.toFloat32(comparison, allocator);
     defer allocator.free(compared);
     try std.testing.expectEqualSlices(f32, &.{ 0, 0 }, compared);
+}
+
+test "metal_compute: resident scans and exact mixed integer comparisons" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var weights = testMetalWeightStoreInit(allocator);
+    defer weights.lazy_weights.deinit(allocator);
+    var compute = try MetalCompute.init(allocator, &weights, null);
+    defer compute.deinit();
+    var cb = compute.computeBackend();
+    // More than one element per lane, strided columns and multiple rows.
+    const dims = [_]i32{ 2, 513, 3 };
+    const values = try allocator.alloc(f32, 2 * 513 * 3);
+    defer allocator.free(values);
+    for (values, 0..) |*value, i| value.* = @as(f32, @floatFromInt(i % 11)) - 5;
+    const input = try compute.importResidentF32(values, &dims);
+    defer cb.free(input);
+    for ([_]bool{ false, true }) |reverse| for ([_]bool{ false, true }) |exclusive| {
+        const output = (try cb.tryCumulativeSum(input, 1, exclusive, reverse)) orelse return error.TestUnexpectedResult;
+        defer cb.free(output);
+        try std.testing.expect(MetalCompute.toBuf(output).metal_tensor.?.isDevice());
+        const actual = try cb.toFloat32(output, allocator);
+        defer allocator.free(actual);
+        for (0..2) |batch| for (0..3) |channel| {
+            var total: f32 = 0;
+            for (0..513) |step| {
+                const index = (batch * 513 + (if (reverse) 512 - step else step)) * 3 + channel;
+                if (!exclusive) total += values[index];
+                try std.testing.expectEqual(total, actual[index]);
+                if (exclusive) total += values[index];
+            }
+        };
+    };
+    const ints = (try cb.fromInt32Shape(&.{ 16777217, -16777217, 2147483647, -2147483648 }, &.{4})) orelse return error.TestUnexpectedResult;
+    defer cb.free(ints);
+    const integer_scan = (try cb.tryCumulativeSum(ints, 0, false, false)) orelse return error.TestUnexpectedResult;
+    defer cb.free(integer_scan);
+    const integer_bytes = (try cb.exportTensorData(integer_scan, allocator)) orelse return error.TestUnexpectedResult;
+    defer allocator.free(integer_bytes.payload.bytes);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]i32{ 16777217, 0, 2147483647, -1 }), integer_bytes.payload.bytes);
+    const floats = try compute.importResidentF32(&.{ 16777216, -16777216, 2147483648, -2147483648 }, &.{4});
+    defer cb.free(floats);
+    for ([_]bool{ false, true }) |swap| {
+        const result = try cb.primLessThan(if (swap) floats else ints, if (swap) ints else floats);
+        defer cb.free(result);
+        try std.testing.expect(MetalCompute.toBuf(result).metal_tensor.?.isDevice());
+        const actual = try cb.toFloat32(result, allocator);
+        defer allocator.free(actual);
+        try std.testing.expectEqualSlices(f32, if (swap) &.{ 1, 0, 0, 0 } else &.{ 0, 1, 1, 0 }, actual);
+    }
 }

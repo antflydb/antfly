@@ -14,7 +14,7 @@
 
 # /// script
 # requires-python = ">=3.11,<3.14"
-# dependencies = ["numpy==2.2.6", "onnxruntime==1.22.1", "tokenizers==0.21.4"]
+# dependencies = ["numpy==2.2.6", "onnxruntime==1.22.1", "tokenizers==0.21.4", "gguf==0.19.0", "onnx==1.23.0"]
 # ///
 """Qualify managed BGE-M3 dense embeddings against the official ONNX export.
 
@@ -28,6 +28,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
 import platform
 import statistics
 import subprocess
@@ -53,6 +55,11 @@ def main():
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--oracle-dir", type=Path, required=True)
     parser.add_argument(
+        "--oracle-gguf",
+        type=Path,
+        help="independently dequantize these GGUF weights into the official graph",
+    )
+    parser.add_argument(
         "--model", action="append", required=True, help="label=managed-model-directory"
     )
     parser.add_argument("--backends", default="native,metal")
@@ -60,13 +67,23 @@ def main():
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--timeout", type=int, default=300)
     parser.add_argument("--minimum-cosine", type=float, default=0.995)
+    parser.add_argument("--texts-json", type=Path)
+    parser.add_argument(
+        "--graph-runtime",
+        choices=["compiled-preferred", "partitioned", "interpreter"],
+        default="compiled-preferred",
+    )
+    parser.add_argument("--require-resident-onnx", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     batches = list(map(int, args.batches.split(",")))
-    if not batches or any(batch < 1 or batch > 4 for batch in batches):
-        parser.error("qualification batches must be between 1 and 4")
+    if not batches or any(batch < 1 or batch > 128 for batch in batches):
+        parser.error("qualification batches must be between 1 and 128")
     if args.repeats < 1:
         parser.error("repeats must be positive")
+    corpus_size = len(json.loads(args.texts_json.read_text())) if args.texts_json else 4
+    if corpus_size < 1:
+        parser.error("text corpus must not be empty")
     oracle_dir = (
         args.oracle_dir / "onnx"
         if (args.oracle_dir / "onnx/model.onnx").exists()
@@ -75,6 +92,13 @@ def main():
     tokenizer = Tokenizer.from_file(str(oracle_dir / "tokenizer.json"))
     session_options = ort.SessionOptions()
     session_options.intra_op_num_threads = 4
+    retained_initializers = []
+    if args.oracle_gguf:
+        from gguf_reference import add_gguf_initializers
+
+        retained_initializers = add_gguf_initializers(
+            session_options, oracle_dir / "model.onnx", args.oracle_gguf
+        )
     session = ort.InferenceSession(
         str(oracle_dir / "model.onnx"),
         sess_options=session_options,
@@ -83,8 +107,13 @@ def main():
     report = {
         "scope": "BGE-M3 dense embeddings; no sparse/ColBERT or CUDA claim",
         "oracle": str(oracle_dir),
+        "oracle_gguf": str(args.oracle_gguf) if args.oracle_gguf else None,
+        "overridden_initializers": len(retained_initializers),
+        "texts_json": str(args.texts_json) if args.texts_json else None,
         "host": platform.platform(),
         "minimum_cosine": args.minimum_cosine,
+        "graph_runtime": args.graph_runtime,
+        "resident_onnx_required": args.require_resident_onnx,
         "minimum_parity_cosine": 0.9999,
         "models": {},
         "runs": [],
@@ -105,7 +134,7 @@ def main():
                 singles = {}
                 # Qualify every row individually before comparing padded
                 # batches, including the Chinese and accented French inputs.
-                cases = [(1, offset) for offset in range(max(batches))]
+                cases = [(1, offset) for offset in range(corpus_size)]
                 cases += [(batch, 0) for batch in batches if batch != 1]
                 for batch, offset in cases:
                     command = [
@@ -127,9 +156,25 @@ def main():
                         "--measure-iters",
                         str(args.repeats),
                     ]
+                    if args.texts_json:
+                        command += ["--texts-json", str(args.texts_json.resolve())]
+                    env = dict(os.environ)
+                    is_metal_onnx = (
+                        backend == "metal"
+                        and receipt.get("source", {}).get("selected_format") == "onnx"
+                    )
+                    if is_metal_onnx:
+                        env["TERMITE_GRAPH_RUNTIME"] = args.graph_runtime
+                        env["TERMITE_GRAPH_PARTITION_REPORT"] = "1"
+                        env["TERMITE_GRAPH_EXECUTOR_STATS"] = "1"
+                        env["TERMITE_METAL_PARTITION_RESIDENCY_STATS"] = "1"
+                        if args.require_resident_onnx:
+                            env["TERMITE_GRAPH_RUNTIME_REQUIRE_NO_FALLBACK"] = "1"
+                            env["TERMITE_GRAPH_RUNTIME_REQUIRE_NO_HOST_ASSISTED"] = "1"
                     try:
                         result = subprocess.run(
                             command,
+                            env=env,
                             text=True,
                             capture_output=True,
                             timeout=args.timeout,
@@ -153,6 +198,79 @@ def main():
                             raise ValueError(
                                 "runtime silently selected a different backend"
                             )
+                        graph = record.get("graph_after")
+                        if is_metal_onnx:
+                            before = record.get("graph_before")
+                            if not graph or not before or graph["last_batch"] != batch:
+                                raise ValueError("missing proof of actual graph batch")
+                            if (
+                                graph["executions"] - before["executions"]
+                                != args.repeats
+                            ):
+                                raise ValueError(
+                                    "managed batch was split into multiple graph executions"
+                                )
+                            if graph["plan_builds"] != before["plan_builds"]:
+                                raise ValueError("warm request rebuilt its cached plan")
+                            if (
+                                args.require_resident_onnx
+                                and args.graph_runtime == "interpreter"
+                            ):
+                                raise ValueError(
+                                    "resident qualification requires planned execution"
+                                )
+                        partitions = [
+                            dict(
+                                zip(
+                                    (
+                                        "target_nodes",
+                                        "fallback_nodes",
+                                        "host_assisted_nodes",
+                                    ),
+                                    map(int, match),
+                                )
+                            )
+                            for match in re.findall(
+                                r"summary target_nodes=(\d+) fallback_nodes=(\d+) host_assisted_target_nodes=(\d+)",
+                                result.stderr,
+                            )
+                        ]
+                        if (
+                            is_metal_onnx
+                            and args.require_resident_onnx
+                            and (
+                                not partitions
+                                or any(
+                                    p["fallback_nodes"] or p["host_assisted_nodes"]
+                                    for p in partitions
+                                )
+                            )
+                        ):
+                            raise ValueError("graph residency requirements not met")
+                        executor_stats = [
+                            dict(
+                                (key, int(value))
+                                for key, value in re.findall(r"(\w+)=(\d+)", line)
+                            )
+                            for line in result.stderr.splitlines()
+                            if line.startswith("graph_executor_stats:")
+                        ]
+                        if is_metal_onnx and args.require_resident_onnx:
+                            if not executor_stats or any(
+                                stat.get("transfers", 0) or stat.get("host_outputs", 0)
+                                for stat in executor_stats
+                            ):
+                                raise ValueError(
+                                    "executor materialized intermediate tensors on CPU"
+                                )
+                            if not all(
+                                stat.get("graph_plan_slots", 0) > 0
+                                and stat.get("metal_frame_chunk_boundaries", 0) > 0
+                                for stat in executor_stats
+                            ):
+                                raise ValueError(
+                                    "planned buffers or bounded command frames were not used"
+                                )
                         ids = [tokenizer.encode(text).ids for text in record["texts"]]
                         if ids != record["token_ids"]:
                             raise ValueError(
@@ -229,6 +347,9 @@ def main():
                                 "cold_ms": record["cold_ms"],
                                 "warm_median_ms": median,
                                 "embeddings_per_second": 1000 * batch / median,
+                                "graph": graph,
+                                "partitions": partitions,
+                                "executor_stats": executor_stats,
                                 "passed": True,
                             }
                         )

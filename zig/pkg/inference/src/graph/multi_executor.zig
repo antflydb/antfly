@@ -16,8 +16,8 @@
 //
 // Executes a partitioned graph across multiple ComputeBackend instances.
 // Each partition runs on its assigned device; cross-partition data flows
-// through CPU-mediated transfers (toFloat32 → fromFloat32). On Apple
-// Silicon with unified memory, this is effectively a memcpy.
+// through direct backend copies when supported, or explicit host transfers.
+// Physical i32 buffers retain exact values across partition boundaries.
 //
 // Partitions execute sequentially in plan order. True pipeline overlap
 // (concurrent stages) is a future extension requiring std.Thread.
@@ -136,13 +136,39 @@ fn transferTensorWithKnownShape(
 ) !CT {
     const trace = traceTransfersEnabled();
     if (trace) std.debug.print("graph_executor_transfer_stage: begin from={s} to={s}\n", .{ @tagName(from.kind()), @tagName(to.kind()) });
-    const owned_shape_i64 = if (known_shape == null) try from.tensorShape(value, allocator) else null;
+    if (try to.copyTensorFromBackend(from, value)) |copied| return copied;
+    const runtime_shape_needed = if (known_shape) |shape| blk: {
+        for (shape) |dim| if (dim < 0) break :blk true;
+        break :blk false;
+    } else true;
+    const owned_shape_i64 = if (runtime_shape_needed) try from.tensorShape(value, allocator) else null;
     defer if (owned_shape_i64) |shape| allocator.free(shape);
-    const shape_i64 = known_shape orelse owned_shape_i64.?;
+    const shape_i64 = owned_shape_i64 orelse known_shape.?;
     if (trace) std.debug.print("graph_executor_transfer_stage: shape_i64={any}\n", .{shape_i64});
     const shape_i32 = try tensorShapeI32(allocator, shape_i64);
     defer allocator.free(shape_i32);
     if (trace) std.debug.print("graph_executor_transfer_stage: shape_i32={any}\n", .{shape_i32});
+    const dtype = from.tensorDType(value) catch |err| switch (err) {
+        error.UnsupportedTensorType => .f32,
+        else => return err,
+    };
+    if (dtype == .i32) {
+        const exported = (try from.exportTensorData(value, allocator)) orelse return error.UnsupportedTensorType;
+        const bytes = switch (exported.payload) {
+            .bytes => |bytes| bytes,
+            .quantized_f32 => |quant| {
+                allocator.free(quant.raw_bytes);
+                allocator.free(quant.shape);
+                return error.UnsupportedTensorType;
+            },
+        };
+        defer allocator.free(bytes);
+        if (exported.dtype != .i32 or bytes.len % 4 != 0) return error.UnsupportedTensorType;
+        const integers = try allocator.alloc(i32, bytes.len / 4);
+        defer allocator.free(integers);
+        for (integers, 0..) |*integer, i| integer.* = std.mem.readInt(i32, bytes[i * 4 ..][0..4], .little);
+        return (try to.fromInt32Shape(integers, shape_i32)) orelse return error.UnsupportedTensorType;
+    }
     const f32_data = try from.toFloat32(value, allocator);
     defer allocator.free(f32_data);
     if (trace) std.debug.print("graph_executor_transfer_stage: f32_len={d}\n", .{f32_data.len});

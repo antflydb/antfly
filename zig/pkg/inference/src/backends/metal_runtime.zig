@@ -6988,11 +6988,30 @@ pub fn decoderRuntimeArgmaxAxisF32Device(
     return finishDeviceOutput(&output_device, rc);
 }
 
+pub fn decoderRuntimeCumulativeSumF32Device(self: anytype, input: MetalTensor, axis: u8, exclusive: bool, reverse: bool, integer: bool) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (!input.isDevice() or axis >= input.shape().len or input.elemCount() == 0) return null;
+    var outer: usize = 1;
+    var inner: usize = 1;
+    for (input.shape(), 0..) |dim, i| {
+        if (dim <= 0) return null;
+        if (i < axis) outer = try std.math.mul(usize, outer, @intCast(dim));
+        if (i > axis) inner = try std.math.mul(usize, inner, @intCast(dim));
+    }
+    var output = try MetalTensor.deviceAllocate(runtime, input.elemCount() * @sizeOf(f32), .private, input.shape());
+    errdefer output.deinit();
+    output.dtype = if (integer) .i32 else .f32;
+    const rc = termite_metal_decode_runtime_cumulative_sum_f32_device(runtime, input.deviceHandle(), input.deviceByteOffset(), outer, @intCast(input.shape()[axis]), inner, @intFromBool(exclusive), @intFromBool(reverse), @intFromBool(integer), output.deviceHandle(), output.deviceByteOffset());
+    return finishDeviceOutput(&output, rc);
+}
+
+pub extern fn termite_metal_decode_runtime_cumulative_sum_f32_device(runtime: ?*anyopaque, input: ?*anyopaque, input_offset: usize, outer: usize, width: usize, inner: usize, exclusive: u32, reverse: u32, integer: u32, output: ?*anyopaque, output_offset: usize) c_int;
+
 pub fn decoderRuntimeConvertDTypeF32Device(self: anytype, input: MetalTensor, kind: u32) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
     if (!input.isDevice()) return null;
-    if (input.elemCount() == 0 or kind > 2) return null;
+    if (input.elemCount() == 0 or kind > 3) return null;
     var output_device = try MetalTensor.deviceAllocate(runtime, input.elemCount() * @sizeOf(f32), .private, input.shape());
     errdefer output_device.deinit();
     const rc = termite_metal_decode_runtime_convert_dtype_f32_device(
@@ -9018,6 +9037,20 @@ pub fn decoderRuntimeApplyDivideRhsRepeat(self: anytype, lhs: MetalTensor, rhs: 
     );
     return finishDeviceOutput(&output_device, rc);
 }
+
+pub fn decoderRuntimeLessThanTyped(self: anytype, lhs: MetalTensor, rhs: MetalTensor, lhs_integer: bool, rhs_integer: bool) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (!lhs.isDevice() or !rhs.isDevice()) return null;
+    const count = @max(lhs.elemCount(), rhs.elemCount());
+    if (count == 0 or (lhs.elemCount() != count and lhs.elemCount() != 1) or (rhs.elemCount() != count and rhs.elemCount() != 1)) return null;
+    const shape = if (lhs.elemCount() == count) lhs.shape() else rhs.shape();
+    var output = try MetalTensor.deviceAllocate(runtime, count * @sizeOf(f32), .private, shape);
+    errdefer output.deinit();
+    const flags: u32 = @as(u32, @intFromBool(lhs.elemCount() == 1)) | (@as(u32, @intFromBool(rhs.elemCount() == 1)) << 1) | (@as(u32, @intFromBool(lhs_integer)) << 3) | (@as(u32, @intFromBool(rhs_integer)) << 4);
+    return finishDeviceOutput(&output, termite_metal_decode_runtime_less_than_typed_device(runtime, lhs.deviceHandle(), lhs.deviceByteOffset(), rhs.deviceHandle(), rhs.deviceByteOffset(), count, flags, output.deviceHandle(), output.deviceByteOffset()));
+}
+
+pub extern fn termite_metal_decode_runtime_less_than_typed_device(runtime: ?*anyopaque, lhs: ?*anyopaque, lhs_offset: usize, rhs: ?*anyopaque, rhs_offset: usize, count: usize, flags: u32, output: ?*anyopaque, output_offset: usize) c_int;
 
 pub fn decoderRuntimeApplyLessThan(self: anytype, lhs: MetalTensor, rhs: MetalTensor) !?MetalTensor {
     return decoderRuntimeApplyFlatBinaryDevice(self, lhs, rhs, termite_metal_decode_runtime_apply_less_than_device_broadcast);

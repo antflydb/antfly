@@ -1524,6 +1524,11 @@ pub const ComputeBackend = struct {
         return op(self.ptr);
     }
 
+    pub fn tryCumulativeSum(self: *const ComputeBackend, tensor: CT, axis: u8, exclusive: bool, reverse: bool) !?CT {
+        const op = self.vtable.cumulativeSum orelse return null;
+        return op(self.ptr, tensor, axis, exclusive, reverse);
+    }
+
     pub fn tryConvertDType(self: *const ComputeBackend, tensor: CT, target: GraphDType) !?CT {
         const op = self.vtable.convertDType orelse return null;
         return op(self.ptr, tensor, target);
@@ -1628,6 +1633,7 @@ pub const ComputeBackend = struct {
         decoderRuntimePushPlannedComputeBarrierSuppression: ?*const fn (ctx: *anyopaque) anyerror!bool = null,
         decoderRuntimePopPlannedComputeBarrierSuppression: ?*const fn (ctx: *anyopaque) anyerror!void = null,
 
+        cumulativeSum: ?*const fn (ctx: *anyopaque, tensor: CT, axis: u8, exclusive: bool, reverse: bool) anyerror!?CT = null,
         convertDType: ?*const fn (ctx: *anyopaque, tensor: CT, target: GraphDType) anyerror!?CT = null,
         glinerBoundaryDevice: ?*const fn (ctx: *anyopaque, request: *const gliner_boundary_device.Request) anyerror!CT = null,
         glinerBoundaryScope: ?*const fn (ctx: *anyopaque, request: *const gliner_boundary_device.ScopeRequest) anyerror!gliner_boundary_device.ScopeStats = null,

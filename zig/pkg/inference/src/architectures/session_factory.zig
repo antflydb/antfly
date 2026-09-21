@@ -5589,6 +5589,7 @@ fn makeBertConfig(mf: manifest_mod.ModelManifest) bert.Config {
         .layer_norm_eps = mf.bert_layer_norm_eps,
         .num_labels = mf.num_labels,
         .pad_token_id = mf.bert_pad_token_id,
+        .position_embedding_offset = mf.bert_position_embedding_offset,
         .position_id_mode = if (mf.bert_model_type == .roberta) .roberta_padding else .absolute,
     };
 }

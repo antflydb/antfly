@@ -2248,11 +2248,11 @@ fn existingFinalFileProgressSize(
     return total_bytes;
 }
 
-const ModelSnapshot = struct {
+pub const ModelSnapshot = struct {
     commit: []u8,
     files: []HubFile,
 
-    fn deinit(self: *ModelSnapshot, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *ModelSnapshot, allocator: std.mem.Allocator) void {
         allocator.free(self.commit);
         freeHubFiles(allocator, self.files);
     }
@@ -2267,6 +2267,8 @@ fn freeHubFiles(allocator: std.mem.Allocator, files: []HubFile) void {
     allocator.free(files);
 }
 
+/// For discovery only. Downloads must retain resolveModelSnapshot().commit
+/// and use it for every artifact request from the returned file list.
 pub fn listModelFiles(allocator: std.mem.Allocator, io: std.Io, owner: []const u8, name: []const u8, config: HubConfig) ![]HubFile {
     const snapshot = try resolveModelSnapshot(allocator, io, owner, name, config);
     allocator.free(snapshot.commit);
@@ -2274,7 +2276,7 @@ pub fn listModelFiles(allocator: std.mem.Allocator, io: std.Io, owner: []const u
 }
 
 /// Resolve one metadata snapshot, including the immutable commit and files.
-fn resolveModelSnapshot(
+pub fn resolveModelSnapshot(
     allocator: std.mem.Allocator,
     io: std.Io,
     owner: []const u8,

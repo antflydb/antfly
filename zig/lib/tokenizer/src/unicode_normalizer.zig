@@ -137,39 +137,47 @@ const Precompiled = struct {
         return @as(usize, value >> 10) << @intCast((value & (1 << 9)) >> 6);
     }
 
+    fn transform(self: Precompiled, text: []const u8) !?[]const u8 {
+        var cursor = offset(try self.unit(0));
+        for (text) |byte| {
+            if (byte == 0) break;
+            cursor ^= byte;
+            const value = try self.unit(cursor);
+            if (value & 0x800000ff != byte) break;
+            cursor ^= offset(value);
+            if (value & 0x100 != 0) {
+                const index = (try self.unit(cursor)) & 0x7fffffff;
+                const table = self.bytes[4 + self.trie_bytes ..];
+                if (index >= table.len) return error.InvalidTokenizerNormalizer;
+                const end = std.mem.indexOfScalar(u8, table[index..], 0) orelse return error.InvalidTokenizerNormalizer;
+                // Hugging Face spm_precompiled selects the first prefix,
+                // not the longest match in the serialized SentencePiece trie.
+                return table[index..][0..end];
+            }
+        }
+        return null;
+    }
+
     fn normalize(self: Precompiled, allocator: std.mem.Allocator, text: []const u8) ![]u8 {
-        _ = try std.unicode.Utf8View.init(text);
-        var output = std.ArrayListUnmanaged(u8).empty;
+        var output: std.ArrayListUnmanaged(u8) = .empty;
         errdefer output.deinit(allocator);
-        var start: usize = 0;
-        while (start < text.len) {
-            var cursor = offset(try self.unit(0));
-            var matched: usize = 0;
-            var replacement: []const u8 = "";
-            // Longest matching prefix permits composed-character rules as
-            // well as compatibility rewrites and deletion (empty values).
-            for (text[start..], 0..) |byte, i| {
-                if (byte == 0) break;
-                cursor ^= byte;
-                const value = try self.unit(cursor);
-                if (value & 0x800000ff != byte) break;
-                cursor ^= offset(value);
-                if (value & 0x100 != 0) {
-                    const index = (try self.unit(cursor)) & 0x7fffffff;
-                    const table = self.bytes[4 + self.trie_bytes ..];
-                    if (index >= table.len) return error.InvalidTokenizerNormalizer;
-                    const end = std.mem.indexOfScalar(u8, table[index..], 0) orelse return error.InvalidTokenizerNormalizer;
-                    replacement = table[index..][0..end];
-                    matched = i + 1;
+        try output.ensureTotalCapacity(allocator, text.len);
+        var graphemes = @import("grapheme.zig").Iterator{ .text = text };
+        while (try graphemes.next()) |cluster| {
+            // Match the reference's short-grapheme rule exactly, including
+            // its six-byte cutoff. Longer clusters normalize each codepoint.
+            if (cluster.len < 6) {
+                if (try self.transform(cluster)) |replacement| {
+                    try output.appendSlice(allocator, replacement);
+                    continue;
                 }
             }
-            if (matched != 0) {
-                try output.appendSlice(allocator, replacement);
-                start += matched;
-            } else {
-                const length = try std.unicode.utf8ByteSequenceLength(text[start]);
-                try output.appendSlice(allocator, text[start..][0..length]);
-                start += length;
+            var position: usize = 0;
+            while (position < cluster.len) {
+                const length = try std.unicode.utf8ByteSequenceLength(cluster[position]);
+                const codepoint = cluster[position..][0..length];
+                try output.appendSlice(allocator, (try self.transform(codepoint)) orelse codepoint);
+                position += length;
             }
         }
         return output.toOwnedSlice(allocator);
@@ -404,6 +412,14 @@ test "SentencePiece precompiled normalization rewrites Unicode and deletes contr
     const normalized = try map.normalize(allocator, "你好，世界！ Ａ e\u{301}\x01🙂");
     defer allocator.free(normalized);
     try std.testing.expectEqualStrings("你好,世界! A é🙂", normalized);
+    // A short grapheme consumes the entire cluster on the FIRST prefix match.
+    const short_cluster = try map.normalize(allocator, "e\u{301}\u{327}");
+    defer allocator.free(short_cluster);
+    try std.testing.expectEqualStrings("é", short_cluster);
+    // Six or more bytes skip cluster matching and normalize each codepoint.
+    const long_cluster = try map.normalize(allocator, "e\u{301}\u{327}\u{300}");
+    defer allocator.free(long_cluster);
+    try std.testing.expectEqualStrings("e\u{301}\u{327}\u{300}", long_cluster);
     try std.testing.expectError(error.InvalidTokenizerNormalizer, Precompiled.init(allocator, "AAAA"));
     try std.testing.expectError(error.InvalidTokenizerNormalizer, Precompiled.init(allocator, "not base64"));
 }

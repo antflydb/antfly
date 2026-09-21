@@ -21,9 +21,19 @@ Omitting the revision means `main`. Branches, tags, and commit hashes are accept
 At the start of each explicit pull, the Hub's metadata resolves that request to
 one immutable commit. Metadata, weights, tokenizer, and configuration all come
 from that snapshot, even if the branch changes while the transfer is running.
-The completion receipt records the requested revision, resolved commit, and
-selected format. Repeating a pull resolves moving refs again and reuses only
+For managed AI models, the completion receipt records the requested revision,
+resolved commit, and selected format. Repeating a pull resolves moving refs again and reuses only
 verified files; inference uses the installed snapshot without network refresh.
+
+Traditional ML predictor pulls also resolve one snapshot before downloading,
+including explicit branches or commits:
+
+```sh
+antfly inference pull hf:owner/tree-model@release/v2 --type predictor
+```
+
+Their selected artifact's size and available SHA-256 or Git blob digest are
+verified before conversion and atomic installation.
 
 Friendly aliases work in pull and inference. `bge-m3` resolves to `BAAI/bge-m3`;
 it does not substitute an older revision or a community conversion. Explicit
@@ -75,9 +85,11 @@ advertise sparse or multi-vector support for the selected dense export.
 
 The [M4 Max qualification report](https://github.com/antflydb/antfly/blob/main/zig/pkg/inference/scripts/embedder/bge-m3/QUALIFICATION.md)
 records accuracy, batching, CPU/Metal parity, and latency for the three formats.
-Imported ONNX currently runs faster on CPU than Metal on that machine;
-safetensors and GGUF benefit from Metal. These measurements cover short inputs,
-not long-context or large-batch throughput.
+Imported ONNX uses cached plans for concrete input shapes, shared resident weights,
+reusable GPU buffers, and bounded Metal command frames. Qualification checks actual
+batch execution and rejects CPU fallback, intermediate host outputs, and device
+transfers. On the measured short-input workload, all three formats benefit from
+Metal; the report states the tested batch sizes and context lengths.
 
 Run the small downloader suite from `zig/` with:
 
@@ -97,7 +109,20 @@ uv run --script zig/pkg/inference/scripts/embedder/bge-m3/qualify_formats.py \
   --binary zig/zig-out/bin/antfly-inference-bge-m3-e2e-bench \
   --oracle-dir /path/to/official-bge-m3 \
   --model onnx=/path/to/official-bge-m3 \
-  --model safetensors=/path/to/pinned-bge-m3 \
+  --model safetensors=/path/to/historical-bge-m3 \
   --model gguf=/path/to/bge-m3-gguf \
+  --batches 1,2,4,8,16 --require-resident-onnx \
   --output /tmp/bge-m3-qualification.json
 ```
+
+Use `--texts-json PATH` to qualify an additional JSON array of texts; the checked-in
+`unicode-corpus.json` includes combining marks, emoji sequences, and non-Latin
+scripts. `--graph-runtime partitioned` checks the explicit partitioned strategy;
+`interpreter` is also available, without the residency requirement.
+
+For an independent execution reference for the community BGE-M3 Q8 GGUF, add
+`--oracle-gguf /path/to/bge-m3-Q8_0.gguf --minimum-cosine 0.9999`. This replaces
+every weight in the official ONNX graph with gguf-py's dequantized values and
+executes it through ONNX Runtime. The default oracle still uses the official
+full-precision weights, so conversion accuracy and runtime parity are separate
+checks. Neither mode silently relaxes a failed threshold.

@@ -147,6 +147,10 @@ pub const ExecuteOptions = struct {
     /// Strict training graphs use physical integer index tensors. Legacy
     /// imported graphs retain their established numeric-constant behavior.
     strict_integer_constants: bool = false,
+    /// A shape-specialized inference session can execute primitive GPU graphs
+    /// inside planned command frames even without model-specific fused regions.
+    /// Controlled requests still submit at bounded cancellation boundaries.
+    planned_device_execution: bool = false,
     /// Require independent resident capture allocations. This controls tape
     /// snapshots only; it does not certify residency of other graph operations.
     require_resident_capture: bool = false,
@@ -3972,6 +3976,7 @@ pub fn executeNode(
             return result;
         },
         .cumulative_sum => |attrs| {
+            if (try cb.tryCumulativeSum(V.get(ins[0]), attrs.axis, attrs.exclusive, attrs.reverse)) |result| return result;
             // Like runtime shape/range evaluation, use the actual tensor
             // dimensions. BGE uses this small scan for dynamic position IDs.
             const alloc = graph.allocator;
