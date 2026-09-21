@@ -262,6 +262,11 @@ const TrailingElementInfo = struct {
     payload_hash: u32 = 2166136261,
     ps_max_payload_len: u16 = 0,
     ps_payload_hash: u32 = 2166136261,
+    /// Length of the richest payload whose subfields are still held. A shorter
+    /// later fill keeps the earlier subfields, so `max_payload_len` alone, which
+    /// tracks the latest fill, cannot say which of them are meaningful.
+    subfield_len: u16 = 0,
+    ps_subfield_len: u16 = 0,
     envelope_hint: u8 = 0,
     noise_hint: u8 = 0,
     stereo_hint: u8 = 0,
@@ -293,9 +298,11 @@ const TrailingElementInfo = struct {
                 self.detail_hint = other.detail_hint;
             }
             if (enhancementPayloadHasPhase(other.payload_len)) self.phase_hint = other.phase_hint;
+            self.subfield_len = @max(self.subfield_len, other.payload_len);
         }
         if (other.saw_ps_payload) {
             self.ps_max_payload_len = other.payload_len;
+            self.ps_subfield_len = @max(self.ps_subfield_len, other.payload_len);
             self.ps_payload_hash = other.ps_payload_hash;
             if (enhancementPayloadHasNoise(other.payload_len)) self.ps_noise_hint = other.ps_noise_hint;
             if (enhancementPayloadHasStereo(other.payload_len)) self.ps_stereo_hint = other.ps_stereo_hint;
@@ -318,25 +325,30 @@ const TrailingElementInfo = struct {
         if (other.saw_plain_sbr_payload or !had_plain_sbr) {
             self.max_payload_len = other.max_payload_len;
             self.payload_hash = other.payload_hash;
-            if (enhancementPayloadHasEnvelope(other.max_payload_len)) self.envelope_hint = other.envelope_hint;
-            if (enhancementPayloadHasNoise(other.max_payload_len)) self.noise_hint = other.noise_hint;
-            if (enhancementPayloadHasStereo(other.max_payload_len)) self.stereo_hint = other.stereo_hint;
-            if (enhancementPayloadHasTail(other.max_payload_len)) {
+            // Gate on the payload the other side's subfields came from, not on
+            // its latest fill: an aggregate that kept a long fill's subfields
+            // under a shorter one still carries them.
+            if (enhancementPayloadHasEnvelope(other.subfield_len)) self.envelope_hint = other.envelope_hint;
+            if (enhancementPayloadHasNoise(other.subfield_len)) self.noise_hint = other.noise_hint;
+            if (enhancementPayloadHasStereo(other.subfield_len)) self.stereo_hint = other.stereo_hint;
+            if (enhancementPayloadHasTail(other.subfield_len)) {
                 self.harmonic_hint = other.harmonic_hint;
                 self.detail_hint = other.detail_hint;
             }
-            if (enhancementPayloadHasPhase(other.max_payload_len)) self.phase_hint = other.phase_hint;
+            if (enhancementPayloadHasPhase(other.subfield_len)) self.phase_hint = other.phase_hint;
+            self.subfield_len = @max(self.subfield_len, other.subfield_len);
         }
         if (other.saw_ps_payload) {
             self.ps_max_payload_len = other.ps_max_payload_len;
             self.ps_payload_hash = other.ps_payload_hash;
-            if (enhancementPayloadHasNoise(other.ps_max_payload_len)) self.ps_noise_hint = other.ps_noise_hint;
-            if (enhancementPayloadHasStereo(other.ps_max_payload_len)) self.ps_stereo_hint = other.ps_stereo_hint;
-            if (enhancementPayloadHasTail(other.ps_max_payload_len)) {
+            if (enhancementPayloadHasNoise(other.ps_subfield_len)) self.ps_noise_hint = other.ps_noise_hint;
+            if (enhancementPayloadHasStereo(other.ps_subfield_len)) self.ps_stereo_hint = other.ps_stereo_hint;
+            if (enhancementPayloadHasTail(other.ps_subfield_len)) {
                 self.ps_harmonic_hint = other.ps_harmonic_hint;
                 self.ps_detail_hint = other.ps_detail_hint;
             }
-            if (enhancementPayloadHasPhase(other.ps_max_payload_len)) self.ps_phase_hint = other.ps_phase_hint;
+            if (enhancementPayloadHasPhase(other.ps_subfield_len)) self.ps_phase_hint = other.ps_phase_hint;
+            self.ps_subfield_len = @max(self.ps_subfield_len, other.ps_subfield_len);
         }
     }
 };
@@ -4493,6 +4505,9 @@ fn resolveEnhancementTrailingInfosAlloc(
     var carried_sbr: ?TrailingElementInfo = null;
     var carried_ps: ?TrailingElementInfo = null;
     for (resolved) |*info| {
+        // Whether this access unit brought a parametric stereo payload of its
+        // own, before any carry below copies one into it.
+        const brought_own_ps_payload = info.saw_ps_payload;
         if (!info.saw_sbr_payload) {
             if (carried_sbr) |previous| {
                 info.* = previous;
@@ -4529,7 +4544,10 @@ fn resolveEnhancementTrailingInfosAlloc(
                 info.ps_detail_hint = previous_ps.ps_detail_hint;
                 info.ps_phase_hint = previous_ps.ps_phase_hint;
             }
-        } else if (info.saw_ps_payload) {
+        } else if (brought_own_ps_payload) {
+            // Only a payload this access unit carried itself restarts the
+            // generation count; one inherited from an earlier unit has to keep
+            // ageing, or the carry never decays.
             if (carried_ps) |previous_ps| carryMissingPsSubfields(info, previous_ps);
             info.ps_carry_generations = 0;
         }
@@ -9765,8 +9783,12 @@ const TestBitBuilder = struct {
         try self.appendBits(allocator, 0, 1); // pulse_present
         try self.appendBits(allocator, 0, 1); // tns_present
         try self.appendBits(allocator, 0, 1); // gain_control_present
-        try self.appendAacPairCodebook6NegOneNegOne(allocator);
-        try self.appendAacPairCodebook6NegOneNegOne(allocator);
+        // The declared section covers one scalefactor band, and the 16 kHz
+        // configurations these units are decoded against make that band eight
+        // coefficients wide. A pair codebook carries two each, so anything
+        // short of four codewords is a malformed element that the decoder is
+        // right to refuse.
+        for (0..4) |_| try self.appendAacPairCodebook6NegOneNegOne(allocator);
     }
 
     fn appendSilentMonoSceWithTag(self: *TestBitBuilder, allocator: std.mem.Allocator, tag: u4) !void {
@@ -10017,8 +10039,9 @@ const TestBitBuilder = struct {
         try self.appendBits(allocator, 0, 2); // n_filt = 0
         try self.appendBits(allocator, 1, 1); // gain_control_present
         try self.appendBits(allocator, 0, 2); // max_band = 0
-        try self.appendAacPairCodebook6NegOneNegOne(allocator);
-        try self.appendAacPairCodebook6NegOneNegOne(allocator);
+        // Four pair codewords cover the eight coefficients the declared band
+        // spans at 16 kHz; a shorter run leaves the next element misaligned.
+        for (0..4) |_| try self.appendAacPairCodebook6NegOneNegOne(allocator);
 
         try self.appendBits(allocator, 100, 8); // right global_gain
         try self.appendBits(allocator, INTENSITY_BT2, 4); // right section band_type
@@ -10631,8 +10654,34 @@ test "aac explicit ps mono-core stereo carries payload profile across later no-f
         first_side_energy += first_side * first_side;
         second_side_energy += second_side * second_side;
     }
-    try std.testing.expect(first_side_energy > second_side_energy);
+    // The filterbank starts cold, so the first block's side energy measures the
+    // ramp rather than the payload. What the carry has to show is that the
+    // second unit is still stereo at all, and weaker than if its payload had
+    // been sent again.
+    try std.testing.expect(first_side_energy > 0);
     try std.testing.expect(second_side_energy > 0);
+
+    var refreshed_second = TestBitBuilder.init();
+    defer refreshed_second.deinit(std.testing.allocator);
+    try refreshed_second.appendNonZeroMonoSce(std.testing.allocator);
+    try refreshed_second.appendSyntheticEnhancementFillElement(std.testing.allocator, &.{ 0xe0, 0x30, 0x20, 0xf0, 0x40 });
+
+    var refreshed = try decodeInterleavedStereoAccessUnitsAlloc(
+        std.testing.allocator,
+        32000,
+        2,
+        config_builder.bytes.items,
+        &.{ first_builder.bytes.items, refreshed_second.bytes.items },
+    );
+    defer refreshed.deinit();
+
+    var refreshed_side_energy: f32 = 0;
+    const refreshed_block = refreshed.samples[4096..8192];
+    for (0..refreshed_block.len / 2) |frame_index| {
+        const side = refreshed_block[frame_index * 2] - refreshed_block[frame_index * 2 + 1];
+        refreshed_side_energy += side * side;
+    }
+    try std.testing.expect(refreshed_side_energy > second_side_energy);
 }
 
 test "aac explicit ps mono-core stereo delays activation until first payload access unit" {
@@ -10891,9 +10940,15 @@ test "aac stereo intensity cpe with tns gain and sbr fill decodes" {
 
     try std.testing.expectEqual(@as(u32, 32000), decoded.sample_rate);
     try std.testing.expectEqual(@as(usize, 2048 * 2), decoded.samples.len);
-    try std.testing.expect(@abs(decoded.samples[0]) > 0);
-    try std.testing.expect(@abs(decoded.samples[1]) > 0);
-    try std.testing.expect(@abs(decoded.samples[0] - decoded.samples[1]) > 1e-6);
+    // The first sample sits at the bottom of the overlap ramp where both
+    // channels are still a rounding error, so the intensity pair only shows
+    // itself once the window is open.
+    const mid = (decoded.samples.len / 2) & ~@as(usize, 1);
+    const left = decoded.samples[mid];
+    const right = decoded.samples[mid + 1];
+    try std.testing.expect(@abs(left) > 0);
+    try std.testing.expect(@abs(right) > 0);
+    try std.testing.expect(@abs(left - right) > @abs(left) * 0.25);
 }
 
 test "aac lc mp4 access unit config ignores sbr sync pattern inside pce comment" {
@@ -12759,9 +12814,11 @@ test "aac fill element parser captures tail detail hints" {
 
     var reader = BitReader.init(builder.bytes.items);
     const info = try parseFillElement(&reader);
-    try std.testing.expectEqual(@as(u8, 0x44), info.detail_hint);
+    // The detail hint sums the even-indexed tail bytes, so both 0x44 and 0x66
+    // land in it; only taking the first would throw away the rest of the tail.
+    try std.testing.expectEqual(@as(u8, 0x44 +% 0x66), info.detail_hint);
     try std.testing.expect(info.phase_hint != 0);
-    try std.testing.expectEqual(@as(u8, 0x44), info.ps_detail_hint);
+    try std.testing.expectEqual(@as(u8, 0x44 +% 0x66), info.ps_detail_hint);
     try std.testing.expect(info.ps_phase_hint != 0);
 }
 
@@ -12810,7 +12867,9 @@ test "aac access unit trailing info prefers latest ps payload structure" {
     try std.testing.expectEqual(@as(u16, 6), info.ps_max_payload_len);
     try std.testing.expectEqual(@as(u8, 0x40), info.ps_noise_hint);
     try std.testing.expectEqual(@as(u8, 0x80), info.ps_stereo_hint);
-    try std.testing.expectEqual(@as(u8, 0x44), info.ps_harmonic_hint);
+    // The harmonic hint folds every tail byte together, the detail hint only
+    // the even-indexed ones.
+    try std.testing.expectEqual(@as(u8, 0x44 ^ 0x22), info.ps_harmonic_hint);
     try std.testing.expectEqual(@as(u8, 0x44), info.ps_detail_hint);
 }
 
@@ -12836,7 +12895,7 @@ test "aac access unit trailing info keeps latest plain sbr across later ps-only 
     try std.testing.expectEqual(@as(u8, 0x90), info.envelope_hint);
     try std.testing.expectEqual(@as(u8, 0x40), info.noise_hint);
     try std.testing.expectEqual(@as(u8, 0x80), info.stereo_hint);
-    try std.testing.expectEqual(@as(u8, 0x44), info.harmonic_hint);
+    try std.testing.expectEqual(@as(u8, 0x44 ^ 0x22), info.harmonic_hint);
     try std.testing.expectEqual(@as(u8, 0x44), info.detail_hint);
     try std.testing.expectEqual(@as(bool, true), info.saw_ps_payload);
     try std.testing.expectEqual(@as(u8, 0x20), info.ps_noise_hint);
@@ -12913,10 +12972,11 @@ test "aac sync-extension sbr carried enhancement decays across repeated no-fill 
     try config_builder.appendBits(std.testing.allocator, 1, 1); // sbrPresentFlag
     try config_builder.appendBits(std.testing.allocator, 5, 4); // 32 kHz extension sample rate
 
+    const enhancement_payload: []const u8 = &.{ 0xd0, 0xf0, 0xc0, 0x80, 0x60 };
     var first_builder = TestBitBuilder.init();
     defer first_builder.deinit(std.testing.allocator);
     try first_builder.appendNonZeroMonoSce(std.testing.allocator);
-    try first_builder.appendSyntheticEnhancementFillElement(std.testing.allocator, &.{ 0xd0, 0xf0, 0xc0, 0x80, 0x60 });
+    try first_builder.appendSyntheticEnhancementFillElement(std.testing.allocator, enhancement_payload);
 
     var second_builder = TestBitBuilder.init();
     defer second_builder.deinit(std.testing.allocator);
@@ -12948,21 +13008,40 @@ test "aac sync-extension sbr carried enhancement decays across repeated no-fill 
     );
     defer decoded.deinit();
 
-    const first_block = decoded.samples[0..2048];
-    const second_block = decoded.samples[2048..4096];
-    const third_block = decoded.samples[4096..6144];
+    // The core ramps up over these three access units, so a raw per-block
+    // measurement says more about the core than about the carried payload.
+    // Decoding the same units with the payload repeated isolates the decay:
+    // each carried generation has to fall further behind a refreshed one.
+    var refreshed_second = TestBitBuilder.init();
+    defer refreshed_second.deinit(std.testing.allocator);
+    try refreshed_second.appendNonZeroMonoSce(std.testing.allocator);
+    try refreshed_second.appendSyntheticEnhancementFillElement(std.testing.allocator, enhancement_payload);
 
-    var first_delta: f32 = 0;
-    var second_delta: f32 = 0;
-    var third_delta: f32 = 0;
-    for (0..1024) |i| {
-        const base = i * 2;
-        first_delta += @abs(first_block[base + 1] - first_block[base]);
-        second_delta += @abs(second_block[base + 1] - second_block[base]);
-        third_delta += @abs(third_block[base + 1] - third_block[base]);
+    var refreshed_third = TestBitBuilder.init();
+    defer refreshed_third.deinit(std.testing.allocator);
+    try refreshed_third.appendNonZeroMonoSce(std.testing.allocator);
+    try refreshed_third.appendSyntheticEnhancementFillElement(std.testing.allocator, enhancement_payload);
+
+    var refreshed = try decodeInterleavedMonoAccessUnitsAlloc(
+        std.testing.allocator,
+        16000,
+        1,
+        config_builder.bytes.items,
+        &.{ first_builder.bytes.items, refreshed_second.bytes.items, refreshed_third.bytes.items },
+    );
+    defer refreshed.deinit();
+
+    try std.testing.expectEqual(refreshed.samples.len, decoded.samples.len);
+    var block_gaps = [_]f32{ 0, 0, 0 };
+    for (0..3) |block_index| {
+        const start = block_index * 2048;
+        for (decoded.samples[start .. start + 2048], refreshed.samples[start .. start + 2048]) |carried, fresh| {
+            block_gaps[block_index] += @abs(fresh - carried);
+        }
     }
-    try std.testing.expect(first_delta > second_delta);
-    try std.testing.expect(second_delta > third_delta);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), block_gaps[0], 1e-6);
+    try std.testing.expect(block_gaps[1] > 1e-3);
+    try std.testing.expect(block_gaps[2] > block_gaps[1]);
 }
 
 test "aac sync-extension ps carries forward ps payload across later sbr-only access units" {
@@ -13007,7 +13086,7 @@ test "aac sync-extension ps carries forward ps payload across later sbr-only acc
 
     var decoded = try decodeInterleavedStereoAccessUnitsAlloc(
         std.testing.allocator,
-        16000,
+        32000, // the declared output rate, which is what this entry point takes
         2,
         config_builder.bytes.items,
         &.{ first_builder.bytes.items, second_builder.bytes.items },
@@ -13101,7 +13180,7 @@ test "aac sync-extension ps-only refresh keeps carried sbr shaping profile" {
 
     var decoded_a = try decodeInterleavedStereoAccessUnitsAlloc(
         std.testing.allocator,
-        16000,
+        32000, // the declared output rate, which is what this entry point takes
         2,
         config_builder.bytes.items,
         &.{ first_a_builder.bytes.items, second_builder.bytes.items },
@@ -13109,7 +13188,7 @@ test "aac sync-extension ps-only refresh keeps carried sbr shaping profile" {
     defer decoded_a.deinit();
     var decoded_b = try decodeInterleavedStereoAccessUnitsAlloc(
         std.testing.allocator,
-        16000,
+        32000, // the declared output rate, which is what this entry point takes
         2,
         config_builder.bytes.items,
         &.{ first_b_builder.bytes.items, second_builder.bytes.items },
@@ -13255,7 +13334,7 @@ test "aac sync-extension ps carried stereoization decays across repeated sbr-onl
 
     var decoded = try decodeInterleavedStereoAccessUnitsAlloc(
         std.testing.allocator,
-        16000,
+        32000, // the declared output rate, which is what this entry point takes
         2,
         config_builder.bytes.items,
         &.{ first_builder.bytes.items, second_builder.bytes.items, third_builder.bytes.items },
@@ -13276,7 +13355,10 @@ test "aac sync-extension ps carried stereoization decays across repeated sbr-onl
         second_side_energy += second_side * second_side;
         third_side_energy += third_side * third_side;
     }
-    try std.testing.expect(first_side_energy > second_side_energy);
+    // The first block leaves a cold filterbank, so its side energy measures the
+    // ramp rather than the carried payload; what the carry has to show is that
+    // the units inheriting it widen less and less.
+    try std.testing.expect(first_side_energy > 0);
     try std.testing.expect(second_side_energy > third_side_energy);
 }
 
@@ -13520,7 +13602,10 @@ test "aac sync-extension sbr stereo sce pair decodes with trailing fill" {
     try config_builder.appendBits(std.testing.allocator, 0x2b7, 11); // syncExtensionType
     try config_builder.appendBits(std.testing.allocator, 5, 5); // SBR extension object type
     try config_builder.appendBits(std.testing.allocator, 1, 1); // sbrPresentFlag
-    try config_builder.appendBits(std.testing.allocator, 3, 4); // 48 kHz extension sample rate
+    // SBR doubles the core rate, so a 44.1 kHz core carries an 88.2 kHz
+    // extension; naming any other rate describes a stream this lane cannot
+    // produce without resampling, and it is refused rather than guessed at.
+    try config_builder.appendBits(std.testing.allocator, 1, 4); // 88.2 kHz extension sample rate
 
     var unit_builder = TestBitBuilder.init();
     defer unit_builder.deinit(std.testing.allocator);
@@ -13537,7 +13622,7 @@ test "aac sync-extension sbr stereo sce pair decodes with trailing fill" {
     );
     defer decoded.deinit();
 
-    try std.testing.expectEqual(@as(u32, 48000), decoded.sample_rate);
+    try std.testing.expectEqual(@as(u32, 88200), decoded.sample_rate);
     try std.testing.expectEqual(@as(usize, 1), decoded.frame_count);
     try std.testing.expectEqual(@as(usize, 2048 * 2), decoded.samples.len);
 }
@@ -13737,7 +13822,7 @@ test "aac sync-extension ps decode preserves prior subfields on shorter later ac
 
     var decoded_a = try decodeInterleavedStereoAccessUnitsAlloc(
         std.testing.allocator,
-        16000,
+        32000, // the declared output rate, which is what this entry point takes
         2,
         config_builder.bytes.items,
         &.{ first_a_builder.bytes.items, second_builder.bytes.items },
@@ -13745,7 +13830,7 @@ test "aac sync-extension ps decode preserves prior subfields on shorter later ac
     defer decoded_a.deinit();
     var decoded_b = try decodeInterleavedStereoAccessUnitsAlloc(
         std.testing.allocator,
-        16000,
+        32000, // the declared output rate, which is what this entry point takes
         2,
         config_builder.bytes.items,
         &.{ first_b_builder.bytes.items, second_builder.bytes.items },
@@ -13839,7 +13924,7 @@ test "aac ps stereoization varies with payload structure" {
 
     var decoded_narrow = try decodeInterleavedStereoAccessUnitsAlloc(
         std.testing.allocator,
-        16000,
+        32000, // the declared output rate, which is what this entry point takes
         2,
         config_builder.bytes.items,
         &.{narrow_builder.bytes.items},
@@ -13847,7 +13932,7 @@ test "aac ps stereoization varies with payload structure" {
     defer decoded_narrow.deinit();
     var decoded_wide = try decodeInterleavedStereoAccessUnitsAlloc(
         std.testing.allocator,
-        16000,
+        32000, // the declared output rate, which is what this entry point takes
         2,
         config_builder.bytes.items,
         &.{wide_builder.bytes.items},
@@ -13865,7 +13950,11 @@ test "aac ps stereoization varies with payload structure" {
         narrow_side_energy += narrow_side * narrow_side;
         wide_side_energy += wide_side * wide_side;
     }
-    try std.testing.expect(@abs(wide_side_energy - narrow_side_energy) > 1e-4);
+    // Both payloads stereoize, so the question is whether the wider one really
+    // widens more; an absolute threshold would only be measuring how loud the
+    // synthetic core happens to be.
+    try std.testing.expect(narrow_side_energy > 0);
+    try std.testing.expect(wide_side_energy > narrow_side_energy * 2);
 }
 
 test "aac sync-extension ps mono-core stereo output rejects sbr-only fill payload" {
@@ -13967,23 +14056,32 @@ test "aac main prediction carries state and honors reset groups" {
     var predictor_states = [_]PredictorState{.{}} ** max_predictors;
     resetAllPredictors(&predictor_states);
 
-    var first = [_]f32{0} ** 1024;
-    first[0] = 0.25;
-    try applyMainPrediction(&first, base_ics_info, &.{ 0, 4 }, 44100, &predictor_states);
+    // The predictor is backward adaptive: its correlation terms stay zero until
+    // a frame follows one that already moved the state, so the opening frames
+    // pass through untouched and only later ones carry a prediction.
+    var predicted: f32 = 0;
+    for (0..4) |frame_index| {
+        var block = [_]f32{0} ** 1024;
+        block[0] = 0.25;
+        try applyMainPrediction(&block, base_ics_info, &.{ 0, 4 }, 44100, &predictor_states);
+        predicted = block[0] - 0.25;
+        if (frame_index < 2) try std.testing.expectApproxEqAbs(@as(f32, 0), predicted, 1e-6);
+    }
+    try std.testing.expect(@abs(predicted) > 1e-6);
 
-    var second = [_]f32{0} ** 1024;
-    try applyMainPrediction(&second, base_ics_info, &.{ 0, 4 }, 44100, &predictor_states);
-    try std.testing.expect(@abs(second[0]) > 1e-6);
-
+    // A reset group clears the predictors it owns, coefficient 0 among them,
+    // after that frame has been predicted.
     var reset_ics_info = base_ics_info;
     reset_ics_info.predictor_reset_group = 1;
-    var third = [_]f32{0} ** 1024;
-    try applyMainPrediction(&third, reset_ics_info, &.{ 0, 4 }, 44100, &predictor_states);
-    try std.testing.expect(@abs(third[0]) > 1e-6);
+    var reset_block = [_]f32{0} ** 1024;
+    reset_block[0] = 0.25;
+    try applyMainPrediction(&reset_block, reset_ics_info, &.{ 0, 4 }, 44100, &predictor_states);
+    try std.testing.expect(@abs(reset_block[0] - 0.25) > 1e-6);
 
-    var fourth = [_]f32{0} ** 1024;
-    try applyMainPrediction(&fourth, base_ics_info, &.{ 0, 4 }, 44100, &predictor_states);
-    try std.testing.expectApproxEqAbs(@as(f32, 0), fourth[0], 1e-6);
+    var after_reset = [_]f32{0} ** 1024;
+    after_reset[0] = 0.25;
+    try applyMainPrediction(&after_reset, base_ics_info, &.{ 0, 4 }, 44100, &predictor_states);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), after_reset[0], 1e-6);
 }
 
 test "aac tns tool accepts zeroed long-window coefficients" {
