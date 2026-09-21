@@ -321,3 +321,40 @@ func TestCreateAutoschemaTaxonomyIndexConfig(t *testing.T) {
 		t.Fatalf("NewCreateIndexRequest rejected taxonomy config: %v", err)
 	}
 }
+
+func decodeIndexStatus(t *testing.T, raw string) antfly.IndexStatus {
+	t.Helper()
+	var status antfly.IndexStatus
+	if err := json.Unmarshal([]byte(raw), &status); err != nil {
+		t.Fatalf("unmarshal index status: %v", err)
+	}
+	return status
+}
+
+func TestVerifyAutoschemaGraphIndexEnrichments(t *testing.T) {
+	// A pre-existing taxonomy index admitted with its conceptualizer
+	// enrichment passes verification.
+	complete := decodeIndexStatus(t,
+		`{"config":{"type":"graph","name":"taxonomy","enrichments":[{"name":"conceptualize_v1","kind":"asset"}]}}`)
+	if err := verifyAutoschemaGraphIndexEnrichments(complete, AutoschemaEntitiesTable, AutoschemaTaxonomyIndex, []string{AutoschemaConceptAsset}); err != nil {
+		t.Fatalf("complete taxonomy index rejected: %v", err)
+	}
+
+	// A pre-existing index admitted without the conceptualizer is a hard,
+	// actionable error naming the missing enrichment, never a warning.
+	partial := decodeIndexStatus(t,
+		`{"config":{"type":"graph","name":"taxonomy"}}`)
+	err := verifyAutoschemaGraphIndexEnrichments(partial, AutoschemaEntitiesTable, AutoschemaTaxonomyIndex, []string{AutoschemaConceptAsset})
+	if err == nil || !strings.Contains(err.Error(), AutoschemaConceptAsset) || !strings.Contains(err.Error(), "pre-exists") {
+		t.Fatalf("partial taxonomy index: err = %v, want missing-enrichment error naming %s", err, AutoschemaConceptAsset)
+	}
+
+	// A name-collided index of a different type is reported as a
+	// configuration mismatch on the pre-existing table.
+	wrongType := decodeIndexStatus(t,
+		`{"config":{"type":"full_text","name":"taxonomy"}}`)
+	err = verifyAutoschemaGraphIndexEnrichments(wrongType, AutoschemaEntitiesTable, AutoschemaTaxonomyIndex, []string{AutoschemaConceptAsset})
+	if err == nil || !strings.Contains(err.Error(), "not the expected graph index") {
+		t.Fatalf("wrong-type index: err = %v, want graph-index mismatch error", err)
+	}
+}

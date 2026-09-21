@@ -188,6 +188,24 @@ three artifacts). Everything downstream — durable edge artifacts, generation
 binding, visibility inheritance, replay, split/merge — is the existing
 autograph machinery, unchanged.
 
+Relation edges are entity-sourced with document ownership: a relation whose
+endpoints reference extraction entities materializes only once resolution
+lands, with both endpoints rendered as resolver-minted canonical keys
+(`person/ada_lovelace --works_at--> org/antfly`). The graph edge artifact key
+embeds the topological source as an optional trailing component while its
+leading component remains the producing document, so routing, retirement,
+replacement manifests, and split ranges stay owner-scoped
+(`GraphEdgeWrite.owner`, `graphEdgeArtifactKeyWithSourceAlloc`). Before
+resolution such relations are deliberately absent rather than rendered with
+local mention ids; endpoints matching no extraction entity keep the
+external-node string passthrough, and legacy inline endpoint objects keep the
+document source. Resolved endpoints carry their home table in edge metadata
+(`target_table`), the same cross-table tag mention edges use. Seeded
+personalized PageRank consumes the entity-sourced topology directly (the
+kernel reads the raw edge snapshot); traversal EXPANSION from a cross-table
+entity node remains the GRAPH.md-deferred entity node model, because bare
+store keys would alias distinct table namespaces.
+
 Fuzzy resolution ("A. Lovelace" vs "Ada Lovelace") upgrades later by swapping
 the deterministic resolver for the matcher-scorer configuration with
 confidence fusion (`catalog/resolver_catalog.zig`), per `RESOLUTION.md`.

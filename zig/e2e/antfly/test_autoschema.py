@@ -44,6 +44,7 @@ AUTOSCHEMA_INDEXES = {
             "source": {"type": "field", "value": "kg"},
             "content_type": "application/json",
         },
+        "metrics": {"ppr": {"kind": "pagerank", "enabled": True, "damping": 0.85}},
         "edge_types": [
             {"name": "mentions"},
             {"name": "works_at"},
@@ -139,9 +140,13 @@ def test_label_routed_autograph_promotes_events_and_entities(resolution_cluster)
 
     api.create_table("entities", num_shards=1, deadline=_new_e2e_deadline())
     api.create_table("events", num_shards=1, deadline=_new_e2e_deadline())
+    # One shard: the seeded fresh graph metric below fails closed on
+    # cross-shard tables (personalized scores are not globally comparable);
+    # cross-shard promotion itself is covered by test_resolution's
+    # multi-node autograph suite.
     api.create_table(
         "documents",
-        num_shards=3,
+        num_shards=1,
         indexes=json.loads(json.dumps(AUTOSCHEMA_INDEXES)),
         deadline=_new_e2e_deadline(),
     )
@@ -170,6 +175,68 @@ def test_label_routed_autograph_promotes_events_and_entities(resolution_cluster)
     absent_deadline = _new_e2e_deadline()
     assert _lookup_absent(api, "entities", EVENT_KEY, deadline=absent_deadline)
     assert _lookup_absent(api, "events", "event/ada_lovelace", deadline=absent_deadline)
+
+    # Entity-sourced topology: once resolution lands, the works_at and
+    # participates_in relations re-render with the resolver-minted canonical
+    # keys as their topological source. Query-seeded personalized PageRank
+    # reads the raw edge snapshot, so seeding the person must push teleport
+    # mass onto its relation targets — the HippoRAG-style proof that the
+    # graph carries entity->entity/event topology instead of doc-mediated
+    # edges. (Traversal EXPANSION from a cross-table entity node remains the
+    # GRAPH.md-deferred entity node model; PageRank does not wait for it.)
+    _wait_for_seeded_mass(
+        api,
+        seed="person/ada_lovelace",
+        expect_positive={"org/antfly", EVENT_KEY},
+        deadline=_new_e2e_deadline(),
+    )
+
+
+def _wait_for_seeded_mass(
+    api: _Api,
+    *,
+    seed: str,
+    expect_positive: set[str],
+    deadline: _Deadline,
+) -> None:
+    payload = {
+        "query": {"match_all": {}},
+        "graph_metric": {
+            "index": "knowledge_graph",
+            "metric": "ppr",
+            "seed_nodes": [seed],
+            "damping": 0.9,
+            "metric_freshness": "fresh",
+            "top_k": 20,
+        },
+        "limit": 1,
+    }
+    last: dict | None = None
+    while not deadline.expired():
+        try:
+            response = api.query_table(
+                "documents", payload, timeout=deadline.request_timeout()
+            )
+        except requests.RequestException as exc:
+            if not _transient_poll_error(exc):
+                raise
+            deadline.sleep(0.5)
+            continue
+        last = response
+        scores = (
+            (response.get("responses") or [{}])[0]
+            .get("graph_metric_results", {})
+            .get("ppr", {})
+            .get("scores", [])
+        )
+        positive = {s["node"] for s in scores if s.get("score", 0) > 0}
+        if expect_positive <= positive and seed in positive:
+            return
+        deadline.sleep(0.5)
+    raise AssertionError(
+        f"seeded PageRank mass never reached relation targets of {seed}: "
+        f"expected positive {sorted(expect_positive)}, last {json.dumps(last)[:800]}"
+    )
 
 
 def test_overlapping_labeled_resolvers_rejected_at_admission(resolution_cluster):

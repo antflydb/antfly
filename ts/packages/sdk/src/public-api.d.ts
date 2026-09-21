@@ -9429,7 +9429,7 @@ export interface components {
             reranker?: components["schemas"]["RerankerConfig"];
             /** @description Direct top-k read from a published graph metric generation. Results are returned in graph_metric_results under the requested name or the metric name when no explicit name is supplied. Supplying seed_nodes switches a pagerank metric to query-seeded personalized PageRank computed at query time; that form requires metric_freshness=fresh because published generations are global-only. */
             graph_metric?: components["schemas"]["GraphMetricQuery"];
-            /** @description Blend a published graph metric feature into ordinary search hit scores. Requests may require either any published generation or a generation that is fresh with respect to graph writes. Supplying seed_nodes switches a pagerank metric to a query-seeded personalized PageRank blend computed at query time; that form requires metric_freshness=fresh. Retrieval-agent queries that combine graph_queries with a fresh graph_metric_rerank are seeded automatically from their literal traversal start-node keys. */
+            /** @description Blend a published graph metric feature into ordinary search hit scores. Requests may require either any published generation or a generation that is fresh with respect to graph writes. Supplying seed_nodes switches a pagerank metric to a query-seeded personalized PageRank blend computed at query time; that form requires metric_freshness=fresh. Retrieval-agent queries may opt in to automatic seeding with auto_seed=true, which seeds the blend from the query's literal graph-search start keys; only valid for pagerank metrics with metric_freshness=fresh. Caller-supplied seed_nodes always take precedence and are never overwritten. */
             graph_metric_rerank?: components["schemas"]["GraphMetricRerank"];
             analyses?: components["schemas"]["Analyses"];
             /**
@@ -15640,6 +15640,11 @@ export interface components {
              * @description Damping override for the query-seeded personalized PageRank blend. Only valid together with seed_nodes; omitted blends keep the metric's configured damping.
              */
             damping?: number;
+            /**
+             * @description Seed the personalized PageRank blend from the query's literal graph-search start keys; only valid for pagerank metrics with metric_freshness=fresh. Honored by retrieval-agent queries: caller-supplied seed_nodes always take precedence and are never overwritten, and queries without literal graph-search start keys keep their unseeded (global) blend.
+             * @default false
+             */
+            auto_seed?: boolean;
         };
         /** @description User-visible graph alias or named result under Antfly graph identifier policy v1 (Unicode 15.0.0). Identifiers are exact UTF-8 strings and are not normalized. Ordinary internal ASCII spaces are allowed. The value must not equal `*`, begin with `$`, have leading or trailing spaces, contain non-ASCII Unicode White_Space, or contain Unicode Cc control or Cf format code points. UTF-8 encoding is limited to 512 bytes. */
         GraphIdentifier: string;

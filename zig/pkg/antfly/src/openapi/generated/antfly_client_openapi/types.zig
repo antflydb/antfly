@@ -14934,7 +14934,7 @@ pub const GlobalStatefulQueryRequest = struct {
     reranker: ?RerankerConfig = null,
     /// Direct top-k read from a published graph metric generation. Results are returned in graph_metric_results under the requested name or the metric name when no explicit name is supplied. Supplying seed_nodes switches a pagerank metric to query-seeded personalized PageRank computed at query time; that form requires metric_freshness=fresh because published generations are global-only.
     graph_metric: ?GraphMetricQuery = null,
-    /// Blend a published graph metric feature into ordinary search hit scores. Requests may require either any published generation or a generation that is fresh with respect to graph writes. Supplying seed_nodes switches a pagerank metric to a query-seeded personalized PageRank blend computed at query time; that form requires metric_freshness=fresh. Retrieval-agent queries that combine graph_queries with a fresh graph_metric_rerank are seeded automatically from their literal traversal start-node keys.
+    /// Blend a published graph metric feature into ordinary search hit scores. Requests may require either any published generation or a generation that is fresh with respect to graph writes. Supplying seed_nodes switches a pagerank metric to a query-seeded personalized PageRank blend computed at query time; that form requires metric_freshness=fresh. Retrieval-agent queries may opt in to automatic seeding with auto_seed=true, which seeds the blend from the query's literal graph-search start keys; only valid for pagerank metrics with metric_freshness=fresh. Caller-supplied seed_nodes always take precedence and are never overwritten.
     graph_metric_rerank: ?GraphMetricRerank = null,
     analyses: ?Analyses = null,
     /// Declarative graph matching, traversal, and path queries. A nested node `filter` is a typed, non-scoring stored-document predicate. It shares familiar scalar syntax with document queries but deliberately excludes analyzer-backed and index-only clauses. A request may contain at most 64 named graph operations, of which at most 8 may be named `match` operations. Each operation key is a GraphIdentifier under the versioned policy published in the GraphIdentifier schema. Put multiple counts over one pattern in the same `match` return object so they share one complete anchor scan.
@@ -17437,6 +17437,8 @@ pub const GraphMetricRerank = struct {
     seed_nodes: ?[]const []const u8 = null,
     /// Damping override for the query-seeded personalized PageRank blend. Only valid together with seed_nodes; omitted blends keep the metric's configured damping.
     damping: ?f64 = null,
+    /// Seed the personalized PageRank blend from the query's literal graph-search start keys; only valid for pagerank metrics with metric_freshness=fresh. Honored by retrieval-agent queries: caller-supplied seed_nodes always take precedence and are never overwritten, and queries without literal graph-search start keys keep their unseeded (global) blend.
+    auto_seed: ?bool = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -17449,6 +17451,7 @@ pub const GraphMetricRerank = struct {
         .{ "metric_freshness", "metric_freshness", true },
         .{ "seed_nodes", "seed_nodes", true },
         .{ "damping", "damping", true },
+        .{ "auto_seed", "auto_seed", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -17491,6 +17494,10 @@ pub const GraphMetricRerank = struct {
         }
         if (self.damping) |value| {
             try jw.objectField("damping");
+            try jw.write(value);
+        }
+        if (self.auto_seed) |value| {
+            try jw.objectField("auto_seed");
             try jw.write(value);
         }
         try jw.endObject();
@@ -30005,7 +30012,7 @@ pub const QueryRequest = struct {
     reranker: ?RerankerConfig = null,
     /// Direct top-k read from a published graph metric generation. Results are returned in graph_metric_results under the requested name or the metric name when no explicit name is supplied. Supplying seed_nodes switches a pagerank metric to query-seeded personalized PageRank computed at query time; that form requires metric_freshness=fresh because published generations are global-only.
     graph_metric: ?GraphMetricQuery = null,
-    /// Blend a published graph metric feature into ordinary search hit scores. Requests may require either any published generation or a generation that is fresh with respect to graph writes. Supplying seed_nodes switches a pagerank metric to a query-seeded personalized PageRank blend computed at query time; that form requires metric_freshness=fresh. Retrieval-agent queries that combine graph_queries with a fresh graph_metric_rerank are seeded automatically from their literal traversal start-node keys.
+    /// Blend a published graph metric feature into ordinary search hit scores. Requests may require either any published generation or a generation that is fresh with respect to graph writes. Supplying seed_nodes switches a pagerank metric to a query-seeded personalized PageRank blend computed at query time; that form requires metric_freshness=fresh. Retrieval-agent queries may opt in to automatic seeding with auto_seed=true, which seeds the blend from the query's literal graph-search start keys; only valid for pagerank metrics with metric_freshness=fresh. Caller-supplied seed_nodes always take precedence and are never overwritten.
     graph_metric_rerank: ?GraphMetricRerank = null,
     analyses: ?Analyses = null,
     /// Declarative graph matching, traversal, and path queries. A nested node `filter` is a typed, non-scoring stored-document predicate. It shares familiar scalar syntax with document queries but deliberately excludes analyzer-backed and index-only clauses. A request may contain at most 64 named graph operations, of which at most 8 may be named `match` operations. Each operation key is a GraphIdentifier under the versioned policy published in the GraphIdentifier schema. Put multiple counts over one pattern in the same `match` return object so they share one complete anchor scan.
@@ -35150,7 +35157,7 @@ pub const StatefulQueryRequest = struct {
     reranker: ?RerankerConfig = null,
     /// Direct top-k read from a published graph metric generation. Results are returned in graph_metric_results under the requested name or the metric name when no explicit name is supplied. Supplying seed_nodes switches a pagerank metric to query-seeded personalized PageRank computed at query time; that form requires metric_freshness=fresh because published generations are global-only.
     graph_metric: ?GraphMetricQuery = null,
-    /// Blend a published graph metric feature into ordinary search hit scores. Requests may require either any published generation or a generation that is fresh with respect to graph writes. Supplying seed_nodes switches a pagerank metric to a query-seeded personalized PageRank blend computed at query time; that form requires metric_freshness=fresh. Retrieval-agent queries that combine graph_queries with a fresh graph_metric_rerank are seeded automatically from their literal traversal start-node keys.
+    /// Blend a published graph metric feature into ordinary search hit scores. Requests may require either any published generation or a generation that is fresh with respect to graph writes. Supplying seed_nodes switches a pagerank metric to a query-seeded personalized PageRank blend computed at query time; that form requires metric_freshness=fresh. Retrieval-agent queries may opt in to automatic seeding with auto_seed=true, which seeds the blend from the query's literal graph-search start keys; only valid for pagerank metrics with metric_freshness=fresh. Caller-supplied seed_nodes always take precedence and are never overwritten.
     graph_metric_rerank: ?GraphMetricRerank = null,
     analyses: ?Analyses = null,
     /// Declarative graph matching, traversal, and path queries. A nested node `filter` is a typed, non-scoring stored-document predicate. It shares familiar scalar syntax with document queries but deliberately excludes analyzer-backed and index-only clauses. A request may contain at most 64 named graph operations, of which at most 8 may be named `match` operations. Each operation key is a GraphIdentifier under the versioned policy published in the GraphIdentifier schema. Put multiple counts over one pattern in the same `match` return object so they share one complete anchor scan.

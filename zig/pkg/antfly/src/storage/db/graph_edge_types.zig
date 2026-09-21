@@ -21,6 +21,12 @@ pub const GraphEdgeWrite = struct {
     created_at: u64 = 0,
     updated_at: u64 = 0,
     metadata_json: []const u8 = "",
+    /// Owning document for artifact-key routing, retirement, replacement
+    /// manifests, and split ranges when it differs from the topological
+    /// `source` (entity-sourced relations, zig/AUTOSCHEMA.md). Empty means
+    /// `source` is the owner — the legacy shape every existing producer
+    /// emits.
+    owner: []const u8 = "",
 };
 
 pub const GraphEdgeDelete = struct {

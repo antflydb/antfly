@@ -1468,6 +1468,9 @@ func loadCmd(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return fmt.Errorf("failed to parse flags: %w", err)
 	}
+	if *autoschema && !*createTable {
+		return fmt.Errorf("--autoschema requires --create-table: the AutoSchemaKG pipeline is provisioned as part of table creation")
+	}
 	syncLevel, err := parseSyncLevelFlag(*syncLevelFlag)
 	if err != nil {
 		return err
@@ -1515,6 +1518,7 @@ func loadCmd(args []string) error {
 			}
 			indexes[*artifactGraphIndex] = *graphRequest
 		}
+		var autoschemaDocIndexes []autoschemaRequiredIndex
 		if *autoschema {
 			if err := provisionAutoschemaTables(ctx, client, *autoschemaModel, *inferenceURL); err != nil {
 				return fmt.Errorf("failed to provision autoschema tables: %w", err)
@@ -1528,16 +1532,33 @@ func loadCmd(args []string) error {
 				return fmt.Errorf("failed to create knowledge graph index request: %w", err)
 			}
 			indexes[AutoschemaKnowledgeGraphIndex] = *kgRequest
+			autoschemaDocIndexes = []autoschemaRequiredIndex{{
+				name:        AutoschemaKnowledgeGraphIndex,
+				request:     *kgRequest,
+				enrichments: []string{AutoschemaEntityEntityAsset, AutoschemaEntityEventAsset, AutoschemaEventEventAsset},
+			}}
 		}
 
 		err = client.CreateTable(ctx, *tableName, antfly.CreateTableRequest{
 			NumShards: uint(*numShards),
 			Indexes:   indexes,
 		})
-		if err != nil {
-			log.Printf("Warning: Failed to create table (may already exist): %v\n", err)
-		} else {
+		switch {
+		case err == nil:
 			fmt.Printf("Table created with BM25 and embedding indexes\n\n")
+		case *autoschema:
+			// A pre-existing documents table must still carry the
+			// knowledge_graph extraction index; silently loading without it
+			// would skip the AutoSchemaKG pipeline entirely.
+			if _, getErr := client.GetTable(ctx, *tableName); getErr != nil {
+				return fmt.Errorf("failed to create table %q: %w", *tableName, err)
+			}
+			fmt.Printf("Table '%s' already exists; verifying required autoschema configuration...\n", *tableName)
+			if err := ensureAutoschemaIndexes(ctx, client, *tableName, autoschemaDocIndexes); err != nil {
+				return err
+			}
+		default:
+			log.Printf("Warning: Failed to create table (may already exist): %v\n", err)
 		}
 
 		if err := client.WaitForTable(ctx, *tableName, 30*time.Second); err != nil {
@@ -1606,6 +1627,9 @@ func syncCmd(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return fmt.Errorf("failed to parse flags: %w", err)
 	}
+	if *autoschema && !*createTable {
+		return fmt.Errorf("--autoschema requires --create-table: the AutoSchemaKG pipeline is provisioned as part of table creation")
+	}
 	syncLevel, err := parseSyncLevelFlag(*syncLevelFlag)
 	if err != nil {
 		return err
@@ -1656,6 +1680,7 @@ func syncCmd(args []string) error {
 			}
 			indexes[*artifactGraphIndex] = *graphRequest
 		}
+		var autoschemaDocIndexes []autoschemaRequiredIndex
 		if *autoschema {
 			if err := provisionAutoschemaTables(ctx, client, *autoschemaModel, *inferenceURL); err != nil {
 				return fmt.Errorf("failed to provision autoschema tables: %w", err)
@@ -1669,13 +1694,32 @@ func syncCmd(args []string) error {
 				return fmt.Errorf("failed to create knowledge graph index request: %w", err)
 			}
 			indexes[AutoschemaKnowledgeGraphIndex] = *kgRequest
+			autoschemaDocIndexes = []autoschemaRequiredIndex{{
+				name:        AutoschemaKnowledgeGraphIndex,
+				request:     *kgRequest,
+				enrichments: []string{AutoschemaEntityEntityAsset, AutoschemaEntityEventAsset, AutoschemaEventEventAsset},
+			}}
 		}
 
 		err = client.CreateTable(ctx, *tableName, antfly.CreateTableRequest{
 			NumShards: uint(*numShards),
 			Indexes:   indexes,
 		})
-		if err != nil {
+		switch {
+		case err == nil:
+			fmt.Printf("Table created\n\n")
+		case *autoschema:
+			// A pre-existing documents table must still carry the
+			// knowledge_graph extraction index; silently syncing without it
+			// would skip the AutoSchemaKG pipeline entirely.
+			if _, getErr := client.GetTable(ctx, *tableName); getErr != nil {
+				return fmt.Errorf("failed to create table %q: %w", *tableName, err)
+			}
+			fmt.Printf("Table '%s' already exists; verifying required autoschema configuration...\n", *tableName)
+			if err := ensureAutoschemaIndexes(ctx, client, *tableName, autoschemaDocIndexes); err != nil {
+				return err
+			}
+		default:
 			log.Printf("Warning: %v\n", err)
 		}
 

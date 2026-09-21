@@ -13229,6 +13229,59 @@ pub const IndexManager = struct {
         return self.cached_has_generated_enrichment_targets.load(.acquire);
     }
 
+    /// Which adjacency orientations asset enrichments sample from one graph
+    /// index via `neighbor_context`. `out` means some enrichment samples a
+    /// document's outgoing edges (direction `out` or `both`), `in` means some
+    /// enrichment samples reverse edges (direction `in` or `both`).
+    pub const NeighborContextDirections = struct {
+        out: bool = false,
+        in: bool = false,
+
+        pub fn any(self: @This()) bool {
+            return self.out or self.in;
+        }
+    };
+
+    /// Read-only scheduling lookup for graph-edge mutations: does any
+    /// admitted asset enrichment sample `neighbor_context` adjacency from the
+    /// named graph index, and in which orientations? An edge write or delete
+    /// on a referenced index must wake the enrichment worker for the affected
+    /// documents, because the sampled adjacency participates in the producer
+    /// skip-state hash. Catalogs hold few enrichments and the stored
+    /// neighbor-context JSON is small and admission-validated, so this parses
+    /// on demand instead of maintaining another invalidated cache; callers on
+    /// the batch-apply path memoize per index name. A stored config that no
+    /// longer parses contributes nothing (fail open-empty, matching the
+    /// runtime's empty-neighbors fallback).
+    pub fn assetNeighborContextDirectionsForGraphIndex(
+        self: *const IndexManager,
+        alloc: Allocator,
+        graph_index_name: []const u8,
+    ) !NeighborContextDirections {
+        var directions: NeighborContextDirections = .{};
+        if (graph_index_name.len == 0) return directions;
+        for (self.enrichments.items) |entry| {
+            if (entry.kind != .asset) continue;
+            if (entry.neighbor_context_json.len == 0) continue;
+            var context = enrichment_neighbor_context.parseConfigJson(alloc, entry.neighbor_context_json) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => continue,
+            };
+            defer context.deinit(alloc);
+            if (!std.mem.eql(u8, context.graph_index, graph_index_name)) continue;
+            switch (context.direction) {
+                .out => directions.out = true,
+                .in => directions.in = true,
+                .both => {
+                    directions.out = true;
+                    directions.in = true;
+                },
+            }
+            if (directions.out and directions.in) break;
+        }
+        return directions;
+    }
+
     pub fn has(self: *const IndexManager, name: []const u8) bool {
         return self.get(name) != null;
     }

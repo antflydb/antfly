@@ -6486,6 +6486,8 @@ pub const GraphMetricRerank = struct {
     seed_nodes: ?[]const []const u8 = null,
     /// Damping override for the query-seeded personalized PageRank blend. Only valid together with seed_nodes; omitted blends keep the metric's configured damping.
     damping: ?f64 = null,
+    /// Seed the personalized PageRank blend from the query's literal graph-search start keys; only valid for pagerank metrics with metric_freshness=fresh. Honored by retrieval-agent queries: caller-supplied seed_nodes always take precedence and are never overwritten, and queries without literal graph-search start keys keep their unseeded (global) blend.
+    auto_seed: ?bool = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -6498,6 +6500,7 @@ pub const GraphMetricRerank = struct {
         .{ "metric_freshness", "metric_freshness", true },
         .{ "seed_nodes", "seed_nodes", true },
         .{ "damping", "damping", true },
+        .{ "auto_seed", "auto_seed", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -6540,6 +6543,10 @@ pub const GraphMetricRerank = struct {
         }
         if (self.damping) |value| {
             try jw.objectField("damping");
+            try jw.write(value);
+        }
+        if (self.auto_seed) |value| {
+            try jw.objectField("auto_seed");
             try jw.write(value);
         }
         try jw.endObject();

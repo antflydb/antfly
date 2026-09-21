@@ -444,6 +444,22 @@ func TestParseSyncLevelFlag(t *testing.T) {
 	}
 }
 
+func TestAutoschemaRequiresCreateTable(t *testing.T) {
+	commands := []struct {
+		name string
+		run  func([]string) error
+	}{
+		{name: "load", run: loadCmd},
+		{name: "sync", run: syncCmd},
+	}
+	for _, cmd := range commands {
+		err := cmd.run([]string{"--autoschema"})
+		if err == nil || !strings.Contains(err.Error(), "--autoschema requires --create-table") {
+			t.Fatalf("%s with --autoschema but without --create-table: err = %v, want the --create-table requirement", cmd.name, err)
+		}
+	}
+}
+
 func TestCreateSearchTableIndexesUsesServerDefaultFullText(t *testing.T) {
 	embeddingIndex, err := createEmbeddingIndex(DefaultEmbeddingModel, DefaultInferenceURL, DefaultChunkerModel, 512, 50)
 	if err != nil {

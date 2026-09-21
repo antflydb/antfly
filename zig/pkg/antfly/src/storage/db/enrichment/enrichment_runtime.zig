@@ -19323,7 +19323,7 @@ fn materializeGraphAssetForRuntime(
         var write_positions = RuntimeWritePositions.empty;
         defer write_positions.deinit(runtime.alloc);
         for (graph_writes) |write| {
-            const key = try internal_keys.graphEdgeArtifactKeyAlloc(runtime.alloc, write.source, write.index_name, write.edge_type, write.target);
+            const key = try internal_keys.graphEdgeArtifactKeyWithSourceAlloc(runtime.alloc, if (write.owner.len > 0) write.owner else write.source, write.index_name, write.edge_type, write.target, write.source);
             var key_owned = true;
             errdefer if (key_owned) runtime.alloc.free(key);
             const payload = try enrichment_artifact_codec.encodeGraphEdgeAlloc(runtime.alloc, null, graph_entry.config.coverage_generation, write.weight, write.created_at, write.updated_at, write.metadata_json);
@@ -19937,6 +19937,7 @@ fn runtimeFreeGraphWriteFields(alloc: Allocator, write: types.GraphEdgeWrite) vo
     alloc.free(@constCast(write.target));
     alloc.free(@constCast(write.edge_type));
     if (write.metadata_json.len > 0) alloc.free(@constCast(write.metadata_json));
+    if (write.owner.len > 0) alloc.free(@constCast(write.owner));
 }
 
 test "enrichment runtime graph materializer rejects non-finite mapped weights" {
@@ -20046,7 +20047,20 @@ fn runtimeAppendRelationItem(
         runtimeJsonStringField(item, "type") orelse runtimeJsonStringField(item, "edge_type") orelse runtimeJsonStringField(item, "relation") orelse return;
     if (edge_type.len == 0) return;
 
-    const source_doc = doc_key;
+    // Mirrors db.zig appendRelationItem: owning document routes the row, the
+    // topological source may resolve canonically; an entity-referencing
+    // source with no canonical identity drops the edge (resolution replay
+    // re-renders it), and legacy inline endpoint objects keep the document.
+    const source_doc = blk: {
+        const source_value = item.object.get("source") orelse break :blk doc_key;
+        if (runtimeResolveGraphEndpointEntity(source_value, artifact_value)) |entity| {
+            break :blk runtimeCanonicalEntityDocumentId(entity) orelse return;
+        }
+        break :blk switch (source_value) {
+            .string => |external| if (external.len > 0) external else doc_key,
+            else => doc_key,
+        };
+    };
 
     const mapped_target = if (mapping.target_template.len > 0)
         try runtimeRenderGraphArtifactTemplateAlloc(alloc, mapping.target_template, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)
@@ -20061,6 +20075,11 @@ fn runtimeAppendRelationItem(
         const target_value = item.object.get("target") orelse return;
         break :blk runtimeJsonEndpointDocumentIdResolved(target_value, artifact_value) orelse return;
     };
+    const target_table: ?[]const u8 = if (mapped_target != null) null else blk: {
+        const target_value = item.object.get("target") orelse break :blk null;
+        const entity = runtimeResolveGraphEndpointEntity(target_value, artifact_value) orelse break :blk null;
+        break :blk runtimeCanonicalEntityTable(entity);
+    };
     if (writes.items.len >= edge_limit) return error.ResourceLimitExceeded;
 
     const weight = if (mapping.weight_template.len > 0) blk: {
@@ -20072,6 +20091,8 @@ fn runtimeAppendRelationItem(
     if (!std.math.isFinite(weight)) return error.InvalidGraphEdges;
     const metadata_json = if (mapping.metadata_template_json.len > 0)
         try runtimeRenderGraphArtifactMetadataTemplateAlloc(alloc, mapping.metadata_template_json, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)
+    else if (target_table) |table|
+        try runtimePrependTargetTableToItemMetadataAlloc(alloc, table, item)
     else
         try std.json.Stringify.valueAlloc(alloc, item, .{});
     errdefer alloc.free(metadata_json);
@@ -20084,6 +20105,8 @@ fn runtimeAppendRelationItem(
     errdefer alloc.free(owned_target);
     const owned_edge_type = try alloc.dupe(u8, edge_type);
     errdefer alloc.free(owned_edge_type);
+    const owned_owner = if (!std.mem.eql(u8, source_doc, doc_key)) try alloc.dupe(u8, doc_key) else "";
+    errdefer if (owned_owner.len > 0) alloc.free(@constCast(owned_owner));
     try writes.append(alloc, .{
         .index_name = owned_index_name,
         .source = owned_source,
@@ -20091,6 +20114,7 @@ fn runtimeAppendRelationItem(
         .edge_type = owned_edge_type,
         .weight = weight,
         .metadata_json = metadata_json,
+        .owner = owned_owner,
     });
 }
 
@@ -20302,19 +20326,72 @@ fn runtimeJsonEndpointDocumentId(value: std.json.Value) ?[]const u8 {
 }
 
 fn runtimeJsonEndpointDocumentIdResolved(value: std.json.Value, artifact_value: std.json.Value) ?[]const u8 {
-    return runtimeJsonEndpointDocumentId(value) orelse if (runtimeResolveGraphEndpointEntity(value, artifact_value)) |entity| runtimeJsonEndpointDocumentId(entity) else null;
+    // Mirrors db.zig jsonEndpointDocumentIdResolved: an endpoint referencing
+    // an extraction entity renders its canonical identity or nothing at all
+    // (the live path has no resolutions yet, so entity-referencing relations
+    // are deferred to the resolution replay); non-entity endpoints keep the
+    // external-node passthrough.
+    if (runtimeResolveGraphEndpointEntity(value, artifact_value)) |entity| {
+        return runtimeCanonicalEntityDocumentId(entity);
+    }
+    return runtimeJsonEndpointDocumentId(value);
+}
+
+fn runtimeCanonicalEntityDocumentId(entity: std.json.Value) ?[]const u8 {
+    if (entity != .object) return null;
+    if (runtimeJsonStringField(entity, "document_id") orelse runtimeJsonStringField(entity, "doc_key") orelse runtimeJsonStringField(entity, "key")) |id| return id;
+    if (entity.object.get("doc_ref")) |doc_ref| return runtimeJsonEndpointDocumentId(doc_ref);
+    return null;
+}
+
+fn runtimeCanonicalEntityTable(entity: std.json.Value) ?[]const u8 {
+    if (entity != .object) return null;
+    if (runtimeJsonStringField(entity, "table")) |table| return table;
+    if (entity.object.get("doc_ref")) |doc_ref| return runtimeJsonStringField(doc_ref, "table");
+    return null;
+}
+
+fn runtimePrependTargetTableToItemMetadataAlloc(alloc: Allocator, target_table: []const u8, item: std.json.Value) ![]u8 {
+    const item_json = try std.json.Stringify.valueAlloc(alloc, item, .{});
+    defer alloc.free(item_json);
+    std.debug.assert(item_json.len >= 2 and item_json[0] == '{');
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, "{\"target_table\":");
+    const quoted = try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .string = target_table }, .{});
+    defer alloc.free(quoted);
+    try out.appendSlice(alloc, quoted);
+    if (!std.mem.eql(u8, item_json, "{}")) {
+        try out.append(alloc, ',');
+        try out.appendSlice(alloc, item_json[1..]);
+    } else {
+        try out.append(alloc, '}');
+    }
+    return try out.toOwnedSlice(alloc);
 }
 
 fn runtimeResolveGraphEndpointEntity(value: std.json.Value, artifact_value: std.json.Value) ?std.json.Value {
-    if (value != .object) return null;
-    if (runtimeJsonIntegerField(value, "entity_index")) |entity_index| return runtimeGraphArtifactEntityAtIndex(artifact_value, entity_index);
-    const entity_id = runtimeJsonStringField(value, "entity_id") orelse runtimeJsonStringField(value, "id") orelse runtimeJsonStringField(value, "local_id") orelse return null;
-    return runtimeFindGraphArtifactEntity(artifact_value, entity_id);
+    switch (value) {
+        .string => return runtimeFindGraphArtifactEntity(artifact_value, value.string),
+        .object => {
+            if (runtimeJsonIntegerField(value, "entity_index")) |entity_index| return runtimeGraphArtifactEntityAtIndex(artifact_value, entity_index);
+            const entity_id = runtimeJsonStringField(value, "entity_id") orelse runtimeJsonStringField(value, "id") orelse runtimeJsonStringField(value, "local_id") orelse return null;
+            return runtimeFindGraphArtifactEntity(artifact_value, entity_id);
+        },
+        else => return null,
+    }
 }
 
 fn runtimeFindGraphArtifactEntity(artifact_value: std.json.Value, entity_id: []const u8) ?std.json.Value {
     if (artifact_value != .object) return null;
-    const entities = artifact_value.object.get("_entities") orelse artifact_value.object.get("entities") orelse return null;
+    if (artifact_value.object.get("_entities")) |resolved| {
+        if (runtimeFindGraphArtifactEntityIn(resolved, entity_id)) |entity| return entity;
+    }
+    const entities = artifact_value.object.get("entities") orelse return null;
+    return runtimeFindGraphArtifactEntityIn(entities, entity_id);
+}
+
+fn runtimeFindGraphArtifactEntityIn(entities: std.json.Value, entity_id: []const u8) ?std.json.Value {
     return switch (entities) {
         .array => |array| blk: {
             for (array.items) |entity| {
@@ -28835,6 +28912,139 @@ test "asset producer neighbor context samples local graph adjacency into the inp
     try runOnce(&runtime, plain, &prepared_sources, &window);
     try std.testing.expectEqual(@as(usize, 3), harness.calls);
     try std.testing.expectEqualStrings("Black Mountain College", harness.last_input.items);
+
+    // --- Scheduling. The manual invocations above prove the skip-state
+    // behavior; the rest drives the re-run through the scheduling path the
+    // worker uses (edge batch -> replay hint emission -> worker selection ->
+    // catalog-planned request). Before any asset enrichment references the
+    // graph index, an edge-only batch on the default thin-replay sync level
+    // emits no enrichment hint, so worker selection yields nothing.
+    try db.batch(.{ .graph_writes = &.{
+        .{ .index_name = "taxonomy", .source = doc_key, .target = "entities/person/anni_albers", .edge_type = "taught", .weight = 0.6 },
+    } });
+    {
+        const groups = try enrichment_worker.collectPendingDocumentGroups(alloc, db.core.replaySource(), 0);
+        defer enrichment_worker.freePendingDocumentGroups(alloc, groups);
+        try std.testing.expectEqual(@as(usize, 0), groups.len);
+    }
+
+    // Admit the neighbor-context enrichment and apply another edge-only
+    // batch through the same thin path. The journal record now carries the
+    // enrichment hint for the owning source document and, because the
+    // context samples reverse edges (direction `both`), for the same-table
+    // target document.
+    try db.addEnrichment(.{
+        .name = "conceptualize_v1",
+        .kind = .asset,
+        .field = "name",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}",
+        .neighbor_context = .{ .graph_index = "taxonomy" },
+    });
+    try db.batch(.{ .graph_writes = &.{
+        .{ .index_name = "taxonomy", .source = doc_key, .target = "entities/person/ruth_asawa", .edge_type = "exhibited", .weight = 0.25 },
+    } });
+    const write_hint_sequence = blk: {
+        const groups = try enrichment_worker.collectPendingDocumentGroups(alloc, db.core.replaySource(), 0);
+        defer enrichment_worker.freePendingDocumentGroups(alloc, groups);
+        try std.testing.expectEqual(@as(usize, 2), groups.len);
+        try std.testing.expectEqualStrings(doc_key, groups[0].doc_key);
+        try std.testing.expectEqualStrings("entities/person/ruth_asawa", groups[1].doc_key);
+        break :blk groups[0].sequence;
+    };
+
+    // Process exactly what the hint selected, planning each document's
+    // requests from the admitted catalog the way the worker does. The target
+    // has no local document, so it plans zero requests; the source re-runs
+    // the producer and samples the two scheduled edges.
+    var request_plan_cache = std.ArrayListUnmanaged(RequestPlanCacheEntry).empty;
+    defer freeRequestPlanCache(alloc, &request_plan_cache);
+    const runScheduled = struct {
+        fn run(
+            rt: *EnrichmentRuntime,
+            groups: []const enrichment_worker.PendingDocumentGroup,
+            plan_cache: *std.ArrayListUnmanaged(RequestPlanCacheEntry),
+            sources: *PreparedDocumentSourceCache,
+            win: *GeneratedReplayWindow,
+        ) !void {
+            for (groups) |group| {
+                const planned = try getOrCreatePlannedRequests(rt, group.doc_key, plan_cache);
+                for (planned) |planned_request| {
+                    var scheduled = planned_request;
+                    scheduled.sequence = group.sequence;
+                    var batch = PreparedAssetBatch{};
+                    defer batch.deinit(rt.alloc);
+                    try processAsset(rt, scheduled, &batch, sources, win);
+                    try batch.flush(rt, win);
+                    try std.testing.expect(batch.retry_error == null);
+                }
+            }
+        }
+    }.run;
+    try db.runDerivedUntil(write_hint_sequence);
+    {
+        const groups = try enrichment_worker.collectPendingDocumentGroups(alloc, db.core.replaySource(), 0);
+        defer enrichment_worker.freePendingDocumentGroups(alloc, groups);
+        try runScheduled(&runtime, groups, &request_plan_cache, &prepared_sources, &window);
+    }
+    try std.testing.expectEqual(@as(usize, 4), harness.calls);
+    try std.testing.expectEqualStrings(
+        "Black Mountain College\n{\"neighbors\":[" ++
+            "{\"edge_type\":\"exhibited\",\"direction\":\"out\",\"target\":\"entities/person/ruth_asawa\",\"weight\":0.25}," ++
+            "{\"edge_type\":\"influenced\",\"direction\":\"out\",\"target\":\"entities/person/josef_albers\",\"weight\":0.75}," ++
+            "{\"edge_type\":\"located_in\",\"direction\":\"out\",\"target\":\"entities/place/north_carolina\",\"weight\":0.5}," ++
+            "{\"edge_type\":\"started_by\",\"direction\":\"out\",\"target\":\"entities/person/john_andrew_rice\",\"weight\":0.98}," ++
+            "{\"edge_type\":\"taught\",\"direction\":\"out\",\"target\":\"entities/person/anni_albers\",\"weight\":0.6}]}",
+        harness.last_input.items,
+    );
+
+    // An edge delete on the referenced index wakes the worker through the
+    // same path, and the re-run observes the shrunken adjacency.
+    try db.batch(.{ .graph_deletes = &.{
+        .{ .index_name = "taxonomy", .source = doc_key, .target = "entities/person/anni_albers", .edge_type = "taught" },
+    } });
+    const delete_hint_sequence = blk: {
+        const groups = try enrichment_worker.collectPendingDocumentGroups(alloc, db.core.replaySource(), write_hint_sequence);
+        defer enrichment_worker.freePendingDocumentGroups(alloc, groups);
+        try std.testing.expectEqual(@as(usize, 2), groups.len);
+        try std.testing.expectEqualStrings(doc_key, groups[0].doc_key);
+        try std.testing.expectEqualStrings("entities/person/anni_albers", groups[1].doc_key);
+        try db.runDerivedUntil(groups[0].sequence);
+        try runScheduled(&runtime, groups, &request_plan_cache, &prepared_sources, &window);
+        break :blk groups[0].sequence;
+    };
+    try std.testing.expectEqual(@as(usize, 5), harness.calls);
+    try std.testing.expectEqualStrings(
+        "Black Mountain College\n{\"neighbors\":[" ++
+            "{\"edge_type\":\"exhibited\",\"direction\":\"out\",\"target\":\"entities/person/ruth_asawa\",\"weight\":0.25}," ++
+            "{\"edge_type\":\"influenced\",\"direction\":\"out\",\"target\":\"entities/person/josef_albers\",\"weight\":0.75}," ++
+            "{\"edge_type\":\"located_in\",\"direction\":\"out\",\"target\":\"entities/place/north_carolina\",\"weight\":0.5}," ++
+            "{\"edge_type\":\"started_by\",\"direction\":\"out\",\"target\":\"entities/person/john_andrew_rice\",\"weight\":0.98}]}",
+        harness.last_input.items,
+    );
+
+    // Convergence: re-delivering the same hints re-plans the documents, but
+    // the unchanged source and adjacency skip the producer by state hash,
+    // and the producer's own writes never emit an enrichment hint, so the
+    // schedule quiesces instead of cycling.
+    {
+        const groups = try enrichment_worker.collectPendingDocumentGroups(alloc, db.core.replaySource(), write_hint_sequence);
+        defer enrichment_worker.freePendingDocumentGroups(alloc, groups);
+        try runScheduled(&runtime, groups, &request_plan_cache, &prepared_sources, &window);
+    }
+    try std.testing.expectEqual(@as(usize, 5), harness.calls);
+
+    // An edge-only batch on a graph index no enrichment references emits no
+    // enrichment hint even while a neighbor-context enrichment is admitted
+    // for a sibling index.
+    try db.addIndex(.{ .name = "other_graph", .kind = .graph, .config_json = "{}" });
+    try db.batch(.{ .graph_writes = &.{
+        .{ .index_name = "other_graph", .source = doc_key, .target = "entities/person/merce_cunningham", .edge_type = "hosted", .weight = 0.9 },
+    } });
+    {
+        const groups = try enrichment_worker.collectPendingDocumentGroups(alloc, db.core.replaySource(), delete_hint_sequence);
+        defer enrichment_worker.freePendingDocumentGroups(alloc, groups);
+        try std.testing.expectEqual(@as(usize, 0), groups.len);
+    }
 }
 
 test "asset batch fallback keeps the logical request retry budget" {

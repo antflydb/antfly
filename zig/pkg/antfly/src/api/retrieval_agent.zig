@@ -6575,14 +6575,15 @@ fn encodeQueryValueForRetrievalQueryWithText(
         );
     }
 
-    // HippoRAG-style personalization: a graph search combined with an
-    // explicitly fresh graph_metric_rerank opts this query into seeding the
-    // metric from its literal traversal start-node keys — the resolved query
-    // entities. The generated rerank wire type predates seed personalization,
-    // so seeds are injected into the encoded object. Queries without literal
-    // start keys keep their unseeded (global) rerank behavior; seeding never
-    // fails the retrieval.
-    const seed_keys = try collectSeedMetricRerankKeys(arena, query_request);
+    // HippoRAG-style personalization: a fresh graph_metric_rerank carrying an
+    // explicit auto_seed=true opts this query into seeding the metric from its
+    // literal graph-search start-node keys — the resolved query entities.
+    // Caller-provided seed_nodes are authoritative and are never overwritten.
+    // The generated rerank wire type predates auto_seed, so the flag is read
+    // from the raw query object and seeds are injected into the encoded
+    // object. Queries without literal start keys keep their unseeded (global)
+    // rerank behavior.
+    const seed_keys = try collectSeedMetricRerankKeys(arena, value, query_request);
 
     // This is an internal request hop, so keep the canonical wire compact and
     // preserve the public absent-vs-null contract for optional fields.
@@ -6592,16 +6593,25 @@ fn encodeQueryValueForRetrievalQueryWithText(
     return try injectSeedNodesIntoEncodedQuery(alloc, arena, encoded, seed_keys);
 }
 
-/// Literal graph-search start keys for personalized metric seeding. Returns
-/// an empty slice unless the query both runs graph searches and requests a
-/// fresh graph_metric_rerank: personalization requires fresh reads, so a
-/// published-freshness rerank keeps its global scores untouched.
+/// Literal graph-search start keys for personalized metric seeding. Seeding
+/// is explicit opt-in: it requires auto_seed=true on the raw rerank object.
+/// Caller-provided seed_nodes always win — an opted-in rerank that already
+/// carries seeds is left untouched. auto_seed is only valid for pagerank
+/// metrics with metric_freshness=fresh (personalization requires fresh
+/// reads), so an opted-in published-freshness rerank is rejected instead of
+/// silently ignoring the flag. The metric's configured kind is not visible
+/// through the agent's QueryRunner surface; a non-pagerank metric is
+/// rejected by the engine when the seeded rerank executes.
 fn collectSeedMetricRerankKeys(
     arena: std.mem.Allocator,
+    raw_query: std.json.Value,
     query_request: QueryRequest,
 ) ![]const []const u8 {
     const rerank = query_request.graph_metric_rerank orelse return &.{};
-    if (!std.mem.eql(u8, rerank.metric_freshness orelse "published", "fresh")) return &.{};
+    if (!rawRerankAutoSeedRequested(raw_query)) return &.{};
+    if (rerank.seed_nodes != null) return &.{};
+    if (!std.mem.eql(u8, rerank.metric_freshness orelse "published", "fresh"))
+        return error.InvalidRetrievalAgentRequest;
     const graph_queries = query_request.graph_queries orelse return &.{};
 
     var keys = std.ArrayListUnmanaged([]const u8).empty;
@@ -6625,6 +6635,19 @@ fn collectSeedMetricRerankKeys(
         }
     }
     return keys.items;
+}
+
+/// True only when the raw query's graph_metric_rerank object carries an
+/// explicit auto_seed=true. The generated GraphMetricRerank wire type
+/// predates auto_seed, so the flag is admitted from the raw request object,
+/// mirroring how rerank personalization fields were first admitted. The
+/// typed re-encode drops the flag, so it never reaches the engine.
+fn rawRerankAutoSeedRequested(raw_query: std.json.Value) bool {
+    if (raw_query != .object) return false;
+    const rerank = raw_query.object.get("graph_metric_rerank") orelse return false;
+    if (rerank != .object) return false;
+    const flag = rerank.object.get("auto_seed") orelse return false;
+    return flag == .bool and flag.bool;
 }
 
 fn appendUniqueSeedKey(
@@ -8030,39 +8053,74 @@ fn encodeSeedMetricRerankFixture(alloc: std.mem.Allocator, raw_json: []const u8)
 test "retrieval agent seeds fresh graph metric rerank from graph search start nodes" {
     const alloc = std.testing.allocator;
     const encoded = try encodeSeedMetricRerankFixture(alloc,
-        \\{"table":"docs","graph_queries":{"related":{"index":"graph_idx","traverse":{"start":{"keys":["doc:a","doc:b","doc:a"]}}}},"graph_metric_rerank":{"index":"graph_idx","metric":"rank","metric_freshness":"fresh"},"limit":5}
+        \\{"table":"docs","graph_queries":{"related":{"index":"graph_idx","traverse":{"start":{"keys":["doc:a","doc:b","doc:a"]}}}},"graph_metric_rerank":{"index":"graph_idx","metric":"rank","metric_freshness":"fresh","auto_seed":true},"limit":5}
     );
     defer alloc.free(encoded);
-    // Literal traversal start keys become the deduplicated teleport seeds of
-    // the fresh metric rerank.
+    // With explicit auto_seed opt-in, literal traversal start keys become the
+    // deduplicated teleport seeds of the fresh metric rerank.
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"seed_nodes\":[\"doc:a\",\"doc:b\"]") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"metric_freshness\":\"fresh\"") != null);
+    // auto_seed is an agent-level directive; the typed re-encode drops it
+    // from the internal hop.
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "auto_seed") == null);
 }
 
 test "retrieval agent skips metric seeding without fresh rerank or literal start keys" {
     const alloc = std.testing.allocator;
 
-    // A rerank left at published freshness keeps its global blend untouched.
-    const published = try encodeSeedMetricRerankFixture(alloc,
-        \\{"table":"docs","graph_queries":{"related":{"index":"graph_idx","traverse":{"start":{"keys":["doc:a"]}}}},"graph_metric_rerank":{"index":"graph_idx","metric":"rank"},"limit":5}
-    );
-    defer alloc.free(published);
-    try std.testing.expect(std.mem.indexOf(u8, published, "seed_nodes") == null);
+    // A published-freshness rerank with an explicit auto_seed opt-in is a
+    // contradiction: personalization requires fresh reads, so the request is
+    // rejected instead of silently ignoring the flag.
+    try std.testing.expectError(error.InvalidRetrievalAgentRequest, encodeSeedMetricRerankFixture(alloc,
+        \\{"table":"docs","graph_queries":{"related":{"index":"graph_idx","traverse":{"start":{"keys":["doc:a"]}}}},"graph_metric_rerank":{"index":"graph_idx","metric":"rank","auto_seed":true},"limit":5}
+    ));
 
-    // A fresh rerank without literal start keys degrades to the unseeded
-    // request instead of failing the retrieval.
+    // An opted-in fresh rerank without literal start keys degrades to the
+    // unseeded request instead of failing the retrieval.
     const unresolved = try encodeSeedMetricRerankFixture(alloc,
-        \\{"table":"docs","graph_queries":{"related":{"index":"graph_idx","traverse":{"start":{"result_ref":"$query_results","limit":4}}}},"graph_metric_rerank":{"index":"graph_idx","metric":"rank","metric_freshness":"fresh"},"limit":5}
+        \\{"table":"docs","graph_queries":{"related":{"index":"graph_idx","traverse":{"start":{"result_ref":"$query_results","limit":4}}}},"graph_metric_rerank":{"index":"graph_idx","metric":"rank","metric_freshness":"fresh","auto_seed":true},"limit":5}
     );
     defer alloc.free(unresolved);
     try std.testing.expect(std.mem.indexOf(u8, unresolved, "seed_nodes") == null);
 
     // Without any graph search there is nothing to seed from.
     const no_graph = try encodeSeedMetricRerankFixture(alloc,
-        \\{"table":"docs","graph_metric_rerank":{"index":"graph_idx","metric":"rank","metric_freshness":"fresh"},"limit":5}
+        \\{"table":"docs","graph_metric_rerank":{"index":"graph_idx","metric":"rank","metric_freshness":"fresh","auto_seed":true},"limit":5}
     );
     defer alloc.free(no_graph);
     try std.testing.expect(std.mem.indexOf(u8, no_graph, "seed_nodes") == null);
+}
+
+test "retrieval agent never overwrites caller seed nodes when auto seeding" {
+    const alloc = std.testing.allocator;
+    const encoded = try encodeSeedMetricRerankFixture(alloc,
+        \\{"table":"docs","graph_queries":{"related":{"index":"graph_idx","traverse":{"start":{"keys":["doc:a","doc:b"]}}}},"graph_metric_rerank":{"index":"graph_idx","metric":"rank","metric_freshness":"fresh","auto_seed":true,"seed_nodes":["custom:x","custom:y"]},"limit":5}
+    );
+    defer alloc.free(encoded);
+    // Caller-provided seed_nodes are authoritative and pass through verbatim;
+    // the literal graph-search start keys are never injected over them.
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"seed_nodes\":[\"custom:x\",\"custom:y\"]") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, encoded, "\"seed_nodes\""));
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"seed_nodes\":[\"doc:a\"") == null);
+}
+
+test "retrieval agent skips metric seeding without explicit auto seed opt-in" {
+    const alloc = std.testing.allocator;
+
+    // A fresh rerank combined with literal graph-search start keys — the
+    // previously auto-seeded shape — stays unseeded when auto_seed is absent.
+    const absent = try encodeSeedMetricRerankFixture(alloc,
+        \\{"table":"docs","graph_queries":{"related":{"index":"graph_idx","traverse":{"start":{"keys":["doc:a","doc:b"]}}}},"graph_metric_rerank":{"index":"graph_idx","metric":"rank","metric_freshness":"fresh"},"limit":5}
+    );
+    defer alloc.free(absent);
+    try std.testing.expect(std.mem.indexOf(u8, absent, "seed_nodes") == null);
+
+    // An explicit auto_seed=false behaves like an absent flag.
+    const disabled = try encodeSeedMetricRerankFixture(alloc,
+        \\{"table":"docs","graph_queries":{"related":{"index":"graph_idx","traverse":{"start":{"keys":["doc:a"]}}}},"graph_metric_rerank":{"index":"graph_idx","metric":"rank","metric_freshness":"fresh","auto_seed":false},"limit":5}
+    );
+    defer alloc.free(disabled);
+    try std.testing.expect(std.mem.indexOf(u8, disabled, "seed_nodes") == null);
 }
 
 test "retrieval contains filter treats wildcard operators as literals" {

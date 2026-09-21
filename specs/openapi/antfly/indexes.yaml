@@ -5451,6 +5451,16 @@ components:
             Damping override for the query-seeded personalized PageRank blend.
             Only valid together with seed_nodes; omitted blends keep the
             metric's configured damping.
+        auto_seed:
+          type: boolean
+          default: false
+          description: >-
+            Seed the personalized PageRank blend from the query's literal
+            graph-search start keys; only valid for pagerank metrics with
+            metric_freshness=fresh. Honored by retrieval-agent queries:
+            caller-supplied seed_nodes always take precedence and are never
+            overwritten, and queries without literal graph-search start keys
+            keep their unseeded (global) blend.
     GraphMetricResult:
       type: object
       required:

@@ -26,7 +26,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"strings"
 	"time"
 
@@ -504,6 +503,11 @@ func createAutoschemaTaxonomyIndex(model, inferenceURL string) (*antfly.IndexCon
 			Template:     autoschemaConceptPrompt + "\n\nEntity: {{ canonical_name }} ({{ entity_type }})",
 			ContentType:  "application/json",
 			ProducerJson: producerJSON,
+			// neighbor_context samples the taxonomy index's own is_a edges —
+			// concepts promoted by earlier conceptualization passes — not
+			// extracted facts from the knowledge graph. The first pass
+			// therefore runs with empty neighbors; later passes ground
+			// re-conceptualization in the previously promoted concepts.
 			NeighborContext: oapi.EnrichmentNeighborContextConfig{
 				GraphIndex: AutoschemaTaxonomyIndex,
 				EdgeTypes:  []string{"is_a"},
@@ -515,15 +519,109 @@ func createAutoschemaTaxonomyIndex(model, inferenceURL string) (*antfly.IndexCon
 	return idx, nil
 }
 
+// autoschemaRequiredIndex describes one index that must exist on an
+// autoschema table, together with the inline enrichments its admitted config
+// must carry.
+type autoschemaRequiredIndex struct {
+	name        string
+	request     antfly.CreateIndexRequest
+	enrichments []string
+}
+
+// ensureAutoschemaTable creates tableName with the given request. When the
+// table already exists, it does not warn-and-continue: it verifies the
+// pre-existing table carries every required index (with its enrichments),
+// creates missing indexes on the existing table, and returns an actionable
+// error when the table cannot be brought up to the required configuration.
+func ensureAutoschemaTable(ctx context.Context, client *antfly.AntflyClient, tableName string, req antfly.CreateTableRequest, required []autoschemaRequiredIndex) error {
+	createErr := client.CreateTable(ctx, tableName, req)
+	if createErr == nil {
+		return nil
+	}
+	if _, getErr := client.GetTable(ctx, tableName); getErr != nil {
+		return fmt.Errorf("failed to create table %q: %w", tableName, createErr)
+	}
+	fmt.Printf("Table '%s' already exists; verifying required autoschema configuration...\n", tableName)
+	return ensureAutoschemaIndexes(ctx, client, tableName, required)
+}
+
+// ensureAutoschemaIndexes verifies each required index exists on the table
+// with its required enrichments, creating missing indexes on the existing
+// table. A pre-existing index admitted with a different configuration is a
+// hard, actionable error instead of a silently partial provisioning.
+func ensureAutoschemaIndexes(ctx context.Context, client *antfly.AntflyClient, tableName string, required []autoschemaRequiredIndex) error {
+	if len(required) == 0 {
+		return nil
+	}
+	existing, err := client.ListIndexes(ctx, tableName)
+	if err != nil {
+		return fmt.Errorf("table %q pre-exists but its index configuration could not be verified: %w", tableName, err)
+	}
+	for _, want := range required {
+		status, ok := existing[want.name]
+		if !ok {
+			fmt.Printf("Table '%s' pre-exists without index '%s'; creating it...\n", tableName, want.name)
+			if _, err := client.CreateIndex(ctx, tableName, want.name, want.request); err != nil {
+				return fmt.Errorf(
+					"table %q pre-exists without required autoschema index %q and creating it failed: %w; "+
+						"the table was created with a different configuration — drop the table (or create index %q manually) and rerun with --autoschema",
+					tableName, want.name, err, want.name)
+			}
+			continue
+		}
+		if err := verifyAutoschemaGraphIndexEnrichments(status, tableName, want.name, want.enrichments); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// verifyAutoschemaGraphIndexEnrichments checks that a pre-existing index is
+// the expected graph index and that its admitted config carries every
+// required inline enrichment.
+func verifyAutoschemaGraphIndexEnrichments(status antfly.IndexStatus, tableName, indexName string, required []string) error {
+	value, err := status.Config.ValueByDiscriminator()
+	if err != nil {
+		return fmt.Errorf("table %q pre-exists but the config of index %q could not be read: %w", tableName, indexName, err)
+	}
+	graph, ok := value.(oapi.CreatedGraphIndex)
+	if !ok {
+		return fmt.Errorf(
+			"table %q pre-exists but index %q is not the expected graph index (found %T); "+
+				"the index was created with a different configuration — drop index %q (or the table) and rerun with --autoschema",
+			tableName, indexName, value, indexName)
+	}
+	present := make(map[string]bool, len(graph.Enrichments))
+	for _, enrichment := range graph.Enrichments {
+		present[enrichment.Name] = true
+	}
+	var missing []string
+	for _, name := range required {
+		if !present[name] {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf(
+			"table %q pre-exists with index %q but without required enrichment(s) %s; "+
+				"the index was created with a different configuration — drop index %q (or the table) and rerun with --autoschema",
+			tableName, indexName, strings.Join(missing, ", "), indexName)
+	}
+	return nil
+}
+
 // provisionAutoschemaTables creates the concepts and events tables (plain) and
 // the entities table with the Stage 3 taxonomy autograph. The entity, event,
 // and concept tables must exist before the documents table's knowledge_graph
-// resolvers start promoting into them.
+// resolvers start promoting into them. Pre-existing tables are verified (and
+// repaired where possible) instead of warned about: a pre-existing entities
+// table without the taxonomy autograph would otherwise silently skip
+// conceptualization.
 func provisionAutoschemaTables(ctx context.Context, client *antfly.AntflyClient, model, inferenceURL string) error {
 	for _, tableName := range []string{AutoschemaConceptsTable, AutoschemaEventsTable} {
 		fmt.Printf("Creating table '%s'...\n", tableName)
-		if err := client.CreateTable(ctx, tableName, antfly.CreateTableRequest{NumShards: 1}); err != nil {
-			log.Printf("Warning: Failed to create table %s (may already exist): %v\n", tableName, err)
+		if err := ensureAutoschemaTable(ctx, client, tableName, antfly.CreateTableRequest{NumShards: 1}, nil); err != nil {
+			return err
 		}
 	}
 
@@ -536,13 +634,17 @@ func provisionAutoschemaTables(ctx context.Context, client *antfly.AntflyClient,
 		return fmt.Errorf("failed to create taxonomy index request: %w", err)
 	}
 	fmt.Printf("Creating table '%s' with taxonomy autograph...\n", AutoschemaEntitiesTable)
-	if err := client.CreateTable(ctx, AutoschemaEntitiesTable, antfly.CreateTableRequest{
+	if err := ensureAutoschemaTable(ctx, client, AutoschemaEntitiesTable, antfly.CreateTableRequest{
 		NumShards: 1,
 		Indexes: map[string]antfly.CreateIndexRequest{
 			AutoschemaTaxonomyIndex: *taxonomyRequest,
 		},
-	}); err != nil {
-		log.Printf("Warning: Failed to create table %s (may already exist): %v\n", AutoschemaEntitiesTable, err)
+	}, []autoschemaRequiredIndex{{
+		name:        AutoschemaTaxonomyIndex,
+		request:     *taxonomyRequest,
+		enrichments: []string{AutoschemaConceptAsset},
+	}}); err != nil {
+		return err
 	}
 
 	for _, tableName := range []string{AutoschemaConceptsTable, AutoschemaEventsTable, AutoschemaEntitiesTable} {
