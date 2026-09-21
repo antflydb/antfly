@@ -62,6 +62,9 @@ pub fn add(
                         "compiled structural reconciliation publishes",
                         "api.kernel_owner_source.",
                         "compiled startup catch-up retains exact retries",
+                        "compiled owner coordinated ttl admission",
+                        "source owner deadlines normalize executor clock epochs",
+                        "distributed txn native lookup read-index rejects leader loss before storage execution",
                     }
                 else
                     &.{b.fmt("storage.{s}.", .{std.fs.path.stem(test_sources[index])})},
@@ -69,10 +72,6 @@ pub fn add(
             });
             tests.executable.root_module.addObject(test_metadata.object);
             runs[index] = tests.run(b);
-            if (index == 0)
-                b.step("antfly-storage-owner-test", "Run tests through the compiled storage owner boundary").dependOn(&runs[index].step);
-            if (index == 1)
-                b.step("antfly-storage-owner-source-test", "Run provisioned storage owner boundary tests").dependOn(&runs[index].step);
             if (index == 2) {
                 tests.executable.root_module.linkLibrary(artifacts[@intFromEnum(runtime.RuntimeLibraryUnit.enrichment_compute)].?);
             } else {

@@ -94,6 +94,10 @@ pub fn aggregationFullResultRequestAtGeneration(
     identity_read_generation: ?u64,
 ) !types.SearchRequest {
     const full_limit = try aggregationFullResultLimit(req, result, operation);
+    return aggregationCollectionRequest(req, full_limit, identity_read_generation);
+}
+
+pub fn aggregationCollectionRequest(req: types.SearchRequest, full_limit: u32, identity_read_generation: ?u64) types.SearchRequest {
     var full_req = req;
     full_req.identity_read_generation = identity_read_generation;
     full_req.offset = 0;

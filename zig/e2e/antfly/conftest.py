@@ -3181,7 +3181,12 @@ def stateful_api(request: pytest.FixtureRequest):
                 self._raise_request_error(err)
 
         def cluster_backup(
-            self, *, backup_id: str, location: str, table_names: list[str] | None = None
+            self,
+            *,
+            backup_id: str,
+            location: str,
+            table_names: list[str] | None = None,
+            backup_format: str | None = None,
         ) -> dict:
             payload: dict[str, object] = {
                 "backup_id": backup_id,
@@ -3190,6 +3195,8 @@ def stateful_api(request: pytest.FixtureRequest):
             }
             if table_names is not None:
                 payload["table_names"] = table_names
+            if backup_format is not None:
+                payload["format"] = backup_format
             try:
                 with self._request_lock:
                     return self._check(
@@ -3807,7 +3814,12 @@ def backup_api(request: pytest.FixtureRequest):
                 self._raise_request_error(err)
 
         def cluster_backup(
-            self, *, backup_id: str, location: str, table_names: list[str] | None = None
+            self,
+            *,
+            backup_id: str,
+            location: str,
+            table_names: list[str] | None = None,
+            backup_format: str | None = None,
         ) -> dict:
             payload: dict[str, object] = {
                 "backup_id": backup_id,
@@ -3816,6 +3828,8 @@ def backup_api(request: pytest.FixtureRequest):
             }
             if table_names is not None:
                 payload["table_names"] = table_names
+            if backup_format is not None:
+                payload["format"] = backup_format
             try:
                 with self._request_lock:
                     return self._check(

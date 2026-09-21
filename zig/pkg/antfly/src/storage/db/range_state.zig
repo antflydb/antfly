@@ -20,6 +20,67 @@ const lsm_backend = @import("../lsm_backend.zig");
 const mem_backend = @import("../mem_backend.zig");
 
 pub const range_key = "\x00\x00__metadata__:range";
+pub const InitialOwnerRange = struct {
+    range: docstore_mod.ByteRange,
+    namespace: @import("doc_identity.zig").Namespace,
+    cancellation: @import("../../common/cancellation.zig").CancellationToken = .none,
+    deadline_ns: ?u64 = null,
+
+    fn check(self: @This()) !void {
+        try self.cancellation.check();
+        if (self.deadline_ns) |deadline| if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.DeadlineExceeded;
+    }
+};
+
+/// Cold owner construction happens before the store is published to workers.
+/// Persisted split/merge state wins over any historical descriptor hint.
+/// Missing older metadata is reconciled with a streaming containment proof,
+/// never by admitting existing out-of-range primary rows.
+pub fn initializeOwnerRange(alloc: Allocator, store: *docstore_mod.DocStore, initial: InitialOwnerRange) !void {
+    try initial.check();
+    if (initial.range.end.len != 0 and std.mem.order(u8, initial.range.start, initial.range.end) != .lt) return error.InvalidRangeState;
+    {
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        const present = read.get(range_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (present != null) return;
+    }
+    var txn = try store.beginWriteTxn();
+    var txn_open = true;
+    defer if (txn_open) txn.abort();
+    const present = txn.get(range_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    if (present != null) return;
+    if (try @import("doc_identity.zig").loadNamespaceTxn(&txn)) |namespace|
+        if (!namespace.eql(initial.namespace)) return error.IdentityNamespaceMismatch;
+    try @import("relational_integrity_topology.zig").requireUnfenced(&txn);
+    var scratch: std.ArrayListUnmanaged(u8) = .empty;
+    defer scratch.deinit(alloc);
+    {
+        const keys = @import("../internal_keys.zig");
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var row = try cursor.seekAtOrAfter(&.{keys.user_namespace});
+        while (row) |entry| : (row = try cursor.next()) {
+            try initial.check();
+            if (!keys.isInternalUserKey(entry.key)) break;
+            if (try keys.decodeStoredDocumentRowKeyScratch(&scratch, alloc, entry.key)) |key|
+                if (!initial.range.contains(key)) return error.KeyOutOfRange;
+        }
+    }
+    try initial.check();
+    const encoded = try encodeRangeAlloc(alloc, initial.range);
+    defer alloc.free(encoded);
+    try txn.put(range_key, encoded);
+    try txn.commit();
+    txn_open = false;
+    try store.sync(true);
+}
 pub const split_delta_final_seq_key = "\x00\x00__metadata__:split_delta_final_seq";
 pub const split_bootstrap_marker_key = "\x00\x00__metadata__:split_bootstrap_marker";
 

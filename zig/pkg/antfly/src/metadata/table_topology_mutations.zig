@@ -150,18 +150,25 @@ pub fn create(
     var catalog_locked = true;
     defer if (catalog_locked) unlockTableCatalogMutation(svc, table_name);
     try request.ensureActive();
-    const table = tables_api.deriveTableRecord(table_name, normalized_req);
+    var table = tables_api.deriveTableRecord(table_name, normalized_req);
+    const original_table_id = table.table_id;
     // Read the durable fence on the leader while holding the catalog mutation
     // lock. Its generation is both the apply precondition and the storage
     // incarnation salt, so a recreate cannot reuse paths owned by an earlier
     // drop even when post-commit cleanup is delayed or the caller crashes.
     try svc.ensureLinearizableReadWithContext(request);
     try svc.validateTableTopologyProtocolReadinessWithContext(request, protocol_readiness);
+    if (comptime @hasDecl(@typeInfo(@TypeOf(svc)).pointer.child, "resolveTableCreateIdentity")) {
+        table.table_id = try svc.resolveTableCreateIdentity(table.table_id);
+    }
     const transition_generation = try svc.captureTableCreateGeneration(alloc, table.table_id);
+    var identity_bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &identity_bytes, table.table_id, .little);
+    const storage_generation = if (table.table_id == original_table_id) transition_generation else std.hash.Wyhash.hash(transition_generation, &identity_bytes);
     const ranges = try tables_api.deriveInitialRangesForGeneration(
         alloc,
         table,
-        transition_generation,
+        storage_generation,
     );
     defer {
         for (ranges) |record| metadata_table_manager.freeRange(alloc, record);

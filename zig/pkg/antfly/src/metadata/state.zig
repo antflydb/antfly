@@ -86,8 +86,8 @@ pub const MetadataState = struct {
     pub fn init(alloc: std.mem.Allocator) MetadataState {
         return .{
             .alloc = alloc,
-            .desired = metadata_table_manager.TableManager.init(alloc),
-            .projected = metadata_table_manager.TableManager.init(alloc),
+            .desired = metadata_table_manager.TableManager.initProvisioning(alloc),
+            .projected = metadata_table_manager.TableManager.initProvisioning(alloc),
         };
     }
 
@@ -153,10 +153,18 @@ pub const MetadataState = struct {
     }
 
     pub fn syncProjected(self: *MetadataState, service: anytype) !void {
-        const projected_tables = try service.listProjectedTables(self.alloc);
-        defer service.freeProjectedTables(self.alloc, projected_tables);
-        const projected_ranges = try service.listProjectedRanges(self.alloc);
-        defer service.freeProjectedRanges(self.alloc, projected_ranges);
+        const Service = switch (@typeInfo(@TypeOf(service))) {
+            .pointer => |ptr| ptr.child,
+            else => @TypeOf(service),
+        };
+        // Hidden restore generations participate in placement, never public
+        // routing. Both namespaces come from one authoritative read revision.
+        var provisioning: ?@import("restore_staging.zig").ProvisioningProjection = if (comptime @hasDecl(Service, "captureProvisioningCatalog")) try service.captureProvisioningCatalog(self.alloc) else null;
+        defer if (provisioning) |*projection| projection.deinit(self.alloc);
+        const projected_tables = if (provisioning) |projection| projection.tables else try service.listProjectedTables(self.alloc);
+        defer if (provisioning == null) service.freeProjectedTables(self.alloc, projected_tables);
+        const projected_ranges = if (provisioning) |projection| projection.ranges else try service.listProjectedRanges(self.alloc);
+        defer if (provisioning == null) service.freeProjectedRanges(self.alloc, projected_ranges);
         const projected_nodes = try listProjectedNodes(self, service);
         defer freeProjectedNodes(self, service, projected_nodes);
         const projected_stores = try listProjectedStores(self, service);
@@ -256,7 +264,11 @@ pub const MetadataState = struct {
         for (self.committed_merges.items, 0..) |record, i| {
             merge_observations[i] = .{
                 .transition_id = record.transition_id,
-                .observation = (service.observeMergeTransition(record.transition_id) catch |err| blk: {
+                // Online merges have their own replicated receipts. Their
+                // driver holds the transition lock across bounded I/O; asking
+                // the ordinary observer here can recursively acquire it while
+                // building an admin/planning snapshot for route discovery.
+                .observation = if (record.online != null) defaultMergeObservation(record) else (service.observeMergeTransition(record.transition_id) catch |err| blk: {
                     std.log.warn("merge transition observation failed transition_id={d} err={s}", .{ record.transition_id, @errorName(err) });
                     break :blk null;
                 }) orelse defaultMergeObservation(record),
@@ -1138,6 +1150,7 @@ fn defaultMergeObservation(record: transition_state.MergeTransitionRecord) trans
 
 test "metadata state captures committed transitions and observations" {
     const FakeService = struct {
+        merge_observation_calls: usize = 0,
         pub fn listProjectedTables(_: *@This(), alloc: std.mem.Allocator) ![]metadata_table_manager.TableRecord {
             const out = try alloc.alloc(metadata_table_manager.TableRecord, 1);
             out[0] = .{
@@ -1245,7 +1258,8 @@ test "metadata state captures committed transitions and observations" {
             };
         }
 
-        pub fn observeMergeTransition(_: *@This(), transition_id: u64) !?transition_state.MergeObservation {
+        pub fn observeMergeTransition(self: *@This(), transition_id: u64) !?transition_state.MergeObservation {
+            self.merge_observation_calls += 1;
             return defaultMergeObservation(.{
                 .transition_id = transition_id,
                 .donor_group_id = 12,
@@ -1273,6 +1287,20 @@ test "metadata state captures committed transitions and observations" {
     defer state.projectedTableManager().freeRanges(std.testing.allocator, ranges);
     try std.testing.expectEqual(@as(usize, 1), tables.len);
     try std.testing.expectEqual(@as(usize, 1), ranges.len);
+    try std.testing.expectEqual(@as(usize, 1), fake.merge_observation_calls);
+    state.committed_merges.items[0].online = .{ .scope = .{
+        .fence = .{ .transition_id = 2, .attempt = 1, .admission_epoch = 1, .owner_group_id = 12, .peer_group_id = 11, .role = .merge_source, .namespace = .{ .table_id = 7, .shard_id = 12, .range_id = 12 }, .catalog_digest = @splat(1) },
+        .receiver_namespace = .{ .table_id = 7, .shard_id = 11, .range_id = 11 },
+        .consumer_epoch = 1,
+        .copy_attempt = .{ .donor_term = 1, .sequence = 1 },
+    } };
+    var online_current = try state.captureCurrent(&fake);
+    defer online_current.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), fake.merge_observation_calls);
+    const online_observations = try @import("api.zig").captureMergeObservations(std.testing.allocator, &fake, state.committed_merges.items);
+    defer std.testing.allocator.free(online_observations);
+    try std.testing.expectEqual(@as(usize, 0), online_observations.len);
+    try std.testing.expectEqual(@as(usize, 1), fake.merge_observation_calls);
 }
 
 test "metadata state seeds active projected transitions after authority handoff" {

@@ -369,3 +369,18 @@ pub fn applyDelta(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_i
     defer alloc.free(bytes);
     try txn.put(key, bytes);
 }
+
+/// Bootstrap a previously published standalone row journal without renumbering
+/// its logical catalog generation. Never overwrite an initialized authority.
+pub fn importState(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, state: domain.State) !void {
+    if ((try readMeta(alloc, txn, group_id)).revision != 0) return error.CatalogGenerationChanged;
+    if (state.next_id < 3) return error.InvalidCatalogRecord;
+    try writeResource(alloc, txn, group_id, domain.default_database);
+    try writeResource(alloc, txn, group_id, domain.default_namespace);
+    for (state.resources) |resource| try writeResource(alloc, txn, group_id, resource);
+    const key = try keyAlloc(alloc, group_id, "meta");
+    defer alloc.free(key);
+    const bytes = try std.json.Stringify.valueAlloc(alloc, Meta{ .revision = state.revision, .next_id = state.next_id }, .{});
+    defer alloc.free(bytes);
+    try txn.put(key, bytes);
+}

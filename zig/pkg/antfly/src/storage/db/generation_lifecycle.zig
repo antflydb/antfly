@@ -838,6 +838,46 @@ pub const ExclusiveTransition = struct {
         try self.validate(self.path);
         return try beginStagingGeneration(self.alloc, self.manager, self.path, self.id, self.cleanup_scheduler, self.io, true);
     }
+
+    /// Adopt a caller-owned immutable tree whose files and directory entries
+    /// were already made durable incrementally. Unlike seal(), this does not
+    /// recursively resync the corpus. The caller must authenticate the tree
+    /// and stop writing it before adoption. Failed publication retains it for
+    /// restart/retry; normal generation reconciliation/GC reclaims abandoned
+    /// canonical siblings.
+    pub fn adoptDurableStaging(self: *ExclusiveTransition, path: []const u8) !StagedGeneration {
+        try self.validate(self.path);
+        const canonical = try retainedGenerationPathAlloc(self.alloc, self.path, std.fs.path.basename(path));
+        defer self.alloc.free(canonical);
+        if (!std.mem.eql(u8, canonical, path)) return error.InvalidGenerationTransition;
+        const live_path = try self.alloc.dupe(u8, self.path);
+        errdefer self.alloc.free(live_path);
+        const live_z = try self.alloc.dupeZ(u8, self.path);
+        errdefer self.alloc.free(live_z);
+        const staged = try self.alloc.dupe(u8, path);
+        errdefer self.alloc.free(staged);
+        const staged_z = try self.alloc.dupeZ(u8, path);
+        return .{ .alloc = self.alloc, .manager = self.manager, .transition_id = self.id, .live_path = live_path, .live_path_z = live_z, .staging_path = staged, .staging_path_z = staged_z, .cleanup_scheduler = self.cleanup_scheduler, .io = self.io, .sealed = true, .preserve_unpublished = true };
+    }
+
+    /// Complete a first-publication immutable adoption after the caller has
+    /// revalidated its exact content identity. There was no serving generation
+    /// to roll back to and no external catalog decision remains outstanding.
+    /// This avoids discarding the only durable source tree after a crash in
+    /// the rename-to-commit interval.
+    pub fn completeDurableAdoption(self: *ExclusiveTransition) !void {
+        try self.validate(self.path);
+        const io = self.io orelse return error.BackendRuntimeIoUnavailable;
+        var marker = try readPublicationMarker(self.alloc, io, self.path);
+        defer if (marker) |*value| value.deinit(self.alloc);
+        const parent = std.fs.path.dirname(self.path) orelse ".";
+        try fs_paths.syncDirPortable(io, parent);
+        if (marker) |value| {
+            if (value.had_live_generation) return error.InvalidGenerationTransition;
+            if (value.phase == .prepared) try writePublicationMarker(self.alloc, io, self.path, .{ .phase = .committed, .retained_name = value.retained_name, .had_live_generation = false });
+            if (!clearPublicationMarker(self.alloc, io, self.path)) return error.GenerationDurabilityUncertain;
+        }
+    }
 };
 
 fn beginStagingGeneration(
