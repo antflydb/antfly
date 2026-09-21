@@ -34,4 +34,10 @@ pub const GraphEdgeDelete = struct {
     source: []const u8,
     target: []const u8,
     edge_type: []const u8,
+    /// Owning document of the durable edge artifact when it differs from the
+    /// topological `source` (entity-sourced relations). Deleting such an edge
+    /// must address the six-component artifact key owned by the producer;
+    /// reconstructing a key from `source` alone would miss the row. Empty
+    /// means `source` is the owner — the legacy shape.
+    owner: []const u8 = "",
 };

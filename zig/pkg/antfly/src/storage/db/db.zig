@@ -13641,6 +13641,7 @@ pub const DB = struct {
         alloc.free(@constCast(delete.source));
         alloc.free(@constCast(delete.target));
         alloc.free(@constCast(delete.edge_type));
+        if (delete.owner.len > 0) alloc.free(@constCast(delete.owner));
         delete.* = undefined;
     }
 
@@ -45124,7 +45125,10 @@ fn encodeThinReplayRecordPayload(
     var neighbor_context_hint_memo: NeighborContextHintMemo = .{};
 
     for (req.graph_writes) |write| {
-        try appendUniqueReplayRecordKeyWithSet(alloc, &changed_doc_keys, &changed_doc_key_set, write.source);
+        // The changed-doc classification follows the OWNING document, whose
+        // graph projection holds the row; an entity-sourced write's
+        // topological source is not a document of this table.
+        try appendUniqueReplayRecordKeyWithSet(alloc, &changed_doc_keys, &changed_doc_key_set, if (write.owner.len > 0) write.owner else write.source);
         const artifact_key = try internal_keys.graphEdgeArtifactKeyWithSourceAlloc(alloc, if (write.owner.len > 0) write.owner else write.source, write.index_name, write.edge_type, write.target, write.source);
         defer alloc.free(artifact_key);
         try appendUniqueReplayRecordKeyWithSet(alloc, &thin_changed_artifact_keys, &thin_changed_artifact_key_set, artifact_key);
@@ -45140,9 +45144,12 @@ fn encodeThinReplayRecordPayload(
         // An edge deletion changes the source document's graph projection; it
         // does not delete the source document. Classifying it as a document
         // deletion makes graph replay clear every source edge before applying
-        // the targeted artifact delta.
-        try appendUniqueReplayRecordKeyWithSet(alloc, &changed_doc_keys, &changed_doc_key_set, delete.source);
-        const artifact_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, delete.source, delete.index_name, delete.edge_type, delete.target);
+        // the targeted artifact delta. An entity-sourced deletion addresses
+        // the six-component artifact key under its OWNING document — a key
+        // rebuilt from the topological source alone would miss the durable
+        // row and strand its replay bookkeeping.
+        try appendUniqueReplayRecordKeyWithSet(alloc, &changed_doc_keys, &changed_doc_key_set, if (delete.owner.len > 0) delete.owner else delete.source);
+        const artifact_key = try internal_keys.graphEdgeArtifactKeyWithSourceAlloc(alloc, if (delete.owner.len > 0) delete.owner else delete.source, delete.index_name, delete.edge_type, delete.target, delete.source);
         defer alloc.free(artifact_key);
         try appendUniqueReplayRecordKeyWithSet(alloc, &thin_changed_artifact_keys, &thin_changed_artifact_key_set, artifact_key);
         try appendUniqueReplayRecordHint(alloc, &target_hints, .graph);
@@ -64692,6 +64699,7 @@ const OwnedGraphMutations = struct {
             self.alloc.free(@constCast(delete.source));
             self.alloc.free(@constCast(delete.target));
             self.alloc.free(@constCast(delete.edge_type));
+            if (delete.owner.len > 0) self.alloc.free(@constCast(delete.owner));
         }
         if (self.deletes.len > 0) self.alloc.free(self.deletes);
 
@@ -64735,6 +64743,7 @@ fn collectGraphMutationsForArtifacts(
             alloc.free(@constCast(delete.source));
             alloc.free(@constCast(delete.target));
             alloc.free(@constCast(delete.edge_type));
+            if (delete.owner.len > 0) alloc.free(@constCast(delete.owner));
         }
         deletes.deinit(alloc);
     }
@@ -64811,6 +64820,7 @@ fn collectGraphMutationsForArtifacts(
                     .source = try alloc.dupe(u8, edge_source),
                     .target = try alloc.dupe(u8, parsed.target_doc_key),
                     .edge_type = try alloc.dupe(u8, parsed.edge_type),
+                    .owner = if (parsed.source_node != null) try alloc.dupe(u8, parsed.doc_key) else "",
                 });
                 continue;
             }
@@ -64844,6 +64854,7 @@ fn collectGraphMutationsForArtifacts(
                 .source = try alloc.dupe(u8, edge_source),
                 .target = try alloc.dupe(u8, parsed.target_doc_key),
                 .edge_type = try alloc.dupe(u8, parsed.edge_type),
+                .owner = if (parsed.source_node != null) try alloc.dupe(u8, parsed.doc_key) else "",
             });
         }
     }
@@ -107443,6 +107454,65 @@ test "db thin replay marks artifact-derived target hints" {
     try std.testing.expectEqualStrings(graph_key, decoded.record.changed_artifact_keys[2]);
     try std.testing.expect(journalRecordHasHint(decoded.record, .full_text));
     try std.testing.expect(journalRecordHasHint(decoded.record, .graph));
+}
+
+test "db thin replay addresses entity-sourced edge mutations by owner key" {
+    const alloc = std.testing.allocator;
+
+    // An entity-sourced write and its deletion must both address the
+    // six-component artifact key under the OWNING document; rebuilding the
+    // key from the topological source alone would miss the durable row and
+    // strand its replay bookkeeping.
+    const payload = try encodeThinReplayRecordPayload(
+        alloc,
+        .{
+            .graph_writes = &.{.{
+                .index_name = "kg_graph",
+                .source = "person/ada_lovelace",
+                .target = "org/antfly",
+                .edge_type = "works_at",
+                .owner = "doc:a",
+            }},
+            .graph_deletes = &.{.{
+                .index_name = "kg_graph",
+                .source = "person/ada_lovelace",
+                .target = "event/first_program",
+                .edge_type = "participates_in",
+                .owner = "doc:a",
+            }},
+        },
+        &.{},
+        &.{},
+        &.{},
+        &.{},
+        &.{},
+        45,
+        false,
+        null,
+        null,
+    );
+    defer alloc.free(payload);
+
+    var decoded = try change_journal_mod.decodeRecord(alloc, payload);
+    defer decoded.deinit();
+
+    const write_key = try internal_keys.graphEdgeArtifactKeyWithSourceAlloc(alloc, "doc:a", "kg_graph", "works_at", "org/antfly", "person/ada_lovelace");
+    defer alloc.free(write_key);
+    const delete_key = try internal_keys.graphEdgeArtifactKeyWithSourceAlloc(alloc, "doc:a", "kg_graph", "participates_in", "event/first_program", "person/ada_lovelace");
+    defer alloc.free(delete_key);
+    try std.testing.expectEqual(@as(usize, 2), decoded.record.changed_artifact_keys.len);
+    try std.testing.expectEqualStrings(write_key, decoded.record.changed_artifact_keys[0]);
+    try std.testing.expectEqualStrings(delete_key, decoded.record.changed_artifact_keys[1]);
+
+    // The deletion's changed-doc classification follows the owner, whose
+    // graph projection holds the row, not the entity source key.
+    var saw_owner = false;
+    for (decoded.record.changed_doc_keys) |key| {
+        if (std.mem.eql(u8, key, "doc:a")) saw_owner = true;
+        try std.testing.expect(!std.mem.eql(u8, key, "event/first_program"));
+        try std.testing.expect(!std.mem.eql(u8, key, "person/ada_lovelace"));
+    }
+    try std.testing.expect(saw_owner);
 }
 
 test "db thin replay marks document deletes for managed index replay" {

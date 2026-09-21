@@ -148,6 +148,7 @@ pub fn deinitDerivedGraphDelete(alloc: Allocator, delete: graph_edge_types.Graph
     alloc.free(@constCast(delete.source));
     alloc.free(@constCast(delete.target));
     alloc.free(@constCast(delete.edge_type));
+    if (delete.owner.len > 0) alloc.free(@constCast(delete.owner));
 }
 
 fn cloneDerivedTargetRefs(alloc: Allocator, targets: []const DerivedTargetRef) ![]DerivedTargetRef {

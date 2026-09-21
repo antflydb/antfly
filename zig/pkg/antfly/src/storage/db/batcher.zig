@@ -1180,5 +1180,6 @@ fn deinitGraphDelete(alloc: Allocator, delete: *types.GraphEdgeDelete) void {
     alloc.free(@constCast(delete.source));
     alloc.free(@constCast(delete.target));
     alloc.free(@constCast(delete.edge_type));
+    if (delete.owner.len > 0) alloc.free(@constCast(delete.owner));
     delete.* = undefined;
 }
