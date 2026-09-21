@@ -58,6 +58,20 @@ retain all fixed producers. These are native macOS results, not Linux ARC
 qualification. The separate catalog readiness evidence is recorded in the
 [E2E history](e2e/FLAKES.md#2026-09-21-catalog-reporter-startup-preceded-protocol-readiness).
 
+PR #832's [first CI run](https://github.com/antflydb/antfly/actions/runs/35633482490/job/106446151397)
+exposed a test-registration mistake in this fix: the normal, non-TLA Raft gate
+rejected `trace files preserve overlapping producers` because no declared test
+matched that filter. The helper was reachable only through the enabled trace
+writer's function body. The standalone helper test and TLA-enabled runs passed,
+but did not exercise normal aggregate discovery. A focused non-TLA build
+reproduced the missing declaration locally. The tracing module now explicitly
+imports the helper in its test block so both build modes discover the regression;
+the required filter remains strict. CI evidence and local before/after logs are
+`ci-832-unit.log`, `ci-832-filter-negative.log`, `ci-832-raft-fixed.log`, and
+`ci-832-raft-tla-fixed.log` beside the other #828 evidence. Both complete native
+Raft aggregates pass after the correction, with and without `-Dwith_tla=true`;
+each discovers and executes the file-ownership regression.
+
 ## 2026-09-18: HTTP cancellation lost a socket published after the watchdog won
 
 [PR #801's x86 unit job](https://github.com/antflydb/antfly/actions/runs/35382288964/job/105721669088)

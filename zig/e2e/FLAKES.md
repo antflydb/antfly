@@ -1,5 +1,31 @@
 # Zig E2E flakes
 
+## 2026-09-21: online merge recovery exceeded phase deadlines in PR #832 CI
+
+[Run 35633482490's recovery-1 job](https://github.com/antflydb/antfly/actions/runs/35633482490/job/106465550834)
+failed two `test_online_merge_recovers_after_owner_link_outage_and_crash` cases:
+`release-reply_loss` did not reach its injected release window within 90 seconds,
+and `snapshot-raft_quorum` did not finish source release after the injected outage.
+The latter's final observation remained in online `freeze`. Nine other recovery
+cases passed. The ordinary Antfly E2E lane passed 727 tests (five skipped),
+including the catalog cases for #828 and #831. Recovery-0, inference, and VOPR
+qualification also passed in the same run.
+
+Retained metadata/data logs show slow persistence, repeated group-leader and
+transport timeouts, and delayed merge phase progress. The first case eventually
+logs the release phase during teardown. Native stacks include threads in
+`fsync`, but lack enough symbols to identify a complete wait chain. These are
+different signatures from the catalog reporter-readiness and five-second
+read-budget failures documented below; the logs do not establish their root
+cause or prove they are unrelated to the candidate. No recovery deadline or
+assertion has been relaxed, and the trace-test registration correction does not
+fix these failures.
+
+Evidence is retained under `.benchmark-results/issue-828/` in the PR worktree:
+`ci-832-recovery.log` and `ci-832-recovery-artifacts/`, including both failed
+clusters' metadata/data logs and native stacks. These remain open recovery
+qualification failures pending targeted reproduction.
+
 ## 2026-09-21: catalog reporter startup preceded protocol readiness
 
 [Issue #828](https://github.com/antflydb/antfly/issues/828) records
