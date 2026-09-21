@@ -648,10 +648,11 @@ fn importMetalTensor(allocator: std.mem.Allocator, compute: *MetalCompute, tenso
     defer allocator.free(shape);
     switch (tensor.dtype) {
         .i8, .i16, .i32, .i64, .u8, .bool_ => {
-            const values = try tensorToOwnedI32(allocator, tensor);
-            defer allocator.free(values);
             const cb = compute.computeBackend();
-            return (try cb.fromInt32Shape(values, shape)) orelse error.UnsupportedTensorType;
+            const dtype: ops_mod.GraphDType = switch (tensor.dtype) {
+                inline else => |tag| @field(ops_mod.GraphDType, @tagName(tag)),
+            };
+            return (try cb.fromConstantBytes(tensor.data, dtype, tensor.shape)) orelse error.UnsupportedTensorType;
         },
         else => {},
     }
@@ -663,12 +664,24 @@ fn importMetalTensor(allocator: std.mem.Allocator, compute: *MetalCompute, tenso
 }
 
 fn importTensorToBackend(allocator: std.mem.Allocator, cb: *const ops_mod.ComputeBackend, tensor: *const Tensor) !ops_mod.CT {
+    switch (tensor.dtype) {
+        .i8, .i16, .i32, .i64, .u8, .bool_ => {
+            const dtype: ops_mod.GraphDType = switch (tensor.dtype) {
+                inline else => |tag| @field(ops_mod.GraphDType, @tagName(tag)),
+            };
+            if (try cb.fromConstantBytes(tensor.data, dtype, tensor.shape)) |value| return value;
+            // Backends without typed storage must decline instead of narrowing.
+            if (tensor.dtype != .i32) return error.UnsupportedTensorType;
+        },
+        else => {},
+    }
     if (tensorToOwnedI32(allocator, tensor)) |values| {
         defer allocator.free(values);
         const shape = try tensorShapeI32(allocator, tensor.shape);
         defer allocator.free(shape);
         if (try cb.fromInt32Shape(values, shape)) |ct| return ct;
     } else |_| {}
+    if (tensor.dtype == .i32) return error.UnsupportedTensorType;
 
     const values = try tensorToOwnedF32(allocator, tensor);
     defer allocator.free(values);
@@ -3095,6 +3108,32 @@ test "findSdpaMask returns borrowed attention_mask input" {
 
     const found = findSdpaMask(&.{ input_ids, attention_mask }).?;
     try std.testing.expectEqualSlices(i64, &mask, found);
+}
+
+test "imported ONNX preserves integer input storage on CPU and Metal" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var weights = @import("../ops/gpu_hosted_store.zig").WeightStore{ .allocator = a, .prefix = "", .lazy_weights = .empty };
+    defer weights.lazy_weights.deinit(a);
+    var metal = try MetalCompute.init(a, &weights, null);
+    defer metal.deinit();
+    var native_weights = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var native = NativeCompute.init(a, &native_weights, null);
+    defer native.deinit();
+    inline for (.{ i8, i16, i32, i64, u8 }) |T| {
+        const values = [_]T{ if (T == i64) 9007199254740993 else std.math.maxInt(T), std.math.minInt(T) };
+        const tensor = Tensor{ .name = "input", .data = @constCast(std.mem.sliceAsBytes(&values)), .dtype = @field(@import("tensor.zig").DType, @typeName(T)), .shape = &.{ 1, 2 }, .allocator = a, .owns_data = false, .owns_shape = false };
+        for ([_]bool{ false, true }) |gpu| {
+            const cb = if (gpu) metal.computeBackend() else native.computeBackend();
+            const ct = if (gpu) try importMetalTensor(a, &metal, &tensor) else try native.importHostTensor(&tensor);
+            defer cb.free(ct);
+            const raw = (try cb.exportTensorData(ct, a)).?;
+            defer a.free(raw.payload.bytes);
+            try std.testing.expectEqual(tensor.dtype, raw.dtype);
+            try std.testing.expectEqualSlices(u8, tensor.data, raw.payload.bytes);
+        }
+    }
 }
 
 test "imported ONNX Metal shape cache shares weights and survives eviction" {

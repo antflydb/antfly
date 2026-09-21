@@ -8725,7 +8725,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         comptime op_kind: HostBinaryOp,
     ) !?CT {
         const primary_buf = toBuf(primary);
-        if (primary_buf.integer_storage or toBuf(secondary).integer_storage) return error.UnsupportedTensorType;
+        if (primary_buf.integer_storage or toBuf(secondary).integer_storage) return null;
         if (primary_buf.weight_handle_name != null) return null;
         const secondary_buf = toBuf(secondary);
         if (primary_buf.quantized_storage != null or secondary_buf.quantized_storage != null) {
@@ -11829,7 +11829,17 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn primSliceOp(ctx: *anyopaque, input: CT, starts: []const i64, limits: []const i64, strides: []const i64, input_shape: []const i64) anyerror!CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const input_buf = toBuf(input);
-        if (input_buf.integer_storage) return error.UnsupportedResidentTrainingPrimitive;
+        if (input_buf.integer_storage) {
+            var mt = try self.selectionOperand(input);
+            defer mt.deinit();
+            var shape: [8]i64 = undefined;
+            for (mt.shape(), 0..) |dim, i| shape[i] = dim;
+            const plan = try @import("slice_plan.zig").Plan.init(shape[0..mt.shape().len], starts, limits, strides, input_shape);
+            const output = try metal_runtime.decoderRuntimeSliceTypedDevice(self.provider_impl, mt, plan) orelse return error.UnsupportedTensorType;
+            const result = try self.ctFromOwnedMetalTensor(output);
+            toBuf(result).integer_bounds = input_buf.integer_bounds;
+            return result;
+        }
         if (input_buf.quantized_storage != null) return error.UnsupportedTensorType;
         if (starts.len != limits.len or starts.len != strides.len or starts.len != input_shape.len) return error.UnsupportedShape;
         if (input_shape.len > metal_tensor_mod.max_dims) return error.UnsupportedShape;

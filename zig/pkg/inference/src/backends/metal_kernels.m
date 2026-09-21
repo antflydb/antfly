@@ -1048,6 +1048,7 @@ typedef struct termite_metal_decode_runtime {
     id<MTLComputePipelineState> cumulative_sum_u8_pipeline;
     id<MTLComputePipelineState> integer_binary_pipeline;
     id<MTLComputePipelineState> select_typed_pipeline;
+    id<MTLComputePipelineState> slice_typed_pipeline;
     id<MTLComputePipelineState> gather_typed_pipeline;
     id<MTLComputePipelineState> cast_typed_pipeline;
     id<MTLComputePipelineState> cumulative_sum_i32_pipeline;
@@ -10574,6 +10575,11 @@ static NSString *termite_metal_shader_source(void) {
            "    if (a < -9223372036854775808.0f) return true;\n"
            "    long integral = long(a);\n"
            "    return integral < b || (integral == b && a < float(integral));\n"
+           "}\n"
+           "kernel void termite_slice_typed(device const uchar *src [[buffer(0)]], device const uchar *unused [[buffer(1)]], device uchar *out [[buffer(2)]], constant long *p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
+           "  if (ulong(gid) >= ulong(p[0])) return; long index = p[3]; ulong rem = gid;\n"
+           "  if (p[2] == 1) index += long(gid) * p[12]; else for (uint a = 0; a < uint(p[2]); ++a) { ulong coord = rem / ulong(p[4+a]); rem %= ulong(p[4+a]); index += long(coord) * p[12+a]; }\n"
+           "  switch (p[1]) { case 8: ((device ulong *)out)[gid] = ((device const ulong *)src)[index]; break; case 4: ((device uint *)out)[gid] = ((device const uint *)src)[index]; break; case 2: ((device ushort *)out)[gid] = ((device const ushort *)src)[index]; break; default: out[gid] = src[index]; }\n"
            "}\n"
            "kernel void termite_select_typed(device const uchar *c [[buffer(0)]], device const uchar *t [[buffer(1)]], device const uchar *f [[buffer(2)]], device uchar *out [[buffer(3)]], constant uint *p [[buffer(4)]], uint gid [[thread_position_in_grid]]) {\n"
            "  if (gid >= p[0]) return; uint rem = gid; uint3 ix = uint3(0);\n"
@@ -25780,6 +25786,7 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         runtime->cumulative_sum_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_cumulative_sum_f32");
         runtime->integer_binary_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_integer_binary");
         runtime->select_typed_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_select_typed");
+        runtime->slice_typed_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_slice_typed");
         runtime->gather_typed_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_gather_typed");
         runtime->cast_typed_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_cast_typed");
         runtime->cumulative_sum_i32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_cumulative_sum_i32");
@@ -26656,6 +26663,7 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->cumulative_sum_f32_pipeline = nil;
     runtime->integer_binary_pipeline = nil;
     runtime->select_typed_pipeline = nil;
+    runtime->slice_typed_pipeline = nil;
     runtime->gather_typed_pipeline = nil;
     runtime->cast_typed_pipeline = nil;
     runtime->cumulative_sum_i32_pipeline = nil;
@@ -45167,6 +45175,13 @@ static int termite_metal_decode_runtime_typed_binary_dispatch(termite_metal_deco
 
 int termite_metal_decode_runtime_gather_typed_device(termite_metal_decode_runtime *runtime, void *input_handle, size_t input_offset, size_t input_bytes, void *indices_handle, size_t indices_offset, size_t indices_bytes, void *output_handle, size_t output_offset, size_t output_bytes, const uint32_t *params) {
     return termite_metal_decode_runtime_typed_binary_dispatch(runtime, input_handle, input_offset, input_bytes, indices_handle, indices_offset, indices_bytes, output_handle, output_offset, output_bytes, params, 6, runtime != NULL ? runtime->gather_typed_pipeline : nil);
+}
+
+int termite_metal_decode_runtime_slice_typed_device(termite_metal_decode_runtime *runtime, void *input_handle, size_t input_offset, size_t input_bytes, void *output_handle, size_t output_offset, size_t output_bytes, const int64_t *params) {
+    if (params == NULL) return -1;
+    uint32_t words[40];
+    memcpy(words, params, sizeof(words));
+    return termite_metal_decode_runtime_typed_binary_dispatch(runtime, input_handle, input_offset, input_bytes, input_handle, input_offset, input_bytes, output_handle, output_offset, output_bytes, words, 40, runtime != NULL ? runtime->slice_typed_pipeline : nil);
 }
 
 int termite_metal_decode_runtime_integer_binary_device(termite_metal_decode_runtime *runtime, void *input_handle, size_t input_offset, size_t input_bytes, void *indices_handle, size_t indices_offset, size_t indices_bytes, void *output_handle, size_t output_offset, size_t output_bytes, const uint32_t *params) {

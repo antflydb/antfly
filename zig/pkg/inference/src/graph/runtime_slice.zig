@@ -43,6 +43,19 @@ fn applyRuntimeBounds(
     const index: usize = @intCast(value_id);
     if (index >= values.len) return error.MissingRuntimeInput;
     const value = values[index] orelse return error.MissingRuntimeInput;
+    switch (try cb.tensorDType(value)) {
+        .i8, .i16, .i32, .i64, .u8, .bool_ => {
+            var buffer: [8]i64 = undefined;
+            const raw = try @import("runtime_shape_values.zig").read(cb, value, &buffer);
+            if (raw.len != axes.len) return error.InvalidTensorShape;
+            for (axes, raw) |axis, bound| {
+                if (axis >= rank) return error.InvalidTensorShape;
+                out[axis] = bound;
+            }
+            return;
+        },
+        else => {},
+    }
     const raw = try cb.toFloat32(value, allocator);
     defer allocator.free(raw);
     if (raw.len != axes.len) return error.InvalidTensorShape;

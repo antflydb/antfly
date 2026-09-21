@@ -621,7 +621,17 @@ fn metalSliceHasResidentShape(query: CapabilityQuery) bool {
     };
     const input_shape = nodeInputShape(query, 0) orelse return false;
     const output_shape = query.graph.node(query.node_id).output_shape;
-    if (input_shape.dtype != .f32 or output_shape.dtype != .f32) return false;
+    if (input_shape.dtype != output_shape.dtype) return false;
+    switch (input_shape.dtype) {
+        .i8, .i16, .i32, .i64, .u8, .bool_ => {
+            const rank = input_shape.rank();
+            if (attrs.num_axes != rank or attrs.runtime_starts or attrs.runtime_limits) return false;
+            const plan = @import("../ops/slice_plan.zig").Plan.init(input_shape.dims[0..rank], attrs.starts[0..rank], attrs.limits[0..rank], attrs.strides[0..rank], input_shape.dims[0..rank]) catch return false;
+            return plan.count <= std.math.maxInt(u32) and std.mem.eql(i64, plan.shape[0..plan.rank], output_shape.dims[0..output_shape.rank()]);
+        },
+        .f32 => {},
+        else => return false,
+    }
     const rank = input_shape.rank();
     if (rank == 0 or output_shape.rank() != rank or attrs.num_axes != rank) return false;
 
@@ -1369,7 +1379,13 @@ test "metal planner keeps typed broadcast and selection resident" {
         .inputs = .{ condition, expanded, y, null_node },
         .num_inputs = 3,
     });
-    try g.markOutput(selected);
+    const sliced = try g.addNode(.{
+        .op = .{ .slice = .{ .starts = .{ 0, 1, 0, 0, 0, 0, 0, 0 }, .limits = .{ 2, 3, 0, 0, 0, 0, 0, 0 }, .strides = @splat(1), .num_axes = 2 } },
+        .output_shape = Shape.init(.i64, &.{ 2, 2 }),
+        .inputs = .{ selected, null_node, null_node, null_node },
+        .num_inputs = 1,
+    });
+    try g.markOutput(sliced);
     const seeds = try partition.allocTensorDescriptorSeeds(allocator, &g);
     defer allocator.free(seeds);
     try partition.seedAllParameterResidency(seeds, &g, .metal, 0);
@@ -1379,7 +1395,7 @@ test "metal planner keeps typed broadcast and selection resident" {
     };
     var plan = try partition.partitionWithOptions(allocator, &g, &caps, .{ .tensor_descs = seeds });
     defer plan.deinit();
-    for ([_]NodeId{ expanded, selected }) |id| try std.testing.expectEqual(contracts.BackendKind.metal, plan.partitions[plan.node_assignment[id]].backend);
+    for ([_]NodeId{ expanded, selected, sliced }) |id| try std.testing.expectEqual(contracts.BackendKind.metal, plan.partitions[plan.node_assignment[id]].backend);
 }
 
 test "metal planner accepts default reverse transpose with resident input" {

@@ -7058,6 +7058,28 @@ pub fn decoderRuntimeIntegerBinaryDevice(self: anytype, lhs: MetalTensor, rhs: M
 }
 extern fn termite_metal_decode_runtime_integer_binary_device(runtime: ?*anyopaque, lhs: ?*anyopaque, lhs_offset: usize, lhs_bytes: usize, rhs: ?*anyopaque, rhs_offset: usize, rhs_bytes: usize, output: ?*anyopaque, output_offset: usize, output_bytes: usize, params: *const [31]u32) c_int;
 
+pub fn decoderRuntimeSliceTypedDevice(self: anytype, input: MetalTensor, plan: @import("../ops/slice_plan.zig").Plan) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (!input.isDevice() or input.elemCount() != plan.input_count) return error.InvalidTensorShape;
+    var shape: [8]i32 = undefined;
+    for (plan.shape[0..plan.rank], 0..) |dim, i| shape[i] = std.math.cast(i32, dim) orelse return error.InvalidTensorShape;
+    const width = input.dtype.byteSize();
+    if (plan.count > 0 and plan.contiguous()) return try input.retainedView(try std.math.mul(usize, @intCast(plan.base), width), try std.math.mul(usize, plan.count, width), shape[0..plan.rank]);
+    if (plan.count > std.math.maxInt(u32)) return error.InvalidTensorShape;
+    var output = try MetalTensor.deviceAllocateTyped(std.heap.c_allocator, runtime, input.dtype, .private, shape[0..plan.rank]);
+    errdefer output.deinit();
+    if (plan.count == 0) return output;
+    var params: [20]i64 = @splat(0);
+    params[0..4].* = .{ @intCast(plan.count), @intCast(width), @intCast(plan.axes), plan.base };
+    for (0..plan.axes) |axis| {
+        params[4 + axis] = std.math.cast(i64, plan.divisors[axis]) orelse return error.InvalidTensorShape;
+        params[12 + axis] = plan.strides[axis];
+    }
+    const rc = termite_metal_decode_runtime_slice_typed_device(runtime, input.deviceHandle(), input.deviceByteOffset(), input.deviceByteLen(), output.deviceHandle(), output.deviceByteOffset(), output.deviceByteLen(), &params);
+    return finishDeviceOutput(&output, rc);
+}
+extern fn termite_metal_decode_runtime_slice_typed_device(runtime: ?*anyopaque, input: ?*anyopaque, input_offset: usize, input_bytes: usize, output: ?*anyopaque, output_offset: usize, output_bytes: usize, params: *const [20]i64) c_int;
+
 pub fn decoderRuntimeSelectTypedDevice(self: anytype, inputs: [3]MetalTensor, plan: @import("../ops/binary_broadcast.zig").SelectionPlan, broadcast: bool) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     for (inputs, 0..) |input, i| {

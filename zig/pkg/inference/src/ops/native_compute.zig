@@ -4232,16 +4232,20 @@ pub const NativeCompute = struct {
     }
 
     pub fn importHostTensor(self: *NativeCompute, tensor: *const tensor_mod.Tensor) !CT {
-        if (tensor.dtype == .i32 or tensor.dtype == .i64) return copyIntegerTensorWithShape(self, tensor, tensor.shape);
+        switch (tensor.dtype) {
+            .i8, .i16, .i32, .i64, .u8, .bool_ => return copyIntegerTensorWithShape(self, tensor, tensor.shape),
+            else => {},
+        }
         const converted = try convertTensorToOwnedF32(self.allocator, tensor);
         errdefer self.allocator.free(converted);
         return self.importDenseTensor(tensor.name, tensor.dtype, tensor.shape, converted);
     }
 
     pub fn importOwnedStaticTensor(self: *NativeCompute, tensor: tensor_mod.Tensor) !CT {
-        const can_keep_typed =
-            tensor.dtype == .i32 or tensor.dtype == .i64 or (tensor.shape.len == 2 and
-                (tensor.dtype == .f32 or tensor.dtype == .f16 or tensor.dtype == .bf16));
+        const can_keep_typed = switch (tensor.dtype) {
+            .i8, .i16, .i32, .i64, .u8, .bool_ => true,
+            else => tensor.shape.len == 2 and (tensor.dtype == .f32 or tensor.dtype == .f16 or tensor.dtype == .bf16),
+        };
         if (can_keep_typed) {
             return self.makeBufWithOwnedSourceTensor(tensor);
         }
@@ -6636,6 +6640,7 @@ fn addOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
 }
 
 fn addConsumeLeftOp(_: *anyopaque, a: CT, b: CT) anyerror!?CT {
+    if (integerSource(a) != null or integerSource(b) != null) return null;
     if (try applyShapeAwareBinaryConsumeLeft(a, b, .add)) |result| return result;
     const a_buf = ownedDenseBufWithMaxSharedRefs(a, 2) orelse return null;
     const a_data = a_buf.data;
@@ -6662,6 +6667,7 @@ fn addConsumeLeftOp(_: *anyopaque, a: CT, b: CT) anyerror!?CT {
 }
 
 fn addConsumeRightOp(_: *anyopaque, a: CT, b: CT) anyerror!?CT {
+    if (integerSource(a) != null or integerSource(b) != null) return null;
     if (try applyShapeAwareBinaryConsumeLeft(b, a, .add)) |result| return result;
     const b_buf = ownedDenseBufWithMaxSharedRefs(b, 2) orelse return null;
     const a_data = getData(a);
@@ -6688,6 +6694,7 @@ fn addConsumeRightOp(_: *anyopaque, a: CT, b: CT) anyerror!?CT {
 }
 
 fn multiplyConsumeLeftOp(_: *anyopaque, a: CT, b: CT) anyerror!?CT {
+    if (integerSource(a) != null or integerSource(b) != null) return null;
     if (try applyShapeAwareBinaryConsumeLeft(a, b, .mul)) |result| return result;
     const a_buf = ownedDenseBufWithMaxSharedRefs(a, 2) orelse return null;
     const a_data = a_buf.data;
@@ -6714,6 +6721,7 @@ fn multiplyConsumeLeftOp(_: *anyopaque, a: CT, b: CT) anyerror!?CT {
 }
 
 fn multiplyConsumeRightOp(_: *anyopaque, a: CT, b: CT) anyerror!?CT {
+    if (integerSource(a) != null or integerSource(b) != null) return null;
     if (try applyShapeAwareBinaryConsumeLeft(b, a, .mul)) |result| return result;
     const b_buf = ownedDenseBufWithMaxSharedRefs(b, 2) orelse return null;
     const a_data = getData(a);
@@ -6740,6 +6748,7 @@ fn multiplyConsumeRightOp(_: *anyopaque, a: CT, b: CT) anyerror!?CT {
 }
 
 fn subtractConsumeLeftOp(_: *anyopaque, a: CT, b: CT) anyerror!?CT {
+    if (integerSource(a) != null or integerSource(b) != null) return null;
     if (try applyShapeAwareBinaryConsumeLeft(a, b, .sub)) |result| return result;
     const a_buf = ownedDenseBufWithMaxSharedRefs(a, 2) orelse return null;
     const a_data = a_buf.data;
@@ -39812,6 +39821,20 @@ fn primGatherOp(ctx: *anyopaque, input: CT, indices: CT, axis: u8, input_shape: 
 
 fn primSliceOp(ctx: *anyopaque, input: CT, starts: []const i64, limits: []const i64, strides: []const i64, input_shape: []const i64) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    if (integerSource(input)) |source| {
+        const plan = try @import("slice_plan.zig").Plan.init(storedOrDeclaredShape(input, input_shape), starts, limits, strides, input_shape);
+        if (plan.input_count != try integerTensorCount(source)) return error.ShapeMismatch;
+        const width = source.dtype.byteSize();
+        const bytes = try self.allocator.alloc(u8, try std.math.mul(usize, plan.count, width));
+        if (plan.count > 0) {
+            if (plan.contiguous()) {
+                @memcpy(bytes, source.data[@as(usize, @intCast(plan.base)) * width ..][0..bytes.len]);
+            } else for (0..plan.count) |i| {
+                @memcpy(bytes[i * width ..][0..width], source.data[plan.offset(i) * width ..][0..width]);
+            }
+        }
+        return takeOwnedIntegerBytes(self, bytes, source.dtype, plan.shape[0..plan.rank]);
+    }
     const in_data = getData(input);
     const rank = input_shape.len;
     if (rank > 8 or starts.len < rank or limits.len < rank or strides.len < rank) return error.UnsupportedShape;
