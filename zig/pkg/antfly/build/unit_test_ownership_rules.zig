@@ -312,6 +312,7 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
             "api.indexes.consumerTests.Suite.test.public index config encoders omit root write-only producer documents",
             "api.indexes.consumerTests.Suite.test.public index config encoders redact coverage incarnation",
             "api.indexes.consumerTests.Suite.test.public index config encoders redact nested credentials",
+            "api.indexes.consumerTests.Suite.test.public index config encoders preserve enrichment objects on read",
             "api.indexes.consumerTests.Suite.test.readiness completion fences include every observation dimension",
             "api.indexes.consumerTests.Suite.test.readiness evaluation cannot complete while convergence work remains",
             "api.indexes.consumerTests.Suite.test.serviceable full text replacement remains queryable while rebuilding",
