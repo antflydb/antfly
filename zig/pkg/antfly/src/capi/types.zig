@@ -241,12 +241,18 @@ pub fn errorCodeDescription(code: c_int) [*:0]const u8 {
 }
 
 pub fn mapError(err: anyerror) ErrorCode {
+    if (err == error.GeneratedColumnRewriteRequired) return .intent_conflict;
     return switch (err) {
         error.VersionConflict => .version_conflict,
         error.IntentConflict, error.DecisionConflict, error.SchemaInUse => .intent_conflict,
         error.TxnNotFound => .txn_not_found,
         error.NotFound => .not_found,
         error.InvalidArgument,
+        error.RelationalExpressionOverflow,
+        error.RelationalExpressionDivisionByZero,
+        error.RelationalExpressionBudgetExceeded,
+        error.InvalidRelationalExpressionInput,
+        error.InvalidRelationalGeneratedValue,
         error.InvalidBatchRequest,
         error.TransactionTooLarge,
         error.UnsupportedBatchRequestEncoding,

@@ -3449,7 +3449,82 @@ pub const StorageKernelLookupWireRequest = struct {
     key: []const u8,
     fields: []const []const u8 = &.{},
     include_all_fields: bool = true,
+    include_primary_digest: bool = false,
+    restore_staging_scope: ?[32]u8 = null,
+    restore_staging_plan_id: ?[16]u8 = null,
+    relational_integrity_catalog: bool = false,
+    relational_integrity_action: bool = false,
+    relational_integrity_jobs_json: []const u8 = "",
+    relational_activation_json: []const u8 = "",
+    relational_index_status_json: []const u8 = "",
+    relational_topology_json: []const u8 = "",
+
+    pub fn options(self: StorageKernelLookupWireRequest) db_mod.types.LookupOptions {
+        return .{
+            .fields = self.fields,
+            .include_all_fields = self.include_all_fields,
+            .include_primary_digest = self.include_primary_digest,
+            .restore_staging_scope = self.restore_staging_scope,
+            .restore_staging_plan_id = self.restore_staging_plan_id,
+            .relational_integrity_catalog = self.relational_integrity_catalog,
+            .relational_integrity_action = self.relational_integrity_action,
+            .relational_integrity_jobs_json = self.relational_integrity_jobs_json,
+            .relational_activation_json = self.relational_activation_json,
+            .relational_index_status_json = self.relational_index_status_json,
+            .relational_topology_json = self.relational_topology_json,
+        };
+    }
+
+    pub fn jsonStringify(self: StorageKernelLookupWireRequest, stream: anytype) @TypeOf(stream.*).Error!void {
+        try stream.beginObject();
+        inline for (@typeInfo(StorageKernelLookupWireRequest).@"struct".fields) |field| {
+            try stream.objectField(field.name);
+            if (comptime std.mem.eql(u8, field.name, "key") or std.mem.eql(u8, field.name, "restore_staging_scope") or std.mem.eql(u8, field.name, "restore_staging_plan_id")) {
+                try @import("../storage/db/relational_integrity_json.zig").write(@field(self, field.name), stream);
+            } else try stream.write(@field(self, field.name));
+        }
+        try stream.endObject();
+    }
 };
+
+pub fn integrityLookupMode(opts: db_mod.types.LookupOptions) bool {
+    return opts.relational_integrity_catalog or opts.relational_integrity_action or opts.relational_integrity_jobs_json.len != 0 or opts.relational_index_status_json.len != 0 or opts.relational_activation_json.len != 0 or opts.relational_topology_json.len != 0;
+}
+
+test "compiled lookup wire preserves binary scope and every integrity control" {
+    const alloc = std.testing.allocator;
+    const scope: [32]u8 = @splat(0xff);
+    const options: db_mod.types.LookupOptions = .{
+        .fields = &.{"id"},
+        .include_all_fields = false,
+        .include_primary_digest = true,
+        .restore_staging_scope = scope,
+        .restore_staging_plan_id = @splat(0xfe),
+        .relational_integrity_catalog = true,
+        .relational_integrity_action = true,
+        .relational_integrity_jobs_json = "{\"kind\":\"references\"}",
+        .relational_activation_json = "{\"mode\":\"status\"}",
+        .relational_index_status_json = "{\"name\":\"by_id\",\"schema_version\":2}",
+        .relational_topology_json = "{\"mode\":\"identity\"}",
+        .execution_deadline_ns = 1234,
+    };
+    const encoded = try encodeStorageKernelLookupRequest(alloc, "\xff\x00\x80", options);
+    defer alloc.free(encoded);
+    var decoded = try std.json.parseFromSlice(StorageKernelLookupWireRequest, alloc, encoded, .{});
+    defer decoded.deinit();
+    try std.testing.expectEqualStrings("\xff\x00\x80", decoded.value.key);
+    const actual = decoded.value.options();
+    try std.testing.expectEqualSlices(u8, &scope, &actual.restore_staging_scope.?);
+    try std.testing.expectEqual(options.restore_staging_plan_id, actual.restore_staging_plan_id);
+    try std.testing.expect(actual.include_primary_digest and !actual.include_all_fields);
+    try std.testing.expect(actual.relational_integrity_catalog and actual.relational_integrity_action);
+    try std.testing.expectEqualStrings(options.relational_integrity_jobs_json, actual.relational_integrity_jobs_json);
+    try std.testing.expectEqualStrings(options.relational_activation_json, actual.relational_activation_json);
+    try std.testing.expectEqualStrings(options.relational_index_status_json, actual.relational_index_status_json);
+    try std.testing.expectEqualStrings(options.relational_topology_json, actual.relational_topology_json);
+    try std.testing.expectEqualStrings("id", actual.fields[0]);
+    try std.testing.expect(actual.execution_deadline_ns == null and actual.execution_io == null and actual.cancellation == null);
+}
 
 pub fn encodeStorageKernelLookupRequest(
     alloc: std.mem.Allocator,
@@ -3460,6 +3535,15 @@ pub fn encodeStorageKernelLookupRequest(
         .key = key,
         .fields = opts.fields,
         .include_all_fields = opts.include_all_fields,
+        .include_primary_digest = opts.include_primary_digest,
+        .restore_staging_scope = opts.restore_staging_scope,
+        .restore_staging_plan_id = opts.restore_staging_plan_id,
+        .relational_integrity_catalog = opts.relational_integrity_catalog,
+        .relational_integrity_action = opts.relational_integrity_action,
+        .relational_integrity_jobs_json = opts.relational_integrity_jobs_json,
+        .relational_activation_json = opts.relational_activation_json,
+        .relational_index_status_json = opts.relational_index_status_json,
+        .relational_topology_json = opts.relational_topology_json,
     }, .{});
 }
 
@@ -3517,6 +3601,32 @@ pub const StorageKernelScanWireRequest = struct {
     include_all_fields: bool = true,
     filter_query_json: []const u8 = "",
     include_content_hashes: bool = false,
+    relational_query_json: []const u8 = "",
+
+    pub fn options(self: StorageKernelScanWireRequest) db_mod.types.ScanOptions {
+        return .{
+            .inclusive_from = self.inclusive_from,
+            .exclusive_to = self.exclusive_to,
+            .include_documents = self.include_documents,
+            .limit = self.limit,
+            .fields = self.fields,
+            .include_all_fields = self.include_all_fields,
+            .filter_query_json = self.filter_query_json,
+            .include_content_hashes = self.include_content_hashes,
+            .relational_query_json = self.relational_query_json,
+        };
+    }
+
+    pub fn jsonStringify(self: StorageKernelScanWireRequest, stream: anytype) @TypeOf(stream.*).Error!void {
+        try stream.beginObject();
+        inline for (@typeInfo(StorageKernelScanWireRequest).@"struct".fields) |field| {
+            try stream.objectField(field.name);
+            if (comptime std.mem.eql(u8, field.name, "from_key") or std.mem.eql(u8, field.name, "to_key")) {
+                try @import("../storage/db/relational_integrity_json.zig").write(@field(self, field.name), stream);
+            } else try stream.write(@field(self, field.name));
+        }
+        try stream.endObject();
+    }
 };
 
 pub fn encodeStorageKernelScanRequest(
@@ -3536,6 +3646,7 @@ pub fn encodeStorageKernelScanRequest(
         .include_all_fields = opts.include_all_fields,
         .filter_query_json = opts.filter_query_json,
         .include_content_hashes = opts.include_content_hashes,
+        .relational_query_json = opts.relational_query_json,
     }, .{});
 }
 
@@ -3548,9 +3659,37 @@ pub fn encodeStorageKernelScanNdjson(
     defer out.deinit(alloc);
     for (result.hashes, 0..) |entry, i| {
         const json = if (include_documents) result.documents[i].json else null;
-        try appendScanLine(alloc, &out, entry.id, json, entry.content_hash);
+        if (entry.relational_schema_version) |version| {
+            try appendRelationalScanLine(alloc, &out, .{ .id = entry.id, .hash = entry.hash, .document_json = json, .content_hash = entry.content_hash, .relational_schema_version = version, .relational_cursor = entry.relational_cursor }, version);
+        } else try appendScanLine(alloc, &out, entry.id, json, entry.content_hash);
     }
     return try out.toOwnedSlice(alloc);
+}
+
+test "compiled typed scan preserves filter projection and versioned row envelope" {
+    const alloc = std.testing.allocator;
+    const query = "{\"schema_version\":7,\"fields\":[\"count\"]}";
+    const filter = "{\"term\":\"tenant-a\"}";
+    const encoded = try encodeStorageKernelScanRequest(alloc, "\x80", "\xff", .{ .relational_query_json = query, .filter_query_json = filter, .include_documents = true, .include_all_fields = false, .fields = &.{"count"}, .limit = 12 });
+    defer alloc.free(encoded);
+    var decoded = try std.json.parseFromSlice(StorageKernelScanWireRequest, alloc, encoded, .{});
+    defer decoded.deinit();
+    try std.testing.expectEqualStrings("\x80", decoded.value.from_key);
+    try std.testing.expectEqualStrings("\xff", decoded.value.to_key);
+    try std.testing.expectEqualStrings(query, decoded.value.options().relational_query_json);
+    try std.testing.expectEqualStrings(filter, decoded.value.options().filter_query_json);
+    try std.testing.expectEqualStrings("count", decoded.value.options().fields[0]);
+    try std.testing.expect(!decoded.value.options().include_all_fields);
+    const row = "{\"count\":9007199254740993}";
+    var hashes = [_]db_mod.types.ScanHash{.{ .id = @constCast("doc:a"), .hash = 9007199254740993, .relational_schema_version = 7 }};
+    var documents = [_]db_mod.types.ScanDocument{.{ .id = @constCast("doc:a"), .json = @constCast(row) }};
+    const buffered = try encodeStorageKernelScanNdjson(alloc, .{ .hashes = &hashes, .documents = &documents }, true);
+    defer alloc.free(buffered);
+    var streamed: std.ArrayListUnmanaged(u8) = .empty;
+    defer streamed.deinit(alloc);
+    try appendRelationalScanLine(alloc, &streamed, .{ .id = "doc:a", .hash = hashes[0].hash, .document_json = row, .relational_schema_version = 7 }, 7);
+    try std.testing.expectEqualStrings(buffered, streamed.items);
+    try std.testing.expectEqualStrings("{\"_id\":\"doc:a\",\"version\":\"9007199254740993\",\"schema_version\":7,\"row\":{\"count\":9007199254740993}}\n", buffered);
 }
 
 pub const StorageKernelDynamicFieldObservationWireRequest = struct {
@@ -5551,6 +5690,22 @@ pub fn appendJsonStringArray(
         try appendJsonString(alloc, out, value);
     }
     try out.append(alloc, ']');
+}
+
+pub fn appendRelationalScanLine(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), entry: db_mod.types.ScanVisitEntry, schema_version: u32) !void {
+    const projected = entry.document_json orelse "{}";
+    if (out.items.len +| projected.len +| entry.id.len > 16 * 1024 * 1024) return error.RelationalRowsOutputBudgetExceeded;
+    const header = try std.fmt.allocPrint(alloc, "{{\"_id\":{f},\"version\":\"{d}\",\"schema_version\":{d},\"row\":", .{ std.json.fmt(entry.id, .{}), entry.hash, schema_version });
+    defer alloc.free(header);
+    const cursor_bytes = if (entry.relational_cursor) |cursor| cursor.len +| 12 else @as(usize, 0);
+    if (header.len +| projected.len +| cursor_bytes +| 2 > (16 * 1024 * 1024) -| out.items.len) return error.RelationalRowsOutputBudgetExceeded;
+    try out.appendSlice(alloc, header);
+    try out.appendSlice(alloc, projected);
+    if (entry.relational_cursor) |cursor| {
+        try out.appendSlice(alloc, ",\"cursor\":");
+        try appendJsonString(alloc, out, cursor);
+    }
+    try out.appendSlice(alloc, "}\n");
 }
 
 pub fn appendScanLine(

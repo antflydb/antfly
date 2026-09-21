@@ -437,6 +437,49 @@ pub fn parseBatchNamespaceTableBody(allocator: std.mem.Allocator, body: []const 
     return std.json.parseFromSlice(types.BatchRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Repair version-conditional rows after failed or diagnosed constraint activation
+pub const RepairNamespaceRelationalConstraintsPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for repairNamespaceRelationalConstraints.
+pub fn parseRepairNamespaceRelationalConstraintsBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RelationalRowMutationRequest) {
+    return std.json.parseFromSlice(types.RelationalRowMutationRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Retire unique and foreign-key definitions safely
+pub const RetireNamespaceRelationalConstraintsPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for retireNamespaceRelationalConstraints.
+pub fn parseRetireNamespaceRelationalConstraintsBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RelationalConstraintRetirementRequest) {
+    return std.json.parseFromSlice(types.RelationalConstraintRetirementRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Restart failed UNIQUE/FK/CHECK validation after administrative repair
+pub const RetryNamespaceRelationalConstraintsPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for retryNamespaceRelationalConstraints.
+pub fn parseRetryNamespaceRelationalConstraintsBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RelationalConstraintRetryRequest) {
+    return std.json.parseFromSlice(types.RelationalConstraintRetryRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Read distributed UNIQUE, foreign-key, and CHECK validation coverage
+pub const GetNamespaceRelationalConstraintStatusPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+};
+
 /// Retrieve a document by key from an explicit namespace table
 pub const LookupNamespaceTableDocumentPathParams = struct {
     /// Database name
@@ -523,6 +566,32 @@ pub const ExecuteNamespaceTableGraphMetricActionPathParams = struct {
     action: []const u8,
 };
 
+/// Repair an index generation
+pub const RepairNamespaceIndexPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    index_name: []const u8,
+};
+
+/// Parse the JSON request body for repairNamespaceIndex.
+pub fn parseRepairNamespaceIndexBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_indexes_openapi.IndexMaintenanceRequest) {
+    return std.json.parseFromSlice(antfly_indexes_openapi.IndexMaintenanceRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Retry a failed index build
+pub const RetryNamespaceIndexPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    index_name: []const u8,
+};
+
+/// Parse the JSON request body for retryNamespaceIndex.
+pub fn parseRetryNamespaceIndexBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_indexes_openapi.IndexMaintenanceRequest) {
+    return std.json.parseFromSlice(antfly_indexes_openapi.IndexMaintenanceRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Query an explicit namespace table
 pub const QueryNamespaceTablePathParams = struct {
     /// Database name
@@ -563,6 +632,30 @@ pub const RestoreNamespaceTablePathParams = struct {
 /// Parse the JSON request body for restoreNamespaceTable.
 pub fn parseRestoreNamespaceTableBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RestoreRequest) {
     return std.json.parseFromSlice(types.RestoreRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Atomically replace or delete version-conditional typed rows
+pub const MutateNamespaceRelationalRowsPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for mutateNamespaceRelationalRows.
+pub fn parseMutateNamespaceRelationalRowsBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RelationalRowMutationRequest) {
+    return std.json.parseFromSlice(types.RelationalRowMutationRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Query projected typed relational rows
+pub const QueryNamespaceRelationalRowsPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for queryNamespaceRelationalRows.
+pub fn parseQueryNamespaceRelationalRowsBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RelationalRowQueryRequest) {
+    return std.json.parseFromSlice(types.RelationalRowQueryRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
 /// Replace a table's schema
@@ -855,6 +948,41 @@ pub fn parseBatchWriteBody(allocator: std.mem.Allocator, body: []const u8) !std.
     return std.json.parseFromSlice(types.BatchRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Repair version-conditional rows after failed or diagnosed constraint activation
+pub const RepairRelationalConstraintsPathParams = struct {
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for repairRelationalConstraints.
+pub fn parseRepairRelationalConstraintsBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RelationalRowMutationRequest) {
+    return std.json.parseFromSlice(types.RelationalRowMutationRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Retire unique and foreign-key definitions safely
+pub const RetireRelationalConstraintsPathParams = struct {
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for retireRelationalConstraints.
+pub fn parseRetireRelationalConstraintsBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RelationalConstraintRetirementRequest) {
+    return std.json.parseFromSlice(types.RelationalConstraintRetirementRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Restart failed UNIQUE/FK/CHECK validation after administrative repair
+pub const RetryRelationalConstraintsPathParams = struct {
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for retryRelationalConstraints.
+pub fn parseRetryRelationalConstraintsBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RelationalConstraintRetryRequest) {
+    return std.json.parseFromSlice(types.RelationalConstraintRetryRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Read distributed UNIQUE, foreign-key, and CHECK validation coverage
+pub const GetRelationalConstraintStatusPathParams = struct {
+    table_name: []const u8,
+};
+
 /// Adopt stored write destinations with the current credential
 pub const ReauthorizeTableDestinationsPathParams = struct {
     /// Name of the table whose stored destinations should be adopted
@@ -972,6 +1100,28 @@ pub const ExecuteGraphMetricActionPathParams = struct {
     action: []const u8,
 };
 
+/// Repair an index generation
+pub const RepairIndexPathParams = struct {
+    table_name: []const u8,
+    index_name: []const u8,
+};
+
+/// Parse the JSON request body for repairIndex.
+pub fn parseRepairIndexBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_indexes_openapi.IndexMaintenanceRequest) {
+    return std.json.parseFromSlice(antfly_indexes_openapi.IndexMaintenanceRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Retry a failed index build
+pub const RetryIndexPathParams = struct {
+    table_name: []const u8,
+    index_name: []const u8,
+};
+
+/// Parse the JSON request body for retryIndex.
+pub fn parseRetryIndexBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_indexes_openapi.IndexMaintenanceRequest) {
+    return std.json.parseFromSlice(antfly_indexes_openapi.IndexMaintenanceRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Synchronize data from external sources (Shopify, Postgres, S3) using a linear merge
 pub const LinearMergePathParams = struct {
     /// Name of the table
@@ -1073,10 +1223,35 @@ pub fn parseRestoreTableBody(allocator: std.mem.Allocator, body: []const u8) !st
     return std.json.parseFromSlice(types.RestoreRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Atomically replace or delete version-conditional typed rows
+pub const MutateRelationalRowsPathParams = struct {
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for mutateRelationalRows.
+pub fn parseMutateRelationalRowsBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RelationalRowMutationRequest) {
+    return std.json.parseFromSlice(types.RelationalRowMutationRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Query projected typed relational rows
+pub const QueryRelationalRowsPathParams = struct {
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for queryRelationalRows.
+pub fn parseQueryRelationalRowsBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RelationalRowQueryRequest) {
+    return std.json.parseFromSlice(types.RelationalRowQueryRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Replace a table's schema
 pub const UpdateSchemaPathParams = struct {
     /// Name of the table
     table_name: []const u8,
+};
+
+pub const UpdateSchemaParams = struct {
+    /// Explicitly enqueue a durable fresh-generation schema rewrite instead of changing the live schema. Requires administrator permission on the entire dependency cohort. Sources remain writable during snapshot and catch-up; final validation and publication are atomic across the cohort. Returns a restore job (202), whose existing status/cancel routes apply. Independent graph/vector artifacts without a retained row-derived source proof are rejected before admission. The default false retains ordinary schema-update behavior. Existing absent values remain absent rather than retroactively receiving defaults. Stored column type changes and destructive column removal are rejected.
+    rewrite: ?[]const u8 = null,
 };
 
 /// Parse the JSON request body for updateSchema.
@@ -1088,6 +1263,11 @@ pub fn parseUpdateSchemaBody(allocator: std.mem.Allocator, body: []const u8) !st
 pub const PatchSchemaPathParams = struct {
     /// Name of the table
     table_name: []const u8,
+};
+
+pub const PatchSchemaParams = struct {
+    /// Explicitly enqueue a durable fresh-generation schema rewrite instead of changing the live schema. Requires administrator permission on the entire dependency cohort. Sources remain writable during snapshot and catch-up; final validation and publication are atomic across the cohort. Returns a restore job (202), whose existing status/cancel routes apply. Independent graph/vector artifacts without a retained row-derived source proof are rejected before admission. The default false retains ordinary schema-update behavior. Existing absent values remain absent rather than retroactively receiving defaults. Stored column type changes and destructive column removal are rejected.
+    rewrite: ?[]const u8 = null,
 };
 
 /// Parse the JSON request body for patchSchema.
@@ -1298,15 +1478,23 @@ pub const routes = [_]Route{
     .{ .method = "DELETE", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}", .operation_id = "dropNamespaceTable", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/backup", .operation_id = "backupNamespaceTable", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/batch", .operation_id = "batchNamespaceTable", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/repair", .operation_id = "repairNamespaceRelationalConstraints", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/retire", .operation_id = "retireNamespaceRelationalConstraints", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/retry", .operation_id = "retryNamespaceRelationalConstraints", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/status", .operation_id = "getNamespaceRelationalConstraintStatus", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/documents/{key}", .operation_id = "lookupNamespaceTableDocument", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes", .operation_id = "listNamespaceTableIndexes", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}", .operation_id = "getNamespaceTableIndex", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}", .operation_id = "createNamespaceTableIndex", .request_body = .buffered, .streaming_response = false },
     .{ .method = "DELETE", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}", .operation_id = "dropNamespaceTableIndex", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}:{action}", .operation_id = "executeNamespaceTableGraphMetricAction", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/repair", .operation_id = "repairNamespaceIndex", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/retry", .operation_id = "retryNamespaceIndex", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/query", .operation_id = "queryNamespaceTable", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rename", .operation_id = "renameNamespaceTable", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/restore", .operation_id = "restoreNamespaceTable", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rows/mutate", .operation_id = "mutateNamespaceRelationalRows", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rows/query", .operation_id = "queryNamespaceRelationalRows", .request_body = .buffered, .streaming_response = true },
     .{ .method = "PUT", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/schema", .operation_id = "updateNamespaceTableSchema", .request_body = .buffered, .streaming_response = false },
     .{ .method = "PATCH", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/schema", .operation_id = "patchNamespaceTableSchema", .request_body = .buffered, .streaming_response = false },
     .{ .method = "PUT", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/tablespace", .operation_id = "setNamespaceTableTablespace", .request_body = .buffered, .streaming_response = false },
@@ -1340,6 +1528,10 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}/cancel", .operation_id = "cancelDocumentArtifactReprocessJob", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/backup", .operation_id = "backupTable", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/batch", .operation_id = "batchWrite", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/constraints/repair", .operation_id = "repairRelationalConstraints", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/constraints/retire", .operation_id = "retireRelationalConstraints", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/constraints/retry", .operation_id = "retryRelationalConstraints", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/tables/{tableName}/constraints/status", .operation_id = "getRelationalConstraintStatus", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/destination-authorization", .operation_id = "reauthorizeTableDestinations", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/documents", .operation_id = "scanKeys", .request_body = .buffered, .streaming_response = true },
     .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}", .operation_id = "lookupKey", .request_body = .none, .streaming_response = false },
@@ -1351,6 +1543,8 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}", .operation_id = "createIndex", .request_body = .buffered, .streaming_response = false },
     .{ .method = "DELETE", .path = "/tables/{tableName}/indexes/{indexName}", .operation_id = "dropIndex", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}:{action}", .operation_id = "executeGraphMetricAction", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}/repair", .operation_id = "repairIndex", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}/retry", .operation_id = "retryIndex", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/merge", .operation_id = "linearMerge", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/query", .operation_id = "queryTable", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/repair/control-jobs", .operation_id = "startTableRepairControlJob", .request_body = .buffered, .streaming_response = false },
@@ -1361,6 +1555,8 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/tables/{tableName}/repair/jobs/{jobId}/cancel", .operation_id = "cancelTableRepairJob", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/repair/run", .operation_id = "runTableRepair", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/restore", .operation_id = "restoreTable", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/rows/mutate", .operation_id = "mutateRelationalRows", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/rows/query", .operation_id = "queryRelationalRows", .request_body = .buffered, .streaming_response = true },
     .{ .method = "PUT", .path = "/tables/{tableName}/schema", .operation_id = "updateSchema", .request_body = .buffered, .streaming_response = false },
     .{ .method = "PATCH", .path = "/tables/{tableName}/schema", .operation_id = "patchSchema", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/storage/migrations", .operation_id = "createTableStorageMigration", .request_body = .buffered, .streaming_response = false },
@@ -1434,15 +1630,23 @@ pub const routes = [_]Route{
 //   fn dropNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn backupNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn batchNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
+//   fn repairNamespaceRelationalConstraints(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
+//   fn retireNamespaceRelationalConstraints(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
+//   fn retryNamespaceRelationalConstraints(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
+//   fn getNamespaceRelationalConstraintStatus(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn lookupNamespaceTableDocument(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8, params: LookupNamespaceTableDocumentParams) !httpx.Response
 //   fn listNamespaceTableIndexes(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn getNamespaceTableIndex(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn createNamespaceTableIndex(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn dropNamespaceTableIndex(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn executeNamespaceTableGraphMetricAction(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8, metric_name: []const u8, action: []const u8) !httpx.Response
+//   fn repairNamespaceIndex(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response
+//   fn retryNamespaceIndex(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn queryNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn renameNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn restoreNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
+//   fn mutateNamespaceRelationalRows(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
+//   fn queryNamespaceRelationalRows(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn updateNamespaceTableSchema(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn patchNamespaceTableSchema(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn setNamespaceTableTablespace(self: *Impl, ctx: *httpx.Context, table_name: []const u8, database_name: []const u8, namespace_name: []const u8) !httpx.Response
@@ -1476,6 +1680,10 @@ pub const routes = [_]Route{
 //   fn cancelDocumentArtifactReprocessJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8, job_id: []const u8) !httpx.Response
 //   fn backupTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn batchWrite(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn repairRelationalConstraints(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn retireRelationalConstraints(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn retryRelationalConstraints(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn getRelationalConstraintStatus(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn reauthorizeTableDestinations(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn scanKeys(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn lookupKey(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: LookupKeyParams) !httpx.Response
@@ -1487,6 +1695,8 @@ pub const routes = [_]Route{
 //   fn createIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn dropIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn executeGraphMetricAction(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8, metric_name: []const u8, action: []const u8) !httpx.Response
+//   fn repairIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
+//   fn retryIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn linearMerge(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn queryTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn startTableRepairControlJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
@@ -1497,8 +1707,10 @@ pub const routes = [_]Route{
 //   fn cancelTableRepairJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8, job_id: []const u8) !httpx.Response
 //   fn runTableRepair(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn restoreTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
-//   fn updateSchema(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
-//   fn patchSchema(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn mutateRelationalRows(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn queryRelationalRows(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn updateSchema(self: *Impl, ctx: *httpx.Context, table_name: []const u8, params: UpdateSchemaParams) !httpx.Response
+//   fn patchSchema(self: *Impl, ctx: *httpx.Context, table_name: []const u8, params: PatchSchemaParams) !httpx.Response
 //   fn createTableStorageMigration(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn getTableStorageMigration(self: *Impl, ctx: *httpx.Context, table_name: []const u8, job_id: []const u8) !httpx.Response
 //   fn advanceTableStorageMigration(self: *Impl, ctx: *httpx.Context, table_name: []const u8, job_id: []const u8) !httpx.Response

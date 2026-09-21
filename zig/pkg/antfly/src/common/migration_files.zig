@@ -42,3 +42,34 @@ pub fn lockCatalog(alloc: std.mem.Allocator, io: std.Io, path: []const u8) !std.
         else => err,
     };
 }
+
+// The released stopped-server operator only understands JSON catalogs. New
+// standalone instances migrate authority into this sibling durable store;
+// changing their obsolete JSON file would leave native and catalog ownership
+// inconsistent. Reject before admitting a job or touching its source root.
+pub fn requireJsonCatalogAuthority(alloc: std.mem.Allocator, io: std.Io, catalog_path: []const u8) !void {
+    const authority_path = try std.fs.path.join(alloc, &.{ std.fs.path.dirname(catalog_path) orelse ".", "local-state" });
+    defer alloc.free(authority_path);
+    std.Io.Dir.cwd().access(io, authority_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    return error.VectorMigrationAuthoritativeCatalogUnsupported;
+}
+
+test "offline migration rejects authoritative metadata before changing legacy catalog" {
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const catalog_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog.json", .{tmp.sub_path});
+    defer alloc.free(catalog_path);
+    const original = "{\"epoch\":7,\"tables\":[],\"ranges\":[]}";
+    try tmp.dir.writeFile(io, .{ .sub_path = "catalog.json", .data = original });
+    try requireJsonCatalogAuthority(alloc, io, catalog_path);
+    try tmp.dir.createDir(io, "local-state", .default_dir);
+    try std.testing.expectError(error.VectorMigrationAuthoritativeCatalogUnsupported, requireJsonCatalogAuthority(alloc, io, catalog_path));
+    const unchanged = try tmp.dir.readFileAlloc(io, "catalog.json", alloc, .limited(1024));
+    defer alloc.free(unchanged);
+    try std.testing.expectEqualStrings(original, unchanged);
+}

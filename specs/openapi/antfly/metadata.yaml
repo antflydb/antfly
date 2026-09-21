@@ -5448,6 +5448,158 @@ components:
             matching keys in the range. Useful for pagination or sampling.
           example: 100
 
+    RelationalRowCondition:
+      type: object
+      additionalProperties: false
+      required: [column, op]
+      properties:
+        column:
+          type: string
+          minLength: 1
+        op:
+          $ref: "schema.yaml#/components/schemas/RelationalComparisonOp"
+        value:
+          description: Typed scalar operand. Omission means NULL. Integer columns also accept exact decimal strings.
+        collation:
+          type: string
+
+    RelationalRowQueryRequest:
+      type: object
+      additionalProperties: false
+      required: [fields]
+      description: |
+        Bounded relational scan in primary-key order, or composite index order
+        when index is supplied. Index queries require schema_version and every
+        owning shard must have the selected generation ready. Partial indexes
+        require their WHERE predicates to be implied by the query conditions.
+        The bounded proof combines per-column equality, tighter ranges,
+        exclusions, and NULL-aware predicates using exact typed values and
+        matching collations. Unsupported implications fail closed. Explicit
+        scan bounds alone are not an implication proof. Equal tuples are
+        ordered by primary key. Each shard read pins its own immutable schema
+        and row snapshot; this is not a table-wide consistent snapshot.
+        Resume with the last returned _id as from for primary scans, or its
+        cursor as after for index scans. A resumed request opens a fresh snapshot,
+        not a retained cursor; concurrent mutations may move rows across the
+        continuation boundary. Keep index, bounds and conditions unchanged when paging.
+        An empty projection returns row identities and versions only.
+      properties:
+        index:
+          type: string
+          minLength: 1
+          description: Ready composite secondary index. Requires schema_version; cannot be combined with from/to.
+        after:
+          type: string
+          maxLength: 2097248
+          description: Opaque exclusive index-order cursor from the last returned row. Binds the immutable schema version, logical index name, and comparison semantics, independent of owner-local physical generations. Each owner must still prove its current local index is ready.
+        lower:
+          $ref: "#/components/schemas/RelationalRowIndexBound"
+        upper:
+          $ref: "#/components/schemas/RelationalRowIndexBound"
+        fields:
+          type: array
+          maxItems: 256
+          items:
+            type: string
+            minLength: 1
+        conditions:
+          type: array
+          maxItems: 256
+          items:
+            $ref: "#/components/schemas/RelationalRowCondition"
+        from:
+          type: string
+          description: Exclusive lower primary-key bound, including pagination continuation.
+        to:
+          type: string
+          description: Exclusive upper primary-key bound.
+        limit:
+          type: integer
+          format: uint32
+          minimum: 1
+          maximum: 4096
+          default: 128
+        schema_version:
+          type: integer
+          format: uint32
+          x-go-type-skip-optional-pointer: false
+          description: Reject the read if an owning shard has a different active schema epoch. Zero is a valid epoch and is distinct from omission.
+
+    RelationalRowIndexBound:
+      type: object
+      additionalProperties: false
+      required: [values]
+      description: >
+        Typed left-prefix bound in declared index order, including descending
+        components. Inclusive bounds include the entire matching prefix.
+        Integer components accept exact decimal strings; null is an indexed null.
+      properties:
+        values:
+          type: array
+          minItems: 1
+          maxItems: 256
+          items: {}
+        inclusive:
+          type: boolean
+          default: true
+
+    RelationalRow:
+      type: object
+      required: [_id, row, version, schema_version]
+      properties:
+        cursor:
+          type: string
+          description: Opaque index-order continuation; present only for secondary-index queries.
+        _id:
+          type: string
+        row:
+          type: object
+          additionalProperties: true
+        version:
+          type: string
+          pattern: '^[0-9]+$'
+          description: Exact row version for mutation preconditions, encoded as decimal text.
+        schema_version:
+          type: integer
+          format: uint32
+          description: Active pinned schema epoch, not the historical physical row layout.
+
+    RelationalRowMutation:
+      type: object
+      additionalProperties: false
+      required: [key, expected_version]
+      description: A complete row replacement, or deletion when row is omitted. No read-modify-write is implied.
+      properties:
+        key:
+          type: string
+          minLength: 1
+        expected_version:
+          type: string
+          pattern: '^[0-9]+$'
+          description: Exact observed version. Zero requires that the row does not exist.
+        row:
+          type: object
+          additionalProperties: true
+
+    RelationalRowMutationRequest:
+      type: object
+      additionalProperties: false
+      required: [schema_version, mutations]
+      description: Atomic version-conditional typed-row replacements and deletions using the durable distributed transaction coordinator.
+      properties:
+        schema_version:
+          type: integer
+          format: uint32
+          description: Required active relational schema epoch, fenced during every participant prepare.
+        mutations:
+          type: array
+          minItems: 1
+          maxItems: 4096
+          items:
+            $ref: "#/components/schemas/RelationalRowMutation"
+        sync_level:
+          $ref: "#/components/schemas/SyncLevel"
+
     BatchRequest:
       type: object
       description: |
@@ -5752,6 +5904,110 @@ components:
             - prepare
             - resolve
           description: 2PC participant phase that reported the conflict.
+    RelationalConstraintConflictReason:
+      type: string
+      enum: [unique_constraint_violation, foreign_key_parent_missing, foreign_key_referenced]
+      description: Deterministic relational integrity failure; changing the mutation or data is required before retry.
+    RelationalConstraintActivationPhase:
+      type: string
+      enum: [unique, foreign_key, check]
+    RelationalConstraintRangeStatus:
+      type: object
+      required: [group_id, state, phase, rows_scanned, owner]
+      properties:
+        group_id:
+          type: string
+          description: Exact owner group identifier as decimal text.
+        state:
+          $ref: "schema.yaml#/components/schemas/RelationalConstraintValidationState"
+        phase:
+          $ref: "#/components/schemas/RelationalConstraintActivationPhase"
+        rows_scanned:
+          type: string
+          description: Exact cumulative validation row count as decimal text.
+        owner:
+          type: string
+          description: Opaque namespace-and-range ownership digest.
+        failure:
+          type: string
+    RelationalConstraintRetryRequest:
+      type: object
+      additionalProperties: false
+      required: [schema_version]
+      properties:
+        schema_version:
+          type: integer
+          minimum: 0
+          maximum: 4294967295
+    RelationalConstraintRetryResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [accepted]
+    RelationalConstraintRetirementRequest:
+      type: object
+      additionalProperties: false
+      required: [schema_version]
+      description: |
+        Supply exactly one of target_schema or drop=true. A target schema may
+        only remove UNIQUE/FK definitions; all other schema properties must
+        remain unchanged. Its version is assigned by the server. Retirement
+        fences primary mutations while existing reference and claim records
+        are drained. External foreign keys referencing removed definitions
+        must be retired first.
+      properties:
+        schema_version:
+          type: integer
+          minimum: 0
+          maximum: 4294967295
+        target_schema:
+          $ref: "schema.yaml#/components/schemas/TableSchema"
+        drop:
+          type: boolean
+          default: false
+          description: Prepare for explicit table deletion; this operation does not delete the table.
+    RelationalConstraintRetirementStatus:
+      type: object
+      required: [id, phase, drop, target_schema_version]
+      properties:
+        id:
+          type: string
+          description: Opaque retirement job identity.
+        phase:
+          type: string
+          enum: [fencing, foreign_keys, unique, publishing, published, ready_to_drop]
+        drop:
+          type: boolean
+        target_schema_version:
+          type: integer
+          format: uint32
+        failure:
+          type: string
+          description: |
+            Durable diagnostic that pauses the job. Retry resumes the exact
+            checkpoint after the cause is addressed; it does not undo a partial
+            drain or permit primary mutations while retirement is active.
+    RelationalConstraintStatus:
+      type: object
+      required: [schema_version, coverage_kind, state, ranges]
+      properties:
+        schema_version:
+          type: integer
+          format: uint32
+        coverage_kind:
+          type: string
+          enum: [unique_foreign_key_and_check]
+          description: Distributed UNIQUE, foreign-key, and scalar CHECK coverage across every current table owner. Native local validation is not a substitute for this coordinated proof.
+        state:
+          $ref: "schema.yaml#/components/schemas/RelationalConstraintValidationState"
+        ranges:
+          type: array
+          items:
+            $ref: "#/components/schemas/RelationalConstraintRangeStatus"
+        retirement:
+          $ref: "#/components/schemas/RelationalConstraintRetirementStatus"
     TransactionConflict:
       type: object
       description: Structured details for an aborted transaction attempt.
@@ -5771,6 +6027,8 @@ components:
         message:
           type: string
           description: Human-readable conflict description.
+        reason:
+          $ref: "#/components/schemas/RelationalConstraintConflictReason"
         kind:
           type: string
           enum:
@@ -6156,6 +6414,13 @@ components:
             paths resolve beneath the connection root.
     ClusterBackupRequest:
       type: object
+      description: |
+        Native cluster backups pin a common transaction cut across a dependency-complete
+        table set. Restart-stable LSM seals are journaled before releasing write fences;
+        artifact upload uses those immutable seals without holding the write pause.
+        Native cohorts support at most 4096 tables and 4096 ranges and require the
+        filesystem-managed LSM backend. Portable backups do not support coordinated
+        UNIQUE/FK constraints or promise a common cross-table transaction cut.
       additionalProperties: false
       required:
         - backup_id
@@ -6273,6 +6538,16 @@ components:
           description: Opaque artifact generation retained by an ambiguous cluster attempt.
     ClusterRestoreRequest:
       type: object
+      description: |
+        Native cohort restores use the existing asynchronous restore job to provision
+        hidden fresh generations, import rows, rebuild indexes and coordinated constraints,
+        and publish the dependency-complete target set atomically. Document, relational,
+        and mixed native cohorts use the same workflow (at most 128 tables/4096 ranges).
+        Skipping a live parent cannot substitute it for a parent generation required by
+        a restored child. Overwrite retains the old generation until validation and
+        cutover; cancellation after publication completes publication rather than rollback.
+        Reserved destination authorization is immutable: changing principal requires
+        canceling the old job and creating a new restore.
       additionalProperties: false
       required:
         - backup_id
@@ -11850,6 +12125,232 @@ paths:
           $ref: "#/components/responses/QueryGatewayTimeout"
         "500":
           $ref: "#/components/responses/QueryInternalServerError"
+  /tables/{tableName}/constraints/status:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: getRelationalConstraintStatus
+      summary: Read distributed UNIQUE, foreign-key, and CHECK validation coverage
+      tags: [data_operations]
+      responses:
+        "200":
+          description: Epoch- and owner-fenced validation status for every active range.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RelationalConstraintStatus"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Schema or ownership changed during status collection.
+        "503":
+          description: One or more current owners could not report authoritative coverage.
+  /tables/{tableName}/constraints/repair:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: repairRelationalConstraints
+      summary: Repair version-conditional rows after failed or diagnosed constraint activation
+      description: |
+        Requires table administrator permission. Each affected target range must
+        have failed UNIQUE/FK/CHECK activation or a validating MATCH PARTIAL
+        missing-parent diagnostic. Replacement values still satisfy all
+        constraints, and referential actions require write permission on every
+        affected table. Existing dependencies remain protected. Repairs do not
+        mark historical coverage valid. Invoke constraint retry after repairing
+        failed activation; validating diagnostics resume validation automatically.
+      tags: [data_operations]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RelationalRowMutationRequest"
+      responses:
+        "201":
+          description: Repair transaction committed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchResponse"
+        "202":
+          description: Commit is durable; visibility or participant recovery is pending.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          description: Administrator or affected-table write permission is missing.
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Activation, schema, row version, or constraint changed.
+        "503":
+          description: Write coordination is temporarily unavailable.
+  /tables/{tableName}/constraints/retry:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: retryRelationalConstraints
+      summary: Restart failed UNIQUE/FK/CHECK validation after administrative repair
+      description: |
+        Requires table administrator permission. Resets each failed owner using
+        an exact checkpoint precondition. Owners already validating or enforced
+        are unchanged. Retrying after partial progress is safe. Inspect the
+        constraint status endpoint for coverage and diagnostics.
+        When a retirement job is active, clears its paused diagnostic and
+        resumes that job instead of restarting activation. Retirement remains
+        fenced and retains all prior drain progress.
+      tags: [data_operations]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RelationalConstraintRetryRequest"
+      responses:
+        "202":
+          description: Failed owner checkpoints reset; background validation is pending.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RelationalConstraintRetryResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          description: Administrator permission is missing.
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Schema or activation state changed; refresh and retry.
+        "503":
+          description: Some owners could not be reset; repeating the request is safe.
+  /tables/{tableName}/constraints/retire:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: retireRelationalConstraints
+      summary: Retire unique and foreign-key definitions safely
+      description: |
+        Requires table administrator permission. Starts a durable, bounded
+        all-owner drain. Poll constraints/status for progress. A target schema
+        is published automatically after the drain. With drop=true the table
+        remains fenced at ready_to_drop until an administrator explicitly
+        deletes it with the existing table deletion endpoint.
+      tags: [data_operations]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RelationalConstraintRetirementRequest"
+      responses:
+        "202":
+          description: Retirement accepted; no data or schema publication is implied yet.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RelationalConstraintRetryResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          description: Administrator permission is missing.
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Schema, retirement state, topology, or incoming foreign-key dependency changed.
+        "503":
+          description: Retirement coordination is temporarily unavailable.
+  /tables/{tableName}/rows/query:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: queryRelationalRows
+      summary: Query projected typed relational rows
+      tags: [data_operations]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RelationalRowQueryRequest"
+      responses:
+        "200":
+          description: Bounded newline-delimited typed rows in primary-key order.
+          content:
+            application/x-ndjson:
+              schema:
+                type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Requested schema epoch is stale.
+        "503":
+          description: Read ownership or storage is temporarily unavailable.
+  /tables/{tableName}/rows/mutate:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: mutateRelationalRows
+      summary: Atomically replace or delete version-conditional typed rows
+      tags: [data_operations]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RelationalRowMutationRequest"
+      responses:
+        "201":
+          description: Atomic mutations committed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchResponse"
+        "202":
+          description: Durable commit decision; participant visibility or recovery is pending.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: A version precondition or relational constraint conflicted.
+        "503":
+          description: Write coordination is temporarily unavailable.
   /tables/{tableName}/batch:
     parameters:
       - name: tableName
@@ -12151,6 +12652,31 @@ paths:
         description: Name of the table
         schema:
           type: string
+      - name: rewrite
+        in: query
+        required: false
+        description: |
+          Explicitly enqueue a durable fresh-generation schema rewrite instead
+          of changing the live schema. Requires administrator permission on the
+          entire dependency cohort. Sources remain writable during snapshot and
+          catch-up; final validation and publication are atomic across the cohort.
+          Returns a restore job (202), whose existing status/cancel routes apply.
+          Independent graph/vector artifacts without a retained row-derived
+          source proof are rejected before admission. The default false retains
+          ordinary schema-update behavior. Existing absent values remain absent
+          rather than retroactively receiving defaults. Stored column type
+          changes and destructive column removal are rejected.
+        schema:
+          type: boolean
+          default: false
+      - name: Idempotency-Key
+        in: header
+        required: false
+        description: Retry identity for rewrite=true admission. Reusing a key for a different rewrite returns 409.
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 256
     put:
       summary: Replace a table's schema
       description: |
@@ -12188,7 +12714,17 @@ paths:
               schema:
                 $ref: "#/components/schemas/Table"
         "202":
-          $ref: "#/components/responses/CommittedMutationAccepted"
+          description: Durable rewrite job accepted, or ordinary schema mutation committed with pending visibility
+          headers:
+            Location:
+              description: Restore job status URL when rewrite=true.
+              schema: { type: string }
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/RestoreJob"
+                  - $ref: "#/components/schemas/CommittedMutationOutcome"
         "400":
           $ref: "#/components/responses/BadRequest"
         "404":
@@ -12238,7 +12774,17 @@ paths:
               schema:
                 $ref: "#/components/schemas/Table"
         "202":
-          $ref: "#/components/responses/CommittedMutationAccepted"
+          description: Durable rewrite job accepted, or ordinary schema mutation committed with pending visibility
+          headers:
+            Location:
+              description: Restore job status URL when rewrite=true.
+              schema: { type: string }
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/RestoreJob"
+                  - $ref: "#/components/schemas/CommittedMutationOutcome"
         "400":
           $ref: "#/components/responses/BadRequest"
         "404":
@@ -13321,6 +13867,98 @@ paths:
           $ref: "#/components/responses/NotFound"
         "500":
           $ref: "#/components/responses/InternalServerError"
+  /tables/{tableName}/indexes/{indexName}/retry:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: indexName
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      summary: Retry a failed index build
+      description: >-
+        Generation-fenced relational index maintenance. Requires table ADMIN permission.
+        Retry accepts failed generations.
+        Owners are admitted independently and durably; exact request replay resumes
+        after partial acknowledgements. Unsupported index types return 405.
+      tags: [index_management]
+      operationId: retryIndex
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "indexes.yaml#/components/schemas/IndexMaintenanceRequest"
+      responses:
+        "200":
+          description: All selected owner maintenance commands acknowledged
+          content:
+            application/json:
+              schema:
+                $ref: "indexes.yaml#/components/schemas/IndexMaintenanceResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+        "409":
+          $ref: "#/components/responses/IndexMutationConflict"
+        "429":
+          $ref: "#/components/responses/StorageResourceExhausted"
+        "503":
+          $ref: "#/components/responses/IndexMutationServiceUnavailable"
+  /tables/{tableName}/indexes/{indexName}/repair:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: indexName
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      summary: Repair an index generation
+      description: >-
+        Generation-fenced relational index maintenance. Requires table ADMIN permission.
+        Repair accepts ready or failed generations and rebuilds their derived records.
+        Owners are admitted independently and durably; exact request replay resumes
+        after partial acknowledgements. Unsupported index types return 405.
+      tags: [index_management]
+      operationId: repairIndex
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "indexes.yaml#/components/schemas/IndexMaintenanceRequest"
+      responses:
+        "200":
+          description: All selected owner maintenance commands acknowledged
+          content:
+            application/json:
+              schema:
+                $ref: "indexes.yaml#/components/schemas/IndexMaintenanceResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+        "409":
+          $ref: "#/components/responses/IndexMutationConflict"
+        "429":
+          $ref: "#/components/responses/StorageResourceExhausted"
+        "503":
+          $ref: "#/components/responses/IndexMutationServiceUnavailable"
   /tables/{tableName}/indexes/{indexName}:
     parameters:
       - name: tableName
@@ -14530,6 +15168,396 @@ paths:
           $ref: "#/components/responses/InternalServerError"
         "501":
           description: Catalog target cannot be delegated to legacy table storage unambiguously.
+
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/status:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: { type: string }
+      - name: namespaceName
+        in: path
+        required: true
+        schema: { type: string }
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: getNamespaceRelationalConstraintStatus
+      summary: Read distributed UNIQUE, foreign-key, and CHECK validation coverage
+      tags: [data_operations]
+      responses:
+        "200":
+          description: Epoch- and owner-fenced validation status for every active range.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RelationalConstraintStatus"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Schema or ownership changed during status collection.
+        "503":
+          description: One or more current owners could not report authoritative coverage.
+
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/repair:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: { type: string }
+      - name: namespaceName
+        in: path
+        required: true
+        schema: { type: string }
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: repairNamespaceRelationalConstraints
+      summary: Repair version-conditional rows after failed or diagnosed constraint activation
+      description: |
+        Requires table administrator permission. Each affected target range must
+        have failed UNIQUE/FK/CHECK activation or a validating MATCH PARTIAL
+        missing-parent diagnostic. Replacement values still satisfy all
+        constraints, and referential actions require write permission on every
+        affected table. Existing dependencies remain protected. Repairs do not
+        mark historical coverage valid. Invoke constraint retry after repairing
+        failed activation; validating diagnostics resume validation automatically.
+      tags: [data_operations]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RelationalRowMutationRequest"
+      responses:
+        "201":
+          description: Repair transaction committed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchResponse"
+        "202":
+          description: Commit is durable; visibility or participant recovery is pending.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          description: Administrator or affected-table write permission is missing.
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Activation, schema, row version, or constraint changed.
+        "503":
+          description: Write coordination is temporarily unavailable.
+
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/retry:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: { type: string }
+      - name: namespaceName
+        in: path
+        required: true
+        schema: { type: string }
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: retryNamespaceRelationalConstraints
+      summary: Restart failed UNIQUE/FK/CHECK validation after administrative repair
+      description: |
+        Requires table administrator permission. Resets each failed owner using
+        an exact checkpoint precondition. Owners already validating or enforced
+        are unchanged. Retrying after partial progress is safe. Inspect the
+        constraint status endpoint for coverage and diagnostics.
+        When a retirement job is active, clears its paused diagnostic and
+        resumes that job instead of restarting activation. Retirement remains
+        fenced and retains all prior drain progress.
+      tags: [data_operations]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RelationalConstraintRetryRequest"
+      responses:
+        "202":
+          description: Failed owner checkpoints reset; background validation is pending.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RelationalConstraintRetryResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          description: Administrator permission is missing.
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Schema or activation state changed; refresh and retry.
+        "503":
+          description: Some owners could not be reset; repeating the request is safe.
+
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/retire:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: { type: string }
+      - name: namespaceName
+        in: path
+        required: true
+        schema: { type: string }
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: retireNamespaceRelationalConstraints
+      summary: Retire unique and foreign-key definitions safely
+      description: |
+        Requires table administrator permission. Starts a durable, bounded
+        all-owner drain. Poll constraints/status for progress. A target schema
+        is published automatically after the drain. With drop=true the table
+        remains fenced at ready_to_drop until an administrator explicitly
+        deletes it with the existing table deletion endpoint.
+      tags: [data_operations]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RelationalConstraintRetirementRequest"
+      responses:
+        "202":
+          description: Retirement accepted; no data or schema publication is implied yet.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RelationalConstraintRetryResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          description: Administrator permission is missing.
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Schema, retirement state, topology, or incoming foreign-key dependency changed.
+        "503":
+          description: Retirement coordination is temporarily unavailable.
+
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rows/query:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: { type: string }
+      - name: namespaceName
+        in: path
+        required: true
+        schema: { type: string }
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: queryNamespaceRelationalRows
+      summary: Query projected typed relational rows
+      tags: [data_operations]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RelationalRowQueryRequest"
+      responses:
+        "200":
+          description: Bounded newline-delimited typed rows in primary-key order.
+          content:
+            application/x-ndjson:
+              schema:
+                type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Requested schema epoch is stale.
+        "503":
+          description: Read ownership or storage is temporarily unavailable.
+
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rows/mutate:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: { type: string }
+      - name: namespaceName
+        in: path
+        required: true
+        schema: { type: string }
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: mutateNamespaceRelationalRows
+      summary: Atomically replace or delete version-conditional typed rows
+      tags: [data_operations]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RelationalRowMutationRequest"
+      responses:
+        "201":
+          description: Atomic mutations committed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchResponse"
+        "202":
+          description: Durable commit decision; participant visibility or recovery is pending.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: A version precondition or relational constraint conflicted.
+        "503":
+          description: Write coordination is temporarily unavailable.
+
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/retry:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: { type: string }
+      - name: namespaceName
+        in: path
+        required: true
+        schema: { type: string }
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: indexName
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      summary: Retry a failed index build
+      description: >-
+        Generation-fenced relational index maintenance. Requires table ADMIN permission.
+        Retry accepts failed generations.
+        Owners are admitted independently and durably; exact request replay resumes
+        after partial acknowledgements. Unsupported index types return 405.
+      tags: [index_management]
+      operationId: retryNamespaceIndex
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "indexes.yaml#/components/schemas/IndexMaintenanceRequest"
+      responses:
+        "200":
+          description: All selected owner maintenance commands acknowledged
+          content:
+            application/json:
+              schema:
+                $ref: "indexes.yaml#/components/schemas/IndexMaintenanceResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+        "409":
+          $ref: "#/components/responses/IndexMutationConflict"
+        "429":
+          $ref: "#/components/responses/StorageResourceExhausted"
+        "503":
+          $ref: "#/components/responses/IndexMutationServiceUnavailable"
+
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/repair:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: { type: string }
+      - name: namespaceName
+        in: path
+        required: true
+        schema: { type: string }
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: indexName
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      summary: Repair an index generation
+      description: >-
+        Generation-fenced relational index maintenance. Requires table ADMIN permission.
+        Repair accepts ready or failed generations and rebuilds their derived records.
+        Owners are admitted independently and durably; exact request replay resumes
+        after partial acknowledgements. Unsupported index types return 405.
+      tags: [index_management]
+      operationId: repairNamespaceIndex
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "indexes.yaml#/components/schemas/IndexMaintenanceRequest"
+      responses:
+        "200":
+          description: All selected owner maintenance commands acknowledged
+          content:
+            application/json:
+              schema:
+                $ref: "indexes.yaml#/components/schemas/IndexMaintenanceResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+        "409":
+          $ref: "#/components/responses/IndexMutationConflict"
+        "429":
+          $ref: "#/components/responses/StorageResourceExhausted"
+        "503":
+          $ref: "#/components/responses/IndexMutationServiceUnavailable"
 
   /databases/{databaseName}/rename:
     post:

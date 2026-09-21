@@ -8064,6 +8064,26 @@ pub const IndexManager = struct {
         artifacts: std.ArrayListUnmanaged(Artifact) = .empty,
         native_files: ?native_backup.PinnedGeneratedArtifacts = null,
 
+        pub fn walPrefixBytes(self: *const NativeBackupCheckpoints) !u64 {
+            return if (self.native_files) |*files| try files.walPrefixBytes() else 0;
+        }
+
+        pub fn seal(self: *NativeBackupCheckpoints, io: std.Io, root: []const u8, cancellation: CancellationToken, wal_budget: u64) !u64 {
+            if (try self.walPrefixBytes() > wal_budget) return error.BackupSealWalBudgetExceeded;
+            var total: u64 = 0;
+            for (self.artifacts.items) |*artifact| {
+                const destination = try std.fmt.allocPrint(self.alloc, "{s}/indexes/{s}/{s}", .{ root, artifact.index_name, artifact.backend_root });
+                defer self.alloc.free(destination);
+                const bytes = switch (artifact.checkpoint) {
+                    .lsm => |*checkpoint| try checkpoint.seal(io, destination, cancellation),
+                    .text_segments => |*checkpoint| try checkpoint.seal(self.alloc, io, destination, cancellation),
+                };
+                total = std.math.add(u64, total, bytes) catch return error.FileTooBig;
+            }
+            if (self.native_files) |*files| total = std.math.add(u64, total, try files.seal(root, cancellation, wal_budget)) catch return error.FileTooBig;
+            return total;
+        }
+
         const Artifact = struct {
             index_name: []u8,
             backend_root: []const u8,
@@ -20891,6 +20911,7 @@ pub const IndexManager = struct {
         defer runtime_store.deinit();
         var txn = try runtime_store.store.beginWrite();
         errdefer txn.abort();
+        try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, enrichment_catalog_key, data);
         try txn.put(enrichment_catalog_key, data);
         try txn.commit();
         // Enrichment definitions are part of the immutable foreground write
@@ -20969,6 +20990,7 @@ pub const IndexManager = struct {
         defer runtime_store.deinit();
         var txn = try runtime_store.store.beginWrite();
         errdefer txn.abort();
+        try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, resolver_catalog_key, data);
         try txn.put(resolver_catalog_key, data);
         if (mode == .mark_reresolve_dirty) {
             try txn.put(resolver_catalog.reresolve_resume_key, "");

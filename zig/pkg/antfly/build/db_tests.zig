@@ -433,6 +433,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "match_all sorted segment seek zero limit returns profile without scanning",
         "match_all sorted segment seek rejects cursor when segment bounds are unavailable",
         "match_all projected source load rejects expired deadline before batch load",
+        "projected source batches",
         "dense projected source load rejects expired deadline before load",
         "match_all unordered source loads selected hits through projected batch",
         "text field sort uses sorted segment membership path when index sort matches",

@@ -90,6 +90,7 @@ fn BoundaryImpl(comptime VTable: type) type {
             args: *const anyopaque,
             output: ?*anyopaque,
         ) callconv(.c) error_abi.Status {
+            @setEvalBranchQuota(64 * std.meta.fields(VTable).len);
             if (contract.version != native_abi.abi_version)
                 return error_abi.statusFromError(error.UnsupportedVersion);
             inline for (std.meta.fields(VTable)) |field| {
@@ -241,6 +242,10 @@ test "boundary dispatcher preserves local calls and maps cross-unit calls" {
             return error.StorageReadTemporarilyUnavailable;
         }
 
+        fn concurrencyUnavailable(_: *u32) anyerror!void {
+            return error.ConcurrencyUnavailable;
+        }
+
         fn topologyUpgradeRequired(_: *u32) anyerror!void {
             return error.TableTopologyProtocolUpgradeRequired;
         }
@@ -315,6 +320,10 @@ test "boundary dispatcher preserves local calls and maps cross-unit calls" {
     try std.testing.expectError(
         error.StorageReadTemporarilyUnavailable,
         TestBoundary.call("retryable_fail", &callbacks.foreignDispatch, &callbacks.storageReadUnavailable, .{&base}),
+    );
+    try std.testing.expectError(
+        error.ConcurrencyUnavailable,
+        TestBoundary.call("retryable_fail", &callbacks.foreignDispatch, &callbacks.concurrencyUnavailable, .{&base}),
     );
     try std.testing.expectError(
         error.TableTopologyProtocolUpgradeRequired,

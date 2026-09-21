@@ -502,13 +502,22 @@ def _seed_cluster(monkeypatch, outcomes):
             response.headers.update(headers[0])
         return response
 
+    def get(url, **kwargs):
+        # Create admission tests start with an absent, uniquely named table.
+        response = requests.Response()
+        response.status_code = 404
+        response._content = b"table not found"
+        response.url = url
+        response.request = requests.Request("GET", url).prepare()
+        return response
+
     return (
         SimpleNamespace(
             data_api_urls=["http://localhost/db/v1"],
             assert_processes_alive=lambda: None,
             debug_logs=lambda: "cluster write diagnostics",
         ),
-        SimpleNamespace(post=post),
+        SimpleNamespace(post=post, get=get),
         calls,
     )
 
@@ -676,13 +685,25 @@ def test_cluster_seed_waits_for_precommit_write_admission(monkeypatch):
 def test_cluster_seed_preserves_non_admission_failures(monkeypatch, outcome):
     cluster, session, calls = _seed_cluster(monkeypatch, [outcome])
     with pytest.raises(AssertionError, match="cluster write diagnostics") as failure:
-        backups._seed_cluster_docs_when_writable(cluster, session, "docs", {})
+        backups._seed_cluster_docs_when_writable(
+            cluster, session, "docs", {"doc:a": {"title": "a"}}
+        )
     if isinstance(outcome, Exception):
-        assert failure.value.__cause__ is outcome
+        # The mutation helper deliberately shields transport failures from the
+        # read-polling retry policy, while retaining the original exception.
+        assert isinstance(failure.value.__cause__, AssertionError)
+        assert failure.value.__cause__.__cause__ is outcome
     else:
         assert f"last_status={outcome[0]}" in str(failure.value)
         assert outcome[1].decode() in str(failure.value)
     assert len(calls) == 1
+
+
+def test_cluster_seed_rejects_empty_expectations_without_sending(monkeypatch):
+    cluster, session, calls = _seed_cluster(monkeypatch, [])
+    with pytest.raises(AssertionError, match="expected a nonempty batch"):
+        backups._seed_cluster_docs_when_writable(cluster, session, "docs", {})
+    assert calls == []
 
 
 def test_cluster_seed_deadline_retains_cluster_diagnostics(monkeypatch):
@@ -691,7 +712,7 @@ def test_cluster_seed_deadline_retains_cluster_diagnostics(monkeypatch):
     )
     with pytest.raises(AssertionError, match="cluster write diagnostics"):
         backups._seed_cluster_docs_when_writable(
-            cluster, session, "docs", {}, timeout_s=0.25
+            cluster, session, "docs", {"doc:a": {"title": "a"}}, timeout_s=0.25
         )
     assert len(calls) == 3
     assert calls[-1]["timeout"] < calls[0]["timeout"]
@@ -706,7 +727,9 @@ def test_cluster_seed_stops_when_server_exits(monkeypatch):
 
     cluster.assert_processes_alive = assert_alive
     with pytest.raises(RuntimeError, match="data server exited"):
-        backups._seed_cluster_docs_when_writable(cluster, session, "docs", {})
+        backups._seed_cluster_docs_when_writable(
+            cluster, session, "docs", {"doc:a": {"title": "a"}}
+        )
     assert len(calls) == 1
 
 
@@ -768,7 +791,7 @@ def test_cluster_seed_observes_uncertain_commit_without_replaying(monkeypatch, v
         assert reads == ["a", "b"]
     else:
         with pytest.raises(
-            AssertionError, match="did not commit every expected document"
+            AssertionError, match="did not expose every expected document mutation"
         ):
             backups._seed_cluster_docs_when_writable(
                 cluster, session, "docs", docs, timeout_s=0.25

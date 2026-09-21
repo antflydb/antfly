@@ -66,6 +66,10 @@ pub fn classifyCreateTableRequestError(err: anyerror) CreateTableRequestErrorDis
 
 pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tables_api.CreateTableRequest {
     if (body.len == 0) return .{ .indexes_json = try coverage_policy.withMissingIncarnationsAlloc(alloc, tables_api.default_indexes_json) };
+    if (try @import("relational_index_mutation.zig").normalizeCreateTableBody(alloc, body)) |normalized| {
+        defer alloc.free(normalized);
+        return parseCreateTableRequest(alloc, normalized);
+    }
 
     // Validate and normalize indexes from the raw request before invoking the
     // generated parser. The generated OpenAPI parser rejects unknown enum
@@ -110,6 +114,7 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
             alloc,
             fallback.indexes_json orelse tables_api.default_indexes_json,
         );
+        try @import("../schema/relational_index_namespace.zig").validate(alloc, fallback.schema_json orelse "", fallback.indexes_json orelse tables_api.default_indexes_json);
         return fallback;
     };
     defer parsed.deinit();
@@ -139,7 +144,12 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
     }
     try validateCreateTableIndexSemantics(alloc, req.indexes_json.?);
 
-    if (raw_root.get("schema")) |schema_value| {
+    // The generated scalar parser and artifact validators use machine
+    // numbers. Extract only schema separately so typed literals retain their
+    // original tokens instead of rounding before schema validation.
+    var exact_schema = try std.json.parseFromSlice(struct { schema: ?std.json.Value = null }, alloc, body, .{ .ignore_unknown_fields = true, .parse_numbers = false });
+    defer exact_schema.deinit();
+    if (exact_schema.value.schema) |schema_value| {
         if (schema_value != .null) {
             const raw_schema = try stringifyJsonAlloc(alloc, schema_value);
             defer alloc.free(raw_schema);
@@ -157,6 +167,8 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
     if (parsed.value.replication_sources) |replication_sources| {
         req.replication_sources_json = try stringifyJsonAlloc(alloc, replication_sources);
     }
+
+    try @import("../schema/relational_index_namespace.zig").validate(alloc, req.schema_json orelse "", req.indexes_json.?);
 
     if (req.num_shards) |num_shards| {
         if (num_shards == 0) return error.InvalidCreateTableRequest;
@@ -362,7 +374,10 @@ pub fn createTableRequestErrorMessage(err: anyerror, body: []const u8) []const u
 pub fn parseCreateIndexRequest(alloc: std.mem.Allocator, index_name: []const u8, body: []const u8) ![]u8 {
     if (body.len == 0) return error.InvalidCreateIndexRequest;
 
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    // Typed literal binding must see the caller's exact numeric token. Keep
+    // artifact validation's established numeric representation unchanged.
+    const relational = try @import("relational_index_mutation.zig").isRelational(alloc, body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{ .parse_numbers = !relational });
     defer parsed.deinit();
     const root = switch (parsed.value) {
         .object => |object| object,
@@ -611,6 +626,13 @@ fn validatePublicIndexFieldRelationships(object: anytype, index_type: public_ind
             }
         },
         .algebraic => {},
+        .relational => {
+            const keys = indexObjectGet(object, "keys") orelse return error.InvalidCreateIndexRequest;
+            try validatePublicCreatedShape(keys, .relational_keys);
+            if (indexObjectGet(object, "where")) |conditions| {
+                if (conditions != .null) try validatePublicCreatedShape(conditions, .relational_predicates);
+            }
+        },
     }
 }
 

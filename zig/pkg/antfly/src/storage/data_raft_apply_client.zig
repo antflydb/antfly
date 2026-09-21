@@ -23,6 +23,7 @@ pub const RaftApplyStoreConfig = struct {
     root_dir: []const u8,
     no_sync: bool = false,
     read_only: bool = false,
+    native_source_delegate: bool = false,
     context: ?*anyopaque = null,
 };
 
@@ -36,6 +37,7 @@ pub const AppliedDataBatch = struct {
 };
 
 pub const RaftApplyStore = struct {
+    native_snapshot_delegate: ?@import("../raft/native_snapshot_delegate.zig").Delegate = null,
     handle: ?*anyopaque,
 
     pub fn init(_: std.mem.Allocator, cfg: RaftApplyStoreConfig) !RaftApplyStore {
@@ -43,6 +45,7 @@ pub const RaftApplyStore = struct {
         try statusToError(abi.antfly_data_apply_store_open(&.{
             .no_sync = @intFromBool(cfg.no_sync),
             .read_only = @intFromBool(cfg.read_only),
+            .native_source_delegate = @intFromBool(cfg.native_source_delegate),
             .context = cfg.context,
             .root_dir = .fromSlice(cfg.root_dir),
         }, &handle));
@@ -138,6 +141,12 @@ pub const RaftApplyStore = struct {
         return try projection_wire.decodeSplitControlAlloc(alloc, response.slice());
     }
 
+    pub fn topologyRejection(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, index: u64) !?projection_wire.TopologyRejection {
+        var response = try self.projection(.{ .kind = .topology_rejection, .group_id = group_id, .after_sequence = index });
+        defer abi.antfly_storage_owner_buffer_destroy(&response);
+        return try std.json.parseFromSliceLeaky(?projection_wire.TopologyRejection, alloc, response.slice(), .{});
+    }
+
     pub fn currentMergeSourceState(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) !?projection_wire.AppliedMergeSourceState {
         var response = try self.projection(.{ .kind = .current_merge_source, .group_id = group_id });
         defer abi.antfly_storage_owner_buffer_destroy(&response);
@@ -203,6 +212,28 @@ pub const RaftApplyStore = struct {
     ) !projection_wire.GroupStatePage {
         var response = try self.projection(.{
             .kind = .group_state_page,
+            .group_id = group_id,
+            .max_entries = @intCast(max_entries),
+            .max_bytes = @intCast(max_bytes),
+            .range_start = .fromSlice(byte_range.start),
+            .range_end = .fromSlice(byte_range.end),
+            .after_key = .fromSlice(after_key orelse ""),
+        });
+        defer abi.antfly_storage_owner_buffer_destroy(&response);
+        return try projection_wire.decodeGroupStatePageAlloc(alloc, response.slice());
+    }
+
+    pub fn groupStateKeysPageInRange(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        byte_range: anytype,
+        after_key: ?[]const u8,
+        max_entries: usize,
+        max_bytes: usize,
+    ) !projection_wire.GroupStatePage {
+        var response = try self.projection(.{
+            .kind = .group_state_keys_page,
             .group_id = group_id,
             .max_entries = @intCast(max_entries),
             .max_bytes = @intCast(max_bytes),
@@ -359,6 +390,15 @@ pub const RaftApplyStore = struct {
 
     pub const PreparedSnapshot = struct {
         handle: ?*anyopaque,
+
+        pub fn requiresNative(self: *const PreparedSnapshot) bool {
+            return abi.antfly_data_apply_prepared_snapshot_requires_native(self.handle);
+        }
+
+        /// The capture handle is consumed only on success.
+        pub fn attachNative(self: *PreparedSnapshot, capture: *anyopaque) !void {
+            try statusToError(abi.antfly_data_apply_prepared_snapshot_attach_native(self.handle, capture));
+        }
 
         pub const MaterializedFile = struct {
             path: []u8,

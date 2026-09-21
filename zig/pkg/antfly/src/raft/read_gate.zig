@@ -120,7 +120,8 @@ pub const AppliedReadTracker = struct {
         lock(&self.mutex);
         defer self.mutex.unlock();
         const entry = try self.applied_indexes.getOrPut(self.allocator, group_id);
-        if (!entry.found_existing or applied_index > entry.value_ptr.*) entry.value_ptr.* = applied_index;
+        if (entry.found_existing and applied_index <= entry.value_ptr.*) return;
+        entry.value_ptr.* = applied_index;
         const visible_index = entry.value_ptr.*;
         var waiters = self.waiters.iterator();
         while (waiters.next()) |waiter| {
@@ -128,6 +129,12 @@ pub const AppliedReadTracker = struct {
             const target_index = waiter.value_ptr.target_index orelse continue;
             if (visible_index >= target_index) waiter.value_ptr.complete = true;
         }
+    }
+
+    pub fn appliedIndex(self: *AppliedReadTracker, group_id: u64) u64 {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        return self.applied_indexes.get(group_id) orelse 0;
     }
 
     pub fn observeReadStates(

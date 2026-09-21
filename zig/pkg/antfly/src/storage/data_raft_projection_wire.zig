@@ -18,6 +18,8 @@
 
 const std = @import("std");
 
+pub const TopologyRejection = enum(u8) { busy = 1, scope_changed = 2 };
+
 const magic = "AFRP";
 const format_version: u8 = 1;
 

@@ -21,6 +21,7 @@ components:
         - embeddings
         - graph
         - algebraic
+        - relational
       description: "The type of the index."
     IndexConfig:
       type: object
@@ -30,6 +31,7 @@ components:
         - $ref: "#/components/schemas/EmbeddingsIndexConfig"
         - $ref: "#/components/schemas/GraphIndexConfig"
         - $ref: "#/components/schemas/AlgebraicIndexConfig"
+        - $ref: "#/components/schemas/RelationalIndexConfig"
       required:
         - name
         - type
@@ -322,6 +324,56 @@ components:
             type:
               type: string
               enum: [algebraic]
+    RelationalIndexConfig:
+      type: object
+      required: [keys]
+      description: >
+        Schema-bound composite ordered index on a relational table. Keys use
+        stable typed comparison semantics and independent direction, null
+        placement, and string collation. Existing rows build asynchronously;
+        indexed queries require complete owner coverage. The table schema is
+        the single durable authority for these definitions.
+      properties:
+        keys:
+          type: array
+          minItems: 1
+          maxItems: 32
+          items:
+            $ref: "schema.yaml#/components/schemas/RelationalIndexKey"
+        include_columns:
+          type: array
+          maxItems: 256
+          uniqueItems: true
+          description: Non-key columns stored for index-only projection; distinct from keys.
+          items:
+            type: string
+            minLength: 1
+        where:
+          type: array
+          maxItems: 256
+          description: Optional conjunction selecting index members. Queries must explicitly include all typed conjuncts.
+          items:
+            $ref: "schema.yaml#/components/schemas/RelationalIndexPredicate"
+    CreateRelationalIndexRequest:
+      description: Create a composite ordered index through the shared index resource.
+      allOf:
+        - $ref: "#/components/schemas/RelationalIndexConfig"
+        - type: object
+          required: [type]
+          properties:
+            description:
+              type: string
+              description: Optional description of the index and its purpose.
+            version:
+              type: integer
+              default: 0
+              minimum: 0
+              maximum: 0
+              x-go-type-skip-optional-pointer: true
+              description: Index implementation version. Only zero is supported; the schema epoch is managed by the server.
+            type:
+              type: string
+              enum: [relational]
     CreateIndexRequest:
       description: "Type-safe configuration for a new index. The index name is owned by the request path."
       x-antfly-sdk-alternative:
@@ -333,6 +385,7 @@ components:
         - $ref: "#/components/schemas/CreateEmbeddingsIndexRequest"
         - $ref: "#/components/schemas/CreateGraphIndexRequest"
         - $ref: "#/components/schemas/CreateAlgebraicIndexRequest"
+        - $ref: "#/components/schemas/CreateRelationalIndexRequest"
       discriminator:
         propertyName: type
         mapping:
@@ -340,6 +393,7 @@ components:
           embeddings: "#/components/schemas/CreateEmbeddingsIndexRequest"
           graph: "#/components/schemas/CreateGraphIndexRequest"
           algebraic: "#/components/schemas/CreateAlgebraicIndexRequest"
+          relational: "#/components/schemas/CreateRelationalIndexRequest"
     IndexMutationConflictError:
       type: object
       additionalProperties: false
@@ -552,6 +606,17 @@ components:
             type:
               type: string
               enum: [algebraic]
+    CreatedRelationalIndex:
+      description: Effective schema-bound composite index configuration.
+      allOf:
+        - $ref: "#/components/schemas/CreatedIndexCommon"
+        - $ref: "#/components/schemas/RelationalIndexConfig"
+        - type: object
+          required: [type]
+          properties:
+            type:
+              type: string
+              enum: [relational]
     CreatedIndex:
       description: "Discriminated normalized configuration returned after an index is created."
       oneOf:
@@ -559,6 +624,7 @@ components:
         - $ref: "#/components/schemas/CreatedEmbeddingsIndex"
         - $ref: "#/components/schemas/CreatedGraphIndex"
         - $ref: "#/components/schemas/CreatedAlgebraicIndex"
+        - $ref: "#/components/schemas/CreatedRelationalIndex"
       discriminator:
         propertyName: type
         mapping:
@@ -566,6 +632,7 @@ components:
           embeddings: "#/components/schemas/CreatedEmbeddingsIndex"
           graph: "#/components/schemas/CreatedGraphIndex"
           algebraic: "#/components/schemas/CreatedAlgebraicIndex"
+          relational: "#/components/schemas/CreatedRelationalIndex"
     EnrichmentKind:
       type: string
       enum:
@@ -2052,11 +2119,152 @@ components:
           embeddings: "indexes.yaml#/components/schemas/EmbeddingsIndexStats"
           graph: "indexes.yaml#/components/schemas/GraphIndexStats"
           algebraic: "indexes.yaml#/components/schemas/AlgebraicIndexStats"
+          relational: "indexes.yaml#/components/schemas/RelationalIndexStats"
       oneOf:
         - $ref: "#/components/schemas/FullTextIndexStats"
         - $ref: "#/components/schemas/EmbeddingsIndexStats"
         - $ref: "#/components/schemas/GraphIndexStats"
         - $ref: "#/components/schemas/AlgebraicIndexStats"
+        - $ref: "#/components/schemas/RelationalIndexStats"
+    RelationalIndexStats:
+      type: object
+      required: [index_type, milestones, relational_index]
+      properties:
+        index_type:
+          type: string
+          enum: [relational]
+        milestones:
+          $ref: "#/components/schemas/IndexMilestones"
+        relational_index:
+          $ref: "#/components/schemas/RelationalIndexStatus"
+    RelationalIndexBuildState:
+      type: string
+      enum: [building, ready, failed]
+    RelationalIndexBuildFailure:
+      type: string
+      enum: [incompatible_schema, invalid_row, key_too_large]
+    RelationalIndexRangeStatus:
+      type: object
+      required: [group_id, generation, slot, owner, comparison, progress_digest, maintenance_epoch, state, rows_scanned]
+      properties:
+        group_id:
+          type: string
+          pattern: "^[0-9]+$"
+        generation:
+          type: string
+          pattern: "^[0-9]+$"
+          description: Exact uint64 generation encoded as decimal, never a floating-point number.
+        slot:
+          type: integer
+          format: uint32
+        owner:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+          description: Namespace and owned-range fingerprint.
+        comparison:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+          description: Executable tuple comparison fingerprint.
+        progress_digest:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+          description: Exact durable progress observation for generation-fenced maintenance.
+        maintenance_epoch:
+          type: string
+          pattern: "^[0-9]+$"
+          description: Replicated desired maintenance ticket, separate from replica-local progress.
+        last_maintenance_request:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+          description: Most recently accepted maintenance command proof for exact retry acknowledgement.
+        state:
+          $ref: "#/components/schemas/RelationalIndexBuildState"
+        rows_scanned:
+          type: string
+          pattern: "^[0-9]+$"
+        failure:
+          $ref: "#/components/schemas/RelationalIndexBuildFailure"
+    RelationalIndexStatus:
+      type: object
+      required: [table_id, schema_version, index_name, state, ranges]
+      properties:
+        table_id:
+          type: string
+          pattern: "^[0-9]+$"
+        schema_version:
+          type: integer
+          format: uint32
+        index_name:
+          type: string
+        state:
+          $ref: "#/components/schemas/RelationalIndexBuildState"
+        ranges:
+          type: array
+          maxItems: 4096
+          items:
+            $ref: "#/components/schemas/RelationalIndexRangeStatus"
+    IndexMaintenanceAction:
+      type: string
+      enum: [retry, repair]
+    IndexMaintenanceOwnerProof:
+      type: object
+      additionalProperties: false
+      required: [group_id, generation, slot, owner, comparison, progress_digest, maintenance_epoch]
+      properties:
+        group_id:
+          type: string
+          pattern: "^[0-9]+$"
+        generation:
+          type: string
+          pattern: "^[0-9]+$"
+        slot:
+          type: integer
+          format: uint32
+        owner:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+        comparison:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+        progress_digest:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+        maintenance_epoch:
+          type: string
+          pattern: "^[0-9]+$"
+    IndexMaintenanceRequest:
+      type: object
+      additionalProperties: false
+      required: [table_id, schema_version, owners]
+      description: >-
+        Exact observations from index status. Each selected owner is admitted atomically
+        through the replicated transaction journal; the selection is not one global
+        transaction. Cancellation, conflicts, or a lost acknowledgement may leave some
+        owners admitted. Resubmit the identical request to resume safely; do not replace
+        its observations with newer progress unless starting a new maintenance attempt.
+      properties:
+        table_id:
+          type: string
+          pattern: "^[0-9]+$"
+        schema_version:
+          type: integer
+          format: uint32
+        owners:
+          type: array
+          minItems: 1
+          maxItems: 128
+          items:
+            $ref: "#/components/schemas/IndexMaintenanceOwnerProof"
+    IndexMaintenanceResponse:
+      type: object
+      required: [acknowledged_groups]
+      properties:
+        acknowledged_groups:
+          type: array
+          maxItems: 128
+          items:
+            type: string
+            pattern: "^[0-9]+$"
     AlgebraicIndexStats:
       type: object
       description: "Compact public statistics for an algebraic sidecar index. Detailed runtime, adaptive, and materialization records remain internal diagnostics."
