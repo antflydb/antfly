@@ -742,10 +742,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         /// Host aliases retain its data independently of the original bytes
         /// and lazy-weight pin. Never copied into aliases; freed by freeOp.
         native_dense_host_cache: ?CT = null,
-        /// Boundary-device metadata is physically i32, never float indices.
-        /// Kept local to these strict tensors; legacy primitive conventions
-        /// remain unchanged.
-        boundary_i32_storage: bool = false,
+        /// Physical integer storage; float primitives must not reinterpret it.
+        integer_storage: bool = false,
+        integer_bounds: ?struct { minimum: i64, maximum: i64 } = null,
         resident_index_bounds: ?ops.resident_training.IndexBounds = null,
         resident_index_storage: ?*ResidentIndexStorage = null,
         /// Strict operations accept handles from their creating backend only.
@@ -2727,7 +2726,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .owned = false,
             .logical_shape = logical_shape,
             .metal_tensor = tensor,
-            .boundary_i32_storage = tensor.dtype == .i32,
+            .integer_storage = tensor.dtype != .f32,
             .resident_owner = self,
         };
         return @ptrCast(buf);
@@ -2756,7 +2755,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     fn hostSliceForBuf(buf: *Buf) ![]f32 {
-        if (buf.boundary_i32_storage) return error.UnsupportedTensorType;
+        if (buf.integer_storage) return error.UnsupportedTensorType;
         if (buf.quantized_storage != null) return error.UnsupportedTensorType;
         if (buf.lazy_multiply != null) return error.UnsupportedTensorType;
         if (buf.metal_tensor) |*metal_tensor| {
@@ -4649,7 +4648,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn ownedMetalTensorFromCt(self: *MetalCompute, tensor: CT) !MetalTensor {
         const buf = toBuf(tensor);
-        if (buf.boundary_i32_storage) return error.UnsupportedTensorType;
+        if (buf.integer_storage) return error.UnsupportedTensorType;
         if (buf.quantized_storage != null or
             buf.runtime_quantized_storage != null or
             buf.owned_quantized_storage != null)
@@ -4727,7 +4726,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn borrowedMetalTensorFromCt(self: *MetalCompute, tensor: CT) !MetalTensor {
         const buf = toBuf(tensor);
-        if (buf.boundary_i32_storage) return error.UnsupportedTensorType;
+        if (buf.integer_storage) return error.UnsupportedTensorType;
         if (buf.quantized_storage != null or
             buf.runtime_quantized_storage != null or
             buf.owned_quantized_storage != null)
@@ -5231,6 +5230,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     fn deviceWhereOperand(self: *MetalCompute, buf: *Buf) !?MetalTensor {
+        if (buf.integer_storage) return null;
         if (buf.quantized_storage != null or buf.runtime_quantized_storage != null or buf.owned_quantized_storage != null) return null;
         if (buf.metal_tensor) |*metal_tensor| {
             if (metal_tensor.isDevice()) return try metal_tensor.retainedCopy();
@@ -6455,7 +6455,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn cloneTensorShapeOp(ctx: *anyopaque, tensor: CT, shape: []const i32) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const buf = toBuf(tensor);
-        if (buf.boundary_i32_storage) return self.residentTrainingReshape(tensor, shape, .{}, true);
+        if (buf.integer_storage) return self.reshapeInteger(tensor, shape, true);
         if (buf.quantized_storage != null or
             buf.runtime_quantized_storage != null or
             buf.owned_quantized_storage != null)
@@ -6516,14 +6516,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const src_self: *MetalCompute = @ptrCast(@alignCast(src_ctx));
         const src_buf = toBuf(src_tensor);
-        if (src_buf.boundary_i32_storage) {
-            const source = try src_self.residentTrainingTensor(src_tensor, .i32, .{});
+        if (src_buf.integer_storage) {
+            const source = src_buf.metal_tensor orelse return error.UnsupportedTensorType;
             const runtime = self.provider_impl.raw_decode_runtime orelse return error.UnsupportedResidentTrainingPrimitive;
-            var copied = try MetalTensor.deviceAllocateFresh(@ptrCast(runtime), source.deviceByteLen(), .private, source.shape());
+            var copied = try MetalTensor.deviceAllocateTyped(self.allocator, @ptrCast(runtime), source.dtype, .private, source.shape());
             errdefer copied.deinit();
-            copied.dtype = .i32;
-            try source.copyInto(&copied);
+            if (source.deviceByteLen() != 0) try source.copyInto(&copied);
             const result = try self.ctFromOwnedMetalTensor(copied);
+            toBuf(result).integer_bounds = src_buf.integer_bounds;
             toBuf(result).resident_index_bounds = src_buf.resident_index_bounds;
             toBuf(result).resident_index_storage = if (src_buf.resident_index_storage) |storage| storage.retain() else null;
             return result;
@@ -6638,80 +6638,70 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn fromConstantBytesOp(ctx: *anyopaque, data: []const u8, dtype: ops.GraphDType, shape: []const i64) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
-        // Metal's device tensor ABI has exact integer storage for i32 only.
-        // Keep every graph integer constant exact by narrowing values that fit
-        // into that representation; reject larger i64 values instead of
-        // allowing the interpreter's f32 fallback to silently round them.
-        switch (dtype) {
-            .i8, .i16, .i32, .i64, .u8, .bool_ => {},
+        const physical: metal_tensor_mod.DType = switch (dtype) {
+            inline .i8, .i16, .i32, .i64, .u8, .bool_ => |tag| @field(metal_tensor_mod.DType, @tagName(tag)),
             else => return null,
-        }
+        };
         if (shape.len > metal_tensor_mod.max_dims) return error.InvalidTensorShape;
-        var shape_i32: [metal_tensor_mod.max_dims]i32 = undefined;
+        var dims: [metal_tensor_mod.max_dims]i32 = undefined;
+        var count: usize = 1;
         for (shape, 0..) |dim, i| {
-            if (dim <= 0) return null;
-            shape_i32[i] = std.math.cast(i32, dim) orelse return error.InvalidTensorShape;
+            if (dim < 0) return error.InvalidTensorShape;
+            dims[i] = std.math.cast(i32, dim) orelse return error.InvalidTensorShape;
+            count = try std.math.mul(usize, count, @intCast(dim));
         }
-        const dims = shape_i32[0..shape.len];
-        const count = try ops.resident_training.shapeElements(i32, dims, .{});
-        const expected_bytes = std.math.mul(usize, count, dtype.byteSize()) catch return error.InvalidTensorShape;
-        if (data.len != expected_bytes) return error.InvalidTensorShape;
-
-        const values = try self.allocator.alloc(i32, count);
-        defer self.allocator.free(values);
-        switch (dtype) {
-            .i8 => for (values, 0..) |*value, i| {
-                value.* = @as(i8, @bitCast(data[i]));
-            },
-            .i16 => for (values, 0..) |*value, i| {
-                value.* = std.mem.readInt(i16, data[i * 2 ..][0..2], .little);
-            },
-            .i32 => for (values, 0..) |*value, i| {
-                value.* = std.mem.readInt(i32, data[i * 4 ..][0..4], .little);
-            },
-            .i64 => for (values, 0..) |*value, i| {
-                const wide = std.mem.readInt(i64, data[i * 8 ..][0..8], .little);
-                value.* = std.math.cast(i32, wide) orelse return error.UnsupportedTensorType;
-            },
-            .u8 => for (values, 0..) |*value, i| {
-                value.* = data[i];
-            },
-            .bool_ => for (values, 0..) |*value, i| {
-                value.* = if (data[i] == 0) 0 else 1;
-            },
-            else => unreachable,
+        if (data.len != try std.math.mul(usize, count, physical.byteSize())) return error.InvalidTensorShape;
+        const runtime = self.provider_impl.raw_decode_runtime orelse return error.MetalRuntimeUnavailable;
+        var device = try MetalTensor.deviceAllocateTyped(self.allocator, @ptrCast(runtime), physical, .private, dims[0..shape.len]);
+        errdefer device.deinit();
+        if (data.len != 0) try device.uploadBytes(data);
+        const result = try self.ctFromOwnedMetalTensor(device);
+        if (count != 0) {
+            var minimum: i64 = std.math.maxInt(i64);
+            var maximum: i64 = std.math.minInt(i64);
+            for (0..count) |i| {
+                const value: i64 = switch (physical) {
+                    .i8 => @as(i8, @bitCast(data[i])),
+                    .i16 => std.mem.readInt(i16, data[i * 2 ..][0..2], .little),
+                    .i32 => std.mem.readInt(i32, data[i * 4 ..][0..4], .little),
+                    .i64 => std.mem.readInt(i64, data[i * 8 ..][0..8], .little),
+                    .u8, .bool_ => data[i],
+                    else => unreachable,
+                };
+                minimum = @min(minimum, value);
+                maximum = @max(maximum, value);
+            }
+            toBuf(result).integer_bounds = .{ .minimum = minimum, .maximum = maximum };
         }
-        return try self.residentTrainingUpload(i32, values, dims, .{}, true);
+        return result;
     }
 
     fn tensorDTypeOp(_: *anyopaque, tensor: CT) anyerror!tensor_mod.DType {
         const buf = toBuf(tensor);
-        if (buf.boundary_i32_storage) {
-            const device = buf.metal_tensor orelse return error.UnsupportedTensorType;
-            if (device.dtype != .i32 or !device.isDevice()) return error.UnsupportedTensorType;
-            return .i32;
+        if (buf.metal_tensor) |device| {
+            return switch (device.dtype) {
+                inline else => |tag| @field(tensor_mod.DType, @tagName(tag)),
+            };
         }
         if (buf.native_dense_dtype) |dtype| return dtype;
-        if (bufHasAnyQuantizedStorage(buf)) return .f32;
-        if (buf.metal_tensor) |device| if (device.dtype != .f32) return error.UnsupportedTensorType;
         return .f32;
     }
 
     fn exportTensorDataOp(ctx: *anyopaque, tensor: CT, allocator: std.mem.Allocator) anyerror!?ops.ExportTensorData {
-        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
-        if (!toBuf(tensor).boundary_i32_storage) return null;
-        const device = try self.residentTrainingTensor(tensor, .i32, .{});
+        _ = ctx;
+        const device = toBuf(tensor).metal_tensor orelse return null;
+        if (device.dtype == .f32) return null;
         const bytes = try allocator.alloc(u8, device.deviceByteLen());
         errdefer allocator.free(bytes);
-        try device.downloadBytesInto(bytes);
-        return .{ .dtype = .i32, .payload = .{ .bytes = bytes } };
+        if (bytes.len != 0) try device.downloadBytesInto(bytes);
+        return .{ .dtype = try tensorDTypeOp(undefined, tensor), .payload = .{ .bytes = bytes } };
     }
 
     fn residentTrainingUpload(self: *MetalCompute, comptime T: type, values: []const T, shape: []const i32, limits: ops.resident_training.Limits, retain_indices: bool) !CT {
         const count = try ops.resident_training.shapeElements(i32, shape, limits);
         if (count != values.len) return error.InvalidResidentTrainingShape;
         const runtime = self.provider_impl.raw_decode_runtime orelse return error.UnsupportedResidentTrainingPrimitive;
-        const bounds = if (T == i32) try ops.resident_training.IndexBounds.of(values) else null;
+        const bounds: ?ops.resident_training.IndexBounds = if (T == i32) try ops.resident_training.IndexBounds.of(values) else null;
         const indices = if (T == i32 and retain_indices) blk: {
             if (count * 4 > limits.max_index_metadata_bytes) return error.ResourceLimitExceeded;
             break :blk try ResidentIndexStorage.create(self.allocator, values);
@@ -6722,6 +6712,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         device.dtype = if (T == i32) .i32 else .f32;
         try device.uploadBytes(std.mem.sliceAsBytes(values));
         const result = try self.ctFromOwnedMetalTensor(device);
+        if (bounds) |proof| toBuf(result).integer_bounds = .{ .minimum = proof.minimum, .maximum = proof.maximum };
         toBuf(result).resident_index_bounds = bounds;
         toBuf(result).resident_index_storage = indices;
         return result;
@@ -6736,13 +6727,37 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             return error.UnsupportedResidentTrainingPrimitive;
         const device = buf.metal_tensor orelse return error.ResidentTrainingRequiresDeviceTensor;
         if (!device.isDevice() or (dtype != null and device.dtype != dtype.?) or
-            buf.boundary_i32_storage != (device.dtype == .i32))
+            buf.integer_storage != (device.dtype == .i32))
             return error.UnsupportedResidentTrainingPrimitive;
         const logical = buf.logical_shape orelse return error.InvalidResidentTrainingShape;
         const count = try ops.resident_training.shapeElements(i64, logical, limits);
         if (device.elemCount() != count or device.deviceByteLen() != count * 4)
             return error.InvalidResidentTrainingShape;
         return device;
+    }
+
+    fn reshapeInteger(self: *MetalCompute, input: CT, shape: []const i32, independent: bool) !CT {
+        const source = toBuf(input).metal_tensor orelse return error.UnsupportedTensorType;
+        if (shape.len > metal_tensor_mod.max_dims) return error.InvalidTensorShape;
+        var count: usize = 1;
+        for (shape) |dim| {
+            if (dim < 0) return error.InvalidTensorShape;
+            count = try std.math.mul(usize, count, @intCast(dim));
+        }
+        if (count != source.elemCount()) return error.InvalidTensorShape;
+        var output = if (independent) blk: {
+            const runtime = self.provider_impl.raw_decode_runtime orelse return error.MetalRuntimeUnavailable;
+            var copied = try MetalTensor.deviceAllocateTyped(self.allocator, @ptrCast(runtime), source.dtype, .private, shape);
+            errdefer copied.deinit();
+            if (source.deviceByteLen() != 0) try source.copyInto(&copied);
+            break :blk copied;
+        } else try source.retainedView(0, source.deviceByteLen(), shape);
+        errdefer output.deinit();
+        const result = try self.ctFromOwnedMetalTensor(output);
+        toBuf(result).integer_bounds = toBuf(input).integer_bounds;
+        toBuf(result).resident_index_bounds = toBuf(input).resident_index_bounds;
+        toBuf(result).resident_index_storage = if (toBuf(input).resident_index_storage) |storage| storage.retain() else null;
+        return result;
     }
 
     fn residentTrainingReshape(self: *MetalCompute, input: CT, shape: []const i32, limits: ops.resident_training.Limits, independent: bool) !CT {
@@ -6759,6 +6774,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         } else try source.retainedView(0, count * 4, shape);
         errdefer output.deinit();
         const result = try self.ctFromOwnedMetalTensor(output);
+        toBuf(result).integer_bounds = toBuf(input).integer_bounds;
         toBuf(result).resident_index_bounds = toBuf(input).resident_index_bounds;
         toBuf(result).resident_index_storage = if (toBuf(input).resident_index_storage) |storage| storage.retain() else null;
         return result;
@@ -7328,7 +7344,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const device = tensor.device orelse return error.GlinerBoundaryRequiresResidentInput;
         const runtime = self.provider_impl.raw_decode_runtime orelse return error.UnsupportedGlinerBoundaryScope;
         if (device.ref.runtime != @as(*anyopaque, @ptrCast(runtime)) or tensor.deviceHandle() == null or
-            buf.boundary_i32_storage != (tensor.dtype == .i32)) return error.ForeignGlinerBoundaryTensor;
+            buf.integer_storage != (tensor.dtype == .i32)) return error.ForeignGlinerBoundaryTensor;
         // The immutable session owner outlives the provider lease. Its payload
         // is already admitted separately, and does not become transient when
         // a request's lightweight wrapper is released.
@@ -7410,7 +7426,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn boundaryFloatDevice(input: CT) !MetalTensor {
         const buf = toBuf(input);
-        if (bufHasAnyQuantizedStorage(buf) or buf.boundary_i32_storage or buf.lazy_multiply != null or
+        if (bufHasAnyQuantizedStorage(buf) or buf.integer_storage or buf.lazy_multiply != null or
             buf.view_index_map != null or buf.view_strides != null)
             return error.UnsupportedGlinerBoundaryDevice;
         const tensor = buf.metal_tensor orelse return error.GlinerBoundaryRequiresResidentInput;
@@ -7439,7 +7455,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const expected_bytes = try precision.byteLen(rows, columns);
         if (precision == .f32) return error.UnsupportedGlinerBoundaryPrecision;
         const buf = toBuf(input);
-        if (buf.boundary_i32_storage or buf.lazy_multiply != null or buf.view_index_map != null or
+        if (buf.integer_storage or buf.lazy_multiply != null or buf.view_index_map != null or
             buf.view_strides != null or buf.logical_view_strides != null or buf.view_base_offset != 0 or buf.data.len != 0)
             return error.InvalidGlinerBoundaryTensorPrecision;
         const shape = buf.logical_shape orelse return error.InvalidGlinerBoundaryWeightShape;
@@ -7520,7 +7536,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             const integer = layout.integer_inputs & (@as(u16, 1) << @intCast(i)) != 0;
             const element_bytes: usize = if (request.kind == .cast_half and i == 0) 2 else 4;
             if (bufHasAnyQuantizedStorage(buf) or buf.lazy_multiply != null or buf.view_index_map != null or
-                buf.view_strides != null or buf.boundary_i32_storage != integer or !tensor.isDevice() or
+                buf.view_strides != null or buf.integer_storage != integer or !tensor.isDevice() or
                 tensor.elemCount() != count or tensor.deviceByteLen() != try std.math.mul(usize, count, element_bytes))
                 return error.InvalidBoundaryDeviceShape;
             tensors[i] = tensor;
@@ -7580,7 +7596,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             },
             .resident_f32 => |r| {
                 const buf = toBuf(r.input);
-                if (bufHasAnyQuantizedStorage(buf) or buf.boundary_i32_storage or buf.lazy_multiply != null or
+                if (bufHasAnyQuantizedStorage(buf) or buf.integer_storage or buf.lazy_multiply != null or
                     buf.view_index_map != null or buf.view_strides != null)
                     return error.UnsupportedGlinerBoundaryDevice;
                 if (buf.metal_tensor) |tensor| {
@@ -7724,54 +7740,33 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn cumulativeSumOp(ctx: *anyopaque, tensor: CT, axis: u8, exclusive: bool, reverse: bool) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const buf = toBuf(tensor);
-        var source = if (buf.boundary_i32_storage) try (try self.residentTrainingTensor(tensor, .i32, .{})).retainedCopy() else (try self.deviceWhereOperand(buf)) orelse return null;
+        var source = if (buf.integer_storage) try buf.metal_tensor.?.retainedCopy() else (try self.deviceWhereOperand(buf)) orelse return null;
         defer source.deinit();
-        const output = (try metal_runtime.decoderRuntimeCumulativeSumF32Device(self.provider_impl, source, axis, exclusive, reverse, buf.boundary_i32_storage)) orelse return null;
+        const output = (try metal_runtime.decoderRuntimeCumulativeSumF32Device(self.provider_impl, source, axis, exclusive, reverse)) orelse return null;
         const result = try self.ctFromOwnedMetalTensor(output);
-        toBuf(result).boundary_i32_storage = buf.boundary_i32_storage;
+        toBuf(result).integer_storage = buf.integer_storage;
         return result;
     }
 
     fn convertDTypeOp(ctx: *anyopaque, tensor: CT, target: ops.GraphDType) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const buf = toBuf(tensor);
-        if (buf.boundary_i32_storage) {
-            const source = try self.residentTrainingTensor(tensor, .i32, .{});
-            if (target == .i32) return self.residentTrainingReshape(tensor, source.shape(), .{}, false);
-            // Imported graphs cast integer attention masks to floating point.
-            // Convert values explicitly; reinterpreting their device bytes as
-            // f32 would silently corrupt the mask.
-            switch (target) {
-                .f32, .f16, .bf16, .f64 => {
-                    const converted = (try metal_runtime.decoderRuntimeConvertDTypeF32Device(self.provider_impl, source, 3)) orelse return error.UnsupportedResidentTrainingPrimitive;
-                    return self.ctFromOwnedMetalTensor(converted);
-                },
-                else => return error.UnsupportedResidentTrainingPrimitive,
-            }
-        }
         if (buf.quantized_storage != null) return null;
-        const metal_tensor = buf.metal_tensor orelse return null;
-        if (!metal_tensor.isDevice()) return null;
-
-        const kind: u32 = switch (target) {
-            .f32, .f16, .bf16, .f64 => 0,
-            .bool_ => 2,
-            .i8, .i16, .i32, .i64, .u8 => 1,
+        var source = if (buf.integer_storage) try buf.metal_tensor.?.retainedCopy() else try self.ownedDeviceMetalTensorFromCt(tensor);
+        defer source.deinit();
+        const physical: metal_tensor_mod.DType = switch (target) {
+            .f32, .f16, .bf16, .f64 => .f32,
+            inline .i8, .i16, .i32, .i64, .u8, .bool_ => |tag| @field(metal_tensor_mod.DType, @tagName(tag)),
         };
-
-        var input_mt = try metal_tensor.retainedCopy();
-        defer input_mt.deinit();
-        if (kind == 0) return self.ctFromOwnedMetalTensor(try metal_tensor.retainedCopy());
-        if (try metal_runtime.decoderRuntimeConvertDTypeF32Device(self.provider_impl, input_mt, kind)) |converted| {
-            return self.ctFromOwnedMetalTensor(converted);
-        }
-        return null;
+        if (source.dtype == physical) return self.ctFromOwnedMetalTensor(try source.retainedCopy());
+        const output = (try metal_runtime.decoderRuntimeCastTypedDevice(self.provider_impl, source, physical)) orelse return null;
+        return self.ctFromOwnedMetalTensor(output);
     }
 
     fn toFloat32Op(ctx: *anyopaque, tensor: CT, allocator: std.mem.Allocator) anyerror![]f32 {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const buf = toBuf(tensor);
-        if (buf.boundary_i32_storage) return error.UnsupportedTensorType;
+        if (buf.integer_storage) return error.UnsupportedTensorType;
         if (buf.quantized_storage) |storage| return try self.dequantizeStorageToFloat32(tensor, storage, allocator);
         if (buf.runtime_quantized_storage) |storage| return try self.dequantizeStorageToFloat32(tensor, storage, allocator);
         if (buf.owned_quantized_storage) |storage| return try self.dequantizeStorageToFloat32(tensor, storage, allocator);
@@ -8131,12 +8126,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn primReshapeOp(ctx: *anyopaque, input: CT, new_shape: []const i64) anyerror!CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const input_buf = toBuf(input);
-        if (input_buf.boundary_i32_storage) {
+        if (input_buf.integer_storage) {
             const resolved = try resolveReshapeShape(input_buf.logical_shape, bufElemCount(input_buf), new_shape);
             var dims: [metal_tensor_mod.max_dims]i32 = undefined;
             if (new_shape.len > dims.len) return error.InvalidResidentTrainingShape;
             for (resolved[0..new_shape.len], 0..) |dim, i| dims[i] = std.math.cast(i32, dim) orelse return error.InvalidResidentTrainingShape;
-            return self.residentTrainingReshape(input, dims[0..new_shape.len], .{}, false);
+            return self.reshapeInteger(input, dims[0..new_shape.len], false);
         }
         if (input_buf.quantized_storage != null) return error.UnsupportedTensorType;
 
@@ -8467,6 +8462,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn importCtToHostNative(self: *MetalCompute, native_ctx: *HostFallbackNative, ct: CT, shape_override: ?[]const i64) !CT {
         const buf = toBuf(ct);
         const shape_i64 = shape_override orelse buf.logical_shape orelse &[_]i64{@intCast(bufElemCount(buf))};
+        if (buf.integer_storage) {
+            const exported = (try exportTensorDataOp(self, ct, self.allocator)).?;
+            defer self.allocator.free(exported.payload.bytes);
+            const dtype: ops.GraphDType = switch (exported.dtype) {
+                inline else => |tag| @field(ops.GraphDType, @tagName(tag)),
+            };
+            return (try native_ctx.cb.fromConstantBytes(exported.payload.bytes, dtype, shape_i64)) orelse error.UnsupportedTensorType;
+        }
         const shape_i32 = try self.i32ShapeFromI64(shape_i64);
         defer self.allocator.free(shape_i32);
         if (buf.quantized_storage) |storage| {
@@ -8515,6 +8518,17 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     fn exportCtFromHostNative(self: *MetalCompute, native_ctx: *HostFallbackNative, ct: CT, shape_override: ?[]const i64) !CT {
+        const dtype = try native_ctx.cb.tensorDType(ct);
+        switch (dtype) {
+            inline .i8, .i16, .i32, .i64, .u8, .bool_ => |tag| {
+                const exported = (try native_ctx.cb.exportTensorData(ct, self.allocator)).?;
+                defer self.allocator.free(exported.payload.bytes);
+                const shape = try native_ctx.cb.tensorShape(ct, self.allocator);
+                defer self.allocator.free(shape);
+                return (try fromConstantBytesOp(self, exported.payload.bytes, @field(ops.GraphDType, @tagName(tag)), shape_override orelse shape)).?;
+            },
+            else => {},
+        }
         const out = try native_ctx.cb.toFloat32(ct, self.allocator);
         errdefer self.allocator.free(out);
         const out_shape_i64 = blk: {
@@ -8711,7 +8725,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         comptime op_kind: HostBinaryOp,
     ) !?CT {
         const primary_buf = toBuf(primary);
-        if (primary_buf.boundary_i32_storage or toBuf(secondary).boundary_i32_storage) return error.UnsupportedTensorType;
+        if (primary_buf.integer_storage or toBuf(secondary).integer_storage) return error.UnsupportedTensorType;
         if (primary_buf.weight_handle_name != null) return null;
         const secondary_buf = toBuf(secondary);
         if (primary_buf.quantized_storage != null or secondary_buf.quantized_storage != null) {
@@ -9194,12 +9208,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn lessThanConsumeLeftOp(ctx: *anyopaque, a: CT, b: CT) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
-        if (toBuf(a).boundary_i32_storage or toBuf(b).boundary_i32_storage) return null;
+        if (toBuf(a).integer_storage or toBuf(b).integer_storage) return null;
         return self.binaryConsumeIntoPreferred(a, b, .less_than);
     }
 
     fn tryFlatDeviceBinaryRuntimeOp(self: *MetalCompute, a: CT, b: CT, comptime op_kind: HostBinaryOp) !?CT {
-        if (toBuf(a).boundary_i32_storage or toBuf(b).boundary_i32_storage) return error.UnsupportedTensorType;
+        if (toBuf(a).integer_storage or toBuf(b).integer_storage) return error.UnsupportedTensorType;
         if (disableRuntimeElementwise()) return null;
         const a_buf = toBuf(a);
         const b_buf = toBuf(b);
@@ -9372,7 +9386,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     fn tryFlatDeviceUnaryRuntimeOp(self: *MetalCompute, a: CT, comptime op_kind: HostUnaryOp) !?CT {
-        if (toBuf(a).boundary_i32_storage) return error.UnsupportedTensorType;
+        if (toBuf(a).integer_storage) return error.UnsupportedTensorType;
         if (disableRuntimeElementwise()) return null;
         const input_buf = toBuf(a);
         if (input_buf.quantized_storage != null) return null;
@@ -11272,29 +11286,6 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return self.exportCtFromHostNative(&native_ctx, n_output, null);
     }
 
-    fn boundaryI32AsF32(self: *MetalCompute, tensor: CT) !CT {
-        const buf = toBuf(tensor);
-        const device = buf.metal_tensor orelse return error.UnsupportedTensorType;
-        if (!buf.boundary_i32_storage or device.dtype != .i32) return error.UnsupportedTensorType;
-        const bytes_len = device.deviceByteLen();
-        if (bytes_len % @sizeOf(i32) != 0) return error.InvalidTensorShape;
-        const bytes = try self.allocator.alloc(u8, bytes_len);
-        defer self.allocator.free(bytes);
-        try device.downloadBytesInto(bytes);
-        const values = try self.allocator.alloc(f32, bytes_len / @sizeOf(i32));
-        errdefer self.allocator.free(values);
-        for (values, 0..) |*value, i| {
-            const integer = std.mem.readInt(i32, bytes[i * @sizeOf(i32) ..][0..@sizeOf(i32)], .little);
-            if (integer > (1 << 24) or integer < -(1 << 24)) return error.UnsupportedTensorType;
-            value.* = @floatFromInt(integer);
-        }
-        var shape_buf: [metal_tensor_mod.max_dims]i32 = undefined;
-        const logical_shape = buf.logical_shape orelse &[_]i64{@intCast(values.len)};
-        if (logical_shape.len > shape_buf.len) return error.InvalidTensorShape;
-        for (logical_shape, 0..) |dim, i| shape_buf[i] = std.math.cast(i32, dim) orelse return error.InvalidTensorShape;
-        return denseBuf(self.allocator, values, true, shape_buf[0..logical_shape.len]);
-    }
-
     fn unsupportedUnaryConsumeOp(_: *anyopaque, _: ops.UnaryConsumeOp, _: CT) anyerror!?CT {
         return null;
     }
@@ -11314,7 +11305,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn primTransposeOp(ctx: *anyopaque, input: CT, perm: []const u8, input_shape: []const i64) anyerror!CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const input_buf = toBuf(input);
-        if (input_buf.boundary_i32_storage) return error.UnsupportedResidentTrainingPrimitive;
+        if (input_buf.integer_storage) return error.UnsupportedResidentTrainingPrimitive;
         if (input_buf.quantized_storage != null) return error.UnsupportedTensorType;
         if (perm.len != input_shape.len or perm.len > metal_tensor_mod.max_dims) return error.UnsupportedShape;
 
@@ -11458,7 +11449,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn primBroadcastInDimOp(ctx: *anyopaque, input: CT, target_shape: []const i64, broadcast_axes: []const u8, input_shape: []const i64) anyerror!CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const input_buf = toBuf(input);
-        if (input_buf.boundary_i32_storage) return error.UnsupportedResidentTrainingPrimitive;
+        if (input_buf.integer_storage) return error.UnsupportedResidentTrainingPrimitive;
         if (input_buf.quantized_storage != null) return error.UnsupportedTensorType;
         if (target_shape.len > metal_tensor_mod.max_dims or input_shape.len > metal_tensor_mod.max_dims) return error.UnsupportedShape;
 
@@ -11703,26 +11694,26 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn primGatherOp(ctx: *anyopaque, input: CT, indices: CT, axis: u8, input_shape: []const i64) anyerror!CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
-        if (toBuf(indices).boundary_i32_storage) {
-            if (axis != 0) {
-                const float_indices = try self.boundaryI32AsF32(indices);
-                defer freeOp(self, float_indices);
-                return self.hostFallbackGather(input, float_indices, axis, input_shape);
+        if (toBuf(indices).integer_storage or toBuf(input).integer_storage) {
+            if (toBuf(indices).integer_bounds) |bounds| {
+                const resolved = try resolveConcreteShape(toBuf(input), input_shape);
+                if (axis >= input_shape.len) return error.InvalidTensorShape;
+                const extent = resolved[axis];
+                if (bounds.minimum < -extent or bounds.maximum >= extent) return error.IndexOutOfBounds;
+                const index_tensor = toBuf(indices).metal_tensor.?;
+                const rank = input_shape.len - 1 + index_tensor.shape().len;
+                if (rank > metal_tensor_mod.max_dims) return error.InvalidTensorShape;
+                var shape: [metal_tensor_mod.max_dims]i32 = undefined;
+                for (resolved[0..axis], 0..) |dim, i| shape[i] = @intCast(dim);
+                @memcpy(shape[axis..][0..index_tensor.shape().len], index_tensor.shape());
+                for (resolved[axis + 1 .. input_shape.len], axis + index_tensor.shape().len..) |dim, i| shape[i] = @intCast(dim);
+                var source = if (toBuf(input).integer_storage) try toBuf(input).metal_tensor.?.retainedCopy() else try self.ownedDeviceMetalTensorFromCt(input);
+                defer source.deinit();
+                const result = (try metal_runtime.decoderRuntimeGatherTypedDevice(self.provider_impl, source, index_tensor, axis, shape[0..rank])) orelse return error.UnsupportedTensorType;
+                return self.ctFromOwnedMetalTensor(result);
             }
-            if (toBuf(input).resident_owner != null)
-                return self.residentTrainingGather(input, indices, input_shape, axis, .{});
-            // Imported ONNX weights use ordinary inference handles, while
-            // input IDs are exact device i32 tensors. Admit the weight into
-            // this context before using the integer-index gather kernel.
-            var device = try self.ownedDeviceMetalTensorFromCt(input);
-            const resident = self.ctFromOwnedMetalTensor(device) catch |err| {
-                device.deinit();
-                return err;
-            };
-            defer freeOp(self, resident);
-            return self.residentTrainingGather(resident, indices, input_shape, axis, .{});
+            return self.hostFallbackGather(input, indices, axis, input_shape);
         }
-        if (toBuf(input).boundary_i32_storage) return error.UnsupportedResidentTrainingPrimitive;
         const input_buf = toBuf(input);
         const indices_buf = toBuf(indices);
         if (input_buf.quantized_storage != null or indices_buf.quantized_storage != null) return error.UnsupportedTensorType;
@@ -11829,7 +11820,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn primSliceOp(ctx: *anyopaque, input: CT, starts: []const i64, limits: []const i64, strides: []const i64, input_shape: []const i64) anyerror!CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const input_buf = toBuf(input);
-        if (input_buf.boundary_i32_storage) return error.UnsupportedResidentTrainingPrimitive;
+        if (input_buf.integer_storage) return error.UnsupportedResidentTrainingPrimitive;
         if (input_buf.quantized_storage != null) return error.UnsupportedTensorType;
         if (starts.len != limits.len or starts.len != strides.len or starts.len != input_shape.len) return error.UnsupportedShape;
         if (input_shape.len > metal_tensor_mod.max_dims) return error.UnsupportedShape;
@@ -11936,6 +11927,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn subtractOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (toBuf(a).integer_storage or toBuf(b).integer_storage) return self.integerBinary(a, b, 1);
         if (traceFlatBinaryRuntimeEnabled()) {
             const a_buf = toBuf(a);
             const b_buf = toBuf(b);
@@ -12030,20 +12022,18 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return self.hostFallbackUnary(a, null, .abs);
     }
 
+    fn integerBinary(self: *MetalCompute, a: CT, b: CT, kind: u32) !CT {
+        var lhs = if (toBuf(a).integer_storage) try toBuf(a).metal_tensor.?.retainedCopy() else try self.ownedDeviceMetalTensorFromCt(a);
+        defer lhs.deinit();
+        var rhs = if (toBuf(b).integer_storage) try toBuf(b).metal_tensor.?.retainedCopy() else try self.ownedDeviceMetalTensorFromCt(b);
+        defer rhs.deinit();
+        const output = (try metal_runtime.decoderRuntimeIntegerBinaryDevice(self.provider_impl, lhs, rhs, kind)) orelse return error.UnsupportedTensorType;
+        return self.ctFromOwnedMetalTensor(output);
+    }
+
     fn lessThanOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
-        // ONNX mask comparisons may consume exact integer inputs. Ordinary
-        // floating-point kernels cannot reinterpret their device storage.
-        if (toBuf(a).boundary_i32_storage or toBuf(b).boundary_i32_storage) {
-            const lhs_int = toBuf(a).boundary_i32_storage;
-            const rhs_int = toBuf(b).boundary_i32_storage;
-            var lhs = if (lhs_int) try (try self.residentTrainingTensor(a, .i32, .{})).retainedCopy() else (try self.deviceWhereOperand(toBuf(a))) orelse return error.UnsupportedTensorType;
-            defer lhs.deinit();
-            var rhs = if (rhs_int) try (try self.residentTrainingTensor(b, .i32, .{})).retainedCopy() else (try self.deviceWhereOperand(toBuf(b))) orelse return error.UnsupportedTensorType;
-            defer rhs.deinit();
-            const output = (try metal_runtime.decoderRuntimeLessThanTyped(self.provider_impl, lhs, rhs, lhs_int, rhs_int)) orelse return error.UnsupportedTensorType;
-            return self.ctFromOwnedMetalTensor(output);
-        }
+        if (toBuf(a).integer_storage or toBuf(b).integer_storage) return self.integerBinary(a, b, 3);
         if (try self.tryFlatDeviceBinaryRuntimeOp(a, b, .less_than)) |device_result| return device_result;
         const a_len = bufElemCount(toBuf(a));
         const b_len = bufElemCount(toBuf(b));
@@ -13166,7 +13156,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn concatPrimOp(ctx: *anyopaque, a: CT, b: CT, axis: u8, a_shape: []const i64, b_shape: []const i64) anyerror!CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
-        if (toBuf(a).boundary_i32_storage or toBuf(b).boundary_i32_storage) return error.UnsupportedResidentTrainingPrimitive;
+        if (toBuf(a).integer_storage or toBuf(b).integer_storage) return error.UnsupportedResidentTrainingPrimitive;
         if (getenvBool("TERMITE_METAL_TRACE_CONCAT_PRIM")) {
             const a_buf = toBuf(a);
             const b_buf = toBuf(b);
@@ -13638,8 +13628,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn primScatterAddOp(ctx: *anyopaque, input: CT, indices: CT, input_shape: []const i64, indices_shape: []const i64, axis: u8) anyerror!CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
-        if (toBuf(indices).boundary_i32_storage) return self.residentTrainingScatter(input, indices, input_shape, indices_shape, axis, .{}, null);
-        if (toBuf(input).boundary_i32_storage) return error.UnsupportedResidentTrainingPrimitive;
+        if (toBuf(indices).integer_storage) return self.residentTrainingScatter(input, indices, input_shape, indices_shape, axis, .{}, null);
+        if (toBuf(input).integer_storage) return error.UnsupportedResidentTrainingPrimitive;
         if (axis != 0 or input_shape.len != 2 or indices_shape.len == 0) return error.UnsupportedPrimitiveOp;
         if (input_shape[0] <= 0 or input_shape[1] <= 0 or indices_shape[0] <= 0) return error.UnsupportedShape;
 
@@ -17108,7 +17098,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     ) anyerror!CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const input_buf = toBuf(input);
-        if (input_buf.boundary_i32_storage) return error.UnsupportedTensorType;
+        if (input_buf.integer_storage) return error.UnsupportedTensorType;
         if (input_buf.quantized_storage != null) return error.UnsupportedTensorType;
         if (!disableRuntimeElementwise()) {
             if (runtime_kind) |kind| {
@@ -22725,7 +22715,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn addOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
-        if (toBuf(a).boundary_i32_storage or toBuf(b).boundary_i32_storage) return error.UnsupportedTensorType;
+        if (toBuf(a).integer_storage or toBuf(b).integer_storage) return self.integerBinary(a, b, 0);
+        if (toBuf(a).integer_storage or toBuf(b).integer_storage) return error.UnsupportedTensorType;
         const a_buf = toBuf(a);
         const b_buf = toBuf(b);
         if (bufHasAnyQuantizedStorage(a_buf) or bufHasAnyQuantizedStorage(b_buf)) return error.UnsupportedTensorType;
@@ -22849,7 +22840,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn multiplyOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
-        if (toBuf(a).boundary_i32_storage or toBuf(b).boundary_i32_storage) return error.UnsupportedTensorType;
+        if (toBuf(a).integer_storage or toBuf(b).integer_storage) return self.integerBinary(a, b, 2);
+        if (toBuf(a).integer_storage or toBuf(b).integer_storage) return error.UnsupportedTensorType;
         const a_buf = toBuf(a);
         const b_buf = toBuf(b);
         if (bufHasAnyQuantizedStorage(a_buf) or bufHasAnyQuantizedStorage(b_buf)) return error.UnsupportedTensorType;

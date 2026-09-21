@@ -7272,3 +7272,188 @@ test "runtime CumSum retains vector constant shape and exact native dtype" {
         try std.testing.expectEqualSlices(i64, &.{2}, shape);
     }
 }
+
+test "Metal graph constants preserve all integer widths through scans casts and clones" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const Metal = @import("../ops/metal_compute.zig").MetalCompute;
+    var weights = @import("../ops/gpu_hosted_store.zig").WeightStore{ .allocator = a, .prefix = "", .lazy_weights = .empty };
+    defer weights.lazy_weights.deinit(a);
+    var compute = try Metal.init(a, &weights, null);
+    defer compute.deinit();
+    var cb = compute.computeBackend();
+    inline for (.{ i8, i16, i32, i64, u8 }) |T| {
+        const dtype: ml.graph.DType = @field(ml.graph.DType, @typeName(T));
+        const large: T = if (T == i64) 9007199254740993 else std.math.maxInt(T);
+        const pattern = [_]T{ large, 1, 1, std.math.minInt(T), 2, 3 };
+        var values: [2 * 513 * 3]T = undefined;
+        for (&values, 0..) |*v, i| v.* = pattern[i % pattern.len];
+        for ([_]bool{ false, true }) |exclusive| for ([_]bool{ false, true }) |reverse| {
+            var g = Graph.init(a);
+            defer g.deinit();
+            var builder = ml.graph.Builder.init(&g);
+            const x = try builder.tensorConstBytes(std.mem.sliceAsBytes(&values), Shape.init(dtype, &.{ 2, 513, 3 }));
+            const out = try g.addNode(.{
+                .op = .{ .cumulative_sum = .{ .axis = 1, .exclusive = exclusive, .reverse = reverse } },
+                .output_shape = Shape.init(dtype, &.{ 2, 513, 3 }),
+                .inputs = .{ x, null_node, null_node, null_node },
+                .num_inputs = 1,
+            });
+            try g.markOutput(out);
+            var result = try execute(a, &g, &cb, .{});
+            defer result.deinit(&cb);
+            try std.testing.expect(Metal.debugHasDeviceTensor(&cb, result.outputs[0]));
+            const copy = (try cb.cloneTensorShape(result.outputs[0], &.{ 2, 513, 3 })).?;
+            defer cb.free(copy);
+            const exported = (try cb.exportTensorData(copy, a)).?;
+            defer a.free(exported.payload.bytes);
+            try std.testing.expectEqualStrings(@tagName(dtype), @tagName(exported.dtype));
+            const actual = std.mem.bytesAsSlice(T, exported.payload.bytes);
+            for (0..2) |batch| for (0..3) |channel| {
+                var total: T = 0;
+                for (0..513) |step| {
+                    const index = (batch * 513 + (if (reverse) 512 - step else step)) * 3 + channel;
+                    if (!exclusive) total +%= values[index];
+                    try std.testing.expectEqual(total, actual[index]);
+                    if (exclusive) total +%= values[index];
+                }
+            };
+        };
+        const empty = (try cb.fromConstantBytes(&.{}, dtype, &.{ 2, 0, 3 })).?;
+        defer cb.free(empty);
+        const scanned = (try cb.tryCumulativeSum(empty, 1, false, false)).?;
+        defer cb.free(scanned);
+        try std.testing.expectEqualStrings(@tagName(dtype), @tagName(try cb.tensorDType(scanned)));
+    }
+    const wide = (try cb.fromConstantBytes(std.mem.sliceAsBytes(&[_]i64{ 2147483647, 1 }), .i64, &.{2})).?;
+    defer cb.free(wide);
+    const sum = (try cb.tryCumulativeSum(wide, 0, false, false)).?;
+    defer cb.free(sum);
+    const bytes = (try cb.exportTensorData(sum, a)).?;
+    defer a.free(bytes.payload.bytes);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]i64{ 2147483647, 2147483648 }), bytes.payload.bytes);
+    const tiny = (try cb.fromConstantBytes(std.mem.sliceAsBytes(&[_]i8{ -128, 127 }), .i8, &.{2})).?;
+    defer cb.free(tiny);
+    const widened = (try cb.tryConvertDType(tiny, .i64)).?;
+    defer cb.free(widened);
+    const cast_bytes = (try cb.exportTensorData(widened, a)).?;
+    defer a.free(cast_bytes.payload.bytes);
+    try std.testing.expectEqual(.i64, cast_bytes.dtype);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]i64{ -128, 127 }), cast_bytes.payload.bytes);
+    const booleans = (try cb.fromConstantBytes(&.{ 0, 1 }, .bool_, &.{2})).?;
+    defer cb.free(booleans);
+    const cloned = (try cb.cloneTensorShape(booleans, &.{ 1, 2 })).?;
+    defer cb.free(cloned);
+    const boolean_bytes = (try cb.exportTensorData(cloned, a)).?;
+    defer a.free(boolean_bytes.payload.bytes);
+    try std.testing.expectEqual(.bool_, boolean_bytes.dtype);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 1 }, boolean_bytes.payload.bytes);
+}
+
+test "Metal exact integer constants survive transfers and gather on every axis" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const Metal = @import("../ops/metal_compute.zig").MetalCompute;
+    var weights = @import("../ops/gpu_hosted_store.zig").WeightStore{ .allocator = a, .prefix = "", .lazy_weights = .empty };
+    defer weights.lazy_weights.deinit(a);
+    var compute = try Metal.init(a, &weights, null);
+    defer compute.deinit();
+    var gpu = compute.computeBackend();
+    var ws = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var native = NativeCompute.init(a, &ws, null);
+    defer native.deinit();
+    const cpu = native.computeBackend();
+    inline for (.{ i8, i16, i32, i64, u8, bool }) |T| {
+        const dtype: ml.graph.DType = if (T == bool) .bool_ else @field(ml.graph.DType, @typeName(T));
+        const Storage = if (T == bool) u8 else T;
+        const large: Storage = if (T == bool) 1 else if (T == i64) 9007199254740993 else std.math.maxInt(T);
+        const values = [_]Storage{ large, 0, 1, 0 };
+        const original = (try gpu.fromConstantBytes(std.mem.sliceAsBytes(&values), dtype, &.{ 2, 2 })).?;
+        defer gpu.free(original);
+        const host = try @import("multi_executor.zig").transferTensor(a, original, &gpu, &cpu);
+        defer cpu.free(host);
+        const back = try @import("multi_executor.zig").transferTensor(a, host, &cpu, &gpu);
+        defer gpu.free(back);
+        const copy = try @import("multi_executor.zig").transferTensor(a, back, &gpu, &gpu);
+        defer gpu.free(copy);
+        const exported = (try gpu.exportTensorData(copy, a)).?;
+        defer a.free(exported.payload.bytes);
+        try std.testing.expectEqualStrings(@tagName(dtype), @tagName(exported.dtype));
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&values), exported.payload.bytes);
+        const indices = (try gpu.fromConstantBytes(std.mem.sliceAsBytes(&[_]i64{ -1, 0 }), .i64, &.{2})).?;
+        defer gpu.free(indices);
+        for ([_]u8{ 0, 1 }) |axis| {
+            const selected = try gpu.primGather(copy, indices, axis, &.{ 2, 2 });
+            defer gpu.free(selected);
+            try std.testing.expect(Metal.debugHasDeviceTensor(&gpu, selected));
+            const actual = (try gpu.exportTensorData(selected, a)).?;
+            defer a.free(actual.payload.bytes);
+            const expected = if (axis == 0) [_]Storage{ 1, 0, large, 0 } else [_]Storage{ 0, large, 0, 1 };
+            try std.testing.expectEqualStrings(@tagName(dtype), @tagName(actual.dtype));
+            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&expected), actual.payload.bytes);
+        }
+    }
+}
+
+test "Metal i64 arithmetic and mixed comparisons never round through float" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const Metal = @import("../ops/metal_compute.zig").MetalCompute;
+    var weights = @import("../ops/gpu_hosted_store.zig").WeightStore{ .allocator = a, .prefix = "", .lazy_weights = .empty };
+    defer weights.lazy_weights.deinit(a);
+    var compute = try Metal.init(a, &weights, null);
+    defer compute.deinit();
+    const gpu = compute.computeBackend();
+    const left = (try gpu.fromConstantBytes(std.mem.sliceAsBytes(&[_]i64{ 9007199254740993, -9007199254740993, std.math.maxInt(i64) }), .i64, &.{3})).?;
+    defer gpu.free(left);
+    const one = (try gpu.fromConstantBytes(std.mem.sliceAsBytes(&[_]i64{1}), .i64, &.{})).?;
+    defer gpu.free(one);
+    var ws = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var native = NativeCompute.init(a, &ws, null);
+    defer native.deinit();
+    const cpu = native.computeBackend();
+    const cpu_left = try @import("multi_executor.zig").transferTensor(a, left, &gpu, &cpu);
+    defer cpu.free(cpu_left);
+    const cpu_one = try @import("multi_executor.zig").transferTensor(a, one, &gpu, &cpu);
+    defer cpu.free(cpu_one);
+    inline for (.{ "add", "primSubtract", "multiply" }) |operation| {
+        const expected = try @field(ComputeBackend, operation)(&cpu, cpu_left, cpu_one);
+        defer cpu.free(expected);
+        const actual = try @field(ComputeBackend, operation)(&gpu, left, one);
+        defer gpu.free(actual);
+        const expected_bytes = (try cpu.exportTensorData(expected, a)).?;
+        defer a.free(expected_bytes.payload.bytes);
+        const actual_bytes = (try gpu.exportTensorData(actual, a)).?;
+        defer a.free(actual_bytes.payload.bytes);
+        try std.testing.expectEqual(.i64, actual_bytes.dtype);
+        try std.testing.expectEqualSlices(u8, expected_bytes.payload.bytes, actual_bytes.payload.bytes);
+    }
+    const sum = try gpu.add(left, one);
+    defer gpu.free(sum);
+    const exact = (try gpu.exportTensorData(sum, a)).?;
+    defer a.free(exact.payload.bytes);
+    try std.testing.expectEqual(.i64, exact.dtype);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]i64{ 9007199254740994, -9007199254740992, std.math.minInt(i64) }), exact.payload.bytes);
+    const floats = try gpu.fromFloat32Shape(&.{ 9007199254740992, -9007199254740992, 9223372036854775808.0 }, &.{3});
+    defer gpu.free(floats);
+    const less = try gpu.primLessThan(left, floats);
+    defer gpu.free(less);
+    const less_values = try gpu.toFloat32(less, a);
+    defer a.free(less_values);
+    try std.testing.expectEqualSlices(f32, &.{ 0, 1, 1 }, less_values);
+    const reverse = try gpu.primLessThan(floats, left);
+    defer gpu.free(reverse);
+    const reverse_values = try gpu.toFloat32(reverse, a);
+    defer a.free(reverse_values);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 0, 0 }, reverse_values);
+    const fractional = try gpu.fromFloat32Shape(&.{ -1.9, 0.5, 2.9 }, &.{3});
+    defer gpu.free(fractional);
+    const cast = (try gpu.tryConvertDType(fractional, .i64)).?;
+    defer gpu.free(cast);
+    const cast_bytes = (try gpu.exportTensorData(cast, a)).?;
+    defer a.free(cast_bytes.payload.bytes);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]i64{ -1, 0, 2 }), cast_bytes.payload.bytes);
+}

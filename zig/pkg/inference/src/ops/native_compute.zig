@@ -996,7 +996,10 @@ fn getDataChecked(ct: CT) ![]f32 {
 fn materializeIntegerNumericView(buf: *Buf) !void {
     if (buf.data.len != 0) return;
     const source = buf.source_tensor orelse return;
-    if (source.dtype != .i32 and source.dtype != .i64) return;
+    switch (source.dtype) {
+        .i8, .i16, .i32, .i64, .u8, .bool_ => {},
+        else => return,
+    }
     const data = try convertTensorToOwnedF32(buf.allocator, source);
     buf.data = data;
     buf.owned = true;
@@ -4719,6 +4722,7 @@ pub const vtable_impl = ComputeBackend.VTable{
     .fromFloat32Shape = &fromFloat32ShapeOp,
     .fromInt32Shape = &fromInt32ShapeOp,
     .fromConstantBytes = &fromConstantBytesOp,
+    .convertDType = &convertDTypeOp,
     .cumulativeSum = &cumulativeSumOp,
     .cloneTensorShape = &cloneTensorShapeOp,
     .toFloat32 = &toFloat32Op,
@@ -6596,6 +6600,7 @@ fn unaryConsumeOp(_: *anyopaque, op: ops.UnaryConsumeOp, input: CT) anyerror!?CT
 
 fn addOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    if (integerSource(a) != null and integerSource(b) != null) return integerBinaryOp(self, a, b, .add);
     if (try applyShapeAwareBinaryOp(self, a, b, .add)) |result| {
         return result;
     }
@@ -36162,6 +36167,7 @@ pub fn t5RelativePositionBucket(relative_position: i64, num_buckets_: usize, max
 
 fn multiplyOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    if (integerSource(a) != null and integerSource(b) != null) return integerBinaryOp(self, a, b, .multiply);
     if (try applyShapeAwareBinaryOp(self, a, b, .mul)) |result| {
         return result;
     }
@@ -37297,6 +37303,7 @@ fn primBinaryBroadcast(allocator: std.mem.Allocator, a_data: []const f32, b_data
 
 fn subtractOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    if (integerSource(a) != null and integerSource(b) != null) return integerBinaryOp(self, a, b, .subtract);
     if (try applyShapeAwareBinaryOp(self, a, b, .sub)) |result| {
         return result;
     }
@@ -38893,6 +38900,39 @@ fn scanAxis(comptime T: type, values: []align(1) T, outer: usize, width: usize, 
     };
 }
 
+fn integerBinaryOp(self: *NativeCompute, a: CT, b: CT, comptime kind: enum { add, subtract, multiply }) !CT {
+    const lhs = integerSource(a) orelse return error.UnsupportedTensorType;
+    const rhs = integerSource(b) orelse return error.UnsupportedTensorType;
+    if (lhs.dtype != rhs.dtype or lhs.dtype == .bool_) return error.UnsupportedTensorType;
+    const left = try IndexReader.init(a);
+    const right = try IndexReader.init(b);
+    const count = @max(left.len, right.len);
+    if ((left.len != count and left.len != 1) or (right.len != count and right.len != 1)) return error.ShapeMismatch;
+    const shape = if (left.len == count) lhs.shape else rhs.shape;
+    const bytes = try self.allocator.alloc(u8, try std.math.mul(usize, count, lhs.dtype.byteSize()));
+    defer self.allocator.free(bytes);
+    for (0..count) |i| {
+        const x: u64 = @bitCast(try left.at(if (left.len == 1) 0 else i));
+        const y: u64 = @bitCast(try right.at(if (right.len == 1) 0 else i));
+        const result = switch (kind) {
+            .add => x +% y,
+            .subtract => x -% y,
+            .multiply => x *% y,
+        };
+        switch (lhs.dtype) {
+            .i8, .u8 => bytes[i] = @truncate(result),
+            .i16 => std.mem.writeInt(u16, bytes[i * 2 ..][0..2], @truncate(result), .little),
+            .i32 => std.mem.writeInt(u32, bytes[i * 4 ..][0..4], @truncate(result), .little),
+            .i64 => std.mem.writeInt(u64, bytes[i * 8 ..][0..8], result, .little),
+            else => unreachable,
+        }
+    }
+    const dtype: ops.GraphDType = switch (lhs.dtype) {
+        inline else => |tag| @field(ops.GraphDType, @tagName(tag)),
+    };
+    return (try fromConstantBytesOp(self, bytes, dtype, shape)).?;
+}
+
 fn cumulativeSumOp(ctx: *anyopaque, input: CT, axis: u8, exclusive: bool, reverse: bool) anyerror!?CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     var flat_shape: [1]i64 = undefined;
@@ -38906,10 +38946,14 @@ fn cumulativeSumOp(ctx: *anyopaque, input: CT, axis: u8, exclusive: bool, revers
     const inner = typedShapeNumel(shape[axis + 1 ..]) orelse return error.InvalidTensorShape;
     const width: usize = @intCast(shape[axis]);
     if (integerSource(input)) |source| {
+        if (source.dtype == .bool_) return error.UnsupportedTensorType;
         if (try integerTensorCount(source) != count) return error.ShapeMismatch;
         const output = try copyIntegerTensorWithShape(self, source, shape);
         const data = toBuf(output).owned_source_tensor.?.data;
         switch (source.dtype) {
+            .i8 => scanAxis(i8, std.mem.bytesAsSlice(i8, data), outer, width, inner, exclusive, reverse),
+            .i16 => scanAxis(i16, std.mem.bytesAsSlice(i16, data), outer, width, inner, exclusive, reverse),
+            .u8 => scanAxis(u8, data, outer, width, inner, exclusive, reverse),
             .i32 => scanAxis(i32, std.mem.bytesAsSlice(i32, data), outer, width, inner, exclusive, reverse),
             .i64 => scanAxis(i64, std.mem.bytesAsSlice(i64, data), outer, width, inner, exclusive, reverse),
             else => unreachable,
@@ -38932,11 +38976,17 @@ fn cumulativeSumOp(ctx: *anyopaque, input: CT, axis: u8, exclusive: bool, revers
 
 fn integerSource(input: CT) ?*const tensor_mod.Tensor {
     const source = toBuf(input).source_tensor orelse return null;
-    return if (source.dtype == .i32 or source.dtype == .i64) source else null;
+    return switch (source.dtype) {
+        .i8, .i16, .i32, .i64, .u8, .bool_ => source,
+        else => null,
+    };
 }
 
 fn integerTensorCount(tensor: *const tensor_mod.Tensor) !usize {
-    if (tensor.dtype != .i32 and tensor.dtype != .i64) return error.UnsupportedTensorType;
+    switch (tensor.dtype) {
+        .i8, .i16, .i32, .i64, .u8, .bool_ => {},
+        else => return error.UnsupportedTensorType,
+    }
     const expected = tensorExpectedDenseByteLen(tensor) orelse return error.InvalidTensorShape;
     if (tensor.data.len != expected) return error.InvalidTensorShape;
     return expected / tensor.dtype.byteSize();
@@ -38968,6 +39018,9 @@ const IndexReader = struct {
     fn at(self: IndexReader, index: usize) !i64 {
         if (index >= self.len) return error.IndexOutOfBounds;
         if (self.source) |source| return switch (source.dtype) {
+            .i8 => std.mem.bytesAsSlice(i8, source.data)[index],
+            .i16 => std.mem.bytesAsSlice(i16, source.data)[index],
+            .u8, .bool_ => source.data[index],
             .i32 => std.mem.bytesAsSlice(i32, source.data)[index],
             .i64 => std.mem.bytesAsSlice(i64, source.data)[index],
             else => unreachable,
@@ -40063,11 +40116,56 @@ fn fromFloat32ShapeOp(ctx: *anyopaque, data: []const f32, shape: []const i32) an
     return buf;
 }
 
+fn convertDTypeOp(ctx: *anyopaque, input: CT, target: ops.GraphDType) anyerror!?CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const source = integerSource(input);
+    const target_integer = switch (target) {
+        .i8, .i16, .i32, .i64, .u8, .bool_ => true,
+        else => false,
+    };
+    if (!target_integer) {
+        if (source == null) return null;
+        const data = try convertTensorToOwnedF32(self.allocator, source.?);
+        const output = try self.makeOwnedBuf(data);
+        errdefer self.computeBackend().free(output);
+        return self.withLogicalShape(output, source.?.shape);
+    }
+    const floats = if (source == null) try getDataChecked(input) else &.{};
+    const count = if (source) |tensor| try integerTensorCount(tensor) else floats.len;
+    const fallback = [_]i64{@intCast(count)};
+    const shape = tensorStoredShape(input) orelse &fallback;
+    const bytes = try self.allocator.alloc(u8, try std.math.mul(usize, count, target.byteSize()));
+    defer self.allocator.free(bytes);
+    const reader = if (source != null) try IndexReader.init(input) else null;
+    for (0..count) |i| {
+        var value: i64 = undefined;
+        if (reader) |exact| {
+            value = try exact.at(i);
+        } else {
+            const f: f64 = floats[i];
+            if (target == .bool_) {
+                bytes[i] = @intFromBool(f != 0);
+                continue;
+            }
+            if (!std.math.isFinite(f) or f < -9223372036854775808.0 or f >= 9223372036854775808.0) return error.InvalidIntegerCast;
+            value = @intFromFloat(f);
+        }
+        switch (target) {
+            .i8, .u8 => bytes[i] = @truncate(@as(u64, @bitCast(value))),
+            .i16 => std.mem.writeInt(u16, bytes[i * 2 ..][0..2], @truncate(@as(u64, @bitCast(value))), .little),
+            .i32 => std.mem.writeInt(u32, bytes[i * 4 ..][0..4], @truncate(@as(u64, @bitCast(value))), .little),
+            .i64 => std.mem.writeInt(i64, bytes[i * 8 ..][0..8], value, .little),
+            .bool_ => bytes[i] = @intFromBool(value != 0),
+            else => unreachable,
+        }
+    }
+    return fromConstantBytesOp(ctx, bytes, target, shape);
+}
+
 fn fromConstantBytesOp(ctx: *anyopaque, data: []const u8, dtype: ops.GraphDType, shape: []const i64) anyerror!?CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     const storage_dtype: tensor_mod.DType = switch (dtype) {
-        .i32 => .i32,
-        .i64 => .i64,
+        inline .i8, .i16, .i32, .i64, .u8, .bool_ => |tag| @field(tensor_mod.DType, @tagName(tag)),
         else => return null,
     };
     if (shape.len > 8) return error.InvalidTensorShape;

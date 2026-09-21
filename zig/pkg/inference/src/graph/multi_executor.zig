@@ -152,22 +152,27 @@ fn transferTensorWithKnownShape(
         error.UnsupportedTensorType => .f32,
         else => return err,
     };
-    if (dtype == .i32) {
-        const exported = (try from.exportTensorData(value, allocator)) orelse return error.UnsupportedTensorType;
-        const bytes = switch (exported.payload) {
-            .bytes => |bytes| bytes,
-            .quantized_f32 => |quant| {
-                allocator.free(quant.raw_bytes);
-                allocator.free(quant.shape);
-                return error.UnsupportedTensorType;
-            },
-        };
-        defer allocator.free(bytes);
-        if (exported.dtype != .i32 or bytes.len % 4 != 0) return error.UnsupportedTensorType;
-        const integers = try allocator.alloc(i32, bytes.len / 4);
-        defer allocator.free(integers);
-        for (integers, 0..) |*integer, i| integer.* = std.mem.readInt(i32, bytes[i * 4 ..][0..4], .little);
-        return (try to.fromInt32Shape(integers, shape_i32)) orelse return error.UnsupportedTensorType;
+    switch (dtype) {
+        inline .i8, .i16, .i32, .i64, .u8, .bool_ => |tag| {
+            const exported = (try from.exportTensorData(value, allocator)) orelse return error.UnsupportedTensorType;
+            const bytes = switch (exported.payload) {
+                .bytes => |bytes| bytes,
+                .quantized_f32 => |quant| {
+                    allocator.free(quant.raw_bytes);
+                    allocator.free(quant.shape);
+                    return error.UnsupportedTensorType;
+                },
+            };
+            defer allocator.free(bytes);
+            if (exported.dtype != dtype) return error.UnsupportedTensorType;
+            if (try to.fromConstantBytes(bytes, @field(ml.graph.DType, @tagName(tag)), shape_i64)) |exact| return exact;
+            if (dtype != .i32 or bytes.len % 4 != 0) return error.UnsupportedTensorType;
+            const integers = try allocator.alloc(i32, bytes.len / 4);
+            defer allocator.free(integers);
+            for (integers, 0..) |*integer, i| integer.* = std.mem.readInt(i32, bytes[i * 4 ..][0..4], .little);
+            return (try to.fromInt32Shape(integers, shape_i32)) orelse return error.UnsupportedTensorType;
+        },
+        else => {},
     }
     const f32_data = try from.toFloat32(value, allocator);
     defer allocator.free(f32_data);

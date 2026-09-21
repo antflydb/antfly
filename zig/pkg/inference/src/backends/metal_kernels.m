@@ -1042,6 +1042,13 @@ typedef struct termite_metal_decode_runtime {
     id<MTLComputePipelineState> argmax_axis_f32_pipeline;
     id<MTLComputePipelineState> convert_dtype_f32_pipeline;
     id<MTLComputePipelineState> cumulative_sum_f32_pipeline;
+    id<MTLComputePipelineState> cumulative_sum_i64_pipeline;
+    id<MTLComputePipelineState> cumulative_sum_i8_pipeline;
+    id<MTLComputePipelineState> cumulative_sum_i16_pipeline;
+    id<MTLComputePipelineState> cumulative_sum_u8_pipeline;
+    id<MTLComputePipelineState> integer_binary_pipeline;
+    id<MTLComputePipelineState> gather_typed_pipeline;
+    id<MTLComputePipelineState> cast_typed_pipeline;
     id<MTLComputePipelineState> cumulative_sum_i32_pipeline;
     id<MTLComputePipelineState> sdpa_f32_pipeline;
     id<MTLComputePipelineState> sdpa_f32_bert_prefill_s256_hd64_q8_pipeline;
@@ -10445,6 +10452,165 @@ static NSString *termite_metal_shader_source(void) {
            "        uint pos = p.reverse != 0u ? p.width - 1u - uint(j) : uint(j), index = base + pos * p.inner;\n"
            "        uint value = input[index]; if (p.exclusive != 0u) output[index] = sum;\n"
            "        sum += value; if (p.exclusive == 0u) output[index] = sum;\n"
+           "    }\n"
+           "}\n"
+           "kernel void termite_cumulative_sum_i64(device const ulong *input [[buffer(0)]], device ulong *output [[buffer(1)]], constant termite_scan_params &p [[buffer(2)]], uint tid [[thread_index_in_threadgroup]], uint row [[threadgroup_position_in_grid]]) {\n"
+           "    // Each lane scans a contiguous chunk, then a workgroup prefix propagates\n"
+           "    // chunk totals. O(N + 256 log 256) work, constant scratch, one dispatch.\n"
+           "    threadgroup ulong totals[256];\n"
+           "    uint chunk = p.width / 256u + uint(p.width % 256u != 0u);\n"
+           "    ulong start = ulong(tid) * chunk, end = min(start + chunk, ulong(p.width));\n"
+           "    uint base = (row / p.inner) * p.width * p.inner + row % p.inner;\n"
+           "    ulong sum = 0u;\n"
+           "    for (ulong j = start; j < end; ++j) { uint pos = p.reverse != 0u ? p.width - 1u - uint(j) : uint(j); sum += input[base + pos * p.inner]; }\n"
+           "    totals[tid] = sum; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    for (uint step = 1u; step < 256u; step <<= 1u) {\n"
+           "        ulong prior = tid >= step ? totals[tid - step] : 0u;\n"
+           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "        totals[tid] += prior; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    }\n"
+           "    sum = tid == 0u ? 0u : totals[tid - 1u];\n"
+           "    for (ulong j = start; j < end; ++j) {\n"
+           "        uint pos = p.reverse != 0u ? p.width - 1u - uint(j) : uint(j), index = base + pos * p.inner;\n"
+           "        ulong value = input[index]; if (p.exclusive != 0u) output[index] = sum;\n"
+           "        sum += value; if (p.exclusive == 0u) output[index] = sum;\n"
+           "    }\n"
+           "}\n"
+           "kernel void termite_cumulative_sum_i8(device const uchar *input [[buffer(0)]], device uchar *output [[buffer(1)]], constant termite_scan_params &p [[buffer(2)]], uint tid [[thread_index_in_threadgroup]], uint row [[threadgroup_position_in_grid]]) {\n"
+           "    // Each lane scans a contiguous chunk, then a workgroup prefix propagates\n"
+           "    // chunk totals. O(N + 256 log 256) work, constant scratch, one dispatch.\n"
+           "    threadgroup uchar totals[256];\n"
+           "    uint chunk = p.width / 256u + uint(p.width % 256u != 0u);\n"
+           "    ulong start = ulong(tid) * chunk, end = min(start + chunk, ulong(p.width));\n"
+           "    uint base = (row / p.inner) * p.width * p.inner + row % p.inner;\n"
+           "    uchar sum = 0u;\n"
+           "    for (ulong j = start; j < end; ++j) { uint pos = p.reverse != 0u ? p.width - 1u - uint(j) : uint(j); sum += input[base + pos * p.inner]; }\n"
+           "    totals[tid] = sum; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    for (uint step = 1u; step < 256u; step <<= 1u) {\n"
+           "        uchar prior = tid >= step ? totals[tid - step] : 0u;\n"
+           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "        totals[tid] += prior; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    }\n"
+           "    sum = tid == 0u ? 0u : totals[tid - 1u];\n"
+           "    for (ulong j = start; j < end; ++j) {\n"
+           "        uint pos = p.reverse != 0u ? p.width - 1u - uint(j) : uint(j), index = base + pos * p.inner;\n"
+           "        uchar value = input[index]; if (p.exclusive != 0u) output[index] = sum;\n"
+           "        sum += value; if (p.exclusive == 0u) output[index] = sum;\n"
+           "    }\n"
+           "}\n"
+           "kernel void termite_cumulative_sum_i16(device const ushort *input [[buffer(0)]], device ushort *output [[buffer(1)]], constant termite_scan_params &p [[buffer(2)]], uint tid [[thread_index_in_threadgroup]], uint row [[threadgroup_position_in_grid]]) {\n"
+           "    // Each lane scans a contiguous chunk, then a workgroup prefix propagates\n"
+           "    // chunk totals. O(N + 256 log 256) work, constant scratch, one dispatch.\n"
+           "    threadgroup ushort totals[256];\n"
+           "    uint chunk = p.width / 256u + uint(p.width % 256u != 0u);\n"
+           "    ulong start = ulong(tid) * chunk, end = min(start + chunk, ulong(p.width));\n"
+           "    uint base = (row / p.inner) * p.width * p.inner + row % p.inner;\n"
+           "    ushort sum = 0u;\n"
+           "    for (ulong j = start; j < end; ++j) { uint pos = p.reverse != 0u ? p.width - 1u - uint(j) : uint(j); sum += input[base + pos * p.inner]; }\n"
+           "    totals[tid] = sum; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    for (uint step = 1u; step < 256u; step <<= 1u) {\n"
+           "        ushort prior = tid >= step ? totals[tid - step] : 0u;\n"
+           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "        totals[tid] += prior; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    }\n"
+           "    sum = tid == 0u ? 0u : totals[tid - 1u];\n"
+           "    for (ulong j = start; j < end; ++j) {\n"
+           "        uint pos = p.reverse != 0u ? p.width - 1u - uint(j) : uint(j), index = base + pos * p.inner;\n"
+           "        ushort value = input[index]; if (p.exclusive != 0u) output[index] = sum;\n"
+           "        sum += value; if (p.exclusive == 0u) output[index] = sum;\n"
+           "    }\n"
+           "}\n"
+           "kernel void termite_cumulative_sum_u8(device const uchar *input [[buffer(0)]], device uchar *output [[buffer(1)]], constant termite_scan_params &p [[buffer(2)]], uint tid [[thread_index_in_threadgroup]], uint row [[threadgroup_position_in_grid]]) {\n"
+           "    // Each lane scans a contiguous chunk, then a workgroup prefix propagates\n"
+           "    // chunk totals. O(N + 256 log 256) work, constant scratch, one dispatch.\n"
+           "    threadgroup uchar totals[256];\n"
+           "    uint chunk = p.width / 256u + uint(p.width % 256u != 0u);\n"
+           "    ulong start = ulong(tid) * chunk, end = min(start + chunk, ulong(p.width));\n"
+           "    uint base = (row / p.inner) * p.width * p.inner + row % p.inner;\n"
+           "    uchar sum = 0u;\n"
+           "    for (ulong j = start; j < end; ++j) { uint pos = p.reverse != 0u ? p.width - 1u - uint(j) : uint(j); sum += input[base + pos * p.inner]; }\n"
+           "    totals[tid] = sum; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    for (uint step = 1u; step < 256u; step <<= 1u) {\n"
+           "        uchar prior = tid >= step ? totals[tid - step] : 0u;\n"
+           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "        totals[tid] += prior; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    }\n"
+           "    sum = tid == 0u ? 0u : totals[tid - 1u];\n"
+           "    for (ulong j = start; j < end; ++j) {\n"
+           "        uint pos = p.reverse != 0u ? p.width - 1u - uint(j) : uint(j), index = base + pos * p.inner;\n"
+           "        uchar value = input[index]; if (p.exclusive != 0u) output[index] = sum;\n"
+           "        sum += value; if (p.exclusive == 0u) output[index] = sum;\n"
+           "    }\n"
+           "}\n"
+           "inline long termite_read_integer(device const uchar *input, uint dtype, uint i) {\n"
+           "    switch (dtype) {\n"
+           "        case 1: return ((device const int *)input)[i];\n"
+           "        case 2: return ((device const long *)input)[i];\n"
+           "        case 3: return ((device const char *)input)[i];\n"
+           "        case 4: return ((device const short *)input)[i];\n"
+           "        default: return input[i];\n"
+           "    }\n"
+           "}\n"
+           "kernel void termite_gather_typed(device const uchar *input [[buffer(0)]], device const uchar *indices [[buffer(1)]], device uchar *output [[buffer(2)]], constant uint *p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
+           "    if (gid >= p[0]) return;\n"
+           "    uint inner = p[1], count = p[2], extent = p[3], bytes = p[4];\n"
+           "    uint index_pos = (gid / inner) % count;\n"
+           "    long index = termite_read_integer(indices, p[5], index_pos);\n"
+           "    if (index < 0) index += long(extent);\n"
+           "    ulong source = (ulong(gid / (inner * count)) * extent + ulong(index)) * inner + gid % inner;\n"
+           "    for (uint j = 0; j < bytes; ++j) output[ulong(gid) * bytes + j] = input[source * bytes + j];\n"
+           "}\n"
+           "inline bool termite_integer_lt_float(long a, float b) {\n"
+           "    if (isnan(b)) return false;\n"
+           "    if (b >= 9223372036854775808.0f) return true;\n"
+           "    if (b < -9223372036854775808.0f) return false;\n"
+           "    long integral = long(b);\n"
+           "    return a < integral || (a == integral && b > float(integral));\n"
+           "}\n"
+           "inline bool termite_float_lt_integer(float a, long b) {\n"
+           "    if (isnan(a)) return false;\n"
+           "    if (a >= 9223372036854775808.0f) return false;\n"
+           "    if (a < -9223372036854775808.0f) return true;\n"
+           "    long integral = long(a);\n"
+           "    return integral < b || (integral == b && a < float(integral));\n"
+           "}\n"
+           "kernel void termite_integer_binary(device const uchar *lhs [[buffer(0)]], device const uchar *rhs [[buffer(1)]], device uchar *output [[buffer(2)]], constant uint *p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
+           "    if (gid >= p[0]) return;\n"
+           "    uint li = p[3] != 0u ? 0u : gid, ri = p[4] != 0u ? 0u : gid;\n"
+           "    long a = p[1] != 0u ? termite_read_integer(lhs, p[1], li) : 0;\n"
+           "    long b = p[2] != 0u ? termite_read_integer(rhs, p[2], ri) : 0;\n"
+           "    if (p[5] == 3u) {\n"
+           "        bool result = p[1] == 0u ? termite_float_lt_integer(((device const float *)lhs)[li], b) : p[2] == 0u ? termite_integer_lt_float(a, ((device const float *)rhs)[ri]) : a < b;\n"
+           "        ((device float *)output)[gid] = result ? 1.0f : 0.0f;\n"
+           "        return;\n"
+           "    }\n"
+           "    ulong result = p[5] == 0u ? ulong(a) + ulong(b) : p[5] == 1u ? ulong(a) - ulong(b) : ulong(a) * ulong(b);\n"
+           "    switch (p[1]) {\n"
+           "        case 1: ((device uint *)output)[gid] = uint(result); break;\n"
+           "        case 2: ((device ulong *)output)[gid] = result; break;\n"
+           "        case 3: case 5: output[gid] = uchar(result); break;\n"
+           "        case 4: ((device ushort *)output)[gid] = ushort(result); break;\n"
+           "    }\n"
+           "}\n"
+           "kernel void termite_cast_typed(device const uchar *input [[buffer(0)]], device uchar *output [[buffer(1)]], constant uint *p [[buffer(2)]], uint gid [[thread_position_in_grid]]) {\n"
+           "    if (gid >= p[0]) return;\n"
+           "    long integer = 0;\n"
+           "    switch (p[1]) {\n"
+           "        case 1: integer = ((device const int *)input)[gid]; break;\n"
+           "        case 2: integer = ((device const long *)input)[gid]; break;\n"
+           "        case 3: integer = ((device const char *)input)[gid]; break;\n"
+           "        case 4: integer = ((device const short *)input)[gid]; break;\n"
+           "        case 5: case 6: integer = input[gid]; break;\n"
+           "    }\n"
+           "    float floating = p[1] == 0u ? ((device const float *)input)[gid] : float(integer);\n"
+           "    if (p[2] == 0u) { ((device float *)output)[gid] = floating; return; }\n"
+           "    if (p[2] == 6u) { output[gid] = p[1] == 0u ? uchar(floating != 0.0f) : uchar(integer != 0); return; }\n"
+           "    if (p[1] == 0u) integer = long(floating);\n"
+           "    switch (p[2]) {\n"
+           "        case 1: ((device uint *)output)[gid] = uint(integer); break;\n"
+           "        case 2: ((device ulong *)output)[gid] = ulong(integer); break;\n"
+           "        case 3: case 5: output[gid] = uchar(integer); break;\n"
+           "        case 4: ((device ushort *)output)[gid] = ushort(integer); break;\n"
            "    }\n"
            "}\n"
            "kernel void termite_convert_dtype_f32(device const float *input [[buffer(0)]], device float *output [[buffer(1)]], constant termite_metal_convert_dtype_f32_params &p [[buffer(2)]], uint gid [[thread_position_in_grid]]) {\n"
@@ -25597,7 +25763,14 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         runtime->argmax_axis_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_argmax_axis_f32");
         runtime->convert_dtype_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_convert_dtype_f32");
         runtime->cumulative_sum_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_cumulative_sum_f32");
+        runtime->integer_binary_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_integer_binary");
+        runtime->gather_typed_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_gather_typed");
+        runtime->cast_typed_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_cast_typed");
         runtime->cumulative_sum_i32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_cumulative_sum_i32");
+        runtime->cumulative_sum_u8_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_cumulative_sum_u8");
+        runtime->cumulative_sum_i16_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_cumulative_sum_i16");
+        runtime->cumulative_sum_i8_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_cumulative_sum_i8");
+        runtime->cumulative_sum_i64_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_cumulative_sum_i64");
         runtime->sdpa_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_sdpa_f32");
         runtime->sdpa_f32_bert_prefill_s256_hd64_q8_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_sdpa_f32_bert_prefill_s256_hd64_q8");
         runtime->sdpa_f32_vision_hd64_q8_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_sdpa_f32_vision_hd64_q8");
@@ -26465,7 +26638,14 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->argmax_axis_f32_pipeline = nil;
     runtime->convert_dtype_f32_pipeline = nil;
     runtime->cumulative_sum_f32_pipeline = nil;
+    runtime->integer_binary_pipeline = nil;
+    runtime->gather_typed_pipeline = nil;
+    runtime->cast_typed_pipeline = nil;
     runtime->cumulative_sum_i32_pipeline = nil;
+    runtime->cumulative_sum_u8_pipeline = nil;
+    runtime->cumulative_sum_i16_pipeline = nil;
+    runtime->cumulative_sum_i8_pipeline = nil;
+    runtime->cumulative_sum_i64_pipeline = nil;
     runtime->sdpa_f32_pipeline = nil;
     runtime->sdpa_f32_bert_prefill_s256_hd64_q8_pipeline = nil;
     runtime->sdpa_f32_vision_hd64_q8_pipeline = nil;
@@ -44865,13 +45045,23 @@ int termite_metal_decode_runtime_cumulative_sum_f32_device(
     void *output_handle, size_t output_offset
 ) {
     if (runtime == NULL || input_handle == NULL || output_handle == NULL) return -1;
-    id<MTLComputePipelineState> pipeline = integer ? runtime->cumulative_sum_i32_pipeline : runtime->cumulative_sum_f32_pipeline;
+    id<MTLComputePipelineState> pipeline = nil;
+    size_t element_bytes = 4;
+    switch (integer) {
+        case 0: pipeline = runtime->cumulative_sum_f32_pipeline; break;
+        case 1: pipeline = runtime->cumulative_sum_i32_pipeline; break;
+        case 2: pipeline = runtime->cumulative_sum_i64_pipeline; element_bytes = 8; break;
+        case 3: pipeline = runtime->cumulative_sum_i8_pipeline; element_bytes = 1; break;
+        case 4: pipeline = runtime->cumulative_sum_i16_pipeline; element_bytes = 2; break;
+        case 5: pipeline = runtime->cumulative_sum_u8_pipeline; element_bytes = 1; break;
+        default: return -3;
+    }
     if (pipeline == nil) return -2;
     if (outer == 0 || width == 0 || inner == 0 || width > UINT32_MAX || outer > UINT32_MAX / width || inner > UINT32_MAX / (outer * width)) return -3;
     @autoreleasepool {
         id<MTLBuffer> input = (__bridge id<MTLBuffer>)input_handle;
         id<MTLBuffer> output = (__bridge id<MTLBuffer>)output_handle;
-        const size_t bytes = outer * width * inner * sizeof(float);
+        const size_t bytes = outer * width * inner * element_bytes;
         if (input_offset > input.length || bytes > input.length - input_offset || output_offset > output.length || bytes > output.length - output_offset) return -4;
         if (termite_metal_decode_runtime_prepare_planned_compute_unary_accesses(runtime, input, input_offset, bytes, output, output_offset, bytes, -9) != 0) return -9;
         const uint32_t params[4] = { (uint32_t)width, (uint32_t)inner, exclusive, reverse };
@@ -44888,6 +45078,70 @@ int termite_metal_decode_runtime_cumulative_sum_f32_device(
         [encoder setBytes:params length:sizeof(params) atIndex:2];
         [encoder dispatchThreadgroups:MTLSizeMake(outer * inner, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         if (!planned_encoder) [encoder endEncoding];
+        return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -10);
+    }
+}
+
+static int termite_metal_decode_runtime_typed_binary_dispatch(termite_metal_decode_runtime *runtime, void *input_handle, size_t input_offset, size_t input_bytes, void *indices_handle, size_t indices_offset, size_t indices_bytes, void *output_handle, size_t output_offset, size_t output_bytes, const uint32_t *params, id<MTLComputePipelineState> pipeline) {
+    if (!runtime || !input_handle || !indices_handle || !output_handle || !params) return -1;
+    @autoreleasepool {
+        id<MTLBuffer> input = (__bridge id<MTLBuffer>)input_handle;
+        id<MTLBuffer> indices = (__bridge id<MTLBuffer>)indices_handle;
+        id<MTLBuffer> output = (__bridge id<MTLBuffer>)output_handle;
+        if (input_offset > input.length || input_bytes > input.length - input_offset || indices_offset > indices.length || indices_bytes > indices.length - indices_offset || output_offset > output.length || output_bytes > output.length - output_offset) return -2;
+        if (pipeline == nil) return -3;
+        if (termite_metal_decode_runtime_prepare_planned_compute_binary_accesses(runtime, input, input_offset, input_bytes, indices, indices_offset, indices_bytes, output, output_offset, output_bytes, -9) != 0) return -9;
+        bool frame_owned = true;
+        id<MTLCommandBuffer> command_buffer = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);
+        if (command_buffer == nil) return -8;
+        id<MTLComputeCommandEncoder> encoder = runtime->active_planned_compute_encoder;
+        BOOL planned = encoder != nil;
+        if (!planned) encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
+        if (encoder == nil) return -9;
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:input offset:input_offset atIndex:0];
+        [encoder setBuffer:indices offset:indices_offset atIndex:1];
+        [encoder setBuffer:output offset:output_offset atIndex:2];
+        [encoder setBytes:params length:6 * sizeof(uint32_t) atIndex:3];
+        [encoder dispatchThreads:MTLSizeMake(params[0], 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(pipeline, params[0]), 1, 1)];
+        if (!planned) [encoder endEncoding];
+        return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -10);
+    }
+}
+
+int termite_metal_decode_runtime_gather_typed_device(termite_metal_decode_runtime *runtime, void *input_handle, size_t input_offset, size_t input_bytes, void *indices_handle, size_t indices_offset, size_t indices_bytes, void *output_handle, size_t output_offset, size_t output_bytes, const uint32_t *params) {
+    return termite_metal_decode_runtime_typed_binary_dispatch(runtime, input_handle, input_offset, input_bytes, indices_handle, indices_offset, indices_bytes, output_handle, output_offset, output_bytes, params, runtime != NULL ? runtime->gather_typed_pipeline : nil);
+}
+
+int termite_metal_decode_runtime_integer_binary_device(termite_metal_decode_runtime *runtime, void *input_handle, size_t input_offset, size_t input_bytes, void *indices_handle, size_t indices_offset, size_t indices_bytes, void *output_handle, size_t output_offset, size_t output_bytes, const uint32_t *params) {
+    return termite_metal_decode_runtime_typed_binary_dispatch(runtime, input_handle, input_offset, input_bytes, indices_handle, indices_offset, indices_bytes, output_handle, output_offset, output_bytes, params, runtime != NULL ? runtime->integer_binary_pipeline : nil);
+}
+
+int termite_metal_decode_runtime_cast_typed_device(termite_metal_decode_runtime *runtime, void *input_handle, size_t input_offset, void *output_handle, size_t output_offset, size_t count, uint32_t source_dtype, uint32_t target_dtype) {
+    if (!runtime || !input_handle || !output_handle || source_dtype > 6 || target_dtype > 6 || count > UINT32_MAX) return -1;
+    const size_t widths[] = {4, 4, 8, 1, 2, 1, 1};
+    @autoreleasepool {
+        id<MTLBuffer> input = (__bridge id<MTLBuffer>)input_handle;
+        id<MTLBuffer> output = (__bridge id<MTLBuffer>)output_handle;
+        size_t input_bytes = count * widths[source_dtype], output_bytes = count * widths[target_dtype];
+        if (input_offset > input.length || input_bytes > input.length - input_offset || output_offset > output.length || output_bytes > output.length - output_offset) return -2;
+        id<MTLComputePipelineState> pipeline = runtime->cast_typed_pipeline;
+        if (pipeline == nil) return -3;
+        if (termite_metal_decode_runtime_prepare_planned_compute_unary_accesses(runtime, input, input_offset, input_bytes, output, output_offset, output_bytes, -9) != 0) return -9;
+        const uint32_t params[] = {(uint32_t)count, source_dtype, target_dtype};
+        bool frame_owned = true;
+        id<MTLCommandBuffer> command_buffer = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);
+        if (command_buffer == nil) return -8;
+        id<MTLComputeCommandEncoder> encoder = runtime->active_planned_compute_encoder;
+        BOOL planned = encoder != nil;
+        if (!planned) encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
+        if (encoder == nil) return -9;
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:input offset:input_offset atIndex:0];
+        [encoder setBuffer:output offset:output_offset atIndex:1];
+        [encoder setBytes:params length:sizeof(params) atIndex:2];
+        [encoder dispatchThreads:MTLSizeMake(count, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(pipeline, count), 1, 1)];
+        if (!planned) [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -10);
     }
 }
