@@ -24256,17 +24256,11 @@ const RemoteMetadataSource = struct {
     }
 
     fn readSystemCatalog(self: *RemoteMetadataSource, alloc: std.mem.Allocator, request: antfly.public_api.operation.RequestContext, input: @import("../system_catalog/domain.zig").Call) ![]u8 {
-        try request.ensureActive();
-        const started = self.awakeNs();
-        var budget_ns: u64 = @as(u64, antfly.public_api.raft_mutation_forwarding.max_remaining_ms) * std.time.ns_per_ms;
-        if (request.deadline_ns) |deadline| {
-            const now: u64 = if (request.deadline_io) |borrow| blk: {
-                var receiver = try borrow.receive();
-                break :blk @intCast(@max(0, std.Io.Clock.awake.now(receiver.io()).nanoseconds));
-            } else @import("antfly_platform").time.monotonicNs();
-            budget_ns = @min(budget_ns, deadline -| now);
-        }
-        const deadline = started +| budget_ns;
+        // The forwarding envelope bounds one RPC, not the complete read.
+        // Share the caller's existing snapshot allowance across attempts so
+        // a slow/failed peer cannot consume a fresh budget or prematurely
+        // terminate write validation while its caller still has time left.
+        const deadline = try requestDeadlineOnClock(request, self.awakeNs(), remote_metadata_snapshot_timeout_ns);
         // Pin the endpoint order for each pass. Concurrent successful calls
         // may change affinity, but must not cause this read to skip a peer.
         while (true) {
@@ -24279,7 +24273,11 @@ const RemoteMetadataSource = struct {
                 const index = (first + attempt) % self.base_uris.len;
                 var client = self.metadataClient(alloc);
                 var cancellation = antfly.raft.transport.http_common.RequestCancellation.fromToken(request.cancellation);
-                const read = client.readSystemCatalog(self.base_uris[index], input, @intCast(@max(1, remaining_ns / std.time.ns_per_ms)), &cancellation) catch |err| {
+                const attempt_ms: u32 = @intCast(@min(
+                    antfly.public_api.raft_mutation_forwarding.max_remaining_ms,
+                    @max(1, remaining_ns / std.time.ns_per_ms),
+                ));
+                const read = client.readSystemCatalog(self.base_uris[index], input, attempt_ms, &cancellation) catch |err| {
                     switch (err) {
                         error.InvalidCatalogName, error.CatalogNotFound, error.CatalogGenerationChanged, error.CatalogCommandTooLarge, error.OutOfMemory, error.Cancelled, error.Canceled => return err,
                         else => {
@@ -24290,6 +24288,9 @@ const RemoteMetadataSource = struct {
                         },
                     }
                 };
+                errdefer read.deinit(alloc);
+                try request.ensureActive();
+                if (self.awakeNs() >= deadline) return error.DeadlineExceeded;
                 self.acceptMetadataIdentity(read.metadata_group_id, read.metadata_incarnation) catch |err| {
                     read.deinit(alloc);
                     terminal_error = err;
@@ -30887,6 +30888,64 @@ fn consumerTests() type {
             fake = .{ .unavailable = std.math.maxInt(usize), .cancel = &cancellation };
             try std.testing.expectError(error.Canceled, source.readSystemCatalog(alloc, .{ .cancellation = cancellation.token() }, .snapshot));
             try std.testing.expectEqual(@as(usize, 1), fake.calls);
+        }
+
+        test "system catalog remote reads spend one caller budget across bounded RPC attempts" {
+            const alloc = std.testing.allocator;
+            const Http = antfly.common.http;
+            const VoprIo = @import("vopr").vopr_io.VoprIo;
+            const Mode = enum { recover, short_deadline, exhausted, late_response, canceled_response };
+            const Fake = struct {
+                clock: *VoprIo,
+                mode: Mode,
+                cancellation: *antfly.raft.transport.http_common.RequestCancellation,
+                calls: usize = 0,
+
+                fn execute(ptr: *anyopaque, a: std.mem.Allocator, request: Http.HttpRequest) !Http.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.calls += 1;
+                    // The wire's per-attempt ceiling must not be raised to
+                    // implement an operation's longer retry allowance.
+                    const expected_ms: u32 = if (self.mode == .short_deadline) 3_000 else if (self.mode == .exhausted and self.calls == 3) 2_000 else 5_000;
+                    try std.testing.expectEqual(expected_ms, request.timeout_ms.?);
+                    if (self.calls == 1 or self.mode == .exhausted) {
+                        try self.clock.advance(@as(u64, expected_ms) * std.time.ns_per_ms);
+                        return error.Timeout;
+                    }
+                    try std.testing.expectEqual(@as(usize, 2), self.calls);
+                    try self.clock.advance(if (self.mode == .late_response) 8 * std.time.ns_per_s else 1_400 * std.time.ns_per_ms);
+                    if (self.mode == .canceled_response) self.cancellation.cancel();
+                    const headers = try a.alloc(Http.Header, 2);
+                    headers[0] = .{ .name = try a.dupe(u8, "x-antfly-catalog-metadata-group"), .value = try a.dupe(u8, "9") };
+                    headers[1] = .{ .name = try a.dupe(u8, "x-antfly-catalog-metadata-incarnation"), .value = try a.dupe(u8, "11111111111111111111111111111111") };
+                    return .{ .status = 200, .headers = headers, .body = try a.dupe(u8, "null") };
+                }
+            };
+            for (std.enums.values(Mode)) |mode| {
+                var clock = try VoprIo.init(.{ .monotonic_ns = 7 * std.time.ns_per_s });
+                defer clock.deinit();
+                const io = clock.io();
+                var cancellation = antfly.raft.transport.http_common.RequestCancellation{};
+                var fake = Fake{ .clock = &clock, .mode = mode, .cancellation = &cancellation };
+                var source = try RemoteMetadataSource.initWithRequestExecutors(alloc, &.{ "http://one.invalid", "http://two.invalid", "http://three.invalid" }, &.{.{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } }}, io);
+                defer source.deinit();
+                const context: antfly.public_api.operation.RequestContext = .{
+                    .deadline_ns = source.awakeNs() + (if (mode == .short_deadline) @as(u64, 3 * std.time.ns_per_s) else remote_metadata_snapshot_timeout_ns),
+                    .deadline_io = @import("../runtime_io_abi.zig").Borrow.init(&io),
+                    .cancellation = cancellation.token(),
+                };
+                const result = source.readSystemCatalog(alloc, context, .{ .write_validation = "docs" });
+                switch (mode) {
+                    .recover => {
+                        const body = try result;
+                        defer alloc.free(body);
+                        try std.testing.expectEqualStrings("null", body);
+                    },
+                    .short_deadline, .exhausted, .late_response => try std.testing.expectError(error.DeadlineExceeded, result),
+                    .canceled_response => try std.testing.expectError(error.Canceled, result),
+                }
+                try std.testing.expectEqual(@as(usize, if (mode == .short_deadline) 1 else if (mode == .exhausted) 3 else 2), fake.calls);
+            }
         }
 
         test "data ownership fallback requires a single store across all roles" {

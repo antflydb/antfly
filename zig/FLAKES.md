@@ -4,6 +4,10 @@ See also the [E2E flake history](e2e/FLAKES.md). Record the original evidence,
 reproduction conditions, deterministic regression, and before/after results;
 a passing soak alone does not establish a failure's cause.
 
+The later [Antfly E2E failures](e2e/FLAKES.md#2026-09-18-concurrent-aggregations-stalled-hydration-and-raced-primary-generations)
+add full-text hydration contention, aggregation generation races, and overlapping transaction session recovery;
+their deterministic regressions and native soak evidence are recorded there.
+
 ## 2026-09-21: TLA trace producers truncated each other's output
 
 [Issue #828](https://github.com/antflydb/antfly/issues/828) records
@@ -42,6 +46,9 @@ Six fresh extraction/validation runs through `scripts/ci/zig-tla-verify.sh` pass
 each validating 18 Raft and 22 transaction model segments. Run from the repository
 root with `ANTFLY_TLA_TRACE_VALIDATE=true` and a fresh
 `ANTFLY_TLA_TRACE_DIR`; extraction uses the bounded Zig build wrapper.
+After rebasing onto main at `227f2dc39c`, another full extraction/validation run
+passes all 18 Raft and 24 transaction segments (the additional transaction cases
+come from main).
 
 Local raw traces, producer commands, negative-control output, and validation logs
 are under `.benchmark-results/issue-828/` in `.worktrees/issue-828-flakes`.
@@ -50,10 +57,6 @@ In particular, `raft-overlap-before-2.ndjson`, `trace-overlap-result-2.log`, and
 retain all fixed producers. These are native macOS results, not Linux ARC
 qualification. The separate catalog readiness evidence is recorded in the
 [E2E history](e2e/FLAKES.md#2026-09-21-catalog-reporter-startup-preceded-protocol-readiness).
-
-The later [Antfly E2E failures](e2e/FLAKES.md#2026-09-18-concurrent-aggregations-stalled-hydration-and-raced-primary-generations)
-add full-text hydration contention, aggregation generation races, and overlapping transaction session recovery;
-their deterministic regressions and native soak evidence are recorded there.
 
 ## 2026-09-18: HTTP cancellation lost a socket published after the watchdog won
 

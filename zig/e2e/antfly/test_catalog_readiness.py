@@ -32,8 +32,7 @@ def status(*, ready=17, role="leader", incarnation="same-cluster"):
 @pytest.fixture
 def readiness(monkeypatch):
     clock = Clock()
-    monkeypatch.setattr(catalog_readiness.time, "monotonic", clock.monotonic)
-    monkeypatch.setattr(catalog_readiness.time, "sleep", clock.sleep)
+    monkeypatch.setattr(catalog_readiness, "time", clock)
     cluster = SimpleNamespace(
         metadata_procs=[SimpleNamespace(poll=lambda: None)],
         metadata_urls=["http://metadata"],

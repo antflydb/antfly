@@ -14,6 +14,54 @@ The probe also checks incarnation compatibility; a peer advertising version 17
 alone does not prove readiness. The evidence does not establish an activation
 state-machine defect.
 
+[Issue #831](https://github.com/antflydb/antfly/issues/831) also reports this
+signature in [PR #793's catalog job](https://github.com/antflydb/antfly/actions/runs/35564629013/job/106229248643),
+where `test_report_baseline_fragments_large_group_and_batches_neighbors` fails
+registration on all three metadata endpoints with the same protocol error and
+deferred activation probe. The shared fixture barrier covers both tests.
+
+The other main-run occurrence linked from #831 has a different signature.
+[Job 106215258019](https://github.com/antflydb/antfly/actions/runs/35557807565/job/106215258019)
+fails `test_skewed_schema_migrations_keep_foreground_traffic_available` on a
+foreground batch write with HTTP 503 / `DeadlineExceeded` after 5,003 ms, after
+setup succeeds. Metadata logs include a WAL commit lasting 6,457 ms; the trace
+does not identify the write's exact wait or establish the timeout's root cause.
+Do not classify this failure as protocol readiness merely because the startup
+log also contains `MetadataIncarnationUnavailable`. This full-E2E job retained
+only its executable artifact. It now preserves failed cluster roots and uploads
+server logs, diagnostic snapshots, and native stacks, like the base-E2E job.
+Original job logs are `issue-831-pr793.log` and `issue-831-main.log` beside the
+#828 evidence below.
+
+The read-budget audit found a distinct defect that can explain an early
+five-second failure: write validation establishes the existing 12-second metadata
+snapshot allowance, but `readSystemCatalog` truncated the entire operation to
+the five-second forwarding-envelope limit for one RPC. A deterministic VoprIo
+regression lets the first peer consume its five-second allowance, then makes the
+next peer recover 1.4 seconds later. On unchanged main's read implementation,
+it fails with `DeadlineExceeded` before trying the recovered peer, despite time
+remaining in the caller's budget (`issue-831-budget-negative.log`).
+
+Catalog reads now keep one absolute deadline from the caller, capped by the
+existing snapshot allowance, and cap each individual RPC at the unchanged
+five-second wire limit. Retry backoff consumes that same deadline. Shorter
+deadlines and cancellation remain authoritative, including after a response
+arrives. Mutations do not gain retries. The regression also covers complete
+budget exhaustion and rejects late or canceled successful responses. This
+establishes and fixes premature read-budget exhaustion; the retained CI log
+alone cannot prove that this was its exact internal failure path.
+All seven focused catalog read/cache/failover regressions pass without leaks.
+The final Debug server, including the budget correction, passes all 19 catalog
+and readiness cases with the normal four-worker runner. Its SHA-256 is
+`e77cf5b0c7139a6f7a53a817a4c052c8081a51a4e8d4302585b0495f8aa3fedd`;
+see `issue-831-budget-fixed.log` and `catalog-with-budget-module.log`.
+The targeted #831 soak then passes 40/40 fresh-server cases: two workers, five
+repetitions each of reporter baseline fragmentation and foreground migration
+traffic, under both normal and 256-FD profiles. There are no errors or skips;
+write deadlines and every availability/count assertion are unchanged. Reports
+and logs are in `issue-831-soak/` and `issue-831-soak.log`. This is native macOS
+ARM64 qualification; it does not substitute for native Linux ARC CI.
+
 Inspection of `origin/main` at `a032858819bd89ffcb31e5dcf7e76699babfdc3b`
 confirmed the missing fixture barrier and the HTTP 500 classification. An
 unchanged macOS ARM64 Debug binary passed one isolated case and twelve cases
@@ -49,6 +97,20 @@ deliberate leader termination and a full-text count of 2001 instead of 2002 were
 the failures. The unchanged binary subsequently passed those two cases, which
 does not establish that these failures are unrelated or pre-existing. The final
 module pass after resource classification does not prove their runtime causes.
+A subsequent two-worker soak passed 20/20 fresh-server cases: five per worker
+under each of the normal and 256-FD profiles, with no failures or skips. Its
+reports are in `final-soak/` and `catalog-final-soak.log` beside the failed runs.
+
+During qualification, main advanced to `227f2dc39c` (#784), which independently
+added the same catalog process-resource declaration. Rebase preserves that
+upstream change; trace ownership and the readiness barrier were still unfixed.
+All 77 readiness/scheduler regressions pass on that base.
+The rebuilt Debug server also passes all 19 catalog/readiness cases through the
+normal four-worker runner, two isolated large-inventory repetitions, and eight
+two-worker inventory cases across normal and 256-FD profiles. Its SHA-256 is
+`baad0214e7c0e07f4f3d1de88e8f9f8e59d216b744ee24adebf6756c21e6487b`;
+results are `catalog-rebased-*.log`, `rebased-serial/`, and `rebased-soak/`.
+These checks precede the separate catalog-read deadline correction for #831.
 
 Evidence is in `.benchmark-results/issue-828/` in `.worktrees/issue-828-flakes`:
 `catalog-readiness-negative.log`, `catalog-fixed-soak.log`, `fixed-soak/`,
@@ -65,6 +127,11 @@ Reproduce with `scripts/ci/zig-e2e-catalog-soak.sh`, `SKIP_BUILD=1`, an absolute
 normal and 256-FD profiles; worker and repeat counts use
 `ANTFLY_E2E_REGRESSION_WORKERS` and `ANTFLY_E2E_REGRESSION_REPEATS`. Use the normal
 `scripts/ci/zig-antfly-e2e-pytest.sh` runner for module-level parallel scheduling.
+The catalog soak also accepts explicit pytest selectors; its no-argument default
+is unchanged. For #831, pass
+`e2e/antfly/test_catalog_resilience.py::test_report_baseline_fragments_large_group_and_batches_neighbors`
+and
+`e2e/antfly/test_catalog_resilience.py::test_skewed_schema_migrations_keep_foreground_traffic_available`.
 
 ## 2026-09-18: concurrent aggregations stalled hydration and raced primary generations
 
