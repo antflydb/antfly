@@ -795,6 +795,7 @@ pub const ExtractEnrichmentsResult = struct {
             alloc.free(@constCast(write.target));
             alloc.free(@constCast(write.edge_type));
             if (write.metadata_json.len > 0) alloc.free(@constCast(write.metadata_json));
+            if (write.owner.len > 0) alloc.free(@constCast(write.owner));
         }
         if (self.graph_writes.len > 0) alloc.free(self.graph_writes);
 

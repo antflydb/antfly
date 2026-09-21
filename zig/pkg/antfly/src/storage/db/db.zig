@@ -13633,6 +13633,7 @@ pub const DB = struct {
         alloc.free(@constCast(write.target));
         alloc.free(@constCast(write.edge_type));
         if (write.metadata_json.len > 0) alloc.free(@constCast(write.metadata_json));
+        if (write.owner.len > 0) alloc.free(@constCast(write.owner));
         write.* = undefined;
     }
 
@@ -30270,6 +30271,7 @@ pub const DB = struct {
                 alloc.free(@constCast(write.target));
                 alloc.free(@constCast(write.edge_type));
                 if (write.metadata_json.len > 0) alloc.free(@constCast(write.metadata_json));
+                if (write.owner.len > 0) alloc.free(@constCast(write.owner));
             }
             graph_writes.deinit(alloc);
         }
@@ -30321,6 +30323,7 @@ pub const DB = struct {
                     .created_at = graph_write.created_at,
                     .updated_at = graph_write.updated_at,
                     .metadata_json = if (graph_write.metadata_json.len > 0) try alloc.dupe(u8, graph_write.metadata_json) else "",
+                    .owner = if (graph_write.owner.len > 0) try alloc.dupe(u8, graph_write.owner) else "",
                 });
             }
         }
@@ -45400,6 +45403,7 @@ fn augmentExtractedWriteWithGraphFieldEdgesParsed(
             alloc.free(@constCast(write.target));
             alloc.free(@constCast(write.edge_type));
             if (write.metadata_json.len > 0) alloc.free(@constCast(write.metadata_json));
+            if (write.owner.len > 0) alloc.free(@constCast(write.owner));
         }
         extra_writes.deinit(alloc);
     }
@@ -45479,6 +45483,7 @@ fn augmentExtractedWriteWithGraphFieldEdgesFromSnapshotParsed(
             alloc.free(@constCast(write.target));
             alloc.free(@constCast(write.edge_type));
             if (write.metadata_json.len > 0) alloc.free(@constCast(write.metadata_json));
+            if (write.owner.len > 0) alloc.free(@constCast(write.owner));
         }
         extra_writes.deinit(alloc);
     }
@@ -64691,6 +64696,7 @@ const OwnedGraphMutations = struct {
             self.alloc.free(@constCast(write.target));
             self.alloc.free(@constCast(write.edge_type));
             if (write.metadata_json.len > 0) self.alloc.free(@constCast(write.metadata_json));
+            if (write.owner.len > 0) self.alloc.free(@constCast(write.owner));
         }
         if (self.writes.len > 0) self.alloc.free(self.writes);
 
@@ -64733,6 +64739,7 @@ fn collectGraphMutationsForArtifacts(
             alloc.free(@constCast(write.target));
             alloc.free(@constCast(write.edge_type));
             if (write.metadata_json.len > 0) alloc.free(@constCast(write.metadata_json));
+            if (write.owner.len > 0) alloc.free(@constCast(write.owner));
         }
         writes.deinit(alloc);
     }
@@ -64839,6 +64846,7 @@ fn collectGraphMutationsForArtifacts(
             try writes.append(alloc, .{
                 .index_name = try alloc.dupe(u8, parsed.index_name),
                 .source = try alloc.dupe(u8, edge_source),
+                .owner = if (parsed.source_node != null) try alloc.dupe(u8, parsed.doc_key) else "",
                 .target = try alloc.dupe(u8, parsed.target_doc_key),
                 .edge_type = try alloc.dupe(u8, parsed.edge_type),
                 .weight = decoded.weight,
@@ -66652,11 +66660,14 @@ fn applySplitGraphArtifactsStreaming(
             errdefer state.alloc.free(target);
             const edge_type = try state.alloc.dupe(u8, parsed.edge_type);
             errdefer state.alloc.free(edge_type);
+            const owner = if (parsed.source_node != null) try state.alloc.dupe(u8, parsed.doc_key) else "";
+            errdefer if (owner.len > 0) state.alloc.free(owner);
             buffer.writes.appendAssumeCapacity(.{
                 .index_name = index_name,
                 .source = source,
                 .target = target,
                 .edge_type = edge_type,
+                .owner = owner,
                 .weight = decoded.weight,
                 .created_at = decoded.created_at,
                 .updated_at = decoded.updated_at,
@@ -66734,6 +66745,7 @@ fn applySplitGraphArtifactsForIndexStreamingContext(
                 state.ctx.alloc.free(@constCast(write.target));
                 state.ctx.alloc.free(@constCast(write.edge_type));
                 if (write.metadata_json.len > 0) state.ctx.alloc.free(@constCast(write.metadata_json));
+                if (write.owner.len > 0) state.ctx.alloc.free(@constCast(write.owner));
             }
             state.writes.clearRetainingCapacity();
         }
@@ -66830,8 +66842,9 @@ fn applySplitGraphArtifactsForIndexStreamingContext(
             try state.writes.append(state.ctx.alloc, .{
                 .index_name = try state.ctx.alloc.dupe(u8, parsed.index_name),
                 // Entity-sourced relations rebuild from the key's embedded
-                // source node, not the owning document.
+                // source node; the owning document keys the rebuilt row.
                 .source = try state.ctx.alloc.dupe(u8, parsed.source_node orelse parsed.doc_key),
+                .owner = if (parsed.source_node != null) try state.ctx.alloc.dupe(u8, parsed.doc_key) else "",
                 .target = try state.ctx.alloc.dupe(u8, parsed.target_doc_key),
                 .edge_type = try state.ctx.alloc.dupe(u8, parsed.edge_type),
                 .weight = decoded.weight,
