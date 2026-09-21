@@ -6636,6 +6636,54 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return self.residentTrainingUpload(i32, data, shape, .{}, true);
     }
 
+    fn fromConstantBytesOp(ctx: *anyopaque, data: []const u8, dtype: ops.GraphDType, shape: []const i64) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        // Metal's device tensor ABI has exact integer storage for i32 only.
+        // Keep every graph integer constant exact by narrowing values that fit
+        // into that representation; reject larger i64 values instead of
+        // allowing the interpreter's f32 fallback to silently round them.
+        switch (dtype) {
+            .i8, .i16, .i32, .i64, .u8, .bool_ => {},
+            else => return null,
+        }
+        if (shape.len > metal_tensor_mod.max_dims) return error.InvalidTensorShape;
+        var shape_i32: [metal_tensor_mod.max_dims]i32 = undefined;
+        for (shape, 0..) |dim, i| {
+            if (dim <= 0) return null;
+            shape_i32[i] = std.math.cast(i32, dim) orelse return error.InvalidTensorShape;
+        }
+        const dims = shape_i32[0..shape.len];
+        const count = try ops.resident_training.shapeElements(i32, dims, .{});
+        const expected_bytes = std.math.mul(usize, count, dtype.byteSize()) catch return error.InvalidTensorShape;
+        if (data.len != expected_bytes) return error.InvalidTensorShape;
+
+        const values = try self.allocator.alloc(i32, count);
+        defer self.allocator.free(values);
+        switch (dtype) {
+            .i8 => for (values, 0..) |*value, i| {
+                value.* = @as(i8, @bitCast(data[i]));
+            },
+            .i16 => for (values, 0..) |*value, i| {
+                value.* = std.mem.readInt(i16, data[i * 2 ..][0..2], .little);
+            },
+            .i32 => for (values, 0..) |*value, i| {
+                value.* = std.mem.readInt(i32, data[i * 4 ..][0..4], .little);
+            },
+            .i64 => for (values, 0..) |*value, i| {
+                const wide = std.mem.readInt(i64, data[i * 8 ..][0..8], .little);
+                value.* = std.math.cast(i32, wide) orelse return error.UnsupportedTensorType;
+            },
+            .u8 => for (values, 0..) |*value, i| {
+                value.* = data[i];
+            },
+            .bool_ => for (values, 0..) |*value, i| {
+                value.* = if (data[i] == 0) 0 else 1;
+            },
+            else => unreachable,
+        }
+        return try self.residentTrainingUpload(i32, values, dims, .{}, true);
+    }
+
     fn tensorDTypeOp(_: *anyopaque, tensor: CT) anyerror!tensor_mod.DType {
         const buf = toBuf(tensor);
         if (buf.boundary_i32_storage) {
@@ -11224,6 +11272,29 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return self.exportCtFromHostNative(&native_ctx, n_output, null);
     }
 
+    fn boundaryI32AsF32(self: *MetalCompute, tensor: CT) !CT {
+        const buf = toBuf(tensor);
+        const device = buf.metal_tensor orelse return error.UnsupportedTensorType;
+        if (!buf.boundary_i32_storage or device.dtype != .i32) return error.UnsupportedTensorType;
+        const bytes_len = device.deviceByteLen();
+        if (bytes_len % @sizeOf(i32) != 0) return error.InvalidTensorShape;
+        const bytes = try self.allocator.alloc(u8, bytes_len);
+        defer self.allocator.free(bytes);
+        try device.downloadBytesInto(bytes);
+        const values = try self.allocator.alloc(f32, bytes_len / @sizeOf(i32));
+        errdefer self.allocator.free(values);
+        for (values, 0..) |*value, i| {
+            const integer = std.mem.readInt(i32, bytes[i * @sizeOf(i32) ..][0..@sizeOf(i32)], .little);
+            if (integer > (1 << 24) or integer < -(1 << 24)) return error.UnsupportedTensorType;
+            value.* = @floatFromInt(integer);
+        }
+        var shape_buf: [metal_tensor_mod.max_dims]i32 = undefined;
+        const logical_shape = buf.logical_shape orelse &[_]i64{@intCast(values.len)};
+        if (logical_shape.len > shape_buf.len) return error.InvalidTensorShape;
+        for (logical_shape, 0..) |dim, i| shape_buf[i] = std.math.cast(i32, dim) orelse return error.InvalidTensorShape;
+        return denseBuf(self.allocator, values, true, shape_buf[0..logical_shape.len]);
+    }
+
     fn unsupportedUnaryConsumeOp(_: *anyopaque, _: ops.UnaryConsumeOp, _: CT) anyerror!?CT {
         return null;
     }
@@ -11633,6 +11704,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn primGatherOp(ctx: *anyopaque, input: CT, indices: CT, axis: u8, input_shape: []const i64) anyerror!CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (toBuf(indices).boundary_i32_storage) {
+            if (axis != 0) {
+                const float_indices = try self.boundaryI32AsF32(indices);
+                defer freeOp(self, float_indices);
+                return self.hostFallbackGather(input, float_indices, axis, input_shape);
+            }
             if (toBuf(input).resident_owner != null)
                 return self.residentTrainingGather(input, indices, input_shape, axis, .{});
             // Imported ONNX weights use ordinary inference handles, while
@@ -30276,7 +30352,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.fromFloat32 = fromFloat32Op;
         vt.fromFloat32Shape = fromFloat32ShapeOp;
         vt.fromInt32Shape = fromInt32ShapeOp;
-        vt.fromConstantBytes = null; // Keep legacy ONNX constants until all integer primitives are supported.
+        vt.fromConstantBytes = fromConstantBytesOp;
         vt.convertDType = convertDTypeOp;
         vt.cumulativeSum = cumulativeSumOp;
         vt.glinerBoundaryDevice = glinerBoundaryDeviceOp;

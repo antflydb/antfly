@@ -7210,6 +7210,37 @@ test "runtime CumSum preserves exact integers and dtype" {
     try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]i32{ 16777217, 16777218 }), exported.payload.bytes);
 }
 
+test "runtime CumSum preserves exact Metal graph integer constants" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var g = Graph.init(a);
+    defer g.deinit();
+    var builder = ml.graph.Builder.init(&g);
+    const input = try builder.tensorConstBytes(
+        std.mem.sliceAsBytes(&[_]i32{ 16777217, 1 }),
+        Shape.init(.i32, &.{2}),
+    );
+    const out = try g.addNode(.{
+        .op = .{ .cumulative_sum = .{ .axis = 0 } },
+        .output_shape = Shape.init(.i32, &.{2}),
+        .inputs = .{ input, null_node, null_node, null_node },
+        .num_inputs = 1,
+    });
+    try g.markOutput(out);
+    var weights = @import("../ops/gpu_hosted_store.zig").WeightStore{ .allocator = a, .prefix = "", .lazy_weights = .empty };
+    defer weights.lazy_weights.deinit(a);
+    var compute = try @import("../ops/metal_compute.zig").MetalCompute.init(a, &weights, null);
+    defer compute.deinit();
+    var cb = compute.computeBackend();
+    var result = try execute(a, &g, &cb, .{});
+    defer result.deinit(&cb);
+    const exported = (try cb.exportTensorData(result.outputs[0], a)).?;
+    defer a.free(exported.payload.bytes);
+    try std.testing.expectEqual(.i32, exported.dtype);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]i32{ 16777217, 16777218 }), exported.payload.bytes);
+}
+
 test "runtime CumSum retains vector constant shape and exact native dtype" {
     const a = std.testing.allocator;
     inline for (.{ i32, i64, f32 }) |T| {
