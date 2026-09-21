@@ -25,7 +25,7 @@ permissions:
   pull-requests: read
 jobs:
   approve:
-    runs-on: ubuntu-latest
+    runs-on: arc-antfly-standard
     timeout-minutes: 5
     concurrency:
       group: pr-ci-state-${{ inputs.pr_number }}
@@ -141,7 +141,7 @@ jobs:
     name: PR CI result
     needs: [approve, policy, zig, sdks, proxy, operator, scale, gpu, darwin]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: arc-antfly-standard
     timeout-minutes: 5
     steps:
       - uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
@@ -159,7 +159,7 @@ jobs:
     name: Publish PR CI check
     needs: result
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: arc-antfly-standard
     timeout-minutes: 5
     concurrency:
       group: pr-ci-state-${{ inputs.pr_number }}

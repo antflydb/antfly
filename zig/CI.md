@@ -1,8 +1,8 @@
 # CI approval and test selection
 
 PR CI requires a human approval for each commit and each new run. Labels select
-additional suites; they never authorize compute on their own. Antfly and Colony
-use the same controller implementation and repository-specific suite maps.
+additional suites; they never authorize test compute on their own. Antfly and
+Colony share the approval design and use repository-specific suite maps.
 
 ## Run CI on a PR
 
@@ -101,10 +101,11 @@ queue; they have a separate execution policy below.
   final job rechecks the live approval and publishes the PR check directly; it
   does not depend on delivery of a separate completion event.
 - `.github/workflows/pr-ci-admission.yml` verifies the approval and checkout for
-  each suite on a small GitHub-hosted runner before its test jobs are eligible.
+  each suite on `arc-antfly-standard` before its test jobs are eligible.
 - `.github/scripts/pr-ci.cjs` implements the controller; `pr-ci-config.json`
-  contains the repository's suite labels and path patterns. Keep controller and
-  test code identical in both repositories when changing policy.
+  contains the repository's suite labels and path patterns. Coordinate common
+  controller/workflow changes and regression coverage in both repositories,
+  preserving their current fork and required-check policies.
 - Markdown is documentation, not test input. The suite path patterns ignore
   `.md`/`.mdx` files, and the `changes` job in `zig-tests.yml` decides through
   a change filter embedded in the workflow itself (workflow text comes from
@@ -121,9 +122,20 @@ queue; they have a separate execution policy below.
   trusted control plane writes `PR CI` on the actual PR commit, because a normal
   dispatched workflow's checks attach to its default-branch dispatch SHA.
 
-The small controller/admission jobs consume some GitHub-hosted minutes, including
-on draft PR events. No ARC, GPU, or test job starts from those events without a
-valid approval. The controller does not keep a runner waiting for a person.
+Routing, control, admission, result aggregation, final publication, and policy
+tests use `arc-antfly-standard`. Metadata jobs also run for draft and unapproved
+PR events, so they consume GCP resources and share the standard runner pool with
+tests. They finish after processing the event; no runner waits for human approval.
+PR code still runs only after admission, in separate test jobs with their existing
+permissions. Trusted controller jobs use default-branch code and do not persist
+checkout credentials.
+
+ARC capacity or outages can delay approval, invalidation, cancellation, and result
+publication. Admission and completion still recheck live approval state. This
+placement relies on the existing ephemeral ARC runner pods; it adds no runner
+pool, credentials, or network isolation. The opt-in `backup-s3-integration` worker
+and existing GitHub-hosted release, publication, and maintenance jobs retain their
+runner placement; enabling that integration still requires GitHub-hosted capacity.
 
 Antfly accepts both same-repository and fork PRs through this approval flow.
 Approval requires write access to the target repository, not merely the fork.
@@ -168,6 +180,9 @@ actionlint 1.7.12 does not yet recognize.
    together into each repository's default branch. Default-branch event handlers
    cannot be exercised by merely pushing this implementation branch. Existing
    queued/running workflows from before rollout are not retroactively gated.
+   A GitHub-hosted billing failure can still block CI for the runner migration PR
+   until its changes land. After rollout, verify the assigned runner and steps
+   for the complete approval chain; placement alone does not prove tests passed.
 2. Create the suite labels above. Approvers use their existing repository write,
    maintain, or admin access. No extra secrets, GitHub App, personal access token,
    per-user allowlist, or approval environment is required: `GITHUB_TOKEN` handles
@@ -202,9 +217,11 @@ actionlint -shellcheck=''
 python3 -m unittest discover -s scripts/ci -p 'test_*.py'
 ```
 
-The controller tests mock GitHub responses and cover authorization, draft/fork
-rejection, immutable checkouts, suite selection, replay rejection, cancellation,
-and late/failed completion. They do not provision runners or run GPU/scale tests.
+The controller tests mock GitHub responses and cover authorization, draft
+rejection, fork approval, immutable checkouts, suite selection, replay rejection,
+cancellation, and late/failed completion. Structural checks cover ARC placement
+throughout the approval chain and trusted controller checkouts. They do not
+provision runners or run GPU/scale tests.
 
 ## GitHub references
 

@@ -15,7 +15,7 @@ jobs:
     if: >-
       (github.event_name != 'issue_comment' || github.event.issue.pull_request) &&
       (github.event_name != 'workflow_run' || github.event.workflow_run.path == '.github/workflows/pr-ci.yml')
-    runs-on: ubuntu-latest
+    runs-on: arc-antfly-standard
     timeout-minutes: 5
     outputs:
       number: ${{ steps.route.outputs.number }}
@@ -32,7 +32,7 @@ jobs:
   control:
     needs: route
     if: needs.route.outputs.number != ''
-    runs-on: ubuntu-latest
+    runs-on: arc-antfly-standard
     timeout-minutes: 5
     # Serialize state changes with admission without dropping pending events.
     concurrency:

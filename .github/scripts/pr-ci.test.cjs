@@ -315,6 +315,43 @@ test('completion routing uses the orchestrator title, not a branch or arbitrary 
   f.context.payload.workflow_run.path='.github/workflows/release.yml'; assert.equal(route(f.context),'');
 });
 
+test('the complete approval chain uses ARC and trusted jobs never check out PR code', () => {
+  const root = path.resolve(__dirname, '../workflows');
+  const chain = {
+    'pr-ci-controller.yml': ['route', 'control'],
+    'pr-ci-admission.yml': ['verify'],
+    'pr-ci.yml': ['approve', 'result', 'publish'],
+    'pr-ci-policy.yml': ['test'],
+  };
+  for (const [file, expectedJobs] of Object.entries(chain)) {
+    const workflow = fs.readFileSync(path.join(root, file), 'utf8');
+    const jobs = [...workflow.matchAll(/^  ([\w-]+):\n([\s\S]*?)(?=^  [\w-]+:\n|(?![\s\S]))/gm)]
+      .filter(([, , block]) => /^    runs-on:/m.test(block));
+    assert.deepEqual(jobs.map(([, name]) => name), expectedJobs, file);
+    for (const [, name, block] of jobs) {
+      const location = `${file}: ${name}`;
+      // A hosted job anywhere in this chain would still block approval or its result.
+      assert.match(block, /^    runs-on: arc-antfly-standard$/m, location);
+      assert.match(block, /^    timeout-minutes: 5$/m, location);
+      if (file === 'pr-ci-policy.yml') continue; // Approved, unprivileged test code.
+      assert.doesNotMatch(block, /^\s+(?:-\s+)?run:/m, location);
+      for (const [, action] of block.matchAll(/^\s+(?:-\s+)?uses: (\S+)/gm)) {
+        assert.match(action, /^actions\/(?:checkout|github-script)@[a-f0-9]{40}$/, location);
+      }
+      const checkouts = block.match(/uses: actions\/checkout@[^\n]+\n[\s\S]*?(?=\n      -|(?![\s\S]))/g) || [];
+      assert.equal(checkouts.length, ['route', 'result'].includes(name) ? 0 : 1, location);
+      for (const checkout of checkouts) {
+        assert.match(checkout, /^          ref: \$\{\{ github.event.repository.default_branch \}\}$/m, location);
+        assert.match(checkout, /^          sparse-checkout: \.github\/scripts$/m, location);
+        assert.match(checkout, /^          persist-credentials: false$/m, location);
+      }
+    }
+    if (file === 'pr-ci-policy.yml') {
+      assert.doesNotMatch(workflow, /^\s+(?:contents|actions|checks|statuses|id-token): write$/m, file);
+    }
+  }
+});
+
 test('every expensive worker is gated, pins its checkout, and disables automatic PR triggers', () => {
   const root=path.resolve(__dirname,'../workflows');
   for (const suite of config.suites) {
