@@ -1491,6 +1491,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-api-transactions-test", "Run transaction coordinator and participant contracts").dependOn(&addFilteredTestRunArtifact(b, api_transaction_contract_tests).step);
     const run_api_public_table_http_docid_tests = addFilteredTestRunArtifact(b, api_public_table_http_docid_tests);
+    b.step("antfly-api-public-table-http-test", "Run public table HTTP response contracts").dependOn(&run_api_public_table_http_docid_tests.step);
     const run_raft_transition_runtime_docid_tests = addFilteredTestRunArtifact(b, raft_transition_runtime_docid_tests);
     const api_table_writes_production_regression_tests = @import("linked_tests.zig").addPair(b, .{
         .name = "api-table-write-lifecycle-tests",

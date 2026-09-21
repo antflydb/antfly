@@ -4044,6 +4044,9 @@ test "public table query handler preserves retryable failure status" {
     };
     const cases = [_]Case{
         .{ .err = error.QueryEmbeddingInputTooLarge, .status = 413, .body = "{\"code\":\"query_embedding_input_too_large\",\"error\":\"query_embedding_input_too_large\",\"message\":\"query embedding input too large\",\"retryable\":false}", .json = true },
+        .{ .err = error.RerankTransientFailure, .status = 503, .body = "", .json = true, .retry_after_seconds = 1, .unavailable_code = "reranker_temporarily_unavailable", .unavailable_message = "reranker temporarily unavailable" },
+        .{ .err = error.RerankRateLimited, .status = 429, .body = "{\"code\":\"reranker_rate_limited\",\"error\":\"reranker_rate_limited\",\"message\":\"reranker rate limited\",\"retryable\":true}", .json = true, .retry_after_seconds = 1 },
+        .{ .err = error.RerankUpstreamFailure, .status = 502, .body = "{\"code\":\"reranker_upstream_failure\",\"error\":\"reranker_upstream_failure\",\"message\":\"reranker provider failed\",\"retryable\":false}", .json = true },
         .{ .err = error.QueryEmbeddingOverloaded, .status = 429, .body = "{\"code\":\"query_embedding_overloaded\",\"error\":\"query_embedding_overloaded\",\"message\":\"query embedding overloaded\",\"retryable\":true}", .json = true, .retry_after_seconds = 1 },
         .{ .err = error.EmbedRateLimited, .status = 429, .body = "{\"code\":\"query_embedding_rate_limited\",\"error\":\"query_embedding_rate_limited\",\"message\":\"query embedding rate limited\",\"retryable\":true}", .json = true, .retry_after_seconds = 1 },
         .{ .err = error.EmbedTransientFailure, .status = 503, .body = "", .json = true, .retry_after_seconds = 1, .unavailable_code = "query_embedding_temporarily_unavailable", .unavailable_message = "query embedding temporarily unavailable" },

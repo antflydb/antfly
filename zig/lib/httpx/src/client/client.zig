@@ -540,7 +540,7 @@ const RequestInterrupt = struct {
         self.cancelled.store(true, .release);
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        if (self.socket) |socket| socket.shutdown();
+        if (self.socket) |socket| socket.abortRequest();
         if (self.h2_entry) |entry| {
             const stream_id = self.h2_stream_id.?;
             self.h2_entry = null;
@@ -1901,6 +1901,7 @@ pub const Client = struct {
                 try applyTimeouts(&tls_conn.socket, timeout_ms, write_timeout_ms, deadline_ms);
                 try interrupt.publish(&tls_conn.socket, self.io);
                 defer interrupt.clear(&tls_conn.socket, self.io);
+                errdefer if (interrupt.isCancellationRequested()) (&tls_conn.socket).abortRequest();
                 return self.executeOnTls(&tls_conn.session, req, &ok);
             }
 
@@ -1910,6 +1911,7 @@ pub const Client = struct {
             try applyTimeouts(&socket, timeout_ms, write_timeout_ms, deadline_ms);
             try interrupt.publish(&socket, self.io);
             defer interrupt.clear(&socket, self.io);
+            errdefer if (interrupt.isCancellationRequested()) (&socket).abortRequest();
             return self.executeOnNewTls(&socket, host, req);
         }
 
@@ -1923,6 +1925,7 @@ pub const Client = struct {
             try applyTimeouts(&conn.socket, timeout_ms, write_timeout_ms, deadline_ms);
             try interrupt.publish(&conn.socket, self.io);
             defer interrupt.clear(&conn.socket, self.io);
+            errdefer if (interrupt.isCancellationRequested()) (&conn.socket).abortRequest();
             return self.executeOnSocket(&conn.socket, req, &ok);
         }
 
@@ -1931,6 +1934,7 @@ pub const Client = struct {
         try applyTimeouts(&socket, timeout_ms, write_timeout_ms, deadline_ms);
         try interrupt.publish(&socket, self.io);
         defer interrupt.clear(&socket, self.io);
+        errdefer if (interrupt.isCancellationRequested()) (&socket).abortRequest();
         return self.executeOnSocket(&socket, req, null);
     }
 
@@ -2000,6 +2004,7 @@ pub const Client = struct {
                 try applyTimeouts(&tls_conn.socket, timeout_ms, write_timeout_ms, deadline_ms);
                 try interrupt.publish(&tls_conn.socket, self.io);
                 defer interrupt.clear(&tls_conn.socket, self.io);
+                errdefer if (interrupt.isCancellationRequested()) (&tls_conn.socket).abortRequest();
                 return self.executeOnTlsToWriter(&tls_conn.session, req, writer, progress_cb, progress_ctx, &ok);
             }
 
@@ -2008,6 +2013,7 @@ pub const Client = struct {
             try applyTimeouts(&socket, timeout_ms, write_timeout_ms, deadline_ms);
             try interrupt.publish(&socket, self.io);
             defer interrupt.clear(&socket, self.io);
+            errdefer if (interrupt.isCancellationRequested()) (&socket).abortRequest();
             return self.executeOnNewTlsToWriter(&socket, host, req, writer, progress_cb, progress_ctx);
         }
 
@@ -2021,6 +2027,7 @@ pub const Client = struct {
             try applyTimeouts(&conn.socket, timeout_ms, write_timeout_ms, deadline_ms);
             try interrupt.publish(&conn.socket, self.io);
             defer interrupt.clear(&conn.socket, self.io);
+            errdefer if (interrupt.isCancellationRequested()) (&conn.socket).abortRequest();
             return self.executeOnSocketToWriter(&conn.socket, req, writer, progress_cb, progress_ctx, &ok);
         }
 
@@ -2029,6 +2036,7 @@ pub const Client = struct {
         try applyTimeouts(&socket, timeout_ms, write_timeout_ms, deadline_ms);
         try interrupt.publish(&socket, self.io);
         defer interrupt.clear(&socket, self.io);
+        errdefer if (interrupt.isCancellationRequested()) (&socket).abortRequest();
         return self.executeOnSocketToWriter(&socket, req, writer, progress_cb, progress_ctx, null);
     }
 
