@@ -318,6 +318,9 @@ from .extraction_constraint_not import ExtractionConstraintNot
 from .extraction_constraint_not_type import ExtractionConstraintNotType
 from .extraction_constraint_or import ExtractionConstraintOr
 from .extraction_constraint_or_type import ExtractionConstraintOrType
+from .extraction_decision import ExtractionDecision
+from .extraction_decision_confidence_method import ExtractionDecisionConfidenceMethod
+from .extraction_decision_type import ExtractionDecisionType
 from .extraction_decoder_options import ExtractionDecoderOptions
 from .extraction_decoder_options_algorithm import ExtractionDecoderOptionsAlgorithm
 from .extraction_entity import ExtractionEntity
@@ -356,6 +359,7 @@ from .extraction_joint_schema import ExtractionJointSchema
 from .extraction_joint_schema_entities import ExtractionJointSchemaEntities
 from .extraction_joint_schema_relations import ExtractionJointSchemaRelations
 from .extraction_label_definition import ExtractionLabelDefinition
+from .extraction_label_probability import ExtractionLabelProbability
 from .extraction_long_document_metadata import ExtractionLongDocumentMetadata
 from .extraction_long_document_metadata_classification_aggregation import (
     ExtractionLongDocumentMetadataClassificationAggregation,
@@ -1548,6 +1552,9 @@ __all__ = (
     "ExtractionConstraintNotType",
     "ExtractionConstraintOr",
     "ExtractionConstraintOrType",
+    "ExtractionDecision",
+    "ExtractionDecisionConfidenceMethod",
+    "ExtractionDecisionType",
     "ExtractionDecoderOptions",
     "ExtractionDecoderOptionsAlgorithm",
     "ExtractionEntity",
@@ -1586,6 +1593,7 @@ __all__ = (
     "ExtractionJointSchemaEntities",
     "ExtractionJointSchemaRelations",
     "ExtractionLabelDefinition",
+    "ExtractionLabelProbability",
     "ExtractionLongDocumentMetadata",
     "ExtractionLongDocumentMetadataClassificationAggregation",
     "ExtractionLongDocumentMetadataDuplicateScore",

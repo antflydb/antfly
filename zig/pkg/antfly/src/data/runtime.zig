@@ -17422,10 +17422,14 @@ pub const DataServer = struct {
                     .target_index_name = schema_index_name,
                     .advance_index_repairs = schema_index_name != null,
                     .index_repair_options = .{
-                        .admission_deadline_ns = schema_yield.catalogDeadline(),
+                        // Restore/startup advances bounded durable phases; it is
+                        // not a schema-index build quantum. Applying the 25 ms
+                        // slice to its remote descriptor fetch can starve every
+                        // attempt when catalog latency exceeds that slice.
+                        .admission_deadline_ns = if (schema_index_name != null) schema_yield.catalogDeadline() else null,
                         .target_index_name = schema_index_name,
                         .cancel_check = .{ .ptr = &schema_fence, .is_requested = SchemaRepairFence.cancelled },
-                        .yield_check = .{ .ptr = &schema_yield, .is_requested = IndexRepairYieldFence.requested },
+                        .yield_check = if (schema_index_name != null) .{ .ptr = &schema_yield, .is_requested = IndexRepairYieldFence.requested } else null,
                         .activation_check = .{ .ptr = &schema_fence, .is_current_owner = SchemaRepairFence.current },
                         .owner_epoch = schema_fence.ownership_generation,
                         .capacity_domain_id = registration.store_id,
@@ -21253,7 +21257,7 @@ const RemoteMetadataSource = struct {
             if (now_ns >= deadline_ns)
                 return replay_proof_error;
             const index = (start_index + attempt) % self.base_uris.len;
-            // A slow or unavailable status endpoint cannot consume the whole
+            // A slow or unavailable topology endpoint cannot consume the whole
             // mutation budget. Give every remaining endpoint a turn and
             // reserve one share for delivery to the discovered authority.
             const discovery_budget = antfly.metadata_http_client.RequestBudget{
@@ -21264,7 +21268,7 @@ const RemoteMetadataSource = struct {
             defer arena.deinit();
             const scratch = arena.allocator();
             var metadata_client = self.metadataClient(scratch);
-            const status = metadata_client.fetchStatusWithBudget(self.base_uris[index], discovery_budget) catch |err| {
+            const status = metadata_client.fetchMutationTopologyWithBudget(self.base_uris[index], discovery_budget) catch |err| {
                 if (self.awakeNs() >= deadline_ns)
                     return replay_proof_error;
                 last_pre_admission_err = if (err == error.Timeout) error.NotLeader else err;
@@ -21346,7 +21350,7 @@ const RemoteMetadataSource = struct {
         fn observe(
             self: *MetadataMutationEndpointDiscovery,
             index: usize,
-            status: antfly.metadata_api.MetadataStatus,
+            status: anytype,
         ) ?usize {
             if (metadataMutationEndpointReportsLocalLeader(status)) return index;
             std.debug.assert(self.fallback_count < self.fallback_indices.len);
@@ -21360,7 +21364,7 @@ const RemoteMetadataSource = struct {
         }
     };
 
-    fn metadataMutationEndpointReportsLocalLeader(status: antfly.metadata_api.MetadataStatus) bool {
+    fn metadataMutationEndpointReportsLocalLeader(status: anytype) bool {
         const leader_id = status.metadata_raft_leader_id orelse return false;
         return leader_id == status.metadata_raft_local_node_id and
             std.mem.eql(u8, status.metadata_raft_role, "leader");
@@ -29093,6 +29097,7 @@ fn consumerTests() type {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     self.probes += 1;
                     try std.testing.expectEqual(.GET, request.method);
+                    try std.testing.expect(std.mem.endsWith(u8, request.uri, "/metadata/v1/runtime-topology"));
                     const first = std.mem.startsWith(u8, request.uri, "http://stalled.test/");
                     if (self.mode == .slow_all or (first and self.mode != .affinity_changed)) {
                         self.clock.monotonic_ns += @as(u64, request.timeout_ms.?) * std.time.ns_per_ms;
@@ -34671,9 +34676,19 @@ fn consumerTests() type {
                 .metrics = .{},
             });
 
+            const topology = antfly.metadata_api.stabilizeMetadataRuntimeTopology(.{
+                .metadata_group_id = 1,
+                .metadata_raft_local_node_id = 2,
+                .metadata_raft_leader_id = 2,
+                .metadata_raft_role = source_role,
+            });
             try std.testing.expect(status.metadata_raft_role.ptr != source_role.ptr);
+            try std.testing.expect(topology.metadata_raft_role.ptr != source_role.ptr);
             @memset(source_role, 'x');
             try std.testing.expectEqualStrings("leader", status.metadata_raft_role);
+            try std.testing.expectEqualStrings("leader", topology.metadata_raft_role);
+            try std.testing.expectEqual(@as(u64, 2), topology.metadata_raft_local_node_id);
+            try std.testing.expectEqual(@as(?u64, 2), topology.metadata_raft_leader_id);
             const future = antfly.metadata_api.stabilizeMetadataStatus(.{
                 .metadata_group_id = 1,
                 .metadata_raft_role = "future_role",
@@ -34681,6 +34696,11 @@ fn consumerTests() type {
             });
             try std.testing.expectEqualStrings("unknown", future.metadata_raft_role);
             try std.testing.expect(future.metadata_raft_role.ptr != "future_role".ptr);
+            const future_topology = antfly.metadata_api.stabilizeMetadataRuntimeTopology(.{
+                .metadata_group_id = 1,
+                .metadata_raft_role = "future_role",
+            });
+            try std.testing.expectEqualStrings("unknown", future_topology.metadata_raft_role);
         }
 
         test "data runtime health metrics include replay debt and provisioned warmup counters" {

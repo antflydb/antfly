@@ -146,6 +146,13 @@ fn expectFullTextQueryValue(raw: metadata_openapi.RawQuery, expected: []const u8
     try std.testing.expectEqualStrings(expected, query.string);
 }
 
+fn expectFullTextMatchValue(raw: metadata_openapi.RawQuery, expected: []const u8) !void {
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw.bytes, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(expected, lexicalMatchText(parsed.value) orelse return error.TestExpectedEqual);
+    try std.testing.expectEqualStrings("body", parsed.value.object.get("field").?.string);
+}
+
 const TestSseEvent = struct {
     event: []const u8,
     data: []const u8,
@@ -1012,7 +1019,7 @@ fn executeInternal(
             });
         }
 
-        if (initialRefinedQueryText(classification_result, retrieval_query, retrieval_query_index)) |refined_query| {
+        if (initialRefinedQueryText(arena, classification_result, retrieval_query, retrieval_query_index)) |refined_query| {
             try refinement_queries.append(arena, refined_query);
             try appendStep(arena, &steps_list, &live, .{
                 .kind = .planning,
@@ -6070,6 +6077,7 @@ fn queryTextForProbe(
     }
     if (retrieval_query.semantic_search) |semantic_search| return semantic_search;
     if (retrieval_query.full_text_search) |full_text| {
+        if (refinableQueryText(alloc, retrieval_query)) |text| return text;
         if (extractRawQueryStringAlloc(alloc, full_text)) |query| return query;
     }
     if (retrieval_query.filter_query) |filter_query| {
@@ -6540,15 +6548,7 @@ fn encodeQueryValueForRetrievalQueryWithText(
     try applyClassificationRefinement(arena, &query_request, classification_result, retrieval_query_index, refinement_pass);
     if (explicit_text) |text| {
         if (query_request.semantic_search != null) query_request.semantic_search = text;
-        if (query_request.full_text_search) |*full_text| {
-            const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, full_text.bytes, .{});
-            if (parsed == .object) {
-                if (parsed.object.getPtr("query")) |query_value| {
-                    query_value.* = .{ .string = text };
-                    full_text.* = try rawQueryFromValueAlloc(arena, parsed);
-                }
-            }
-        }
+        if (query_request.full_text_search) |*full_text| try refineLexicalMatchText(arena, full_text, text);
     }
     // The raw query predicates are already folded into this query's mandatory
     // set. Install that canonical set instead of conjoining the source query a
@@ -6897,16 +6897,32 @@ fn applyClassificationRefinement(
         query_request.semantic_search = refined_text;
     }
     if (refinement_pass == .evaluation or classification.strategy == .decompose) {
-        if (query_request.full_text_search) |*full_text| {
-            const parsed = try std.json.parseFromSliceLeaky(std.json.Value, alloc, full_text.bytes, .{});
-            if (parsed == .object) {
-                if (parsed.object.getPtr("query")) |query_value| {
-                    query_value.* = .{ .string = refined_text };
-                    full_text.* = try rawQueryFromValueAlloc(alloc, parsed);
-                }
-            }
-        }
+        if (query_request.full_text_search) |*full_text| try refineLexicalMatchText(alloc, full_text, refined_text);
     }
+}
+
+// A query string is executable syntax, not a natural-language placeholder.
+// Replacing it loses field scopes, Boolean clauses, boosts, and phrase rules;
+// generated prose also turns into implicit AND terms. Only a native match
+// node exposes a text slot that can be refined without changing its operators.
+fn lexicalMatchText(value: std.json.Value) ?[]const u8 {
+    if (value != .object) return null;
+    const match = value.object.get("match") orelse return null;
+    return if (match == .string) match.string else null;
+}
+
+fn refineLexicalMatchText(alloc: std.mem.Allocator, raw: *metadata_openapi.RawQuery, text: []const u8) !void {
+    var parsed = try std.json.parseFromSliceLeaky(std.json.Value, alloc, raw.bytes, .{});
+    if (lexicalMatchText(parsed) == null) return;
+    parsed.object.getPtr("match").?.* = .{ .string = text };
+    raw.* = try rawQueryFromValueAlloc(alloc, parsed);
+}
+
+fn refinableQueryText(alloc: std.mem.Allocator, request: RetrievalQueryRequest) ?[]const u8 {
+    if (request.semantic_search) |text| return text;
+    const raw = request.full_text_search orelse return null;
+    const value = std.json.parseFromSliceLeaky(std.json.Value, alloc, raw.bytes, .{}) catch return null;
+    return lexicalMatchText(value);
 }
 
 fn selectRefinedQueryText(
@@ -6955,14 +6971,16 @@ fn selectEvaluationQueryText(
 }
 
 fn initialRefinedQueryText(
+    alloc: std.mem.Allocator,
     classification_result: ?generating_api_openapi.ClassificationTransformationResult,
     retrieval_query: RetrievalQueryRequest,
     retrieval_query_index: usize,
 ) ?[]const u8 {
-    _ = retrieval_query.semantic_search orelse return null;
+    const current = refinableQueryText(alloc, retrieval_query) orelse return null;
     const classification = classification_result orelse return null;
+    if (retrieval_query.semantic_search == null and classification.strategy != .decompose) return null;
     const refined = selectRefinedQueryText(classification, retrieval_query_index, .initial) orelse return null;
-    if (std.mem.eql(u8, retrieval_query.semantic_search.?, refined)) return null;
+    if (std.mem.eql(u8, current, refined)) return null;
     return refined;
 }
 
@@ -6972,6 +6990,7 @@ fn currentRetrievalQueryText(
 ) ?[]const u8 {
     if (retrieval_query.semantic_search) |semantic_search| return semantic_search;
     if (retrieval_query.full_text_search) |full_text| {
+        if (refinableQueryText(alloc, retrieval_query)) |text| return text;
         if (extractRawQueryStringAlloc(alloc, full_text)) |query| return query;
     }
     if (retrieval_query.filter_query) |filter_query| {
@@ -6997,6 +7016,7 @@ fn nextEvaluationRefinedQueryText(
     retrieval_query_index: usize,
     used_queries: []const []const u8,
 ) ?[]const u8 {
+    _ = refinableQueryText(alloc, retrieval_query) orelse return null;
     const classification = classification_result orelse return null;
     if (classification.multi_phrases) |multi_phrases| {
         for (multi_phrases) |phrase| {
@@ -9444,9 +9464,9 @@ test "retrieval agent agentic mode evaluates weak lexical hits and falls back to
             defer parsed_query.deinit();
             if (parsed_query.value.full_text_search) |full_text| {
                 if (self.call_count == 1) {
-                    try expectFullTextQueryValue(full_text, "body:raft");
+                    try expectFullTextMatchValue(full_text, "raft");
                 } else {
-                    try expectFullTextQueryValue(full_text, "Find exact raft entries in Antfly documents");
+                    try expectFullTextMatchValue(full_text, "Find exact raft entries in Antfly documents");
                 }
                 return .{
                     .json = try alloc.dupe(u8,
@@ -9467,7 +9487,7 @@ test "retrieval agent agentic mode evaluates weak lexical hits and falls back to
 
     var runner = FakeRunner{};
     const body =
-        \\{"query":"Find exact raft entries in Antfly documents","stream":false,"max_internal_iterations":3,"steps":{"classification":{"enabled":true,"force_strategy":"simple","with_reasoning":true}},"queries":[{"table":"docs","full_text_search":{"query":"body:raft"},"limit":5},{"table":"docs","embeddings":{"dense_idx":[1.0,0.0,0.0]},"indexes":["dense_idx"],"limit":5}]}
+        \\{"query":"Find exact raft entries in Antfly documents","stream":false,"max_internal_iterations":3,"steps":{"classification":{"enabled":true,"force_strategy":"simple","with_reasoning":true}},"queries":[{"table":"docs","full_text_search":{"match":"raft","field":"body"},"limit":5},{"table":"docs","embeddings":{"dense_idx":[1.0,0.0,0.0]},"indexes":["dense_idx"],"limit":5}]}
     ;
     const encoded = try executeJson(std.testing.allocator, runner.iface(), null, body);
     defer std.testing.allocator.free(encoded);
@@ -9523,9 +9543,9 @@ test "retrieval agent agentic mode evaluates weak multi-hit lexical results and 
             defer parsed_query.deinit();
             if (parsed_query.value.full_text_search) |full_text| {
                 if (self.call_count == 1) {
-                    try expectFullTextQueryValue(full_text, "body:raft");
+                    try expectFullTextMatchValue(full_text, "raft");
                 } else {
-                    try expectFullTextQueryValue(full_text, "Find exact raft entries in Antfly documents");
+                    try expectFullTextMatchValue(full_text, "Find exact raft entries in Antfly documents");
                 }
                 return .{
                     .json = try alloc.dupe(u8,
@@ -9546,7 +9566,7 @@ test "retrieval agent agentic mode evaluates weak multi-hit lexical results and 
 
     var runner = FakeRunner{};
     const body =
-        \\{"query":"Find exact raft entries in Antfly documents","stream":false,"max_internal_iterations":3,"steps":{"classification":{"enabled":true,"force_strategy":"simple","with_reasoning":true}},"queries":[{"table":"docs","full_text_search":{"query":"body:raft"},"limit":5},{"table":"docs","embeddings":{"dense_idx":[1.0,0.0,0.0]},"indexes":["dense_idx"],"limit":5}]}
+        \\{"query":"Find exact raft entries in Antfly documents","stream":false,"max_internal_iterations":3,"steps":{"classification":{"enabled":true,"force_strategy":"simple","with_reasoning":true}},"queries":[{"table":"docs","full_text_search":{"match":"raft","field":"body"},"limit":5},{"table":"docs","embeddings":{"dense_idx":[1.0,0.0,0.0]},"indexes":["dense_idx"],"limit":5}]}
     ;
     const encoded = try executeJson(std.testing.allocator, runner.iface(), null, body);
     defer std.testing.allocator.free(encoded);
@@ -9603,9 +9623,9 @@ test "retrieval agent asks for clarification after ambiguous post-refinement fal
             if (parsed_query.value.full_text_search != null and parsed_query.value.embeddings == null) {
                 const full_text = parsed_query.value.full_text_search.?;
                 if (self.call_count == 1) {
-                    try expectFullTextQueryValue(full_text, "body:raft");
+                    try expectFullTextMatchValue(full_text, "raft");
                 } else {
-                    try expectFullTextQueryValue(full_text, "Find exact raft entries in Antfly cluster documents");
+                    try expectFullTextMatchValue(full_text, "Find exact raft entries in Antfly cluster documents");
                 }
                 return .{
                     .json = try alloc.dupe(u8,
@@ -9633,7 +9653,7 @@ test "retrieval agent asks for clarification after ambiguous post-refinement fal
 
     var runner = FakeRunner{};
     const body =
-        \\{"query":"Find exact raft entries in Antfly cluster documents","stream":false,"max_internal_iterations":4,"max_user_clarifications":2,"decisions":[{"question_id":"select_query","answer":0}],"steps":{"classification":{"enabled":true,"force_strategy":"simple","with_reasoning":true}},"queries":[{"table":"docs","full_text_search":{"query":"body:raft"},"limit":5},{"table":"docs","embeddings":{"dense_idx":[1.0,0.0,0.0]},"indexes":["dense_idx"],"limit":5},{"table":"docs","full_text_search":{"query":"body:architecture"},"embeddings":{"dense_idx":[1.0,0.0,0.0]},"indexes":["dense_idx"],"limit":5}]}
+        \\{"query":"Find exact raft entries in Antfly cluster documents","stream":false,"max_internal_iterations":4,"max_user_clarifications":2,"decisions":[{"question_id":"select_query","answer":0}],"steps":{"classification":{"enabled":true,"force_strategy":"simple","with_reasoning":true}},"queries":[{"table":"docs","full_text_search":{"match":"raft","field":"body"},"limit":5},{"table":"docs","embeddings":{"dense_idx":[1.0,0.0,0.0]},"indexes":["dense_idx"],"limit":5},{"table":"docs","full_text_search":{"query":"body:architecture"},"embeddings":{"dense_idx":[1.0,0.0,0.0]},"indexes":["dense_idx"],"limit":5}]}
     ;
     const encoded = try executeJson(std.testing.allocator, runner.iface(), null, body);
     defer std.testing.allocator.free(encoded);
@@ -9927,7 +9947,7 @@ test "retrieval agent agentic mode uses multiple tools for decompose queries" {
             var parsed_query = try parseQueryRequestBody(alloc, query_json);
             defer parsed_query.deinit();
             if (self.call_count == 1) {
-                try std.testing.expect(parsed_query.value.full_text_search != null);
+                try expectFullTextQueryValue(parsed_query.value.full_text_search.?, "body:raft");
                 return .{
                     .json = try alloc.dupe(u8,
                         \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"body":"raft consensus"}}]}}]}
@@ -9952,6 +9972,9 @@ test "retrieval agent agentic mode uses multiple tools for decompose queries" {
 
     var parsed = try std.json.parseFromSlice(RetrievalAgentResult, std.testing.allocator, encoded, .{});
     defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.hits.len);
+    try std.testing.expectEqualStrings("doc:a", parsed.value.hits[0]._id);
+    try std.testing.expectEqualStrings("doc:b", parsed.value.hits[1]._id);
     try std.testing.expectEqual(@as(usize, 2), runner.call_count);
     try std.testing.expectEqual(@as(i64, 2), parsed.value.tool_calls_made.?);
     try std.testing.expectEqual(RetrievalStrategy.hybrid, parsed.value.strategy_used.?);
@@ -9976,9 +9999,9 @@ test "retrieval agent refines decompose queries before execution" {
             defer parsed_query.deinit();
             const full_text = parsed_query.value.full_text_search.?;
             if (self.call_count == 1) {
-                try expectFullTextQueryValue(full_text, "Compare raft consensus?");
+                try expectFullTextMatchValue(full_text, "Compare raft consensus?");
             } else {
-                try expectFullTextQueryValue(full_text, "active document status?");
+                try expectFullTextMatchValue(full_text, "active document status?");
             }
             return .{
                 .json = try alloc.dupe(u8,
@@ -9990,7 +10013,7 @@ test "retrieval agent refines decompose queries before execution" {
 
     var runner = FakeRunner{};
     const body =
-        \\{"query":"Compare raft consensus and active document status","stream":false,"max_internal_iterations":3,"queries":[{"table":"docs","full_text_search":{"query":"body:placeholder"},"limit":5},{"table":"docs","full_text_search":{"query":"body:placeholder"},"limit":5}]}
+        \\{"query":"Compare raft consensus and active document status","stream":false,"max_internal_iterations":3,"queries":[{"table":"docs","full_text_search":{"match":"placeholder","field":"body"},"limit":5},{"table":"docs","full_text_search":{"match":"placeholder","field":"body"},"limit":5}]}
     ;
     const encoded = try executeJson(std.testing.allocator, runner.iface(), null, body);
     defer std.testing.allocator.free(encoded);
@@ -11975,4 +11998,31 @@ test "probe cache requires the same scope and canonical query" {
     try std.testing.expectEqualStrings("cached", cachedProbeResults(&candidates, 1, "canonical query with mandatory predicates").?[0]._id);
     try std.testing.expect(cachedProbeResults(&candidates, 0, "canonical query with mandatory predicates") == null);
     try std.testing.expect(cachedProbeResults(&candidates, 1, "refined query") == null);
+}
+
+test "retrieval refinement preserves query syntax and only edits native match text" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const syntax = [_][]const u8{
+        "{\"query\":\"body:raft AND status:active -title:draft\"}",
+        "{\"term\":\"raft\",\"field\":\"body\"}",
+        "{\"match_phrase\":\"raft consensus\",\"field\":\"body\"}",
+        "{\"conjuncts\":[{\"match\":\"raft\",\"field\":\"body\"},{\"term\":\"active\",\"field\":\"status\"}]}",
+    };
+    for (syntax) |bytes| {
+        var raw = metadata_openapi.RawQuery{ .bytes = bytes };
+        try refineLexicalMatchText(a, &raw, "Compare raft consensus?");
+        try std.testing.expectEqualStrings(bytes, raw.bytes);
+        try std.testing.expect(refinableQueryText(a, .{ .table = "docs", .full_text_search = raw }) == null);
+    }
+    var raw = metadata_openapi.RawQuery{ .bytes = "{\"match\":\"raft\",\"field\":\"body\",\"analyzer\":\"standard\",\"boost\":2,\"operator\":\"or\"}" };
+    try refineLexicalMatchText(a, &raw, "Compare raft consensus?");
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, raw.bytes, .{});
+    try std.testing.expectEqualStrings("Compare raft consensus?", lexicalMatchText(parsed).?);
+    try std.testing.expectEqualStrings("body", parsed.object.get("field").?.string);
+    try std.testing.expectEqualStrings("standard", parsed.object.get("analyzer").?.string);
+    try std.testing.expectEqualStrings("or", parsed.object.get("operator").?.string);
+    try std.testing.expectEqual(@as(i64, 2), parsed.object.get("boost").?.integer);
+    try std.testing.expect(parsed.object.get("query") == null);
 }

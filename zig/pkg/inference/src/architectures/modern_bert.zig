@@ -155,6 +155,7 @@ fn preplanMetalModernBertEncoder(
 // ---------------------------------------------------------------------------
 
 pub const Config = struct {
+    laya: ?@import("../models/laya.zig").Config = null,
     vocab_size: u32 = 50368,
     hidden_size: u32 = 768,
     num_hidden_layers: u32 = 22,
@@ -211,6 +212,7 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !Config
 
     const obj = parsed.value.object;
     var config = Config{};
+    if (obj.get("laya")) |value| config.laya = try @import("../models/laya.zig").Config.parse(value);
     if (obj.get("vocab_size")) |value| config.vocab_size = jsonU32(value) orelse config.vocab_size;
     if (obj.get("hidden_size")) |value| config.hidden_size = jsonU32(value) orelse config.hidden_size;
     if (obj.get("num_hidden_layers")) |value| config.num_hidden_layers = jsonU32(value) orelse config.num_hidden_layers;
@@ -232,6 +234,9 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !Config
             // consecutive (interleaved) pairs.
             config.rope_interleaved = false;
         }
+    }
+    if (config.laya) |laya| {
+        if (config.hidden_size < 64 or config.hidden_size % 64 != 0 or config.num_attention_heads == 0 or config.hidden_size % config.num_attention_heads != 0 or config.num_hidden_layers == 0 or laya.max_len > config.max_position_embeddings) return error.InvalidLayaConfig;
     }
     return config;
 }
@@ -531,6 +536,7 @@ fn encoderLayer(
         total,
         H,
         intermediate,
+        config.checkpoint_layout == .huggingface_fused_qkv_no_bias,
         if (resident_slots) modernBertLinearSlot(layer_idx, .ffn_in) else null,
         if (resident_slots) modernBertLinearSlot(layer_idx, .ffn_out) else null,
     );
@@ -674,6 +680,7 @@ fn geGluFfn(
     total: usize,
     hidden_size: usize,
     intermediate_size: usize,
+    exact_gelu: bool,
     wi_slot: ?usize,
     wo_slot: ?usize,
 ) !CT {
@@ -695,8 +702,11 @@ fn geGluFfn(
     const value_ct = try cb.sliceLastDim(gated_ct, intermediate_size, 2 * intermediate_size);
     defer cb.free(value_ct);
 
-    const activated_ct = (try cb.activationMultiply(gate_ct, value_ct, .gelu)) orelse blk: {
-        const gate_gelu_ct = try cb.gelu(gate_ct);
+    // HF ACT2FN["gelu"] uses erf, not the tanh approximation. The small
+    // per-layer difference accumulates across released 28-layer encoders.
+    const activation: ops.DecoderRuntimeActivationKind = if (exact_gelu) .gelu_exact else .gelu;
+    const activated_ct = (try cb.activationMultiply(gate_ct, value_ct, activation)) orelse blk: {
+        const gate_gelu_ct = if (exact_gelu) (try cb.geluExact(gate_ct)) orelse return error.UnsupportedModernBertActivation else try cb.gelu(gate_ct);
         defer cb.free(gate_gelu_ct);
         break :blk try cb.multiply(gate_gelu_ct, value_ct);
     };
@@ -1106,7 +1116,7 @@ fn encoderLayerWithNormedAttn(
     const Wo_w = try getLayerWeight(cb, layer_idx, "mlp.Wo.weight", &name_buf);
     defer cb.free(Wo_w);
 
-    const ffn_out = try geGluFfn(cb, normed_ffn, Wi_w, Wo_w, total, H, intermediate, null, null);
+    const ffn_out = try geGluFfn(cb, normed_ffn, Wi_w, Wo_w, total, H, intermediate, config.checkpoint_layout == .huggingface_fused_qkv_no_bias, null, null);
     defer cb.free(ffn_out);
 
     return .{
@@ -1246,7 +1256,7 @@ fn encoderLayerCapturing(
     const Wo_w = try getLayerWeight(cb, layer_idx, "mlp.Wo.weight", &name_buf);
     defer cb.free(Wo_w);
 
-    const ffn_out = try geGluFfn(cb, normed_ffn, Wi_w, Wo_w, total, H, intermediate, null, null);
+    const ffn_out = try geGluFfn(cb, normed_ffn, Wi_w, Wo_w, total, H, intermediate, config.checkpoint_layout == .huggingface_fused_qkv_no_bias, null, null);
     defer cb.free(ffn_out);
 
     // Residual: add FFN output to post-attention hidden state
@@ -1323,4 +1333,25 @@ test "HuggingFace ModernBERT fused checkpoint omits layer zero attention norm an
     }, &.{ 0, 1 }, &.{ 1, 1 }, 1, 2);
     defer allocator.free(output);
     try std.testing.expectEqual(@as(usize, 8), output.len);
+}
+
+test "HuggingFace ModernBERT GeGLU uses exact erf activation" {
+    const a = std.testing.allocator;
+    var store = native_compute.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    defer deinitTestWeightStore(a, &store);
+    var compute = native_compute.NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const input = try cb.fromFloat32Shape(&.{1}, &.{ 1, 1 });
+    defer cb.free(input);
+    const wi = try cb.fromFloat32Shape(&.{ -2, 1 }, &.{ 2, 1 });
+    defer cb.free(wi);
+    const wo = try cb.fromFloat32Shape(&.{1}, &.{ 1, 1 });
+    defer cb.free(wo);
+    const result = try geGluFfn(&cb, input, wi, wo, 1, 1, 1, true, null, null);
+    defer cb.free(result);
+    const values = try cb.toFloat32(result, a);
+    defer a.free(values);
+    // GELU(-2) = -1 * (1 + erf(-sqrt(2))). Tanh gives -0.0454023.
+    try std.testing.expectApproxEqAbs(@as(f32, -0.0455002639), values[0], 3e-7);
 }

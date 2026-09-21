@@ -58,9 +58,9 @@ export ANTFLY_BIN="${ANTFLY_BIN:-./zig-out/bin/antfly}"
 # specific startup/open stall.
 e2e_suite="${ANTFLY_E2E_SUITE:-all}"
 case "$e2e_suite" in
-  all|antfly|inference) ;;
+  all|antfly|antfly-recovery-0|antfly-recovery-1|inference) ;;
   *)
-    echo "ANTFLY_E2E_SUITE must be all, antfly, or inference; got: $e2e_suite" >&2
+    echo "ANTFLY_E2E_SUITE must be all, antfly, antfly-recovery-0, antfly-recovery-1, or inference; got: $e2e_suite" >&2
     exit 2
     ;;
 esac
@@ -83,7 +83,14 @@ fi
 
 antfly_status=0
 if [[ "$e2e_suite" != "inference" ]]; then
-  UV_PROJECT_ENVIRONMENT="$antfly_venv" "$script_dir/zig-antfly-e2e-pytest.sh" "${antfly_args[@]}" || antfly_status=$?
+  # CI splits the same marker selection into exhaustive required lanes. Keep
+  # the local/default invocation complete, and let xdist retain its existing
+  # per-runner process budget inside each lane.
+  default_shard=all
+  if [[ "$e2e_suite" == antfly-recovery-* ]]; then default_shard="${e2e_suite#antfly-}"; fi
+  PYTHONPATH="$script_dir${PYTHONPATH:+:$PYTHONPATH}" UV_PROJECT_ENVIRONMENT="$antfly_venv" \
+    "$script_dir/zig-antfly-e2e-pytest.sh" -p zig_e2e_shard \
+    --antfly-ci-shard "${ANTFLY_E2E_SHARD:-$default_shard}" "${antfly_args[@]}" || antfly_status=$?
 fi
 
 inference_status=0

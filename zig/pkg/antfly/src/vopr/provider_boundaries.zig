@@ -269,7 +269,8 @@ pub const Scenario = struct {
                 },
                 .inference_transient => try self.expectInferenceError(error.EmbedTransientFailure),
                 .inference_retry => {
-                    try self.expectInferenceError(error.EmbedTransientFailure);
+                    // Admission pressure preserves its typed, retryable error.
+                    try self.expectInferenceError(error.QueueFull);
                     try self.runInferenceOnce();
                     self.retry_recovered = self.inference_attempts == 2;
                 },

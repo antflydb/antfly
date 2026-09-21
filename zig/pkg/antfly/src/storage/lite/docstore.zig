@@ -598,6 +598,7 @@ const PendingNode = struct {
 const PendingMutation = struct {
     key: []u8,
     value: ?[]u8 = null,
+    borrowed: bool = false,
 };
 
 pub const Txn = struct {
@@ -606,6 +607,7 @@ pub const Txn = struct {
     pending: std.ArrayListUnmanaged(PendingMutation) = .empty,
     pending_tree: PendingTree = .{},
     pending_count: usize = 0,
+    borrowed_versions: std.ArrayListUnmanaged([]u8) = .empty,
     read_only: bool = true,
     writer_reserved: bool = false,
     prefix: []const u8 = "",
@@ -733,7 +735,10 @@ pub const Txn = struct {
         const lookup_key = try self.prefixedKey(key);
         defer if (self.prefix.len > 0) self.allocator.free(lookup_key);
         if (self.pending_tree.getEntryFor(lookup_key).node) |node| {
-            return self.pending.items[pendingNode(node).ordinal].value orelse error.NotFound;
+            const pending = &self.pending.items[pendingNode(node).ordinal];
+            const value = pending.value orelse return error.NotFound;
+            pending.borrowed = true;
+            return value;
         }
         if (self.snapshot_reads.get(lookup_key)) |cached| return cached orelse error.NotFound;
         const value = blk: {
@@ -769,7 +774,9 @@ pub const Txn = struct {
             const full = try self.prefixedKey(keys[i]);
             defer if (self.prefix.len > 0) alloc.free(full);
             if (self.pending_tree.getEntryFor(full).node) |node| {
-                @memset(values[i..end], self.pending.items[pendingNode(node).ordinal].value);
+                const pending = &self.pending.items[pendingNode(node).ordinal];
+                pending.borrowed = pending.value != null;
+                @memset(values[i..end], pending.value);
             } else if (self.snapshot_reads.get(full)) |cached| {
                 @memset(values[i..end], cached);
             } else {
@@ -823,18 +830,30 @@ pub const Txn = struct {
         return @fieldParentPtr("tree", node);
     }
 
-    // Versions remain owned until transaction teardown: get() borrows values.
-    // Only the final version of each key is indexed and written at commit.
+    // Keep one active slot per key. Only values returned by the borrowed-read
+    // APIs survive replacement; cursors own their copies independently.
     fn appendPending(self: *Txn, mutation: PendingMutation) !void {
         var entry = self.pending_tree.getEntryFor(mutation.key);
-        const node = if (entry.node) |existing| pendingNode(existing) else try self.allocator.create(PendingNode);
-        errdefer if (entry.node == null) self.allocator.destroy(node);
+        if (entry.node) |existing| {
+            const current = &self.pending.items[pendingNode(existing).ordinal];
+            if (current.value) |value| {
+                if (current.borrowed) {
+                    // Reserve before changing any ownership so OOM leaves the
+                    // pending value and every existing borrow intact.
+                    try self.borrowed_versions.append(self.allocator, value);
+                } else self.allocator.free(value);
+            }
+            self.allocator.free(mutation.key);
+            current.value = mutation.value;
+            current.borrowed = false;
+            return;
+        }
+        const node = try self.allocator.create(PendingNode);
+        errdefer self.allocator.destroy(node);
         try self.pending.append(self.allocator, mutation);
         node.ordinal = self.pending.items.len - 1;
-        if (entry.node == null) {
-            entry.set(&node.tree);
-            self.pending_count += 1;
-        }
+        entry.set(&node.tree);
+        self.pending_count += 1;
     }
 
     pub fn setReplayOpaque(self: *Txn, sequence: u64, payload: []const u8) !void {
@@ -867,6 +886,9 @@ pub const Txn = struct {
         }
         self.pending.deinit(self.allocator);
         self.pending = .empty;
+        for (self.borrowed_versions.items) |value| self.allocator.free(value);
+        self.borrowed_versions.deinit(self.allocator);
+        self.borrowed_versions = .empty;
     }
 
     fn freeOwnedReads(self: *Txn) void {
@@ -2977,6 +2999,79 @@ test "lite transaction snapshot cache allocation failures release ownership and 
             }
         }
         try std.testing.expectEqual(@as(usize, 0), budget.live);
+        if (exhausted) break;
+    }
+    try std.testing.expect(exhausted);
+}
+
+test "lite pending overwrites retain only borrowed versions" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "pending-retention.aflite");
+    defer a.free(path);
+    var budget = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+    var store = try Store.createWithOptions(budget.allocator(), path, .{ .no_sync = true, .io = std.testing.io });
+    defer store.close();
+    const value = try a.alloc(u8, 256 * 1024);
+    defer a.free(value);
+    @memset(value, 'v');
+    var txn = try store.beginWrite();
+    defer txn.abort();
+    const baseline = budget.live;
+    budget.limit = baseline + 600 * 1024;
+    defer budget.limit = std.math.maxInt(usize);
+    for (0..64) |i| {
+        value[0] = @intCast(i);
+        try txn.put("key", value);
+    }
+    try std.testing.expectEqual(@as(usize, 1), txn.pending.items.len);
+    try std.testing.expectEqual(@as(usize, 0), txn.borrowed_versions.items.len);
+    try std.testing.expect(budget.live - baseline < 300 * 1024);
+    const first = try txn.get("key");
+    budget.limit = baseline + 1024 * 1024;
+    value[0] = 100;
+    try txn.put("key", value);
+    var values: [2]?[]const u8 = undefined;
+    try txn.getManySorted(&.{ "key", "key" }, &values);
+    try std.testing.expect(values[0].?.ptr == values[1].?.ptr);
+    try txn.delete("key");
+    try std.testing.expectError(error.NotFound, txn.get("key"));
+    try txn.put("key", "newest");
+    try std.testing.expectEqual(@as(u8, 63), first[0]);
+    try std.testing.expectEqual(@as(u8, 100), values[0].?[0]);
+    try std.testing.expectEqual(@as(usize, 2), txn.borrowed_versions.items.len);
+    try std.testing.expectEqualStrings("newest", try txn.get("key"));
+}
+
+test "lite pending replacement allocation failures preserve borrowed values" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "pending-failures.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io });
+    defer store.close();
+    var exhausted = false;
+    for (0..32) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(a, .{});
+        var txn = try store.beginWrite();
+        txn.allocator = failing.allocator();
+        defer txn.abort();
+        try txn.put("key", "old");
+        const borrowed = try txn.get("key");
+        failing.fail_index = failing.alloc_index + fail_index;
+        if (txn.put("key", "new")) |_| {
+            exhausted = !failing.has_induced_failure;
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            failing.fail_index = std.math.maxInt(usize);
+            failing.resize_fail_index = std.math.maxInt(usize);
+            try std.testing.expectEqualStrings("old", try txn.get("key"));
+            try txn.put("key", "new");
+        }
+        try std.testing.expectEqualStrings("old", borrowed);
+        try std.testing.expectEqualStrings("new", try txn.get("key"));
         if (exhausted) break;
     }
     try std.testing.expect(exhausted);
