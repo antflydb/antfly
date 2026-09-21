@@ -56,3 +56,33 @@ pub fn read(cb: *const ComputeBackend, input: CT, out: *[8]i64) ![]const i64 {
     }
     return out[0..count];
 }
+
+/// Read floating-point scalar controls without routing f64 through the
+/// backend's f32 conversion path. The returned f64 values preserve the source
+/// representation (and therefore all f64 bits) until Range materialization.
+pub fn readFloat(cb: *const ComputeBackend, input: CT, out: *[8]f64) ![]const f64 {
+    const allocator = std.heap.page_allocator;
+    const shape = try cb.tensorShape(input, allocator);
+    defer allocator.free(shape);
+    var count: usize = 1;
+    for (shape) |dim| {
+        if (dim < 0) return error.InvalidTensorShape;
+        count = try std.math.mul(usize, count, @intCast(dim));
+    }
+    if (count > out.len) return error.InvalidTensorShape;
+    const exported = (try cb.exportTensorData(input, allocator)) orelse return error.UnsupportedTensorType;
+    defer allocator.free(exported.payload.bytes);
+    const bytes = exported.payload.bytes;
+    if (bytes.len != count * exported.dtype.byteSize()) return error.InvalidTensorShape;
+    for (out[0..count], 0..) |*value, i| value.* = switch (exported.dtype) {
+        .f32 => @floatCast(@as(f32, @bitCast(std.mem.readInt(u32, bytes[i * 4 ..][0..4], .little)))),
+        .f64 => @bitCast(std.mem.readInt(u64, bytes[i * 8 ..][0..8], .little)),
+        .f16 => @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, bytes[i * 2 ..][0..2], .little)))),
+        .bf16 => blk: {
+            const bits: u32 = @as(u32, std.mem.readInt(u16, bytes[i * 2 ..][0..2], .little)) << 16;
+            break :blk @floatCast(@as(f32, @bitCast(bits)));
+        },
+        else => return error.UnsupportedTensorType,
+    };
+    return out[0..count];
+}

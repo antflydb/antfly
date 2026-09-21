@@ -4050,12 +4050,13 @@ pub fn executeNode(
                 return fromIntegerValues(cb, range_values[0..count], out_dtype);
             }
 
-            const start_data = try cb.toFloat32(V.get(ins[0]), tmp_alloc);
-            defer tmp_alloc.free(start_data);
-            const limit_data = try cb.toFloat32(V.get(ins[1]), tmp_alloc);
-            defer tmp_alloc.free(limit_data);
-            const delta_data = try cb.toFloat32(V.get(ins[2]), tmp_alloc);
-            defer tmp_alloc.free(delta_data);
+            var start_buf: [8]f64 = undefined;
+            var limit_buf: [8]f64 = undefined;
+            var delta_buf: [8]f64 = undefined;
+            const start_data = try runtime_shape_values.readFloat(cb, V.get(ins[0]), &start_buf);
+            const limit_data = try runtime_shape_values.readFloat(cb, V.get(ins[1]), &limit_buf);
+            const delta_data = try runtime_shape_values.readFloat(cb, V.get(ins[2]), &delta_buf);
+            if (start_data.len != 1 or limit_data.len != 1 or delta_data.len != 1) return error.InvalidTensorShape;
 
             const start = if (start_data.len > 0) start_data[0] else 0.0;
             const limit = if (limit_data.len > 0) limit_data[0] else 0.0;
@@ -4063,15 +4064,18 @@ pub fn executeNode(
             if (delta == 0.0) return error.InvalidAttribute;
 
             const raw_count = @ceil((limit - start) / delta);
-            const count = if (raw_count <= 0.0) @as(usize, 0) else @as(usize, @intFromFloat(raw_count));
-            const data = try tmp_alloc.alloc(f32, count);
+            const count = if (raw_count <= 0.0) @as(usize, 0) else blk: {
+                if (!std.math.isFinite(raw_count) or raw_count > @as(f64, @floatFromInt(std.math.maxInt(usize)))) return error.InvalidTensorShape;
+                break :blk @as(usize, @intFromFloat(raw_count));
+            };
+            if (count > 4096) return error.InvalidTensorShape;
+            const data = try tmp_alloc.alloc(f64, count);
             defer tmp_alloc.free(data);
             for (0..count) |i| {
-                data[i] = start + @as(f32, @floatFromInt(i)) * delta;
+                data[i] = start + @as(f64, @floatFromInt(i)) * delta;
             }
 
-            const shape = [_]i32{@intCast(count)};
-            return cb.fromFloat32Shape(data, &shape);
+            return fromFloatValues(cb, data[0..count], out_dtype);
         },
         .concat_prim => |attrs| {
             var abuf: [8]i64 = undefined;
@@ -4319,6 +4323,24 @@ fn fromIntegerValues(cb: *const ComputeBackend, values: []const i64, dtype: ml.g
         .i8 => bytes[i] = @bitCast(std.math.cast(i8, value) orelse return error.InvalidTensorShape),
         .u8 => bytes[i] = std.math.cast(u8, value) orelse return error.InvalidTensorShape,
         .bool_ => bytes[i] = if (value == 0) 0 else if (value == 1) 1 else return error.InvalidTensorShape,
+        else => return error.UnsupportedTensorType,
+    };
+    const shape = [_]i64{@intCast(values.len)};
+    return (try cb.fromConstantBytes(bytes, dtype, &shape)) orelse error.UnsupportedTensorType;
+}
+
+fn fromFloatValues(cb: *const ComputeBackend, values: []const f64, dtype: ml.graph.DType) !CT {
+    const allocator = std.heap.page_allocator;
+    const bytes = try allocator.alloc(u8, values.len * dtype.byteSize());
+    defer allocator.free(bytes);
+    for (values, 0..) |value, i| switch (dtype) {
+        .f64 => std.mem.writeInt(u64, bytes[i * 8 ..][0..8], @bitCast(value), .little),
+        .f32 => std.mem.writeInt(u32, bytes[i * 4 ..][0..4], @bitCast(@as(f32, @floatCast(value))), .little),
+        .f16 => std.mem.writeInt(u16, bytes[i * 2 ..][0..2], @bitCast(@as(f16, @floatCast(value))), .little),
+        .bf16 => {
+            const bits: u32 = @bitCast(@as(f32, @floatCast(value)));
+            std.mem.writeInt(u16, bytes[i * 2 ..][0..2], @intCast(bits >> 16), .little);
+        },
         else => return error.UnsupportedTensorType,
     };
     const shape = [_]i64{@intCast(values.len)};
