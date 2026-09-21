@@ -1329,6 +1329,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "restore manifest preserves trusted coverage incarnation metadata",
             "public index config encoders redact coverage incarnation",
             "public index config encoders redact nested credentials",
+            "public index config encoders preserve enrichment objects on read",
             "public index config encoders omit root write-only producer documents",
             "created index configs normalize single-source input forms",
             "table contract rejects unknown fields for every public index variant",
