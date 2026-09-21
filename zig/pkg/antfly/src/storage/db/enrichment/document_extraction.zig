@@ -105,6 +105,8 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.is_test or build_opti
                 }
             };
 
+            pub const PageBox = @import("antfly_pdf").reader.PageBox;
+
             pub const TextOutputSpan = struct {
                 start: usize,
                 end: usize,
@@ -163,6 +165,7 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.is_test or build_opti
         pub const RenderedPageRasterBatch = @import("antfly_pdf").RenderedPageRasterBatch;
 
         pub const RenderQuality = @import("antfly_pdf").RenderQuality;
+        pub const nativeRasterBboxToPagePoints = @import("antfly_pdf").nativeRasterBboxToPagePoints;
         pub const RenderProfile = enum { exact, ocr };
         // Keep the erased executor ABI identical in unit/minimal builds even
         // though the rendering functions themselves are stubbed.
@@ -686,6 +689,19 @@ pub const TextRegion = struct {
     bbox: [4]f64,
 };
 
+pub const OcrRegionCoordinateSpace = enum {
+    unknown,
+    image_pixels_top_left,
+};
+
+/// Borrowed Reader region metadata. The runtime parser owns `text`; this type
+/// only defines the validated handoff into document coordinates.
+pub const OcrReaderRegion = struct {
+    text: []const u8,
+    bbox: ?[4]f64 = null,
+    coordinate_space: OcrRegionCoordinateSpace = .unknown,
+};
+
 pub const Unit = struct {
     unit_id: []u8,
     unit_type: []u8,
@@ -738,6 +754,70 @@ pub const Unit = struct {
         self.* = undefined;
     }
 };
+
+/// Align known Reader regions to OCR UTF-8 text and invert the exact native PDF
+/// raster transform. Unknown Reader conventions and compatibility-renderer
+/// pixels deliberately remain ungrounded rather than receiving guessed boxes.
+///
+/// `grounded_text_len` limits alignment to a byte-identical OCR prefix. The
+/// numeric-row hybrid uses this to leave appended embedded rows ungrounded.
+pub fn mapOcrReaderRegionsAlloc(
+    alloc: Allocator,
+    final_text: []const u8,
+    grounded_text_len: usize,
+    regions: []const OcrReaderRegion,
+    unit: Unit,
+) ![]TextRegion {
+    if (regions.len == 0 or grounded_text_len == 0 or grounded_text_len > final_text.len or
+        !std.unicode.utf8ValidateSlice(final_text) or !isUtf8Boundary(final_text, grounded_text_len))
+        return &.{};
+    if (unit.extraction_warning) |warning| {
+        if (std.mem.indexOf(u8, warning, "pdf_render_quality:compatibility_backend:") != null)
+            return &.{};
+    }
+    const page_bbox = unit.page_bbox orelse return &.{};
+    const effective_dpi = unit.ocr_effective_render_dpi orelse return &.{};
+    const raster_width = unit.ocr_rendered_width orelse return &.{};
+    const raster_height = unit.ocr_rendered_height orelse return &.{};
+    const page_box = pdf.reader.PageBox{
+        .min_x = page_bbox[0],
+        .min_y = page_bbox[1],
+        .max_x = page_bbox[2],
+        .max_y = page_bbox[3],
+    };
+
+    var mapped = std.ArrayListUnmanaged(TextRegion).empty;
+    defer mapped.deinit(alloc);
+    var search_offset: usize = 0;
+    const grounded_text = final_text[0..grounded_text_len];
+    for (regions) |region| {
+        if (region.text.len == 0 or !std.unicode.utf8ValidateSlice(region.text)) continue;
+        const start = std.mem.indexOfPos(u8, grounded_text, search_offset, region.text) orelse continue;
+        const end = start + region.text.len;
+        if (!isUtf8Boundary(grounded_text, start) or !isUtf8Boundary(grounded_text, end)) continue;
+        // A rejected box must still consume its text occurrence. Otherwise a
+        // later repeated line would attach its box to an earlier ungrounded line.
+        search_offset = end;
+        if (region.coordinate_space != .image_pixels_top_left) continue;
+        const page_region = pdf.nativeRasterBboxToPagePoints(
+            page_box,
+            effective_dpi,
+            raster_width,
+            raster_height,
+            unit.page_rotation,
+            region.bbox orelse continue,
+        ) orelse continue;
+        const span_start = std.math.cast(u32, start) orelse continue;
+        const span_end = std.math.cast(u32, end) orelse continue;
+        try mapped.append(alloc, .{ .span = .{ span_start, span_end }, .bbox = page_region });
+    }
+    return try mapped.toOwnedSlice(alloc);
+}
+
+fn isUtf8Boundary(text: []const u8, offset: usize) bool {
+    return offset <= text.len and
+        (offset == 0 or offset == text.len or text[offset] & 0xc0 != 0x80);
+}
 
 pub const Result = struct {
     content_type: []u8,
@@ -943,6 +1023,8 @@ pub const OcrQuality = struct {
     corrupted_line_ratio: f64 = 0,
     replacement_char_ratio: f64 = 0,
     trimmed_len: usize = 0,
+    /// Valid UTF-8 codepoints, excluding ASCII whitespace.
+    non_whitespace_chars: usize = 0,
 
     pub fn needsFallback(self: OcrQuality) bool {
         return self.too_short or self.garbled or self.font_corrupted or self.replacement_corrupted;
@@ -992,6 +1074,7 @@ pub fn assessOcrQuality(text: []const u8, config: OcrQualityConfig) OcrQuality {
         var iter = valid_view.iterator();
         while (iter.nextCodepoint()) |cp| {
             codepoints += 1;
+            if (cp >= 0x80 or !std.ascii.isWhitespace(@intCast(cp))) out.non_whitespace_chars += 1;
             if (cp == 0xfffd) replacements += 1;
         }
     } else {
@@ -1094,6 +1177,11 @@ pub fn preferOcrText(embedded: OcrQuality, ocr: OcrQuality) bool {
     // quality failure (for example embedded `.garbled` versus OCR
     // `.too_short`) and the ratio tie-breakers favor the one-character OCR.
     if (ocr.too_short and !embedded.too_short) return false;
+    // Fragmentation does not make decoded content expendable. A cleaner
+    // partial transcription must not erase most of a page. Count characters
+    // without whitespace so faithful reconstruction can still join fragments.
+    if (!embedded.font_corrupted and !embedded.replacement_corrupted and
+        ocr.non_whitespace_chars *| 2 < embedded.non_whitespace_chars) return false;
     if (embedded.needsFallback() != ocr.needsFallback()) return !ocr.needsFallback();
     if (embedded.failureCount() != ocr.failureCount()) return ocr.failureCount() < embedded.failureCount();
     if (embedded.replacement_char_ratio != ocr.replacement_char_ratio) return ocr.replacement_char_ratio < embedded.replacement_char_ratio;
@@ -1102,9 +1190,9 @@ pub fn preferOcrText(embedded: OcrQuality, ocr: OcrQuality) bool {
     return ocr.trimmed_len > embedded.trimmed_len;
 }
 
-/// Content-aware merger policy for numeric tables. Vision OCR can improve
-/// prose quality while silently dropping dense cells; when embedded PDF text
-/// contains a substantial numeric table, require the OCR candidate to retain
+/// Content-aware merger policy for numeric records. Vision OCR can improve
+/// prose quality while silently dropping values; when embedded PDF text
+/// contains substantial numeric content, require the OCR candidate to retain
 /// most of its numeric-token occurrences before replacing it.
 pub fn preferOcrTextForContentAlloc(alloc: Allocator, embedded_text: []const u8, ocr_text: []const u8, embedded: OcrQuality, ocr: OcrQuality) !bool {
     return (try chooseOcrTextForContentAlloc(alloc, embedded_text, ocr_text, embedded, ocr)) != .embedded;
@@ -1133,9 +1221,9 @@ pub fn chooseOcrTextForContentAlloc(alloc: Allocator, embedded_text: []const u8,
     return .ocr;
 }
 
-/// Append only numeric-rich embedded lines containing occurrences absent from
-/// OCR. Candidate token counts are consumed in document order, so repeated
-/// values are handled as a multiset instead of being mistaken for one match.
+/// Append embedded lines containing numeric occurrences absent from OCR.
+/// Candidate token counts are consumed in document order, so repeated and
+/// signed values are handled as a multiset instead of one set membership.
 pub fn mergeOcrWithEmbeddedNumericRowsAlloc(alloc: Allocator, embedded_text: []const u8, ocr_text: []const u8) ![]u8 {
     return try mergeOcrWithEmbeddedNumericRowsWithLimitsAlloc(
         alloc,
@@ -1160,22 +1248,29 @@ fn mergeOcrWithEmbeddedNumericRowsWithLimitsAlloc(
     while (tokens.next()) |raw| {
         const token = normalizedNumericToken(raw) orelse continue;
         reference_occurrences +|= 1;
-        if (reference_occurrences > max_token_occurrences) return try alloc.dupe(u8, embedded_text);
+        if (reference_occurrences > max_token_occurrences)
+            return try appendOcrWithEmbeddedNumericRowsAlloc(alloc, ocr_text, embedded_text);
         const entry = try candidate_counts.getOrPut(alloc, token);
         if (!entry.found_existing) {
-            if (candidate_counts.count() > max_unique_tokens) return try alloc.dupe(u8, embedded_text);
+            if (candidate_counts.count() > max_unique_tokens)
+                return try appendOcrWithEmbeddedNumericRowsAlloc(alloc, ocr_text, embedded_text);
             entry.value_ptr.* = 0;
         }
     }
+    var candidate_occurrences: usize = 0;
     tokens = std.mem.tokenizeAny(u8, ocr_text, &std.ascii.whitespace);
     while (tokens.next()) |raw| {
         const token = normalizedNumericToken(raw) orelse continue;
+        candidate_occurrences +|= 1;
+        if (candidate_occurrences > max_token_occurrences)
+            return try appendOcrWithEmbeddedNumericRowsAlloc(alloc, ocr_text, embedded_text);
         if (candidate_counts.getPtr(token)) |count| count.* +|= 1;
     }
 
     var retained = std.ArrayList(u8).empty;
     defer retained.deinit(alloc);
     var previous_line: ?[]const u8 = null;
+    var previous_line_has_numeric = false;
     var previous_appended = false;
     var lines = std.mem.splitScalar(u8, embedded_text, '\n');
     while (lines.next()) |raw_line| {
@@ -1194,8 +1289,11 @@ fn mergeOcrWithEmbeddedNumericRowsWithLimitsAlloc(
             }
             missing_count += 1;
         }
-        if (numeric_count >= 2 and missing_count > 0) {
-            if (!previous_appended) if (previous_line) |header| {
+        if (missing_count > 0) {
+            // Retain the complete source line, even when OCR matched some of
+            // its values: isolated normalized tokens lose labels, currency,
+            // percentages, and the relationships between values.
+            if (!previous_appended and !previous_line_has_numeric) if (previous_line) |header| {
                 if (header.len > 0) {
                     try retained.appendSlice(alloc, header);
                     try retained.append(alloc, '\n');
@@ -1208,12 +1306,17 @@ fn mergeOcrWithEmbeddedNumericRowsWithLimitsAlloc(
             previous_appended = false;
         }
         previous_line = line;
+        previous_line_has_numeric = numeric_count > 0;
     }
     if (retained.items.len == 0) return try alloc.dupe(u8, ocr_text);
+    return try appendOcrWithEmbeddedNumericRowsAlloc(alloc, ocr_text, retained.items);
+}
+
+fn appendOcrWithEmbeddedNumericRowsAlloc(alloc: Allocator, ocr_text: []const u8, embedded_rows: []const u8) ![]u8 {
     return try std.fmt.allocPrint(
         alloc,
-        "{s}\n\n--- Embedded PDF table rows preserved for numeric accuracy ---\n{s}",
-        .{ std.mem.trimEnd(u8, ocr_text, &std.ascii.whitespace), std.mem.trimEnd(u8, retained.items, &std.ascii.whitespace) },
+        "{s}\n\n--- Embedded PDF rows preserved for numeric accuracy ---\n{s}",
+        .{ std.mem.trimEnd(u8, ocr_text, &std.ascii.whitespace), std.mem.trimEnd(u8, embedded_rows, &std.ascii.whitespace) },
     );
 }
 
@@ -1260,9 +1363,13 @@ fn numericTokenRecallAllocWithLimits(
     if (reference_count == 0) return .{ .reference_count = 0, .recall = 1.0 };
 
     var matched: usize = 0;
+    var candidate_count: usize = 0;
     tokens = std.mem.tokenizeAny(u8, candidate, &std.ascii.whitespace);
     while (tokens.next()) |raw| {
         const token = normalizedNumericToken(raw) orelse continue;
+        candidate_count +|= 1;
+        if (candidate_count > max_token_occurrences)
+            return .{ .reference_count = reference_count, .recall = 0, .complete = false };
         if (remaining.getPtr(token)) |count| if (count.* > 0) {
             count.* -= 1;
             matched += 1;
@@ -2485,6 +2592,69 @@ test "PDF text regions use reconstructed output spans" {
     const unaligned_regions = try extractPdfTextRegionsFromRunsAlloc(alloc, &unaligned_runs, "FOURTH EDITION FR");
     defer if (unaligned_regions.len > 0) alloc.free(unaligned_regions);
     try std.testing.expectEqual(@as(usize, 0), unaligned_regions.len);
+}
+
+test "OCR Reader regions align repeated UTF-8 text monotonically and require native pixel geometry" {
+    const alloc = std.testing.allocator;
+    const text = "écho\nécho\n東京";
+    const unit = Unit{
+        .unit_id = @constCast("page:000001"),
+        .unit_type = @constCast("page"),
+        .text = @constCast(text),
+        .method = @constCast("ocr_text"),
+        .ocr_effective_render_dpi = 72,
+        .ocr_rendered_width = 100,
+        .ocr_rendered_height = 100,
+        .page_bbox = .{ 0.25, -5, 100.25, 95 },
+        .page_rotation = 0,
+    };
+    const reader_regions = [_]OcrReaderRegion{
+        .{ .text = "écho", .bbox = .{ 10, 10, 30, 20 }, .coordinate_space = .image_pixels_top_left },
+        .{ .text = "écho", .bbox = .{ 10, 30, 30, 40 }, .coordinate_space = .image_pixels_top_left },
+        .{ .text = "東京", .bbox = .{ 20, 60, 50, 80 }, .coordinate_space = .image_pixels_top_left },
+    };
+    const mapped = try mapOcrReaderRegionsAlloc(alloc, text, text.len, &reader_regions, unit);
+    defer alloc.free(mapped);
+    try std.testing.expectEqual(@as(usize, 3), mapped.len);
+    try std.testing.expectEqual([2]u32{ 0, 5 }, mapped[0].span);
+    try std.testing.expectEqual([2]u32{ 6, 11 }, mapped[1].span);
+    try std.testing.expectEqual([2]u32{ 12, 18 }, mapped[2].span);
+    try std.testing.expectEqual([4]f64{ 10.25, 75, 30.25, 85 }, mapped[0].bbox);
+    try std.testing.expectEqual([4]f64{ 10.25, 55, 30.25, 65 }, mapped[1].bbox);
+
+    const prefix_only = try mapOcrReaderRegionsAlloc(alloc, text, 11, &reader_regions, unit);
+    defer alloc.free(prefix_only);
+    try std.testing.expectEqual(@as(usize, 2), prefix_only.len);
+
+    var compatibility = unit;
+    compatibility.extraction_warning = @constCast("pdf_render_quality:compatibility_backend:fallback_groups=0:reason=none");
+    const unavailable = try mapOcrReaderRegionsAlloc(alloc, text, text.len, &reader_regions, compatibility);
+    try std.testing.expectEqual(@as(usize, 0), unavailable.len);
+}
+
+test "OCR Reader region mapping is allocation-failure safe" {
+    const Runner = struct {
+        fn run(alloc: Allocator) !void {
+            const unit = Unit{
+                .unit_id = @constCast("page:000001"),
+                .unit_type = @constCast("page"),
+                .text = @constCast("first\nsecond"),
+                .method = @constCast("ocr_text"),
+                .ocr_effective_render_dpi = 72,
+                .ocr_rendered_width = 100,
+                .ocr_rendered_height = 100,
+                .page_bbox = .{ 0, 0, 100, 100 },
+            };
+            const regions = [_]OcrReaderRegion{
+                .{ .text = "first", .bbox = .{ 10, 10, 40, 20 }, .coordinate_space = .image_pixels_top_left },
+                .{ .text = "second", .bbox = .{ 10, 30, 50, 40 }, .coordinate_space = .image_pixels_top_left },
+            };
+            const mapped = try mapOcrReaderRegionsAlloc(alloc, unit.text, unit.text.len, &regions, unit);
+            defer alloc.free(mapped);
+            try std.testing.expectEqual(@as(usize, 2), mapped.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 fn extractSingleTextUnitAlloc(
@@ -4590,7 +4760,8 @@ test "numeric recall limits preserve embedded text without exhausting scratch me
         100,
     );
     defer std.testing.allocator.free(merged);
-    try std.testing.expectEqualStrings("row 101 102 103", merged);
+    try std.testing.expect(std.mem.startsWith(u8, merged, "row 101"));
+    try std.testing.expect(std.mem.indexOf(u8, merged, "row 101 102 103") != null);
 }
 
 test "PDF render quality warning preserves prior diagnostics and fallback reason" {
@@ -4782,4 +4953,117 @@ test "OCR prompt echo detection covers Florence task and canonical prompts" {
     try std.testing.expect(isOcrPromptEcho("what is the text in the image", florence_ocr_prompt));
     try std.testing.expect(isOcrPromptEcho("TRANSCRIBE this page faithfully!", "Transcribe this page faithfully."));
     try std.testing.expect(!isOcrPromptEcho("Invoice total: $123.45", florence_ocr_prompt));
+}
+
+test "OCR numeric hybrid preserves fragmented single-value lines" {
+    const alloc = std.testing.allocator;
+    const config = OcrQualityConfig{};
+    const embedded_text =
+        \\Classified references
+        \\Alpha listing
+        \\101
+        \\Bravo listing
+        \\202
+        \\Charlie listing
+        \\303
+        \\Delta listing
+        \\404
+        \\Echo listing
+        \\505
+        \\Foxtrot listing
+        \\606
+        \\Golf listing
+        \\707
+        \\Hotel listing
+        \\808
+    ;
+    const ocr_text = "The OCR transcription makes every classified listing readable and preserves the descriptive prose, but the small reference values are absent from the clearer transcription.";
+    const embedded_quality = assessOcrQuality(embedded_text, config);
+    const ocr_quality = assessOcrQuality(ocr_text, config);
+    try std.testing.expectEqual(
+        OcrTextChoice.ocr_with_embedded_numeric_rows,
+        try chooseOcrTextForContentAlloc(alloc, embedded_text, ocr_text, embedded_quality, ocr_quality),
+    );
+
+    const merged = try mergeOcrWithEmbeddedNumericRowsAlloc(alloc, embedded_text, ocr_text);
+    defer alloc.free(merged);
+    const exact_ocr_prefix = std.mem.trimEnd(u8, ocr_text, &std.ascii.whitespace);
+    try std.testing.expect(std.mem.startsWith(u8, merged, exact_ocr_prefix));
+    inline for (.{ "101", "202", "303", "404", "505", "606", "707", "808" }) |value|
+        try std.testing.expect(std.mem.indexOf(u8, merged, value) != null);
+}
+
+test "OCR numeric hybrid preserves signed duplicate values and source row context" {
+    const alloc = std.testing.allocator;
+    const embedded_text =
+        \\Ledger
+        \\-12
+        \\-12
+        \\+12
+        \\Account Alpha 101 $40 5%
+    ;
+    const ocr_text = "Readable ledger transcription retained debit -12 and account 101.";
+
+    const merged = try mergeOcrWithEmbeddedNumericRowsAlloc(alloc, embedded_text, ocr_text);
+    defer alloc.free(merged);
+    try std.testing.expect(std.mem.startsWith(u8, merged, ocr_text));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, merged, "-12"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, merged, "+12"));
+    try std.testing.expect(std.mem.indexOf(u8, merged, "Account Alpha 101 $40 5%") != null);
+}
+
+test "numeric hybrid bounds candidate accounting and preserves OCR provenance on fallback" {
+    const candidate_limited = try numericTokenRecallAllocWithLimits(
+        std.testing.allocator,
+        "101 202",
+        "101 101 101",
+        10,
+        2,
+    );
+    try std.testing.expect(!candidate_limited.complete);
+
+    const ocr_text = "OCR retained 101";
+    const merged = try mergeOcrWithEmbeddedNumericRowsWithLimitsAlloc(
+        std.testing.allocator,
+        "row 101 202",
+        ocr_text,
+        1,
+        100,
+    );
+    defer std.testing.allocator.free(merged);
+    try std.testing.expect(std.mem.startsWith(u8, merged, ocr_text));
+    try std.testing.expect(std.mem.indexOf(u8, merged, "row 101 202") != null);
+}
+
+test "OCR selection rejects partial transcription without rejecting whitespace reconstruction" {
+    const alloc = std.testing.allocator;
+    const config = OcrQualityConfig{};
+    const partial = "Project Alpha retains the original delivery records.";
+    const complete = partial ++
+        " The supplier delivered all requested materials to the receiving warehouse." ++
+        " Each package has a recorded destination and a responsible contact." ++
+        " The following instructions describe inspection, storage, and dispatch.";
+    var fragmented = std.ArrayListUnmanaged(u8).empty;
+    defer fragmented.deinit(alloc);
+    for (complete) |byte| {
+        try fragmented.append(alloc, byte);
+        try fragmented.append(alloc, '\n');
+    }
+    const embedded_quality = assessOcrQuality(fragmented.items, config);
+    const partial_quality = assessOcrQuality(partial, config);
+    try std.testing.expectEqual(
+        OcrTextChoice.embedded,
+        try chooseOcrTextForContentAlloc(alloc, fragmented.items, partial, embedded_quality, partial_quality),
+    );
+    try std.testing.expectEqual(
+        OcrTextChoice.ocr,
+        try chooseOcrTextForContentAlloc(alloc, fragmented.items, complete, embedded_quality, assessOcrQuality(complete, config)),
+    );
+    // A shorter usable transcription can still replace genuinely undecodable
+    // source text; the content-retention guard is not a blanket length rule.
+    const undecodable = "\u{fffd}" ** 200;
+    try std.testing.expectEqual(
+        OcrTextChoice.ocr,
+        try chooseOcrTextForContentAlloc(alloc, undecodable, partial, assessOcrQuality(undecodable, config), partial_quality),
+    );
 }

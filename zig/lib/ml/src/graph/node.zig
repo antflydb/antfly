@@ -74,6 +74,7 @@ pub const PrimitiveOp = enum(u8) {
 
     // Convolution
     conv_general,
+    average_pool,
 
     // Type conversion
     convert_dtype,
@@ -201,9 +202,52 @@ pub const DotGeneralAttrs = struct {
 
 pub const ConvAttrs = struct {
     strides: [4]u32 = .{1} ** 4,
+    /// Signed [begin, end] padding for each spatial axis.
     padding: [4][2]i32 = .{.{0} ** 2} ** 4,
+    dilations: [4]u32 = .{1} ** 4,
+    output_padding: [4]u32 = .{0} ** 4,
     num_spatial: u8 = 0,
     groups: u32 = 1,
+    /// Selects ONNX ConvTranspose weight layout [Cin, Cout/groups, kernel...].
+    transposed: bool = false,
+};
+
+/// NCHW sliding-window mean. Ceil-mode pooling is rejected by the importer;
+/// unsupported window semantics must not become a global reduction.
+pub const AveragePoolAttrs = struct {
+    pub const max_spatial = max_rank - 2;
+    pub const AutoPad = enum { explicit, valid, same_upper, same_lower };
+
+    kernel: [max_spatial]u32 = .{1} ** max_spatial,
+    strides: [max_spatial]u32 = .{1} ** max_spatial,
+    dilations: [max_spatial]u32 = .{1} ** max_spatial,
+    padding: [max_spatial][2]u32 = .{.{ 0, 0 }} ** max_spatial,
+    num_spatial: u8 = 0,
+    auto_pad: AutoPad = .explicit,
+    count_include_pad: bool = false,
+
+    pub fn spatialOutput(self: *const AveragePoolAttrs, axis: usize, input: usize) ?struct { size: usize, pad_before: usize } {
+        if (axis >= self.num_spatial or axis >= max_spatial or input == 0) return null;
+        const kernel = self.kernel[axis];
+        const stride = self.strides[axis];
+        const dilation = self.dilations[axis];
+        if (kernel == 0 or stride == 0 or dilation == 0) return null;
+        const effective = std.math.add(usize, std.math.mul(usize, kernel - 1, dilation) catch return null, 1) catch return null;
+        if (self.auto_pad == .same_upper or self.auto_pad == .same_lower) {
+            const size = (input - 1) / stride + 1;
+            const extent = std.math.add(usize, std.math.mul(usize, size - 1, stride) catch return null, effective) catch return null;
+            const total_pad = extent -| input;
+            return .{
+                .size = size,
+                .pad_before = total_pad / 2 + if (self.auto_pad == .same_lower) total_pad % 2 else @as(usize, 0),
+            };
+        }
+        const before = if (self.auto_pad == .explicit) self.padding[axis][0] else 0;
+        const after = if (self.auto_pad == .explicit) self.padding[axis][1] else 0;
+        const padded = std.math.add(usize, std.math.add(usize, input, before) catch return null, after) catch return null;
+        if (padded < effective) return null;
+        return .{ .size = (padded - effective) / stride + 1, .pad_before = before };
+    }
 };
 
 pub const ConvertDTypeAttrs = struct {
@@ -415,6 +459,7 @@ pub const OpCode = union(enum) {
     scatter_add: ScatterAddAttrs,
     dot_general: DotGeneralAttrs,
     conv_general: ConvAttrs,
+    average_pool: AveragePoolAttrs,
     convert_dtype: ConvertDTypeAttrs,
 
     // Fused ops (matching ComputeBackend VTable)

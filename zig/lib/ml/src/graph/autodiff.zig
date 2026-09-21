@@ -600,6 +600,7 @@ fn applyVjp(
             // Convolution gradient is complex; skip for MVP.
             // Training with conv layers needs this implemented.
         },
+        .average_pool => return error.UnsupportedPoolGradient,
 
         // ── Type conversion ──────────────────────────────────────────
         .convert_dtype => {

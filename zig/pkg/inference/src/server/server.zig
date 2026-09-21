@@ -17579,12 +17579,13 @@ fn readerRegionsJsonAlloc(allocator: std.mem.Allocator, regions: []const readers
     try arr.ensureTotalCapacity(regions.len);
     for (regions) |region| {
         var obj: std.json.ObjectMap = .empty;
-        try obj.ensureTotalCapacity(alloc, 4);
+        try obj.ensureTotalCapacity(alloc, 5);
         try obj.put(alloc, "text", .{ .string = region.text });
         var bbox = std.json.Array.init(alloc);
         try bbox.ensureTotalCapacity(region.bbox.len);
         for (region.bbox) |coord| bbox.appendAssumeCapacity(.{ .float = coord });
         try obj.put(alloc, "bbox", .{ .array = bbox });
+        try obj.put(alloc, "coordinate_space", .{ .string = @tagName(region.coordinate_space) });
         if (region.confidence) |confidence| try obj.put(alloc, "confidence", .{ .float = confidence });
         if (region.label) |label| try obj.put(alloc, "label", .{ .string = label });
         arr.appendAssumeCapacity(.{ .object = obj });

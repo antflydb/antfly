@@ -63,8 +63,9 @@ pub const PreprocessConfig = struct {
     rescale_factor: f32 = 1.0 / 255.0,
     resample: image.Resample = .bilinear,
     keep_aspect_ratio: bool = false,
+    resize_multiple: u32 = 1,
     dynamic_width: bool = false,
-    pad_value_rgb: [3]u8 = .{ 255, 255, 255 },
+    pad_value_rgb: [3]f32 = .{ 255, 255, 255 },
 };
 
 pub const RecognitionResult = struct {
@@ -196,6 +197,88 @@ pub const DetectionPostProcessor = union(enum) {
     }
 };
 
+fn alignDetectionDimension(value: u32, multiple: u32) !u32 {
+    if (multiple == 0) return error.InvalidImageBuffer;
+    var blocks: u64 = value / multiple;
+    const twice_remainder = @as(u64, value % multiple) * 2;
+    // Match nearest-multiple resizing, including ties to an even block count.
+    if (twice_remainder > multiple or (twice_remainder == multiple and blocks % 2 != 0))
+        blocks += 1;
+    return std.math.cast(u32, @max(blocks, 1) * multiple) orelse error.ImageTooLarge;
+}
+
+fn detectionInputSize(config: PreprocessConfig, source_width: u32, source_height: u32) !struct { width: u32, height: u32 } {
+    if (source_width == 0 or source_height == 0 or config.width == 0 or config.height == 0)
+        return error.InvalidImageBuffer;
+    var width = config.width;
+    var height = config.height;
+    if (config.keep_aspect_ratio) {
+        const scale = @min(1.0, @min(
+            @as(f64, @floatFromInt(config.width)) / @as(f64, @floatFromInt(source_width)),
+            @as(f64, @floatFromInt(config.height)) / @as(f64, @floatFromInt(source_height)),
+        ));
+        width = try alignDetectionDimension(@intFromFloat(@as(f64, @floatFromInt(source_width)) * scale), config.resize_multiple);
+        height = try alignDetectionDimension(@intFromFloat(@as(f64, @floatFromInt(source_height)) * scale), config.resize_multiple);
+    }
+    try image.DecodeLimits.inference_default.validate(width, height);
+    return .{ .width = width, .height = height };
+}
+
+fn recognitionInputWidth(config: PreprocessConfig, source_width: u32, source_height: u32) !u32 {
+    if (source_width == 0 or source_height == 0 or config.width == 0 or config.height == 0)
+        return error.InvalidImageBuffer;
+    const scaled_width = try std.math.divCeil(u64, @as(u64, source_width) * config.height, source_height);
+    const width = std.math.cast(u32, @max(config.width, scaled_width)) orelse return error.ImageTooLarge;
+    try image.DecodeLimits.inference_default.validate(width, config.height);
+    return width;
+}
+
+test "dynamic recognition preserves square glyphs beyond the width hint" {
+    const config = PreprocessConfig{ .width = 20, .height = 5, .keep_aspect_ratio = true, .dynamic_width = true };
+    var pixels = [_]u8{255} ** (80 * 10 * 3);
+    for (0..10) |row| @memset(pixels[row * 80 * 3 ..][0 .. 10 * 3], 0);
+    const img = image.Image{ .data = &pixels, .width = 80, .height = 10, .channels = 3 };
+    const width = try recognitionInputWidth(config, img.width, img.height);
+    const actual = try image.preprocessDecodedRectKeepAspectPadRightScaledWithResample(
+        std.testing.allocator,
+        img,
+        width,
+        config.height,
+        config.mean,
+        config.std,
+        config.rescale_factor,
+        config.resample,
+        config.pad_value_rgb,
+    );
+    defer std.testing.allocator.free(actual);
+    try std.testing.expectEqual(@as(u32, 40), width);
+    for (0..3) |channel| {
+        for (0..5) |row| {
+            for (0..width) |column| {
+                const expected: f32 = if (column < 5) -1 else 1;
+                try std.testing.expectApproxEqAbs(expected, actual[channel * 5 * width + row * width + column], 1e-6);
+            }
+        }
+    }
+}
+
+test "dynamic recognition rejects oversized normalized images before allocating" {
+    try std.testing.expectError(error.ImageTooLarge, recognitionInputWidth(.{ .width = 320, .height = 48 }, 1_000_000, 1));
+}
+
+test "aspect-preserving detection bounds pages and aligns model inputs" {
+    const config = PreprocessConfig{ .width = 960, .height = 960, .keep_aspect_ratio = true, .resize_multiple = 32 };
+    const landscape = try detectionInputSize(config, 1000, 240);
+    try std.testing.expectEqual(@as(u32, 960), landscape.width);
+    try std.testing.expectEqual(@as(u32, 224), landscape.height);
+    const portrait = try detectionInputSize(config, 240, 1000);
+    try std.testing.expectEqual(@as(u32, 224), portrait.width);
+    try std.testing.expectEqual(@as(u32, 960), portrait.height);
+    const unscaled = try detectionInputSize(config, 208, 240);
+    try std.testing.expectEqual(@as(u32, 192), unscaled.width);
+    try std.testing.expectEqual(@as(u32, 256), unscaled.height);
+}
+
 pub const CTCRecognizer = struct {
     allocator: std.mem.Allocator,
     session: backends.Session,
@@ -211,23 +294,13 @@ pub const CTCRecognizer = struct {
         var input_width = self.preprocess.width;
         const pixel_values = if (self.preprocess.keep_aspect_ratio) blk: {
             if (self.preprocess.dynamic_width) {
-                input_width = image.computeAspectFitWidth(img.width, img.height, self.preprocess.height, self.preprocess.width);
-                break :blk try image.preprocessDecodedRectScaledWithResample(
-                    self.allocator,
-                    img,
-                    input_width,
-                    self.preprocess.height,
-                    self.preprocess.mean,
-                    self.preprocess.std,
-                    self.preprocess.rescale_factor,
-                    self.preprocess.resample,
-                );
+                input_width = try recognitionInputWidth(self.preprocess, img.width, img.height);
             }
 
             break :blk try image.preprocessDecodedRectKeepAspectPadRightScaledWithResample(
                 self.allocator,
                 img,
-                self.preprocess.width,
+                input_width,
                 self.preprocess.height,
                 self.preprocess.mean,
                 self.preprocess.std,
@@ -375,6 +448,7 @@ pub const MultiStageOCRPipeline = struct {
     detection_preprocess: PreprocessConfig,
     post_processor: DetectionPostProcessor,
     recognizer: ?Recognizer = null,
+    recognition_crop_orientation: crop.Orientation = .preserve,
     layout: ?backends.Session = null,
     order: ?backends.Session = null,
 
@@ -439,17 +513,15 @@ pub const MultiStageOCRPipeline = struct {
             for (regions, 0..) |region, index| {
                 if (control) |active|
                     try active.update(.executing, @intCast(index), @intCast(regions.len));
-                const cropped = try crop.cropBBox(self.allocator, img, region.bbox);
+                const cropped = try crop.cropBBox(self.allocator, img, region.bbox, self.recognition_crop_orientation);
                 defer cropped.deinit(self.allocator);
 
-                const rec = recognizer.recognize(cropped, control) catch |err| switch (err) {
-                    error.Cancelled, error.Timeout => return err,
-                    else => continue,
-                };
+                const rec = try recognizer.recognize(cropped, control);
                 if (rec.text.len == 0) {
                     self.allocator.free(rec.text);
                     continue;
                 }
+                errdefer self.allocator.free(rec.text);
 
                 try recognized.append(self.allocator, .{
                     .bbox = region.bbox,
@@ -491,11 +563,12 @@ pub const MultiStageOCRPipeline = struct {
     }
 
     fn detect(self: *MultiStageOCRPipeline, img: image.Image, control: ?InferenceExecutionControl) ![]TextRegion {
+        const input_size = try detectionInputSize(self.detection_preprocess, img.width, img.height);
         const pixel_values = try image.preprocessDecodedRectScaledWithResample(
             self.allocator,
             img,
-            self.detection_preprocess.width,
-            self.detection_preprocess.height,
+            input_size.width,
+            input_size.height,
             self.detection_preprocess.mean,
             self.detection_preprocess.std,
             self.detection_preprocess.rescale_factor,
@@ -507,8 +580,8 @@ pub const MultiStageOCRPipeline = struct {
         const shape = [_]i64{
             1,
             3,
-            @intCast(self.detection_preprocess.height),
-            @intCast(self.detection_preprocess.width),
+            @intCast(input_size.height),
+            @intCast(input_size.width),
         };
         var input_tensor = try backends.Tensor.initFloat32(self.allocator, input_name, &shape, pixel_values);
         defer input_tensor.deinit();
@@ -517,7 +590,7 @@ pub const MultiStageOCRPipeline = struct {
         defer freeTensorSlice(self.allocator, outputs);
         if (outputs.len == 0) return self.allocator.dupe(TextRegion, &.{});
 
-        const heatmap = try extractDetectionHeatmap(self.allocator, &outputs[0], self.detection_preprocess.width, self.detection_preprocess.height);
+        const heatmap = try extractDetectionHeatmap(self.allocator, &outputs[0], input_size.width, input_size.height);
         defer self.allocator.free(heatmap.values);
         traceDetectionHeatmap(&outputs[0], heatmap.values, heatmap.width, heatmap.height, self.post_processor);
         return self.post_processor.process(self.allocator, heatmap.values, heatmap.width, heatmap.height, img.width, img.height);
@@ -899,6 +972,74 @@ fn freeTensorSlice(allocator: std.mem.Allocator, tensors: []backends.Tensor) voi
         mut.deinit();
     }
     allocator.free(tensors);
+}
+
+test "recognition backend failure cannot become successful partial OCR" {
+    const allocator = std.testing.allocator;
+    const Fixture = struct {
+        recognition: bool,
+        calls: usize = 0,
+
+        fn run(ptr: *anyopaque, _: []const backends.Tensor, alloc: std.mem.Allocator) ![]backends.Tensor {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.recognition and self.calls == 2) return error.UnsupportedShape;
+            const outputs = try alloc.alloc(backends.Tensor, 1);
+            errdefer alloc.free(outputs);
+            outputs[0] = if (self.recognition)
+                try backends.Tensor.initFloat32(alloc, "logits", &.{ 1, 1, 2 }, &.{ 0, 1 })
+            else
+                try backends.Tensor.initFloat32(alloc, "heatmap", &.{ 1, 1, 3, 5 }, &.{
+                    1, 1, 0, 1, 1,
+                    1, 1, 0, 1, 1,
+                    0, 0, 0, 0, 0,
+                });
+            return outputs;
+        }
+
+        fn info(_: *anyopaque) []const backends.TensorInfo {
+            return &.{};
+        }
+
+        fn backend(_: *anyopaque) backends.BackendType {
+            return .native;
+        }
+
+        fn close(_: *anyopaque) void {}
+
+        const vtable = backends.Session.VTable{
+            .run = run,
+            .inputInfo = info,
+            .outputInfo = info,
+            .backend = backend,
+            .close = close,
+        };
+    };
+    var detector = Fixture{ .recognition = false };
+    var recognizer = Fixture{ .recognition = true };
+    var letter = [_]u8{'A'};
+    var dictionary = [_][]u8{&letter};
+    var pipeline = MultiStageOCRPipeline{
+        .allocator = allocator,
+        .detector = .{ .ptr = &detector, .vtable = &Fixture.vtable },
+        .detection_preprocess = .{ .width = 5, .height = 3 },
+        .post_processor = .{ .heatmap = .{ .threshold = 0.5, .min_area = 1 } },
+        .recognizer = .{ .ctc = .{
+            .allocator = allocator,
+            .session = .{ .ptr = &recognizer, .vtable = &Fixture.vtable },
+            .char_dict = &dictionary,
+            .preprocess = .{ .width = 2, .height = 2 },
+        } },
+    };
+    var pixels = [_]u8{255} ** (5 * 3 * 3);
+    const img = image.Image{ .data = &pixels, .width = 5, .height = 3, .channels = 3 };
+    if (pipeline.runDecoded(img)) |result_value| {
+        var result = result_value;
+        defer result.deinit();
+        return error.TestExpectedRecognitionFailure;
+    } else |err| {
+        try std.testing.expectEqual(error.UnsupportedShape, err);
+    }
 }
 
 test "sortRegionsByReadingOrder sorts by y band then x" {

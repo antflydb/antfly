@@ -45,10 +45,11 @@ pub fn hasSignature(bytes: []const u8) bool {
 }
 
 pub fn encodeRgba(alloc: Allocator, width: u32, height: u32, rgba: []const u8) ![]u8 {
-    return try encodeRgbaWithCancellation(alloc, width, height, rgba, .{});
+    return try encodeRgbaWithCancellation(alloc, alloc, width, height, rgba, .{});
 }
 
-pub fn encodeRgbaWithCancellation(alloc: Allocator, width: u32, height: u32, rgba: []const u8, cancellation: CancellationProbe) ![]u8 {
+/// Compression storage is transient; only the returned PNG uses output_alloc.
+pub fn encodeRgbaWithCancellation(scratch_alloc: Allocator, output_alloc: Allocator, width: u32, height: u32, rgba: []const u8, cancellation: CancellationProbe) ![]u8 {
     try cancellation.check();
     if (width == 0 or height == 0) return error.InvalidRgbaSize;
     const pixel_count = std.math.mul(usize, width, height) catch return error.InvalidRgbaSize;
@@ -58,7 +59,7 @@ pub fn encodeRgbaWithCancellation(alloc: Allocator, width: u32, height: u32, rgb
     const row_bytes = std.math.mul(usize, width, 4) catch return error.InvalidRgbaSize;
     // The flate writer requires an initial output buffer (and grows it through
     // Writer.Allocating as compressed bytes are emitted).
-    var compressed = try std.Io.Writer.Allocating.initCapacity(alloc, 16 * 1024);
+    var compressed = try std.Io.Writer.Allocating.initCapacity(scratch_alloc, 16 * 1024);
     defer compressed.deinit();
     {
         try compressed.writer.writeAll(std.compress.flate.Container.zlib.header());
@@ -98,8 +99,8 @@ pub fn encodeRgbaWithCancellation(alloc: Allocator, width: u32, height: u32, rgb
 
     const png_len = 8 + chunkTotalLen(13) + chunkTotalLen(zlib_len) + chunkTotalLen(0);
     try cancellation.check();
-    const out = try alloc.alloc(u8, png_len);
-    errdefer alloc.free(out);
+    const out = try output_alloc.alloc(u8, png_len);
+    errdefer output_alloc.free(out);
     var cursor: usize = 0;
     @memcpy(out[cursor .. cursor + 8], &[_]u8{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' });
     cursor += 8;
@@ -703,6 +704,21 @@ test "encode rgba writes png signature" {
     try std.testing.expectEqualSlices(u8, &rgba, decoded.rgba);
 }
 
+test "PNG encoding fits a retained-output budget without charging compression scratch" {
+    const alloc = std.testing.allocator;
+    const rgba = [_]u8{0xa5} ** (64 * 64 * 4);
+    const reference = try encodeRgba(alloc, 64, 64, &rgba);
+    defer alloc.free(reference);
+    const storage = try alloc.alloc(u8, reference.len);
+    defer alloc.free(storage);
+    var output = std.heap.FixedBufferAllocator.init(storage);
+    const png = try encodeRgbaWithCancellation(alloc, output.allocator(), 64, 64, &rgba, .{});
+    defer output.allocator().free(png);
+    const decoded = try decodeRgba(alloc, png);
+    defer alloc.free(decoded.rgba);
+    try std.testing.expectEqualSlices(u8, &rgba, decoded.rgba);
+}
+
 test "encode rgba cancellation bounds compression and IDAT work" {
     const CancelAtCheck = struct {
         checks: usize = 0,
@@ -724,7 +740,7 @@ test "encode rgba cancellation bounds compression and IDAT work" {
     var during_compression = CancelAtCheck{ .cancel_at = 3 };
     try std.testing.expectError(
         error.Canceled,
-        encodeRgbaWithCancellation(std.testing.allocator, 20_000, 1, &wide_rgba, during_compression.probe()),
+        encodeRgbaWithCancellation(std.testing.allocator, std.testing.allocator, 20_000, 1, &wide_rgba, during_compression.probe()),
     );
     try std.testing.expectEqual(@as(usize, 3), during_compression.checks);
 
@@ -734,7 +750,7 @@ test "encode rgba cancellation bounds compression and IDAT work" {
     var during_idat = CancelAtCheck{ .cancel_at = 13 };
     try std.testing.expectError(
         error.Canceled,
-        encodeRgbaWithCancellation(std.testing.allocator, 8, 8, &small_rgba, during_idat.probe()),
+        encodeRgbaWithCancellation(std.testing.allocator, std.testing.allocator, 8, 8, &small_rgba, during_idat.probe()),
     );
     try std.testing.expectEqual(@as(usize, 13), during_idat.checks);
 }

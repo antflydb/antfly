@@ -1047,12 +1047,14 @@ fn convertReshape(allocator: std.mem.Allocator, builder: *Builder, node: *const 
     const rank: u8 = @intCast(@min(data.len, 8));
     var materialized_negative_count: usize = 0;
     var copied_zero_axes: [8]bool = .{false} ** 8;
+    var copies_dynamic_axis = false;
     for (0..rank) |i| {
         const d: i64 = @intFromFloat(data[i]);
         if (d == 0 and !allow_zero) {
             // ONNX opset <14 default: 0 means copy from input shape
             dims[i] = if (i < input_shape.rank()) input_shape.dim(@intCast(i)) else 1;
             copied_zero_axes[i] = true;
+            copies_dynamic_axis = copies_dynamic_axis or dims[i] < 0;
         } else if (d == -1) {
             dims[i] = -1;
             materialized_negative_count += 1;
@@ -1325,7 +1327,9 @@ fn convertReshape(allocator: std.mem.Allocator, builder: *Builder, node: *const 
 
     const result = try builder.reshape(inputs[0], new_shape);
     const target_node = builder.graph.node(inputs[1]);
-    const runtime_shape = std.meta.activeTag(target_node.op) != .constant;
+    // A constant zero still depends on the runtime input shape. Keep the
+    // original target so copied axes do not become extra inferred dimensions.
+    const runtime_shape = std.meta.activeTag(target_node.op) != .constant or copies_dynamic_axis;
     if (runtime_shape or allow_zero) {
         const reshape_node = builder.graph.nodeMut(result);
         reshape_node.op.reshape.runtime_shape = runtime_shape;
@@ -3657,54 +3661,64 @@ fn broadcastPerAxis(builder: *Builder, input: NodeId, target_shape: Shape, axis_
 // ── Phase 3: Pooling Ops ────────────────────────────────────────────
 
 fn convertAveragePool(builder: *Builder, node: *const NodeProto, inputs: []const NodeId) ConvertError!NodeId {
-    // AveragePool: reduce_mean over spatial window
-    // For global average pool variant or simple cases
+    if (inputs.len != 1) return error.MissingInput;
     const in_shape = builder.graph.node(inputs[0]).output_shape;
+    const PoolAttrs = ml.graph.node.AveragePoolAttrs;
+    if (in_shape.rank() < 3 or in_shape.rank() > PoolAttrs.max_spatial + 2) return error.UnsupportedOp;
+    const spatial = in_shape.rank() - 2;
     const kernel = getInts(node.attributes, "kernel_shape");
     const strides = getInts(node.attributes, "strides");
+    const dilations = getInts(node.attributes, "dilations");
+    const pads = getInts(node.attributes, "pads");
+    if (kernel.len != spatial or (strides.len != 0 and strides.len != spatial) or
+        (dilations.len != 0 and dilations.len != spatial) or (pads.len != 0 and pads.len != spatial * 2))
+    {
+        return error.InvalidAttribute;
+    }
+    const ceil_mode = getInt(node.attributes, "ceil_mode", 0);
+    if (ceil_mode != 0 and ceil_mode != 1) return error.InvalidAttribute;
+    if (ceil_mode == 1) return error.UnsupportedOp;
+    const include_pad = getInt(node.attributes, "count_include_pad", 0);
+    if (include_pad != 0 and include_pad != 1) return error.InvalidAttribute;
+    var attrs = PoolAttrs{ .num_spatial = spatial, .count_include_pad = include_pad == 1 };
+    const auto_pad = getString(node.attributes, "auto_pad", "NOTSET");
+    attrs.auto_pad = if (std.mem.eql(u8, auto_pad, "NOTSET"))
+        .explicit
+    else if (std.mem.eql(u8, auto_pad, "VALID"))
+        .valid
+    else if (std.mem.eql(u8, auto_pad, "SAME_UPPER"))
+        .same_upper
+    else if (std.mem.eql(u8, auto_pad, "SAME_LOWER"))
+        .same_lower
+    else
+        return error.InvalidAttribute;
+    if (attrs.auto_pad != .explicit and pads.len != 0) return error.InvalidAttribute;
 
-    if (kernel.len == 0) return error.InvalidAttribute;
-
-    // Simple case: kernel covers entire spatial dim and stride=1
-    // → reduce_mean over spatial axes
-    const num_spatial = in_shape.rank() - 2;
-    var is_global = true;
-    for (0..num_spatial) |i| {
-        if (i < kernel.len and kernel[i] != in_shape.dim(@intCast(i + 2))) {
-            is_global = false;
-            break;
+    var output_shape = in_shape;
+    for (0..spatial) |axis| {
+        attrs.kernel[axis] = std.math.cast(u32, kernel[axis]) orelse return error.InvalidAttribute;
+        if (strides.len != 0) attrs.strides[axis] = std.math.cast(u32, strides[axis]) orelse return error.InvalidAttribute;
+        if (dilations.len != 0) attrs.dilations[axis] = std.math.cast(u32, dilations[axis]) orelse return error.InvalidAttribute;
+        if (attrs.kernel[axis] == 0 or attrs.strides[axis] == 0 or attrs.dilations[axis] == 0) return error.InvalidAttribute;
+        if (pads.len != 0) {
+            attrs.padding[axis][0] = std.math.cast(u32, pads[axis]) orelse return error.InvalidAttribute;
+            attrs.padding[axis][1] = std.math.cast(u32, pads[spatial + axis]) orelse return error.InvalidAttribute;
+        }
+        const input_dim = in_shape.dim(@intCast(axis + 2));
+        output_shape.bounds[axis + 2] = 0;
+        if (input_dim < 0) {
+            output_shape.dims[axis + 2] = -1;
+        } else {
+            const dimension = attrs.spatialOutput(axis, @intCast(input_dim)) orelse return error.ShapeMismatch;
+            output_shape.dims[axis + 2] = std.math.cast(i64, dimension.size) orelse return error.ShapeMismatch;
         }
     }
-
-    if (is_global) {
-        return convertGlobalAveragePool(builder, inputs);
-    }
-
-    // Non-global: compute output shape and use reduce_mean windowed
-    // This is an approximation — proper sliding window needs conv_general
-    var out_dims: [8]i64 = .{0} ** 8;
-    out_dims[0] = in_shape.dim(0); // batch
-    out_dims[1] = in_shape.dim(1); // channels
-    for (0..num_spatial) |i| {
-        const in_d = in_shape.dim(@intCast(i + 2));
-        const k: i64 = if (i < kernel.len) kernel[i] else 1;
-        const s: i64 = if (i < strides.len) strides[i] else 1;
-        out_dims[i + 2] = @divTrunc(in_d - k, s) + 1;
-    }
-    const out_shape = Shape{ .dtype = in_shape.dtype, .dims = out_dims, .rank_ = in_shape.rank_ };
-
-    // Use conv_general with uniform weights as average pooling
-    // For simplicity, use reduce_mean on spatial axes as approximation
-    var spatial_axes: [8]u8 = undefined;
-    for (0..num_spatial) |i| spatial_axes[i] = @intCast(i + 2);
-    const reduced = try builder.reduceMean(inputs[0], spatial_axes[0..num_spatial]);
-
-    // If output shape differs from reduced, reshape
-    const red_shape = builder.graph.node(reduced).output_shape;
-    if (red_shape.rank_ != out_shape.rank_) {
-        return builder.reshape(reduced, out_shape);
-    }
-    return reduced;
+    return builder.graph.addNode(.{
+        .op = .{ .average_pool = attrs },
+        .output_shape = output_shape,
+        .inputs = .{ inputs[0], null_node, null_node, null_node },
+        .num_inputs = 1,
+    });
 }
 
 fn convertMaxPool(builder: *Builder, node: *const NodeProto, inputs: []const NodeId) ConvertError!NodeId {
@@ -4109,96 +4123,255 @@ fn convertEinsum(builder: *Builder, node: *const NodeProto, inputs: []const Node
 
 // ── Phase 4: ConvTranspose, Resize ─────────────────────────────────
 
+fn convTransposePositiveU32(value: i64) ConvertError!u32 {
+    if (value <= 0) return error.InvalidAttribute;
+    if (value > std.math.maxInt(u32)) return error.Overflow;
+    return @intCast(value);
+}
+
+fn convTransposeNonnegativeU32(value: i64) ConvertError!u32 {
+    if (value < 0) return error.InvalidAttribute;
+    if (value > std.math.maxInt(u32)) return error.Overflow;
+    return @intCast(value);
+}
+
+fn convTransposePaddingI32(value: i64) ConvertError!i32 {
+    if (value < std.math.minInt(i32) or value > std.math.maxInt(i32)) return error.Overflow;
+    return @intCast(value);
+}
+
+fn convTransposeEffectiveKernel(kernel: i64, dilation: u32) ConvertError!i64 {
+    const kernel_span = std.math.sub(i64, kernel, 1) catch return error.Overflow;
+    const dilated_span = std.math.mul(i64, kernel_span, @as(i64, dilation)) catch return error.Overflow;
+    return std.math.add(i64, dilated_span, 1) catch return error.Overflow;
+}
+
+fn convTransposeNaturalExtent(
+    input_extent: i64,
+    effective_kernel: i64,
+    stride: u32,
+    output_padding: u32,
+) ConvertError!i64 {
+    const input_steps = std.math.sub(i64, input_extent, 1) catch return error.Overflow;
+    const strided_extent = std.math.mul(i64, input_steps, @as(i64, stride)) catch return error.Overflow;
+    const with_output_padding = std.math.add(i64, strided_extent, @as(i64, output_padding)) catch return error.Overflow;
+    return std.math.add(i64, with_output_padding, effective_kernel) catch return error.Overflow;
+}
+
 fn convertConvTranspose(builder: *Builder, node: *const NodeProto, inputs: []const NodeId) ConvertError!NodeId {
-    if (inputs.len < 2) return error.MissingInput;
+    if (inputs.len < 2 or inputs[0] == null_node or inputs[1] == null_node) return error.MissingInput;
+    if (inputs.len > 3) return error.InvalidAttribute;
     const x = inputs[0];
     const w = inputs[1];
-    const has_bias = inputs.len >= 3 and inputs[2] != null_node;
+    const has_bias = inputs.len == 3 and inputs[2] != null_node;
 
     const x_shape = builder.graph.node(x).output_shape;
     const w_shape = builder.graph.node(w).output_shape;
-    if (x_shape.rank() < 3) return error.UnsupportedOp;
+    if ((x_shape.rank() != 3 and x_shape.rank() != 4) or
+        (w_shape.rank() != 3 and w_shape.rank() != 4))
+    {
+        return error.UnsupportedOp;
+    }
+    if (x_shape.rank() != w_shape.rank()) return error.ShapeMismatch;
+
     const num_spatial: u8 = x_shape.rank() - 2;
+    const spatial_len: usize = num_spatial;
+    const group_raw = getInt(node.attributes, "group", 1);
+    const group = try convTransposePositiveU32(group_raw);
+
+    const input_channels = x_shape.dim(1);
+    const weight_input_channels = w_shape.dim(0);
+    const weight_output_channels_per_group = w_shape.dim(1);
+    if (input_channels == 0 or weight_input_channels == 0 or weight_output_channels_per_group == 0) {
+        return error.ShapeMismatch;
+    }
+    if (input_channels > 0 and @mod(input_channels, group_raw) != 0) return error.ShapeMismatch;
+    if (weight_input_channels > 0 and @mod(weight_input_channels, group_raw) != 0) return error.ShapeMismatch;
+    if (input_channels > 0 and weight_input_channels > 0 and input_channels != weight_input_channels) {
+        return error.ShapeMismatch;
+    }
+
+    const output_channels = if (weight_output_channels_per_group < 0)
+        @as(i64, -1)
+    else
+        std.math.mul(i64, weight_output_channels_per_group, group_raw) catch return error.Overflow;
+
+    if (has_bias) {
+        const bias_shape = builder.graph.node(inputs[2]).output_shape;
+        if (bias_shape.rank() != 1) return error.ShapeMismatch;
+        const bias_channels = bias_shape.dim(0);
+        if (bias_channels == 0 or
+            (bias_channels > 0 and output_channels > 0 and bias_channels != output_channels))
+        {
+            return error.ShapeMismatch;
+        }
+    }
 
     const strides_attr = getInts(node.attributes, "strides");
     const pads_attr = getInts(node.attributes, "pads");
     const dilations_attr = getInts(node.attributes, "dilations");
+    const kernel_shape_attr = getInts(node.attributes, "kernel_shape");
     const output_padding_attr = getInts(node.attributes, "output_padding");
-    const group: u32 = @intCast(getInt(node.attributes, "group", 1));
+    const output_shape_attr = getInts(node.attributes, "output_shape");
 
-    for (0..num_spatial) |i| {
-        const stride: i64 = if (i < strides_attr.len) strides_attr[i] else 1;
-        if (stride != 1) return error.UnsupportedOp;
+    const strides_present = findAttr(node.attributes, "strides") != null;
+    const pads_present = findAttr(node.attributes, "pads") != null;
+    const dilations_present = findAttr(node.attributes, "dilations") != null;
+    const kernel_shape_present = findAttr(node.attributes, "kernel_shape") != null;
+    const output_padding_present = findAttr(node.attributes, "output_padding") != null;
+    const output_shape_present = findAttr(node.attributes, "output_shape") != null;
+
+    if ((strides_present and strides_attr.len != spatial_len) or
+        (pads_present and pads_attr.len != spatial_len * 2) or
+        (dilations_present and dilations_attr.len != spatial_len) or
+        (kernel_shape_present and kernel_shape_attr.len != spatial_len) or
+        (output_padding_present and output_padding_attr.len != spatial_len) or
+        (output_shape_present and output_shape_attr.len != spatial_len))
+    {
+        return error.InvalidAttribute;
     }
 
-    // ConvTranspose: decompose as conv_general with adjusted padding.
-    // For stride=1, ConvTranspose is conv with kernel spatially flipped and
-    // padding = kernel_size - 1 - original_padding (full convolution).
-    // For stride>1, we insert zeros between input elements (fractional striding),
-    // which we approximate by using conv_general with stride=1 and expanded padding.
+    const auto_pad = getString(node.attributes, "auto_pad", "NOTSET");
+    const auto_pad_notset = std.mem.eql(u8, auto_pad, "NOTSET");
+    const auto_pad_valid = std.mem.eql(u8, auto_pad, "VALID");
+    const auto_pad_same_upper = std.mem.eql(u8, auto_pad, "SAME_UPPER");
+    const auto_pad_same_lower = std.mem.eql(u8, auto_pad, "SAME_LOWER");
+    if (!auto_pad_notset and !auto_pad_valid and !auto_pad_same_upper and !auto_pad_same_lower) {
+        return error.InvalidAttribute;
+    }
+    if (pads_present and !auto_pad_notset) return error.InvalidAttribute;
 
     var conv_attrs = ml.graph.node.ConvAttrs{};
+    conv_attrs.transposed = true;
     conv_attrs.num_spatial = num_spatial;
     conv_attrs.groups = group;
 
-    // ConvTranspose always runs the inner conv with stride=1.
-    // The "stride" in ConvTranspose means input dilation (fractional striding).
-    for (0..num_spatial) |i| {
-        conv_attrs.strides[i] = 1;
+    var effective_kernels: [4]i64 = .{0} ** 4;
+    var padding: [4][2]i64 = .{.{0} ** 2} ** 4;
+
+    for (0..spatial_len) |i| {
+        const stride_raw = if (strides_present) strides_attr[i] else 1;
+        const dilation_raw = if (dilations_present) dilations_attr[i] else 1;
+        const output_padding_raw = if (output_padding_present) output_padding_attr[i] else 0;
+        const stride = try convTransposePositiveU32(stride_raw);
+        const dilation = try convTransposePositiveU32(dilation_raw);
+        const output_padding = try convTransposeNonnegativeU32(output_padding_raw);
+        if (output_padding >= stride and output_padding >= dilation) return error.InvalidAttribute;
+
+        conv_attrs.strides[i] = stride;
+        conv_attrs.dilations[i] = dilation;
+        conv_attrs.output_padding[i] = output_padding;
+        if (x_shape.dim(@intCast(i + 2)) == 0) return error.ShapeMismatch;
+
+        const weight_kernel = w_shape.dim(@intCast(i + 2));
+        if (weight_kernel == 0) return error.ShapeMismatch;
+        const kernel_extent = if (kernel_shape_present) blk: {
+            const declared_kernel = kernel_shape_attr[i];
+            if (declared_kernel <= 0) return error.InvalidAttribute;
+            if (weight_kernel > 0 and weight_kernel != declared_kernel) return error.ShapeMismatch;
+            break :blk declared_kernel;
+        } else weight_kernel;
+        effective_kernels[i] = if (kernel_extent > 0)
+            try convTransposeEffectiveKernel(kernel_extent, dilation)
+        else
+            -1;
+
+        if (pads_present) {
+            const pad_begin = pads_attr[i];
+            const pad_end = pads_attr[i + spatial_len];
+            if (pad_begin < 0 or pad_end < 0) return error.InvalidAttribute;
+            padding[i] = .{ pad_begin, pad_end };
+        }
+        if (output_shape_present) {
+            if (output_shape_attr[i] < 0) return error.InvalidAttribute;
+            if (output_shape_attr[i] == 0) return error.UnsupportedOp;
+        }
     }
 
-    // Compute output spatial dims and effective padding.
-    // out = (in - 1) * stride - 2*pad + dilation*(kernel-1) + output_padding + 1
+    if (output_shape_present) {
+        for (0..spatial_len) |i| {
+            const input_extent = x_shape.dim(@intCast(i + 2));
+            if (input_extent < 0 or effective_kernels[i] < 0) return error.UnsupportedOp;
+            const natural_extent = try convTransposeNaturalExtent(
+                input_extent,
+                effective_kernels[i],
+                conv_attrs.strides[i],
+                conv_attrs.output_padding[i],
+            );
+            const total_padding = std.math.sub(i64, natural_extent, output_shape_attr[i]) catch return error.Overflow;
+            if (total_padding < 0) return error.UnsupportedOp;
+            const smaller_half = @divTrunc(total_padding, 2);
+            const larger_half = std.math.sub(i64, total_padding, smaller_half) catch return error.Overflow;
+            padding[i] = if (auto_pad_same_upper)
+                .{ smaller_half, larger_half }
+            else
+                .{ larger_half, smaller_half };
+        }
+    } else if (auto_pad_same_upper or auto_pad_same_lower) {
+        for (0..spatial_len) |i| {
+            if (effective_kernels[i] < 0) return error.UnsupportedOp;
+            const padded_kernel = std.math.add(
+                i64,
+                effective_kernels[i],
+                @as(i64, conv_attrs.output_padding[i]),
+            ) catch return error.Overflow;
+            const total_padding = std.math.sub(
+                i64,
+                padded_kernel,
+                @as(i64, conv_attrs.strides[i]),
+            ) catch return error.Overflow;
+            if (total_padding < 0) return error.UnsupportedOp;
+            const smaller_half = @divTrunc(total_padding, 2);
+            const larger_half = std.math.sub(i64, total_padding, smaller_half) catch return error.Overflow;
+            padding[i] = if (auto_pad_same_upper)
+                .{ smaller_half, larger_half }
+            else
+                .{ larger_half, smaller_half };
+        }
+    } else if (auto_pad_valid) {
+        padding = .{.{0} ** 2} ** 4;
+    }
+
+    for (0..spatial_len) |i| {
+        conv_attrs.padding[i][0] = try convTransposePaddingI32(padding[i][0]);
+        conv_attrs.padding[i][1] = try convTransposePaddingI32(padding[i][1]);
+    }
+
     var out_dims: [8]i64 = .{0} ** 8;
-    out_dims[0] = x_shape.dim(0); // batch
-    // For ConvTranspose, weight layout is [C_in, C_out/groups, kH, kW]
-    out_dims[1] = w_shape.dim(1) * @as(i64, group); // output channels
+    out_dims[0] = x_shape.dim(0);
+    out_dims[1] = output_channels;
+    for (0..spatial_len) |i| {
+        if (output_shape_present) {
+            out_dims[i + 2] = output_shape_attr[i];
+            continue;
+        }
 
-    for (0..num_spatial) |i| {
-        const in_d = x_shape.dim(@intCast(i + 2));
-        const k_d = w_shape.dim(@intCast(i + 2));
-        const stride: i64 = if (i < strides_attr.len) strides_attr[i] else 1;
-        const dilation: i64 = if (i < dilations_attr.len) dilations_attr[i] else 1;
-        const pad_begin: i64 = if (i < pads_attr.len) pads_attr[i] else 0;
-        const pad_end: i64 = if (i + num_spatial < pads_attr.len) pads_attr[i + num_spatial] else 0;
-        const out_pad: i64 = if (i < output_padding_attr.len) output_padding_attr[i] else 0;
-        const effective_k = dilation * (k_d - 1) + 1;
+        const input_extent = x_shape.dim(@intCast(i + 2));
+        if (input_extent < 0 or effective_kernels[i] < 0) {
+            out_dims[i + 2] = -1;
+            continue;
+        }
 
-        out_dims[i + 2] = if (in_d <= 0 or k_d <= 0)
-            -1
-        else
-            (in_d - 1) * stride - pad_begin - pad_end + effective_k + out_pad;
-
-        // Effective padding for the transpose conv (full convolution padding)
-        conv_attrs.padding[i][0] = @intCast(effective_k - 1 - pad_begin);
-        conv_attrs.padding[i][1] = @intCast(effective_k - 1 - pad_end + out_pad);
+        var output_extent = try convTransposeNaturalExtent(
+            input_extent,
+            effective_kernels[i],
+            conv_attrs.strides[i],
+            conv_attrs.output_padding[i],
+        );
+        output_extent = std.math.sub(i64, output_extent, padding[i][0]) catch return error.Overflow;
+        output_extent = std.math.sub(i64, output_extent, padding[i][1]) catch return error.Overflow;
+        if (output_extent <= 0) return error.ShapeMismatch;
+        out_dims[i + 2] = output_extent;
     }
 
     const out_shape = Shape{ .dtype = x_shape.dtype, .dims = out_dims, .rank_ = x_shape.rank_ };
-
     var result = try builder.graph.addNode(.{
         .op = .{ .conv_general = conv_attrs },
         .output_shape = out_shape,
         .inputs = .{ x, w, null_node, null_node },
         .num_inputs = 2,
     });
-
-    if (has_bias) {
-        const bias = inputs[2];
-        const bias_shape = builder.graph.node(bias).output_shape;
-        if (bias_shape.rank() == 1 and out_shape.rank() >= 3) {
-            var bias_dims: [8]i64 = .{0} ** 8;
-            bias_dims[0] = 1;
-            bias_dims[1] = bias_shape.dim(0);
-            for (2..out_shape.rank()) |i| bias_dims[i] = 1;
-            const reshaped_bias_shape = Shape{ .dtype = bias_shape.dtype, .dims = bias_dims, .rank_ = out_shape.rank_ };
-            const reshaped_bias = try builder.reshape(bias, reshaped_bias_shape);
-            result = try builder.add(result, reshaped_bias);
-        } else {
-            result = try builder.add(result, bias);
-        }
-    }
-
+    if (has_bias) result = try addConvBias(builder, result, inputs[2], out_shape);
     return result;
 }
 
@@ -6129,6 +6302,21 @@ test "convertNode Quantize → Dequantize roundtrip preserves shape" {
     try std.testing.expectEqual(@as(i64, 4), dq_shape.dim(1));
 }
 
+test "AveragePool rejects unsupported ceil mode instead of approximating" {
+    const allocator = std.testing.allocator;
+    var graph = Graph.init(allocator);
+    defer graph.deinit();
+    var builder = Builder.init(&graph);
+    const input = try builder.parameter("x", Shape.init(.f32, &.{ 1, 1, 3 }));
+    var kernel = [_]i64{2};
+    var attributes = [_]AttributeProto{
+        .{ .name = "kernel_shape", .ints = &kernel, .attr_type = .ints },
+        .{ .name = "ceil_mode", .i = 1, .attr_type = .int },
+    };
+    const node = NodeProto{ .op_type = "AveragePool", .attributes = &attributes };
+    try std.testing.expectError(error.UnsupportedOp, convertNode(allocator, &builder, &node, &.{input}, null));
+}
+
 test "convertNode GlobalAveragePool" {
     const allocator = std.testing.allocator;
     var g = Graph.init(allocator);
@@ -7389,54 +7577,213 @@ test "convertNode Mod floor (default)" {
     try std.testing.expect(std.meta.activeTag(g.node(result).op) == .sub);
 }
 
-test "convertNode ConvTranspose 1D" {
+test "convertNode ConvTranspose lowers grouped stride dilation and output padding exactly" {
     const allocator = std.testing.allocator;
     var g = Graph.init(allocator);
     defer g.deinit();
     var b = Builder.init(&g);
 
-    // Input: [batch=1, C_in=4, L=8], Weight: [C_in=4, C_out=2, K=3]
-    const x = try b.parameter("x", Shape.init(.f32, &.{ 1, 4, 8 }));
-    const w = try b.parameter("w", Shape.init(.f32, &.{ 4, 2, 3 }));
-    const node = NodeProto{ .op_type = "ConvTranspose" };
+    const x = try b.parameter("x", Shape.init(.f32, &.{ 1, 4, 5 }));
+    const w = try b.parameter("w", Shape.init(.f32, &.{ 4, 3, 3 }));
+    var strides = [_]i64{2};
+    var dilations = [_]i64{2};
+    var pads = [_]i64{ 1, 2 };
+    var output_padding = [_]i64{1};
+    var attrs = [_]AttributeProto{
+        .{ .name = "group", .i = 2 },
+        .{ .name = "strides", .ints = &strides },
+        .{ .name = "dilations", .ints = &dilations },
+        .{ .name = "pads", .ints = &pads },
+        .{ .name = "output_padding", .ints = &output_padding },
+    };
+    const node = NodeProto{ .op_type = "ConvTranspose", .attributes = &attrs };
     const result = try convertNode(allocator, &b, &node, &.{ x, w }, null);
-    const out_shape = g.node(result).output_shape;
-    // out = (8-1)*1 + 3 = 10 (stride=1, no padding, no dilation)
-    try std.testing.expectEqual(@as(i64, 1), out_shape.dim(0));
-    try std.testing.expectEqual(@as(i64, 2), out_shape.dim(1));
-    try std.testing.expectEqual(@as(i64, 10), out_shape.dim(2));
+    const imported = g.node(result);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 6, 11 }, imported.output_shape.dims[0..3]);
+    const conv_attrs = switch (imported.op) {
+        .conv_general => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(conv_attrs.transposed);
+    try std.testing.expectEqual(@as(u32, 2), conv_attrs.groups);
+    try std.testing.expectEqual(@as(u32, 2), conv_attrs.strides[0]);
+    try std.testing.expectEqual(@as(u32, 2), conv_attrs.dilations[0]);
+    try std.testing.expectEqual(@as(i32, 1), conv_attrs.padding[0][0]);
+    try std.testing.expectEqual(@as(i32, 2), conv_attrs.padding[0][1]);
+    try std.testing.expectEqual(@as(u32, 1), conv_attrs.output_padding[0]);
 }
 
-test "convertNode ConvTranspose 2D with stride is unsupported until native upsampling is exact" {
+test "convertNode ConvTranspose lowers 2D stride-two detector geometry" {
     const allocator = std.testing.allocator;
     var g = Graph.init(allocator);
     defer g.deinit();
     var b = Builder.init(&g);
 
-    // Input: [1, 3, 4, 4], Weight: [3, 2, 3, 3], stride=2
-    const x = try b.parameter("x", Shape.init(.f32, &.{ 1, 3, 4, 4 }));
-    const w = try b.parameter("w", Shape.init(.f32, &.{ 3, 2, 3, 3 }));
+    const x = try b.parameter("x", Shape.init(.f32, &.{ 1, 3, 4, 5 }));
+    const w = try b.parameter("w", Shape.init(.f32, &.{ 3, 2, 2, 2 }));
     var strides = [_]i64{ 2, 2 };
     var attrs = [_]AttributeProto{
         .{ .name = "strides", .ints = &strides },
     };
     const node = NodeProto{ .op_type = "ConvTranspose", .attributes = &attrs };
-    try std.testing.expectError(error.UnsupportedOp, convertNode(allocator, &b, &node, &.{ x, w }, null));
+    const result = try convertNode(allocator, &b, &node, &.{ x, w }, null);
+    const imported = g.node(result);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 2, 8, 10 }, imported.output_shape.dims[0..4]);
+    const conv_attrs = switch (imported.op) {
+        .conv_general => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(conv_attrs.transposed);
+    try std.testing.expectEqual(@as(u32, 2), conv_attrs.strides[0]);
+    try std.testing.expectEqual(@as(u32, 2), conv_attrs.strides[1]);
 }
 
-test "convertNode ConvTranspose with bias" {
+test "convertNode ConvTranspose output_shape overrides explicit pads" {
     const allocator = std.testing.allocator;
     var g = Graph.init(allocator);
     defer g.deinit();
     var b = Builder.init(&g);
 
-    const x = try b.parameter("x", Shape.init(.f32, &.{ 1, 4, 8 }));
+    const x = try b.parameter("x", Shape.init(.f32, &.{ 1, 2, 4 }));
+    const w = try b.parameter("w", Shape.init(.f32, &.{ 2, 3, 3 }));
+    var strides = [_]i64{2};
+    var pads = [_]i64{ 100, 100 };
+    var output_padding = [_]i64{1};
+    var output_shape = [_]i64{8};
+    var attrs = [_]AttributeProto{
+        .{ .name = "strides", .ints = &strides },
+        .{ .name = "pads", .ints = &pads },
+        .{ .name = "output_padding", .ints = &output_padding },
+        .{ .name = "output_shape", .ints = &output_shape },
+    };
+    const node = NodeProto{ .op_type = "ConvTranspose", .attributes = &attrs };
+    const result = try convertNode(allocator, &b, &node, &.{ x, w }, null);
+    const imported = g.node(result);
+    try std.testing.expectEqual(@as(i64, 8), imported.output_shape.dim(2));
+    const conv_attrs = switch (imported.op) {
+        .conv_general => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(i32, 1), conv_attrs.padding[0][0]);
+    try std.testing.expectEqual(@as(i32, 1), conv_attrs.padding[0][1]);
+}
+
+test "convertNode ConvTranspose SAME_UPPER derives asymmetric pads" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+
+    const x = try b.parameter("x", Shape.init(.f32, &.{ 1, 1, 4 }));
+    const w = try b.parameter("w", Shape.init(.f32, &.{ 1, 1, 3 }));
+    var strides = [_]i64{2};
+    var attrs = [_]AttributeProto{
+        .{ .name = "auto_pad", .s = "SAME_UPPER" },
+        .{ .name = "strides", .ints = &strides },
+    };
+    const node = NodeProto{ .op_type = "ConvTranspose", .attributes = &attrs };
+    const result = try convertNode(allocator, &b, &node, &.{ x, w }, null);
+    const imported = g.node(result);
+    try std.testing.expectEqual(@as(i64, 8), imported.output_shape.dim(2));
+    const conv_attrs = switch (imported.op) {
+        .conv_general => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(i32, 0), conv_attrs.padding[0][0]);
+    try std.testing.expectEqual(@as(i32, 1), conv_attrs.padding[0][1]);
+}
+
+test "convertNode ConvTranspose preserves dynamic spatial extent" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+
+    const x = try b.parameter("x", Shape.init(.f32, &.{ 1, 2, -1, 7 }));
+    const w = try b.parameter("w", Shape.init(.f32, &.{ 2, 3, 3, 3 }));
+    var strides = [_]i64{ 2, 2 };
+    var pads = [_]i64{ 1, 1, 1, 1 };
+    var attrs = [_]AttributeProto{
+        .{ .name = "strides", .ints = &strides },
+        .{ .name = "pads", .ints = &pads },
+    };
+    const node = NodeProto{ .op_type = "ConvTranspose", .attributes = &attrs };
+    const result = try convertNode(allocator, &b, &node, &.{ x, w }, null);
+    const out_shape = g.node(result).output_shape;
+    try std.testing.expectEqual(@as(i64, -1), out_shape.dim(2));
+    try std.testing.expectEqual(@as(i64, 13), out_shape.dim(3));
+}
+
+test "convertNode ConvTranspose rejects invalid attributes and channel shapes" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+
+    const x = try b.parameter("x", Shape.init(.f32, &.{ 1, 4, 5 }));
     const w = try b.parameter("w", Shape.init(.f32, &.{ 4, 2, 3 }));
-    const bias = try b.parameter("bias", Shape.init(.f32, &.{2}));
-    const node = NodeProto{ .op_type = "ConvTranspose" };
-    const result = try convertNode(allocator, &b, &node, &.{ x, w, bias }, null);
-    // Result should be add (conv + bias)
-    try std.testing.expect(std.meta.activeTag(g.node(result).op) == .add);
+    var bad_strides = [_]i64{ 2, 2 };
+    var bad_stride_attrs = [_]AttributeProto{
+        .{ .name = "strides", .ints = &bad_strides },
+    };
+    const bad_stride_node = NodeProto{ .op_type = "ConvTranspose", .attributes = &bad_stride_attrs };
+    try std.testing.expectError(
+        error.InvalidAttribute,
+        convertNode(allocator, &b, &bad_stride_node, &.{ x, w }, null),
+    );
+
+    var invalid_output_padding = [_]i64{1};
+    var output_padding_attrs = [_]AttributeProto{
+        .{ .name = "output_padding", .ints = &invalid_output_padding },
+    };
+    const output_padding_node = NodeProto{ .op_type = "ConvTranspose", .attributes = &output_padding_attrs };
+    try std.testing.expectError(
+        error.InvalidAttribute,
+        convertNode(allocator, &b, &output_padding_node, &.{ x, w }, null),
+    );
+
+    const mismatched_w = try b.parameter("mismatched_w", Shape.init(.f32, &.{ 3, 2, 3 }));
+    const plain_node = NodeProto{ .op_type = "ConvTranspose" };
+    try std.testing.expectError(
+        error.ShapeMismatch,
+        convertNode(allocator, &b, &plain_node, &.{ x, mismatched_w }, null),
+    );
+
+    var group_attrs = [_]AttributeProto{
+        .{ .name = "group", .i = 3 },
+    };
+    const group_node = NodeProto{ .op_type = "ConvTranspose", .attributes = &group_attrs };
+    try std.testing.expectError(
+        error.ShapeMismatch,
+        convertNode(allocator, &b, &group_node, &.{ x, w }, null),
+    );
+}
+
+test "convertNode ConvTranspose rejects unsupported rank and shape overflow" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+
+    const x_3d = try b.parameter("x_3d", Shape.init(.f32, &.{ 1, 1, 2, 2, 2 }));
+    const w_3d = try b.parameter("w_3d", Shape.init(.f32, &.{ 1, 1, 3, 3, 3 }));
+    const plain_node = NodeProto{ .op_type = "ConvTranspose" };
+    try std.testing.expectError(
+        error.UnsupportedOp,
+        convertNode(allocator, &b, &plain_node, &.{ x_3d, w_3d }, null),
+    );
+
+    const huge_x = try b.parameter("huge_x", Shape.init(.f32, &.{ 1, 1, std.math.maxInt(i64) }));
+    const w = try b.parameter("w", Shape.init(.f32, &.{ 1, 1, 3 }));
+    var strides = [_]i64{2};
+    var attrs = [_]AttributeProto{
+        .{ .name = "strides", .ints = &strides },
+    };
+    const overflow_node = NodeProto{ .op_type = "ConvTranspose", .attributes = &attrs };
+    try std.testing.expectError(
+        error.Overflow,
+        convertNode(allocator, &b, &overflow_node, &.{ huge_x, w }, null),
+    );
 }
 
 test "convertNode IsNaN produces mul (AND of two masks)" {

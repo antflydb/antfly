@@ -18,3 +18,21 @@ const antfly_image = @import("antfly_image");
 test {
     std.testing.refAllDecls(antfly_image);
 }
+
+test "CCITT Group 3 accepts zero fill before row end markers" {
+    // Two white/black striped rows. EOLs have 4, 8, and 4 leading fill bits;
+    // row codes are white(2), black(2), white(2), black(2).
+    const encoded = [_]u8{ 0x00, 0x01, 0x7d, 0xf0, 0x00, 0x01, 0x7d, 0xf0, 0x00, 0x10 };
+    const pixels = try antfly_image.ccitt.decodeGrayAlloc(std.testing.allocator, &encoded, .msb, .group3, 8, 2, .{});
+    defer std.testing.allocator.free(pixels);
+    try std.testing.expectEqualSlices(u8, &.{
+        255, 255, 0, 0, 255, 255, 0, 0,
+        255, 255, 0, 0, 255, 255, 0, 0,
+    }, pixels);
+}
+
+test "CCITT Group 3 rejects short or unterminated end markers" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.MissingCcittEol, antfly_image.ccitt.decodeGrayAlloc(alloc, &.{0x01}, .msb, .group3, 8, 1, .{}));
+    try std.testing.expectError(error.EndOfStream, antfly_image.ccitt.decodeGrayAlloc(alloc, &.{ 0, 0, 0 }, .msb, .group3, 8, 1, .{}));
+}

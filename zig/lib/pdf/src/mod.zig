@@ -376,6 +376,7 @@ fn renderParsedPagePngEffectiveWithRotationAllocators(
             if (used_compatibility_backend) |value| value.* = true;
             break :blk if (compatibility_session) |session|
                 try session.renderPagePngAlloc(
+                    scratch_alloc,
                     output_alloc,
                     page_number,
                     dpi,
@@ -384,7 +385,7 @@ fn renderParsedPagePngEffectiveWithRotationAllocators(
                     parsed.cancellationProbe(),
                 )
             else
-                try darwin_render.renderPagePngAlloc(output_alloc, parsed.sourceBytes(), page_number, dpi, max_pixels, rotation);
+                try darwin_render.renderPagePngAlloc(scratch_alloc, output_alloc, parsed.sourceBytes(), page_number, dpi, max_pixels, rotation);
         } else return err,
         else => return err,
     };
@@ -416,6 +417,7 @@ fn renderParsedPagePngNativeWithAllocators(
     defer scratch_alloc.free(raw.rgba);
     try parsed.checkCancellation();
     return try image.png.encodeRgbaWithCancellation(
+        scratch_alloc,
         output_alloc,
         @intCast(raw.width),
         @intCast(raw.height),
@@ -572,6 +574,130 @@ fn normalizedPageRotation(rotation: ?i32) !render.PageRotation {
         270 => .clockwise_270,
         else => error.InvalidPageRotation,
     };
+}
+
+/// Invert the native page renderer's raster transform for one Reader region.
+///
+/// Native rendering scales PDF points by `effective_dpi / 72`, extends the
+/// scaled CropBox maximum edges to the next pixel without moving its minimum
+/// origin, paints into a top-left raster, then rotates that finished canvas.
+/// Consequently the scale must not be reconstructed from page and raster
+/// widths: the aligned trailing pixel can make that ratio inexact.
+///
+/// `raster_bbox` is `[left, top, right, bottom]` in the final rotated raster.
+/// The returned box is `[min_x, min_y, max_x, max_y]` in source page points.
+/// Compatibility renderers intentionally do not use this contract.
+pub fn nativeRasterBboxToPagePoints(
+    page_box: reader.PageBox,
+    effective_dpi: u16,
+    raster_width: u32,
+    raster_height: u32,
+    page_rotation: ?i32,
+    raster_bbox: [4]f64,
+) ?[4]f64 {
+    if (effective_dpi == 0 or raster_width == 0 or raster_height == 0) return null;
+    if (!std.math.isFinite(page_box.min_x) or !std.math.isFinite(page_box.min_y) or
+        !std.math.isFinite(page_box.max_x) or !std.math.isFinite(page_box.max_y) or
+        !(page_box.min_x < page_box.max_x) or !(page_box.min_y < page_box.max_y))
+        return null;
+    for (raster_bbox) |coordinate| if (!std.math.isFinite(coordinate)) return null;
+    const left = raster_bbox[0];
+    const top = raster_bbox[1];
+    const right = raster_bbox[2];
+    const bottom = raster_bbox[3];
+    const final_width: f64 = @floatFromInt(raster_width);
+    const final_height: f64 = @floatFromInt(raster_height);
+    if (!(left < right) or !(top < bottom) or left < 0 or top < 0 or
+        right > final_width or bottom > final_height)
+        return null;
+
+    const rotation = normalizedPageRotation(page_rotation) catch return null;
+    const scale = @as(f64, @floatFromInt(effective_dpi)) / 72.0;
+    const expected_unrotated_width = @ceil((page_box.max_x - page_box.min_x) * scale);
+    const expected_unrotated_height = @ceil((page_box.max_y - page_box.min_y) * scale);
+    if (!std.math.isFinite(expected_unrotated_width) or !std.math.isFinite(expected_unrotated_height) or
+        expected_unrotated_width < 1 or expected_unrotated_height < 1)
+        return null;
+    const expected_final_width = if (rotation == .clockwise_90 or rotation == .clockwise_270)
+        expected_unrotated_height
+    else
+        expected_unrotated_width;
+    const expected_final_height = if (rotation == .clockwise_90 or rotation == .clockwise_270)
+        expected_unrotated_width
+    else
+        expected_unrotated_height;
+    if (final_width != expected_final_width or final_height != expected_final_height) return null;
+    var unrotated: [4]f64 = undefined;
+    var unrotated_width = final_width;
+    var unrotated_height = final_height;
+    switch (rotation) {
+        .none => unrotated = raster_bbox,
+        .clockwise_90 => {
+            unrotated_width = final_height;
+            unrotated_height = final_width;
+            unrotated = .{ top, unrotated_height - right, bottom, unrotated_height - left };
+        },
+        .clockwise_180 => {
+            unrotated = .{
+                unrotated_width - right,
+                unrotated_height - bottom,
+                unrotated_width - left,
+                unrotated_height - top,
+            };
+        },
+        .clockwise_270 => {
+            unrotated_width = final_height;
+            unrotated_height = final_width;
+            unrotated = .{ unrotated_width - bottom, left, unrotated_width - top, right };
+        },
+    }
+    if (unrotated[0] < 0 or unrotated[1] < 0 or
+        unrotated[2] > unrotated_width or unrotated[3] > unrotated_height)
+        return null;
+
+    // `scale` and the exact pixel-grid dimensions were validated above.
+    const mapped = [4]f64{
+        page_box.min_x + unrotated[0] / scale,
+        page_box.min_y + (unrotated_height - unrotated[3]) / scale,
+        page_box.min_x + unrotated[2] / scale,
+        page_box.min_y + (unrotated_height - unrotated[1]) / scale,
+    };
+    if (!(mapped[0] < mapped[2]) or !(mapped[1] < mapped[3]) or
+        mapped[0] < page_box.min_x or mapped[1] < page_box.min_y or
+        mapped[2] > page_box.max_x or mapped[3] > page_box.max_y)
+        return null;
+    return mapped;
+}
+
+test "native raster region inversion preserves fractional CropBox geometry through rotations" {
+    const page_box = reader.PageBox{ .min_x = 10.25, .min_y = -4.5, .max_x = 82.45, .max_y = 31.9 };
+    const expected = [4]f64{ 20.25, 5.5, 40.25, 15.5 };
+    const Case = struct {
+        rotation: ?i32,
+        width: u32,
+        height: u32,
+        bbox: [4]f64,
+    };
+    const cases = [_]Case{
+        .{ .rotation = 0, .width = 145, .height = 73, .bbox = .{ 20, 33, 60, 53 } },
+        .{ .rotation = 90, .width = 73, .height = 145, .bbox = .{ 20, 20, 40, 60 } },
+        .{ .rotation = 180, .width = 145, .height = 73, .bbox = .{ 85, 20, 125, 40 } },
+        .{ .rotation = 270, .width = 73, .height = 145, .bbox = .{ 33, 85, 53, 125 } },
+    };
+    for (cases) |case| {
+        const mapped = nativeRasterBboxToPagePoints(page_box, 144, case.width, case.height, case.rotation, case.bbox) orelse
+            return error.ExpectedMappedNativeRegion;
+        for (mapped, expected) |actual, wanted|
+            try std.testing.expectApproxEqAbs(wanted, actual, 0.000_001);
+    }
+}
+
+test "native raster region inversion rejects invalid source bounds and rotations" {
+    const page_box = reader.PageBox{ .min_x = 0.25, .min_y = 1.5, .max_x = 72.45, .max_y = 37.9 };
+    try std.testing.expect(nativeRasterBboxToPagePoints(page_box, 144, 145, 73, 0, .{ -1, 2, 4, 5 }) == null);
+    try std.testing.expect(nativeRasterBboxToPagePoints(page_box, 144, 145, 73, 45, .{ 1, 2, 4, 5 }) == null);
+    try std.testing.expect(nativeRasterBboxToPagePoints(page_box, 144, 145, 73, 0, .{ 1, 2, std.math.inf(f64), 5 }) == null);
+    try std.testing.expect(nativeRasterBboxToPagePoints(page_box, 144, 144, 73, 0, .{ 1, 2, 4, 5 }) == null);
 }
 
 /// Renders at the requested DPI when safe, reducing it only enough to satisfy

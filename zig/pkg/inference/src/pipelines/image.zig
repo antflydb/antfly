@@ -1439,13 +1439,6 @@ fn clampImageIndex(idx: i32, dim: u32) u32 {
     return @intCast(idx);
 }
 
-pub fn computeAspectFitWidth(src_width: u32, src_height: u32, target_height: u32, max_width: u32) u32 {
-    if (src_width == 0 or src_height == 0 or target_height == 0 or max_width == 0) return 0;
-    const scaled = (@as(u64, src_width) * @as(u64, target_height) + @as(u64, src_height / 2)) / @as(u64, src_height);
-    const clamped = @min(@as(u64, max_width), @max(@as(u64, 1), scaled));
-    return @intCast(clamped);
-}
-
 pub fn preprocessDecodedRectKeepAspectPadRightWithResample(
     allocator: std.mem.Allocator,
     img: Image,
@@ -1454,7 +1447,7 @@ pub fn preprocessDecodedRectKeepAspectPadRightWithResample(
     mean: [3]f32,
     std_dev: [3]f32,
     resample: Resample,
-    pad_rgb: [3]u8,
+    pad_rgb: [3]f32,
 ) ![]f32 {
     return preprocessDecodedRectKeepAspectPadRightScaledWithResample(
         allocator,
@@ -1478,42 +1471,20 @@ pub fn preprocessDecodedRectKeepAspectPadRightScaledWithResample(
     std_dev: [3]f32,
     rescale_factor: f32,
     resample: Resample,
-    pad_rgb: [3]u8,
+    pad_rgb: [3]f32,
 ) ![]f32 {
-    const resized_width = computeAspectFitWidth(img.width, img.height, target_height, max_width);
-    if (resized_width == 0) return error.InvalidImageBuffer;
-
-    var resized = try preprocessDecodedRectScaledWithResample(
+    if (max_width == 0 or target_height == 0) return error.InvalidImageBuffer;
+    return shared.preprocessDecodedRectKeepAspectPadRightScaledWithResample(
         allocator,
-        img,
-        resized_width,
+        toSharedImage(img),
+        max_width,
         target_height,
         mean,
         std_dev,
         rescale_factor,
         resample,
+        pad_rgb,
     );
-    defer allocator.free(resized);
-
-    const output_plane_stride = @as(usize, max_width) * @as(usize, target_height);
-    const resized_plane_stride = @as(usize, resized_width) * @as(usize, target_height);
-    const output = try allocator.alloc(f32, 3 * output_plane_stride);
-    errdefer allocator.free(output);
-
-    for (0..3) |ch| {
-        const pad_value = ((@as(f32, @floatFromInt(pad_rgb[ch])) * rescale_factor) - mean[ch]) / std_dev[ch];
-        @memset(output[ch * output_plane_stride ..][0..output_plane_stride], pad_value);
-
-        const src_plane = resized[ch * resized_plane_stride ..][0..resized_plane_stride];
-        const dst_plane = output[ch * output_plane_stride ..][0..output_plane_stride];
-        for (0..target_height) |row| {
-            const dst_row = row * @as(usize, max_width);
-            const src_row = row * @as(usize, resized_width);
-            @memcpy(dst_plane[dst_row .. dst_row + @as(usize, resized_width)], src_plane[src_row .. src_row + @as(usize, resized_width)]);
-        }
-    }
-
-    return output;
 }
 
 /// Preprocess a batch of images. Returns [batch, 3, target_size, target_size] as f32.
