@@ -591,6 +591,8 @@ pub fn collectFramePayloads(allocator: std.mem.Allocator, mp3_bytes: []const u8)
                 const end_bit = running_bit_offset + bit_length;
                 const required_bytes = end_bit + 7;
                 if (required_bytes / 8 > frame_data.len) {
+                    // The granules decoded so far own their copied main data.
+                    for (granules[0..payload_index]) |*granule| granule.deinit(allocator);
                     allocator.free(granules);
                     // The stream stopped mid-frame and the reservoir does not
                     // hold what the frame still needs: end the stream here
@@ -1397,7 +1399,10 @@ fn buildStereoBandMap(
         const short_bands = requantize.scalefactorBandShort(header.sample_rate);
         const short_start = scalefactors.short_band_start;
         const short_end = scalefactors.short_band_start + scalefactors.short_band_count;
-        var source_offset: usize = if (scalefactors.long_band_count > 0) 36 else 0;
+        var source_offset: usize = if (scalefactors.long_band_count > 0)
+            requantize.mixedBlockLongSamples(header.sample_rate)
+        else
+            0;
         for (short_start..short_end) |band| {
             const band_width = short_bands[band + 1] - short_bands[band];
             for (0..3) |window| {
@@ -1731,6 +1736,20 @@ test "a silent frame keeps its place in the timeline" {
     const decoded = try mp3.decodeMono(std.testing.allocator, fixture);
     defer std.testing.allocator.free(decoded.samples);
     try std.testing.expectEqual(plans.len * 1152, decoded.samples.len);
+}
+
+test "a frame cut between its granules frees what it already copied" {
+    // Truncating this vector around 1.5 kB leaves the last frame's first
+    // granule satisfiable from the reservoir and its second granule short, so
+    // collection abandons the frame with one granule's main data already
+    // copied. The testing allocator is what catches that copy going missing.
+    const fixture = @embedFile("../../testdata/mp3-corpus/l3-si.bit");
+    var length: usize = 1600;
+    while (length > 1400) : (length -= 1) {
+        const payloads = collectFramePayloads(std.testing.allocator, fixture[0..length]) catch continue;
+        for (payloads) |*payload| payload.deinit(std.testing.allocator);
+        std.testing.allocator.free(payloads);
+    }
 }
 
 test "a truncated final frame decodes from the reservoir" {
