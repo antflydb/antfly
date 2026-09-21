@@ -358,3 +358,85 @@ func TestVerifyAutoschemaGraphIndexEnrichments(t *testing.T) {
 		t.Fatalf("wrong-type index: err = %v, want graph-index mismatch error", err)
 	}
 }
+
+func TestVerifyAutoschemaGraphIndexConfigDetectsDrift(t *testing.T) {
+	idx, err := createAutoschemaTaxonomyIndex(DefaultAutoschemaModel, DefaultInferenceURL)
+	if err != nil {
+		t.Fatalf("createAutoschemaTaxonomyIndex failed: %v", err)
+	}
+	request, err := antfly.NewCreateIndexRequest(idx)
+	if err != nil {
+		t.Fatalf("NewCreateIndexRequest failed: %v", err)
+	}
+
+	// Identical want and got must verify: the created shape mirrors the
+	// request's graph config sections after a JSON round-trip.
+	same := statusFromCreateRequest(t, *request)
+	if err := verifyAutoschemaGraphIndexConfig(same, "entities", AutoschemaTaxonomyIndex, *request); err != nil {
+		t.Fatalf("identical config must verify, got: %v", err)
+	}
+
+	// A drifted resolver key template must fail with a named path even
+	// though the index type and enrichment names all match.
+	drifted := *idx
+	driftedCfg := drifted
+	driftedRequest, err := antfly.NewCreateIndexRequest(&driftedCfg)
+	if err != nil {
+		t.Fatalf("NewCreateIndexRequest(drift) failed: %v", err)
+	}
+	got := statusFromCreateRequest(t, *driftedRequest)
+	mutateStatusJSON(t, &got, func(m map[string]any) {
+		resolvers := m["resolvers"].([]any)
+		resolvers[0].(map[string]any)["key_template"] = "{{ _entity.text }}"
+	})
+	err = verifyAutoschemaGraphIndexConfig(got, "entities", AutoschemaTaxonomyIndex, *request)
+	if err == nil || !strings.Contains(err.Error(), "resolvers") {
+		t.Fatalf("drifted resolver template must fail verification naming resolvers, got: %v", err)
+	}
+
+	// A drifted enrichment template (the conceptualizer prompt) must fail.
+	got = statusFromCreateRequest(t, *request)
+	mutateStatusJSON(t, &got, func(m map[string]any) {
+		enrichments := m["enrichments"].([]any)
+		enrichments[0].(map[string]any)["template"] = "{{ canonical_name }}"
+	})
+	err = verifyAutoschemaGraphIndexConfig(got, "entities", AutoschemaTaxonomyIndex, *request)
+	if err == nil || !strings.Contains(err.Error(), "enrichment templates") {
+		t.Fatalf("drifted enrichment template must fail verification, got: %v", err)
+	}
+}
+
+// statusFromCreateRequest round-trips a create request into the created
+// status shape the server would return for it.
+func statusFromCreateRequest(t *testing.T, request antfly.CreateIndexRequest) antfly.IndexStatus {
+	t.Helper()
+	encoded, err := json.Marshal(request)
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	var status antfly.IndexStatus
+	if err := json.Unmarshal([]byte(`{"config":`+string(encoded)+`}`), &status); err != nil {
+		t.Fatalf("unmarshal status: %v", err)
+	}
+	return status
+}
+
+func mutateStatusJSON(t *testing.T, status *antfly.IndexStatus, mutate func(map[string]any)) {
+	t.Helper()
+	encoded, err := json.Marshal(status.Config)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(encoded, &m); err != nil {
+		t.Fatalf("unmarshal config: %v", err)
+	}
+	mutate(m)
+	mutated, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal mutated: %v", err)
+	}
+	if err := json.Unmarshal(mutated, &status.Config); err != nil {
+		t.Fatalf("unmarshal mutated config: %v", err)
+	}
+}

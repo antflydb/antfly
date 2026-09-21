@@ -66632,7 +66632,10 @@ fn applySplitGraphArtifactsStreaming(
             try buffer.writes.ensureUnusedCapacity(state.alloc, 1);
             const index_name = try state.alloc.dupe(u8, parsed.index_name);
             errdefer state.alloc.free(index_name);
-            const source = try state.alloc.dupe(u8, parsed.doc_key);
+            // The applied edge starts from the explicit source node when the
+            // key embeds one (entity-sourced relations); the owner stays the
+            // key's leading document component.
+            const source = try state.alloc.dupe(u8, parsed.source_node orelse parsed.doc_key);
             errdefer state.alloc.free(source);
             const target = try state.alloc.dupe(u8, parsed.target_doc_key);
             errdefer state.alloc.free(target);
@@ -66661,6 +66664,7 @@ fn applySplitGraphArtifactsStreaming(
                 state.alloc.free(parsed.index_name);
                 state.alloc.free(parsed.edge_type);
                 state.alloc.free(parsed.target_doc_key);
+                if (parsed.source_node) |source| state.alloc.free(source);
             }
             const buffer_index = state.indexes_by_name.get(parsed.index_name) orelse return .@"continue";
             var decoded = try enrichment_artifact_codec.decodeGraphEdgeAlloc(state.alloc, value);
@@ -66764,6 +66768,7 @@ fn applySplitGraphArtifactsForIndexStreamingContext(
                 state.ctx.alloc.free(parsed.index_name);
                 state.ctx.alloc.free(parsed.edge_type);
                 state.ctx.alloc.free(parsed.target_doc_key);
+                if (parsed.source_node) |source| state.ctx.alloc.free(source);
             }
             if (!std.mem.eql(u8, parsed.index_name, state.index_name)) return .@"continue";
 
@@ -66813,7 +66818,9 @@ fn applySplitGraphArtifactsForIndexStreamingContext(
             errdefer decoded.deinit(state.ctx.alloc);
             try state.writes.append(state.ctx.alloc, .{
                 .index_name = try state.ctx.alloc.dupe(u8, parsed.index_name),
-                .source = try state.ctx.alloc.dupe(u8, parsed.doc_key),
+                // Entity-sourced relations rebuild from the key's embedded
+                // source node, not the owning document.
+                .source = try state.ctx.alloc.dupe(u8, parsed.source_node orelse parsed.doc_key),
                 .target = try state.ctx.alloc.dupe(u8, parsed.target_doc_key),
                 .edge_type = try state.ctx.alloc.dupe(u8, parsed.edge_type),
                 .weight = decoded.weight,

@@ -26,6 +26,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"strings"
 	"time"
 
@@ -572,6 +573,9 @@ func ensureAutoschemaIndexes(ctx context.Context, client *antfly.AntflyClient, t
 		if err := verifyAutoschemaGraphIndexEnrichments(status, tableName, want.name, want.enrichments); err != nil {
 			return err
 		}
+		if err := verifyAutoschemaGraphIndexConfig(status, tableName, want.name, want.request); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -608,6 +612,133 @@ func verifyAutoschemaGraphIndexEnrichments(status antfly.IndexStatus, tableName,
 			tableName, indexName, strings.Join(missing, ", "), indexName)
 	}
 	return nil
+}
+
+// verifyAutoschemaGraphIndexConfig compares a pre-existing index's admitted
+// configuration against the config --autoschema would have created, section
+// by section: sources, resolvers, metrics, and per-enrichment kind+template
+// (the templates carry the extraction and conceptualization prompts, so a
+// wrong prompt fails verification). Comparison is "expected is a subset of
+// existing": server responses may add derived fields, but every field the
+// expected config specifies must match. producer_json is a write-only field
+// the server never returns and therefore cannot be verified from a read;
+// the template check is the strongest readable proxy for producer intent.
+func verifyAutoschemaGraphIndexConfig(status antfly.IndexStatus, tableName, indexName string, want antfly.CreateIndexRequest) error {
+	wantValue, err := want.ValueByDiscriminator()
+	if err != nil {
+		return fmt.Errorf("internal: expected autoschema index %q config unreadable: %w", indexName, err)
+	}
+	wantGraph, ok := wantValue.(oapi.CreateGraphIndexRequest)
+	if !ok {
+		return fmt.Errorf("internal: expected autoschema index %q is not a graph index request (%T)", indexName, wantValue)
+	}
+	gotValue, err := status.Config.ValueByDiscriminator()
+	if err != nil {
+		return fmt.Errorf("table %q pre-exists but the config of index %q could not be read: %w", tableName, indexName, err)
+	}
+	gotGraph, ok := gotValue.(oapi.CreatedGraphIndex)
+	if !ok {
+		return fmt.Errorf("table %q pre-exists but index %q is not the expected graph index (found %T)", tableName, indexName, gotValue)
+	}
+
+	type section struct {
+		name string
+		want any
+		got  any
+	}
+	wantEnrichments := map[string]map[string]any{}
+	for _, e := range wantGraph.Enrichments {
+		wantEnrichments[e.Name] = map[string]any{"kind": e.Kind, "template": e.Template}
+	}
+	gotEnrichments := map[string]map[string]any{}
+	for _, e := range gotGraph.Enrichments {
+		gotEnrichments[e.Name] = map[string]any{"kind": e.Kind, "template": e.Template}
+	}
+	sections := []section{
+		{"sources", wantGraph.Sources, gotGraph.Sources},
+		{"resolvers", wantGraph.Resolvers, gotGraph.Resolvers},
+		{"metrics", wantGraph.Metrics, gotGraph.Metrics},
+		{"enrichment templates", wantEnrichments, gotEnrichments},
+	}
+	for _, sec := range sections {
+		if err := verifyConfigSubset(sec.want, sec.got); err != nil {
+			return fmt.Errorf(
+				"table %q pre-exists with index %q whose %s differ from the autoschema configuration (%w); "+
+					"the index was created with a different configuration — drop index %q (or the table) and rerun with --autoschema",
+				tableName, indexName, sec.name, err, indexName)
+		}
+	}
+	return nil
+}
+
+// verifyConfigSubset asserts every field the expected value specifies is
+// present and equal in the existing value, after a JSON round-trip that
+// normalizes both generated struct families to plain maps/slices. Zero-value
+// expected fields are omitted by omitzero and therefore not enforced; extra
+// fields on the existing side are ignored.
+func verifyConfigSubset(want, got any) error {
+	normalize := func(v any) (any, error) {
+		encoded, err := json.Marshal(v)
+		if err != nil {
+			return nil, err
+		}
+		var out any
+		if err := json.Unmarshal(encoded, &out); err != nil {
+			return nil, err
+		}
+		return out, nil
+	}
+	wantNorm, err := normalize(want)
+	if err != nil {
+		return err
+	}
+	gotNorm, err := normalize(got)
+	if err != nil {
+		return err
+	}
+	return configSubsetMismatch("", wantNorm, gotNorm)
+}
+
+func configSubsetMismatch(path string, want, got any) error {
+	switch wantTyped := want.(type) {
+	case map[string]any:
+		gotMap, ok := got.(map[string]any)
+		if !ok {
+			return fmt.Errorf("%s: expected an object, found %T", path, got)
+		}
+		for key, wantChild := range wantTyped {
+			if key == "producer_json" {
+				continue // write-only; the server never returns it
+			}
+			gotChild, present := gotMap[key]
+			if !present {
+				return fmt.Errorf("%s.%s: missing", path, key)
+			}
+			if err := configSubsetMismatch(path+"."+key, wantChild, gotChild); err != nil {
+				return err
+			}
+		}
+		return nil
+	case []any:
+		gotSlice, ok := got.([]any)
+		if !ok {
+			return fmt.Errorf("%s: expected a list, found %T", path, got)
+		}
+		if len(wantTyped) != len(gotSlice) {
+			return fmt.Errorf("%s: expected %d entries, found %d", path, len(wantTyped), len(gotSlice))
+		}
+		for i, wantChild := range wantTyped {
+			if err := configSubsetMismatch(fmt.Sprintf("%s[%d]", path, i), wantChild, gotSlice[i]); err != nil {
+				return err
+			}
+		}
+		return nil
+	default:
+		if !reflect.DeepEqual(want, got) {
+			return fmt.Errorf("%s: expected %v, found %v", path, want, got)
+		}
+		return nil
+	}
 }
 
 // provisionAutoschemaTables creates the concepts and events tables (plain) and
