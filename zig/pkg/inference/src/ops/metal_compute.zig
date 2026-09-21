@@ -22716,7 +22716,6 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn addOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (toBuf(a).integer_storage or toBuf(b).integer_storage) return self.integerBinary(a, b, 0);
-        if (toBuf(a).integer_storage or toBuf(b).integer_storage) return error.UnsupportedTensorType;
         const a_buf = toBuf(a);
         const b_buf = toBuf(b);
         if (bufHasAnyQuantizedStorage(a_buf) or bufHasAnyQuantizedStorage(b_buf)) return error.UnsupportedTensorType;
@@ -22841,7 +22840,6 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn multiplyOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (toBuf(a).integer_storage or toBuf(b).integer_storage) return self.integerBinary(a, b, 2);
-        if (toBuf(a).integer_storage or toBuf(b).integer_storage) return error.UnsupportedTensorType;
         const a_buf = toBuf(a);
         const b_buf = toBuf(b);
         if (bufHasAnyQuantizedStorage(a_buf) or bufHasAnyQuantizedStorage(b_buf)) return error.UnsupportedTensorType;

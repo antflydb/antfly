@@ -38906,14 +38906,16 @@ fn integerBinaryOp(self: *NativeCompute, a: CT, b: CT, comptime kind: enum { add
     if (lhs.dtype != rhs.dtype or lhs.dtype == .bool_) return error.UnsupportedTensorType;
     const left = try IndexReader.init(a);
     const right = try IndexReader.init(b);
-    const count = @max(left.len, right.len);
-    if ((left.len != count and left.len != 1) or (right.len != count and right.len != 1)) return error.ShapeMismatch;
-    const shape = if (left.len == count) lhs.shape else rhs.shape;
+    const plan = try @import("binary_broadcast.zig").Plan.init(tensorStoredShape(a) orelse lhs.shape, tensorStoredShape(b) orelse rhs.shape);
+    if (plan.lhs_count != left.len or plan.rhs_count != right.len) return error.ShapeMismatch;
+    const count = plan.count;
+    const shape = plan.shape[0..plan.rank];
     const bytes = try self.allocator.alloc(u8, try std.math.mul(usize, count, lhs.dtype.byteSize()));
     defer self.allocator.free(bytes);
     for (0..count) |i| {
-        const x: u64 = @bitCast(try left.at(if (left.len == 1) 0 else i));
-        const y: u64 = @bitCast(try right.at(if (right.len == 1) 0 else i));
+        const offsets = plan.offsets(i);
+        const x: u64 = @bitCast(try left.at(offsets.lhs));
+        const y: u64 = @bitCast(try right.at(offsets.rhs));
         const result = switch (kind) {
             .add => x +% y,
             .subtract => x -% y,

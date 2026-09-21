@@ -10577,6 +10577,13 @@ static NSString *termite_metal_shader_source(void) {
            "kernel void termite_integer_binary(device const uchar *lhs [[buffer(0)]], device const uchar *rhs [[buffer(1)]], device uchar *output [[buffer(2)]], constant uint *p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
            "    if (gid >= p[0]) return;\n"
            "    uint li = p[3] != 0u ? 0u : gid, ri = p[4] != 0u ? 0u : gid;\n"
+           "    if (p[6] != 0u) {\n"
+           "        li = 0u; ri = 0u; uint remaining = gid;\n"
+           "        for (uint axis = 0u; axis < p[6]; ++axis) {\n"
+           "            uint coord = remaining / p[7u + axis]; remaining %= p[7u + axis];\n"
+           "            li += coord * p[15u + axis]; ri += coord * p[23u + axis];\n"
+           "        }\n"
+           "    }\n"
            "    long a = p[1] != 0u ? termite_read_integer(lhs, p[1], li) : 0;\n"
            "    long b = p[2] != 0u ? termite_read_integer(rhs, p[2], ri) : 0;\n"
            "    if (p[5] == 3u) {\n"
@@ -45082,7 +45089,7 @@ int termite_metal_decode_runtime_cumulative_sum_f32_device(
     }
 }
 
-static int termite_metal_decode_runtime_typed_binary_dispatch(termite_metal_decode_runtime *runtime, void *input_handle, size_t input_offset, size_t input_bytes, void *indices_handle, size_t indices_offset, size_t indices_bytes, void *output_handle, size_t output_offset, size_t output_bytes, const uint32_t *params, id<MTLComputePipelineState> pipeline) {
+static int termite_metal_decode_runtime_typed_binary_dispatch(termite_metal_decode_runtime *runtime, void *input_handle, size_t input_offset, size_t input_bytes, void *indices_handle, size_t indices_offset, size_t indices_bytes, void *output_handle, size_t output_offset, size_t output_bytes, const uint32_t *params, size_t params_count, id<MTLComputePipelineState> pipeline) {
     if (!runtime || !input_handle || !indices_handle || !output_handle || !params) return -1;
     @autoreleasepool {
         id<MTLBuffer> input = (__bridge id<MTLBuffer>)input_handle;
@@ -45102,7 +45109,7 @@ static int termite_metal_decode_runtime_typed_binary_dispatch(termite_metal_deco
         [encoder setBuffer:input offset:input_offset atIndex:0];
         [encoder setBuffer:indices offset:indices_offset atIndex:1];
         [encoder setBuffer:output offset:output_offset atIndex:2];
-        [encoder setBytes:params length:6 * sizeof(uint32_t) atIndex:3];
+        [encoder setBytes:params length:params_count * sizeof(uint32_t) atIndex:3];
         [encoder dispatchThreads:MTLSizeMake(params[0], 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(pipeline, params[0]), 1, 1)];
         if (!planned) [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -10);
@@ -45110,11 +45117,11 @@ static int termite_metal_decode_runtime_typed_binary_dispatch(termite_metal_deco
 }
 
 int termite_metal_decode_runtime_gather_typed_device(termite_metal_decode_runtime *runtime, void *input_handle, size_t input_offset, size_t input_bytes, void *indices_handle, size_t indices_offset, size_t indices_bytes, void *output_handle, size_t output_offset, size_t output_bytes, const uint32_t *params) {
-    return termite_metal_decode_runtime_typed_binary_dispatch(runtime, input_handle, input_offset, input_bytes, indices_handle, indices_offset, indices_bytes, output_handle, output_offset, output_bytes, params, runtime != NULL ? runtime->gather_typed_pipeline : nil);
+    return termite_metal_decode_runtime_typed_binary_dispatch(runtime, input_handle, input_offset, input_bytes, indices_handle, indices_offset, indices_bytes, output_handle, output_offset, output_bytes, params, 6, runtime != NULL ? runtime->gather_typed_pipeline : nil);
 }
 
 int termite_metal_decode_runtime_integer_binary_device(termite_metal_decode_runtime *runtime, void *input_handle, size_t input_offset, size_t input_bytes, void *indices_handle, size_t indices_offset, size_t indices_bytes, void *output_handle, size_t output_offset, size_t output_bytes, const uint32_t *params) {
-    return termite_metal_decode_runtime_typed_binary_dispatch(runtime, input_handle, input_offset, input_bytes, indices_handle, indices_offset, indices_bytes, output_handle, output_offset, output_bytes, params, runtime != NULL ? runtime->integer_binary_pipeline : nil);
+    return termite_metal_decode_runtime_typed_binary_dispatch(runtime, input_handle, input_offset, input_bytes, indices_handle, indices_offset, indices_bytes, output_handle, output_offset, output_bytes, params, 31, runtime != NULL ? runtime->integer_binary_pipeline : nil);
 }
 
 int termite_metal_decode_runtime_cast_typed_device(termite_metal_decode_runtime *runtime, void *input_handle, size_t input_offset, void *output_handle, size_t output_offset, size_t count, uint32_t source_dtype, uint32_t target_dtype) {

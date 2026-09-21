@@ -7032,17 +7032,31 @@ extern fn termite_metal_decode_runtime_gather_typed_device(runtime: ?*anyopaque,
 pub fn decoderRuntimeIntegerBinaryDevice(self: anytype, lhs: MetalTensor, rhs: MetalTensor, kind: u32) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (kind > 3 or (kind != 3 and (lhs.dtype != rhs.dtype or lhs.dtype == .f32 or lhs.dtype == .bool_))) return error.UnsupportedTensorType;
-    const count = @max(lhs.elemCount(), rhs.elemCount());
-    if ((lhs.elemCount() != count and lhs.elemCount() != 1) or (rhs.elemCount() != count and rhs.elemCount() != 1)) return error.InvalidTensorShape;
-    const shape = if (lhs.elemCount() == count) lhs.shape() else rhs.shape();
-    var output = try MetalTensor.deviceAllocateTyped(std.heap.c_allocator, runtime, if (kind == 3) .f32 else lhs.dtype, .private, shape);
+    var lhs_shape: [8]i64 = undefined;
+    var rhs_shape: [8]i64 = undefined;
+    for (lhs.shape(), 0..) |dim, i| lhs_shape[i] = dim;
+    for (rhs.shape(), 0..) |dim, i| rhs_shape[i] = dim;
+    const plan = try @import("../ops/binary_broadcast.zig").Plan.init(lhs_shape[0..lhs.shape().len], rhs_shape[0..rhs.shape().len]);
+    if (plan.lhs_count != lhs.elemCount() or plan.rhs_count != rhs.elemCount()) return error.InvalidTensorShape;
+    const count = plan.count;
+    var shape: [8]i32 = undefined;
+    for (plan.shape[0..plan.rank], 0..) |dim, i| shape[i] = std.math.cast(i32, dim) orelse return error.InvalidTensorShape;
+    var output = try MetalTensor.deviceAllocateTyped(std.heap.c_allocator, runtime, if (kind == 3) .f32 else lhs.dtype, .private, shape[0..plan.rank]);
     errdefer output.deinit();
     if (count == 0) return output;
-    const params = [_]u32{ std.math.cast(u32, count) orelse return error.InvalidTensorShape, @intFromEnum(lhs.dtype), @intFromEnum(rhs.dtype), @intFromBool(lhs.elemCount() == 1), @intFromBool(rhs.elemCount() == 1), kind };
+    // Header followed by coalesced output divisors and zero-stride input maps.
+    // Flat/scalar operands retain the original division-free fast path.
+    var params: [31]u32 = @splat(0);
+    params[0..7].* = .{ std.math.cast(u32, count) orelse return error.InvalidTensorShape, @intFromEnum(lhs.dtype), @intFromEnum(rhs.dtype), @intFromBool(lhs.elemCount() == 1), @intFromBool(rhs.elemCount() == 1), kind, if (plan.flat()) 0 else @intCast(plan.axes) };
+    for (0..plan.axes) |i| {
+        params[7 + i] = std.math.cast(u32, plan.divisors[i]) orelse return error.InvalidTensorShape;
+        params[15 + i] = std.math.cast(u32, plan.lhs_strides[i]) orelse return error.InvalidTensorShape;
+        params[23 + i] = std.math.cast(u32, plan.rhs_strides[i]) orelse return error.InvalidTensorShape;
+    }
     const rc = termite_metal_decode_runtime_integer_binary_device(runtime, lhs.deviceHandle(), lhs.deviceByteOffset(), lhs.deviceByteLen(), rhs.deviceHandle(), rhs.deviceByteOffset(), rhs.deviceByteLen(), output.deviceHandle(), output.deviceByteOffset(), output.deviceByteLen(), &params);
     return finishDeviceOutput(&output, rc);
 }
-extern fn termite_metal_decode_runtime_integer_binary_device(runtime: ?*anyopaque, lhs: ?*anyopaque, lhs_offset: usize, lhs_bytes: usize, rhs: ?*anyopaque, rhs_offset: usize, rhs_bytes: usize, output: ?*anyopaque, output_offset: usize, output_bytes: usize, params: *const [6]u32) c_int;
+extern fn termite_metal_decode_runtime_integer_binary_device(runtime: ?*anyopaque, lhs: ?*anyopaque, lhs_offset: usize, lhs_bytes: usize, rhs: ?*anyopaque, rhs_offset: usize, rhs_bytes: usize, output: ?*anyopaque, output_offset: usize, output_bytes: usize, params: *const [31]u32) c_int;
 
 pub fn decoderRuntimeCastTypedDevice(self: anytype, input: MetalTensor, dtype: @import("metal_tensor.zig").DType) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;

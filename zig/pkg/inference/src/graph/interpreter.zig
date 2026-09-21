@@ -7397,6 +7397,114 @@ test "Metal exact integer constants survive transfers and gather on every axis" 
     }
 }
 
+fn checkExactIntegerBroadcasts(cb: *const ComputeBackend, metal: bool) !void {
+    const a = std.testing.allocator;
+    const Case = struct { lhs: []const i64, rhs: []const i64, out: []const i64, li: []const usize, ri: []const usize };
+    const cases = [_]Case{
+        .{ .lhs = &.{ 2, 1 }, .rhs = &.{3}, .out = &.{ 2, 3 }, .li = &.{ 0, 0, 0, 1, 1, 1 }, .ri = &.{ 0, 1, 2, 0, 1, 2 } },
+        .{ .lhs = &.{ 2, 1 }, .rhs = &.{ 1, 2 }, .out = &.{ 2, 2 }, .li = &.{ 0, 0, 1, 1 }, .ri = &.{ 0, 1, 0, 1 } },
+        .{ .lhs = &.{ 2, 1, 2 }, .rhs = &.{ 3, 1 }, .out = &.{ 2, 3, 2 }, .li = &.{ 0, 1, 0, 1, 0, 1, 2, 3, 2, 3, 2, 3 }, .ri = &.{ 0, 0, 1, 1, 2, 2, 0, 0, 1, 1, 2, 2 } },
+        .{ .lhs = &.{ 1, 2 }, .rhs = &.{2}, .out = &.{ 1, 2 }, .li = &.{ 0, 1 }, .ri = &.{ 0, 1 } },
+        .{ .lhs = &.{}, .rhs = &.{ 1, 2 }, .out = &.{ 1, 2 }, .li = &.{ 0, 0 }, .ri = &.{ 0, 1 } },
+        .{ .lhs = &.{ 2, 1, 1, 1, 1, 1, 1, 1 }, .rhs = &.{2}, .out = &.{ 2, 1, 1, 1, 1, 1, 1, 2 }, .li = &.{ 0, 0, 1, 1 }, .ri = &.{ 0, 1, 0, 1 } },
+    };
+    inline for (.{ i8, i16, i32, i64, u8 }) |T| {
+        const dtype = @field(ml.graph.DType, @typeName(T));
+        const wide: T = if (T == i64) 9007199254740993 else std.math.maxInt(T);
+        const lv = [_]T{ wide, std.math.minInt(T), 3, 5 };
+        const rv = [_]T{ 1, 2, 3 };
+        for (cases) |case| {
+            var ln: usize = 1;
+            var rn: usize = 1;
+            for (case.lhs) |dim| ln *= @intCast(dim);
+            for (case.rhs) |dim| rn *= @intCast(dim);
+            const lhs = (try cb.fromConstantBytes(std.mem.sliceAsBytes(lv[0..ln]), dtype, case.lhs)).?;
+            defer cb.free(lhs);
+            const rhs = (try cb.fromConstantBytes(std.mem.sliceAsBytes(rv[0..rn]), dtype, case.rhs)).?;
+            defer cb.free(rhs);
+            inline for (.{ "add", "primSubtract", "multiply" }) |op| {
+                // Swap operands too: subtraction detects reversed indexing.
+                for ([_]bool{ false, true }) |swap| {
+                    const out = try @field(ComputeBackend, op)(cb, if (swap) rhs else lhs, if (swap) lhs else rhs);
+                    defer cb.free(out);
+                    if (metal) try std.testing.expect(@import("../ops/metal_compute.zig").MetalCompute.debugHasDeviceTensor(cb, out));
+                    const shape = try cb.tensorShape(out, a);
+                    defer a.free(shape);
+                    try std.testing.expectEqualSlices(i64, case.out, shape);
+                    const actual = (try cb.exportTensorData(out, a)).?;
+                    defer a.free(actual.payload.bytes);
+                    try std.testing.expectEqualStrings(@tagName(dtype), @tagName(actual.dtype));
+                    const values = std.mem.bytesAsSlice(T, actual.payload.bytes);
+                    try std.testing.expectEqual(case.li.len, values.len);
+                    for (case.li, case.ri, values) |li, ri, value| {
+                        const x = if (swap) rv[ri] else lv[li];
+                        const y = if (swap) lv[li] else rv[ri];
+                        const expected = if (comptime std.mem.eql(u8, op, "add")) x +% y else if (comptime std.mem.eql(u8, op, "multiply")) x *% y else x -% y;
+                        try std.testing.expectEqual(expected, value);
+                    }
+                }
+            }
+        }
+    }
+    const empty = (try cb.fromConstantBytes(&.{}, .i64, &.{ 2, 0, 3 })).?;
+    defer cb.free(empty);
+    const scalar = (try cb.fromConstantBytes(std.mem.sliceAsBytes(&[_]i64{1}), .i64, &.{})).?;
+    defer cb.free(scalar);
+    const row = (try cb.fromConstantBytes(std.mem.sliceAsBytes(&[_]i64{ 1, 2, 3 }), .i64, &.{ 1, 3 })).?;
+    defer cb.free(row);
+    for ([_]CT{ scalar, row }) |rhs| {
+        const out = try cb.add(empty, rhs);
+        defer cb.free(out);
+        const shape = try cb.tensorShape(out, a);
+        defer a.free(shape);
+        try std.testing.expectEqualSlices(i64, &.{ 2, 0, 3 }, shape);
+        const data = (try cb.exportTensorData(out, a)).?;
+        defer a.free(data.payload.bytes);
+        try std.testing.expectEqual(@as(usize, 0), data.payload.bytes.len);
+    }
+    const square = (try cb.fromConstantBytes(std.mem.sliceAsBytes(&[_]i64{ 1, 2, 3, 4 }), .i64, &.{ 2, 2 })).?;
+    defer cb.free(square);
+    try std.testing.expectError(error.ShapeMismatch, cb.add(square, row));
+    const flat = (try cb.fromConstantBytes(std.mem.sliceAsBytes(&[_]i64{ 1, 2, 3, 4 }), .i64, &.{4})).?;
+    defer cb.free(flat);
+    try std.testing.expectError(error.ShapeMismatch, cb.multiply(square, flat));
+}
+
+test "native exact integer multidimensional broadcasting" {
+    const a = std.testing.allocator;
+    var ws = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var native = NativeCompute.init(a, &ws, null);
+    defer native.deinit();
+    const cb = native.computeBackend();
+    try checkExactIntegerBroadcasts(&cb, false);
+}
+
+test "Metal exact integer multidimensional broadcasting" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var weights = @import("../ops/gpu_hosted_store.zig").WeightStore{ .allocator = a, .prefix = "", .lazy_weights = .empty };
+    defer weights.lazy_weights.deinit(a);
+    var compute = try @import("../ops/metal_compute.zig").MetalCompute.init(a, &weights, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    try checkExactIntegerBroadcasts(&cb, true);
+    const ints = (try cb.fromConstantBytes(std.mem.sliceAsBytes(&[_]i64{ 9007199254740993, -9007199254740993 }), .i64, &.{ 2, 1 })).?;
+    defer cb.free(ints);
+    const floats = try cb.fromFloat32Shape(&.{ -9007199254740992, 0, 9007199254740992 }, &.{3});
+    defer cb.free(floats);
+    for ([_]bool{ false, true }) |swap| {
+        const out = try cb.primLessThan(if (swap) floats else ints, if (swap) ints else floats);
+        defer cb.free(out);
+        const values = try cb.toFloat32(out, a);
+        defer a.free(values);
+        try std.testing.expectEqualSlices(f32, if (swap) &.{ 1, 1, 1, 0, 0, 0 } else &.{ 0, 0, 0, 1, 1, 1 }, values);
+        const shape = try cb.tensorShape(out, a);
+        defer a.free(shape);
+        try std.testing.expectEqualSlices(i64, &.{ 2, 3 }, shape);
+    }
+}
+
 test "Metal i64 arithmetic and mixed comparisons never round through float" {
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
     if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
