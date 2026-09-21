@@ -28,6 +28,7 @@ pub fn configureModule(
     indexes_openapi_mod: *std.Build.Module,
     sort_openapi_mod: *std.Build.Module,
     metadata_openapi_mod: *std.Build.Module,
+    schema_openapi_mod: *std.Build.Module,
     reranking_mod: *std.Build.Module,
     objectstore_mod: *std.Build.Module,
     httpx_mod: *std.Build.Module,
@@ -55,6 +56,9 @@ pub fn configureModule(
     mod.addImport("antfly_indexes_openapi", indexes_openapi_mod);
     mod.addImport("antfly_sort_openapi", sort_openapi_mod);
     mod.addImport("antfly_metadata_openapi", metadata_openapi_mod);
+    // schema/table_schema_impl.zig takes the public table storage mode and
+    // the relational wire types from the schema OpenAPI module (#784).
+    mod.addImport("antfly_schema_openapi", schema_openapi_mod);
     mod.addImport("antfly_reranking", reranking_mod);
     mod.addImport("objectstore", objectstore_mod);
     mod.addImport("httpx", httpx_mod);
@@ -123,6 +127,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     const sort_openapi_mod = options.antfly_imports.sort_openapi;
     const query_openapi_mod = options.antfly_imports.query_openapi;
     const metadata_openapi_mod = options.antfly_imports.metadata_openapi;
+    const schema_openapi_mod = options.antfly_imports.schema_openapi;
     const handlebars_mod = options.antfly_imports.handlebars;
     const platform_mod = options.antfly_imports.platform;
     const objectstore_mod = options.antfly_imports.objectstore;
@@ -155,6 +160,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         indexes_openapi_mod,
         sort_openapi_mod,
         metadata_openapi_mod,
+        schema_openapi_mod,
         reranking_mod,
         objectstore_mod,
         httpx_mod,
