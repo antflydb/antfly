@@ -233,27 +233,37 @@ pub const Store = struct {
         var image = try source.prepareVacuum(cancel);
         defer image.deinit();
         image.prepared.no_sync = true;
-        // Opportunistic rounds: publish only when the writer slot happens to
-        // be free and nothing changed since the last catch-up; otherwise
-        // catch the image up to the captured changes outside every
-        // foreground lock and try again. The final round instead takes its
-        // fair ticketed turn at the writer slot, drains the residual changes
-        // while holding it (no mutation can start in between), and publishes.
-        // Without that, a background writer that is merely busy at each
-        // opportunistic attempt -- for example full-text maintenance after a
-        // burst of writes -- made an explicit vacuum fail with FileBusy on a
-        // slow host even though nothing prevented it from completing.
+        // Every mutation -- transaction commits and the disk index's
+        // out-of-band catalog publications alike -- is applied through the
+        // group-commit queue under the store mutex, so that mutex is the one
+        // fence that stops a new change from landing between a catch-up and
+        // the publish. The writer slot only excludes an open transaction.
+        //
+        // Each round takes the writer slot without blocking. With the slot
+        // and no captured changes, it publishes under the generation lock
+        // and the store mutex. With the slot but captured changes, it
+        // releases everything and catches the image up outside every
+        // foreground lock, so the large copy never stalls writers. Without
+        // the slot it backs off briefly so a background transaction that is
+        // merely mid-commit can finish; a caller holding its own writer never
+        // releases it, and the bounded backoff still ends in FileBusy.
+        //
+        // The final round holds the store mutex across the catch-up as well
+        // as the publish: the residual is then exactly what was captured and
+        // nothing can be applied behind it. Holding the writer slot alone is
+        // not that fence -- the x86_64 CI runner saw one index publication
+        // land after every slot-held catch-up and gave up busy on all eight
+        // rounds -- and waiting on the slot without bound deadlocked the
+        // caller that holds a writer and expects FileBusy.
         const max_rounds = 8;
+        var backoff_ms: u64 = 1;
         for (0..max_rounds) |round| {
             if (cancel) |token| try token.check();
             const final_round = round + 1 == max_rounds;
             // Flush the large copy/catch-up outside foreground locks. Only
             // the final header and rename remain in the publication window.
             if (!self.file.no_sync) try image.prepared.file.sync(io);
-            const reserved = if (final_round) blk: {
-                try self.reserveWriterSlotYielding();
-                break :blk true;
-            } else blk: {
+            const reserved = blk: {
                 self.reserveWriterSlot() catch |err| switch (err) {
                     error.FileBusy => break :blk false,
                     else => return err,
@@ -262,10 +272,6 @@ pub const Store = struct {
             };
             if (reserved) {
                 defer self.releaseWriterSlot();
-                if (final_round and capture.count > 0) {
-                    try self.applyResidualVacuumChanges(&image, &capture, cancel);
-                    if (!self.file.no_sync) try image.prepared.file.sync(io);
-                }
                 self.generation_lock.lockUncancelable(io);
                 defer self.generation_lock.unlock(io);
                 lockStore(self);
@@ -273,6 +279,10 @@ pub const Store = struct {
                 if (capture.overflow) {
                     std.log.warn("lite vacuum gave up: change capture overflowed while holding the writer slot round={d} captured={d}", .{ round, capture.count });
                     return error.FileBusy;
+                }
+                if (final_round and capture.count > 0) {
+                    try self.applyResidualVacuumChangesAssumeLocked(&image, &capture, cancel);
+                    if (!self.file.no_sync) try image.prepared.file.sync(io);
                 }
                 if (capture.count == 0) {
                     if (self.file.checkpoint_publication_uncertain or self.secret_store_uncertain) return error.OutcomeUnknown;
@@ -285,43 +295,68 @@ pub const Store = struct {
                     try self.file.publishVacuum(&image);
                     return image.report;
                 }
+            } else if (!final_round) {
+                io.sleep(std.Io.Duration.fromMilliseconds(@intCast(backoff_ms)), .awake) catch {};
+                backoff_ms = @min(backoff_ms * 2, 64);
             }
             if (final_round) break;
             try self.applyResidualVacuumChanges(&image, &capture, cancel);
         }
-        std.log.warn("lite vacuum gave up: every round found captured changes after taking the writer slot captured={d} overflow={}", .{ capture.count, capture.overflow });
+        std.log.warn("lite vacuum gave up: the writer slot stayed busy through every round captured={d} overflow={}", .{ capture.count, capture.overflow });
         return error.FileBusy;
     }
 
     /// Catch the prepared vacuum image up to every change captured since the
     /// last catch-up. Takes the store mutex only to snapshot the live header
     /// and swap the capture out; the copy itself runs outside foreground
-    /// locks (or, on the final round, while the caller holds the writer slot
-    /// so no further mutation can be captured behind it).
+    /// locks.
     fn applyResidualVacuumChanges(
         self: *Store,
         image: *native.VacuumImage,
         capture: *native.ChangeCapture,
         cancel: ?*const @import("../maintenance.zig").CancelToken,
     ) !void {
-        const io = self.file.runtime();
         var changes = native.ChangeCapture{};
         defer changes.deinit(self.allocator);
         var latest = blk: {
             lockStore(self);
             defer self.mutex.unlock();
-            if (capture.overflow) {
-                std.log.warn("lite vacuum gave up: change capture overflowed before catch-up captured={d} key_bytes={d}", .{ capture.count, capture.key_bytes });
-                return error.FileBusy;
-            }
-            var snapshot = try native.NativeFile.openWithIo(self.allocator, io, self.file.path, .{ .read_only = true, .no_sync = true, .resource_manager = self.resource_manager });
-            snapshot.page_cache_policy = .metadata_only;
-            snapshot.header = self.file.header;
-            std.mem.swap(native.ChangeCapture, &changes, capture);
-            break :blk snapshot;
+            break :blk try self.takeResidualVacuumChangesAssumeLocked(capture, &changes);
         };
         defer latest.close();
         try latest.applyCapturedChanges(&image.prepared, &changes, &image.report, cancel);
+    }
+
+    /// The final-round variant: the caller already holds the store mutex and
+    /// keeps it through the publish, so no mutation can be applied while this
+    /// copies the residual, and the capture is empty afterwards for as long
+    /// as the caller holds the lock.
+    fn applyResidualVacuumChangesAssumeLocked(
+        self: *Store,
+        image: *native.VacuumImage,
+        capture: *native.ChangeCapture,
+        cancel: ?*const @import("../maintenance.zig").CancelToken,
+    ) !void {
+        var changes = native.ChangeCapture{};
+        defer changes.deinit(self.allocator);
+        var latest = try self.takeResidualVacuumChangesAssumeLocked(capture, &changes);
+        defer latest.close();
+        try latest.applyCapturedChanges(&image.prepared, &changes, &image.report, cancel);
+    }
+
+    /// Open a read-only snapshot at the live header and move the captured
+    /// changes out of `capture` into `changes`. Caller holds the store mutex.
+    fn takeResidualVacuumChangesAssumeLocked(self: *Store, capture: *native.ChangeCapture, changes: *native.ChangeCapture) !native.NativeFile {
+        const io = self.file.runtime();
+        if (capture.overflow) {
+            std.log.warn("lite vacuum gave up: change capture overflowed before catch-up captured={d} key_bytes={d}", .{ capture.count, capture.key_bytes });
+            return error.FileBusy;
+        }
+        var snapshot = try native.NativeFile.openWithIo(self.allocator, io, self.file.path, .{ .read_only = true, .no_sync = true, .resource_manager = self.resource_manager });
+        snapshot.page_cache_policy = .metadata_only;
+        snapshot.header = self.file.header;
+        std.mem.swap(native.ChangeCapture, changes, capture);
+        return snapshot;
     }
 
     /// Publishes an offline, fully finalized store generation while fencing
@@ -2390,6 +2425,74 @@ test "lite failed commit group discards every root and allows a clean retry" {
     const value = (try store.file.getDocumentAlloc(alloc, "doc")).?;
     defer alloc.free(value);
     try std.testing.expectEqualStrings("unpublished", value);
+    try std.testing.expect((try store.file.check()).valid);
+}
+
+test "lite online vacuum publishes while group-commit mutations keep landing" {
+    // The disk index publishes its catalog record through the group-commit
+    // queue without ever taking the writer slot, so a vacuum that fenced
+    // its final catch-up with the slot alone could see a new change land
+    // after every catch-up and give up busy. Keep such mutations landing for
+    // the whole vacuum and require it to publish with all of them intact.
+    const Hammer = struct {
+        store: *Store,
+        stop: std.atomic.Value(bool) = .init(false),
+        submitted: std.atomic.Value(usize) = .init(0),
+        result: anyerror!void = {},
+
+        fn apply(ptr: *anyopaque, file: *native.NativeFile) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            var key_buf: [32]u8 = undefined;
+            const key = try std.fmt.bufPrint(&key_buf, "oob:{d}", .{self.submitted.load(.monotonic)});
+            try file.putDocumentBatch(&.{.{ .key = key, .value = "landed", .is_delete = false }});
+        }
+
+        fn run(self: *@This()) void {
+            while (!self.stop.load(.acquire)) {
+                self.store.submitMutation(self, apply) catch |err| {
+                    self.result = err;
+                    return;
+                };
+                _ = self.submitted.fetchAdd(1, .monotonic);
+            }
+        }
+    };
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "vacuum-under-group-commits.aflite");
+    defer alloc.free(path);
+    var store = try Store.createWithOptions(alloc, path, .{});
+    defer store.close();
+    {
+        var write = try store.beginWrite();
+        try write.put("doc", "seed");
+        try write.commit();
+    }
+    var hammer = Hammer{ .store = &store };
+    const thread = try std.Thread.spawn(.{}, Hammer.run, .{&hammer});
+    var joined = false;
+    defer {
+        hammer.stop.store(true, .release);
+        if (!joined) thread.join();
+    }
+    while (hammer.submitted.load(.acquire) < 4) std.Thread.yield() catch {};
+    _ = try store.vacuum();
+    hammer.stop.store(true, .release);
+    thread.join();
+    joined = true;
+    try hammer.result;
+    const landed = hammer.submitted.load(.acquire);
+    try std.testing.expect(landed >= 4);
+
+    var read = try store.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("seed", try read.get("doc"));
+    var key_buf: [32]u8 = undefined;
+    for (0..landed) |i| {
+        const key = try std.fmt.bufPrint(&key_buf, "oob:{d}", .{i});
+        try std.testing.expectEqualStrings("landed", try read.get(key));
+    }
     try std.testing.expect((try store.file.check()).valid);
 }
 
