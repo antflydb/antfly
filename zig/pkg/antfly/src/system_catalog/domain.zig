@@ -769,7 +769,10 @@ pub const Request = struct {
 };
 
 pub const ResolveMany = struct {
-    targets: []const Target,
+    targets: []const Target = &.{},
+    /// Internal reverse lookup for dependency authorization and schema output.
+    /// Captured with forward bindings in the same immutable catalog read.
+    storage_names: []const []const u8 = &.{},
     include_query_definitions: bool = false,
     expected_revision: ?u64 = null,
 };
@@ -777,12 +780,33 @@ pub const ResolveMany = struct {
 pub const ResolvedMany = struct {
     revision: u64,
     tables: []const ?ResolvedTable,
+    logical_names: []const ?[]const u8 = &.{},
 
     pub fn deinit(self: @This(), alloc: std.mem.Allocator) void {
         for (self.tables) |table| if (table) |value| value.deinit(alloc);
         alloc.free(self.tables);
+        for (self.logical_names) |name| if (name) |value| alloc.free(value);
+        alloc.free(self.logical_names);
     }
 };
+
+/// The reverse index makes dependency authorization O(dependencies), not
+/// O(catalog size). Returned names are owned independently of the read view.
+pub fn logicalNamesAlloc(alloc: std.mem.Allocator, reader: anytype, names: []const []const u8) ![]?[]const u8 {
+    const out = try alloc.alloc(?[]const u8, names.len);
+    @memset(out, null);
+    errdefer {
+        for (out) |name| if (name) |value| alloc.free(value);
+        alloc.free(out);
+    }
+    for (names, out) |name, *slot| {
+        const table = (try reader.bindingForStorage(name)) orelse continue;
+        const namespace = (try reader.byId(.namespace, table.parent_id)) orelse return error.InvalidCatalogRecord;
+        const database = (try reader.byId(.database, namespace.parent_id)) orelse return error.InvalidCatalogRecord;
+        slot.* = try (Target{ .database = database.name, .namespace = namespace.name, .table = table.name }).resourceNameAlloc(alloc);
+    }
+    return out;
+}
 
 pub const Read = struct {
     kind: Kind,

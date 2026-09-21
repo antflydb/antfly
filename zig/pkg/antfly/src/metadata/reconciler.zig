@@ -369,6 +369,22 @@ pub const Reconciler = struct {
         defer manager.freeSplitTransitions(self.alloc, desired_splits);
         const desired_merges = try manager.listDesiredMergeTransitions(self.alloc);
         defer manager.freeMergeTransitions(self.alloc, desired_merges);
+        for (desired_splits) |*record| {
+            if (findSplitRecord(current.split_transitions, record.transition_id) == null) {
+                @import("relational_topology_admission.zig").prepare(self.alloc, &record.table_contract, current.stores) catch |err| switch (err) {
+                    error.RelationalTopologyProtocolUpgradeRequired, error.RelationalTopologyMigrationUnsupported => record.table_contract.integrity_protocol = .none,
+                    else => return err,
+                };
+            }
+        }
+        for (desired_merges) |*record| {
+            if (findMergeRecord(current.merge_transitions, record.transition_id) == null) {
+                @import("relational_topology_admission.zig").prepare(self.alloc, &record.table_contract, current.stores) catch |err| switch (err) {
+                    error.RelationalTopologyProtocolUpgradeRequired, error.RelationalTopologyMigrationUnsupported => record.table_contract.integrity_protocol = .none,
+                    else => return err,
+                };
+            }
+        }
         const split_provisioning_ranges = try allocSplitProvisioningRanges(self.alloc, desired_ranges, desired_splits);
         defer self.alloc.free(split_provisioning_ranges);
 
@@ -591,6 +607,9 @@ pub const Reconciler = struct {
         for (desired_splits) |desired| {
             const existing = findSplitRecord(current.split_transitions, desired.transition_id);
             if (existing == null) {
+                if (desired.table_contract.integrity_protocol == .none and
+                    (try @import("relational_topology_admission.zig").coordinated(self.alloc, desired.table_contract.schema_json) or
+                        try @import("relational_topology_admission.zig").coordinated(self.alloc, desired.table_contract.read_schema_json))) continue;
                 try desired.table_contract.validateForSplit();
                 const current_table = findTableRecord(
                     current.tables,
@@ -645,6 +664,9 @@ pub const Reconciler = struct {
         for (desired_merges) |desired| {
             const existing = findMergeRecord(current.merge_transitions, desired.transition_id);
             if (existing == null) {
+                if (desired.table_contract.integrity_protocol == .none and
+                    (try @import("relational_topology_admission.zig").coordinated(self.alloc, desired.table_contract.schema_json) or
+                        try @import("relational_topology_admission.zig").coordinated(self.alloc, desired.table_contract.read_schema_json))) continue;
                 desired.table_contract.validateForMerge(
                     desired.allow_doc_identity_reassignment,
                 ) catch continue;
@@ -3479,6 +3501,7 @@ const ActiveTransitionContractIndex = struct {
         table_id: u64,
         table_name: []const u8,
         schema_json: []const u8,
+        read_schema_json: []const u8,
         indexes_json: []const u8,
 
         fn fromContract(
@@ -3488,6 +3511,7 @@ const ActiveTransitionContractIndex = struct {
                 .table_id = contract.table_id,
                 .table_name = contract.table_name,
                 .schema_json = contract.schema_json,
+                .read_schema_json = contract.read_schema_json,
                 .indexes_json = contract.indexes_json,
             };
         }
@@ -3496,6 +3520,7 @@ const ActiveTransitionContractIndex = struct {
             return self.table_id == other.table_id and
                 std.mem.eql(u8, self.table_name, other.table_name) and
                 std.mem.eql(u8, self.schema_json, other.schema_json) and
+                std.mem.eql(u8, self.read_schema_json, other.read_schema_json) and
                 std.mem.eql(u8, self.indexes_json, other.indexes_json);
         }
 
@@ -3506,6 +3531,7 @@ const ActiveTransitionContractIndex = struct {
             return table.table_id == self.table_id and
                 std.mem.eql(u8, table.name, self.table_name) and
                 std.mem.eql(u8, table.schema_json, self.schema_json) and
+                std.mem.eql(u8, table.read_schema_json, self.read_schema_json) and
                 std.mem.eql(u8, table.indexes_json, self.indexes_json);
         }
     };
@@ -3730,6 +3756,7 @@ fn tableMatchesTransitionContract(
     return table.table_id == contract.table_id and
         std.mem.eql(u8, table.name, contract.table_name) and
         std.mem.eql(u8, table.schema_json, contract.schema_json) and
+        std.mem.eql(u8, table.read_schema_json, contract.read_schema_json) and
         std.mem.eql(u8, table.indexes_json, contract.indexes_json);
 }
 
@@ -4042,6 +4069,9 @@ fn allocSplitProvisioningRanges(
     var out = std.ArrayListUnmanaged(table_manager.RangeRecord).empty;
     errdefer out.deinit(alloc);
     for (splits) |split| {
+        if (split.table_contract.integrity_protocol == .none and
+            (try @import("relational_topology_admission.zig").coordinated(alloc, split.table_contract.schema_json) or
+                try @import("relational_topology_admission.zig").coordinated(alloc, split.table_contract.read_schema_json))) continue;
         if (findRangeRecord(ranges, split.destination_group_id) != null) continue;
         const source = findRangeRecord(ranges, split.source_group_id) orelse continue;
         const split_key = split.split_key orelse continue;
@@ -4065,6 +4095,7 @@ fn cloneMergeRecord(alloc: std.mem.Allocator, record: transition_state.MergeTran
         owned_contract.deinitOwned(alloc);
     }
     return .{
+        .online = record.online,
         .transition_id = record.transition_id,
         .donor_group_id = record.donor_group_id,
         .receiver_group_id = record.receiver_group_id,
@@ -4088,7 +4119,7 @@ fn splitRecordsEqual(a: transition_state.SplitTransitionRecord, b: transition_st
 }
 
 fn mergeRecordsEqual(a: transition_state.MergeTransitionRecord, b: transition_state.MergeTransitionRecord) bool {
-    return a.transition_id == b.transition_id and
+    return std.meta.eql(a.online, b.online) and a.transition_id == b.transition_id and
         a.donor_group_id == b.donor_group_id and
         a.receiver_group_id == b.receiver_group_id and
         a.phase == b.phase and
@@ -4244,6 +4275,39 @@ test "metadata reconciler publishes table contracts before admitting transitions
     try std.testing.expectEqual(@as(u64, 0), admission_plan.split_admissions[0].expected_source_epoch);
     try std.testing.expectEqual(@as(usize, 0), admission_plan.split_upserts.len);
     try std.testing.expectEqual(@as(usize, 1), admission_plan.merge_upserts.len);
+}
+
+test "relational topology admission leaves unavailable transitions pending without blocking catalog work" {
+    const alloc = std.testing.allocator;
+    var manager = table_manager.TableManager.init(alloc);
+    defer manager.deinit();
+    const constrained: table_manager.TableRecord = .{ .table_id = 10, .name = "rows", .schema_json = "{\"unique_constraints\":[{\"name\":\"pk\"}]}" };
+    const range: table_manager.RangeRecord = .{ .group_id = 101, .table_id = 10, .start_key = "" };
+    try manager.upsertTable(constrained);
+    try manager.upsertTable(.{ .table_id = 11, .name = "unrelated" });
+    try manager.upsertRange(range);
+    try manager.requestSplit(.{ .transition_id = 9001, .table_id = 10, .source_group_id = 101, .destination_group_id = 102, .split_key = "m" });
+    const requested_splits = try manager.listDesiredSplitTransitions(alloc);
+    defer manager.freeSplitTransitions(alloc, requested_splits);
+    const blocked_provisioning = try allocSplitProvisioningRanges(alloc, &.{range}, requested_splits);
+    defer alloc.free(blocked_provisioning);
+    try std.testing.expectEqual(@as(usize, 0), blocked_provisioning.len);
+    var reconciler = Reconciler.init(alloc);
+    var pending = try reconciler.computePlan(&manager, &.{}, &.{}, .{ .tables = &.{constrained}, .ranges = &.{range} });
+    defer pending.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), pending.split_admissions.len);
+    try std.testing.expectEqual(@as(usize, 1), pending.table_upserts.len);
+    const capable: table_manager.StoreRecord = .{ .store_id = 1, .node_id = 1, .reporter_incarnation = 8, .relational_topology_protocol_version = 1 };
+    var ready = try reconciler.computePlan(&manager, &.{}, &.{}, .{ .tables = &.{constrained}, .ranges = &.{range}, .stores = &.{capable} });
+    defer ready.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), ready.split_admissions.len);
+    try std.testing.expectEqual(.distributed_quiescent_v1, ready.split_admissions[0].record.table_contract.integrity_protocol);
+    var migrating = constrained;
+    migrating.read_schema_json = "{}";
+    try manager.upsertTable(migrating);
+    var migration = try reconciler.computePlan(&manager, &.{}, &.{}, .{ .tables = &.{migrating}, .ranges = &.{range}, .stores = &.{capable} });
+    defer migration.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), migration.split_admissions.len);
 }
 
 test "metadata reconciler provisions split destination without publishing overlapping range" {

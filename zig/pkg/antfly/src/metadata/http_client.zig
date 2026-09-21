@@ -334,6 +334,46 @@ pub const MetadataHttpClient = struct {
         return try self.getJsonWithBudget(metadata_api.AdminSnapshot, base_uri, routes.Routes.admin_snapshot, budget);
     }
 
+    pub fn fetchProvisioningSnapshot(self: *MetadataHttpClient, base_uri: []const u8, node_id: u64, budget: ?RequestBudget) !std.json.Parsed(@import("restore_staging.zig").ProvisioningSnapshot) {
+        const uri = try join(self.alloc, base_uri, routes.Routes.internal_provisioning_snapshot);
+        defer self.alloc.free(uri);
+        const body = try std.json.Stringify.valueAlloc(self.alloc, @import("restore_staging.zig").ProvisioningRequest{ .node_id = node_id }, .{});
+        defer self.alloc.free(body);
+        var resp = try self.executeWithRetryBudget(.{ .method = .POST, .uri = uri, .body = body, .content_type = "application/json", .timeout_ms = linearizable_snapshot_request_timeout_ms }, budget);
+        defer resp.deinit(self.alloc);
+        if (resp.status == 404 or resp.status == 405 or resp.status == 501) return error.UnsupportedOperation;
+        try mapStatus(resp.status, null, null, null);
+        if (resp.body.len > 64 * 1024 * 1024) return error.InvalidRestoreStaging;
+        var result = try parseJson(@import("restore_staging.zig").ProvisioningSnapshot, self.alloc, resp.body);
+        errdefer result.deinit();
+        if (result.value.node_id != node_id) return error.InvalidRestoreStaging;
+        try ensureRequestBudget(budget);
+        return result;
+    }
+
+    pub fn fetchRestoreStagingAuthority(self: *MetadataHttpClient, base_uri: []const u8, request: @import("restore_staging.zig").AuthorityRequest, budget: ?RequestBudget) !std.json.Parsed(@import("restore_staging.zig").AuthorityResponse) {
+        const staging = @import("restore_staging.zig");
+        try request.validate();
+        const uri = try join(self.alloc, base_uri, routes.Routes.internal_restore_staging_authority);
+        defer self.alloc.free(uri);
+        const body = try std.json.Stringify.valueAlloc(self.alloc, request, .{});
+        defer self.alloc.free(body);
+        const max_bytes: usize = if (request.include_plan) staging.max_encoded_bytes * 2 + 4096 else 4096;
+        var resp = try self.executeWithRetryBudget(.{ .method = .POST, .uri = uri, .body = body, .content_type = "application/json", .timeout_ms = linearizable_snapshot_request_timeout_ms, .max_response_bytes = max_bytes }, budget);
+        defer resp.deinit(self.alloc);
+        if (resp.status == 404 or resp.status == 405 or resp.status == 501) return error.UnsupportedOperation;
+        if (resp.status == 403) return error.RestoreStagingScopeChanged;
+        try mapStatus(resp.status, null, null, null);
+        // A full immutable plan is fetched only on a cold owner descriptor.
+        // Compact progress/receipt reads cannot grow with the restored corpus.
+        if (resp.body.len > max_bytes) return error.InvalidRestoreStaging;
+        var result = try parseJson(staging.AuthorityResponse, self.alloc, resp.body);
+        errdefer result.deinit();
+        try result.value.validate(request);
+        try ensureRequestBudget(budget);
+        return result;
+    }
+
     pub fn fetchRoutingSnapshotWithBudget(
         self: *MetadataHttpClient,
         base_uri: []const u8,
@@ -2596,6 +2636,52 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(u64, 91), head.metadata_group_id);
             try std.testing.expectEqual(@as(u64, 18), head.metadata_epoch);
             try std.testing.expectEqual(@as(usize, 1), executor.calls);
+        }
+
+        test "restore staging authority client is signed bounded and fails closed on mismatched scope" {
+            const staging = @import("restore_staging.zig");
+            const Fake = struct {
+                status: u16 = 200,
+                wrong_node: bool = false,
+                calls: usize = 0,
+                fn execute(raw: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.calls += 1;
+                    try std.testing.expectEqualStrings("http://metadata/internal/v1/catalog/restore-staging-authority", req.uri);
+                    try std.testing.expect(req.header(internal_service_auth.header_name) != null);
+                    var input = try std.json.parseFromSlice(staging.AuthorityRequest, alloc, req.body, .{});
+                    defer input.deinit();
+                    try input.value.validate();
+                    try std.testing.expectEqual(@as(?usize, if (input.value.include_plan) staging.max_encoded_bytes * 2 + 4096 else 4096), req.max_response_bytes);
+                    return .{ .status = self.status, .body = try std.json.Stringify.valueAlloc(alloc, staging.AuthorityResponse{
+                        .node_id = if (self.wrong_node) input.value.node_id + 1 else input.value.node_id,
+                        .plan_id = input.value.plan_id,
+                        .metadata_group_id = 77,
+                        .metadata_incarnation = "11111111111111111111111111111111".*,
+                        .metadata_epoch = 2,
+                        .progress = .{ .state = .published, .revision = 9 },
+                        .receipt = if (input.value.receipt != null) @splat(255) else null,
+                    }, .{}) };
+                }
+            };
+            var fake: Fake = .{};
+            var client = MetadataHttpClient.init(std.testing.allocator, .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } });
+            _ = client.withInternalServiceAuth("metadata-client-test-service-secret", "cluster-a");
+            const input: staging.AuthorityRequest = .{ .node_id = 4, .plan_id = @splat(255), .receipt = .{ .state = .validating, .owner_group = 301 } };
+            var result = try client.fetchRestoreStagingAuthority("http://metadata", input, null);
+            defer result.deinit();
+            try std.testing.expectEqual(staging.State.published, result.value.progress.?.state);
+            try std.testing.expectEqual(@as(staging.Digest, @splat(255)), result.value.receipt.?);
+            fake.wrong_node = true;
+            try std.testing.expectError(error.InvalidRestoreStaging, client.fetchRestoreStagingAuthority("http://metadata", input, null));
+            fake.status = 403;
+            try std.testing.expectError(error.RestoreStagingScopeChanged, client.fetchRestoreStagingAuthority("http://metadata", input, null));
+            fake.status = 501;
+            try std.testing.expectError(error.UnsupportedOperation, client.fetchRestoreStagingAuthority("http://metadata", input, null));
+            var invalid = input;
+            invalid.node_id = 0;
+            try std.testing.expectError(error.InvalidArgument, client.fetchRestoreStagingAuthority("http://metadata", invalid, null));
+            try std.testing.expectEqual(@as(usize, 4), fake.calls);
         }
 
         test "metadata http client signs internal routes without leaking authority to public routes" {

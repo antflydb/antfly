@@ -194,6 +194,49 @@ pub fn parseBatchNamespaceTableBody(allocator: std.mem.Allocator, body: []const 
     return std.json.parseFromSlice(types.BatchRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Repair version-conditional rows after failed or diagnosed constraint activation
+pub const RepairNamespaceRelationalConstraintsPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for repairNamespaceRelationalConstraints.
+pub fn parseRepairNamespaceRelationalConstraintsBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RelationalRowMutationRequest) {
+    return std.json.parseFromSlice(types.RelationalRowMutationRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Retire unique and foreign-key definitions safely
+pub const RetireNamespaceRelationalConstraintsPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for retireNamespaceRelationalConstraints.
+pub fn parseRetireNamespaceRelationalConstraintsBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RelationalConstraintRetirementRequest) {
+    return std.json.parseFromSlice(types.RelationalConstraintRetirementRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Restart failed UNIQUE/FK/CHECK validation after administrative repair
+pub const RetryNamespaceRelationalConstraintsPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for retryNamespaceRelationalConstraints.
+pub fn parseRetryNamespaceRelationalConstraintsBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RelationalConstraintRetryRequest) {
+    return std.json.parseFromSlice(types.RelationalConstraintRetryRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Read distributed UNIQUE, foreign-key, and CHECK validation coverage
+pub const GetNamespaceRelationalConstraintStatusPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+};
+
 /// Retrieve a document by key from an explicit namespace table
 pub const LookupNamespaceTableDocumentPathParams = struct {
     /// Database name
@@ -280,6 +323,32 @@ pub const ExecuteNamespaceTableGraphMetricActionPathParams = struct {
     action: []const u8,
 };
 
+/// Repair an index generation
+pub const RepairNamespaceIndexPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    index_name: []const u8,
+};
+
+/// Parse the JSON request body for repairNamespaceIndex.
+pub fn parseRepairNamespaceIndexBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_indexes_openapi.IndexMaintenanceRequest) {
+    return std.json.parseFromSlice(antfly_indexes_openapi.IndexMaintenanceRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Retry a failed index build
+pub const RetryNamespaceIndexPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    index_name: []const u8,
+};
+
+/// Parse the JSON request body for retryNamespaceIndex.
+pub fn parseRetryNamespaceIndexBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_indexes_openapi.IndexMaintenanceRequest) {
+    return std.json.parseFromSlice(antfly_indexes_openapi.IndexMaintenanceRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Query an explicit namespace table
 pub const QueryNamespaceTablePathParams = struct {
     /// Database name
@@ -320,6 +389,30 @@ pub const RestoreNamespaceTablePathParams = struct {
 /// Parse the JSON request body for restoreNamespaceTable.
 pub fn parseRestoreNamespaceTableBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RestoreRequest) {
     return std.json.parseFromSlice(types.RestoreRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Atomically replace or delete version-conditional typed rows
+pub const MutateNamespaceRelationalRowsPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for mutateNamespaceRelationalRows.
+pub fn parseMutateNamespaceRelationalRowsBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RelationalRowMutationRequest) {
+    return std.json.parseFromSlice(types.RelationalRowMutationRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Query projected typed relational rows
+pub const QueryNamespaceRelationalRowsPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for queryNamespaceRelationalRows.
+pub fn parseQueryNamespaceRelationalRowsBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RelationalRowQueryRequest) {
+    return std.json.parseFromSlice(types.RelationalRowQueryRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
 /// Replace a table's schema
@@ -612,6 +705,41 @@ pub fn parseBatchWriteBody(allocator: std.mem.Allocator, body: []const u8) !std.
     return std.json.parseFromSlice(types.BatchRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Repair version-conditional rows after failed or diagnosed constraint activation
+pub const RepairRelationalConstraintsPathParams = struct {
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for repairRelationalConstraints.
+pub fn parseRepairRelationalConstraintsBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RelationalRowMutationRequest) {
+    return std.json.parseFromSlice(types.RelationalRowMutationRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Retire unique and foreign-key definitions safely
+pub const RetireRelationalConstraintsPathParams = struct {
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for retireRelationalConstraints.
+pub fn parseRetireRelationalConstraintsBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RelationalConstraintRetirementRequest) {
+    return std.json.parseFromSlice(types.RelationalConstraintRetirementRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Restart failed UNIQUE/FK/CHECK validation after administrative repair
+pub const RetryRelationalConstraintsPathParams = struct {
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for retryRelationalConstraints.
+pub fn parseRetryRelationalConstraintsBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RelationalConstraintRetryRequest) {
+    return std.json.parseFromSlice(types.RelationalConstraintRetryRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Read distributed UNIQUE, foreign-key, and CHECK validation coverage
+pub const GetRelationalConstraintStatusPathParams = struct {
+    table_name: []const u8,
+};
+
 /// Adopt stored write destinations with the current credential
 pub const ReauthorizeTableDestinationsPathParams = struct {
     /// Name of the table whose stored destinations should be adopted
@@ -729,6 +857,28 @@ pub const ExecuteGraphMetricActionPathParams = struct {
     action: []const u8,
 };
 
+/// Repair an index generation
+pub const RepairIndexPathParams = struct {
+    table_name: []const u8,
+    index_name: []const u8,
+};
+
+/// Parse the JSON request body for repairIndex.
+pub fn parseRepairIndexBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_indexes_openapi.IndexMaintenanceRequest) {
+    return std.json.parseFromSlice(antfly_indexes_openapi.IndexMaintenanceRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Retry a failed index build
+pub const RetryIndexPathParams = struct {
+    table_name: []const u8,
+    index_name: []const u8,
+};
+
+/// Parse the JSON request body for retryIndex.
+pub fn parseRetryIndexBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_indexes_openapi.IndexMaintenanceRequest) {
+    return std.json.parseFromSlice(antfly_indexes_openapi.IndexMaintenanceRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Synchronize data from external sources (Shopify, Postgres, S3) using a linear merge
 pub const LinearMergePathParams = struct {
     /// Name of the table
@@ -830,10 +980,35 @@ pub fn parseRestoreTableBody(allocator: std.mem.Allocator, body: []const u8) !st
     return std.json.parseFromSlice(types.RestoreRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Atomically replace or delete version-conditional typed rows
+pub const MutateRelationalRowsPathParams = struct {
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for mutateRelationalRows.
+pub fn parseMutateRelationalRowsBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RelationalRowMutationRequest) {
+    return std.json.parseFromSlice(types.RelationalRowMutationRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Query projected typed relational rows
+pub const QueryRelationalRowsPathParams = struct {
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for queryRelationalRows.
+pub fn parseQueryRelationalRowsBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RelationalRowQueryRequest) {
+    return std.json.parseFromSlice(types.RelationalRowQueryRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Replace a table's schema
 pub const UpdateSchemaPathParams = struct {
     /// Name of the table
     table_name: []const u8,
+};
+
+pub const UpdateSchemaParams = struct {
+    /// Explicitly enqueue a durable fresh-generation schema rewrite instead of changing the live schema. Requires administrator permission on the entire dependency cohort. Sources remain writable during snapshot and catch-up; final validation and publication are atomic across the cohort. Returns a restore job (202), whose existing status/cancel routes apply. Independent graph/vector artifacts without a retained row-derived source proof are rejected before admission. The default false retains ordinary schema-update behavior. Existing absent values remain absent rather than retroactively receiving defaults. Stored column type changes and destructive column removal are rejected.
+    rewrite: ?[]const u8 = null,
 };
 
 /// Parse the JSON request body for updateSchema.
@@ -845,6 +1020,11 @@ pub fn parseUpdateSchemaBody(allocator: std.mem.Allocator, body: []const u8) !st
 pub const PatchSchemaPathParams = struct {
     /// Name of the table
     table_name: []const u8,
+};
+
+pub const PatchSchemaParams = struct {
+    /// Explicitly enqueue a durable fresh-generation schema rewrite instead of changing the live schema. Requires administrator permission on the entire dependency cohort. Sources remain writable during snapshot and catch-up; final validation and publication are atomic across the cohort. Returns a restore job (202), whose existing status/cancel routes apply. Independent graph/vector artifacts without a retained row-derived source proof are rejected before admission. The default false retains ordinary schema-update behavior. Existing absent values remain absent rather than retroactively receiving defaults. Stored column type changes and destructive column removal are rejected.
+    rewrite: ?[]const u8 = null,
 };
 
 /// Parse the JSON request body for patchSchema.
@@ -1031,15 +1211,23 @@ pub const routes = [_]Route{
     .{ .method = "DELETE", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}", .operation_id = "dropNamespaceTable", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/backup", .operation_id = "backupNamespaceTable", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/batch", .operation_id = "batchNamespaceTable", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/repair", .operation_id = "repairNamespaceRelationalConstraints", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/retire", .operation_id = "retireNamespaceRelationalConstraints", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/retry", .operation_id = "retryNamespaceRelationalConstraints", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/status", .operation_id = "getNamespaceRelationalConstraintStatus", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/documents/{key}", .operation_id = "lookupNamespaceTableDocument", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes", .operation_id = "listNamespaceTableIndexes", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}", .operation_id = "getNamespaceTableIndex", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}", .operation_id = "createNamespaceTableIndex", .request_body = .buffered, .streaming_response = false },
     .{ .method = "DELETE", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}", .operation_id = "dropNamespaceTableIndex", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}:{action}", .operation_id = "executeNamespaceTableGraphMetricAction", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/repair", .operation_id = "repairNamespaceIndex", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/retry", .operation_id = "retryNamespaceIndex", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/query", .operation_id = "queryNamespaceTable", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rename", .operation_id = "renameNamespaceTable", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/restore", .operation_id = "restoreNamespaceTable", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rows/mutate", .operation_id = "mutateNamespaceRelationalRows", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rows/query", .operation_id = "queryNamespaceRelationalRows", .request_body = .buffered, .streaming_response = true },
     .{ .method = "PUT", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/schema", .operation_id = "updateNamespaceTableSchema", .request_body = .buffered, .streaming_response = false },
     .{ .method = "PATCH", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/schema", .operation_id = "patchNamespaceTableSchema", .request_body = .buffered, .streaming_response = false },
     .{ .method = "PUT", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/tablespace", .operation_id = "setNamespaceTableTablespace", .request_body = .buffered, .streaming_response = false },
@@ -1073,6 +1261,10 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}/cancel", .operation_id = "cancelDocumentArtifactReprocessJob", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/backup", .operation_id = "backupTable", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/batch", .operation_id = "batchWrite", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/constraints/repair", .operation_id = "repairRelationalConstraints", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/constraints/retire", .operation_id = "retireRelationalConstraints", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/constraints/retry", .operation_id = "retryRelationalConstraints", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/tables/{tableName}/constraints/status", .operation_id = "getRelationalConstraintStatus", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/destination-authorization", .operation_id = "reauthorizeTableDestinations", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/documents", .operation_id = "scanKeys", .request_body = .buffered, .streaming_response = true },
     .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}", .operation_id = "lookupKey", .request_body = .none, .streaming_response = false },
@@ -1084,6 +1276,8 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}", .operation_id = "createIndex", .request_body = .buffered, .streaming_response = false },
     .{ .method = "DELETE", .path = "/tables/{tableName}/indexes/{indexName}", .operation_id = "dropIndex", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}:{action}", .operation_id = "executeGraphMetricAction", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}/repair", .operation_id = "repairIndex", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}/retry", .operation_id = "retryIndex", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/merge", .operation_id = "linearMerge", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/query", .operation_id = "queryTable", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/repair/control-jobs", .operation_id = "startTableRepairControlJob", .request_body = .buffered, .streaming_response = false },
@@ -1094,6 +1288,8 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/tables/{tableName}/repair/jobs/{jobId}/cancel", .operation_id = "cancelTableRepairJob", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/repair/run", .operation_id = "runTableRepair", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/restore", .operation_id = "restoreTable", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/rows/mutate", .operation_id = "mutateRelationalRows", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/rows/query", .operation_id = "queryRelationalRows", .request_body = .buffered, .streaming_response = true },
     .{ .method = "PUT", .path = "/tables/{tableName}/schema", .operation_id = "updateSchema", .request_body = .buffered, .streaming_response = false },
     .{ .method = "PATCH", .path = "/tables/{tableName}/schema", .operation_id = "patchSchema", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/storage/migrations", .operation_id = "createTableStorageMigration", .request_body = .buffered, .streaming_response = false },
@@ -1152,15 +1348,23 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "dropNamespaceTable")) @compileError("ServerRouter: Impl missing required method 'dropNamespaceTable'");
         if (!@hasDecl(Impl, "backupNamespaceTable")) @compileError("ServerRouter: Impl missing required method 'backupNamespaceTable'");
         if (!@hasDecl(Impl, "batchNamespaceTable")) @compileError("ServerRouter: Impl missing required method 'batchNamespaceTable'");
+        if (!@hasDecl(Impl, "repairNamespaceRelationalConstraints")) @compileError("ServerRouter: Impl missing required method 'repairNamespaceRelationalConstraints'");
+        if (!@hasDecl(Impl, "retireNamespaceRelationalConstraints")) @compileError("ServerRouter: Impl missing required method 'retireNamespaceRelationalConstraints'");
+        if (!@hasDecl(Impl, "retryNamespaceRelationalConstraints")) @compileError("ServerRouter: Impl missing required method 'retryNamespaceRelationalConstraints'");
+        if (!@hasDecl(Impl, "getNamespaceRelationalConstraintStatus")) @compileError("ServerRouter: Impl missing required method 'getNamespaceRelationalConstraintStatus'");
         if (!@hasDecl(Impl, "lookupNamespaceTableDocument")) @compileError("ServerRouter: Impl missing required method 'lookupNamespaceTableDocument'");
         if (!@hasDecl(Impl, "listNamespaceTableIndexes")) @compileError("ServerRouter: Impl missing required method 'listNamespaceTableIndexes'");
         if (!@hasDecl(Impl, "getNamespaceTableIndex")) @compileError("ServerRouter: Impl missing required method 'getNamespaceTableIndex'");
         if (!@hasDecl(Impl, "createNamespaceTableIndex")) @compileError("ServerRouter: Impl missing required method 'createNamespaceTableIndex'");
         if (!@hasDecl(Impl, "dropNamespaceTableIndex")) @compileError("ServerRouter: Impl missing required method 'dropNamespaceTableIndex'");
         if (!@hasDecl(Impl, "executeNamespaceTableGraphMetricAction")) @compileError("ServerRouter: Impl missing required method 'executeNamespaceTableGraphMetricAction'");
+        if (!@hasDecl(Impl, "repairNamespaceIndex")) @compileError("ServerRouter: Impl missing required method 'repairNamespaceIndex'");
+        if (!@hasDecl(Impl, "retryNamespaceIndex")) @compileError("ServerRouter: Impl missing required method 'retryNamespaceIndex'");
         if (!@hasDecl(Impl, "queryNamespaceTable")) @compileError("ServerRouter: Impl missing required method 'queryNamespaceTable'");
         if (!@hasDecl(Impl, "renameNamespaceTable")) @compileError("ServerRouter: Impl missing required method 'renameNamespaceTable'");
         if (!@hasDecl(Impl, "restoreNamespaceTable")) @compileError("ServerRouter: Impl missing required method 'restoreNamespaceTable'");
+        if (!@hasDecl(Impl, "mutateNamespaceRelationalRows")) @compileError("ServerRouter: Impl missing required method 'mutateNamespaceRelationalRows'");
+        if (!@hasDecl(Impl, "queryNamespaceRelationalRows")) @compileError("ServerRouter: Impl missing required method 'queryNamespaceRelationalRows'");
         if (!@hasDecl(Impl, "updateNamespaceTableSchema")) @compileError("ServerRouter: Impl missing required method 'updateNamespaceTableSchema'");
         if (!@hasDecl(Impl, "patchNamespaceTableSchema")) @compileError("ServerRouter: Impl missing required method 'patchNamespaceTableSchema'");
         if (!@hasDecl(Impl, "setNamespaceTableTablespace")) @compileError("ServerRouter: Impl missing required method 'setNamespaceTableTablespace'");
@@ -1194,6 +1398,10 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "cancelDocumentArtifactReprocessJob")) @compileError("ServerRouter: Impl missing required method 'cancelDocumentArtifactReprocessJob'");
         if (!@hasDecl(Impl, "backupTable")) @compileError("ServerRouter: Impl missing required method 'backupTable'");
         if (!@hasDecl(Impl, "batchWrite")) @compileError("ServerRouter: Impl missing required method 'batchWrite'");
+        if (!@hasDecl(Impl, "repairRelationalConstraints")) @compileError("ServerRouter: Impl missing required method 'repairRelationalConstraints'");
+        if (!@hasDecl(Impl, "retireRelationalConstraints")) @compileError("ServerRouter: Impl missing required method 'retireRelationalConstraints'");
+        if (!@hasDecl(Impl, "retryRelationalConstraints")) @compileError("ServerRouter: Impl missing required method 'retryRelationalConstraints'");
+        if (!@hasDecl(Impl, "getRelationalConstraintStatus")) @compileError("ServerRouter: Impl missing required method 'getRelationalConstraintStatus'");
         if (!@hasDecl(Impl, "reauthorizeTableDestinations")) @compileError("ServerRouter: Impl missing required method 'reauthorizeTableDestinations'");
         if (!@hasDecl(Impl, "scanKeys")) @compileError("ServerRouter: Impl missing required method 'scanKeys'");
         if (!@hasDecl(Impl, "lookupKey")) @compileError("ServerRouter: Impl missing required method 'lookupKey'");
@@ -1205,6 +1413,8 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "createIndex")) @compileError("ServerRouter: Impl missing required method 'createIndex'");
         if (!@hasDecl(Impl, "dropIndex")) @compileError("ServerRouter: Impl missing required method 'dropIndex'");
         if (!@hasDecl(Impl, "executeGraphMetricAction")) @compileError("ServerRouter: Impl missing required method 'executeGraphMetricAction'");
+        if (!@hasDecl(Impl, "repairIndex")) @compileError("ServerRouter: Impl missing required method 'repairIndex'");
+        if (!@hasDecl(Impl, "retryIndex")) @compileError("ServerRouter: Impl missing required method 'retryIndex'");
         if (!@hasDecl(Impl, "linearMerge")) @compileError("ServerRouter: Impl missing required method 'linearMerge'");
         if (!@hasDecl(Impl, "queryTable")) @compileError("ServerRouter: Impl missing required method 'queryTable'");
         if (!@hasDecl(Impl, "startTableRepairControlJob")) @compileError("ServerRouter: Impl missing required method 'startTableRepairControlJob'");
@@ -1215,6 +1425,8 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "cancelTableRepairJob")) @compileError("ServerRouter: Impl missing required method 'cancelTableRepairJob'");
         if (!@hasDecl(Impl, "runTableRepair")) @compileError("ServerRouter: Impl missing required method 'runTableRepair'");
         if (!@hasDecl(Impl, "restoreTable")) @compileError("ServerRouter: Impl missing required method 'restoreTable'");
+        if (!@hasDecl(Impl, "mutateRelationalRows")) @compileError("ServerRouter: Impl missing required method 'mutateRelationalRows'");
+        if (!@hasDecl(Impl, "queryRelationalRows")) @compileError("ServerRouter: Impl missing required method 'queryRelationalRows'");
         if (!@hasDecl(Impl, "updateSchema")) @compileError("ServerRouter: Impl missing required method 'updateSchema'");
         if (!@hasDecl(Impl, "patchSchema")) @compileError("ServerRouter: Impl missing required method 'patchSchema'");
         if (!@hasDecl(Impl, "createTableStorageMigration")) @compileError("ServerRouter: Impl missing required method 'createTableStorageMigration'");
@@ -1271,15 +1483,23 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.delete("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName", httpx.Handler.bind(self.impl, dropNamespaceTable));
             try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/backup", httpx.Handler.bind(self.impl, backupNamespaceTable));
             try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/batch", httpx.Handler.bind(self.impl, batchNamespaceTable));
+            try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/constraints/repair", httpx.Handler.bind(self.impl, repairNamespaceRelationalConstraints));
+            try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/constraints/retire", httpx.Handler.bind(self.impl, retireNamespaceRelationalConstraints));
+            try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/constraints/retry", httpx.Handler.bind(self.impl, retryNamespaceRelationalConstraints));
+            try server.get("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/constraints/status", httpx.Handler.bind(self.impl, getNamespaceRelationalConstraintStatus));
             try server.get("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/documents/:key", httpx.Handler.bind(self.impl, lookupNamespaceTableDocument));
             try server.get("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/indexes", httpx.Handler.bind(self.impl, listNamespaceTableIndexes));
             try server.get("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/indexes/:indexName", httpx.Handler.bind(self.impl, getNamespaceTableIndex));
             try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/indexes/:indexName", httpx.Handler.bind(self.impl, createNamespaceTableIndex));
             try server.delete("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/indexes/:indexName", httpx.Handler.bind(self.impl, dropNamespaceTableIndex));
             try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/indexes/:indexName/graph-metrics/:metricName::action", httpx.Handler.bind(self.impl, executeNamespaceTableGraphMetricAction));
+            try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/indexes/:indexName/repair", httpx.Handler.bind(self.impl, repairNamespaceIndex));
+            try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/indexes/:indexName/retry", httpx.Handler.bind(self.impl, retryNamespaceIndex));
             try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/query", httpx.Handler.bind(self.impl, queryNamespaceTable));
             try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/rename", httpx.Handler.bind(self.impl, renameNamespaceTable));
             try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/restore", httpx.Handler.bind(self.impl, restoreNamespaceTable));
+            try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/rows/mutate", httpx.Handler.bind(self.impl, mutateNamespaceRelationalRows));
+            try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/rows/query", httpx.Handler.bind(self.impl, queryNamespaceRelationalRows));
             try server.put("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/schema", httpx.Handler.bind(self.impl, updateNamespaceTableSchema));
             try server.patch("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/schema", httpx.Handler.bind(self.impl, patchNamespaceTableSchema));
             try server.put("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/tablespace", httpx.Handler.bind(self.impl, setNamespaceTableTablespace));
@@ -1313,6 +1533,10 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/tables/:tableName/artifacts/:artifactName/reprocess-jobs/:jobId/cancel", httpx.Handler.bind(self.impl, cancelDocumentArtifactReprocessJob));
             try server.post("/tables/:tableName/backup", httpx.Handler.bind(self.impl, backupTable));
             try server.post("/tables/:tableName/batch", httpx.Handler.bind(self.impl, batchWrite));
+            try server.post("/tables/:tableName/constraints/repair", httpx.Handler.bind(self.impl, repairRelationalConstraints));
+            try server.post("/tables/:tableName/constraints/retire", httpx.Handler.bind(self.impl, retireRelationalConstraints));
+            try server.post("/tables/:tableName/constraints/retry", httpx.Handler.bind(self.impl, retryRelationalConstraints));
+            try server.get("/tables/:tableName/constraints/status", httpx.Handler.bind(self.impl, getRelationalConstraintStatus));
             try server.post("/tables/:tableName/destination-authorization", httpx.Handler.bind(self.impl, reauthorizeTableDestinations));
             try server.post("/tables/:tableName/documents", httpx.Handler.bind(self.impl, scanKeys));
             try server.get("/tables/:tableName/documents/:key", httpx.Handler.bind(self.impl, lookupKey));
@@ -1324,6 +1548,8 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/tables/:tableName/indexes/:indexName", httpx.Handler.bind(self.impl, createIndex));
             try server.delete("/tables/:tableName/indexes/:indexName", httpx.Handler.bind(self.impl, dropIndex));
             try server.post("/tables/:tableName/indexes/:indexName/graph-metrics/:metricName::action", httpx.Handler.bind(self.impl, executeGraphMetricAction));
+            try server.post("/tables/:tableName/indexes/:indexName/repair", httpx.Handler.bind(self.impl, repairIndex));
+            try server.post("/tables/:tableName/indexes/:indexName/retry", httpx.Handler.bind(self.impl, retryIndex));
             try server.post("/tables/:tableName/merge", httpx.Handler.bind(self.impl, linearMerge));
             try server.post("/tables/:tableName/query", httpx.Handler.bind(self.impl, queryTable));
             try server.post("/tables/:tableName/repair/control-jobs", httpx.Handler.bind(self.impl, startTableRepairControlJob));
@@ -1334,6 +1560,8 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/tables/:tableName/repair/jobs/:jobId/cancel", httpx.Handler.bind(self.impl, cancelTableRepairJob));
             try server.post("/tables/:tableName/repair/run", httpx.Handler.bind(self.impl, runTableRepair));
             try server.post("/tables/:tableName/restore", httpx.Handler.bind(self.impl, restoreTable));
+            try server.post("/tables/:tableName/rows/mutate", httpx.Handler.bind(self.impl, mutateRelationalRows));
+            try server.post("/tables/:tableName/rows/query", httpx.Handler.bind(self.impl, queryRelationalRows));
             try server.put("/tables/:tableName/schema", httpx.Handler.bind(self.impl, updateSchema));
             try server.patch("/tables/:tableName/schema", httpx.Handler.bind(self.impl, patchSchema));
             try server.post("/tables/:tableName/storage/migrations", httpx.Handler.bind(self.impl, createTableStorageMigration));
@@ -1536,6 +1764,42 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.batchNamespaceTable(ctx, database_name, namespace_name, table_name);
         }
 
+        /// Repair version-conditional rows after failed or diagnosed constraint activation
+        /// POST /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/repair
+        fn repairNamespaceRelationalConstraints(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.repairNamespaceRelationalConstraints(ctx, database_name, namespace_name, table_name);
+        }
+
+        /// Retire unique and foreign-key definitions safely
+        /// POST /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/retire
+        fn retireNamespaceRelationalConstraints(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.retireNamespaceRelationalConstraints(ctx, database_name, namespace_name, table_name);
+        }
+
+        /// Restart failed UNIQUE/FK/CHECK validation after administrative repair
+        /// POST /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/retry
+        fn retryNamespaceRelationalConstraints(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.retryNamespaceRelationalConstraints(ctx, database_name, namespace_name, table_name);
+        }
+
+        /// Read distributed UNIQUE, foreign-key, and CHECK validation coverage
+        /// GET /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/status
+        fn getNamespaceRelationalConstraintStatus(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.getNamespaceRelationalConstraintStatus(ctx, database_name, namespace_name, table_name);
+        }
+
         /// Retrieve a document by key from an explicit namespace table
         /// GET /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/documents/{key}
         fn lookupNamespaceTableDocument(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
@@ -1601,6 +1865,26 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.executeNamespaceTableGraphMetricAction(ctx, database_name, namespace_name, table_name, index_name, metric_name, action);
         }
 
+        /// Repair an index generation
+        /// POST /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/repair
+        fn repairNamespaceIndex(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const index_name = ctx.param("indexName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: indexName" });
+            return impl.repairNamespaceIndex(ctx, database_name, namespace_name, table_name, index_name);
+        }
+
+        /// Retry a failed index build
+        /// POST /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/retry
+        fn retryNamespaceIndex(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const index_name = ctx.param("indexName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: indexName" });
+            return impl.retryNamespaceIndex(ctx, database_name, namespace_name, table_name, index_name);
+        }
+
         /// Query an explicit namespace table
         /// POST /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/query
         fn queryNamespaceTable(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
@@ -1626,6 +1910,24 @@ pub fn ServerRouter(comptime Impl: type) type {
             const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
             return impl.restoreNamespaceTable(ctx, database_name, namespace_name, table_name);
+        }
+
+        /// Atomically replace or delete version-conditional typed rows
+        /// POST /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rows/mutate
+        fn mutateNamespaceRelationalRows(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.mutateNamespaceRelationalRows(ctx, database_name, namespace_name, table_name);
+        }
+
+        /// Query projected typed relational rows
+        /// POST /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rows/query
+        fn queryNamespaceRelationalRows(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.queryNamespaceRelationalRows(ctx, database_name, namespace_name, table_name);
         }
 
         /// Replace a table's schema
@@ -1884,6 +2186,34 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.batchWrite(ctx, table_name);
         }
 
+        /// Repair version-conditional rows after failed or diagnosed constraint activation
+        /// POST /tables/{tableName}/constraints/repair
+        fn repairRelationalConstraints(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.repairRelationalConstraints(ctx, table_name);
+        }
+
+        /// Retire unique and foreign-key definitions safely
+        /// POST /tables/{tableName}/constraints/retire
+        fn retireRelationalConstraints(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.retireRelationalConstraints(ctx, table_name);
+        }
+
+        /// Restart failed UNIQUE/FK/CHECK validation after administrative repair
+        /// POST /tables/{tableName}/constraints/retry
+        fn retryRelationalConstraints(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.retryRelationalConstraints(ctx, table_name);
+        }
+
+        /// Read distributed UNIQUE, foreign-key, and CHECK validation coverage
+        /// GET /tables/{tableName}/constraints/status
+        fn getRelationalConstraintStatus(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.getRelationalConstraintStatus(ctx, table_name);
+        }
+
         /// Adopt stored write destinations with the current credential
         /// POST /tables/{tableName}/destination-authorization
         fn reauthorizeTableDestinations(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
@@ -1983,6 +2313,22 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.executeGraphMetricAction(ctx, table_name, index_name, metric_name, action);
         }
 
+        /// Repair an index generation
+        /// POST /tables/{tableName}/indexes/{indexName}/repair
+        fn repairIndex(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const index_name = ctx.param("indexName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: indexName" });
+            return impl.repairIndex(ctx, table_name, index_name);
+        }
+
+        /// Retry a failed index build
+        /// POST /tables/{tableName}/indexes/{indexName}/retry
+        fn retryIndex(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const index_name = ctx.param("indexName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: indexName" });
+            return impl.retryIndex(ctx, table_name, index_name);
+        }
+
         /// Synchronize data from external sources (Shopify, Postgres, S3) using a linear merge
         /// POST /tables/{tableName}/merge
         fn linearMerge(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
@@ -2056,18 +2402,38 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.restoreTable(ctx, table_name);
         }
 
+        /// Atomically replace or delete version-conditional typed rows
+        /// POST /tables/{tableName}/rows/mutate
+        fn mutateRelationalRows(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.mutateRelationalRows(ctx, table_name);
+        }
+
+        /// Query projected typed relational rows
+        /// POST /tables/{tableName}/rows/query
+        fn queryRelationalRows(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.queryRelationalRows(ctx, table_name);
+        }
+
         /// Replace a table's schema
         /// PUT /tables/{tableName}/schema
         fn updateSchema(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
-            return impl.updateSchema(ctx, table_name);
+            const query_params = UpdateSchemaParams{
+                .rewrite = try ctx.queryDecoded("rewrite"),
+            };
+            return impl.updateSchema(ctx, table_name, query_params);
         }
 
         /// Patch a table's schema
         /// PATCH /tables/{tableName}/schema
         fn patchSchema(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
-            return impl.patchSchema(ctx, table_name);
+            const query_params = PatchSchemaParams{
+                .rewrite = try ctx.queryDecoded("rewrite"),
+            };
+            return impl.patchSchema(ctx, table_name, query_params);
         }
 
         /// Create or resume a table storage migration job
@@ -2244,15 +2610,23 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn dropNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn backupNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn batchNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
+//   fn repairNamespaceRelationalConstraints(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
+//   fn retireNamespaceRelationalConstraints(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
+//   fn retryNamespaceRelationalConstraints(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
+//   fn getNamespaceRelationalConstraintStatus(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn lookupNamespaceTableDocument(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8, params: LookupNamespaceTableDocumentParams) !httpx.Response
 //   fn listNamespaceTableIndexes(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn getNamespaceTableIndex(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn createNamespaceTableIndex(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn dropNamespaceTableIndex(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn executeNamespaceTableGraphMetricAction(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8, metric_name: []const u8, action: []const u8) !httpx.Response
+//   fn repairNamespaceIndex(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response
+//   fn retryNamespaceIndex(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn queryNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn renameNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn restoreNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
+//   fn mutateNamespaceRelationalRows(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
+//   fn queryNamespaceRelationalRows(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn updateNamespaceTableSchema(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn patchNamespaceTableSchema(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn setNamespaceTableTablespace(self: *Impl, ctx: *httpx.Context, table_name: []const u8, database_name: []const u8, namespace_name: []const u8) !httpx.Response
@@ -2286,6 +2660,10 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn cancelDocumentArtifactReprocessJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8, job_id: []const u8) !httpx.Response
 //   fn backupTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn batchWrite(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn repairRelationalConstraints(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn retireRelationalConstraints(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn retryRelationalConstraints(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn getRelationalConstraintStatus(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn reauthorizeTableDestinations(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn scanKeys(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn lookupKey(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: LookupKeyParams) !httpx.Response
@@ -2297,6 +2675,8 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn createIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn dropIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn executeGraphMetricAction(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8, metric_name: []const u8, action: []const u8) !httpx.Response
+//   fn repairIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
+//   fn retryIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn linearMerge(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn queryTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn startTableRepairControlJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
@@ -2307,8 +2687,10 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn cancelTableRepairJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8, job_id: []const u8) !httpx.Response
 //   fn runTableRepair(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn restoreTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
-//   fn updateSchema(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
-//   fn patchSchema(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn mutateRelationalRows(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn queryRelationalRows(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn updateSchema(self: *Impl, ctx: *httpx.Context, table_name: []const u8, params: UpdateSchemaParams) !httpx.Response
+//   fn patchSchema(self: *Impl, ctx: *httpx.Context, table_name: []const u8, params: PatchSchemaParams) !httpx.Response
 //   fn createTableStorageMigration(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn getTableStorageMigration(self: *Impl, ctx: *httpx.Context, table_name: []const u8, job_id: []const u8) !httpx.Response
 //   fn advanceTableStorageMigration(self: *Impl, ctx: *httpx.Context, table_name: []const u8, job_id: []const u8) !httpx.Response

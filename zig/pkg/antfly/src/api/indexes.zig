@@ -1164,7 +1164,7 @@ fn configuredArtifactSourceNames(config: std.json.Value, index_type: ApiIndexTyp
             if (source != .object) break :blk null;
             break :blk source.object.get("artifact");
         },
-        .algebraic => null,
+        .algebraic, .relational => null,
     };
     if (singular) |artifact| {
         if (artifact == .string and artifact.string.len > 0) {
@@ -1242,6 +1242,7 @@ fn appendPublicIndexConfig(
             .embeddings => "embeddings",
             .graph => "graph",
             .algebraic => "algebraic",
+            .relational => "relational",
         });
     }
     // Public configuration is an effective contract, not a byte-for-byte
@@ -1404,9 +1405,9 @@ fn appendPublicConfigValue(
                 // deny-list cannot safely project them into a public response,
                 // so preserve the table-status invariant and omit the entire
                 // write-only document.
-                // Metric map keys are user-owned names, not credential fields;
-                // their values are still projected through a closed schema.
-                if (object_shape != .graph_metrics) {
+                // Metric names and typed predicate literals are user data,
+                // not credential references. Both have closed public schemas.
+                if (object_shape != .graph_metrics and object_shape != .relational_predicate and object_shape != .relational_expression) {
                     if (public_index_contract.isWriteOnlyConfigField(entry.key_ptr.*)) continue;
                     if (isSensitivePublicConfigField(entry.key_ptr.*)) continue;
                     if (isSensitivePublicConfigValue(entry.key_ptr.*, entry.value_ptr.*)) continue;
@@ -1536,6 +1537,7 @@ fn indexTypeName(index_type: ApiIndexType) []const u8 {
         .embeddings => "embeddings",
         .graph => "graph",
         .algebraic => "algebraic",
+        .relational => "relational",
     };
 }
 
@@ -3780,7 +3782,7 @@ fn appendSingleIndexRuntimeStatusWithGraphMetricRuntime(
     try out.appendSlice(alloc, "\"rebuilding\":");
     try out.appendSlice(alloc, if (backfill_active) "true" else "false");
     switch (index_type) {
-        .full_text, .embeddings, .algebraic => {
+        .full_text, .embeddings, .algebraic, .relational => {
             try out.appendSlice(alloc, ",\"total_indexed\":");
             try appendIntValue(alloc, out, visible_doc_count);
         },
@@ -4927,6 +4929,7 @@ pub fn inferIndexType(index_name: []const u8, config: std.json.Value) ?ApiIndexT
         if (std.mem.eql(u8, type_value.string, "embeddings")) return .embeddings;
         if (std.mem.eql(u8, type_value.string, "graph")) return .graph;
         if (std.mem.eql(u8, type_value.string, "algebraic")) return .algebraic;
+        if (std.mem.eql(u8, type_value.string, "relational")) return .relational;
         return null;
     }
     if (config.object.get("dimension") != null or

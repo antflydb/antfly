@@ -9804,6 +9804,7 @@ test "retrieval agent agentic mode uses multiple tools for decompose queries" {
             var parsed_query = try parseQueryRequestBody(alloc, query_json);
             defer parsed_query.deinit();
             if (self.call_count == 1) {
+                try std.testing.expect(parsed_query.value.full_text_search != null);
                 try expectFullTextQueryValue(parsed_query.value.full_text_search.?, "body:raft");
                 return .{
                     .json = try alloc.dupe(u8,
@@ -9836,9 +9837,12 @@ test "retrieval agent agentic mode uses multiple tools for decompose queries" {
     try std.testing.expectEqual(@as(i64, 2), parsed.value.tool_calls_made.?);
     try std.testing.expectEqual(RetrievalStrategy.hybrid, parsed.value.strategy_used.?);
     try std.testing.expectEqual(generating_api_openapi.QueryStrategy.decompose, parsed.value.classification.?.strategy);
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.hits.len);
+    try std.testing.expectEqualStrings("doc:a", parsed.value.hits[0]._id);
+    try std.testing.expectEqualStrings("doc:b", parsed.value.hits[1]._id);
 }
 
-test "retrieval agent refines decompose queries before execution" {
+test "retrieval agent refines decompose semantic queries before execution" {
     const FakeRunner = struct {
         call_count: usize = 0,
 
@@ -9854,11 +9858,10 @@ test "retrieval agent refines decompose queries before execution" {
             self.call_count += 1;
             var parsed_query = try parseQueryRequestBody(alloc, query_json);
             defer parsed_query.deinit();
-            const full_text = parsed_query.value.full_text_search.?;
             if (self.call_count == 1) {
-                try expectFullTextMatchValue(full_text, "Compare raft consensus?");
+                try std.testing.expectEqualStrings("Compare raft consensus?", parsed_query.value.semantic_search.?);
             } else {
-                try expectFullTextMatchValue(full_text, "active document status?");
+                try std.testing.expectEqualStrings("active document status?", parsed_query.value.semantic_search.?);
             }
             return .{
                 .json = try alloc.dupe(u8,
@@ -9870,7 +9873,7 @@ test "retrieval agent refines decompose queries before execution" {
 
     var runner = FakeRunner{};
     const body =
-        \\{"query":"Compare raft consensus and active document status","stream":false,"max_internal_iterations":3,"queries":[{"table":"docs","full_text_search":{"match":"placeholder","field":"body"},"limit":5},{"table":"docs","full_text_search":{"match":"placeholder","field":"body"},"limit":5}]}
+        \\{"query":"Compare raft consensus and active document status","stream":false,"max_internal_iterations":3,"queries":[{"table":"docs","semantic_search":"placeholder","indexes":["semantic_idx"],"limit":5},{"table":"docs","semantic_search":"placeholder","indexes":["semantic_idx"],"limit":5}]}
     ;
     const encoded = try executeJson(std.testing.allocator, runner.iface(), null, body);
     defer std.testing.allocator.free(encoded);

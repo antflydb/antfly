@@ -38090,8 +38090,10 @@ fn primBroadcastInDimOp(ctx: *anyopaque, input: CT, target_shape: []const i64, b
         }
     }
     if (axis_count == 0) {
-        if (input_buf.data.len > 0) {
-            const in_data = getData(input);
+        const view = try denseTensorView(self, input);
+        defer if (view.owned) |owned| self.allocator.free(owned);
+        if (view.data.len > 0) {
+            const in_data = view.data;
             const output = try self.allocator.alloc(f32, out_numel);
             var raw_output: ?[]f32 = output;
             errdefer if (raw_output) |raw| self.allocator.free(raw);
@@ -38136,7 +38138,11 @@ fn primBroadcastInDimOp(ctx: *anyopaque, input: CT, target_shape: []const i64, b
         }
     }
 
-    const in_data = getData(input);
+    const view = try denseTensorView(self, input);
+    defer if (view.owned) |owned| self.allocator.free(owned);
+    const in_data = view.data;
+    // Materialization returns contiguous logical data, including source tensors.
+    computeStrides(resolved_input_shape, in_strides[0..in_rank]);
     const output = try self.allocator.alloc(f32, out_numel);
     var raw_output: ?[]f32 = output;
     errdefer if (raw_output) |raw| self.allocator.free(raw);
@@ -38159,12 +38165,13 @@ fn primBroadcastInDimOp(ctx: *anyopaque, input: CT, target_shape: []const i64, b
                             coord % input_extent
                         else
                             return error.ShapeMismatch;
-                        flat_in += input_coord * logical_in_strides[in_d];
+                        flat_in += input_coord * in_strides[in_d];
                     }
                     break;
                 }
             }
         }
+        if (flat_in >= in_data.len) return error.ShapeMismatch;
         output[flat_out] = in_data[flat_in];
     }
     const result = try self.makeBuf(output, true);
@@ -50225,6 +50232,23 @@ test "concat expands stale concrete axis shape from runtime length" {
 
     try std.testing.expectEqualSlices(i64, &.{ 1, 3, 3 }, tensorStoredShape(out_ct).?);
     try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9 }, getData(out_ct));
+}
+
+test "broadcast_in_dim materializes source-backed vectors and scalars" {
+    const allocator = std.testing.allocator;
+    var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
+    const vector = try compute.makeBufWithOwnedSourceTensor(try tensor_mod.Tensor.initFloat32(allocator, "vector", &.{3}, &.{ 1, 2, 3 }));
+    defer freeTensor(&compute, vector);
+    const expanded = try primBroadcastInDimOp(&compute, vector, &.{ 2, 3 }, &.{1}, &.{3});
+    defer freeTensor(&compute, expanded);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 1, 2, 3 }, getData(expanded));
+    const scalar = try compute.makeBufWithOwnedSourceTensor(try tensor_mod.Tensor.initFloat32(allocator, "scalar", &.{}, &.{7}));
+    defer freeTensor(&compute, scalar);
+    const filled = try primBroadcastInDimOp(&compute, scalar, &.{ 2, 3 }, &.{}, &.{});
+    defer freeTensor(&compute, filled);
+    try std.testing.expectEqualSlices(f32, &.{ 7, 7, 7, 7, 7, 7 }, getData(filled));
 }
 
 test "transpose materializes source-backed tensors" {

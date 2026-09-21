@@ -35,6 +35,21 @@ with patch.object(sys, "path", [str(Path(__file__).resolve().parent), *sys.path]
 
 
 class OpenApiBuildPathsTest(unittest.TestCase):
+    def test_joined_relational_query_preserves_optional_zero_epoch(self):
+        # Exercise the authoritative metadata input and join pipeline, not a
+        # manually modified generated root spec that make generate overwrites.
+        joined = join_public_openapi.join_antfly_spec()
+        request = joined["components"]["schemas"]["RelationalRowQueryRequest"]
+        epoch = request["properties"]["schema_version"]
+        self.assertIs(epoch["x-go-type-skip-optional-pointer"], False)
+        self.assertNotIn("schema_version", request.get("required", []))
+        self.assertLessEqual(epoch.get("minimum", 0), 0)
+        mutation = joined["components"]["schemas"]["RelationalRowMutationRequest"]
+        self.assertIn("schema_version", mutation["required"])
+        self.assertLessEqual(
+            mutation["properties"]["schema_version"].get("minimum", 0), 0
+        )
+
     def test_vendored_exa_inline_schemas_generate_named_types(self):
         root = Path(__file__).resolve().parent.parent
         spec = root / "zig/specs/exa-openapi.yaml"

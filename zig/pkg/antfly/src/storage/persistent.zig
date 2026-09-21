@@ -1956,6 +1956,23 @@ pub const PersistentIndex = struct {
     /// until this owner is released after off-fence materialization.
     pub const NativeSegmentCheckpoint = struct {
         snapshot: *index_mod.IndexSnapshot,
+        source_root: []const u8,
+
+        pub fn seal(self: *const NativeSegmentCheckpoint, alloc: Allocator, io: std.Io, destination_root: []const u8, cancellation: CancellationToken) !u64 {
+            try fs_paths.createDirPathPortable(io, destination_root);
+            var total: u64 = 0;
+            for (self.snapshot.segments) |segment| {
+                try cancellation.check();
+                const source = try std.fmt.allocPrint(alloc, "{s}/{d}.seg", .{ self.source_root, segment.id });
+                defer alloc.free(source);
+                const target = try std.fmt.allocPrint(alloc, "{s}/{d}.seg", .{ destination_root, segment.id });
+                defer alloc.free(target);
+                try std.Io.Dir.hardLink(.cwd(), source, .cwd(), target, io, .{});
+                total = std.math.add(u64, total, @intCast(segment.data.bytes().len)) catch return error.FileTooBig;
+            }
+            try fs_paths.syncDirPortable(io, destination_root);
+            return total;
+        }
 
         pub fn deinit(self: *NativeSegmentCheckpoint) void {
             self.snapshot.release();
@@ -2013,7 +2030,7 @@ pub const PersistentIndex = struct {
         self.lockStorage();
         defer self.unlockStorage();
         const segments = if (self.segment_files != null)
-            NativeSegmentCheckpoint{ .snapshot = self.writer.acquireSnapshot() }
+            NativeSegmentCheckpoint{ .snapshot = self.writer.acquireSnapshot(), .source_root = self.segment_files.?.root_dir }
         else
             null;
         errdefer if (segments) |checkpoint| checkpoint.snapshot.release();

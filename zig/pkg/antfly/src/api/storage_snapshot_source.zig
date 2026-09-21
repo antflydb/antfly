@@ -23,6 +23,10 @@ const descriptor_contract = @import("../storage/kernel_owner_descriptor.zig");
 const backup_contract = @import("backup_contract.zig");
 
 pub const PrepareRequest = struct {
+    /// Trusted compiled raw-store handle. Native snapshots prepare both stores
+    /// from the same unpublished checkpoint extraction before publication.
+    projection_store: ?*anyopaque = null,
+    expected_applied_index: u64 = 0,
     path: []const u8,
     table_name: []const u8,
     group_id: u64,

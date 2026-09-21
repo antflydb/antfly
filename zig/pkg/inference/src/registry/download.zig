@@ -49,6 +49,9 @@ pub const HubConfig = struct {
     /// This prevents a repository with many individually valid shards from
     /// exhausting the model volume.
     max_model_bytes: u64 = default_max_model_bytes,
+    /// Shared wall-clock budget for one artifact's redirects, transfer and
+    /// resumable retries. Zero is invalid: a stalled model pull must be finite.
+    artifact_timeout_ms: u64 = 30 * 60 * 1000,
 };
 
 pub const managed_download_in_progress_filename = managed_receipt.in_progress_filename;
@@ -2464,6 +2467,7 @@ pub fn readModelFileAlloc(
     config: HubConfig,
     max_bytes: usize,
 ) ![]u8 {
+    const deadline = try DownloadDeadline.init(io, 300_000);
     const url = try modelFileUrlAlloc(allocator, config, owner, name, filename);
     defer allocator.free(url);
 
@@ -2494,6 +2498,7 @@ pub fn readModelFileAlloc(
         url,
         headers_buf[0..n_headers],
         headers_buf[0..2],
+        deadline,
     );
     defer allocator.free(download_url);
     const request_headers = if (sameHttpOrigin(url, download_url))
@@ -2503,7 +2508,7 @@ pub fn readModelFileAlloc(
     var resp = try client.get(download_url, .{
         .headers = request_headers,
         .follow_redirects = false,
-        .timeout_ms = 300_000,
+        .timeout_ms = try deadline.remainingMs(io),
     });
     defer resp.deinit();
 
@@ -2564,6 +2569,7 @@ fn resolveDownloadUrl(
     start_url: []const u8,
     authenticated_headers: []const [2][]const u8,
     anonymous_headers: []const [2][]const u8,
+    deadline: DownloadDeadline,
 ) ![]u8 {
     var current_url = try allocator.dupe(u8, start_url);
     errdefer allocator.free(current_url);
@@ -2577,6 +2583,7 @@ fn resolveDownloadUrl(
         var resp = try client.request(.HEAD, current_url, .{
             .headers = headers,
             .follow_redirects = false,
+            .timeout_ms = try deadline.remainingMs(client.io),
         });
         defer resp.deinit();
 
@@ -2594,6 +2601,29 @@ fn resolveDownloadUrl(
         redirects += 1;
     }
 }
+
+const DownloadDeadline = struct {
+    expires_ns: i96,
+
+    fn init(io: std.Io, timeout_ms: u64) !DownloadDeadline {
+        if (timeout_ms == 0) return error.InvalidDownloadTimeout;
+        return .{ .expires_ns = std.Io.Clock.awake.now(io).nanoseconds +| @as(i96, timeout_ms) * std.time.ns_per_ms };
+    }
+
+    fn remainingMs(self: DownloadDeadline, io: std.Io) !u64 {
+        try io.checkCancel();
+        const remaining = self.expires_ns - std.Io.Clock.awake.now(io).nanoseconds;
+        if (remaining <= 0) return error.Timeout;
+        // Never round down to zero: httpx interprets zero as no deadline.
+        return @intCast(@divTrunc(remaining + std.time.ns_per_ms - 1, std.time.ns_per_ms));
+    }
+
+    fn backoff(self: DownloadDeadline, io: std.Io, attempt: u32) !void {
+        const delay_ms = @min(streamedDownloadRetryDelayMs(attempt), try self.remainingMs(io));
+        try io.sleep(std.Io.Duration.fromMilliseconds(@intCast(delay_ms)), .awake);
+        _ = try self.remainingMs(io);
+    }
+};
 
 fn downloadResponseLimit(config: HubConfig) !usize {
     if (config.max_artifact_bytes == 0) return error.InvalidDownloadSizeLimit;
@@ -2619,6 +2649,7 @@ fn downloadClientConfig(max_response_size: usize) httpx.ClientConfig {
 
 fn isRetryableStreamDownloadError(err: anyerror) bool {
     return switch (err) {
+        error.NameServerFailure,
         error.ConnectionClosed,
         error.ConnectionRefused,
         error.Closed,
@@ -2652,6 +2683,93 @@ fn streamedDownloadRetryDelayMs(attempt: u32) u64 {
     if (attempt == 0) return 0;
     const shift: u6 = @intCast(@min(attempt - 1, 5));
     return @min(streamed_download_initial_retry_ms << shift, 10_000);
+}
+
+test "model download retries transient DNS but preserves terminal failures" {
+    try std.testing.expect(isRetryableStreamDownloadError(error.NameServerFailure));
+    inline for (.{ error.UnknownHostName, error.ResolvConfParseFailed, error.InvalidDnsARecord, error.ChecksumMismatch, error.UnsafeRedirect, error.DownloadSizeLimitExceeded, error.Canceled, error.Cancelled, error.TlsBadRecordMac, error.TlsCertificateNotVerified }) |err| {
+        try std.testing.expect(!isRetryableStreamDownloadError(err));
+    }
+    try std.testing.expectEqual(@as(u64, 500), streamedDownloadRetryDelayMs(1));
+    try std.testing.expectEqual(@as(u64, 2_000), streamedDownloadRetryDelayMs(streamed_download_max_retries));
+}
+
+test "model download deadline is finite shared and cancellation aware" {
+    const io = std.testing.io;
+    try std.testing.expectError(error.InvalidDownloadTimeout, DownloadDeadline.init(io, 0));
+    const expired: DownloadDeadline = .{ .expires_ns = 0 };
+    try std.testing.expectError(error.Timeout, expired.remainingMs(io));
+    try std.testing.expectError(error.Timeout, expired.backoff(io, 1));
+    const deadline = try DownloadDeadline.init(io, 60_000);
+    const remaining = try deadline.remainingMs(io);
+    try std.testing.expect(remaining > 0 and remaining <= 60_000);
+    const CanceledIo = struct {
+        fn checkCancel(_: ?*anyopaque) std.Io.Cancelable!void {
+            return error.Canceled;
+        }
+    };
+    var vtable = io.vtable.*;
+    vtable.checkCancel = CanceledIo.checkCancel;
+    const canceled_io: std.Io = .{ .userdata = io.userdata, .vtable = &vtable };
+    try std.testing.expectError(error.Canceled, deadline.remainingMs(canceled_io));
+    try std.testing.expectError(error.Canceled, deadline.backoff(canceled_io, 1));
+}
+
+test "model download recovers transient DNS during redirect lookup and artifact stream" {
+    const allocator = std.testing.allocator;
+    const fixture_io = std.testing.io;
+    const Fixture = struct {
+        var lookups = std.atomic.Value(usize).init(0);
+
+        fn lookup(_: ?*anyopaque, _: std.Io.net.HostName, resolved: *std.Io.Queue(std.Io.net.HostName.LookupResult), options: std.Io.net.HostName.LookupOptions) std.Io.net.HostName.LookupError!void {
+            const io = std.testing.io;
+            defer resolved.close(io);
+            const attempt = lookups.fetchAdd(1, .acq_rel);
+            if (attempt == 0 or attempt == 2) return error.NameServerFailure;
+            resolved.putOne(io, .{ .address = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = options.port } } }) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                error.Closed => unreachable,
+            };
+        }
+
+        fn serve(server: *httpx.TestServer) !void {
+            try server.handleOne(); // HEAD URL resolution, after DNS retry.
+            try server.handleOne(); // GET artifact, after independent DNS retry.
+        }
+    };
+    Fixture.lookups.store(0, .release);
+    var vtable = fixture_io.vtable.*;
+    vtable.netLookup = Fixture.lookup;
+    const io: std.Io = .{ .userdata = fixture_io.userdata, .vtable = &vtable };
+    const payload = "verified vocabulary";
+    const path = "/owner/name/resolve/main/vocab.txt";
+    var server = try httpx.TestServer.start(allocator, fixture_io, &.{
+        .{ .method = .HEAD, .path = path, .respond = .{ .body = payload } },
+        .{ .method = .GET, .path = path, .respond = .{ .body = payload } },
+    });
+    defer server.deinit();
+    var serving = try fixture_io.concurrent(Fixture.serve, .{&server});
+    defer serving.cancel(fixture_io) catch {};
+    const base_url = try std.fmt.allocPrint(allocator, "http://model-download.test:{d}", .{server.port});
+    defer allocator.free(base_url);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dest_dir = try testTmpPath(allocator, tmp, "downloads");
+    defer allocator.free(dest_dir);
+    try std.Io.Dir.cwd().createDirPath(io, dest_dir);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(payload, &digest, .{});
+    const digest_hex = std.fmt.bytesToHex(digest, .lower);
+    try std.testing.expect(!try downloadFile(allocator, io, "owner", "name", "vocab.txt", dest_dir, .{
+        .base_url = base_url,
+        .artifact_timeout_ms = 10_000,
+    }, .{}, 0, 1, payload.len, &digest_hex, null));
+    try serving.await(fixture_io);
+    try std.testing.expectEqual(@as(usize, 4), Fixture.lookups.load(.acquire));
+    const downloaded = try tmp.dir.readFileAlloc(io, "downloads/vocab.txt", allocator, .limited(1024));
+    defer allocator.free(downloaded);
+    try std.testing.expectEqualStrings(payload, downloaded);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile(io, "downloads/vocab.txt.part", .{}));
 }
 
 const ParsedContentRange = struct {
@@ -2745,6 +2863,7 @@ fn downloadFileAtRevision(
 ) !bool {
     if (!managed_receipt.artifactPathIsSafe(filename)) return error.InvalidModelArtifactPath;
     if (!hubRevisionIsSafe(revision)) return error.InvalidHubRevision;
+    const deadline = try DownloadDeadline.init(io, config.artifact_timeout_ms);
     const max_response_size = try downloadResponseLimit(config);
     if (total_bytes) |total| {
         if (total > config.max_artifact_bytes) return error.DownloadSizeLimitExceeded;
@@ -2827,11 +2946,13 @@ fn downloadFileAtRevision(
         url,
         headers_buf[0..n_headers],
         headers_buf[0..2],
+        deadline,
     );
     defer allocator.free(download_url);
 
     var download_attempt: u32 = 0;
     while (true) {
+        const request_timeout_ms = try deadline.remainingMs(io);
         if (range_header) |range| {
             allocator.free(range);
             range_header = null;
@@ -2887,6 +3008,7 @@ fn downloadFileAtRevision(
         var streamed = client.getToWriter(download_url, .{
             .headers = headers_buf[0..n_headers],
             .follow_redirects = false,
+            .timeout_ms = request_timeout_ms,
         }, &resume_writer, FileProgressCtx.onWriterProgress, &progress_ctx) catch |err| {
             file.close(io);
             // A server that ignores Range can send a complete response after
@@ -2941,7 +3063,7 @@ fn downloadFileAtRevision(
                     "model artifact stream interrupted; retrying file={s} attempt={d}/{d} resume_bytes={d} delay_ms={d} err={s}",
                     .{ filename, download_attempt, streamed_download_max_retries, resume_from, delay_ms, @errorName(err) },
                 );
-                io.sleep(std.Io.Duration.fromMilliseconds(@intCast(delay_ms)), .awake) catch {};
+                try deadline.backoff(io, download_attempt);
                 continue;
             }
             return err;
@@ -2973,7 +3095,7 @@ fn downloadFileAtRevision(
                     "model artifact server returned retryable status; retrying file={s} status={d} attempt={d}/{d} delay_ms={d}",
                     .{ filename, status_code, download_attempt, streamed_download_max_retries, delay_ms },
                 );
-                io.sleep(std.Io.Duration.fromMilliseconds(@intCast(delay_ms)), .awake) catch {};
+                try deadline.backoff(io, download_attempt);
                 continue;
             }
             return error.DownloadFailed;
