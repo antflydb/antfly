@@ -1401,6 +1401,119 @@ components:
       schema:
         type: string
   schemas:
+    DatabaseCatalogRecord:
+      type: object
+      required:
+        - database_id
+        - name
+        - settings_json
+      description: Database catalog object. Tables and namespaces resolve under a database before authorization and routing.
+      properties:
+        database_id:
+          type: integer
+          format: uint64
+          description: Stable database catalog identifier.
+          example: 22
+        name:
+          type: string
+          description: Database name.
+          example: tenant_ops
+        settings_json:
+          type: string
+          description: JSON-encoded database settings owned by the catalog.
+          example: "{}"
+        tablespace_name:
+          type: string
+          nullable: true
+          description: Optional durable tablespace binding inherited by new namespace/table placement policy.
+          example: fastspace
+    NamespaceCatalogRecord:
+      type: object
+      required:
+        - namespace_id
+        - database_id
+        - database_name
+        - name
+      description: Namespace catalog object inside a database. PostgreSQL schemas map to Antfly namespaces.
+      properties:
+        namespace_id:
+          type: integer
+          format: uint64
+          description: Stable namespace catalog identifier.
+          example: 222
+        database_id:
+          type: integer
+          format: uint64
+          description: Parent database identifier.
+          example: 22
+        database_name:
+          type: string
+          description: Parent database name.
+          example: tenant_ops
+        name:
+          type: string
+          description: Namespace name.
+          example: analytics
+        tablespace_name:
+          type: string
+          nullable: true
+          description: Optional durable tablespace binding inherited by new table placement policy in this namespace.
+          example: fastspace
+    CatalogTablespaceBindingRequest:
+      type: object
+      required:
+        - tablespace_name
+      properties:
+        tablespace_name:
+          type: string
+          description: Existing tablespace name to bind to the catalog object.
+          example: fastspace
+    TablespaceCatalogRecord:
+      type: object
+      required:
+        - tablespace_id
+        - name
+        - location_json
+        - placement_policy_json
+      description: Tablespace catalog object. Placement policy resource with a stable identity. SQL adapters consume this native lifecycle surface.
+      properties:
+        tablespace_id:
+          type: integer
+          format: uint64
+          description: Stable tablespace catalog identifier.
+          example: 42
+        name:
+          type: string
+          description: Tablespace name.
+          example: fastspace
+        location_json:
+          type: string
+          description: JSON-encoded location descriptor. String locations are encoded as JSON strings.
+          example: "\"/var/lib/antfly/fastspace\""
+        placement_policy_json:
+          type: string
+          description: JSON-encoded placement policy reserved for native placement planning.
+          example: "{}"
+    CreateTablespaceRequest:
+      type: object
+      description: Tablespace creation request. Placement policy is validated and applied when new tables are created.
+      properties:
+        location_json:
+          type: string
+          description: JSON-encoded location descriptor. Defaults to `null`.
+          example: "\"/var/lib/antfly/fastspace\""
+        placement_policy_json:
+          type: string
+          description: JSON-encoded placement policy. Supported fields are placement_role, desired_replica_count, and min_ranges. Location is metadata, never a filesystem override.
+          example: "{}"
+    RenameCatalogResourceRequest:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties:
+        name:
+          type: string
+          description: New logical name. The durable resource identity remains unchanged.
     CommittedMutationOutcome:
       type: object
       required: [status]
@@ -1424,6 +1537,14 @@ components:
         RFC 7396 JSON Merge Patch for a table schema. Object members are merged
         recursively; null removes a member. The resulting document must be a
         valid TableSchema and `version` remains server-managed.
+    CatalogMutationVisibilityPending:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [committed_visibility_pending]
+      description: The mutation committed. Read the resource to observe it; do not replay the mutation to obtain its representation.
     Error:
       $ref: "../auth/api.yaml#/components/schemas/Error"
     UnsupportedIndexCapabilityError:
@@ -3793,6 +3914,16 @@ components:
           description: "Secret name (e.g., openai.api_key)"
         status:
           $ref: "#/components/schemas/SecretStatus"
+        source:
+          type: string
+          description: Name of the winning source, or environment.
+        managed:
+          type: boolean
+          description: Whether this key has an Antfly-managed override that can be deleted.
+        revision:
+          type: integer
+          format: uint64
+          description: Committed native entry revision, when supported by the configured backend.
         env_var:
           type: string
           description: "Corresponding environment variable name (e.g., OPENAI_API_KEY)"
@@ -3807,6 +3938,9 @@ components:
       required:
         - secrets
       properties:
+        writable:
+          type: boolean
+          description: Whether this server has a native store for secret API writes.
         secrets:
           type: array
           items:
@@ -3873,6 +4007,10 @@ components:
     CreateTableRequest:
       type: object
       properties:
+        tablespace_name:
+          type: string
+          description: Explicit tablespace policy for the new table, overriding namespace and database defaults.
+          maxLength: 128
         storage:
           $ref: "#/components/schemas/TableStorageSettings"
         num_shards:
@@ -5157,6 +5295,9 @@ components:
           required:
             - storage_status
           properties:
+            table_id:
+              type: string
+              description: Immutable physical table identity, preserved by catalog renames.
             storage_status:
               $ref: "#/components/schemas/StorageStatus"
             artifact_enrichments:
@@ -5306,6 +5447,158 @@ components:
             Maximum number of results to return. If not specified, returns all
             matching keys in the range. Useful for pagination or sampling.
           example: 100
+
+    RelationalRowCondition:
+      type: object
+      additionalProperties: false
+      required: [column, op]
+      properties:
+        column:
+          type: string
+          minLength: 1
+        op:
+          $ref: "schema.yaml#/components/schemas/RelationalComparisonOp"
+        value:
+          description: Typed scalar operand. Omission means NULL. Integer columns also accept exact decimal strings.
+        collation:
+          type: string
+
+    RelationalRowQueryRequest:
+      type: object
+      additionalProperties: false
+      required: [fields]
+      description: |
+        Bounded relational scan in primary-key order, or composite index order
+        when index is supplied. Index queries require schema_version and every
+        owning shard must have the selected generation ready. Partial indexes
+        require their WHERE predicates to be implied by the query conditions.
+        The bounded proof combines per-column equality, tighter ranges,
+        exclusions, and NULL-aware predicates using exact typed values and
+        matching collations. Unsupported implications fail closed. Explicit
+        scan bounds alone are not an implication proof. Equal tuples are
+        ordered by primary key. Each shard read pins its own immutable schema
+        and row snapshot; this is not a table-wide consistent snapshot.
+        Resume with the last returned _id as from for primary scans, or its
+        cursor as after for index scans. A resumed request opens a fresh snapshot,
+        not a retained cursor; concurrent mutations may move rows across the
+        continuation boundary. Keep index, bounds and conditions unchanged when paging.
+        An empty projection returns row identities and versions only.
+      properties:
+        index:
+          type: string
+          minLength: 1
+          description: Ready composite secondary index. Requires schema_version; cannot be combined with from/to.
+        after:
+          type: string
+          maxLength: 2097248
+          description: Opaque exclusive index-order cursor from the last returned row. Binds the immutable schema version, logical index name, and comparison semantics, independent of owner-local physical generations. Each owner must still prove its current local index is ready.
+        lower:
+          $ref: "#/components/schemas/RelationalRowIndexBound"
+        upper:
+          $ref: "#/components/schemas/RelationalRowIndexBound"
+        fields:
+          type: array
+          maxItems: 256
+          items:
+            type: string
+            minLength: 1
+        conditions:
+          type: array
+          maxItems: 256
+          items:
+            $ref: "#/components/schemas/RelationalRowCondition"
+        from:
+          type: string
+          description: Exclusive lower primary-key bound, including pagination continuation.
+        to:
+          type: string
+          description: Exclusive upper primary-key bound.
+        limit:
+          type: integer
+          format: uint32
+          minimum: 1
+          maximum: 4096
+          default: 128
+        schema_version:
+          type: integer
+          format: uint32
+          x-go-type-skip-optional-pointer: false
+          description: Reject the read if an owning shard has a different active schema epoch. Zero is a valid epoch and is distinct from omission.
+
+    RelationalRowIndexBound:
+      type: object
+      additionalProperties: false
+      required: [values]
+      description: >
+        Typed left-prefix bound in declared index order, including descending
+        components. Inclusive bounds include the entire matching prefix.
+        Integer components accept exact decimal strings; null is an indexed null.
+      properties:
+        values:
+          type: array
+          minItems: 1
+          maxItems: 256
+          items: {}
+        inclusive:
+          type: boolean
+          default: true
+
+    RelationalRow:
+      type: object
+      required: [_id, row, version, schema_version]
+      properties:
+        cursor:
+          type: string
+          description: Opaque index-order continuation; present only for secondary-index queries.
+        _id:
+          type: string
+        row:
+          type: object
+          additionalProperties: true
+        version:
+          type: string
+          pattern: '^[0-9]+$'
+          description: Exact row version for mutation preconditions, encoded as decimal text.
+        schema_version:
+          type: integer
+          format: uint32
+          description: Active pinned schema epoch, not the historical physical row layout.
+
+    RelationalRowMutation:
+      type: object
+      additionalProperties: false
+      required: [key, expected_version]
+      description: A complete row replacement, or deletion when row is omitted. No read-modify-write is implied.
+      properties:
+        key:
+          type: string
+          minLength: 1
+        expected_version:
+          type: string
+          pattern: '^[0-9]+$'
+          description: Exact observed version. Zero requires that the row does not exist.
+        row:
+          type: object
+          additionalProperties: true
+
+    RelationalRowMutationRequest:
+      type: object
+      additionalProperties: false
+      required: [schema_version, mutations]
+      description: Atomic version-conditional typed-row replacements and deletions using the durable distributed transaction coordinator.
+      properties:
+        schema_version:
+          type: integer
+          format: uint32
+          description: Required active relational schema epoch, fenced during every participant prepare.
+        mutations:
+          type: array
+          minItems: 1
+          maxItems: 4096
+          items:
+            $ref: "#/components/schemas/RelationalRowMutation"
+        sync_level:
+          $ref: "#/components/schemas/SyncLevel"
 
     BatchRequest:
       type: object
@@ -5611,6 +5904,110 @@ components:
             - prepare
             - resolve
           description: 2PC participant phase that reported the conflict.
+    RelationalConstraintConflictReason:
+      type: string
+      enum: [unique_constraint_violation, foreign_key_parent_missing, foreign_key_referenced]
+      description: Deterministic relational integrity failure; changing the mutation or data is required before retry.
+    RelationalConstraintActivationPhase:
+      type: string
+      enum: [unique, foreign_key, check]
+    RelationalConstraintRangeStatus:
+      type: object
+      required: [group_id, state, phase, rows_scanned, owner]
+      properties:
+        group_id:
+          type: string
+          description: Exact owner group identifier as decimal text.
+        state:
+          $ref: "schema.yaml#/components/schemas/RelationalConstraintValidationState"
+        phase:
+          $ref: "#/components/schemas/RelationalConstraintActivationPhase"
+        rows_scanned:
+          type: string
+          description: Exact cumulative validation row count as decimal text.
+        owner:
+          type: string
+          description: Opaque namespace-and-range ownership digest.
+        failure:
+          type: string
+    RelationalConstraintRetryRequest:
+      type: object
+      additionalProperties: false
+      required: [schema_version]
+      properties:
+        schema_version:
+          type: integer
+          minimum: 0
+          maximum: 4294967295
+    RelationalConstraintRetryResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [accepted]
+    RelationalConstraintRetirementRequest:
+      type: object
+      additionalProperties: false
+      required: [schema_version]
+      description: |
+        Supply exactly one of target_schema or drop=true. A target schema may
+        only remove UNIQUE/FK definitions; all other schema properties must
+        remain unchanged. Its version is assigned by the server. Retirement
+        fences primary mutations while existing reference and claim records
+        are drained. External foreign keys referencing removed definitions
+        must be retired first.
+      properties:
+        schema_version:
+          type: integer
+          minimum: 0
+          maximum: 4294967295
+        target_schema:
+          $ref: "schema.yaml#/components/schemas/TableSchema"
+        drop:
+          type: boolean
+          default: false
+          description: Prepare for explicit table deletion; this operation does not delete the table.
+    RelationalConstraintRetirementStatus:
+      type: object
+      required: [id, phase, drop, target_schema_version]
+      properties:
+        id:
+          type: string
+          description: Opaque retirement job identity.
+        phase:
+          type: string
+          enum: [fencing, foreign_keys, unique, publishing, published, ready_to_drop]
+        drop:
+          type: boolean
+        target_schema_version:
+          type: integer
+          format: uint32
+        failure:
+          type: string
+          description: |
+            Durable diagnostic that pauses the job. Retry resumes the exact
+            checkpoint after the cause is addressed; it does not undo a partial
+            drain or permit primary mutations while retirement is active.
+    RelationalConstraintStatus:
+      type: object
+      required: [schema_version, coverage_kind, state, ranges]
+      properties:
+        schema_version:
+          type: integer
+          format: uint32
+        coverage_kind:
+          type: string
+          enum: [unique_foreign_key_and_check]
+          description: Distributed UNIQUE, foreign-key, and scalar CHECK coverage across every current table owner. Native local validation is not a substitute for this coordinated proof.
+        state:
+          $ref: "schema.yaml#/components/schemas/RelationalConstraintValidationState"
+        ranges:
+          type: array
+          items:
+            $ref: "#/components/schemas/RelationalConstraintRangeStatus"
+        retirement:
+          $ref: "#/components/schemas/RelationalConstraintRetirementStatus"
     TransactionConflict:
       type: object
       description: Structured details for an aborted transaction attempt.
@@ -5630,6 +6027,8 @@ components:
         message:
           type: string
           description: Human-readable conflict description.
+        reason:
+          $ref: "#/components/schemas/RelationalConstraintConflictReason"
         kind:
           type: string
           enum:
@@ -6015,6 +6414,13 @@ components:
             paths resolve beneath the connection root.
     ClusterBackupRequest:
       type: object
+      description: |
+        Native cluster backups pin a common transaction cut across a dependency-complete
+        table set. Restart-stable LSM seals are journaled before releasing write fences;
+        artifact upload uses those immutable seals without holding the write pause.
+        Native cohorts support at most 4096 tables and 4096 ranges and require the
+        filesystem-managed LSM backend. Portable backups do not support coordinated
+        UNIQUE/FK constraints or promise a common cross-table transaction cut.
       additionalProperties: false
       required:
         - backup_id
@@ -6132,6 +6538,16 @@ components:
           description: Opaque artifact generation retained by an ambiguous cluster attempt.
     ClusterRestoreRequest:
       type: object
+      description: |
+        Native cohort restores use the existing asynchronous restore job to provision
+        hidden fresh generations, import rows, rebuild indexes and coordinated constraints,
+        and publish the dependency-complete target set atomically. Document, relational,
+        and mixed native cohorts use the same workflow (at most 128 tables/4096 ranges).
+        Skipping a live parent cannot substitute it for a parent generation required by
+        a restored child. Overwrite retains the old generation until validation and
+        cutover; cancellation after publication completes publication rather than rollback.
+        Reserved destination authorization is immutable: changing principal requires
+        canceling the old job and creating a new restore.
       additionalProperties: false
       required:
         - backup_id
@@ -6493,11 +6909,14 @@ components:
             Antfly query request assembled by the coordinator. New clients should prefer this
             field when they want an executable Antfly query object.
         retrieval_query_request:
-          $ref: "#/components/schemas/RetrievalQueryRequest"
+          $ref: "#/components/schemas/QueryRequest"
           description: |
             Antfly retrieval query assembled by the coordinator when the requested artifact
-            needs retrieval-only features such as tree_search. This is additive to
+            is intended for retrieval. Apply retrieval_navigation to steps.retrieval.navigation. This is additive to
             query_request for clients that execute through the retrieval agent pipeline.
+        retrieval_navigation:
+          $ref: "#/components/schemas/RetrievalNavigationConfig"
+          description: Optional retrieval-step navigation policy for the returned query at query_index zero.
         specialist:
           type: string
           description: Specialist or strategy used to build the query, such as `full_text`, `filter`, or `hybrid`.
@@ -6569,55 +6988,90 @@ components:
         - graph: Relationship-based traversal
         - hybrid: Combine multiple strategies with RRF or rerank
 
-    TreeSearchConfig:
+    RetrievalNavigationStrategy:
+      type: string
+      enum: [tree, graph]
+
+    RetrievalNavigationSelection:
+      type: string
+      enum: [agentic, ranked]
+
+    RetrievalNavigationConfig:
       type: object
+      additionalProperties: false
+      required: [query_index, strategy, selection, index]
       description: |
-        Configuration for tree search strategy. Tree search navigates hierarchical
-        document structures by evaluating summaries at each level.
-      required:
-        - index
+        Retrieval-step navigation targeting one ordinary query. Graph navigation
+        follows one path; tree navigation explores a retained branch frontier.
+        Agentic selection uses the enclosing model and budgets. Ranked selection
+        is supported for trees and uses the existing deterministic tree traversal.
+        Agentic selection requires agentic mode and a retrieval generator. Search
+        starts exploration; navigation selects only an offered, unvisited node.
+        All reads enforce mandatory predicates and authenticated row filters.
       properties:
-        index:
-          type: string
-          description: Name of the graph index to use for tree navigation
-          example: "doc_hierarchy"
-        start_nodes:
-          type: string
-          description: |
-            Starting nodes for tree search:
-            - "$roots" - Query for root nodes (nodes with no parents)
-            - Comma-separated explicit node IDs
-            When omitted and combined with a QueryRequest in a RetrievalQueryRequest,
-            the query results are used as start nodes.
-          example: "$roots"
+        query_index:
+          type: integer
+          minimum: 0
+          description: Zero-based index into the enclosing request queries.
+        strategy:
+          $ref: "#/components/schemas/RetrievalNavigationStrategy"
+        selection:
+          $ref: "#/components/schemas/RetrievalNavigationSelection"
+          description: Ranked selection is supported only with strategy tree.
         max_depth:
           type: integer
           minimum: 1
           maximum: 20
-          default: 5
-          description: Maximum depth to traverse in the tree
+          description: Tree-only maximum depth from the start node (depth zero); defaults to 5.
         beam_width:
           type: integer
           minimum: 1
           maximum: 20
-          default: 3
-          description: Number of branches to explore at each level
-
-    RetrievalQueryRequest:
-      description: |
-        A canonical query in the retrieval pipeline with an optional tree search
-        configuration. Each query specifies its own table. Deprecated stateful
-        graph_searches compatibility is intentionally unavailable here.
-
-        When both search fields (semantic_search, full_text_search) and tree_search
-        are provided, the search results are used as start nodes for tree navigation.
-      allOf:
-        - $ref: "#/components/schemas/QueryRequest"
-        - type: object
-          properties:
-            tree_search:
-              $ref: "#/components/schemas/TreeSearchConfig"
-              description: Optional tree search configuration
+          description: Tree-only maximum children offered per expansion; defaults to 3.
+        index:
+          type: string
+          minLength: 1
+          pattern: .*\S.*
+          description: Graph index used for every neighbor read.
+        start_nodes:
+          type: string
+          minLength: 1
+          description: Ranked-tree-only seed selector (comma-separated keys, $roots, or a prior-result selector). Mutually exclusive with start_key.
+        start_key:
+          type: string
+          minLength: 1
+          description: Literal start document key. Agentic selection defaults to the first query hit; ranked selection defaults to seed results or prior query hits.
+        direction:
+          $ref: 'indexes.yaml#/components/schemas/EdgeDirection'
+          description: Direction for every hop; defaults to out.
+        edge_types:
+          type: array
+          maxItems: 64
+          uniqueItems: true
+          items:
+            $ref: 'indexes.yaml#/components/schemas/GraphEdgeType'
+        max_steps:
+          type: integer
+          minimum: 1
+          maximum: 20
+          description: Graph-only maximum moves after the start node (default 8). The enclosing agent's iteration and tool limits also apply.
+        neighbor_limit:
+          type: integer
+          minimum: 1
+          maximum: 256
+          description: Graph-only maximum candidate neighbors per node (default 8), further limited by the context budget.
+        instruction:
+          type: string
+          minLength: 1
+          description: Optional caller-supplied workflow instruction retained in agent history.
+        instruction_field:
+          type: string
+          minLength: 1
+          description: |
+            Explicitly opt in to following instructions from this top-level string
+            field of each visited document. Instructions accumulate in agent history.
+            Other document fields and unvisited neighbors remain untrusted evidence.
+            The field must be included if the query uses a fields projection.
 
     AgentQuestionKind:
       type: string
@@ -6882,6 +7336,9 @@ components:
         Configuration for the retrieval step. Retrieval tools are constrained by
         the top-level request tools policy when both are present.
       properties:
+        navigation:
+          $ref: "#/components/schemas/RetrievalNavigationConfig"
+          description: Navigation policy for one query; incompatible with graph_queries on that query.
         tools:
           $ref: "generating.yaml#/components/schemas/ChatToolsConfig"
           description: |
@@ -6932,7 +7389,8 @@ components:
       type: object
       description: |
         Request for the retrieval agent. Queries define which tables and indexes
-        to search, each as a QueryRequest with optional tree search configuration.
+        to search, each as an ordinary QueryRequest. Optional tree or graph exploration
+        is configured by steps.retrieval.navigation, targeting one query by index.
 
         **Pipeline mode** (default, max_internal_iterations=0): Queries are executed
         directly without an LLM tool-calling loop.
@@ -6957,7 +7415,7 @@ components:
         queries:
           type: array
           items:
-            $ref: "#/components/schemas/RetrievalQueryRequest"
+            $ref: "#/components/schemas/QueryRequest"
           description: |
             Queries to execute. Each query carries its own table via the
             QueryRequest table field.
@@ -7542,6 +8000,16 @@ components:
         children:
           $ref: "#/components/schemas/HierarchyChildren"
           x-go-type-skip-optional-pointer: false
+    CatalogTableTarget:
+      type: object
+      description: An explicit native table target. Components are literal names; dots do not qualify a string table name.
+      properties:
+        database: {type: string, default: default}
+        namespace: {type: string, default: public}
+        table: {type: string}
+      required: [table]
+      additionalProperties: false
+
     QueryRequest: # Based on remoteindex.Query
       type: object
       not:
@@ -7649,9 +8117,11 @@ components:
                   - required: [join]
                   - required: [foreign_sources]
       properties:
+        table_target:
+          $ref: "#/components/schemas/CatalogTableTarget"
         table:
           type: string
-          description: Name of the table to query. Required for global-query requests.
+          description: Literal table name in default.public. Global queries require exactly one of table or table_target.
           example: "wikipedia"
         query:
           x-go-type: json.RawMessage
@@ -8297,12 +8767,13 @@ components:
         Configuration for joining data from another table.
         Supports inner, left, and right joins with automatic strategy selection.
       required:
-        - right_table
         - "on"
       properties:
+        right_target:
+          $ref: "#/components/schemas/CatalogTableTarget"
         right_table:
           type: string
-          description: Name of the table to join with.
+          description: Literal native table name or declared foreign-source alias. Specify exactly one of right_table or right_target.
           example: "customers"
         join_type:
           $ref: "#/components/schemas/JoinType"
@@ -10341,6 +10812,91 @@ paths:
                 $ref: "#/components/schemas/Error"
         "500":
           $ref: "#/components/responses/InternalServerError"
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}:{action}:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 128
+      - name: namespaceName
+        in: path
+        required: true
+        description: Namespace name
+        schema:
+          type: string
+          maxLength: 128
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the table
+        schema:
+          type: string
+      - name: indexName
+        in: path
+        required: true
+        description: Name of the graph index
+        schema:
+          type: string
+      - name: metricName
+        in: path
+        required: true
+        description: Name of the configured graph metric
+        schema:
+          type: string
+      - name: action
+        in: path
+        required: true
+        description: Operational action to apply to the graph metric materialization
+        schema:
+          type: string
+          enum: [refresh, rebuild, delete, pause, resume]
+    post:
+      summary: Execute a graph metric operational action
+      description: |
+        Refresh, rebuild, delete, pause, or resume maintenance for a configured
+        graph metric. The metric configuration remains owned by the graph index.
+        Refresh and rebuild durably enqueue bounded, resumable maintenance and
+        return the aggregate shard status without waiting for graph-sized work.
+        `delete` clears materialized metric state and durably disables automatic
+        maintenance. A later refresh, rebuild, or resume action re-enables the
+        metric and can publish a new generation.
+      tags:
+        - index_management
+      operationId: executeNamespaceTableGraphMetricAction
+      responses:
+        "200":
+          description: Aggregate graph metric status after the action is durably accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GraphMetricActionResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          description: The table topology or write-owner generation changed, or only some shards accepted the action; retrying is consistency-safe and reuses any still-active build
+          content:
+            text/plain:
+              schema:
+                type: string
+        "429":
+          description: Local storage resources are temporarily exhausted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "405":
+          description: Graph metric actions are unavailable for this runtime
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
   /transactions/commit:
     post:
       summary: Commit an OCC transaction
@@ -11287,9 +11843,32 @@ paths:
             maxLength: 500
           description: Filter tables by regex pattern (e.g., "^prod_.*_v[0-9]+$")
           example: "^user_.*"
+        - name: limit
+          in: query
+          required: false
+          description: Maximum catalog rows examined per page (1-1000). Omit for the complete list. Authorization may return fewer rows; follow X-Antfly-Next-Cursor even for an empty page.
+          schema:
+            type: integer
+            format: int32
+            x-go-type-skip-optional-pointer: false
+            minimum: 1
+            maximum: 1000
+        - name: cursor
+          in: query
+          required: false
+          description: Opaque continuation from X-Antfly-Next-Cursor, bound to the same scope and prefix. Defaults to 100 rows when limit is omitted. Catalog DDL invalidates the cursor with 409; restart the listing.
+          schema:
+            type: string
+            x-go-type-skip-optional-pointer: false
+            maxLength: 4096
       responses:
         "200":
           description: A list of tables
+          headers:
+            X-Antfly-Next-Cursor:
+              description: Continue with this cursor until the header is absent. Pages may contain no authorized rows.
+              schema:
+                type: string
           content:
             application/json:
               schema:
@@ -11298,6 +11877,12 @@ paths:
                   $ref: "#/components/schemas/TableStatus"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "409":
+          description: Catalog changed during pagination. Restart without a cursor.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "500":
           $ref: "#/components/responses/InternalServerError"
   /tables/{tableName}:
@@ -11532,6 +12117,232 @@ paths:
           $ref: "#/components/responses/QueryGatewayTimeout"
         "500":
           $ref: "#/components/responses/QueryInternalServerError"
+  /tables/{tableName}/constraints/status:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: getRelationalConstraintStatus
+      summary: Read distributed UNIQUE, foreign-key, and CHECK validation coverage
+      tags: [data_operations]
+      responses:
+        "200":
+          description: Epoch- and owner-fenced validation status for every active range.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RelationalConstraintStatus"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Schema or ownership changed during status collection.
+        "503":
+          description: One or more current owners could not report authoritative coverage.
+  /tables/{tableName}/constraints/repair:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: repairRelationalConstraints
+      summary: Repair version-conditional rows after failed or diagnosed constraint activation
+      description: |
+        Requires table administrator permission. Each affected target range must
+        have failed UNIQUE/FK/CHECK activation or a validating MATCH PARTIAL
+        missing-parent diagnostic. Replacement values still satisfy all
+        constraints, and referential actions require write permission on every
+        affected table. Existing dependencies remain protected. Repairs do not
+        mark historical coverage valid. Invoke constraint retry after repairing
+        failed activation; validating diagnostics resume validation automatically.
+      tags: [data_operations]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RelationalRowMutationRequest"
+      responses:
+        "201":
+          description: Repair transaction committed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchResponse"
+        "202":
+          description: Commit is durable; visibility or participant recovery is pending.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          description: Administrator or affected-table write permission is missing.
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Activation, schema, row version, or constraint changed.
+        "503":
+          description: Write coordination is temporarily unavailable.
+  /tables/{tableName}/constraints/retry:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: retryRelationalConstraints
+      summary: Restart failed UNIQUE/FK/CHECK validation after administrative repair
+      description: |
+        Requires table administrator permission. Resets each failed owner using
+        an exact checkpoint precondition. Owners already validating or enforced
+        are unchanged. Retrying after partial progress is safe. Inspect the
+        constraint status endpoint for coverage and diagnostics.
+        When a retirement job is active, clears its paused diagnostic and
+        resumes that job instead of restarting activation. Retirement remains
+        fenced and retains all prior drain progress.
+      tags: [data_operations]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RelationalConstraintRetryRequest"
+      responses:
+        "202":
+          description: Failed owner checkpoints reset; background validation is pending.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RelationalConstraintRetryResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          description: Administrator permission is missing.
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Schema or activation state changed; refresh and retry.
+        "503":
+          description: Some owners could not be reset; repeating the request is safe.
+  /tables/{tableName}/constraints/retire:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: retireRelationalConstraints
+      summary: Retire unique and foreign-key definitions safely
+      description: |
+        Requires table administrator permission. Starts a durable, bounded
+        all-owner drain. Poll constraints/status for progress. A target schema
+        is published automatically after the drain. With drop=true the table
+        remains fenced at ready_to_drop until an administrator explicitly
+        deletes it with the existing table deletion endpoint.
+      tags: [data_operations]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RelationalConstraintRetirementRequest"
+      responses:
+        "202":
+          description: Retirement accepted; no data or schema publication is implied yet.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RelationalConstraintRetryResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          description: Administrator permission is missing.
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Schema, retirement state, topology, or incoming foreign-key dependency changed.
+        "503":
+          description: Retirement coordination is temporarily unavailable.
+  /tables/{tableName}/rows/query:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: queryRelationalRows
+      summary: Query projected typed relational rows
+      tags: [data_operations]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RelationalRowQueryRequest"
+      responses:
+        "200":
+          description: Bounded newline-delimited typed rows in primary-key order.
+          content:
+            application/x-ndjson:
+              schema:
+                type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Requested schema epoch is stale.
+        "503":
+          description: Read ownership or storage is temporarily unavailable.
+  /tables/{tableName}/rows/mutate:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: mutateRelationalRows
+      summary: Atomically replace or delete version-conditional typed rows
+      tags: [data_operations]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RelationalRowMutationRequest"
+      responses:
+        "201":
+          description: Atomic mutations committed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchResponse"
+        "202":
+          description: Durable commit decision; participant visibility or recovery is pending.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: A version precondition or relational constraint conflicted.
+        "503":
+          description: Write coordination is temporarily unavailable.
   /tables/{tableName}/batch:
     parameters:
       - name: tableName
@@ -11833,6 +12644,31 @@ paths:
         description: Name of the table
         schema:
           type: string
+      - name: rewrite
+        in: query
+        required: false
+        description: |
+          Explicitly enqueue a durable fresh-generation schema rewrite instead
+          of changing the live schema. Requires administrator permission on the
+          entire dependency cohort. Sources remain writable during snapshot and
+          catch-up; final validation and publication are atomic across the cohort.
+          Returns a restore job (202), whose existing status/cancel routes apply.
+          Independent graph/vector artifacts without a retained row-derived
+          source proof are rejected before admission. The default false retains
+          ordinary schema-update behavior. Existing absent values remain absent
+          rather than retroactively receiving defaults. Stored column type
+          changes and destructive column removal are rejected.
+        schema:
+          type: boolean
+          default: false
+      - name: Idempotency-Key
+        in: header
+        required: false
+        description: Retry identity for rewrite=true admission. Reusing a key for a different rewrite returns 409.
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 256
     put:
       summary: Replace a table's schema
       description: |
@@ -11870,7 +12706,17 @@ paths:
               schema:
                 $ref: "#/components/schemas/Table"
         "202":
-          $ref: "#/components/responses/CommittedMutationAccepted"
+          description: Durable rewrite job accepted, or ordinary schema mutation committed with pending visibility
+          headers:
+            Location:
+              description: Restore job status URL when rewrite=true.
+              schema: { type: string }
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/RestoreJob"
+                  - $ref: "#/components/schemas/CommittedMutationOutcome"
         "400":
           $ref: "#/components/responses/BadRequest"
         "404":
@@ -11920,7 +12766,17 @@ paths:
               schema:
                 $ref: "#/components/schemas/Table"
         "202":
-          $ref: "#/components/responses/CommittedMutationAccepted"
+          description: Durable rewrite job accepted, or ordinary schema mutation committed with pending visibility
+          headers:
+            Location:
+              description: Restore job status URL when rewrite=true.
+              schema: { type: string }
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/RestoreJob"
+                  - $ref: "#/components/schemas/CommittedMutationOutcome"
         "400":
           $ref: "#/components/responses/BadRequest"
         "404":
@@ -12155,6 +13011,159 @@ paths:
           $ref: "#/components/responses/NotFound"
         "405":
           $ref: "#/components/responses/MethodNotAllowed"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /tables/{tableName}/storage/migrations:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      operationId: createTableStorageMigration
+      summary: Create or resume a table storage migration job
+      description: |
+        Table-admin operation for local single-shard standalone tables. Target
+        vector_store changes primary_lsm source ownership without changing models,
+        dimensions, artifacts or logical indexes. Retry creation with the same
+        job_id, target and budgets. The job is advanced explicitly through its
+        job endpoint; the server does not schedule an unattended migration loop.
+        Offline migration uses antfly storage migrate against a stopped server.
+      tags: [data_operations]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [job_id, target]
+              properties:
+                job_id:
+                  type: string
+                  pattern: '^[A-Za-z0-9_-]{1,128}$'
+                target:
+                  type: string
+                  enum: [vector_store]
+                budget:
+                  type: object
+                  additionalProperties: false
+                  properties:
+                    batch_bytes:
+                      type: integer
+                      format: int64
+                      minimum: 4096
+                      maximum: 67108864
+                      default: 4194304
+                    batch_rows:
+                      type: integer
+                      minimum: 1
+                      maximum: 65536
+                      default: 1024
+                    temporary_bytes:
+                      type: integer
+                      format: int64
+                      default: 68719476736
+                    disk_reserve_bytes:
+                      type: integer
+                      format: int64
+                      default: 1073741824
+      responses:
+        "200":
+          description: Durable migration receipt, or admitted receipt before DB preparation
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Conflicting job, lifecycle operation or publication state
+        "503":
+          description: Retryable resource or recovery admission failure
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /tables/{tableName}/storage/migrations/{jobId}:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema: { type: string }
+      - name: jobId
+        in: path
+        required: true
+        schema:
+          type: string
+          pattern: '^[A-Za-z0-9_-]{1,128}$'
+    get:
+      operationId: getTableStorageMigration
+      summary: Read a table storage migration receipt
+      description: |
+        Table-admin observation only. Does not admit, advance, or publish a job.
+        A phase of admitted means catalog admission is durable but DB preparation
+        has not begun; retry creation or send a job action to recover it. The
+        receipt is retained until a later migration replaces it; this endpoint
+        is not a permanent job history.
+      tags: [data_operations]
+      responses:
+        "200":
+          description: Durable migration receipt, or admitted receipt before DB preparation
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Conflicting job, lifecycle operation or publication state
+        "503":
+          description: Retryable resource or recovery admission failure
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+    post:
+      operationId: advanceTableStorageMigration
+      summary: Advance, publish or cancel a table storage migration job
+      description: |
+        Uses the job's durable configuration and budgets. Each step commits
+        bounded progress. Publish is accepted only at ready; complete additionally
+        certifies reference-only primary artifacts and native ANN serving.
+        Cancellation is allowed only before publication. Repeating an action
+        after an ambiguous response resumes the durable job.
+      tags: [data_operations]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [action]
+              properties:
+                action:
+                  type: string
+                  enum: [step, publish, cancel]
+      responses:
+        "200":
+          description: Durable migration receipt, or admitted receipt before DB preparation
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Conflicting job, lifecycle operation or publication state
+        "503":
+          description: Retryable resource or recovery admission failure
         "500":
           $ref: "#/components/responses/InternalServerError"
   /tables/{tableName}/repair/run:
@@ -12850,6 +13859,98 @@ paths:
           $ref: "#/components/responses/NotFound"
         "500":
           $ref: "#/components/responses/InternalServerError"
+  /tables/{tableName}/indexes/{indexName}/retry:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: indexName
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      summary: Retry a failed index build
+      description: >-
+        Generation-fenced relational index maintenance. Requires table ADMIN permission.
+        Retry accepts failed generations.
+        Owners are admitted independently and durably; exact request replay resumes
+        after partial acknowledgements. Unsupported index types return 405.
+      tags: [index_management]
+      operationId: retryIndex
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "indexes.yaml#/components/schemas/IndexMaintenanceRequest"
+      responses:
+        "200":
+          description: All selected owner maintenance commands acknowledged
+          content:
+            application/json:
+              schema:
+                $ref: "indexes.yaml#/components/schemas/IndexMaintenanceResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+        "409":
+          $ref: "#/components/responses/IndexMutationConflict"
+        "429":
+          $ref: "#/components/responses/StorageResourceExhausted"
+        "503":
+          $ref: "#/components/responses/IndexMutationServiceUnavailable"
+  /tables/{tableName}/indexes/{indexName}/repair:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: indexName
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      summary: Repair an index generation
+      description: >-
+        Generation-fenced relational index maintenance. Requires table ADMIN permission.
+        Repair accepts ready or failed generations and rebuilds their derived records.
+        Owners are admitted independently and durably; exact request replay resumes
+        after partial acknowledgements. Unsupported index types return 405.
+      tags: [index_management]
+      operationId: repairIndex
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "indexes.yaml#/components/schemas/IndexMaintenanceRequest"
+      responses:
+        "200":
+          description: All selected owner maintenance commands acknowledged
+          content:
+            application/json:
+              schema:
+                $ref: "indexes.yaml#/components/schemas/IndexMaintenanceResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+        "409":
+          $ref: "#/components/responses/IndexMutationConflict"
+        "429":
+          $ref: "#/components/responses/StorageResourceExhausted"
+        "503":
+          $ref: "#/components/responses/IndexMutationServiceUnavailable"
   /tables/{tableName}/indexes/{indexName}:
     parameters:
       - name: tableName
@@ -12933,6 +14034,1699 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/IndexStatus"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /tablespaces:
+    get:
+      summary: List tablespaces
+      description: Lists tablespace catalog objects visible to the caller.
+      tags:
+        - table_management
+      operationId: listTablespaces
+      responses:
+        "200":
+          description: A list of tablespaces
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/TablespaceCatalogRecord"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /tablespaces/{tablespaceName}:
+    parameters:
+      - name: tablespaceName
+        in: path
+        required: true
+        description: Tablespace name
+        schema:
+          type: string
+          maxLength: 128
+    get:
+      summary: Get tablespace
+      tags:
+        - table_management
+      operationId: getTablespace
+      responses:
+        "200":
+          description: Tablespace details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TablespaceCatalogRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    post:
+      summary: Create tablespace
+      description: Creates a tablespace catalog object. The server applies the same lifecycle semantics as `CREATE TABLESPACE`.
+      tags:
+        - table_management
+      operationId: createTablespace
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateTablespaceRequest"
+      responses:
+        "202":
+          description: Mutation committed; resource visibility is pending. Observe with GET instead of repeating the mutation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CatalogMutationVisibilityPending"
+        "201":
+          description: Tablespace created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TablespaceCatalogRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          description: Tablespace already exists
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+    delete:
+      summary: Drop tablespace
+      description: Drops a tablespace catalog object. Table placement by tablespace is fail-closed until native placement planning consumes tablespace policy.
+      tags:
+        - table_management
+      operationId: dropTablespace
+      responses:
+        "204":
+          description: Tablespace dropped
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /databases:
+    get:
+      summary: List databases
+      description: Lists database catalog objects visible to the caller. Shorthand table APIs resolve through the caller's current/default database.
+      tags:
+        - table_management
+      operationId: listDatabases
+      responses:
+        "200":
+          description: A list of databases
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/DatabaseCatalogRecord"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /databases/{databaseName}:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 128
+    get:
+      summary: Get database
+      tags:
+        - table_management
+      operationId: getDatabase
+      responses:
+        "200":
+          description: Database details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DatabaseCatalogRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    post:
+      summary: Create database
+      description: Creates a database catalog object. The server applies the same semantics as `CREATE DATABASE`.
+      tags:
+        - table_management
+      operationId: createDatabase
+      responses:
+        "202":
+          description: Mutation committed; resource visibility is pending. Observe with GET instead of repeating the mutation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CatalogMutationVisibilityPending"
+        "201":
+          description: Database created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DatabaseCatalogRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          description: Database already exists
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+    delete:
+      summary: Drop database
+      description: Drops an empty database catalog object. Non-empty databases fail with a conflict.
+      tags:
+        - table_management
+      operationId: dropDatabase
+      responses:
+        "204":
+          description: Database dropped
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Database is not empty
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /databases/{databaseName}/tablespace:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 128
+    put:
+      summary: Set database tablespace
+      description: Binds the database catalog object to an existing tablespace.
+      tags:
+        - table_management
+      operationId: setDatabaseTablespace
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CatalogTablespaceBindingRequest"
+      responses:
+        "202":
+          description: Mutation committed; resource visibility is pending. Observe with GET instead of repeating the mutation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CatalogMutationVisibilityPending"
+        "200":
+          description: Updated database
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DatabaseCatalogRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+    delete:
+      summary: Clear database tablespace
+      description: Clears the database catalog object's durable tablespace binding.
+      tags:
+        - table_management
+      operationId: clearDatabaseTablespace
+      responses:
+        "202":
+          description: Mutation committed; resource visibility is pending. Observe with GET instead of repeating the mutation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CatalogMutationVisibilityPending"
+        "200":
+          description: Updated database
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DatabaseCatalogRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /databases/{databaseName}/namespaces:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 128
+    get:
+      summary: List namespaces
+      description: Lists namespace catalog objects inside a database. PostgreSQL schemas map to these namespaces.
+      tags:
+        - table_management
+      operationId: listNamespaces
+      responses:
+        "200":
+          description: A list of namespaces in the database
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/NamespaceCatalogRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /databases/{databaseName}/namespaces/{namespaceName}:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 128
+      - name: namespaceName
+        in: path
+        required: true
+        description: Namespace name
+        schema:
+          type: string
+          maxLength: 128
+    post:
+      summary: Create namespace
+      description: Creates a namespace catalog object in a database. The server applies the same semantics as `CREATE SCHEMA` for the selected database.
+      tags:
+        - table_management
+      operationId: createNamespace
+      responses:
+        "202":
+          description: Mutation committed; resource visibility is pending. Observe with GET instead of repeating the mutation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CatalogMutationVisibilityPending"
+        "201":
+          description: Namespace created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NamespaceCatalogRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Namespace already exists
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+    delete:
+      summary: Drop namespace
+      description: Drops an empty namespace catalog object. Non-empty namespaces fail with a conflict.
+      tags:
+        - table_management
+      operationId: dropNamespace
+      responses:
+        "204":
+          description: Namespace dropped
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Namespace is not empty
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /databases/{databaseName}/namespaces/{namespaceName}/tablespace:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 128
+      - name: namespaceName
+        in: path
+        required: true
+        description: Namespace name
+        schema:
+          type: string
+          maxLength: 128
+    put:
+      summary: Set namespace tablespace
+      description: Binds the namespace catalog object to an existing tablespace.
+      tags:
+        - table_management
+      operationId: setNamespaceTablespace
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CatalogTablespaceBindingRequest"
+      responses:
+        "202":
+          description: Mutation committed; resource visibility is pending. Observe with GET instead of repeating the mutation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CatalogMutationVisibilityPending"
+        "200":
+          description: Updated namespace
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NamespaceCatalogRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+    delete:
+      summary: Clear namespace tablespace
+      description: Clears the namespace catalog object's durable tablespace binding.
+      tags:
+        - table_management
+      operationId: clearNamespaceTablespace
+      responses:
+        "202":
+          description: Mutation committed; resource visibility is pending. Observe with GET instead of repeating the mutation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CatalogMutationVisibilityPending"
+        "200":
+          description: Updated namespace
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NamespaceCatalogRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /databases/{databaseName}/namespaces/{namespaceName}/tables:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 128
+      - name: namespaceName
+        in: path
+        required: true
+        description: Namespace name
+        schema:
+          type: string
+          maxLength: 128
+    get:
+      summary: List tables in namespace
+      description: Lists table catalog objects under an explicit database and namespace.
+      tags:
+        - table_management
+      operationId: listNamespaceTables
+      parameters:
+        - name: prefix
+          in: query
+          required: false
+          schema:
+            type: string
+            maxLength: 128
+          description: Filter tables by name prefix.
+        - name: limit
+          in: query
+          required: false
+          description: Maximum catalog rows examined per page (1-1000). Omit for the complete list. Authorization may return fewer rows; follow X-Antfly-Next-Cursor even for an empty page.
+          schema:
+            type: integer
+            format: int32
+            x-go-type-skip-optional-pointer: false
+            minimum: 1
+            maximum: 1000
+        - name: cursor
+          in: query
+          required: false
+          description: Opaque continuation from X-Antfly-Next-Cursor, bound to the same scope and prefix. Defaults to 100 rows when limit is omitted. Catalog DDL invalidates the cursor with 409; restart the listing.
+          schema:
+            type: string
+            x-go-type-skip-optional-pointer: false
+            maxLength: 4096
+      responses:
+        "200":
+          description: A list of tables in the namespace
+          headers:
+            X-Antfly-Next-Cursor:
+              description: Continue with this cursor until the header is absent. Pages may contain no authorized rows.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/TableStatus"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Catalog changed during pagination. Restart without a cursor.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 128
+      - name: namespaceName
+        in: path
+        required: true
+        description: Namespace name
+        schema:
+          type: string
+          maxLength: 128
+      - name: tableName
+        in: path
+        required: true
+        description: Table name
+        schema:
+          type: string
+          maxLength: 255
+    get:
+      summary: Get namespace table details
+      description: Gets a table through an explicit database and namespace route.
+      tags:
+        - table_management
+      operationId: getNamespaceTable
+      responses:
+        "200":
+          description: Table details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TableStatus"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    post:
+      summary: Create namespace table
+      description: Creates a table through an explicit database and namespace route.
+      tags:
+        - table_management
+      operationId: createNamespaceTable
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateTableRequest"
+      responses:
+        "201":
+          description: Table created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TableStatus"
+        "202":
+          $ref: "#/components/responses/CommittedMutationAccepted"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "501":
+          description: Explicit catalog table lifecycle is not supported by the configured local table write backend.
+    delete:
+      summary: Drop namespace table
+      description: Drops a table through an explicit database and namespace route.
+      tags:
+        - table_management
+      operationId: dropNamespaceTable
+      responses:
+        "204":
+          description: Table dropped
+        "202":
+          $ref: "#/components/responses/CommittedMutationAccepted"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "501":
+          description: Explicit catalog table lifecycle is not supported by the configured local table write backend.
+
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/query:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 128
+      - name: namespaceName
+        in: path
+        required: true
+        description: Namespace name
+        schema:
+          type: string
+          maxLength: 128
+      - name: tableName
+        in: path
+        required: true
+        description: Table name
+        schema:
+          type: string
+          maxLength: 255
+    post:
+      summary: Query an explicit namespace table
+      description: Queries a table through an explicit database and namespace route. While storage APIs are still bare-table-name based, the server fails closed when the resolved catalog table does not map to a unique physical table name.
+      tags:
+        - query_operations
+      operationId: queryNamespaceTable
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StatefulQueryRequest"
+          application/x-ndjson:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: Query successful
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QueryResponses"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "501":
+          description: Catalog target cannot be delegated to legacy table storage unambiguously.
+
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/batch:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 128
+      - name: namespaceName
+        in: path
+        required: true
+        description: Namespace name
+        schema:
+          type: string
+          maxLength: 128
+      - name: tableName
+        in: path
+        required: true
+        description: Table name
+        schema:
+          type: string
+          maxLength: 255
+    post:
+      summary: Perform batch inserts and deletes on an explicit namespace table
+      description: Performs batch writes through an explicit database and namespace route. While storage APIs are still bare-table-name based, the server fails closed when the resolved catalog table does not map to a unique physical table name.
+      tags:
+        - data_operations
+      operationId: batchNamespaceTable
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BatchRequest"
+      responses:
+        "201":
+          description: Batch operation successful
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "501":
+          description: Catalog target cannot be delegated to legacy table storage unambiguously.
+
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/schema:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 128
+      - name: namespaceName
+        in: path
+        required: true
+        description: Namespace name
+        schema:
+          type: string
+          maxLength: 128
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the table
+        schema:
+          type: string
+    put:
+      summary: Replace a table's schema
+      description: |
+        Replaces the complete table schema. Properties omitted from the request
+        are removed. Use PATCH on this path for a partial JSON Merge Patch update.
+      tags:
+        - table_management
+      operationId: updateNamespaceTableSchema
+      parameters:
+        - name: If-Match
+          in: header
+          required: false
+          description: Strong schema ETag returned by a previous schema mutation, for example `"schema-0"`. A mismatch returns 409 instead of overwriting a concurrent update.
+          schema:
+            type: string
+            pattern: '^"schema-[0-9]+"$'
+            example: '"schema-0"'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "schema.yaml#/components/schemas/TableSchema"
+      responses:
+        "200":
+          description: Schema updated successfully
+          headers:
+            ETag:
+              description: Strong ETag for the committed schema version.
+              schema:
+                type: string
+                example: '"schema-1"'
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Table"
+        "202":
+          $ref: "#/components/responses/CommittedMutationAccepted"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+    patch:
+      summary: Patch a table's schema
+      description: |
+        Applies an RFC 7396 JSON Merge Patch to the current table schema. Object
+        members are merged recursively and a null value removes that member.
+        Antfly validates and versions the resulting complete schema atomically.
+      tags:
+        - table_management
+      operationId: patchNamespaceTableSchema
+      parameters:
+        - name: If-Match
+          in: header
+          required: false
+          description: Strong schema ETag returned by a previous schema mutation, for example `"schema-0"`. A mismatch returns 409 instead of overwriting a concurrent update.
+          schema:
+            type: string
+            pattern: '^"schema-[0-9]+"$'
+            example: '"schema-0"'
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              $ref: "#/components/schemas/TableSchemaPatch"
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TableSchemaPatch"
+      responses:
+        "200":
+          description: Schema patched successfully
+          headers:
+            ETag:
+              description: Strong ETag for the committed schema version.
+              schema:
+                type: string
+                example: '"schema-1"'
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Table"
+        "202":
+          $ref: "#/components/responses/CommittedMutationAccepted"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/backup:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 128
+      - name: namespaceName
+        in: path
+        required: true
+        description: Namespace name
+        schema:
+          type: string
+          maxLength: 128
+      - name: tableName
+        in: path
+        required: true
+        description: Table name
+        schema:
+          type: string
+          maxLength: 255
+    post:
+      summary: Backup an explicit namespace table
+      tags:
+        - data_operations
+      operationId: backupNamespaceTable
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BackupRequest"
+      responses:
+        "201":
+          description: Backup process initiated successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  backup:
+                    type: string
+                    example: successful
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/restore:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 128
+      - name: namespaceName
+        in: path
+        required: true
+        description: Namespace name
+        schema:
+          type: string
+          maxLength: 128
+      - name: tableName
+        in: path
+        required: true
+        description: Table name
+        schema:
+          type: string
+          maxLength: 255
+    post:
+      summary: Restore an explicit namespace table from backup
+      tags:
+        - data_operations
+      operationId: restoreNamespaceTable
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 256
+            x-go-type-skip-optional-pointer: false
+          description: Stable key used to safely retry creation of this restore job. Keys are scoped to the authenticated principal and table. Requests without this header create a new job.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RestoreRequest"
+      responses:
+        "202":
+          description: Restore process triggered successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RestoreJob"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/documents/{key}:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 128
+      - name: namespaceName
+        in: path
+        required: true
+        description: Namespace name
+        schema:
+          type: string
+          maxLength: 128
+      - name: tableName
+        in: path
+        required: true
+        description: Table name
+        schema:
+          type: string
+          maxLength: 255
+      - name: key
+        in: path
+        required: true
+        description: Key of the document to retrieve
+        schema:
+          type: string
+    get:
+      summary: Retrieve a document by key from an explicit namespace table
+      description: Retrieves a document through an explicit database and namespace route. While storage APIs are still bare-table-name based, the server fails closed when the resolved catalog table does not map to a unique physical table name.
+      tags:
+        - data_operations
+      operationId: lookupNamespaceTableDocument
+      parameters:
+        - name: fields
+          in: query
+          required: false
+          description: Comma-separated list of fields to include in the response.
+          schema:
+            type: string
+        - name: consistency
+          in: query
+          required: false
+          description: Read consistency; defaults to read_index.
+          schema:
+            type: string
+            enum: [read_index, stale]
+      responses:
+        "200":
+          description: Record found
+          headers:
+            X-Antfly-Version:
+              description: Version token for this document.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "501":
+          description: Catalog target cannot be delegated to legacy table storage unambiguously.
+
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 128
+      - name: namespaceName
+        in: path
+        required: true
+        description: Namespace name
+        schema:
+          type: string
+          maxLength: 128
+      - name: tableName
+        in: path
+        required: true
+        description: Table name
+        schema:
+          type: string
+          maxLength: 255
+    get:
+      summary: List indexes for an explicit namespace table
+      description: Lists index metadata through an explicit database and namespace route.
+      tags:
+        - index_management
+      operationId: listNamespaceTableIndexes
+      responses:
+        "200":
+          description: A list of indexes for the table
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/IndexStatus"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "501":
+          description: Catalog target cannot be delegated to legacy table storage unambiguously.
+
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 128
+      - name: namespaceName
+        in: path
+        required: true
+        description: Namespace name
+        schema:
+          type: string
+          maxLength: 128
+      - name: tableName
+        in: path
+        required: true
+        description: Table name
+        schema:
+          type: string
+          maxLength: 255
+      - name: indexName
+        in: path
+        required: true
+        description: Name of the index
+        schema:
+          type: string
+    get:
+      summary: Get index details for an explicit namespace table
+      tags:
+        - index_management
+      operationId: getNamespaceTableIndex
+      responses:
+        "200":
+          description: Index details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IndexStatus"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "501":
+          description: Catalog target cannot be delegated to legacy table storage unambiguously.
+    post:
+      summary: Add an index to an explicit namespace table
+      tags:
+        - index_management
+      operationId: createNamespaceTableIndex
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "indexes.yaml#/components/schemas/CreateIndexRequest"
+      responses:
+        "201":
+          description: Index added successfully
+          content:
+            application/json:
+              schema:
+                $ref: "indexes.yaml#/components/schemas/CreatedIndex"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "501":
+          description: Catalog target cannot be delegated to legacy table storage unambiguously.
+    delete:
+      summary: Drop an index from an explicit namespace table
+      tags:
+        - index_management
+      operationId: dropNamespaceTableIndex
+      responses:
+        "201":
+          description: Index dropped successfully
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "501":
+          description: Catalog target cannot be delegated to legacy table storage unambiguously.
+
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/status:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: { type: string }
+      - name: namespaceName
+        in: path
+        required: true
+        schema: { type: string }
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: getNamespaceRelationalConstraintStatus
+      summary: Read distributed UNIQUE, foreign-key, and CHECK validation coverage
+      tags: [data_operations]
+      responses:
+        "200":
+          description: Epoch- and owner-fenced validation status for every active range.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RelationalConstraintStatus"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Schema or ownership changed during status collection.
+        "503":
+          description: One or more current owners could not report authoritative coverage.
+
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/repair:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: { type: string }
+      - name: namespaceName
+        in: path
+        required: true
+        schema: { type: string }
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: repairNamespaceRelationalConstraints
+      summary: Repair version-conditional rows after failed or diagnosed constraint activation
+      description: |
+        Requires table administrator permission. Each affected target range must
+        have failed UNIQUE/FK/CHECK activation or a validating MATCH PARTIAL
+        missing-parent diagnostic. Replacement values still satisfy all
+        constraints, and referential actions require write permission on every
+        affected table. Existing dependencies remain protected. Repairs do not
+        mark historical coverage valid. Invoke constraint retry after repairing
+        failed activation; validating diagnostics resume validation automatically.
+      tags: [data_operations]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RelationalRowMutationRequest"
+      responses:
+        "201":
+          description: Repair transaction committed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchResponse"
+        "202":
+          description: Commit is durable; visibility or participant recovery is pending.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          description: Administrator or affected-table write permission is missing.
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Activation, schema, row version, or constraint changed.
+        "503":
+          description: Write coordination is temporarily unavailable.
+
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/retry:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: { type: string }
+      - name: namespaceName
+        in: path
+        required: true
+        schema: { type: string }
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: retryNamespaceRelationalConstraints
+      summary: Restart failed UNIQUE/FK/CHECK validation after administrative repair
+      description: |
+        Requires table administrator permission. Resets each failed owner using
+        an exact checkpoint precondition. Owners already validating or enforced
+        are unchanged. Retrying after partial progress is safe. Inspect the
+        constraint status endpoint for coverage and diagnostics.
+        When a retirement job is active, clears its paused diagnostic and
+        resumes that job instead of restarting activation. Retirement remains
+        fenced and retains all prior drain progress.
+      tags: [data_operations]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RelationalConstraintRetryRequest"
+      responses:
+        "202":
+          description: Failed owner checkpoints reset; background validation is pending.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RelationalConstraintRetryResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          description: Administrator permission is missing.
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Schema or activation state changed; refresh and retry.
+        "503":
+          description: Some owners could not be reset; repeating the request is safe.
+
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/retire:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: { type: string }
+      - name: namespaceName
+        in: path
+        required: true
+        schema: { type: string }
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: retireNamespaceRelationalConstraints
+      summary: Retire unique and foreign-key definitions safely
+      description: |
+        Requires table administrator permission. Starts a durable, bounded
+        all-owner drain. Poll constraints/status for progress. A target schema
+        is published automatically after the drain. With drop=true the table
+        remains fenced at ready_to_drop until an administrator explicitly
+        deletes it with the existing table deletion endpoint.
+      tags: [data_operations]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RelationalConstraintRetirementRequest"
+      responses:
+        "202":
+          description: Retirement accepted; no data or schema publication is implied yet.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RelationalConstraintRetryResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          description: Administrator permission is missing.
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Schema, retirement state, topology, or incoming foreign-key dependency changed.
+        "503":
+          description: Retirement coordination is temporarily unavailable.
+
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rows/query:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: { type: string }
+      - name: namespaceName
+        in: path
+        required: true
+        schema: { type: string }
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: queryNamespaceRelationalRows
+      summary: Query projected typed relational rows
+      tags: [data_operations]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RelationalRowQueryRequest"
+      responses:
+        "200":
+          description: Bounded newline-delimited typed rows in primary-key order.
+          content:
+            application/x-ndjson:
+              schema:
+                type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Requested schema epoch is stale.
+        "503":
+          description: Read ownership or storage is temporarily unavailable.
+
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rows/mutate:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: { type: string }
+      - name: namespaceName
+        in: path
+        required: true
+        schema: { type: string }
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: mutateNamespaceRelationalRows
+      summary: Atomically replace or delete version-conditional typed rows
+      tags: [data_operations]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RelationalRowMutationRequest"
+      responses:
+        "201":
+          description: Atomic mutations committed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchResponse"
+        "202":
+          description: Durable commit decision; participant visibility or recovery is pending.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: A version precondition or relational constraint conflicted.
+        "503":
+          description: Write coordination is temporarily unavailable.
+
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/retry:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: { type: string }
+      - name: namespaceName
+        in: path
+        required: true
+        schema: { type: string }
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: indexName
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      summary: Retry a failed index build
+      description: >-
+        Generation-fenced relational index maintenance. Requires table ADMIN permission.
+        Retry accepts failed generations.
+        Owners are admitted independently and durably; exact request replay resumes
+        after partial acknowledgements. Unsupported index types return 405.
+      tags: [index_management]
+      operationId: retryNamespaceIndex
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "indexes.yaml#/components/schemas/IndexMaintenanceRequest"
+      responses:
+        "200":
+          description: All selected owner maintenance commands acknowledged
+          content:
+            application/json:
+              schema:
+                $ref: "indexes.yaml#/components/schemas/IndexMaintenanceResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+        "409":
+          $ref: "#/components/responses/IndexMutationConflict"
+        "429":
+          $ref: "#/components/responses/StorageResourceExhausted"
+        "503":
+          $ref: "#/components/responses/IndexMutationServiceUnavailable"
+
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/repair:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: { type: string }
+      - name: namespaceName
+        in: path
+        required: true
+        schema: { type: string }
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: indexName
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      summary: Repair an index generation
+      description: >-
+        Generation-fenced relational index maintenance. Requires table ADMIN permission.
+        Repair accepts ready or failed generations and rebuilds their derived records.
+        Owners are admitted independently and durably; exact request replay resumes
+        after partial acknowledgements. Unsupported index types return 405.
+      tags: [index_management]
+      operationId: repairNamespaceIndex
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "indexes.yaml#/components/schemas/IndexMaintenanceRequest"
+      responses:
+        "200":
+          description: All selected owner maintenance commands acknowledged
+          content:
+            application/json:
+              schema:
+                $ref: "indexes.yaml#/components/schemas/IndexMaintenanceResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+        "409":
+          $ref: "#/components/responses/IndexMutationConflict"
+        "429":
+          $ref: "#/components/responses/StorageResourceExhausted"
+        "503":
+          $ref: "#/components/responses/IndexMutationServiceUnavailable"
+
+  /databases/{databaseName}/rename:
+    post:
+      operationId: renameDatabase
+      summary: Rename catalog resource
+      tags: [table_management]
+      parameters:
+        - name: databaseName
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RenameCatalogResourceRequest"
+      responses:
+        '204':
+          description: Renamed with stable identity.
+        '400':
+          description: Invalid name.
+        '404':
+          description: Resource not found.
+        '409':
+          description: Name already exists or resource is protected.
+
+  /databases/{databaseName}/namespaces/{namespaceName}/rename:
+    post:
+      operationId: renameNamespace
+      summary: Rename catalog resource
+      tags: [table_management]
+      parameters:
+        - name: databaseName
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: namespaceName
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RenameCatalogResourceRequest"
+      responses:
+        '204':
+          description: Renamed with stable identity.
+        '400':
+          description: Invalid name.
+        '404':
+          description: Resource not found.
+        '409':
+          description: Name already exists or resource is protected.
+
+  /tablespaces/{tablespaceName}/rename:
+    post:
+      operationId: renameTablespace
+      summary: Rename catalog resource
+      tags: [table_management]
+      parameters:
+        - name: tablespaceName
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RenameCatalogResourceRequest"
+      responses:
+        '204':
+          description: Renamed with stable identity.
+        '400':
+          description: Invalid name.
+        '404':
+          description: Resource not found.
+        '409':
+          description: Name already exists or resource is protected.
+
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rename:
+    post:
+      operationId: renameNamespaceTable
+      summary: Rename catalog resource
+      tags: [table_management]
+      parameters:
+        - name: databaseName
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: namespaceName
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: tableName
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RenameCatalogResourceRequest"
+      responses:
+        '204':
+          description: Renamed with stable identity.
+        '400':
+          description: Invalid name.
+        '404':
+          description: Resource not found.
+        '409':
+          description: Name already exists or resource is protected.
+
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/tablespace:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 128
+      - name: namespaceName
+        in: path
+        required: true
+        description: Namespace name
+        schema:
+          type: string
+          maxLength: 128
+    put:
+      summary: Set namespace tablespace
+      description: Binds the namespace catalog object to an existing tablespace.
+      tags:
+        - table_management
+      operationId: setNamespaceTableTablespace
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CatalogTablespaceBindingRequest"
+      responses:
+        "204":
+          description: Updated namespace
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+    delete:
+      summary: Clear namespace tablespace
+      description: Clears the namespace catalog object's durable tablespace binding.
+      tags:
+        - table_management
+      operationId: clearNamespaceTableTablespace
+      responses:
+        "204":
+          description: Updated namespace
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "404":
           $ref: "#/components/responses/NotFound"
         "500":

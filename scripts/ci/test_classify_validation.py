@@ -61,9 +61,11 @@ class ClassifyValidationTests(unittest.TestCase):
         self.assertFalse(scopes["antfarm_e2e"])
 
     def test_formatter_infrastructure_checks_every_language(self) -> None:
-        scopes = classify(["scripts/format.sh"])
-        for language in ("zig", "go", "python", "typescript", "rust"):
-            self.assertTrue(scopes[f"format_{language}"])
+        for path in ("scripts/format.sh", "ruff.toml"):
+            with self.subTest(path=path):
+                scopes = classify([path])
+                for language in ("zig", "go", "python", "typescript", "rust"):
+                    self.assertTrue(scopes[f"format_{language}"])
 
     def test_shared_validation_infrastructure_runs_every_contract(self) -> None:
         for path in (

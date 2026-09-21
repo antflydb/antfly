@@ -6,6 +6,7 @@
 const std = @import("std");
 const codec = @import("db/enrichment/artifact_codec.zig");
 const keys = @import("internal_keys.zig");
+const migration = @import("../common/vector_migration.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Stats = struct {
@@ -91,6 +92,8 @@ pub const Stats = struct {
     resolved_bytes: u64 = 0,
     active_wal_bytes: u64 = 0,
     immutable_block_bytes: u64 = 0,
+    // Owner-local collection observations, not restored with retained inventory
+    // on open. Require collections > 0 when asserting a completed collection.
     live_payloads_at_collection: u64 = 0,
     live_payload_bytes_at_collection: u64 = 0,
     collections: u64 = 0,
@@ -318,6 +321,10 @@ pub const Session = struct {
     refs: std.atomic.Value(usize) = .init(1),
     arena: std.heap.ArenaAllocator,
     store: Store,
+    /// Pre-publication writes retain inline authority while atomically
+    /// maintaining the migration's durable candidate reference root.
+    capture_inline: bool = false,
+    migration_allowance: ?u64 = null,
     // Keep preparations contiguous for one durable append, indexed by their
     // immutable identity for reads. The index owns no second payload copy and
     // is released with this transaction, including on abort.
@@ -354,6 +361,9 @@ pub const Session = struct {
     }
     pub fn retain(self: *Session) void {
         _ = self.refs.fetchAdd(1, .monotonic);
+    }
+    pub fn primaryValue(self: *const Session, inline_value: []const u8, prepared_value: []const u8) []const u8 {
+        return if (self.capture_inline) inline_value else prepared_value;
     }
     pub fn release(self: *Session) void {
         if (self.refs.fetchSub(1, .acq_rel) != 1) return;
@@ -474,8 +484,24 @@ pub const Session = struct {
     /// existing replay WAL. No independent journal can outlive its checkpoint.
     /// Called only after the physical artifact mutation succeeded.
     pub fn recordOwnership(self: *Session, txn: anytype, key: []const u8, value: ?[]const u8) !void {
-        if (!ownershipEnabled() or !isEmbeddingKey(key)) return;
+        if (!isEmbeddingKey(key)) return;
         errdefer self.ownership_failed = true;
+        if (self.capture_inline) {
+            const candidate_key = try migration.candidateKeyAlloc(self.alloc, key);
+            defer self.alloc.free(candidate_key);
+            if (value) |raw| {
+                if (isReference(raw)) {
+                    try txn.put(candidate_key, raw);
+                    return;
+                }
+            }
+            txn.delete(candidate_key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+            return;
+        }
+        if (!ownershipEnabled()) return;
         var owner_key: [ownership_prefix.len + 32]u8 = undefined;
         @memcpy(owner_key[0..ownership_prefix.len], ownership_prefix);
         std.crypto.hash.sha2.Sha256.hash(key, owner_key[ownership_prefix.len..], .{});
@@ -515,6 +541,26 @@ pub const Session = struct {
     pub fn stageReferenceEpoch(self: *Session, txn: anytype) !void {
         if (self.ownership_failed) return error.VectorOwnershipMutationFailed;
         if (!self.reference_mutated or self.reference_epoch_staged) return;
+        if (self.migration_allowance) |limit| {
+            const before = txn.get(migration.accounting_key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            var charged: u64 = if (before) |raw| blk: {
+                if (raw.len != 8) return error.InvalidVectorMigrationState;
+                break :blk std.mem.readInt(u64, raw[0..8], .little);
+            } else 0;
+            // Conservative overlap allowance includes source WAL/segments,
+            // primary candidate/reference rows and transaction/replay copies.
+            for (self.prepared.keys()) |item| {
+                charged = try std.math.add(u64, charged, try std.math.mul(u64, item.artifact.len + reference_len + 1024, 8));
+            }
+            if (charged > limit) return error.VectorMigrationTemporaryBudgetExceeded;
+            var encoded: [8]u8 = undefined;
+            std.mem.writeInt(u64, &encoded, charged, .little);
+            try txn.put(migration.accounting_key, &encoded);
+        }
+
         const previous = txn.get(reference_epoch_key) catch |err| switch (err) {
             error.NotFound => null,
             else => return err,

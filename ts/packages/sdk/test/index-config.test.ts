@@ -7,7 +7,120 @@ import {
   validateCreateIndexRequestRelationships,
 } from "../src/index-config.js";
 
+import { indexEmbedderProviders } from "../src/types.js";
+
+describe("relational index request validation", () => {
+  const config = {
+    type: "relational",
+    keys: [{ column: "tenant" }, { column: "id", direction: "desc" }],
+    include_columns: ["status"],
+    where: [
+      { column: "status", op: "eq", value: "open" },
+      { column: "id", op: "gt", value: "9007199254740993" },
+    ],
+  };
+  it("preserves composite partial declarations and exact literals", () => {
+    const before = JSON.stringify(config);
+    expect(() => validateCreateIndexRequestRelationships(config)).not.toThrow();
+    expect(JSON.stringify(config)).toBe(before);
+    for (const op of ["is_null", "is_not_null", "is_distinct", "is_not_distinct"]) {
+      expect(() =>
+        validateCreateIndexRequestRelationships({
+          ...config,
+          where: [{ column: "id", op, value: null }],
+        })
+      ).not.toThrow();
+    }
+  });
+  it("rejects unsupported shapes and duplicate key or include columns", () => {
+    for (const invalid of [
+      { keys: [] },
+      { keys: [{ column: "id" }, { column: "id" }] },
+      { include_columns: ["id"] },
+      { where: [{ column: "id", op: "__proto__" }] },
+      { where: [{ column: "id", op: "is_null", value: 1 }] },
+      { where: [{ column: "id", op: "eq", value: { literal: 1 } }] },
+      { where: [{ column: "id", op: "eq", value: Number.NaN }] },
+      { where: Array.from({ length: 257 }, () => ({ column: "id", op: "is_null" })) },
+      { unique: true },
+      { enrichments: [] },
+      { version: 1 },
+    ])
+      expect(() => validateCreateIndexRequestRelationships({ ...config, ...invalid })).toThrow();
+  });
+  it("accepts mixed expression keys without mutating exact literals or INCLUDED inputs", () => {
+    const expression = {
+      op: "add",
+      args: [
+        { op: "column", column: "id" },
+        { op: "literal", type: "integer", value: "9007199254740993" },
+      ],
+    };
+    const request = {
+      type: "relational",
+      keys: [{ column: "tenant" }, { expression, result_type: "integer", direction: "desc" }],
+      include_columns: ["id"],
+    };
+    const before = JSON.stringify(request);
+    expect(() => validateCreateIndexRequestRelationships(request)).not.toThrow();
+    expect(JSON.stringify(request)).toBe(before);
+  });
+  it("budgets blob literals by decoded bytes and strings by UTF-8 bytes", () => {
+    const request = (type: string, value: string) => ({
+      type: "relational",
+      keys: [
+        {
+          expression: { op: "literal", type, value },
+          result_type: type,
+        },
+      ],
+    });
+    // 810 KiB decoded, but >1 MiB as base64: valid on the native compiler.
+    expect(() =>
+      validateCreateIndexRequestRelationships(request("blob", "AAAA".repeat(270 * 1024)))
+    ).not.toThrow();
+    expect(() =>
+      validateCreateIndexRequestRelationships(request("blob", "AAAA".repeat(350 * 1024)))
+    ).toThrow();
+    expect(() => validateCreateIndexRequestRelationships(request("blob", "!!=="))).toThrow();
+    expect(() =>
+      validateCreateIndexRequestRelationships(request("string", "é".repeat(600 * 1024)))
+    ).toThrow();
+  });
+  it("rejects ambiguous, unbounded and malformed expression keys", () => {
+    const literal = { op: "literal", type: "integer", value: 1 };
+    const expressionKey = { expression: literal, result_type: "integer" };
+    let deep: unknown = literal;
+    for (let i = 0; i < 16; ++i) deep = { op: "negate", args: [deep] };
+    for (const key of [
+      {},
+      { column: "id", ...expressionKey },
+      { column: "id", result_type: "integer" },
+      { expression: literal },
+      { ...expressionKey, result_type: "object" },
+      { ...expressionKey, expression: { ...literal, value: 9007199254740992 } },
+      { ...expressionKey, expression: { ...literal, column: "id" } },
+      { ...expressionKey, expression: { op: "__proto__", args: [] } },
+      { ...expressionKey, expression: { op: "add", args: [literal] } },
+      { ...expressionKey, expression: deep },
+    ])
+      expect(() =>
+        validateCreateIndexRequestRelationships({ type: "relational", keys: [key] })
+      ).toThrow();
+  });
+});
+
 describe("artifact embedding index configuration", () => {
+  it("offers OpenRouter for managed embedding indexes", () => {
+    expect(indexEmbedderProviders).toContain("openrouter");
+    const config = artifactEmbeddingIndexConfig("router_vectors", {
+      sources: [{ artifact: "dense_v1", field: "body" }],
+      embedder: { provider: "openrouter", model: "openai/text-embedding-3-small" },
+      dimension: 1536,
+    });
+    expect(config.embedder?.provider).toBe("openrouter");
+  });
+
   it("builds a full-text index over multiple artifact streams", () => {
     expect(
       artifactFullTextIndexConfig("document_text", "document_text_v1", "document_chunks_v1")

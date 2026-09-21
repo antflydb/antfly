@@ -71,7 +71,7 @@ components:
 
     ResourceType:
       type: string
-      enum: ["table", "user", "inference", "*"]
+      enum: ["table", "database", "namespace", "tablespace", "user", "inference", "*"]
       description: "Type of resource: table, user, inference, or global ('*'). Use inference with resource '*' to grant access to unified inference routes."
       example: "table"
 
@@ -81,19 +81,45 @@ components:
       description: "Type of permission."
       example: "read"
 
+    CatalogTableScope:
+      type: object
+      description: A table or all tables in an explicit namespace. A missing table selects the namespace; a table named '*' remains literal.
+      properties:
+        database:
+          type: string
+          default: default
+        namespace:
+          type: string
+          default: public
+        table:
+          type: string
+      additionalProperties: false
+
+    ScopedRowFilter:
+      type: object
+      properties:
+        table_target:
+          $ref: "#/components/schemas/CatalogTableScope"
+        filter:
+          type: object
+          additionalProperties: {}
+      required: [table_target, filter]
+
     Permission:
       type: object
+      description: Specify exactly one of a legacy literal resource or a structured table_target; table_target requires resource_type table.
       properties:
         resource:
           type: string
           description: "Resource name (e.g., table name, target username, or '*' for all inference operations or a global grant)."
           example: "orders_table"
+        table_target:
+          $ref: "#/components/schemas/CatalogTableScope"
         resource_type:
           $ref: "#/components/schemas/ResourceType"
         type:
           $ref: "#/components/schemas/PermissionType"
       required:
-        - resource
         - resource_type
         - type
 
@@ -213,6 +239,10 @@ components:
             $ref: "#/components/schemas/Permission"
           nullable: true
           description: "Optional permission scoping. If empty, inherits owner's full permissions."
+        scoped_row_filters:
+          type: array
+          items:
+            $ref: "#/components/schemas/ScopedRowFilter"
         row_filter:
           type: object
           additionalProperties: {}
@@ -262,6 +292,8 @@ components:
           type: string
           description: "Table name (or '*' for all tables)."
           example: "orders"
+        table_target:
+          $ref: "#/components/schemas/CatalogTableScope"
         filter:
           type: object
           additionalProperties: {}
@@ -291,6 +323,10 @@ components:
             $ref: "#/components/schemas/Permission"
           nullable: true
           description: "Optional permission scoping. Each permission must be a subset of the creator's permissions."
+        scoped_row_filters:
+          type: array
+          items:
+            $ref: "#/components/schemas/ScopedRowFilter"
         row_filter:
           type: object
           additionalProperties: {}
@@ -643,6 +679,15 @@ paths:
           description: The type of the resource for the permission to be removed.
           schema:
             $ref: "#/components/schemas/ResourceType"
+        - name: database
+          in: query
+          schema: {type: string}
+        - name: namespace
+          in: query
+          schema: {type: string}
+        - name: all_tables
+          in: query
+          schema: {type: boolean}
       responses:
         "204":
           description: Permission removed successfully
@@ -858,6 +903,18 @@ paths:
         schema:
           type: string
           example: "orders"
+      - name: database
+        in: query
+        schema: {type: string}
+        description: Explicit database; defaults to default when namespace is supplied.
+      - name: namespace
+        in: query
+        schema: {type: string}
+        description: Explicit namespace; defaults to public when database is supplied.
+      - name: all_tables
+        in: query
+        schema: {type: boolean}
+        description: Select all tables in the explicit namespace instead of the literal path table.
     get:
       tags:
         - RowFilter
@@ -948,6 +1005,18 @@ paths:
         schema:
           type: string
           example: "orders"
+      - name: database
+        in: query
+        schema: {type: string}
+        description: Explicit database; defaults to default when namespace is supplied.
+      - name: namespace
+        in: query
+        schema: {type: string}
+        description: Explicit namespace; defaults to public when database is supplied.
+      - name: all_tables
+        in: query
+        schema: {type: boolean}
+        description: Select all tables in the explicit namespace instead of the literal path table.
     get:
       tags:
         - RowFilter

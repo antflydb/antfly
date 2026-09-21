@@ -223,6 +223,7 @@ type haPrimaryRouteEvaluation struct {
 }
 
 type haPlan struct {
+	WaitingForTables          bool
 	Actions                   []haPlannedAction
 	AutomaticPromotionAllowed bool
 	DesiredStandbyCount       int32
@@ -1482,6 +1483,27 @@ func haLeaseFenceGeneration(lease *coordinationv1.Lease) uint64 {
 	return 0
 }
 
+// Once durable HA work has begun, an empty catalog must not tear it down.
+func haActivationHasStarted(status *antflyv1.HAStatus) bool {
+	if status == nil {
+		return false
+	}
+	if status.ActivationStarted || status.LastPromotion != nil {
+		return true
+	}
+	for _, standby := range status.Standbys {
+		if standby.Active || standby.TimelineID > 0 {
+			return true
+		}
+	}
+	for _, action := range status.PlannedActions {
+		if haPlannedActionExecutionStarted(action) {
+			return true
+		}
+	}
+	return false
+}
+
 func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 	ha := cluster.Spec.HighAvailability
 	if ha == nil || ha.Mode == "" || ha.Mode == antflyv1.HAModeDisabled {
@@ -1491,6 +1513,17 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 	status := cluster.Status.HAStatus
 	if status == nil {
 		status = &antflyv1.HAStatus{Mode: ha.Mode}
+	}
+
+	if ha.ActivationPolicy == "OnFirstTable" && !haActivationHasStarted(status) && (!status.PrimaryAdminReachable || !status.CatalogObserved || status.WaitingForTables) {
+		plan := haPlan{WaitingForTables: true, SyncPolicy: haEvaluateSyncPolicy(ha, status)}
+		plan.SyncPolicyDegraded = plan.SyncPolicy.Degraded
+		for _, standby := range ha.Standbys {
+			if standbyDesired(standby) {
+				plan.DesiredStandbyCount++
+			}
+		}
+		return plan
 	}
 
 	slotByName := map[string]antflyv1.HAStandbyStatus{}
@@ -3948,6 +3981,18 @@ func setHAConditions(cluster *antflyv1.AntflyCluster, plan haPlan) {
 		setHACondition(cluster, antflyv1.TypeHARetentionPressure, metav1.ConditionFalse, antflyv1.ReasonHADisabled, "Hot-standby HA is disabled")
 		setHACondition(cluster, antflyv1.TypeHAReseedRequired, metav1.ConditionFalse, antflyv1.ReasonHADisabled, "Hot-standby HA is disabled")
 		setHACondition(cluster, antflyv1.TypeHAAutomaticFailoverReady, metav1.ConditionFalse, antflyv1.ReasonHADisabled, "Hot-standby HA is disabled")
+		return
+	}
+
+	if plan.WaitingForTables {
+		for _, condition := range []string{antflyv1.TypeHAAvailable, antflyv1.TypeHAUnhealthy, antflyv1.TypeHALagging, antflyv1.TypeHARetentionPressure, antflyv1.TypeHAReseedRequired, antflyv1.TypeHAAutomaticFailoverReady} {
+			setHACondition(cluster, condition, metav1.ConditionFalse, "WaitingForTables", "HA configured; waiting for the primary to report a table before seeding standbys")
+		}
+		degraded := metav1.ConditionFalse
+		if plan.SyncPolicyDegraded {
+			degraded = metav1.ConditionTrue
+		}
+		setHACondition(cluster, antflyv1.TypeHADegraded, degraded, "WaitingForTables", "Standbys are not initialized; configured synchronous durability remains enforced")
 		return
 	}
 

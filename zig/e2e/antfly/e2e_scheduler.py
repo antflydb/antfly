@@ -814,14 +814,43 @@ class IsolationAwareScheduling(LoadGroupScheduling):
         if not candidates:
             return False
         candidate = max(candidates, key=self._retirement_score)
+        return self._retire_resource_worker(candidate)
+
+    def _retire_resource_worker(self, candidate: WorkerController) -> bool:
+        """Release reservations only after the worker tears down its fixtures."""
         replacement_started = self._start_replacement(candidate)
         if not replacement_started and not any(
-            successor is not candidate for successor in live_nodes
+            successor is not candidate and not successor.shutting_down
+            for successor in self.nodes
         ):
             return False
         self._retiring_nodes.add(candidate)
         candidate.shutdown()
         return True
+
+    def _retire_unused_session_worker(self, node: WorkerController) -> bool:
+        """Reclaim an idle session lane before it serializes independent work."""
+        owned = self._persistent_processes.get(node, set())
+        if not owned or self._pending_of(self.assigned_work[node]) > 1:
+            return False
+        queued_scopes = [
+            scope
+            for scope, work_unit in self.workqueue.items()
+            if any(not complete for complete in work_unit.values())
+        ]
+        if not any(self._scope_uses_process(scope) for scope in queued_scopes):
+            return False
+        if any(
+            self._scope_persistent_processes(scope).intersection(owned)
+            for scope in queued_scopes
+        ):
+            return False
+        # Waiting for global deadlock leaves an unused session process holding
+        # a slot while a different worker drains all transient tests serially.
+        # Rotate the exhausted owner even when another worker is making progress.
+        # A final queued test is drainable: shutdown supplies xdist's lookahead
+        # sentinel, so that test runs before the session fixtures are torn down.
+        return self._retire_resource_worker(node)
 
     def _another_worker_will_make_progress(
         self,
@@ -972,6 +1001,8 @@ class IsolationAwareScheduling(LoadGroupScheduling):
             return
         if self._next_eligible_scope(node) is not None:
             self._assign_work_unit(node)
+            return
+        if self._retire_unused_session_worker(node):
             return
         # This worker cannot reserve an Antfly process slot and no lightweight
         # work remains. Preserve a live successor whenever a shutdown is needed

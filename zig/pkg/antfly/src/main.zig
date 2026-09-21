@@ -85,6 +85,7 @@ fn mainImpl(init: std.process.Init) !void {
             return runRuntimeUnit(.inference, subcommand, init, &args);
         },
         .metadata => return runRuntimeUnit(.metadata, subcommand, init, &args),
+        .storage => return runRuntimeUnit(.storage, subcommand, init, &args),
         .serverless => return runRuntimeUnit(.serverless, subcommand, init, &args),
         .standalone => return runRuntimeUnit(.standalone, subcommand, init, &args),
         .cloud => {
@@ -97,13 +98,14 @@ fn mainImpl(init: std.process.Init) !void {
     }
 }
 
-const RuntimeRole = enum { cli, data, inference, metadata, serverless, standalone, standby };
+const RuntimeRole = enum { cli, data, inference, metadata, storage, serverless, standalone, standby };
 
 extern fn antfly_runtime_cli(context: *const runtime_bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_data(context: *const runtime_bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_standby(context: *const runtime_bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_inference(context: *const runtime_bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_metadata(context: *const runtime_bridge.Context) callconv(.c) c_int;
+extern fn antfly_runtime_storage(context: *const runtime_bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_serverless(context: *const runtime_bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_standalone(context: *const runtime_bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_lite(context: *const runtime_bridge.Context) callconv(.c) c_int;
@@ -119,6 +121,16 @@ pub fn runRuntimeUnit(
     defer argument_views.deinit(init.gpa);
     while (args.next()) |arg| try argument_views.append(init.gpa, .init(arg));
 
+    if (comptime role == .inference) {
+        const one_shot = @import("antfly_platform").one_shot_process;
+        if (one_shot.isTrainingInvocation(init.minimal.args)) {
+            // RuntimeProcess reconstructs synthetic arguments across this ABI.
+            // A training worker must re-execute the actual public invocation.
+            const original = try one_shot.encodeOriginalArguments(init.gpa, init.minimal.args);
+            defer init.gpa.free(original);
+            try init.environ_map.put(one_shot.original_argv_env, original);
+        }
+    }
     const environment_names = init.environ_map.keys();
     const environment_values = init.environ_map.values();
     std.debug.assert(environment_names.len == environment_values.len);
@@ -141,6 +153,7 @@ pub fn runRuntimeUnit(
         .standby => antfly_runtime_standby(&context),
         .inference => antfly_runtime_inference(&context),
         .metadata => antfly_runtime_metadata(&context),
+        .storage => antfly_runtime_storage(&context),
         .serverless => antfly_runtime_serverless(&context),
         .standalone => if (std.mem.eql(u8, command, "lite"))
             if (argument_views.items.len > 0 and std.mem.eql(u8, argument_views.items[0].slice(), "serve"))
@@ -257,6 +270,7 @@ fn printUsage(argv0: []const u8) void {
         \\  agents         Run AI agents (retrieval, query-builder)
         \\  backup         Backup tables
         \\  restore        Restore tables from backup, including Lite *.aflite input
+        \\  storage        Manage table storage (migrate)
         \\  auth           Manage data-plane users, roles, permissions, row filters, and API keys
         \\  internal       Internal cluster management
         \\  cloud          Delegate to the separate Antfly Cloud CLI

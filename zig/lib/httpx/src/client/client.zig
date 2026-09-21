@@ -444,13 +444,14 @@ const RequestInterrupt = struct {
     h2_entry: ?*H2PoolEntry = null,
     h2_stream_id: ?u31 = null,
 
-    fn publish(self: *RequestInterrupt, socket: *Socket, io: Io) void {
+    fn publish(self: *RequestInterrupt, socket: *Socket, io: Io) error{Cancelled}!void {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        if (self.isCancellationRequested()) {
-            socket.shutdown();
-            return;
-        }
+        // Cancellation may win while connect is completing, before the
+        // watchdog has a socket to interrupt. Reject this attempt and let its
+        // owner close/evict it. Shutdown is itself cancelable and cannot be
+        // relied on to prevent a subsequent unguarded blocking read.
+        if (self.isCancellationRequested()) return error.Cancelled;
         socket.setRequestCancellation(isCancellationRequestedOpaque, self);
         self.socket = socket;
     }
@@ -579,6 +580,11 @@ fn isSafeUnsentRetryError(err: anyerror) bool {
 
 fn isRetryableTransportError(err: anyerror) bool {
     return switch (err) {
+        // std.Io reports SERVFAIL / EAI_AGAIN with this name, not the
+        // application-level DnsResolutionFailed alias. NXDOMAIN and malformed
+        // resolver configuration remain terminal. The method/retry-policy and
+        // whole-request deadline gates still apply before replaying anything.
+        error.NameServerFailure,
         error.ConnectionClosed,
         error.ConnectionRefused,
         error.Closed,
@@ -1898,7 +1904,7 @@ pub const Client = struct {
                 }
 
                 try applyTimeouts(&tls_conn.socket, timeout_ms, write_timeout_ms, deadline_ms);
-                interrupt.publish(&tls_conn.socket, self.io);
+                try interrupt.publish(&tls_conn.socket, self.io);
                 defer interrupt.clear(&tls_conn.socket, self.io);
                 return self.executeOnTls(&tls_conn.session, req, &ok);
             }
@@ -1907,7 +1913,7 @@ pub const Client = struct {
             var socket = try self.connectHost(host, port, deadline_ms);
             defer socket.close();
             try applyTimeouts(&socket, timeout_ms, write_timeout_ms, deadline_ms);
-            interrupt.publish(&socket, self.io);
+            try interrupt.publish(&socket, self.io);
             defer interrupt.clear(&socket, self.io);
             return self.executeOnNewTls(&socket, host, req);
         }
@@ -1920,7 +1926,7 @@ pub const Client = struct {
             }
 
             try applyTimeouts(&conn.socket, timeout_ms, write_timeout_ms, deadline_ms);
-            interrupt.publish(&conn.socket, self.io);
+            try interrupt.publish(&conn.socket, self.io);
             defer interrupt.clear(&conn.socket, self.io);
             return self.executeOnSocket(&conn.socket, req, &ok);
         }
@@ -1928,7 +1934,7 @@ pub const Client = struct {
         var socket = try self.connectHost(host, port, deadline_ms);
         defer socket.close();
         try applyTimeouts(&socket, timeout_ms, write_timeout_ms, deadline_ms);
-        interrupt.publish(&socket, self.io);
+        try interrupt.publish(&socket, self.io);
         defer interrupt.clear(&socket, self.io);
         return self.executeOnSocket(&socket, req, null);
     }
@@ -1997,7 +2003,7 @@ pub const Client = struct {
                 }
 
                 try applyTimeouts(&tls_conn.socket, timeout_ms, write_timeout_ms, deadline_ms);
-                interrupt.publish(&tls_conn.socket, self.io);
+                try interrupt.publish(&tls_conn.socket, self.io);
                 defer interrupt.clear(&tls_conn.socket, self.io);
                 return self.executeOnTlsToWriter(&tls_conn.session, req, writer, progress_cb, progress_ctx, &ok);
             }
@@ -2005,7 +2011,7 @@ pub const Client = struct {
             var socket = try self.connectHost(host, port, deadline_ms);
             defer socket.close();
             try applyTimeouts(&socket, timeout_ms, write_timeout_ms, deadline_ms);
-            interrupt.publish(&socket, self.io);
+            try interrupt.publish(&socket, self.io);
             defer interrupt.clear(&socket, self.io);
             return self.executeOnNewTlsToWriter(&socket, host, req, writer, progress_cb, progress_ctx);
         }
@@ -2018,7 +2024,7 @@ pub const Client = struct {
             }
 
             try applyTimeouts(&conn.socket, timeout_ms, write_timeout_ms, deadline_ms);
-            interrupt.publish(&conn.socket, self.io);
+            try interrupt.publish(&conn.socket, self.io);
             defer interrupt.clear(&conn.socket, self.io);
             return self.executeOnSocketToWriter(&conn.socket, req, writer, progress_cb, progress_ctx, &ok);
         }
@@ -2026,7 +2032,7 @@ pub const Client = struct {
         var socket = try self.connectHost(host, port, deadline_ms);
         defer socket.close();
         try applyTimeouts(&socket, timeout_ms, write_timeout_ms, deadline_ms);
-        interrupt.publish(&socket, self.io);
+        try interrupt.publish(&socket, self.io);
         defer interrupt.clear(&socket, self.io);
         return self.executeOnSocketToWriter(&socket, req, writer, progress_cb, progress_ctx, null);
     }
@@ -4042,6 +4048,111 @@ test "Client config retry policy defaults" {
     try std.testing.expectEqual(@as(u32, 3), config.retry_policy.max_retries);
 }
 
+const DnsRetryFixture = struct {
+    var calls = std.atomic.Value(usize).init(0);
+    var failures: usize = 0;
+    var lookup_error: HostName.LookupError = error.NameServerFailure;
+    var cancellation: ?*std.atomic.Value(bool) = null;
+
+    fn reset(fail_count: usize, err: HostName.LookupError) void {
+        calls.store(0, .release);
+        failures = fail_count;
+        lookup_error = err;
+        cancellation = null;
+    }
+
+    fn lookup(_: ?*anyopaque, _: HostName, resolved: *Io.Queue(HostName.LookupResult), options: HostName.LookupOptions) HostName.LookupError!void {
+        const io = std.testing.io;
+        defer resolved.close(io);
+        const call = calls.fetchAdd(1, .acq_rel);
+        if (cancellation) |signal| signal.store(true, .release);
+        if (call < failures) return lookup_error;
+        resolved.putOne(io, .{ .address = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = options.port } } }) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            error.Closed => unreachable,
+        };
+    }
+};
+
+test "DNS retry recovers idempotent GET and HEAD without external DNS" {
+    const TestServer = @import("../testing.zig").TestServer;
+    const io = std.testing.io;
+    var vtable = io.vtable.*;
+    vtable.netLookup = DnsRetryFixture.lookup;
+    const fault_io: Io = .{ .userdata = io.userdata, .vtable = &vtable };
+    for ([_]types.Method{ .GET, .HEAD }) |method| {
+        DnsRetryFixture.reset(2, error.NameServerFailure);
+        var server = try TestServer.start(std.testing.allocator, io, &.{.{ .method = method, .path = "/", .respond = .{ .body = "ok" } }});
+        defer server.deinit();
+        var serving = try io.concurrent(TestServer.handleOne, .{&server});
+        defer serving.cancel(io) catch {};
+        const url = try std.fmt.allocPrint(std.testing.allocator, "http://model-download.test:{d}/", .{server.port});
+        defer std.testing.allocator.free(url);
+        var client = Client.initWithConfig(std.testing.allocator, fault_io, .{
+            .keep_alive = false,
+            .retry_policy = .{ .initial_delay_ms = 1 },
+            .timeouts = .{ .request_ms = 2_000 },
+        });
+        defer client.deinit();
+        var response = try client.request(method, url, .{});
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        try std.testing.expectEqual(@as(usize, 3), DnsRetryFixture.calls.load(.acquire));
+        try serving.await(io);
+    }
+}
+
+test "DNS retry preserves terminal lookup errors method policy and attempt bound" {
+    const io = std.testing.io;
+    var vtable = io.vtable.*;
+    vtable.netLookup = DnsRetryFixture.lookup;
+    const fault_io: Io = .{ .userdata = io.userdata, .vtable = &vtable };
+    const Case = struct { method: types.Method = .GET, err: HostName.LookupError, expected_calls: usize };
+    for ([_]Case{
+        .{ .err = error.NameServerFailure, .expected_calls = 4 },
+        .{ .method = .POST, .err = error.NameServerFailure, .expected_calls = 1 },
+        .{ .err = error.UnknownHostName, .expected_calls = 1 },
+        .{ .err = error.ResolvConfParseFailed, .expected_calls = 1 },
+        .{ .err = error.InvalidDnsARecord, .expected_calls = 1 },
+    }) |case| {
+        DnsRetryFixture.reset(100, case.err);
+        var client = Client.initWithConfig(std.testing.allocator, fault_io, .{
+            .keep_alive = false,
+            .retry_policy = .{ .initial_delay_ms = 1 },
+            .timeouts = .{ .request_ms = 2_000 },
+        });
+        defer client.deinit();
+        try std.testing.expectError(case.err, client.request(case.method, "http://model-download.test/", .{}));
+        try std.testing.expectEqual(case.expected_calls, DnsRetryFixture.calls.load(.acquire));
+    }
+}
+
+test "DNS retry backoff obeys the original request deadline and cancellation" {
+    const io = std.testing.io;
+    var vtable = io.vtable.*;
+    vtable.netLookup = DnsRetryFixture.lookup;
+    const fault_io: Io = .{ .userdata = io.userdata, .vtable = &vtable };
+    var client = Client.initWithConfig(std.testing.allocator, fault_io, .{
+        .keep_alive = false,
+        .retry_policy = .{ .initial_delay_ms = 5_000 },
+        .timeouts = .{ .request_ms = 50 },
+    });
+    defer client.deinit();
+    DnsRetryFixture.reset(100, error.NameServerFailure);
+    try std.testing.expectError(error.Timeout, client.get("http://model-download.test/", .{}));
+    try std.testing.expectEqual(@as(usize, 1), DnsRetryFixture.calls.load(.acquire));
+
+    DnsRetryFixture.reset(100, error.NameServerFailure);
+    var cancelled = std.atomic.Value(bool).init(false);
+    DnsRetryFixture.cancellation = &cancelled;
+    defer DnsRetryFixture.cancellation = null;
+    try std.testing.expectError(error.Cancelled, client.get("http://model-download.test/", .{
+        .timeout_ms = 2_000,
+        .cancellation = .fromAtomic(&cancelled),
+    }));
+    try std.testing.expectEqual(@as(usize, 1), DnsRetryFixture.calls.load(.acquire));
+}
+
 test "Client config redirect policy defaults" {
     const config = ClientConfig{};
     try std.testing.expectEqual(@as(u32, 10), config.redirect_policy.max_redirects);
@@ -5115,6 +5226,64 @@ test "successful H1 requests do not wait for their timeout deadline" {
     }
     try std.testing.expectEqual(@as(usize, 4 * rounds), sends.load(.acquire));
     try std.testing.expect(common.milliTimestamp(io) - started_ms < 2_000 * rounds);
+}
+
+test "request cancellation before socket publication prevents sending" {
+    const allocator = std.testing.allocator;
+    const fixture_io = std.testing.io;
+    const TestServer = @import("../testing.zig").TestServer;
+    const Fixture = struct {
+        fn canceledShutdown(_: ?*anyopaque, _: Io.net.Socket.Handle, _: Io.net.ShutdownHow) Io.net.ShutdownError!void {
+            // A request task canceled while connect completes can reach socket
+            // publication with cancellation still pending. Shutdown is itself
+            // a cancellation point, so it need not perform the syscall.
+            return error.Canceled;
+        }
+
+        fn serve(server: *TestServer) !void {
+            server.handleOne() catch |err| switch (err) {
+                error.EmptyRequest => {}, // The canceled attempt closed before sending.
+                else => return err,
+            };
+        }
+    };
+    var vtable = fixture_io.vtable.*;
+    vtable.netShutdown = Fixture.canceledShutdown;
+    const io: Io = .{ .userdata = fixture_io.userdata, .vtable = &vtable };
+    for ([_]bool{ false, true }) |keep_alive| {
+        for ([_]bool{ false, true }) |streamed| {
+            var server = try TestServer.start(allocator, fixture_io, &.{.{ .method = .POST, .path = "/", .respond = .{ .body = "ok" } }});
+            defer server.deinit();
+            var serving = try fixture_io.concurrent(Fixture.serve, .{&server});
+            defer serving.cancel(fixture_io) catch {};
+            var client = Client.initWithConfig(allocator, io, .{ .keep_alive = keep_alive });
+            defer client.deinit();
+            var req = try Request.init(allocator, .POST, server.baseUrl());
+            defer req.deinit();
+            try req.setBody("mutation");
+            var interrupt: RequestInterrupt = .{};
+            // Force the watchdog to win after the retry/admission checks but
+            // before the newly connected socket is published.
+            interrupt.cancelled.store(true, .release);
+            var bytes: std.ArrayListUnmanaged(u8) = .empty;
+            defer bytes.deinit(allocator);
+            const result = if (streamed)
+                client.executeRequestToWriterOnce(&req, null, null, arrayListWriter(&bytes, allocator), null, null, &interrupt)
+            else
+                client.executeRequestOnce(&req, null, null, &interrupt);
+            if (result) |response_value| {
+                var response = response_value;
+                response.deinit();
+                return error.TestUnexpectedResult;
+            } else |err| {
+                try std.testing.expectEqual(error.Cancelled, err);
+            }
+            try serving.await(fixture_io);
+            try std.testing.expectEqual(@as(usize, 0), server.routeHitCount(0));
+            try std.testing.expectEqual(@as(usize, 0), client.pool.stats().total);
+            try std.testing.expectEqual(@as(usize, 0), bytes.items.len);
+        }
+    }
 }
 
 test "H1 transport cancellation interrupts an active response read" {

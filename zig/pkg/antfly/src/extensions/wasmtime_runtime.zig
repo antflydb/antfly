@@ -293,9 +293,14 @@ const WasmtimeFunc = extern struct {
     private: ?*anyopaque = null,
 };
 
-const WasmtimeMemory = extern struct {
+// v45 embeds a store/index struct; its trailing padding is part of the ABI.
+const WasmtimeStoreIndex = extern struct {
     store_id: u64 = 0,
     private1: u32 = 0,
+};
+
+const WasmtimeMemory = extern struct {
+    store: WasmtimeStoreIndex = .{},
     private2: u32 = 0,
 };
 
@@ -311,12 +316,12 @@ const WASMTIME_EXTERN_MEMORY: WasmtimeExternKind = 3;
 const WasmtimeExternUnion = extern union {
     func: WasmtimeFunc,
     memory: WasmtimeMemory,
-    bytes: [32]u8,
+    bytes: [24]u8,
 };
 
 const WasmtimeExtern = extern struct {
     kind: WasmtimeExternKind = 0,
-    of: WasmtimeExternUnion = .{ .bytes = [_]u8{0} ** 32 },
+    of: WasmtimeExternUnion = .{ .bytes = [_]u8{0} ** 24 },
 };
 
 const WasmtimeValRaw = extern union {
@@ -332,8 +337,7 @@ const WasmtimeComponentInstance = extern struct {
 };
 
 const WasmtimeComponentFunc = extern struct {
-    store_id: u64 = 0,
-    private1: u32 = 0,
+    store: WasmtimeStoreIndex = .{},
     private2: u32 = 0,
 };
 
@@ -994,4 +998,12 @@ fn wasmNameDupe(alloc: std.mem.Allocator, name: WasmName) ![]u8 {
 
 fn lookup(dynlib: *std.DynLib, name: [:0]const u8, comptime T: type) InvokeError!T {
     return dynlib.lookup(T, name) orelse error.WasmtimeSymbolMissing;
+}
+
+test "wasmtime v45 C handle layouts retain nested struct padding" {
+    try std.testing.expectEqual(@as(usize, 24), @sizeOf(WasmtimeMemory));
+    try std.testing.expectEqual(@as(usize, 16), @offsetOf(WasmtimeMemory, "private2"));
+    try std.testing.expectEqual(@as(usize, 24), @sizeOf(WasmtimeComponentFunc));
+    try std.testing.expectEqual(@as(usize, 16), @offsetOf(WasmtimeComponentFunc, "private2"));
+    try std.testing.expectEqual(@as(usize, 32), @sizeOf(WasmtimeExtern));
 }

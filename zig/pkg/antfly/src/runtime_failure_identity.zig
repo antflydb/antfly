@@ -29,6 +29,184 @@ const Mapping = struct {
 };
 
 const mappings = [_]Mapping{
+    .{ .status = .catalog_already_exists, .err = error.CatalogAlreadyExists },
+    .{ .status = .catalog_command_too_large, .err = error.CatalogCommandTooLarge },
+    .{ .status = .catalog_generation_changed, .err = error.CatalogGenerationChanged },
+    .{ .status = .catalog_id_exhausted, .err = error.CatalogIdExhausted },
+    .{ .status = .catalog_not_found, .err = error.CatalogNotFound },
+    .{ .status = .catalog_projection_refresh_required, .err = error.CatalogProjectionRefreshRequired },
+    .{ .status = .catalog_routing_snapshot_timeout, .err = error.CatalogRoutingSnapshotTimeout },
+    .{ .status = .catalog_table_topology_required, .err = error.CatalogTableTopologyRequired },
+    .{ .status = .create_table_request_too_large, .err = error.CreateTableRequestTooLarge },
+    .{ .status = .database_not_empty, .err = error.DatabaseNotEmpty },
+    .{ .status = .database_not_found, .err = error.DatabaseNotFound },
+    .{ .status = .forbidden, .err = error.Forbidden },
+    .{ .status = .invalid_catalog_mutation, .err = error.InvalidCatalogMutation },
+    .{ .status = .invalid_catalog_name, .err = error.InvalidCatalogName },
+    .{ .status = .invalid_catalog_record, .err = error.InvalidCatalogRecord },
+    .{ .status = .invalid_catalog_route_fence, .err = error.InvalidCatalogRouteFence },
+    .{ .status = .invalid_metadata_node_id, .err = error.InvalidNodeID },
+    .{ .status = .invalid_store_reporter_fence, .err = error.InvalidStoreReporterFence },
+    .{ .status = .invalid_tablespace_location, .err = error.InvalidTablespaceLocation },
+    .{ .status = .invalid_tablespace_placement_policy, .err = error.InvalidTablespacePlacementPolicy },
+    .{ .status = .metadata_incarnation_mismatch, .err = error.MetadataIncarnationMismatch },
+    .{ .status = .metadata_incarnation_unavailable, .err = error.MetadataIncarnationUnavailable },
+    .{ .status = .metadata_mutation_outcome_unknown, .err = error.MetadataMutationOutcomeUnknown },
+    .{ .status = .metadata_snapshot_head_mismatch, .err = error.MetadataSnapshotHeadMismatch },
+    .{ .status = .namespace_not_empty, .err = error.NamespaceNotEmpty },
+    .{ .status = .namespace_not_found, .err = error.NamespaceNotFound },
+    .{ .status = .not_leader, .err = error.NotLeader },
+    .{ .status = .protected_catalog_resource, .err = error.ProtectedCatalogResource },
+    .{ .status = .resource_request_too_large, .err = error.ResourceRequestTooLarge },
+    .{ .status = .store_report_base_mismatch, .err = error.StoreReportBaseMismatch },
+    .{ .status = .table_already_exists, .err = error.TableAlreadyExists },
+    .{ .status = .table_topology_protocol_upgrade_required, .err = error.TableTopologyProtocolUpgradeRequired },
+    .{ .status = .tablespace_in_use, .err = error.TablespaceInUse },
+    .{ .status = .tablespace_not_found, .err = error.TablespaceNotFound },
+    .{ .status = .ha_seed_snapshot_runtime_busy, .err = error.HASeedSnapshotRuntimeBusy },
+    .{ .status = .ha_seed_capture_already_in_progress, .err = error.HASeedCaptureAlreadyInProgress },
+
+    .{ .status = .relational_expression_overflow, .err = error.RelationalExpressionOverflow },
+    .{ .status = .relational_expression_division_by_zero, .err = error.RelationalExpressionDivisionByZero },
+    .{ .status = .relational_expression_budget_exceeded, .err = error.RelationalExpressionBudgetExceeded },
+    .{ .status = .relational_index_key_too_large, .err = error.RelationalIndexKeyTooLarge },
+    .{ .status = .invalid_relational_expression_input, .err = error.InvalidRelationalExpressionInput },
+    .{ .status = .invalid_relational_generated_value, .err = error.InvalidRelationalGeneratedValue },
+    .{ .status = .generated_column_rewrite_required, .err = error.GeneratedColumnRewriteRequired },
+    .{ .status = .relational_index_not_ready, .err = error.RelationalIndexNotReady },
+    .{ .status = .foreign_key_partial_support_index_required, .err = error.ForeignKeyPartialSupportIndexRequired },
+    .{ .status = .foreign_key_partial_support_index_conflict, .err = error.ForeignKeyPartialSupportIndexConflict },
+    .{ .status = .reserved_foreign_key_support_index, .err = error.ReservedForeignKeySupportIndex },
+    .{ .status = .invalid_relational_index_bound, .err = error.InvalidRelationalIndexBound },
+    .{ .status = .relational_index_column_not_found, .err = error.RelationalIndexColumnNotFound },
+    .{ .status = .unsupported_relational_index_column, .err = error.UnsupportedRelationalIndexColumn },
+    .{ .status = .relational_rows_output_budget_exceeded, .err = error.RelationalRowsOutputBudgetExceeded },
+    .{ .status = .relational_row_result_too_large, .err = error.RelationalRowResultTooLarge },
+    .{ .status = .relational_index_column_type_mismatch, .err = error.RelationalIndexColumnTypeMismatch },
+    .{ .status = .relational_table_required, .err = error.RelationalTableRequired },
+    .{ .status = .invalid_relational_index_forward_key, .err = error.InvalidRelationalIndexForwardKey },
+    .{ .status = .metadata_ha_binding_busy, .err = error.MetadataHABindingBusy },
+    .{ .status = .metadata_ha_outbox_pending, .err = error.MetadataHAOutboxPending },
+    .{ .status = .metadata_ha_checkpoint_target_not_empty, .err = error.MetadataHACheckpointTargetNotEmpty },
+    .{ .status = .invalid_metadata_ha_checkpoint, .err = error.InvalidMetadataHACheckpoint },
+    .{ .status = .metadata_ha_migration_after_binding, .err = error.MetadataHAMigrationAfterBinding },
+    .{ .status = .metadata_ha_incomplete_effect, .err = error.MetadataHAIncompleteEffect },
+    .{ .status = .metadata_ha_source_changed, .err = error.MetadataHASourceChanged },
+    .{ .status = .metadata_ha_sequence_gap, .err = error.MetadataHASequenceGap },
+    .{ .status = .table_lifecycle_conflict, .err = error.TableLifecycleConflict },
+    .{ .status = .invalid_metadata_ha_effect_chunk, .err = error.InvalidMetadataHAEffectChunk },
+    .{ .status = .ha_sync_commit_would_block, .err = error.HASyncCommitWouldBlock },
+    .{ .status = .ha_sync_commit_wait_missing_context, .err = error.HASyncCommitWaitMissingContext },
+    .{ .status = .ha_sync_commit_wait_limit_exceeded, .err = error.HASyncCommitWaitLimitExceeded },
+    .{ .status = .ha_sync_commit_wait_standby_not_in_policy, .err = error.HASyncCommitWaitStandbyNotInPolicy },
+    .{ .status = .ha_fenced_primary, .err = error.HAFencedPrimary },
+    .{ .status = .ha_promoted_standby_requires_primary_open, .err = error.HAPromotedStandbyRequiresPrimaryOpen },
+    .{ .status = .ha_primary_not_configured, .err = error.HAPrimaryNotConfigured },
+    .{ .status = .integrity_topology_cutover_required, .err = error.IntegrityTopologyCutoverRequired },
+    .{ .status = .invalid_restore_terminal, .err = error.InvalidRestoreTerminal },
+    .{ .status = .invalid_standalone_metadata_checkpoint, .err = error.InvalidStandaloneMetadataCheckpoint },
+    .{ .status = .seed_below_ha_replay_floor, .err = error.SeedBelowHAReplayFloor },
+    .{ .status = .seed_metadata_topology_mismatch, .err = error.SeedMetadataTopologyMismatch },
+    .{ .status = .backup_seal_released, .err = error.BackupSealReleased },
+    .{ .status = .integrity_address_mismatch, .err = error.IntegrityAddressMismatch },
+    .{ .status = .integrity_handoff_collision, .err = error.IntegrityHandoffCollision },
+    .{ .status = .integrity_handoff_destination_reset_required, .err = error.IntegrityHandoffDestinationResetRequired },
+    .{ .status = .integrity_handoff_incomplete, .err = error.IntegrityHandoffIncomplete },
+    .{ .status = .integrity_handoff_missing, .err = error.IntegrityHandoffMissing },
+    .{ .status = .integrity_handoff_sequence_changed, .err = error.IntegrityHandoffSequenceChanged },
+    .{ .status = .missing_integrity_binding, .err = error.MissingIntegrityBinding },
+    .{ .status = .missing_integrity_catalog, .err = error.MissingIntegrityCatalog },
+    .{ .status = .integrity_catalog_too_large, .err = error.IntegrityCatalogTooLarge },
+    .{ .status = .integrity_handoff_too_large, .err = error.IntegrityHandoffTooLarge },
+    .{ .status = .invalid_integrity_address, .err = error.InvalidIntegrityAddress },
+    .{ .status = .invalid_integrity_budget, .err = error.InvalidIntegrityBudget },
+    .{ .status = .invalid_integrity_catalog, .err = error.InvalidIntegrityCatalog },
+    .{ .status = .invalid_integrity_definition, .err = error.InvalidIntegrityDefinition },
+    .{ .status = .invalid_integrity_record, .err = error.InvalidIntegrityRecord },
+    .{ .status = .coordinated_constraints_require_table_identity, .err = error.CoordinatedConstraintsRequireTableIdentity },
+    .{ .status = .integrity_retirement_backlog_full, .err = error.IntegrityRetirementBacklogFull },
+    .{ .status = .restore_projection_catch_up_pending, .err = error.RestoreProjectionCatchUpPending },
+    .{ .status = .integrity_checksum_mismatch, .err = error.IntegrityChecksumMismatch },
+    .{ .status = .integrity_missing_companion, .err = error.IntegrityMissingCompanion },
+    .{ .status = .backup_integrity_failure, .err = error.BackupIntegrityFailure },
+    .{ .status = .coordinated_constraint_portable_backup_unsupported, .err = error.CoordinatedConstraintPortableBackupUnsupported },
+    .{ .status = .coordinated_constraint_restore_required, .err = error.CoordinatedConstraintRestoreRequired },
+    .{ .status = .coordinated_constraint_topology_unsupported, .err = error.CoordinatedConstraintTopologyUnsupported },
+    .{ .status = .integrity_generation_exhausted, .err = error.IntegrityGenerationExhausted },
+    .{ .status = .backup_cohort_already_committed, .err = error.BackupCohortAlreadyCommitted },
+    .{ .status = .backup_cohort_cancelled, .err = error.BackupCohortCancelled },
+    .{ .status = .backup_cohort_changed, .err = error.BackupCohortChanged },
+    .{ .status = .backup_cohort_fence_lost, .err = error.BackupCohortFenceLost },
+    .{ .status = .backup_seal_mismatch, .err = error.BackupSealMismatch },
+    .{ .status = .backup_seal_source_changed, .err = error.BackupSealSourceChanged },
+    .{ .status = .restore_staging_canceled, .err = error.RestoreStagingCanceled },
+    .{ .status = .restore_staging_progress_changed, .err = error.RestoreStagingProgressChanged },
+    .{ .status = .restore_staging_scope_changed, .err = error.RestoreStagingScopeChanged },
+    .{ .status = .integrity_topology_changed, .err = error.IntegrityTopologyChanged },
+    .{ .status = .integrity_topology_completed, .err = error.IntegrityTopologyCompleted },
+    .{ .status = .integrity_topology_fence_missing, .err = error.IntegrityTopologyFenceMissing },
+    .{ .status = .integrity_catalog_changed, .err = error.IntegrityCatalogChanged },
+    .{ .status = .integrity_catalog_incarnation_mismatch, .err = error.IntegrityCatalogIncarnationMismatch },
+    .{ .status = .constraint_activation_changed, .err = error.ConstraintActivationChanged },
+    .{ .status = .constraint_activation_owner_changed, .err = error.ConstraintActivationOwnerChanged },
+    .{ .status = .constraint_retirement_changed, .err = error.ConstraintRetirementChanged },
+    .{ .status = .foreign_key_parent_missing, .err = error.ForeignKeyParentMissing },
+    .{ .status = .foreign_key_referenced, .err = error.ForeignKeyReferenced },
+    .{ .status = .unique_constraint_violation, .err = error.UniqueConstraintViolation },
+    .{ .status = .prepared_generation_changed, .err = error.PreparedGenerationChanged },
+    .{ .status = .prepared_read_set_changed, .err = error.PreparedReadSetChanged },
+    .{ .status = .foreign_key_action_mismatch, .err = error.ForeignKeyActionMismatch },
+    .{ .status = .foreign_key_action_not_validated, .err = error.ForeignKeyActionNotValidated },
+    .{ .status = .constraint_activation_failed, .err = error.ConstraintActivationFailed },
+    .{ .status = .foreign_key_action_failed, .err = error.ForeignKeyActionFailed },
+    .{ .status = .restore_staging_target_not_empty, .err = error.RestoreStagingTargetNotEmpty },
+    .{ .status = .backup_pin_source_unavailable, .err = error.BackupPinSourceUnavailable },
+    .{ .status = .restore_source_durability_uncertain, .err = error.RestoreSourceDurabilityUncertain },
+    .{ .status = .restore_staging_in_progress, .err = error.RestoreStagingInProgress },
+    .{ .status = .restore_validation_pending, .err = error.RestoreValidationPending },
+    .{ .status = .integrity_topology_busy, .err = error.IntegrityTopologyBusy },
+    .{ .status = .transaction_topology_busy, .err = error.TransactionTopologyBusy },
+    .{ .status = .relational_topology_protocol_upgrade_required, .err = error.RelationalTopologyProtocolUpgradeRequired },
+    .{ .status = .integrity_catalog_unavailable, .err = error.IntegrityCatalogUnavailable },
+    .{ .status = .constraint_retirement_in_progress, .err = error.ConstraintRetirementInProgress },
+    .{ .status = .constraint_activation_in_progress, .err = error.ConstraintActivationInProgress },
+    .{ .status = .foreign_key_action_in_progress, .err = error.ForeignKeyActionInProgress },
+    .{ .status = .coordinated_ttl_backpressure, .err = error.CoordinatedTtlBackpressure },
+    .{ .status = .metadata_capability_unavailable, .err = error.MetadataCapabilityUnavailable },
+    .{ .status = .backup_cohort_too_large, .err = error.BackupCohortTooLarge },
+    .{ .status = .incomplete_backup_cohort, .err = error.IncompleteBackupCohort },
+    .{ .status = .invalid_backup_cohort, .err = error.InvalidBackupCohort },
+    .{ .status = .backup_seal_inventory_too_large, .err = error.BackupSealInventoryTooLarge },
+    .{ .status = .invalid_backup_seal, .err = error.InvalidBackupSeal },
+    .{ .status = .restore_dependency_missing, .err = error.RestoreDependencyMissing },
+    .{ .status = .restore_source_proof_missing, .err = error.RestoreSourceProofMissing },
+    .{ .status = .invalid_restore_source_checkpoint, .err = error.InvalidRestoreSourceCheckpoint },
+    .{ .status = .invalid_restore_staging, .err = error.InvalidRestoreStaging },
+    .{ .status = .invalid_restore_staging_command, .err = error.InvalidRestoreStagingCommand },
+    .{ .status = .invalid_restore_staging_record, .err = error.InvalidRestoreStagingRecord },
+    .{ .status = .invalid_integrity_topology_fence, .err = error.InvalidIntegrityTopologyFence },
+    .{ .status = .invalid_metadata_ha_effect, .err = error.InvalidMetadataHAEffect },
+    .{ .status = .invalid_metadata_ha_chunk, .err = error.InvalidMetadataHAChunk },
+    .{ .status = .metadata_ha_checkpoint_too_large, .err = error.MetadataHACheckpointTooLarge },
+    .{ .status = .metadata_ha_effect_too_large, .err = error.MetadataHAEffectTooLarge },
+    .{ .status = .invalid_constraint_activation_command, .err = error.InvalidConstraintActivationCommand },
+    .{ .status = .invalid_constraint_retirement_command, .err = error.InvalidConstraintRetirementCommand },
+    .{ .status = .key_out_of_range, .err = error.KeyOutOfRange },
+    .{ .status = .invalid_integrity_command, .err = error.InvalidIntegrityCommand },
+    .{ .status = .invalid_integrity_operation, .err = error.InvalidIntegrityOperation },
+    .{ .status = .invalid_integrity_continuation, .err = error.InvalidIntegrityContinuation },
+    .{ .status = .integrity_claim_guard_required, .err = error.IntegrityClaimGuardRequired },
+    .{ .status = .integrity_action_job_required, .err = error.IntegrityActionJobRequired },
+    .{ .status = .invalid_relational_rows_request, .err = error.InvalidRelationalRowsRequest },
+    .{ .status = .constraint_retirement_required, .err = error.ConstraintRetirementRequired },
+    .{ .status = .invalid_integrity_key, .err = error.InvalidIntegrityKey },
+    .{ .status = .integrity_record_too_large, .err = error.IntegrityRecordTooLarge },
+    .{ .status = .invalid_range, .err = error.InvalidRange },
+    .{ .status = .backup_seal_backend_unsupported, .err = error.BackupSealBackendUnsupported },
+    .{ .status = .relational_topology_migration_unsupported, .err = error.RelationalTopologyMigrationUnsupported },
+    .{ .status = .foreign_key_coordination_required, .err = error.ForeignKeyCoordinationRequired },
+    .{ .status = .constraint_not_found, .err = error.ConstraintNotFound },
+    .{ .status = .integrity_topology_epoch_exhausted, .err = error.IntegrityTopologyEpochExhausted },
     .{ .status = .invalid_abi, .err = error.InvalidAbiVersion },
     .{ .status = .invalid_argument, .err = error.InvalidArgument },
     .{ .status = .invalid_arguments, .err = error.InvalidArguments },
@@ -48,8 +226,13 @@ const mappings = [_]Mapping{
     .{ .status = .invalid_query, .err = error.InvalidQueryRequest },
     .{ .status = .unsupported_query, .err = error.UnsupportedQueryRequest },
     .{ .status = .index_not_found, .err = error.IndexNotFound },
+    .{ .status = .index_rebuilding, .err = error.IndexRebuilding },
+    .{ .status = .incomplete_published_snapshot, .err = error.IncompletePublishedSnapshot },
+    .{ .status = .distributed_query_unavailable, .err = error.DistributedQueryUnavailable },
+    .{ .status = .storage_read_temporarily_unavailable, .err = error.StorageReadTemporarilyUnavailable },
     .{ .status = .identity_read_generation_changed, .err = error.IdentityReadGenerationChanged },
     .{ .status = .timeout, .err = error.Timeout },
+    .{ .status = .read_index_timeout, .err = error.ReadIndexTimeout },
     .{ .status = .table_visibility_timeout, .err = error.TableVisibilityTimeout },
     .{ .status = .cancelled, .err = error.Cancelled },
     .{ .status = .canceled, .err = error.Canceled },
@@ -427,6 +610,61 @@ const mappings = [_]Mapping{
     .{ .status = .restore_dense_checkpoint_incomplete, .err = error.RestoreDenseCheckpointIncomplete },
     .{ .status = .restore_index_availability_incomplete, .err = error.RestoreIndexAvailabilityIncomplete },
     .{ .status = .provider_internal, .err = error.Internal },
+    .{ .status = .invalid_online_source_command, .err = error.InvalidOnlineSourceCommand },
+    .{ .status = .online_source_corrupt, .err = error.OnlineSourceCorrupt },
+    .{ .status = .online_source_scope_changed, .err = error.OnlineSourceScopeChanged },
+    .{ .status = .invalid_retained_effects_admission, .err = error.InvalidRetainedEffectsAdmission },
+    .{ .status = .retained_effects_consumer_limit, .err = error.RetainedEffectsConsumerLimit },
+    .{ .status = .retained_effects_corrupt, .err = error.RetainedEffectsCorrupt },
+    .{ .status = .retained_effects_cursor_mismatch, .err = error.RetainedEffectsCursorMismatch },
+    .{ .status = .retained_effects_fence_mismatch, .err = error.RetainedEffectsFenceMismatch },
+    .{ .status = .retained_effects_full, .err = error.RetainedEffectsFull },
+    .{ .status = .retained_effects_identity_required, .err = error.RetainedEffectsIdentityRequired },
+    .{ .status = .retained_effects_mixed_control, .err = error.RetainedEffectsMixedControl },
+    .{ .status = .retained_effects_namespace_mismatch, .err = error.RetainedEffectsNamespaceMismatch },
+    .{ .status = .retained_effects_transaction_failed, .err = error.RetainedEffectsTransactionFailed },
+    .{ .status = .invalid_source_snapshot, .err = error.InvalidSourceSnapshot },
+    .{ .status = .source_snapshot_corrupt, .err = error.SourceSnapshotCorrupt },
+    .{ .status = .source_snapshot_incomplete, .err = error.SourceSnapshotIncomplete },
+    .{ .status = .source_snapshot_too_large, .err = error.SourceSnapshotTooLarge },
+    .{ .status = .source_snapshot_cut_mismatch, .err = error.SourceSnapshotCutMismatch },
+    .{ .status = .invalid_merge_page, .err = error.InvalidMergePage },
+    .{ .status = .merge_page_incomplete, .err = error.MergePageIncomplete },
+    .{ .status = .merge_page_required, .err = error.MergePageRequired },
+    .{ .status = .merge_page_sequence_gap, .err = error.MergePageSequenceGap },
+    .{ .status = .merge_page_source_missing, .err = error.MergePageSourceMissing },
+    .{ .status = .missing_online_source_applied_index, .err = error.MissingOnlineSourceAppliedIndex },
+    .{ .status = .online_source_pin_pending, .err = error.OnlineSourcePinPending },
+    .{ .status = .online_source_pin_missing, .err = error.OnlineSourcePinMissing },
+    .{ .status = .source_copy_restore_unsupported, .err = error.SourceCopyRestoreUnsupported },
+    .{ .status = .merge_page_chunk_required, .err = error.MergePageChunkRequired },
+    .{ .status = .invalid_vector_migration_budget, .err = error.InvalidVectorMigrationBudget },
+    .{ .status = .invalid_vector_migration_id, .err = error.InvalidVectorMigrationId },
+    .{ .status = .invalid_vector_migration_state, .err = error.InvalidVectorMigrationState },
+    .{ .status = .unsupported_vector_migration_direction, .err = error.UnsupportedVectorMigrationDirection },
+    .{ .status = .unsupported_vector_migration_version, .err = error.UnsupportedVectorMigrationVersion },
+    .{ .status = .vector_migration_active, .err = error.VectorMigrationActive },
+    .{ .status = .vector_migration_already_exists, .err = error.VectorMigrationAlreadyExists },
+    .{ .status = .vector_migration_already_published, .err = error.VectorMigrationAlreadyPublished },
+    .{ .status = .vector_migration_configuration_changed, .err = error.VectorMigrationConfigurationChanged },
+    .{ .status = .vector_migration_coverage_mismatch, .err = error.VectorMigrationCoverageMismatch },
+    .{ .status = .vector_migration_disk_reserve, .err = error.VectorMigrationDiskReserve },
+    .{ .status = .vector_migration_idempotency_conflict, .err = error.VectorMigrationIdempotencyConflict },
+    .{ .status = .vector_migration_identity_mismatch, .err = error.VectorMigrationIdentityMismatch },
+    .{ .status = .vector_migration_inline_payload_remains, .err = error.VectorMigrationInlinePayloadRemains },
+    .{ .status = .vector_migration_not_found, .err = error.VectorMigrationNotFound },
+    .{ .status = .vector_migration_not_ready, .err = error.VectorMigrationNotReady },
+    .{ .status = .vector_migration_read_epoch_changed, .err = error.VectorMigrationReadEpochChanged },
+    .{ .status = .vector_migration_recovery_required, .err = error.VectorMigrationRecoveryRequired },
+    .{ .status = .vector_migration_row_exceeds_budget, .err = error.VectorMigrationRowExceedsBudget },
+    .{ .status = .vector_migration_temporary_budget_exceeded, .err = error.VectorMigrationTemporaryBudgetExceeded },
+    .{ .status = .vector_migration_offline_admission, .err = error.VectorMigrationOfflineAdmission },
+    .{ .status = .vector_migration_catalog_in_use, .err = error.VectorMigrationCatalogInUse },
+    .{ .status = .vector_migration_copy_mismatch, .err = error.VectorMigrationCopyMismatch },
+    .{ .status = .vector_migration_unsupported_file, .err = error.VectorMigrationUnsupportedFile },
+    .{ .status = .vector_store_requires_empty_table, .err = error.VectorStoreRequiresEmptyTable },
+    .{ .status = .vector_store_requires_local_single_shard_table, .err = error.VectorStoreRequiresLocalSingleShardTable },
+    .{ .status = .vector_store_requires_offline_command, .err = error.VectorStoreRequiresOfflineCommand },
 };
 
 pub fn statusFromError(err: anyerror) abi.Status {
@@ -556,7 +794,10 @@ fn hasRegisteredIdentity(status: abi.Status) bool {
 
 pub fn validateForTest() !void {
     @setEvalBranchQuota(100_000);
-    inline for (mappings) |mapping| {
+    // Execute the audit as loops. Expanding every mapping and pair into
+    // separate checks produces quadratic-size IR and makes LLVM optimization
+    // dominate compilation of the linked owner tests as the registry grows.
+    for (mappings) |mapping| {
         try std.testing.expectEqual(mapping.status, statusFromError(mapping.err));
         try std.testing.expectError(mapping.err, statusToError(mapping.status));
     }
@@ -567,14 +808,13 @@ pub fn validateForTest() !void {
     // The three exceptions are protocol sentinels rather than domain-error
     // identities: success, the ABI-27 compatibility status, and the explicit
     // unexpected-provider-failure sentinel.
-    inline for (std.meta.fields(abi.Status)) |field| {
-        const status: abi.Status = @enumFromInt(field.value);
+    for (std.meta.tags(abi.Status)) |status| {
         if (status == .ok or status == .backup_integrity or status == .internal) continue;
         try std.testing.expect(hasRegisteredIdentity(status));
     }
 
-    inline for (mappings, 0..) |lhs, i| {
-        inline for (mappings[i + 1 ..]) |rhs| {
+    for (mappings, 0..) |lhs, i| {
+        for (mappings[i + 1 ..]) |rhs| {
             try std.testing.expect(lhs.status != rhs.status);
             try std.testing.expect(lhs.err != rhs.err);
         }
@@ -664,5 +904,24 @@ pub fn validateForTest() !void {
 }
 
 test "registered storage-kernel errors are unique and round trip without losing identity" {
+    // A newly created/rebuilt ANN index has no serving generation yet. This
+    // expected state must survive both compiled query boundaries as a retry,
+    // rather than becoming an unregistered StorageKernelFailure (HTTP 500).
+    try std.testing.expectEqual(abi.Status.index_rebuilding, statusFromError(error.IndexRebuilding));
+    try std.testing.expectError(error.IndexRebuilding, statusToError(.index_rebuilding));
     try validateForTest();
+}
+
+test "index readiness survives the local query and storage owner boundary" {
+    for ([_]anyerror{ error.IndexRebuilding, error.IncompletePublishedSnapshot }) |expected| {
+        // The local query provider reports readiness through the storage
+        // owner before the serving callback can return a retryable response.
+        const failure = failureFromError(expected, .local_query, abi.abi_version, 4);
+        try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
+        const transported = blk: {
+            statusToError(failure.status) catch |err| break :blk err;
+            return error.ExpectedReadinessFailure;
+        };
+        try std.testing.expectEqual(expected, transported);
+    }
 }

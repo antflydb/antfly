@@ -14,12 +14,22 @@ Current status:
 - The shared passing lane currently covers all encoded fixtures checked into
   this directory.
 - The shared decode-but-not-claimed lane is currently empty.
+- The `reference/` directory holds ffmpeg decodes of the transient/noise AAC fixtures (first
+  quarter second, mono downmix, 16-bit little-endian PCM at the fixture rate);
+  the corpus test compares those fixtures against these excerpts instead of the
+  tone source.
+- The stereo fixtures were made from the mono tone with ffmpeg, whose
+  mono-to-stereo matrix places the tone at -3 dB in each channel; the corpus
+  test scales the tone reference by 1/sqrt(2) for stereo fixtures.
+- The Vorbis fixtures (`tone-stereo.ogg`, `tone-stereo.oga`) are held to the
+  same reference closeness as every other codec; the pure-Zig Vorbis decoder
+  matches ffmpeg at about 120 dB SNR on them.
 - The shared unsupported lane is intentionally separate from this directory and
   currently only covers synthetic unknown bytes in code.
 - The `lib/audio` tests verify both that every encoded fixture here is present
   in the shared passing table and that the fixture list documented in this file
   stays aligned with the files on disk.
-- `zig build lib-audio-conformance` runs the external Xiph-family and
+- Running `zig build lib-audio-conformance` runs the external Xiph-family and
   MP3/AAC/MP4 conformance sweeps, fetching missing corpora and reusing cached
   fixtures. Use `-Dconformance-fetch=false` for an offline run.
 

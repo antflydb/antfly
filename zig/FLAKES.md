@@ -4,6 +4,968 @@ See also the [E2E flake history](e2e/FLAKES.md). Record the original evidence,
 reproduction conditions, deterministic regression, and before/after results;
 a passing soak alone does not establish a failure's cause.
 
+The later [Antfly E2E failures](e2e/FLAKES.md#2026-09-18-concurrent-aggregations-stalled-hydration-and-raced-primary-generations)
+add full-text hydration contention, aggregation generation races, and overlapping transaction session recovery;
+their deterministic regressions and native soak evidence are recorded there.
+
+## 2026-09-18: HTTP cancellation lost a socket published after the watchdog won
+
+[PR #801's x86 unit job](https://github.com/antflydb/antfly/actions/runs/35382288964/job/105721669088)
+hit the idle watchdog after 1,815 seconds. The new per-process progress log
+identified `native_chat.test.server request cancellation interrupts a blocked
+response`: it entered the test but never reached runner I/O teardown. PID 17421
+had 11 threads, waited in `futex_wait_queue`, and had no OOM kill. Debugger
+attachment was denied again. This resembles the earlier anonymous stall below,
+but the earlier artifacts cannot prove that it was the same test.
+
+The unchanged Debug test reproduced under Linux x86 container emulation on
+repetition 41 of one of four concurrent workers. A second instrumented run hung
+on repetition 51. Cancellation won before the request registered its socket;
+the surviving worker was blocked in a socket read while its caller joined the
+request task. Publication's already-canceled branch attempted `netShutdown`,
+discarded its error, and continued without installing the cancellation callback.
+Because shutdown is itself cancelable, it could return `Canceled` without
+shutting down the socket. The subsequent native read had no timeout or callback
+to release it after the watchdog had finished.
+
+Socket publication now returns `Cancelled` when cancellation already won.
+Every buffered/streamed, pooled/unpooled HTTP/1 path propagates it, including TLS;
+existing connection ownership closes or evicts the socket before sending. The
+publication mutex still serializes registration against the watchdog's shutdown.
+No test timeout was raised and the original chat test is unchanged.
+
+A deterministic regression forces the late-publication ordering with a shutdown
+backend that returns `Canceled`, covering buffered and streamed requests with
+and without pooling. It fails against the old client, which sends and accepts a
+response, and passes with the fix, requiring no server request, output, or retained
+pooled connection. All nine client lifecycle tests and the active-read cancellation
+and timeout regressions pass on native macOS. The unchanged chat test passes
+1,000 Linux x86 Debug repetitions across four workers after the fix. These Linux
+results use local emulation; native ARC qualification remains a CI gate.
+
+## 2026-09-17: unit watchdog lost attribution outside the DB partitions
+
+[Run 35298670343's x86 unit job](https://github.com/antflydb/antfly/actions/runs/35298670343/job/105456824907)
+hit the 1,801-second idle watchdog. Both retained DB partition logs ended normally:
+138 passed/3 skipped and 1,177 passed/5 skipped, without failures or leaks. The
+remaining anonymous executable was `f26151a39b6115e67510f0853223991c/test`, PID 16100,
+blocked in `futex_wait_queue` with 11 threads. Both ordinary and elevated debugger
+attachments failed with `ptrace: Inappropriate ioctl for device`; no OOM kill was
+recorded. The ephemeral runner cache is gone. These artifacts do not identify
+the stalled test or establish a runtime deadlock's cause.
+
+Only the DB partition wrapper streamed progress to retained files. Other checked
+build runs buffered stderr until exit, including CPU inference's separate simple
+runner. Both simple runners now write a separate PID-named log under the existing
+`ANTFLY_TEST_LOG_DIR`, recording arguments, test entry, I/O teardown, allocator
+teardown, and completion. Diagnostic I/O is independent of the per-test I/O owner.
+The existing idle watchdog watches these files, so advancing tests no longer
+appear idle solely because their console output is buffered until process exit.
+Inventories retain their existing output and do not execute tests. The watchdog
+also copies live test executables with their arguments, working directory, and
+SHA-256 before termination, so a ptrace denial cannot erase the executable too.
+Watchdog limits and test selection are unchanged.
+
+The compiled runner regressions verify that an in-flight test is visible while
+stdout/stderr remain captured, then verify both teardown phases and completion.
+The retention helper checks exact binary bytes, arguments containing spaces,
+digest, and exclusion of compilers. This closes the diagnostic gap; it does not
+by itself resolve or reproduce the original hang.
+
+Local CPU-inference runs completed 4,319 selected tests on native macOS (4,261
+passed, 58 skipped) and 4,305 on Linux x86 under emulation (3,909 passed, 396
+skipped). The emulated run required a 64 MiB stack after the emulator hit its
+8 MiB default stack boundary; this is not a native ARC qualification result.
+The newer run `35304355356` also passed its x86 base-unit job. These passes do not
+identify or resolve the original stalled executable.
+
+The same run's E2E failure was a large-catalog database-create HTTP 503, not a
+restore timeout. See the [catalog E2E record](e2e/FLAKES.md#2026-09-17-large-catalog-mutation-failed-during-fast-native-elections).
+
+## 2026-09-17: standby drain stalled behind status-protocol probing
+
+Both standby-scaling shards in [run 35247508165](https://github.com/antflydb/antfly/actions/runs/35247508165)
+failed `ProductionStandbyBaselineDrainTimeout`. Seed `2713408769` reproduced locally:
+store reports remained at approximately 2.277 seconds while drain reconciliation
+continued. The simulated metadata endpoint exercises compatibility with a peer
+that does not yet support `/status/update`. Its 60-second capability-probe delay
+shared the worker's publication retry timer, suppressing supported full reports
+and leaving drain observations stale.
+
+The worker now separates capability probing from publication retries. Full reports
+continue while the newer protocol is unavailable; actual transport failures and
+pending baselines retain their existing backoff. The borrowed-`VoprIo` regression
+verifies three consecutive full reports, one unsupported probe, and adoption of
+the current protocol when the peer upgrades. All nine runtime VOPR tests pass.
+With the capability timer fixed, seed `2713408769` completed promotion, split,
+merge, scale-in, and exact replay. Seed `11400714822036607254` then exposed a
+second defect: full publication carried a `maxInt(u64)` deadline into HTTP.
+Three socket timeouts advanced virtual time by approximately 149 days before the
+next control round returned `Timeout`. The finding replayed exactly.
+
+Collection now checks cancellation separately and starts a fresh two-second
+network budget after the snapshot is ready. Discovery and publication share a
+bounded allocation for each remaining metadata endpoint, allowing a later healthy
+peer to respond even when the first endpoint stalls. The borrowed-I/O regression
+checks the timeout bound and both stalled-head and stalled-publication failover.
+Schema progress retains its separate bounded quantum after a successful report,
+so slow publication cannot repeatedly exhaust the schema checkpoint budget.
+Failure diagnostics also retain the drain catalog snapshot. On the final macOS
+ARM64 ReleaseSafe executable, both retained seeds completed promotion, split,
+merge, scale-in, and exact replay: 721,262 transitions, two clean histories, zero
+failures, replay divergences, or harness errors. Both histories verified quiet
+teardown with no live tasks, open files, or open sockets. The executable SHA-256 is
+`1f0d8f180d853864057578a5431507f294e62d74bfb7a704d2f9526148d4cb3f`.
+Fresh recordings were required after rebuilding because task identities include
+compiled function offsets; replaying the previous executable's traces stopped
+at the first task identity mismatch, before workload execution. All 48 final
+build steps and all 34 runtime VOPR tests pass. Full Linux CI and the scheduled
+soak remain separate qualification gates.
+
+The same PR's [x86 unit build](https://github.com/antflydb/antfly/actions/runs/35247545305/job/105292308708)
+exposed a separate C API module-root violation: the restore admission helper was
+imported via `../storage` from a module rooted at `capi/db.zig`. Export it from the
+owning C API root and use the existing `antfly` module dependency. The production
+build and all 12 focused C API tests pass with that ownership corrected.
+
+## 2026-09-17: restore leadership recovery lost proposal error identity
+
+The production E2E job in [run 35247508165](https://github.com/antflydb/antfly/actions/runs/35247508165/job/105291344795)
+recorded repeated restore ownership changes and 120-second completion failures.
+The final 100-case run had 16 failures: 11 restore completion timeouts and five
+seed-write failures. Retained metadata logs
+show `MetadataProposalSuperseded`, `MetadataProposalApplyTimeout`, and WAL commits
+around 600 ms. The native 3x3 fixture forced 5 ms Raft and control ticks; it now uses
+the executable's production cadence instead of election deadlines shorter than
+observed storage latency. This does not change any API completion deadline or
+acknowledged-data assertion. Fast virtual schedules remain covered by VOPR.
+
+Proposal supersession and apply-timeout errors were absent from the stable runtime
+error ABI. During restore leadership preparation they could become generic
+persistence failures and HTTP 500. Preserve their exact identity across archives.
+Before public dispatch, leadership preparation may return 503 and rebuild from
+committed rows on the next request, including after an unknown write outcome.
+This broader recovery classification does not apply to an already dispatched
+mutation and does not authorize replay of ambiguous client writes. Restore workers
+also recover their exact durable attempt after these outcomes instead of terminally
+failing a partially published restore.
+
+The deterministic leadership-rebuild regression injects each outcome through the
+real persistence ABI, then verifies successful FIFO recovery. All 29 restore-store
+tests, 19 error-boundary/authority tests, and 46 compiled backup/restore tests pass.
+The latter require local networking; the sandboxed run was not a valid pass.
+A native macOS ARM64 soak of the production recovery changes passed 20/20 cases
+across both variants and descriptor profiles. The subsequent publication-budget
+change is validated separately by the runtime VOPR tests and retained histories.
+See the E2E record for the separate
+stalled-discovery HTTP 500, original-log limitations, and production soak coverage.
+
+## 2026-09-16: 3x3 restore owner admission blocked its own bootstrap
+
+[PR #771's base E2E job](https://github.com/antflydb/antfly/actions/runs/35163796459/job/105028671150)
+failed `test_three_by_three_cluster_backup_restore_through_metadata_public_api`:
+restore job `3531487279743073036` did not finish within 120 seconds. Data node 4
+repeatedly failed Raft admission for group `51491842878582563` with
+`GenerationTransitionActive`. Other replicas completed runtime repair. The logs
+also contain `CorruptLsmWalIndex` while closing old, deleted groups; that diagnostic
+alone does not establish the cause of the restore admission stall.
+
+A local 20-case, two-worker baseline reproduced the same 120-second stall and
+repeated generation-transition admission errors. A deterministic compiled-owner
+regression then forced catalog visibility before bootstrap import: reconciliation
+incorrectly returned `complete` and retained an empty physical owner. Its generation
+reader prevents bootstrap's exclusive import, so retrying bootstrap cannot heal it.
+Both the server point catalog projection and the remote metadata client's owned
+point snapshot stripped the restore binding from range records. A regression using
+the real remote source on `VoprIo` fails before the client fix and verifies that
+both point-read modes and the final owner descriptor retain the exact binding,
+even after warming the compact catalog-wide routing cache.
+
+Owner descriptors now retain the range's restore identity. Before opening a cold
+owner, the storage kernel verifies that the published generation contains the exact
+primary import proof (backup, location, artifact, native manifest, shard path, and
+destination group). It holds the validated generation lease through `DB.open`,
+preventing a check/open race. Missing or different imports yield retryable
+`StorageReadTemporarilyUnavailable` without creating a resident DB. Matching imports
+remain admissible while runtime repair is pending; requiring completed repair would
+create a second circular dependency. Ordinary owner cache hits do not acquire a new
+proof or read a marker. A cached owner with a different or absent admitted restore
+binding drains before reopening, preventing an earlier catalog view from bypassing
+the check. Register `StorageReadTemporarilyUnavailable` in the compiled failure
+registry so this deferral retains its retryable identity across the storage ABI.
+The internal storage-owner ABI advances to version 61.
+
+`restore-admission-vopr-test` explores 256 seeded interleavings across nine replica
+placements and exact replays each history. It uses the production admission helper,
+generation leases, and durable markers on borrowed `VoprIo`. Owner probes compete
+with publication on the same replica, including while its exclusive publication
+lease remains held across scheduler steps. It checks missing and
+mismatched proofs, incomplete primary import, admission before runtime repair
+completion, lease release after rejection, and pinning until an admitted reader
+releases its lease. The compiled-owner regression covers actual owner admission;
+the native soak covers backup import and atomic generation replacement.
+The scheduled qualification runs this target. Native scheduled coverage adds
+`zig-e2e-cluster-restore-soak.sh`: 50 fresh 3x3 clusters each under normal and
+256-descriptor limits, with exact JUnit counts and retained failed roots.
+
+The baseline also exposed two incorrect E2E assumptions: committed deletion may
+return `committed_repair_required`, and restore admission may lose its acknowledgement.
+The test still requires catalog absence and successful restore, but recovers admission
+with one explicit idempotency key and verifies that retries retain the same job ID.
+Timeout diagnostics now refresh metadata and retain observed job states. A fifth
+failure was a transient `TableTopologyProtocolUpgradeRequired` losing its identity
+at the compiled callback boundary and becoming HTTP 500. The merged main catalog
+changes register that identity in both failure formats; boundary regressions verify
+that the existing HTTP 503 path remains available. The
+create harness recognizes the documented text rejections only with explicit
+non-admission headers; uncertain/committed outcomes still fail without replay.
+
+A first post-fix experiment ran both profiles concurrently (four six-process
+clusters), exceeding the scheduled two-cluster concurrency. It was stopped after
+20 completed cases (15 passed, five failed) when the host reached 48,342 TCP sockets
+in `TIME_WAIT`, matching the previously recorded local socket-pressure failure.
+Failures included lost seed connections, replication/election deadlines, a batch
+conflict, and a data control-loop exit with `WriteFailed`; none reproduced the
+original restore admission stall. These results do not qualify the native soak.
+
+The fatal write error exposed a separate HTTP boundary defect. A deterministic
+injected socket reset returned generic `WriteFailed` instead of
+`ConnectionResetByPeer`. The direct HTTP send path now unwraps the network writer's
+stored error and retires the failed connection. It preserves uncertain delivery
+and makes no automatic mutation retry. Generic non-network writer errors retain
+their identity. Executor tests cover GET/POST, one write attempt, delivery state,
+and pool retirement; the VOPR status test covers delayed socket failures and the
+existing backoff/deadline rules. The injected regression establishes this transport
+bug, although the retained process log cannot identify the original socket errno.
+
+An intermediate two-worker run completed 18 cases (16 passed, two setup failures)
+before review found the missing remote client projection. The setup failures were
+explicit uncertain delete and stateless batch outcomes. The harness now observes
+all original table/range identities disappearing after an uncertain delete, and
+requires every seeded document's complete payload to appear after an uncertain
+batch. It never replays those mutations or treats unresolved outcomes as success.
+Five harness regressions cover successful observation, missing/incorrect data,
+missing outcome headers, and exactly one mutation attempt. Partial runs from before
+the final production rebuild are excluded from qualification.
+
+The first run against the merged catalog executable completed 12 cases (11 passed,
+one post-restore assertion failure). The restore job succeeded and all metadata
+nodes reported full replication, but a separate one-second topology probe then
+returned `None`. That helper conflated transport/HTTP failures with missing tables,
+so the exact reason for the extra probe's failure was not captured. The replication
+check now returns the exact table/group identities it validated, requires agreement
+across all three metadata nodes, and avoids the redundant probe. Backup manifests
+must match the captured original groups, and restored documents must still be read
+through every data node. Six harness regressions cover a failed later observation,
+inconsistent identities, missing placement, missing health, and missing snapshots.
+
+The next two-worker macOS run completed 32 cases (31 passed, one unresolved delete)
+under measured host socket exhaustion: Python metadata probes failed with
+`EADDRNOTAVAIL`, data control reported `AddressUnavailable`, metadata nodes lost
+leader visibility, and the host had 51,921 TCP sockets in `TIME_WAIT`. The restore
+had not started. The test correctly failed instead of replaying the uncertain
+delete. These results do not qualify the restore soak. Final local validation uses
+one six-process cluster at a time (`ANTFLY_E2E_REGRESSION_WORKERS=1`,
+`ANTFLY_E2E_REGRESSION_REPEATS=50`) while retaining 100 total cases and both FD
+profiles. Scheduled Linux coverage keeps two workers and 25 repeats per profile;
+local serial results do not establish that parallel macOS runs are reliable.
+
+Final macOS ARM64 ReleaseSafe validation passed all 100 native cases: 50 normal
+and 50 with a 256-descriptor limit, one cluster at a time. JUnit verification found
+no missing, skipped, failed, or errored cases; the production executable SHA-256
+remained `7689b05ded6616b815c904b9e3727c2732fb6573566738ac7ed1427c953f0d15`.
+The merged-main runtime suite passed 34 tests, compiled owner source passed 14,
+error registry passed one, callback/error boundaries passed 20, and Python harness
+and script checks passed 110. All 256 VOPR histories (81 transitions each) and
+exact replays passed, as did the determinism audit. Linux CI and the scheduled
+parallel profile must validate the original platform separately.
+
+## 2026-09-16: replay-retention fixture timed out on a checkpoint proxy
+
+PR #691's [x86_64 unit job](https://github.com/antflydb/antfly/actions/runs/35176786855/job/105060523520)
+at `37b9910520` failed only
+`db async replay truncation retains journal behind generated enrichment`.
+`waitForAppliedSequenceAdvance` timed out waiting for `ft_v1` to persist a
+checkpoint within 100 ten-millisecond polls. The production E2E job passed,
+including the prior shutdown regression. Twenty fresh local Debug processes,
+with four running concurrently, did not reproduce this Linux timeout.
+
+The retention fixture used checkpoint appearance as a proxy for a truncation
+attempt, then watched the journal for another half second. Neither established
+that the truncation callback had finished. A delayed checkpoint is not evidence
+of replay loss, and the trace alone does not establish a stuck production worker.
+The test now observes the real provider rejection through an event, requests
+truncation through the captured source tail, and compares every retained record's
+sequence and payload after that call returns. It then permits provider recovery,
+drains the production pipeline, checks both durable index checkpoints, and
+queries the generated vectors for both documents. This covers retention and
+recovery without requiring autonomous checkpoint publication within one second.
+
+The revised case passed 40/40 fresh Debug processes with four concurrent workers.
+As a negative control, temporarily removing only the generated-enrichment clamp
+in `truncateReplaySequenceAsync` made it fail at the record-count assertion
+(`expected 1, found 0`). Restoring the clamp restores the passing test; the
+committed change modifies only the fixture and this investigation record. All
+five related replay-retention, provider-restart, and index-worker cases pass.
+
+## 2026-09-16: source quiescence freed activity borrowed by transaction callbacks
+
+PR #691's [base Antfly E2E job](https://github.com/antflydb/antfly/actions/runs/35168905132/job/105044672774)
+tested `19ffc3c820` and passed the body of
+`test_multinode_exact_candidates_follow_redirects_across_entity_shards`, then
+failed teardown when data node 101 exited with `SIGSEGV`. The uploaded build
+artifact contained only the executable; the failure-log upload glob omitted
+multinode roots. CI now retains their node logs, failure diagnostics, and any
+captured native stacks as well as standalone logs.
+
+A local Debug repetition failed on the fourteenth run, again during node 101
+teardown. This time `endGroupOperationLocked` asserted because a
+`ResolveFollowerFanoutTask` finishing `txnResolveGroupLocalWithCancellation`
+could no longer find its activity record. `ProvisionedTableWriteSource.quiesce`
+freed those records after joining source-owned jobs, before the data server
+joined DB-owned promotion workers that could still call the transaction source.
+The same premature destruction exists on main. Without a Linux stack, the local
+assertion establishes a concrete lifecycle defect but cannot prove the exact
+instruction behind CI's segmentation fault.
+
+Source quiescence must close its own job admission and drain those jobs while
+retaining bookkeeping borrowed by external callbacks. Final source destruction
+releases that state after the caller has joined the DB workers. The regression
+holds a real transaction-resolution operation across source quiescence and
+requires normal activity release on both success and cancellation; production
+E2E keeps its crash-rejecting teardown assertion.
+The deterministic regression fails before the fix in `endGroupOperationLocked`
+and passes afterwards. The full writer lifecycle target passes all 228 tests;
+the merged error-ABI suites pass all 17 tests.
+On macOS ARM64, the rebuilt Debug and ReleaseSafe production executables each
+pass all 35 resolution/Autograph module cases (including data-node restart) and
+20 fresh-cluster repetitions of the originally failing exact-candidate case.
+That is 40/40 additional shutdown repetitions with the crash assertion enabled.
+Linux CI must still confirm the original platform.
+
+## 2026-09-16: constrained Autograph restart lost retryable owner admission
+
+The second retained-corpus qualification of PR #704 at `81ab94c8b1` failed its
+[production E2E job](https://github.com/antflydb/antfly/actions/runs/35126679231/job/104951437450).
+All eight VOPR campaign shards and all four corpus replay jobs passed. Under
+the 256-descriptor Autograph profile, worker 2, iteration 16,
+`test_multinode_autograph_recovers_after_data_restart` completed its assertions
+but failed teardown because data node 102 exited with code 1. Its log identifies
+`StorageBusy` applying the `documents` Raft entry at index 6. The artifact
+`production-e2e-soak` retains the failed root `antfly-zig-scaling-e2e-l3fykcbz`.
+
+The descriptor-pinned committed-entry path used foreground owner acquisition,
+which waits up to five seconds for registry/owner admission before returning
+`StorageBusy`. The apply driver recognized only writer-unavailable and resource
+budget errors as retryable, so the busy result escaped and stopped the process.
+The logs do not identify which lease held admission. The regression forces
+registry contention, an exclusive owner lease, and publication independently.
+
+Committed-entry admission now makes one attempt and yields conflicts to the
+existing Raft pending-apply queue, before encoding the batch. `StorageBusy` and
+publication's `StorageReadTemporarilyUnavailable` retain the original term/index
+and retry checkpoint. Neither advances the applied watermark, completes a write
+waiter, nor marks the command rejected. Recovery replays the same entry identity;
+the owner persists that identity atomically with the mutation. Unexpected errors
+retain their fatal behavior. This avoids parking the shared progress driver behind an owner
+whose maintenance callback may itself need Raft progress.
+
+The same failed root logged `DistributedQueryUnavailable` becoming
+`RuntimeBoundaryFailure` and then `InternalFailure`. Register that exact
+retryable identity in both callback and owner failure formats so the HTTP layer
+can retain its existing 503 behavior. The new cross-unit callback assertion
+failed before the fix with exactly that identity loss.
+
+The Autograph step was misleadingly green because GitHub's implicit Bash shell
+did not enable `pipefail`; `tee` hid the script's nonzero exit. The final JUnit
+evidence check correctly failed the job. Explicit Bash now propagates pipeline
+failures while retaining logs. Injected failures in all three production
+pipelines fail against the original workflow and preserve their exit status
+with the fix. The existing 200-case Autograph soak, including restart and
+teardown checks in both profiles, remains enabled. The Raft checkpoint regression
+also runs in scheduled VOPR qualification.
+
+## 2026-09-16: Debug stack unwinding escaped a fresh VOPR fiber
+
+Local macOS ARM64 Debug profiling of `origin/main` (`70098c101d`) crashed in
+these borrowed-runtime tests:
+
+- `db apply fences wait through their borrowed runtime`
+- `graph ownership cleanup runs on borrowed VoprIo before replicated merge`
+- `background maintenance services lifecycle runs on borrowed VoprIo`
+- `ttl runtime executes production pass on borrowed VoprIo`
+- `transaction recovery executes production pass on borrowed VoprIo`
+
+The apply-fence case also failed with timing instrumentation disabled. The
+reported segmentation fault was at address `0x8`; stack-trace printing then
+stalled. DebugAllocator captures allocation/free traces on the VOPR task stack,
+so stack unwinding itself can cause this fault before any diagnostic is printed.
+
+`Kernel.createTask` initialized the fiber frame pointer to zero, but `Entry.entry`
+left ARM64's link register inherited from the scheduler. Metadata-based unwinding
+could follow that unrelated return address and interpret the null frame pointer
+as another frame. A standalone task-kernel regression reproduced the same
+`EXC_BAD_ACCESS` at `0x8` in `std.debug.Dwarf.SelfUnwinder.nextInner` under LLDB.
+The equivalent x86_64 synthetic return-address slot was uninitialized too.
+
+The entry trampoline now initializes the nonexistent caller's return address to
+zero on both architectures. This costs one instruction at task entry and leaves
+normal context switches unchanged. Allocator diagnostics and stack tracing stay
+enabled. The regression captures a complete trace and exercises DebugAllocator
+both before and after yielding the same task back to the scheduler.
+
+After the fix, macOS ARM64 Debug passed all **32 runtime adapter tests**, including
+the five failures, and all **167 VOPR library tests**. The standalone task-kernel
+suite also passed all **14 tests in ReleaseSafe**.
+The five reported cases additionally passed **20 fresh processes / 100 cases**
+with zero skips, failures, or leaks. The 14 task-kernel tests passed in Debug on
+Linux x86_64 under local container emulation. The pre-fix standalone regression
+also passed there, so the Linux run validates the fix but does not establish a
+Linux reproduction of the macOS fault.
+
+## 2026-09-16: metadata ownership fixtures bypassed Raft serialization
+
+PR #704's [x86_64 unit job](https://github.com/antflydb/antfly/actions/runs/35052615288/job/104656431732)
+at `fadf936c29` aborted in
+`metadata ownership preserves same-id remote backfill observations`.
+The restore supervisor's `ensureLinearizableRead` called Raft `readIndex` while
+`Scheduler.ready_pass_active` was true, failing the scheduler's non-reentrancy
+assertion. The graph-repair and resolver-reopen regressions from the preceding
+failure both passed; the SDK, ARM codec, and base E2E suites also passed.
+
+The ownership fixtures added in [#737](https://github.com/antflydb/antfly/pull/737)
+start a real metadata server, including its asynchronous restore supervisor, but
+four calls in two fixtures advanced
+`svc.raft.runRaftRoundOnly()` directly. The supervisor uses the owning
+`MetadataHttpService` runtime mutex; those raw-host calls bypassed it. Production
+service round and read-barrier entrypoints already share that mutex.
+
+The fixtures now advance through `svc.runRaftRoundOnly()`, preserving the live
+supervisor and serializing Ready processing with its read barriers through the
+existing `std.Io.Mutex`. This fixes the invalid concurrent caller, without
+weakening the scheduler assertion, disabling background work, or adding another
+lock to the Raft hot path. Both the placement/restart fixture and all four
+ownership-projection cases use the same service boundary.
+
+With native localhost socket access, the unchanged `fadf936c29` binary reproduced
+the same backfill-test abort in repetition 32 of a four-process runner: the
+restore supervisor entered `resumeGroupOnActivity` through ReadIndex during an
+active Ready pass. The runner stopped scheduling new work after that failure;
+34 other processes completed successfully. Sandbox-only runs skipped all eight
+listener-dependent tests and are not counted as validation.
+
+After the fix, the failed CI shard's exact runtime filter/skip selection passed
+all **207 tests** locally with native sockets, zero skips, failures, or leaks.
+The separate read-cadence regression also passed, verifying linearizable reads
+do not take over the election/heartbeat clock.
+All eight ownership cases then passed **200/200 fresh processes (1,600 test
+executions)** with four concurrent processes and native sockets, with no skips,
+failures, or leaks. Formatting and diff checks passed. These are local results;
+standard CI and full-soak qualification must be checked for the pushed commit.
+
+## 2026-09-15: graph repair yield accounting and independent resolver completion
+
+PR #704's [x86_64 unit job](https://github.com/antflydb/antfly/actions/runs/35044256661/job/104631027746)
+at `95b0e74334` failed `db index repair streams graph artifact rebuild in batches`
+with `expected 2051, found 0`, then aborted while freeing the fixture's writes.
+The separate DB-core partition failed
+`db resolver workers recover pending journal targets after reopen without new writes`
+because resolution still required catch-up. The previous replay-truncation
+regression completed; this run did not hit the idle watchdog.
+
+The graph repair wrapper converted activation-budget exhaustion into an empty
+`yielded` result, dropping the work count even after durable snapshot construction.
+A one-millisecond activation budget deterministically forces this path because it
+cannot cover the five-millisecond publication reserve. The graph batching
+regression now exercises that yield, checks retained work and candidate state,
+reopens the DB, and verifies activation reuses the same candidate without another
+batch flush or recounting previously completed work. The wrapper retains the
+current turn's completed-work and discovered-artifact-debt counts on a deadline
+yield. This adds no scans or storage I/O. Production pause limits and retry policy
+remain unchanged. The original CI log did not retain repair state,
+so it cannot independently prove which early-return path produced its zero count.
+
+The fixture also left function-scoped `errdefer` frees armed after handing its
+last key/value pair to the writes list. A later assertion error freed that pair
+twice. Allocation-to-list transfer now has a local scope, so assertion failures
+report normally and the list remains the sole owner after append.
+
+Resolver output publication and resolution checkpoint/backfill completion are
+independent. The test waited for promotion and two sink writes, then immediately
+asserted resolution was idle. Its completion condition now checks both stages;
+it keeps the existing bounded wait and still tests automatic recovery without
+new writes for both pending-resolution and pending-promotion reopen cases.
+
+Before the production accounting fix, the forced graph-yield test failed with
+`expected 2051, found 0`; the corrected fixture cleanup reported that assertion
+normally, without an abort or leaks. Repeating the two original tests against
+`95b0e74334` reproduced the resolver failure in fresh process 75 (74 prior passes).
+
+After the fix, all 20 focused repair/resolver tests passed in ReleaseSafe,
+including graph and full-text replacement, corrupt-artifact debt, activation
+budget yielding, and dense candidate yield/reopen accounting. The graph-yield
+and resolver-reopen cases passed **200/200 fresh processes (400 selected test
+executions)** with four concurrent processes, no skips, failures, or leaks.
+Formatting and diff checks passed. These are local regression results; standard
+CI and full-soak qualification must be checked separately for the pushed commit.
+
+## 2026-09-15: merged runtime-lane assertions and replay fixture deadlock
+
+PR #704's [x86_64 unit job](https://github.com/antflydb/antfly/actions/runs/35025324900/job/104571966002)
+at `7c061722ac` failed the Raft service-worker test twice, then terminated after
+1,801 seconds without log progress. No OOM kill was recorded. These were
+merge regressions, not evidence of an intermittent production race.
+
+The Raft host had been assigned `raftOutboundIo()` while the merged test and
+runtime ownership contract required `runtime.io()`. Native runtimes give those
+lanes distinct identities. Host synchronization/reconciliation now use the
+general owner runtime; transport retains its dedicated outbound lane. The VOPR
+regression supplies distinct general and outbound runtimes with different clock
+values and checks both identities, in addition to the native worker-budget and
+rollback test.
+
+A local run of the DB-core complement reproduced the stall in
+`db async replay truncation retains durable enrichment debt`. A native stack
+sample showed its main thread parked in `truncateReplaySequenceAsync` on the
+repair-pin mutex. The fixture had locked that mutex and installed an incomplete
+fake vtable in `AsyncContext.io`, expecting its wait callback to unlock it.
+Truncation correctly uses `index_manager.checkpointIo()`, so the fake callback
+could never execute. The durable-retention fixture now tests the journal
+watermark directly. Contention remains covered by the real scheduled VOPR test
+`db replay truncation waits for repair pins through borrowed VoprIo`, including
+both truncation entrypoints and an absent operation-level Io override. The
+owner's synchronization authority remains stable throughout the operation.
+
+CI's checked Run output buffered the entire unfinished DB partition, while its
+stack-dump selector missed named `*-tests` executables. Partition output now
+also streams to per-process logs, including a test name without its final
+newline. The watchdog observes those logs, prints their tails on failure, and
+includes named test executables in stack capture; the workflow retains the logs
+as artifacts. A process handshake regression verifies partial output is visible
+before the child exits and a nonzero child status is preserved. This preserves
+the existing watchdog limits rather than masking a blocked test with more time.
+
+Validation: all three focused Raft host cases and six managed-Raft contracts
+passed with native socket access. The three replay retention/repair-pin/restart
+cases passed; the retention and repair-pin cases also passed 20 fresh-process
+repetitions (40 executions). All 32 `vopr-runtime-test` cases passed without
+skips or leaks. Workflow lint, 55 CI policy tests, three partition-runner tests,
+and two validation-scope tests passed. This is local regression evidence; fresh
+standard CI and full-soak qualification must be checked separately.
+
+## 2026-09-15: snapshot ownership leaked between cooperative tasks
+
+Review of #704 reproduced a pre-existing `SnapshotAdmission` bug on both
+`096a1f9e4` and `origin/main` (`0fb01a4add`). A VOPR task acquired capture and
+slept for ten virtual milliseconds. Before advancing time, another task acquired
+mutation admission on the same OS thread and reported `capture_active=true`,
+`mutation_overlapped=true`, and `lease_bypassed=true`. Thread-local ownership
+mistook an unrelated task for the capture owner. The same mechanism also made
+leases unsafe to transfer between native Io workers.
+
+Admission now belongs to explicit operation leases. Nested mutations retain a
+shared lease without re-entering the writer-closed gate. Capture lends a scoped
+mutation capability to its catalog guard. Bulk-ingest nested batches pass their
+parent lease; LSM maintenance calls its admitted helper. Dense replay passes the
+exact catch-up session token through both manual and Io executor callbacks,
+retains its lease under the session-map mutex, and rejects stale or mismatched
+tokens. Closing the session cannot retire a lease still held by an active batch.
+Ordinary acquisition remains allocation-free; waits use the owner's `std.Io`.
+
+Five admission regressions cover independent VOPR tasks, cancellation, a queued
+capture with an explicitly retained mutation, capture-owned maintenance, and
+release on a different native Io worker. They passed **200/200 fresh processes
+(1,000 test executions)**. The DB token regression also checks that a retained
+batch keeps capture excluded after session close and that closed/wrong-index
+tokens cannot borrow admission. These cases run in `vopr-runtime-test` and
+production VOPR qualification. The focused DB integration run passed 28 cases
+(native snapshots, concurrent capture/writes, bulk ingest, and replay-worker
+lifecycle), with one LSM-backend fixture skip and no leaks. The final
+`vopr-runtime-test` run passed all 25 storage/runtime and seven DataServer tests
+with no skips or leaks. Full-soak results must be associated with the new commit;
+an earlier-head soak cannot qualify this fix.
+
+## 2026-09-15: runtime-bound apply locks delayed handoff by polling
+
+Review of #704 found that binding `ApplyRwLock` to the DB runtime selected
+50-microsecond to 1-millisecond sleeps, while unlock skipped the futex wake for
+bound locks. This affected ordinary native DBs as well as VOPR. A native
+ReleaseSafe handoff probe (30 fresh reader tasks, each parked behind a writer
+for two milliseconds) measured **617 microseconds average / 1,252 worst** from
+unlock to acquisition on `256bb99782`, versus 4 / 11 for the unbound native lock.
+These are local latency measurements, not production throughput estimates.
+
+Contended acquisition now captures the wake epoch before checking admission and
+parks on the owner's `std.Io` futex. Unlock advances the epoch and wakes that
+same runtime. Sequentially consistent waiter registration and epoch rechecking
+let uncontended unlock avoid the wake call without losing a concurrent waiter.
+The last priority reader signals unconditionally: checking a separate writer
+count could miss a concurrently registering writer on a weakly ordered CPU.
+DB apply and snapshot admission, plus HBC publication and cache locks, are bound
+before use. A caller's separate filesystem/request I/O lane cannot move the wait
+to a different scheduler. Writer intent, reader priority, and cancellation
+cleanup retain their existing admission rules.
+
+Backend task cancellation wakes its futex directly. Callback-only cancellation
+tokens lack wake registration, so their futex waits retain a one-millisecond
+cancellation recheck; unlock still wakes immediately. Dense-posting admission
+uses one absolute 50-millisecond deadline on the owning runtime clock, including
+VOPR, instead of polling the host clock. Timeout releases writer intent and the
+reader gate, leaving repair work pending.
+
+The deterministic regressions cover shared/exclusive handoff without advancing
+virtual time, an unlock between failed admission and parking, and deadline and
+callback cancellation after closing reader admission. The no-clock-advance
+regression fails against the old lock with `LockWaiterDidNotPark` and passes
+after the change. They run in
+`vopr-runtime-test` and production VOPR qualification. The native contention
+regression uses `std.Io.Group.concurrent` for both bound and unbound locks.
+The same handoff probe after the fix measured **6 microseconds average / 20 worst**
+for the bound lock (unbound: 7 / 29). Four snapshot admission tests pass. The
+14-test lock suite passed 200/200 fresh processes (2,800 test executions),
+including four million writes across the native bound/unbound exclusion test.
+`zig build vopr-runtime-test -Doptimize=ReleaseSafe -j1` also passes: 18
+storage/runtime adapter tests and seven DataServer tests, with no skips or leaks.
+
+## 2026-09-15: multi-node Autograph promotion stalls with an untransportable read timeout
+
+[The base E2E shard](https://github.com/antflydb/antfly/actions/runs/34928784180/job/104259435053)
+failed `test_resolution.py::test_multinode_autograph_resolves_promotes_and_hydrates_entities`
+on `4dedffc703eb4aa744ae89d1d9fbd0ddc4b97931` (`codex/spfresh-segment-wal`).
+[The linked aggregate job](https://github.com/antflydb/antfly/actions/runs/34928784180/job/104263235408)
+only reports that shard failure. The shard finished with 447 passes, five skips,
+and one failure. Neither `person/ada_lovelace` nor `org/antfly` became visible
+within the 115-second promotion deadline. Its last lookup returned HTTP 500;
+the server logged `runtime callback returned untransportable error method=lookup
+err=ReadIndexTimeout`, `RuntimeBoundaryFailure`, and resolution
+`StorageKernelFailure`. Startup also logged `WriterLocked`. Attempts to capture
+six native process stacks were denied by ptrace policy.
+
+The failed revision lacks the `read_index_timeout` semantic identity and the
+public/internal read availability mapping already in #704. These preserve the
+error through the compiled callback and HTTP client boundaries and return
+503 with `Retry-After`, without weakening the Raft read barrier. The boundary
+round-trip and public-read parity regressions exercise this concrete error.
+The failed revision already contains bounded read-owner admission: that earlier
+fix alone did not prevent this failure. There are no usable stacks proving a
+new resolver/Raft deadlock in that CI job.
+
+Local production repetitions on the merged-main executable (SHA-256
+`710889d55cec215eeffd136ccf0327487cbb3b84d8cc99443f5ab330b42c7658`)
+reproduced **two failures in 100 fresh clusters**: normal 48/50, descriptor-limited
+50/50. Another 50 normal cases passed, illustrating why a rerun cannot clear the
+failure. Twenty repetitions of the original CI Linux executable under local
+emulation passed; that is not equivalent to native Linux CI qualification.
+
+The retained LSM tables from a local stall contain a generation-one resolution
+artifact with both canonical entities and a durable promotion replay record at
+sequence 3. Resolution and promotion report target/applied 2, while the graph is
+ready at 3 and the entity table is empty. Runtime initialization restored only
+the applied checkpoint, losing the volatile target on reopen. Both stages now
+recover their target from their own durable replay lane, independently of graph
+progress. The deterministic DB regression forces reopen before resolution and
+after resolution/before promotion, checks that the journal contains pending
+work, then requires completion without another write or synchronous drain. It
+fails before the change and passes with it, alongside the existing backfill and
+catalog-fencing regressions. The original CI's final read timeout is not by itself
+proof that its entire history followed this same reopen path.
+
+The new production data-restart case also exposed `AddressUnavailable` escaping
+the lookup callback as `RuntimeBoundaryFailure`/HTTP 500. Known read-transport
+failures now become `StorageReadTemporarilyUnavailable` before that boundary;
+cancellation, timeouts, and unexpected defects retain their distinct meanings.
+An injected failing transport verifies that normalization makes one attempt and
+does not silently retry or return a missing document.
+The pre-fix restart experiment failed 7/10 cases (three HTTP 500s and four
+promotion deadlines); its native stacks and roots are retained. Startup also
+returned `TableNotFound` from routed batch validation before invoking the writer.
+That now retains the existing `Unavailable`/503 response with the explicit
+`not_proposed_v1` outcome, rather than reporting an ambiguous HTTP 500. The
+operation regression asserts the writer was never called on those failures.
+
+The first corrected executable (`05ee0bf5c6`, SHA-256
+`c0c7056ebc8594d31d6d59a5838fcd9f6578dab9024e676e5639152151b110a2`)
+still failed **3/10 restart cases**: two second-document `WriterLocked` failures
+and one promotion deadline. Its retained log also caught a shutdown use-after-free:
+`PromotionRuntime.workerStep` called `GroupLeadershipSource.isLocalLeader` through
+a freed `ManagedHttpHostService` (`0xaaaaaaaaaaaab1da`, process exit `SIGABRT`).
+The provider shutdown barrier closed inline caches but skipped compiled owners,
+whose workers survived until after Raft destruction. Compiled-owner quiescence
+now fences admission, drains leases, and joins workers before destroying Raft or
+provider callback contexts. Its regression holds an actual promotion callback
+across shutdown using `std.Io.concurrent` and verifies admission stays closed.
+Restart and final teardown now reject spontaneous crashes and retain failure
+diagnostics instead of silently replacing or discarding the failed process;
+intentional bounded-stop `SIGKILL` remains a crash-recovery case.
+
+Compiled owner open also started resolver workers before reconciling the
+authoritative resolver configuration. A worker could hold the resolver catalog
+fence and make that configuration return `WriterLocked`. Open now defers those
+workers until configuration completes, matching the resident-cache lifecycle.
+Unchanged resolver refreshes also used the mutation fence and rewrote the
+catalog. With a distributed promotion in flight this could return `WriterLocked`,
+retire the owner, and repeatedly make promotion return `StorageBusy`. Exact
+configuration equality now uses a short catalog read lock and skips allocation,
+catalog persistence, and the replay mutation fence. Changed configurations still
+require that fence. The catalog regression holds each replay mutex in turn and
+requires an unchanged refresh to succeed while a changed refresh remains fenced.
+The compiled-owner suite passes all ten cases with no skips or leaks. The
+unchanged/changed resolver fence and both replay/reopen regressions also pass.
+The corrected production executable from `256bb99782` (SHA-256
+`58c637b81274785e5502f6f208fb45c2da90502295686e99c710b898ba54c99c`)
+passed ten restart probes and the full local 200-case Autograph soak: 100 normal
+and 100 under a 256-descriptor limit, with exactly 50 ordinary-resolution and
+50 data-restart cases per profile, zero failures/errors/skips, and the same
+executable hash after completion. These results precede the apply-lock handoff
+fix above; they do not qualify a later executable or establish the cause of the
+original CI read-timeout history.
+
+The E2E poller now stops on unexpected HTTP errors, including 500, instead of
+hiding them behind a generic promotion timeout. Only 503 with `Retry-After` and
+transport timeouts/disconnects are retryable. Its original deadline still applies.
+The first failure captures native stacks with a five-second per-process limit;
+teardown reuses that snapshot and stores it with the retained server root.
+macOS uses `sample`; the disposable Linux launcher opts test children into
+debugger attachment and the scheduled job installs GDB. Poll deadlines that
+fall below the request floor still report pending keys and graph diagnostics.
+
+The full nightly/manual soak now runs the production Autograph scenario under
+both normal and 256-descriptor limits, two concurrent workers and 25 repetitions
+per case per profile: **200 fresh six-process clusters**, split equally between
+the original case and a case restarting all data nodes after the initial write.
+Reports are distinct from the
+200 restore repetitions and must contain the exact expected test names and
+counts with no skips or failures. A failed normal profile does not prevent
+collecting constrained-profile evidence, and either failure fails the soak.
+The source revision and retained production executable identify the tested bytes.
+Run locally against a prebuilt executable with:
+
+```sh
+SKIP_BUILD=1 ANTFLY_BIN="$PWD/zig/zig-out/bin/antfly" \
+  ANTFLY_E2E_REGRESSION_REPORT_DIR=/tmp/autograph-soak-reports \
+  scripts/ci/zig-e2e-autograph-soak.sh
+```
+
+The poller/helper regressions pass locally (29 tests), as do the six regression
+orchestration tests, including profile isolation and failure propagation.
+Post-fix production repetition and Linux qualification results are pending; adding a
+soak is not proof that the progress failure is fixed.
+
+## 2026-09-15: distributed-data materialization fails during exact replay
+
+[The second full soak](https://github.com/antflydb/antfly/actions/runs/34927431365)
+failed distributed-data history 6 during replay with
+`VoprIndexMaterializationIncomplete`. The recording completed four transitions
+without property failures. The retained trace is
+`history-6-b54cda599d6a3d7e.voprtrace`, seed `13064056697522896254`; its original
+Linux executable SHA-256 is
+`163c27a17d1a0943f766840998bc9678fc88300578f126a4fea717a3700128fa`.
+
+The unchanged trace passed 30 native macOS replays, 25 emulated Linux replays,
+and [200 fresh-process native Linux replays under GDB](https://github.com/antflydb/antfly/actions/runs/34993873598).
+The retained log contains all 200 completed four-transition replays. Those
+passes do not explain or clear the original failure. The materialization helper
+uses 40 immediate repair polls; durable repair backoff uses host time. A normal
+activation-budget miss became a failed attempt with roughly 30 seconds of
+backoff, which the helper does not wait out. Budget exhaustion now returns the
+existing cooperative-yield result and keeps the durable candidate runnable;
+missing replay progress and actual storage errors retain failure handling.
+A deterministic regression gives activation less than its fixed publication
+reserve, requires no failure streak/backoff, then completes the same candidate
+with a sufficient budget. All four focused activation, coverage-failure, and
+candidate-resume tests pass locally. This independently validated scheduling
+fix is not proven attribution of this particular CI history.
+Native diagnostics now retain repair phase, attempt,
+failure streak, retry deadline, and last error when a replay fails.
+
+## 2026-09-15: standby/scaling corpus runner lost during cache publication
+
+[Corpus job 104276235667](https://github.com/antflydb/antfly/actions/runs/34927431365/job/104276235667)
+completed replay/merge validation and uploaded the small diagnostics artifact.
+The runner then lost communication during `actions/cache/save`; GitHub's check
+annotation reports runner loss, and full artifact retention was cancelled.
+Both scaling campaign shards passed. This is not evidence of a scaling assertion
+or replay failure, and the available log does not identify why the runner died.
+The workflow now retains the complete merged corpus before publishing its working
+cache. Cache publication still fails the job on failure; it is not treated as a
+passing seeded soak. The second full run failed independently in distributed-data.
+
+## 2026-09-14: soak qualification exceeds declared compiler memory (#704)
+
+[Qualification job 104248350481](https://github.com/antflydb/antfly/actions/runs/34927431365/job/104248350481)
+on `0f56ccd77e` reports a Linux ReleaseSafe compilation peak of
+13,255,065,600 bytes against a declared upper bound of 7,516,192,768 bytes
+(7 GiB). The production DataServer VOPR artifact uses
+`productionVoprCompileMaxRss`; the separate background-adapter artifact has its
+own declaration. The eight standby lifecycle tests and seven DataServer runtime
+tests shown in the log passed with zero skips, failures, or leaks. The completed
+qualification job succeeded with 27/27 build steps. Zig 0.16 records this RSS
+overrun as a diagnostic without returning `MakeFailed`; it is an inaccurate
+build-scheduling reservation, not a test failure or a killed compiler.
+
+The shared production-owner compile reservation now uses 16 GiB on Linux, with
+headroom over the observed 12.35 GiB peak; macOS keeps its existing 18 GiB
+reservation. This allows Zig to account for the actual compiler footprint when
+admitting concurrent build steps. It does not alter production memory limits,
+suppress resource checks, reduce test coverage, or retry away the failure.
+The revised reservation passed [Linux qualification on `43b79fc10b`](https://github.com/antflydb/antfly/actions/runs/34993639738/job/104465497701).
+The second full soak failed separately in its distributed-data replay;
+qualification itself passed.
+
+## 2026-09-14: standby/scaling read fails after sibling merge (#704)
+
+[Adversarial scaling job 104181278895](https://github.com/antflydb/antfly/actions/runs/34899531048/job/104181278895)
+on `919fa9d124` completed two histories with one clean and one failed history.
+Both received exact replay; there were no harness errors or replay divergences.
+The failure was a document lookup returning generic HTTP 500 after the automatic
+sibling merge, immediately before scale-in. `history-completes` and
+`promotion-and-topology-converge` failed; `owners-quiesce` passed with zero live
+tasks, files, or sockets after teardown. This is a failed soak, not a timeout.
+
+The failed history is `history-1-9e3779ba20f0d116.voprtrace`, seed
+`11400714822035230998`, mutated at choice 251091 from the first history of
+campaign seed `2712032513`. The original Linux executable SHA-256 is
+`8d44bc8e6ba94292e93b68b57369aa6f74bd31fceb261d49a7aaf85e9d448a5c`.
+The trace, mutation schedule, flight recording, and reports are retained in
+run artifacts `vopr-run-ha-scaling--1` and `vopr-diagnostics-ha-scaling--1`.
+Several earlier merge observations report `UnknownGroup`; that alone does not
+identify the later lookup error.
+
+The [original Linux diagnostic replay](https://github.com/antflydb/antfly/actions/runs/34913890221)
+captured `ReadIndexTimeout` in the HTTP transport's concrete error argument for
+`GET /db/v1/tables/tenant_b_docs/documents/tenant%3Aq`. The adversarial suffix
+advances time by roughly a minute while tasks remain pending. The production
+Raft read barrier correctly expires without returning an unproven read, but
+the public lookup adapter omitted this availability error and emitted generic
+HTTP 500. This request reads the separate tenant table; the preceding sibling
+merge and its `UnknownGroup` observations do not establish a merge defect.
+
+Test-linked executables suppress HTTP stderr to preserve Zig's test protocol.
+The debugger now captures the transport function's concrete error argument,
+numeric value, and request without changing the retained executable or its
+schedule. An ingress-only breakpoint missed inlined code; a source-line
+breakpoint exposed the error-union discriminant rather than the error payload.
+Symbol-based transport diagnostics avoid both problems. Native macOS replay of
+this Linux trace diverges at the first scheduled task and is not reproduction
+proof.
+
+The fix preserves `ReadIndexTimeout` through typed internal read operations,
+internal HTTP responses, and client decoding. Public lookup and pre-stream scan
+return HTTP 503 with `Retry-After: 1`, using their existing group-unavailable
+response. Explicit request deadlines remain HTTP 504, and unexpected storage
+errors still propagate as failures. The Raft barrier's quorum/apply requirement
+and timeout budget are unchanged.
+
+The focused public-read regression failed on the baseline with
+`ReadIndexTimeout` (one executed test, zero leaks). It now exercises lookup and
+scan, the typed internal lookup and its HTTP/client round trip, explicit
+deadline handling, and fail-closed corruption handling. Existing production
+DataServer VOPR coverage also forces a real read-barrier timeout by pausing Raft
+drivers and verifies that no waiter remains. The updated public API parity suite
+passed all 192 tests with zero skips, failures, or leaks. Final Linux CI and
+full-soak qualification remain pending.
+
+## 2026-09-14: restore publication races storage-owner users (#704)
+
+[CI job 104174381057](https://github.com/antflydb/antfly/actions/runs/34899514358/job/104174381057?pr=704)
+on `919fa9d124` failed `test_cluster_restore_modes` during cluster overwrite
+restore. The public restore job reported `InternalFailure`; the retained server
+log showed staged repair complete, then `table restore failed phase=execution
+class=StorageBusy` and `cluster restore failed phase=materialization
+class=StorageBusy`. This is separate from the earlier transaction HTTP 503.
+
+The unchanged native executable reproduced the same signature **5 times in 100
+fresh-server repetitions** (four workers, 25 iterations each; 95 passed).
+Binary SHA-256: `ae0f4294a59fd9eb0b90a58e5516e927927fa47d456bdd9a89abfe5d109dbdce`.
+Evidence is retained in `/tmp/pr704-919-restore-modes-soak.log`,
+`/tmp/pr704-919-restore-soak-evidence.json`, and its five retained server roots.
+The failing immediate-busy retirement function and restore caller were identical
+to `origin/main`; the retirement check dates to #536. This establishes a
+pre-existing handoff defect, but no matched base-binary reproduction establishes
+whether #704 changed its probability. A passing transaction soak is not evidence
+that this restore race is fixed.
+
+Table generation admission does not drain every storage-owner borrower: status
+and maintenance can already hold leases. Publication previously returned busy
+immediately, and retirement alone would allow a replacement owner to open after
+the last old entry closed but before namespace exchange completed.
+
+Publication now closes group admission under the owner registry mutex, drains
+existing users and owner shutdown using the operation's I/O and cancellation,
+and retains the gate across physical publication, catalog commit or rollback,
+and staged snapshot destruction. Timeout/cancellation releases the gate while
+existing leases keep their owners alive. Ordinary reads encountering the gate
+return temporary unavailability so callers can refresh their catalog descriptor.
+The same contract covers restore reconciliation and Raft snapshot installation.
+
+The deterministic compiled-owner regression forces a held read, status, or
+maintenance lease to release at the first drain wait. It checks successful
+handoff, exclusion after the entry disappears, and timeout/cancellation cleanup.
+The production restore composition runs real maintenance and status workers
+across portable/native restore, rejected publication, and reconciliation. The
+scheduled VOPR workflow also runs repeated public cluster restores with
+concurrent document reads and index-status observation, retaining failure roots
+and the exact executable. These production stress runs complement replayable
+VOPR campaigns; their OS schedules are not replay traces.
+
+The new concurrent HTTP case also failed on the unchanged executable with
+HTTP 500 and `GenerationTransitionActive` in the server log
+(`/tmp/pr704-publication-observer-baseline.log`). Lookup and pre-stream scan
+admission now translate that retryable identity and bounded `StorageBusy` into
+the existing structured storage-unavailable 503 with `Retry-After`. The response
+contract regression covers both routes. The stress test rejects arbitrary 500s
+and unclassified 503s and does not retry a restore request.
+
+Native post-fix validation passed all 56 build steps, six compiled-owner tests,
+and 192 public HTTP contract tests. Twenty additional owner-suite repetitions
+passed all 120 test executions without leaks. The public restore soak passed
+**200/200 fresh-server cases**: 100 original mode tests and 100 with concurrent
+read/status observers, four workers, no retries of failed restores and no skips.
+All used executable SHA-256
+`410911f311beeec02a44d723357e6f4d17edd5f81d28f325d3bc30005450f89a`;
+the digest was checked again after the soak. Evidence:
+`/tmp/pr704-publication-focused-build-approved.log`,
+`/tmp/pr704-publication-owner-soak/verified.json`, and
+`/tmp/pr704-publication-final/verified.json` with individual JUnit reports.
+Linux CI and the separately reported scaling finding remain outstanding.
+
+## 2026-09-14: standby VOPR promotion overtakes apply (#704)
+
+[Full soak 34878521929](https://github.com/antflydb/antfly/actions/runs/34878521929)
+on `03e1a8e0d2` stopped both standalone standby shards with
+`PromotionRequiresForce`, at histories 171 and 759. The other six campaign
+shards and all four corpus jobs passed. Those partial results do not qualify
+the full soak, and no second required-seed run was started.
+
+The lifecycle scenario obtained a non-forced fence after catching up, then
+allowed another primary append and standby receive before promotion. The
+production standby correctly rejected promotion with unapplied received data;
+the scenario propagated that expected refusal as a fatal harness error.
+The scripted regression reproduces the same error, then covers rejection,
+restart, another rejection, apply, successful promotion, and former-primary
+assessment with exact replay. Explicit forced promotion remains covered too.
+
+The scenario now records the refusal as a rejected transition. A separate
+safety property checks the applied-tail requirement and verifies rejection
+preserves identity and progress. Unexpected errors still escape. Production
+promotion rules and force authorization are unchanged. Scenario version 3
+marks the changed trace/property contract, and the reusable qualification job
+runs the standby lifecycle regressions before admitting full campaigns.
+
+The initial scripted regression failed with `PromotionRequiresForce`; after
+the fix it passed with exact replay and no leaks. Evidence is retained in
+`/tmp/pr704-promotion-regression-red.log` and
+`/tmp/pr704-promotion-regression-green.log`. New complete soaks must validate
+the corrected revision; earlier successful shards are historical evidence.
+
+The same revision's ordinary CI independently failed
+`test_session_stage_transform_commit` with HTTP 503 (446 other tests passed).
+Its retained server log contained no underlying error, and 30 unchanged-binary
+native repetitions passed. The transaction helper now retains the response
+body through its existing error checker; it does not retry commits or treat
+503 as success. There is no evidence establishing a common cause with the
+standby rejection or proving #723 resolves that transaction failure.
+
 ## 2026-09-14: producer readiness snapshot loss (#723)
 
 [The Antfly E2E job on #723](https://github.com/antflydb/antfly/actions/runs/34801864332/job/103853126220)

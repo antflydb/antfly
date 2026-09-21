@@ -42,7 +42,7 @@ Backend and runtime design docs (linked below) describe how these work today; th
 - GGUF/GGML quantization format coverage and graph-execution partitioning — see [GGML.md](GGML.md)
 - Generic graph IR (tracing, compiler passes, execution backends, partitioning, caching, offline artifacts) — see [GRAPH.md](GRAPH.md)
 - TurboQuant KV cache codec — see [TURBOQUANT.md](TURBOQUANT.md)
-- Gemma 4 support, including MTP speculative decoding — see [GEMMA4.md](GEMMA4.md)
+- Gemma 4 support, including MTP speculative decoding — see [GEMMA4.md](models/gemma4/GEMMA4.md)
 - Document readers (OCR/layout/extraction pipelines) — see [READERS.md](READERS.md)
 - TTL ResultCache with stats
 - Model registry (local discovery, ModelRef parsing)

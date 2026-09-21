@@ -1512,11 +1512,36 @@ fn convertReduce(builder: *Builder, comptime op: ReduceTag, node: *const NodePro
         }
     }
 
-    return switch (op) {
+    const reduced = try switch (op) {
         .reduce_sum => builder.reduceSum(inputs[0], axes_buf[0..num_axes]),
         .reduce_mean => builder.reduceMean(inputs[0], axes_buf[0..num_axes]),
         .reduce_max => builder.reduceMax(inputs[0], axes_buf[0..num_axes]),
     };
+
+    // The primitive keeps the reduced axes as size 1; ONNX `keepdims=0`
+    // drops them, which is a pure reshape of the same data.
+    const keepdims = getInt(node.attributes, "keepdims", 1) != 0;
+    if (keepdims or num_axes == 0) return reduced;
+    const reduced_shape = builder.graph.node(reduced).output_shape;
+    var out_dims: [8]i64 = .{0} ** 8;
+    var out_rank: u8 = 0;
+    for (0..reduced_shape.rank()) |d| {
+        var dropped = false;
+        for (axes_buf[0..num_axes]) |ax| {
+            if (ax == d) dropped = true;
+        }
+        if (dropped) continue;
+        out_dims[out_rank] = reduced_shape.dim(@intCast(d));
+        out_rank += 1;
+    }
+    if (out_rank == 0) {
+        // A full reduction is a scalar; keep a one-element vector so later
+        // broadcasts see a concrete rank.
+        out_dims[0] = 1;
+        out_rank = 1;
+    }
+    const out_shape = Shape{ .dtype = reduced_shape.dtype, .dims = out_dims, .rank_ = out_rank };
+    return builder.reshape(reduced, out_shape);
 }
 
 fn convertGather(builder: *Builder, node: *const NodeProto, inputs: []const NodeId) ConvertError!NodeId {
@@ -2881,9 +2906,10 @@ fn convertConv(builder: *Builder, node: *const NodeProto, inputs: []const NodeId
     conv_attrs.num_spatial = num_spatial;
     conv_attrs.groups = group;
 
-    // Strides
+    // Strides and dilations
     for (0..num_spatial) |i| {
         conv_attrs.strides[i] = if (i < strides_attr.len) @intCast(strides_attr[i]) else 1;
+        conv_attrs.dilations[i] = if (i < dilations_attr.len and dilations_attr[i] > 0) @intCast(dilations_attr[i]) else 1;
     }
 
     // Padding: ONNX format is [begin_0, begin_1, ..., end_0, end_1, ...]
@@ -3659,6 +3685,27 @@ fn broadcastPerAxis(builder: *Builder, input: NodeId, target_shape: Shape, axis_
 }
 
 // ── Phase 3: Pooling Ops ────────────────────────────────────────────
+
+/// Static slice `[start, end)` along `axis` of a tensor of any rank.
+fn sliceAxisStatic(builder: *Builder, input: NodeId, axis: u8, start: i64, end: i64) ConvertError!NodeId {
+    const in_shape = builder.graph.node(input).output_shape;
+    var attrs = ml.graph.node.SliceAttrs{};
+    attrs.num_axes = in_shape.rank();
+    var out_dims: [8]i64 = .{0} ** 8;
+    for (0..in_shape.rank()) |d| {
+        const dim = in_shape.dim(@intCast(d));
+        attrs.starts[d] = if (d == axis) start else 0;
+        attrs.limits[d] = if (d == axis) end else dim;
+        attrs.strides[d] = 1;
+        out_dims[d] = if (d == axis) end - start else dim;
+    }
+    return builder.graph.addNode(.{
+        .op = .{ .slice = attrs },
+        .output_shape = Shape{ .dtype = in_shape.dtype, .dims = out_dims, .rank_ = in_shape.rank_ },
+        .inputs = .{ input, null_node, null_node, null_node },
+        .num_inputs = 1,
+    });
+}
 
 fn convertAveragePool(builder: *Builder, node: *const NodeProto, inputs: []const NodeId) ConvertError!NodeId {
     if (inputs.len != 1) return error.MissingInput;

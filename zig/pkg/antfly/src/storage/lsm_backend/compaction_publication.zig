@@ -25,7 +25,6 @@ const Plan = @import("compaction.zig").CompactionPlan;
 const Certificate = @import("dependency_job.zig").Job;
 const runtime = @import("runtime.zig");
 const resources = @import("../resource_manager.zig");
-const clock = @import("antfly_platform").time;
 const quantum_ns = 2 * std.time.ns_per_ms;
 
 pub const Job = struct {
@@ -88,7 +87,7 @@ pub const Job = struct {
         errdefer source.deinit(allocator);
         const store = try allocator.create(Store);
         store.* = backend.runs.fork();
-        return .{ .accounting = current.pinAccounting(), .base = base, .directory = directory, .source = source, .store = store, .base_obsolete = backend.obsolete_paths.fork(), .obsolete = backend.obsolete_paths.fork(), .plan = plan, .reservation = reservation, .created_ns = clock.monotonicNs(), .delete_after_ns = if (backend.options.obsolete_retention_ns == 0) 0 else backend.nowNs() +| backend.options.obsolete_retention_ns };
+        return .{ .accounting = current.pinAccounting(), .base = base, .directory = directory, .source = source, .store = store, .base_obsolete = backend.obsolete_paths.fork(), .obsolete = backend.obsolete_paths.fork(), .plan = plan, .reservation = reservation, .created_ns = backend.nowNs(), .delete_after_ns = if (backend.options.obsolete_retention_ns == 0) 0 else backend.nowNs() +| backend.options.obsolete_retention_ns };
     }
 
     pub fn accountedMemoryBytes(self: *const Job, pass: u64) u64 {
@@ -134,7 +133,7 @@ pub const Job = struct {
             self.certificate = .init(self.base, plan);
             self.certificate.?.covered = plan.complete_coverage orelse true;
         }
-        while (credits != 0 and clock.monotonicNs() < deadline) {
+        while (credits != 0 and runtime.workNowNs(backend) < deadline) {
             credits -= 1;
             switch (self.phase) {
                 .inputs => {
@@ -165,7 +164,9 @@ pub const Job = struct {
                         return;
                     }
                     const output = &outputs[self.index];
-                    if (self.requested_gc and (output.tombstone_count orelse 0) != 0) output.gc_requested = true;
+                    // A full overlap rewrite discharges both tombstones and
+                    // superseded-value requests. Partial outputs keep the intent.
+                    output.gc_requested = !self.plan.tombstone_gc and (self.requested_gc or output.gc_requested);
                     const names = (if (output.path) |path| path.len else 0) + output.smallest_key.len + output.largest_key.len +
                         (if (output.smallest_namespace_name) |name| name.len else 0) + (if (output.largest_namespace_name) |name| name.len else 0);
                     try self.admitNames(names + (if (output.state) |*state| state.estimatedMemoryBytes() else 0));
@@ -211,7 +212,7 @@ pub const Job = struct {
     fn rebaseStep(self: *Job, backend: anytype, credits_arg: usize, deadline: u64) !bool {
         var credits = credits_arg;
         const rebase = &self.rebase.?;
-        while (credits != 0 and clock.monotonicNs() < deadline) {
+        while (credits != 0 and runtime.workNowNs(backend) < deadline) {
             if (!rebase.runs.done()) {
                 const change = rebase.runs.next(&credits) orelse continue;
                 if (!self.certificate.?.acceptChange(change) or
@@ -254,7 +255,7 @@ pub const Job = struct {
         if (backend.manifestCoordinationIo()) |io| try io.checkCancel();
         if (self.rebase != null) {
             runtime.unlockBackend(@TypeOf(backend.*), backend, true);
-            const result = self.rebaseStep(backend, 512, clock.monotonicNs() +| quantum_ns);
+            const result = self.rebaseStep(backend, 512, runtime.workNowNs(backend) +| quantum_ns);
             _ = runtime.lockBackend(@TypeOf(backend.*), backend);
             if (!try result) return false;
             const rebase = self.rebase.?;
@@ -267,7 +268,7 @@ pub const Job = struct {
             self.drainLedger(backend, obsolete);
         } else if (self.phase != .ready) {
             runtime.unlockBackend(@TypeOf(backend.*), backend, true);
-            const result = self.step(backend, outputs, 512, clock.monotonicNs() +| quantum_ns);
+            const result = self.step(backend, outputs, 512, runtime.workNowNs(backend) +| quantum_ns);
             _ = runtime.lockBackend(@TypeOf(backend.*), backend);
             try result;
         }
@@ -280,7 +281,7 @@ pub const Job = struct {
         // obsolete entries off-lock; increasing slack avoids chasing the clock
         // once per input on large jobs or after a long executor suspension.
         if (backend.options.obsolete_retention_ns != 0 and self.delete_after_ns < backend.nowNs() +| backend.options.obsolete_retention_ns) {
-            self.deadline_slack_ns = @max(self.deadline_slack_ns *| 2, (clock.monotonicNs() -| self.created_ns) *| 2 +| quantum_ns);
+            self.deadline_slack_ns = @max(self.deadline_slack_ns *| 2, (backend.nowNs() -| self.created_ns) *| 2 +| quantum_ns);
             self.delete_after_ns = backend.nowNs() +| backend.options.obsolete_retention_ns +| self.deadline_slack_ns;
             self.index = 0;
             self.phase = .deadlines;
@@ -340,9 +341,9 @@ pub const Job = struct {
             var i: usize = 0;
             while (i < self.prepared_inputs) {
                 runtime.unlockBackend(@TypeOf(backend.*), backend, true);
-                const deadline = clock.monotonicNs() +| quantum_ns;
+                const deadline = runtime.workNowNs(backend) +| quantum_ns;
                 const end = @min(self.prepared_inputs, i + 512);
-                while (i < end and clock.monotonicNs() < deadline) : (i += 1) inputs[i].release(backend.allocator);
+                while (i < end and runtime.workNowNs(backend) < deadline) : (i += 1) inputs[i].release(backend.allocator);
                 if (backend.manifestCoordinationIo()) |io| io.sleep(.fromNanoseconds(1), .awake) catch {};
                 _ = runtime.lockBackend(@TypeOf(backend.*), backend);
             }
@@ -361,9 +362,9 @@ pub fn releaseOutputsLocked(backend: anytype, outputs: *std.ArrayListUnmanaged(R
     var index: usize = 0;
     while (index < outputs.items.len) {
         runtime.unlockBackend(@TypeOf(backend.*), backend, true);
-        const deadline = clock.monotonicNs() +| quantum_ns;
+        const deadline = runtime.workNowNs(backend) +| quantum_ns;
         const end = @min(outputs.items.len, index + 512);
-        while (index < end and clock.monotonicNs() < deadline) : (index += 1) {
+        while (index < end and runtime.workNowNs(backend) < deadline) : (index += 1) {
             const run = &outputs.items[index];
             if (discard) {
                 // Production outputs own preallocated tickets. Destruction
@@ -505,6 +506,67 @@ const TestFixture = struct {
 
 test "compaction publication stages and rebases all roots and cleans every allocation failure" {
     for (0..6) |variant| try std.testing.checkAllAllocationFailures(std.testing.allocator, TestFixture.check, .{variant});
+}
+
+test "compaction publication uses the borrowed clock for bounded preparation" {
+    const allocator = std.testing.allocator;
+    const Clock = struct {
+        var now_ns: i96 = 0;
+        fn now(_: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+            return .{ .nanoseconds = now_ns };
+        }
+    };
+    // This leaf storage test also runs in lean sparse-index roots. Override
+    // only the clock, retaining the native I/O context for synchronization.
+    // Composed VOPR tests separately cover scheduling and cancellation.
+    Clock.now_ns = 0;
+    var vtable = std.testing.io.vtable.*;
+    vtable.now = Clock.now;
+    const io: std.Io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    const Backend = @import("../lsm_backend.zig").Backend;
+    var backend = Backend.init(allocator, .{
+        .wal_enabled = false,
+        .read_runtime = @import("storage_io.zig").ReadRuntime.init(io),
+    });
+    defer backend.close();
+    try std.testing.expect(backend.mu.tryLock());
+    defer backend.mu.unlock();
+    backend.retainReaderKind(.compaction);
+    defer backend.releaseReaderKind(.compaction);
+    try TestFixture.append(&backend, 1, 0, "a");
+    try TestFixture.append(&backend, 2, 0, "a");
+    const directory = try backend.planningDirectory();
+    const handles = [_]Directory.Handle{ directory.at(0), directory.at(1) };
+    const plan = Plan{
+        .source_level = 0,
+        .source_start = 0,
+        .source_len = 2,
+        .target_start = 2,
+        .target_len = 0,
+        .output_level = 1,
+        .input_handles = &handles,
+        .complete_coverage = true,
+    };
+    var outputs: std.ArrayListUnmanaged(Run) = .empty;
+    var job = try Job.init(&backend, plan, 0);
+    backend.active_compaction_publications = &job;
+    defer {
+        job.finishLocked(&backend, &outputs);
+        backend.active_compaction_publications = null;
+    }
+    // One credit advances exactly one input while the owning clock is
+    // before the deadline, regardless of the host clock's epoch.
+    backend.mu.unlock();
+    const first = job.step(&backend, &.{}, 1, 10);
+    try std.testing.expect(backend.mu.tryLock());
+    try first;
+    try std.testing.expectEqual(@as(usize, 1), job.prepared_inputs);
+    Clock.now_ns = 10;
+    backend.mu.unlock();
+    const expired = job.step(&backend, &.{}, 1, 10);
+    try std.testing.expect(backend.mu.tryLock());
+    try expired;
+    try std.testing.expectEqual(@as(usize, 1), job.prepared_inputs);
 }
 
 test "compaction publication atomic fence scaling benchmark" {

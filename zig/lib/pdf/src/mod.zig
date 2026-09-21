@@ -1792,8 +1792,7 @@ const PageRenderWorker = struct {
             };
             self.scratch_initialized = true;
         } else {
-            std.debug.assert(self.scratch_budget.backing.ptr == backing.ptr and
-                self.scratch_budget.backing.vtable == backing.vtable);
+            std.debug.assert(allocatorsEqual(self.scratch_budget.backing, backing));
             self.parsed.?.setCancellationProbe(self.wave_control.probe());
             self.scratch_budget.limit_exceeded = false;
         }
@@ -2313,7 +2312,28 @@ fn renderParsedPageWorkBatchAlloc(
 }
 
 fn allocatorsEqual(a: Allocator, b: Allocator) bool {
-    return a.ptr == b.ptr and a.vtable == b.vtable;
+    if (a.vtable != b.vtable) return false;
+    // Stateless standard allocators deliberately leave ptr undefined. Reading
+    // it, even to compare identities, is UB and can erase the lane-reuse branch
+    // in optimized builds. Their vtable alone identifies the allocator.
+    if (a.vtable == std.heap.page_allocator.vtable or
+        a.vtable == std.heap.smp_allocator.vtable) return true;
+    if (comptime builtin.link_libc) {
+        if (a.vtable == std.heap.c_allocator.vtable) return true;
+    }
+    return a.ptr == b.ptr;
+}
+
+test "render allocator identity does not read stateless context pointers" {
+    try std.testing.expect(allocatorsEqual(std.heap.page_allocator, std.heap.page_allocator));
+    try std.testing.expect(!allocatorsEqual(std.testing.allocator, std.heap.page_allocator));
+    try std.testing.expect(!allocatorsEqual(std.heap.page_allocator, std.testing.allocator));
+    var first = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer first.deinit();
+    var second = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer second.deinit();
+    try std.testing.expect(allocatorsEqual(first.allocator(), first.allocator()));
+    try std.testing.expect(!allocatorsEqual(first.allocator(), second.allocator()));
 }
 
 fn scaleBox(box: *reader.PageBox, scale: f64) void {

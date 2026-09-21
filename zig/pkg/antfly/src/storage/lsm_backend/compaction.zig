@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const work_budget = @import("work_budget.zig");
 const lsm_table_file = @import("../lsm/table_file.zig");
 const state_mod = @import("state.zig");
 const repository_mod = @import("repository.zig");
@@ -113,7 +114,7 @@ pub fn nextTombstoneGcDelay(backend: anytype) ?u64 {
     }
     for (0..run_store.count(backend)) |rank| {
         const run = run_store.at(backend, rank);
-        if (run.gc_requested and (run.tombstone_count orelse 0) != 0) return 0;
+        if (run.gc_requested) return 0;
     }
     if (comptime !@hasField(@TypeOf(backend.options), "tombstone_gc_max_age_ns")) return null;
     if (backend.options.tombstone_gc_max_age_ns == 0) return null;
@@ -219,8 +220,8 @@ pub const PendingAdmission = struct {
             self.work = work;
         }
         const end = @min(count, self.prepared + 2048);
-        const deadline = @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_ms;
-        while (self.prepared < end and @import("antfly_platform").time.monotonicNs() < deadline) : (self.prepared += 1) {
+        const deadline = work_budget.after(backend.manifestCoordinationIo(), 2 * std.time.ns_per_ms);
+        while (self.prepared < end and work_budget.before(deadline)) : (self.prepared += 1) {
             const offset = if (self.prepared < plan.source_len) plan.source_start + self.prepared else plan.target_start + self.prepared - plan.source_len;
             const run = handles[offset].run.*;
             self.work.run_ids[self.prepared] = run.id;
@@ -589,9 +590,9 @@ const SelectedPlan = struct {
         var owned = self;
         while (true) {
             var credits: usize = 2048;
-            const deadline = @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_ms;
+            const deadline = work_budget.after(backend.manifestCoordinationIo(), 2 * std.time.ns_per_ms);
             var done = false;
-            while (credits != 0 and @import("antfly_platform").time.monotonicNs() < deadline) {
+            while (credits != 0 and work_budget.before(deadline)) {
                 var quantum: usize = @min(credits, 64);
                 const before = quantum;
                 done = owned.deinitStep(backend.allocator, &quantum);
@@ -920,10 +921,16 @@ fn resumeClosureToSelectionForTest(backend: anytype, slot: *?*PendingDirectoryCl
 }
 
 test "compaction phase handoff bounds memory and preserves epoch validation" {
+    try testCompactionPhaseHandoff(513, 768, 128 * 1024, .{ .max_inputs = 32 });
+}
+
+test "compaction phase handoff production scale" {
+    try testCompactionPhaseHandoff(20001, 30000, 3 * 1024 * 1024, .{});
+}
+
+fn testCompactionPhaseHandoff(inputs: usize, count: usize, cap: u64, planning_budget: DirectoryPlanningBudget) !void {
     const Backend = @import("../lsm_backend.zig").Backend;
     const allocator = std.testing.allocator;
-    const inputs = 20001;
-    const cap = 3 * 1024 * 1024;
     for (0..3) |mode| {
         var budgets = resource_manager_mod.Options.defaultBudgets();
         budgets[@intFromEnum(resource_manager_mod.Slice.lsm_table_builder_working_set)] = .{ .hard_limit_bytes = cap };
@@ -931,7 +938,7 @@ test "compaction phase handoff bounds memory and preserves epoch validation" {
         defer std.debug.assert(manager.sliceStats(.lsm_table_builder_working_set).used_bytes == 0);
         var backend = Backend.init(allocator, .{ .level_target_runs_base = 1000000, .level_target_bytes_base = 0 });
         defer backend.close();
-        try populateClosureDirectoryWithInputsForTest(&backend, 30000, inputs);
+        try populateClosureDirectoryWithInputsForTest(&backend, count, inputs);
         // Any persisted tombstone requires coverage validation, including when
         // there was no concurrent publication during discovery.
         const initial = try (try backend.planningDirectory()).fork(allocator);
@@ -944,7 +951,7 @@ test "compaction phase handoff bounds memory and preserves epoch validation" {
         defer runtime_mod.unlockBackend(Backend, &backend, locked);
         const started = @import("antfly_platform").time.monotonicNs();
         var stats: CompactionSelectionStats = .{};
-        try std.testing.expect(try selectDomainPlan(&backend, 0, false, 0, false, &stats) == null);
+        try std.testing.expect(try selectDirectoryPlanBudgeted(&backend, 0, false, 0, false, &stats, planning_budget) == null);
         const pending = backend.pending_directory_closure.?;
         for (0..4096) |_| {
             if (pending.phase == .reclaim_discovery) break;
@@ -972,7 +979,7 @@ test "compaction phase handoff bounds memory and preserves epoch validation" {
         // Publish either an unrelated edit or a replacement of an input while
         // its discovery scratch is being retired. Handles/epoch stay pinned.
         const changed = try (try backend.planningDirectory()).fork(allocator);
-        var replacement = changed.at(if (mode == 0) 29999 else 1).run.*;
+        var replacement = changed.at(if (mode == 0) count - 1 else 1).run.*;
         replacement.gc_requested = true;
         try changed.put(&backend, replacement);
         backend.invalidateReadVersion();
@@ -985,6 +992,8 @@ test "compaction phase handoff bounds memory and preserves epoch validation" {
         try std.testing.expect(pending.phase == .validate);
         try std.testing.expectEqual(@as(u64, 0), pending.scratch.?.live_bytes);
         const retained = manager.sliceStats(.lsm_table_builder_working_set).used_bytes;
+        if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_WORK_PROFILE"))
+            std.debug.print("\nWORK compaction mode={d} inputs={d} discovery_bytes={d} retained_bytes={d} validation_bytes={d} cap={d}\n", .{ mode, inputs, used_before, retained, validation_bytes, cap });
         try std.testing.expect(retained + validation_bytes <= cap);
         var accepted = false;
         for (0..4096) |_| {
@@ -1077,9 +1086,9 @@ pub const PendingDirectoryClosure = struct {
         return self.job.deinitStep(allocator, credits);
     }
 
-    fn reclaimDiscoveryUntil(self: *@This(), allocator: std.mem.Allocator, credits_arg: usize, deadline: u64) bool {
+    fn reclaimDiscoveryUntil(self: *@This(), allocator: std.mem.Allocator, credits_arg: usize, deadline: anytype) bool {
         var credits = credits_arg;
-        while (credits != 0 and @import("antfly_platform").time.monotonicNs() < deadline) {
+        while (credits != 0 and work_budget.before(deadline)) {
             var quantum: usize = @min(credits, 64);
             const before = quantum;
             const done = self.job.deinitStep(allocator, &quantum);
@@ -1089,7 +1098,7 @@ pub const PendingDirectoryClosure = struct {
         return false;
     }
 
-    fn step(self: *@This(), allocator: std.mem.Allocator, deadline: u64) !bool {
+    fn step(self: *@This(), allocator: std.mem.Allocator, deadline: anytype) !bool {
         if (self.restart_limit) |limit| {
             if (!self.reclaimDiscoveryUntil(allocator, 2048, deadline)) return false;
             // Release the superseded arena before admitting replacement
@@ -1125,7 +1134,7 @@ fn resumeDirectoryClosure(backend: anytype, slot: *?*PendingDirectoryClosure) !?
     if (pending.phase != .discover) return resumeClosureValidation(backend, pending, slot);
     if (backend.manifestCoordinationIo()) |io| try io.checkCancel();
     runtime_mod.unlockBackend(BackendType, backend, true);
-    const deadline = @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_ms;
+    const deadline = work_budget.after(backend.manifestCoordinationIo(), 2 * std.time.ns_per_ms);
     const advanced = pending.step(backend.allocator, deadline);
     _ = runtime_mod.lockBackend(BackendType, backend);
     backend.directory_planning_slices +|= 1;
@@ -1188,7 +1197,7 @@ fn resumeClosureValidation(backend: anytype, pending: *PendingDirectoryClosure, 
     if (pending.phase == .reclaim_discovery) {
         if (backend.manifestCoordinationIo()) |io| try io.checkCancel();
         runtime_mod.unlockBackend(@TypeOf(backend.*), backend, true);
-        const done = pending.reclaimDiscoveryUntil(backend.allocator, 2048, @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_ms);
+        const done = pending.reclaimDiscoveryUntil(backend.allocator, 2048, work_budget.after(backend.manifestCoordinationIo(), 2 * std.time.ns_per_ms));
         _ = runtime_mod.lockBackend(@TypeOf(backend.*), backend);
         backend.directory_planning_slices +|= 1;
         if (done) {
@@ -1427,10 +1436,10 @@ fn gcComponentEligible(backend: anytype, indices: []const usize) bool {
         const deletes = run.tombstone_count orelse 0;
         tombstones +|= deletes;
         entries = @max(entries, run.entry_count);
-        if (deletes != 0) requested = requested or run.gc_requested or tombstoneAgeDue(backend, run);
+        requested = requested or run.gc_requested or (deletes != 0 and tombstoneAgeDue(backend, run));
     }
     const percent = if (comptime @hasField(@TypeOf(backend.options), "tombstone_gc_min_percent")) @min(@as(u8, 100), backend.options.tombstone_gc_min_percent) else 50;
-    return tombstones != 0 and (requested or @as(u128, tombstones) * 100 >= @as(u128, entries) * percent);
+    return requested or (tombstones != 0 and @as(u128, tombstones) * 100 >= @as(u128, entries) * percent);
 }
 
 /// Persist the collection objective on every delete-bearing input, not just
@@ -1487,7 +1496,7 @@ fn tombstoneGcCandidate(backend: anytype, index: *const DomainIndex, max_bytes: 
 pub fn hasTombstoneGcDebt(backend: anytype) bool {
     if (comptime @hasField(@TypeOf(backend.*), "run_directory_dirty")) {
         if (!backend.run_directory_dirty) if (backend.run_directory) |directory| {
-            if (directory.tombstoneRunCount() == 0) return false;
+            if (directory.tombstoneRunCount() == 0 and !directory.hasGcRequest()) return false;
         };
     }
     if (comptime @hasField(@TypeOf(backend.*), "gc_debt_cache")) {
@@ -1563,7 +1572,7 @@ pub const PendingGc = struct {
             self.rebase = null;
         }
 
-        fn stepRebase(self: *Intent, backend: anytype, component: anytype, selected: *const SelectedPlan, credits_arg: usize, deadline: u64) !bool {
+        fn stepRebase(self: *Intent, backend: anytype, component: anytype, selected: *const SelectedPlan, credits_arg: usize, deadline: anytype) !bool {
             var credits = credits_arg;
             const rebase = &self.rebase.?;
             const objectives = selected.gc_objective_handles orelse selected.plan.input_handles.?;
@@ -1571,7 +1580,7 @@ pub const PendingGc = struct {
             const first_visibility = if (first.visibility_id == 0) first.id else first.visibility_id;
             while (credits != 0) {
                 const change = rebase.pending_change orelse rebase.changes.next(&credits) orelse return rebase.changes.done();
-                if (@import("antfly_platform").time.monotonicNs() >= deadline) {
+                if (!work_budget.before(deadline)) {
                     rebase.pending_change = change;
                     return false;
                 }
@@ -1640,10 +1649,10 @@ pub const PendingGc = struct {
             return .{ .base = base, .directory = directory, .store = store, .wire = wire, .reservation = reservation, .header_bytes = 3 * @sizeOf(Directory) + 2 * @sizeOf(run_store.Store) + (2 * @bitSizeOf(usize) * 8 + 128) * 6 * @sizeOf(usize) };
         }
 
-        fn step(self: *Intent, backend: anytype, selected: *SelectedPlan, credits_arg: usize, deadline: u64) !bool {
+        fn step(self: *Intent, backend: anytype, selected: *SelectedPlan, credits_arg: usize, deadline: anytype) !bool {
             var credits = credits_arg;
             const objectives = selected.gc_objective_handles orelse selected.plan.input_handles.?;
-            while (credits != 0 and @import("antfly_platform").time.monotonicNs() < deadline) {
+            while (credits != 0 and work_budget.before(deadline)) {
                 credits -= 1;
                 if (self.index < objectives.len) {
                     const handle = objectives[self.index];
@@ -1945,17 +1954,17 @@ fn resumeGcIntent(backend: anytype, pending: *PendingGc) !?SelectedPlan {
     backend.retainReaderKind(.compaction);
     defer backend.releaseReaderKind(.compaction);
     const intent = &pending.intent.?;
-    var deadline: u64 = 0;
+    var deadline: ?work_budget.Deadline = null;
     var turns: usize = 0;
     while (true) {
         runtime_mod.unlockBackend(@TypeOf(backend.*), backend, true);
         // Reclamation has its own bounded quantum. Starting this deadline
         // before unlock can starve intent work under continuous publication.
-        if (deadline == 0) deadline = @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_ms;
+        if (deadline == null) deadline = work_budget.after(backend.manifestCoordinationIo(), 2 * std.time.ns_per_ms);
         const result = if (intent.rebase != null)
-            intent.stepRebase(backend, &pending.objective_bounds, &pending.selected.?, 512, deadline)
+            intent.stepRebase(backend, &pending.objective_bounds, &pending.selected.?, 512, deadline.?)
         else
-            intent.step(backend, &pending.selected.?, 512, deadline);
+            intent.step(backend, &pending.selected.?, 512, deadline.?);
         _ = runtime_mod.lockBackend(@TypeOf(backend.*), backend);
         backend.directory_planning_slices +|= 1;
         const done = result catch |err| {
@@ -1971,7 +1980,7 @@ fn resumeGcIntent(backend: anytype, pending: *PendingGc) !?SelectedPlan {
                 return err;
             };
         }
-        if (turns == 4 or @import("antfly_platform").time.monotonicNs() >= deadline) return null;
+        if (turns == 4 or !work_budget.before(deadline)) return null;
     }
     retire = true;
     // All record revisions, metadata clones and handle refreshes are prepared.
@@ -2046,7 +2055,7 @@ fn selectDirectoryGc(backend: anytype, max_bytes: u64) !?SelectedPlan {
     const limit = if (max_bytes == 0) configured else if (configured == 0) max_bytes else @min(max_bytes, configured);
     if (backend.pending_gc == null) {
         const current_directory = try backend.planningDirectory();
-        if (current_directory.tombstoneRunCount() == 0) return null;
+        if (current_directory.tombstoneRunCount() == 0 and !current_directory.hasGcRequest()) return null;
         const directory = try current_directory.fork(allocator);
         errdefer backend.retireCheckpointDirectory(directory);
         var reservation: ?resource_manager_mod.Reservation = null;
@@ -2072,7 +2081,7 @@ fn selectDirectoryGc(backend: anytype, max_bytes: u64) !?SelectedPlan {
     backend.retainReaderKind(.compaction);
     defer backend.releaseReaderKind(.compaction);
     runtime_mod.unlockBackend(@TypeOf(backend.*), backend, true);
-    const result = pending.job.step(allocator, 2048, @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_ms);
+    const result = pending.job.step(allocator, 2048, work_budget.after(backend.manifestCoordinationIo(), 2 * std.time.ns_per_ms));
     _ = runtime_mod.lockBackend(@TypeOf(backend.*), backend);
     backend.directory_planning_slices +|= 1;
     const done = result catch |err| {
@@ -2105,9 +2114,9 @@ fn resumeGcValidation(backend: anytype, pending: *PendingGc) !?SelectedPlan {
         defer backend.releaseReaderKind(.compaction);
         runtime_mod.unlockBackend(@TypeOf(backend.*), backend, true);
         var credits: usize = 2048;
-        const deadline = @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_ms;
+        const deadline = work_budget.after(backend.manifestCoordinationIo(), 2 * std.time.ns_per_ms);
         var done = false;
-        while (credits != 0 and @import("antfly_platform").time.monotonicNs() < deadline) {
+        while (credits != 0 and work_budget.before(deadline)) {
             var quantum: usize = @min(credits, 64);
             const before = quantum;
             done = pending.job.deinitStep(backend.allocator, &quantum);
@@ -2189,7 +2198,7 @@ fn selectGcProgress(backend: anytype, index: *const DomainIndex, limit: u64) !?S
         const runs = if (index.mixed) (try run_store.oracleItems(backend)) else index.runs[start..end];
         for (runs, 0..) |run, i| {
             const deletes = run.tombstone_count orelse 0;
-            if (deletes == 0 or run.level == std.math.maxInt(u32)) continue;
+            if ((deletes == 0 and !run.gc_requested) or run.level == std.math.maxInt(u32)) continue;
             const percent = if (comptime @hasField(@TypeOf(backend.options), "tombstone_gc_min_percent")) backend.options.tombstone_gc_min_percent else 50;
             // The projection may predate the request bit; use the live input.
             const live_index = if (index.mixed) i else index.order[start + i];
@@ -3341,13 +3350,13 @@ pub const PendingBulkPlan = struct {
         }
         backend.retainReaderKind(.compaction);
         runtime_mod.unlockBackend(@TypeOf(backend.*), backend, true);
-        const result = self.step(backend, 2048, @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_ms);
+        const result = self.step(backend, 2048, work_budget.after(backend.manifestCoordinationIo(), 2 * std.time.ns_per_ms));
         _ = runtime_mod.lockBackend(@TypeOf(backend.*), backend);
         backend.releaseReaderKind(.compaction);
         try result;
         return self.phase == .done;
     }
-    fn step(self: *@This(), backend: anytype, credits_arg: usize, deadline: u64) !void {
+    fn step(self: *@This(), backend: anytype, credits_arg: usize, deadline: anytype) !void {
         var credits = credits_arg;
         const allocator = backend.allocator;
         if (self.phase == .select) {
@@ -3375,7 +3384,7 @@ pub const PendingBulkPlan = struct {
             self.cursor = self.directory.?.readCursor();
             self.cursor.?.rank = range.start;
         }
-        while (self.emitted < range.len and credits != 0 and @import("antfly_platform").time.monotonicNs() < deadline) {
+        while (self.emitted < range.len and credits != 0 and work_budget.before(deadline)) {
             const handle = self.cursor.?.next().?.retain();
             self.handles.?[self.emitted] = handle;
             self.work.run_ids[self.emitted] = handle.run.id;
@@ -3863,8 +3872,8 @@ fn compactionWorkForSelectedPlanLocked(backend: anytype, plan: CompactionPlan, s
             var index: usize = 0;
             while (index < count) {
                 const end = @min(count, index + 2048);
-                const deadline = @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_ms;
-                while (index < end and @import("antfly_platform").time.monotonicNs() < deadline) : (index += 1) {
+                const deadline = work_budget.after(backend.manifestCoordinationIo(), 2 * std.time.ns_per_ms);
+                while (index < end and work_budget.before(deadline)) : (index += 1) {
                     const offset = if (index < plan.source_len) plan.source_start + index else plan.target_start + index - plan.source_len;
                     const run = handles[offset].run.*;
                     ids[index] = run.id;
@@ -6051,7 +6060,7 @@ test "bounded GC carries aggregate eligibility across windows and retries indepe
     outputs[1].tombstone_count = 0;
     inheritTombstoneAge(&outputs, &.{&runs[0]});
     try std.testing.expect(outputs[0].gc_requested);
-    try std.testing.expect(!outputs[1].gc_requested);
+    try std.testing.expect(outputs[1].gc_requested);
 }
 
 test "persistent planner ordering matches rebuilt domain and GC indexes after level moves" {
@@ -6129,7 +6138,7 @@ test "compaction installation preserves GC requests advanced during its build" {
     live[1].gc_requested = true;
     reconcileGcObjective(&live, plan, &outputs);
     try std.testing.expect(outputs[0].gc_requested);
-    try std.testing.expect(!outputs[1].gc_requested);
+    try std.testing.expect(outputs[1].gc_requested);
 }
 
 test "domain compaction maps interleaved inputs and revalidates concurrent publication" {
@@ -6917,12 +6926,12 @@ pub const PendingTombstoneReconcile = struct {
         self.* = .{ .handle = handle.retain(), .account = handle.retainAccounting(), .reservation = credit, .budget = if (backend.options.resource_manager) |manager| .init(manager, .lsm_table_builder_working_set, backend.allocator, 1) else null };
         return self;
     }
-    fn step(self: *@This(), backend: anytype, credits_arg: usize, deadline: u64) anyerror!bool {
+    fn step(self: *@This(), backend: anytype, credits_arg: usize, deadline: anytype) anyerror!bool {
         if (self.complete) return true;
         var credits = credits_arg;
         const run = self.handle.run;
         const allocator = if (self.budget) |*budget| budget.allocator() else backend.allocator;
-        if (credits == 0 or @import("antfly_platform").time.monotonicNs() >= deadline) return false;
+        if (credits == 0 or !work_budget.before(deadline)) return false;
         if (run.path) |path| {
             if (self.footer == null) {
                 self.footer = try repository_mod.loadRunFooterWithStorage(backend.storage.?, allocator, path);
@@ -6939,7 +6948,7 @@ pub const PendingTombstoneReconcile = struct {
             }
         }
         var may_read_window = if (self.cursor) |*cursor| cursor.nextReadBytes() != 0 else false;
-        while (credits != 0 and @import("antfly_platform").time.monotonicNs() < deadline) {
+        while (credits != 0 and work_budget.before(deadline)) {
             const deleted = if (self.cursor) |*cursor| blk: {
                 if (cursor.nextReadBytes() != 0) {
                     if (!may_read_window) return false;
@@ -7041,7 +7050,7 @@ pub fn reconcileTombstonesStep(backend: anytype) anyerror!bool {
     const before = pending.rows;
     backend.retainReaderKind(.compaction);
     runtime_mod.unlockBackend(@TypeOf(backend.*), backend, true);
-    const result: anyerror!bool = pending.step(backend, 2048, @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_ms);
+    const result: anyerror!bool = pending.step(backend, 2048, work_budget.after(backend.manifestCoordinationIo(), 2 * std.time.ns_per_ms));
     _ = runtime_mod.lockBackend(@TypeOf(backend.*), backend);
     backend.releaseReaderKind(.compaction);
     backend.tombstone_reconcile_rows +|= pending.rows - before;
@@ -7812,22 +7821,24 @@ fn reconcileGcObjective(live: anytype, plan: CompactionPlan, outputs: []Run) voi
     var requested = false;
     for (0..plan.source_len) |i| requested = requested or run_store.planGet(live, plan, i).gc_requested;
     for (0..plan.target_len) |i| requested = requested or run_store.planGet(live, plan, plan.source_len + i).gc_requested;
-    if (requested) for (outputs) |*run| {
-        if ((run.tombstone_count orelse 0) != 0) run.gc_requested = true;
-    };
+    // Only a validated full overlap closure discharges a rewrite request.
+    // Partial level jobs and source splits must carry it even without deletes:
+    // their outputs can still hide obsolete values in deeper runs.
+    for (outputs) |*run| run.gc_requested = !plan.tombstone_gc and (requested or run.gc_requested);
 }
 
 fn inheritTombstoneAge(outputs: []Run, inputs: anytype) void {
     var oldest = gcNowNs();
     var requested = false;
-    for (@as([]const @TypeOf(inputs[0]), inputs)) |run| if ((inputRun(run).tombstone_count orelse 0) != 0) {
-        oldest = @min(oldest, inputRun(run).oldest_tombstone_unix_ns);
+    for (@as([]const @TypeOf(inputs[0]), inputs)) |run| {
+        if ((inputRun(run).tombstone_count orelse 0) != 0)
+            oldest = @min(oldest, inputRun(run).oldest_tombstone_unix_ns);
         requested = requested or inputRun(run).gc_requested;
-    };
+    }
     for (outputs) |*run| {
         const has_deletes = (run.tombstone_count orelse 0) != 0;
         run.oldest_tombstone_unix_ns = if (has_deletes) oldest else 0;
-        run.gc_requested = has_deletes and requested;
+        run.gc_requested = requested;
     }
 }
 

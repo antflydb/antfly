@@ -41,6 +41,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
   checks: read
   pull-requests: read
 
@@ -79,6 +80,7 @@ jobs:
       model_check: ${{ steps.detect.outputs.model_check }}
       trace_validate: ${{ steps.detect.outputs.trace_validate }}
       backup_s3: ${{ steps.detect.outputs.backup_s3 }}
+      vopr_qualification: ${{ steps.vopr.outputs.required }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -91,6 +93,50 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
+          helper="$RUNNER_TEMP/zig-relevant-changes.sh"
+          cat > "$helper" <<'HELPER'
+          #!/usr/bin/env bash
+          # Decide whether a diff selects Zig test work.
+          #
+          # Usage: zig-relevant-changes.sh BASE HEAD -- PATHSPEC...
+          # Exit 0 when the diff contains a relevant change, 1 when it does not.
+          #
+          # Markdown is documentation, not test input: .md/.mdx files are dropped from
+          # the diff before deciding. Two exceptions stay in scope: fixture READMEs under
+          # a testdata/ directory (oracle scripts check them) and the files listed in
+          # DOC_TEST_INPUTS, which Zig tests read directly. Renames are reported as a
+          # delete plus an add so renaming code to Markdown still counts. If git itself
+          # fails, the change is treated as relevant so tests run rather than skip.
+          set -uo pipefail
+
+          DOC_TEST_INPUTS=(
+            zig/pkg/inference/QUANT_KERNEL_COMPILER.md
+          )
+
+          base="${1:?base revision}"
+          head="${2:?head revision}"
+          shift 2
+          if [ "${1:-}" != "--" ]; then
+            echo "usage: $0 BASE HEAD -- PATHSPEC..." >&2
+            exit 2
+          fi
+          shift
+
+          if ! changed="$(git diff --no-renames --name-only "$base" "$head" -- "$@")"; then
+            echo "zig-relevant-changes: git diff failed; selecting tests conservatively" >&2
+            exit 0
+          fi
+
+          keep="$(printf '%s\n' "$changed" | awk -v inputs="${DOC_TEST_INPUTS[*]}" '
+            BEGIN { n = split(inputs, list, " "); for (i = 1; i <= n; i++) allow[list[i]] = 1 }
+            $0 == "" { next }
+            /\.mdx?$/ && !/(^|\/)testdata\// && !($0 in allow) { next }
+            { print }
+          ')"
+          [ -n "$keep" ]
+          HELPER
+          chmod +x "$helper"
 
           if [[ "${{ inputs.pr_number != '' && 'pull_request' || github.event_name }}" == "workflow_dispatch" ]]; then
             if [[ "${{ inputs.validation_scope }}" == "inference-e2e" ]]; then
@@ -148,10 +194,14 @@ jobs:
             exit 0
           fi
 
-          if git diff --quiet "$base" "${{ inputs.head_sha || github.sha }}" -- \
+          if ! "$helper" "$base" "${{ inputs.head_sha || github.sha }}" -- \
             ':(glob)zig/**' \
             ':(exclude,glob)zig/pkg/antfly/antfarm/**' \
             ':(glob)scripts/ci/zig-*.sh' \
+            scripts/ci/zig_e2e_shard.py \
+            scripts/ci/test_zig_e2e_shard.py \
+            ':(glob)scripts/ci/*vopr*.py' \
+            .github/workflows/zig-vopr-soak.yml \
             scripts/ci/check_zig_checksum_usage.py \
             scripts/ci/test_check_zig_checksum_usage.py \
             scripts/ci/toolchain-policy.json \
@@ -183,10 +233,12 @@ jobs:
             echo "zig_tests=true" >> "$GITHUB_OUTPUT"
           fi
 
-          if git diff --quiet "$base" "${{ inputs.head_sha || github.sha }}" -- \
+          if ! "$helper" "$base" "${{ inputs.head_sha || github.sha }}" -- \
             ':(glob)zig/**' \
             ':(exclude,glob)zig/pkg/antfly/antfarm/**' \
             ':(glob)scripts/ci/zig-*.sh' \
+            scripts/ci/zig_e2e_shard.py \
+            scripts/ci/test_zig_e2e_shard.py \
             scripts/ci/toolchain-policy.json \
             ':(glob)go/pkg/operator/**' \
             ':(glob)go/pkg/sdk/admin/**' \
@@ -204,7 +256,7 @@ jobs:
             echo "e2e=true" >> "$GITHUB_OUTPUT"
           fi
 
-          if git diff --quiet "$base" "${{ inputs.head_sha || github.sha }}" -- \
+          if ! "$helper" "$base" "${{ inputs.head_sha || github.sha }}" -- \
             scripts/test-backup-s3-integration.sh \
             zig/build.zig \
             ':(glob)zig/pkg/antfly/build/**' \
@@ -223,7 +275,7 @@ jobs:
             echo "backup_s3=true" >> "$GITHUB_OUTPUT"
           fi
 
-          if git diff --quiet "$base" "${{ inputs.head_sha || github.sha }}" -- \
+          if ! "$helper" "$base" "${{ inputs.head_sha || github.sha }}" -- \
             ':(glob)zig/specs/tla/**' \
             ':(glob)scripts/tla-*.sh' \
             ':(glob)scripts/tla-*.py' \
@@ -235,7 +287,7 @@ jobs:
             echo "model_check=true" >> "$GITHUB_OUTPUT"
           fi
 
-          if git diff --quiet "$base" "${{ inputs.head_sha || github.sha }}" -- \
+          if ! "$helper" "$base" "${{ inputs.head_sha || github.sha }}" -- \
             ':(glob)zig/specs/tla/**' \
             ':(glob)scripts/tla-*.sh' \
             ':(glob)scripts/tla-*.py' \
@@ -255,6 +307,42 @@ jobs:
             echo "trace_validate=false" >> "$GITHUB_OUTPUT"
           else
             echo "trace_validate=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Detect VOPR qualification changes
+        id: vopr
+        if: inputs.pr_number != ''
+        env:
+          BASE_SHA: ${{ inputs.base_sha }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+        run: |
+          helper="$RUNNER_TEMP/zig-relevant-changes.sh"
+          if [ ! -x "$helper" ]; then
+            echo "change filter missing; requiring VOPR qualification" >&2
+            echo "required=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! "$helper" "$BASE_SHA" "$HEAD_SHA" -- \
+            zig/build.zig \
+            zig/build.zig.zon \
+            ':(glob)zig/lib/vopr/**' \
+            ':(glob)zig/pkg/antfly/src/vopr/**' \
+            ':(glob)zig/pkg/antfly/src/storage/hot_standby/**' \
+            ':(glob)zig/pkg/antfly/src/raft/transport/**' \
+            zig/pkg/antfly/src/raft/host.zig \
+            zig/pkg/antfly/src/raft/reconciler.zig \
+            zig/pkg/antfly/src/raft/vopr_harness.zig \
+            zig/pkg/antfly/src/data/runtime.zig \
+            ':(glob)zig/pkg/antfly/build/**' \
+            ':(glob)scripts/ci/*vopr*.py' \
+            scripts/ci/toolchain-policy.json \
+            .github/actions/load-toolchain-policy/action.yml \
+            .github/workflows/zig-vopr-soak.yml \
+            .github/workflows/zig-tests.yml
+          then
+            echo "required=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "required=true" >> "$GITHUB_OUTPUT"
           fi
 
   backup-s3-integration:
@@ -470,11 +558,15 @@ jobs:
           python3 -m unittest
           tools/test_patch_zig_0_16_build_runner_maxrss.py
           tools/test_run_bounded_zig_build.py
+          tools/test_fixture_workspace.py
+          tools/test_prune_completed_test_cache.py
           tools/test_analyze_zig_import_graph.py
           tools/test_audit_storage_test_shards.py
           tools/test_audit_test_selection.py
+          tools/test_audit_unit_test_ownership.py
           tools/test_check_storage_compilation.py
           tools/test_run_test_partitions.py
+          tools/test_retain_test_process.py
           tools/test_run_recall_checks.py
           tools/test_test_runner.py
           tools/test_sync_generated.py
@@ -508,6 +600,8 @@ jobs:
             scripts.gemma4.test_gemma4_qat_llamacpp_pair_benchmark \
             scripts.test_paired_benchmark \
             scripts.test_regen_cuda_artifacts \
+            scripts.test_regen_cuda_training_math \
+            scripts.test_regen_cuda_boundary_attention \
             scripts.test_summarize_cuda_flash_prefill_v2 \
             scripts.gemma4.test_validate_gemma4_cuda_candidate \
             scripts.gemma4.test_validate_gemma4_cuda_quality_candidate
@@ -521,6 +615,19 @@ jobs:
 
       - name: Test reproducible release archive packaging
         run: python3 scripts/packaging/test_reproducible_tar.py
+
+      - name: Release completed pre-unit test artifacts
+        if: needs.changes.outputs.zig_tests == 'true'
+        run: |
+          # The checks above compile and run several standalone test binaries
+          # into the same job-local cache. Release completed test link inputs
+          # before the aggregate unit suite so late partitions retain disk
+          # headroom without invalidating cached executables.
+          cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
+          du -sh "$cache"
+          python3 zig/tools/prune_completed_test_cache.py "$cache"
+          df -h "$cache"
+          df -i "$cache"
 
       # ARC may expose the shared node's memory total when the runner cgroup is
       # unlimited. Cap the aggregate scheduler budget at 22 GiB so concurrent
@@ -544,10 +651,16 @@ jobs:
             "$patched_runner"
           echo "build_runner=$patched_runner" >> "$GITHUB_OUTPUT"
 
+      - name: Prepare bounded correctness-fixture workspace
+        if: needs.changes.outputs.zig_tests == 'true'
+        run: python3 zig/tools/fixture_workspace.py prepare
+
       - name: Run hermetic Antfly unit tests
         if: needs.changes.outputs.zig_tests == 'true'
         env:
+          ANTFLY_TEST_WORK_PROFILE: "1"
           ANTFLY_TEST_CLEANUP_TRACE: "1"
+          ANTFLY_TEST_TIMINGS: "1"
         run: |
           set -euo pipefail
 
@@ -569,6 +682,12 @@ jobs:
 
           dump_stacks() {
             local root_pid="$1"
+            for partition_log in "$ANTFLY_TEST_LOG_DIR"/*.log; do
+              [ -f "$partition_log" ] || continue
+              echo "::group::partition progress $partition_log"
+              tail -n 80 "$partition_log" || true
+              echo "::endgroup::"
+            done
             echo "::group::antfly unit watchdog ptrace settings"
             if [ -r /proc/sys/kernel/yama/ptrace_scope ]; then
               cat /proc/sys/kernel/yama/ptrace_scope || true
@@ -589,7 +708,10 @@ jobs:
               local cmdline
               cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
               case "$cmdline" in
-                *"/test "*|*"/test"*|*"zig build"*|*" make "*)
+                *"/test "*|*"/test"*|*"-tests "*|*"-tests"|*"zig build"*|*" make "*)
+                  # Ephemeral runner caches disappear with the pod. Keep the
+                  # test bytes even when ptrace cannot supply a stack trace.
+                  python3 zig/tools/retain_test_process.py "$pid" "$ANTFLY_TEST_LOG_DIR/hung" || true
                   echo "::group::proc snapshot pid=$pid cmd=$cmdline"
                   if [ -r "/proc/$pid/status" ]; then
                     grep -E "^(Name|State|Pid|PPid|Threads|VmRSS|VmHWM|voluntary_ctxt_switches|nonvoluntary_ctxt_switches):" "/proc/$pid/status" || true
@@ -646,6 +768,8 @@ jobs:
 
           unit_log="${RUNNER_TEMP:-/tmp}/antfly-zig-unit.log"
           : > "$unit_log"
+          export ANTFLY_TEST_LOG_DIR="${RUNNER_TEMP:-/tmp}/antfly-zig-test-logs"
+          mkdir -p "$ANTFLY_TEST_LOG_DIR"
 
           (
             set +e
@@ -668,13 +792,14 @@ jobs:
             while kill -0 "$unit_pid" 2>/dev/null; do
               sleep 15
               now_epoch="$(date +%s)"
-              if [ -e "$unit_log" ]; then
-                current_mtime="$(stat -c %Y "$unit_log" 2>/dev/null || echo 0)"
+              for progress_log in "$unit_log" "$ANTFLY_TEST_LOG_DIR"/*.log; do
+                [ -f "$progress_log" ] || continue
+                current_mtime="$(stat -c %Y "$progress_log" 2>/dev/null || echo 0)"
                 if [ "$current_mtime" -gt "$last_mtime" ]; then
                   last_mtime="$current_mtime"
                   last_progress_epoch="$now_epoch"
                 fi
-              fi
+              done
 
               elapsed_secs=$((now_epoch - start_epoch))
               idle_secs=$((now_epoch - last_progress_epoch))
@@ -711,6 +836,24 @@ jobs:
             echo "::endgroup::"
           fi
           exit "$status"
+
+      - name: Release correctness-fixture workspace
+        if: always() && env.ANTFLY_TEST_WORKSPACE != ''
+        run: |
+          df -h "$ANTFLY_TEST_WORKSPACE"
+          python3 zig/tools/fixture_workspace.py cleanup
+
+      - name: Retain unit test progress
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: zig-unit-progress-${{ github.job }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/antfly-zig-unit.log
+            ${{ runner.temp }}/antfly-zig-test-logs/*.log
+            ${{ runner.temp }}/antfly-zig-test-logs/hung/
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: Set up Java for TLA+
         if: needs.changes.outputs.model_check == 'true' || needs.changes.outputs.trace_validate == 'true'
@@ -761,16 +904,26 @@ jobs:
         uses: ./.github/actions/load-toolchain-policy
 
       - name: Install build tools
-        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb file
 
       - name: Install uv
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
 
-      - name: Set up Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
         with:
-          version: ${{ steps.toolchain.outputs.zig_version }}
-          use-cache: false
+          nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/${{ steps.toolchain.outputs.zig_nixpkgs_revision }}.tar.gz
+      - name: Install glibc-linked Zig
+        env:
+          ZIG_VERSION: ${{ steps.toolchain.outputs.zig_version }}
+          ZIG_NIX_ATTRIBUTE: ${{ steps.toolchain.outputs.zig_nix_attribute }}
+        run: |
+          zig_path="$(nix-build '<nixpkgs>' -A "$ZIG_NIX_ATTRIBUTE" --no-out-link)"
+          test "$("$zig_path/bin/zig" version)" = "$ZIG_VERSION"
+          compiler_description="$(file "$zig_path/bin/zig")"
+          echo "$compiler_description"
+          grep -q 'dynamically linked' <<<"$compiler_description"
+          echo "$zig_path/bin" >> "$GITHUB_PATH"
 
       - name: Restore ARC Zig cache dirs
         run: |
@@ -794,11 +947,15 @@ jobs:
           python3 -m unittest
           tools/test_patch_zig_0_16_build_runner_maxrss.py
           tools/test_run_bounded_zig_build.py
+          tools/test_fixture_workspace.py
+          tools/test_prune_completed_test_cache.py
           tools/test_analyze_zig_import_graph.py
           tools/test_audit_storage_test_shards.py
           tools/test_audit_test_selection.py
+          tools/test_audit_unit_test_ownership.py
           tools/test_check_storage_compilation.py
           tools/test_run_test_partitions.py
+          tools/test_retain_test_process.py
           tools/test_run_recall_checks.py
           tools/test_test_runner.py
           tools/test_sync_generated.py
@@ -825,7 +982,12 @@ jobs:
             "$patched_runner"
           echo "build_runner=$patched_runner" >> "$GITHUB_OUTPUT"
 
+      - name: Prepare bounded correctness-fixture workspace
+        run: python3 zig/tools/fixture_workspace.py prepare
+
       - name: Run library, Antfly, and inference unit tests
+        env:
+          ANTFLY_TEST_TIMINGS: "1"
         run: |
           set +e
           taskset -c ${{ steps.cpus.outputs.list }} make zig-unit-test ZIG_BUILD_FLAGS="--build-runner ${{ steps.cpus.outputs.build_runner }} --maxrss ${{ steps.cpus.outputs.max_rss }} --summary all"
@@ -841,6 +1003,25 @@ jobs:
             echo "::endgroup::"
           fi
           exit "$status"
+
+      - name: Release correctness-fixture workspace
+        if: always() && env.ANTFLY_TEST_WORKSPACE != ''
+        run: |
+          df -h "$ANTFLY_TEST_WORKSPACE"
+          python3 zig/tools/fixture_workspace.py cleanup
+          # Later scale and qualification phases keep their disk-backed paths.
+          echo 'ANTFLY_TEST_WORKSPACE=' >> "$GITHUB_ENV"
+          echo 'ANTFLY_TEST_WORKSPACE_MOUNTED=' >> "$GITHUB_ENV"
+
+      - name: Release completed phase compiler cache
+        run: |
+          # The preceding build has finished. Release its large test link inputs
+          # while retaining cached executables, dependencies, and generators.
+          cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
+          du -sh "$cache"
+          python3 zig/tools/prune_completed_test_cache.py "$cache"
+          df -h "$cache"
+          df -i "$cache"
 
       - name: Run corpus-scale release regressions
         working-directory: zig
@@ -866,17 +1047,58 @@ jobs:
 
       # Includes index-maintenance and index-ownership replay campaigns. The
       # fixed maintenance seed is already part of the zig-base unit aggregate.
+      - name: Release completed phase compiler cache
+        run: |
+          # The preceding build has finished. Release its large test link inputs
+          # while retaining cached executables, dependencies, and generators.
+          cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
+          du -sh "$cache"
+          python3 zig/tools/prune_completed_test_cache.py "$cache"
+          df -h "$cache"
+          df -i "$cache"
+
       - name: Run Zig VOPR tests
         working-directory: zig
         run: >-
           taskset -c ${{ steps.cpus.outputs.list }}
           python3 tools/run_bounded_zig_build.py --zig zig -- build
           vopr-test
+          secrets-test
+          vopr-build
           --build-runner ${{ steps.cpus.outputs.build_runner }}
           --maxrss ${{ steps.cpus.outputs.max_rss }}
 
+      - name: Test VOPR corpus retention and reuse
+        timeout-minutes: 10
+        run: |
+          python3 -m unittest discover -s scripts/ci -p test_zig_vopr_soak.py
+          python3 scripts/ci/zig_vopr_qualification.py --binary zig/zig-out/bin/vopr --output "$RUNNER_TEMP/vopr-qualification"
+
+      - name: Retain VOPR qualification diagnostics
+        if: always()
+        timeout-minutes: 5
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vopr-qualification-diagnostics
+          path: |
+            ${{ runner.temp }}/vopr-qualification/**/*.json
+            ${{ runner.temp }}/vopr-qualification/**/*.log
+            ${{ runner.temp }}/vopr-qualification/**/*.voprtrace
+            ${{ runner.temp }}/vopr-qualification/**/*.voprquarantine
+          retention-days: 90
+
       # Includes complete graph owner coverage and the native maintenance fixture;
       # no graph-specific CLI or promotion matrix is built here.
+      - name: Release completed phase compiler cache
+        run: |
+          # The preceding build has finished. Release its large test link inputs
+          # while retaining cached executables, dependencies, and generators.
+          cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
+          du -sh "$cache"
+          python3 zig/tools/prune_completed_test_cache.py "$cache"
+          df -h "$cache"
+          df -i "$cache"
+
       - name: Run Zig integration tests
         working-directory: zig
         run: >-
@@ -903,6 +1125,11 @@ jobs:
           antfly-chaos-test
           --build-runner ${{ steps.cpus.outputs.build_runner }}
           --maxrss ${{ steps.cpus.outputs.max_rss }}
+
+      - name: Remove job compiler cache
+        if: always()
+        run: |
+          rm -rf -- "/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
 
   zig-build-cache-tests:
     if: >-
@@ -971,6 +1198,22 @@ jobs:
           path: zig/storage-compilation.json
           if-no-files-found: ignore
 
+  vopr-qualification:
+    name: VOPR qualification
+    needs: [admission, changes]
+    if: >-
+      ${{ !cancelled() && success() &&
+      needs.admission.result == 'success' &&
+      github.run_attempt == 1 && inputs.pr_number != '' &&
+      needs.changes.outputs.vopr_qualification == 'true' }}
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/zig-vopr-soak.yml
+    with:
+      qualification_only: true
+      head_sha: ${{ inputs.head_sha }}
+
   zig-base:
     if: >-
       ${{ !cancelled() &&
@@ -985,7 +1228,7 @@ jobs:
       needs.changes.outputs.model_check == 'true' ||
       needs.changes.outputs.trace_validate == 'true' )) }}
     name: zig-base
-    needs: [admission, changes, zig-base-tests, arm64-codec]
+    needs: [admission, changes, zig-base-tests, arm64-codec, vopr-qualification]
     runs-on: arc-antfly-standard
     steps:
       - name: Verify zig-base shards
@@ -993,11 +1236,14 @@ jobs:
           CHANGES_RESULT: ${{ needs.changes.result }}
           X86_64_RESULT: ${{ needs.zig-base-tests.result }}
           ARM64_CODEC_RESULT: ${{ needs.arm64-codec.result }}
+          VOPR_REQUIRED: ${{ needs.changes.outputs.vopr_qualification }}
+          VOPR_RESULT: ${{ needs.vopr-qualification.result }}
         run: |
           set -euo pipefail
           test "$CHANGES_RESULT" = "success"
           test "$X86_64_RESULT" = "success"
           test "$ARM64_CODEC_RESULT" = "success"
+          if [ "$VOPR_REQUIRED" = "true" ]; then test "$VOPR_RESULT" = "success"; fi
 
   zig-full:
     if: >-
@@ -1116,13 +1362,23 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        suite: [antfly, inference]
+        include:
+          - suite: antfly
+            shard: ordinary
+          - suite: antfly-recovery-0
+            shard: recovery-0
+          - suite: antfly-recovery-1
+            shard: recovery-1
+          - suite: inference
+            shard: all
     env:
       ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/${{ matrix.suite }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local
       ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
       UV_CACHE_DIR: /mnt/cache/antfly/zig/uv
       HF_HOME: /mnt/cache/antfly/zig/hf
       ANTFLY_E2E_DURATION_FILE: /mnt/cache/antfly/zig/e2e-durations/antfly-v1.json
+      # Permit the diagnostic debugger to attach to disposable test children.
+      ANTFLY_E2E_NATIVE_STACKS: "1"
       ANTFLY_CI_TRACE: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1148,7 +1404,10 @@ jobs:
         run: |
           local_cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ matrix.suite }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
           global_cache="/mnt/cache/antfly/zig/zig-global"
-          test_tmp="/mnt/cache/antfly/zig/e2e-tmp/${{ github.job }}/${{ matrix.suite }}/${{ github.run_id }}-${{ github.run_attempt }}"
+          # Keep WAL/fsync-heavy disposable databases on runner-local disk,
+          # not the network-attached cache PVC. Do not use memory tmpfs: these
+          # tests must exercise diskful crash/reopen and retain failure logs.
+          test_tmp="${RUNNER_TEMP}/antfly-e2e/${{ github.job }}/${{ matrix.suite }}/${{ github.run_id }}-${{ github.run_attempt }}"
           {
             echo "ZIG_LOCAL_CACHE_DIR=$local_cache"
             echo "ZIG_GLOBAL_CACHE_DIR=$global_cache"
@@ -1200,11 +1459,22 @@ jobs:
           -tags runtimeintegration ./controllers/inference
           -run '^TestInferenceRuntimeContract$' -count=1 -v -timeout=20m
 
+      - name: Test exhaustive E2E shard partition
+        if: matrix.suite == 'antfly'
+        run: python3 -m unittest discover -s scripts/ci -p test_zig_e2e_shard.py
+
       - name: Run base E2E
         env:
           SKIP_BUILD: "1"
           ANTFLY_E2E_SUITE: ${{ matrix.suite }}
-        run: taskset -c ${{ steps.e2e_cpus.outputs.list }} scripts/ci/zig-e2e-base-linux.sh
+          ANTFLY_E2E_SHARD: ${{ matrix.shard }}
+          ANTFLY_E2E_PRESERVE_ROOT_ON_FAILURE: "1"
+        run: |
+          if [[ "$ANTFLY_E2E_SUITE" == antfly* && ! -f scripts/ci/zig_e2e_shard.py ]]; then
+            echo "::error::Merge origin/main into this PR to obtain the required E2E shard helper."
+            exit 1
+          fi
+          taskset -c ${{ steps.e2e_cpus.outputs.list }} scripts/ci/zig-e2e-base-linux.sh
 
       - name: Run inference config contract with a real CPU model
         if: matrix.suite == 'inference'
@@ -1237,6 +1507,22 @@ jobs:
           taskset -c ${{ steps.e2e_cpus.outputs.list }}
           scripts/ci/zig-e2e-regression-loop.sh
           e2e/antfly/test_resolution.py::test_multinode_autograph_resolves_promotes_and_hydrates_entities
+
+      - name: Retain failed E2E server logs and cluster diagnostics
+        if: failure() && startsWith(matrix.suite, 'antfly')
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: antfly-e2e-server-logs-${{ matrix.suite }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.TMPDIR }}/antfly-zig-standalone-e2e-*/server.log
+            ${{ env.TMPDIR }}/antfly-zig-scaling-e2e-*/*.log
+            ${{ env.TMPDIR }}/antfly-zig-scaling-e2e-*/failure-diagnostics.json
+            ${{ env.TMPDIR }}/antfly-zig-scaling-e2e-*/native-stacks.txt
+            ${{ env.TMPDIR }}/antfly-zig-metadata-backup-e2e-*/*.log
+            ${{ env.TMPDIR }}/antfly-zig-metadata-backup-e2e-*/failure-diagnostics.json
+            ${{ env.TMPDIR }}/antfly-zig-metadata-backup-e2e-*/native-stacks.txt
+          if-no-files-found: ignore
+          retention-days: 7
 
   e2e-base:
     if: >-
@@ -1372,7 +1658,9 @@ jobs:
 
       - name: Prepare ARC test cache dirs
         run: |
-          test_tmp="/mnt/cache/antfly/zig/e2e-tmp/${{ github.job }}/${{ matrix.suite }}/${{ github.run_id }}-${{ github.run_attempt }}"
+          # Cache/model downloads stay on the PVC; crash-test databases use
+          # runner-local disk (not tmpfs), just like the required base lanes.
+          test_tmp="${RUNNER_TEMP}/antfly-e2e/${{ github.job }}/${{ matrix.suite }}/${{ github.run_id }}-${{ github.run_attempt }}"
           echo "TMPDIR=$test_tmp" >> "$GITHUB_ENV"
           mkdir -p "$test_tmp" "$UV_CACHE_DIR" "$HF_HOME" "$(dirname "$ANTFLY_E2E_DURATION_FILE")"
           mkdir -p "/mnt/cache/antfly/zig/home-cache-full-${{ matrix.suite }}" "/mnt/cache/antfly/zig/home-antfly-full-${{ matrix.suite }}"

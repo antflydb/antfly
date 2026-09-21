@@ -265,6 +265,32 @@ fn continueRun(
             break;
     }
     try choice_source.finish();
+    if (@hasDecl(Scenario, "budgetFailure")) {
+        if (transition_index == transition_budget and !Scenario.done(world)) {
+            const identity = Scenario.budgetFailure(world);
+            try result.addFailure(.{
+                .index = transition_index,
+                .class = .liveness,
+                .property_id = null,
+                .identity = identity,
+                .fingerprint = ids.stable("failure.liveness", identity),
+                .observation_digest = last_digest,
+            });
+        }
+    }
+    // Final checks run after the canonical workload, even at its budget limit.
+    // They must use distinct properties from per-transition evaluation.
+    if (@hasDecl(Scenario, "finalize")) {
+        var sink: property.Sink = .{};
+        defer sink.deinit(allocator);
+        try Scenario.finalize(world, &sink, allocator);
+        try appendEvaluations(Scenario, &sink, result, tracker, transition_index);
+        std.mem.sort(trace.PropertyRecord, result.properties.items, {}, struct {
+            fn lessThan(_: void, lhs: trace.PropertyRecord, rhs: trace.PropertyRecord) bool {
+                return lhs.index < rhs.index or (lhs.index == rhs.index and lhs.property_id < rhs.property_id);
+            }
+        }.lessThan);
+    }
     tracker.finish(transition_index);
     var property_failures: std.ArrayListUnmanaged(PropertyFailure) = .empty;
     defer property_failures.deinit(allocator);
@@ -430,7 +456,7 @@ fn executeStep(
     const prior_failure_count = tracker.failureCount();
     try evaluateProperties(Scenario, allocator, world, result, tracker, transition_index.*);
     if (@hasDecl(Scenario, "quiescent") and Scenario.quiescent(world)) tracker.beginQuiescence(transition_index.*);
-    if (Scenario.done(world)) tracker.finish(transition_index.*);
+    if (!@hasDecl(Scenario, "finalize") and Scenario.done(world)) tracker.finish(transition_index.*);
     recordHealth(Scenario, world, transition_index.*, health_recorder);
     if (tracker.failureCount() > prior_failure_count) {
         for (Scenario.properties, tracker.statuses) |declaration, status| {
@@ -592,6 +618,10 @@ fn evaluateProperties(
     var sink = property.Sink{};
     defer sink.deinit(allocator);
     try Scenario.evaluate(world, &sink, allocator);
+    try appendEvaluations(Scenario, &sink, result, tracker, index);
+}
+
+fn appendEvaluations(comptime Scenario: type, sink: *property.Sink, result: *trace.Trace, tracker: *property.Tracker, index: u64) !void {
     try sink.canonicalize();
     for (sink.evaluations.items) |evaluation| {
         const declaration = declarationFor(Scenario.properties, evaluation.property_id) orelse return error.UnknownPropertyId;
@@ -860,4 +890,62 @@ test "runner automatically records phased health outside canonical replay bytes"
     var resumed = try resumeFromCheckpoint(Scenario, std.testing.allocator, &artifact, checkpoint, suffix.source());
     defer resumed.deinit();
     try std.testing.expectEqualDeep(evidence, resumed.health_evidence.?);
+}
+
+test "budget cutoff retains liveness evidence and verifies cleanup before finishing properties" {
+    const S = struct {
+        pub const name: []const u8 = "finalization-test";
+        pub const version: u32 = 1;
+        pub const World = struct { owners: usize = 1 };
+        pub const properties = &[_]property.Declaration{
+            .{ .id = 1, .name = "cleanup", .kind = .always },
+            .{ .id = 2, .name = "completed", .kind = .reachable },
+        };
+        pub fn init(_: std.mem.Allocator) !World {
+            return .{};
+        }
+        pub fn deinit(world: *World, _: std.mem.Allocator) void {
+            std.debug.assert(world.owners == 0);
+        }
+        pub fn enumerate(_: *World, list: *transition.List, alloc: std.mem.Allocator) !void {
+            try list.append(alloc, .{ .id = 1, .name = "wait", .kind = .workload });
+        }
+        pub fn execute(_: *World, _: transition.Transition, _: *event.Sink, _: std.mem.Allocator) !outcome.TransitionOutcome {
+            return outcome.TransitionOutcome.applied();
+        }
+        pub fn observe(world: *World, builder: *observation.Builder, alloc: std.mem.Allocator) !void {
+            try builder.addNamed(alloc, "owners", @intCast(world.owners));
+        }
+        pub fn evaluate(_: *World, sink: *property.Sink, alloc: std.mem.Allocator) !void {
+            try sink.check(alloc, 2, false);
+        }
+        pub fn done(_: *World) bool {
+            return false;
+        }
+        pub fn budgetFailure(_: *World) []const u8 {
+            return "transition-budget-exhausted";
+        }
+        pub fn finalize(world: *World, sink: *property.Sink, alloc: std.mem.Allocator) !void {
+            world.owners = 0;
+            try sink.check(alloc, 1, world.owners == 0);
+        }
+    };
+    var choices = choice.Seeded.init(1);
+    var artifact = try run(S, std.testing.allocator, choices.source(), .{ .transition_budget = 2 });
+    defer artifact.deinit();
+    try std.testing.expectEqual(@as(usize, 2), artifact.failures.items.len);
+    var saw_liveness = false;
+    for (artifact.failures.items) |failure| {
+        saw_liveness = saw_liveness or failure.class == .liveness;
+        try std.testing.expect(failure.property_id != 1);
+    }
+    try std.testing.expect(saw_liveness);
+    var replay_choices = choice.Replay{ .records = artifact.choices.items };
+    var replayed = try run(S, std.testing.allocator, replay_choices.source(), .{ .transition_budget = 2 });
+    defer replayed.deinit();
+    const original = try artifact.renderAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(original);
+    const replay_bytes = try replayed.renderAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(replay_bytes);
+    try std.testing.expectEqualStrings(original, replay_bytes);
 }

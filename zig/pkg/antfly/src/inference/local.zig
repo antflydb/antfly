@@ -23,7 +23,6 @@ const builtin = @import("builtin");
 const httpx = @import("httpx");
 const inference_api = @import("inference_api");
 const inference = @import("types.zig");
-const binary = @import("binary.zig");
 const template_mod = if (builtin.os.tag == .freestanding or builtin.is_test)
     @import("../storage/db/template_stub.zig")
 else
@@ -542,27 +541,6 @@ pub const Provider = struct {
         }
 
         const body = resp.body orelse return error.EmptyResponse;
-        if (resp.contentType()) |ct| {
-            if (std.mem.startsWith(u8, ct, "application/octet-stream")) {
-                var result = try binary.deserializeSparse(alloc, body);
-                defer result.deinit(alloc);
-
-                const indices = try alloc.alloc([]const i32, result.vectors.len);
-                errdefer alloc.free(indices);
-                const values = try alloc.alloc([]const f32, result.vectors.len);
-                errdefer alloc.free(values);
-
-                for (result.vectors, 0..) |vector, i| {
-                    indices[i] = try alloc.dupe(i32, vector.indices);
-                    values[i] = try alloc.dupe(f32, vector.values);
-                }
-                return .{
-                    .indices = indices,
-                    .values = values,
-                    .allocator = alloc,
-                };
-            }
-        }
 
         const JsonSparseVector = struct {
             indices: []const i32,
@@ -691,26 +669,10 @@ pub const Provider = struct {
         }
 
         const body = resp.body orelse return error.EmptyResponse;
-        if (resp.contentType()) |ct| {
-            if (std.ascii.eqlIgnoreCase(ct, httpx.numeric_response.content_type)) {
-                const view = try httpx.numeric_response.parse(body, .dense, expected_count, self.numeric_dense_dimensions);
-                return .{ .vectors = try view.denseAlloc(alloc), .dimension = view.columns, .allocator = alloc };
-            }
-            if (self.numeric_dense_dimensions != null) return error.InferenceCapabilitiesStale;
-            if (std.mem.startsWith(u8, ct, "application/octet-stream")) {
-                if (body.len < 16 or std.mem.readInt(u64, body[0..8], .little) != expected_count)
-                    return error.InvalidEmbeddingResponse;
-                var result = try binary.deserializeDense(alloc, body);
-                const vectors = result.vectors;
-                const dim = result.dimension;
-                result.vectors = &.{};
-                return .{
-                    .vectors = vectors,
-                    .dimension = dim,
-                    .allocator = alloc,
-                };
-            }
-        }
+        if (resp.contentType()) |ct| if (std.ascii.eqlIgnoreCase(ct, httpx.numeric_response.content_type)) {
+            const view = try httpx.numeric_response.parse(body, .dense, expected_count, self.numeric_dense_dimensions);
+            return .{ .vectors = try view.denseAlloc(alloc), .dimension = view.columns, .allocator = alloc };
+        };
 
         if (self.numeric_dense_dimensions != null) return error.InferenceCapabilitiesStale;
         var result = try parseDenseJsonResponseAlloc(alloc, body);
@@ -1429,7 +1391,7 @@ fn testRerankScoresResponse(binary_response: bool) !void {
     try std.testing.expectEqual(@as(f32, 0.8), result_first_score);
 }
 
-test "antfly embed round trip (binary)" {
+test "antfly embed round trip (numeric frame)" {
     try testDenseEmbedRequest(null, null);
 }
 
@@ -1445,15 +1407,11 @@ fn testDenseEmbedRequest(comptime task_type: ?[]const u8, comptime instruction: 
     defer io_impl.deinit();
     const io = io_impl.io();
 
-    // Build a binary dense embedding response:
-    // Header: u64 num_vectors (1) + u64 dimension (3) + 3 x f32 values
-    var bin_buf: [16 + 3 * 4]u8 = undefined;
-    std.mem.writeInt(u64, bin_buf[0..8], 1, .little); // num_vectors
-    std.mem.writeInt(u64, bin_buf[8..16], 3, .little); // dimension
-    // f32 values: 0.5, 1.5, 2.5
-    bin_buf[16..20].* = @bitCast(@as(f32, 0.5));
-    bin_buf[20..24].* = @bitCast(@as(f32, 1.5));
-    bin_buf[24..28].* = @bitCast(@as(f32, 2.5));
+    // One dense vector in the frame a current server returns when the
+    // request's Accept header names the numeric media type.
+    const frame = try httpx.numeric_response.allocFrame(alloc, .dense, 1, 3);
+    defer alloc.free(frame);
+    for ([_]f32{ 0.5, 1.5, 2.5 }, 0..) |value, i| try httpx.numeric_response.setValue(frame, i, value);
 
     const Assert = struct {
         fn request(req: httpx.testing_mod.RequestInfo) !void {
@@ -1478,8 +1436,8 @@ fn testDenseEmbedRequest(comptime task_type: ?[]const u8, comptime instruction: 
 
     var ts = try httpx.TestServer.start(alloc, io, &.{
         .{ .method = .POST, .path = "/embed", .assert_request = Assert.request, .respond = .{
-            .body = &bin_buf,
-            .content_type = "application/octet-stream",
+            .body = frame,
+            .content_type = httpx.numeric_response.content_type,
         } },
     });
     defer ts.deinit();

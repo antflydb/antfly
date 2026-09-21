@@ -17,8 +17,10 @@ const topology_records = @import("../../common/topology_records.zig");
 const extensions = @import("../../extensions/mod.zig");
 const validation = @import("validation.zig");
 
-pub const topology_format_version: u16 = 3;
+pub const topology_format_version: u16 = 4;
 pub const topology_name = "TOPOLOGY.json";
+pub const private_provisioning_name = "restore-provisioning.json";
+pub const standalone_metadata_name = "standalone-metadata.bin";
 pub const logical_snapshot_manifest_name = "SNAPSHOT.json";
 pub const max_topology_bytes: usize = 64 * 1024 * 1024;
 pub const max_files: usize = 1_000_000;
@@ -41,6 +43,8 @@ pub const PortableAuthSeed = struct {
 
 pub const LogicalCatalog = struct {
     epoch: u64,
+    // Optional only for reading v3 seeds. V4 always carries the catalog.
+    system_catalog: ?@import("../../system_catalog/domain.zig").State = null,
     tables: []const topology_records.TableRecord,
     ranges: []const topology_records.RangeRecord,
     extension_packages: []const extensions.PackageManifest = &.{},
@@ -85,6 +89,11 @@ pub const Topology = struct {
     extension_artifacts: []const ExtensionArtifact = &.{},
     auth_enabled: bool = false,
     auth_artifact: ?AuthArtifact = null,
+    private_provisioning: ?@import("../../metadata/restore_provisioning_contract.zig").ProvisioningProjection = null,
+    native_restore_tables: []const @import("restore_owner_contract.zig").OwnerTable = &.{},
+    native_restore_owners: []const @import("restore_owner_contract.zig").OwnerRef = &.{},
+    restore_terminals: ?AuthArtifact = null,
+    standalone_metadata: ?AuthArtifact = null,
 };
 
 pub fn validate(
@@ -94,14 +103,45 @@ pub fn validate(
     expected_generation: []const u8,
     topology: Topology,
 ) !void {
-    if (topology.format_version != topology_format_version or
+    var proof_arena = std.heap.ArenaAllocator.init(alloc);
+    defer proof_arena.deinit();
+    const proof_alloc = proof_arena.allocator();
+    const private = topology.private_provisioning;
+    const placed_tables = if (private) |projection| try std.mem.concat(proof_alloc, topology_records.TableRecord, &.{ topology.catalog.tables, projection.tables }) else topology.catalog.tables;
+    const placed_ranges = if (private) |projection| try std.mem.concat(proof_alloc, topology_records.RangeRecord, &.{ topology.catalog.ranges, projection.ranges }) else topology.catalog.ranges;
+    const native_owners = try @import("restore_owner_contract.zig").expand(proof_alloc, topology.native_restore_tables, topology.native_restore_owners);
+    const native_projection = try @import("restore_owner_contract.zig").project(proof_alloc, native_owners, topology.catalog.tables, placed_tables, placed_ranges);
+    if (native_projection.owners.len != topology.native_restore_owners.len) return error.NonCanonicalSeedTopology;
+    for (topology.native_restore_owners, 0..) |owner, index| if (index != 0 and topology.native_restore_owners[index - 1].scope.target_namespace.shard_id >= owner.scope.target_namespace.shard_id) return error.NonCanonicalSeedTopology;
+    const all_tables = try std.mem.concat(proof_alloc, topology_records.TableRecord, &.{ placed_tables, native_projection.tables });
+    const all_ranges = try std.mem.concat(proof_alloc, topology_records.RangeRecord, &.{ placed_ranges, native_projection.ranges });
+    if (topology.restore_terminals) |artifact| {
+        if (!std.mem.eql(u8, artifact.path, @import("restore_owner_contract.zig").terminal_artifact_name) or artifact.size_bytes < 8 or artifact.size_bytes > max_file_bytes or !isCanonicalSha256(artifact.sha256)) return error.InvalidRestoreTerminal;
+        const path = try std.fs.path.join(proof_alloc, &.{ raw_root, artifact.path });
+        const stat = try std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false });
+        if (stat.kind != .file or stat.size != artifact.size_bytes) return error.InvalidRestoreTerminal;
+        try expectFileSha256(io, alloc, path, artifact.sha256);
+    }
+    if (topology.standalone_metadata) |artifact| {
+        if (!std.mem.eql(u8, artifact.path, standalone_metadata_name) or artifact.size_bytes < 8 or artifact.size_bytes > max_file_bytes or !isCanonicalSha256(artifact.sha256)) return error.InvalidStandaloneMetadataCheckpoint;
+        const path = try std.fs.path.join(proof_alloc, &.{ raw_root, artifact.path });
+        const stat = try std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false });
+        if (stat.kind != .file or stat.size != artifact.size_bytes) return error.InvalidStandaloneMetadataCheckpoint;
+        try expectFileSha256(io, alloc, path, artifact.sha256);
+    }
+    // Released v3 seeds may contain a truly empty public catalog without a
+    // full metadata artifact. Hidden owners still require the independently
+    // authenticated private/registry proofs validated above.
+    if ((topology.format_version != topology_format_version and topology.format_version != 3) or
         !std.mem.eql(u8, topology.generation, expected_generation) or
-        topology.catalog.epoch == 0 or topology.catalog.tables.len == 0 or
-        topology.catalog.ranges.len == 0 or
-        topology.replicas.len != topology.catalog.ranges.len) return error.InvalidSeedTopology;
+        topology.catalog.epoch == 0 or
+        (topology.catalog.tables.len == 0) != (topology.catalog.ranges.len == 0) or
+        topology.replicas.len != all_ranges.len) return error.InvalidSeedTopology;
 
+    try validateLogicalCatalog(alloc, topology.format_version, topology.catalog);
     for (topology.catalog.tables, 0..) |table, index| {
-        if (table.table_id == 0 or !validation.isIdentifier(table.name)) return error.InvalidSeedTopology;
+        if (table.table_id == 0) return error.InvalidSeedTopology;
+        try validateTableIdentityName(table.name);
         if (index > 0 and topology.catalog.tables[index - 1].table_id >= table.table_id) return error.NonCanonicalSeedTopology;
         try validateJson(table.schema_json, true);
         try validateJson(table.read_schema_json, true);
@@ -144,8 +184,8 @@ pub fn validate(
 
     for (topology.replicas, 0..) |replica, index| {
         if (index > 0 and topology.replicas[index - 1].group_id >= replica.group_id) return error.NonCanonicalSeedTopology;
-        const range = findRange(topology.catalog.ranges, replica.group_id) orelse return error.SeedReplicaRangeMissing;
-        const table = findTable(topology.catalog.tables, replica.table_id) orelse return error.SeedReplicaTableMissing;
+        const range = findRange(all_ranges, replica.group_id) orelse return error.SeedReplicaRangeMissing;
+        const table = findTable(all_tables, replica.table_id) orelse return error.SeedReplicaTableMissing;
         const expected_path = try std.fmt.allocPrint(alloc, "replicas/group-{d}", .{replica.group_id});
         defer alloc.free(expected_path);
         if (replica.group_id != range.group_id or replica.table_id != range.table_id or
@@ -178,8 +218,9 @@ pub fn validate(
             return error.InvalidExtensionSeedArtifact;
         if (index > 0 and std.mem.order(u8, topology.extension_artifacts[index - 1].path, artifact.path) != .lt)
             return error.NonCanonicalSeedTopology;
-        _ = findPackage(topology.catalog.extension_packages, artifact.package_name, artifact.package_version) orelse
+        const package = findPackage(topology.catalog.extension_packages, artifact.package_name, artifact.package_version) orelse
             return error.ExtensionSeedCatalogMismatch;
+        _ = package;
         const path = try std.fs.path.join(alloc, &.{ raw_root, artifact.path });
         defer alloc.free(path);
         const stat = try std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false });
@@ -328,4 +369,64 @@ fn encodeHex(out: []u8, bytes: []const u8) void {
 
 fn readFileAlloc(io: std.Io, alloc: Allocator, path: []const u8, max_bytes: usize) ![]u8 {
     return try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(max_bytes));
+}
+
+pub fn validateLogicalCatalog(alloc: Allocator, version: u16, catalog: LogicalCatalog) !void {
+    if (version >= 4 and catalog.system_catalog == null) return error.InvalidSeedTopology;
+    if (catalog.system_catalog) |state| {
+        if (state.next_id < 3) return error.InvalidSeedTopology;
+        const domain = @import("../../system_catalog/domain.zig");
+        var index = try domain.StateIndex.init(alloc, state);
+        defer index.deinit(alloc);
+        for (state.resources) |resource| {
+            try domain.validateResourceName(resource.kind, resource.name);
+            if (resource.id == 0 or (resource.kind != .table and resource.id >= state.next_id)) return error.InvalidSeedTopology;
+            switch (resource.kind) {
+                .table => {
+                    const table = findTable(catalog.tables, resource.id) orelse return error.InvalidSeedTopology;
+                    if (!std.mem.eql(u8, table.name, resource.storage_name) or index.byId(.namespace, resource.parent_id) == null) return error.InvalidSeedTopology;
+                },
+                .namespace => if (index.byId(.database, resource.parent_id) == null) return error.InvalidSeedTopology,
+                else => {},
+            }
+            if (resource.tablespace_id != 0 and index.byId(.tablespace, resource.tablespace_id) == null) return error.InvalidSeedTopology;
+        }
+    }
+}
+
+pub fn validateTableIdentityName(name: []const u8) !void {
+    const domain = @import("../../system_catalog/domain.zig");
+    if (name.len <= 255) {
+        domain.validateTableName(name) catch return error.InvalidSeedTopology;
+    } else domain.validateStorageName(name) catch return error.InvalidSeedTopology;
+}
+
+test "empty standalone seed retains epoch and rejects incomplete topology" {
+    const alloc = std.testing.allocator;
+    const io = std.Options.debug_io;
+    const empty = Topology{
+        .generation = "empty-1",
+        .catalog = .{ .epoch = 1, .tables = &.{}, .ranges = &.{}, .system_catalog = .{} },
+        .replicas = &.{},
+    };
+    try validate(alloc, io, ".", "empty-1", empty);
+
+    var invalid = empty;
+    invalid.catalog.epoch = 0;
+    try std.testing.expectError(error.InvalidSeedTopology, validate(alloc, io, ".", "empty-1", invalid));
+    try std.testing.expectError(error.InvalidSeedTopology, validate(alloc, io, ".", "other-generation", empty));
+
+    invalid = empty;
+    invalid.catalog.tables = &.{undefined};
+    try std.testing.expectError(error.InvalidSeedTopology, validate(alloc, io, ".", "empty-1", invalid));
+    invalid = empty;
+    invalid.catalog.ranges = &.{undefined};
+    try std.testing.expectError(error.InvalidSeedTopology, validate(alloc, io, ".", "empty-1", invalid));
+    invalid = empty;
+    invalid.replicas = &.{undefined};
+    try std.testing.expectError(error.InvalidSeedTopology, validate(alloc, io, ".", "empty-1", invalid));
+
+    invalid = empty;
+    invalid.auth_enabled = true;
+    try std.testing.expectError(error.AuthSeedTopologyMismatch, validate(alloc, io, ".", "empty-1", invalid));
 }

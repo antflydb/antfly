@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const system_catalog = @import("../system_catalog/domain.zig");
 const schema_mod = @import("../schema/mod.zig");
 
 pub const wasmtime_runtime = @import("wasmtime_runtime.zig");
@@ -429,7 +430,10 @@ pub const ExtensionMember = struct {
         if (self.shape_kind != null and self.object_kind != .data_shape) return error.MemberShapeKindWithoutDataShape;
         if (self.shape_name.len > 0) try requireObjectName(self.shape_name);
         if (self.scope.kind == .table and self.table_name.len != 0 and !std.mem.eql(u8, self.scope.table_name, self.table_name)) {
-            return error.MemberTableOutsideScope;
+            // The scope remains the public admission identity. Lifecycle
+            // planning binds table_name to an immutable storage identity before
+            // persistence; restore and Raft apply validate that bound shape.
+            system_catalog.validateStorageName(self.table_name) catch return error.MemberTableOutsideScope;
         }
         try validateJsonObject("member.owner_metadata_json", self.owner_metadata_json);
     }
@@ -520,13 +524,44 @@ pub const ExtensionCatalog = struct {
     packages: std.ArrayListUnmanaged(PackageManifest) = .empty,
     installed: std.ArrayListUnmanaged(InstalledExtension) = .empty,
     members: std.ArrayListUnmanaged(ExtensionMember) = .empty,
+    data_shapes_by_table: std.StringHashMapUnmanaged(std.ArrayListUnmanaged([]const u8)) = .empty,
+    data_shapes_index_valid: bool = false,
     dependencies: std.ArrayListUnmanaged(ExtensionDependency) = .empty,
+
+    fn invalidateDataShapes(self: *ExtensionCatalog) void {
+        var it = self.data_shapes_by_table.iterator();
+        while (it.next()) |entry| entry.value_ptr.deinit(self.alloc);
+        self.data_shapes_by_table.clearRetainingCapacity();
+        self.data_shapes_index_valid = false;
+    }
+
+    /// Borrowed immutable schemas, indexed once per membership generation.
+    /// Mutation invalidates before freeing any borrowed member storage.
+    pub fn tableDataShapes(self: *ExtensionCatalog, name: []const u8) ![]const []const u8 {
+        if (!self.data_shapes_index_valid) {
+            self.invalidateDataShapes();
+            errdefer self.invalidateDataShapes();
+            for (self.members.items) |member| {
+                if (member.object_kind != .data_shape) continue;
+                const kind = member.shape_kind orelse continue;
+                if (kind != .document and kind != .row) continue;
+                const table = if (member.table_name.len != 0) member.table_name else if (member.scope.kind == .table) member.scope.table_name else continue;
+                const entry = try self.data_shapes_by_table.getOrPut(self.alloc, table);
+                if (!entry.found_existing) entry.value_ptr.* = .empty;
+                try entry.value_ptr.append(self.alloc, member.owner_metadata_json);
+            }
+            self.data_shapes_index_valid = true;
+        }
+        return if (self.data_shapes_by_table.get(name)) |shapes| shapes.items else &.{};
+    }
 
     pub fn init(alloc: std.mem.Allocator) ExtensionCatalog {
         return .{ .alloc = alloc };
     }
 
     pub fn deinit(self: *ExtensionCatalog) void {
+        self.invalidateDataShapes();
+        self.data_shapes_by_table.deinit(self.alloc);
         for (self.packages.items) |package| freePackageManifest(self.alloc, package);
         self.packages.deinit(self.alloc);
         for (self.installed.items) |extension| freeInstalledExtension(self.alloc, extension);
@@ -563,6 +598,7 @@ pub const ExtensionCatalog = struct {
     }
 
     pub fn upsertMember(self: *ExtensionCatalog, member: ExtensionMember) !void {
+        self.invalidateDataShapes();
         try member.validate();
         const owned = try cloneExtensionMember(self.alloc, member);
         errdefer freeExtensionMember(self.alloc, owned);
@@ -593,6 +629,7 @@ pub const ExtensionCatalog = struct {
         members: []const ExtensionMember,
         dependencies: []const ExtensionDependency,
     ) !void {
+        self.invalidateDataShapes();
         for (packages) |package| try self.registerPackage(package);
         for (installed) |extension| {
             try extension.validate();
@@ -615,6 +652,7 @@ pub const ExtensionCatalog = struct {
         request: InstallExtensionRequest,
         installed_at_epoch_ms: i64,
     ) !InstalledExtension {
+        self.invalidateDataShapes();
         if (request.dry_run) return error.DryRunRequiresPlan;
         if (self.findInstalledIndex(extension_name) != null) return error.ExtensionAlreadyInstalled;
         const package = self.findPackage(package_name, request.version) orelse return error.PackageNotFound;
@@ -662,6 +700,7 @@ pub const ExtensionCatalog = struct {
     }
 
     pub fn dropInstalledWithMode(self: *ExtensionCatalog, extension_name: []const u8, request: DropExtensionRequest) !void {
+        self.invalidateDataShapes();
         try request.validate();
         if (request.dry_run) return error.DryRunRequiresPlan;
         _ = self.findInstalledIndex(extension_name) orelse return error.ExtensionNotInstalled;
@@ -712,6 +751,7 @@ pub const ExtensionCatalog = struct {
         extension_name: []const u8,
         request: UpdateExtensionRequest,
     ) !InstalledExtension {
+        self.invalidateDataShapes();
         try request.validate();
         if (request.dry_run) return error.DryRunRequiresPlan;
         const installed_idx = self.findInstalledIndex(extension_name) orelse return error.ExtensionNotInstalled;
@@ -731,6 +771,23 @@ pub const ExtensionCatalog = struct {
             .grants = current.granted_capabilities,
         }, current.installed_at_epoch_ms);
         errdefer plan.deinit(self.alloc);
+        // Version upgrades rebuild members from the public manifest. Retain
+        // the installed table identity, including for newly added members,
+        // instead of resolving a possibly renamed or reused public name.
+        if (current.scope.kind == .table) {
+            var bound_table: ?[]const u8 = null;
+            for (self.members.items) |member| {
+                if (!std.mem.eql(u8, member.extension_name, extension_name) or member.table_name.len == 0) continue;
+                if (bound_table) |bound| {
+                    if (!std.mem.eql(u8, bound, member.table_name)) return error.ExtensionLifecycleConflict;
+                } else bound_table = member.table_name;
+            }
+            if (bound_table) |bound| for (plan.members) |*member| {
+                const owned = try self.alloc.dupe(u8, bound);
+                if (member.table_name.len > 0) self.alloc.free(member.table_name);
+                member.table_name = owned;
+            };
+        }
         try self.members.ensureUnusedCapacity(self.alloc, plan.members.len);
         var dependency_rows = try self.planDependencyRowsAlloc(extension_name, target.*);
         defer {
@@ -1011,6 +1068,7 @@ pub const ExtensionCatalog = struct {
     }
 
     fn removeMembersForExtension(self: *ExtensionCatalog, extension_name: []const u8) void {
+        self.invalidateDataShapes();
         var i: usize = 0;
         while (i < self.members.items.len) {
             if (std.mem.eql(u8, self.members.items[i].extension_name, extension_name)) {
@@ -1277,6 +1335,10 @@ fn memberFromObjectAlloc(
     install: InstallManifest,
     object: ExtensionObjectDecl,
 ) !ExtensionMember {
+    // Package declarations contain public names, never trusted routing IDs.
+    // Enforce scope before lifecycle planning resolves the storage binding.
+    if (scope.kind == .table and object.table_name.len != 0 and
+        !std.mem.eql(u8, scope.table_name, object.table_name)) return error.MemberTableOutsideScope;
     const table_name = if (object.table_name.len > 0)
         object.table_name
     else if (scope.kind == .table)
@@ -2329,7 +2391,7 @@ test "extension catalog rejects grants not requested by package" {
     ));
 }
 
-test "extension catalog updates configures disables and enables extension" {
+test "extension lifecycle updates preserve durable bindings for existing and new members" {
     var catalog = ExtensionCatalog.init(std.testing.allocator);
     defer catalog.deinit();
 
@@ -2382,6 +2444,10 @@ test "extension catalog updates configures disables and enables extension" {
     try catalog.configureInstalled("memoryaf", .{ .config_json = "{\"ttl_days\":60}" });
     try std.testing.expectEqualStrings("{\"ttl_days\":60}", catalog.installed.items[0].config_json);
 
+    const physical = "table:0123456789abcdef0123456789abcdef";
+    const bound = try std.testing.allocator.dupe(u8, physical);
+    std.testing.allocator.free(catalog.members.items[0].table_name);
+    catalog.members.items[0].table_name = bound;
     const updated = try catalog.updateManifestOnly("memoryaf", .{ .target_version = "1.1.0" });
     defer freeInstalledExtension(std.testing.allocator, updated);
     try std.testing.expectEqualStrings("1.1.0", updated.package_version);
@@ -2392,4 +2458,34 @@ test "extension catalog updates configures disables and enables extension" {
     const members = try catalog.listMembersForExtension(std.testing.allocator, "memoryaf");
     defer catalog.freeMembers(std.testing.allocator, members);
     try std.testing.expectEqual(@as(usize, 2), members.len);
+    for (members) |member| {
+        try std.testing.expectEqualStrings(physical, member.table_name);
+        try std.testing.expectEqualStrings("memories", member.scope.table_name);
+    }
+}
+
+test "extension lifecycle bound members retain public scope without accepting package scope escapes" {
+    const physical = "table:0123456789abcdef0123456789abcdef";
+    const scope: ExtensionScope = .{ .kind = .table, .table_name = "docs" };
+    try (ExtensionMember{
+        .extension_name = "ext",
+        .scope = scope,
+        .object_kind = .index,
+        .object_name = "search",
+        .table_name = physical,
+    }).validate();
+    try std.testing.expectError(error.MemberTableOutsideScope, memberFromObjectAlloc(
+        std.testing.allocator,
+        "ext",
+        scope,
+        .{},
+        .{ .kind = .index, .name = "search", .table_name = physical },
+    ));
+    try std.testing.expectError(error.MemberTableOutsideScope, (ExtensionMember{
+        .extension_name = "ext",
+        .scope = scope,
+        .object_kind = .index,
+        .object_name = "search",
+        .table_name = "other",
+    }).validate());
 }

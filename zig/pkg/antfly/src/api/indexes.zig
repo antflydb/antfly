@@ -660,6 +660,17 @@ pub fn collectArtifactEnrichmentsFromValueWithOptions(
                     defer parsed.deinit();
                     var owned = try db_mod.types.EnrichmentConfig.clone(alloc, parsed.value);
                     errdefer owned.deinit(alloc);
+                    if (item.object.get("transcriber")) |transcriber| {
+                        // The typed shorthand replaces producer_json rather
+                        // than layering on it, and only an asset stream can
+                        // hold transcripts.
+                        if (owned.kind != .asset or owned.producer_json.len > 0) return error.InvalidEnrichmentConfig;
+                        owned.producer_json = enrichment_config_validation.transcriberShorthandProducerJsonAlloc(alloc, transcriber) catch |err| switch (err) {
+                            error.OutOfMemory => return err,
+                            else => return error.InvalidEnrichmentConfig,
+                        };
+                        if (owned.content_type.len == 0) owned.content_type = try alloc.dupe(u8, "application/json");
+                    }
                     if (owned.kind == .embedding) {
                         if (embedding_producer_json) |raw| {
                             if (owned.producer_json.len > 0) alloc.free(owned.producer_json);
@@ -1153,7 +1164,7 @@ fn configuredArtifactSourceNames(config: std.json.Value, index_type: ApiIndexTyp
             if (source != .object) break :blk null;
             break :blk source.object.get("artifact");
         },
-        .algebraic => null,
+        .algebraic, .relational => null,
     };
     if (singular) |artifact| {
         if (artifact == .string and artifact.string.len > 0) {
@@ -1231,6 +1242,7 @@ fn appendPublicIndexConfig(
             .embeddings => "embeddings",
             .graph => "graph",
             .algebraic => "algebraic",
+            .relational => "relational",
         });
     }
     // Public configuration is an effective contract, not a byte-for-byte
@@ -1393,9 +1405,9 @@ fn appendPublicConfigValue(
                 // deny-list cannot safely project them into a public response,
                 // so preserve the table-status invariant and omit the entire
                 // write-only document.
-                // Metric map keys are user-owned names, not credential fields;
-                // their values are still projected through a closed schema.
-                if (object_shape != .graph_metrics) {
+                // Metric names and typed predicate literals are user data,
+                // not credential references. Both have closed public schemas.
+                if (object_shape != .graph_metrics and object_shape != .relational_predicate and object_shape != .relational_expression) {
                     if (public_index_contract.isWriteOnlyConfigField(entry.key_ptr.*)) continue;
                     if (isSensitivePublicConfigField(entry.key_ptr.*)) continue;
                     if (isSensitivePublicConfigValue(entry.key_ptr.*, entry.value_ptr.*)) continue;
@@ -1525,6 +1537,7 @@ fn indexTypeName(index_type: ApiIndexType) []const u8 {
         .embeddings => "embeddings",
         .graph => "graph",
         .algebraic => "algebraic",
+        .relational => "relational",
     };
 }
 
@@ -1602,29 +1615,29 @@ fn appendAlgebraicIndexStatsFields(
     var stats = indexes_openapi.AlgebraicIndexStats{
         .index_type = .algebraic,
         .healthy = item.algebraic_parse_error_count == 0,
-        .parse_error_count = saturatingI64(item.algebraic_parse_error_count),
-        .schema_version = saturatingI64(item.algebraic_schema_version),
+        .parse_error_count = item.algebraic_parse_error_count,
+        .schema_version = item.algebraic_schema_version,
         .capability_lifecycle_status = item.algebraic_capability_lifecycle_status orelse "current",
-        .planner_selected = saturatingI64(item.algebraic_planner_selected),
-        .planner_fallback_count = saturatingI64(item.algebraic_planner_fallback_count),
+        .planner_selected = item.algebraic_planner_selected,
+        .planner_fallback_count = item.algebraic_planner_fallback_count,
         .planner_last_decision = item.algebraic_planner_last_decision,
         .planner_last_fallback_reason = item.algebraic_planner_last_fallback_reason,
-        .planner_last_estimated_scan_rows = if (item.algebraic_planner_last_estimated_scan_rows) |value| saturatingI64(value) else null,
-        .planner_last_estimated_result_buckets = if (item.algebraic_planner_last_estimated_result_buckets) |value| saturatingI64(value) else null,
+        .planner_last_estimated_scan_rows = item.algebraic_planner_last_estimated_scan_rows,
+        .planner_last_estimated_result_buckets = item.algebraic_planner_last_estimated_result_buckets,
         .planner_lifecycle_ready = item.algebraic_planner_lifecycle_ready,
         .planner_lifecycle_blocking_reason = item.algebraic_planner_lifecycle_blocking_reason,
-        .adaptive_progress_count = saturatingI64(item.algebraic_adaptive_progress_count),
-        .recommendation_count = saturatingI64(item.algebraic_recommendation_count),
-        .adaptive_backfilling_count = saturatingI64(item.algebraic_adaptive_backfilling_count),
-        .adaptive_ready_count = saturatingI64(item.algebraic_adaptive_ready_count),
-        .adaptive_stale_count = saturatingI64(item.algebraic_adaptive_stale_count),
-        .adaptive_cleanup_recommended_count = saturatingI64(item.algebraic_adaptive_dematerialize_recommended_count),
+        .adaptive_progress_count = item.algebraic_adaptive_progress_count,
+        .recommendation_count = item.algebraic_recommendation_count,
+        .adaptive_backfilling_count = item.algebraic_adaptive_backfilling_count,
+        .adaptive_ready_count = item.algebraic_adaptive_ready_count,
+        .adaptive_stale_count = item.algebraic_adaptive_stale_count,
+        .adaptive_cleanup_recommended_count = item.algebraic_adaptive_dematerialize_recommended_count,
         .last_error_reason = item.algebraic_last_error_reason,
     };
     if (item.algebraic_active_progress) |progress_status| {
         stats.active_progress_lifecycle = progress_status.lifecycle;
-        stats.active_progress_rows_processed = saturatingI64(progress_status.rows_processed);
-        stats.active_progress_target_rows = saturatingI64(progress_status.target_rows);
+        stats.active_progress_rows_processed = progress_status.rows_processed;
+        stats.active_progress_target_rows = progress_status.target_rows;
     }
 
     const encoded = try std.json.Stringify.valueAlloc(alloc, stats, .{ .emit_null_optional_fields = false });
@@ -1632,10 +1645,6 @@ fn appendAlgebraicIndexStatsFields(
     if (encoded.len <= 2) return;
     try out.append(alloc, ',');
     try out.appendSlice(alloc, encoded[1 .. encoded.len - 1]);
-}
-
-fn saturatingI64(value: u64) i64 {
-    return std.math.cast(i64, value) orelse std.math.maxInt(i64);
 }
 
 fn appendIndexRuntimeStatus(
@@ -2036,7 +2045,7 @@ const AggregatedIndexStatus = struct {
     catch_up_target_sequence: u64 = 0,
     text_merge: db_mod.types.TextMergeStats = .{},
     hbc_cache: db_mod.types.HbcCacheStats = .{},
-    hbc_posting: db_mod.types.HbcPostingStats = .{},
+    hbc_posting: db_mod.types.HbcPostingStats = .{ .refresh_pending = false },
     async_indexing: db_mod.types.AsyncIndexingStats = .{},
     enrichment: db_mod.types.EnrichmentStats = .{},
     enrichment_observation_count: u64 = 0,
@@ -3044,6 +3053,7 @@ fn aggregateHbcCacheStats(dst: *db_mod.types.HbcCacheStats, src: db_mod.types.Hb
 }
 
 fn aggregateHbcPostingStats(dst: *db_mod.types.HbcPostingStats, src: db_mod.types.HbcPostingStats) void {
+    dst.refresh_pending = dst.refresh_pending or src.refresh_pending;
     dst.scanned_nodes += src.scanned_nodes;
     dst.scanned_postings += src.scanned_postings;
     dst.dirty_postings += src.dirty_postings;
@@ -3772,7 +3782,7 @@ fn appendSingleIndexRuntimeStatusWithGraphMetricRuntime(
     try out.appendSlice(alloc, "\"rebuilding\":");
     try out.appendSlice(alloc, if (backfill_active) "true" else "false");
     switch (index_type) {
-        .full_text, .embeddings, .algebraic => {
+        .full_text, .embeddings, .algebraic, .relational => {
             try out.appendSlice(alloc, ",\"total_indexed\":");
             try appendIntValue(alloc, out, visible_doc_count);
         },
@@ -4859,6 +4869,8 @@ fn appendHbcPostingStatus(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged
     try appendIntValue(alloc, out, stats.lazy_payload_deferrals);
     try out.appendSlice(alloc, ",\"lazy_ancestor_deferrals\":");
     try appendIntValue(alloc, out, stats.lazy_ancestor_deferrals);
+    try out.appendSlice(alloc, ",\"refresh_pending\":");
+    try out.appendSlice(alloc, if (stats.refresh_pending) "true" else "false");
     try out.append(alloc, '}');
 }
 
@@ -4917,6 +4929,7 @@ pub fn inferIndexType(index_name: []const u8, config: std.json.Value) ?ApiIndexT
         if (std.mem.eql(u8, type_value.string, "embeddings")) return .embeddings;
         if (std.mem.eql(u8, type_value.string, "graph")) return .graph;
         if (std.mem.eql(u8, type_value.string, "algebraic")) return .algebraic;
+        if (std.mem.eql(u8, type_value.string, "relational")) return .relational;
         return null;
     }
     if (config.object.get("dimension") != null or
@@ -7124,6 +7137,8 @@ fn consumerTests() type {
                 .doc_count = 1,
                 .node_count = 1,
                 .coverage_produced_count = 1,
+                .publication_target_count = 1,
+                .publication_target_ready = true,
                 .coverage_generation = 7,
                 .coverage_config_hash = 41,
                 .coverage_identity_ready = true,
@@ -8007,6 +8022,32 @@ fn consumerTests() type {
             defer db_mod.types.freeEnrichmentConfigs(std.testing.allocator, effective);
             try std.testing.expectEqual(@as(usize, 1), effective.len);
             try std.testing.expect(std.mem.indexOf(u8, effective[0].producer_json, "https://inference.example/ai/v1") != null);
+        }
+
+        test "transcriber enrichment shorthand expands into a document extraction producer" {
+            const configs = try collectArtifactEnrichmentsFromTableIndexesJson(std.testing.allocator,
+                \\{"enrichments":[{"name":"call_transcripts","kind":"asset","field":"recording_url","transcriber":{"provider":"antfly","model":"openai/whisper-base","language_code":"en","timestamps":true}},{"name":"call_chunks","kind":"chunk","field":"text","source_artifact_name":"call_transcripts","chunk_size":256}]}
+            );
+            defer db_mod.types.freeEnrichmentConfigs(std.testing.allocator, configs);
+            try std.testing.expectEqual(@as(usize, 2), configs.len);
+            try std.testing.expectEqualStrings("application/json", configs[0].content_type);
+            try std.testing.expectEqualStrings(
+                "{\"type\":\"document_extraction\",\"config\":{\"transcription\":{\"enabled\":true,\"config\":{\"provider\":\"antfly\",\"model\":\"openai/whisper-base\",\"language_code\":\"en\",\"timestamps\":true}}}}",
+                configs[0].producer_json,
+            );
+            try validateArtifactEnrichmentConfigs(std.testing.allocator, configs);
+
+            // A chunk stream cannot hold transcripts, and the shorthand does
+            // not combine with a hand-written producer.
+            try std.testing.expectError(error.InvalidEnrichmentConfig, collectArtifactEnrichmentsFromTableIndexesJson(std.testing.allocator,
+                \\{"enrichments":[{"name":"t","kind":"chunk","field":"url","chunk_size":8,"transcriber":{"provider":"antfly","model":"m"}}]}
+            ));
+            try std.testing.expectError(error.InvalidEnrichmentConfig, collectArtifactEnrichmentsFromTableIndexesJson(std.testing.allocator,
+                \\{"enrichments":[{"name":"t","kind":"asset","field":"url","producer_json":"{\"type\":\"reader\",\"config\":{}}","transcriber":{"provider":"antfly","model":"m"}}]}
+            ));
+            try std.testing.expectError(error.InvalidEnrichmentConfig, collectArtifactEnrichmentsFromTableIndexesJson(std.testing.allocator,
+                \\{"enrichments":[{"name":"t","kind":"asset","field":"url","transcriber":{"model":"m"}}]}
+            ));
         }
 
         test "index metadata rejects artifact enrichment deletion with dependents" {
@@ -10622,4 +10663,22 @@ fn consumerTests() type {
 }
 comptime {
     if (@import("builtin").is_test) _ = consumer_tests;
+}
+
+test "posting refresh status aggregates unknown and pending shards conservatively" {
+    const alloc = std.testing.allocator;
+    var aggregate: AggregatedIndexStatus = .{};
+    aggregateHbcPostingStats(&aggregate.hbc_posting, .{ .refresh_pending = false });
+    try std.testing.expect(!aggregate.hbc_posting.refresh_pending);
+    // A missing observation has the same conservative default as old senders.
+    aggregateHbcPostingStats(&aggregate.hbc_posting, .{});
+    aggregateHbcPostingStats(&aggregate.hbc_posting, .{ .refresh_pending = false });
+    try std.testing.expect(aggregate.hbc_posting.refresh_pending);
+    var encoded: std.ArrayListUnmanaged(u8) = .empty;
+    defer encoded.deinit(alloc);
+    try appendHbcPostingStatus(alloc, &encoded, aggregate.hbc_posting);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"refresh_pending\":true") != null);
+    encoded.clearRetainingCapacity();
+    try appendHbcPostingStatus(alloc, &encoded, .{ .refresh_pending = false });
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"refresh_pending\":false") != null);
 }

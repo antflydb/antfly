@@ -17,3 +17,6 @@ paths:
   .github/workflows/pr-ci.yml:
     ignore:
       - '^unexpected key "queue" for "concurrency" section\.'
+      # GitHub enforces this read-only cache policy; actionlint 1.7.12 predates it.
+      # https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#cache-mode
+      - '^unexpected key "cache-mode" for "workflow" section\.'

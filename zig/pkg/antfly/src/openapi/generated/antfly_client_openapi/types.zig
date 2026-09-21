@@ -892,15 +892,15 @@ pub const AlgebraicIndexStats = struct {
     readiness: ?IndexReadinessStatus = null,
     /// Opaque identity of the desired index incarnation. Clients may compare it for equality but must not interpret its contents.
     incarnation: ?[]const u8 = null,
-    target_revision: ?i64 = null,
-    published_revision: ?i64 = null,
+    target_revision: ?u64 = null,
+    published_revision: ?u64 = null,
     milestones: ?IndexMilestones = null,
     /// Error message if stats could not be retrieved
     @"error": ?[]const u8 = null,
     /// Number of documents reflected in the algebraic sidecar
-    total_indexed: ?i64 = null,
+    total_indexed: ?u64 = null,
     /// Size of the index in bytes
-    disk_usage: ?i64 = null,
+    disk_usage: ?u64 = null,
     /// Whether the sidecar is currently rebuilding
     rebuilding: ?bool = null,
     repair: ?IndexRepairStatus = null,
@@ -909,14 +909,14 @@ pub const AlgebraicIndexStats = struct {
     /// Backfill progress as a ratio from 0.0 to 1.0
     backfill_progress: ?f64 = null,
     /// Number of documents processed during current backfill
-    backfill_items_processed: ?i64 = null,
+    backfill_items_processed: ?u64 = null,
     /// Operational readiness state such as ready, running, retrying, degraded, or failed.
     backfill_state: ?[]const u8 = null,
     /// Number of documents visible to the sidecar.
-    doc_count: ?i64 = null,
-    term_count: ?i64 = null,
-    replay_applied_sequence: ?i64 = null,
-    replay_target_sequence: ?i64 = null,
+    doc_count: ?u64 = null,
+    term_count: ?u64 = null,
+    replay_applied_sequence: ?u64 = null,
+    replay_target_sequence: ?u64 = null,
     replay_catch_up_required: ?bool = null,
     runtime_present: ?bool = null,
     runtime_fresh: ?bool = null,
@@ -924,59 +924,59 @@ pub const AlgebraicIndexStats = struct {
     runtime_freshness: ?[]const u8 = null,
     catch_up_active: ?bool = null,
     catch_up_phase: ?[]const u8 = null,
-    catch_up_applied_sequence: ?i64 = null,
-    catch_up_target_sequence: ?i64 = null,
+    catch_up_applied_sequence: ?u64 = null,
+    catch_up_target_sequence: ?u64 = null,
     async_indexing: ?std.json.ArrayHashMap(std.json.Value) = null,
     healthy: ?bool = null,
-    parse_error_count: ?i64 = null,
-    schema_version: ?i64 = null,
+    parse_error_count: ?u64 = null,
+    schema_version: ?u64 = null,
     /// Schema-derived algebraic capability lifecycle, for example current, stale, or rebuild_required.
     capability_lifecycle_status: ?[]const u8 = null,
-    planner_selected: ?i64 = null,
-    planner_fallback_count: ?i64 = null,
+    planner_selected: ?u64 = null,
+    planner_fallback_count: ?u64 = null,
     planner_last_decision: ?[]const u8 = null,
     planner_last_fallback_reason: ?[]const u8 = null,
     /// Latest algebraic planner scan-row estimate for the last selected or fallback decision.
-    planner_last_estimated_scan_rows: ?i64 = null,
+    planner_last_estimated_scan_rows: ?u64 = null,
     /// Latest algebraic planner result-bucket estimate for the last selected or fallback decision.
-    planner_last_estimated_result_buckets: ?i64 = null,
+    planner_last_estimated_result_buckets: ?u64 = null,
     planner_lifecycle_ready: ?bool = null,
     planner_lifecycle_blocking_reason: ?[]const u8 = null,
-    adaptive_progress_count: ?i64 = null,
+    adaptive_progress_count: ?u64 = null,
     /// Number of currently recommended algebraic shapes.
-    recommendation_count: ?i64 = null,
-    adaptive_backfilling_count: ?i64 = null,
-    adaptive_ready_count: ?i64 = null,
-    adaptive_stale_count: ?i64 = null,
-    adaptive_cleanup_recommended_count: ?i64 = null,
+    recommendation_count: ?u64 = null,
+    adaptive_backfilling_count: ?u64 = null,
+    adaptive_ready_count: ?u64 = null,
+    adaptive_stale_count: ?u64 = null,
+    adaptive_cleanup_recommended_count: ?u64 = null,
     last_error_reason: ?[]const u8 = null,
     active_progress_lifecycle: ?[]const u8 = null,
-    active_progress_rows_processed: ?i64 = null,
-    active_progress_target_rows: ?i64 = null,
+    active_progress_rows_processed: ?u64 = null,
+    active_progress_target_rows: ?u64 = null,
     /// Durable projection checkpoint status: clean, rebuilding, degraded, or repair_required.
     projection_checkpoint_status: ?[]const u8 = null,
     /// Highest derived-log sequence covered by the durable projection checkpoint.
-    projection_checkpoint_applied_sequence: ?i64 = null,
+    projection_checkpoint_applied_sequence: ?u64 = null,
     /// Projection generation associated with the durable checkpoint.
-    projection_checkpoint_generation: ?i64 = null,
+    projection_checkpoint_generation: ?u64 = null,
     /// Projection configuration identity associated with the durable checkpoint.
     projection_checkpoint_config_fingerprint: ?[]const u8 = null,
     /// Number of derived-log sequences after the durable checkpoint that still need replay.
-    checkpoint_replay_tail_sequence_count: ?i64 = null,
+    checkpoint_replay_tail_sequence_count: ?u64 = null,
     /// Repair issues found by explicit repair-scan accounting for this projection.
-    repair_scan_issue_count: ?i64 = null,
-    edge_count: ?i64 = null,
-    node_count: ?i64 = null,
+    repair_scan_issue_count: ?u64 = null,
+    edge_count: ?u64 = null,
+    node_count: ?u64 = null,
     repair_degraded: ?bool = null,
-    repair_issue_count: ?i64 = null,
+    repair_issue_count: ?u64 = null,
     repair_summary_ready: ?bool = null,
     repair_issue_count_estimated: ?bool = null,
-    expected_groups: ?i64 = null,
-    reported_groups: ?i64 = null,
-    fresh_groups: ?i64 = null,
-    stale_groups: ?i64 = null,
-    missing_groups: ?i64 = null,
-    unknown_remote_groups: ?i64 = null,
+    expected_groups: ?u64 = null,
+    reported_groups: ?u64 = null,
+    fresh_groups: ?u64 = null,
+    stale_groups: ?u64 = null,
+    missing_groups: ?u64 = null,
+    unknown_remote_groups: ?u64 = null,
     /// Source artifact stream used to materialize graph edges.
     source_artifact: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// Graph resolver replay diagnostics.
@@ -1931,12 +1931,33 @@ pub const ApiKey = struct {
     username: []const u8,
     /// Optional permission scoping. If empty, inherits owner's full permissions.
     permissions: OpenApiOptionalNullable([]const Permission) = .absent,
+    scoped_row_filters: ?[]const ScopedRowFilter = null,
     /// Optional per-table row filter. Keys are table names (or '*' for all tables). Values are Antfly query JSON objects. API keys inherit the owner's effective row filters; key-local filters are applied as additional narrowing.
     row_filter: OpenApiOptionalNullable(std.json.ArrayHashMap(std.json.Value)) = .absent,
     /// When the API key was created.
     created_at: []const u8,
     /// When the API key expires. Null means never.
     expires_at: OpenApiOptionalNullable([]const u8) = .absent,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "key_id", "key_id", false },
+        .{ "name", "name", false },
+        .{ "username", "username", false },
+        .{ "permissions", "permissions", false },
+        .{ "scoped_row_filters", "scoped_row_filters", true },
+        .{ "row_filter", "row_filter", false },
+        .{ "created_at", "created_at", false },
+        .{ "expires_at", "expires_at", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
@@ -1956,6 +1977,10 @@ pub const ApiKey = struct {
                 try jw.objectField("permissions");
                 try jw.write(value);
             },
+        }
+        if (self.scoped_row_filters) |value| {
+            try jw.objectField("scoped_row_filters");
+            try jw.write(value);
         }
         switch (self.row_filter) {
             .absent => {},
@@ -1995,6 +2020,7 @@ pub const ApiKeyWithSecret = struct {
     username: []const u8,
     /// Optional permission scoping. If empty, inherits owner's full permissions.
     permissions: OpenApiOptionalNullable([]const Permission) = .absent,
+    scoped_row_filters: ?[]const ScopedRowFilter = null,
     /// Optional per-table row filter. Keys are table names (or '*' for all tables). Values are Antfly query JSON objects. API keys inherit the owner's effective row filters; key-local filters are applied as additional narrowing.
     row_filter: OpenApiOptionalNullable(std.json.ArrayHashMap(std.json.Value)) = .absent,
     /// When the API key was created.
@@ -2005,6 +2031,28 @@ pub const ApiKeyWithSecret = struct {
     key_secret: []const u8,
     /// Pre-encoded credential ready for the Authorization header: base64(key_id:key_secret).
     encoded: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "key_id", "key_id", false },
+        .{ "name", "name", false },
+        .{ "username", "username", false },
+        .{ "permissions", "permissions", false },
+        .{ "scoped_row_filters", "scoped_row_filters", true },
+        .{ "row_filter", "row_filter", false },
+        .{ "created_at", "created_at", false },
+        .{ "expires_at", "expires_at", false },
+        .{ "key_secret", "key_secret", false },
+        .{ "encoded", "encoded", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
@@ -2024,6 +2072,10 @@ pub const ApiKeyWithSecret = struct {
                 try jw.objectField("permissions");
                 try jw.write(value);
             },
+        }
+        if (self.scoped_row_filters) |value| {
+            try jw.objectField("scoped_row_filters");
+            try jw.write(value);
         }
         switch (self.row_filter) {
             .absent => {},
@@ -3046,13 +3098,99 @@ pub const CardinalityMode = enum {
     }
 };
 
+/// The mutation committed. Read the resource to observe it; do not replay the mutation to obtain its representation.
+pub const CatalogMutationVisibilityPending = struct {
+    status: []const u8,
+};
+
+/// A table or all tables in an explicit namespace. A missing table selects the namespace; a table named '*' remains literal.
+pub const CatalogTableScope = struct {
+    database: ?[]const u8 = null,
+    namespace: ?[]const u8 = null,
+    table: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "database", "database", true },
+        .{ "namespace", "namespace", true },
+        .{ "table", "table", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.database) |value| {
+            try jw.objectField("database");
+            try jw.write(value);
+        }
+        if (self.namespace) |value| {
+            try jw.objectField("namespace");
+            try jw.write(value);
+        }
+        if (self.table) |value| {
+            try jw.objectField("table");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// An explicit native table target. Components are literal names; dots do not qualify a string table name.
+pub const CatalogTableTarget = struct {
+    database: ?[]const u8 = null,
+    namespace: ?[]const u8 = null,
+    table: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "database", "database", true },
+        .{ "namespace", "namespace", true },
+        .{ "table", "table", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.database) |value| {
+            try jw.objectField("database");
+            try jw.write(value);
+        }
+        if (self.namespace) |value| {
+            try jw.objectField("namespace");
+            try jw.write(value);
+        }
+        try jw.objectField("table");
+        try jw.write(self.table);
+        try jw.endObject();
+    }
+};
+
+pub const CatalogTablespaceBindingRequest = struct {
+    /// Existing tablespace name to bind to the catalog object.
+    tablespace_name: []const u8,
+};
+
 pub const CdcConnection = struct {
     /// CDC provider type. Currently "postgres"; future CDC providers may add new values.
     provider: []const u8,
     /// Antfly table receiving changes from this CDC source.
     table_name: []const u8,
     /// Zero-based ordinal of the replication source within the table config.
-    source_ordinal: i64,
+    source_ordinal: u32,
     /// Source-side table or stream name when reported by the provider.
     external_table: ?[]const u8 = null,
     /// Provider replication cursor or slot name when applicable.
@@ -3062,15 +3200,15 @@ pub const CdcConnection = struct {
     /// Runtime CDC phase such as snapshot, streaming, configured, or failed.
     phase: ?[]const u8 = null,
     /// Source records behind, when reported by the runtime.
-    lag_records: ?i64 = null,
+    lag_records: ?u64 = null,
     /// Source commit lag in milliseconds, when reported by the runtime.
-    lag_millis: ?i64 = null,
+    lag_millis: ?u64 = null,
     /// Wall-clock timestamp of the last successful CDC poll/apply, in milliseconds.
-    last_success_at_ms: ?i64 = null,
+    last_success_at_ms: ?u64 = null,
     /// Wall-clock timestamp of the last applied source change, in milliseconds.
-    last_change_applied_at_ms: ?i64 = null,
+    last_change_applied_at_ms: ?u64 = null,
     /// Wall-clock timestamp when this CDC status was last updated, in milliseconds.
-    updated_at_ms: ?i64 = null,
+    updated_at_ms: ?u64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -3354,7 +3492,7 @@ pub const ChatToolsConfig = struct {
     /// List of tools to enable. If empty, retrieval agents default to all retrieval tools available for the request.
     enabled_tools: ?[]const ChatToolName = null,
     /// Inline web search provider configuration. Prefer web_search_connection for configured production agents; inline config remains useful for CLI/dev requests. See specs/openapi/antfly/websearch.yaml for provider-specific options.
-    web_search_config: ?WebSearchConfig = null,
+    web_search_config: ?WebSearchProviderConfig = null,
     /// Name of a configured connections.<id> resource with kind web_search. Request-level tool options may reduce scope, but cannot expand the connection's configured capabilities or policy.
     web_search_connection: ?[]const u8 = null,
     /// URL fetching configuration. See specs/openapi/antfly/websearch.yaml for available options and security controls.
@@ -3682,6 +3820,7 @@ pub const ClassificationTransformationResult = struct {
     }
 };
 
+/// Native cluster backups pin a common transaction cut across a dependency-complete table set. Restart-stable LSM seals are journaled before releasing write fences; artifact upload uses those immutable seals without holding the write pause. Native cohorts support at most 4096 tables and 4096 ranges and require the filesystem-managed LSM backend. Portable backups do not support coordinated UNIQUE/FK constraints or promise a common cross-table transaction cut.
 pub const ClusterBackupRequest = struct {
     /// Unique identifier for this backup. Used to reference the backup for restore operations. Choose a meaningful name that includes date/version information.
     backup_id: []const u8,
@@ -3741,12 +3880,12 @@ pub const ClusterBackupResponse = struct {
 };
 
 pub const ClusterDataGroupStatus = struct {
-    group_id: i64,
+    group_id: u64,
     leader_known: ?bool = null,
-    leader_data_id: OpenApiOptionalNullable(i64) = .absent,
+    leader_data_id: OpenApiOptionalNullable(u64) = .absent,
     voter_count_known: ?bool = null,
-    voter_count: ?i64 = null,
-    healthy_voter_reports: ?i64 = null,
+    voter_count: ?u32 = null,
+    healthy_voter_reports: ?u32 = null,
     joint_consensus: ?bool = null,
     transition_pending: ?bool = null,
     replay_required: ?bool = null,
@@ -3754,8 +3893,8 @@ pub const ClusterDataGroupStatus = struct {
     cutover_ready: ?bool = null,
     reads_ready_after_cutover: ?bool = null,
     doc_identity_lifecycle: ?[]const u8 = null,
-    doc_count: ?i64 = null,
-    disk_bytes: ?i64 = null,
+    doc_count: ?u64 = null,
+    disk_bytes: ?u64 = null,
     empty: ?bool = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -3862,8 +4001,8 @@ pub const ClusterDataGroupStatus = struct {
 };
 
 pub const ClusterDataNodeStatus = struct {
-    data_id: i64,
-    node_id: i64,
+    data_id: u64,
+    node_id: u64,
     api_url: ?[]const u8 = null,
     raft_url: ?[]const u8 = null,
     role: ?[]const u8 = null,
@@ -3872,12 +4011,12 @@ pub const ClusterDataNodeStatus = struct {
     failure_domain: ?[]const u8 = null,
     live: ?bool = null,
     drain_requested: ?bool = null,
-    capacity_bytes: ?i64 = null,
-    available_bytes: ?i64 = null,
-    lease_pressure: ?i64 = null,
-    read_load: ?i64 = null,
-    write_load: ?i64 = null,
-    active_backfills: ?i64 = null,
+    capacity_bytes: ?u64 = null,
+    available_bytes: ?u64 = null,
+    lease_pressure: ?u32 = null,
+    read_load: ?u32 = null,
+    write_load: ?u32 = null,
+    active_backfills: ?u32 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -3974,19 +4113,19 @@ pub const ClusterDataNodeStatus = struct {
 };
 
 pub const ClusterDataRangeStatus = struct {
-    group_id: i64,
-    range_id: i64,
-    table_id: i64,
+    group_id: u64,
+    range_id: u64,
+    table_id: u64,
     table_name: ?[]const u8 = null,
     start_key: ?[]const u8 = null,
     end_key: OpenApiOptionalNullable([]const u8) = .absent,
-    doc_identity_shard_id: ?i64 = null,
-    doc_identity_range_id: ?i64 = null,
+    doc_identity_shard_id: ?u64 = null,
+    doc_identity_range_id: ?u64 = null,
     state: ?[]const u8 = null,
-    leader_data_id: OpenApiOptionalNullable(i64) = .absent,
-    voter_count: ?i64 = null,
-    doc_count: ?i64 = null,
-    disk_bytes: ?i64 = null,
+    leader_data_id: OpenApiOptionalNullable(u64) = .absent,
+    voter_count: ?u32 = null,
+    doc_count: ?u64 = null,
+    disk_bytes: ?u64 = null,
     empty: ?bool = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -4086,11 +4225,11 @@ pub const ClusterDataRangeStatus = struct {
 };
 
 pub const ClusterDataReplicaStatus = struct {
-    group_id: i64,
-    data_id: i64,
-    node_id: i64,
-    replica_id: i64,
-    peer_node_ids: ?[]const i64 = null,
+    group_id: u64,
+    data_id: u64,
+    node_id: u64,
+    replica_id: u64,
+    peer_node_ids: ?[]const u64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -4207,6 +4346,7 @@ pub const ClusterHealth = enum {
     }
 };
 
+/// Native cohort restores use the existing asynchronous restore job to provision hidden fresh generations, import rows, rebuild indexes and coordinated constraints, and publish the dependency-complete target set atomically. Document, relational, and mixed native cohorts use the same workflow (at most 128 tables/4096 ranges). Skipping a live parent cannot substitute it for a parent generation required by a restored child. Overwrite retains the old generation until validation and cutover; cancellation after publication completes publication rather than rollback. Reserved destination authorization is immutable: changing principal requires canceling the old job and creating a new restore.
 pub const ClusterRestoreRequest = struct {
     /// Unique identifier of the backup to restore from.
     backup_id: []const u8,
@@ -4974,6 +5114,7 @@ pub const CreateApiKeyRequest = struct {
     expires_in: ?[]const u8 = null,
     /// Optional permission scoping. Each permission must be a subset of the creator's permissions.
     permissions: OpenApiOptionalNullable([]const Permission) = .absent,
+    scoped_row_filters: ?[]const ScopedRowFilter = null,
     /// Optional per-table row filter. Keys are table names (or '*' for all tables). Values are Antfly query JSON objects. API keys inherit the owner's effective row filters; key-local filters are applied as additional narrowing.
     row_filter: OpenApiOptionalNullable(std.json.ArrayHashMap(std.json.Value)) = .absent,
 
@@ -4982,6 +5123,7 @@ pub const CreateApiKeyRequest = struct {
         .{ "name", "name", false },
         .{ "expires_in", "expires_in", true },
         .{ "permissions", "permissions", false },
+        .{ "scoped_row_filters", "scoped_row_filters", true },
         .{ "row_filter", "row_filter", false },
     };
 
@@ -5011,6 +5153,10 @@ pub const CreateApiKeyRequest = struct {
                 try jw.objectField("permissions");
                 try jw.write(value);
             },
+        }
+        if (self.scoped_row_filters) |value| {
+            try jw.objectField("scoped_row_filters");
+            try jw.write(value);
         }
         switch (self.row_filter) {
             .absent => {},
@@ -5433,6 +5579,7 @@ pub const CreateIndexRequest = union(enum) {
     create_embeddings_index_request: CreateEmbeddingsIndexRequest,
     create_graph_index_request: CreateGraphIndexRequest,
     create_algebraic_index_request: CreateAlgebraicIndexRequest,
+    create_relational_index_request: CreateRelationalIndexRequest,
 
     pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
         const DiscriminatorProbe = union(enum) {
@@ -5464,6 +5611,9 @@ pub const CreateIndexRequest = union(enum) {
         if (std.mem.eql(u8, disc_str, "algebraic")) {
             return .{ .create_algebraic_index_request = try std.json.parseFromSliceLeaky(CreateAlgebraicIndexRequest, allocator, input, options) };
         }
+        if (std.mem.eql(u8, disc_str, "relational")) {
+            return .{ .create_relational_index_request = try std.json.parseFromSliceLeaky(CreateRelationalIndexRequest, allocator, input, options) };
+        }
         return error.UnexpectedToken;
     }
 
@@ -5493,6 +5643,9 @@ pub const CreateIndexRequest = union(enum) {
         if (std.mem.eql(u8, disc_str, "algebraic")) {
             return .{ .create_algebraic_index_request = try std.json.parseFromValueLeaky(CreateAlgebraicIndexRequest, allocator, source, options) };
         }
+        if (std.mem.eql(u8, disc_str, "relational")) {
+            return .{ .create_relational_index_request = try std.json.parseFromValueLeaky(CreateRelationalIndexRequest, allocator, source, options) };
+        }
         return error.UnexpectedToken;
     }
 
@@ -5502,11 +5655,71 @@ pub const CreateIndexRequest = union(enum) {
             .create_embeddings_index_request => |v| try jw.write(v),
             .create_graph_index_request => |v| try jw.write(v),
             .create_algebraic_index_request => |v| try jw.write(v),
+            .create_relational_index_request => |v| try jw.write(v),
         }
     }
 };
 
+/// Create a composite ordered index through the shared index resource.
+pub const CreateRelationalIndexRequest = struct {
+    keys: []const RelationalIndexKey,
+    /// Non-key columns stored for index-only projection; distinct from keys.
+    include_columns: ?[]const []const u8 = null,
+    /// Optional conjunction selecting index members. Queries must explicitly include all typed conjuncts.
+    where: ?[]const RelationalIndexPredicate = null,
+    /// Optional description of the index and its purpose.
+    description: ?[]const u8 = null,
+    /// Index implementation version. Only zero is supported; the schema epoch is managed by the server.
+    version: ?i64 = null,
+    type: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "keys", "keys", false },
+        .{ "include_columns", "include_columns", true },
+        .{ "where", "where", true },
+        .{ "description", "description", true },
+        .{ "version", "version", true },
+        .{ "type", "type", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("keys");
+        try jw.write(self.keys);
+        if (self.include_columns) |value| {
+            try jw.objectField("include_columns");
+            try jw.write(value);
+        }
+        if (self.where) |value| {
+            try jw.objectField("where");
+            try jw.write(value);
+        }
+        if (self.description) |value| {
+            try jw.objectField("description");
+            try jw.write(value);
+        }
+        if (self.version) |value| {
+            try jw.objectField("version");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.endObject();
+    }
+};
+
 pub const CreateTableRequest = struct {
+    /// Explicit tablespace policy for the new table, overriding namespace and database defaults.
+    tablespace_name: ?[]const u8 = null,
     storage: ?TableStorageSettings = null,
     /// Number of shards to create for the table. Data is partitioned across shards based on key ranges. **Sizing Guidelines:** - Small datasets (<100K docs): 1-3 shards - Medium datasets (100K-1M docs): 3-10 shards - Large datasets (>1M docs): 10+ shards More shards enable better parallelism but increase overhead. Choose based on expected data size and query patterns. **When to Add More Shards:** Antfly supports **online shard reallocation** without downtime. Add more shards when: - Individual shards exceed size thresholds (configurable) - Query latency increases due to large shard size - Need better parallelism for write-heavy workloads Use the internal `/reallocate` endpoint to trigger automatic shard splitting: ```bash POST /internal/v1/reallocate ``` This enqueues a reallocation request that the leader processes asynchronously, splitting large shards and redistributing data without service interruption. **Advantages over Elasticsearch:** - Automatic shard splitting (no manual reindexing required) - Online operation (no downtime) - Transparent to applications (keys remain accessible during reallocation)
     num_shards: ?i64 = null,
@@ -5521,6 +5734,7 @@ pub const CreateTableRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "tablespace_name", "tablespace_name", true },
         .{ "storage", "storage", true },
         .{ "num_shards", "num_shards", true },
         .{ "description", "description", true },
@@ -5539,6 +5753,10 @@ pub const CreateTableRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.tablespace_name) |value| {
+            try jw.objectField("tablespace_name");
+            try jw.write(value);
+        }
         if (self.storage) |value| {
             try jw.objectField("storage");
             try jw.write(value);
@@ -5561,6 +5779,41 @@ pub const CreateTableRequest = struct {
         }
         if (self.replication_sources) |value| {
             try jw.objectField("replication_sources");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Tablespace creation request. Placement policy is validated and applied when new tables are created.
+pub const CreateTablespaceRequest = struct {
+    /// JSON-encoded location descriptor. Defaults to `null`.
+    location_json: ?[]const u8 = null,
+    /// JSON-encoded placement policy. Supported fields are placement_role, desired_replica_count, and min_ranges. Location is metadata, never a filesystem override.
+    placement_policy_json: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "location_json", "location_json", true },
+        .{ "placement_policy_json", "placement_policy_json", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.location_json) |value| {
+            try jw.objectField("location_json");
+            try jw.write(value);
+        }
+        if (self.placement_policy_json) |value| {
+            try jw.objectField("placement_policy_json");
             try jw.write(value);
         }
         try jw.endObject();
@@ -6476,6 +6729,7 @@ pub const CreatedIndex = union(enum) {
     created_embeddings_index: CreatedEmbeddingsIndex,
     created_graph_index: CreatedGraphIndex,
     created_algebraic_index: CreatedAlgebraicIndex,
+    created_relational_index: CreatedRelationalIndex,
 
     pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
         const DiscriminatorProbe = union(enum) {
@@ -6507,6 +6761,9 @@ pub const CreatedIndex = union(enum) {
         if (std.mem.eql(u8, disc_str, "algebraic")) {
             return .{ .created_algebraic_index = try std.json.parseFromSliceLeaky(CreatedAlgebraicIndex, allocator, input, options) };
         }
+        if (std.mem.eql(u8, disc_str, "relational")) {
+            return .{ .created_relational_index = try std.json.parseFromSliceLeaky(CreatedRelationalIndex, allocator, input, options) };
+        }
         return error.UnexpectedToken;
     }
 
@@ -6536,6 +6793,9 @@ pub const CreatedIndex = union(enum) {
         if (std.mem.eql(u8, disc_str, "algebraic")) {
             return .{ .created_algebraic_index = try std.json.parseFromValueLeaky(CreatedAlgebraicIndex, allocator, source, options) };
         }
+        if (std.mem.eql(u8, disc_str, "relational")) {
+            return .{ .created_relational_index = try std.json.parseFromValueLeaky(CreatedRelationalIndex, allocator, source, options) };
+        }
         return error.UnexpectedToken;
     }
 
@@ -6545,6 +6805,7 @@ pub const CreatedIndex = union(enum) {
             .created_embeddings_index => |v| try jw.write(v),
             .created_graph_index => |v| try jw.write(v),
             .created_algebraic_index => |v| try jw.write(v),
+            .created_relational_index => |v| try jw.write(v),
         }
     }
 };
@@ -6743,6 +7004,75 @@ pub const CreatedProviderConfig = struct {
     }
 };
 
+/// Effective schema-bound composite index configuration.
+pub const CreatedRelationalIndex = struct {
+    /// Name of the created index
+    name: []const u8,
+    /// Optional description of the index and its purpose
+    description: ?[]const u8 = null,
+    /// Version of the index implementation. Defaults to 0.
+    version: ?i64 = null,
+    /// Normalized inline managed enrichment definitions required by this index.
+    enrichments: ?[]const CreatedEnrichmentConfig = null,
+    keys: []const RelationalIndexKey,
+    /// Non-key columns stored for index-only projection; distinct from keys.
+    include_columns: ?[]const []const u8 = null,
+    /// Optional conjunction selecting index members. Queries must explicitly include all typed conjuncts.
+    where: ?[]const RelationalIndexPredicate = null,
+    type: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "name", "name", false },
+        .{ "description", "description", true },
+        .{ "version", "version", true },
+        .{ "enrichments", "enrichments", true },
+        .{ "keys", "keys", false },
+        .{ "include_columns", "include_columns", true },
+        .{ "where", "where", true },
+        .{ "type", "type", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        if (self.description) |value| {
+            try jw.objectField("description");
+            try jw.write(value);
+        }
+        if (self.version) |value| {
+            try jw.objectField("version");
+            try jw.write(value);
+        }
+        if (self.enrichments) |value| {
+            try jw.objectField("enrichments");
+            try jw.write(value);
+        }
+        try jw.objectField("keys");
+        try jw.write(self.keys);
+        if (self.include_columns) |value| {
+            try jw.objectField("include_columns");
+            try jw.write(value);
+        }
+        if (self.where) |value| {
+            try jw.objectField("where");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.endObject();
+    }
+};
+
 pub const Credentials = struct {
     /// S3-compatible endpoint (e.g., 's3.amazonaws.com' or 'localhost:9000' for MinIO)
     endpoint: ?[]const u8 = null,
@@ -6876,6 +7206,40 @@ pub const DataShapeKind = enum {
     }
 };
 
+/// Database catalog object. Tables and namespaces resolve under a database before authorization and routing.
+pub const DatabaseCatalogRecord = struct {
+    /// Stable database catalog identifier.
+    database_id: u64,
+    /// Database name.
+    name: []const u8,
+    /// JSON-encoded database settings owned by the catalog.
+    settings_json: []const u8,
+    /// Optional durable tablespace binding inherited by new namespace/table placement policy.
+    tablespace_name: OpenApiOptionalNullable([]const u8) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("database_id");
+        try jw.write(self.database_id);
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("settings_json");
+        try jw.write(self.settings_json);
+        switch (self.tablespace_name) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("tablespace_name");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("tablespace_name");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
 pub const DateRangeStringQuery = struct {
     start: ?[]const u8 = null,
     end: ?[]const u8 = null,
@@ -6997,15 +7361,15 @@ pub const DenseRepairBackpressureError = struct {
     message: []const u8,
     retryable: bool,
     /// Suggested delay before retrying the write.
-    retry_after_ms: i64,
+    retry_after_ms: u32,
 };
 
 /// Exact dense-vector publication cardinality for the observed index incarnation.
 pub const DenseVectorPublicationStatus = struct {
     /// Exact durable vector target for the current dense-index incarnation.
-    target_vectors: i64,
+    target_vectors: u64,
     /// Physical vectors currently visible to queries.
-    searchable_vectors: i64,
+    searchable_vectors: u64,
     /// Whether searchable_vectors exactly equals target_vectors.
     complete: bool,
 };
@@ -7097,23 +7461,23 @@ pub const DerivedCoverageStatus = struct {
     /// Whether all observed shard-local coverage summaries were read atomically and completely.
     summary_ready: bool,
     /// Freshly observed shard groups reporting a different semantic configuration fingerprint.
-    config_mismatch_group_count: i64,
+    config_mismatch_group_count: u64,
     /// Source documents observed across fresh shard reports. This is the exact table total only when observation_complete is true; otherwise it is a lower bound and all outcome counts are partial observations.
-    source_total: i64,
+    source_total: u64,
     /// Source documents with a durable produced outcome for this index generation.
-    produced: i64,
+    produced: u64,
     /// Source documents intentionally producing no indexable output.
-    skipped: i64,
+    skipped: u64,
     /// Source documents whose generation failed non-retryably.
-    terminal_failed: i64,
+    terminal_failed: u64,
     /// Raw terminal source outcomes counted by the configured policy. This may exceed source_total only while observation_complete is false with counter_mismatch.
-    covered: i64,
+    covered: u64,
     /// Source documents with any durable terminal outcome: produced, intentionally skipped, or terminally failed.
-    settled: i64,
+    settled: u64,
     /// Source documents without an outcome accepted by the configured coverage policy. Null when observations are incomplete.
-    uncovered: ?i64,
+    uncovered: ?u64,
     /// Source documents that have not reached any terminal outcome and may still be processing. Null when observations are incomplete.
-    pending: ?i64,
+    pending: ?u64,
     /// Whether observations are complete, replay has reached its target, and every observed source has an outcome accepted by the policy.
     complete: bool,
     /// Whether coverage is complete without terminal failures.
@@ -7225,7 +7589,7 @@ pub const DisjunctionQuery = struct {
     disjuncts: []const Query,
     boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
     /// Minimum number of disjuncts that must match. Omit for conventional disjunction semantics; set to 0 to make a pure disjunction optional.
-    min: ?i64 = null,
+    min: ?u32 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -7404,9 +7768,9 @@ pub const DocumentArtifactChildRange = struct {
     /// Current placement summary for the range.
     placement: []const u8,
     /// Owner group for this child artifact range, when assigned.
-    owner_group_id: OpenApiOptionalNullable(i64) = .absent,
+    owner_group_id: OpenApiOptionalNullable(u64) = .absent,
     /// Placement generation for range ownership metadata.
-    placement_generation: OpenApiOptionalNullable(i64) = .absent,
+    placement_generation: OpenApiOptionalNullable(u64) = .absent,
     /// Current routing status for child writes in this range.
     route_status: OpenApiOptionalNullable([]const u8) = .absent,
     /// Whether this range may split at its configured split boundary.
@@ -7510,9 +7874,9 @@ pub const DocumentArtifactManifest = struct {
     /// Stable identity of this artifact under the document.
     artifact_id: []const u8,
     /// Version of the opaque manifest payload schema.
-    manifest_version: i64,
+    manifest_version: u64,
     /// Monotonic generation for the current artifact state.
-    generation: i64,
+    generation: u64,
     /// Source URL or source identifier used to derive this artifact.
     source_url: []const u8,
     /// Fingerprint of the source bytes and extractor configuration.
@@ -7536,7 +7900,7 @@ pub const DocumentArtifactManifest = struct {
     /// Number of pages whose OCR rendering or recognition failed.
     ocr_failed_count: ?i64 = null,
     /// Up to 32 one-based page numbers where OCR failed.
-    ocr_failed_page_numbers: ?[]const i64 = null,
+    ocr_failed_page_numbers: ?[]const u32 = null,
     /// Whether additional failed page numbers were omitted from the summary.
     ocr_failed_pages_truncated: ?bool = null,
     /// Parsed child range descriptors for this artifact generation.
@@ -7546,9 +7910,9 @@ pub const DocumentArtifactManifest = struct {
     /// Current materialization or merge status.
     merge_status: []const u8,
     /// Previous artifact generation used by the current merge plan.
-    merge_from_generation: i64,
+    merge_from_generation: u64,
     /// Target artifact generation produced by the current merge plan.
-    merge_to_generation: i64,
+    merge_to_generation: u64,
     /// Granularity used when computing merge-plan operations.
     merge_operation_granularity: []const u8,
     /// Number of merge operations recorded for this artifact.
@@ -7733,9 +8097,9 @@ pub const DocumentArtifactReprocessFailure = struct {
 
 pub const DocumentArtifactReprocessJob = struct {
     /// Server-assigned durable repair job identifier.
-    job_id: i64,
+    job_id: u64,
     /// Monotonic execution attempt token for the current running pass.
-    attempt_id: i64,
+    attempt_id: u64,
     /// Table containing the source documents being repaired.
     table_name: []const u8,
     /// Name of the derived artifact being repaired.
@@ -7749,7 +8113,7 @@ pub const DocumentArtifactReprocessJob = struct {
     /// Original inclusive upper bound for the job, or empty for the end of the table/range.
     to_key: []const u8,
     /// Current per-shard bounded pass limit.
-    limit: i64,
+    limit: u32,
     /// Single-shard continuation key when no shard cursors are present.
     next_key: OpenApiOptionalNullable([]const u8) = .absent,
     /// Cumulative source rows scanned by completed passes.
@@ -7771,11 +8135,11 @@ pub const DocumentArtifactReprocessJob = struct {
     /// Whether cancellation has been requested for a running pass. Running passes finish at a bounded reprocess boundary before the job transitions to cancelled.
     cancel_requested: bool,
     /// Unix epoch milliseconds when the job was created.
-    created_at_millis: i64,
+    created_at_millis: u64,
     /// Unix epoch milliseconds when the job was last updated.
-    last_updated_at_millis: i64,
+    last_updated_at_millis: u64,
     /// Unix epoch milliseconds after which the retained job status may be removed.
-    expires_at_millis: i64,
+    expires_at_millis: u64,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
@@ -7852,7 +8216,7 @@ pub const DocumentArtifactReprocessJobStartRequest = struct {
     /// Inclusive upper bound source document key, or empty for the end of the table/range.
     to_key: ?[]const u8 = null,
     /// Maximum source rows to scan per shard-local repair pass. Zero uses the server default.
-    limit: ?i64 = null,
+    limit: ?u32 = null,
     /// When true, immediately runs the first bounded pass before returning the job state.
     advance: ?bool = null,
 
@@ -7901,7 +8265,7 @@ pub const DocumentArtifactReprocessResponse = struct {
 
 pub const DocumentArtifactReprocessShardCursor = struct {
     /// Physical table group that produced this cursor, when known.
-    group_id: OpenApiOptionalNullable(i64) = .absent,
+    group_id: OpenApiOptionalNullable(u64) = .absent,
     /// Source key cursor for resuming this shard-local repair pass.
     next_key: []const u8,
     /// Number of source rows scanned by this shard-local pass.
@@ -7913,7 +8277,7 @@ pub const DocumentArtifactReprocessShardCursor = struct {
     /// Number of scanned source rows that failed in this shard-local pass.
     failed: i64,
     /// Effective scan limit used by this shard-local pass.
-    limit: i64,
+    limit: u32,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
@@ -7951,7 +8315,7 @@ pub const DocumentArtifactTableReprocessRequest = struct {
     /// Inclusive upper bound source document key, or empty for the end of the table/range.
     to_key: ?[]const u8 = null,
     /// Maximum source rows to scan per shard-local repair pass. Zero uses the server default.
-    limit: ?i64 = null,
+    limit: ?u32 = null,
     /// Per-shard continuation cursors returned by a prior response. When present, distributed repair resumes exactly these shard-local cursors instead of resolving a fresh global key span.
     shard_cursors: ?[]const DocumentArtifactReprocessShardCursor = null,
 
@@ -8009,7 +8373,7 @@ pub const DocumentArtifactTableReprocessResponse = struct {
     /// Number of scanned source rows that failed before recording a normal artifact manifest.
     failed: i64,
     /// Effective scan limit used by the bounded pass.
-    limit: i64,
+    limit: u32,
     /// Source key cursor for the next bounded pass, when more rows may remain.
     next_key: OpenApiOptionalNullable([]const u8) = .absent,
     /// Number of shard-local continuations still pending after this pass. For single-shard callers this is 1 when only `next_key` remains and 0 when complete.
@@ -8729,12 +9093,12 @@ pub const EmbeddingIndexActivity = struct {
     epoch: []const u8,
     phase: EmbeddingIndexActivityPhase,
     /// Chunks created for this index during the activity epoch.
-    chunks_created: i64,
-    embedding_batches_completed: i64,
+    chunks_created: u64,
+    embedding_batches_completed: u64,
     /// Embedding vectors successfully computed for this index during the activity epoch.
-    embeddings_computed: i64,
+    embeddings_computed: u64,
     /// Items currently submitted to an embedding provider for this index.
-    active_batch_size: i64,
+    active_batch_size: u64,
     /// Completion time of the latest successful embedding batch, or null before the first batch.
     last_progress_at: ?[]const u8,
 
@@ -8861,15 +9225,15 @@ pub const EmbeddingSourceCoverageStatus = struct {
     /// Semantic configuration fingerprint for the observed index incarnation.
     config_fingerprint: []const u8,
     /// Source documents in scope. This is a lower bound when observation_complete is false.
-    total: i64,
+    total: u64,
     /// Sources awaiting a terminal generation decision; null when the observation is incomplete.
-    pending: ?i64,
+    pending: ?u64,
     /// Sources that durably produced material for this index incarnation.
-    covered: i64,
+    covered: u64,
     /// Sources intentionally producing no material after generation evaluated them.
-    skipped: i64,
+    skipped: u64,
     /// Sources whose generation reached a non-retryable failure.
-    failed: i64,
+    failed: u64,
     /// Whether source outcomes satisfy the configured coverage policy. Replay and publication are reported independently by revisions and milestones.
     complete: bool,
     healthy: bool,
@@ -9105,12 +9469,12 @@ pub const EmbeddingsIndexStats = struct {
     readiness: ?IndexReadinessStatus = null,
     /// Opaque identity of the desired index incarnation. Clients may compare it for equality but must not interpret its contents.
     incarnation: ?[]const u8 = null,
-    target_revision: ?i64 = null,
-    published_revision: ?i64 = null,
+    target_revision: ?u64 = null,
+    published_revision: ?u64 = null,
     milestones: ?IndexMilestones = null,
     source_coverage: ?EmbeddingSourceCoverageStatus = null,
     /// Physical vectors or sparse entries visible to queries; chunked indexes may exceed source coverage.
-    searchable_vectors: ?i64 = null,
+    searchable_vectors: ?u64 = null,
     /// Dense-only exact publication status; absent for sparse indexes and when the target proof is unavailable.
     publication: ?DenseVectorPublicationStatus = null,
     /// Fresh owner-reported activity, or null when no heartbeat for this index incarnation is available.
@@ -9118,45 +9482,45 @@ pub const EmbeddingsIndexStats = struct {
     /// Error message if stats could not be retrieved
     @"error": ?[]const u8 = null,
     /// Number of vectors/documents in the index
-    total_indexed: ?i64 = null,
+    total_indexed: ?u64 = null,
     /// Size of the index in bytes
-    disk_usage: ?i64 = null,
+    disk_usage: ?u64 = null,
     /// Total number of nodes in the index (dense only)
-    total_nodes: ?i64 = null,
+    total_nodes: ?u64 = null,
     /// Number of unique terms in the inverted index (sparse only)
-    total_terms: ?i64 = null,
+    total_terms: ?u64 = null,
     /// Whether enrichment, publication, or replay work is still pending. Documents that do not contain the indexed field are terminal skipped outcomes and do not keep this true.
     rebuilding: ?bool = null,
     repair: ?IndexRepairStatus = null,
     /// Number of documents pending enrichment in the WAL
-    wal_backlog: ?i64 = null,
+    wal_backlog: ?u64 = null,
     /// Whether the index is actively rebuilding, replaying, enriching, or catching up.
     backfill_active: ?bool = null,
     /// Fraction of source documents with a terminal materialization outcome, including produced embeddings and intentionally skipped documents. Reaches 1.0 when no source work is pending and replay is current.
     backfill_progress: ?f64 = null,
     /// Total items processed during backfill
-    backfill_items_processed: ?i64 = null,
+    backfill_items_processed: ?u64 = null,
     /// Operational readiness state. Clients should use ready (or rebuilding=false) for query readiness; replay watermarks diagnose replay progress but do not replace this signal.
     backfill_state: ?[]const u8 = null,
     /// Number of physical vectors or sparse entries visible to the index; chunked indexes may contain multiple entries per source document.
-    doc_count: ?i64 = null,
+    doc_count: ?u64 = null,
     /// Generation-scoped source-document coverage, separate from physical index cardinality.
     coverage: ?DerivedCoverageStatus = null,
     /// Documents currently visible to queries.
-    query_visible_doc_count: ?i64 = null,
-    published_doc_count: ?i64 = null,
-    published_node_count: ?i64 = null,
-    root_node: ?i64 = null,
-    published_root_node: ?i64 = null,
-    dense_replay_applied_sequence: ?i64 = null,
-    dense_replay_target_sequence: ?i64 = null,
+    query_visible_doc_count: ?u64 = null,
+    published_doc_count: ?u64 = null,
+    published_node_count: ?u64 = null,
+    root_node: ?u64 = null,
+    published_root_node: ?u64 = null,
+    dense_replay_applied_sequence: ?u64 = null,
+    dense_replay_target_sequence: ?u64 = null,
     /// Whether dense/vector artifacts still need publication before queries see the latest data.
     dense_publish_pending: ?bool = null,
     /// Whether the shared native exact-vector projection is still being built or reconciled. Queries remain correct by falling back to primary embedding artifacts while this is true.
     dense_vector_projection_pending: ?bool = null,
     dense_native_storage_phase: ?DenseNativeStoragePhase = null,
-    replay_applied_sequence: ?i64 = null,
-    replay_target_sequence: ?i64 = null,
+    replay_applied_sequence: ?u64 = null,
+    replay_target_sequence: ?u64 = null,
     replay_catch_up_required: ?bool = null,
     runtime_present: ?bool = null,
     runtime_fresh: ?bool = null,
@@ -9164,8 +9528,8 @@ pub const EmbeddingsIndexStats = struct {
     runtime_freshness: ?[]const u8 = null,
     catch_up_active: ?bool = null,
     catch_up_phase: ?[]const u8 = null,
-    catch_up_applied_sequence: ?i64 = null,
-    catch_up_target_sequence: ?i64 = null,
+    catch_up_applied_sequence: ?u64 = null,
+    catch_up_target_sequence: ?u64 = null,
     enrichment_runtime: ?EnrichmentRuntimeStatus = null,
     hbc_cache: ?std.json.ArrayHashMap(std.json.Value) = null,
     hbc_posting: ?std.json.ArrayHashMap(std.json.Value) = null,
@@ -9173,28 +9537,28 @@ pub const EmbeddingsIndexStats = struct {
     /// Durable projection checkpoint status: clean, rebuilding, degraded, or repair_required.
     projection_checkpoint_status: ?[]const u8 = null,
     /// Highest derived-log sequence covered by the durable projection checkpoint.
-    projection_checkpoint_applied_sequence: ?i64 = null,
+    projection_checkpoint_applied_sequence: ?u64 = null,
     /// Projection generation associated with the durable checkpoint.
-    projection_checkpoint_generation: ?i64 = null,
+    projection_checkpoint_generation: ?u64 = null,
     /// Projection configuration identity associated with the durable checkpoint.
     projection_checkpoint_config_fingerprint: ?[]const u8 = null,
     /// Number of derived-log sequences after the durable checkpoint that still need replay.
-    checkpoint_replay_tail_sequence_count: ?i64 = null,
+    checkpoint_replay_tail_sequence_count: ?u64 = null,
     /// Repair issues found by explicit repair-scan accounting for this projection.
-    repair_scan_issue_count: ?i64 = null,
-    term_count: ?i64 = null,
-    edge_count: ?i64 = null,
-    node_count: ?i64 = null,
+    repair_scan_issue_count: ?u64 = null,
+    term_count: ?u64 = null,
+    edge_count: ?u64 = null,
+    node_count: ?u64 = null,
     repair_degraded: ?bool = null,
-    repair_issue_count: ?i64 = null,
+    repair_issue_count: ?u64 = null,
     repair_summary_ready: ?bool = null,
     repair_issue_count_estimated: ?bool = null,
-    expected_groups: ?i64 = null,
-    reported_groups: ?i64 = null,
-    fresh_groups: ?i64 = null,
-    stale_groups: ?i64 = null,
-    missing_groups: ?i64 = null,
-    unknown_remote_groups: ?i64 = null,
+    expected_groups: ?u64 = null,
+    reported_groups: ?u64 = null,
+    fresh_groups: ?u64 = null,
+    stale_groups: ?u64 = null,
+    missing_groups: ?u64 = null,
+    unknown_remote_groups: ?u64 = null,
     /// Artifact resolution replay diagnostics.
     resolution: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// Artifact promotion replay diagnostics.
@@ -9602,6 +9966,8 @@ pub const EnrichmentConfig = struct {
     producer_json: ?[]const u8 = null,
     /// Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity.
     execution: ?ExecutionPolicy = null,
+    /// Typed shorthand for a transcription asset enrichment. Only valid with kind=asset and without producer_json; Antfly expands it into a document_extraction producer whose audio route transcribes each recording with this speech-to-text provider. The produced units carry the transcript text, provider confidence, and per-phrase time offsets, and chunk enrichments that consume them emit _start_time_ms/_end_time_ms on every chunk. With diarization: true the phrases also carry who spoke them, and a chunk that does not straddle a turn emits _speaker. content_type defaults to application/json.
+    transcriber: ?TranscriberEnrichmentConfig = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -9619,6 +9985,7 @@ pub const EnrichmentConfig = struct {
         .{ "content_type", "content_type", true },
         .{ "producer_json", "producer_json", true },
         .{ "execution", "execution", true },
+        .{ "transcriber", "transcriber", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -9683,6 +10050,10 @@ pub const EnrichmentConfig = struct {
             try jw.objectField("execution");
             try jw.write(value);
         }
+        if (self.transcriber) |value| {
+            try jw.objectField("transcriber");
+            try jw.write(value);
+        }
         try jw.endObject();
     }
 };
@@ -9719,24 +10090,24 @@ pub const EnrichmentKind = enum {
 /// Runtime state for the durable embeddings enrichment worker.
 pub const EnrichmentRuntimeStatus = struct {
     enabled: bool,
-    target_sequence: i64,
-    applied_sequence: i64,
-    pending_sequence_count: i64,
+    target_sequence: u64,
+    applied_sequence: u64,
+    pending_sequence_count: u64,
     projection_checkpoint_status: []const u8,
-    projection_checkpoint_applied_sequence: i64,
-    projection_checkpoint_generation: i64,
+    projection_checkpoint_applied_sequence: u64,
+    projection_checkpoint_generation: u64,
     projection_checkpoint_config_fingerprint: []const u8,
     /// Whether every shard contributing to this status reports the same checkpoint generation and configuration identity.
     projection_checkpoint_identity_consistent: bool,
-    checkpoint_replay_tail_sequence_count: i64,
-    processed_requests: i64,
-    error_count: i64,
-    retryable_error_count: i64,
-    fatal_error_count: i64,
+    checkpoint_replay_tail_sequence_count: u64,
+    processed_requests: u64,
+    error_count: u64,
+    retryable_error_count: u64,
+    fatal_error_count: u64,
     /// Consecutive durable worker retries for the current failed request window.
-    consecutive_retry_count: i64,
+    consecutive_retry_count: u32,
     /// Unix epoch time in milliseconds when the current durable retry becomes eligible. Zero when not retrying.
-    next_retry_at_ms: i64,
+    next_retry_at_ms: u64,
     retrying: bool,
     worker_failed: bool,
     /// Whether the background enrichment worker is currently running.
@@ -9748,31 +10119,31 @@ pub const EnrichmentRuntimeStatus = struct {
     active_model: []const u8,
     active_backend: []const u8,
     /// Display-only Unix deadline in milliseconds; timeout decisions use a monotonic clock.
-    active_deadline_ms: i64,
-    last_progress_ms: i64,
-    active_progress_completed: i64,
-    active_progress_total: i64,
-    inference_timeout_count: i64,
-    inference_cancel_count: i64,
-    skip_by_hash_count: i64,
-    skipped_source_count: i64,
-    codec_decode_failures: i64,
-    embed_batches_started: i64,
-    embed_batches_completed: i64,
-    embed_items_started: i64,
-    embed_items_completed: i64,
-    active_embed_batch_items: i64,
-    active_embed_batch_bytes: i64,
-    active_embed_batch_max_bytes: i64,
-    active_embed_batch_started_ms: i64,
-    last_embed_batch_items: i64,
-    last_embed_batch_bytes: i64,
-    last_embed_batch_max_bytes: i64,
+    active_deadline_ms: u64,
+    last_progress_ms: u64,
+    active_progress_completed: u64,
+    active_progress_total: u64,
+    inference_timeout_count: u64,
+    inference_cancel_count: u64,
+    skip_by_hash_count: u64,
+    skipped_source_count: u64,
+    codec_decode_failures: u64,
+    embed_batches_started: u64,
+    embed_batches_completed: u64,
+    embed_items_started: u64,
+    embed_items_completed: u64,
+    active_embed_batch_items: u64,
+    active_embed_batch_bytes: u64,
+    active_embed_batch_max_bytes: u64,
+    active_embed_batch_started_ms: u64,
+    last_embed_batch_items: u64,
+    last_embed_batch_bytes: u64,
+    last_embed_batch_max_bytes: u64,
     /// Wall-clock completion time in Unix milliseconds for the most recently completed embedding batch.
-    last_embed_batch_completed_ms: i64,
+    last_embed_batch_completed_ms: u64,
     /// Elapsed duration in nanoseconds for the most recently completed embedding batch.
-    last_embed_batch_ns: i64,
-    total_embed_ns: i64,
+    last_embed_batch_ns: u64,
+    total_embed_ns: u64,
 };
 
 pub const Error = struct {
@@ -10459,9 +10830,9 @@ pub const ExecutionPolicy = struct {
     /// Maximum items to process in one batch for this operation.
     batch_items: ?i64 = null,
     /// Approximate maximum source bytes to process in one batch for this operation.
-    batch_bytes: ?i64 = null,
+    batch_bytes: ?u64 = null,
     /// Maximum PDF pages admitted for one request-atomic document operation.
-    max_document_pages: ?i64 = null,
+    max_document_pages: ?u32 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -10843,6 +11214,62 @@ pub const ExternalIoProtocol = enum {
     }
 };
 
+/// Version 2 attributes are scored on retained entity spans using shared encoded states. Omitted applies_to selects all entities; [] selects none. Raw labels must be unique across groups, including when qualify_labels is true. Group names text,confidence,start,end are reserved.
+pub const ExtractionAttributeGroup = struct {
+    labels: []const []const u8,
+    multi_label: ?bool = null,
+    threshold: ?std.json.Value = null,
+    applies_to: ?[]const []const u8 = null,
+    qualify_labels: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "labels", "labels", false },
+        .{ "multi_label", "multi_label", true },
+        .{ "threshold", "threshold", true },
+        .{ "applies_to", "applies_to", true },
+        .{ "qualify_labels", "qualify_labels", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("labels");
+        try jw.write(self.labels);
+        if (self.multi_label) |value| {
+            try jw.objectField("multi_label");
+            try jw.write(value);
+        }
+        if (self.threshold) |value| {
+            try jw.objectField("threshold");
+            try jw.write(value);
+        }
+        if (self.applies_to) |value| {
+            try jw.objectField("applies_to");
+            try jw.write(value);
+        }
+        if (self.qualify_labels) |value| {
+            try jw.objectField("qualify_labels");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ExtractionAttributeLabel = struct {
+    label: []const u8,
+    confidence: ExtractionProbability,
+};
+
+pub const ExtractionAttributeSelection = std.json.Value;
+
 pub const ExtractionClassification = struct {
     name: []const u8,
     label: []const u8,
@@ -10877,15 +11304,38 @@ pub const ExtractionClassification = struct {
     }
 };
 
+/// Declarative, bounded constraint AST. Task and label references are validated before inference. Nesting is bounded by the server schema limit.
+pub const ExtractionClassificationConstraint = std.json.Value;
+
+pub const ExtractionClassificationExample = std.json.Value;
+
 pub const ExtractionClassificationSchema = struct {
     name: []const u8,
     labels: []const []const u8,
-    /// When false, return the highest-ranked labels up to `top_k` (one by default). When true, return every label meeting `options.threshold`.
+    /// The server uses false when omitted. Version 1: return highest-ranked labels up to top_k when false, or labels meeting options.threshold when true. Version 2: selects ordinary single or multi classification unless mode is specified; classification.threshold controls the decision threshold.
     multi_label: ?bool = null,
-    /// NLI hypothesis template for this named taxonomy. Use `{}` as the candidate-label placeholder. Non-NLI extractors ignore this field.
+    /// Version 1 NLI hypothesis template with {} as the label placeholder; the server uses "This example is {}." when omitted. Version 2 GLiNER boundary extraction rejects an explicit hypothesis_template; use prompt/instruction and label_definitions for model conditioning.
     hypothesis_template: ?[]const u8 = null,
-    /// Maximum labels returned for single-label classification. Ignored when `multi_label` is true, where `options.threshold` controls the returned set.
+    /// Maximum labels for ordinary single-label classification; the server uses 1 when omitted. Version 2 constrained or ordinal selection uses min_labels/max_labels. Advanced set-selection options or cross-task constraints on any classification in the collection reject every explicit top_k in that collection, including 1. Omit top_k when using these options.
     top_k: ?i64 = null,
+    /// Version 2 classification mode. Ordinal labels are ordered from lowest to highest. Typed-decision extractors support boolean with labels ["false", "true"] in that order. Each model rejects modes it does not support.
+    mode: ?[]const u8 = null,
+    label_definitions: ?std.json.ArrayHashMap(ExtractionLabelDefinition) = null,
+    min_labels: ?i64 = null,
+    /// Version 2 maximum selected labels. Explicit null means no maximum; omission preserves mode defaults.
+    max_labels: OpenApiOptionalNullable(i64) = .absent,
+    ordered: ?bool = null,
+    threshold: ?std.json.Value = null,
+    candidate_threshold: ?std.json.Value = null,
+    activation: ?[]const u8 = null,
+    temperature: ?f64 = null,
+    /// Version 2 fallback label; must be declared in labels.
+    default: ?[]const u8 = null,
+    /// Version 2 model-facing task instruction. Mutually exclusive with instruction.
+    prompt: ?[]const u8 = null,
+    /// Alias of prompt.
+    instruction: ?[]const u8 = null,
+    examples: ?[]const ExtractionClassificationExample = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -10894,6 +11344,19 @@ pub const ExtractionClassificationSchema = struct {
         .{ "multi_label", "multi_label", true },
         .{ "hypothesis_template", "hypothesis_template", true },
         .{ "top_k", "top_k", true },
+        .{ "mode", "mode", true },
+        .{ "label_definitions", "label_definitions", true },
+        .{ "min_labels", "min_labels", true },
+        .{ "max_labels", "max_labels", false },
+        .{ "ordered", "ordered", true },
+        .{ "threshold", "threshold", true },
+        .{ "candidate_threshold", "candidate_threshold", true },
+        .{ "activation", "activation", true },
+        .{ "temperature", "temperature", true },
+        .{ "default", "default", true },
+        .{ "prompt", "prompt", true },
+        .{ "instruction", "instruction", true },
+        .{ "examples", "examples", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -10922,6 +11385,310 @@ pub const ExtractionClassificationSchema = struct {
             try jw.objectField("top_k");
             try jw.write(value);
         }
+        if (self.mode) |value| {
+            try jw.objectField("mode");
+            try jw.write(value);
+        }
+        if (self.label_definitions) |value| {
+            try jw.objectField("label_definitions");
+            try jw.write(value);
+        }
+        if (self.min_labels) |value| {
+            try jw.objectField("min_labels");
+            try jw.write(value);
+        }
+        switch (self.max_labels) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("max_labels");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("max_labels");
+                try jw.write(value);
+            },
+        }
+        if (self.ordered) |value| {
+            try jw.objectField("ordered");
+            try jw.write(value);
+        }
+        if (self.threshold) |value| {
+            try jw.objectField("threshold");
+            try jw.write(value);
+        }
+        if (self.candidate_threshold) |value| {
+            try jw.objectField("candidate_threshold");
+            try jw.write(value);
+        }
+        if (self.activation) |value| {
+            try jw.objectField("activation");
+            try jw.write(value);
+        }
+        if (self.temperature) |value| {
+            try jw.objectField("temperature");
+            try jw.write(value);
+        }
+        if (self.default) |value| {
+            try jw.objectField("default");
+            try jw.write(value);
+        }
+        if (self.prompt) |value| {
+            try jw.objectField("prompt");
+            try jw.write(value);
+        }
+        if (self.instruction) |value| {
+            try jw.objectField("instruction");
+            try jw.write(value);
+        }
+        if (self.examples) |value| {
+            try jw.objectField("examples");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ExtractionConstraintAnd = struct {
+    type: []const u8,
+    children: []const ExtractionClassificationConstraint,
+};
+
+pub const ExtractionConstraintAnyOtherSelected = struct {
+    type: []const u8,
+    task: []const u8,
+};
+
+pub const ExtractionConstraintAnySelected = struct {
+    type: []const u8,
+    task: []const u8,
+};
+
+pub const ExtractionConstraintAtLevel = struct {
+    type: []const u8,
+    task: []const u8,
+    level: std.json.Value,
+};
+
+pub const ExtractionConstraintCardinality = struct {
+    type: []const u8,
+    task: []const u8,
+    minimum: ?i64 = null,
+    maximum: OpenApiOptionalNullable(i64) = .absent,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "task", "task", false },
+        .{ "minimum", "minimum", true },
+        .{ "maximum", "maximum", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("task");
+        try jw.write(self.task);
+        if (self.minimum) |value| {
+            try jw.objectField("minimum");
+            try jw.write(value);
+        }
+        switch (self.maximum) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("maximum");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("maximum");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ExtractionConstraintExactlyOneOf = struct {
+    type: []const u8,
+    children: []const ExtractionClassificationConstraint,
+};
+
+pub const ExtractionConstraintExcludes = struct {
+    type: []const u8,
+    left: ExtractionClassificationConstraint,
+    right: ExtractionClassificationConstraint,
+};
+
+pub const ExtractionConstraintIff = struct {
+    type: []const u8,
+    left: ExtractionClassificationConstraint,
+    right: ExtractionClassificationConstraint,
+};
+
+pub const ExtractionConstraintImplies = struct {
+    type: []const u8,
+    cond: ExtractionClassificationConstraint,
+    then: ExtractionClassificationConstraint,
+};
+
+pub const ExtractionConstraintIsDefault = struct {
+    type: []const u8,
+    task: []const u8,
+};
+
+pub const ExtractionConstraintLabelRef = struct {
+    type: []const u8,
+    task: []const u8,
+    label: []const u8,
+};
+
+pub const ExtractionConstraintMaxLevel = struct {
+    type: []const u8,
+    task: []const u8,
+    level: std.json.Value,
+};
+
+pub const ExtractionConstraintMinLevel = struct {
+    type: []const u8,
+    task: []const u8,
+    level: std.json.Value,
+};
+
+pub const ExtractionConstraintNot = struct {
+    type: []const u8,
+    child: ExtractionClassificationConstraint,
+};
+
+pub const ExtractionConstraintOr = struct {
+    type: []const u8,
+    children: []const ExtractionClassificationConstraint,
+};
+
+/// Version 2 typed classification decision. Probabilities follow request label order; ordinal levels are zero-based.
+pub const ExtractionDecision = struct {
+    name: []const u8,
+    type: []const u8,
+    /// Highest-probability label. This is distinct from the expected ordinal value.
+    label: []const u8,
+    probabilities: []const ExtractionLabelProbability,
+    confidence: f32,
+    /// Entropy confidence is not the probability that the selected label is correct.
+    confidence_method: []const u8,
+    /// Score decisions only; sum of zero-based level index times probability.
+    expected_value: ?f32 = null,
+    /// Boolean decisions only; probability of the true label.
+    true_probability: ?f32 = null,
+    /// Auxiliary model estimate for acting. Does not authorize or execute a tool call.
+    act_probability: f32,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "name", "name", false },
+        .{ "type", "type", false },
+        .{ "label", "label", false },
+        .{ "probabilities", "probabilities", false },
+        .{ "confidence", "confidence", false },
+        .{ "confidence_method", "confidence_method", false },
+        .{ "expected_value", "expected_value", true },
+        .{ "true_probability", "true_probability", true },
+        .{ "act_probability", "act_probability", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("label");
+        try jw.write(self.label);
+        try jw.objectField("probabilities");
+        try jw.write(self.probabilities);
+        try jw.objectField("confidence");
+        try jw.write(self.confidence);
+        try jw.objectField("confidence_method");
+        try jw.write(self.confidence_method);
+        if (self.expected_value) |value| {
+            try jw.objectField("expected_value");
+            try jw.write(value);
+        }
+        if (self.true_probability) |value| {
+            try jw.objectField("true_probability");
+            try jw.write(value);
+        }
+        try jw.objectField("act_probability");
+        try jw.write(self.act_probability);
+        try jw.endObject();
+    }
+};
+
+/// Finite centered-logit decisions require a threshold strictly between zero and one.
+pub const ExtractionDecisionProbability = f64;
+
+/// Bounded classification and JointIE selection. Exact optimality is with respect to admitted candidates. A completed beam may be feasible without an optimality proof. By default exhausted search is an error; best_effort permits only a validated feasible witness and reports exhausted:true.
+pub const ExtractionDecoderOptions = struct {
+    /// Omit to use the model's per-task default. GLiNER2.5 uses source-compatible beam selection for single-window JointIE and automatic selection for classification. Windowed JointIE uses the native automatic global solver with independent window resources. Explicit values select the native bounded search algorithm.
+    algorithm: ?[]const u8 = null,
+    beam_width: ?i64 = null,
+    max_search_nodes: ?i64 = null,
+    max_local_assignments: ?i64 = null,
+    best_effort: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "algorithm", "algorithm", true },
+        .{ "beam_width", "beam_width", true },
+        .{ "max_search_nodes", "max_search_nodes", true },
+        .{ "max_local_assignments", "max_local_assignments", true },
+        .{ "best_effort", "best_effort", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.algorithm) |value| {
+            try jw.objectField("algorithm");
+            try jw.write(value);
+        }
+        if (self.beam_width) |value| {
+            try jw.objectField("beam_width");
+            try jw.write(value);
+        }
+        if (self.max_search_nodes) |value| {
+            try jw.objectField("max_search_nodes");
+            try jw.write(value);
+        }
+        if (self.max_local_assignments) |value| {
+            try jw.objectField("max_local_assignments");
+            try jw.write(value);
+        }
+        if (self.best_effort) |value| {
+            try jw.objectField("best_effort");
+            try jw.write(value);
+        }
         try jw.endObject();
     }
 };
@@ -10932,6 +11699,8 @@ pub const ExtractionEntity = struct {
     start: ?i64 = null,
     end: ?i64 = null,
     score: ?f32 = null,
+    /// Version 2 span attributes. Attribute confidence is retained independently of include_confidence.
+    attributes: ?std.json.ArrayHashMap(ExtractionAttributeSelection) = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -10940,6 +11709,7 @@ pub const ExtractionEntity = struct {
         .{ "start", "start", true },
         .{ "end", "end", true },
         .{ "score", "score", true },
+        .{ "attributes", "attributes", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -10968,6 +11738,60 @@ pub const ExtractionEntity = struct {
             try jw.objectField("score");
             try jw.write(value);
         }
+        if (self.attributes) |value| {
+            try jw.objectField("attributes");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ExtractionEntityDefinition = struct {
+    description: ?[]const u8 = null,
+    dtype: ?[]const u8 = null,
+    type: ?[]const u8 = null,
+    threshold: ?std.json.Value = null,
+    validators: ?[]const ExtractionRegexValidator = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "description", "description", true },
+        .{ "dtype", "dtype", true },
+        .{ "type", "type", true },
+        .{ "threshold", "threshold", true },
+        .{ "validators", "validators", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.description) |value| {
+            try jw.objectField("description");
+            try jw.write(value);
+        }
+        if (self.dtype) |value| {
+            try jw.objectField("dtype");
+            try jw.write(value);
+        }
+        if (self.type) |value| {
+            try jw.objectField("type");
+            try jw.write(value);
+        }
+        if (self.threshold) |value| {
+            try jw.objectField("threshold");
+            try jw.write(value);
+        }
+        if (self.validators) |value| {
+            try jw.objectField("validators");
+            try jw.write(value);
+        }
         try jw.endObject();
     }
 };
@@ -10977,6 +11801,10 @@ pub const ExtractionInput = struct {
     content: ChatMessageContent,
     tokens: ?[]const ExtractionToken = null,
     metadata: ?std.json.ArrayHashMap(std.json.Value) = null,
+    /// Version 2 only. Replaces the complete shared schema for this input.
+    schema: ?std.json.Value = null,
+    /// Version 2 only. Replaces the complete shared options; omitted fields use runtime defaults.
+    options: ?std.json.Value = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -10984,6 +11812,8 @@ pub const ExtractionInput = struct {
         .{ "content", "content", false },
         .{ "tokens", "tokens", true },
         .{ "metadata", "metadata", true },
+        .{ "schema", "schema", true },
+        .{ "options", "options", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -11010,24 +11840,33 @@ pub const ExtractionInput = struct {
             try jw.objectField("metadata");
             try jw.write(value);
         }
+        if (self.schema) |value| {
+            try jw.objectField("schema");
+            try jw.write(value);
+        }
+        if (self.options) |value| {
+            try jw.objectField("options");
+            try jw.write(value);
+        }
         try jw.endObject();
     }
 };
 
-pub const ExtractionObject = struct {
-    id: ?[]const u8 = null,
-    entities: ?[]const ExtractionEntity = null,
-    relations: ?[]const ExtractionRelation = null,
-    classifications: ?[]const ExtractionClassification = null,
-    structures: ?std.json.ArrayHashMap(std.json.Value) = null,
+pub const ExtractionJointConstraint = std.json.Value;
+
+pub const ExtractionJointConstraintAcyclicRelation = struct {
+    type: []const u8,
+    relation: []const u8,
+};
+
+pub const ExtractionJointConstraintEntityOverlapPolicy = struct {
+    type: []const u8,
+    policy: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
-        .{ "id", "id", true },
-        .{ "entities", "entities", true },
-        .{ "relations", "relations", true },
-        .{ "classifications", "classifications", true },
-        .{ "structures", "structures", true },
+        .{ "type", "type", false },
+        .{ "policy", "policy", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -11040,8 +11879,629 @@ pub const ExtractionObject = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.policy) |value| {
+            try jw.objectField("policy");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ExtractionJointConstraintInverseRelation = struct {
+    type: []const u8,
+    relation: []const u8,
+    inverse: []const u8,
+};
+
+pub const ExtractionJointConstraintMaxRelationsPerHead = struct {
+    type: []const u8,
+    relation: ?[]const u8 = null,
+    limit: i64,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "relation", "relation", true },
+        .{ "limit", "limit", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.relation) |value| {
+            try jw.objectField("relation");
+            try jw.write(value);
+        }
+        try jw.objectField("limit");
+        try jw.write(self.limit);
+        try jw.endObject();
+    }
+};
+
+pub const ExtractionJointConstraintMaxRelationsPerTail = struct {
+    type: []const u8,
+    relation: ?[]const u8 = null,
+    limit: i64,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "relation", "relation", true },
+        .{ "limit", "limit", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.relation) |value| {
+            try jw.objectField("relation");
+            try jw.write(value);
+        }
+        try jw.objectField("limit");
+        try jw.write(self.limit);
+        try jw.endObject();
+    }
+};
+
+pub const ExtractionJointConstraintNoSelfLoops = struct {
+    type: []const u8,
+    relation: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "relation", "relation", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.relation) |value| {
+            try jw.objectField("relation");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ExtractionJointConstraintSymmetricRelation = struct {
+    type: []const u8,
+    relation: []const u8,
+};
+
+pub const ExtractionJointConstraintTypedEndpoints = struct {
+    type: []const u8,
+    relation: ?[]const u8 = null,
+    head_types: ?[]const []const u8 = null,
+    tail_types: ?[]const []const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "relation", "relation", true },
+        .{ "head_types", "head_types", true },
+        .{ "tail_types", "tail_types", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.relation) |value| {
+            try jw.objectField("relation");
+            try jw.write(value);
+        }
+        if (self.head_types) |value| {
+            try jw.objectField("head_types");
+            try jw.write(value);
+        }
+        if (self.tail_types) |value| {
+            try jw.objectField("tail_types");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ExtractionJointConstraintUniqueRelationPair = struct {
+    type: []const u8,
+    relation: ?[]const u8 = null,
+    directed: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "relation", "relation", true },
+        .{ "directed", "directed", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.relation) |value| {
+            try jw.objectField("relation");
+            try jw.write(value);
+        }
+        if (self.directed) |value| {
+            try jw.objectField("directed");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ExtractionJointConstraintUniqueRelationSlot = struct {
+    type: []const u8,
+    relation: ?[]const u8 = null,
+    slot: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "relation", "relation", true },
+        .{ "slot", "slot", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.relation) |value| {
+            try jw.objectField("relation");
+            try jw.write(value);
+        }
+        if (self.slot) |value| {
+            try jw.objectField("slot");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ExtractionJointEntity = struct {
+    description: ?[]const u8 = null,
+    threshold: ?std.json.Value = null,
+    candidate_threshold: ?std.json.Value = null,
+    max_candidates: ?i64 = null,
+    allow_nested: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "description", "description", true },
+        .{ "threshold", "threshold", true },
+        .{ "candidate_threshold", "candidate_threshold", true },
+        .{ "max_candidates", "max_candidates", true },
+        .{ "allow_nested", "allow_nested", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.description) |value| {
+            try jw.objectField("description");
+            try jw.write(value);
+        }
+        if (self.threshold) |value| {
+            try jw.objectField("threshold");
+            try jw.write(value);
+        }
+        if (self.candidate_threshold) |value| {
+            try jw.objectField("candidate_threshold");
+            try jw.write(value);
+        }
+        if (self.max_candidates) |value| {
+            try jw.objectField("max_candidates");
+            try jw.write(value);
+        }
+        if (self.allow_nested) |value| {
+            try jw.objectField("allow_nested");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// JointIE proposal admission and utility calibration. Entity candidate caps are bypassed for endpoints of retained relation proposals, subject to server hard bounds. entity_threshold overrides candidate admission, not entity decision thresholds.
+pub const ExtractionJointOptions = struct {
+    candidate_threshold: ?std.json.Value = null,
+    entity_threshold: ?std.json.Value = null,
+    relation_role_threshold: ?std.json.Value = null,
+    top_k_entities: ?i64 = null,
+    top_k_roles: ?i64 = null,
+    relation_pair_cap: ?i64 = null,
+    max_edges_per_type: ?i64 = null,
+    entity_weight: ?f64 = null,
+    relation_weight: ?f64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "candidate_threshold", "candidate_threshold", true },
+        .{ "entity_threshold", "entity_threshold", true },
+        .{ "relation_role_threshold", "relation_role_threshold", true },
+        .{ "top_k_entities", "top_k_entities", true },
+        .{ "top_k_roles", "top_k_roles", true },
+        .{ "relation_pair_cap", "relation_pair_cap", true },
+        .{ "max_edges_per_type", "max_edges_per_type", true },
+        .{ "entity_weight", "entity_weight", true },
+        .{ "relation_weight", "relation_weight", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.candidate_threshold) |value| {
+            try jw.objectField("candidate_threshold");
+            try jw.write(value);
+        }
+        if (self.entity_threshold) |value| {
+            try jw.objectField("entity_threshold");
+            try jw.write(value);
+        }
+        if (self.relation_role_threshold) |value| {
+            try jw.objectField("relation_role_threshold");
+            try jw.write(value);
+        }
+        if (self.top_k_entities) |value| {
+            try jw.objectField("top_k_entities");
+            try jw.write(value);
+        }
+        if (self.top_k_roles) |value| {
+            try jw.objectField("top_k_roles");
+            try jw.write(value);
+        }
+        if (self.relation_pair_cap) |value| {
+            try jw.objectField("relation_pair_cap");
+            try jw.write(value);
+        }
+        if (self.max_edges_per_type) |value| {
+            try jw.objectField("max_edges_per_type");
+            try jw.write(value);
+        }
+        if (self.entity_weight) |value| {
+            try jw.objectField("entity_weight");
+            try jw.write(value);
+        }
+        if (self.relation_weight) |value| {
+            try jw.objectField("relation_weight");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ExtractionJointRelation = struct {
+    head: []const []const u8,
+    tail: []const []const u8,
+    /// Retained declarative metadata; model conditioning follows the pinned JointIE compiler.
+    description: ?[]const u8 = null,
+    threshold: ?std.json.Value = null,
+    candidate_threshold: ?std.json.Value = null,
+    directed: ?bool = null,
+    symmetric: ?bool = null,
+    inverse: ?[]const u8 = null,
+    allow_self: ?bool = null,
+    max_per_head: ?i64 = null,
+    max_per_tail: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "head", "head", false },
+        .{ "tail", "tail", false },
+        .{ "description", "description", true },
+        .{ "threshold", "threshold", true },
+        .{ "candidate_threshold", "candidate_threshold", true },
+        .{ "directed", "directed", true },
+        .{ "symmetric", "symmetric", true },
+        .{ "inverse", "inverse", true },
+        .{ "allow_self", "allow_self", true },
+        .{ "max_per_head", "max_per_head", true },
+        .{ "max_per_tail", "max_per_tail", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("head");
+        try jw.write(self.head);
+        try jw.objectField("tail");
+        try jw.write(self.tail);
+        if (self.description) |value| {
+            try jw.objectField("description");
+            try jw.write(value);
+        }
+        if (self.threshold) |value| {
+            try jw.objectField("threshold");
+            try jw.write(value);
+        }
+        if (self.candidate_threshold) |value| {
+            try jw.objectField("candidate_threshold");
+            try jw.write(value);
+        }
+        if (self.directed) |value| {
+            try jw.objectField("directed");
+            try jw.write(value);
+        }
+        if (self.symmetric) |value| {
+            try jw.objectField("symmetric");
+            try jw.write(value);
+        }
+        if (self.inverse) |value| {
+            try jw.objectField("inverse");
+            try jw.write(value);
+        }
+        if (self.allow_self) |value| {
+            try jw.objectField("allow_self");
+            try jw.write(value);
+        }
+        if (self.max_per_head) |value| {
+            try jw.objectField("max_per_head");
+            try jw.write(value);
+        }
+        if (self.max_per_tail) |value| {
+            try jw.objectField("max_per_tail");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Separate typed graph schema, mutually exclusive with ordinary extraction families. Hard typed endpoints, overlap, uniqueness and declared graph constraints apply to every returned edge, including derived companions.
+pub const ExtractionJointSchema = struct {
+    entities: std.json.ArrayHashMap(std.json.Value),
+    relations: ?std.json.ArrayHashMap(ExtractionJointRelation) = null,
+    constraints: ?[]const ExtractionJointConstraint = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "entities", "entities", false },
+        .{ "relations", "relations", true },
+        .{ "constraints", "constraints", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("entities");
+        try jw.write(self.entities);
+        if (self.relations) |value| {
+            try jw.objectField("relations");
+            try jw.write(value);
+        }
+        if (self.constraints) |value| {
+            try jw.objectField("constraints");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ExtractionLabelDefinition = struct {
+    /// Model-facing label description.
+    description: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "description", "description", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.description) |value| {
+            try jw.objectField("description");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ExtractionLabelProbability = struct {
+    label: []const u8,
+    probability: f32,
+};
+
+pub const ExtractionLongDocumentMetadata = struct {
+    version: i64,
+    window_count: i64,
+    window_policy: []const u8,
+    classification_aggregation: []const u8,
+    duplicate_score: []const u8,
+    natural_record_identity: []const u8,
+    other_record_identity: []const u8,
+    solver_optimality_scope: []const u8,
+};
+
+/// Version 2 never silently truncates. Reject is the default. Windowing requires an enabled runtime capability, reconstructs document-global offsets and revalidates all hard graph constraints after merging.
+pub const ExtractionLongDocumentOptions = struct {
+    mode: ?[]const u8 = null,
+    /// Maximum body words per window; also bounded by the checkpoint and encoded token limits.
+    window_words: ?i64 = null,
+    overlap_words: ?i64 = null,
+    max_windows: ?i64 = null,
+    /// Identity of latent, anchorless and legacy records across windows. Occurrence uses exact source spans; semantic explicitly merges equal field values. Natural records always use their exact source anchor. This is independent of annotation occurrence_policy.
+    record_identity: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "mode", "mode", true },
+        .{ "window_words", "window_words", true },
+        .{ "overlap_words", "overlap_words", true },
+        .{ "max_windows", "max_windows", true },
+        .{ "record_identity", "record_identity", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.mode) |value| {
+            try jw.objectField("mode");
+            try jw.write(value);
+        }
+        if (self.window_words) |value| {
+            try jw.objectField("window_words");
+            try jw.write(value);
+        }
+        if (self.overlap_words) |value| {
+            try jw.objectField("overlap_words");
+            try jw.write(value);
+        }
+        if (self.max_windows) |value| {
+            try jw.objectField("max_windows");
+            try jw.write(value);
+        }
+        if (self.record_identity) |value| {
+            try jw.objectField("record_identity");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ExtractionObject = struct {
+    /// Typed decision results from capable extractors, alongside compatible per-label classifications.
+    decisions: ?[]const ExtractionDecision = null,
+    id: ?[]const u8 = null,
+    offset_unit: ?std.json.Value = null,
+    entities: ?[]const ExtractionEntity = null,
+    relations: ?[]const ExtractionRelation = null,
+    classifications: ?[]const ExtractionClassification = null,
+    /// Structure name to record array. Each record maps field names to value objects or arrays of value objects; v2 value objects follow ExtractionFieldValue.
+    structures: ?std.json.ArrayHashMap(std.json.Value) = null,
+    /// Version 2 metadata arrays aligned with each named structure's record array.
+    structure_metadata: ?std.json.ArrayHashMap([]const ExtractionRecordMetadata) = null,
+    solvers: ?std.json.Value = null,
+    long_document: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "decisions", "decisions", true },
+        .{ "id", "id", true },
+        .{ "offset_unit", "offset_unit", true },
+        .{ "entities", "entities", true },
+        .{ "relations", "relations", true },
+        .{ "classifications", "classifications", true },
+        .{ "structures", "structures", true },
+        .{ "structure_metadata", "structure_metadata", true },
+        .{ "solvers", "solvers", true },
+        .{ "long_document", "long_document", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.decisions) |value| {
+            try jw.objectField("decisions");
+            try jw.write(value);
+        }
         if (self.id) |value| {
             try jw.objectField("id");
+            try jw.write(value);
+        }
+        if (self.offset_unit) |value| {
+            try jw.objectField("offset_unit");
             try jw.write(value);
         }
         if (self.entities) |value| {
@@ -11060,7 +12520,48 @@ pub const ExtractionObject = struct {
             try jw.objectField("structures");
             try jw.write(value);
         }
+        if (self.structure_metadata) |value| {
+            try jw.objectField("structure_metadata");
+            try jw.write(value);
+        }
+        if (self.solvers) |value| {
+            try jw.objectField("solvers");
+            try jw.write(value);
+        }
+        if (self.long_document) |value| {
+            try jw.objectField("long_document");
+            try jw.write(value);
+        }
         try jw.endObject();
+    }
+};
+
+/// Half-open offsets into the immutable caller text. Version 2 defaults to utf8_bytes. No normalization, lowercasing or synthetic suffix is included in these coordinates.
+pub const ExtractionOffsetUnit = enum {
+    utf8_bytes,
+    unicode_codepoints,
+    utf16_codeunits,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .utf8_bytes => "utf8_bytes",
+            .unicode_codepoints => "unicode_codepoints",
+            .utf16_codeunits => "utf16_codeunits",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "utf8_bytes", .utf8_bytes },
+            .{ "unicode_codepoints", .unicode_codepoints },
+            .{ "utf16_codeunits", .utf16_codeunits },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
     }
 };
 
@@ -11069,6 +12570,14 @@ pub const ExtractionOptions = struct {
     flat_ner: ?bool = null,
     include_confidence: ?bool = null,
     include_spans: ?bool = null,
+    /// Version 2 source word splitting. char keeps ASCII alphanumeric and @._-+ runs together and splits other non-whitespace codepoints, preserving original source offsets. An input's options replace the shared options in full; omitted word_splitter uses whitespace. Explicit word_splitter is rejected by version 1.
+    word_splitter: ?[]const u8 = null,
+    /// Version 2 overlap selection. flat/disallow prohibit overlap, nested permits containment, longest removes strictly contained spans.
+    overlap: ?[]const u8 = null,
+    offset_unit: ?std.json.Value = null,
+    long_document: ?std.json.Value = null,
+    decoder: ?std.json.Value = null,
+    joint_ie: ?std.json.Value = null,
     reader: ?ExtractionReaderOptions = null,
     resolver: ?ExtractionResolverOptions = null,
 
@@ -11078,6 +12587,12 @@ pub const ExtractionOptions = struct {
         .{ "flat_ner", "flat_ner", true },
         .{ "include_confidence", "include_confidence", true },
         .{ "include_spans", "include_spans", true },
+        .{ "word_splitter", "word_splitter", true },
+        .{ "overlap", "overlap", true },
+        .{ "offset_unit", "offset_unit", true },
+        .{ "long_document", "long_document", true },
+        .{ "decoder", "decoder", true },
+        .{ "joint_ie", "joint_ie", true },
         .{ "reader", "reader", true },
         .{ "resolver", "resolver", true },
     };
@@ -11108,6 +12623,30 @@ pub const ExtractionOptions = struct {
             try jw.objectField("include_spans");
             try jw.write(value);
         }
+        if (self.word_splitter) |value| {
+            try jw.objectField("word_splitter");
+            try jw.write(value);
+        }
+        if (self.overlap) |value| {
+            try jw.objectField("overlap");
+            try jw.write(value);
+        }
+        if (self.offset_unit) |value| {
+            try jw.objectField("offset_unit");
+            try jw.write(value);
+        }
+        if (self.long_document) |value| {
+            try jw.objectField("long_document");
+            try jw.write(value);
+        }
+        if (self.decoder) |value| {
+            try jw.objectField("decoder");
+            try jw.write(value);
+        }
+        if (self.joint_ie) |value| {
+            try jw.objectField("joint_ie");
+            try jw.write(value);
+        }
         if (self.reader) |value| {
             try jw.objectField("reader");
             try jw.write(value);
@@ -11119,6 +12658,8 @@ pub const ExtractionOptions = struct {
         try jw.endObject();
     }
 };
+
+pub const ExtractionProbability = f64;
 
 pub const ExtractionReaderOptions = struct {
     provider: ?[]const u8 = null,
@@ -11164,11 +12705,94 @@ pub const ExtractionReaderOptions = struct {
     }
 };
 
+pub const ExtractionRecordMetadata = struct {
+    score: ?std.json.Value = null,
+    anchor: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "score", "score", true },
+        .{ "anchor", "anchor", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.score) |value| {
+            try jw.objectField("score");
+            try jw.write(value);
+        }
+        if (self.anchor) |value| {
+            try jw.objectField("anchor");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ExtractionRegexValidator = struct {
+    type: ?[]const u8 = null,
+    pattern: []const u8,
+    mode: ?[]const u8 = null,
+    exclude: ?bool = null,
+    /// Python-compatible regex flags supported by the active bounded validator engine; unsupported flags or syntax fail validation.
+    flags: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", true },
+        .{ "pattern", "pattern", false },
+        .{ "mode", "mode", true },
+        .{ "exclude", "exclude", true },
+        .{ "flags", "flags", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.type) |value| {
+            try jw.objectField("type");
+            try jw.write(value);
+        }
+        try jw.objectField("pattern");
+        try jw.write(self.pattern);
+        if (self.mode) |value| {
+            try jw.objectField("mode");
+            try jw.write(value);
+        }
+        if (self.exclude) |value| {
+            try jw.objectField("exclude");
+            try jw.write(value);
+        }
+        if (self.flags) |value| {
+            try jw.objectField("flags");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 pub const ExtractionRelation = struct {
     type: []const u8,
     source: ?ExtractionRelationEndpoint = null,
     target: ?ExtractionRelationEndpoint = null,
     score: ?f32 = null,
+    /// Version 2 inverse or symmetric companion derived from a selected relation.
+    derived: ?bool = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -11176,6 +12800,7 @@ pub const ExtractionRelation = struct {
         .{ "source", "source", true },
         .{ "target", "target", true },
         .{ "score", "score", true },
+        .{ "derived", "derived", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -11202,6 +12827,10 @@ pub const ExtractionRelation = struct {
             try jw.objectField("score");
             try jw.write(value);
         }
+        if (self.derived) |value| {
+            try jw.objectField("derived");
+            try jw.write(value);
+        }
         try jw.endObject();
     }
 };
@@ -11209,11 +12838,23 @@ pub const ExtractionRelation = struct {
 pub const ExtractionRelationEndpoint = struct {
     entity_index: ?i64 = null,
     id: ?[]const u8 = null,
+    /// Entity type when the endpoint has a typed identity.
+    label: ?[]const u8 = null,
+    /// Version 2 endpoint surface, including endpoints absent from the entities list.
+    text: ?[]const u8 = null,
+    start: ?i64 = null,
+    end: ?i64 = null,
+    score: ?f32 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "entity_index", "entity_index", true },
         .{ "id", "id", true },
+        .{ "label", "label", true },
+        .{ "text", "text", true },
+        .{ "start", "start", true },
+        .{ "end", "end", true },
+        .{ "score", "score", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -11234,6 +12875,26 @@ pub const ExtractionRelationEndpoint = struct {
             try jw.objectField("id");
             try jw.write(value);
         }
+        if (self.label) |value| {
+            try jw.objectField("label");
+            try jw.write(value);
+        }
+        if (self.text) |value| {
+            try jw.objectField("text");
+            try jw.write(value);
+        }
+        if (self.start) |value| {
+            try jw.objectField("start");
+            try jw.write(value);
+        }
+        if (self.end) |value| {
+            try jw.objectField("end");
+            try jw.write(value);
+        }
+        if (self.score) |value| {
+            try jw.objectField("score");
+            try jw.write(value);
+        }
         try jw.endObject();
     }
 };
@@ -11243,12 +12904,17 @@ pub const ExtractionRelationSchema = struct {
     type: []const u8,
     source: ?[]const u8 = null,
     target: ?[]const u8 = null,
+    /// Version 2 model-facing relation description.
+    description: ?[]const u8 = null,
+    threshold: ?std.json.Value = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "type", "type", false },
         .{ "source", "source", true },
         .{ "target", "target", true },
+        .{ "description", "description", true },
+        .{ "threshold", "threshold", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -11271,12 +12937,22 @@ pub const ExtractionRelationSchema = struct {
             try jw.objectField("target");
             try jw.write(value);
         }
+        if (self.description) |value| {
+            try jw.objectField("description");
+            try jw.write(value);
+        }
+        if (self.threshold) |value| {
+            try jw.objectField("threshold");
+            try jw.write(value);
+        }
         try jw.endObject();
     }
 };
 
+/// Atomic extraction request. Every input is validated before inference; failures return no partial data.
 pub const ExtractionRequest = struct {
     model: []const u8,
+    schema_version: ?std.json.Value = null,
     inputs: []const ExtractionInput,
     schema: ExtractionSchema,
     options: ?ExtractionOptions = null,
@@ -11284,6 +12960,7 @@ pub const ExtractionRequest = struct {
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "model", "model", false },
+        .{ "schema_version", "schema_version", true },
         .{ "inputs", "inputs", false },
         .{ "schema", "schema", false },
         .{ "options", "options", true },
@@ -11301,6 +12978,10 @@ pub const ExtractionRequest = struct {
         try jw.beginObject();
         try jw.objectField("model");
         try jw.write(self.model);
+        if (self.schema_version) |value| {
+            try jw.objectField("schema_version");
+            try jw.write(value);
+        }
         try jw.objectField("inputs");
         try jw.write(self.inputs);
         try jw.objectField("schema");
@@ -11373,6 +13054,7 @@ pub const ExtractionResolverOptions = struct {
 pub const ExtractionResponse = struct {
     object: []const u8,
     model: []const u8,
+    schema_version: ?std.json.Value = null,
     data: []const ExtractionObject,
     usage: ?std.json.ArrayHashMap(std.json.Value) = null,
 
@@ -11380,6 +13062,7 @@ pub const ExtractionResponse = struct {
     pub const openApiFieldMetadata = .{
         .{ "object", "object", false },
         .{ "model", "model", false },
+        .{ "schema_version", "schema_version", true },
         .{ "data", "data", false },
         .{ "usage", "usage", true },
     };
@@ -11398,6 +13081,10 @@ pub const ExtractionResponse = struct {
         try jw.write(self.object);
         try jw.objectField("model");
         try jw.write(self.model);
+        if (self.schema_version) |value| {
+            try jw.objectField("schema_version");
+            try jw.write(value);
+        }
         try jw.objectField("data");
         try jw.write(self.data);
         if (self.usage) |value| {
@@ -11408,12 +13095,16 @@ pub const ExtractionResponse = struct {
     }
 };
 
-/// Selects one extraction operation family per request. Entity labels may accompany relation schemas so relation extraction can return its participating entities in the same response.
+/// Version 1 selects one extraction family; entities may accompany relations. With schema_version 2, entities, attributes, classifications, structures, and ordinary relations may share one encoded input. joint_ie is a separate, mutually exclusive typed graph schema. The version 2 compiler rejects unknown fields and validates all references before model execution.
 pub const ExtractionSchema = struct {
     entities: ?[]const []const u8 = null,
     relations: ?[]const ExtractionRelationSchema = null,
     classifications: ?[]const ExtractionClassificationSchema = null,
     structures: ?std.json.ArrayHashMap(ExtractionStructureSchema) = null,
+    entity_definitions: ?std.json.ArrayHashMap(ExtractionEntityDefinition) = null,
+    entity_attributes: ?std.json.ArrayHashMap(ExtractionAttributeGroup) = null,
+    classification_constraints: ?[]const ExtractionClassificationConstraint = null,
+    joint_ie: ?std.json.Value = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -11421,6 +13112,10 @@ pub const ExtractionSchema = struct {
         .{ "relations", "relations", true },
         .{ "classifications", "classifications", true },
         .{ "structures", "structures", true },
+        .{ "entity_definitions", "entity_definitions", true },
+        .{ "entity_attributes", "entity_attributes", true },
+        .{ "classification_constraints", "classification_constraints", true },
+        .{ "joint_ie", "joint_ie", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -11449,14 +13144,118 @@ pub const ExtractionSchema = struct {
             try jw.objectField("structures");
             try jw.write(value);
         }
+        if (self.entity_definitions) |value| {
+            try jw.objectField("entity_definitions");
+            try jw.write(value);
+        }
+        if (self.entity_attributes) |value| {
+            try jw.objectField("entity_attributes");
+            try jw.write(value);
+        }
+        if (self.classification_constraints) |value| {
+            try jw.objectField("classification_constraints");
+            try jw.write(value);
+        }
+        if (self.joint_ie) |value| {
+            try jw.objectField("joint_ie");
+            try jw.write(value);
+        }
         try jw.endObject();
     }
+};
+
+/// Omission preserves the legacy extraction contract. Version 2 opts into strict mixed-task schemas, per-input replacements and explicit offsets; the selected model/runtime must support every requested feature.
+pub const ExtractionSchemaVersion = i64;
+
+pub const ExtractionSolverDiagnostics = struct {
+    classification: ?std.json.Value = null,
+    joint_ie: ?std.json.Value = null,
+    records: ?std.json.Value = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "classification", "classification", true },
+        .{ "joint_ie", "joint_ie", true },
+        .{ "records", "records", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.classification) |value| {
+            try jw.objectField("classification");
+            try jw.write(value);
+        }
+        if (self.joint_ie) |value| {
+            try jw.objectField("joint_ie");
+            try jw.write(value);
+        }
+        if (self.records) |value| {
+            try jw.objectField("records");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ExtractionSolverStatus = struct {
+    status: []const u8,
+    utility: f64,
+    visited_nodes: i64,
+    exhausted: bool,
 };
 
 pub const ExtractionStructureField = std.json.Value;
 
 pub const ExtractionStructureSchema = struct {
     fields: std.json.ArrayHashMap(ExtractionStructureField),
+    /// Version 2 record grouping. Omission preserves one-record extraction.
+    mode: ?[]const u8 = null,
+    /// Natural mode only; defaults to the first declared field.
+    anchor: ?[]const u8 = null,
+    occurrence_policy: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "fields", "fields", false },
+        .{ "mode", "mode", true },
+        .{ "anchor", "anchor", true },
+        .{ "occurrence_policy", "occurrence_policy", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("fields");
+        try jw.write(self.fields);
+        if (self.mode) |value| {
+            try jw.objectField("mode");
+            try jw.write(value);
+        }
+        if (self.anchor) |value| {
+            try jw.objectField("anchor");
+            try jw.write(value);
+        }
+        if (self.occurrence_policy) |value| {
+            try jw.objectField("occurrence_policy");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const ExtractionToken = struct {
@@ -11925,6 +13724,93 @@ pub const ForeignColumn = struct {
     }
 };
 
+/// Action on referencing rows when a referenced row is changed or removed.
+pub const ForeignKeyAction = enum {
+    restrict,
+    set_null,
+    cascade,
+    no_action,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .restrict => "restrict",
+            .set_null => "set_null",
+            .cascade => "cascade",
+            .no_action => "no_action",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "restrict", .restrict },
+            .{ "set_null", .set_null },
+            .{ "cascade", .cascade },
+            .{ "no_action", .no_action },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Null matching semantics of a composite foreign key. Partial requires at least one parent matching every non-null child component; all-null children are exempt. Compatible parent witnesses are guarded through commit, including concurrent deletion of alternative witnesses.
+pub const ForeignKeyMatch = enum {
+    simple,
+    full,
+    partial,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .simple => "simple",
+            .full => "full",
+            .partial => "partial",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "simple", .simple },
+            .{ "full", .full },
+            .{ "partial", .partial },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Enforcement timing for atomic mutations and transaction sessions. Deferred requires deferrable=true and validates the final transaction state. NO ACTION permits a valid final-state parent replacement; RESTRICT still rejects referenced parent removal. Existing multi-request transaction sessions retain deferred checks until commit; immediate checks apply to each staged statement. SET CONSTRAINTS is not provided.
+pub const ForeignKeyTiming = enum {
+    immediate,
+    deferred,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .immediate => "immediate",
+            .deferred => "deferred",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "immediate", .immediate },
+            .{ "deferred", .deferred },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const ForeignSource = struct {
     /// Type of the foreign data source. Currently only "postgres" is supported.
     type: []const u8,
@@ -12078,15 +13964,15 @@ pub const FullTextIndexStats = struct {
     readiness: ?IndexReadinessStatus = null,
     /// Opaque identity of the desired index incarnation. Clients may compare it for equality but must not interpret its contents.
     incarnation: ?[]const u8 = null,
-    target_revision: ?i64 = null,
-    published_revision: ?i64 = null,
+    target_revision: ?u64 = null,
+    published_revision: ?u64 = null,
     milestones: ?IndexMilestones = null,
     /// Error message if stats could not be retrieved
     @"error": ?[]const u8 = null,
     /// Number of documents in the index
-    total_indexed: ?i64 = null,
+    total_indexed: ?u64 = null,
     /// Size of the index in bytes
-    disk_usage: ?i64 = null,
+    disk_usage: ?u64 = null,
     /// Whether the index is currently rebuilding
     rebuilding: ?bool = null,
     repair: ?IndexRepairStatus = null,
@@ -12095,17 +13981,17 @@ pub const FullTextIndexStats = struct {
     /// Full-text materialization completion as a fraction from 0.0 to 1.0. A ready index reports 1.0.
     backfill_progress: ?f64 = null,
     /// Number of documents indexed during current rebuild
-    backfill_items_processed: ?i64 = null,
+    backfill_items_processed: ?u64 = null,
     /// Operational readiness state such as ready, running, retrying, degraded, or failed.
     backfill_state: ?[]const u8 = null,
     /// Number of documents visible to the index.
-    doc_count: ?i64 = null,
+    doc_count: ?u64 = null,
     /// Number of indexed terms when available.
-    term_count: ?i64 = null,
+    term_count: ?u64 = null,
     /// Highest replay sequence applied to the index runtime.
-    replay_applied_sequence: ?i64 = null,
+    replay_applied_sequence: ?u64 = null,
     /// Replay sequence the index runtime must reach to be current.
-    replay_target_sequence: ?i64 = null,
+    replay_target_sequence: ?u64 = null,
     /// Whether replay must catch up before the index is fully current.
     replay_catch_up_required: ?bool = null,
     runtime_present: ?bool = null,
@@ -12114,8 +14000,8 @@ pub const FullTextIndexStats = struct {
     runtime_freshness: ?[]const u8 = null,
     catch_up_active: ?bool = null,
     catch_up_phase: ?[]const u8 = null,
-    catch_up_applied_sequence: ?i64 = null,
-    catch_up_target_sequence: ?i64 = null,
+    catch_up_applied_sequence: ?u64 = null,
+    catch_up_target_sequence: ?u64 = null,
     /// Full-text merge runtime diagnostics.
     text_merge: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// Asynchronous indexer runtime diagnostics.
@@ -12123,27 +14009,27 @@ pub const FullTextIndexStats = struct {
     /// Durable projection checkpoint status: clean, rebuilding, degraded, or repair_required.
     projection_checkpoint_status: ?[]const u8 = null,
     /// Highest derived-log sequence covered by the durable projection checkpoint.
-    projection_checkpoint_applied_sequence: ?i64 = null,
+    projection_checkpoint_applied_sequence: ?u64 = null,
     /// Projection generation associated with the durable checkpoint.
-    projection_checkpoint_generation: ?i64 = null,
+    projection_checkpoint_generation: ?u64 = null,
     /// Projection configuration identity associated with the durable checkpoint.
     projection_checkpoint_config_fingerprint: ?[]const u8 = null,
     /// Number of derived-log sequences after the durable checkpoint that still need replay.
-    checkpoint_replay_tail_sequence_count: ?i64 = null,
+    checkpoint_replay_tail_sequence_count: ?u64 = null,
     /// Repair issues found by explicit repair-scan accounting for this projection.
-    repair_scan_issue_count: ?i64 = null,
-    edge_count: ?i64 = null,
-    node_count: ?i64 = null,
+    repair_scan_issue_count: ?u64 = null,
+    edge_count: ?u64 = null,
+    node_count: ?u64 = null,
     repair_degraded: ?bool = null,
-    repair_issue_count: ?i64 = null,
+    repair_issue_count: ?u64 = null,
     repair_summary_ready: ?bool = null,
     repair_issue_count_estimated: ?bool = null,
-    expected_groups: ?i64 = null,
-    reported_groups: ?i64 = null,
-    fresh_groups: ?i64 = null,
-    stale_groups: ?i64 = null,
-    missing_groups: ?i64 = null,
-    unknown_remote_groups: ?i64 = null,
+    expected_groups: ?u64 = null,
+    reported_groups: ?u64 = null,
+    fresh_groups: ?u64 = null,
+    stale_groups: ?u64 = null,
+    missing_groups: ?u64 = null,
+    unknown_remote_groups: ?u64 = null,
     /// Artifact resolution replay diagnostics.
     resolution: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// Artifact promotion replay diagnostics.
@@ -12556,6 +14442,10 @@ pub const GeneratorConfig = struct {
     timeout: ?i64 = null,
     /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
     api_url: ?[]const u8 = null,
+    /// OpenAI completion budget, including visible output and reasoning tokens. Use for reasoning models instead of max_tokens; the two are mutually exclusive.
+    max_completion_tokens: ?i64 = null,
+    /// Optional reasoning effort. Supported values depend on the selected OpenAI model.
+    reasoning_effort: ?OpenAIReasoningEffort = null,
     /// Penalty for token frequency (-2.0 to 2.0).
     frequency_penalty: ?f32 = null,
     /// Penalty for token presence (-2.0 to 2.0).
@@ -12577,6 +14467,8 @@ pub const GeneratorConfig = struct {
         .{ "credentials_path", "credentials_path", true },
         .{ "timeout", "timeout", true },
         .{ "api_url", "api_url", true },
+        .{ "max_completion_tokens", "max_completion_tokens", true },
+        .{ "reasoning_effort", "reasoning_effort", true },
         .{ "frequency_penalty", "frequency_penalty", true },
         .{ "presence_penalty", "presence_penalty", true },
         .{ "rate_limit", "rate_limit", true },
@@ -12644,6 +14536,14 @@ pub const GeneratorConfig = struct {
             try jw.objectField("api_url");
             try jw.write(value);
         }
+        if (self.max_completion_tokens) |value| {
+            try jw.objectField("max_completion_tokens");
+            try jw.write(value);
+        }
+        if (self.reasoning_effort) |value| {
+            try jw.objectField("reasoning_effort");
+            try jw.write(value);
+        }
         if (self.frequency_penalty) |value| {
             try jw.objectField("frequency_penalty");
             try jw.write(value);
@@ -12666,6 +14566,7 @@ pub const GeneratorProvider = enum {
     vertex,
     ollama,
     openai,
+    openrouter,
     antfly,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -12674,6 +14575,7 @@ pub const GeneratorProvider = enum {
             .vertex => "vertex",
             .ollama => "ollama",
             .openai => "openai",
+            .openrouter => "openrouter",
             .antfly => "antfly",
         };
         try jw.write(s);
@@ -12689,6 +14591,7 @@ pub const GeneratorProvider = enum {
             .{ "vertex", .vertex },
             .{ "ollama", .ollama },
             .{ "openai", .openai },
+            .{ "openrouter", .openrouter },
             .{ "antfly", .antfly },
         });
         return map.get(s) orelse error.UnexpectedToken;
@@ -12915,7 +14818,8 @@ pub const GeoShapeQuery = struct {
 
 /// A stateful global query. The target table is required on this route.
 pub const GlobalStatefulQueryRequest = struct {
-    /// Name of the table to query. Required for global-query requests.
+    table_target: ?CatalogTableTarget = null,
+    /// Literal table name in default.public. Global queries require exactly one of table or table_target.
     table: ?[]const u8 = null,
     /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is non-scoring query input. - `bool.must_not` is non-scoring exclusion query input. Filter branches accept the same query variants as `filter_query` and `exclusion_query`. Structured clauses use the native document-value path; text clauses are resolved through the text index before scoring.
     query: ?std.json.Value = null,
@@ -12990,6 +14894,7 @@ pub const GlobalStatefulQueryRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "table_target", "table_target", true },
         .{ "table", "table", false },
         .{ "query", "query", true },
         .{ "full_text_search", "full_text_search", true },
@@ -13039,6 +14944,10 @@ pub const GlobalStatefulQueryRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.table_target) |value| {
+            try jw.objectField("table_target");
+            try jw.write(value);
+        }
         try jw.objectField("table");
         try jw.write(self.table);
         if (self.query) |value| {
@@ -13822,7 +15731,7 @@ pub const GraphDistinctBudgetExceededError = struct {
     /// Distinct aggregation resource exhausted by the operation.
     dimension: []const u8,
     /// Configured request ceiling for the exhausted resource.
-    maximum: i64,
+    maximum: u64,
     /// Stable user-facing guidance for reducing exact distinct state.
     remediation: []const u8,
 };
@@ -14095,7 +16004,7 @@ pub const GraphDocumentFilterConjunction = struct {
 pub const GraphDocumentFilterDisjunction = struct {
     disjuncts: []const GraphDocumentFilter,
     /// Minimum number of disjuncts that must match. Omit for conventional context-sensitive disjunction semantics; set to 0 to impose no matching-clause requirement. Under `must_not`, the complete thresholded disjunction is negated as one group.
-    min: ?i64 = null,
+    min: ?u32 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -14346,7 +16255,7 @@ pub const GraphEdgeWeightRange = struct {
 /// Completion statistics for a graph result that is exact or fails without producing a result.
 pub const GraphExactResultStats = struct {
     /// Number of primary result items returned (paths or aggregates).
-    returned_items: i64,
+    returned_items: u64,
 };
 
 /// User-visible graph alias or named result under Antfly graph identifier policy v1 (Unicode 15.0.0). Identifiers are exact UTF-8 strings and are not normalized. Ordinary internal ASCII spaces are allowed. The value must not equal `*`, begin with `$`, have leading or trailing spaces, contain non-ASCII Unicode White_Space, or contain Unicode Cc control or Cf format code points. UTF-8 encoding is limited to 512 bytes.
@@ -14477,17 +16386,17 @@ pub const GraphIndexStats = struct {
     readiness: ?IndexReadinessStatus = null,
     /// Opaque identity of the desired index incarnation. Clients may compare it for equality but must not interpret its contents.
     incarnation: ?[]const u8 = null,
-    target_revision: ?i64 = null,
-    published_revision: ?i64 = null,
+    target_revision: ?u64 = null,
+    published_revision: ?u64 = null,
     milestones: ?IndexMilestones = null,
     /// Error message if stats could not be retrieved
     @"error": ?[]const u8 = null,
     /// Total number of edges in the graph
-    total_edges: ?i64 = null,
+    total_edges: ?u64 = null,
     /// True while ownership cleanup is pending on any observed shard. Counts are physical upper bounds until cleanup completes; serving adjacency already enforces ownership.
     counts_pending: ?bool = null,
     /// Count of edges per edge type
-    edge_types: ?std.json.ArrayHashMap(i64) = null,
+    edge_types: ?std.json.ArrayHashMap(u64) = null,
     /// Whether the index is currently rebuilding
     rebuilding: ?bool = null,
     repair: ?IndexRepairStatus = null,
@@ -14496,17 +16405,17 @@ pub const GraphIndexStats = struct {
     /// Rebuild progress as a ratio from 0.0 to 1.0
     backfill_progress: ?f64 = null,
     /// Number of edges indexed during current rebuild
-    backfill_items_processed: ?i64 = null,
+    backfill_items_processed: ?u64 = null,
     /// Operational readiness state such as ready, running, retrying, degraded, or failed.
     backfill_state: ?[]const u8 = null,
     /// Number of documents covered by the graph index.
-    doc_count: ?i64 = null,
+    doc_count: ?u64 = null,
     /// Number of graph edges currently indexed.
-    edge_count: ?i64 = null,
+    edge_count: ?u64 = null,
     /// Number of graph nodes currently indexed.
-    node_count: ?i64 = null,
-    replay_applied_sequence: ?i64 = null,
-    replay_target_sequence: ?i64 = null,
+    node_count: ?u64 = null,
+    replay_applied_sequence: ?u64 = null,
+    replay_target_sequence: ?u64 = null,
     replay_catch_up_required: ?bool = null,
     runtime_present: ?bool = null,
     runtime_fresh: ?bool = null,
@@ -14514,8 +16423,8 @@ pub const GraphIndexStats = struct {
     runtime_freshness: ?[]const u8 = null,
     catch_up_active: ?bool = null,
     catch_up_phase: ?[]const u8 = null,
-    catch_up_applied_sequence: ?i64 = null,
-    catch_up_target_sequence: ?i64 = null,
+    catch_up_applied_sequence: ?u64 = null,
+    catch_up_target_sequence: ?u64 = null,
     /// Graph source artifact materialization status.
     source_artifact: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// Resolver replay diagnostics for graph materialization.
@@ -14524,26 +16433,26 @@ pub const GraphIndexStats = struct {
     /// Durable projection checkpoint status: clean, rebuilding, degraded, or repair_required.
     projection_checkpoint_status: ?[]const u8 = null,
     /// Highest derived-log sequence covered by the durable projection checkpoint.
-    projection_checkpoint_applied_sequence: ?i64 = null,
+    projection_checkpoint_applied_sequence: ?u64 = null,
     /// Projection generation associated with the durable checkpoint.
-    projection_checkpoint_generation: ?i64 = null,
+    projection_checkpoint_generation: ?u64 = null,
     /// Projection configuration identity associated with the durable checkpoint.
     projection_checkpoint_config_fingerprint: ?[]const u8 = null,
     /// Number of derived-log sequences after the durable checkpoint that still need replay.
-    checkpoint_replay_tail_sequence_count: ?i64 = null,
+    checkpoint_replay_tail_sequence_count: ?u64 = null,
     /// Repair issues found by explicit repair-scan accounting for this projection.
-    repair_scan_issue_count: ?i64 = null,
-    term_count: ?i64 = null,
+    repair_scan_issue_count: ?u64 = null,
+    term_count: ?u64 = null,
     repair_degraded: ?bool = null,
-    repair_issue_count: ?i64 = null,
+    repair_issue_count: ?u64 = null,
     repair_summary_ready: ?bool = null,
     repair_issue_count_estimated: ?bool = null,
-    expected_groups: ?i64 = null,
-    reported_groups: ?i64 = null,
-    fresh_groups: ?i64 = null,
-    stale_groups: ?i64 = null,
-    missing_groups: ?i64 = null,
-    unknown_remote_groups: ?i64 = null,
+    expected_groups: ?u64 = null,
+    reported_groups: ?u64 = null,
+    fresh_groups: ?u64 = null,
+    stale_groups: ?u64 = null,
+    missing_groups: ?u64 = null,
+    unknown_remote_groups: ?u64 = null,
     /// Artifact resolution replay diagnostics.
     resolution: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// Artifact promotion replay diagnostics.
@@ -15083,9 +16992,9 @@ pub const GraphMatchOperationLimitExceededError = struct {
     message: []const u8,
     retryable: bool,
     /// Maximum named MATCH operations accepted in one request.
-    maximum: i64,
+    maximum: u64,
     /// Named MATCH operations supplied by the request.
-    actual: i64,
+    actual: u64,
 };
 
 /// Conjunctive graph match over the complete authorized source universe. Top-level retrieval queries and filters do not scope that universe; put source constraints on the node named by match.anchor. Results are exact or the request fails; execution never labels a partial aggregate exact. Source anchors are streamed in stable snapshot-pinned pages and charged to the request-wide `scanned_anchors` work dimension; transient expansion state remains bounded, and execution observes request deadlines, cancellation, and server resource admission. Exact distinct identity sets are also bounded and fail closed when their request-scoped memory budget is exhausted.
@@ -15568,57 +17477,57 @@ pub const GraphMetricResult = struct {
 pub const GraphMetricRuntimeStats = struct {
     enabled: ?bool = null,
     role: ?[]const u8 = null,
-    runtime_id_hash: ?i64 = null,
-    owner_id_hash: ?i64 = null,
-    lease_key_hash: ?i64 = null,
-    worker_id_hash: ?i64 = null,
-    worker_count: ?i64 = null,
+    runtime_id_hash: ?u64 = null,
+    owner_id_hash: ?u64 = null,
+    lease_key_hash: ?u64 = null,
+    worker_id_hash: ?u64 = null,
+    worker_count: ?u64 = null,
     lease_owned: ?bool = null,
     has_lease: ?bool = null,
-    acquisition_count: ?i64 = null,
-    takeover_count: ?i64 = null,
-    lease_acquire_failures: ?i64 = null,
-    lost_leases: ?i64 = null,
-    last_acquired_ms: ?i64 = null,
+    acquisition_count: ?u64 = null,
+    takeover_count: ?u64 = null,
+    lease_acquire_failures: ?u64 = null,
+    lost_leases: ?u64 = null,
+    last_acquired_ms: ?u64 = null,
     /// Cached expiry of the currently held maintenance lease, or zero when no lease is held.
-    lease_expires_at_ms: ?i64 = null,
+    lease_expires_at_ms: ?u64 = null,
     /// Earliest time the runtime will renew its maintenance lease, or zero when no lease is held.
-    lease_renew_after_ms: ?i64 = null,
+    lease_renew_after_ms: ?u64 = null,
     /// Number of durable maintenance lease renewals completed by this runtime.
-    renewal_count: ?i64 = null,
+    renewal_count: ?u64 = null,
     started: ?bool = null,
     shutdown: ?bool = null,
     notified: ?bool = null,
-    ticks_started: ?i64 = null,
-    ticks_completed: ?i64 = null,
-    durable_progress_ticks: ?i64 = null,
-    idle_ticks: ?i64 = null,
-    error_ticks: ?i64 = null,
+    ticks_started: ?u64 = null,
+    ticks_completed: ?u64 = null,
+    durable_progress_ticks: ?u64 = null,
+    idle_ticks: ?u64 = null,
+    error_ticks: ?u64 = null,
     last_error_name: ?[]const u8 = null,
-    total_metrics_scanned: ?i64 = null,
-    total_active_builds: ?i64 = null,
-    total_builds_started: ?i64 = null,
-    total_worker_steps: ?i64 = null,
-    total_coordinator_steps: ?i64 = null,
+    total_metrics_scanned: ?u64 = null,
+    total_active_builds: ?u64 = null,
+    total_builds_started: ?u64 = null,
+    total_worker_steps: ?u64 = null,
+    total_coordinator_steps: ?u64 = null,
     /// Consumed intermediate records retired at completed reduction barriers.
-    total_retired_input_records: ?i64 = null,
-    total_pages_claimed: ?i64 = null,
-    total_pages_completed: ?i64 = null,
-    total_phases_advanced: ?i64 = null,
-    total_published: ?i64 = null,
-    total_failed_builds: ?i64 = null,
-    last_metrics_scanned: ?i64 = null,
-    last_active_builds: ?i64 = null,
-    last_builds_started: ?i64 = null,
-    last_worker_steps: ?i64 = null,
-    last_coordinator_steps: ?i64 = null,
+    total_retired_input_records: ?u64 = null,
+    total_pages_claimed: ?u64 = null,
+    total_pages_completed: ?u64 = null,
+    total_phases_advanced: ?u64 = null,
+    total_published: ?u64 = null,
+    total_failed_builds: ?u64 = null,
+    last_metrics_scanned: ?u64 = null,
+    last_active_builds: ?u64 = null,
+    last_builds_started: ?u64 = null,
+    last_worker_steps: ?u64 = null,
+    last_coordinator_steps: ?u64 = null,
     /// Consumed intermediate records retired in the latest maintenance tick.
-    last_retired_input_records: ?i64 = null,
-    last_pages_claimed: ?i64 = null,
-    last_pages_completed: ?i64 = null,
-    last_phases_advanced: ?i64 = null,
-    last_published: ?i64 = null,
-    last_failed_builds: ?i64 = null,
+    last_retired_input_records: ?u64 = null,
+    last_pages_claimed: ?u64 = null,
+    last_pages_completed: ?u64 = null,
+    last_phases_advanced: ?u64 = null,
+    last_published: ?u64 = null,
+    last_failed_builds: ?u64 = null,
     last_budget_exhausted: ?bool = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -16779,7 +18688,7 @@ pub const GraphResolverConfig = struct {
     fusion_trust: ?f64 = null,
     fusion_prior: ?f64 = null,
     fusion_prior_weight: ?f64 = null,
-    config_generation: ?i64 = null,
+    config_generation: ?u64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -17084,7 +18993,7 @@ pub const GraphResultRow = std.json.ArrayHashMap(GraphResultBinding);
 /// Completion statistics for a bounded graph result.
 pub const GraphResultStats = struct {
     /// Number of primary result items returned (nodes or rows).
-    returned_items: i64,
+    returned_items: u64,
     /// True when bounded enumeration stopped before exhaustive completion.
     truncated: bool,
 };
@@ -17464,7 +19373,7 @@ pub const GraphWorkBudgetExceededError = struct {
     /// Bounded resource exhausted by the operation.
     dimension: []const u8,
     /// Configured request ceiling for the exhausted resource.
-    maximum: i64,
+    maximum: u64,
     /// Stable user-facing guidance for reducing graph work.
     remediation: []const u8,
 };
@@ -17595,7 +19504,7 @@ pub const HierarchyAncestors = struct {
 pub const HierarchyArtifact = struct {
     name: []const u8,
     kind: []const u8,
-    chunk_id: ?i64 = null,
+    chunk_id: ?u32 = null,
     unit_id: ?[]const u8 = null,
     source: ?HierarchyArtifactSource = null,
 
@@ -17641,7 +19550,7 @@ pub const HierarchyArtifact = struct {
 pub const HierarchyArtifactSource = struct {
     name: []const u8,
     kind: []const u8,
-    chunk_id: ?i64 = null,
+    chunk_id: ?u32 = null,
     unit_id: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -17927,7 +19836,7 @@ pub const HierarchyMatchHit = struct {
 
 pub const HierarchyMatches = struct {
     /// Maximum matching descendant hits attached to each group, independent of the top-level query limit. Matches follow the effective query order, and the group score is the score of its best matching descendant. The maximum bounds nested response growth. Group selection uses an adaptive candidate window, then each returned group is expanded with a separately bounded query, so a group with fewer matches never forces a global exhaustive scan. To bound execution as well as response growth, grouped queries accept at most 100 top-level groups and 1,000 requested matches across the complete result page.
-    limit: ?i64 = null,
+    limit: ?u32 = null,
     /// Fields to include in each nested match. This projection is required because grouped and matching records commonly have different schemas. Use an empty array to return match identity and hierarchy metadata without stored fields.
     fields: []const []const u8,
 
@@ -18086,6 +19995,11 @@ pub const IndexConfig = struct {
     resolvers: ?[]const GraphResolverConfig = null,
     /// When true, derive the algebraic capability sidecar from the table schema. Internal fields and materialization definitions are not public API.
     derive_from_schema: ?bool = null,
+    keys: ?[]const RelationalIndexKey = null,
+    /// Non-key columns stored for index-only projection; distinct from keys.
+    include_columns: ?[]const []const u8 = null,
+    /// Optional conjunction selecting index members. Queries must explicitly include all typed conjuncts.
+    where: ?[]const RelationalIndexPredicate = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -18122,6 +20036,9 @@ pub const IndexConfig = struct {
         .{ "algebraic_planning", "algebraic_planning", true },
         .{ "resolvers", "resolvers", true },
         .{ "derive_from_schema", "derive_from_schema", true },
+        .{ "keys", "keys", true },
+        .{ "include_columns", "include_columns", true },
+        .{ "where", "where", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -18262,6 +20179,18 @@ pub const IndexConfig = struct {
             try jw.objectField("derive_from_schema");
             try jw.write(value);
         }
+        if (self.keys) |value| {
+            try jw.objectField("keys");
+            try jw.write(value);
+        }
+        if (self.include_columns) |value| {
+            try jw.objectField("include_columns");
+            try jw.write(value);
+        }
+        if (self.where) |value| {
+            try jw.objectField("where");
+            try jw.write(value);
+        }
         try jw.endObject();
     }
 };
@@ -18270,6 +20199,7 @@ pub const IndexConfig = struct {
 pub const IndexEmbedderConfig = union(enum) {
     ollama_embedder_config: OllamaEmbedderConfig,
     open_ai_embedder_config: OpenAIEmbedderConfig,
+    open_router_embedder_config: OpenRouterEmbedderConfig,
     bedrock_embedder_config: BedrockEmbedderConfig,
     cohere_embedder_config: CohereEmbedderConfig,
     google_embedder_config: GoogleEmbedderConfig,
@@ -18299,6 +20229,9 @@ pub const IndexEmbedderConfig = union(enum) {
         }
         if (std.mem.eql(u8, disc_str, "openai")) {
             return .{ .open_ai_embedder_config = try std.json.parseFromSliceLeaky(OpenAIEmbedderConfig, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "openrouter")) {
+            return .{ .open_router_embedder_config = try std.json.parseFromSliceLeaky(OpenRouterEmbedderConfig, allocator, input, options) };
         }
         if (std.mem.eql(u8, disc_str, "bedrock")) {
             return .{ .bedrock_embedder_config = try std.json.parseFromSliceLeaky(BedrockEmbedderConfig, allocator, input, options) };
@@ -18338,6 +20271,9 @@ pub const IndexEmbedderConfig = union(enum) {
         if (std.mem.eql(u8, disc_str, "openai")) {
             return .{ .open_ai_embedder_config = try std.json.parseFromValueLeaky(OpenAIEmbedderConfig, allocator, source, options) };
         }
+        if (std.mem.eql(u8, disc_str, "openrouter")) {
+            return .{ .open_router_embedder_config = try std.json.parseFromValueLeaky(OpenRouterEmbedderConfig, allocator, source, options) };
+        }
         if (std.mem.eql(u8, disc_str, "bedrock")) {
             return .{ .bedrock_embedder_config = try std.json.parseFromValueLeaky(BedrockEmbedderConfig, allocator, source, options) };
         }
@@ -18360,6 +20296,7 @@ pub const IndexEmbedderConfig = union(enum) {
         switch (self) {
             .ollama_embedder_config => |v| try jw.write(v),
             .open_ai_embedder_config => |v| try jw.write(v),
+            .open_router_embedder_config => |v| try jw.write(v),
             .bedrock_embedder_config => |v| try jw.write(v),
             .cohere_embedder_config => |v| try jw.write(v),
             .google_embedder_config => |v| try jw.write(v),
@@ -18402,6 +20339,27 @@ pub const IndexExecutionConfig = struct {
         }
         try jw.endObject();
     }
+};
+
+pub const IndexMaintenanceOwnerProof = struct {
+    group_id: []const u8,
+    generation: []const u8,
+    slot: u32,
+    owner: []const u8,
+    comparison: []const u8,
+    progress_digest: []const u8,
+    maintenance_epoch: []const u8,
+};
+
+/// Exact observations from index status. Each selected owner is admitted atomically through the replicated transaction journal; the selection is not one global transaction. Cancellation, conflicts, or a lost acknowledgement may leave some owners admitted. Resubmit the identical request to resume safely; do not replace its observations with newer progress unless starting a new maintenance attempt.
+pub const IndexMaintenanceRequest = struct {
+    table_id: []const u8,
+    schema_version: u32,
+    owners: []const IndexMaintenanceOwnerProof,
+};
+
+pub const IndexMaintenanceResponse = struct {
+    acknowledged_groups: []const []const u8,
 };
 
 pub const IndexMilestoneStatus = struct {
@@ -18553,9 +20511,9 @@ pub const IndexReadinessStatus = struct {
     /// Opaque identity for the desired index incarnation. Clients may compare it for equality but must not interpret its contents.
     incarnation: ?[]const u8 = null,
     /// Highest captured source/replay revision required by this readiness observation.
-    target_revision: ?i64 = null,
+    target_revision: ?u64 = null,
     /// Highest revision published to the query-visible index represented by this observation.
-    published_revision: ?i64 = null,
+    published_revision: ?u64 = null,
     /// Stable, machine-readable blockers or failure reasons. Empty when state is ready.
     pending_reasons: []const IndexReadinessReason,
     /// Operational readiness for each configured artifact stream. Present only for artifact-backed indexes, in configuration order.
@@ -18723,6 +20681,7 @@ pub const IndexStats = union(enum) {
     embeddings_index_stats: EmbeddingsIndexStats,
     graph_index_stats: GraphIndexStats,
     algebraic_index_stats: AlgebraicIndexStats,
+    relational_index_stats: RelationalIndexStats,
 
     pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
         const DiscriminatorProbe = union(enum) {
@@ -18754,6 +20713,9 @@ pub const IndexStats = union(enum) {
         if (std.mem.eql(u8, disc_str, "algebraic")) {
             return .{ .algebraic_index_stats = try std.json.parseFromSliceLeaky(AlgebraicIndexStats, allocator, input, options) };
         }
+        if (std.mem.eql(u8, disc_str, "relational")) {
+            return .{ .relational_index_stats = try std.json.parseFromSliceLeaky(RelationalIndexStats, allocator, input, options) };
+        }
         return error.UnexpectedToken;
     }
 
@@ -18783,6 +20745,9 @@ pub const IndexStats = union(enum) {
         if (std.mem.eql(u8, disc_str, "algebraic")) {
             return .{ .algebraic_index_stats = try std.json.parseFromValueLeaky(AlgebraicIndexStats, allocator, source, options) };
         }
+        if (std.mem.eql(u8, disc_str, "relational")) {
+            return .{ .relational_index_stats = try std.json.parseFromValueLeaky(RelationalIndexStats, allocator, source, options) };
+        }
         return error.UnexpectedToken;
     }
 
@@ -18792,6 +20757,7 @@ pub const IndexStats = union(enum) {
             .embeddings_index_stats => |v| try jw.write(v),
             .graph_index_stats => |v| try jw.write(v),
             .algebraic_index_stats => |v| try jw.write(v),
+            .relational_index_stats => |v| try jw.write(v),
         }
     }
 };
@@ -18808,6 +20774,7 @@ pub const IndexType = enum {
     embeddings,
     graph,
     algebraic,
+    relational,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -18815,6 +20782,7 @@ pub const IndexType = enum {
             .embeddings => "embeddings",
             .graph => "graph",
             .algebraic => "algebraic",
+            .relational => "relational",
         };
         try jw.write(s);
     }
@@ -18829,6 +20797,7 @@ pub const IndexType = enum {
             .{ "embeddings", .embeddings },
             .{ "graph", .graph },
             .{ "algebraic", .algebraic },
+            .{ "relational", .relational },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -18928,6 +20897,32 @@ pub const InferenceAudioChunkConfig = struct {
             try jw.write(value);
         }
         try jw.endObject();
+    }
+};
+
+/// How much of Whisper's 30 s window the encoder processes. `full` pads every clip to 30 s, which is what the model was trained on and gives the most accurate transcripts. `dynamic` trims the encoder to the audio actually present (plus one second), which cuts encoder time roughly in proportion for short clips at a small accuracy cost on some models. Dictation defaults to `full`; streaming sessions default to `dynamic` because partials re-decode short open segments many times.
+pub const InferenceAudioContext = enum {
+    full,
+    dynamic,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .full => "full",
+            .dynamic => "dynamic",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "full", .full },
+            .{ "dynamic", .dynamic },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
     }
 };
 
@@ -19879,6 +21874,372 @@ pub const InferenceCredentials = struct {
     }
 };
 
+pub const InferenceDictateRequest = struct {
+    /// Transcriber model from models_dir/transcribers/.
+    model: []const u8,
+    /// Base64-encoded audio clip (WAV, Opus, MP3, FLAC, etc.). Clips longer than 30 s are transcribed in windows.
+    audio: []const u8,
+    /// Force the transcript language (ISO 639-1). Omit for automatic detection.
+    language: ?[]const u8 = null,
+    /// Generator model from models_dir/generators/ that rewrites the transcript. Omit to return the raw transcript.
+    cleanup_model: ?[]const u8 = null,
+    style: ?InferenceDictationStyle = null,
+    /// Preferred spellings for names and terms the recognizer tends to miss.
+    dictionary: ?[]const []const u8 = null,
+    /// Where the text will be inserted, for example "email to a customer". Steers tone and formatting.
+    context: ?[]const u8 = null,
+    /// Extra cleanup instructions appended to the built-in rules.
+    instructions: ?[]const u8 = null,
+    /// Text the recognizer treats as preceding context, so it prefers these spellings and this style. Defaults to the dictionary entries joined by commas.
+    transcript_prompt: ?[]const u8 = null,
+    vad: ?InferenceVadConfig = null,
+    audio_context: ?InferenceAudioContext = null,
+    /// Stream the response as Server-Sent Events.
+    stream: ?bool = null,
+    /// Output budget for the cleanup pass. Defaults to about twice the transcript length.
+    max_tokens: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "model", "model", false },
+        .{ "audio", "audio", false },
+        .{ "language", "language", true },
+        .{ "cleanup_model", "cleanup_model", true },
+        .{ "style", "style", true },
+        .{ "dictionary", "dictionary", true },
+        .{ "context", "context", true },
+        .{ "instructions", "instructions", true },
+        .{ "transcript_prompt", "transcript_prompt", true },
+        .{ "vad", "vad", true },
+        .{ "audio_context", "audio_context", true },
+        .{ "stream", "stream", true },
+        .{ "max_tokens", "max_tokens", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("model");
+        try jw.write(self.model);
+        try jw.objectField("audio");
+        try jw.write(self.audio);
+        if (self.language) |value| {
+            try jw.objectField("language");
+            try jw.write(value);
+        }
+        if (self.cleanup_model) |value| {
+            try jw.objectField("cleanup_model");
+            try jw.write(value);
+        }
+        if (self.style) |value| {
+            try jw.objectField("style");
+            try jw.write(value);
+        }
+        if (self.dictionary) |value| {
+            try jw.objectField("dictionary");
+            try jw.write(value);
+        }
+        if (self.context) |value| {
+            try jw.objectField("context");
+            try jw.write(value);
+        }
+        if (self.instructions) |value| {
+            try jw.objectField("instructions");
+            try jw.write(value);
+        }
+        if (self.transcript_prompt) |value| {
+            try jw.objectField("transcript_prompt");
+            try jw.write(value);
+        }
+        if (self.vad) |value| {
+            try jw.objectField("vad");
+            try jw.write(value);
+        }
+        if (self.audio_context) |value| {
+            try jw.objectField("audio_context");
+            try jw.write(value);
+        }
+        if (self.stream) |value| {
+            try jw.objectField("stream");
+            try jw.write(value);
+        }
+        if (self.max_tokens) |value| {
+            try jw.objectField("max_tokens");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const InferenceDictateResponse = struct {
+    object: []const u8,
+    id: []const u8,
+    /// Unix timestamp (seconds).
+    created: i64,
+    /// Transcriber model used.
+    model: []const u8,
+    /// Generator model used for cleanup, when one ran.
+    cleanup_model: ?[]const u8 = null,
+    transcript: InferenceDictationTranscript,
+    /// Cleaned text, or the raw transcript when no cleanup ran.
+    text: []const u8,
+    usage: InferenceGenerateUsage,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "object", "object", false },
+        .{ "id", "id", false },
+        .{ "created", "created", false },
+        .{ "model", "model", false },
+        .{ "cleanup_model", "cleanup_model", true },
+        .{ "transcript", "transcript", false },
+        .{ "text", "text", false },
+        .{ "usage", "usage", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("object");
+        try jw.write(self.object);
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("created");
+        try jw.write(self.created);
+        try jw.objectField("model");
+        try jw.write(self.model);
+        if (self.cleanup_model) |value| {
+            try jw.objectField("cleanup_model");
+            try jw.write(value);
+        }
+        try jw.objectField("transcript");
+        try jw.write(self.transcript);
+        try jw.objectField("text");
+        try jw.write(self.text);
+        try jw.objectField("usage");
+        try jw.write(self.usage);
+        try jw.endObject();
+    }
+};
+
+/// One Server-Sent Event of a streaming dictation. `dictation.transcript` carries `transcript`; `dictation.delta` carries `delta`; `dictation.completed` carries `text` and `usage`; `error` carries `error` and `message`. The stream ends with the literal `[DONE]`.
+pub const InferenceDictationEvent = struct {
+    type: []const u8,
+    id: []const u8,
+    model: ?[]const u8 = null,
+    cleanup_model: ?[]const u8 = null,
+    transcript: ?InferenceDictationTranscript = null,
+    delta: ?[]const u8 = null,
+    text: ?[]const u8 = null,
+    usage: ?InferenceGenerateUsage = null,
+    @"error": ?[]const u8 = null,
+    message: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "id", "id", false },
+        .{ "model", "model", true },
+        .{ "cleanup_model", "cleanup_model", true },
+        .{ "transcript", "transcript", true },
+        .{ "delta", "delta", true },
+        .{ "text", "text", true },
+        .{ "usage", "usage", true },
+        .{ "error", "error", true },
+        .{ "message", "message", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("id");
+        try jw.write(self.id);
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.cleanup_model) |value| {
+            try jw.objectField("cleanup_model");
+            try jw.write(value);
+        }
+        if (self.transcript) |value| {
+            try jw.objectField("transcript");
+            try jw.write(value);
+        }
+        if (self.delta) |value| {
+            try jw.objectField("delta");
+            try jw.write(value);
+        }
+        if (self.text) |value| {
+            try jw.objectField("text");
+            try jw.write(value);
+        }
+        if (self.usage) |value| {
+            try jw.objectField("usage");
+            try jw.write(value);
+        }
+        if (self.@"error") |value| {
+            try jw.objectField("error");
+            try jw.write(value);
+        }
+        if (self.message) |value| {
+            try jw.objectField("message");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// One phrase bracketed by Whisper timestamp tokens (about 20 ms resolution).
+pub const InferenceDictationSegment = struct {
+    text: []const u8,
+    /// Phrase start offset in the clip, in milliseconds.
+    start_ms: i64,
+    /// Phrase end offset in the clip, in milliseconds.
+    end_ms: i64,
+    /// Word spans estimated inside the phrase by distributing its duration over word lengths.
+    words: []const InferenceDictationWord,
+    /// Speaker label from diarization (`SPEAKER_00`, ...). Absent without diarization or when the phrase had no usable audio.
+    speaker: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "text", "text", false },
+        .{ "start_ms", "start_ms", false },
+        .{ "end_ms", "end_ms", false },
+        .{ "words", "words", false },
+        .{ "speaker", "speaker", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("text");
+        try jw.write(self.text);
+        try jw.objectField("start_ms");
+        try jw.write(self.start_ms);
+        try jw.objectField("end_ms");
+        try jw.write(self.end_ms);
+        try jw.objectField("words");
+        try jw.write(self.words);
+        if (self.speaker) |value| {
+            try jw.objectField("speaker");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// How the cleanup pass rewrites the transcript. `clean` removes fillers and fixes punctuation while keeping the speaker's wording; `formal` and `casual` also adjust register; `verbatim` skips the generator and returns the raw transcript.
+pub const InferenceDictationStyle = enum {
+    clean,
+    formal,
+    casual,
+    verbatim,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .clean => "clean",
+            .formal => "formal",
+            .casual => "casual",
+            .verbatim => "verbatim",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "clean", .clean },
+            .{ "formal", .formal },
+            .{ "casual", .casual },
+            .{ "verbatim", .verbatim },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const InferenceDictationTranscript = struct {
+    /// Raw transcript before cleanup.
+    text: []const u8,
+    /// Detected or forced language.
+    language: ?[]const u8 = null,
+    /// Decoded clip duration in milliseconds.
+    duration_ms: i64,
+    /// Timestamped phrases in clip order.
+    segments: []const InferenceDictationSegment,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "text", "text", false },
+        .{ "language", "language", true },
+        .{ "duration_ms", "duration_ms", false },
+        .{ "segments", "segments", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("text");
+        try jw.write(self.text);
+        if (self.language) |value| {
+            try jw.objectField("language");
+            try jw.write(value);
+        }
+        try jw.objectField("duration_ms");
+        try jw.write(self.duration_ms);
+        try jw.objectField("segments");
+        try jw.write(self.segments);
+        try jw.endObject();
+    }
+};
+
+pub const InferenceDictationWord = struct {
+    word: []const u8,
+    start_ms: i64,
+    end_ms: i64,
+};
+
 /// OpenAI-compatible embedding request with inference multimodal content-part extension
 pub const InferenceEmbedRequest = struct {
     /// Model name to use for embedding generation
@@ -20115,6 +22476,10 @@ pub const InferenceError = struct {
     retryable: ?bool = null,
     /// Minimum retry delay in milliseconds
     retry_after_ms: ?i64 = null,
+    /// Input whose atomic extraction validation or decoding failed, when known
+    input_index: ?i64 = null,
+    /// Extraction failure stage, when known
+    stage: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -20123,6 +22488,8 @@ pub const InferenceError = struct {
         .{ "reason", "reason", true },
         .{ "retryable", "retryable", true },
         .{ "retry_after_ms", "retry_after_ms", true },
+        .{ "input_index", "input_index", true },
+        .{ "stage", "stage", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -20151,6 +22518,14 @@ pub const InferenceError = struct {
         }
         if (self.retry_after_ms) |value| {
             try jw.objectField("retry_after_ms");
+            try jw.write(value);
+        }
+        if (self.input_index) |value| {
+            try jw.objectField("input_index");
+            try jw.write(value);
+        }
+        if (self.stage) |value| {
+            try jw.objectField("stage");
             try jw.write(value);
         }
         try jw.endObject();
@@ -21347,7 +23722,7 @@ pub const InferenceModelRef = struct {
     /// Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal or CUDA runtime. On qualified SM89 CUDA, auto resolves to resident and fails closed unless its envelope fits. Other model geometries reject this field.
     residency_mode: ?InferenceA4bResidencyMode = null,
     /// Per-model A4B memory envelope in MiB. Zero selects the backend default (2048 MiB streamed on Metal or 16384 MiB resident on qualified CUDA); CUDA rejects any envelope too small for full residency. Other model geometries reject this field.
-    memory_budget_mb: ?i64 = null,
+    memory_budget_mb: ?u32 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -21528,7 +23903,7 @@ pub const InferencePredictorsResponse = struct {
 
 /// Native generator prompt KV cache configuration.
 pub const InferencePromptCacheConfig = struct {
-    /// Enable inference-native prompt KV cache reuse for generator requests.
+    /// Enable inference-native prompt KV cache reuse for generator requests. On by default; set false to disable.
     enabled: ?bool = null,
     /// Prompt KV cache implementation. `block_hash` (default) uses hash-addressed full KV blocks under prompt_cache_key with O(1) block lookup. `radix` is an opt-in page-aligned compressed radix tree with shared-prefix ownership and leaf-only LRU eviction; it is currently qualified for native and Metal backends. Eligible Metal requests use eager paged attention; explicit compiled generation is incompatible with prompt caching. `simple` keeps the linear-scan retained-prefix cache and is only suitable for small caches or debugging.
     mode: ?[]const u8 = null,
@@ -22284,6 +24659,12 @@ pub const InferenceTranscribeObject = struct {
     text: []const u8,
     /// Detected or forced language
     language: ?[]const u8 = null,
+    /// Decoded clip duration in milliseconds.
+    duration_ms: ?i64 = null,
+    /// Timestamped phrases in clip order, so a transcript can be indexed and linked back to a moment in the recording. Clips longer than 30 s are transcribed in windows; segment offsets are relative to the whole clip.
+    segments: ?[]const InferenceDictationSegment = null,
+    /// Speaker labels found by diarization, in order of first appearance. Present only when `diarization` was requested.
+    speakers: ?[]const []const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -22291,6 +24672,9 @@ pub const InferenceTranscribeObject = struct {
         .{ "index", "index", false },
         .{ "text", "text", false },
         .{ "language", "language", true },
+        .{ "duration_ms", "duration_ms", true },
+        .{ "segments", "segments", true },
+        .{ "speakers", "speakers", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -22313,6 +24697,18 @@ pub const InferenceTranscribeObject = struct {
             try jw.objectField("language");
             try jw.write(value);
         }
+        if (self.duration_ms) |value| {
+            try jw.objectField("duration_ms");
+            try jw.write(value);
+        }
+        if (self.segments) |value| {
+            try jw.objectField("segments");
+            try jw.write(value);
+        }
+        if (self.speakers) |value| {
+            try jw.objectField("speakers");
+            try jw.write(value);
+        }
         try jw.endObject();
     }
 };
@@ -22320,16 +24716,19 @@ pub const InferenceTranscribeObject = struct {
 pub const InferenceTranscribeRequest = struct {
     /// Explicit name of the transcriber model from models_dir/transcribers/. Required so direct and distributed execution resolve the same model.
     model: []const u8,
-    /// Base64-encoded audio data (WAV, MP3, FLAC, etc.)
+    /// Base64-encoded audio data (WAV, MP3, AAC/M4A, MP4/MOV audio, Ogg/Opus, WebM/Matroska, FLAC, etc.). Clips longer than 30 s are transcribed in windows cut at pauses; silent clips return an empty transcript.
     audio: []const u8,
     /// Force specific language for transcription (optional, model-dependent)
     language: ?[]const u8 = null,
+    /// Label each segment with a speaker. Runs a local speaker-embedding model (pull `csukuangfj/speaker-embedding-models:3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx`) and clusters phrases by voice; labels are `SPEAKER_00`, `SPEAKER_01`, ... in order of first appearance.
+    diarization: ?bool = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "model", "model", false },
         .{ "audio", "audio", false },
         .{ "language", "language", true },
+        .{ "diarization", "diarization", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -22350,6 +24749,10 @@ pub const InferenceTranscribeRequest = struct {
             try jw.objectField("language");
             try jw.write(value);
         }
+        if (self.diarization) |value| {
+            try jw.objectField("diarization");
+            try jw.write(value);
+        }
         try jw.endObject();
     }
 };
@@ -22364,6 +24767,372 @@ pub const InferenceTranscribeResponse = struct {
     usage: InferenceGenerateUsage,
 };
 
+pub const InferenceTranscriptionAudioAppend = struct {
+    /// Base64 audio chunk. Optional when `commit` is true.
+    audio: ?[]const u8 = null,
+    format: ?InferenceTranscriptionAudioFormat = null,
+    /// Sample rate of raw `pcm16` / `pcm_f32` chunks. Default 16000. Ignored for containers.
+    sample_rate: ?i64 = null,
+    /// Finalize buffered speech even without trailing silence.
+    commit: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "audio", "audio", true },
+        .{ "format", "format", true },
+        .{ "sample_rate", "sample_rate", true },
+        .{ "commit", "commit", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.audio) |value| {
+            try jw.objectField("audio");
+            try jw.write(value);
+        }
+        if (self.format) |value| {
+            try jw.objectField("format");
+            try jw.write(value);
+        }
+        if (self.sample_rate) |value| {
+            try jw.objectField("sample_rate");
+            try jw.write(value);
+        }
+        if (self.commit) |value| {
+            try jw.objectField("commit");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const InferenceTranscriptionAudioFormat = enum {
+    auto,
+    pcm16,
+    pcm_f32,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .auto => "auto",
+            .pcm16 => "pcm16",
+            .pcm_f32 => "pcm_f32",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "auto", .auto },
+            .{ "pcm16", .pcm16 },
+            .{ "pcm_f32", .pcm_f32 },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const InferenceTranscriptionEvent = struct {
+    object: []const u8,
+    type: []const u8,
+    /// Monotonic per-session event counter.
+    sequence: i64,
+    /// Current hypothesis for the segment.
+    text: []const u8,
+    /// Prefix of `text` that agreed with the previous hypothesis. Equals `text` for final events.
+    stable_text: []const u8,
+    /// Segment start in the session timeline, in milliseconds.
+    start_ms: i64,
+    end_ms: i64,
+    language: ?[]const u8 = null,
+    /// Word spans on the session timeline. Empty for partial events.
+    words: ?[]const InferenceDictationWord = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "object", "object", false },
+        .{ "type", "type", false },
+        .{ "sequence", "sequence", false },
+        .{ "text", "text", false },
+        .{ "stable_text", "stable_text", false },
+        .{ "start_ms", "start_ms", false },
+        .{ "end_ms", "end_ms", false },
+        .{ "language", "language", true },
+        .{ "words", "words", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("object");
+        try jw.write(self.object);
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("sequence");
+        try jw.write(self.sequence);
+        try jw.objectField("text");
+        try jw.write(self.text);
+        try jw.objectField("stable_text");
+        try jw.write(self.stable_text);
+        try jw.objectField("start_ms");
+        try jw.write(self.start_ms);
+        try jw.objectField("end_ms");
+        try jw.write(self.end_ms);
+        if (self.language) |value| {
+            try jw.objectField("language");
+            try jw.write(value);
+        }
+        if (self.words) |value| {
+            try jw.objectField("words");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const InferenceTranscriptionEventList = struct {
+    object: []const u8,
+    session_id: []const u8,
+    model: []const u8,
+    data: []const InferenceTranscriptionEvent,
+    buffered_ms: i64,
+    total_ms: i64,
+};
+
+pub const InferenceTranscriptionSession = struct {
+    object: []const u8,
+    id: []const u8,
+    model: []const u8,
+    language: ?[]const u8 = null,
+    /// Unix timestamp (seconds).
+    created: i64,
+    /// Unix timestamp (seconds) after which the session is reclaimed unless audio is appended.
+    expires_at: i64,
+    /// Audio held for the open segment.
+    buffered_ms: i64,
+    /// Audio appended over the session lifetime.
+    total_ms: i64,
+    finals: i64,
+    partials: i64,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "object", "object", false },
+        .{ "id", "id", false },
+        .{ "model", "model", false },
+        .{ "language", "language", true },
+        .{ "created", "created", false },
+        .{ "expires_at", "expires_at", false },
+        .{ "buffered_ms", "buffered_ms", false },
+        .{ "total_ms", "total_ms", false },
+        .{ "finals", "finals", false },
+        .{ "partials", "partials", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("object");
+        try jw.write(self.object);
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("model");
+        try jw.write(self.model);
+        if (self.language) |value| {
+            try jw.objectField("language");
+            try jw.write(value);
+        }
+        try jw.objectField("created");
+        try jw.write(self.created);
+        try jw.objectField("expires_at");
+        try jw.write(self.expires_at);
+        try jw.objectField("buffered_ms");
+        try jw.write(self.buffered_ms);
+        try jw.objectField("total_ms");
+        try jw.write(self.total_ms);
+        try jw.objectField("finals");
+        try jw.write(self.finals);
+        try jw.objectField("partials");
+        try jw.write(self.partials);
+        try jw.endObject();
+    }
+};
+
+pub const InferenceTranscriptionSessionDeleted = struct {
+    object: []const u8,
+    id: []const u8,
+    deleted: bool,
+};
+
+pub const InferenceTranscriptionSessionRequest = struct {
+    /// Transcriber model from models_dir/transcribers/.
+    model: []const u8,
+    /// Force the transcript language (ISO 639-1). Omit for automatic detection.
+    language: ?[]const u8 = null,
+    vad: ?InferenceVadConfig = null,
+    audio_context: ?InferenceAudioContext = null,
+    /// Minimum new audio before the open segment is decoded again for a partial. Each partial is a full Whisper pass, so lower values raise decoder load. Default 2000.
+    partial_interval_ms: ?i64 = null,
+    /// Continuous speech that forces a segment boundary. Default 25000.
+    max_segment_ms: ?i64 = null,
+    /// Emit partial hypotheses for the open segment.
+    emit_partials: ?bool = null,
+    /// Preferred spellings for names and terms; joined into the recognizer's preceding-context prompt.
+    dictionary: ?[]const []const u8 = null,
+    /// Explicit preceding-context text for the recognizer. Overrides `dictionary`.
+    transcript_prompt: ?[]const u8 = null,
+    /// Idle time after which the session expires. Default 300.
+    ttl_seconds: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "model", "model", false },
+        .{ "language", "language", true },
+        .{ "vad", "vad", true },
+        .{ "audio_context", "audio_context", true },
+        .{ "partial_interval_ms", "partial_interval_ms", true },
+        .{ "max_segment_ms", "max_segment_ms", true },
+        .{ "emit_partials", "emit_partials", true },
+        .{ "dictionary", "dictionary", true },
+        .{ "transcript_prompt", "transcript_prompt", true },
+        .{ "ttl_seconds", "ttl_seconds", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("model");
+        try jw.write(self.model);
+        if (self.language) |value| {
+            try jw.objectField("language");
+            try jw.write(value);
+        }
+        if (self.vad) |value| {
+            try jw.objectField("vad");
+            try jw.write(value);
+        }
+        if (self.audio_context) |value| {
+            try jw.objectField("audio_context");
+            try jw.write(value);
+        }
+        if (self.partial_interval_ms) |value| {
+            try jw.objectField("partial_interval_ms");
+            try jw.write(value);
+        }
+        if (self.max_segment_ms) |value| {
+            try jw.objectField("max_segment_ms");
+            try jw.write(value);
+        }
+        if (self.emit_partials) |value| {
+            try jw.objectField("emit_partials");
+            try jw.write(value);
+        }
+        if (self.dictionary) |value| {
+            try jw.objectField("dictionary");
+            try jw.write(value);
+        }
+        if (self.transcript_prompt) |value| {
+            try jw.objectField("transcript_prompt");
+            try jw.write(value);
+        }
+        if (self.ttl_seconds) |value| {
+            try jw.objectField("ttl_seconds");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// One Server-Sent Event on a session event stream. `session.open` starts the stream, `transcription.event` carries `event`, `ping` keeps the connection alive, `session.closed` ends it, and `error` carries `error` and `message`. The stream ends with the literal `[DONE]`.
+pub const InferenceTranscriptionStreamMessage = struct {
+    type: []const u8,
+    session_id: []const u8,
+    event: ?InferenceTranscriptionEvent = null,
+    buffered_ms: ?i64 = null,
+    total_ms: ?i64 = null,
+    @"error": ?[]const u8 = null,
+    message: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "session_id", "session_id", false },
+        .{ "event", "event", true },
+        .{ "buffered_ms", "buffered_ms", true },
+        .{ "total_ms", "total_ms", true },
+        .{ "error", "error", true },
+        .{ "message", "message", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("session_id");
+        try jw.write(self.session_id);
+        if (self.event) |value| {
+            try jw.objectField("event");
+            try jw.write(value);
+        }
+        if (self.buffered_ms) |value| {
+            try jw.objectField("buffered_ms");
+            try jw.write(value);
+        }
+        if (self.total_ms) |value| {
+            try jw.objectField("total_ms");
+            try jw.write(value);
+        }
+        if (self.@"error") |value| {
+            try jw.objectField("error");
+            try jw.write(value);
+        }
+        if (self.message) |value| {
+            try jw.objectField("message");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// Actionable retry contract for temporary inference-capacity failures.
 pub const InferenceTransientCapacityError = struct {
     /// Stable machine-readable error code
@@ -22376,6 +25145,69 @@ pub const InferenceTransientCapacityError = struct {
     retryable: bool,
     /// Minimum retry delay in milliseconds
     retry_after_ms: i64,
+};
+
+/// Voice activity detection. Without `model`, frames are classified by RMS energy against `threshold`. With `model` naming a pulled Silero VAD export (`antfly inference pull onnx-community/silero-vad --tasks vad`), 512-sample frames at 16 kHz are scored by the neural model, which separates speech from tones, music, and keyboard noise that the energy rule accepts.
+pub const InferenceVadConfig = struct {
+    /// Silero VAD model directory name from models_dir, for example `onnx-community/silero-vad`.
+    model: ?[]const u8 = null,
+    /// Speech probability at or above which a Silero frame counts as speech. Default 0.5.
+    silero_threshold: ?f32 = null,
+    /// RMS amplitude on [-1, 1] PCM at or above which a 20 ms frame counts as speech. Default 0.012 (about -38 dBFS).
+    threshold: ?f32 = null,
+    /// Consecutive speech needed to open a segment. Default 120.
+    min_speech_ms: ?i64 = null,
+    /// Continuous silence that closes a segment. Default 600.
+    min_silence_ms: ?i64 = null,
+    /// Padding kept on both sides of each segment. Default 120.
+    speech_pad_ms: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "model", "model", true },
+        .{ "silero_threshold", "silero_threshold", true },
+        .{ "threshold", "threshold", true },
+        .{ "min_speech_ms", "min_speech_ms", true },
+        .{ "min_silence_ms", "min_silence_ms", true },
+        .{ "speech_pad_ms", "speech_pad_ms", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.silero_threshold) |value| {
+            try jw.objectField("silero_threshold");
+            try jw.write(value);
+        }
+        if (self.threshold) |value| {
+            try jw.objectField("threshold");
+            try jw.write(value);
+        }
+        if (self.min_speech_ms) |value| {
+            try jw.objectField("min_speech_ms");
+            try jw.write(value);
+        }
+        if (self.min_silence_ms) |value| {
+            try jw.objectField("min_silence_ms");
+            try jw.write(value);
+        }
+        if (self.speech_pad_ms) |value| {
+            try jw.objectField("speech_pad_ms");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Legacy inference-local logging configuration. The current unified Zig runtime ignores it; configure the top-level `log` object instead.
@@ -22571,8 +25403,9 @@ pub const InstalledExtension = struct {
 
 /// Configuration for joining data from another table. Supports inner, left, and right joins with automatic strategy selection.
 pub const JoinClause = struct {
-    /// Name of the table to join with.
-    right_table: []const u8,
+    right_target: ?CatalogTableTarget = null,
+    /// Literal native table name or declared foreign-source alias. Specify exactly one of right_table or right_target.
+    right_table: ?[]const u8 = null,
     /// Type of join to perform. Defaults to "inner".
     join_type: ?JoinType = null,
     /// Join condition specifying which fields to match.
@@ -22588,7 +25421,8 @@ pub const JoinClause = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
-        .{ "right_table", "right_table", false },
+        .{ "right_target", "right_target", true },
+        .{ "right_table", "right_table", true },
         .{ "join_type", "join_type", true },
         .{ "on", "on", false },
         .{ "right_filters", "right_filters", true },
@@ -22607,8 +25441,14 @@ pub const JoinClause = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
-        try jw.objectField("right_table");
-        try jw.write(self.right_table);
+        if (self.right_target) |value| {
+            try jw.objectField("right_target");
+            try jw.write(value);
+        }
+        if (self.right_table) |value| {
+            try jw.objectField("right_table");
+            try jw.write(value);
+        }
         if (self.join_type) |value| {
             try jw.objectField("join_type");
             try jw.write(value);
@@ -23540,42 +26380,42 @@ pub const LinkupSearchConfig = struct {
 
 /// Compact LSM backend operational status. Detailed low-level counters are available through metrics.
 pub const LsmStorageStatus = struct {
-    run_count: ?i64 = null,
-    run_bytes: ?i64 = null,
-    l0_run_count: ?i64 = null,
-    l0_bytes: ?i64 = null,
-    lower_level_run_count: ?i64 = null,
-    lower_level_bytes: ?i64 = null,
-    max_level: ?i64 = null,
-    compactable_l0_run_count: ?i64 = null,
-    overlapping_l0_run_count: ?i64 = null,
-    soft_limit_l0_run_count: ?i64 = null,
-    hard_limit_l0_run_count: ?i64 = null,
-    write_stall_l0_run_debt: ?i64 = null,
-    soft_limit_l0_bytes: ?i64 = null,
-    hard_limit_l0_bytes: ?i64 = null,
-    write_stall_l0_byte_debt: ?i64 = null,
-    level_overflow_run_count: ?i64 = null,
-    level_overflow_bytes: ?i64 = null,
-    obsolete_path_count: ?i64 = null,
-    obsolete_paths_pinned_by_readers: ?i64 = null,
-    obsolete_paths_pinned_by_versions: ?i64 = null,
-    obsolete_paths_waiting_for_retry: ?i64 = null,
-    obsolete_paths_reclaimable: ?i64 = null,
-    obsolete_delete_failures: ?i64 = null,
-    obsolete_delete_retries: ?i64 = null,
-    current_manifest_bytes: ?i64 = null,
-    mutable_entry_count: ?i64 = null,
-    mutable_bytes: ?i64 = null,
-    immutable_memtable_count: ?i64 = null,
-    immutable_entry_count: ?i64 = null,
-    immutable_bytes: ?i64 = null,
-    mutable_snapshot_clone_count: ?i64 = null,
-    mutable_snapshot_clone_bytes: ?i64 = null,
-    mutable_snapshot_clone_peak_bytes: ?i64 = null,
-    read_snapshot_mutable_rotation_count: ?i64 = null,
-    read_snapshot_mutable_rotation_bytes: ?i64 = null,
-    wal_retained_bytes: ?i64 = null,
+    run_count: ?u64 = null,
+    run_bytes: ?u64 = null,
+    l0_run_count: ?u64 = null,
+    l0_bytes: ?u64 = null,
+    lower_level_run_count: ?u64 = null,
+    lower_level_bytes: ?u64 = null,
+    max_level: ?u64 = null,
+    compactable_l0_run_count: ?u64 = null,
+    overlapping_l0_run_count: ?u64 = null,
+    soft_limit_l0_run_count: ?u64 = null,
+    hard_limit_l0_run_count: ?u64 = null,
+    write_stall_l0_run_debt: ?u64 = null,
+    soft_limit_l0_bytes: ?u64 = null,
+    hard_limit_l0_bytes: ?u64 = null,
+    write_stall_l0_byte_debt: ?u64 = null,
+    level_overflow_run_count: ?u64 = null,
+    level_overflow_bytes: ?u64 = null,
+    obsolete_path_count: ?u64 = null,
+    obsolete_paths_pinned_by_readers: ?u64 = null,
+    obsolete_paths_pinned_by_versions: ?u64 = null,
+    obsolete_paths_waiting_for_retry: ?u64 = null,
+    obsolete_paths_reclaimable: ?u64 = null,
+    obsolete_delete_failures: ?u64 = null,
+    obsolete_delete_retries: ?u64 = null,
+    current_manifest_bytes: ?u64 = null,
+    mutable_entry_count: ?u64 = null,
+    mutable_bytes: ?u64 = null,
+    immutable_memtable_count: ?u64 = null,
+    immutable_entry_count: ?u64 = null,
+    immutable_bytes: ?u64 = null,
+    mutable_snapshot_clone_count: ?u64 = null,
+    mutable_snapshot_clone_bytes: ?u64 = null,
+    mutable_snapshot_clone_peak_bytes: ?u64 = null,
+    read_snapshot_mutable_rotation_count: ?u64 = null,
+    read_snapshot_mutable_rotation_bytes: ?u64 = null,
+    wal_retained_bytes: ?u64 = null,
     /// Whether WAL checkpoint maintenance is pending.
     wal_checkpoint_pending: ?bool = null,
     /// Whether WAL hard-limit admission is currently blocked.
@@ -23583,65 +26423,65 @@ pub const LsmStorageStatus = struct {
     /// Representative reason for the earliest pending WAL checkpoint retry.
     wal_checkpoint_retry_reason: ?[]const u8 = null,
     /// Consecutive failures for the representative WAL checkpoint retry.
-    wal_checkpoint_retry_attempts: ?i64 = null,
+    wal_checkpoint_retry_attempts: ?u64 = null,
     /// Nanoseconds until the earliest WAL checkpoint retry; zero means due now.
-    wal_checkpoint_retry_delay_ns: ?i64 = null,
+    wal_checkpoint_retry_delay_ns: ?u64 = null,
     /// Logical bytes in immutable memtables awaiting run publication.
-    active_immutable_logical_bytes: ?i64 = null,
+    active_immutable_logical_bytes: ?u64 = null,
     /// Logical bytes in runs awaiting durable manifest publication.
-    unpublished_wal_logical_bytes: ?i64 = null,
+    unpublished_wal_logical_bytes: ?u64 = null,
     /// Largest logical batch awaiting durable manifest publication.
-    unpublished_wal_max_batch_logical_bytes: ?i64 = null,
-    compaction_backlog_bytes: ?i64 = null,
-    active_readers: ?i64 = null,
-    active_readers_bound_read_txn: ?i64 = null,
-    active_readers_namespace_read_txn: ?i64 = null,
-    active_readers_probe_txn: ?i64 = null,
-    active_readers_current_scan: ?i64 = null,
-    active_readers_write_txn: ?i64 = null,
-    active_readers_compaction: ?i64 = null,
-    active_readers_other: ?i64 = null,
-    obsolete_paths_pinned_by_reader_bound_read_txn: ?i64 = null,
-    obsolete_paths_pinned_by_reader_namespace_read_txn: ?i64 = null,
-    obsolete_paths_pinned_by_reader_probe_txn: ?i64 = null,
-    obsolete_paths_pinned_by_reader_current_scan: ?i64 = null,
-    obsolete_paths_pinned_by_reader_write_txn: ?i64 = null,
-    obsolete_paths_pinned_by_reader_compaction: ?i64 = null,
-    obsolete_paths_pinned_by_reader_other: ?i64 = null,
-    active_bulk_ingest_batches: ?i64 = null,
+    unpublished_wal_max_batch_logical_bytes: ?u64 = null,
+    compaction_backlog_bytes: ?u64 = null,
+    active_readers: ?u64 = null,
+    active_readers_bound_read_txn: ?u64 = null,
+    active_readers_namespace_read_txn: ?u64 = null,
+    active_readers_probe_txn: ?u64 = null,
+    active_readers_current_scan: ?u64 = null,
+    active_readers_write_txn: ?u64 = null,
+    active_readers_compaction: ?u64 = null,
+    active_readers_other: ?u64 = null,
+    obsolete_paths_pinned_by_reader_bound_read_txn: ?u64 = null,
+    obsolete_paths_pinned_by_reader_namespace_read_txn: ?u64 = null,
+    obsolete_paths_pinned_by_reader_probe_txn: ?u64 = null,
+    obsolete_paths_pinned_by_reader_current_scan: ?u64 = null,
+    obsolete_paths_pinned_by_reader_write_txn: ?u64 = null,
+    obsolete_paths_pinned_by_reader_compaction: ?u64 = null,
+    obsolete_paths_pinned_by_reader_other: ?u64 = null,
+    active_bulk_ingest_batches: ?u64 = null,
     manifest_dirty: ?bool = null,
     obsolete_manifest_dirty: ?bool = null,
-    maintenance_score: ?i64 = null,
-    maintenance_debt_hint: ?i64 = null,
-    flush_count: ?i64 = null,
-    flush_output_run_count: ?i64 = null,
-    flush_output_bytes: ?i64 = null,
-    sorted_ingest_run_count: ?i64 = null,
-    sorted_ingest_bytes: ?i64 = null,
-    manifest_write_count: ?i64 = null,
-    manifest_bytes: ?i64 = null,
-    write_pressure_event_count: ?i64 = null,
-    write_pressure_compaction_count: ?i64 = null,
-    write_pressure_compaction_step_count: ?i64 = null,
-    write_pressure_overload_count: ?i64 = null,
-    write_pressure_overload_l0_run_debt: ?i64 = null,
-    immutable_rotation_count: ?i64 = null,
-    immutable_flush_count: ?i64 = null,
-    direct_bulk_ingest_attempt_count: ?i64 = null,
-    direct_bulk_ingest_success_count: ?i64 = null,
-    direct_bulk_ingest_entry_count: ?i64 = null,
-    bulk_append_attempt_count: ?i64 = null,
-    bulk_append_entry_count: ?i64 = null,
-    bulk_append_direct_success_count: ?i64 = null,
-    bulk_append_direct_entry_count: ?i64 = null,
-    bulk_append_fallback_backend_pending_count: ?i64 = null,
-    bulk_append_fallback_below_threshold_count: ?i64 = null,
-    bulk_append_fallback_duplicate_key_count: ?i64 = null,
-    bulk_append_fallback_to_mutable_entry_count: ?i64 = null,
-    direct_bulk_ingest_direct_entry_count: ?i64 = null,
-    direct_bulk_ingest_fallback_unsupported_count: ?i64 = null,
-    direct_bulk_ingest_fallback_backend_mutable_count: ?i64 = null,
-    direct_bulk_ingest_fallback_below_threshold_count: ?i64 = null,
+    maintenance_score: ?u64 = null,
+    maintenance_debt_hint: ?u64 = null,
+    flush_count: ?u64 = null,
+    flush_output_run_count: ?u64 = null,
+    flush_output_bytes: ?u64 = null,
+    sorted_ingest_run_count: ?u64 = null,
+    sorted_ingest_bytes: ?u64 = null,
+    manifest_write_count: ?u64 = null,
+    manifest_bytes: ?u64 = null,
+    write_pressure_event_count: ?u64 = null,
+    write_pressure_compaction_count: ?u64 = null,
+    write_pressure_compaction_step_count: ?u64 = null,
+    write_pressure_overload_count: ?u64 = null,
+    write_pressure_overload_l0_run_debt: ?u64 = null,
+    immutable_rotation_count: ?u64 = null,
+    immutable_flush_count: ?u64 = null,
+    direct_bulk_ingest_attempt_count: ?u64 = null,
+    direct_bulk_ingest_success_count: ?u64 = null,
+    direct_bulk_ingest_entry_count: ?u64 = null,
+    bulk_append_attempt_count: ?u64 = null,
+    bulk_append_entry_count: ?u64 = null,
+    bulk_append_direct_success_count: ?u64 = null,
+    bulk_append_direct_entry_count: ?u64 = null,
+    bulk_append_fallback_backend_pending_count: ?u64 = null,
+    bulk_append_fallback_below_threshold_count: ?u64 = null,
+    bulk_append_fallback_duplicate_key_count: ?u64 = null,
+    bulk_append_fallback_to_mutable_entry_count: ?u64 = null,
+    direct_bulk_ingest_direct_entry_count: ?u64 = null,
+    direct_bulk_ingest_fallback_unsupported_count: ?u64 = null,
+    direct_bulk_ingest_fallback_backend_mutable_count: ?u64 = null,
+    direct_bulk_ingest_fallback_below_threshold_count: ?u64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -24583,6 +27423,44 @@ pub const MultiPhraseQuery = struct {
     }
 };
 
+/// Namespace catalog object inside a database. PostgreSQL schemas map to Antfly namespaces.
+pub const NamespaceCatalogRecord = struct {
+    /// Stable namespace catalog identifier.
+    namespace_id: u64,
+    /// Parent database identifier.
+    database_id: u64,
+    /// Parent database name.
+    database_name: []const u8,
+    /// Namespace name.
+    name: []const u8,
+    /// Optional durable tablespace binding inherited by new table placement policy in this namespace.
+    tablespace_name: OpenApiOptionalNullable([]const u8) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("namespace_id");
+        try jw.write(self.namespace_id);
+        try jw.objectField("database_id");
+        try jw.write(self.database_id);
+        try jw.objectField("database_name");
+        try jw.write(self.database_name);
+        try jw.objectField("name");
+        try jw.write(self.name);
+        switch (self.tablespace_name) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("tablespace_name");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("tablespace_name");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
 /// Filter nodes during graph traversal using existing query primitives
 pub const NodeFilter = struct {
     /// Antfly query to filter nodes (same syntax as search filter_query)
@@ -24882,7 +27760,192 @@ pub const OpenAIGeneratorConfig = struct {
     temperature: ?f32 = null,
     /// Maximum number of tokens to generate.
     max_tokens: ?i64 = null,
+    /// OpenAI completion budget, including visible output and reasoning tokens. Use for reasoning models instead of max_tokens; the two are mutually exclusive.
+    max_completion_tokens: ?i64 = null,
+    /// Optional reasoning effort. Supported values depend on the selected OpenAI model.
+    reasoning_effort: ?OpenAIReasoningEffort = null,
     /// Nucleus sampling parameter.
+    top_p: ?f32 = null,
+    /// Penalty for token frequency (-2.0 to 2.0).
+    frequency_penalty: ?f32 = null,
+    /// Penalty for token presence (-2.0 to 2.0).
+    presence_penalty: ?f32 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
+        .{ "model", "model", false },
+        .{ "url", "url", true },
+        .{ "api_key", "api_key", true },
+        .{ "temperature", "temperature", true },
+        .{ "max_tokens", "max_tokens", true },
+        .{ "max_completion_tokens", "max_completion_tokens", true },
+        .{ "reasoning_effort", "reasoning_effort", true },
+        .{ "top_p", "top_p", true },
+        .{ "frequency_penalty", "frequency_penalty", true },
+        .{ "presence_penalty", "presence_penalty", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
+        try jw.objectField("model");
+        try jw.write(self.model);
+        if (self.url) |value| {
+            try jw.objectField("url");
+            try jw.write(value);
+        }
+        if (self.api_key) |value| {
+            try jw.objectField("api_key");
+            try jw.write(value);
+        }
+        if (self.temperature) |value| {
+            try jw.objectField("temperature");
+            try jw.write(value);
+        }
+        if (self.max_tokens) |value| {
+            try jw.objectField("max_tokens");
+            try jw.write(value);
+        }
+        if (self.max_completion_tokens) |value| {
+            try jw.objectField("max_completion_tokens");
+            try jw.write(value);
+        }
+        if (self.reasoning_effort) |value| {
+            try jw.objectField("reasoning_effort");
+            try jw.write(value);
+        }
+        if (self.top_p) |value| {
+            try jw.objectField("top_p");
+            try jw.write(value);
+        }
+        if (self.frequency_penalty) |value| {
+            try jw.objectField("frequency_penalty");
+            try jw.write(value);
+        }
+        if (self.presence_penalty) |value| {
+            try jw.objectField("presence_penalty");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// OpenAI reasoning effort; model support varies. Omit to use the model default.
+pub const OpenAIReasoningEffort = enum {
+    none,
+    minimal,
+    low,
+    medium,
+    high,
+    xhigh,
+    max,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .none => "none",
+            .minimal => "minimal",
+            .low => "low",
+            .medium => "medium",
+            .high => "high",
+            .xhigh => "xhigh",
+            .max => "max",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "none", .none },
+            .{ "minimal", .minimal },
+            .{ "low", .low },
+            .{ "medium", .medium },
+            .{ "high", .high },
+            .{ "xhigh", .xhigh },
+            .{ "max", .max },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Configuration for the OpenRouter embedding provider. OpenRouter provides a unified API for multiple embedding models from different providers. API key via `api_key` field or `OPENROUTER_API_KEY` environment variable. Antfly currently supports dense text embeddings through this provider. **Example Models:** openai/text-embedding-3-small (default), openai/text-embedding-3-large, google/gemini-embedding-001, qwen/qwen3-embedding-8b **Docs:** https://openrouter.ai/docs/api/reference/embeddings
+pub const OpenRouterEmbedderConfig = struct {
+    provider: []const u8,
+    /// The OpenRouter model identifier (e.g., 'openai/text-embedding-3-small', 'google/gemini-embedding-001').
+    model: []const u8,
+    /// The OpenRouter API base URL. Defaults to OPENROUTER_BASE_URL or https://openrouter.ai/api/v1.
+    url: ?[]const u8 = null,
+    /// The OpenRouter API key. Can also be set via OPENROUTER_API_KEY environment variable.
+    api_key: ?[]const u8 = null,
+    /// Output dimension for the embedding (if supported by the model).
+    dimensions: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
+        .{ "model", "model", false },
+        .{ "url", "url", true },
+        .{ "api_key", "api_key", true },
+        .{ "dimensions", "dimensions", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
+        try jw.objectField("model");
+        try jw.write(self.model);
+        if (self.url) |value| {
+            try jw.objectField("url");
+            try jw.write(value);
+        }
+        if (self.api_key) |value| {
+            try jw.objectField("api_key");
+            try jw.write(value);
+        }
+        if (self.dimensions) |value| {
+            try jw.objectField("dimensions");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Configuration for the OpenRouter generative AI provider.
+pub const OpenRouterGeneratorConfig = struct {
+    provider: []const u8,
+    /// The OpenRouter model identifier to use.
+    model: []const u8,
+    /// The URL of the OpenRouter API endpoint.
+    url: ?[]const u8 = null,
+    /// The OpenRouter API key.
+    api_key: ?[]const u8 = null,
+    /// Controls randomness in generation (0.0-2.0).
+    temperature: ?f32 = null,
+    /// Maximum number of tokens to generate in the response.
+    max_tokens: ?i64 = null,
+    /// Nucleus sampling parameter (0.0-1.0).
     top_p: ?f32 = null,
     /// Penalty for token frequency (-2.0 to 2.0).
     frequency_penalty: ?f32 = null,
@@ -24942,50 +28005,6 @@ pub const OpenAIGeneratorConfig = struct {
         }
         if (self.presence_penalty) |value| {
             try jw.objectField("presence_penalty");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
-
-/// Configuration for the OpenRouter embedding provider. OpenRouter provides a unified API for multiple embedding models from different providers. API key via `api_key` field or `OPENROUTER_API_KEY` environment variable. **Example Models:** openai/text-embedding-3-small (default), openai/text-embedding-3-large, google/gemini-embedding-001, qwen/qwen3-embedding-8b **Docs:** https://openrouter.ai/docs/api/reference/embeddings
-pub const OpenRouterEmbedderConfig = struct {
-    provider: []const u8,
-    /// The OpenRouter model identifier (e.g., 'openai/text-embedding-3-small', 'google/gemini-embedding-001').
-    model: []const u8,
-    /// The OpenRouter API key. Can also be set via OPENROUTER_API_KEY environment variable.
-    api_key: ?[]const u8 = null,
-    /// Output dimension for the embedding (if supported by the model).
-    dimensions: ?i64 = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "provider", "provider", false },
-        .{ "model", "model", false },
-        .{ "api_key", "api_key", true },
-        .{ "dimensions", "dimensions", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        try jw.objectField("provider");
-        try jw.write(self.provider);
-        try jw.objectField("model");
-        try jw.write(self.model);
-        if (self.api_key) |value| {
-            try jw.objectField("api_key");
-            try jw.write(value);
-        }
-        if (self.dimensions) |value| {
-            try jw.objectField("dimensions");
             try jw.write(value);
         }
         try jw.endObject();
@@ -25595,11 +28614,46 @@ pub const PatternStep = struct {
     }
 };
 
+/// Specify exactly one of a legacy literal resource or a structured table_target; table_target requires resource_type table.
 pub const Permission = struct {
     /// Resource name (e.g., table name, target username, or '*' for all inference operations or a global grant).
-    resource: []const u8,
+    resource: ?[]const u8 = null,
+    table_target: ?CatalogTableScope = null,
     resource_type: ResourceType,
     type: PermissionType,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "resource", "resource", true },
+        .{ "table_target", "table_target", true },
+        .{ "resource_type", "resource_type", false },
+        .{ "type", "type", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.resource) |value| {
+            try jw.objectField("resource");
+            try jw.write(value);
+        }
+        if (self.table_target) |value| {
+            try jw.objectField("table_target");
+            try jw.write(value);
+        }
+        try jw.objectField("resource_type");
+        try jw.write(self.resource_type);
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.endObject();
+    }
 };
 
 /// Type of permission.
@@ -26206,8 +29260,10 @@ pub const QueryBuilderResult = struct {
     query: std.json.ArrayHashMap(std.json.Value),
     /// Antfly query request assembled by the coordinator. New clients should prefer this field when they want an executable Antfly query object.
     query_request: ?QueryRequest = null,
-    /// Antfly retrieval query assembled by the coordinator when the requested artifact needs retrieval-only features such as tree_search. This is additive to query_request for clients that execute through the retrieval agent pipeline.
-    retrieval_query_request: ?RetrievalQueryRequest = null,
+    /// Antfly retrieval query assembled by the coordinator when the requested artifact is intended for retrieval. Apply retrieval_navigation to steps.retrieval.navigation. This is additive to query_request for clients that execute through the retrieval agent pipeline.
+    retrieval_query_request: ?QueryRequest = null,
+    /// Optional retrieval-step navigation policy for the returned query at query_index zero.
+    retrieval_navigation: ?RetrievalNavigationConfig = null,
     /// Specialist or strategy used to build the query, such as `full_text`, `filter`, or `hybrid`.
     specialist: ?[]const u8 = null,
     /// Optional machine-readable coordination plan for observability.
@@ -26232,6 +29288,7 @@ pub const QueryBuilderResult = struct {
         .{ "query", "query", false },
         .{ "query_request", "query_request", true },
         .{ "retrieval_query_request", "retrieval_query_request", true },
+        .{ "retrieval_navigation", "retrieval_navigation", true },
         .{ "specialist", "specialist", true },
         .{ "plan", "plan", true },
         .{ "explanation", "explanation", true },
@@ -26289,6 +29346,10 @@ pub const QueryBuilderResult = struct {
         }
         if (self.retrieval_query_request) |value| {
             try jw.objectField("retrieval_query_request");
+            try jw.write(value);
+        }
+        if (self.retrieval_navigation) |value| {
+            try jw.objectField("retrieval_navigation");
             try jw.write(value);
         }
         if (self.specialist) |value| {
@@ -26724,7 +29785,7 @@ pub const QueryHits = struct {
 /// Total hit count metadata.
 pub const QueryHitsTotal = struct {
     /// Hit count value.
-    value: i64,
+    value: u64,
     /// Whether value is exact or a lower bound.
     relation: []const u8,
 };
@@ -26793,7 +29854,8 @@ pub const QueryProfile = struct {
 };
 
 pub const QueryRequest = struct {
-    /// Name of the table to query. Required for global-query requests.
+    table_target: ?CatalogTableTarget = null,
+    /// Literal table name in default.public. Global queries require exactly one of table or table_target.
     table: ?[]const u8 = null,
     /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is non-scoring query input. - `bool.must_not` is non-scoring exclusion query input. Filter branches accept the same query variants as `filter_query` and `exclusion_query`. Structured clauses use the native document-value path; text clauses are resolved through the text index before scoring.
     query: ?std.json.Value = null,
@@ -26864,6 +29926,7 @@ pub const QueryRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "table_target", "table_target", true },
         .{ "table", "table", true },
         .{ "query", "query", true },
         .{ "full_text_search", "full_text_search", true },
@@ -26911,6 +29974,10 @@ pub const QueryRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.table_target) |value| {
+            try jw.objectField("table_target");
+            try jw.write(value);
+        }
         if (self.table) |value| {
             try jw.objectField("table");
             try jw.write(value);
@@ -27664,6 +30731,1367 @@ pub const RegexpQuery = struct {
     }
 };
 
+/// A typed CHECK. Supply either expression or column and op (with optional value and collation), never both forms. Expressions must return boolean and use the shared bounded immutable scalar expression vocabulary. New writes are checked from schema publication; existing rows are validated separately. SQL UNKNOWN satisfies CHECK. Comparison values must match the column type. Integer values may also use exact decimal strings to avoid client-side floating-point rounding.
+pub const RelationalCheckConstraint = struct {
+    name: []const u8,
+    column: ?[]const u8 = null,
+    op: ?RelationalComparisonOp = null,
+    /// Scalar comparison operand. Omission represents NULL. Null tests require a NULL operand.
+    value: ?std.json.Value = null,
+    /// String comparison collation; uses the same rules as ordered indexes.
+    collation: ?[]const u8 = null,
+    expression: ?RelationalScalarExpression = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "name", "name", false },
+        .{ "column", "column", true },
+        .{ "op", "op", true },
+        .{ "value", "value", true },
+        .{ "collation", "collation", true },
+        .{ "expression", "expression", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        if (self.column) |value| {
+            try jw.objectField("column");
+            try jw.write(value);
+        }
+        if (self.op) |value| {
+            try jw.objectField("op");
+            try jw.write(value);
+        }
+        if (self.value) |value| {
+            try jw.objectField("value");
+            try jw.write(value);
+        }
+        if (self.collation) |value| {
+            try jw.objectField("collation");
+            try jw.write(value);
+        }
+        if (self.expression) |value| {
+            try jw.objectField("expression");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const RelationalColumnExpression = struct {
+    column: []const u8,
+    expression: RelationalScalarExpression,
+};
+
+pub const RelationalComparisonOp = enum {
+    is_null,
+    is_not_null,
+    eq,
+    ne,
+    gt,
+    gte,
+    lt,
+    lte,
+    is_distinct,
+    is_not_distinct,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .is_null => "is_null",
+            .is_not_null => "is_not_null",
+            .eq => "eq",
+            .ne => "ne",
+            .gt => "gt",
+            .gte => "gte",
+            .lt => "lt",
+            .lte => "lte",
+            .is_distinct => "is_distinct",
+            .is_not_distinct => "is_not_distinct",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "is_null", .is_null },
+            .{ "is_not_null", .is_not_null },
+            .{ "eq", .eq },
+            .{ "ne", .ne },
+            .{ "gt", .gt },
+            .{ "gte", .gte },
+            .{ "lt", .lt },
+            .{ "lte", .lte },
+            .{ "is_distinct", .is_distinct },
+            .{ "is_not_distinct", .is_not_distinct },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const RelationalConstraintActivationPhase = enum {
+    unique,
+    foreign_key,
+    check,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .unique => "unique",
+            .foreign_key => "foreign_key",
+            .check => "check",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "unique", .unique },
+            .{ "foreign_key", .foreign_key },
+            .{ "check", .check },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Deterministic relational integrity failure; changing the mutation or data is required before retry.
+pub const RelationalConstraintConflictReason = enum {
+    unique_constraint_violation,
+    foreign_key_parent_missing,
+    foreign_key_referenced,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .unique_constraint_violation => "unique_constraint_violation",
+            .foreign_key_parent_missing => "foreign_key_parent_missing",
+            .foreign_key_referenced => "foreign_key_referenced",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "unique_constraint_violation", .unique_constraint_violation },
+            .{ "foreign_key_parent_missing", .foreign_key_parent_missing },
+            .{ "foreign_key_referenced", .foreign_key_referenced },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const RelationalConstraintRangeStatus = struct {
+    /// Exact owner group identifier as decimal text.
+    group_id: []const u8,
+    state: RelationalConstraintValidationState,
+    phase: RelationalConstraintActivationPhase,
+    /// Exact cumulative validation row count as decimal text.
+    rows_scanned: []const u8,
+    /// Opaque namespace-and-range ownership digest.
+    owner: []const u8,
+    failure: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "group_id", "group_id", false },
+        .{ "state", "state", false },
+        .{ "phase", "phase", false },
+        .{ "rows_scanned", "rows_scanned", false },
+        .{ "owner", "owner", false },
+        .{ "failure", "failure", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("group_id");
+        try jw.write(self.group_id);
+        try jw.objectField("state");
+        try jw.write(self.state);
+        try jw.objectField("phase");
+        try jw.write(self.phase);
+        try jw.objectField("rows_scanned");
+        try jw.write(self.rows_scanned);
+        try jw.objectField("owner");
+        try jw.write(self.owner);
+        if (self.failure) |value| {
+            try jw.objectField("failure");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Supply exactly one of target_schema or drop=true. A target schema may only remove UNIQUE/FK definitions; all other schema properties must remain unchanged. Its version is assigned by the server. Retirement fences primary mutations while existing reference and claim records are drained. External foreign keys referencing removed definitions must be retired first.
+pub const RelationalConstraintRetirementRequest = struct {
+    schema_version: i64,
+    target_schema: ?TableSchema = null,
+    /// Prepare for explicit table deletion; this operation does not delete the table.
+    drop: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "schema_version", "schema_version", false },
+        .{ "target_schema", "target_schema", true },
+        .{ "drop", "drop", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("schema_version");
+        try jw.write(self.schema_version);
+        if (self.target_schema) |value| {
+            try jw.objectField("target_schema");
+            try jw.write(value);
+        }
+        if (self.drop) |value| {
+            try jw.objectField("drop");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const RelationalConstraintRetirementStatus = struct {
+    /// Opaque retirement job identity.
+    id: []const u8,
+    phase: []const u8,
+    drop: bool,
+    target_schema_version: u32,
+    /// Durable diagnostic that pauses the job. Retry resumes the exact checkpoint after the cause is addressed; it does not undo a partial drain or permit primary mutations while retirement is active.
+    failure: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", false },
+        .{ "phase", "phase", false },
+        .{ "drop", "drop", false },
+        .{ "target_schema_version", "target_schema_version", false },
+        .{ "failure", "failure", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("phase");
+        try jw.write(self.phase);
+        try jw.objectField("drop");
+        try jw.write(self.drop);
+        try jw.objectField("target_schema_version");
+        try jw.write(self.target_schema_version);
+        if (self.failure) |value| {
+            try jw.objectField("failure");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const RelationalConstraintRetryRequest = struct {
+    schema_version: i64,
+};
+
+pub const RelationalConstraintRetryResponse = struct {
+    status: []const u8,
+};
+
+pub const RelationalConstraintStatus = struct {
+    schema_version: u32,
+    /// Distributed UNIQUE, foreign-key, and scalar CHECK coverage across every current table owner. Native local validation is not a substitute for this coordinated proof.
+    coverage_kind: []const u8,
+    state: RelationalConstraintValidationState,
+    ranges: []const RelationalConstraintRangeStatus,
+    retirement: ?RelationalConstraintRetirementStatus = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "schema_version", "schema_version", false },
+        .{ "coverage_kind", "coverage_kind", false },
+        .{ "state", "state", false },
+        .{ "ranges", "ranges", false },
+        .{ "retirement", "retirement", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("schema_version");
+        try jw.write(self.schema_version);
+        try jw.objectField("coverage_kind");
+        try jw.write(self.coverage_kind);
+        try jw.objectField("state");
+        try jw.write(self.state);
+        try jw.objectField("ranges");
+        try jw.write(self.ranges);
+        if (self.retirement) |value| {
+            try jw.objectField("retirement");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Validation state of an existing-row constraint.
+pub const RelationalConstraintValidationState = enum {
+    enforced,
+    unvalidated,
+    validating,
+    invalid,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .enforced => "enforced",
+            .unvalidated => "unvalidated",
+            .validating => "validating",
+            .invalid => "invalid",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "enforced", .enforced },
+            .{ "unvalidated", .unvalidated },
+            .{ "validating", .validating },
+            .{ "invalid", .invalid },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const RelationalExpressionOp = enum {
+    literal,
+    column,
+    add,
+    subtract,
+    multiply,
+    divide,
+    negate,
+    concat,
+    coalesce,
+    lower_ascii,
+    upper_ascii,
+    eq,
+    ne,
+    gt,
+    gte,
+    lt,
+    lte,
+    is_null,
+    is_not_null,
+    is_distinct,
+    is_not_distinct,
+    @"and",
+    @"or",
+    not,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .literal => "literal",
+            .column => "column",
+            .add => "add",
+            .subtract => "subtract",
+            .multiply => "multiply",
+            .divide => "divide",
+            .negate => "negate",
+            .concat => "concat",
+            .coalesce => "coalesce",
+            .lower_ascii => "lower_ascii",
+            .upper_ascii => "upper_ascii",
+            .eq => "eq",
+            .ne => "ne",
+            .gt => "gt",
+            .gte => "gte",
+            .lt => "lt",
+            .lte => "lte",
+            .is_null => "is_null",
+            .is_not_null => "is_not_null",
+            .is_distinct => "is_distinct",
+            .is_not_distinct => "is_not_distinct",
+            .@"and" => "and",
+            .@"or" => "or",
+            .not => "not",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "literal", .literal },
+            .{ "column", .column },
+            .{ "add", .add },
+            .{ "subtract", .subtract },
+            .{ "multiply", .multiply },
+            .{ "divide", .divide },
+            .{ "negate", .negate },
+            .{ "concat", .concat },
+            .{ "coalesce", .coalesce },
+            .{ "lower_ascii", .lower_ascii },
+            .{ "upper_ascii", .upper_ascii },
+            .{ "eq", .eq },
+            .{ "ne", .ne },
+            .{ "gt", .gt },
+            .{ "gte", .gte },
+            .{ "lt", .lt },
+            .{ "lte", .lte },
+            .{ "is_null", .is_null },
+            .{ "is_not_null", .is_not_null },
+            .{ "is_distinct", .is_distinct },
+            .{ "is_not_distinct", .is_not_distinct },
+            .{ "and", .@"and" },
+            .{ "or", .@"or" },
+            .{ "not", .not },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const RelationalExpressionType = enum {
+    string,
+    blob,
+    boolean,
+    datetime,
+    integer,
+    number,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .string => "string",
+            .blob => "blob",
+            .boolean => "boolean",
+            .datetime => "datetime",
+            .integer => "integer",
+            .number => "number",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "string", .string },
+            .{ "blob", .blob },
+            .{ "boolean", .boolean },
+            .{ "datetime", .datetime },
+            .{ "integer", .integer },
+            .{ "number", .number },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Composite foreign key. Child and parent columns correspond by position and must have the same physical comparison types. The parent columns must identify a unique key. Existing-row validation is independent of new-write enforcement and is never client-writable. Enforcement and referential actions share the bounded distributed transaction path, including TTL expiry. Partial matching uses ordered support indexes on the parent; activation waits until these are ready. SET NULL requires every child column to accept explicit NULL.
+pub const RelationalForeignKeyConstraint = struct {
+    name: []const u8,
+    child_columns: []const []const u8,
+    /// Literal parent table name in the child table's database and namespace. Resolved to an immutable table identity when the constraint is declared; renaming a parent preserves the reference. Public schemas show its current name.
+    parent_table: []const u8,
+    parent_columns: []const []const u8,
+    on_delete: ?ForeignKeyAction = null,
+    on_update: ?ForeignKeyAction = null,
+    timing: ?ForeignKeyTiming = null,
+    match: ?ForeignKeyMatch = null,
+    deferrable: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "name", "name", false },
+        .{ "child_columns", "child_columns", false },
+        .{ "parent_table", "parent_table", false },
+        .{ "parent_columns", "parent_columns", false },
+        .{ "on_delete", "on_delete", true },
+        .{ "on_update", "on_update", true },
+        .{ "timing", "timing", true },
+        .{ "match", "match", true },
+        .{ "deferrable", "deferrable", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("child_columns");
+        try jw.write(self.child_columns);
+        try jw.objectField("parent_table");
+        try jw.write(self.parent_table);
+        try jw.objectField("parent_columns");
+        try jw.write(self.parent_columns);
+        if (self.on_delete) |value| {
+            try jw.objectField("on_delete");
+            try jw.write(value);
+        }
+        if (self.on_update) |value| {
+            try jw.objectField("on_update");
+            try jw.write(value);
+        }
+        if (self.timing) |value| {
+            try jw.objectField("timing");
+            try jw.write(value);
+        }
+        if (self.match) |value| {
+            try jw.objectField("match");
+            try jw.write(value);
+        }
+        if (self.deferrable) |value| {
+            try jw.objectField("deferrable");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const RelationalIndexBuildFailure = enum {
+    incompatible_schema,
+    invalid_row,
+    key_too_large,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .incompatible_schema => "incompatible_schema",
+            .invalid_row => "invalid_row",
+            .key_too_large => "key_too_large",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "incompatible_schema", .incompatible_schema },
+            .{ "invalid_row", .invalid_row },
+            .{ "key_too_large", .key_too_large },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const RelationalIndexBuildState = enum {
+    building,
+    ready,
+    failed,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .building => "building",
+            .ready => "ready",
+            .failed => "failed",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "building", .building },
+            .{ "ready", .ready },
+            .{ "failed", .failed },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Schema-bound composite ordered index on a relational table. Keys use stable typed comparison semantics and independent direction, null placement, and string collation. Existing rows build asynchronously; indexed queries require complete owner coverage. The table schema is the single durable authority for these definitions.
+pub const RelationalIndexConfig = struct {
+    keys: []const RelationalIndexKey,
+    /// Non-key columns stored for index-only projection; distinct from keys.
+    include_columns: ?[]const []const u8 = null,
+    /// Optional conjunction selecting index members. Queries must explicitly include all typed conjuncts.
+    where: ?[]const RelationalIndexPredicate = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "keys", "keys", false },
+        .{ "include_columns", "include_columns", true },
+        .{ "where", "where", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("keys");
+        try jw.write(self.keys);
+        if (self.include_columns) |value| {
+            try jw.objectField("include_columns");
+            try jw.write(value);
+        }
+        if (self.where) |value| {
+            try jw.objectField("where");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Declarative table-owned ordered index. Keys are compared lexicographically in the declared order, with independent direction, null placement, and string collation. Creation builds existing rows asynchronously; queries must wait for range-local coverage. Unique constraints and expression keys are not implied by this object. Optional WHERE conjuncts select only matching rows. INCLUDE columns store typed values alongside keys for index-only projected reads.
+pub const RelationalIndexDefinition = struct {
+    /// Optional human-readable description, also exposed by the shared indexes API.
+    description: ?[]const u8 = null,
+    name: []const u8,
+    keys: []const RelationalIndexKey,
+    /// Non-key columns stored in the index; must be distinct from key columns.
+    include_columns: ?[]const []const u8 = null,
+    /// Conjunction of typed predicates. Indexed queries must explicitly contain every conjunct with equivalent typed comparison semantics.
+    where: ?[]const RelationalIndexPredicate = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "description", "description", true },
+        .{ "name", "name", false },
+        .{ "keys", "keys", false },
+        .{ "include_columns", "include_columns", true },
+        .{ "where", "where", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.description) |value| {
+            try jw.objectField("description");
+            try jw.write(value);
+        }
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("keys");
+        try jw.write(self.keys);
+        if (self.include_columns) |value| {
+            try jw.objectField("include_columns");
+            try jw.write(value);
+        }
+        if (self.where) |value| {
+            try jw.objectField("where");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Ordered component of a relational ordered-tuple index key. Supply either a declared column or a deterministic typed scalar expression with its result_type. Composite keys may mix both forms. Bounds use the expression result type, not its input columns.
+pub const RelationalIndexKey = struct {
+    /// Declared relational column used by this key component.
+    column: ?[]const u8 = null,
+    expression: ?RelationalScalarExpression = null,
+    result_type: ?RelationalExpressionType = null,
+    /// String-key collation. Omission selects binary ordering. Supported binary aliases are C, POSIX, and binary. The aliases ci, case_insensitive, and antfly.case_insensitive select ASCII-only case folding, not locale-aware or Unicode case folding.
+    collation: ?[]const u8 = null,
+    direction: ?RelationalIndexKeyDirection = null,
+    nulls: ?RelationalIndexKeyNulls = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "column", "column", true },
+        .{ "expression", "expression", true },
+        .{ "result_type", "result_type", true },
+        .{ "collation", "collation", true },
+        .{ "direction", "direction", true },
+        .{ "nulls", "nulls", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.column) |value| {
+            try jw.objectField("column");
+            try jw.write(value);
+        }
+        if (self.expression) |value| {
+            try jw.objectField("expression");
+            try jw.write(value);
+        }
+        if (self.result_type) |value| {
+            try jw.objectField("result_type");
+            try jw.write(value);
+        }
+        if (self.collation) |value| {
+            try jw.objectField("collation");
+            try jw.write(value);
+        }
+        if (self.direction) |value| {
+            try jw.objectField("direction");
+            try jw.write(value);
+        }
+        if (self.nulls) |value| {
+            try jw.objectField("nulls");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Direction of one ordered index key component. Omission selects asc.
+pub const RelationalIndexKeyDirection = enum {
+    asc,
+    desc,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .asc => "asc",
+            .desc => "desc",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "asc", .asc },
+            .{ "desc", .desc },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Null placement for one ordered index key component. The default is last for ascending keys and first for descending keys. Omission selects default.
+pub const RelationalIndexKeyNulls = enum {
+    default,
+    first,
+    last,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .default => "default",
+            .first => "first",
+            .last => "last",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "default", .default },
+            .{ "first", .first },
+            .{ "last", .last },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// A typed partial-index conjunct. Only TRUE is indexed; FALSE and SQL UNKNOWN are excluded.
+pub const RelationalIndexPredicate = struct {
+    column: []const u8,
+    op: RelationalComparisonOp,
+    /// Typed scalar operand; integer columns also accept exact decimal strings. Omission means NULL.
+    value: ?std.json.Value = null,
+    /// String comparison collation with the same semantics as ordered keys.
+    collation: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "column", "column", false },
+        .{ "op", "op", false },
+        .{ "value", "value", true },
+        .{ "collation", "collation", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("column");
+        try jw.write(self.column);
+        try jw.objectField("op");
+        try jw.write(self.op);
+        if (self.value) |value| {
+            try jw.objectField("value");
+            try jw.write(value);
+        }
+        if (self.collation) |value| {
+            try jw.objectField("collation");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const RelationalIndexRangeStatus = struct {
+    group_id: []const u8,
+    /// Exact uint64 generation encoded as decimal, never a floating-point number.
+    generation: []const u8,
+    slot: u32,
+    /// Namespace and owned-range fingerprint.
+    owner: []const u8,
+    /// Executable tuple comparison fingerprint.
+    comparison: []const u8,
+    /// Exact durable progress observation for generation-fenced maintenance.
+    progress_digest: []const u8,
+    /// Replicated desired maintenance ticket, separate from replica-local progress.
+    maintenance_epoch: []const u8,
+    /// Most recently accepted maintenance command proof for exact retry acknowledgement.
+    last_maintenance_request: ?[]const u8 = null,
+    state: RelationalIndexBuildState,
+    rows_scanned: []const u8,
+    failure: ?RelationalIndexBuildFailure = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "group_id", "group_id", false },
+        .{ "generation", "generation", false },
+        .{ "slot", "slot", false },
+        .{ "owner", "owner", false },
+        .{ "comparison", "comparison", false },
+        .{ "progress_digest", "progress_digest", false },
+        .{ "maintenance_epoch", "maintenance_epoch", false },
+        .{ "last_maintenance_request", "last_maintenance_request", true },
+        .{ "state", "state", false },
+        .{ "rows_scanned", "rows_scanned", false },
+        .{ "failure", "failure", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("group_id");
+        try jw.write(self.group_id);
+        try jw.objectField("generation");
+        try jw.write(self.generation);
+        try jw.objectField("slot");
+        try jw.write(self.slot);
+        try jw.objectField("owner");
+        try jw.write(self.owner);
+        try jw.objectField("comparison");
+        try jw.write(self.comparison);
+        try jw.objectField("progress_digest");
+        try jw.write(self.progress_digest);
+        try jw.objectField("maintenance_epoch");
+        try jw.write(self.maintenance_epoch);
+        if (self.last_maintenance_request) |value| {
+            try jw.objectField("last_maintenance_request");
+            try jw.write(value);
+        }
+        try jw.objectField("state");
+        try jw.write(self.state);
+        try jw.objectField("rows_scanned");
+        try jw.write(self.rows_scanned);
+        if (self.failure) |value| {
+            try jw.objectField("failure");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const RelationalIndexStatsIndexType = enum {
+    relational,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .relational => "relational",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "relational", .relational },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const RelationalIndexStats = struct {
+    index_type: RelationalIndexStatsIndexType,
+    milestones: IndexMilestones,
+    relational_index: RelationalIndexStatus,
+};
+
+pub const RelationalIndexStatus = struct {
+    table_id: []const u8,
+    schema_version: u32,
+    index_name: []const u8,
+    state: RelationalIndexBuildState,
+    ranges: []const RelationalIndexRangeStatus,
+};
+
+pub const RelationalRow = struct {
+    /// Opaque index-order continuation; present only for secondary-index queries.
+    cursor: ?[]const u8 = null,
+    _id: []const u8,
+    row: std.json.ArrayHashMap(std.json.Value),
+    /// Exact row version for mutation preconditions, encoded as decimal text.
+    version: []const u8,
+    /// Active pinned schema epoch, not the historical physical row layout.
+    schema_version: u32,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "cursor", "cursor", true },
+        .{ "_id", "_id", false },
+        .{ "row", "row", false },
+        .{ "version", "version", false },
+        .{ "schema_version", "schema_version", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.cursor) |value| {
+            try jw.objectField("cursor");
+            try jw.write(value);
+        }
+        try jw.objectField("_id");
+        try jw.write(self._id);
+        try jw.objectField("row");
+        try jw.write(self.row);
+        try jw.objectField("version");
+        try jw.write(self.version);
+        try jw.objectField("schema_version");
+        try jw.write(self.schema_version);
+        try jw.endObject();
+    }
+};
+
+pub const RelationalRowCondition = struct {
+    column: []const u8,
+    op: RelationalComparisonOp,
+    /// Typed scalar operand. Omission means NULL. Integer columns also accept exact decimal strings.
+    value: ?std.json.Value = null,
+    collation: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "column", "column", false },
+        .{ "op", "op", false },
+        .{ "value", "value", true },
+        .{ "collation", "collation", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("column");
+        try jw.write(self.column);
+        try jw.objectField("op");
+        try jw.write(self.op);
+        if (self.value) |value| {
+            try jw.objectField("value");
+            try jw.write(value);
+        }
+        if (self.collation) |value| {
+            try jw.objectField("collation");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Typed left-prefix bound in declared index order, including descending components. Inclusive bounds include the entire matching prefix. Integer components accept exact decimal strings; null is an indexed null.
+pub const RelationalRowIndexBound = struct {
+    values: []const std.json.Value,
+    inclusive: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "values", "values", false },
+        .{ "inclusive", "inclusive", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("values");
+        try jw.write(self.values);
+        if (self.inclusive) |value| {
+            try jw.objectField("inclusive");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// A complete row replacement, or deletion when row is omitted. No read-modify-write is implied.
+pub const RelationalRowMutation = struct {
+    key: []const u8,
+    /// Exact observed version. Zero requires that the row does not exist.
+    expected_version: []const u8,
+    row: ?std.json.ArrayHashMap(std.json.Value) = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "key", "key", false },
+        .{ "expected_version", "expected_version", false },
+        .{ "row", "row", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("key");
+        try jw.write(self.key);
+        try jw.objectField("expected_version");
+        try jw.write(self.expected_version);
+        if (self.row) |value| {
+            try jw.objectField("row");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Atomic version-conditional typed-row replacements and deletions using the durable distributed transaction coordinator.
+pub const RelationalRowMutationRequest = struct {
+    /// Required active relational schema epoch, fenced during every participant prepare.
+    schema_version: u32,
+    mutations: []const RelationalRowMutation,
+    sync_level: ?SyncLevel = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "schema_version", "schema_version", false },
+        .{ "mutations", "mutations", false },
+        .{ "sync_level", "sync_level", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("schema_version");
+        try jw.write(self.schema_version);
+        try jw.objectField("mutations");
+        try jw.write(self.mutations);
+        if (self.sync_level) |value| {
+            try jw.objectField("sync_level");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Bounded relational scan in primary-key order, or composite index order when index is supplied. Index queries require schema_version and every owning shard must have the selected generation ready. Partial indexes require their WHERE predicates to be implied by the query conditions. The bounded proof combines per-column equality, tighter ranges, exclusions, and NULL-aware predicates using exact typed values and matching collations. Unsupported implications fail closed. Explicit scan bounds alone are not an implication proof. Equal tuples are ordered by primary key. Each shard read pins its own immutable schema and row snapshot; this is not a table-wide consistent snapshot. Resume with the last returned _id as from for primary scans, or its cursor as after for index scans. A resumed request opens a fresh snapshot, not a retained cursor; concurrent mutations may move rows across the continuation boundary. Keep index, bounds and conditions unchanged when paging. An empty projection returns row identities and versions only.
+pub const RelationalRowQueryRequest = struct {
+    /// Ready composite secondary index. Requires schema_version; cannot be combined with from/to.
+    index: ?[]const u8 = null,
+    /// Opaque exclusive index-order cursor from the last returned row. Binds the immutable schema version, logical index name, and comparison semantics, independent of owner-local physical generations. Each owner must still prove its current local index is ready.
+    after: ?[]const u8 = null,
+    lower: ?RelationalRowIndexBound = null,
+    upper: ?RelationalRowIndexBound = null,
+    fields: []const []const u8,
+    conditions: ?[]const RelationalRowCondition = null,
+    /// Exclusive lower primary-key bound, including pagination continuation.
+    from: ?[]const u8 = null,
+    /// Exclusive upper primary-key bound.
+    to: ?[]const u8 = null,
+    limit: ?u32 = null,
+    /// Reject the read if an owning shard has a different active schema epoch. Zero is a valid epoch and is distinct from omission.
+    schema_version: ?u32 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "index", "index", true },
+        .{ "after", "after", true },
+        .{ "lower", "lower", true },
+        .{ "upper", "upper", true },
+        .{ "fields", "fields", false },
+        .{ "conditions", "conditions", true },
+        .{ "from", "from", true },
+        .{ "to", "to", true },
+        .{ "limit", "limit", true },
+        .{ "schema_version", "schema_version", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.index) |value| {
+            try jw.objectField("index");
+            try jw.write(value);
+        }
+        if (self.after) |value| {
+            try jw.objectField("after");
+            try jw.write(value);
+        }
+        if (self.lower) |value| {
+            try jw.objectField("lower");
+            try jw.write(value);
+        }
+        if (self.upper) |value| {
+            try jw.objectField("upper");
+            try jw.write(value);
+        }
+        try jw.objectField("fields");
+        try jw.write(self.fields);
+        if (self.conditions) |value| {
+            try jw.objectField("conditions");
+            try jw.write(value);
+        }
+        if (self.from) |value| {
+            try jw.objectField("from");
+            try jw.write(value);
+        }
+        if (self.to) |value| {
+            try jw.objectField("to");
+            try jw.write(value);
+        }
+        if (self.limit) |value| {
+            try jw.objectField("limit");
+            try jw.write(value);
+        }
+        if (self.schema_version) |value| {
+            try jw.objectField("schema_version");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Immutable typed scalar expression, limited to 128 nodes and 16 levels. A literal requires type; omitted value means typed null. A column requires column; other operations require args. Unknown or irrelevant fields are rejected. Arithmetic operands have the same integer or number type. Integer division truncates toward zero. Overflow and division by zero reject the write. Arithmetic and string operations propagate null. ASCII case operations leave non-ASCII bytes unchanged. No volatile functions are accepted. Allocated results are bounded to 1 MiB each. Allocations and byte-comparison operand work share a 4 MiB evaluation budget per row and expression set. An integer literal may use a decimal string for exact int64 transport; blob uses base64 and datetime uses the normal relational datetime representation. Comparisons require operands of the same type and return boolean or SQL UNKNOWN (null); is_distinct and is_not_distinct always return a boolean. Unary is_null and is_not_null test presence/null. AND and OR evaluate left to right with SQL three-valued short-circuit semantics; NOT preserves UNKNOWN. CHECK accepts TRUE and UNKNOWN, rejecting FALSE.
+pub const RelationalScalarExpression = struct {
+    op: RelationalExpressionOp,
+    type: ?RelationalExpressionType = null,
+    /// Typed literal value, including null.
+    value: ?std.json.Value = null,
+    column: ?[]const u8 = null,
+    /// Optional binary or ASCII case-insensitive collation for binary string comparison operations only; aliases match ordered indexes.
+    collation: ?[]const u8 = null,
+    args: ?[]const RelationalScalarExpression = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "op", "op", false },
+        .{ "type", "type", true },
+        .{ "value", "value", true },
+        .{ "column", "column", true },
+        .{ "collation", "collation", true },
+        .{ "args", "args", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("op");
+        try jw.write(self.op);
+        if (self.type) |value| {
+            try jw.objectField("type");
+            try jw.write(value);
+        }
+        if (self.value) |value| {
+            try jw.objectField("value");
+            try jw.write(value);
+        }
+        if (self.column) |value| {
+            try jw.objectField("column");
+            try jw.write(value);
+        }
+        if (self.collation) |value| {
+            try jw.objectField("collation");
+            try jw.write(value);
+        }
+        if (self.args) |value| {
+            try jw.objectField("args");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// A named, ordered composite unique key. Validation status is maintained by the server. TTL expiry uses the distributed integrity coordinator. Referenced unique keys are nondeferrable.
+pub const RelationalUniqueConstraint = struct {
+    name: []const u8,
+    columns: []const []const u8,
+    /// When true, NULL components compare equal for uniqueness.
+    nulls_not_distinct: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "name", "name", false },
+        .{ "columns", "columns", false },
+        .{ "nulls_not_distinct", "nulls_not_distinct", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("columns");
+        try jw.write(self.columns);
+        if (self.nulls_not_distinct) |value| {
+            try jw.objectField("nulls_not_distinct");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const RenameCatalogResourceRequest = struct {
+    /// New logical name. The durable resource identity remains unchanged.
+    name: []const u8,
+};
+
 /// Bounded request to list table repair issues.
 pub const RepairIssueListRequest = struct {
     /// Repair subsystem to list. `artifact` lists durable artifact queue records; `index` lists index repair candidates derived from index status and artifact debt.
@@ -27674,7 +32102,7 @@ pub const RepairIssueListRequest = struct {
     /// Opaque cursor returned by a prior response.
     cursor: ?[]const u8 = null,
     /// Maximum repair records to return.
-    limit: ?i64 = null,
+    limit: ?u32 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -27734,7 +32162,7 @@ pub const RepairRunRequest = struct {
     /// Optional opaque generation fence for a repair control. A stale value is rejected instead of affecting a newer repair.
     repair_id: ?[]const u8 = null,
     /// Maximum artifact repair records to attempt. For target=index, any positive value permits one named index repair.
-    limit: ?i64 = null,
+    limit: ?u32 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -28402,6 +32830,9 @@ pub const RerankerProvider = enum {
 /// Type of resource: table, user, inference, or global ('*'). Use inference with resource '*' to grant access to unified inference routes.
 pub const ResourceType = enum {
     table,
+    database,
+    namespace,
+    tablespace,
     user,
     inference,
     @"*",
@@ -28409,6 +32840,9 @@ pub const ResourceType = enum {
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
             .table => "table",
+            .database => "database",
+            .namespace => "namespace",
+            .tablespace => "tablespace",
             .user => "user",
             .inference => "inference",
             .@"*" => "*",
@@ -28423,6 +32857,9 @@ pub const ResourceType = enum {
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "table", .table },
+            .{ "database", .database },
+            .{ "namespace", .namespace },
+            .{ "tablespace", .tablespace },
             .{ "user", .user },
             .{ "inference", .inference },
             .{ "*", .@"*" },
@@ -28572,12 +33009,12 @@ pub const RestoreRequest = struct {
     connection: []const u8,
 };
 
-/// Request for the retrieval agent. Queries define which tables and indexes to search, each as a QueryRequest with optional tree search configuration. **Pipeline mode** (default, max_internal_iterations=0): Queries are executed directly without an LLM tool-calling loop. **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to call, using the queries to determine available tables and indexes. A query may contain only a table scope and caller constraints: build_query delegates to the query-builder agent, then search executes its validated QueryRequest. Refinements use the same canonical full-DSL validator, not keyword substitution. Authenticated row filters are enforced on every initial and generated operation in both modes, including scans, aggregates, and graph/tree traversal. They cannot be replaced or weakened by model tool arguments.
+/// Request for the retrieval agent. Queries define which tables and indexes to search, each as an ordinary QueryRequest. Optional tree or graph exploration is configured by steps.retrieval.navigation, targeting one query by index. **Pipeline mode** (default, max_internal_iterations=0): Queries are executed directly without an LLM tool-calling loop. **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to call, using the queries to determine available tables and indexes. A query may contain only a table scope and caller constraints: build_query delegates to the query-builder agent, then search executes its validated QueryRequest. Refinements use the same canonical full-DSL validator, not keyword substitution. Authenticated row filters are enforced on every initial and generated operation in both modes, including scans, aggregates, and graph/tree traversal. They cannot be replaced or weakened by model tool arguments.
 pub const RetrievalAgentRequest = struct {
     /// User's natural language query
     query: []const u8,
     /// Queries to execute. Each query carries its own table via the QueryRequest table field. In pipeline mode (max_internal_iterations=0), these are executed directly. In agentic mode, these declare which table and indexes are available. `filter_query` and `exclusion_query` are mandatory table predicates for retrieval-agent execution. Predicates declared by any query for a table are conjoined (or unioned for exclusions) and applied to every initial query, generated refinement, probe, aggregation, graph/tree traversal, root scan, and follow-up for that table. They cannot be weakened by generated operations.
-    queries: []const RetrievalQueryRequest,
+    queries: []const QueryRequest,
     /// Optional conversational context for the current turn. Decisions remain the authoritative continuation input for bounded agent interactions.
     messages: ?[]const ChatMessage = null,
     /// Domain-specific knowledge to include in the agent's system prompt. Useful for providing context about the document collection.
@@ -29040,117 +33477,51 @@ pub const RetrievalAgentUsage = struct {
     }
 };
 
-/// A canonical query in the retrieval pipeline with an optional tree search configuration. Each query specifies its own table. Deprecated stateful graph_searches compatibility is intentionally unavailable here. When both search fields (semantic_search, full_text_search) and tree_search are provided, the search results are used as start nodes for tree navigation.
-pub const RetrievalQueryRequest = struct {
-    /// Name of the table to query. Required for global-query requests.
-    table: ?[]const u8 = null,
-    /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is non-scoring query input. - `bool.must_not` is non-scoring exclusion query input. Filter branches accept the same query variants as `filter_query` and `exclusion_query`. Structured clauses use the native document-value path; text clauses are resolved through the text index before scoring.
-    query: ?std.json.Value = null,
-    /// Antfly query for full-text search. Supports all Antfly query types. See specs/openapi/antfly/query.yaml for complete type definitions. Examples: - Simple: `{"query": "computer"}` - Field-specific: `{"query": "body:computer"}` - Boolean: `{"query": "+artificial +intelligence"}` - Range: `{"query": "year:>2020"}` - Phrase: `{"query": "\"exact phrase\""}`
-    full_text_search: ?RawQuery = null,
-    /// Full-text index used by `full_text_search` and by scoring text clauses in `query`. Use this to query a named document- or artifact-backed full-text index. The selected index must exist and have type `full_text`. Omit this field to use the table's active schema full-text index, preserving v0.2 behavior. Structured document filters continue to use the active schema index even when retrieval uses a named artifact index. This selector is invalid without `full_text_search` or a scoring text clause in `query` and receives HTTP 422. This semantic relationship is enforced after the recursive query AST is normalized; OpenAPI presence checks cannot accurately distinguish scoring clauses from filter-only or exclusion-only trees.
-    full_text_index: ?[]const u8 = null,
-    /// Natural language query for vector similarity search. Results are ranked by semantic similarity to the query and can be combined with full_text_search using Reciprocal Rank Fusion (RRF). The semantic_search string is automatically embedded using the configured embedding model for the specified indexes. UTF-8 input is limited to 1 MiB. Use `embedding_template` for multimodal queries.
-    semantic_search: ?[]const u8 = null,
-    /// Optional Handlebars template for multimodal embedding of the semantic_search query. The template has access to `this` which contains the semantic_search string value. UTF-8 template input is limited to 64 KiB. Use this when you want to embed template-time multimodal content instead of just text. The template is rendered using dotprompt with access to remote content helpers. **Available Helpers**: - `remoteMedia url=<url>` - Fetches and embeds remote images/media - `remotePDF url=<url>` - **Deprecated.** Fetches and extracts text from born-digital PDFs - `remoteText url=<url>` - Fetches and includes remote text content Use a `document_extraction` asset producer when PDF pages and chunks must be persisted and reprocessed. `remoteMedia` and the other helpers only prepare template-time inference input. **Examples**: - Legacy PDF search: `{{remotePDF url=this}}` - Image search: `{{remoteMedia url=this}}` - Mixed: `Search for: {{this}} {{#if this}}{{remoteMedia url=this}}{{/if}}` When not specified, the semantic_search string is embedded as plain text.
-    embedding_template: ?[]const u8 = null,
-    /// Embedding index names selected for `semantic_search` or explicit `embeddings`. Dense and sparse indexes are supported when the corresponding query representation is supplied. Provisioned deployments require at least one index for `semantic_search`; serverless may infer its single published dense index when this field is omitted. When `embeddings` is supplied without this field, the embedding map keys select the indexes. Provisioned results from multiple indexes are merged using RRF. Serverless currently executes at most one dense and one sparse index per request; it rejects multiple same-kind selectors and omitted selectors when more than one corresponding index is published rather than choosing an index by catalog order.
-    indexes: ?[]const []const u8 = null,
-    /// Filter results by key prefix. Only returns documents whose keys start with this string. Applied before scoring to improve performance. Common use cases: - Multi-tenant filtering: `"tenant:acme:"` - User-specific data: `"user:123:"` - Document type filtering: `"article:"`
-    filter_prefix: ?[]const u8 = null,
-    /// Antfly query applied as an AND condition. Documents must match both the main query and this filter. Applied before scoring for better performance. See specs/openapi/antfly/query.yaml for complete type definitions. Use for: - Status filtering: `"status:published"` - Date ranges: `"created_at:>2023-01-01"` - Category filtering: `"+category:technology +language:en"` - Geo bounding boxes: `{"geo_bbox":{"field":"location","min_lat":-1,"min_lon":179.5,"max_lat":1,"max_lon":-179.5}}` For structured `geo_bbox`, `min_lon > max_lon` intentionally represents a bounding box that crosses the antimeridian.
-    filter_query: ?RawQuery = null,
-    /// Antfly query applied as a NOT condition. Documents matching this query are excluded from results. Applied before scoring. See specs/openapi/antfly/query.yaml for complete type definitions. Use for: - Excluding drafts: `"status:draft"` - Removing deprecated content: `"deprecated:true"` - Filtering out archived items: `"status:archived"`
-    exclusion_query: ?RawQuery = null,
-    /// Aggregation requests for computing metrics and bucketing results. Each key is a user-defined name for the aggregation, and the value specifies the aggregation configuration. When `hierarchy.group_by` is present, aggregations operate on the complete set of top-level grouped source or unit records. Nested `group_by.matches` are bounded evidence projections and are not counted as aggregation rows. Supports metric aggregations (sum, avg, min, max, count, stats, cardinality), bucketing aggregations (terms, range, date_range, histogram, date_histogram), geo aggregations (geohash_grid, geo_distance), and analytics (significant_terms). Example: ```json { "price_stats": { "type": "stats", "field": "price" }, "categories": { "type": "terms", "field": "category", "size": 10 } } ```
-    aggregations: ?std.json.ArrayHashMap(AggregationRequest) = null,
-    /// Pre-computed embeddings to use for semantic searches instead of embedding the semantic_search string. The keys are the index names. Values can be either: - **Dense (array)**: an array of floats, e.g. `[0.1, 0.2, 0.3]` - **Dense (packed)**: a base64 string of little-endian float32 bytes (~4x more compact) - **Sparse**: an object with `indices` (array of ints) and `values` (array of floats), e.g. `{"indices": [1, 5, 100], "values": [0.3, 0.7, 0.1]}` - **Sparse (packed)**: an object with `packed_indices` (base64 uint32 LE) and `packed_values` (base64 float32 LE) Use when you've already generated embeddings on the client side to avoid redundant embedding calls.
-    embeddings: ?std.json.ArrayHashMap(Embedding) = null,
-    /// Controls the vector search recall/latency tradeoff for semantic searches. - `0.0` = fastest, lowest recall - `0.5` = balanced default - `1.0` = highest recall When omitted, Antfly uses the balanced default effort (`0.5`) unless lower-level vector search overrides are provided internally.
-    search_effort: ?f32 = null,
-    /// List of fields to include in the results. If not specified, all fields are returned. Use to reduce response size and improve performance. This field is required when hierarchy.group_by is present so a grouped query cannot accidentally hydrate an entire grouped document. Use an empty array for identity-only groups. This projection is also required for hierarchy.children traversal.
-    fields: ?[]const []const u8 = null,
-    hierarchy: ?QueryHierarchy = null,
-    /// Maximum number of top-level results to return. For semantic_search, this is the topk parameter. This does not limit nested matches attached through hierarchy.group_by.matches; use hierarchy.group_by.matches.limit for that. Default varies by query type (typically 10). Queries using hierarchy.group_by.matches are limited to 100 top-level groups and a groups-times-matches execution budget of 1,000.
-    limit: ?i64 = null,
-    /// Number of results to skip for pagination. Supported for text-backed, match_all, and filter-only requests. Approximate semantic requests do not support offset on their own. Semantic and hybrid requests support it when a reranker is configured: Antfly retrieves a bounded candidate window and applies offset after coordinator-owned reranking.
-    offset: ?i64 = null,
-    /// Optional query execution deadline in milliseconds. The server applies this as a cooperative deadline across query planning, search execution, aggregation reruns, sorting, and response post-processing. If the deadline expires before the query completes, the HTTP API returns 504. When omitted, semantic query embedding planning and provider I/O use a 30-second default deadline.
-    timeout_ms: ?i64 = null,
-    /// Sort order for results. Array of sort fields with direction. Antfly appends `_id` ascending as a stable tie-breaker when it is omitted. Hierarchy child traversal requires `_hierarchy.position` ascending; its opaque, sortable value is bound to the complete source hierarchy revision. Supported for exact text-backed, match_all, and filter-only requests when each non-`_id` field is a mapped exact scalar field with sortable native doc-value coverage. Sortable mapping types are keyword, numeric/number/integer, boolean/bool, datetime/date/timestamp, and link. Declare the field with `x-antfly-field` and `sortable: true`; `x-antfly-types` shorthand declarations alone are not sortable. Analyzed `text` fields and `search_as_you_type`, geo, embedding, blob, html, object, and array fields are not directly sortable; sort on an exact scalar mapping such as `title.keyword` instead. Requests that cannot be executed through an exact native sort path return 422 rather than falling back to stored JSON sorting. Semantic searches are always sorted by similarity score. Not supported when `count` is true.
-    order_by: ?[]const SortField = null,
-    /// Cursor for forward pagination. Pass the `_sort` values from the last hit of the previous page exactly, including the appended `_id` tie-breaker. Values preserve their JSON types; for example numbers remain numbers, booleans remain booleans, and strings remain strings. Cursor values must be replayable JSON scalars; nulls, arrays, objects, and non-finite numbers are rejected. Mutually exclusive with `offset`. When `order_by` is omitted, Antfly uses `_id` ascending as the effective order and the cursor tuple must contain exactly one `_id` string. Supported for exact text-backed, match_all, and filter-only requests; not supported for semantic_search or count-only requests. For hierarchy child traversal, a cursor whose source-artifact revision changed returns `409 hierarchy_cursor_stale`; restart the same traversal without `search_after` rather than retrying the stale tuple.
-    search_after: ?[]const std.json.Value = null,
-    /// Cursor for backward pagination. Pass the `_sort` values from the first hit of the current page exactly, including the appended `_id` tie-breaker. Values preserve their JSON types; for example numbers remain numbers, booleans remain booleans, and strings remain strings. Cursor values must be replayable JSON scalars; nulls, arrays, objects, and non-finite numbers are rejected. Mutually exclusive with `offset`. When `order_by` is omitted, Antfly uses `_id` ascending as the effective order and the cursor tuple must contain exactly one `_id` string. Supported for exact text-backed, match_all, and filter-only requests; not supported for semantic_search or count-only requests.
-    search_before: ?[]const std.json.Value = null,
-    /// Maximum distance threshold for semantic similarity search. Results with distance greater than this value are excluded. Lower distances indicate higher similarity. Useful for filtering out low-confidence matches.
-    distance_under: ?f32 = null,
-    /// Minimum distance threshold for semantic similarity search. Results with distance less than this value are excluded. Useful for excluding near-exact duplicates or finding dissimilar documents.
-    distance_over: ?f32 = null,
-    /// Configuration for merging full-text and semantic search results. Only applies when both `full_text_search` and `semantic_search` are specified.
-    merge_config: ?MergeConfig = null,
-    /// If true, returns only the total count of matching documents without retrieving the actual documents. Useful for pagination and displaying result counts. Count-only requests do not return an ordered result page, so `order_by`, `search_after`, and `search_before` are not supported when this is true.
-    count: ?bool = null,
-    /// If true, includes detailed execution profiling in the response. Adds a `profile` object with per-phase timing breakdowns, shard statistics, join metadata, reranker stats, and merge details. Has minor performance overhead — not recommended for production traffic.
-    profile: ?bool = null,
-    /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Set `candidate_count` to the bounded retrieval window (often 50-100) and use the query `limit` for the final page size. Antfly retrieves and globally merges that window, calls the reranker once, then applies pruning, offset, and limit at the coordinator. Example: ```json { "provider": "antfly", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
-    reranker: ?RerankerConfig = null,
-    /// Direct top-k read from a published graph metric generation. Results are returned in graph_metric_results under the requested name or the metric name when no explicit name is supplied.
-    graph_metric: ?GraphMetricQuery = null,
-    /// Blend a published graph metric feature into ordinary search hit scores. Requests may require either any published generation or a generation that is fresh with respect to graph writes.
-    graph_metric_rerank: ?GraphMetricRerank = null,
-    analyses: ?Analyses = null,
-    /// Declarative graph matching, traversal, and path queries. A nested node `filter` is a typed, non-scoring stored-document predicate. It shares familiar scalar syntax with document queries but deliberately excludes analyzer-backed and index-only clauses. A request may contain at most 64 named graph operations, of which at most 8 may be named `match` operations. Each operation key is a GraphIdentifier under the versioned policy published in the GraphIdentifier schema. Put multiple counts over one pattern in the same `match` return object so they share one complete anchor scan.
-    graph_queries: ?GraphQueries = null,
-    /// Optional Handlebars template string for rendering document content in RAG queries. Template has access to document fields via `{{this.fields.fieldName}}`. **Default**: Uses TOON (Token-Oriented Object Notation) format for 30-60% token reduction: ```handlebars {{encodeToon this.fields}} ``` **Available Helpers**: - `encodeToon` - Renders fields in compact TOON format with configurable options: - `lengthMarker` (bool): Add # prefix to array counts (default: true) - `indent` (int): Indentation spacing (default: 2) - `delimiter` (string): Field separator for tabular arrays - `scrubHtml` - Removes HTML tags and extracts text - `media` - Wraps data URIs for GenKit multimodal support - `eq` - Equality comparison for conditionals **Examples**: - Basic TOON: `{{encodeToon this.fields}}` - Compact TOON: `{{encodeToon this.fields lengthMarker=false indent=0}}` - Tabular data: `{{encodeToon this.fields delimiter="\t"}}` - Custom template: `Title: {{this.fields.title}}\nBody: {{this.fields.body}}` - Traditional format: `{{#each this.fields}}{{@key}}: {{this}}\n{{/each}}` TOON format produces compact, LLM-optimized output like: ``` title: Introduction to Vector Search author: Jane Doe tags[#3]: ai,search,ml ``` **References**: - TOON Specification: https://github.com/toon-format/toon - Go Implementation: https://github.com/alpkeskin/gotoon
-    document_renderer: ?[]const u8 = null,
-    /// Optional result pruning configuration to filter low-relevance results. Pruning helps detect "elbows" in score distributions and removes results that are significantly worse than top matches. It runs once on globally merged results, after optional reranking and before the final offset/limit page is selected. **Common patterns:** - RAG queries: Use `max_score_gap_percent: 30` to stop at quality drop-offs - Strict matching: Use `min_score_ratio: 0.7` for high-quality results only - Combine both for best results Example: ```json { "min_score_ratio": 0.5, "max_score_gap_percent": 25.0, "min_absolute_score": 0.3 } ```
-    pruner: ?Pruner = null,
-    /// Cross-table join configuration for combining results from multiple tables. Joins allow you to enrich query results with data from related tables, similar to SQL JOINs but optimized for distributed execution. **Join Types:** - `inner`: Only return rows that have matches in both tables - `left`: Return all rows from the primary table, with NULL for non-matching right rows - `right`: Return all rows from the joined table, with NULL for non-matching left rows **Join Strategies** (auto-selected based on table sizes): - `broadcast`: Small table broadcast to all shards (best for dimension tables < 10MB) - `index_lookup`: Batch key lookups using indexes (best for selective joins) - `shuffle`: Hash-partition both tables (best for large-large joins) **Example - Enrich orders with customer data:** ```json { "table": "orders", "full_text_search": {"query": "status:pending"}, "join": { "right_table": "customers", "join_type": "inner", "on": { "left_field": "customer_id", "right_field": "id" }, "right_filters": { "filter_query": {"query": "tier:premium"} } }, "fields": ["order_id", "amount", "customers.name", "customers.email"] } ``` **Multi-way joins** (nested): ```json { "table": "orders", "join": { "right_table": "customers", "on": {"left_field": "customer_id", "right_field": "id"}, "nested_join": { "right_table": "addresses", "on": {"left_field": "customers.address_id", "right_field": "id"} } } } ``` **Performance Tips:** - Filter the driving table first to reduce join input size - Put the smaller table on the right side for broadcast joins - Use indexed fields in join conditions for index_lookup strategy - Limit result fields to reduce data transfer
-    join: ?JoinClause = null,
-    /// Map of table name to foreign data source configuration for query-time federated access. When a table name referenced in this query (or in a join's `right_table`) appears as a key here, the query is routed to the external database instead of Antfly shards. This enables joining Antfly search results with structured relational data (customer records, product catalogs, etc.) without ingesting that data into Antfly. **Supported operations on foreign tables:** filter_query, field selection, limit/offset. **Not supported:** full_text_search, semantic_search, graph_queries, aggregations, reranker. **Example - Join Antfly products with Postgres customers:** ```json { "table": "products", "full_text_search": {"query": "category:electronics"}, "join": { "right_table": "pg_customers", "on": {"left_field": "customer_id", "right_field": "id"} }, "foreign_sources": { "pg_customers": { "type": "postgres", "dsn": "${secret:pg_dsn}", "postgres_table": "customers" } } } ```
-    foreign_sources: ?std.json.ArrayHashMap(ForeignSource) = null,
-    /// Optional tree search configuration
-    tree_search: ?TreeSearchConfig = null,
+/// Retrieval-step navigation targeting one ordinary query. Graph navigation follows one path; tree navigation explores a retained branch frontier. Agentic selection uses the enclosing model and budgets. Ranked selection is supported for trees and uses the existing deterministic tree traversal. Agentic selection requires agentic mode and a retrieval generator. Search starts exploration; navigation selects only an offered, unvisited node. All reads enforce mandatory predicates and authenticated row filters.
+pub const RetrievalNavigationConfig = struct {
+    /// Zero-based index into the enclosing request queries.
+    query_index: i64,
+    strategy: RetrievalNavigationStrategy,
+    /// Ranked selection is supported only with strategy tree.
+    selection: RetrievalNavigationSelection,
+    /// Tree-only maximum depth from the start node (depth zero); defaults to 5.
+    max_depth: ?i64 = null,
+    /// Tree-only maximum children offered per expansion; defaults to 3.
+    beam_width: ?i64 = null,
+    /// Graph index used for every neighbor read.
+    index: []const u8,
+    /// Ranked-tree-only seed selector (comma-separated keys, $roots, or a prior-result selector). Mutually exclusive with start_key.
+    start_nodes: ?[]const u8 = null,
+    /// Literal start document key. Agentic selection defaults to the first query hit; ranked selection defaults to seed results or prior query hits.
+    start_key: ?[]const u8 = null,
+    /// Direction for every hop; defaults to out.
+    direction: ?EdgeDirection = null,
+    edge_types: ?[]const GraphEdgeType = null,
+    /// Graph-only maximum moves after the start node (default 8). The enclosing agent's iteration and tool limits also apply.
+    max_steps: ?i64 = null,
+    /// Graph-only maximum candidate neighbors per node (default 8), further limited by the context budget.
+    neighbor_limit: ?i64 = null,
+    /// Optional caller-supplied workflow instruction retained in agent history.
+    instruction: ?[]const u8 = null,
+    /// Explicitly opt in to following instructions from this top-level string field of each visited document. Instructions accumulate in agent history. Other document fields and unvisited neighbors remain untrusted evidence. The field must be included if the query uses a fields projection.
+    instruction_field: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
-        .{ "table", "table", true },
-        .{ "query", "query", true },
-        .{ "full_text_search", "full_text_search", true },
-        .{ "full_text_index", "full_text_index", true },
-        .{ "semantic_search", "semantic_search", true },
-        .{ "embedding_template", "embedding_template", true },
-        .{ "indexes", "indexes", true },
-        .{ "filter_prefix", "filter_prefix", true },
-        .{ "filter_query", "filter_query", true },
-        .{ "exclusion_query", "exclusion_query", true },
-        .{ "aggregations", "aggregations", true },
-        .{ "embeddings", "embeddings", true },
-        .{ "search_effort", "search_effort", true },
-        .{ "fields", "fields", true },
-        .{ "hierarchy", "hierarchy", true },
-        .{ "limit", "limit", true },
-        .{ "offset", "offset", true },
-        .{ "timeout_ms", "timeout_ms", true },
-        .{ "order_by", "order_by", true },
-        .{ "search_after", "search_after", true },
-        .{ "search_before", "search_before", true },
-        .{ "distance_under", "distance_under", true },
-        .{ "distance_over", "distance_over", true },
-        .{ "merge_config", "merge_config", true },
-        .{ "count", "count", true },
-        .{ "profile", "profile", true },
-        .{ "reranker", "reranker", true },
-        .{ "graph_metric", "graph_metric", true },
-        .{ "graph_metric_rerank", "graph_metric_rerank", true },
-        .{ "analyses", "analyses", true },
-        .{ "graph_queries", "graph_queries", true },
-        .{ "document_renderer", "document_renderer", true },
-        .{ "pruner", "pruner", true },
-        .{ "join", "join", true },
-        .{ "foreign_sources", "foreign_sources", true },
-        .{ "tree_search", "tree_search", true },
+        .{ "query_index", "query_index", false },
+        .{ "strategy", "strategy", false },
+        .{ "selection", "selection", false },
+        .{ "max_depth", "max_depth", true },
+        .{ "beam_width", "beam_width", true },
+        .{ "index", "index", false },
+        .{ "start_nodes", "start_nodes", true },
+        .{ "start_key", "start_key", true },
+        .{ "direction", "direction", true },
+        .{ "edge_types", "edge_types", true },
+        .{ "max_steps", "max_steps", true },
+        .{ "neighbor_limit", "neighbor_limit", true },
+        .{ "instruction", "instruction", true },
+        .{ "instruction_field", "instruction_field", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -29163,161 +33534,118 @@ pub const RetrievalQueryRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
-        if (self.table) |value| {
-            try jw.objectField("table");
+        try jw.objectField("query_index");
+        try jw.write(self.query_index);
+        try jw.objectField("strategy");
+        try jw.write(self.strategy);
+        try jw.objectField("selection");
+        try jw.write(self.selection);
+        if (self.max_depth) |value| {
+            try jw.objectField("max_depth");
             try jw.write(value);
         }
-        if (self.query) |value| {
-            try jw.objectField("query");
+        if (self.beam_width) |value| {
+            try jw.objectField("beam_width");
             try jw.write(value);
         }
-        if (self.full_text_search) |value| {
-            try jw.objectField("full_text_search");
+        try jw.objectField("index");
+        try jw.write(self.index);
+        if (self.start_nodes) |value| {
+            try jw.objectField("start_nodes");
             try jw.write(value);
         }
-        if (self.full_text_index) |value| {
-            try jw.objectField("full_text_index");
+        if (self.start_key) |value| {
+            try jw.objectField("start_key");
             try jw.write(value);
         }
-        if (self.semantic_search) |value| {
-            try jw.objectField("semantic_search");
+        if (self.direction) |value| {
+            try jw.objectField("direction");
             try jw.write(value);
         }
-        if (self.embedding_template) |value| {
-            try jw.objectField("embedding_template");
+        if (self.edge_types) |value| {
+            try jw.objectField("edge_types");
             try jw.write(value);
         }
-        if (self.indexes) |value| {
-            try jw.objectField("indexes");
+        if (self.max_steps) |value| {
+            try jw.objectField("max_steps");
             try jw.write(value);
         }
-        if (self.filter_prefix) |value| {
-            try jw.objectField("filter_prefix");
+        if (self.neighbor_limit) |value| {
+            try jw.objectField("neighbor_limit");
             try jw.write(value);
         }
-        if (self.filter_query) |value| {
-            try jw.objectField("filter_query");
+        if (self.instruction) |value| {
+            try jw.objectField("instruction");
             try jw.write(value);
         }
-        if (self.exclusion_query) |value| {
-            try jw.objectField("exclusion_query");
-            try jw.write(value);
-        }
-        if (self.aggregations) |value| {
-            try jw.objectField("aggregations");
-            try jw.write(value);
-        }
-        if (self.embeddings) |value| {
-            try jw.objectField("embeddings");
-            try jw.write(value);
-        }
-        if (self.search_effort) |value| {
-            try jw.objectField("search_effort");
-            try jw.write(value);
-        }
-        if (self.fields) |value| {
-            try jw.objectField("fields");
-            try jw.write(value);
-        }
-        if (self.hierarchy) |value| {
-            try jw.objectField("hierarchy");
-            try jw.write(value);
-        }
-        if (self.limit) |value| {
-            try jw.objectField("limit");
-            try jw.write(value);
-        }
-        if (self.offset) |value| {
-            try jw.objectField("offset");
-            try jw.write(value);
-        }
-        if (self.timeout_ms) |value| {
-            try jw.objectField("timeout_ms");
-            try jw.write(value);
-        }
-        if (self.order_by) |value| {
-            try jw.objectField("order_by");
-            try jw.write(value);
-        }
-        if (self.search_after) |value| {
-            try jw.objectField("search_after");
-            try jw.write(value);
-        }
-        if (self.search_before) |value| {
-            try jw.objectField("search_before");
-            try jw.write(value);
-        }
-        if (self.distance_under) |value| {
-            try jw.objectField("distance_under");
-            try jw.write(value);
-        }
-        if (self.distance_over) |value| {
-            try jw.objectField("distance_over");
-            try jw.write(value);
-        }
-        if (self.merge_config) |value| {
-            try jw.objectField("merge_config");
-            try jw.write(value);
-        }
-        if (self.count) |value| {
-            try jw.objectField("count");
-            try jw.write(value);
-        }
-        if (self.profile) |value| {
-            try jw.objectField("profile");
-            try jw.write(value);
-        }
-        if (self.reranker) |value| {
-            try jw.objectField("reranker");
-            try jw.write(value);
-        }
-        if (self.graph_metric) |value| {
-            try jw.objectField("graph_metric");
-            try jw.write(value);
-        }
-        if (self.graph_metric_rerank) |value| {
-            try jw.objectField("graph_metric_rerank");
-            try jw.write(value);
-        }
-        if (self.analyses) |value| {
-            try jw.objectField("analyses");
-            try jw.write(value);
-        }
-        if (self.graph_queries) |value| {
-            try jw.objectField("graph_queries");
-            try jw.write(value);
-        }
-        if (self.document_renderer) |value| {
-            try jw.objectField("document_renderer");
-            try jw.write(value);
-        }
-        if (self.pruner) |value| {
-            try jw.objectField("pruner");
-            try jw.write(value);
-        }
-        if (self.join) |value| {
-            try jw.objectField("join");
-            try jw.write(value);
-        }
-        if (self.foreign_sources) |value| {
-            try jw.objectField("foreign_sources");
-            try jw.write(value);
-        }
-        if (self.tree_search) |value| {
-            try jw.objectField("tree_search");
+        if (self.instruction_field) |value| {
+            try jw.objectField("instruction_field");
             try jw.write(value);
         }
         try jw.endObject();
     }
 };
 
+pub const RetrievalNavigationSelection = enum {
+    agentic,
+    ranked,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .agentic => "agentic",
+            .ranked => "ranked",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "agentic", .agentic },
+            .{ "ranked", .ranked },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const RetrievalNavigationStrategy = enum {
+    tree,
+    graph,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .tree => "tree",
+            .graph => "graph",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "tree", .tree },
+            .{ "graph", .graph },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Configuration for the retrieval step. Retrieval tools are constrained by the top-level request tools policy when both are present.
 pub const RetrievalStepConfig = struct {
+    /// Navigation policy for one query; incompatible with graph_queries on that query.
+    navigation: ?RetrievalNavigationConfig = null,
     /// Tool configuration for the retrieval step. When set, this narrows the top-level tools policy for retrieval execution.
     tools: ?ChatToolsConfig = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "navigation", "navigation", true },
         .{ "tools", "tools", true },
     };
 
@@ -29331,6 +33659,10 @@ pub const RetrievalStepConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.navigation) |value| {
+            try jw.objectField("navigation");
+            try jw.write(value);
+        }
         if (self.tools) |value| {
             try jw.objectField("tools");
             try jw.write(value);
@@ -29461,22 +33793,51 @@ pub const RouteType = enum {
 pub const RowFilterEntry = struct {
     /// Table name (or '*' for all tables).
     table: []const u8,
+    table_target: ?CatalogTableScope = null,
     /// Antfly query JSON that documents must match to be visible.
     filter: std.json.ArrayHashMap(std.json.Value),
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "table", "table", false },
+        .{ "table_target", "table_target", true },
+        .{ "filter", "filter", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("table");
+        try jw.write(self.table);
+        if (self.table_target) |value| {
+            try jw.objectField("table_target");
+            try jw.write(value);
+        }
+        try jw.objectField("filter");
+        try jw.write(self.filter);
+        try jw.endObject();
+    }
 };
 
 /// Non-secret status for the applied config.json snapshot. Hot publication accepts validated remote_content-only changes; startup-only changes remain stale until restart.
 pub const RuntimeConfigStatus = struct {
     /// Generation of the fully validated and atomically published configuration.
-    generation: ?i64 = null,
+    generation: ?u64 = null,
     /// Lowercase SHA-256 of the exact fully applied config.json bytes; its first 16 characters match the operator config-hash annotation.
     hash: ?[]const u8 = null,
     /// Whether the latest observed replacement failed loading, semantic validation, or requires restart because startup-only fields changed.
     last_reload_failed: ?bool = null,
     /// Whether requests are using the last-known-good snapshot after a failed reload.
     stale: ?bool = null,
-    reload_successes: ?i64 = null,
-    reload_failures: ?i64 = null,
+    reload_successes: ?u64 = null,
+    reload_failures: ?u64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -29760,6 +34121,35 @@ pub const SSEToolMode = struct {
     }
 };
 
+/// The STT provider to use.
+pub const STTProvider = enum {
+    openai,
+    vertex,
+    antfly,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .openai => "openai",
+            .vertex => "vertex",
+            .antfly => "antfly",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "openai", .openai },
+            .{ "vertex", .vertex },
+            .{ "antfly", .antfly },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Request to scan keys in a table within a key range. If no range is specified, scans all keys in the table.
 pub const ScanKeysRequest = struct {
     /// Start of the key range to scan (exclusive by default). Can be a full key or a prefix. If not specified, starts from the beginning of the table.
@@ -29830,10 +34220,21 @@ pub const ScanKeysRequest = struct {
     }
 };
 
+pub const ScopedRowFilter = struct {
+    table_target: CatalogTableScope,
+    filter: std.json.ArrayHashMap(std.json.Value),
+};
+
 pub const SecretEntry = struct {
     /// Secret name (e.g., openai.api_key)
     key: []const u8,
     status: SecretStatus,
+    /// Name of the winning source, or environment.
+    source: ?[]const u8 = null,
+    /// Whether this key has an Antfly-managed override that can be deleted.
+    managed: ?bool = null,
+    /// Committed native entry revision, when supported by the configured backend.
+    revision: ?u64 = null,
     /// Corresponding environment variable name (e.g., OPENAI_API_KEY)
     env_var: ?[]const u8 = null,
     created_at: ?[]const u8 = null,
@@ -29843,6 +34244,9 @@ pub const SecretEntry = struct {
     pub const openApiFieldMetadata = .{
         .{ "key", "key", false },
         .{ "status", "status", false },
+        .{ "source", "source", true },
+        .{ "managed", "managed", true },
+        .{ "revision", "revision", true },
         .{ "env_var", "env_var", true },
         .{ "created_at", "created_at", true },
         .{ "updated_at", "updated_at", true },
@@ -29862,6 +34266,18 @@ pub const SecretEntry = struct {
         try jw.write(self.key);
         try jw.objectField("status");
         try jw.write(self.status);
+        if (self.source) |value| {
+            try jw.objectField("source");
+            try jw.write(value);
+        }
+        if (self.managed) |value| {
+            try jw.objectField("managed");
+            try jw.write(value);
+        }
+        if (self.revision) |value| {
+            try jw.objectField("revision");
+            try jw.write(value);
+        }
         if (self.env_var) |value| {
             try jw.objectField("env_var");
             try jw.write(value);
@@ -29879,7 +34295,34 @@ pub const SecretEntry = struct {
 };
 
 pub const SecretList = struct {
+    /// Whether this server has a native store for secret API writes.
+    writable: ?bool = null,
     secrets: []const SecretEntry,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "writable", "writable", true },
+        .{ "secrets", "secrets", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.writable) |value| {
+            try jw.objectField("writable");
+            try jw.write(value);
+        }
+        try jw.objectField("secrets");
+        try jw.write(self.secrets);
+        try jw.endObject();
+    }
 };
 
 /// Source of the secret configuration
@@ -29914,7 +34357,7 @@ pub const SecretStatus = enum {
 /// Non-secret status for the local secrets file store, when one is available.
 pub const SecretStoreStatus = struct {
     /// Generation of the currently published secret-store snapshot.
-    generation: ?i64 = null,
+    generation: ?u64 = null,
     /// Whether this store can expose one exact opaque source-generation acknowledgement. This remains true when a single loaded file predates the generation field, and is false for layered stores whose served snapshot has multiple publication sources.
     supports_source_generation: ?bool = null,
     /// Opaque, non-secret generation embedded by the control plane in the currently applied secrets file. It is null for files without an acknowledgement generation and never derives from secret values.
@@ -29923,8 +34366,8 @@ pub const SecretStoreStatus = struct {
     last_reload_failed: ?bool = null,
     /// Whether Antfly is serving a last-known-good secrets snapshot after a failed refresh.
     stale: ?bool = null,
-    reload_successes: ?i64 = null,
-    reload_failures: ?i64 = null,
+    reload_successes: ?u64 = null,
+    reload_failures: ?u64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -30556,7 +34999,8 @@ pub const StatefulGraphResult = union(enum) {
 
 /// Stateful Antfly query request. Canonical clients use graph_queries; deprecated graph_searches is retained only at the stateful public transport boundary for the v0.2 transition window.
 pub const StatefulQueryRequest = struct {
-    /// Name of the table to query. Required for global-query requests.
+    table_target: ?CatalogTableTarget = null,
+    /// Literal table name in default.public. Global queries require exactly one of table or table_target.
     table: ?[]const u8 = null,
     /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is non-scoring query input. - `bool.must_not` is non-scoring exclusion query input. Filter branches accept the same query variants as `filter_query` and `exclusion_query`. Structured clauses use the native document-value path; text clauses are resolved through the text index before scoring.
     query: ?std.json.Value = null,
@@ -30631,6 +35075,7 @@ pub const StatefulQueryRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "table_target", "table_target", true },
         .{ "table", "table", true },
         .{ "query", "query", true },
         .{ "full_text_search", "full_text_search", true },
@@ -30680,6 +35125,10 @@ pub const StatefulQueryRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.table_target) |value| {
+            try jw.objectField("table_target");
+            try jw.write(value);
+        }
         if (self.table) |value| {
             try jw.objectField("table");
             try jw.write(value);
@@ -31004,7 +35453,7 @@ pub const StorageRuntimeStatus = struct {
 pub const StorageStatus = struct {
     source_vectors: ?VectorSourceStorageStatus = null,
     /// Disk usage in bytes.
-    disk_usage: ?i64 = null,
+    disk_usage: ?u64 = null,
     /// Whether the table has received data.
     empty: ?bool = null,
     lsm: ?LsmStorageStatus = null,
@@ -31347,7 +35796,7 @@ pub const TableRepairControlJobStartRequest = struct {
     repair_id: ?[]const u8 = null,
     /// Opaque continuation cursor from a prior bounded control response.
     cursor: ?[]const u8 = null,
-    limit: ?i64 = null,
+    limit: ?u32 = null,
     /// Attempt the first bounded pass immediately. Remaining passes always run server-side.
     advance: ?bool = null,
 
@@ -31415,24 +35864,24 @@ pub const TableRepairIssue = struct {
     /// Hex-encoded internal artifact storage key, when known.
     artifact_key: ?[]const u8 = null,
     /// Chunk ordinal for chunk-derived artifacts.
-    chunk_id: OpenApiOptionalNullable(i64) = .absent,
+    chunk_id: OpenApiOptionalNullable(u32) = .absent,
     /// Whether this artifact kind currently has an automated repair reprocessor.
     repairable: bool,
     /// Stable reason code when repairable is false.
     unsupported_reason: ?[]const u8 = null,
     /// Derived replay sequence that observed the issue.
-    sequence: i64,
+    sequence: u64,
     reason: ArtifactRepairReason,
     /// Number of enrichment generation attempts made before this issue was parked.
-    generation_attempts: i64,
+    generation_attempts: u64,
     /// Stable source-generation error code that caused this issue to be parked.
     generation_error: ?[]const u8 = null,
     /// Number of repair attempts made for this issue.
-    attempts: i64,
+    attempts: u64,
     /// Monotonic timestamp when this issue was first recorded.
-    first_seen_ns: i64,
+    first_seen_ns: u64,
     /// Monotonic timestamp when this issue was last observed or attempted.
-    last_seen_ns: i64,
+    last_seen_ns: u64,
     /// Last stable repair error code, when a repair attempt failed.
     last_error: ?[]const u8 = null,
 
@@ -31545,11 +35994,11 @@ pub const TableRepairIssueList = struct {
     table: []const u8,
     target: RepairTarget,
     /// Effective page limit.
-    limit: i64,
+    limit: u32,
     /// Number of repair records scanned while building this page.
-    scanned: i64,
+    scanned: u64,
     /// Number of table groups touched while building this page.
-    groups_scanned: i64,
+    groups_scanned: u64,
     /// Whether another page is available.
     has_more: bool,
     /// Opaque cursor for the next page when has_more is true.
@@ -31590,9 +36039,9 @@ pub const TableRepairIssueList = struct {
 /// Durable table repair job state.
 pub const TableRepairJob = struct {
     /// Server-assigned durable repair job identifier.
-    job_id: i64,
+    job_id: u64,
     /// Monotonic execution attempt token for the current running pass.
-    attempt_id: i64,
+    attempt_id: u64,
     /// Table being repaired.
     table_name: []const u8,
     /// Lifecycle phase of the repair job.
@@ -31610,7 +36059,7 @@ pub const TableRepairJob = struct {
     /// Opaque continuation cursor for the next bounded repair pass.
     cursor: OpenApiOptionalNullable([]const u8) = .absent,
     /// Effective per-pass repair limit.
-    limit: i64,
+    limit: u32,
     /// Whether the next bounded pass still needs to dispatch the job's one forced named-index generation.
     force: bool,
     result: TableRepairRunResult,
@@ -31619,13 +36068,13 @@ pub const TableRepairJob = struct {
     /// Whether cancellation is pending. For a named-index repair/rebuild job, cancellation durably pauses the matching repair in every group. Cancelling a control job stops remaining passes without undoing controls already applied.
     cancel_requested: bool,
     /// Unix epoch milliseconds when a deferred pass may next run; zero means immediately eligible.
-    next_retry_at_millis: ?i64 = null,
+    next_retry_at_millis: ?u64 = null,
     /// Unix epoch milliseconds when the job was created.
-    created_at_millis: i64,
+    created_at_millis: u64,
     /// Unix epoch milliseconds when the job state was last updated.
-    last_updated_at_millis: i64,
+    last_updated_at_millis: u64,
     /// Unix epoch milliseconds when the job is eligible for cleanup.
-    expires_at_millis: i64,
+    expires_at_millis: u64,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -31744,7 +36193,7 @@ pub const TableRepairJobStartRequest = struct {
     /// Force a named index rebuild even when no repair debt is currently recorded. Only applies to target=index.
     force: ?bool = null,
     /// Maximum artifact repair records to attempt per pass. For target=index, any positive value permits one named index repair.
-    limit: ?i64 = null,
+    limit: ?u32 = null,
     /// When true, the server immediately attempts the first bounded repair pass before returning the job.
     advance: ?bool = null,
 
@@ -31807,40 +36256,40 @@ pub const TableRepairRunResponse = struct {
     table: []const u8,
     target: RepairTarget,
     /// Effective repair limit.
-    limit: i64,
+    limit: u32,
     result: TableRepairRunResult,
 };
 
 /// Result of one bounded table repair pass.
 pub const TableRepairRunResult = struct {
     /// Number of repair records attempted by this pass.
-    scanned: i64,
+    scanned: u64,
     /// Number of table groups touched by this bounded repair pass.
-    groups_scanned: i64,
+    groups_scanned: u64,
     /// Number of artifacts whose source was reprocessed.
-    reprocessed: i64,
+    reprocessed: u64,
     /// Number of repair records cleared because the artifact became readable.
-    repaired: i64,
+    repaired: u64,
     /// Number of repair records whose source document no longer exists.
-    missing_source_docs: i64,
+    missing_source_docs: u64,
     /// Number of supported repair attempts that failed.
-    failed: i64,
+    failed: u64,
     /// Number of repair records skipped because no automated repair exists for the selected target.
-    unsupported: i64,
+    unsupported: u64,
     /// Number of attempted repair records that remained queued after this pass.
-    unresolved: i64,
+    unresolved: u64,
     /// Number of selected repair records or indexes skipped because another repair pass already owns them.
-    in_progress: i64,
+    in_progress: u64,
     /// Number of indexes rebuilt by this pass when target is index.
-    indexes_rebuilt: i64,
+    indexes_rebuilt: u64,
     /// Number of selected indexes that were degraded or quarantined when this repair pass began.
-    indexes_degraded_before: i64,
+    indexes_degraded_before: u64,
     /// Number of selected indexes that remain degraded or quarantined when this repair pass returns.
-    indexes_degraded_after: i64,
+    indexes_degraded_after: u64,
     /// Number of existing index repairs that accepted the requested control.
-    controls_applied: i64,
+    controls_applied: u64,
     /// Effective repair limit.
-    limit: i64,
+    limit: u32,
     /// Opaque cursor for the next artifact repair pass when has_more is true. Named-index operations may return a continuation cursor when table groups remain.
     next_cursor: OpenApiOptionalNullable([]const u8) = .absent,
     /// Whether another repair scan page is available via next_cursor.
@@ -31937,7 +36386,20 @@ pub const TableRestoreStatus = struct {
 /// Schema definition for a table with multiple document types
 pub const TableSchema = struct {
     /// Backend-managed schema generation used for migrations. Omit it from create and update requests.
-    version: ?i64 = null,
+    version: ?u32 = null,
+    storage_mode: ?TableStorageMode = null,
+    /// Immutable typed expressions applied only to absent columns on new writes, never explicit null. Defaults cannot reference columns. A column cannot have both a default and a generated expression. Omission or [] declares none. Relational tables only.
+    column_defaults: ?[]const RelationalColumnExpression = null,
+    /// Stored immutable generated columns, evaluated in dependency order on writes before validation and indexing. Cycles are rejected. Generated columns are output-only; submitted values are replaced by the computed value. Omission or [] declares none. Defaults and generated declarations together are limited to 256 columns, 4096 expression nodes, and 4 MiB of literal data. Evaluation has a shared 4 MiB allocation budget across all column expressions. Restore verifies stored results instead of silently recomputing them. Changing, adding, or removing generated semantics through an existing table's schema update requires explicit rewrite=true on the PUT or PATCH schema route. This returns a durable restore job and replaces the complete authorized dependency cohort only after distributed transformation and validation. Ordinary schema updates reject these changes, even when a table appears empty. Declaration reordering and default-only changes remain allowed. Relational tables only.
+    generated_columns: ?[]const RelationalColumnExpression = null,
+    /// Named scalar CHECK constraints for a relational schema. This is part of the complete schema: omission or [] declares no checks. New writes enforce every check. Existing-row validation status is maintained separately and is never accepted from the client.
+    checks: ?[]const RelationalCheckConstraint = null,
+    /// Complete set of composite unique declarations. Omission or [] declares none.
+    unique_constraints: ?[]const RelationalUniqueConstraint = null,
+    /// Complete set of outgoing composite foreign keys. Omission or [] declares none.
+    foreign_keys: ?[]const RelationalForeignKeyConstraint = null,
+    /// Desired ordered indexes for a relational table. Names must be unique. An explicit array replaces the declarations; an empty array drops them. Omission preserves existing declarations during schema updates. Index definitions commit atomically with the schema; build progress and readiness are local to each owning shard, not client-writable.
+    relational_indexes: ?[]const RelationalIndexDefinition = null,
     /// Default type to use from the document_types.
     default_type: ?[]const u8 = null,
     /// Whether to enforce that documents must match one of the provided document types. If false, documents not matching any type will be accepted but not indexed.
@@ -31956,6 +36418,13 @@ pub const TableSchema = struct {
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "version", "version", true },
+        .{ "storage_mode", "storage_mode", true },
+        .{ "column_defaults", "column_defaults", true },
+        .{ "generated_columns", "generated_columns", true },
+        .{ "checks", "checks", true },
+        .{ "unique_constraints", "unique_constraints", true },
+        .{ "foreign_keys", "foreign_keys", true },
+        .{ "relational_indexes", "relational_indexes", true },
         .{ "default_type", "default_type", true },
         .{ "enforce_types", "enforce_types", true },
         .{ "document_schemas", "document_schemas", true },
@@ -31977,6 +36446,34 @@ pub const TableSchema = struct {
         try jw.beginObject();
         if (self.version) |value| {
             try jw.objectField("version");
+            try jw.write(value);
+        }
+        if (self.storage_mode) |value| {
+            try jw.objectField("storage_mode");
+            try jw.write(value);
+        }
+        if (self.column_defaults) |value| {
+            try jw.objectField("column_defaults");
+            try jw.write(value);
+        }
+        if (self.generated_columns) |value| {
+            try jw.objectField("generated_columns");
+            try jw.write(value);
+        }
+        if (self.checks) |value| {
+            try jw.objectField("checks");
+            try jw.write(value);
+        }
+        if (self.unique_constraints) |value| {
+            try jw.objectField("unique_constraints");
+            try jw.write(value);
+        }
+        if (self.foreign_keys) |value| {
+            try jw.objectField("foreign_keys");
+            try jw.write(value);
+        }
+        if (self.relational_indexes) |value| {
+            try jw.objectField("relational_indexes");
             try jw.write(value);
         }
         if (self.default_type) |value| {
@@ -32084,6 +36581,8 @@ pub const TableStatus = struct {
     replication_sources: ?[]const ReplicationSource = null,
     /// Effective runtime field capabilities for this table. Clients can use this to discover concrete field variants and their supported query modes, such as full_text, exact, range, geo, and autocomplete. Public exact field sort is supported only for `_id` or scalar fields marked sortable whose sort lifecycle is queryable or accelerated.
     field_capabilities: ?[]const FieldCapability = null,
+    /// Immutable physical table identity, preserved by catalog renames.
+    table_id: ?[]const u8 = null,
     storage_status: StorageStatus,
     /// Table-level generated artifact enrichments registered outside a specific index.
     artifact_enrichments: ?[]const EnrichmentConfig = null,
@@ -32099,6 +36598,7 @@ pub const TableStatus = struct {
         .{ "migration", "migration", true },
         .{ "replication_sources", "replication_sources", true },
         .{ "field_capabilities", "field_capabilities", true },
+        .{ "table_id", "table_id", true },
         .{ "storage_status", "storage_status", false },
         .{ "artifact_enrichments", "artifact_enrichments", true },
     };
@@ -32143,6 +36643,10 @@ pub const TableStatus = struct {
             try jw.objectField("field_capabilities");
             try jw.write(value);
         }
+        if (self.table_id) |value| {
+            try jw.objectField("table_id");
+            try jw.write(value);
+        }
         try jw.objectField("storage_status");
         try jw.write(self.storage_status);
         if (self.artifact_enrichments) |value| {
@@ -32150,6 +36654,32 @@ pub const TableStatus = struct {
             try jw.write(value);
         }
         try jw.endObject();
+    }
+};
+
+/// Storage representation for the table. Omission selects "document". "relational" stores schema-bound typed rows and requires exactly one closed document schema with declared properties. It implies enforce_types; explicitly setting enforce_types to false is invalid. Existing JSON document write and read APIs remain available. This setting alone does not declare primary keys or unique constraints.
+pub const TableStorageMode = enum {
+    document,
+    relational,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .document => "document",
+            .relational => "relational",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "document", .document },
+            .{ "relational", .relational },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
     }
 };
 
@@ -32191,6 +36721,18 @@ pub const TableStorageUnreadableError = struct {
     message: []const u8,
     /// Always false; recovery requires repair, restore, or table replacement.
     retryable: bool,
+};
+
+/// Tablespace catalog object. Placement policy resource with a stable identity. SQL adapters consume this native lifecycle surface.
+pub const TablespaceCatalogRecord = struct {
+    /// Stable tablespace catalog identifier.
+    tablespace_id: u64,
+    /// Tablespace name.
+    name: []const u8,
+    /// JSON-encoded location descriptor. String locations are encoded as JSON strings.
+    location_json: []const u8,
+    /// JSON-encoded placement policy reserved for native placement planning.
+    placement_policy_json: []const u8,
 };
 
 /// Configuration for Tavily AI Search API. Tavily is optimized for RAG and AI applications, providing pre-processed results with summaries and relevance scoring. **Setup:** 1. Sign up at https://tavily.com 2. Get API key from dashboard **Docs:** https://docs.tavily.com
@@ -32749,18 +37291,19 @@ pub const TransactionConflict = struct {
     key: []const u8,
     /// Human-readable conflict description.
     message: []const u8,
+    reason: ?RelationalConstraintConflictReason = null,
     /// Stable machine-readable conflict classification.
     kind: []const u8,
     /// Whether retrying the transaction may succeed without changing its writes.
     retryable: bool,
     /// Minimum suggested delay before retrying a retryable conflict.
-    retry_after_ms: ?i64 = null,
+    retry_after_ms: ?u32 = null,
     /// Component whose state should be refreshed before retrying.
     retry_scope: ?[]const u8 = null,
     /// Version required by the transaction predicate.
-    expected_version: ?i64 = null,
+    expected_version: ?u64 = null,
     /// Version observed while validating the transaction predicate.
-    current_version: ?i64 = null,
+    current_version: ?u64 = null,
     participant: ?TransactionConflictParticipant = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -32768,6 +37311,7 @@ pub const TransactionConflict = struct {
         .{ "table", "table", false },
         .{ "key", "key", false },
         .{ "message", "message", false },
+        .{ "reason", "reason", true },
         .{ "kind", "kind", false },
         .{ "retryable", "retryable", false },
         .{ "retry_after_ms", "retry_after_ms", true },
@@ -32793,6 +37337,10 @@ pub const TransactionConflict = struct {
         try jw.write(self.key);
         try jw.objectField("message");
         try jw.write(self.message);
+        if (self.reason) |value| {
+            try jw.objectField("reason");
+            try jw.write(value);
+        }
         try jw.objectField("kind");
         try jw.write(self.kind);
         try jw.objectField("retryable");
@@ -32824,7 +37372,7 @@ pub const TransactionConflict = struct {
 /// Participant location and 2PC phase where the conflict occurred.
 pub const TransactionConflictParticipant = struct {
     /// Raft group that reported the conflict.
-    group_id: ?i64 = null,
+    group_id: ?u64 = null,
     /// 2PC participant phase that reported the conflict.
     phase: ?[]const u8 = null,
 
@@ -33350,6 +37898,108 @@ pub const TransactionStatusResponse = struct {
     transaction_id: []const u8,
 };
 
+/// Speech-to-text provider for the `transcriber` enrichment shorthand. Carries the provider's STT configuration (`provider`, `model`, `api_url`, `api_key`, ...) plus the transcription options below. The fields are declared inline rather than composed from `STTConfig` so that a generated client can leave an option out: a composed schema makes a typed client serialize every field, and a `max_download_bytes` of zero would reject every recording. **Example:** ```yaml name: call_transcripts kind: asset field: recording_url transcriber: provider: antfly model: openai/whisper-base language_code: en timestamps: true ```
+pub const TranscriberEnrichmentConfig = struct {
+    provider: STTProvider,
+    /// Model name, as the provider names it (e.g. 'openai/whisper-base' for antfly, 'whisper-1' for openai).
+    model: ?[]const u8 = null,
+    /// Antfly inference API URL. Falls back to ANTFLY_INFERENCE_URL.
+    api_url: ?[]const u8 = null,
+    /// OpenAI API base URL. Falls back to OPENAI_BASE_URL.
+    base_url: ?[]const u8 = null,
+    /// Provider API key. Falls back to the provider's environment variable.
+    api_key: ?[]const u8 = null,
+    /// Google Cloud project ID for the vertex provider. Falls back to GOOGLE_CLOUD_PROJECT.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location for the vertex provider.
+    location: ?[]const u8 = null,
+    /// Path to an ADC credential JSON file for the vertex provider. Falls back to the default ADC chain.
+    credentials_path: ?[]const u8 = null,
+    /// Spoken language hint (ISO 639-1, e.g. 'en'). Omit for automatic detection where the provider supports it.
+    language_code: ?[]const u8 = null,
+    /// Request timestamped transcript segments so chunks carry recording offsets. Providers without segment timing return plain text.
+    timestamps: ?bool = null,
+    /// Request speaker labels on transcript segments where the provider supports them.
+    diarization: ?bool = null,
+    /// Largest recording fetched from a URL, in bytes. Defaults to 128 MiB, which covers a one hour voice memo or podcast.
+    max_download_bytes: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
+        .{ "model", "model", true },
+        .{ "api_url", "api_url", true },
+        .{ "base_url", "base_url", true },
+        .{ "api_key", "api_key", true },
+        .{ "project_id", "project_id", true },
+        .{ "location", "location", true },
+        .{ "credentials_path", "credentials_path", true },
+        .{ "language_code", "language_code", true },
+        .{ "timestamps", "timestamps", true },
+        .{ "diarization", "diarization", true },
+        .{ "max_download_bytes", "max_download_bytes", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.api_url) |value| {
+            try jw.objectField("api_url");
+            try jw.write(value);
+        }
+        if (self.base_url) |value| {
+            try jw.objectField("base_url");
+            try jw.write(value);
+        }
+        if (self.api_key) |value| {
+            try jw.objectField("api_key");
+            try jw.write(value);
+        }
+        if (self.project_id) |value| {
+            try jw.objectField("project_id");
+            try jw.write(value);
+        }
+        if (self.location) |value| {
+            try jw.objectField("location");
+            try jw.write(value);
+        }
+        if (self.credentials_path) |value| {
+            try jw.objectField("credentials_path");
+            try jw.write(value);
+        }
+        if (self.language_code) |value| {
+            try jw.objectField("language_code");
+            try jw.write(value);
+        }
+        if (self.timestamps) |value| {
+            try jw.objectField("timestamps");
+            try jw.write(value);
+        }
+        if (self.diarization) |value| {
+            try jw.objectField("diarization");
+            try jw.write(value);
+        }
+        if (self.max_download_bytes) |value| {
+            try jw.objectField("max_download_bytes");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// In-place document transformation using MongoDB-style operators. Transforms are applied atomically at the storage layer, eliminating read-modify-write races. **Important:** Transform results are NOT validated against the table schema. This improves performance but means it's possible to create invalid documents. Use with care and ensure your operations maintain schema compliance.
 pub const Transform = struct {
     /// Document key (must be a string, not an object like inserts)
@@ -33633,53 +38283,6 @@ pub const TraverseResponse = struct {
         }
         if (self.count) |value| {
             try jw.objectField("count");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
-
-/// Configuration for tree search strategy. Tree search navigates hierarchical document structures by evaluating summaries at each level.
-pub const TreeSearchConfig = struct {
-    /// Name of the graph index to use for tree navigation
-    index: []const u8,
-    /// Starting nodes for tree search: - "$roots" - Query for root nodes (nodes with no parents) - Comma-separated explicit node IDs When omitted and combined with a QueryRequest in a RetrievalQueryRequest, the query results are used as start nodes.
-    start_nodes: ?[]const u8 = null,
-    /// Maximum depth to traverse in the tree
-    max_depth: ?i64 = null,
-    /// Number of branches to explore at each level
-    beam_width: ?i64 = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "index", "index", false },
-        .{ "start_nodes", "start_nodes", true },
-        .{ "max_depth", "max_depth", true },
-        .{ "beam_width", "beam_width", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        try jw.objectField("index");
-        try jw.write(self.index);
-        if (self.start_nodes) |value| {
-            try jw.objectField("start_nodes");
-            try jw.write(value);
-        }
-        if (self.max_depth) |value| {
-            try jw.objectField("max_depth");
-            try jw.write(value);
-        }
-        if (self.beam_width) |value| {
-            try jw.objectField("beam_width");
             try jw.write(value);
         }
         try jw.endObject();
@@ -34014,13 +38617,13 @@ pub const VectorSourceStorageStatus = struct {
     snapshot_read_ns: ?i64 = null,
     cache_reclaimed_bytes: ?i64 = null,
     retired_ann_references_skipped: ?i64 = null,
-    retained_payloads: ?i64 = null,
-    retained_payload_bytes: ?i64 = null,
-    unreferenced_payload_bytes_at_collection: ?i64 = null,
-    checkpoint_bytes_read: ?i64 = null,
-    checkpoint_bytes_written: ?i64 = null,
+    retained_payloads: ?u64 = null,
+    retained_payload_bytes: ?u64 = null,
+    unreferenced_payload_bytes_at_collection: ?u64 = null,
+    checkpoint_bytes_read: ?u64 = null,
+    checkpoint_bytes_written: ?u64 = null,
     /// Allocator-backed source-store state charged to the shared resource manager, excluding mmap pages and request-owned buffers.
-    heap_bytes: ?i64 = null,
+    heap_bytes: ?u64 = null,
     location_cache_hits: ?i64 = null,
     location_cache_misses: ?i64 = null,
     location_cache_bytes: ?i64 = null,
@@ -34035,21 +38638,21 @@ pub const VectorSourceStorageStatus = struct {
     preparation_ns: ?i64 = null,
     durable_append_ns: ?i64 = null,
     checkpoint_ns: ?i64 = null,
-    prepared_payloads: ?i64 = null,
-    prepared_payload_bytes: ?i64 = null,
-    wal_bytes_written: ?i64 = null,
-    active_sessions: ?i64 = null,
-    resolved_payloads: ?i64 = null,
-    resolved_bytes: ?i64 = null,
-    active_wal_bytes: ?i64 = null,
-    immutable_block_bytes: ?i64 = null,
-    live_payloads_at_collection: ?i64 = null,
-    live_payload_bytes_at_collection: ?i64 = null,
-    collections: ?i64 = null,
-    collection_deferrals: ?i64 = null,
-    collection_bytes_read: ?i64 = null,
-    collection_bytes_written: ?i64 = null,
-    unresolved_primary_commits: ?i64 = null,
+    prepared_payloads: ?u64 = null,
+    prepared_payload_bytes: ?u64 = null,
+    wal_bytes_written: ?u64 = null,
+    active_sessions: ?u64 = null,
+    resolved_payloads: ?u64 = null,
+    resolved_bytes: ?u64 = null,
+    active_wal_bytes: ?u64 = null,
+    immutable_block_bytes: ?u64 = null,
+    live_payloads_at_collection: ?u64 = null,
+    live_payload_bytes_at_collection: ?u64 = null,
+    collections: ?u64 = null,
+    collection_deferrals: ?u64 = null,
+    collection_bytes_read: ?u64 = null,
+    collection_bytes_written: ?u64 = null,
+    unresolved_primary_commits: ?u64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -34883,7 +39486,7 @@ pub const VertexSearchConfig = struct {
     }
 };
 
-/// A unified configuration for web search providers. Each provider has specific configuration requirements. Use the appropriate provider-specific config or set common options at the top level. **Environment Variables (fallbacks):** - EXA_API_KEY - SERPER_API_KEY - TAVILY_API_KEY - BRAVE_API_KEY - YOU_API_KEY - LINKUP_API_KEY - GOOGLE_APPLICATION_CREDENTIALS, GOOGLE_CLOUD_PROJECT, GOOGLE_CLOUD_LOCATION
+/// A unified configuration for web search providers. Each provider has specific configuration requirements. Use the appropriate provider-specific config or set common options at the top level. Omitted options inherit the named connection when one is supplied. Inline configurations preserve omission; clients must not materialize defaults as overrides. Without a connection, the server applies provider defaults (Exa: 5 results, 10000 ms timeout, safe search enabled, content and highlights disabled, and auto search). **Environment Variables (fallbacks):** - EXA_API_KEY - SERPER_API_KEY - TAVILY_API_KEY - BRAVE_API_KEY - YOU_API_KEY - LINKUP_API_KEY - GOOGLE_APPLICATION_CREDENTIALS, GOOGLE_CLOUD_PROJECT, GOOGLE_CLOUD_LOCATION
 pub const WebSearchConfig = struct {
     provider: WebSearchProvider,
     /// Provider API key or secret reference. Prefer named web_search connections for production use.
@@ -35179,6 +39782,109 @@ pub const WebSearchProvider = enum {
     }
 };
 
+/// Provider-specific inline web search configuration.
+pub const WebSearchProviderConfig = union(enum) {
+    exa_search_config: ExaSearchConfig,
+    serper_search_config: SerperSearchConfig,
+    tavily_search_config: TavilySearchConfig,
+    brave_search_config: BraveSearchConfig,
+    you_search_config: YouSearchConfig,
+    linkup_search_config: LinkupSearchConfig,
+    vertex_search_config: VertexSearchConfig,
+
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const DiscriminatorProbe = union(enum) {
+            missing,
+            value: []const u8,
+            pub fn jsonParse(probe_allocator: std.mem.Allocator, probe_source: anytype, probe_options: std.json.ParseOptions) !@This() {
+                return .{ .value = try std.json.innerParse([]const u8, probe_allocator, probe_source, probe_options) };
+            }
+        };
+        const Probe = struct { provider: DiscriminatorProbe = .missing };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = switch (probe.provider) {
+            .value => |value| value,
+            .missing => {
+                return error.MissingField;
+            },
+        };
+        if (std.mem.eql(u8, disc_str, "exa")) {
+            return .{ .exa_search_config = try std.json.parseFromSliceLeaky(ExaSearchConfig, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "serper")) {
+            return .{ .serper_search_config = try std.json.parseFromSliceLeaky(SerperSearchConfig, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "tavily")) {
+            return .{ .tavily_search_config = try std.json.parseFromSliceLeaky(TavilySearchConfig, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "brave")) {
+            return .{ .brave_search_config = try std.json.parseFromSliceLeaky(BraveSearchConfig, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "you")) {
+            return .{ .you_search_config = try std.json.parseFromSliceLeaky(YouSearchConfig, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "linkup")) {
+            return .{ .linkup_search_config = try std.json.parseFromSliceLeaky(LinkupSearchConfig, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "vertex")) {
+            return .{ .vertex_search_config = try std.json.parseFromSliceLeaky(VertexSearchConfig, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        const disc_val = source.object.get("provider") orelse {
+            return error.MissingField;
+        };
+        const disc_str = switch (disc_val) {
+            .string => |s| s,
+            else => return error.UnexpectedToken,
+        };
+        if (std.mem.eql(u8, disc_str, "exa")) {
+            return .{ .exa_search_config = try std.json.parseFromValueLeaky(ExaSearchConfig, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "serper")) {
+            return .{ .serper_search_config = try std.json.parseFromValueLeaky(SerperSearchConfig, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "tavily")) {
+            return .{ .tavily_search_config = try std.json.parseFromValueLeaky(TavilySearchConfig, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "brave")) {
+            return .{ .brave_search_config = try std.json.parseFromValueLeaky(BraveSearchConfig, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "you")) {
+            return .{ .you_search_config = try std.json.parseFromValueLeaky(YouSearchConfig, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "linkup")) {
+            return .{ .linkup_search_config = try std.json.parseFromValueLeaky(LinkupSearchConfig, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "vertex")) {
+            return .{ .vertex_search_config = try std.json.parseFromValueLeaky(VertexSearchConfig, allocator, source, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .exa_search_config => |v| try jw.write(v),
+            .serper_search_config => |v| try jw.write(v),
+            .tavily_search_config => |v| try jw.write(v),
+            .brave_search_config => |v| try jw.write(v),
+            .you_search_config => |v| try jw.write(v),
+            .linkup_search_config => |v| try jw.write(v),
+            .vertex_search_config => |v| try jw.write(v),
+        }
+    }
+};
+
 pub const WildcardQuery = struct {
     wildcard: []const u8,
     field: ?[]const u8 = null,
@@ -35342,6 +40048,134 @@ pub const YouSearchConfig = struct {
             try jw.write(value);
         }
         try jw.endObject();
+    }
+};
+
+pub const OpenApiUpdateSchemaResponse202 = union(enum) {
+    restore_job: *RestoreJob,
+    committed_mutation_outcome: *CommittedMutationOutcome,
+
+    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
+        inline for (keys) |key| {
+            if (object.contains(key)) return true;
+        }
+        return false;
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        if (objectHasAnyKey(source.object, &.{
+            "job_id",
+            "attempt_id",
+            "scope",
+            "table_name",
+            "backup_id",
+            "phase",
+            "cancel_requested",
+            "durability_pending_table_count",
+            "published_table_count",
+            "completed_table_count",
+            "total_table_count",
+            "result",
+            "error",
+            "created_at_ms",
+            "updated_at_ms",
+            "expires_at_ms",
+        })) {
+            if (try parseStructuralVariant(RestoreJob, allocator, source, options)) |parsed| return .{ .restore_job = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "status",
+        })) {
+            if (try parseStructuralVariant(CommittedMutationOutcome, allocator, source, options)) |parsed| return .{ .committed_mutation_outcome = parsed };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .restore_job => |v| try jw.write(v.*),
+            .committed_mutation_outcome => |v| try jw.write(v.*),
+        }
+    }
+};
+
+pub const OpenApiPatchSchemaResponse202 = union(enum) {
+    restore_job: *RestoreJob,
+    committed_mutation_outcome: *CommittedMutationOutcome,
+
+    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
+        inline for (keys) |key| {
+            if (object.contains(key)) return true;
+        }
+        return false;
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        if (objectHasAnyKey(source.object, &.{
+            "job_id",
+            "attempt_id",
+            "scope",
+            "table_name",
+            "backup_id",
+            "phase",
+            "cancel_requested",
+            "durability_pending_table_count",
+            "published_table_count",
+            "completed_table_count",
+            "total_table_count",
+            "result",
+            "error",
+            "created_at_ms",
+            "updated_at_ms",
+            "expires_at_ms",
+        })) {
+            if (try parseStructuralVariant(RestoreJob, allocator, source, options)) |parsed| return .{ .restore_job = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "status",
+        })) {
+            if (try parseStructuralVariant(CommittedMutationOutcome, allocator, source, options)) |parsed| return .{ .committed_mutation_outcome = parsed };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .restore_job => |v| try jw.write(v.*),
+            .committed_mutation_outcome => |v| try jw.write(v.*),
+        }
     }
 };
 

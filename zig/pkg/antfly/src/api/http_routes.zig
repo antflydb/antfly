@@ -88,6 +88,7 @@ pub const Routes = struct {
     pub const merge_suffix = "/merge";
     pub const backup_suffix = "/backup";
     pub const backup_shard_suffix = "/backup-shard";
+    pub const restore_owner_suffix = "/restore-owner";
     pub const restore_suffix = "/restore";
     pub const destination_authorization_suffix = "/destination-authorization";
     pub const query_suffix = "/query";
@@ -108,6 +109,7 @@ pub const Routes = struct {
     pub const txn_prepare_suffix = "/txn-prepare";
     pub const txn_resolve_suffix = "/txn-resolve";
     pub const txn_status_suffix = "/txn-status";
+    pub const online_merge_io_suffix = "/online-merge-io";
     pub const txn_acknowledge_suffix = "/txn-acknowledge";
     pub const corrupt_embedding_artifact_suffix = "/corrupt-embedding-artifact";
     pub const group_db_median_key_suffix = "/db/median-key";
@@ -492,6 +494,29 @@ pub const Routes = struct {
         return .{ .table_name = table_name };
     }
 
+    pub fn matchRelationalRowsQuery(path: []const u8) ?TableScan {
+        return matchRelationalRowsPath(path, "/rows/query");
+    }
+
+    pub fn matchRelationalRowsMutation(path: []const u8) ?TableScan {
+        return matchRelationalRowsPath(path, "/rows/mutate");
+    }
+
+    pub fn matchRelationalConstraintStatus(path: []const u8) ?TableScan {
+        return matchRelationalRowsPath(path, "/constraints/status");
+    }
+
+    pub fn matchRelationalConstraintRecovery(path: []const u8) ?TableScan {
+        return matchRelationalRowsPath(path, "/constraints/repair") orelse matchRelationalRowsPath(path, "/constraints/retry") orelse matchRelationalRowsPath(path, "/constraints/retire");
+    }
+
+    fn matchRelationalRowsPath(path: []const u8, suffix: []const u8) ?TableScan {
+        if (!std.mem.startsWith(u8, path, tables_prefix) or !std.mem.endsWith(u8, path, suffix)) return null;
+        const name = path[tables_prefix.len .. path.len - suffix.len];
+        if (name.len == 0 or std.mem.indexOfScalar(u8, name, '/') != null) return null;
+        return .{ .table_name = name };
+    }
+
     pub fn matchTableQuery(path: []const u8) ?TableQuery {
         if (!std.mem.startsWith(u8, path, tables_prefix)) return null;
         if (!std.mem.endsWith(u8, path, query_suffix)) return null;
@@ -549,6 +574,22 @@ pub const Routes = struct {
 
     pub fn matchTableArtifactRepair(path: []const u8) ?TableArtifactRepair {
         return matchTableArtifactRepairWithSuffix(path, artifact_repair_suffix);
+    }
+
+    pub fn matchTableStorageMigration(path: []const u8) ?TableArtifactRepair {
+        return matchTableArtifactRepairWithSuffix(path, "/storage/migrations");
+    }
+
+    pub const TableStorageMigrationJob = struct { table_name: []const u8, job_id: []const u8 };
+    pub fn matchTableStorageMigrationJob(path: []const u8) ?TableStorageMigrationJob {
+        if (!std.mem.startsWith(u8, path, tables_prefix)) return null;
+        const tail = path[tables_prefix.len..];
+        const separator = std.mem.indexOfScalar(u8, tail, '/') orelse return null;
+        const suffix = "/storage/migrations/";
+        if (separator == 0 or !std.mem.startsWith(u8, tail[separator..], suffix)) return null;
+        const job_id = tail[separator + suffix.len ..];
+        if (job_id.len == 0 or std.mem.indexOfScalar(u8, job_id, '/') != null) return null;
+        return .{ .table_name = tail[0..separator], .job_id = job_id };
     }
 
     pub fn matchTableArtifactRepairRun(path: []const u8) ?TableArtifactRepair {
@@ -637,6 +678,13 @@ pub const Routes = struct {
             .table_name = table_name,
             .index_name = index_name,
         };
+    }
+
+    pub fn matchTableIndexMaintenance(path: []const u8) ?TableIndex {
+        const suffix: []const u8 = if (std.mem.endsWith(u8, path, "/retry")) "/retry" else if (std.mem.endsWith(u8, path, "/repair")) "/repair" else return null;
+        const index = matchTableIndex(path[0 .. path.len - suffix.len]) orelse return null;
+        if (std.mem.indexOfScalar(u8, index.table_name, '/') != null) return null;
+        return index;
     }
 
     pub fn matchTableGraphMetricAction(path: []const u8) ?TableGraphMetricAction {

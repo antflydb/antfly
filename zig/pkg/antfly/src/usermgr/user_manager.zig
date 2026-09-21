@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const catalog_names = @import("../system_catalog/domain.zig");
 const io_abi = @import("../runtime_io_abi.zig");
 const casbin = @import("antfly_casbin");
 
@@ -33,12 +34,18 @@ pub const default_rbac_model_text =
 ;
 
 pub const ResourceType = enum {
+    database,
+    namespace,
+    tablespace,
     table,
     user,
     inference,
     @"*",
 
     pub fn fromSlice(raw: []const u8) !ResourceType {
+        if (std.mem.eql(u8, raw, "database")) return .database;
+        if (std.mem.eql(u8, raw, "namespace")) return .namespace;
+        if (std.mem.eql(u8, raw, "tablespace")) return .tablespace;
         if (std.mem.eql(u8, raw, "table")) return .table;
         if (std.mem.eql(u8, raw, "user")) return .user;
         if (std.mem.eql(u8, raw, "inference")) return .inference;
@@ -48,6 +55,9 @@ pub const ResourceType = enum {
 
     pub fn slice(self: ResourceType) []const u8 {
         return switch (self) {
+            .database => "database",
+            .namespace => "namespace",
+            .tablespace => "tablespace",
             .table => "table",
             .user => "user",
             .inference => "inference",
@@ -865,8 +875,10 @@ pub const UserManager = struct {
         for (permissions) |permission| {
             const resource_type_matches = permission.resource_type == .@"*" or
                 permission.resource_type == resource_type;
-            const resource_matches = std.mem.eql(u8, permission.resource, "*") or
-                std.mem.eql(u8, permission.resource, resource);
+            const resource_matches = if (resource_type == .table)
+                catalog_names.tableResourceMatches(permission.resource, resource)
+            else
+                std.mem.eql(u8, permission.resource, "*") or std.mem.eql(u8, permission.resource, resource);
             const permission_matches = permission.type == .admin or
                 permission.type == permission_type;
             if (resource_type_matches and resource_matches and permission_matches) return true;
@@ -1442,6 +1454,10 @@ fn permissionIntersection(left: Permission, right: Permission) ?struct {
     else if (std.mem.eql(u8, right.resource, "*"))
         left.resource
     else if (std.mem.eql(u8, left.resource, right.resource))
+        left.resource
+    else if (resource_type == .table and catalog_names.tableScopeContains(left.resource, right.resource))
+        right.resource
+    else if (resource_type == .table and catalog_names.tableScopeContains(right.resource, left.resource))
         left.resource
     else
         return null;
@@ -2090,4 +2106,17 @@ test "usermgr api key permission intersection narrows owner and key wildcards" {
     try std.testing.expectEqual(PermissionType.read, effective[0].type);
     try std.testing.expectEqualStrings("private", effective[1].resource);
     try std.testing.expectEqual(PermissionType.write, effective[1].type);
+}
+
+test "system catalog key intersection narrows namespace grants and rejects dotted lookalikes" {
+    const alloc = std.testing.allocator;
+    const scope = try (catalog_names.TableScope{ .database = "tenant" }).keyAlloc(alloc);
+    defer alloc.free(scope);
+    const exact = try (catalog_names.Target{ .database = "tenant", .table = "events" }).resourceNameAlloc(alloc);
+    defer alloc.free(exact);
+    const left = Permission{ .resource_type = .table, .resource = @constCast(scope), .type = .admin };
+    const right = Permission{ .resource_type = .table, .resource = @constCast(exact), .type = .read };
+    try std.testing.expectEqualStrings(exact, permissionIntersection(left, right).?.resource);
+    try std.testing.expectEqual(PermissionType.read, permissionIntersection(right, left).?.permission_type);
+    try std.testing.expect(permissionIntersection(left, .{ .resource_type = .table, .resource = @constCast("tenant.public.events"), .type = .read }) == null);
 }

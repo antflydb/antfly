@@ -185,10 +185,20 @@ pub const MetadataStatus = struct {
 
 /// Detach the only borrowed field from JSON parser and HTTP response storage.
 /// Unknown roles fail closed and remain compatible with older clients.
-pub fn stabilizeMetadataStatus(
-    status: MetadataStatus,
-) MetadataStatus {
+pub fn stabilizeMetadataStatus(status: MetadataStatus) MetadataStatus {
     var stable = status;
+    stable.metadata_raft_role = stableMetadataRaftRole(status.metadata_raft_role);
+    return stable;
+}
+
+/// Preserve the topology wire type while detaching its borrowed role string.
+pub fn stabilizeMetadataRuntimeTopology(topology: MetadataRuntimeTopology) MetadataRuntimeTopology {
+    var stable = topology;
+    stable.metadata_raft_role = stableMetadataRaftRole(topology.metadata_raft_role);
+    return stable;
+}
+
+fn stableMetadataRaftRole(value: []const u8) []const u8 {
     const stable_roles = [_][]const u8{
         "absent",
         "unknown",
@@ -199,13 +209,9 @@ pub fn stabilizeMetadataStatus(
         "leader",
     };
     for (stable_roles) |role| {
-        if (std.mem.eql(u8, role, status.metadata_raft_role)) {
-            stable.metadata_raft_role = role;
-            return stable;
-        }
+        if (std.mem.eql(u8, role, value)) return role;
     }
-    stable.metadata_raft_role = "unknown";
-    return stable;
+    return "unknown";
 }
 
 pub const MetadataHead = struct {
@@ -270,6 +276,7 @@ pub const AdminSnapshot = struct {
     placement_intents: []raft_reconciler.PlacementIntent,
     shuffle_join_leases: []table_manager.ShuffleJoinLeaseRecord = &.{},
     local_bootstrap_statuses: []raft_host.BootstrapStatus = &.{},
+    schema_progresses: []table_manager.SchemaProgressRecord = &.{},
     restore_progresses: []table_manager.RestoreProgressRecord = &.{},
     replication_source_statuses: []table_manager.ReplicationSourceStatusRecord = &.{},
     replication_source_action_hints: []ReplicationSourceActionHint = &.{},
@@ -391,6 +398,10 @@ pub const catalog_route_fence_protocol_current: u16 = 1;
 pub const catalog_route_fence_header = "X-Antfly-Catalog-Route-Fence";
 pub const catalog_route_fence_ack_header = "X-Antfly-Catalog-Route-Fence-Ack";
 pub const catalog_route_fence_ack_value = "1";
+/// Separate from routing acknowledgement: emitted only after a successful
+/// fenced read-index lookup proves the logical key absent.
+pub const read_index_absence_header = "X-Antfly-Read-Index-Absence";
+pub const read_index_absence_value = "1";
 pub const catalog_route_deadline_ms_header = "X-Antfly-Catalog-Route-Deadline-Ms";
 pub const catalog_route_default_deadline_ms: u32 = 5_000;
 pub const catalog_route_max_deadline_ms: u32 = 30_000;
@@ -1007,6 +1018,9 @@ pub fn captureSnapshot(alloc: std.mem.Allocator, source: anytype) !AdminSnapshot
     if (@hasDecl(SourceDeclType, "listLocalBootstrapStatuses")) {
         snapshot.local_bootstrap_statuses = try source.listLocalBootstrapStatuses(alloc);
     }
+    if (@hasDecl(SourceDeclType, "listProjectedSchemaProgress")) {
+        snapshot.schema_progresses = try source.listProjectedSchemaProgress(alloc);
+    }
     if (@hasDecl(SourceDeclType, "listProjectedRestoreProgress")) {
         snapshot.restore_progresses = try source.listProjectedRestoreProgress(alloc);
     }
@@ -1071,6 +1085,9 @@ pub fn freeSnapshot(alloc: std.mem.Allocator, source: anytype, snapshot: *AdminS
     }
     if (@hasDecl(SourceDeclType, "freeLocalBootstrapStatuses") and snapshot.local_bootstrap_statuses.len > 0) {
         source.freeLocalBootstrapStatuses(alloc, snapshot.local_bootstrap_statuses);
+    }
+    if (@hasDecl(SourceDeclType, "freeProjectedSchemaProgress") and snapshot.schema_progresses.len > 0) {
+        source.freeProjectedSchemaProgress(alloc, snapshot.schema_progresses);
     }
     if (@hasDecl(SourceDeclType, "freeProjectedRestoreProgress") and snapshot.restore_progresses.len > 0) {
         source.freeProjectedRestoreProgress(alloc, snapshot.restore_progresses);
@@ -1177,6 +1194,9 @@ pub fn captureMergeObservations(
     var out = std.ArrayListUnmanaged(transition_state.MergeObservationRecord).empty;
     errdefer out.deinit(alloc);
     for (merge_transitions) |record| {
+        // The online controller's durable state is already in the transition
+        // record. Ordinary runtime observations are not its authority.
+        if (record.online != null) continue;
         const observation = (source.observeMergeTransition(record.transition_id) catch |err| {
             std.log.warn("merge transition snapshot observation failed transition_id={d} err={s}", .{ record.transition_id, @errorName(err) });
             continue;

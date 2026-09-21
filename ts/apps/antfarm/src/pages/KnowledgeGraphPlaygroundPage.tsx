@@ -15,11 +15,6 @@ import {
   FormActions,
   Input,
   Label,
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
   Tabs,
   TabsContent,
   TabsList,
@@ -32,12 +27,14 @@ import type React from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { PlaygroundEmptyState } from "@/components/branded-empty-state";
+import { Combobox } from "@/components/Combobox";
 import { BackendInfoBar } from "@/components/playground/BackendInfoBar";
 import { NoModelsGuide } from "@/components/playground/NoModelsGuide";
 import type { SamplePreset } from "@/components/playground/SamplePresets";
 import { SamplePresets } from "@/components/playground/SamplePresets";
 import { useApiConfig } from "@/hooks/use-api-config";
 import { useSelectedInferenceModelNames } from "@/hooks/use-connections";
+import { extractionUnavailableReason } from "@/lib/extraction-model";
 import { fetchWithRetry } from "@/lib/utils";
 
 // Entity and relation response types matching the Antfly extraction API.
@@ -283,16 +280,14 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
       model.toLowerCase().includes("rebel") ? `rel:${model}` : model
     );
     setAvailableModels(models);
-    setSelectedModel((current: string) =>
-      current && models.includes(current) ? current : models[0] || ""
-    );
+    setSelectedModel((current: string) => current || models[0] || "");
     setModelsLoaded(!modelsLoading);
   }, [connectionModels, modelsLoading]);
 
   // Handle ?model= URL param from Model Directory "Open in Playground"
   useEffect(() => {
     const modelParam = searchParams.get("model");
-    if (modelParam && modelsLoaded && availableModels.includes(modelParam)) {
+    if (modelParam && modelsLoaded) {
       setSelectedModel(modelParam);
       setSearchParams(
         (prev) => {
@@ -302,10 +297,15 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
         { replace: true }
       );
     }
-  }, [searchParams, modelsLoaded, availableModels, setSearchParams]);
+  }, [searchParams, modelsLoaded, setSearchParams]);
 
   // Check if the selected model is a REBEL model
   const isRebelModel = selectedModel.startsWith("rel:");
+  const unavailableReason = extractionUnavailableReason(
+    getModelName(selectedModel),
+    connectionModels,
+    modelsLoading
+  );
 
   const handleBuildGraph = useCallback(async () => {
     if (!inputText.trim()) {
@@ -315,6 +315,11 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
 
     if (!selectedModel) {
       setError("Please select a model");
+      return;
+    }
+
+    if (unavailableReason) {
+      setError(unavailableReason);
       return;
     }
 
@@ -345,24 +350,20 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
         .map((t: string) => t.trim())
         .filter((t: string) => t.length > 0);
 
-      // Build a relation extraction request with resolver config.
+      // The current serving listing exposes the legacy extraction protocol.
       const requestBody: Record<string, unknown> = {
         model: getModelName(selectedModel),
         inputs: texts.map((content: string) => ({ content })),
         schema: {
           relations: relationLabels.map((type) => ({ type })),
+          ...(!isRebelModel ? { entities: entityLabels } : {}),
         },
         options: {
-          resolver: config,
           include_confidence: true,
           include_spans: true,
+          resolver: config,
         },
       };
-
-      // Only include labels for GLiNER models
-      if (!isRebelModel) {
-        (requestBody.schema as Record<string, unknown>).entities = entityLabels;
-      }
 
       const response = await fetchWithRetry(inferenceUrl("extract"), {
         method: "POST",
@@ -393,7 +394,16 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
     } finally {
       setIsLoading(false);
     }
-  }, [inputText, selectedModel, isRebelModel, entityLabels, relationLabels, config, inferenceUrl]);
+  }, [
+    inputText,
+    selectedModel,
+    isRebelModel,
+    unavailableReason,
+    entityLabels,
+    relationLabels,
+    config,
+    inferenceUrl,
+  ]);
 
   // Cmd+Enter shortcut
   useEffect(() => {
@@ -655,35 +665,27 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
           {/* Model and Build Button */}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div className="space-y-2">
-              <Label htmlFor="model">Model</Label>
-              <Select
+              <Label>Model</Label>
+              <Combobox
+                options={availableModels.map((model) => ({
+                  value: model,
+                  label: model.startsWith("rel:") ? `${model.slice(4)} (REBEL)` : model,
+                }))}
                 value={selectedModel}
-                onValueChange={setSelectedModel}
-                disabled={!modelsLoaded || availableModels.length === 0}
-              >
-                <SelectTrigger id="model">
-                  <SelectValue
-                    placeholder={
-                      !modelsLoaded
-                        ? "Loading models..."
-                        : availableModels.length === 0
-                          ? "No KG models available"
-                          : "Select a model"
-                    }
-                  />
-                </SelectTrigger>
-                <SelectContent>
-                  {availableModels.map((model) => (
-                    <SelectItem key={model} value={model}>
-                      {model.startsWith("rel:") ? `${model.slice(4)} (REBEL)` : `${model} (GLiNER)`}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+                onChange={setSelectedModel}
+                placeholder={!modelsLoaded ? "Loading models..." : "Select or enter a model"}
+                searchPlaceholder="Search or enter a model ID..."
+                emptyText="Enter a relation extraction model ID."
+                allowCustomValue
+                disabled={!modelsLoaded}
+              />
               {isRebelModel && (
                 <p className="text-xs text-muted-foreground">
                   REBEL models extract 200+ relation types automatically
                 </p>
+              )}
+              {unavailableReason && (
+                <p className="text-xs text-muted-foreground">{unavailableReason}</p>
               )}
             </div>
 
@@ -837,7 +839,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
           <FormActions>
             <Button
               onClick={handleBuildGraph}
-              disabled={isLoading || !inputText.trim() || !selectedModel}
+              disabled={isLoading || !inputText.trim() || !selectedModel || !!unavailableReason}
             >
               {isLoading ? (
                 <>
@@ -1048,7 +1050,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
         </p>
         <p>
           <strong>GLiNER:</strong> Zero-shot entity and relation extraction with custom labels.
-          Requires specifying entity and relation types to extract.
+          GLiNER2.5 uses strict schema v2 JointIE with typed endpoints.
         </p>
       </div>
     </DashboardPage>

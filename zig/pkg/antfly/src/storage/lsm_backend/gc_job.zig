@@ -16,6 +16,7 @@
 //! planning. Select the first eligible component in a rotating read-order
 //! sweep: a blocked hot component cannot monopolize collection indefinitely.
 const std = @import("std");
+const work_budget = @import("work_budget.zig");
 const Directory = @import("run_directory.zig").Directory;
 const Closure = @import("closure_job.zig").Job;
 const ResourceManager = @import("../resource_manager.zig").ResourceManager;
@@ -128,11 +129,11 @@ pub const Job = struct {
 
     pub fn init(directory: *const Directory, start: usize, age: u64, percent: u8, now: u64, limit: u64) Job {
         const rank = if (start < directory.count()) start else 0;
-        return .{ .directory = directory, .cursor = .{ .directory = directory, .rank = rank }, .start_rank = rank, .age = age, .percent = @min(percent, 100), .now = now, .limit = limit };
+        return .{ .directory = directory, .cursor = .{ .directory = directory, .rank = rank, .include_requests = true }, .start_rank = rank, .age = age, .percent = @min(percent, 100), .now = now, .limit = limit };
     }
-    pub fn step(self: *Job, allocator: std.mem.Allocator, credits_arg: usize, deadline: u64) !bool {
+    pub fn step(self: *Job, allocator: std.mem.Allocator, credits_arg: usize, deadline: anytype) !bool {
         var credits = credits_arg;
-        while (credits != 0 and @import("antfly_platform").time.monotonicNs() < deadline) {
+        while (credits != 0 and work_budget.before(deadline)) {
             if (self.phase == .done) return true;
             credits -= 1;
             switch (self.phase) {
@@ -189,7 +190,7 @@ pub const Job = struct {
                         self.entries = @max(self.entries, run.entry_count);
                         if (run.level == 0 and Directory.readLess({}, self.oldest, handle)) self.oldest = handle;
                         const deletes = run.tombstone_count orelse 0;
-                        if (deletes == 0) continue;
+                        if (deletes == 0 and !run.gc_requested) continue;
                         if (!run.gc_requested) {
                             self.intent_runs += 1;
                             const names = run.smallest_key.len + run.largest_key.len + (if (run.path) |path| path.len else 0) +
@@ -201,12 +202,12 @@ pub const Job = struct {
                         self.seen.putPrepared(self.scratch_allocator orelse allocator, .{ .id = run.id });
                         self.deletes +|= deletes;
                         const due = run.oldest_tombstone_unix_ns +| self.age;
-                        const aged = self.age != 0 and (run.oldest_tombstone_unix_ns == 0 or run.oldest_tombstone_unix_ns > self.now or due <= self.now);
+                        const aged = deletes != 0 and self.age != 0 and (run.oldest_tombstone_unix_ns == 0 or run.oldest_tombstone_unix_ns > self.now or due <= self.now);
                         self.requested = self.requested or run.gc_requested or aged;
-                        if (self.age != 0 and !aged) self.valid_until = @min(self.valid_until, due);
+                        if (deletes != 0 and self.age != 0 and !aged) self.valid_until = @min(self.valid_until, due);
                         continue;
                     }
-                    self.eligible = self.deletes != 0 and (self.requested or @as(u128, self.deletes) * 100 >= @as(u128, self.entries) * self.percent);
+                    self.eligible = self.requested or (self.deletes != 0 and @as(u128, self.deletes) * 100 >= @as(u128, self.entries) * self.percent);
                     if (!self.eligible) {
                         self.phase = .discard;
                         continue;

@@ -75,6 +75,9 @@ pub const SplitControlObservation = struct {
 
 pub const RaftApplyStoreConfig = struct {
     root_dir: []const u8,
+    /// Trusted host construction only: a native document delegate must apply
+    /// source controls before the shared Raft applied watermark can advance.
+    native_source_delegate: bool = false,
     no_sync: bool = false,
     /// Borrowed runtime for filesystem and synchronization operations. The
     /// caller owns it and must outlive the store. Native production callers
@@ -96,6 +99,7 @@ pub const RaftApplyStore = struct {
     path: []u8,
     groups_root: []u8,
     no_sync: bool,
+    native_source_delegate: bool,
     read_only: bool,
     backend_runtime: ?*background_runtime.BackendRuntime,
     resource_manager: ?*resource_manager_mod.ResourceManager,
@@ -228,6 +232,7 @@ pub const RaftApplyStore = struct {
             .path = path,
             .groups_root = groups_root,
             .no_sync = cfg.no_sync,
+            .native_source_delegate = cfg.native_source_delegate,
             .read_only = cfg.read_only,
             .backend_runtime = cfg.backend_runtime,
             .resource_manager = cfg.resource_manager,
@@ -723,7 +728,30 @@ pub const RaftApplyStore = struct {
         commit_index: u64,
         encoded: []const u8,
     ) !void {
+        return self.installSnapshotInternal(alloc, group_id, commit_index, encoded, null);
+    }
+
+    pub fn installSnapshotWithNativeSource(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        commit_index: u64,
+        encoded: []const u8,
+        native_source: *docstore.DocStore,
+    ) !void {
+        return self.installSnapshotInternal(alloc, group_id, commit_index, encoded, native_source);
+    }
+
+    fn installSnapshotInternal(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        commit_index: u64,
+        encoded: []const u8,
+        native_source: ?*docstore.DocStore,
+    ) !void {
         const snapshot = try shard_state_store.GroupStateSnapshotStream.init(encoded);
+        if ((snapshot.native_primary != null) != (native_source != null)) return error.NativeSnapshotRequired;
         const empty_batch = try raft_state_machine.encodeCommittedEntries(alloc, &.{});
         defer alloc.free(empty_batch);
         var key_buf: [128]u8 = undefined;
@@ -762,16 +790,15 @@ pub const RaftApplyStore = struct {
                 self.nextGroupStoreAccess(),
             );
             defer candidate.close();
-            try shard_state_store.installSnapshotStreamIntoEmptyStore(
-                &candidate.store,
-                alloc,
-                group_id,
-                snapshot,
-                &.{
-                    .{ .key = key, .value = value },
-                    .{ .key = coverage_key, .value = &coverage_value },
-                },
-            );
+            const metadata_writes = [_]docstore.KVPair{
+                .{ .key = key, .value = value },
+                .{ .key = coverage_key, .value = &coverage_value },
+            };
+            if (native_source) |source| {
+                try shard_state_store.installNativeSnapshotStreamIntoEmptyStore(&candidate.store, alloc, group_id, snapshot, source, &metadata_writes);
+            } else {
+                try shard_state_store.installSnapshotStreamIntoEmptyStore(&candidate.store, alloc, group_id, snapshot, &metadata_writes);
+            }
         }
         try staged.seal();
 
@@ -1195,6 +1222,23 @@ pub const RaftApplyStore = struct {
         return try shard_state_store.currentSplitState(&group_store.store, alloc, group_id);
     }
 
+    pub fn topologyRejection(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, index: u64) !?@import("../../storage/data_raft_projection_wire.zig").TopologyRejection {
+        const io = self.runtimeIo();
+        const shard = self.batchShard(group_id);
+        shard.mutex.lockUncancelable(io);
+        defer shard.mutex.unlock(io);
+        try self.requireTransitionReadyLocked(shard, group_id);
+        const group_store = (try self.readableGroupStoreLocked(shard, group_id)) orelse return null;
+        var key_buf: [176]u8 = undefined;
+        const raw = group_store.store.get(alloc, try @import("online_topology_arbitration.zig").rejectionKey(&key_buf, group_id, index)) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        defer alloc.free(raw);
+        if (raw.len != 1) return error.InvalidOnlineTopologyReservation;
+        return std.enums.fromInt(@import("../../storage/data_raft_projection_wire.zig").TopologyRejection, raw[0]) orelse error.InvalidOnlineTopologyReservation;
+    }
+
     pub fn currentMergeSourceState(
         self: *RaftApplyStore,
         alloc: std.mem.Allocator,
@@ -1352,6 +1396,33 @@ pub const RaftApplyStore = struct {
         );
     }
 
+    pub fn groupStateKeysPageInRange(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        byte_range: AppliedDataRange,
+        after_key: ?[]const u8,
+        max_entries: usize,
+        max_bytes: usize,
+    ) !GroupStatePage {
+        const io = self.runtimeIo();
+        const shard = self.batchShard(group_id);
+        shard.mutex.lockUncancelable(io);
+        defer shard.mutex.unlock(io);
+        try self.waitForGenerationPreparationLocked(shard, group_id);
+        const group_store = (try self.readableGroupStoreLocked(shard, group_id)) orelse
+            return .{ .entries = try alloc.alloc(AppliedDataKV, 0), .exhausted = true };
+        return try shard_state_store.groupStateKeysPageInRange(
+            &group_store.store,
+            alloc,
+            group_id,
+            byte_range,
+            after_key,
+            max_entries,
+            max_bytes,
+        );
+    }
+
     pub fn applySplitHandoff(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, handoff: SplitHandoff) !void {
         const io = self.runtimeIo();
         const shard = self.batchShard(group_id);
@@ -1388,11 +1459,33 @@ pub const RaftApplyStore = struct {
         size: u64,
     };
 
+    pub const NativeSnapshotSource = struct {
+        ptr: *anyopaque,
+        group_id: u64,
+        applied_index: u64,
+        size: u64,
+        write: *const fn (*anyopaque, *std.Io.Writer, *const std.atomic.Value(bool)) anyerror!void,
+        deinit: *const fn (*anyopaque) void,
+    };
+
     pub const PreparedSnapshot = struct {
         owner: *RaftApplyStore,
         txn: docstore.DocStore.Txn,
         group_id: u64,
+        applied_index: u64,
+        requires_native: bool,
+        native: ?NativeSnapshotSource = null,
         cancelled: std.atomic.Value(bool) = .init(false),
+
+        /// Ownership transfers only on success. The two independently pinned
+        /// stores must describe the same shared completed Raft boundary.
+        pub fn attachNative(self: *@This(), native_source: NativeSnapshotSource) !void {
+            if (!self.requires_native or self.native != null or native_source.size == 0 or
+                native_source.group_id != self.group_id or native_source.applied_index != self.applied_index)
+                return error.InvalidGroupStateSnapshot;
+            if (self.cancelled.load(.acquire)) return error.SnapshotBuildCancelled;
+            self.native = native_source;
+        }
 
         fn source(self: *@This()) raft_engine.runtime.storage_iface.SnapshotSource {
             return .{
@@ -1420,6 +1513,7 @@ pub const RaftApplyStore = struct {
 
         pub fn materializeFile(self: *@This(), alloc: std.mem.Allocator) !PreparedSnapshotFile {
             if (self.cancelled.load(.acquire)) return error.SnapshotBuildCancelled;
+            if (self.requires_native and self.native == null) return error.NativeSnapshotRequired;
             const io = self.owner.runtimeIo();
             const spool_dir = try std.fmt.allocPrint(alloc, "{s}/snapshot-spool", .{self.owner.root_dir});
             defer alloc.free(spool_dir);
@@ -1438,7 +1532,16 @@ pub const RaftApplyStore = struct {
                 defer file.close(io);
                 var buffer: [64 * 1024]u8 = undefined;
                 var writer = file.writer(io, &buffer);
-                try shard_state_store.writeSnapshotTxn(&self.txn, alloc, self.group_id, &writer.interface, &self.cancelled);
+                if (self.native) |native| {
+                    try shard_state_store.writeNativeSnapshotPrefixTxn(&self.txn, alloc, self.group_id, &writer.interface, native.size, &self.cancelled);
+                    try writer.interface.flush();
+                    const prefix_size = (try file.stat(io)).size;
+                    try native.write(native.ptr, &writer.interface, &self.cancelled);
+                    try writer.interface.flush();
+                    if ((try file.stat(io)).size -| prefix_size != native.size) return error.InvalidGroupStateSnapshot;
+                } else {
+                    try shard_state_store.writeSnapshotTxn(&self.txn, alloc, self.group_id, &writer.interface, &self.cancelled);
+                }
                 try writer.end();
                 try file.sync(io);
                 size = (try file.stat(io)).size;
@@ -1461,6 +1564,7 @@ pub const RaftApplyStore = struct {
         }
 
         pub fn destroy(self: *@This()) void {
+            if (self.native) |native| native.deinit(native.ptr);
             self.txn.abort();
             self.owner.releaseSnapshotReader(self.group_id);
             std.heap.page_allocator.destroy(self);
@@ -1493,6 +1597,7 @@ pub const RaftApplyStore = struct {
 
         var txn = try group_store.store.beginReadTxn();
         errdefer txn.abort();
+        const requires_native = try shard_state_store.snapshotRequiresNativePrimary(&txn, self.alloc, group_id);
 
         const readers = try shard.snapshot_readers.getOrPut(self.alloc, group_id);
         if (!readers.found_existing) readers.value_ptr.* = 0;
@@ -1506,6 +1611,8 @@ pub const RaftApplyStore = struct {
             .owner = self,
             .txn = txn,
             .group_id = group_id,
+            .applied_index = applied_index,
+            .requires_native = requires_native,
         };
         return prepared;
     }
@@ -1627,6 +1734,7 @@ pub const RaftApplyStore = struct {
             self.alloc,
             decoded_entries,
             if (existing_batch) |existing| existing.last_entry_index else 0,
+            self.native_source_delegate,
         );
         defer freeEntryMetadata(self.alloc, metadata);
         var writes = std.ArrayListUnmanaged(docstore.OwnedKVPair).empty;
@@ -1894,7 +2002,8 @@ pub const RaftApplyStore = struct {
             },
             .prepare_split, .start_split, .finalize_split, .rollback_split => |transition| alloc.free(transition.split_key),
             .merge_receiver_checkpoint => |checkpoint| checkpoint.deinit(alloc),
-            .acknowledge_split, .merge_source_transition, .merge_copy_fence, .set_raft_batch_protocol, .flush_split_delta => {},
+            .merge_page_fence => |payload| alloc.free(payload),
+            .acknowledge_split, .merge_source_transition, .merge_copy_fence, .set_raft_batch_protocol, .require_source_pin_protocol, .topology_guard, .topology_end, .flush_split_delta => {},
         }
     }
 
@@ -1913,13 +2022,14 @@ pub const RaftApplyStore = struct {
     fn describeEntries(alloc: std.mem.Allocator, entries_bytes: []const u8, after_index: u64) !EntryMetadata {
         const decoded = try raft_state_machine.decodeCommittedEntries(alloc, entries_bytes);
         defer alloc.free(decoded);
-        return try describeDecodedEntries(alloc, decoded, after_index);
+        return try describeDecodedEntries(alloc, decoded, after_index, false);
     }
 
     fn describeDecodedEntries(
         alloc: std.mem.Allocator,
         decoded: []const raft_state_machine.DecodedCommittedEntry,
         after_index: u64,
+        native_source_delegate: bool,
     ) !EntryMetadata {
         var normal_entry_count: usize = 0;
         var admin_entry_count: usize = 0;
@@ -1946,7 +2056,8 @@ pub const RaftApplyStore = struct {
                 },
                 .prepare_split, .start_split, .finalize_split, .rollback_split => |transition| alloc.free(transition.split_key),
                 .merge_receiver_checkpoint => |checkpoint| checkpoint.deinit(alloc),
-                .acknowledge_split, .merge_source_transition, .merge_copy_fence, .set_raft_batch_protocol, .flush_split_delta => {},
+                .merge_page_fence => |payload| alloc.free(payload),
+                .acknowledge_split, .merge_source_transition, .merge_copy_fence, .set_raft_batch_protocol, .require_source_pin_protocol, .topology_guard, .topology_end, .flush_split_delta => {},
             };
             operations.deinit(alloc);
         }
@@ -1968,7 +2079,7 @@ pub const RaftApplyStore = struct {
                         errdefer alloc.free(data);
                         try normal_entries.append(alloc, .{ .index = entry.index, .data = data });
                     }
-                    try appendDataOperations(alloc, entry.index, entry.data, &operations);
+                    try appendDataOperations(alloc, entry.index, entry.data, &operations, native_source_delegate);
                 },
                 .conf_change, .conf_change_v2 => admin_entry_count += 1,
             }
@@ -2093,10 +2204,23 @@ pub const RaftApplyStore = struct {
         }
         var deletes = std.ArrayListUnmanaged([]const u8).empty;
         defer deletes.deinit(alloc);
+        var rejection_prefix_buf: [176]u8 = undefined;
+        const rejection_prefix = try @import("online_topology_arbitration.zig").rejectionPrefix(&rejection_prefix_buf, group_id);
+        const rejection_entries = try store.scanPrefix(alloc, rejection_prefix);
+        defer {
+            for (rejection_entries) |entry| {
+                alloc.free(entry.key);
+                alloc.free(entry.value);
+            }
+            alloc.free(rejection_entries);
+        }
         for (entries) |entry| {
             if (try parseEntryIdentityIndex(entry.key, prefix.len) <= applied_index) {
                 try deletes.append(alloc, entry.key);
             }
+        }
+        for (rejection_entries) |entry| {
+            if (try parseEntryIdentityIndex(entry.key, rejection_prefix.len) <= applied_index) try deletes.append(alloc, entry.key);
         }
         if (deletes.items.len == 0 and current_coverage_start != null and current_coverage_start.? == coverage_start) return;
         var coverage_key_buf: [176]u8 = undefined;
@@ -2208,16 +2332,29 @@ pub const RaftApplyStore = struct {
         raft_index: u64,
         data: []const u8,
         operations: *std.ArrayListUnmanaged(DataOperation),
+        native_source_delegate: bool,
     ) !void {
         const operation_start = operations.items.len;
+        var topology_guarded = false;
         if (!data_raft_batch.looksLikeEnvelope(data)) {
             if (try parseDataOperation(alloc, data)) |operation| {
+                switch (operation) {
+                    .prepare_split, .start_split, .finalize_split, .rollback_split, .merge_source_transition => {
+                        operations.append(alloc, .{ .topology_guard = .{ .index = raft_index, .action = .ordinary } }) catch |err| {
+                            freeDataOperation(alloc, operation);
+                            return err;
+                        };
+                        topology_guarded = true;
+                    },
+                    else => {},
+                }
                 operations.append(alloc, operation) catch |err| {
                     freeDataOperation(alloc, operation);
                     return err;
                 };
             }
             if (operations.items.len != operation_start) try operations.append(alloc, .{ .flush_split_delta = raft_index });
+            if (topology_guarded) try operations.append(alloc, .topology_end);
             return;
         }
 
@@ -2227,8 +2364,48 @@ pub const RaftApplyStore = struct {
             try operations.append(alloc, .{ .set_raft_batch_protocol = version });
             return;
         }
+        const native_transfer = decoded.batch.req.restore_staging != null or
+            (if (decoded.batch.req.merge_page) |page| page.source.integrity != null else false) or
+            (if (decoded.batch.req.merge_checkpoint) |checkpoint| if (checkpoint.page_source) |source| source.integrity != null else false else false);
+        if (native_transfer) {
+            // The projection may mirror rows/cursors only when the native
+            // owner commits the accompanying integrity/rewrite transaction.
+            // Never acknowledge a projection-only copy that drops those
+            // effects, even after installing a newer decoder barrier.
+            if (!native_source_delegate) return error.StorageKernelOwnerUnavailable;
+            try operations.append(alloc, .require_source_pin_protocol);
+        }
+        // Retention controls require the native source transaction, including
+        // durable consumers, after-image frames, and topology admission. A
+        // projection-only adapter cannot acknowledge them as empty batches.
+        if (decoded.batch.req.online_source != null) {
+            if (!native_source_delegate) return error.StorageKernelOwnerUnavailable;
+            try @import("../../storage/db/online_source_contract.zig").validateRequest(decoded.batch.req);
+            try operations.append(alloc, .require_source_pin_protocol);
+            try operations.append(alloc, .{ .topology_guard = .{ .index = raft_index, .action = .{ .source = decoded.batch.req.online_source.? } } });
+            try operations.append(alloc, .{ .flush_split_delta = raft_index });
+            try operations.append(alloc, .topology_end);
+            // The ordinary committed-entry identity is durable here; no source
+            // effect is fabricated. The trusted native delegate applies it and
+            // must succeed before DataStateMachine publishes applied_index.
+            return;
+        }
+        if (decoded.batch.req.split_transition != null or decoded.batch.req.split_checkpoint != null or decoded.batch.req.merge_source_transition != null or
+            decoded.batch.req.merge_checkpoint != null or decoded.batch.req.merge_replication != null or decoded.batch.req.merge_page != null)
+        {
+            try operations.append(alloc, .{ .topology_guard = .{ .index = raft_index, .action = .ordinary } });
+            topology_guarded = true;
+        } else if (decoded.batch.req.relational_topology) |control| if (control.action == .abort_transition) {
+            try operations.append(alloc, .{ .topology_guard = .{ .index = raft_index, .action = .{ .revoke = control.fence } } });
+            topology_guarded = true;
+        };
         const fenced_copy = decoded.batch.req.merge_replication != null and decoded.batch.req.merge_checkpoint == null;
-        if (fenced_copy) try operations.append(alloc, .{ .merge_copy_fence = decoded.batch.req.merge_replication });
+        if (decoded.batch.req.merge_page != null) {
+            try @import("../../storage/db/merge_page_contract.zig").validateRequest(decoded.batch.req);
+            const payload = try std.json.Stringify.valueAlloc(alloc, decoded.batch.req, .{});
+            errdefer alloc.free(payload);
+            try operations.append(alloc, .{ .merge_page_fence = payload });
+        } else if (fenced_copy) try operations.append(alloc, .{ .merge_copy_fence = decoded.batch.req.merge_replication });
         for (decoded.batch.req.writes) |write| {
             const key = try alloc.dupe(u8, write.key);
             errdefer alloc.free(key);
@@ -2339,8 +2516,168 @@ pub const RaftApplyStore = struct {
                 .checkpoint = owned,
             } });
         }
+        if (topology_guarded) try operations.append(alloc, .topology_end);
     }
 };
+
+test "data raft integrity transfer refuses projection only owners and retains native protocol barrier" {
+    const alloc = std.testing.allocator;
+    const pages = @import("../../storage/db/merge_page_contract.zig");
+    const source: pages.Source = .{
+        .namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 },
+        .pin_digest = @splat(1),
+        .applied_index = 3,
+        .retention = .{ .epoch = 1, .after_sequence = 0 },
+        .integrity = .{ .catalog_digest = @splat(2), .generation_set = @splat(3) },
+    };
+    var page_request: db_types.BatchRequest = .{
+        .merge_replication = .{ .transition_id = 9, .donor_group_id = 2, .receiver_group_id = 3, .identity_namespace = .{ .table_id = 1, .shard_id = 3, .range_id = 3 }, .copy_attempt = .{ .donor_term = 1, .sequence = 1 } },
+        .merge_page = .{ .source = source, .sequence = 1, .phase = .cleanup_integrity, .exhausted = true, .digest = @splat(0) },
+    };
+    page_request.merge_page.?.digest = pages.commandDigest(page_request);
+    const requests = [_]db_types.BatchRequest{
+        page_request,
+        .{ .merge_checkpoint = .{ .kind = .accept, .transition_id = 9, .donor_group_id = 2, .receiver_group_id = 3, .receiver_base_start = "m", .receiver_base_end = "", .merged_start = "", .merged_end = "", .page_source = source, .page_receiver_namespace = .{ .table_id = 1, .shard_id = 3, .range_id = 3 } } },
+        .{ .restore_staging = .{ .finish = .{ .scope = @splat(1), .phase = .validated } } },
+    };
+    for (requests) |request| {
+        const bytes = try data_raft_batch.encode(alloc, "rows", request);
+        defer alloc.free(bytes);
+        var operations: std.ArrayListUnmanaged(shard_state_store.DataOperation) = .empty;
+        defer {
+            for (operations.items) |operation| RaftApplyStore.freeDataOperation(alloc, operation);
+            operations.deinit(alloc);
+        }
+        try std.testing.expectError(error.StorageKernelOwnerUnavailable, RaftApplyStore.appendDataOperations(alloc, 1, bytes, &operations, false));
+        try std.testing.expectEqual(@as(usize, 0), operations.items.len);
+        try RaftApplyStore.appendDataOperations(alloc, 1, bytes, &operations, true);
+        try std.testing.expect(operations.items[0] == .require_source_pin_protocol);
+    }
+}
+
+test "data raft online topology arbitration persists exact rejection and scopes release across reopen" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/arbitration", .{tmp.sub_path});
+    defer alloc.free(root);
+    var store = try RaftApplyStore.init(alloc, .{ .root_dir = root, .native_source_delegate = true });
+    defer store.deinit();
+    const group: u64 = 601;
+    const Apply = struct {
+        fn bytes(owner: *RaftApplyStore, index: u64, payload: []const u8) !void {
+            const encoded = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{.{ .term = 1, .index = index, .entry_type = .normal, .data = @constCast(payload) }});
+            defer std.testing.allocator.free(encoded);
+            try owner.snapshotBuilder().applyBatch(.{ .group_id = 601, .commit_index = index, .entries_bytes = encoded });
+        }
+        fn request(owner: *RaftApplyStore, index: u64, value: db_types.BatchRequest) !void {
+            const encoded = try data_raft_batch.encode(std.testing.allocator, "docs", value);
+            defer std.testing.allocator.free(encoded);
+            try bytes(owner, index, encoded);
+        }
+    };
+    const barrier = try data_raft_batch.encodeProtocolBarrier(alloc, "docs", data_raft_batch.source_pin_protocol_version);
+    defer alloc.free(barrier);
+    try std.testing.expect(try store.seedGroupSnapshotIfAbsent(alloc, group, 1, .{ .start = "", .end = "m" }, &.{}));
+    try Apply.bytes(&store, 1, barrier);
+    const scope: @import("../../storage/db/online_source_contract.zig").Scope = .{
+        .fence = .{ .transition_id = 91, .attempt = 1, .admission_epoch = 1, .owner_group_id = group, .peer_group_id = 602, .role = .merge_source, .namespace = .{ .table_id = 7, .shard_id = group, .range_id = 700 }, .catalog_digest = @splat(8) },
+        .receiver_namespace = .{ .table_id = 7, .shard_id = 602, .range_id = 701 },
+        .consumer_epoch = 4,
+        .copy_attempt = .{ .donor_term = 1, .sequence = 1 },
+    };
+    try Apply.request(&store, 2, .{ .online_source = .{ .admit = .{ .scope = scope } } });
+    const ordinary: db_types.BatchRequest = .{ .merge_source_transition = .{ .kind = .prepare, .transition_id = 99, .receiver_group_id = 602 } };
+    try Apply.request(&store, 3, ordinary);
+    try std.testing.expectEqual(@as(?@import("../../storage/data_raft_projection_wire.zig").TopologyRejection, .busy), try store.topologyRejection(alloc, group, 3));
+    try std.testing.expect((try store.currentMergeSourceState(alloc, group)) == null);
+    try Apply.request(&store, 4, .{ .split_transition = .{ .kind = .prepare, .transition_id = 92, .attempt_epoch = 1, .destination_group_id = 602, .split_key = "doc:m" } });
+    try std.testing.expectEqual(@as(?@import("../../storage/data_raft_projection_wire.zig").TopologyRejection, .busy), try store.topologyRejection(alloc, group, 4));
+    try std.testing.expect((try store.currentSplitState(alloc, group)) == null);
+    store.deinit();
+    store = try RaftApplyStore.init(alloc, .{ .root_dir = root, .native_source_delegate = true });
+    try std.testing.expectEqual(@as(?@import("../../storage/data_raft_projection_wire.zig").TopologyRejection, .busy), try store.topologyRejection(alloc, group, 3));
+    // Exact replay preserves its rejection even if a later command releases.
+    try Apply.request(&store, 4, .{ .split_transition = .{ .kind = .prepare, .transition_id = 92, .attempt_epoch = 1, .destination_group_id = 602, .split_key = "doc:m" } });
+    try Apply.request(&store, 5, .{ .online_source = .{ .admit = .{ .scope = scope } } });
+    var wrong = scope;
+    wrong.copy_attempt.sequence += 1;
+    try Apply.request(&store, 6, .{ .online_source = .{ .release = wrong } });
+    try std.testing.expectEqual(@as(?@import("../../storage/data_raft_projection_wire.zig").TopologyRejection, .scope_changed), try store.topologyRejection(alloc, group, 6));
+    try Apply.request(&store, 7, .{ .relational_topology = .{ .fence = scope.fence, .action = .abort_transition } });
+    try Apply.request(&store, 8, ordinary);
+    try std.testing.expect((try store.topologyRejection(alloc, group, 8)) == null);
+    try std.testing.expectEqual(@as(u64, 99), (try store.currentMergeSourceState(alloc, group)).?.transition_id);
+    var fresh = scope;
+    fresh.fence.transition_id += 1;
+    fresh.fence.admission_epoch += 1;
+    fresh.consumer_epoch += 1;
+    try Apply.request(&store, 9, .{ .online_source = .{ .admit = .{ .scope = fresh } } });
+    try std.testing.expectEqual(@as(?@import("../../storage/data_raft_projection_wire.zig").TopologyRejection, .busy), try store.topologyRejection(alloc, group, 9));
+    try Apply.request(&store, 10, .{ .merge_source_transition = .{ .kind = .rollback, .transition_id = 99, .receiver_group_id = 602 } });
+    try Apply.request(&store, 11, .{ .online_source = .{ .admit = .{ .scope = fresh } } });
+    try std.testing.expect((try store.topologyRejection(alloc, group, 11)) == null);
+    try Apply.request(&store, 12, .{ .online_source = .{ .release = scope } });
+    try std.testing.expectEqual(@as(?@import("../../storage/data_raft_projection_wire.zig").TopologyRejection, .scope_changed), try store.topologyRejection(alloc, group, 12));
+    const shard = store.batchShard(group);
+    const group_store = (try store.readableGroupStoreLocked(shard, group)).?;
+    // The v4 control stream transports the reservation, not old applied-error
+    // receipts. A fresh replica therefore cannot admit an ordinary prepare.
+    var txn = try group_store.store.beginReadTxn();
+    defer txn.abort();
+    var output = std.Io.Writer.Allocating.init(alloc);
+    defer output.deinit();
+    try shard_state_store.writeNativeSnapshotPrefixTxn(&txn, alloc, group, &output.writer, 1, null);
+    try output.writer.writeByte(0);
+    const stream = try shard_state_store.GroupStateSnapshotStream.init(output.written());
+    try shard_state_store.validateGroupStateSnapshotStream(alloc, group, stream);
+    var controls = stream.controls();
+    var found = false;
+    var reservation_key_buf: [160]u8 = undefined;
+    const reservation_key = try @import("online_topology_arbitration.zig").reservationKey(&reservation_key_buf, group);
+    while (try controls.next()) |entry| if (std.mem.eql(u8, entry.key, reservation_key)) {
+        const restored = try @import("online_topology_arbitration.zig").Reservation.decode(entry.value);
+        try std.testing.expect(std.meta.eql(restored.scope, fresh));
+        try std.testing.expect(!restored.released);
+        found = true;
+    };
+    try std.testing.expect(found);
+    txn.abort();
+    txn = try group_store.store.beginReadTxn();
+    try RaftApplyStore.pruneEntryIdentitiesThroughApplied(&group_store.store, alloc, group, 12);
+    try std.testing.expect((try store.topologyRejection(alloc, group, 3)) == null);
+    try std.testing.expect((try store.topologyRejection(alloc, group, 12)) == null);
+    // One Ready may contain a rejected topology command followed by ordinary
+    // writes. The rejection must terminate exactly at the command boundary
+    // and cannot swallow the later entry's effects.
+    const rejected_command = try data_raft_batch.encode(alloc, "docs", ordinary);
+    defer alloc.free(rejected_command);
+    const later_write = try data_raft_batch.encode(alloc, "docs", .{ .writes = &.{.{ .key = "doc:a", .value = "{}" }} });
+    defer alloc.free(later_write);
+    const mixed = try raft_state_machine.encodeCommittedEntries(alloc, &.{
+        .{ .term = 1, .index = 13, .entry_type = .normal, .data = rejected_command },
+        .{ .term = 1, .index = 14, .entry_type = .normal, .data = later_write },
+    });
+    defer alloc.free(mixed);
+    try store.snapshotBuilder().applyBatch(.{ .group_id = group, .commit_index = 14, .entries_bytes = mixed });
+    try std.testing.expectEqual(@as(?@import("../../storage/data_raft_projection_wire.zig").TopologyRejection, .busy), try store.topologyRejection(alloc, group, 13));
+    const rows = try shard_state_store.groupState(&group_store.store, alloc, group);
+    defer shard_state_store.freeGroupStateEntries(alloc, rows);
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqualStrings("doc:a", rows[0].key);
+    const receiver_accept: db_types.BatchRequest = .{ .merge_checkpoint = .{ .kind = .accept, .transition_id = 120, .donor_group_id = 603, .receiver_group_id = group, .receiver_base_start = "", .receiver_base_end = "m", .merged_start = "", .merged_end = "z" } };
+    try Apply.request(&store, 15, receiver_accept);
+    try std.testing.expectEqual(@as(?@import("../../storage/data_raft_projection_wire.zig").TopologyRejection, .busy), try store.topologyRejection(alloc, group, 15));
+    try std.testing.expect((try store.currentMergeReceiverState(alloc, group)) == null);
+    try Apply.request(&store, 16, .{ .merge_replication = .{ .transition_id = 120, .donor_group_id = 603, .receiver_group_id = group, .identity_namespace = scope.fence.namespace, .copy_attempt = .{ .donor_term = 1, .sequence = 1 } }, .writes = &.{.{ .key = "n", .value = "{}" }} });
+    try std.testing.expectEqual(@as(?@import("../../storage/data_raft_projection_wire.zig").TopologyRejection, .busy), try store.topologyRejection(alloc, group, 16));
+    try Apply.request(&store, 17, .{ .online_source = .{ .release = fresh } });
+    try Apply.request(&store, 18, receiver_accept);
+    try std.testing.expect((try store.topologyRejection(alloc, group, 18)) == null);
+    var accepted = (try store.currentMergeReceiverState(alloc, group)).?;
+    defer accepted.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 120), accepted.transition_id);
+}
 
 test "data raft apply store persists batches across reopen" {
     var tmp = std.testing.tmpDir(.{});

@@ -40,6 +40,7 @@ fn takeUniqueSwitch(seen: *bool, flag: []const u8) void {
 
 fn retrieval(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
     var table_name: ?[]const u8 = null;
+    var web_connection: ?[]const u8 = null;
     var generator_json: ?[]const u8 = null;
     var semantic_search: ?[]const u8 = null;
     var full_text_search: ?[]const u8 = null;
@@ -69,6 +70,8 @@ fn retrieval(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.An
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--table") or std.mem.eql(u8, arg, "-t")) {
             takeUniqueValue(args, &table_name, arg);
+        } else if (std.mem.eql(u8, arg, "--web-search-connection")) {
+            takeUniqueValue(args, &web_connection, arg);
         } else if (std.mem.eql(u8, arg, "--generator")) {
             takeUniqueValue(args, &generator_json, arg);
         } else if (std.mem.eql(u8, arg, "--max-internal-iterations")) {
@@ -126,11 +129,12 @@ fn retrieval(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.An
     }
 
     const gen_json = generator_json orelse cli.fatal("--generator is required", .{});
-    const table = table_name orelse cli.fatal("--table is required", .{});
+    if (table_name == null and web_connection == null) cli.fatal("--table or --web-search-connection is required", .{});
+    if (table_name == null and (semantic_search != null or full_text_search != null or indexes_str != null or fields_str != null or reranker_json != null or pruner_json != null)) cli.fatal("database search options require --table", .{});
     const intent_only = semantic_search == null and full_text_search == null;
     if (intent_only and prompt == null) cli.fatal("provide --intent, --semantic-search, or --full-text-search", .{});
-    const iterations = try parseIterations(iterations_arg orelse if (intent_only) "8" else "0");
-    if (intent_only and iterations == 0) cli.fatal("--intent without a query requires positive --max-internal-iterations", .{});
+    const iterations = try parseIterations(iterations_arg orelse if (intent_only or web_connection != null) "8" else "0");
+    if ((intent_only or web_connection != null) and iterations == 0) cli.fatal("--intent without a query requires positive --max-internal-iterations", .{});
     const query_text = prompt orelse semantic_search orelse full_text_search orelse "";
 
     var generator_value = parseJsonArg(antfly_client.types.GeneratorConfig, allocator, "--generator", gen_json);
@@ -156,8 +160,8 @@ fn retrieval(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.An
     defer if (pruner_value) |*parsed| parsed.deinit();
     if (pruner_json) |raw| pruner_value = parseJsonArg(antfly_client.types.Pruner, allocator, "--pruner", raw);
 
-    const retrieval_query = antfly_client.types.RetrievalQueryRequest{
-        .table = table,
+    const retrieval_query = antfly_client.types.QueryRequest{
+        .table = table_name,
         .full_text_search = if (full_text_value) |*parsed| parsed.value else null,
         .semantic_search = semantic_search,
         .indexes = indexes,
@@ -166,7 +170,7 @@ fn retrieval(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.An
         .reranker = if (reranker_value) |*parsed| parsed.value else null,
         .pruner = if (pruner_value) |*parsed| parsed.value else null,
     };
-    const queries = [_]antfly_client.types.RetrievalQueryRequest{retrieval_query};
+    const queries = [_]antfly_client.types.QueryRequest{retrieval_query};
 
     const steps = antfly_client.types.RetrievalAgentSteps{
         .classification = .{
@@ -174,7 +178,7 @@ fn retrieval(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.An
             .with_reasoning = reasoning,
         },
         .generation = .{
-            .enabled = generate or intent_only,
+            .enabled = generate or intent_only or web_connection != null,
             .system_prompt = system_prompt,
         },
         .followup = .{
@@ -187,7 +191,8 @@ fn retrieval(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.An
 
     const body = antfly_client.types.RetrievalAgentRequest{
         .query = query_text,
-        .queries = queries[0..],
+        .queries = if (table_name != null) queries[0..] else &.{},
+        .tools = if (web_connection) |name| .{ .web_search_connection = name } else null,
         .max_context_tokens = max_context_tokens,
         .max_internal_iterations = iterations,
         .stream = streaming,
@@ -195,7 +200,7 @@ fn retrieval(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.An
         .steps = steps,
     };
 
-    if (semantic_search != null) index_readiness.warnIfSelectedSemanticIndexesAreNotReadyForRetrieval(client, table, indexes);
+    if (semantic_search != null) index_readiness.warnIfSelectedSemanticIndexesAreNotReadyForRetrieval(client, table_name.?, indexes);
     return sendRetrieval(allocator, io, client, body);
 }
 

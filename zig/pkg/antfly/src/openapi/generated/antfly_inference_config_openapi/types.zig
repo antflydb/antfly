@@ -547,6 +547,44 @@ pub const EmbedResponse = struct {
 pub const Error = struct {
     /// Error message
     @"error": []const u8,
+    message: ?[]const u8 = null,
+    input_index: ?i64 = null,
+    stage: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "error", "error", false },
+        .{ "message", "message", true },
+        .{ "input_index", "input_index", true },
+        .{ "stage", "stage", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("error");
+        try jw.write(self.@"error");
+        if (self.message) |value| {
+            try jw.objectField("message");
+            try jw.write(value);
+        }
+        if (self.input_index) |value| {
+            try jw.objectField("input_index");
+            try jw.write(value);
+        }
+        if (self.stage) |value| {
+            try jw.objectField("stage");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Reason why generation stopped
@@ -1431,7 +1469,7 @@ pub const ModelRef = struct {
     /// Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal or CUDA runtime. On Metal, `auto` chooses full residency only when the complete expert set and safety reserves fit the configured budget; otherwise it uses bounded streaming. On the qualified SM89 CUDA lane, `auto` resolves to resident mode and fails closed unless its envelope fits. Other model geometries reject this field.
     residency_mode: ?A4bResidencyMode = null,
     /// Per-model A4B memory envelope in MiB. Zero selects the backend default: the conservative 2048 MiB streamed floor on Metal, or the qualified 16384 MiB resident envelope on CUDA. Explicit values below 2048 fail; CUDA also rejects any envelope too small for full residency. Other model geometries reject this field.
-    memory_budget_mb: ?i64 = null,
+    memory_budget_mb: ?u32 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{

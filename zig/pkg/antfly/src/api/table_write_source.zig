@@ -50,6 +50,7 @@ pub const LocalStructuralReconcileResult = struct {
     repair_repaired: u64 = 0,
     repair_remaining: u64 = 0,
     repair_terminal: u64 = 0,
+    repair_paused: u64 = 0,
     repair_busy: u64 = 0,
     repair_disk_waits: u64 = 0,
     next_retry_at_ms: u64 = 0,
@@ -77,6 +78,16 @@ pub const TableWriteSource = struct {
     boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
 
     pub const VTable = struct {
+        txn_status_group_local_with_request: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            req: distributed_txn.TxnStatusRequest,
+            context: @import("operation.zig").RequestContext,
+        ) anyerror!?db_mod.types.TxnStatus = null,
+        vector_migration_group_local: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request_json: []const u8) anyerror!?[]u8 = null,
+
         /// Committed replication has distinct transaction and entry-identity
         /// semantics from an ordinary request batch. Prepared application may
         /// only borrow an already configured owner, never consult the catalog.
@@ -158,6 +169,7 @@ pub const TableWriteSource = struct {
             table_name: []const u8,
             contract: metadata_topology_protocol.DropCleanupContract,
         ) anyerror!?void = null,
+        backup_pin_control: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: @import("../storage/db/native_backup_seal_contract.zig").Request, control: backup_contract.BackupOperationControl) anyerror!?[]u8 = null,
         backup_table: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -448,6 +460,7 @@ pub const TableWriteSource = struct {
             group_id: u64,
             table_name: []const u8,
         ) anyerror!?void = null,
+        capture_ha_seed_snapshot_group_local: ?*const fn (ptr: *anyopaque, group_id: u64, table_name: []const u8, token: []const u8, destination: []const u8) anyerror!?void = null,
         prepare_ha_seed_snapshot_group_local: ?*const fn (
             ptr: *anyopaque,
             group_id: u64,
@@ -557,6 +570,7 @@ pub const TableWriteSource = struct {
             table_name: []const u8,
             target_index_name: ?[]const u8,
             advance_index_repair: bool,
+            repair_options: db_mod.types.ArtifactRepairRunOptions,
             retain_cold_owner: bool,
         ) anyerror!?LocalStructuralReconcileObservation = null,
         local_runtime_status_group_local: ?*const fn (
@@ -780,6 +794,12 @@ pub const TableWriteSource = struct {
     ) !?void {
         const fn_ptr = self.vtable.drop_table orelse return null;
         return try BoundaryAbi.call("drop_table", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, contract });
+    }
+
+    pub fn backupPinControl(self: TableWriteSource, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: @import("../storage/db/native_backup_seal_contract.zig").Request, control: backup_contract.BackupOperationControl) !?[]u8 {
+        try control.ensureActive();
+        const callback = self.vtable.backup_pin_control orelse return error.UnsupportedOperation;
+        return BoundaryAbi.call("backup_pin_control", self.boundary_dispatch, callback, .{ self.ptr, alloc, table_name, group_id, request, control });
     }
 
     pub fn backupTable(
@@ -1074,6 +1094,20 @@ pub const TableWriteSource = struct {
         return try BoundaryAbi.call("txn_status_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, txn_id });
     }
 
+    pub fn txnStatusGroupLocalWithRequest(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: distributed_txn.TxnStatusRequest,
+        context: @import("operation.zig").RequestContext,
+    ) !?db_mod.types.TxnStatus {
+        try context.ensureActive();
+        if (req.restore_staging_scope == null or req.restore_staging_plan_id == null) return error.InvalidTxnRequest;
+        const callback = self.vtable.txn_status_group_local_with_request orelse return error.DeadlineAwareTxnStatusUnsupported;
+        return try BoundaryAbi.call("txn_status_group_local_with_request", self.boundary_dispatch, callback, .{ self.ptr, alloc, group_id, table_name, req, context });
+    }
+
     pub fn txnStatusGroupLinearizable(
         self: TableWriteSource,
         alloc: std.mem.Allocator,
@@ -1191,6 +1225,11 @@ pub const TableWriteSource = struct {
     ) !?db_mod.types.DocumentArtifactTableReprocessResult {
         const fn_ptr = self.vtable.reprocess_document_artifact_range orelse return null;
         return try BoundaryAbi.call("reprocess_document_artifact_range", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, artifact_name, req });
+    }
+
+    pub fn vectorMigrationGroupLocal(self: TableWriteSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request_json: []const u8) !?[]u8 {
+        const callback = self.vtable.vector_migration_group_local orelse return null;
+        return try BoundaryAbi.call("vector_migration_group_local", self.boundary_dispatch, callback, .{ self.ptr, alloc, group_id, table_name, request_json });
     }
 
     pub fn listArtifactRepairIssues(
@@ -1376,6 +1415,11 @@ pub const TableWriteSource = struct {
         return try BoundaryAbi.call("preflight_write_admission_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, group_id, table_name });
     }
 
+    pub fn captureHASeedSnapshotGroupLocal(self: TableWriteSource, group_id: u64, table_name: []const u8, token: []const u8, destination: []const u8) !?void {
+        const fn_ptr = self.vtable.capture_ha_seed_snapshot_group_local orelse return null;
+        return try BoundaryAbi.call("capture_ha_seed_snapshot_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, group_id, table_name, token, destination });
+    }
+
     pub fn prepareHASeedSnapshotGroupLocal(
         self: TableWriteSource,
         group_id: u64,
@@ -1443,6 +1487,7 @@ pub const TableWriteSource = struct {
         table_name: []const u8,
         target_index_name: ?[]const u8,
         advance_index_repair: bool,
+        repair_options: db_mod.types.ArtifactRepairRunOptions,
         retain_cold_owner: bool,
     ) !?LocalStructuralReconcileObservation {
         const fn_ptr = self.vtable.reconcile_table_group_local_observed orelse return null;
@@ -1453,6 +1498,7 @@ pub const TableWriteSource = struct {
             table_name,
             target_index_name,
             advance_index_repair,
+            repair_options,
             retain_cold_owner,
         });
     }
@@ -1575,12 +1621,26 @@ fn consumerTests() type {
                 source.commitBatchWithCancellation(std.testing.allocator, &.{}, .enrichments, db_mod.types.CancellationToken.fromAtomic(&canceled)),
             );
             try std.testing.expectEqual(@as(usize, 2), fake.calls);
-            fake.failure = error.StorageBusy;
-            try std.testing.expectError(
+            // Exercise the foreign dispatcher used by production archives:
+            // admission failures retain their exact public classification,
+            // while an ambiguous proposal must never become retryable.
+            inline for (.{
                 error.StorageBusy,
-                source.commitBatchWithCancellation(std.testing.allocator, &.{}, .write, db_mod.types.CancellationToken.fromAtomic(&canceled)),
-            );
-            try std.testing.expectEqual(@as(usize, 3), fake.calls);
+                error.CatalogRoutingSnapshotTimeout,
+                error.CatalogRoutingUnavailable,
+                error.CatalogProjectionRefreshRequired,
+                error.RaftBatchWriteOutcomeUnknown,
+                error.CommitDecisionUnknown,
+            }) |failure| {
+                fake.failure = failure;
+                try std.testing.expectError(failure, source.commitBatchWithCancellation(
+                    std.testing.allocator,
+                    &.{},
+                    .write,
+                    .none,
+                ));
+            }
+            fake.failure = error.EnrichmentWorkerFailed;
             canceled.store(true, .release);
             try std.testing.expectError(
                 error.EnrichmentWaitCanceled,

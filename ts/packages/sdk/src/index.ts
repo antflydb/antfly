@@ -48,6 +48,7 @@ export {
   type QueryTemporarilyUnavailableCode,
   QueryTemporarilyUnavailableError,
   type RestoreOptions,
+  type SchemaMutationOptions,
   StorageReadTemporarilyUnavailableError,
   StorageResourceExhaustedError,
 } from "./client.js";
@@ -86,7 +87,12 @@ export {
   InferenceCapacityError,
   InferenceClient,
 } from "./inference-client.js";
-export { deserializeEmbeddings, serializeEmbeddings } from "./inference-codec.js";
+export {
+  decodeNumericDenseFrame,
+  NUMERIC_RESPONSE_ACCEPT,
+  NUMERIC_RESPONSE_MEDIA_TYPE,
+  serializeNumericDenseFrame,
+} from "./inference-codec.js";
 export type {
   Chunk,
   ChunkConfig,
@@ -106,6 +112,7 @@ export type {
   ExtractRelation,
   ExtractRequest,
   ExtractResponse,
+  ExtractV2Request,
   GenerateChunk,
   GenerateRequest,
   GenerateResponse,
@@ -201,11 +208,13 @@ export type {
   ConnectionsResponse,
   CreateAlgebraicIndexRequest,
   CreatedIndex,
+  CreatedRelationalIndex,
   CreateEmbeddingsIndexRequest,
   CreateFullTextIndexRequest,
   CreateGraphIndexRequest,
   // Index types
   CreateIndexRequest,
+  CreateRelationalIndexRequest,
   CreateTableRequest,
   CreateUserRequest,
   DenseEmbedding,
@@ -244,6 +253,8 @@ export type {
   EvalSummary,
   EvaluatorName,
   EvaluatorScore,
+  // Web search types
+  ExaSearchConfig,
   ExternalIoConnection,
   ExternalIoProtocol,
   FetchConfig,
@@ -321,6 +332,9 @@ export type {
   IndexConfig,
   IndexEmbedderConfig,
   IndexEmbedderProvider,
+  IndexMaintenanceOwnerProof,
+  IndexMaintenanceRequest,
+  IndexMaintenanceResponse,
   IndexRuntimeCapabilities,
   IndexStatus,
   IndexType,
@@ -359,6 +373,32 @@ export type {
   QueryResult,
   QueryScoreDetails,
   QueryStrategy,
+  RelationalColumnExpression,
+  RelationalConstraintConflictReason,
+  RelationalConstraintRangeStatus,
+  RelationalConstraintRetirementRequest,
+  RelationalConstraintRetirementStatus,
+  RelationalConstraintRetryRequest,
+  RelationalConstraintRetryResponse,
+  RelationalConstraintStatus,
+  RelationalExpressionOp,
+  RelationalExpressionType,
+  RelationalForeignKeyConstraint,
+  RelationalIndexBuildFailure,
+  RelationalIndexBuildState,
+  RelationalIndexConfig,
+  RelationalIndexPredicate,
+  RelationalIndexRangeStatus,
+  RelationalIndexStats,
+  RelationalIndexStatus,
+  RelationalRow,
+  RelationalRowCondition,
+  RelationalRowIndexBound,
+  RelationalRowMutation,
+  RelationalRowMutationRequest,
+  RelationalRowQueryRequest,
+  RelationalScalarExpression,
+  RelationalUniqueConstraint,
   RerankerConfig,
   RerankerProfile,
   ResourceType,
@@ -371,6 +411,7 @@ export type {
   RetrievalAgentResult,
   RetrievalAgentSteps,
   RetrievalAgentStreamCallbacks,
+  RetrievalNavigationConfig,
   RouteType,
   SemanticQueryMode,
   ShardsProfile,
@@ -393,8 +434,8 @@ export type {
   UpdatePasswordRequest,
   // User and permission types
   User,
-  // Web search types
   WebSearchConfig,
+  WebSearchProviderConfig,
   WebSearchResultItem,
   WriteOptions,
 } from "./types.js";
@@ -416,3 +457,12 @@ import { Client } from "./sdk.js";
 export default Client;
 
 export * from "./models.js";
+
+export type {
+  CatalogTablespaceBindingRequest,
+  CreateTablespaceRequest,
+  DatabaseCatalogRecord,
+  NamespaceCatalogRecord,
+  RenameCatalogResourceRequest,
+  TablespaceCatalogRecord,
+} from "./types.js";

@@ -21,6 +21,7 @@ pub const probe_operations = @import("probe_operations.zig");
 pub const storage_maintenance_operations = @import("storage_maintenance_operations.zig");
 pub const batch = @import("batch.zig");
 pub const backups = @import("backups.zig");
+pub const restore_owner = @import("restore_owner.zig");
 pub const linear_merge = @import("linear_merge.zig");
 pub const query = @import("query.zig");
 pub const query_contract = @import("query_contract.zig");
@@ -41,6 +42,7 @@ const multi_node_e2e = @import("multi_node_e2e.zig");
 pub const table_catalog = @import("table_catalog.zig");
 pub const table_router = @import("table_router.zig");
 pub const tables = @import("tables.zig");
+pub const relational_contract = @import("relational_contract.zig");
 pub const table_contract = @import("table_contract.zig");
 pub const indexes = @import("indexes.zig");
 const openapi_contract = @import("openapi_contract.zig");
@@ -54,6 +56,7 @@ pub const kernel_owner_source = @import("kernel_owner_source.zig");
 pub const storage_maintenance_source = @import("storage_maintenance_source.zig");
 pub const distributed_candidate_source = @import("distributed_candidate_source.zig");
 pub const distributed_entity_sink = @import("distributed_entity_sink.zig");
+pub const join_planning = @import("join_planning.zig");
 pub const distributed_join = @import("distributed_join.zig");
 pub const distributed_graph = @import("distributed_graph.zig");
 pub const artifact_reprocess_jobs = @import("artifact_reprocess_jobs.zig");
@@ -63,6 +66,7 @@ pub const contextual_operations = @import("contextual_operations.zig");
 pub const internal_join_operations = @import("internal_join_operations.zig");
 pub const internal_repair_operations = @import("internal_repair_operations.zig");
 pub const restore_jobs = @import("restore_jobs.zig");
+pub const relational_rewrite_driver = @import("relational_rewrite_driver.zig");
 pub const internal_query_operations = @import("internal_query_operations.zig");
 pub const internal_transition_wire = @import("internal_transition_wire.zig");
 pub const http_server = @import("http_server.zig");
@@ -102,6 +106,7 @@ pub const ApiHttpClient = http_client.ApiHttpClient;
 
 test "api restore jobs module compiles" {
     _ = restore_jobs;
+    _ = relational_rewrite_driver;
 }
 
 test "api query contract preserves filter-only query string filters" {
@@ -247,6 +252,7 @@ test "api module compiles" {
     _ = table_catalog;
     _ = table_router;
     _ = tables;
+    _ = relational_contract;
     _ = table_contract;
     _ = indexes;
     _ = openapi_contract;

@@ -73,6 +73,12 @@ pub const SegmentSizing = struct {
 };
 
 pub const Store = struct {
+    /// Candidate references are protected by the durable migration job until
+    /// all primary rows and their final reference coverage have been verified.
+    migration_retention: std.atomic.Value(bool) = .init(false),
+    migration_disk_reserve: std.atomic.Value(u64) = .init(0),
+    migration_temporary_limit: std.atomic.Value(u64) = .init(0),
+
     alloc: Allocator,
     mutex: std.atomic.Mutex = .unlocked,
     publication_mutex: std.atomic.Mutex = .unlocked,
@@ -259,6 +265,20 @@ pub const Store = struct {
         self.lockPublication();
         self.published_poisoned = poisoned;
         self.publication_mutex.unlock();
+    }
+
+    pub fn beginMigrationRetention(self: *Store) !void {
+        self.lock();
+        defer self.mutex.unlock();
+        // A collector may be staging outside the mutex. Admit only after its
+        // owner retires; atomic publication then prevents the next collector.
+        if (self.marking != null or self.collection != null or self.retiring != null or self.checkpoint_running)
+            return error.StorageBusy;
+        self.migration_retention.store(true, .release);
+    }
+
+    pub fn setMigrationRetention(self: *Store, active: bool) void {
+        self.migration_retention.store(active, .release);
     }
 
     pub fn poison(self: *Store) void {
@@ -1632,6 +1652,13 @@ pub const Store = struct {
 
     fn prepareBatch(self: *Store, prepared: []const payload.Prepared) !void {
         if (self.read_only) return error.ReadOnly;
+        const reserve = self.migration_disk_reserve.load(.acquire);
+        if (reserve != 0) {
+            var bytes: u64 = 0;
+            for (prepared) |item| bytes +|= @as(u64, item.artifact.len) *| 8;
+            const capacity = try @import("antfly_platform").filesystem.capacity(self.opened.store.root_dir);
+            if (capacity.available_bytes < reserve +| bytes) return error.VectorMigrationDiskReserve;
+        }
         // Decode independent artifact envelopes before entering source writer
         // exclusion. Each request has its own allocator reservation.
         var local_budget: ?resources.BudgetedAllocator = if (self.group_commit and self.preparation_manager != null)
@@ -1651,6 +1678,12 @@ pub const Store = struct {
         defer self.mutex.unlock();
         self.waitWriteAdmissionLocked();
         if (self.poisoned) return error.VectorPayloadStorePoisoned;
+        const limit = self.migration_temporary_limit.load(.acquire);
+        if (limit != 0) {
+            var retained = self.stats.retained_payload_bytes;
+            for (prepared) |item| retained +|= item.artifact.len;
+            if (retained > limit / 8) return error.VectorMigrationTemporaryBudgetExceeded;
+        }
         const started = time.monotonicNs();
         self.stats.prepare_lock_wait_ns += started -| lock_started;
         if (self.group_commit) self.stats.decode_outside_lock_ns += lock_started -| decode_started;
@@ -2233,6 +2266,7 @@ pub const Store = struct {
     fn collectStepLocked(self: *Store, primary: *erased.Store, budget_bytes: u64, background: bool) !bool {
         if (self.read_only) return error.ReadOnly;
         if (self.poisoned) return error.VectorPayloadStorePoisoned;
+        if (self.migration_retention.load(.acquire)) return false;
         if (self.checkpoint_running or self.retiring != null) {
             self.stats.collection_deferrals += 1;
             return false;
@@ -2910,7 +2944,9 @@ pub const Store = struct {
 };
 
 test "source vector payloads collection syncs primary WAL without flushing hot documents" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     const backend_mod = @import("lsm_backend.zig");
     const docs = @import("docstore.zig");
     const keys = @import("internal_keys.zig");
@@ -2982,7 +3018,9 @@ test "source vector payloads collection syncs primary WAL without flushing hot d
 }
 
 test "source vector payloads survive restart and preserve independent model versions" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var memory = lsm.MemoryStorage.init(alloc);
     defer memory.deinit();
     const keys = @import("internal_keys.zig");
@@ -3016,7 +3054,9 @@ test "source vector payloads survive restart and preserve independent model vers
 }
 
 test "source vector payloads primary references preserve snapshot and cursor isolation" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     const mem = @import("mem_backend.zig");
     const docs = @import("docstore.zig");
     const keys = @import("internal_keys.zig");
@@ -3100,7 +3140,9 @@ test "source vector payloads batch reads preserve versions preparation and bound
 }
 
 fn checkDenseBatchReads(positional: bool, encoding: vector_block.Encoding) !void {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     const mem = @import("mem_backend.zig");
     const docs = @import("docstore.zig");
     const keys = @import("internal_keys.zig");
@@ -3250,7 +3292,9 @@ fn checkDenseBatchReads(positional: bool, encoding: vector_block.Encoding) !void
 }
 
 test "source vector payloads collect obsolete versions only after readers retire" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     const mem = @import("mem_backend.zig");
     const docs = @import("docstore.zig");
     const keys = @import("internal_keys.zig");
@@ -3294,8 +3338,88 @@ test "source vector payloads collect obsolete versions only after readers retire
     try std.testing.expectEqual(@as(u64, 0), source.statsSnapshot().live_payloads_at_collection);
 }
 
+test "source vector payloads retain accounting across reopen before collection observations" {
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
+    const mem = @import("mem_backend.zig");
+    const docs = @import("docstore.zig");
+    const keys = @import("internal_keys.zig");
+    var memory = lsm.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var backend = mem.Backend.init(alloc, .{});
+    defer backend.close();
+    var raw = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer raw.deinit();
+    var store = try docs.DocStore.openRuntime(alloc, &raw);
+    defer store.close();
+    const key_a = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, "a", "model-a");
+    defer alloc.free(key_a);
+    const key_b = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, "a", "model-b");
+    defer alloc.free(key_b);
+    const obsolete = try codec.encodeDenseEmbeddingAlloc(alloc, 1, &.{ 1, 0, 0 });
+    defer alloc.free(obsolete);
+    const current_a = try codec.encodeDenseEmbeddingAlloc(alloc, 2, &.{ 0, 0, 1 });
+    defer alloc.free(current_a);
+    const current_b = try codec.encodeDenseEmbeddingAlloc(alloc, 2, &.{ 1, 0 });
+    defer alloc.free(current_b);
+
+    // Complete reclamation before restart. There are no optional workers or
+    // persisted collection receipts to race with the first reopened snapshot.
+    {
+        var source = try Store.openWithPolicy(alloc, memory.storage(), "/source-reopen-observation", false, .float32, .{});
+        defer source.deinit();
+        store.payload_store = source.interface();
+        defer store.payload_store = null;
+        try store.put(key_a, obsolete);
+        try store.put(key_b, current_b);
+        try store.put(key_a, current_a);
+        try std.testing.expect(try source.collect(&raw));
+        const stats = source.statsSnapshot();
+        try std.testing.expect(stats.collections > 0);
+        try std.testing.expectEqual(@as(u64, 2), stats.retained_payloads);
+        try std.testing.expectEqual(@as(u64, 20), stats.retained_payload_bytes);
+        try std.testing.expectEqual(@as(u64, 2), stats.live_payloads_at_collection);
+    }
+    // Status inspection can use a read-only owner; foreground activation can
+    // subsequently open a writer. Neither inherits process-local GC counters.
+    for ([_]bool{ true, false }) |read_only| {
+        var source = try Store.openWithPolicy(alloc, memory.storage(), "/source-reopen-observation", read_only, .float32, .{});
+        defer source.deinit();
+        store.payload_store = source.interface();
+        defer store.payload_store = null;
+        const before = source.statsSnapshot();
+        try std.testing.expectEqual(@as(u64, 2), before.retained_payloads);
+        try std.testing.expectEqual(@as(u64, 20), before.retained_payload_bytes);
+        try std.testing.expectEqual(@as(u64, 0), before.collection_pending_bytes);
+        try std.testing.expectEqual(@as(u64, 0), before.collections);
+        try std.testing.expectEqual(@as(u64, 0), before.live_payloads_at_collection);
+        try std.testing.expectEqual(@as(u64, 0), before.live_payload_bytes_at_collection);
+        const value_a = try store.get(alloc, key_a);
+        defer alloc.free(value_a);
+        const value_b = try store.get(alloc, key_b);
+        defer alloc.free(value_b);
+        try std.testing.expectEqualSlices(u8, current_a, value_a);
+        try std.testing.expectEqualSlices(u8, current_b, value_b);
+        if (!read_only) {
+            const generation = source.opened.store.manifest.?.latest_generation;
+            try std.testing.expect(try source.collect(&raw));
+            const after = source.statsSnapshot();
+            try std.testing.expectEqual(@as(u64, 1), after.collections);
+            try std.testing.expectEqual(@as(u64, 2), after.live_payloads_at_collection);
+            try std.testing.expectEqual(@as(u64, 20), after.live_payload_bytes_at_collection);
+            try std.testing.expectEqual(@as(u64, 0), after.collection_pending_bytes);
+            // Verification of an already reclaimed corpus need not rewrite it.
+            try std.testing.expectEqual(generation, source.opened.store.manifest.?.latest_generation);
+            try std.testing.expectEqual(@as(u64, 0), after.collection_bytes_written);
+        }
+    }
+}
+
 test "source vector payloads fence ambiguous durable preparations and recover retries" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     const keys = @import("internal_keys.zig");
     const Fault = struct {
         fn appendThenFail(ptr: *anyopaque, path: []const u8, bytes: []const u8, sync: bool) !void {
@@ -3345,7 +3469,9 @@ test "source vector payloads readonly open cannot initialize missing authority" 
 }
 
 test "source vector payloads failed prepare leaves primary unchanged and orphan is reclaimable after recovery" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     const mem = @import("mem_backend.zig");
     const docs = @import("docstore.zig");
     const keys = @import("internal_keys.zig");
@@ -3396,7 +3522,9 @@ test "source vector payloads failed prepare leaves primary unchanged and orphan 
 }
 
 test "source vector payloads recover both outcomes of an ambiguous primary commit" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     const mem = @import("mem_backend.zig");
     const docs = @import("docstore.zig");
     const keys = @import("internal_keys.zig");
@@ -3454,7 +3582,9 @@ test "source vector payloads recover both outcomes of an ambiguous primary commi
 }
 
 test "source vector payloads fresh managed encoding preserves persisted float16 on reopen" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var memory = lsm.MemoryStorage.init(alloc);
     defer memory.deinit();
     {
@@ -3497,7 +3627,9 @@ test "source vector payloads ANN references share bytes across WAL checkpoint an
 
 fn testAnnReferenceLeases(published: bool) !void {
     for ([_]vector_block.Encoding{ .float32, .float16 }) |encoding| {
-        const alloc = std.testing.allocator;
+        var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+        defer allocator_state.deinit();
+        const alloc = allocator_state.allocator();
         var memory = lsm.MemoryStorage.init(alloc);
         defer memory.deinit();
         var source = try Store.openWithEncoding(alloc, memory.storage(), "/shared-source", false, encoding);
@@ -3599,7 +3731,9 @@ fn testAnnReferenceLeases(published: bool) !void {
 
 test "source vector payloads collection retains lagging durable ANN versions and old query leases" {
     for ([_]bool{ false, true }) |outside_lock| {
-        const alloc = std.testing.allocator;
+        var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+        defer allocator_state.deinit();
+        const alloc = allocator_state.allocator();
         const mem = @import("mem_backend.zig");
         const docs = @import("docstore.zig");
         const keys = @import("internal_keys.zig");
@@ -3655,7 +3789,9 @@ test "source vector payloads collection retains lagging durable ANN versions and
 }
 
 test "source vector payloads adaptive segments retain mixed dimensions through growth and restart" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     const keys = @import("internal_keys.zig");
     var memory = lsm.MemoryStorage.init(alloc);
     defer memory.deinit();
@@ -3707,7 +3843,9 @@ test "source vector payloads adaptive segments retain mixed dimensions through g
 
 test "source vector payloads incremental collection retains updates retries deletes and old readers" {
     for ([_]usize{ 0, 1, 2, 3 }) |mark_rows| {
-        const alloc = std.testing.allocator;
+        var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+        defer allocator_state.deinit();
+        const alloc = allocator_state.allocator();
         const docs = @import("docstore.zig");
         const backend_mod = @import("lsm_backend.zig");
         const keys = @import("internal_keys.zig");
@@ -3788,7 +3926,9 @@ test "source vector payloads incremental collection retains updates retries dele
 }
 
 test "source vector payloads lock-free session admission invalidates a racing GC cut" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     const docs = @import("docstore.zig");
     const backend_mod = @import("lsm_backend.zig");
     const keys = @import("internal_keys.zig");
@@ -3863,7 +4003,9 @@ test "source vector payloads lock-free session admission invalidates a racing GC
 
 test "source vector payloads abandoned incremental copy leaves recoverable authority" {
     for ([_]usize{ 0, 1, 2 }) |mark_rows| {
-        const alloc = std.testing.allocator;
+        var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+        defer allocator_state.deinit();
+        const alloc = allocator_state.allocator();
         const docs = @import("docstore.zig");
         const mem = @import("mem_backend.zig");
         const keys = @import("internal_keys.zig");
@@ -3914,7 +4056,9 @@ test "source vector payloads abandoned incremental copy leaves recoverable autho
 }
 
 test "source vector payloads checkpoint receipt invalidates on delete and source preparation" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     const docs = @import("docstore.zig");
     const mem = @import("mem_backend.zig");
     const keys = @import("internal_keys.zig");
@@ -3961,7 +4105,9 @@ test "source vector payloads checkpoint receipt invalidates on delete and source
 
 test "source vector payloads incremental collection fences ambiguous CURRENT and recovers" {
     @import("../test_error_logs.zig").expectErrorLogs(1);
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     const docs = @import("docstore.zig");
     const mem = @import("mem_backend.zig");
     const keys = @import("internal_keys.zig");
@@ -4003,7 +4149,9 @@ test "source vector payloads incremental collection fences ambiguous CURRENT and
 }
 
 test "source vector payloads delete-only ambiguous primary commit fences collection" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     const docs = @import("docstore.zig");
     const mem = @import("mem_backend.zig");
     const keys = @import("internal_keys.zig");
@@ -4048,7 +4196,9 @@ test "source vector payloads delete-only ambiguous primary commit fences collect
 }
 
 test "source vector payloads writable startup reclaims abandoned temporary outputs" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var memory = lsm.MemoryStorage.init(alloc);
     defer memory.deinit();
     {
@@ -4077,7 +4227,9 @@ test "source vector payloads writable startup reclaims abandoned temporary outpu
 }
 
 test "source vector payloads append segments beyond legacy chain and ignore stale directory hints" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var memory = lsm.MemoryStorage.init(alloc);
     defer memory.deinit();
     var source = try Store.open(alloc, memory.storage(), "/append-source", false);
@@ -4113,7 +4265,9 @@ test "source vector payloads append segments beyond legacy chain and ignore stal
 
 test "source vector payloads selective collection preserves cold files old leases and post cut changes" {
     for ([_]usize{ 0, 1, 2 }) |mark_rows| {
-        const alloc = std.testing.allocator;
+        var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+        defer allocator_state.deinit();
+        const alloc = allocator_state.allocator();
         const mem = @import("mem_backend.zig");
         const docs = @import("docstore.zig");
         const keys = @import("internal_keys.zig");
@@ -4197,7 +4351,9 @@ test "source vector payloads selective collection preserves cold files old lease
 }
 
 test "source vector payloads group commit batches waiting preparations without acknowledging early" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var memory = lsm.MemoryStorage.init(alloc);
     defer memory.deinit();
     var source = try Store.open(alloc, memory.storage(), "/group-source", false);
@@ -4271,7 +4427,9 @@ test "source vector payloads group commit batches waiting preparations without a
 }
 
 test "source vector payloads concurrent lease retirement preserves shared budget accounting" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var manager = resources.ResourceManager.init(.{});
     defer manager.deinit(alloc);
     var memory = lsm.MemoryStorage.init(alloc);
@@ -4301,7 +4459,9 @@ test "source vector payloads concurrent lease retirement preserves shared budget
 
 test "source vector payloads selective collection cannot starve sparse garbage behind empty segments" {
     for ([_]usize{ 0, 1, 2 }) |mark_rows| {
-        const alloc = std.testing.allocator;
+        var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+        defer allocator_state.deinit();
+        const alloc = allocator_state.allocator();
         const mem = @import("mem_backend.zig");
         const docs = @import("docstore.zig");
         const keys = @import("internal_keys.zig");
@@ -4381,7 +4541,9 @@ test "source vector payloads unlocked marking admits writers fences cancellation
     for ([_]bool{ false, true }) |planning_phase| {
         for ([_]bool{ false, true }) |rescue| {
             for ([_]enum { finish, cancel, ambiguous, poisoned }{ .finish, .cancel, .ambiguous, .poisoned }) |outcome| {
-                const alloc = std.testing.allocator;
+                var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+                defer allocator_state.deinit();
+                const alloc = allocator_state.allocator();
                 const docs = @import("docstore.zig");
                 const backend_mod = @import("lsm_backend.zig");
                 const keys = @import("internal_keys.zig");
@@ -4516,7 +4678,9 @@ test "source vector payloads unlocked marking admits writers fences cancellation
 }
 
 test "source vector payloads elapsed marking budget yields before the row cap and completes verification" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     const mem = @import("mem_backend.zig");
     const docs = @import("docstore.zig");
     const keys = @import("internal_keys.zig");
@@ -4622,7 +4786,9 @@ test "source vector payloads elapsed marking budget yields before the row cap an
 
 test "source vector payloads rescued preparations cannot certify an unchanged primary as fully live" {
     for ([_]bool{ false, true }) |extra_orphan| {
-        const alloc = std.testing.allocator;
+        var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+        defer allocator_state.deinit();
+        const alloc = allocator_state.allocator();
         const mem = @import("mem_backend.zig");
         const docs = @import("docstore.zig");
         const keys = @import("internal_keys.zig");
@@ -4676,7 +4842,9 @@ test "source vector payloads active scan scheduling preserves duty and fences" {
     try std.testing.expectEqual(@as(u64, 2_000_000), Store.scanPauseNs(2_000_000, 50));
     try std.testing.expectEqual(@as(u64, 6_000_000), Store.scanPauseNs(2_000_000, 25));
     try std.testing.expectEqual(@as(u64, 100_000), Store.scanPauseNs(2_000_000, 100));
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     const mem = @import("mem_backend.zig");
     var memory = lsm.MemoryStorage.init(alloc);
     defer memory.deinit();
@@ -4704,7 +4872,9 @@ test "source vector payloads active scan scheduling preserves duty and fences" {
 }
 
 test "source vector payloads failed planning discards the consumed mark before retry" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     const mem = @import("mem_backend.zig");
     const docs = @import("docstore.zig");
     const keys = @import("internal_keys.zig");
@@ -4761,7 +4931,9 @@ test "source vector payloads shared catalogs preserve old leases across WAL and 
 }
 
 fn checkSharedCatalogLeases(positional: bool) !void {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var memory = lsm.MemoryStorage.init(alloc);
     defer memory.deinit();
     var source = try Store.open(alloc, memory.storage(), "/shared-catalog", false);
@@ -4805,7 +4977,9 @@ fn checkSharedCatalogLeases(positional: bool) !void {
 }
 
 test "source vector payloads shared catalog allocation failures preserve original owners" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     for (0..2) |fail_index| {
         var memory = lsm.MemoryStorage.init(alloc);
         defer memory.deinit();
@@ -4832,7 +5006,9 @@ test "source vector payloads shared catalog allocation failures preserve origina
 }
 
 test "source vector payloads incremental inventory matches full inventory after duplicate rescue updates and deletes" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     const mem = @import("mem_backend.zig");
     const docs = @import("docstore.zig");
     const keys = @import("internal_keys.zig");
@@ -4894,7 +5070,9 @@ test "source vector payloads publication reuses WAL under memory pressure" {
 }
 
 test "source vector payloads mark workspace admission releases snapshots and resumes reclamation" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     const docs = @import("docstore.zig");
     const mem = @import("mem_backend.zig");
     const keys = @import("internal_keys.zig");
@@ -5008,7 +5186,9 @@ test "source vector payloads mark workspace admission releases snapshots and res
 }
 
 fn testPublicationMemoryPressure(selective: bool) !void {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     const docs = @import("docstore.zig");
     const mem = @import("mem_backend.zig");
     const keys = @import("internal_keys.zig");
@@ -5092,85 +5272,104 @@ fn testPublicationMemoryPressure(selective: bool) !void {
 }
 
 test "source vector payloads publication allocation failures preserve usable authority" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     const docs = @import("docstore.zig");
     const mem = @import("mem_backend.zig");
     const keys = @import("internal_keys.zig");
     var failures: usize = 0;
     var successes: usize = 0;
-    for ([_]bool{ false, true }) |incremental| for (0..128) |fail_index| {
-        var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = fail_index });
-        var memory = lsm.MemoryStorage.init(alloc);
-        defer memory.deinit();
-        var backend = mem.Backend.init(alloc, .{});
-        defer backend.close();
-        var raw = try backend.runtimeStore(alloc, .{ .name = "docs" });
-        defer raw.deinit();
-        var source = try Store.open(alloc, memory.storage(), "/publication-failure", false);
-        defer source.deinit();
-        // Include fallible read-view preparation after inventory has already
-        // advanced to the candidate, even when an environment override is off.
-        source.positional_batch_reads = true;
-        source.append_only = true;
-        source.selective_gc = true;
-        source.mark_outside_lock = true;
-        source.mark_step_rows = 1;
-        source.shared_catalog = incremental;
-        source.incremental_inventory = incremental;
-        var store = try docs.DocStore.openRuntime(alloc, &raw);
-        defer store.close();
-        store.payload_store = source.interface();
-        const key = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "model");
-        defer alloc.free(key);
-        const old = try codec.encodeDenseEmbeddingAlloc(alloc, 1, &.{ 1, 2 });
-        defer alloc.free(old);
-        const current = try codec.encodeDenseEmbeddingAlloc(alloc, 2, &.{ 3, 4 });
-        defer alloc.free(current);
-        try store.put(key, old);
-        try store.put(key, current);
-        var old_view = try source.snapshot(alloc);
-        defer old_view.deinit();
-        try std.testing.expect(!try source.collectStepDeferredMark(&raw, 1));
-        while (!source.marking.?.scan_done) try source.advanceMarkingSnapshot();
-        source.alloc = failing.allocator();
-        source.opened.store.alloc = failing.allocator();
-        const result = source.collectStep(&raw, std.math.maxInt(u64));
-        source.alloc = alloc;
-        source.opened.store.alloc = alloc;
-        if (result) |complete| {
-            try std.testing.expect(complete);
-            successes += 1;
-        } else |err| {
-            failures += 1;
-            if (err == error.GenerationPublicationDurabilityUncertain) {
-                @import("../test_error_logs.zig").expectErrorLogs(1);
-                try std.testing.expect(source.poisoned);
-            } else {
-                try std.testing.expectEqual(error.OutOfMemory, err);
-                try std.testing.expect(!source.poisoned);
-                // Foreground reads and the next collection remain usable.
-                const value = try store.get(alloc, key);
+    for ([_]bool{ false, true }) |incremental| {
+        var fail_index: usize = 0;
+        var mode_failures: usize = 0;
+        while (true) : (fail_index += 1) {
+            var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = fail_index });
+            var memory = lsm.MemoryStorage.init(alloc);
+            defer memory.deinit();
+            var backend = mem.Backend.init(alloc, .{});
+            defer backend.close();
+            var raw = try backend.runtimeStore(alloc, .{ .name = "docs" });
+            defer raw.deinit();
+            var source = try Store.open(alloc, memory.storage(), "/publication-failure", false);
+            defer source.deinit();
+            // Include fallible read-view preparation after inventory has already
+            // advanced to the candidate, even when an environment override is off.
+            source.positional_batch_reads = true;
+            source.append_only = true;
+            source.selective_gc = true;
+            source.mark_outside_lock = true;
+            source.mark_step_rows = 1;
+            source.shared_catalog = incremental;
+            source.incremental_inventory = incremental;
+            var store = try docs.DocStore.openRuntime(alloc, &raw);
+            defer store.close();
+            store.payload_store = source.interface();
+            const key = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "model");
+            defer alloc.free(key);
+            const old = try codec.encodeDenseEmbeddingAlloc(alloc, 1, &.{ 1, 2 });
+            defer alloc.free(old);
+            const current = try codec.encodeDenseEmbeddingAlloc(alloc, 2, &.{ 3, 4 });
+            defer alloc.free(current);
+            try store.put(key, old);
+            try store.put(key, current);
+            var old_view = try source.snapshot(alloc);
+            defer old_view.deinit();
+            try std.testing.expect(!try source.collectStepDeferredMark(&raw, 1));
+            while (!source.marking.?.scan_done) try source.advanceMarkingSnapshot();
+            source.alloc = failing.allocator();
+            source.opened.store.alloc = failing.allocator();
+            const result = source.collectStep(&raw, std.math.maxInt(u64));
+            source.alloc = alloc;
+            source.opened.store.alloc = alloc;
+            if (result) |complete| {
+                try std.testing.expect(complete);
+                successes += 1;
+            } else |err| {
+                failures += 1;
+                if (err == error.GenerationPublicationDurabilityUncertain) {
+                    @import("../test_error_logs.zig").expectErrorLogs(1);
+                    try std.testing.expect(source.poisoned);
+                } else {
+                    try std.testing.expectEqual(error.OutOfMemory, err);
+                    try std.testing.expect(!source.poisoned);
+                    // Foreground reads and the next collection remain usable.
+                    const value = try store.get(alloc, key);
+                    defer alloc.free(value);
+                    try std.testing.expectEqualSlices(u8, current, value);
+                    while (!try source.collectStep(&raw, 1)) {}
+                }
+            }
+            const old_ref = try payload.Reference.forArtifact(key, old);
+            try std.testing.expect((try old_view.get(&old_ref.digest, std.math.maxInt(u64), null)) == .vector);
+            for (0..2) |_| {
+                var reopened = try Store.open(alloc, memory.storage(), "/publication-failure", false);
+                defer reopened.deinit();
+                const ref = try payload.Reference.forArtifact(key, current);
+                const value = try Store.resolve(&reopened, alloc, key, ref);
                 defer alloc.free(value);
                 try std.testing.expectEqualSlices(u8, current, value);
-                while (!try source.collectStep(&raw, 1)) {}
             }
+            // Some allocation failures are recovered internally. Only an attempt
+            // that induced no failure proves we visited every preceding allocation.
+            // Validate old readers and both reopens above before terminating.
+            if (!failing.has_induced_failure) {
+                try std.testing.expect(try result);
+                try std.testing.expect(mode_failures > 0);
+                if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_WORK_PROFILE"))
+                    std.debug.print("\nWORK payload publication incremental={} attempts={d}\n", .{ incremental, fail_index + 1 });
+                break;
+            }
+            mode_failures += 1;
         }
-        const old_ref = try payload.Reference.forArtifact(key, old);
-        try std.testing.expect((try old_view.get(&old_ref.digest, std.math.maxInt(u64), null)) == .vector);
-        for (0..2) |_| {
-            var reopened = try Store.open(alloc, memory.storage(), "/publication-failure", false);
-            defer reopened.deinit();
-            const ref = try payload.Reference.forArtifact(key, current);
-            const value = try Store.resolve(&reopened, alloc, key, ref);
-            defer alloc.free(value);
-            try std.testing.expectEqualSlices(u8, current, value);
-        }
-    };
+    }
     try std.testing.expect(failures != 0 and successes != 0);
 }
 
 test "source vector payloads WAL admission cancels unpublished marks and retains every append" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     const docs = @import("docstore.zig");
     const mem = @import("mem_backend.zig");
     const keys = @import("internal_keys.zig");
@@ -5247,7 +5446,9 @@ test "source vector payloads WAL admission cancels unpublished marks and retains
 }
 
 test "source vector payloads inventory allocation failure discards partial cache and rebuilds" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var memory = lsm.MemoryStorage.init(alloc);
     defer memory.deinit();
     var source = try Store.open(alloc, memory.storage(), "/inventory-failure", false);
@@ -5278,7 +5479,9 @@ test "source vector payloads inventory allocation failure discards partial cache
 }
 
 test "source vector payloads deferred inventory preserves receipt totals and builds on installation" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var memory = lsm.MemoryStorage.init(alloc);
     defer memory.deinit();
     const first = try codec.encodeDenseEmbeddingAlloc(alloc, 1, &.{ 1, 2 });
@@ -5347,7 +5550,9 @@ test "source vector payloads deferred inventory preserves receipt totals and bui
 }
 
 test "source vector payloads deferred inventory rejects corrupt and stale receipts" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     for ([_]bool{ false, true }) |corrupt| {
         var memory = lsm.MemoryStorage.init(alloc);
         defer memory.deinit();
@@ -5382,7 +5587,9 @@ test "source vector payloads deferred inventory rejects corrupt and stale receip
 }
 
 test "source vector payloads independent scan skips apply only before planning and outside fences" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     const mem = @import("mem_backend.zig");
     var memory = lsm.MemoryStorage.init(alloc);
     defer memory.deinit();
@@ -5407,7 +5614,9 @@ test "source vector payloads independent scan skips apply only before planning a
 }
 
 test "source vector payloads delta inventory retires only cut WAL events and preserves duplicate suffix" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var inventory: Store.Inventory = .{ .delta = true };
     defer inventory.deinit(alloc);
     const first: payload.Digest = [_]u8{1} ** 32;
@@ -5431,7 +5640,9 @@ test "source vector payloads delta inventory retires only cut WAL events and pre
 }
 
 test "source vector payloads cost experiments preserve updates deletes old leases and independent inventory" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     const mem = @import("mem_backend.zig");
     const docs = @import("docstore.zig");
     const keys = @import("internal_keys.zig");
@@ -5511,7 +5722,9 @@ test "source vector payloads cost experiments preserve updates deletes old lease
 }
 
 test "source vector payloads debt policy bounds background deferral and explicit collection bypasses it" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     const mem = @import("mem_backend.zig");
     var memory = lsm.MemoryStorage.init(alloc);
     defer memory.deinit();
@@ -5540,7 +5753,9 @@ test "source vector payloads debt policy bounds background deferral and explicit
 
 test "source vector payloads debt notification counts committed replacements and deletes only" {
     if (!payload.ownershipEnabled()) return;
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     const mem = @import("mem_backend.zig");
     const docs = @import("docstore.zig");
     const keys = @import("internal_keys.zig");
@@ -5590,7 +5805,9 @@ fn testBitmapLocatorAllocation(alloc: Allocator, opened: *const native.Opened) !
 }
 
 test "source vector payloads bitmap locator verifies collisions and owns immutable subset leases" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var memory = lsm.MemoryStorage.init(alloc);
     defer memory.deinit();
     var source = try Store.open(alloc, memory.storage(), "/bitmap-locator", false);
@@ -5649,7 +5866,9 @@ test "source vector payloads bitmap locator verifies collisions and owns immutab
 }
 
 test "source vector payloads sparse batches amortize one mark with bounded selection and old leases" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     const mem = @import("mem_backend.zig");
     const docs = @import("docstore.zig");
     const keys = @import("internal_keys.zig");
@@ -5725,7 +5944,9 @@ test "source vector payloads sparse batches amortize one mark with bounded selec
 }
 
 test "source vector payloads transaction index preserves versions and deduplicates preparations" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var memory = lsm.MemoryStorage.init(alloc);
     defer memory.deinit();
     var source = try Store.open(alloc, memory.storage(), "/prepared-index", false);
@@ -5791,7 +6012,9 @@ test "source vector payloads transaction index preserves versions and deduplicat
 }
 
 test "source vector payloads transaction index allocation failures retain prior preparations" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var memory = lsm.MemoryStorage.init(alloc);
     defer memory.deinit();
     var source = try Store.open(alloc, memory.storage(), "/prepared-index-failure", false);
@@ -5830,7 +6053,9 @@ test "source vector payloads published readers and WAL suffix progress during ch
 }
 
 fn checkPublishedCheckpointProgress(base: bool, pause_phase: Store.CheckpointPhase, admission: bool) !void {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     const Interleave = struct {
         var entered: std.atomic.Value(bool) = .init(false);
         var resume_work: std.atomic.Value(bool) = .init(false);
@@ -5965,7 +6190,9 @@ fn checkPublishedCheckpointProgress(base: bool, pause_phase: Store.CheckpointPha
 }
 
 test "source vector payloads staged checkpoint failures preserve authority and recover ambiguous publication" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     const Fault = struct {
         var ambiguous: bool = false;
         fn hook(_: *Store, phase: Store.CheckpointPhase) !void {
@@ -6014,7 +6241,9 @@ test "source vector payloads staged checkpoint failures preserve authority and r
 }
 
 test "source vector payloads read publication allocation failures leave the committed view usable" {
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     var memory = lsm.MemoryStorage.init(alloc);
     defer memory.deinit();
     var source = try Store.open(alloc, memory.storage(), "/read-publication-allocation", false);
@@ -6367,7 +6596,9 @@ test "source vector payloads background receipt is bounded retention and never a
 
 test "source vector payloads detached collection fences ambiguous CURRENT and recovers" {
     @import("../test_error_logs.zig").expectErrorLogs(1);
-    const alloc = std.testing.allocator;
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
     const docs = @import("docstore.zig");
     const mem = @import("mem_backend.zig");
     const keys = @import("internal_keys.zig");

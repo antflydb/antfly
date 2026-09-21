@@ -1,0 +1,391 @@
+{
+  "recorded_at": "2026-09-13",
+  "environment": {
+    "platform": "macOS ARM64",
+    "zig": "0.16.0",
+    "cluster_build": "Debug",
+    "component_build": "ReleaseFast"
+  },
+  "provenance": {
+    "base_commit": "2d34e2e794724d96bb6bbda2520d76a495813d4c",
+    "implementation_commit": "34d56fd81",
+    "note": "Measurements precede storage-boundary merge; resilience binary precedes final outbox ownership and authoritative paging refinements. Final merged-source verification is recorded separately.",
+    "final_server_source_commit": "821b5007bc0fcd7de646cf14c81f2a6f172a7826",
+    "merged_main_commit": "c1a39a3aeb65e62d9e4494c5b785a028e4520c5d",
+    "final_harness_sha256": "0114b4855b799cb4b995766eaf370fa4a591b514ace693fab3af51a14429824c"
+  },
+  "limitations": [
+    "Single developer machine; not production capacity claims.",
+    "Synthetic reporter describes 10000 groups with one index each outside authoritative table placement. Three actual data nodes serve concurrent DDL.",
+    "Snapshot transfers are single cold captures, not steady-state latency samples.",
+    "Telemetry comparison uses two request modes on the same binary, not two different release binaries.",
+    "Sparse publication excludes lazy flat-array materialization; first-reader cost is reported separately.",
+    "Outbox limits bound logical sample payload; allocator and coalescing map overhead is additional.",
+    "The final merged run did not reproduce the earlier concurrent DDL improvement: DDL p50/p95 were 122.499/509.424 ms for normal admission and 147.054/862.871 ms for independent telemetry. Twelve samples per mode give a noisy tail estimate; p95 is the maximum observation.",
+    "Baseline application and cache materialization remain inventory-sized; readiness is outside steady-state measurements, and early catalog requests can return retryable NotLeader during this work."
+  ],
+  "component_rows": [
+    "COLLECTION_BENCH groups=100 indexed=false p50_ms=0.007000",
+    "COLLECTION_BENCH groups=100 indexed=true p50_ms=0.002000",
+    "COLLECTION_BENCH groups=1000 indexed=false p50_ms=0.455000",
+    "COLLECTION_BENCH groups=1000 indexed=true p50_ms=0.015000",
+    "COLLECTION_BENCH groups=10000 indexed=false p50_ms=50.826000",
+    "COLLECTION_BENCH groups=10000 indexed=true p50_ms=0.127000",
+    "REPORT_BENCH groups=100 scenario=cached_heartbeat apply_p50_ms=0.257 wal_bytes_per_apply=304 full_record_bytes=82218 command_bytes=82224",
+    "REPORT_BENCH groups=100 scenario=fresh_clocks apply_p50_ms=0.249 wal_bytes_per_apply=4280 full_record_bytes=82218 command_bytes=82224",
+    "REPORT_BENCH groups=100 scenario=one_group_change apply_p50_ms=0.240 wal_bytes_per_apply=10111 full_record_bytes=82218 command_bytes=82224",
+    "REPORT_BENCH groups=100 scenario=all_groups_change apply_p50_ms=0.237 wal_bytes_per_apply=15886 full_record_bytes=82218 command_bytes=82224",
+    "REPORT_BENCH groups=100 scenario=referenced_runtime apply_p50_ms=0.161 wal_bytes_per_apply=304 full_record_bytes=82218 command_bytes=12424",
+    "SPARSE_REPORT_BENCH groups=100 runtime_changed=false apply_p50_ms=0.142 wal_bytes_per_apply=10232 command_bytes=1125",
+    "SPARSE_REPORT_BENCH groups=100 runtime_changed=true apply_p50_ms=0.161 wal_bytes_per_apply=59417 command_bytes=1125",
+    "REPORT_BENCH groups=100 full_store_read_p50_ms=0.036",
+    "REPORT_BENCH groups=100 full_store_read_allocations=412 full_store_read_allocated_bytes=114887",
+    "REPORT_BENCH groups=100 placement_drain_read_p50_ms=0.006440",
+    "REPORT_BENCH groups=1000 scenario=cached_heartbeat apply_p50_ms=1.299 wal_bytes_per_apply=304 full_record_bytes=821118 command_bytes=821124",
+    "REPORT_BENCH groups=1000 scenario=fresh_clocks apply_p50_ms=1.263 wal_bytes_per_apply=35324 full_record_bytes=821118 command_bytes=821124",
+    "REPORT_BENCH groups=1000 scenario=one_group_change apply_p50_ms=1.085 wal_bytes_per_apply=10111 full_record_bytes=821118 command_bytes=821124",
+    "REPORT_BENCH groups=1000 scenario=all_groups_change apply_p50_ms=1.071 wal_bytes_per_apply=153766 full_record_bytes=821118 command_bytes=821124",
+    "REPORT_BENCH groups=1000 scenario=referenced_runtime apply_p50_ms=0.450 wal_bytes_per_apply=304 full_record_bytes=821118 command_bytes=123124",
+    "SPARSE_REPORT_BENCH groups=1000 runtime_changed=false apply_p50_ms=0.182 wal_bytes_per_apply=10232 command_bytes=1125",
+    "SPARSE_REPORT_BENCH groups=1000 runtime_changed=true apply_p50_ms=0.173 wal_bytes_per_apply=59417 command_bytes=1125",
+    "REPORT_BENCH groups=1000 full_store_read_p50_ms=0.340",
+    "REPORT_BENCH groups=1000 full_store_read_allocations=4014 full_store_read_allocated_bytes=1216197",
+    "REPORT_BENCH groups=1000 placement_drain_read_p50_ms=0.005660",
+    "REPORT_BENCH groups=10000 scenario=cached_heartbeat apply_p50_ms=15.388 wal_bytes_per_apply=304 full_record_bytes=8210118 command_bytes=8210124",
+    "REPORT_BENCH groups=10000 scenario=fresh_clocks apply_p50_ms=21.660 wal_bytes_per_apply=347228 full_record_bytes=8210118 command_bytes=8210124",
+    "REPORT_BENCH groups=10000 scenario=one_group_change apply_p50_ms=19.598 wal_bytes_per_apply=10111 full_record_bytes=8210118 command_bytes=8210124",
+    "REPORT_BENCH groups=10000 scenario=all_groups_change apply_p50_ms=23.201 wal_bytes_per_apply=1533295 full_record_bytes=8210118 command_bytes=8210124",
+    "REPORT_BENCH groups=10000 scenario=referenced_runtime apply_p50_ms=8.674 wal_bytes_per_apply=304 full_record_bytes=8210118 command_bytes=1230124",
+    "SPARSE_REPORT_BENCH groups=10000 runtime_changed=false apply_p50_ms=0.159 wal_bytes_per_apply=10232 command_bytes=1125",
+    "SPARSE_REPORT_BENCH groups=10000 runtime_changed=true apply_p50_ms=0.174 wal_bytes_per_apply=59417 command_bytes=1125",
+    "REPORT_BENCH groups=10000 full_store_read_p50_ms=3.730",
+    "REPORT_BENCH groups=10000 full_store_read_allocations=40015 full_store_read_allocated_bytes=12609697",
+    "REPORT_BENCH groups=10000 placement_drain_read_p50_ms=0.005850",
+    "REPAIR_ADMISSION_BENCH groups=1000 repair=false p50_ms=0.002",
+    "REPAIR_ADMISSION_BENCH groups=1000 repair=true p50_ms=0.627",
+    "REPAIR_ADMISSION_BENCH groups=10000 repair=false p50_ms=0.012",
+    "REPAIR_ADMISSION_BENCH groups=10000 repair=true p50_ms=6.005",
+    "PUBLISHER_BENCH groups=100 sparse=false p50_ms=0.248 http_bytes=361351",
+    "PUBLISHER_BENCH groups=100 sparse=true p50_ms=0.014 http_bytes=4285",
+    "PUBLISHER_BENCH groups=1000 sparse=false p50_ms=2.859 http_bytes=3610552",
+    "PUBLISHER_BENCH groups=1000 sparse=true p50_ms=0.114 http_bytes=4285",
+    "PUBLISHER_BENCH groups=10000 sparse=false p50_ms=24.532 http_bytes=36127753",
+    "PUBLISHER_BENCH groups=10000 sparse=true p50_ms=1.521 http_bytes=4285",
+    "ACTIVITY_BENCH groups=1000 compact=false p50_ms=2.615 total_http_bytes=3903907 max_request_bytes=3903907 requests=1",
+    "ACTIVITY_BENCH groups=1000 compact=true p50_ms=0.303 total_http_bytes=293503 max_request_bytes=150201 requests=2",
+    "ACTIVITY_BENCH groups=10000 compact=false p50_ms=24.947 total_http_bytes=39048908 max_request_bytes=39048908 requests=1",
+    "ACTIVITY_BENCH groups=10000 compact=true p50_ms=3.483 total_http_bytes=2944994 max_request_bytes=150821 requests=20",
+    "ADMISSION_CACHE_BENCH stores=1 groups_per_store=100 selected=false p50_ms=0.019000",
+    "ADMISSION_CACHE_BENCH stores=1 groups_per_store=100 selected=true p50_ms=0.019000",
+    "ADMISSION_CACHE_BENCH stores=10 groups_per_store=100 selected=false p50_ms=0.172000",
+    "ADMISSION_CACHE_BENCH stores=10 groups_per_store=100 selected=true p50_ms=0.016000",
+    "ADMISSION_CACHE_BENCH stores=100 groups_per_store=100 selected=false p50_ms=1.866000",
+    "ADMISSION_CACHE_BENCH stores=100 groups_per_store=100 selected=true p50_ms=0.015000",
+    "ADMISSION_PLAN_BENCH groups=100 header_change=false single_pass=false p50_ms=0.109000 allocations=763",
+    "ADMISSION_PLAN_BENCH groups=100 header_change=false single_pass=true p50_ms=0.046000 allocations=33",
+    "ADMISSION_PLAN_BENCH groups=100 header_change=true single_pass=false p50_ms=0.115000 allocations=1465",
+    "ADMISSION_PLAN_BENCH groups=100 header_change=true single_pass=true p50_ms=0.057000 allocations=736",
+    "ADMISSION_PLAN_BENCH groups=1000 header_change=false single_pass=false p50_ms=1.596000 allocations=7111",
+    "ADMISSION_PLAN_BENCH groups=1000 header_change=false single_pass=true p50_ms=0.706000 allocations=57",
+    "ADMISSION_PLAN_BENCH groups=1000 header_change=true single_pass=false p50_ms=1.547000 allocations=14113",
+    "ADMISSION_PLAN_BENCH groups=1000 header_change=true single_pass=true p50_ms=0.746000 allocations=7060",
+    "ADMISSION_PLAN_BENCH groups=10000 header_change=false single_pass=false p50_ms=14.033000 allocations=70147",
+    "ADMISSION_PLAN_BENCH groups=10000 header_change=false single_pass=true p50_ms=6.364000 allocations=75",
+    "ADMISSION_PLAN_BENCH groups=10000 header_change=true single_pass=false p50_ms=14.709000 allocations=140149",
+    "ADMISSION_PLAN_BENCH groups=10000 header_change=true single_pass=true p50_ms=7.530000 allocations=70078",
+    "RECONCILE_VIEW_BENCH stores=1 groups_per_store=100 shared=false p50_ms=0.013000",
+    "RECONCILE_VIEW_BENCH stores=1 groups_per_store=100 shared=true p50_ms=0.000036",
+    "RECONCILE_VIEW_BENCH stores=10 groups_per_store=100 shared=false p50_ms=0.137000",
+    "RECONCILE_VIEW_BENCH stores=10 groups_per_store=100 shared=true p50_ms=0.000203",
+    "RECONCILE_VIEW_BENCH stores=100 groups_per_store=100 shared=false p50_ms=1.490000",
+    "RECONCILE_VIEW_BENCH stores=100 groups_per_store=100 shared=true p50_ms=0.001881",
+    "GROUP_CACHE_BENCH groups=100 sparse=false refresh_p50_ms=0.047 allocations=1038",
+    "GROUP_CACHE_BENCH groups=100 sparse=true refresh_p50_ms=0.002 allocations=36",
+    "GROUP_CACHE_BENCH groups=1000 sparse=false refresh_p50_ms=0.484 allocations=10101",
+    "GROUP_CACHE_BENCH groups=1000 sparse=true refresh_p50_ms=0.002 allocations=36",
+    "GROUP_CACHE_BENCH groups=10000 sparse=false refresh_p50_ms=5.664 allocations=100708",
+    "GROUP_CACHE_BENCH groups=10000 sparse=true refresh_p50_ms=0.002 allocations=36",
+    "GROUP_CACHE_FIRST_READER_BENCH groups=100 p50_ms=0.003000",
+    "GROUP_CACHE_FIRST_READER_BENCH groups=1000 p50_ms=0.029000",
+    "GROUP_CACHE_FIRST_READER_BENCH groups=10000 p50_ms=0.403000"
+  ],
+  "cluster": {
+    "binary_sha256": "ef98a4ba17fd20d92e24ad1434e58af0ac2ba07cd26bac3569a5e7ae32240685",
+    "workload": {
+      "startup_ms": 3887.055833823979,
+      "metadata_nodes": 3,
+      "real_data_nodes": 3,
+      "groups": 10000,
+      "indexes_per_group": 1,
+      "warmup": 2,
+      "snapshot_transfers": [
+        {
+          "control": true,
+          "elapsed_ms": 1952.20875,
+          "bytes": 8027,
+          "pages": 1,
+          "max_page_bytes": 8027
+        },
+        {
+          "control": false,
+          "elapsed_ms": 983.349084,
+          "bytes": 46148026,
+          "pages": 89,
+          "max_page_bytes": 524288
+        }
+      ],
+      "scenarios": [
+        {
+          "independent_telemetry": false,
+          "collection": {
+            "samples": 12,
+            "p50_ms": 523.9867295,
+            "p95_ms": 837.133291,
+            "max_ms": 837.133291
+          },
+          "collection_raw_ms": [
+            530.768459,
+            460.859792,
+            609.923625,
+            657.820208,
+            837.133291,
+            456.320333,
+            485.181459,
+            517.205,
+            476.366875,
+            501.729,
+            825.279125,
+            637.918083
+          ],
+          "namespace_create_drop": {
+            "samples": 12,
+            "p50_ms": 313.481917,
+            "p95_ms": 875.949625,
+            "max_ms": 875.949625
+          },
+          "namespace_raw_ms": [
+            522.386125,
+            306.288875,
+            320.674959,
+            91.961292,
+            345.982,
+            85.674,
+            101.03675,
+            131.134958,
+            875.949625,
+            129.934458,
+            329.12325,
+            489.58725
+          ]
+        },
+        {
+          "independent_telemetry": true,
+          "collection": {
+            "samples": 12,
+            "p50_ms": 133.47312549999998,
+            "p95_ms": 325.7475,
+            "max_ms": 325.7475
+          },
+          "collection_raw_ms": [
+            325.7475,
+            137.201041,
+            132.081167,
+            128.700208,
+            129.069625,
+            124.606208,
+            124.606542,
+            123.936167,
+            297.639792,
+            136.822333,
+            160.262709,
+            134.865084
+          ],
+          "namespace_create_drop": {
+            "samples": 12,
+            "p50_ms": 133.520583,
+            "p95_ms": 606.802125,
+            "max_ms": 606.802125
+          },
+          "namespace_raw_ms": [
+            80.027166,
+            89.833167,
+            294.093417,
+            92.752583,
+            108.946708,
+            160.390125,
+            606.802125,
+            319.440541,
+            135.999583,
+            159.5555,
+            131.041583,
+            105.639208
+          ]
+        }
+      ]
+    }
+  },
+  "final_merged_cluster": {
+    "binary_sha256": "71612cd75974e1af9d599350f53ca07d762bfa42be028f225e489c9fdd507117",
+    "workload": {
+      "startup_ms": 3923.240500036627,
+      "setup_ms": 8240.496458,
+      "baseline_readiness": {
+        "elapsed_ms": 1814.742584247142,
+        "attempts": 4,
+        "leader_index": 1,
+        "term": 1
+      },
+      "metadata_nodes": 3,
+      "real_data_nodes": 3,
+      "groups": 10000,
+      "indexes_per_group": 1,
+      "warmup": 2,
+      "snapshot_transfers": [
+        {
+          "control": true,
+          "elapsed_ms": 701.828,
+          "bytes": 8035,
+          "pages": 1,
+          "max_page_bytes": 8035
+        },
+        {
+          "control": false,
+          "elapsed_ms": 1766.751791,
+          "bytes": 46148032,
+          "pages": 89,
+          "max_page_bytes": 524288
+        }
+      ],
+      "scenarios": [
+        {
+          "independent_telemetry": false,
+          "collection": {
+            "samples": 12,
+            "p50_ms": 638.178292,
+            "p95_ms": 761.593375,
+            "max_ms": 761.593375
+          },
+          "collection_raw_ms": [
+            642.705042,
+            512.107208,
+            633.294667,
+            562.171958,
+            743.439459,
+            686.442083,
+            752.770917,
+            626.400834,
+            761.593375,
+            689.492625,
+            633.651542,
+            556.996
+          ],
+          "namespace_create_drop": {
+            "samples": 12,
+            "p50_ms": 122.49864600000001,
+            "p95_ms": 509.423792,
+            "max_ms": 509.423792
+          },
+          "namespace_raw_ms": [
+            509.423792,
+            79.954667,
+            117.848208,
+            312.83075,
+            126.149292,
+            106.558416,
+            105.098708,
+            110.018292,
+            162.438833,
+            396.148959,
+            369.7215,
+            118.848
+          ]
+        },
+        {
+          "independent_telemetry": true,
+          "collection": {
+            "samples": 12,
+            "p50_ms": 130.7093125,
+            "p95_ms": 282.215417,
+            "max_ms": 282.215417
+          },
+          "collection_raw_ms": [
+            132.461,
+            142.554875,
+            128.957625,
+            282.215417,
+            119.799042,
+            127.427375,
+            135.94375,
+            137.090166,
+            141.109709,
+            128.827584,
+            120.161416,
+            119.688292
+          ],
+          "namespace_create_drop": {
+            "samples": 12,
+            "p50_ms": 147.0535205,
+            "p95_ms": 862.87125,
+            "max_ms": 862.87125
+          },
+          "namespace_raw_ms": [
+            130.7695,
+            132.034334,
+            133.408625,
+            131.159875,
+            761.256625,
+            134.69775,
+            862.87125,
+            120.744333,
+            278.204375,
+            257.920541,
+            159.409291,
+            738.8695
+          ]
+        }
+      ]
+    }
+  },
+  "setup_failures": [
+    {
+      "attempt": 1,
+      "phase": "tenant creation after full baseline",
+      "failure": "HTTP 503 NotLeader",
+      "measured_samples": 0
+    },
+    {
+      "attempt": 2,
+      "phase": "first normal-admission warmup namespace creation",
+      "failure": "HTTP 503 NotLeader",
+      "measured_samples": 0
+    }
+  ],
+  "setup_resolution": "Create the tenant before loading the large inventory, then explicitly wait for all metadata terms to agree, a single stable leader, and successful public catalog reads for at least one second. Record this setup duration separately. Measured requests do not retry. Cold full-baseline materialization produced approximately two-second metadata rounds in aborted attempts.",
+  "validation": {
+    "server_build_steps": "69/69",
+    "final_e2e": {
+      "passed": 28,
+      "failed": 0,
+      "skipped": 0,
+      "elapsed_seconds": 150.01
+    },
+    "focused_test_executions": {
+      "catalog_api": 62,
+      "catalog": 39,
+      "catalog_transport": 19,
+      "store_reports": 87,
+      "metadata_service": 131,
+      "data_catalog": 14,
+      "compiled_storage_contracts": 36,
+      "ha_seed": 2,
+      "graph_provenance": 1
+    },
+    "note": "Selections overlap and were run at the corresponding implementation revisions. The final server and compiled-owner contracts include the public-label ABI fix. This is not a full repository suite.",
+    "component_benchmark_executions_before_main_merge": 23,
+    "generated_sources_check": "passed",
+    "storage_test_inventory_audit": "passed",
+    "python_audit_unit_tests": 17,
+    "ruff": "passed",
+    "zig_format_and_diff_check": "passed"
+  }
+}

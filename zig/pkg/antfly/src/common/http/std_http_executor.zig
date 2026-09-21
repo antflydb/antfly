@@ -304,6 +304,7 @@ pub const StdHttpExecutor = struct {
         if (req.delivery_tracker) |tracker| tracker.markMayHaveBeenSent();
         var response = try client.requestToWriter(method, req.uri, .{
             .headers = header_pairs,
+            .max_response_size = if (req.max_response_bytes != null) req.responseLimit(self.cfg.max_response_bytes) else null,
             .body = if (req.body.len == 0) null else req.body,
             .timeout_ms = if (req.timeout_ms) |timeout_ms| timeout_ms else null,
             .cancellation = if (req.cancellation) |cancellation| blk: {
@@ -364,18 +365,11 @@ pub const StdHttpExecutor = struct {
         });
         defer request.deinit();
         if (req.delivery_tracker) |tracker| tracker.markMayHaveBeenSent();
-        if (req.body.len > 0 or method.requestHasBody()) {
-            request.transfer_encoding = .{ .content_length = req.body.len };
-            var body_buffer: [16 * 1024]u8 = undefined;
-            var body_writer = try request.sendBodyUnflushed(&body_buffer);
-            if (req.body.len > 0) try body_writer.writer.writeAll(req.body);
-            try body_writer.end();
-            try request.connection.?.flush();
-        } else {
-            try request.sendBodiless();
-        }
+        try sendDirectRequest(&request, req.body);
 
         var response = try request.receiveHead(&.{});
+        const response_limit = if (req.max_response_bytes != null) req.responseLimit(self.cfg.max_response_bytes) else std.math.maxInt(usize);
+        if (response.head.content_length) |length| if (length > response_limit) return error.ResponseTooLarge;
         var header_count: usize = 0;
         var header_it = response.head.iterateHeaders();
         while (header_it.next()) |_| header_count += 1;
@@ -397,9 +391,12 @@ pub const StdHttpExecutor = struct {
         var transfer_buffer: [16 * 1024]u8 = undefined;
         var read_buffer: [16 * 1024]u8 = undefined;
         const body_reader = response.reader(&transfer_buffer);
+        var consumed: usize = 0;
         while (true) {
             const read = try body_reader.readSliceShort(&read_buffer);
             if (read == 0) break;
+            if (read > response_limit - consumed) return error.ResponseTooLarge;
+            consumed += read;
             try downstream.writeAll(read_buffer[0..read]);
         }
         try downstream.flush();
@@ -456,6 +453,7 @@ pub const StdHttpExecutor = struct {
         if (req.delivery_tracker) |tracker| tracker.markMayHaveBeenSent();
         var response = try client.request(method, req.uri, .{
             .headers = header_pairs,
+            .max_response_size = req.responseLimit(self.cfg.max_response_bytes),
             .body = if (req.body.len == 0) null else req.body,
             .timeout_ms = if (req.timeout_ms) |timeout_ms| timeout_ms else null,
             .cancellation = if (req.cancellation) |cancellation| blk: {
@@ -742,20 +740,11 @@ pub const StdHttpExecutor = struct {
         // connection establishment. From the first send operation onward, an
         // error cannot prove that the peer did not receive the request.
         if (req.delivery_tracker) |tracker| tracker.markMayHaveBeenSent();
-        if (req.body.len > 0 or method.requestHasBody()) {
-            request.transfer_encoding = .{ .content_length = req.body.len };
-            var body_buffer: [16 * 1024]u8 = undefined;
-            var body_writer = try request.sendBodyUnflushed(&body_buffer);
-            if (req.body.len > 0) {
-                try body_writer.writer.writeAll(req.body);
-            }
-            try body_writer.end();
-            try request.connection.?.flush();
-        } else {
-            try request.sendBodiless();
-        }
+        try sendDirectRequest(&request, req.body);
 
         var response = try request.receiveHead(&.{});
+        const response_limit = req.responseLimit(self.cfg.max_response_bytes);
+        if (response.head.content_length) |length| if (length > response_limit) return error.ResponseTooLarge;
         const content_type = if (response.head.content_type) |value|
             try alloc.dupe(u8, value)
         else
@@ -789,7 +778,10 @@ pub const StdHttpExecutor = struct {
         }
 
         var transfer_buffer: [512]u8 = undefined;
-        const body = try response.reader(&transfer_buffer).allocRemaining(alloc, .limited(self.cfg.max_response_bytes));
+        const body = response.reader(&transfer_buffer).allocRemaining(alloc, .limited(response_limit)) catch |err| switch (err) {
+            error.StreamTooLong => return error.ResponseTooLarge,
+            else => return err,
+        };
 
         const connection_closing = if (request.connection) |connection| connection.closing else true;
         self.recordCompletedRequest(request_keep_alive, connection_closing);
@@ -799,6 +791,34 @@ pub const StdHttpExecutor = struct {
             .headers = headers,
             .body = body,
         };
+    }
+
+    fn sendDirectRequest(request: *std.http.Client.Request, body: []const u8) !void {
+        sendDirectRequestBytes(request, body) catch |err| {
+            if (request.connection) |connection| {
+                // A partial request cannot return to the keep-alive pool.
+                connection.closing = true;
+                // std.Io.Writer erases socket errors as WriteFailed. Restore
+                // transport identity here, where it cannot be confused with
+                // a storage or JSON writer failure. Delivery remains uncertain;
+                // the executor never replays the mutation.
+                if (err == error.WriteFailed) if (connection.stream_writer.err) |cause| return cause;
+            }
+            return err;
+        };
+    }
+
+    fn sendDirectRequestBytes(request: *std.http.Client.Request, body: []const u8) std.Io.Writer.Error!void {
+        if (body.len > 0 or request.method.requestHasBody()) {
+            request.transfer_encoding = .{ .content_length = body.len };
+            var body_buffer: [16 * 1024]u8 = undefined;
+            var body_writer = try request.sendBodyUnflushed(&body_buffer);
+            if (body.len > 0) try body_writer.writer.writeAll(body);
+            try body_writer.end();
+            try request.connection.?.flush();
+        } else {
+            try request.sendBodiless();
+        }
     }
 
     fn beginRequest(self: *StdHttpExecutor) !void {
@@ -885,6 +905,37 @@ fn shouldForwardRequestHeader(headers: []const common.RequestHeader, name: []con
         }
     }
     return true;
+}
+
+test "std http executor retains socket write failures and uncertain delivery" {
+    const Inject = struct {
+        var writes: std.atomic.Value(usize) = .init(0);
+        fn netWrite(_: ?*anyopaque, _: std.Io.net.Socket.Handle, _: []const u8, _: []const []const u8, _: usize) std.Io.net.Stream.Writer.Error!usize {
+            _ = writes.fetchAdd(1, .monotonic);
+            return error.ConnectionResetByPeer;
+        }
+    };
+    const address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try address.listen(std.testing.io, .{});
+    defer server.deinit(std.testing.io);
+    const uri = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/", .{server.socket.address.getPort()});
+    defer std.testing.allocator.free(uri);
+    for ([_]common.Method{ .GET, .POST }) |method| {
+        var executor = StdHttpExecutor.init(std.testing.allocator, .{ .keep_alive = true });
+        defer executor.deinit();
+        executor.io_vtable.netWrite = Inject.netWrite;
+        Inject.writes.store(0, .monotonic);
+        var delivery: common.RequestDeliveryTracker = .{};
+        try std.testing.expectError(error.ConnectionResetByPeer, executor.executor().execute(std.testing.allocator, .{
+            .method = method,
+            .uri = uri,
+            .body = if (method == .POST) "body" else "",
+            .delivery_tracker = &delivery,
+        }));
+        try std.testing.expectEqual(@as(usize, 1), Inject.writes.load(.monotonic));
+        try std.testing.expectEqual(@as(usize, 0), executor.client.connection_pool.free_len);
+        try std.testing.expectEqual(common.RequestDeliveryTracker.State.may_have_been_sent, delivery.load());
+    }
 }
 
 test "std http executor module compiles" {
@@ -1238,6 +1289,20 @@ test "std http executor streams response metadata and body past buffered limit" 
         try std.testing.expect(capture.flushes > 0);
         try std.testing.expect(!capture.wrote_before_start);
         try std.testing.expectEqual(@as(usize, 128 * 1024), capture.body.items.len);
+
+        var capped_capture = Capture{ .alloc = std.testing.allocator };
+        defer capped_capture.deinit();
+        const capped: common.HttpRequest = .{ .method = .GET, .uri = uri, .max_response_bytes = 256 * 1024 };
+        try std.testing.expectError(error.ResponseTooLarge, executor.executor().executeStream(std.testing.allocator, capped, capped_capture.writer()));
+        try std.testing.expectEqual(@as(usize, 0), capped_capture.body.items.len);
+        try std.testing.expectError(error.ResponseTooLarge, executor.executor().execute(std.testing.allocator, capped));
+
+        var larger = StdHttpExecutor.init(std.testing.allocator, .{ .max_response_bytes = 256 * 1024, .resolve_before_connect = resolve_before_connect });
+        defer larger.deinit();
+        const small: common.HttpRequest = .{ .method = .GET, .uri = uri, .max_response_bytes = 64 };
+        try std.testing.expectError(error.ResponseTooLarge, larger.executor().execute(std.testing.allocator, small));
+        try std.testing.expectError(error.ResponseTooLarge, larger.executor().executeStream(std.testing.allocator, small, capped_capture.writer()));
+        try std.testing.expectEqual(@as(usize, 0), capped_capture.body.items.len);
     }
 }
 

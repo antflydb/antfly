@@ -109,6 +109,7 @@ pub const SearchTextDispatcher = struct {
 
 pub const SearchTextQueryExecutor = struct {
     ctx: ?*anyopaque,
+    load_projected_documents: ?LoadProjectedDocuments = null,
     text_index_entry: *const fn (
         ctx: ?*anyopaque,
         index_name: ?[]const u8,
@@ -15326,12 +15327,78 @@ fn applyProjectedSourceLoadProfileToSortProfile(
     }
 }
 
+const LoadProjectedDocuments = *const fn (?*anyopaque, Allocator, types.SearchRequest, []const []const u8) anyerror![]?[]u8;
+const projected_source_batch_size = 256;
+
+// Amortize view/lease admission without holding a storage view or allocating
+// temporary key/value arrays for the entire aggregation candidate set.
+fn loadMissingProjectedHitBatches(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    ctx: ?*anyopaque,
+    load_many: LoadProjectedDocuments,
+    hits: []types.SearchHit,
+) !ProjectedSourceLoadProfile {
+    const start_ns = platform_time.monotonicNs();
+    var profile = ProjectedSourceLoadProfile{};
+    var keys: [projected_source_batch_size][]const u8 = undefined;
+    var positions: [projected_source_batch_size]usize = undefined;
+    var cursor: usize = 0;
+    try checkSearchRequestDeadline(req);
+    while (cursor < hits.len) {
+        try checkSearchRequestDeadline(req);
+        const end = cursor + @min(hits.len - cursor, projected_source_batch_size);
+        var count: usize = 0;
+        while (cursor < end) : (cursor += 1) {
+            if (hits[cursor].stored_data != null) continue;
+            keys[count] = hits[cursor].id;
+            positions[count] = cursor;
+            count += 1;
+        }
+        if (count == 0) continue;
+        profile.requested_count += count;
+        const loaded = try load_many(ctx, alloc, req, keys[0..count]);
+        defer freeOptionalOwnedBytes(alloc, loaded);
+        profile.batch_count += 1;
+        try checkSearchRequestDeadline(req);
+        if (loaded.len != count) return error.InvalidSearchResult;
+        for (loaded, positions[0..count]) |*value, position| {
+            hits[position].stored_data = value.* orelse return error.StoredDocMissing;
+            value.* = null;
+            profile.loaded_count += 1;
+        }
+    }
+    profile.total_ns = platform_time.monotonicNs() - start_ns;
+    return profile;
+}
+
 fn loadMissingProjectedMatchAllHitDocuments(
     alloc: Allocator,
     req: types.SearchRequest,
     executor: MatchAllExecutor,
     hits: []types.SearchHit,
 ) !ProjectedSourceLoadProfile {
+    return loadMissingProjectedHitDocuments(alloc, req, executor, hits);
+}
+
+fn loadMissingProjectedTextHitDocuments(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    executor: SearchTextQueryExecutor,
+    hits: []types.SearchHit,
+) !ProjectedSourceLoadProfile {
+    return loadMissingProjectedHitDocuments(alloc, req, executor, hits);
+}
+
+fn loadMissingProjectedHitDocuments(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    executor: anytype,
+    hits: []types.SearchHit,
+) !ProjectedSourceLoadProfile {
+    if (executor.load_projected_documents) |load_many| {
+        return loadMissingProjectedHitBatches(alloc, req, executor.ctx, load_many, hits);
+    }
     const start_ns = platform_time.monotonicNs();
     var profile = ProjectedSourceLoadProfile{};
     errdefer profile.total_ns = platform_time.monotonicNs() - start_ns;
@@ -15347,63 +15414,16 @@ fn loadMissingProjectedMatchAllHitDocuments(
         return profile;
     }
 
-    if (executor.load_projected_documents) |load_many| {
-        try checkSearchRequestDeadline(req);
-        const keys = try alloc.alloc([]const u8, missing_count);
-        defer alloc.free(keys);
-        var key_count: usize = 0;
-        for (hits) |hit| {
-            if (hit.stored_data != null) continue;
-            keys[key_count] = hit.id;
-            key_count += 1;
-        }
-
-        var loaded = try load_many(executor.ctx, alloc, req, keys);
-        profile.batch_count += 1;
-        defer freeOptionalOwnedBytes(alloc, loaded);
-        if (loaded.len != keys.len) return error.InvalidSearchResult;
-
-        var loaded_index: usize = 0;
-        for (hits, 0..) |*hit, i| {
-            if (hit.stored_data != null) continue;
-            if (i % 1024 == 0) try checkSearchRequestDeadline(req);
-            const stored = loaded[loaded_index] orelse return error.StoredDocMissing;
-            hit.stored_data = stored;
-            loaded[loaded_index] = null;
-            profile.loaded_count += 1;
-            loaded_index += 1;
-        }
-        profile.total_ns = platform_time.monotonicNs() - start_ns;
-        return profile;
-    }
-
     for (hits, 0..) |*hit, i| {
         if (hit.stored_data != null) continue;
         if (i % 1024 == 0) try checkSearchRequestDeadline(req);
-        hit.stored_data = try executor.load_projected_document(executor.ctx, alloc, req, hit.id);
-        profile.loaded_count += 1;
-        profile.batch_count += 1;
-    }
-    profile.total_ns = platform_time.monotonicNs() - start_ns;
-    return profile;
-}
-
-fn loadMissingProjectedTextHitDocuments(
-    alloc: Allocator,
-    req: types.SearchRequest,
-    executor: SearchTextQueryExecutor,
-    hits: []types.SearchHit,
-) !ProjectedSourceLoadProfile {
-    const start_ns = platform_time.monotonicNs();
-    var profile = ProjectedSourceLoadProfile{};
-    try checkSearchRequestDeadline(req);
-    for (hits, 0..) |*hit, i| {
-        if (hit.stored_data != null) continue;
-        if (i % 1024 == 0) try checkSearchRequestDeadline(req);
-        profile.requested_count += 1;
-        const stored = (try executor.load_stored(executor.ctx, alloc, hit.id)) orelse return error.StoredDocMissing;
-        defer alloc.free(stored);
-        hit.stored_data = try executor.project_stored_search(executor.ctx, alloc, req, hit.id, stored);
+        hit.stored_data = if (comptime @hasField(@TypeOf(executor), "load_projected_document"))
+            try executor.load_projected_document(executor.ctx, alloc, req, hit.id)
+        else blk: {
+            const stored = (try executor.load_stored(executor.ctx, alloc, hit.id)) orelse return error.StoredDocMissing;
+            defer alloc.free(stored);
+            break :blk try executor.project_stored_search(executor.ctx, alloc, req, hit.id, stored);
+        };
         profile.loaded_count += 1;
         profile.batch_count += 1;
     }
@@ -25958,6 +25978,77 @@ test "native doc values sort plan requires a native loader" {
     }, null, testUnexpectedLoadStoredCallback, .{ .kind = .native_doc_values_top_n, .require_native = true }, null));
 }
 
+test "text projected source batch preserves selection and cleans up failed hydration" {
+    const Harness = struct {
+        const Mode = enum { success, missing, invalid_count, expired };
+        mode: Mode,
+        calls: usize = 0,
+
+        fn loadMany(ctx: ?*anyopaque, alloc: Allocator, req: types.SearchRequest, keys: []const []const u8) ![]?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.calls += 1;
+            try std.testing.expectEqual(@as(usize, 2), keys.len);
+            try std.testing.expectEqualStrings("doc:c", keys[0]);
+            try std.testing.expectEqualStrings("doc:a", keys[1]);
+            try std.testing.expectEqualStrings("age", req.fields[0]);
+            const values = try alloc.alloc(?[]u8, if (self.mode == .invalid_count) 3 else keys.len);
+            @memset(values, null);
+            errdefer freeOptionalOwnedBytes(alloc, values);
+            for (keys, 0..) |key, i| {
+                if (self.mode == .missing and i == 1) continue;
+                values[i] = try std.fmt.allocPrint(alloc, "projected:{s}", .{key});
+            }
+            return values;
+        }
+
+        fn run(alloc: Allocator, mode: Mode) !void {
+            var harness = @This(){ .mode = mode };
+            var hits = [_]types.SearchHit{
+                .{ .id = @constCast("present"), .stored_data = null },
+                .{ .id = @constCast("doc:c") },
+                .{ .id = @constCast("doc:a") },
+            };
+            defer for (&hits) |hit| if (hit.stored_data) |stored| alloc.free(stored);
+            hits[0].stored_data = try alloc.dupe(u8, "already projected");
+            const executor: SearchTextQueryExecutor = .{
+                .ctx = &harness,
+                .text_index_entry = undefined,
+                .text_index_is_chunk_backed = undefined,
+                .search_match_all = undefined,
+                .project_stored_search = undefined,
+                .load_stored = undefined,
+                .load_projected_documents = loadMany,
+                .postprocess = undefined,
+            };
+            const result = loadMissingProjectedTextHitDocuments(alloc, .{
+                .fields = &.{"age"},
+                .execution_deadline_ns = if (mode == .expired) 1 else null,
+            }, executor, &hits);
+            switch (mode) {
+                .success => {
+                    const profile = try result;
+                    try std.testing.expectEqual(@as(usize, 1), profile.batch_count);
+                    try std.testing.expectEqual(@as(usize, 2), profile.loaded_count);
+                    try std.testing.expectEqualStrings("already projected", hits[0].stored_data.?);
+                    try std.testing.expectEqualStrings("projected:doc:c", hits[1].stored_data.?);
+                    try std.testing.expectEqualStrings("projected:doc:a", hits[2].stored_data.?);
+                    _ = try loadMissingProjectedTextHitDocuments(alloc, .{}, executor, &hits);
+                    try std.testing.expectEqual(@as(usize, 1), harness.calls);
+                },
+                .missing => try std.testing.expectError(error.StoredDocMissing, result),
+                .invalid_count => try std.testing.expectError(error.InvalidSearchResult, result),
+                .expired => {
+                    try std.testing.expectError(error.Timeout, result);
+                    try std.testing.expectEqual(@as(usize, 0), harness.calls);
+                },
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{Harness.Mode.success});
+    inline for (.{ Harness.Mode.missing, Harness.Mode.invalid_count, Harness.Mode.expired }) |mode|
+        try Harness.run(std.testing.allocator, mode);
+}
+
 test "text field sort source loading happens only for selected missing hits" {
     const alloc = std.testing.allocator;
 
@@ -26018,6 +26109,106 @@ test "text field sort source loading happens only for selected missing hits" {
     try std.testing.expect(result.hits[0].stored_data != null);
     try std.testing.expect(result.hits[1].stored_data != null);
     try std.testing.expectEqualStrings("{\"id\":\"doc:b\"}", result.hits[1].stored_data.?);
+}
+
+test "projected source batches bound admission and preserve loaded hits and order" {
+    const alloc = std.testing.allocator;
+    const Harness = struct {
+        calls: usize = 0,
+        fn load(ctx: ?*anyopaque, a: Allocator, _: types.SearchRequest, keys: []const []const u8) ![]?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.calls += 1;
+            try std.testing.expect(keys.len <= projected_source_batch_size);
+            const values = try a.alloc(?[]u8, keys.len);
+            @memset(values, null);
+            errdefer freeOptionalOwnedBytes(a, values);
+            for (keys, values) |key, *value| value.* = try a.dupe(u8, key);
+            return values;
+        }
+    };
+    var harness = Harness{};
+    const hits = try alloc.alloc(types.SearchHit, projected_source_batch_size * 2 + 1);
+    var result: types.SearchResult = .{ .alloc = alloc, .hits = hits, .total_hits = @intCast(hits.len), .graph_results = &.{} };
+    // Initialize all slots so cleanup also covers allocation failures.
+    for (hits) |*hit| hit.* = .{ .id = "" };
+    defer result.deinit();
+    for (hits, 0..) |*hit, i| {
+        hit.id = try std.fmt.allocPrint(alloc, "row-{d}", .{i});
+        if (i % 7 == 0) hit.stored_data = try alloc.dupe(u8, "already loaded");
+    }
+    const profile = try loadMissingProjectedTextHitDocuments(alloc, .{}, .{
+        .ctx = &harness,
+        .load_projected_documents = Harness.load,
+        .text_index_entry = undefined,
+        .text_index_is_chunk_backed = undefined,
+        .search_match_all = undefined,
+        .project_stored_search = undefined,
+        .load_stored = undefined,
+        .postprocess = undefined,
+    }, hits);
+    try std.testing.expectEqual(@as(usize, 3), harness.calls);
+    try std.testing.expectEqual(harness.calls, profile.batch_count);
+    try std.testing.expectEqual(hits.len - (hits.len + 6) / 7, profile.loaded_count);
+    try std.testing.expectEqual(profile.loaded_count, profile.requested_count);
+    for (hits, 0..) |hit, i| try std.testing.expectEqualStrings(if (i % 7 == 0) "already loaded" else hit.id, hit.stored_data.?);
+}
+
+test "projected source batches clean up malformed missing and failed loads" {
+    const alloc = std.testing.allocator;
+    const Harness = struct {
+        mode: enum { short, missing, failure },
+        fn load(ctx: ?*anyopaque, a: Allocator, _: types.SearchRequest, keys: []const []const u8) ![]?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (self.mode == .failure) return error.InjectedFailure;
+            const values = try a.alloc(?[]u8, if (self.mode == .short) 1 else keys.len);
+            @memset(values, null);
+            errdefer freeOptionalOwnedBytes(a, values);
+            values[0] = try a.dupe(u8, keys[0]);
+            return values;
+        }
+    };
+    for ([_]Harness{ .{ .mode = .short }, .{ .mode = .missing }, .{ .mode = .failure } }) |mode| {
+        var harness = mode;
+        var hits = [_]types.SearchHit{ .{ .id = @constCast("a") }, .{ .id = @constCast("b") } };
+        defer for (hits) |hit| if (hit.stored_data) |value| alloc.free(value);
+        const expected = switch (mode.mode) {
+            .short => error.InvalidSearchResult,
+            .missing => error.StoredDocMissing,
+            .failure => error.InjectedFailure,
+        };
+        try std.testing.expectError(expected, loadMissingProjectedHitBatches(alloc, .{}, &harness, Harness.load, &hits));
+        try std.testing.expect(hits[1].stored_data == null);
+    }
+}
+
+test "projected source batches observe cancellation before publishing loaded values" {
+    const alloc = std.testing.allocator;
+    const Harness = struct {
+        canceled: bool = false,
+        calls: usize = 0,
+        fn isCancelled(ctx: *const anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(ctx));
+            return self.canceled;
+        }
+        fn load(ctx: ?*anyopaque, a: Allocator, _: types.SearchRequest, keys: []const []const u8) ![]?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.calls += 1;
+            const values = try a.alloc(?[]u8, keys.len);
+            @memset(values, null);
+            errdefer freeOptionalOwnedBytes(a, values);
+            for (keys, values) |key, *value| value.* = try a.dupe(u8, key);
+            self.canceled = true;
+            return values;
+        }
+    };
+    var harness = Harness{};
+    var hits = [_]types.SearchHit{ .{ .id = @constCast("a") }, .{ .id = @constCast("b") } };
+    defer for (hits) |hit| if (hit.stored_data) |value| alloc.free(value);
+    try std.testing.expectError(error.Cancelled, loadMissingProjectedHitBatches(alloc, .{
+        .cancellation = .{ .ptr = &harness, .is_cancelled_fn = Harness.isCancelled },
+    }, &harness, Harness.load, &hits));
+    try std.testing.expectEqual(@as(usize, 1), harness.calls);
+    for (hits) |hit| try std.testing.expect(hit.stored_data == null);
 }
 
 test "text projected source load rejects expired deadline before stored load" {

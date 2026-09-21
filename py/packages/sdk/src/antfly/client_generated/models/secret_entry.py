@@ -20,6 +20,9 @@ class SecretEntry:
     Attributes:
         key (str): Secret name (e.g., openai.api_key)
         status (SecretStatus): Source of the secret configuration
+        source (str | Unset): Name of the winning source, or environment.
+        managed (bool | Unset): Whether this key has an Antfly-managed override that can be deleted.
+        revision (int | Unset): Committed native entry revision, when supported by the configured backend.
         env_var (str | Unset): Corresponding environment variable name (e.g., OPENAI_API_KEY)
         created_at (datetime.datetime | Unset):
         updated_at (datetime.datetime | Unset):
@@ -27,6 +30,9 @@ class SecretEntry:
 
     key: str
     status: SecretStatus
+    source: str | Unset = UNSET
+    managed: bool | Unset = UNSET
+    revision: int | Unset = UNSET
     env_var: str | Unset = UNSET
     created_at: datetime.datetime | Unset = UNSET
     updated_at: datetime.datetime | Unset = UNSET
@@ -36,6 +42,12 @@ class SecretEntry:
         key = self.key
 
         status = self.status.value
+
+        source = self.source
+
+        managed = self.managed
+
+        revision = self.revision
 
         env_var = self.env_var
 
@@ -55,6 +67,12 @@ class SecretEntry:
                 "status": status,
             }
         )
+        if source is not UNSET:
+            field_dict["source"] = source
+        if managed is not UNSET:
+            field_dict["managed"] = managed
+        if revision is not UNSET:
+            field_dict["revision"] = revision
         if env_var is not UNSET:
             field_dict["env_var"] = env_var
         if created_at is not UNSET:
@@ -70,6 +88,12 @@ class SecretEntry:
         key = d.pop("key")
 
         status = SecretStatus(d.pop("status"))
+
+        source = d.pop("source", UNSET)
+
+        managed = d.pop("managed", UNSET)
+
+        revision = d.pop("revision", UNSET)
 
         env_var = d.pop("env_var", UNSET)
 
@@ -90,6 +114,9 @@ class SecretEntry:
         secret_entry = cls(
             key=key,
             status=status,
+            source=source,
+            managed=managed,
+            revision=revision,
             env_var=env_var,
             created_at=created_at,
             updated_at=updated_at,

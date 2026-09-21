@@ -1631,7 +1631,9 @@ test "reader discovery preserves allocation failure" {
 }
 
 test "extractor resolution cleans up and preserves every allocation failure" {
-    const allocator = std.testing.allocator;
+    var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
+    defer std.debug.assert(allocator_state.deinit() == .ok);
+    const allocator = if (platform.env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try writeTestManifest(

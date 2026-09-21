@@ -37,8 +37,12 @@ pub const Status = enum {
 
 pub const TaskSnapshot = struct {
     id: ids.StableId,
+    identity_scope: ids.StableId,
+    resource_owner_id: ids.StableId,
     status: Status,
     sleep_deadline_ns: ?i96,
+    sleep_clock: ?std.Io.Clock,
+    awaited_task_id: ?ids.StableId,
     waiting_on_futex: bool,
     external_resource_id: ?ids.StableId,
 };
@@ -178,15 +182,21 @@ const Entry = struct {
     task: *Task,
 
     fn entry() callconv(.naked) void {
+        // A fresh fiber has no caller. Terminate both the frame-pointer chain
+        // and the return-address chain: unwind metadata may follow the latter
+        // even with a null frame pointer. A scheduler return address (or an
+        // uninitialized x86 stack slot) would send it outside this task's stack.
         switch (builtin.cpu.arch) {
             .aarch64 => asm volatile (
                 \\ mov x0, sp
+                \\ mov x30, xzr
                 \\ b %[call]
                 :
                 : [call] "X" (&call),
             ),
             .x86_64 => asm volatile (
                 \\ leaq 8(%%rsp), %%rdi
+                \\ movq $0, (%%rsp)
                 \\ jmp %[call:P]
                 :
                 : [call] "X" (&call),
@@ -275,17 +285,29 @@ pub const Kernel = struct {
 
     pub fn futureSnapshot(self: *const Kernel, any_future: *std.Io.AnyFuture) ?TaskSnapshot {
         const target: *Task = @ptrCast(@alignCast(any_future));
-        for (self.tasks.items) |task| {
+        for (self.tasks.items, 0..) |task, index| {
             if (task != target) continue;
-            return .{
-                .id = task.id,
-                .status = task.status,
-                .sleep_deadline_ns = if (task.sleep) |sleep| sleep.deadline_ns else null,
-                .waiting_on_futex = task.futex_ptr != null,
-                .external_resource_id = task.external_id,
-            };
+            return self.snapshotAt(index);
         }
         return null;
+    }
+
+    /// Allocation-free inspection of retained owners, including wait edges
+    /// and their actual clock deadlines. This never advances scheduler state.
+    pub fn snapshotAt(self: *const Kernel, index: usize) ?TaskSnapshot {
+        if (index >= self.tasks.items.len) return null;
+        const task = self.tasks.items[index];
+        return .{
+            .id = task.id,
+            .identity_scope = task.identity_parent,
+            .resource_owner_id = task.resource_owner_id,
+            .status = task.status,
+            .sleep_deadline_ns = if (task.sleep) |sleep| sleep.deadline_ns else null,
+            .sleep_clock = if (task.sleep) |sleep| sleep.clock else null,
+            .awaited_task_id = if (task.waiting_on_future) |awaited| awaited.id else null,
+            .waiting_on_futex = task.futex_ptr != null,
+            .external_resource_id = task.external_id,
+        };
     }
 
     pub fn isQuiescent(self: *const Kernel) bool {
@@ -803,8 +825,13 @@ pub const Kernel = struct {
         const storage_len = result_offset + @max(result_len, 1);
         const task = try self.allocator.create(Task);
         errdefer self.allocator.destroy(task);
-        const stack = try self.allocator.alignedAlloc(u8, .fromByteUnits(stack_alignment), self.config.stack_size);
-        errdefer self.allocator.free(stack);
+        // A fiber stack contains no initialized objects until the fiber runs.
+        // Keep allocator ownership/accounting, but avoid poisoning every byte
+        // of large stacks for each short-lived task in Debug/ReleaseSafe runs.
+        const stack_ptr = self.allocator.rawAlloc(self.config.stack_size, .fromByteUnits(stack_alignment), @returnAddress()) orelse
+            return error.OutOfMemory;
+        const stack: []align(stack_alignment) u8 = @alignCast(stack_ptr[0..self.config.stack_size]);
+        errdefer self.allocator.rawFree(stack, .fromByteUnits(stack_alignment), @returnAddress());
         const storage = try self.allocator.alignedAlloc(u8, .fromByteUnits(storage_alignment), storage_len);
         errdefer self.allocator.free(storage);
         @memcpy(storage[0..context_bytes.len], context_bytes);
@@ -959,7 +986,7 @@ pub const Kernel = struct {
 
     fn destroyTaskMemory(self: *Kernel, task: *Task) void {
         self.allocator.free(task.storage);
-        self.allocator.free(task.stack);
+        self.allocator.rawFree(task.stack, .fromByteUnits(stack_alignment), @returnAddress());
         self.allocator.destroy(task);
     }
 
@@ -1123,6 +1150,46 @@ pub const Kernel = struct {
 
     const capability_kernel_id = ids.stable("vopr-io", "task-kernel-v1");
 };
+
+test "task stack unwinding terminates before entering the scheduler stack" {
+    const Probe = struct {
+        const Self = @This();
+        const Args = struct { probe: *Self, kernel: *Kernel };
+        captures: usize = 0,
+
+        noinline fn capture(self: *@This()) void {
+            var addresses: [128]usize = undefined;
+            const trace = std.debug.captureCurrentStackTrace(.{}, &addresses);
+            std.debug.assert(trace.return_addresses.len > 0);
+            std.debug.assert(trace.return_addresses.len < addresses.len);
+            std.debug.assert(trace.skipped == .none);
+            // DebugAllocator captures allocation/free traces too; keep that
+            // instrumentation enabled on the task stack.
+            const allocation = std.testing.allocator.alloc(u8, 17) catch @panic("OOM");
+            std.testing.allocator.free(allocation);
+            self.captures += 1;
+        }
+
+        fn start(context: *const anyopaque, _: *anyopaque) void {
+            const args: *const Args = @ptrCast(@alignCast(context));
+            args.probe.capture();
+            const task = args.kernel.currentTask().?;
+            task.status = .runnable;
+            args.kernel.yieldCurrent(task);
+            args.probe.capture();
+        }
+    };
+    var kernel = try Kernel.init(std.testing.allocator, .{});
+    defer kernel.deinit();
+    var probe = Probe{};
+    const args = Probe.Args{ .probe = &probe, .kernel = &kernel };
+    const task = try kernel.createTask(0, .@"1", std.mem.asBytes(&args), .of(@TypeOf(args)), Probe.start, null);
+    const first = (try kernel.executeReady(task.transitionId())).?;
+    try std.testing.expect(!first.completed);
+    const second = (try kernel.executeReady(task.transitionId())).?;
+    try std.testing.expect(second.completed);
+    try std.testing.expectEqual(@as(usize, 2), probe.captures);
+}
 
 test "inactive futex address reuse starts a new logical contention epoch" {
     var kernel = try Kernel.init(std.testing.allocator, .{});

@@ -2139,6 +2139,59 @@ fn fuseChainTranspose(allocator: std.mem.Allocator, work: *Graph, reachable: []c
 
 const TransposeAttrs = node_mod.TransposeAttrs;
 
+/// Opt-in FP32 training profile. Preserve physical matrix storage through
+/// forward contractions and their strict VJP. A copied transpose can select a
+/// different BLAS accumulation order despite having the same logical values.
+/// This is deliberately separate from the default inference fusion pipeline.
+/// No nodes are allocated, removed or renumbered; lowering removes dead copies.
+pub fn retainTrainingDotStorage(graph: *Graph, id: NodeId) bool {
+    if (id >= graph.nodeCount()) return false;
+    var dot = graph.node(id).*;
+    if (dot.op != .dot_general or dot.num_inputs != 2 or dot.output_shape.dtype != .f32 or dot.vjp_alternate != null_node) return false;
+    const rank = dot.output_shape.rank_;
+    if (rank != 2 and rank != 3) return false;
+    const attrs = &dot.op.dot_general;
+    if (attrs.num_contracting != 1 or attrs.num_batch != rank - 2 or
+        attrs.lhs_contracting[0] < rank - 2 or attrs.lhs_contracting[0] >= rank or
+        attrs.rhs_contracting[0] < rank - 2 or attrs.rhs_contracting[0] >= rank or
+        (rank == 3 and (attrs.lhs_batch[0] != 0 or attrs.rhs_batch[0] != 0))) return false;
+    for (dot.inputs[0..2]) |input| {
+        if (input >= id) return false;
+        const shape = graph.node(input).output_shape;
+        if (shape.rank_ != rank or shape.dtype != .f32) return false;
+        for (shape.dims[0..rank]) |dim| if (dim <= 0) return false;
+    }
+    const lhs = graph.node(dot.inputs[0]).output_shape;
+    const rhs = graph.node(dot.inputs[1]).output_shape;
+    if (lhs.dims[attrs.lhs_contracting[0]] != rhs.dims[attrs.rhs_contracting[0]] or
+        dot.output_shape.dims[rank - 2] != lhs.dims[2 * rank - 3 - attrs.lhs_contracting[0]] or
+        dot.output_shape.dims[rank - 1] != rhs.dims[2 * rank - 3 - attrs.rhs_contracting[0]] or
+        (rank == 3 and (lhs.dims[0] != rhs.dims[0] or dot.output_shape.dims[0] != lhs.dims[0]))) return false;
+    var changed = !attrs.retain_backward_storage;
+    attrs.retain_backward_storage = true;
+    for (0..2) |operand| {
+        const axis = if (operand == 0) &attrs.lhs_contracting[0] else &attrs.rhs_contracting[0];
+        while (true) {
+            const input_id = dot.inputs[operand];
+            const input = graph.node(input_id);
+            if (input.op != .transpose or input.num_inputs != 1 or input.inputs[0] >= input_id) break;
+            const transpose = input.op.transpose;
+            if (transpose.num_axes != rank or transpose.perm[rank - 2] != rank - 1 or
+                transpose.perm[rank - 1] != rank - 2 or (rank == 3 and transpose.perm[0] != 0)) break;
+            const source = graph.node(input.inputs[0]).output_shape;
+            if (source.rank_ != rank or source.dtype != .f32) break;
+            var valid = true;
+            for (0..rank) |i| valid = valid and input.output_shape.dims[i] == source.dims[transpose.perm[i]];
+            if (!valid) break;
+            axis.* = transpose.perm[axis.*];
+            dot.inputs[operand] = input.inputs[0];
+            changed = true;
+        }
+    }
+    if (changed) graph.nodeMut(id).* = dot;
+    return changed;
+}
+
 /// Fold `dot_general(x, transpose(W, [1,0]))` into a `dot_general` whose
 /// `rhs_contracting` is shifted to the other axis, eliminating the
 /// transpose entirely. This both saves a copy and lets `fuseLinearBias`
@@ -4111,7 +4164,12 @@ test "fuse detects SDPA pattern: 4D dynamic additive bias is preserved" {
             try std.testing.expectEqual(@as(u32, 64), attrs.head_dim);
             const node = result.graph.node(@intCast(idx));
             try std.testing.expectEqual(@as(u8, 4), node.num_inputs);
-            try std.testing.expectEqual(bias_bcast, node.inputs[3]);
+            // Fusion compacts reachable nodes; compare the remapped semantic
+            // value rather than the input graph's allocation index.
+            try std.testing.expectEqual(result.id_map[bias_bcast], node.inputs[3]);
+            const retained_bias = result.graph.node(node.inputs[3]);
+            try std.testing.expect(retained_bias.op == .broadcast_in_dim);
+            try std.testing.expectEqualStrings("mask_bias", result.graph.parameterName(result.graph.node(retained_bias.inputs[0])));
             found_sdpa = true;
             break;
         }
@@ -5509,4 +5567,67 @@ test "fuse merges adjacent reduce_sum on disjoint axes" {
     }
     try std.testing.expectEqual(@as(u32, 1), reduce_count);
     try std.testing.expectEqual(@as(u8, 2), merged_axes);
+}
+
+test "retained training dots absorb matrix transposes on both operands and are idempotent" {
+    const a = std.testing.allocator;
+    inline for (.{ @as(u8, 2), @as(u8, 3) }) |rank| {
+        var graph = Graph.init(a);
+        defer graph.deinit();
+        var b = Builder.init(&graph);
+        const xs: []const i64 = if (rank == 2) &.{ 5, 3 } else &.{ 2, 5, 3 };
+        const ws: []const i64 = if (rank == 2) &.{ 7, 5 } else &.{ 2, 7, 5 };
+        const perm: []const u8 = if (rank == 2) &.{ 1, 0 } else &.{ 0, 2, 1 };
+        const x = try b.parameter("x", Shape.init(.f32, xs));
+        const w = try b.parameter("w", Shape.init(.f32, ws));
+        const xt = try b.transpose(x, perm);
+        const wt = try b.transpose(w, perm);
+        // Three nested transposes exercise more than one fold per operand.
+        const wttt = try b.transpose(try b.transpose(wt, perm), perm);
+        const y = if (rank == 2) try b.matmul(xt, wttt) else try b.matmul3D(xt, wttt);
+        const original = graph.node(y).*;
+        const count = graph.nodeCount();
+        try std.testing.expect(retainTrainingDotStorage(&graph, y));
+        const retained = graph.node(y);
+        try std.testing.expectEqualSlices(NodeId, &.{ x, w }, retained.inputs[0..2]);
+        try std.testing.expectEqual(rank - 2, retained.op.dot_general.lhs_contracting[0]);
+        try std.testing.expectEqual(rank - 1, retained.op.dot_general.rhs_contracting[0]);
+        try std.testing.expect(retained.op.dot_general.retain_backward_storage);
+        try std.testing.expect(retained.output_shape.eq(original.output_shape));
+        try std.testing.expectEqual(count, graph.nodeCount());
+        try std.testing.expect(!retainTrainingDotStorage(&graph, y));
+        // Other consumers of the transpose continue to observe the same node.
+        try std.testing.expectEqual(x, graph.node(xt).inputs[0]);
+        const xtt = try b.transpose(xt, perm);
+        const even = if (rank == 2) try b.matmul2DLayout(xtt, wt, true, false) else try b.matmul3DLayout(xtt, wt, true, false);
+        try std.testing.expect(retainTrainingDotStorage(&graph, even));
+        try std.testing.expectEqual(x, graph.node(even).inputs[0]);
+        try std.testing.expectEqual(rank - 2, graph.node(even).op.dot_general.lhs_contracting[0]);
+    }
+}
+
+test "retained training dots preserve other permutations and reject malformed contractions" {
+    const a = std.testing.allocator;
+    var graph = Graph.init(a);
+    defer graph.deinit();
+    var b = Builder.init(&graph);
+    const x = try b.parameter("x", Shape.init(.f32, &.{ 2, 3, 5 }));
+    const w = try b.parameter("w", Shape.init(.f32, &.{ 7, 2, 5 }));
+    const wt = try b.transpose(w, &.{ 1, 2, 0 });
+    const y = try b.matmul3D(x, wt);
+    try std.testing.expect(retainTrainingDotStorage(&graph, y));
+    try std.testing.expectEqual(wt, graph.node(y).inputs[1]);
+    // A malformed transpose must remain visible to graph validation.
+    const z = try b.parameter("z", Shape.init(.f32, &.{ 2, 7, 5 }));
+    const zt = try b.transpose(z, &.{ 0, 2, 1 });
+    const bad = try b.matmul3D(x, zt);
+    graph.nodeMut(zt).op.transpose.perm[0] = 1;
+    try std.testing.expect(retainTrainingDotStorage(&graph, bad));
+    try std.testing.expectEqual(zt, graph.node(bad).inputs[1]);
+    graph.nodeMut(bad).op.dot_general.lhs_contracting[0] = 7;
+    const before = graph.node(bad).*;
+    try std.testing.expect(!retainTrainingDotStorage(&graph, bad));
+    try std.testing.expect(std.meta.eql(before, graph.node(bad).*));
+    try std.testing.expect(!retainTrainingDotStorage(&graph, x));
+    try std.testing.expect(!retainTrainingDotStorage(&graph, null_node));
 }

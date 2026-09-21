@@ -14,6 +14,7 @@ pub const Route = enum {
     data,
     inference,
     metadata,
+    storage,
     serverless,
     standalone,
     standby,
@@ -68,6 +69,9 @@ pub const commands = [_]Command{
     .{ .name = "lite", .description = "Manage embedded Antfly Lite databases", .route = .standalone, .subcommands = &lite_subcommands },
     .{ .name = "standby", .description = "Manage hot-standby replication", .route = .standby, .subcommands = &standby_subcommands },
     .{ .name = "ha", .description = "Manage hot-standby replication (deprecated alias for standby)", .route = .standby, .subcommands = &standby_subcommands, .hidden = true },
+    .{ .name = "database", .description = "Manage databases", .route = .cli },
+    .{ .name = "namespace", .description = "Manage namespaces", .route = .cli },
+    .{ .name = "tablespace", .description = "Manage placement policies", .route = .cli },
     .{ .name = "table", .description = "Manage tables", .route = .cli, .subcommands = &table_subcommands },
     .{ .name = "index", .description = "Manage indexes", .route = .cli, .subcommands = &index_subcommands },
     .{ .name = "artifact", .description = "Manage generated artifacts", .route = .cli, .subcommands = &artifact_subcommands },
@@ -79,6 +83,7 @@ pub const commands = [_]Command{
     .{ .name = "agents", .description = "Run AI agents", .route = .cli, .subcommands = &agents_subcommands },
     .{ .name = "backup", .description = "Back up tables", .route = .cli },
     .{ .name = "restore", .description = "Restore tables", .route = .cli },
+    .{ .name = "storage", .description = "Manage table storage", .route = .storage, .subcommands = &.{"migrate"} },
     .{ .name = "auth", .description = "Manage users and authorization", .route = .cli, .subcommands = &auth_subcommands },
     .{ .name = "internal", .description = "Run internal cluster commands", .route = .cli, .subcommands = &internal_subcommands },
     .{ .name = "cloud", .description = "Delegate to the Antfly Cloud CLI", .route = .cloud },
@@ -266,6 +271,8 @@ fn writeFish(writer: *std.Io.Writer) !void {
 test "command table drives routes and completion entries" {
     try std.testing.expectEqual(Route.standalone, findCommand("swarm").?.route);
     try std.testing.expectEqual(Route.cli, findCommand("table").?.route);
+    try std.testing.expectEqual(Route.storage, findCommand("storage").?.route);
+    try std.testing.expectEqualStrings("migrate", findCommand("storage").?.subcommands[0]);
     try std.testing.expectEqual(Route.completion, findCommand("completion").?.route);
     try std.testing.expectEqual(Route.standby, findCommand("standby").?.route);
     try std.testing.expectEqual(Route.standby, findCommand("ha").?.route);

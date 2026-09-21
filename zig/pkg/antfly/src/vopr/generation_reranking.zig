@@ -44,22 +44,31 @@ const remote_generation_cancel_routes = [_]httpx.TestRoute{
 const remote_generation_replacement_routes = [_]httpx.TestRoute{
     .{ .method = .POST, .path = "/generate", .respond = .{ .body = valid_remote_replacement_generation, .delay_ns = 20 * std.time.ns_per_ms } },
 };
+const reranking_discovery_route = httpx.TestRoute{
+    .method = .GET,
+    .path = "/ai/v1/models",
+    .respond = .{ .body = "{\"rerankers\":{\"vopr-reranker\":{}}}" },
+};
 const remote_reranking_replacement_routes = [_]httpx.TestRoute{
     .{ .method = .POST, .path = "/rerank", .respond = .{ .body = valid_remote_reranking, .delay_ns = 20 * std.time.ns_per_ms } },
+    reranking_discovery_route,
 };
 const remote_reranking_truncated_routes = [_]httpx.TestRoute{
     .{ .method = .POST, .path = "/rerank", .respond = .{ .body = valid_remote_reranking, .truncate_body_at = 32 } },
+    reranking_discovery_route,
 };
 const remote_reranking_timeout_routes = [_]httpx.TestRoute{
     .{ .method = .POST, .path = "/rerank", .respond = .{ .body = valid_remote_reranking, .delay_ns = 50 * std.time.ns_per_ms } },
+    reranking_discovery_route,
 };
 const remote_reranking_cancel_routes = [_]httpx.TestRoute{
     .{ .method = .POST, .path = "/rerank", .respond = .{ .body = valid_remote_reranking, .delay_ns = 50 * std.time.ns_per_ms } },
+    reranking_discovery_route,
 };
 
 pub const Scenario = struct {
     pub const name: []const u8 = "generation-reranking-chain";
-    pub const version: u32 = 2;
+    pub const version: u32 = 3;
 
     const generation_id = vopr.id.stable(name, "generation-chain-sound");
     const retry_id = vopr.id.stable(name, "retry-uses-borrowed-io");
@@ -164,6 +173,10 @@ pub const Scenario = struct {
         }
 
         fn deinit(self: *State) void {
+            // A bounded history may stop with a request holding a provider
+            // lease. Run its defers before destroying the registry and client.
+            _ = self.vopr_io.cancelAndDrainTasksForTeardown(self.allocator, 100_000) catch |err|
+                std.debug.panic("generation/reranking VOPR teardown failed: {s}", .{@errorName(err)});
             self.http.deinit();
             self.limits.deinit();
             self.vopr_io.deinit();
@@ -528,7 +541,7 @@ pub const Scenario = struct {
                 .config = .{ .provider = .antfly, .model = "vopr-reranker", .url = server.baseUrl(), .field = "body" },
             };
             defer call.deinit();
-            var server_call = ServerCall{ .server = &server, .requests = 1 };
+            var server_call = ServerCall{ .server = &server, .requests = 2 };
             var request_future = self.vopr_io.io().async(RerankingCall.run, .{&call});
             var server_future = self.vopr_io.io().async(ServerCall.run, .{&server_call});
             const request_error: ?anyerror = if (cancel_after_hit) blk: {
@@ -541,7 +554,7 @@ pub const Scenario = struct {
             };
             server_future.await(self.vopr_io.io());
             self.remote_requests += @intCast(server.routeHitCount(0));
-            if (server.routeHitCount(0) != 1) return error.RemoteRerankingDidNotComplete;
+            if (server.routeHitCount(0) != 1 or server.routeHitCount(1) != 1) return error.RemoteRerankingDidNotComplete;
             const scores_sound = if (call.scores) |scores|
                 scores.len == 2 and scores[0] == 0.2 and scores[1] == 0.8
             else
@@ -573,7 +586,7 @@ pub const Scenario = struct {
                 .config = next_config,
             };
             defer remote_call.deinit();
-            var server_call = ServerCall{ .server = &server, .requests = 1 };
+            var server_call = ServerCall{ .server = &server, .requests = 2 };
             var remote_future = self.vopr_io.io().async(RerankingCall.run, .{&remote_call});
             var server_future = self.vopr_io.io().async(ServerCall.run, .{&server_call});
             try self.awaitRoute(&server, 0);
@@ -599,7 +612,7 @@ pub const Scenario = struct {
                 false;
             return server_call.error_value == null and remote_scores_sound and
                 local_scores.len == 2 and local_scores[0] == 0.3 and local_scores[1] == 0.7 and
-                self.local_reranking_calls == 1 and server.routeHitCount(0) == 1;
+                self.local_reranking_calls == 1 and server.routeHitCount(0) == 1 and server.routeHitCount(1) == 1;
         }
 
         fn runRemoteComposed(self: *State) !void {
@@ -741,7 +754,7 @@ test "generation and reranking chain VOPR exact replays local and remote product
             .system = "antfly",
             .transition_budget = if (std.meta.tags(Scenario.Mode)[ordinal] == .remote_composed) 4_096 else 128,
             .backend_ids = &backend_ids,
-            .source_revision = "generation-reranking-vopr-v2",
+            .source_revision = "generation-reranking-vopr-v3",
             .target = "native",
             .optimize = @tagName(@import("builtin").mode),
         });
@@ -756,4 +769,17 @@ test "generation and reranking chain VOPR exact replays local and remote product
         var replayed = try vopr.replay.exact(Scenario, std.testing.allocator, &recorded);
         replayed.deinit();
     }
+}
+
+test "generation and reranking VOPR drains requests when the history budget expires" {
+    const mode_id = Scenario.mode_ids[@intFromEnum(Scenario.Mode.remote_composed)];
+    var choices = vopr.choice.PrefixedFairSeeded.init(&.{mode_id}, 0x4745_4e52 + @as(u64, @intFromEnum(Scenario.Mode.remote_composed)));
+    var recorded = try vopr.runner.run(Scenario, std.testing.allocator, choices.source(), .{
+        .system = "antfly",
+        .transition_budget = 128,
+    });
+    defer recorded.deinit();
+    // The history is deliberately incomplete. Teardown must unwind provider
+    // leases and request allocations rather than panic or leak their stacks.
+    try std.testing.expect(recorded.summary.?.property_failures > 0);
 }

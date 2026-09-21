@@ -19,99 +19,117 @@ const F32xN = @Vector(VEC_LEN, f32);
 
 // ─── Learning Rate Schedules ───────────────────────────────────────────────────
 
-pub const LearningRateSchedule = union(enum) {
-    constant: f32,
-    cosine: struct {
-        initial_lr: f32,
-        min_lr: f32,
-        total_steps: u32,
-    },
-    warmup_cosine: struct {
-        initial_lr: f32,
-        min_lr: f32,
-        warmup_steps: u32,
-        total_steps: u32,
-    },
-    warmup_cosine_restarts: struct {
-        initial_lr: f32,
-        warmup_steps: u32,
-        total_steps: u32,
-        num_cycles: f32,
-    },
-    warmup_linear: struct {
-        initial_lr: f32,
-        warmup_steps: u32,
-        total_steps: u32,
-    },
-    warmup_constant: struct {
-        initial_lr: f32,
-        warmup_steps: u32,
-        total_steps: u32,
-    },
+/// Schedule arithmetic follows its scalar type; existing callers remain FP32.
+pub const LearningRateSchedule = LearningRateScheduleOf(f32);
+pub const LearningRateSchedule64 = LearningRateScheduleOf(f64);
 
-    /// `step_num` is the 0-based index of the optimizer step about to run: a run
-    /// of `total_steps` steps only ever asks for `0..total_steps-1`. Past
-    /// `total_steps` the schedules hold at their terminal value — zero for
-    /// `warmup_linear`, `warmup_constant` and `warmup_cosine_restarts`, and
-    /// `min_lr` for `warmup_cosine` — so an off-by-one cannot silently apply a
-    /// full-rate update, though a `warmup_cosine` caller with a non-zero
-    /// `min_lr` still needs to stop at its own horizon.
-    pub fn lr(self: LearningRateSchedule, step_num: u32) f32 {
-        return switch (self) {
-            .constant => |val| val,
-            .cosine => |c| blk: {
-                const progress: f32 = @as(f32, @floatFromInt(step_num)) / @as(f32, @floatFromInt(c.total_steps));
-                const cosine_factor = 0.5 * (1.0 + @cos(std.math.pi * progress));
-                break :blk c.min_lr + (c.initial_lr - c.min_lr) * cosine_factor;
-            },
-            .warmup_cosine => |wc| blk: {
-                if (step_num < wc.warmup_steps) {
-                    // Linear warmup: lr increases from 0 to initial_lr
-                    const warmup_progress: f32 = @as(f32, @floatFromInt(step_num)) / @as(f32, @floatFromInt(wc.warmup_steps));
-                    break :blk wc.initial_lr * warmup_progress;
-                }
-                // Cosine decay from initial_lr to min_lr over remaining steps
-                const decay_steps = @max(wc.total_steps -| wc.warmup_steps, 1);
-                const decay_step = @min(step_num -| wc.warmup_steps, decay_steps);
-                const progress: f32 = @as(f32, @floatFromInt(decay_step)) / @as(f32, @floatFromInt(decay_steps));
-                const cosine_factor = 0.5 * (1.0 + @cos(std.math.pi * progress));
-                break :blk wc.min_lr + (wc.initial_lr - wc.min_lr) * cosine_factor;
-            },
-            .warmup_cosine_restarts => |wc| blk: {
-                if (wc.warmup_steps > 0 and step_num < wc.warmup_steps) {
-                    const progress: f32 = @as(f32, @floatFromInt(step_num)) / @as(f32, @floatFromInt(wc.warmup_steps));
-                    break :blk wc.initial_lr * progress;
-                }
-                // Past the horizon the next cycle would restart at full lr.
-                if (step_num >= wc.total_steps) break :blk 0.0;
-                const decay_steps = @max(wc.total_steps -| wc.warmup_steps, 1);
-                const decay_step = step_num -| wc.warmup_steps;
-                const progress = @as(f32, @floatFromInt(decay_step)) / @as(f32, @floatFromInt(decay_steps));
-                const cycle_progress = wc.num_cycles * progress;
-                const phase = cycle_progress - @floor(cycle_progress);
-                break :blk wc.initial_lr * @max(@as(f32, 0.0), 0.5 * (1.0 + @cos(std.math.pi * phase)));
-            },
-            .warmup_linear => |wl| blk: {
-                if (wl.warmup_steps > 0 and step_num < wl.warmup_steps) {
-                    const progress: f32 = @as(f32, @floatFromInt(step_num)) / @as(f32, @floatFromInt(wl.warmup_steps));
-                    break :blk wl.initial_lr * progress;
-                }
-                if (step_num >= wl.total_steps) break :blk 0.0;
-                const decay_steps = @max(wl.total_steps - wl.warmup_steps, 1);
-                const remaining_steps = wl.total_steps - step_num;
-                break :blk wl.initial_lr * @as(f32, @floatFromInt(remaining_steps)) / @as(f32, @floatFromInt(decay_steps));
-            },
-            .warmup_constant => |wc| blk: {
-                if (wc.warmup_steps > 0 and step_num < wc.warmup_steps) {
-                    const progress: f32 = @as(f32, @floatFromInt(step_num)) / @as(f32, @floatFromInt(wc.warmup_steps));
-                    break :blk wc.initial_lr * progress;
-                }
-                if (step_num >= wc.total_steps) break :blk 0.0;
-                break :blk wc.initial_lr;
-            },
-        };
-    }
-};
+pub fn LearningRateScheduleOf(comptime Float: type) type {
+    return union(enum) {
+        constant: Float,
+        cosine: struct {
+            initial_lr: Float,
+            min_lr: Float,
+            total_steps: u32,
+        },
+        warmup_cosine: struct {
+            initial_lr: Float,
+            min_lr: Float,
+            warmup_steps: u32,
+            total_steps: u32,
+        },
+        warmup_cosine_restarts: struct {
+            initial_lr: Float,
+            warmup_steps: u32,
+            total_steps: u32,
+            num_cycles: Float,
+        },
+        warmup_linear: struct {
+            initial_lr: Float,
+            warmup_steps: u32,
+            total_steps: u32,
+        },
+        warmup_constant: struct {
+            initial_lr: Float,
+            warmup_steps: u32,
+            total_steps: u32,
+        },
+
+        /// `step_num` is the 0-based index of the optimizer step about to run: a run
+        /// of `total_steps` steps only ever asks for `0..total_steps-1`. Past
+        /// `total_steps` the schedules hold at their terminal value — zero for
+        /// `warmup_linear`, `warmup_constant` and `warmup_cosine_restarts`, and
+        /// `min_lr` for `warmup_cosine` — so an off-by-one cannot silently apply a
+        /// full-rate update, though a `warmup_cosine` caller with a non-zero
+        /// `min_lr` still needs to stop at its own horizon.
+        pub fn lr(self: @This(), step_num: u32) Float {
+            return switch (self) {
+                .constant => |val| val,
+                .cosine => |c| blk: {
+                    const progress: Float = @as(Float, @floatFromInt(step_num)) / @as(Float, @floatFromInt(c.total_steps));
+                    const cosine_factor = 0.5 * (1.0 + @cos(std.math.pi * progress));
+                    break :blk c.min_lr + (c.initial_lr - c.min_lr) * cosine_factor;
+                },
+                .warmup_cosine => |wc| blk: {
+                    if (step_num < wc.warmup_steps) {
+                        // Linear warmup: lr increases from 0 to initial_lr
+                        const warmup_progress: Float = @as(Float, @floatFromInt(step_num)) / @as(Float, @floatFromInt(wc.warmup_steps));
+                        break :blk wc.initial_lr * warmup_progress;
+                    }
+                    // Cosine decay from initial_lr to min_lr over remaining steps
+                    const decay_steps = @max(wc.total_steps -| wc.warmup_steps, 1);
+                    const decay_step = @min(step_num -| wc.warmup_steps, decay_steps);
+                    const progress: Float = @as(Float, @floatFromInt(decay_step)) / @as(Float, @floatFromInt(decay_steps));
+                    const cosine_factor = 0.5 * (1.0 + @cos(std.math.pi * progress));
+                    break :blk wc.min_lr + (wc.initial_lr - wc.min_lr) * cosine_factor;
+                },
+                .warmup_cosine_restarts => |wc| blk: {
+                    if (wc.warmup_steps > 0 and step_num < wc.warmup_steps) {
+                        const progress: Float = @as(Float, @floatFromInt(step_num)) / @as(Float, @floatFromInt(wc.warmup_steps));
+                        break :blk wc.initial_lr * progress;
+                    }
+                    // Past the horizon the next cycle would restart at full lr.
+                    if (step_num >= wc.total_steps) break :blk 0.0;
+                    const decay_steps = @max(wc.total_steps -| wc.warmup_steps, 1);
+                    const decay_step = step_num -| wc.warmup_steps;
+                    const progress = @as(Float, @floatFromInt(decay_step)) / @as(Float, @floatFromInt(decay_steps));
+                    const cycle_progress = wc.num_cycles * progress;
+                    const phase = cycle_progress - @floor(cycle_progress);
+                    break :blk wc.initial_lr * @max(@as(Float, 0.0), 0.5 * (1.0 + @cos(std.math.pi * phase)));
+                },
+                .warmup_linear => |wl| blk: {
+                    if (wl.warmup_steps > 0 and step_num < wl.warmup_steps) {
+                        const progress: Float = @as(Float, @floatFromInt(step_num)) / @as(Float, @floatFromInt(wl.warmup_steps));
+                        break :blk wl.initial_lr * progress;
+                    }
+                    if (step_num >= wl.total_steps) break :blk 0.0;
+                    const decay_steps = @max(wl.total_steps - wl.warmup_steps, 1);
+                    const remaining_steps = wl.total_steps - step_num;
+                    break :blk wl.initial_lr * @as(Float, @floatFromInt(remaining_steps)) / @as(Float, @floatFromInt(decay_steps));
+                },
+                .warmup_constant => |wc| blk: {
+                    if (wc.warmup_steps > 0 and step_num < wc.warmup_steps) {
+                        const progress: Float = @as(Float, @floatFromInt(step_num)) / @as(Float, @floatFromInt(wc.warmup_steps));
+                        break :blk wc.initial_lr * progress;
+                    }
+                    if (step_num >= wc.total_steps) break :blk 0.0;
+                    break :blk wc.initial_lr;
+                },
+            };
+        }
+        pub fn cast(self: @This(), comptime Other: type) LearningRateScheduleOf(Other) {
+            return switch (self) {
+                .constant => |value| .{ .constant = @floatCast(value) },
+                inline else => |value, tag| blk: {
+                    var result: @FieldType(LearningRateScheduleOf(Other), @tagName(tag)) = undefined;
+                    inline for (@typeInfo(@TypeOf(value)).@"struct".fields) |field| {
+                        @field(result, field.name) = if (field.type == Float) @floatCast(@field(value, field.name)) else @field(value, field.name);
+                    }
+                    break :blk @unionInit(LearningRateScheduleOf(Other), @tagName(tag), result);
+                },
+            };
+        }
+    };
+}
 
 // ─── Optimizer Configs ─────────────────────────────────────────────────────────
 
@@ -125,12 +143,33 @@ pub const AdamConfig = struct {
     eps: f32 = 1e-8,
 };
 
-pub const AdamWConfig = struct {
-    beta1: f32 = 0.9,
-    beta2: f32 = 0.999,
-    eps: f32 = 1e-8,
-    weight_decay: f32 = 0.01,
-};
+pub const AdamWConfig = AdamWConfigOf(f32);
+pub const AdamWConfig64 = AdamWConfigOf(f64);
+pub fn AdamWConfigOf(comptime Float: type) type {
+    return struct {
+        beta1: Float = 0.9,
+        beta2: Float = 0.999,
+        eps: Float = 1e-8,
+        weight_decay: Float = 0.01,
+        pub fn cast(self: @This(), comptime Other: type) AdamWConfigOf(Other) {
+            return .{ .beta1 = @floatCast(self.beta1), .beta2 = @floatCast(self.beta2), .eps = @floatCast(self.eps), .weight_decay = @floatCast(self.weight_decay) };
+        }
+    };
+}
+
+test "optimizer scalar precision preserves schedules and explicit narrowing" {
+    const precise = AdamWConfig64{ .beta1 = 0.900000000123 };
+    const narrow = precise.cast(f32);
+    try std.testing.expectEqual(@as(f32, 0.9), narrow.beta1);
+    try std.testing.expect(precise.beta1 != @as(f64, narrow.beta1));
+    const schedule64 = LearningRateSchedule64{ .warmup_linear = .{ .initial_lr = 0.012345678901, .warmup_steps = 3, .total_steps = 100 } };
+    const schedule32 = schedule64.cast(f32);
+    try std.testing.expectEqual(@as(f32, @floatCast(schedule64.warmup_linear.initial_lr)), schedule32.warmup_linear.initial_lr);
+    try std.testing.expectEqual(@as(f64, 0), schedule64.lr(0));
+    try std.testing.expectEqual(schedule64.warmup_linear.initial_lr, schedule64.lr(3));
+    try std.testing.expectEqual(@as(f64, 0), schedule64.lr(100));
+    try std.testing.expectApproxEqRel(schedule64.warmup_linear.initial_lr / 3, schedule64.lr(1), 1e-15);
+}
 
 pub const Optimizer = union(enum) {
     sgd: SGDConfig,
@@ -150,6 +189,7 @@ pub const ParamState = struct {
 
     pub fn init(allocator: std.mem.Allocator, size: usize, needs_v: bool) !ParamState {
         const m = try allocator.alloc(f32, size);
+        errdefer allocator.free(m);
         @memset(m, 0.0);
 
         const v: []f32 = if (needs_v) blk: {
@@ -200,15 +240,18 @@ pub const OptimizerState = struct {
     }
 
     pub fn getOrCreate(self: *OptimizerState, name: []const u8, size: usize, needs_v: bool) !*ParamState {
+        if (self.param_states.getPtr(name)) |existing| {
+            if (existing.m.len != size or (needs_v and existing.v.len != size)) return error.InvalidOptimizerStateShape;
+            return existing;
+        }
         const owned_name = try self.allocator.dupe(u8, name);
         errdefer self.allocator.free(owned_name);
-        const gop = try self.param_states.getOrPut(self.allocator, owned_name);
-        if (!gop.found_existing) {
-            gop.value_ptr.* = try ParamState.init(self.allocator, size, needs_v);
-        } else {
-            self.allocator.free(owned_name);
-        }
-        return gop.value_ptr;
+        var state = try ParamState.init(self.allocator, size, needs_v);
+        errdefer state.deinit();
+        // Publish only initialized ownership. An allocation failure must not
+        // leave a dangling key and uninitialized moments in the registry.
+        try self.param_states.putNoClobber(self.allocator, owned_name, state);
+        return self.param_states.getPtr(owned_name).?;
     }
 };
 

@@ -31,9 +31,10 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 from urllib.parse import quote
 
 import pytest
@@ -60,7 +61,7 @@ METADATA_MUTATION_NOT_ADMITTED_RESPONSE_HEADERS = {
 }
 
 
-def _new_e2e_deadline() -> "_Deadline":
+def _new_e2e_deadline() -> _Deadline:
     return _Deadline(AUTOGRAPH_E2E_TIMEOUT_S)
 
 
@@ -108,6 +109,23 @@ DOCUMENTS_INDEXES = {
                 "resolution_artifact": "resolution_v1",
                 "key_template": "{{ lower _entity.label }}/{{ slug _entity.text }}",
                 "candidate_search": "prefix",
+                "scorer_json": json.dumps(
+                    {
+                        "comparisons": [
+                            {
+                                "name": "name",
+                                "left": "canonical_text",
+                                "right": "canonical_name",
+                                "levels": [
+                                    {"when": "exact", "weight": 8.0},
+                                    {"else": True, "weight": -6.0},
+                                ],
+                            }
+                        ],
+                        "combine": {"bias": -3.0},
+                        "decision": {"match": 0.9},
+                    }
+                ),
                 "config_generation": 1,
             }
         ],
@@ -132,10 +150,46 @@ def resolution_cluster(request: pytest.FixtureRequest):
         yield cluster
     finally:
         report = getattr(request.node, "rep_call", None)
+        if report and report.failed:
+            # Capture while the six node processes are still alive, including
+            # failures that now stop immediately on an unexpected HTTP 500.
+            _capture_failure_stacks(cluster)
         cluster.stop(
             timeout_s=AUTOGRAPH_E2E_TEARDOWN_TIMEOUT_S,
             test_failed=bool(report and report.failed),
+            reject_data_crashes=not bool(report and report.failed),
         )
+
+
+def _capture_failure_stacks(cluster: MultiNodeScalingCluster) -> str:
+    # Capture once at the first failure, then reuse during fixture teardown.
+    # Six default 25-second debugger waits followed by another capture could
+    # otherwise consume the soak's evidence-upload budget on every failed case.
+    captured = getattr(cluster, "_autograph_failure_stacks", None)
+    if captured is None:
+        captured = cluster.native_stack_dumps(per_process_timeout_s=5.0)
+        cluster._autograph_failure_stacks = captured
+        try:
+            (cluster.root / "native-stacks.txt").write_text(captured, encoding="utf-8")
+        except OSError as exc:
+            print(f"failed to preserve Autograph native stacks: {exc!r}")
+    return captured
+
+
+def test_autograph_failure_stacks_are_bounded_and_retained_once(tmp_path):
+    class Cluster:
+        root = tmp_path
+        calls: ClassVar = []
+
+        def native_stack_dumps(self, *, per_process_timeout_s):
+            self.calls.append(per_process_timeout_s)
+            return "resolver waiting for read barrier"
+
+    cluster = Cluster()
+    first = _capture_failure_stacks(cluster)
+    assert _capture_failure_stacks(cluster) == first
+    assert cluster.calls == [5.0]
+    assert (tmp_path / "native-stacks.txt").read_text() == first
 
 
 class _Api:
@@ -160,7 +214,7 @@ class _Api:
         *,
         num_shards: int = 1,
         indexes: dict | None = None,
-        deadline: "_Deadline | None" = None,
+        deadline: _Deadline | None = None,
     ) -> dict:
         payload: dict = {"num_shards": num_shards}
         if indexes is not None:
@@ -175,7 +229,7 @@ class _Api:
                     else max_timeout
                 )
             except AssertionError as exc:
-                stacks = self._server.native_stack_dumps()
+                stacks = _capture_failure_stacks(self._server)
                 index_names = sorted(indexes.keys()) if indexes is not None else []
                 raise AssertionError(
                     f"create table exhausted its {deadline.timeout_s:.1f}s deadline "
@@ -192,7 +246,7 @@ class _Api:
             except requests.RequestException as exc:
                 # A transport failure does not prove whether the DDL reached
                 # Raft, so never replay it automatically.
-                stacks = self._server.native_stack_dumps()
+                stacks = _capture_failure_stacks(self._server)
                 index_names = sorted(indexes.keys()) if indexes is not None else []
                 raise AssertionError(
                     f"create table timed out/failed table={name!r} shards={num_shards} "
@@ -222,7 +276,7 @@ class _Api:
         body: dict,
         *,
         sync_level: str = "write",
-        deadline: "_Deadline | None" = None,
+        deadline: _Deadline | None = None,
     ) -> dict:
         payload = {"inserts": {doc_id: body}, "sync_level": sync_level}
         max_timeout = 120.0 if sync_level in {"enrichments", "full_index"} else 30.0
@@ -238,7 +292,7 @@ class _Api:
                     else max_timeout
                 )
             except AssertionError as exc:
-                stacks = self._server.native_stack_dumps()
+                stacks = _capture_failure_stacks(self._server)
                 raise AssertionError(
                     f"batch insert exhausted its {deadline.timeout_s:.1f}s deadline "
                     f"table={table!r} key={doc_id!r} sync_level={sync_level!r} "
@@ -255,7 +309,7 @@ class _Api:
                 # A timed-out write usually means a node wedged in memory without
                 # logging anything; capture native stacks before teardown so the
                 # CI failure is diagnosable.
-                stacks = self._server.native_stack_dumps()
+                stacks = _capture_failure_stacks(self._server)
                 raise AssertionError(
                     f"batch insert timed out/failed table={table!r} key={doc_id!r} "
                     f"sync_level={sync_level!r}: {exc!r}\n[native stacks]\n{stacks}"
@@ -303,7 +357,7 @@ class _Api:
         doc_id: str,
         body: dict,
         *,
-        deadline: "_Deadline",
+        deadline: _Deadline,
     ) -> bool:
         reconcile_expires_at = min(
             deadline.expires_at,
@@ -607,9 +661,20 @@ def _wait_for_entities(
     last_error: str | None = None
 
     while not deadline.expired():
+        exhausted = False
         for key in list(pending):
+            remaining = deadline.remaining()
+            if remaining < 0.1:
+                exhausted = True
+                break
             try:
-                doc = api.lookup("entities", key, timeout=deadline.request_timeout())
+                timeout = deadline.request_timeout()
+            except AssertionError:
+                # Preserve the pending keys and diagnostics when there is no
+                # longer enough budget to issue another bounded request.
+                break
+            try:
+                doc = api.lookup("entities", key, timeout=timeout)
             except requests.RequestException as exc:
                 if not _transient_poll_error(exc):
                     raise
@@ -621,15 +686,43 @@ def _wait_for_entities(
                 pending.remove(key)
         if not pending:
             return found
+        if exhausted:
+            break
         deadline.sleep()
 
     raise AssertionError(
         f"entities were not promoted within {deadline.timeout_s}s "
         f"(elapsed={deadline.elapsed():.1f}s, pending={sorted(pending)!r}, "
         f"last={last!r}, last_error={last_error!r})"
-        f"\n[native stacks]\n{api._server.native_stack_dumps()}"
+        f"\n[native stacks]\n{_capture_failure_stacks(api._server)}"
         f"\n{api.diagnostic()}"
     )
+
+
+def test_entity_deadline_retains_diagnostics_below_request_floor(monkeypatch, tmp_path):
+    class Server:
+        root = tmp_path
+
+        def native_stack_dumps(self, *, per_process_timeout_s):
+            assert per_process_timeout_s == 5.0
+            return "captured native stacks"
+
+    class Api:
+        _server = Server()
+
+        def lookup(self, *args, **kwargs):
+            raise AssertionError("must not start a request below the time floor")
+
+        def diagnostic(self):
+            return "captured entity diagnostics"
+
+    deadline = _Deadline(115.0)
+    monkeypatch.setattr(deadline, "remaining", lambda: 0.09)
+    with pytest.raises(AssertionError) as failure:
+        _wait_for_entities(Api(), {"entity:a": "Alice"}, deadline=deadline)
+    assert "pending=['entity:a']" in str(failure.value)
+    assert "captured native stacks" in str(failure.value)
+    assert "captured entity diagnostics" in str(failure.value)
 
 
 def _doc_text(doc: dict) -> str:
@@ -641,7 +734,11 @@ def _doc_text(doc: dict) -> str:
 def _transient_poll_error(exc: requests.RequestException) -> bool:
     response = getattr(exc, "response", None)
     if response is not None:
-        return response.status_code >= 500
+        # Availability has an explicit contract. Retrying an INTERNAL_ERROR
+        # hid an untransportable ReadIndexTimeout until the promotion deadline.
+        return response.status_code == 503 and bool(
+            response.headers.get("Retry-After", "").strip()
+        )
     return isinstance(
         exc,
         (
@@ -650,6 +747,69 @@ def _transient_poll_error(exc: requests.RequestException) -> bool:
             requests.Timeout,
         ),
     )
+
+
+@pytest.mark.parametrize(
+    ("status", "retry_after", "expected"),
+    [
+        (503, "1", True),
+        (503, None, False),
+        (500, "1", False),
+        (502, None, False),
+        (504, None, False),
+        (409, None, False),
+    ],
+)
+def test_autograph_poll_retries_only_explicit_availability(
+    status, retry_after, expected
+):
+    response = requests.Response()
+    response.status_code = status
+    if retry_after is not None:
+        response.headers["Retry-After"] = retry_after
+    assert _transient_poll_error(requests.HTTPError(response=response)) is expected
+
+
+def test_autograph_entity_poll_propagates_internal_failure():
+    class BrokenApi:
+        def lookup(self, *_args, **_kwargs):
+            response = requests.Response()
+            response.status_code = 500
+            raise requests.HTTPError("RuntimeBoundaryFailure", response=response)
+
+    with pytest.raises(requests.HTTPError, match="RuntimeBoundaryFailure"):
+        _wait_for_entities(
+            BrokenApi(),
+            {"person/ada_lovelace": "Ada Lovelace"},
+            deadline=_Deadline(1.0),
+        )
+
+
+@pytest.mark.parametrize("hydrate", [False, True])
+def test_autograph_poll_preserves_context_at_request_deadline(monkeypatch, hydrate):
+    now = [0.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(time, "sleep", lambda delay: now.__setitem__(0, now[0] + delay))
+    monkeypatch.setitem(globals(), "_capture_failure_stacks", lambda _: "stacks")
+
+    class Api:
+        _server = None
+
+        def diagnostic(self, **_kwargs):
+            return "retained graph status"
+
+    deadline = _Deadline(0.05)
+    expected = {"person/ada_lovelace": "Ada Lovelace"}
+    with pytest.raises(AssertionError, match="retained graph status") as failure:
+        if hydrate:
+            _wait_for_mention_hydration(
+                Api(), start_node="doc:a", expected_names=expected, deadline=deadline
+            )
+        else:
+            _wait_for_entities(Api(), expected, deadline=deadline)
+    assert "person/ada_lovelace" in str(failure.value)
+    assert "request floor" not in str(failure.value)
+    assert now[0] <= deadline.timeout_s
 
 
 def _graph_result(result: dict, name: str) -> dict | None:
@@ -688,9 +848,11 @@ def _wait_for_mention_hydration(
     last_error: str | None = None
     while not deadline.expired():
         try:
-            last = api.query_table(
-                "documents", payload, timeout=deadline.request_timeout()
-            )
+            timeout = deadline.request_timeout()
+        except AssertionError:
+            break
+        try:
+            last = api.query_table("documents", payload, timeout=timeout)
         except requests.RequestException as exc:
             if not _transient_poll_error(exc):
                 raise
@@ -723,10 +885,135 @@ def _wait_for_mention_hydration(
     )
 
 
+@pytest.mark.parametrize("candidate_search", ["prefix", "exact_key"])
 def test_multinode_autograph_resolves_promotes_and_hydrates_entities(
     resolution_cluster,
+    candidate_search,
 ):
-    cluster = resolution_cluster
+    _exercise_multinode_autograph(
+        resolution_cluster, candidate_search=candidate_search, restart_data=False
+    )
+
+
+def test_multinode_autograph_recovers_after_data_restart(resolution_cluster):
+    _exercise_multinode_autograph(resolution_cluster, restart_data=True)
+
+
+def _restart_data_owners(cluster):
+    for node in cluster.data_nodes:
+        node_id = int(node["id"])
+        cluster.stop_data_node(node_id)
+        returncode = cluster.data_proc_by_node_id[node_id].returncode
+        # The fixture may force a crash after its bounded graceful-stop wait.
+        # A spontaneous assertion/segfault must not disappear behind restart.
+        assert returncode in (0, -signal.SIGKILL), (
+            f"data node {node_id} crashed during restart rc={returncode}\n"
+            f"{cluster.debug_logs()}"
+        )
+    for node in cluster.data_nodes:
+        cluster._start_data_node(node)
+
+
+@pytest.mark.parametrize(
+    "returncode", [0, -signal.SIGKILL, -signal.SIGABRT, -signal.SIGSEGV]
+)
+def test_autograph_restart_rejects_spontaneous_crashes(returncode):
+    class Process:
+        pass
+
+    process = Process()
+    process.returncode = returncode
+
+    class Cluster:
+        data_nodes: ClassVar = [{"id": 101}, {"id": 102}]
+        data_proc_by_node_id: ClassVar = {101: process, 102: process}
+        actions: ClassVar = []
+
+        def stop_data_node(self, node_id):
+            self.actions.append(("stop", node_id))
+
+        def _start_data_node(self, node):
+            self.actions.append(("start", node["id"]))
+
+        def debug_logs(self):
+            return "retained crash evidence"
+
+    cluster = Cluster()
+    if returncode in (0, -signal.SIGKILL):
+        _restart_data_owners(cluster)
+        assert cluster.actions == [
+            ("stop", 101),
+            ("stop", 102),
+            ("start", 101),
+            ("start", 102),
+        ]
+    else:
+        with pytest.raises(AssertionError, match="retained crash evidence"):
+            _restart_data_owners(cluster)
+        assert cluster.actions == [("stop", 101)]
+
+
+@pytest.mark.parametrize(
+    "returncode", [0, -signal.SIGKILL, -signal.SIGABRT, -signal.SIGSEGV]
+)
+def test_autograph_teardown_crash_preserves_failure_evidence(monkeypatch, returncode):
+    import test_scaling
+
+    class Process:
+        def poll(self):
+            return self.returncode
+
+    process = Process()
+    process.returncode = returncode
+
+    class Resources:
+        cleaned = False
+
+        def close(self):
+            pass
+
+        def cleanup(self):
+            self.cleaned = True
+
+    class Cluster:
+        port_reservations = Resources()
+        tempdir = Resources()
+        data_procs: ClassVar = [process]
+        metadata_procs: ClassVar = []
+        data_proc_by_node_id: ClassVar = {101: process}
+        log_files: ClassVar = []
+        diagnostics_saved = False
+
+        def debug_logs(self):
+            return "promotion callback crash"
+
+        def preserve_failure_diagnostics(self):
+            self.diagnostics_saved = True
+
+    preserved = []
+
+    def preserve(tempdir, *, failed):
+        preserved.append(failed)
+        return failed
+
+    monkeypatch.setattr(test_scaling, "maybe_preserve_tempdir", preserve)
+    cluster = Cluster()
+    crashed = returncode not in (0, -signal.SIGKILL)
+    if crashed:
+        with pytest.raises(AssertionError, match="promotion callback crash"):
+            MultiNodeScalingCluster.stop(cluster, reject_data_crashes=True)
+    else:
+        MultiNodeScalingCluster.stop(cluster, reject_data_crashes=True)
+    assert preserved == [crashed]
+    assert cluster.diagnostics_saved == crashed
+    assert cluster.tempdir.cleaned != crashed
+
+
+def _exercise_multinode_autograph(
+    cluster, *, restart_data: bool, candidate_search="prefix"
+):
+    indexes = json.loads(json.dumps(DOCUMENTS_INDEXES))
+    indexes["relations_graph"]["resolvers"][0]["candidate_search"] = candidate_search
     api = _Api(cluster.data_api_urls[0], cluster)
 
     # Entities live in their own table (own shard group); documents are spread
@@ -737,7 +1024,7 @@ def test_multinode_autograph_resolves_promotes_and_hydrates_entities(
     api.create_table(
         "documents",
         num_shards=3,
-        indexes=DOCUMENTS_INDEXES,
+        indexes=indexes,
         deadline=_new_e2e_deadline(),
     )
 
@@ -755,6 +1042,11 @@ def test_multinode_autograph_resolves_promotes_and_hydrates_entities(
         deadline=_new_e2e_deadline(),
     )
 
+    if restart_data:
+        # Reopen every data owner with the committed document on disk. Do not
+        # issue another write before observing resolution/promotion recovery.
+        _restart_data_owners(cluster)
+
     # The promoter upserts a canonical entity document per resolved mention into
     # the entity table on its own shard.
     _wait_for_entities(
@@ -766,15 +1058,55 @@ def test_multinode_autograph_resolves_promotes_and_hydrates_entities(
         deadline=_new_e2e_deadline(),
     )
 
-    # A second document mentioning the same person resolves (prefix blocking) to
-    # the existing entity rather than minting a new one; the entity persists with
-    # its canonical name.
+    # At least two coordinators must forward to the entity shard's owner.
+    # This covers decoding native physical table names on internal lookups.
+    for base_url in cluster.data_api_urls:
+        node_api = _Api(base_url, cluster)
+        try:
+            assert "Ada Lovelace" in _doc_text(
+                node_api.lookup("entities", "person/ada_lovelace")
+            )
+        finally:
+            node_api.s.close()
+
+    # A curated redirect makes exact-key candidate reads observable: minting
+    # without reading the existing candidate would choose the old key.
+    second_entity_key = "person/ada_lovelace"
+    if candidate_search == "exact_key":
+        second_entity_key = "person/ada_curated"
+        api.insert(
+            "entities",
+            second_entity_key,
+            {
+                "canonical_name": "Ada Lovelace",
+                "entity_type": "person",
+            },
+            sync_level="full_index",
+            deadline=_new_e2e_deadline(),
+        )
+        api.insert(
+            "entities",
+            "person/ada_lovelace",
+            {
+                "canonical_name": "Ada Lovelace",
+                "entity_type": "person",
+                "merged_into": second_entity_key,
+            },
+            sync_level="full_index",
+            deadline=_new_e2e_deadline(),
+        )
+
+    # Repeated mentions share candidate reads and retain the canonical redirect
+    # destination for every mention in both exact and prefix workloads.
     api.insert(
         "documents",
         "doc:b",
         {
             "relations": {
-                "entities": [{"id": "e0", "label": "person", "text": "Ada Lovelace"}]
+                "entities": [
+                    {"id": f"e{i}", "label": "person", "text": "Ada Lovelace"}
+                    for i in range(100)
+                ]
             }
         },
         deadline=_new_e2e_deadline(),
@@ -795,8 +1127,92 @@ def test_multinode_autograph_resolves_promotes_and_hydrates_entities(
     second_mentions = _wait_for_mention_hydration(
         api,
         start_node="doc:b",
-        expected_names={"person/ada_lovelace": "Ada Lovelace"},
+        expected_names={second_entity_key: "Ada Lovelace"},
         deadline=_new_e2e_deadline(),
     )
     second_node_keys = {node["key"] for node in second_mentions["nodes"]}
-    assert "person/ada_lovelace" in second_node_keys
+    assert second_entity_key in second_node_keys
+
+
+def test_multinode_exact_candidates_follow_redirects_across_entity_shards(
+    resolution_cluster,
+):
+    """A batch spans owners; redirects cross owners and duplicate mentions reuse it."""
+    api = _Api(resolution_cluster.data_api_urls[0], resolution_cluster)
+    indexes = json.loads(json.dumps(DOCUMENTS_INDEXES))
+    resolver = indexes["relations_graph"]["resolvers"][0]
+    resolver["candidate_search"] = "exact_key"
+    resolver["key_template"] = "{{ slug _entity.text }}"
+    api.create_table("entities", num_shards=8, deadline=_new_e2e_deadline())
+    api.create_table(
+        "documents", num_shards=3, indexes=indexes, deadline=_new_e2e_deadline()
+    )
+    expected = {}
+    names = ["0 Ada", "5 Grace", "a Alan", "f Edsger"]
+    for name, survivor in zip(
+        names, ["f_curated", "a_curated", "5_curated", "0_curated"]
+    ):
+        expected[survivor] = name
+        for key, fields in [
+            (survivor, {}),
+            (name.lower().replace(" ", "_"), {"merged_into": survivor}),
+        ]:
+            api.insert(
+                "entities",
+                key,
+                {"canonical_name": name, "entity_type": "person", **fields},
+                sync_level="full_index",
+                deadline=_new_e2e_deadline(),
+            )
+    api.insert(
+        "documents",
+        "7:batch",
+        {
+            "relations": {
+                "entities": [
+                    {"id": f"e{i}", "label": "person", "text": names[i % len(names)]}
+                    for i in range(100)
+                ]
+            }
+        },
+        deadline=_new_e2e_deadline(),
+    )
+    graph = _wait_for_mention_hydration(
+        api, start_node="7:batch", expected_names=expected, deadline=_new_e2e_deadline()
+    )
+    keys = {node["key"] for node in graph["nodes"]}
+    assert set(expected) <= keys
+    assert not {name.lower().replace(" ", "_") for name in names} & keys
+
+
+def test_multinode_autograph_deleted_target_does_not_fail_surviving_graph(
+    resolution_cluster,
+):
+    _exercise_multinode_autograph(
+        resolution_cluster, candidate_search="exact_key", restart_data=False
+    )
+    api = _Api(resolution_cluster.data_api_urls[0], resolution_cluster)
+    response = api.s.delete(f"{api.url}/tables/entities", timeout=30)
+    api._check(response)
+    result = api.query_table(
+        "documents",
+        {
+            "query": {"match_all": {}},
+            "graph_queries": {
+                "mentions": {
+                    "index": "relations_graph",
+                    "traverse": {
+                        "start": {"keys": ["doc:a"]},
+                        "edge_types": ["mentions"],
+                        "max_depth": 1,
+                        "limit": 10,
+                        "include_documents": True,
+                    },
+                }
+            },
+            "limit": 10,
+        },
+    )
+    graph = _graph_result(result, "mentions")
+    assert graph is not None
+    assert not any(node.get("table") == "entities" for node in graph.get("nodes", []))

@@ -21,6 +21,7 @@
 pub const cluster = @import("cluster.zig");
 pub const batch = @import("batch.zig");
 pub const backups = @import("backups.zig");
+pub const restore_owner = @import("restore_owner.zig");
 pub const linear_merge = @import("linear_merge.zig");
 pub const query = @import("query.zig");
 pub const query_contract = @import("query_contract.zig");
@@ -46,6 +47,7 @@ pub const table_reads = @import("antfly_source_root").antfly_sources.table_reads
 pub const table_writes = @import("antfly_source_root").antfly_sources.table_writes;
 pub const distributed_candidate_source = @import("distributed_candidate_source.zig");
 pub const distributed_entity_sink = @import("distributed_entity_sink.zig");
+pub const join_planning = @import("join_planning.zig");
 pub const distributed_join = @import("distributed_join.zig");
 pub const distributed_graph = @import("distributed_graph.zig");
 pub const artifact_reprocess_jobs = @import("artifact_reprocess_jobs.zig");

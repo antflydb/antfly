@@ -61,6 +61,11 @@ memory/WAL. Failures after publication must recover either the previous manifest
 view or the newly published view; orphaned output files are cleanup debt, not
 logical state.
 
+`ResourceManager` admits new mutable state against this lifecycle from the
+outside: see the `lsm.in_memory_state` admission contract in
+[WRITES.md](WRITES.md#longer-term-shape) for how global memory pressure gates
+WAL append ahead of the flush phases above.
+
 ### Compaction Lifecycle
 
 Compaction follows the same short-critical-section pattern:
@@ -346,53 +351,16 @@ Write path:
   `--max-compaction-input-bytes`, and `--background-io-budget-bytes`
   when measuring RocksDB-like compaction and write-stall policy changes.
 
+Run the 50k and 1M dense public/provisioned guardrails after any change that
+touches WAL, flush, compaction, manifest publication, HBC publish, or
+ResourceManager pressure.
+
 ### Sampled Baseline Evidence
 
-Collected on 2026-06-02 from this worktree with 3 samples and 20k keys:
-
-- Read command: `zig build lsm-backend-bench && ./zig-out/bin/lsm_backend_bench --samples 3 --keys 20000 --value-size 128 --storage host --cache both > /tmp/lsm-read-current.jsonl`
-- Read comparator smoke: `zig build lsm-backend-bench-compare && ./zig-out/bin/lsm_backend_bench_compare --before /tmp/lsm-read-current.jsonl --after /tmp/lsm-read-current.jsonl`
-- Cached warm hit path: median `ns/op=702.60`, `read_table_block_loads=6`,
-  shared block hit/miss `99994/6`.
-- Cached warm full scan: median `ns/op=88.51`, `cursor_block_loads=485`,
-  `cursor_block_reuses=199515`, `read_table_block_loads=0`, and cursor
-  value borrow/copy `100000/0`.
-- Uncached warm full scan: median `ns/op=139.50`, `read_table_block_loads=450`,
-  `read_table_block_bytes=798655`, and cursor value borrow/copy `100000/0`.
-- Mixed read/write cache mode: median `ns/op=656.63`, bloom negatives
-  `56205`, survivor reads/hits/misses/tombstones `60111/60000/111/0`,
-  and shared block hit/miss `59986/14`.
-- L0-pressure command: `zig build lsm-write-bench && ./zig-out/bin/lsm_write_bench --samples 3 --keys 20000 --batch-size 100 --flush-threshold 100 --storage host --mode default --workload-set l0_pressure > /tmp/lsm-write-l0-current.jsonl`
-- L0-pressure comparator smoke: `zig build lsm-write-bench-compare && ./zig-out/bin/lsm_write_bench_compare --before /tmp/lsm-write-l0-current.jsonl --after /tmp/lsm-write-l0-current.jsonl`
-- L0-pressure load median after the 2026-06-02 base-level target tuning:
-  `ns/op=1449.60`, effective L0 soft/hard `4/8`, foreground write-pressure
-  compactions `28`, `l0_runs_after=4`, `compactable_l0_runs_after=0`,
-  `level_overflow_runs_after=0`, `level_overflow_bytes_after=0`,
-  `wal_retained_bytes_after=0`.
-- L0 maintenance median after the same tuning: `ns/op=250.00`,
-  compactions `0`, `l0_runs_after=4`, `compactable_l0_runs_after=0`,
-  `level_overflow_runs_after=0`, `wal_retained_bytes_after=0`.
-- After widening nonzero L0 pressure assist windows to compact up to
-  `2 * l0_limit`, the same 3-sample L0-pressure run produced load
-  `ns/op=1546.75`, write-pressure compactions `28`, `l0_runs_after=4`,
-  `compactable_l0_runs_after=0`, `level_overflow_runs_after=24`, and
-  `wal_retained_bytes_after=0`. Follow-up maintenance dropped to
-  `ns/op=1504125.00` with `1` compaction.
-- Before the base-level target tuning, the same current run still left
-  `level_overflow_runs_after=24` and required one follow-up maintenance
-  compaction. Raising the default base-level target from 4 runs/128 KiB to
-  32 runs/1 MiB removes that immediate L1 overflow while preserving bounded L0
-  and zero retained WAL.
-
-The next compaction-policy slice should target the remaining foreground
-compaction cost shown by the L0-pressure load phase, while preserving the zero
-retained-WAL after-state and bounded maintenance cleanup.
-
-Large-ingest guardrails:
-
-- Run the 50k and 1M dense public/provisioned guardrails after any change that
-  touches WAL, flush, compaction, manifest publication, HBC publish, or
-  ResourceManager pressure.
+> **Relocated:** The dated 2026-06-02 sampled baseline evidence (48 lines) that
+> previously lived here is preserved verbatim in
+> [work-log/completed/lsm-writes/baseline-evidence-2026-06.md](../../../../../../work-log/completed/lsm-writes/baseline-evidence-2026-06.md).
+> Run the commands in Baseline Commands above to collect current numbers.
 
 ### Read And Scan Work
 
@@ -878,10 +846,8 @@ Task list:
    - Already-accepted owner jobs still drain deterministically, but maintenance
      callbacks cannot recursively schedule new work while close is draining the
      owner.
-   - Verification: `antfly-storage-test --test-timeout 600s` advanced past the
-     prior `Backend.close() -> background.Executor.drain()` stall and the new
-     owner-close runtime tests passed; that long-suite run later timed out in a
-     focused shared-embedding wait that passes independently.
+   - Verification: the owner-close runtime tests pass, including past the
+     previous `Backend.close() -> background.Executor.drain()` stall.
 15. Adding final-state HBC bulk publication for empty or sustained ingest, so
    large loads do not persist every intermediate online mutation, is still
    open (see [Open work](#open-work); this duplicates item 4 above).

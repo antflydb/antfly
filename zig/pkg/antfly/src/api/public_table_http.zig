@@ -104,12 +104,17 @@ pub const TableApi = struct {
     }
 
     pub const ExecuteBatchError = error{
+        RelationalIndexKeyTooLarge,
         InvalidBatchRequest,
+        Forbidden,
         UnsupportedSyncLevel,
         GraphMetricFeatureNotEnabled,
         GraphMetricMaterializationRejected,
         NotFound,
         Conflict,
+        UniqueConstraintViolation,
+        ForeignKeyParentMissing,
+        ForeignKeyReferenced,
         MethodNotAllowed,
         Backpressured,
         DenseRepairBackpressure,
@@ -201,6 +206,7 @@ pub const TableApi = struct {
     };
 
     pub const ExecuteBackupError = error{
+        CoordinatedConstraintPortableBackupUnsupported,
         Canceled,
         DeadlineExceeded,
         MetadataCapabilityUnavailable,
@@ -243,6 +249,8 @@ pub const TableApi = struct {
     };
 
     pub const ExecuteRestoreError = error{
+        CoordinatedConstraintPortableBackupUnsupported,
+        CoordinatedConstraintRestoreRequired,
         Canceled,
         DeadlineExceeded,
         NotLeader,
@@ -268,6 +276,8 @@ pub const TableApi = struct {
         DeadlineExceeded,
         NotFound,
         InternalFailure,
+        Conflict,
+        Unavailable,
     };
 
     pub const ExecuteGetIndexError = error{
@@ -275,6 +285,8 @@ pub const TableApi = struct {
         DeadlineExceeded,
         NotFound,
         InternalFailure,
+        Conflict,
+        Unavailable,
     };
 
     pub const ExecuteCreateIndexError = error{
@@ -323,6 +335,8 @@ pub const TableApi = struct {
         MethodNotAllowed,
         InternalFailure,
     };
+
+    pub const ExecuteIndexMaintenanceError = error{ Canceled, DeadlineExceeded, NotLeader, Conflict, Backpressured, InvalidIndexMaintenance, NotFound, MethodNotAllowed, Unavailable, InternalFailure };
 
     pub const ExecutePutArtifactEnrichmentError = error{
         Canceled,
@@ -482,6 +496,15 @@ pub const TableApi = struct {
             index_name: []const u8,
             request: operation.RequestContext,
         ) ExecuteDeleteIndexError!void,
+        execute_table_index_maintenance: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            index_name: []const u8,
+            action: @import("../storage/db/relational_index_maintenance_contract.zig").Action,
+            body: []const u8,
+            request: operation.RequestContext,
+        ) ExecuteIndexMaintenanceError![]u8 = null,
         execute_table_graph_metric_action: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -1575,7 +1598,72 @@ pub fn handleTableBatch(
     };
     defer batch_req.deinit(alloc);
 
+    return executeOwnedTableBatch(alloc, table_name, batch_req, api);
+}
+
+pub fn handleRelationalRowsMutation(alloc: std.mem.Allocator, table_name: []const u8, body: []const u8, api: TableApi) !OwnedResponse {
+    resetLastBatchFailureName();
+    last_ambiguous_batch_txn_id = null;
+    var req = @import("relational_rows.zig").parseMutation(alloc, body) catch |err| switch (err) {
+        error.InvalidBatchRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "{\"error\":\"invalid relational mutation request\"}"), .json = true },
+        else => return err,
+    };
+    defer req.deinit(alloc);
+    var response = try executeOwnedTableBatch(alloc, table_name, req, api);
+    errdefer response.deinit(alloc);
+    if (response.status >= 400 and !response.json) {
+        const encoded = try std.json.Stringify.valueAlloc(alloc, .{ .@"error" = response.body }, .{});
+        alloc.free(response.body);
+        response.body = encoded;
+        response.json = true;
+    }
+    return response;
+}
+
+pub fn handleRelationalConstraintRetry(alloc: std.mem.Allocator, table_name: []const u8, body: []const u8, api: TableApi) !OwnedResponse {
+    var parsed = std.json.parseFromSlice(struct { schema_version: u32 }, alloc, body, .{}) catch
+        return .{ .status = 400, .json = true, .body = try alloc.dupe(u8, "{\"error\":\"schema_version is required\"}") };
+    defer parsed.deinit();
+    return executeRelationalLifecycle(alloc, table_name, parsed.value.schema_version, api);
+}
+
+pub fn handleRelationalConstraintRetirement(alloc: std.mem.Allocator, table_name: []const u8, body: []const u8, api: TableApi) !OwnedResponse {
+    // The generated public contract owns these fields. Preserve target_schema
+    // as exact JSON here: generated optional/default normalization must not
+    // turn an omitted property into a new property in subtract-only DDL.
+    var parsed = std.json.parseFromSlice(struct { schema_version: u32, target_schema: ?std.json.Value = null, drop: bool = false }, alloc, body, .{ .allocate = .alloc_always, .parse_numbers = false }) catch
+        return .{ .status = 400, .json = true, .body = try alloc.dupe(u8, "{\"error\":\"invalid retirement request\"}") };
+    defer parsed.deinit();
+    if (parsed.value.drop == (parsed.value.target_schema != null)) return .{ .status = 400, .json = true, .body = try alloc.dupe(u8, "{\"error\":\"provide target_schema or drop=true, and schema_version\"}") };
+    const target = if (parsed.value.target_schema) |value| try std.json.Stringify.valueAlloc(alloc, value, .{}) else null;
+    defer if (target) |bytes| alloc.free(bytes);
+    var operation_api = api;
+    operation_api.request.relational_retirement_target = target;
+    operation_api.request.relational_retirement_drop = parsed.value.drop;
+    return executeRelationalLifecycle(alloc, table_name, parsed.value.schema_version, operation_api);
+}
+
+fn executeRelationalLifecycle(alloc: std.mem.Allocator, table_name: []const u8, schema_version: u32, api: TableApi) !OwnedResponse {
+    // Retry is idempotent per owner. A failure after partial progress can be
+    // safely retried; ordinary row writes never gain repair authority.
+    api.executeTableBatch(alloc, table_name, .{ .relational_schema_version = schema_version }) catch |err| {
+        const status: u16 = switch (err) {
+            error.NotFound => 404,
+            error.Forbidden => 403,
+            error.InvalidBatchRequest => 400,
+            error.Conflict => 409,
+            error.Canceled, error.DeadlineExceeded => return err,
+            else => 503,
+        };
+        return .{ .status = status, .json = true, .body = try std.json.Stringify.valueAlloc(alloc, .{ .@"error" = @errorName(err) }, .{}) };
+    };
+    return .{ .status = 202, .json = true, .body = try alloc.dupe(u8, "{\"status\":\"accepted\"}") };
+}
+
+fn executeOwnedTableBatch(alloc: std.mem.Allocator, table_name: []const u8, batch_req: batch_api.OwnedBatchRequest, api: TableApi) !OwnedResponse {
     api.executeTableBatch(alloc, table_name, batch_req.req) catch |err| switch (err) {
+        error.RelationalIndexKeyTooLarge => return .{ .status = 413, .json = true, .body = try alloc.dupe(u8, "{\"error\":\"RelationalIndexKeyTooLarge\",\"message\":\"encoded relational index keys, including the document ID, must not exceed 1048576 bytes\"}") },
+        error.Forbidden => return .{ .status = 403, .body = try alloc.dupe(u8, "write permission required for every table affected by this mutation") },
         error.InvalidBatchRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "invalid batch request") },
         error.UnsupportedSyncLevel => return .{ .status = 400, .body = try alloc.dupe(u8, "unsupported sync_level") },
         error.GraphMetricFeatureNotEnabled => return .{
@@ -1590,6 +1678,11 @@ pub fn handleTableBatch(
         },
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
         error.Conflict => return .{ .status = 409, .body = try alloc.dupe(u8, "batch transaction conflicted") },
+        error.UniqueConstraintViolation, error.ForeignKeyParentMissing, error.ForeignKeyReferenced => return .{
+            .status = 409,
+            .json = true,
+            .body = try std.json.Stringify.valueAlloc(alloc, .{ .@"error" = @errorName(err) }, .{}),
+        },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
         error.Backpressured => return .{
             .status = 429,
@@ -2071,6 +2164,7 @@ pub fn handleTableBackupExpectedFence(
         error.BackupManifestTooLarge => return .{ .status = 400, .body = try alloc.dupe(u8, backups_api.manifest_too_large_message) },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
         error.UnsupportedBackupFormat => return .{ .status = 400, .body = try alloc.dupe(u8, "native backup does not support one or more configured index backends") },
+        error.CoordinatedConstraintPortableBackupUnsupported => return .{ .status = 409, .body = try alloc.dupe(u8, "portable backup of coordinated constraints requires cluster-wide integrity export, which is not yet supported") },
         error.UnsupportedBackupMigrationState => return .{
             .status = 400,
             .body = try backups_api.encodeErrorBody(alloc, "backup does not support active schema migration"),
@@ -2140,6 +2234,8 @@ pub fn handleTableRestore(
         error.UnsupportedBackupMigrationState => return .{ .status = 400, .body = try alloc.dupe(u8, "restore does not support active schema migration") },
         error.UnsupportedMultiRangeTable => return .{ .status = 400, .body = try alloc.dupe(u8, "restore does not support multi-range tables") },
         error.UnsupportedBackupFormat => return .{ .status = 400, .body = try alloc.dupe(u8, "restore does not support this backup layout") },
+        error.CoordinatedConstraintPortableBackupUnsupported => return .{ .status = 409, .body = try alloc.dupe(u8, "portable restore of coordinated constraints requires cluster-wide integrity restoration") },
+        error.CoordinatedConstraintRestoreRequired => return .{ .status = 409, .body = try alloc.dupe(u8, "restoring a constrained table requires coordinated restoration of parent claims and references") },
         error.RestoreValidationPending => return .{ .status = 503, .body = try alloc.dupe(u8, "restore validation is temporarily unavailable; retry later") },
         error.RestoreDurabilityPending => return .{ .status = 202, .body = try backups_api.encodeRestoreDurabilityPending(alloc), .json = true },
         error.RestoreDurabilityConfirmed => return .{ .status = 200, .body = try backups_api.encodeRestoreDurabilityConfirmed(alloc), .json = true },
@@ -2223,6 +2319,8 @@ pub fn handleTableListIndexes(
         error.Canceled, error.DeadlineExceeded => return err,
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "index list failed") },
+        error.Conflict => return .{ .status = 409, .body = try alloc.dupe(u8, "index schema or ownership changed; refresh and retry") },
+        error.Unavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "index owners unavailable; retry status collection") },
     };
     return .{ .status = 200, .body = response_body, .json = true };
 }
@@ -2237,6 +2335,8 @@ pub fn handleTableGetIndex(
         error.Canceled, error.DeadlineExceeded => return err,
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "index lookup failed") },
+        error.Conflict => return .{ .status = 409, .body = try alloc.dupe(u8, "index schema or ownership changed; refresh and retry") },
+        error.Unavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "index owners unavailable; retry status collection") },
     };
     return .{ .status = 200, .body = response_body, .json = true };
 }
@@ -2304,6 +2404,22 @@ pub fn handleTableDeleteIndex(
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "{\"error\":\"internal_error\",\"message\":\"index delete failed\",\"retryable\":false}"), .json = true },
     };
     return .{ .status = 201, .body = try alloc.dupe(u8, "{}"), .json = true };
+}
+
+pub fn handleTableIndexMaintenance(alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, action: @import("../storage/db/relational_index_maintenance_contract.zig").Action, body: []const u8, api: TableApi) !OwnedResponse {
+    try api.ensureActive();
+    const callback = api.vtable.execute_table_index_maintenance orelse return .{ .status = 405, .body = try alloc.dupe(u8, "index maintenance is not supported") };
+    const response = callback(api.ptr, alloc, table_name, index_name, action, body, api.request) catch |err| switch (err) {
+        error.Canceled, error.DeadlineExceeded, error.NotLeader => return err,
+        error.InvalidIndexMaintenance => return .{ .status = 400, .body = try alloc.dupe(u8, "invalid index maintenance proof") },
+        error.Conflict => return .{ .status = 409, .body = try alloc.dupe(u8, "index generation, owner, or maintenance observation changed; some selected owners may already be admitted") },
+        error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "index not found") },
+        error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "index maintenance is not supported") },
+        error.Backpressured => return .{ .status = 429, .body = try alloc.dupe(u8, "index maintenance admission is busy; retry the identical request"), .retry_after_seconds = 1 },
+        error.Unavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "index maintenance acknowledgement unavailable; retry the identical request") },
+        error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "index maintenance failed; retry the identical request") },
+    };
+    return .{ .status = 200, .json = true, .body = response };
 }
 
 pub fn handleTableGraphMetricAction(
@@ -2881,6 +2997,89 @@ fn unsupportedRestore(
     _: operation.RequestContext,
 ) TableApi.ExecuteRestoreError!void {
     return error.InternalFailure;
+}
+
+test "relational mutation HTTP preserves conditional coordinator inputs" {
+    const Backend = struct {
+        called: bool = false,
+        missing: bool = false,
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, table: []const u8, req: db_mod.types.BatchRequest, _: operation.RequestContext) TableApi.ExecuteBatchError!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.missing) return error.NotFound;
+            if (!std.mem.eql(u8, table, "rows") or req.relational_schema_version != 8 or req.writes.len != 1 or req.predicates.len != 1 or
+                req.predicates[0].expected_version != 9007199254740993) return error.InternalFailure;
+            self.called = true;
+        }
+    };
+    var backend: Backend = .{};
+    const api = TableApi{ .ptr = &backend, .request = .{}, .vtable = &.{
+        .execute_table_batch = Backend.execute,
+        .execute_table_query_request = unsupportedQueryRequest,
+        .execute_table_query_view = unsupportedQueryView,
+        .execute_table_backup = unsupportedBackup,
+        .execute_table_restore = unsupportedRestore,
+        .execute_table_list_indexes = unsupportedListIndexes,
+        .execute_table_get_index = unsupportedGetIndex,
+        .execute_table_create_index = unsupportedCreateIndex,
+        .execute_table_delete_index = unsupportedDeleteIndex,
+    } };
+    var response = try handleRelationalRowsMutation(std.testing.allocator, "rows",
+        \\{"schema_version":8,"mutations":[{"key":"a","expected_version":"9007199254740993","row":{"id":9007199254740993}}]}
+    , api);
+    defer response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 201), response.status);
+    try std.testing.expect(backend.called);
+    var invalid = try handleRelationalRowsMutation(std.testing.allocator, "rows", "{}", api);
+    defer invalid.deinit(std.testing.allocator);
+    try std.testing.expect(invalid.json);
+    try std.testing.expectEqual(@as(u16, 400), invalid.status);
+    var invalid_json = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, invalid.body, .{});
+    defer invalid_json.deinit();
+    try std.testing.expect(invalid_json.value.object.contains("error"));
+    backend.missing = true;
+    var missing = try handleRelationalRowsMutation(std.testing.allocator, "rows",
+        \\{"schema_version":8,"mutations":[{"key":"a","expected_version":"0","row":{}}]}
+    , api);
+    defer missing.deinit(std.testing.allocator);
+    try std.testing.expect(missing.json);
+    try std.testing.expectEqual(@as(u16, 404), missing.status);
+    try std.testing.expectEqualStrings("{\"error\":\"not found\"}", missing.body);
+}
+
+test "public table constraint lifecycle accepts explicit epoch zero but never missing versions" {
+    const Backend = struct {
+        called: usize = 0,
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, req: db_mod.types.BatchRequest, _: operation.RequestContext) TableApi.ExecuteBatchError!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (req.relational_schema_version != 0) return error.InternalFailure;
+            self.called += 1;
+        }
+    };
+    var backend: Backend = .{};
+    const api: TableApi = .{ .ptr = &backend, .request = .{}, .vtable = &.{
+        .execute_table_batch = Backend.execute,
+        .execute_table_query_request = unsupportedQueryRequest,
+        .execute_table_query_view = unsupportedQueryView,
+        .execute_table_backup = unsupportedBackup,
+        .execute_table_restore = unsupportedRestore,
+        .execute_table_list_indexes = unsupportedListIndexes,
+        .execute_table_get_index = unsupportedGetIndex,
+        .execute_table_create_index = unsupportedCreateIndex,
+        .execute_table_delete_index = unsupportedDeleteIndex,
+    } };
+    var retry = try handleRelationalConstraintRetry(std.testing.allocator, "initial", "{\"schema_version\":0}", api);
+    defer retry.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 202), retry.status);
+    var retire = try handleRelationalConstraintRetirement(std.testing.allocator, "initial", "{\"schema_version\":0,\"drop\":true}", api);
+    defer retire.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 202), retire.status);
+    var missing_retry = try handleRelationalConstraintRetry(std.testing.allocator, "initial", "{}", api);
+    defer missing_retry.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 400), missing_retry.status);
+    var missing_retire = try handleRelationalConstraintRetirement(std.testing.allocator, "initial", "{\"drop\":true}", api);
+    defer missing_retire.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 400), missing_retire.status);
+    try std.testing.expectEqual(@as(usize, 2), backend.called);
 }
 
 test "public table batch handler returns created batch response" {
@@ -4651,7 +4850,7 @@ test "public table query handler maps exact graph execution failures" {
     try std.testing.expectEqualStrings("pattern", work_error.operation);
     try std.testing.expectEqualStrings("match", work_error.mode);
     try std.testing.expectEqualStrings("intermediate_states", work_error.dimension);
-    try std.testing.expectEqual(@as(i64, 100_000), work_error.maximum);
+    try std.testing.expectEqual(@as(u64, 100_000), work_error.maximum);
 
     kind = .path_weight_domain;
     var weight_resp = try handleTableQueryRequest(
@@ -4702,7 +4901,7 @@ test "public table query handler maps exact graph execution failures" {
     try std.testing.expect(!distinct_error.retryable);
     try std.testing.expectEqualStrings("unique_people", distinct_error.operation);
     try std.testing.expectEqualStrings("distinct_identities", distinct_error.dimension);
-    try std.testing.expectEqual(@as(i64, 512), distinct_error.maximum);
+    try std.testing.expectEqual(@as(u64, 512), distinct_error.maximum);
     try std.testing.expect(distinct_error.remediation.len > 0);
 
     kind = .anchor_filter;
@@ -4758,8 +4957,8 @@ test "public table query handler maps exact graph execution failures" {
         else => return error.TestUnexpectedResult,
     };
     try std.testing.expect(!limit_error.retryable);
-    try std.testing.expectEqual(@as(i64, graph_query_mod.max_match_queries_per_request), limit_error.maximum);
-    try std.testing.expectEqual(@as(i64, graph_query_mod.max_match_queries_per_request + 1), limit_error.actual);
+    try std.testing.expectEqual(@as(u64, graph_query_mod.max_match_queries_per_request), limit_error.maximum);
+    try std.testing.expectEqual(@as(u64, graph_query_mod.max_match_queries_per_request + 1), limit_error.actual);
 
     kind = .graph_query_mode;
     var cross_range_resp = try handleTableQueryRequest(
@@ -4852,7 +5051,7 @@ test "public table query handler maps exact graph execution failures" {
         .graph_match_operation_limit_exceeded_error => |value| value,
         else => return error.TestUnexpectedResult,
     };
-    try std.testing.expectEqual(@as(i64, 2), legacy_limit_error.actual);
+    try std.testing.expectEqual(@as(u64, 2), legacy_limit_error.actual);
 }
 
 test "unsupported graph diagnostics identify the rejected operation feature" {

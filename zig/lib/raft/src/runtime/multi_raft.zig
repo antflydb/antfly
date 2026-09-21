@@ -681,6 +681,34 @@ pub const MultiRaft = struct {
         } else {
             try self.addGroup(desc.group);
             result.created = true;
+            if (desc.recover_persisted_snapshot) {
+                var snapshot = try desc.group.storage.snapshot(self.alloc);
+                defer snapshot.deinit(self.alloc);
+                // A custom provider may return shared storage ownership. Do
+                // not attach this runtime's admission lifetime to that owner.
+                if (snapshot.shared_data != null) {
+                    const detached = try snapshot.cloneDetached(self.alloc);
+                    snapshot.deinit(self.alloc);
+                    snapshot = detached;
+                }
+                if (snapshot.metadata.index == 0 or snapshot.metadata.index <= desc.group.raft_config.applied)
+                    return error.InvalidRecoverySnapshot;
+                if (snapshot.data.len > self.cfg.max_single_apply_ready_bytes or
+                    !self.hasApplyCapacity(1, snapshot.data.len)) return error.SnapshotAdmissionBackpressure;
+                const snapshot_bytes = snapshot.data.len;
+                try self.reserveSnapshotBytes(snapshot_bytes);
+                var admission_owned = true;
+                errdefer if (admission_owned) self.releaseSnapshotBytes(snapshot_bytes);
+                try snapshot.shareOwnedData(self.alloc, .{ .ptr = self, .release = releaseSnapshotBytesCallback });
+                admission_owned = false;
+                // RaftLog.init already accounts for the durable snapshot in
+                // its log cursor, but native application may have crashed
+                // before installation. Put recovery ahead of every later
+                // apply/ReadState in this incarnation's ordinary retry queue.
+                // Repeated admission of a live group must not enqueue it twice.
+                try self.enqueueApply(desc.group.group_id, snapshot, &.{}, &.{}, snapshot.metadata.conf_state);
+                self.refreshQueueMetrics();
+            }
         }
 
         switch (desc.bootstrap) {
@@ -2796,10 +2824,12 @@ const GroupBatchBuilder = struct {
 const PeerBatchBuilder = struct {
     peer_id: core.types.NodeId,
     groups: std.ArrayListUnmanaged(GroupBatchBuilder) = .empty,
+    group_indexes: std.AutoHashMapUnmanaged(core.types.GroupId, usize) = .empty,
 
     fn deinit(self: *PeerBatchBuilder, alloc: std.mem.Allocator) void {
         for (self.groups.items) |*group| group.deinit(alloc);
         self.groups.deinit(alloc);
+        self.group_indexes.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -2924,24 +2954,22 @@ const TransportOutbox = struct {
             peer_builders.deinit(alloc);
         }
 
+        var peer_indexes: std.AutoHashMapUnmanaged(core.types.NodeId, usize) = .empty;
+        defer peer_indexes.deinit(alloc);
         for (self.items.items) |item| {
             if (item.accepted) continue;
-            const peer_idx = blk: {
-                for (peer_builders.items, 0..) |peer, i| {
-                    if (peer.peer_id == item.message.to) break :blk i;
-                }
+            const peer_entry = try peer_indexes.getOrPut(alloc, item.message.to);
+            if (!peer_entry.found_existing) {
+                peer_entry.value_ptr.* = peer_builders.items.len;
                 try peer_builders.append(alloc, .{ .peer_id = item.message.to });
-                break :blk peer_builders.items.len - 1;
-            };
-
-            const peer = &peer_builders.items[peer_idx];
-            const group_idx = blk: {
-                for (peer.groups.items, 0..) |group, i| {
-                    if (group.group_id == item.group_id) break :blk i;
-                }
+            }
+            const peer = &peer_builders.items[peer_entry.value_ptr.*];
+            const group_entry = try peer.group_indexes.getOrPut(alloc, item.group_id);
+            if (!group_entry.found_existing) {
+                group_entry.value_ptr.* = peer.groups.items.len;
                 try peer.groups.append(alloc, .{ .group_id = item.group_id });
-                break :blk peer.groups.items.len - 1;
-            };
+            }
+            const group_idx = group_entry.value_ptr.*;
 
             try peer.groups.items[group_idx].messages.append(alloc, item.message);
         }
@@ -3428,6 +3456,86 @@ test "synchronous snapshot submission emits an exact delivery completion" {
     try std.testing.expectEqual(@as(u64, 13), completion.attempt_generation);
     try std.testing.expectEqual(@as(core.types.Index, 101), completion.snapshot_index);
     try std.testing.expectEqual(snapshot_transport_iface.SnapshotCompletionStatus.delivered, completion.status);
+}
+
+test "multi raft recovered snapshot precedes log replay and read states under retry" {
+    const Fixture = struct {
+        blocked: bool = true,
+        applied: u64 = 5,
+        snapshots: usize = 0,
+        reads: usize = 0,
+        fn apply(ptr: *anyopaque, _: u64, snapshot: ?core.types.Snapshot, entries: []const core.Entry, read_states: []const core.ReadState) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (snapshot) |value| {
+                if (self.blocked) return error.StorageBusy;
+                try std.testing.expectEqualStrings("native-cut-ten", value.data);
+                self.applied = value.metadata.index;
+                self.snapshots += 1;
+            }
+            for (entries) |entry| {
+                try std.testing.expectEqual(self.applied + 1, entry.index);
+                self.applied = entry.index;
+            }
+            for (read_states) |state| {
+                try std.testing.expect(self.applied >= state.index);
+                self.reads += 1;
+            }
+        }
+        fn retryable(_: *anyopaque, _: u64, err: anyerror) bool {
+            return err == error.StorageBusy;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var fixture: Fixture = .{};
+    var storage = core.MemoryStorage.init(alloc);
+    defer storage.deinit();
+    try storage.applySnapshot(.{ .metadata = .{ .index = 10, .term = 2, .conf_state = .{ .voters = @constCast(&[_]u64{1}) } }, .data = @constCast("native-cut-ten") });
+    try storage.append(&.{ .{ .index = 11, .term = 2 }, .{ .index = 12, .term = 2 } });
+    storage.setHardState(.{ .current_term = 2, .commit_index = 12 });
+    var runtime = MultiRaft.init(alloc, .{}, .{ .state_machine = .{ .ptr = &fixture, .vtable = &.{ .apply_ready = Fixture.apply, .is_apply_retryable = Fixture.retryable } } });
+    defer runtime.deinit();
+    const descriptor: replica_mod.ReplicaDescriptor = .{
+        .group = .{ .group_id = 7, .local_node_id = 1, .raft_config = .{ .id = 1, .group_id = 7, .peers = &.{1}, .applied = 5 }, .storage = storage.storage() },
+        .recover_persisted_snapshot = true,
+    };
+    try std.testing.expect((try runtime.ensureReplica(descriptor)).created);
+    try std.testing.expect(!(try runtime.ensureReplica(descriptor)).created);
+    try std.testing.expectEqual(@as(usize, 1), runtime.pending_apply.items.len);
+    _ = try runtime.processReady(7);
+    try runtime.enqueueApply(7, null, &.{}, &.{.{ .index = 12, .request_ctx = @constCast("reader") }}, .{});
+    try runtime.flushPendingApply();
+    try std.testing.expectEqual(@as(u64, 5), fixture.applied);
+    try std.testing.expectEqual(@as(usize, 0), fixture.reads);
+    try std.testing.expectEqual(@as(usize, "native-cut-ten".len), runtime.pending_snapshot_bytes.load(.acquire));
+    fixture.blocked = false;
+    for (0..4) |_| _ = try runtime.processReady(7);
+    try std.testing.expectEqual(@as(u64, 12), fixture.applied);
+    try std.testing.expectEqual(@as(usize, 1), fixture.snapshots);
+    try std.testing.expectEqual(@as(usize, 1), fixture.reads);
+    try std.testing.expectEqual(@as(usize, 0), runtime.pending_snapshot_bytes.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), runtime.pending_apply.items.len);
+}
+
+test "multi raft recovered snapshot admission failure leaves no live replica" {
+    var storage = core.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+    try storage.applySnapshot(.{ .metadata = .{ .index = 10, .term = 2, .conf_state = .{ .voters = @constCast(&[_]u64{1}) } }, .data = @constCast("recovered") });
+    storage.setHardState(.{ .current_term = 2, .commit_index = 10 });
+    var runtime = MultiRaft.init(std.testing.allocator, .{ .max_pending_snapshot_bytes = 1 }, .{});
+    defer runtime.deinit();
+    const descriptor: replica_mod.ReplicaDescriptor = .{
+        .group = .{ .group_id = 7, .local_node_id = 1, .raft_config = .{ .id = 1, .group_id = 7, .peers = &.{1}, .applied = 5 }, .storage = storage.storage() },
+        .recover_persisted_snapshot = true,
+    };
+    try std.testing.expectError(error.SnapshotAdmissionBackpressure, runtime.ensureReplica(descriptor));
+    try std.testing.expect(runtime.group(7) == null);
+    try std.testing.expectEqual(@as(usize, 0), runtime.pending_apply.items.len);
+    try std.testing.expectEqual(@as(usize, 0), runtime.pending_snapshot_bytes.load(.acquire));
+    runtime.cfg.max_pending_snapshot_bytes = 1024;
+    try std.testing.expect((try runtime.ensureReplica(descriptor)).created);
+    try std.testing.expectEqual(@as(usize, 1), runtime.pending_apply.items.len);
+    try std.testing.expect(runtime.removeGroup(7));
+    try std.testing.expectEqual(@as(usize, 0), runtime.pending_snapshot_bytes.load(.acquire));
 }
 
 test "multi raft owns real groups" {

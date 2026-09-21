@@ -132,6 +132,7 @@ fn metadataWalReplicaStateConfig() antfly.raft.storage.WalReplicaStateConfig {
 
 const CliConfig = struct {
     config_path: ?[]const u8 = null,
+    online_merge_enabled: bool = true,
     experimental: bool = false,
     raft_host: ?[]const u8 = null,
     raft_port: ?u16 = null,
@@ -362,6 +363,8 @@ pub const HealthSource = struct {
         try append(writer, "antfly_raft_async_send_queue_full_total", "counter", "Total async raft HTTP global queue-full events", host_metrics.async_send_queue_full);
         try append(writer, "antfly_raft_async_send_peer_queue_full_total", "counter", "Total async raft HTTP per-peer queue-full events", host_metrics.async_send_peer_queue_full);
         try append(writer, "antfly_raft_async_send_pending", "gauge", "Pending async raft HTTP frames", @intCast(host_metrics.async_send_pending));
+        try append(writer, "antfly_raft_async_send_retained_bytes", "gauge", "Retained async raft HTTP bytes including in-flight and failed frames", @intCast(host_metrics.async_send_retained_bytes));
+        try append(writer, "antfly_raft_async_send_retained_frames", "gauge", "Retained async raft HTTP frames including in-flight and failed frames", @intCast(host_metrics.async_send_retained_frames));
         try append(writer, "antfly_raft_async_snapshot_send_enqueued_total", "counter", "Total raft snapshots admitted to the bounded async HTTP send lane", host_metrics.async_snapshot_send_enqueued);
         try append(writer, "antfly_raft_async_snapshot_send_failed_total", "counter", "Total async raft snapshot HTTP send failures", host_metrics.async_snapshot_send_failed);
         try append(writer, "antfly_raft_async_snapshot_send_retried_total", "counter", "Total async raft snapshot sends requeued for retry", host_metrics.async_snapshot_send_retried);
@@ -467,6 +470,10 @@ pub const MetadataClusterPeer = struct {
 };
 
 pub const ServerConfig = struct {
+    /// Prefer online copying where the authenticated native protocol bundle
+    /// and each new candidate are eligible. False disables new admission while
+    /// still recovering already-admitted online transitions.
+    online_merge_enabled: bool = true,
     local_node_id: u64 = 1,
     metadata_group_id: u64 = group_ids.main_metadata_group_id,
     metadata_cluster_peers: []const MetadataClusterPeer = &.{},
@@ -485,6 +492,42 @@ pub const ServerConfig = struct {
     api_server_cfg: antfly.public_api.http_server.ApiHttpServerConfig = .{},
     storage_context: ?*anyopaque = null,
 };
+
+test "metadata server online merge default preserves unsupported startup and explicit disable" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/online-install", .{tmp.sub_path});
+    defer alloc.free(root);
+    const catalog = try std.fmt.allocPrint(alloc, "{s}/catalog", .{root});
+    defer alloc.free(catalog);
+    const snapshots = try std.fmt.allocPrint(alloc, "{s}/snapshots", .{root});
+    defer alloc.free(snapshots);
+    var cfg: ServerConfig = .{ .replica_root_dir = root, .replica_catalog_path = catalog, .snapshot_root_dir = snapshots };
+    try std.testing.expect(cfg.online_merge_enabled);
+    // Missing authentication disables only the online driver, not deployment
+    // startup. The ordinary merge path remains available.
+    {
+        var server = try Server.init(alloc, cfg);
+        defer server.deinit();
+        try std.testing.expect(server.server.svc.online_merge_runtime == null);
+    }
+    cfg.online_merge_enabled = false;
+    cfg.api_server_cfg.internal_service_secret = "online-config-test-secret";
+    {
+        var server = try Server.init(alloc, cfg);
+        defer server.deinit();
+        try std.testing.expectEqual(linked_storage, server.server.svc.online_merge_runtime != null);
+        if (server.server.svc.online_merge_runtime) |runtime| try std.testing.expect(runtime.driver.admit == null);
+    }
+    cfg.online_merge_enabled = true;
+    {
+        var server = try Server.init(alloc, cfg);
+        defer server.deinit();
+        try std.testing.expectEqual(linked_storage, server.server.svc.online_merge_runtime != null);
+        if (server.server.svc.online_merge_runtime) |runtime| try std.testing.expect(runtime.driver.admit != null);
+    }
+}
 
 const MetadataRaftStorageDiagnostics = struct {
     groups: usize = 0,
@@ -603,6 +646,7 @@ pub const Server = struct {
             .reallocation_protocol_peers = result.reallocation_protocol_peers,
         };
         result.server = try antfly.metadata_server.MetadataServer.init(alloc, .{
+            .online_merge_enabled = cfg.online_merge_enabled,
             .http = .{
                 .http = .{
                     .host = .{
@@ -972,8 +1016,8 @@ pub fn runFromIterator(
     var secret_store_initialized = false;
     defer if (secret_store_initialized) secret_store.deinit();
 
-    if (cli.secret_store_paths.items.len > 0) {
-        secret_store = try initLayeredSecretStore(alloc, setup_io.io(), cli.secret_store_paths.items);
+    if (try antfly.common.secrets.initFromConfigPathWithIo(alloc, setup_io.io(), cli.config_path, cli.secret_store_paths.items)) |configured_store| {
+        secret_store = configured_store;
         secret_store_initialized = true;
     }
 
@@ -1113,6 +1157,7 @@ pub fn runFromIterator(
         const security_json = try antfly.common.config.remoteContentSecurityJsonAlloc(alloc, remote_content);
         defer alloc.free(security_json);
         try storage_kernel_context.?.configureRemoteContentSecurity(security_json);
+        try storage_kernel_context.?.configureSecrets(if (secret_store_initialized) &secret_store else null);
     }
 
     var auth_backend: ?LegacyAuthBackend = null;
@@ -1174,7 +1219,19 @@ pub fn runFromIterator(
     const listener = resolveRaftListener(cli, if (loaded_config) |*cfg| cfg else null);
     const admin_listener = resolveAdminListener(cli, if (loaded_config) |*cfg| cfg else null, local_node_id, listener.bind_host);
 
+    var native_keys: @import("../common/secret_keyring.zig").Keyring = undefined;
+    var native_secrets: ?@import("secret_store.zig").Store = null;
+    defer if (native_secrets) |*store| store.deinit();
+    if (secret_store_initialized) {
+        if (secret_store.native_config) |native| {
+            if (native.value.backend != .distributed or native.value.reader != null) return error.InvalidConfig;
+            native_keys = .{ .alloc = alloc, .io = setup_io.io(), .path = native.value.keyring_path.? };
+            try native_keys.validate();
+        }
+    }
+
     var server = try Server.init(alloc, .{
+        .online_merge_enabled = cli.online_merge_enabled,
         .local_node_id = local_node_id,
         .metadata_group_id = metadata_group_id,
         .metadata_cluster_peers = cluster_peers,
@@ -1216,6 +1273,13 @@ pub fn runFromIterator(
         .storage_context = storageKernelContextHandle(storage_kernel_context),
     });
     defer server.deinitWithDeadline(supervisor.deadline());
+    if (secret_store_initialized) {
+        if (secret_store.native_config) |native| {
+            native_secrets = try @import("secret_store.zig").Store.init(alloc, setup_io.io(), native.value.scope, native_keys.provider(), .{ .service = server.server.svc });
+            const handle = native_secrets.?.nativeStore();
+            secret_store.attachNative(handle.source, handle.writer);
+        }
+    }
     try server.start();
     try server.bootstrapCluster(metadata_group_id, local_node_id, cluster_peers);
     const synced_extension_packages = try server.server.svc.syncExtensionPackageStore(setup_io.io(), resolved.extension_package_store_dir);
@@ -1372,6 +1436,14 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
             cfg.control_tick_ms = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
+        if (std.mem.eql(u8, arg, "--online-merge-enabled")) {
+            cfg.online_merge_enabled = parseBoolFlag(args.next() orelse return error.InvalidArguments) orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--online-merge-enabled=")) {
+            cfg.online_merge_enabled = parseBoolFlag(arg["--online-merge-enabled=".len..]) orelse return error.InvalidArguments;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--data-dir")) {
             cfg.data_dir = args.next() orelse return error.InvalidArguments;
             continue;
@@ -1409,22 +1481,18 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
     return cfg;
 }
 
+test "metadata runtime secret store follows projected symlink rotation" {
+    try @import("../common/secret_projection_test_support.zig").expectRuntimeRotation(initLayeredSecretStore);
+}
+
 fn initLayeredSecretStore(
     alloc: std.mem.Allocator,
     io: std.Io,
     raw_paths: []const []const u8,
 ) !antfly.common.secrets.FileStore {
-    var normalized_paths: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer {
-        for (normalized_paths.items) |path| alloc.free(path);
-        normalized_paths.deinit(alloc);
-    }
-    for (raw_paths) |raw_path| {
-        const normalized_path = try normalizeResolvedPathAlloc(alloc, raw_path);
-        errdefer alloc.free(normalized_path);
-        try normalized_paths.append(alloc, normalized_path);
-    }
-    return try antfly.common.secrets.FileStore.initLayeredWithIo(alloc, io, normalized_paths.items);
+    // FileStore owns these paths and must follow their current symlink targets
+    // on reload, including Kubernetes projected-volume generation switches.
+    return try antfly.common.secrets.FileStore.initLayeredWithIo(alloc, io, raw_paths);
 }
 
 fn resolveLocalBaseDir(
@@ -1817,6 +1885,8 @@ fn printUsage(argv0: []const u8) void {
         \\  --experimental                 Enable experimental A2A protocol surfaces
         \\  --raft-tick-ms <ms>            Consensus progress interval, 1-1000 (default: 100)
         \\  --control-tick-ms <ms>         Control scheduling interval, 1-60000 (default: 100)
+        \\  --online-merge-enabled <bool>  Prefer online copying for eligible new merges (default: true; requires authenticated native storage)
+        \\                                 False stops new admission, but completes in-flight online merges
         \\  --data-dir <path>              Local storage root for metadata data
         \\  --replica-root-dir <path>      Replica root directory
         \\  --replica-catalog-path <path>  Replica catalog file path
@@ -1912,6 +1982,23 @@ test "metadata runtime cli accepts secret and extension package store paths" {
     defer cfg.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("/run/antfly/secrets/secrets.json", cfg.secret_store_paths.items[0]);
     try std.testing.expectEqualStrings("/opt/antfly/extensions", cfg.extension_package_store_dir.?);
+}
+
+test "metadata runtime cli online merge defaults on and accepts explicit disable" {
+    try std.testing.expect((CliConfig{}).online_merge_enabled);
+    var argv = [_][*:0]const u8{ "--online-merge-enabled", "true" };
+    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var cfg = try parseCli(std.testing.allocator, &iter);
+    defer cfg.deinit(std.testing.allocator);
+    try std.testing.expect(cfg.online_merge_enabled);
+    var off = [_][*:0]const u8{"--online-merge-enabled=false"};
+    var off_iter = std.process.Args.Iterator.init(.{ .vector = off[0..] });
+    var off_cfg = try parseCli(std.testing.allocator, &off_iter);
+    defer off_cfg.deinit(std.testing.allocator);
+    try std.testing.expect(!off_cfg.online_merge_enabled);
+    var invalid = [_][*:0]const u8{"--online-merge-enabled=maybe"};
+    var invalid_iter = std.process.Args.Iterator.init(.{ .vector = invalid[0..] });
+    try std.testing.expectError(error.InvalidArguments, parseCli(std.testing.allocator, &invalid_iter));
 }
 
 test "metadata runtime cli accepts layered secret store paths" {
@@ -2758,11 +2845,13 @@ test "metadata ownership excludes colliding data placements across control round
         var server = try Server.init(alloc, paths.config());
         defer server.deinit();
         try server.start();
+        // start() runs the restore supervisor. Drive Raft through the service
+        // owner so Ready processing shares its lock with supervisor ReadIndex.
         const svc = server.metadataHttpService();
         try server.bootstrapLocal(svc.metadata_group_id, 3);
         if (boot == 0) {
             try svc.upsertNode(.{ .node_id = 3 });
-            try svc.raft.runRaftRoundOnly();
+            try svc.runRaftRoundOnly();
             try svc.upsertStore(.{
                 .store_id = 3,
                 .node_id = 3,
@@ -2777,7 +2866,7 @@ test "metadata ownership excludes colliding data placements across control round
                 .store_id = 3,
                 .peer_node_ids = &.{},
             }, null, 0, false);
-            for (0..8) |_| try svc.raft.runRaftRoundOnly();
+            for (0..8) |_| try svc.runRaftRoundOnly();
         }
         for (0..8) |_| try server.runRound();
         std.debug.print("OWNERSHIP_RED placements boot={d} expects absent foreign group\n", .{boot});
@@ -2896,11 +2985,13 @@ fn exerciseMetadataOwnershipProjection(case: MetadataOwnershipProjectionCase) !v
         var server = try Server.init(alloc, cfg);
         defer server.deinit();
         try server.start();
+        // start() runs the restore supervisor. Drive Raft through the service
+        // owner so Ready processing shares its lock with supervisor ReadIndex.
         const svc = server.metadataHttpService();
         try server.bootstrapLocal(svc.metadata_group_id, 3);
         if (boot == 0) {
             try svc.upsertNode(.{ .node_id = 3 });
-            try svc.raft.runRaftRoundOnly();
+            try svc.runRaftRoundOnly();
             var groups = [_]antfly.metadata.table_manager.GroupStatusReport{.{
                 .group_id = data_group_id,
                 .doc_count = 1,
@@ -2944,7 +3035,7 @@ fn exerciseMetadataOwnershipProjection(case: MetadataOwnershipProjectionCase) !v
                 });
             }
         }
-        for (0..8) |_| try svc.raft.runRaftRoundOnly();
+        for (0..8) |_| try svc.runRaftRoundOnly();
         switch (case) {
             .progress => {
                 try expectMetadataOwnershipRemoteProgress(svc, boot, "before_control");

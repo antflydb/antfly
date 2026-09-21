@@ -69,10 +69,11 @@ function fixture() {
   };
 }
 
-test('drafts, closed PRs, forks, bots, readers, and stale SHAs never dispatch', async t => {
+test('drafts, closed PRs, foreign targets, missing heads, bots, readers, and stale SHAs never dispatch', async t => {
   for (const change of [
     f => {f.pr.draft=true;}, f => {f.pr.state='closed';},
-    f => {f.pr.head.repo={full_name:'fork/project'};},
+    f => {f.pr.base.repo={full_name:'other/project'};},
+    f => {f.pr.head.repo=null;},
     f => {f.comment.user.type='Bot';}, f => {f.permission('read');},
     f => {f.comment.body='/ci run '+BASE;},
     f => {f.permission('triage');},
@@ -298,6 +299,9 @@ test('path selection matches repository CI owners and does not enable optional t
   if (config.suites.some(s=>s.id==='zig')) {
     assert.deepEqual(selectSuites(['go/pkg/proxy/test.go'],f.pr,config),['policy','zig','sdks','proxy']);
     assert.ok(selectSuites(['specs/openapi/new.yaml'],f.pr,config).includes('operator'));
+    assert.ok(selectSuites(['go/pkg/operator/api/types.go'],f.pr,config).includes('operator'));
+    assert.ok(!selectSuites(['go/pkg/operator/work-log/README.md'],f.pr,config).includes('operator'));
+    assert.ok(!selectSuites(['go/pkg/proxy/docs/notes.mdx'],f.pr,config).includes('proxy'));
   } else {
     assert.deepEqual(selectSuites(['infra/src/test.go'],f.pr,config),['policy','infra']);
     assert.deepEqual(selectSuites(['ts/apps/dashboard/test.ts'],f.pr,config),['policy','vitest','playwright']);
@@ -346,8 +350,8 @@ test('every expensive worker is gated, pins its checkout, and disables automatic
 test('policy validates the executing workflow even when a release predates the controller', () => {
   const text=fs.readFileSync(path.resolve(__dirname,'../workflows/pr-ci-policy.yml'),'utf8');
   assert.match(text,/ref: \$\{\{ github.workflow_sha \}\}\n\s+path: trusted-ci/);
-  assert.match(text,/name: Test executing CI policy\n\s+working-directory: trusted-ci\n\s+run: node --test \.github\/scripts\/pr-ci.test.cjs/);
-  assert.match(text,/name: Test proposed CI policy when present\n\s+if: \$\{\{ hashFiles\('\.github\/scripts\/pr-ci.test.cjs'\) != '' \}\}\n\s+run: node --test \.github\/scripts\/pr-ci.test.cjs/);
+  assert.match(text,/name: Test executing CI policy\n\s+working-directory: trusted-ci\n\s+run: node --test \.github\/scripts\/\*\.test\.cjs/);
+  assert.match(text,/name: Test proposed CI policy when present\n\s+if: \$\{\{ hashFiles\('\.github\/scripts\/pr-ci.test.cjs'\) != '' \}\}\n\s+run: node --test \.github\/scripts\/\*\.test\.cjs/);
 });
 
 // The live rollout first creates an action_required check before an approval.
@@ -520,4 +524,62 @@ test('queued run link is replaced on a fresh approval', async () => {
   await f.call();
   assert.equal(f.statuses.at(-1).target_url, 'https://github.com/acme/project/actions/runs/92');
   assert.equal(f.checks.at(-1).status, 'queued');
+});
+
+
+test('maintainer-approved fork PRs complete using the base repository and exact head SHA', async () => {
+  const f = fixture();
+  f.pr.head.repo = {full_name: 'contributor/project'};
+  await f.call();
+  assert.equal(f.dispatches.length, 1);
+  assert.equal(f.dispatches[0].owner, 'acme');
+  assert.equal(f.dispatches[0].repo, 'project');
+  assert.equal(f.dispatches[0].ref, 'main');
+  await f.call('admit');
+  assert.equal(f.outputs.head_sha, SHA);
+  await f.call('verify');
+  f.finish(); await f.call();
+  assert.equal(f.checks[0].conclusion, 'success');
+  assert.equal(f.statuses.at(-1).sha, SHA);
+  assert.equal(f.statuses.at(-1).repo, 'project');
+});
+
+test('fork authors without upstream write access cannot approve CI', async () => {
+  const f = fixture();
+  f.pr.head.repo = {full_name: 'contributor/project'};
+  f.comment.user.login = 'contributor';
+  f.permission('read');
+  await f.call();
+  assert.equal(f.dispatches.length, 0);
+  assert.match(f.notices[0], /write access/);
+});
+
+test('fork pushes invalidate approval at admission, verification, and completion', async t => {
+  for (const mode of ['admit', 'verify', 'complete']) await t.test(mode, async () => {
+    const f = fixture();
+    f.pr.head.repo = {full_name: 'contributor/project'};
+    await f.call();
+    if (mode !== 'admit') await f.call('admit');
+    f.pr.head.sha = 'c'.repeat(40);
+    if (mode === 'complete') {
+      f.finish(); await f.call();
+      assert.equal(f.checks[0].conclusion, 'failure');
+    } else {
+      await assert.rejects(f.call(mode), /Commit, base, or selected suites changed/);
+    }
+  });
+});
+
+
+test('PR orchestrator limits all called suites to read-only GitHub caches', () => {
+  const root = path.resolve(__dirname, '../workflows');
+  const orchestrator = fs.readFileSync(path.join(root, 'pr-ci.yml'), 'utf8');
+  assert.match(orchestrator, /^cache-mode: read$/m);
+  // A calling job could override the top-level limit; forbid broader access.
+  for (const file of ['pr-ci.yml', 'pr-ci-admission.yml', ...config.suites.map(s => s.workflow)]) {
+    const workflow = fs.readFileSync(path.join(root, file), 'utf8');
+    for (const match of workflow.matchAll(/^\s*cache-mode:\s*(.*?)\s*$/gm)) {
+      assert.ok(['read', 'none'].includes(match[1]), `${file} broadens PR cache access`);
+    }
+  }
 });

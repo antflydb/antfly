@@ -16,10 +16,10 @@
 //! cleanup completes; this object pins every epoch used by its cursors.
 //! advanceLocked performs ONE bounded off-lock slice, including scratch GC.
 const std = @import("std");
+const work_budget = @import("work_budget.zig");
 const Directory = @import("run_directory.zig").Directory;
 const Job = @import("dependency_job.zig").Job;
 const runtime = @import("runtime.zig");
-const time = @import("antfly_platform").time;
 const Reservation = @import("../resource_manager.zig").Reservation;
 
 pub const Validation = struct {
@@ -46,7 +46,7 @@ pub const Validation = struct {
         return self.advanceBudgetedLocked(backend, 2048, std.math.maxInt(u64));
     }
 
-    pub fn advanceBudgetedLocked(self: *Validation, backend: anytype, credits: usize, deadline: u64) !Result {
+    pub fn advanceBudgetedLocked(self: *Validation, backend: anytype, credits: usize, deadline: anytype) !Result {
         if (!self.job.valid) return .invalid;
         if (backend.manifestCoordinationIo()) |io| try io.checkCancel();
         if (self.phase == .certificate and self.changes == null) {
@@ -62,7 +62,7 @@ pub const Validation = struct {
         // Unlocking may itself run bounded reclamation. Give this job its
         // own quantum afterwards; continuous retirement must not consume
         // every validation turn before the first identity can be visited.
-        const advanced = self.step(backend.allocator, credits, @min(deadline, time.monotonicNs() +| 2 * std.time.ns_per_ms));
+        const advanced = self.step(backend.allocator, credits, work_budget.capped(deadline, backend.manifestCoordinationIo(), 2 * std.time.ns_per_ms));
         // Maintenance hands control back to its scheduler after this call.
         // A synchronous drain must explicitly yield through std.Io instead
         // of monopolizing a cooperative executor across successive slices.
@@ -86,7 +86,7 @@ pub const Validation = struct {
         return .pending;
     }
 
-    fn step(self: *Validation, allocator: std.mem.Allocator, credits_arg: usize, deadline: u64) !void {
+    fn step(self: *Validation, allocator: std.mem.Allocator, credits_arg: usize, deadline: anytype) !void {
         var credits = credits_arg;
         switch (self.phase) {
             .identities => {
@@ -97,7 +97,7 @@ pub const Validation = struct {
                 const indices = self.job.indices;
                 self.job.indices = null;
                 defer self.job.indices = indices;
-                while (credits != 0 and time.monotonicNs() < deadline) {
+                while (credits != 0 and work_budget.before(deadline)) {
                     var quantum: usize = @min(credits, 64);
                     const before = quantum;
                     const done = self.job.deinitStep(allocator, &quantum);
@@ -110,7 +110,7 @@ pub const Validation = struct {
                 }
             },
             .certificate => if (self.changes) |*changes| {
-                while (credits != 0 and time.monotonicNs() < deadline and !changes.done()) {
+                while (credits != 0 and work_budget.before(deadline) and !changes.done()) {
                     if (changes.next(&credits)) |change| {
                         if (!self.job.acceptChange(change)) return;
                     } else break;
@@ -147,3 +147,60 @@ pub const Validation = struct {
         if (self.reservation) |*lease| lease.release();
     }
 };
+
+test "dependency validation uses the borrowed clock for every phase" {
+    const Backend = @import("../lsm_backend.zig").Backend;
+    const Clock = struct {
+        var epoch: i96 = 0;
+        fn now(_: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+            return .fromNanoseconds(epoch);
+        }
+    };
+    Clock.epoch = 0;
+    var vtable = std.testing.io.vtable.*;
+    vtable.now = Clock.now;
+    var io = std.testing.io;
+    io.vtable = &vtable;
+    const allocator = std.testing.allocator;
+    var backend = Backend.init(allocator, .{ .wal_enabled = false, .read_runtime = .{ .io = io } });
+    defer backend.close();
+    try std.testing.expect(backend.mu.tryLock());
+    defer backend.mu.unlock();
+    for (1..3) |id| try backend.runs.append(allocator, .{
+        .id = id,
+        .level = 0,
+        .size_bytes = 1,
+        .path = null,
+        .smallest_namespace_name = null,
+        .smallest_key = @constCast("a"),
+        .largest_namespace_name = null,
+        .largest_key = @constCast("a"),
+        .entry_count = 1,
+        .bloom_filter = null,
+        .state = .{},
+        .owns_metadata = false,
+    });
+    const directory = try backend.planningDirectory();
+    const handles = [_]Directory.Handle{ directory.at(0), directory.at(1) };
+    const plan = @import("compaction.zig").CompactionPlan{
+        .source_level = 0,
+        .source_start = 0,
+        .source_len = handles.len,
+        .target_start = handles.len,
+        .target_len = 0,
+        .output_level = 1,
+        .input_handles = &handles,
+    };
+    var validation = try Validation.init(&backend, plan);
+    defer validation.deinit(&backend);
+    _ = try validation.advanceBudgetedLocked(&backend, 1, 10);
+    try std.testing.expectEqual(@as(usize, 1), validation.job.index);
+    Clock.epoch = 10;
+    _ = try validation.advanceBudgetedLocked(&backend, 1, 10);
+    try std.testing.expectEqual(@as(usize, 1), validation.job.index);
+    for (0..32) |_| {
+        if (try validation.advanceBudgetedLocked(&backend, 1, 20) == .valid) break;
+    }
+    try std.testing.expectEqual(Validation.Result.valid, try validation.advanceBudgetedLocked(&backend, 1, 20));
+    try std.testing.expectEqual(handles.len, validation.job.index);
+}

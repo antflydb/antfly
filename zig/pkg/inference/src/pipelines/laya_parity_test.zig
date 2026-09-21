@@ -1,0 +1,256 @@
+// Copyright 2026 Antfly, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+const std = @import("std");
+const platform = @import("antfly_platform");
+const c_file = @import("../util/c_file.zig");
+const factory = @import("../architectures/session_factory.zig");
+const hf = @import("inference_hf_tokenizer");
+const pipeline = @import("laya.zig");
+const Tensor = @import("../backends/tensor.zig").Tensor;
+const Reference = struct {
+    states: []const []const u8,
+    sequences: []const struct { ids: []const i64, markers: []const i64, qtype: i64 },
+    logits: []const []const f32,
+    action_logits: []const []const f32,
+};
+
+test "laya forward preprocessing and batching match the PyTorch reference" {
+    const root = platform.env.getenv("ANTFLY_LAYA_REFERENCE") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const model_path = try std.fmt.allocPrint(a, "{s}/model", .{root});
+    defer a.free(model_path);
+    const reference_path = try std.fmt.allocPrint(a, "{s}/reference.json", .{root});
+    defer a.free(reference_path);
+    const bytes = try c_file.readFile(a, reference_path);
+    defer a.free(bytes);
+    const parsed = try std.json.parseFromSlice(Reference, a, bytes, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const ref = parsed.value;
+    const use_metal = platform.env.getenv("ANTFLY_LAYA_METAL") != null;
+    var session = if (use_metal) try factory.createMetalSession(a, model_path) else try factory.createNativeSession(a, model_path);
+    std.debug.print("Laya parity backend: {s}\n", .{@tagName(session.backend())});
+    defer session.close();
+    const config = factory.getLayaConfig(session) orelse return error.TestUnexpectedResult;
+    const tokenizer_bytes = try c_file.readFileFromDir(a, model_path, "tokenizer.json");
+    defer a.free(tokenizer_bytes);
+    const tokenizer = try hf.HfTokenizer.loadFromBytes(a, tokenizer_bytes);
+    const tok = tokenizer.tokenizer();
+    defer tok.deinitTokenizer();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const questions = [_]pipeline.Question{
+        .{ .name = "tool", .kind = .choice, .instruction = "which tool is needed?", .labels = &.{ "search", "fetch", "none" }, .descriptions = &.{ "", "", "" } },
+        .{ .name = "urgency", .kind = .score, .instruction = "urgency?", .labels = &.{ "low", "medium", "high" }, .descriptions = &.{ "", "", "" } },
+        .{ .name = "needed", .kind = .noul, .instruction = "is search needed?", .labels = &.{ "false", "true" }, .descriptions = &.{ "", "" } },
+    };
+    var tasks: [3]pipeline.Task = undefined;
+    var seq: usize = 0;
+    for (&tasks, questions, ref.states, ref.sequences) |*task, question, text, expected| {
+        task.* = .{ .text = text, .question = question };
+        const prepared = try pipeline.prepare(alloc, tok, config, task.*);
+        try std.testing.expectEqualSlices(i64, expected.ids, prepared.ids);
+        try std.testing.expectEqualSlices(i64, expected.markers, prepared.markers);
+        seq = @max(seq, expected.ids.len);
+    }
+    const ids = try alloc.alloc(i64, 3 * seq);
+    @memset(ids, 0);
+    const masks = try alloc.alloc(i64, ids.len);
+    @memset(masks, 0);
+    const positions = try alloc.alloc(i64, 9);
+    @memset(positions, -1);
+    for (ref.sequences, 0..) |row, i| {
+        @memcpy(ids[i * seq ..][0..row.ids.len], row.ids);
+        @memset(masks[i * seq ..][0..row.ids.len], 1);
+        @memcpy(positions[i * 3 ..][0..row.markers.len], row.markers);
+    }
+    var inputs: [4]Tensor = .{
+        try Tensor.initInt64(alloc, "input_ids", &.{ 3, @intCast(seq) }, ids),
+        try Tensor.initInt64(alloc, "attention_mask", &.{ 3, @intCast(seq) }, masks),
+        try Tensor.initInt64(alloc, "qtype", &.{ 3, 1 }, &.{ 0, 1, 2 }),
+        try Tensor.initInt64(alloc, "marker_pos", &.{ 3, 3 }, positions),
+    };
+    defer for (&inputs) |*input| input.deinit();
+    const outputs = try session.run(&inputs, alloc);
+    defer {
+        for (outputs) |*output| output.deinit();
+        alloc.free(outputs);
+    }
+    try std.testing.expectEqual(@as(usize, 2), outputs.len);
+    for (ref.logits, 0..) |row, i| for (row, 0..) |value, j| try std.testing.expectApproxEqAbs(value, outputs[0].asFloat32()[i * 3 + j], 2e-4);
+    for (ref.action_logits, 0..) |row, i| for (row, 0..) |value, j| try std.testing.expectApproxEqAbs(value, outputs[1].asFloat32()[i * 2 + j], 2e-4);
+    try std.testing.expectError(error.InferenceInputTokensExceeded, pipeline.executeWithTokenLimit(alloc, session, tok, config, &tasks, null, 1));
+    const result = try pipeline.execute(alloc, session, tok, config, &tasks, null);
+    for (result.decisions, questions, ref.logits, ref.action_logits) |actual, q, logits, acts| {
+        const expected = try pipeline.decode(alloc, config, q, logits[0..q.labels.len], acts);
+        try std.testing.expectEqualStrings(expected.label, actual.label);
+        for (expected.probabilities, actual.probabilities) |want, got| try std.testing.expectApproxEqAbs(want, got, 2e-4);
+    }
+    // Different sequence lengths, question types, option counts, and row orders
+    // must not couple independent decisions through padding or batch scheduling.
+    for ([_]usize{ 1, 2, 3, 8, 16, 32, 128, 512 }) |batch_size| {
+        var batch_arena = std.heap.ArenaAllocator.init(a);
+        defer batch_arena.deinit();
+        const batch_alloc = batch_arena.allocator();
+        const batch_tasks = try batch_alloc.alloc(pipeline.Task, batch_size);
+        for (batch_tasks, 0..) |*task, i| task.* = tasks[(batch_size - i - 1) % tasks.len];
+        const batched = try pipeline.execute(batch_alloc, session, tok, config, batch_tasks, null);
+        for (batched.decisions, 0..) |actual, i| {
+            const expected = result.decisions[(batch_size - i - 1) % tasks.len];
+            try std.testing.expectEqualStrings(expected.label, actual.label);
+            for (expected.probabilities, actual.probabilities) |want, got| try std.testing.expectApproxEqAbs(want, got, 2e-4);
+            try std.testing.expectApproxEqAbs(expected.confidence, actual.confidence, 2e-4);
+            try std.testing.expectApproxEqAbs(expected.act_probability, actual.act_probability, 2e-4);
+        }
+    }
+    // Repeated known tokens ensure this is token overflow, not one UNK token.
+    const long_text = "hello " ** 150;
+    try std.testing.expectError(error.ExtractionTextLimitExceeded, pipeline.prepare(alloc, tok, config, .{ .text = long_text, .question = questions[0] }));
+}
+
+const QualificationRow = struct {
+    dataset: []const u8,
+    target: usize,
+    task: pipeline.Task,
+    ids: []const i64,
+    markers: []const i64,
+    probabilities: []const f32,
+    act_probability: f32,
+};
+
+test "laya released checkpoint accuracy parity batching and performance" {
+    const root = platform.env.getenv("ANTFLY_LAYA_QUALIFICATION") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const model_path = try std.fmt.allocPrint(a, "{s}/model", .{root});
+    defer a.free(model_path);
+    const reference_path = try std.fmt.allocPrint(a, "{s}/qualification.json", .{root});
+    defer a.free(reference_path);
+    const bytes = try c_file.readFile(a, reference_path);
+    defer a.free(bytes);
+    const parsed = try std.json.parseFromSlice(struct { rows: []const QualificationRow }, a, bytes, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const rows = parsed.value.rows;
+    try std.testing.expect(rows.len >= 16);
+    const use_metal = platform.env.getenv("ANTFLY_LAYA_METAL") != null;
+    const began = platform.time.monotonicNs();
+    var session = if (use_metal) try factory.createMetalSession(a, model_path) else try factory.createNativeSession(a, model_path);
+    defer session.close();
+    std.debug.print("Laya qualification backend={s} load_ms={d:.2}\n", .{ @tagName(session.backend()), @as(f64, @floatFromInt(platform.time.monotonicNs() - began)) / 1e6 });
+    const config = factory.getLayaConfig(session) orelse return error.TestUnexpectedResult;
+    const tokenizer_bytes = try c_file.readFileFromDir(a, model_path, "tokenizer.json");
+    defer a.free(tokenizer_bytes);
+    const tokenizer = try hf.HfTokenizer.loadFromBytes(a, tokenizer_bytes);
+    const tok = tokenizer.tokenizer();
+    defer tok.deinitTokenizer();
+    var max_probability_error: f32 = 0;
+    var max_action_error: f32 = 0;
+    var disagreements: usize = 0;
+    var correct = [_]usize{0} ** 3;
+    var totals = [_]usize{0} ** 3;
+    var ordinal_error: f64 = 0;
+    var start: usize = 0;
+    while (start < rows.len) : (start += 8) {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        const chunk = rows[start..@min(start + 8, rows.len)];
+        const tasks = try alloc.alloc(pipeline.Task, chunk.len);
+        for (chunk, tasks) |row, *task| {
+            task.* = row.task;
+            const prepared = try pipeline.prepare(alloc, tok, config, task.*);
+            try std.testing.expectEqualSlices(i64, row.ids, prepared.ids);
+            try std.testing.expectEqualSlices(i64, row.markers, prepared.markers);
+        }
+        const result = try pipeline.execute(alloc, session, tok, config, tasks, null);
+        for (chunk, result.decisions) |row, decision| {
+            const actual = argmax(decision.probabilities);
+            disagreements += @intFromBool(actual != argmax(row.probabilities));
+            const kind = @intFromEnum(row.task.question.kind);
+            correct[kind] += @intFromBool(actual == row.target);
+            totals[kind] += 1;
+            if (decision.expected_value) |value| ordinal_error += @abs(value - @as(f64, @floatFromInt(row.target)));
+            for (row.probabilities, decision.probabilities) |want, got| max_probability_error = @max(max_probability_error, @abs(want - got));
+            max_action_error = @max(max_action_error, @abs(row.act_probability - decision.act_probability));
+        }
+        std.debug.print("Laya evaluated {d}/{d}, max_probability_error={d:.7}\n", .{ start + chunk.len, rows.len, max_probability_error });
+    }
+    std.debug.print("Laya accuracy choice={d}/{d} score={d}/{d} boolean={d}/{d}; ordinal_mae={d:.6}; disagreements={d}; max_probability_error={d:.7}; max_action_error={d:.7}\n", .{ correct[0], totals[0], correct[1], totals[1], correct[2], totals[2], ordinal_error / @as(f64, @floatFromInt(totals[1])), disagreements, max_probability_error, max_action_error });
+    try std.testing.expectEqual(@as(usize, 0), disagreements);
+    try std.testing.expect(max_probability_error <= 5e-5);
+    try std.testing.expect(max_action_error <= 5e-5);
+
+    // Fixed-input scaling separates batch effects from changing padded lengths.
+    for ([_]usize{ 1, 2, 4, 8, 16, 32, 64, 128 }) |batch_size| {
+        var timings: [7]u64 = undefined;
+        var batch_error: f32 = 0;
+        for (0..timings.len + 1) |iteration| {
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+            const tasks = try alloc.alloc(pipeline.Task, batch_size);
+            @memset(tasks, rows[0].task);
+            const before = platform.time.monotonicNs();
+            const result = try pipeline.execute(alloc, session, tok, config, tasks, null);
+            const ns = platform.time.monotonicNs() - before;
+            if (iteration > 0) timings[iteration - 1] = ns;
+            for (result.decisions) |actual| {
+                try std.testing.expectEqual(argmax(rows[0].probabilities), argmax(actual.probabilities));
+                for (rows[0].probabilities, actual.probabilities) |want, got| batch_error = @max(batch_error, @abs(want - got));
+            }
+        }
+        std.mem.sort(u64, &timings, {}, std.sort.asc(u64));
+        const p50_ms = @as(f64, @floatFromInt(timings[timings.len / 2])) / 1e6;
+        const p95_ms = @as(f64, @floatFromInt(timings[timings.len - 1])) / 1e6;
+        std.debug.print("Laya performance profile=fixed backend={s} tokens={d} batch={d} p50_ms={d:.3} p95_ms={d:.3} questions_per_second={d:.2} max_batch_error={d:.7}\n", .{ @tagName(session.backend()), rows[0].ids.len, batch_size, p50_ms, p95_ms, @as(f64, @floatFromInt(batch_size)) * 1000 / p50_ms, batch_error });
+        try std.testing.expect(batch_error <= 5e-5);
+    }
+
+    // Compare heterogeneous batches to the same independent PyTorch outputs.
+    // Reverse rows as well, to catch hidden row-order and padding dependencies.
+    for ([_]usize{ 1, 2, 4, 8, 16 }) |batch_size| {
+        var timings: [7]u64 = undefined;
+        var batch_error: f32 = 0;
+        for (0..timings.len + 1) |iteration| {
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+            const tasks = try alloc.alloc(pipeline.Task, batch_size);
+            for (tasks, 0..) |*task, i| task.* = rows[(15 - i) % rows.len].task;
+            const before = platform.time.monotonicNs();
+            const result = try pipeline.execute(alloc, session, tok, config, tasks, null);
+            const ns = platform.time.monotonicNs() - before;
+            if (iteration > 0) timings[iteration - 1] = ns;
+            for (result.decisions, 0..) |actual, i| {
+                const expected = rows[(15 - i) % rows.len];
+                try std.testing.expectEqual(argmax(expected.probabilities), argmax(actual.probabilities));
+                for (expected.probabilities, actual.probabilities) |want, got| batch_error = @max(batch_error, @abs(want - got));
+                try std.testing.expectApproxEqAbs(expected.act_probability, actual.act_probability, 5e-4);
+            }
+        }
+        std.mem.sort(u64, &timings, {}, std.sort.asc(u64));
+        const p50_ms = @as(f64, @floatFromInt(timings[timings.len / 2])) / 1e6;
+        const p95_ms = @as(f64, @floatFromInt(timings[timings.len - 1])) / 1e6;
+        std.debug.print("Laya performance profile=mixed backend={s} batch={d} p50_ms={d:.3} p95_ms={d:.3} questions_per_second={d:.2} max_batch_error={d:.7}\n", .{ @tagName(session.backend()), batch_size, p50_ms, p95_ms, @as(f64, @floatFromInt(batch_size)) * 1000 / p50_ms, batch_error });
+        try std.testing.expect(batch_error <= 5e-4);
+    }
+}
+
+fn argmax(values: []const f32) usize {
+    var index: usize = 0;
+    for (values, 0..) |value, i| if (value > values[index]) {
+        index = i;
+    };
+    return index;
+}

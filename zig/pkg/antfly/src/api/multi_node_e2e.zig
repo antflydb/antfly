@@ -438,6 +438,7 @@ const PublicApiStatusSource = struct {
                 .create_table = createTable,
                 .drop_table = dropTable,
                 .update_schema = updateSchema,
+                .mutate_schema = mutateSchema,
                 .replace_table_definition = replaceTableDefinition,
                 .drop_index = dropIndex,
             },
@@ -486,6 +487,21 @@ const PublicApiStatusSource = struct {
         const updated = try api_tables.applySchemaUpdateRecord(alloc, table, schema_json);
         defer metadata_table_manager.freeTable(alloc, updated);
         try self.node.upsertTable(updated);
+    }
+
+    fn mutateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, mode: api_tables.SchemaMutationMode, body: []const u8, expected_version: ?u32) !api_tables.SchemaMutationResult {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        var snapshot = try self.node.adminSnapshot();
+        defer self.node.freeAdminSnapshot(&snapshot);
+        const table = api_tables.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+        if (expected_version) |version| if (try api_tables.schemaVersion(table.schema_json) != version)
+            return error.SchemaVersionChanged;
+        const updated = try api_tables.applySchemaMutationRecord(alloc, table, mode, body);
+        defer metadata_table_manager.freeTable(alloc, updated);
+        const response_schema = try alloc.dupe(u8, updated.schema_json);
+        errdefer alloc.free(response_schema);
+        try self.node.replaceTableDefinition(table.*, updated);
+        return .{ .version = try api_tables.schemaVersion(updated.schema_json), .schema_json = response_schema };
     }
 
     fn createIndex(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
@@ -1578,7 +1594,7 @@ test "public api multi-node e2e routes CRUD from a non-host node" {
     try std.testing.expect(parsed_updated_schema.value.schema.?.document_schemas != null);
     try std.testing.expect(parsed_updated_schema.value.migration != null);
     try std.testing.expectEqualStrings("rebuilding", parsed_updated_schema.value.migration.?.state);
-    try std.testing.expectEqual(@as(?i64, 0), parsed_updated_schema.value.migration.?.read_schema.version);
+    try std.testing.expectEqual(@as(?u32, 0), parsed_updated_schema.value.migration.?.read_schema.version);
 
     var table_detail_after_schema = try client.fetchTable(client_base, "docs");
     defer table_detail_after_schema.deinit(std.heap.page_allocator);
@@ -1647,7 +1663,7 @@ test "public api multi-node e2e routes CRUD from a non-host node" {
     var query_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.heap.page_allocator, query.body, .{});
     defer query_responses.deinit();
     const query_result = query_responses.value.responses.?[0];
-    try std.testing.expectEqual(@as(i64, 2), query_result.hits.?.total.?.value);
+    try std.testing.expectEqual(@as(u64, 2), query_result.hits.?.total.?.value);
     try std.testing.expect(query_result.profile != null);
 
     const delete_body = try test_contract_helpers.normalizeBatchRequest(std.heap.page_allocator, "{\"deletes\":[\"doc:a\"]}");
@@ -6134,7 +6150,7 @@ test "public api multi-node e2e routes split flow from a non-host node" {
     var query_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.heap.page_allocator, query.body, .{});
     defer query_responses.deinit();
     const query_result = query_responses.value.responses.?[0];
-    try std.testing.expectEqual(@as(i64, 4), query_result.hits.?.total.?.value);
+    try std.testing.expectEqual(@as(u64, 4), query_result.hits.?.total.?.value);
     try expectQueryProfileSummary(std.heap.page_allocator, query_result.profile, 2, true);
 
     const graph_query_body = try test_contract_helpers.encodeGraphTraverseQueryRequest(
@@ -6289,7 +6305,7 @@ test "public api multi-node e2e routes split flow from a non-host node" {
     var ref_graph_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.heap.page_allocator, ref_graph_query.body, .{});
     defer ref_graph_responses.deinit();
     const ref_query_result = ref_graph_responses.value.responses.?[0];
-    try std.testing.expectEqual(@as(i64, 1), ref_query_result.hits.?.total.?.value);
+    try std.testing.expectEqual(@as(u64, 1), ref_query_result.hits.?.total.?.value);
     const ref_graph_result = try expectGraphNodesResult(ref_query_result.graph_results.?.map.get("walk_from_text").?);
     try std.testing.expectEqual(@as(usize, 2), ref_graph_result.nodes.len);
     try expectGraphNodeKeys(ref_graph_result.nodes, &.{ "doc:z", "doc:y" });
@@ -6310,7 +6326,7 @@ test "public api multi-node e2e routes split flow from a non-host node" {
     var fused_ref_graph_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.heap.page_allocator, fused_ref_graph_query.body, .{});
     defer fused_ref_graph_responses.deinit();
     const fused_ref_query_result = fused_ref_graph_responses.value.responses.?[0];
-    try std.testing.expectEqual(@as(i64, 1), fused_ref_query_result.hits.?.total.?.value);
+    try std.testing.expectEqual(@as(u64, 1), fused_ref_query_result.hits.?.total.?.value);
     const fused_ref_graph_result = try expectGraphNodesResult(fused_ref_query_result.graph_results.?.map.get("walk_from_fused").?);
     try std.testing.expectEqual(@as(usize, 2), fused_ref_graph_result.nodes.len);
     try expectGraphNodeKeys(fused_ref_graph_result.nodes, &.{ "doc:z", "doc:y" });
@@ -6614,7 +6630,7 @@ test "public api multi-node e2e routes merge flow from a non-host node" {
     var query_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.heap.page_allocator, query.body, .{});
     defer query_responses.deinit();
     const query_result = query_responses.value.responses.?[0];
-    try std.testing.expectEqual(@as(i64, 4), query_result.hits.?.total.?.value);
+    try std.testing.expectEqual(@as(u64, 4), query_result.hits.?.total.?.value);
     try expectQueryProfileSummary(std.heap.page_allocator, query_result.profile, 1, false);
 
     const graph_query_body = try test_contract_helpers.encodeGraphNeighborsQueryRequest(

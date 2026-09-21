@@ -48,6 +48,9 @@ else
     void;
 
 pub const MetadataServerConfig = struct {
+    /// Prefer online copying for eligible merges. Unsupported deployments keep
+    /// ordinary merging; false disables new admission, not in-flight recovery.
+    online_merge_enabled: bool = true,
     http: raft_managed_host.ManagedHttpHostConfig,
     service: service.MetadataServiceConfig = .{},
     admin_listener: ?raft_transport.StdHttpListenerConfig = null,
@@ -56,8 +59,22 @@ pub const MetadataServerConfig = struct {
 };
 
 pub const MetadataServerDeps = struct {
+    /// When online merge is available, an injected request executor
+    /// must honor the private online-I/O 32MiB response limit. The owned shared
+    /// executor is configured automatically by MetadataServer.init.
     http: service.MetadataHttpServiceDeps = .{},
 };
+
+fn onlineMergeCapabilities(cfg: MetadataServerConfig) !?@import("online_merge.zig").Capabilities {
+    // Default-on is a preference, never permission to bypass authentication or
+    // install a partial protocol bundle. Ineligible nodes retain ordinary merge.
+    if (!control_only_storage_sources) return null;
+    if (cfg.api_server_cfg.deployment_mode == .serverless) return null;
+    if (cfg.api_server_cfg.node_config) |node| if (node.deployment_mode == .serverless) return null;
+    const secret = cfg.api_server_cfg.internal_service_secret orelse return null;
+    if (secret.len == 0) return null;
+    return .{ .replicated_source_pins = true, .native_retained_snapshots = true, .transferable_artifacts = true, .receiver_receipts = true, .transactional_headroom = true };
+}
 
 fn listMetadataRaftQuarantinesForAdmin(
     ptr: *anyopaque,
@@ -101,6 +118,7 @@ pub const MetadataServer = struct {
         cfg: MetadataServerConfig,
         deps: MetadataServerDeps,
     ) !MetadataServer {
+        const online_capabilities = try onlineMergeCapabilities(cfg);
         const svc = try alloc.create(service.MetadataHttpService);
         errdefer alloc.destroy(svc);
         var service_cfg = cfg.service;
@@ -110,8 +128,17 @@ pub const MetadataServer = struct {
             .manager = cfg.api_server_cfg.user_manager,
             .auth_enabled = cfg.api_server_cfg.auth_enabled,
         };
-        svc.* = try service.MetadataHttpService.init(alloc, cfg.http, deps.http, service_cfg);
+        var http_config = cfg.http;
+        if (online_capabilities != null) {
+            http_config.http.executor.max_response_bytes = @max(http_config.http.executor.max_response_bytes, @import("../storage/db/online_merge_io_contract.zig").max_response_bytes);
+        }
+        svc.* = try service.MetadataHttpService.init(alloc, http_config, deps.http, service_cfg);
         errdefer svc.deinit();
+        // This is deliberately a runtime conditional so the production build
+        // typechecks the complete adapter even for unsupported deployments.
+        // The service has its final heap address, and its Raft host owns the
+        // borrowed shared executor until after driver teardown.
+        if (online_capabilities) |capabilities| try service.installOnlineMergeDriverWithAdmission(svc, svc.raft.host.http_host.request_executor, capabilities, cfg.online_merge_enabled);
 
         var owned_hosted_shard_ops: ?*raft_hosted_shard_ops.HostedShardOperationAdapter = null;
         errdefer if (owned_hosted_shard_ops) |ops| alloc.destroy(ops);
@@ -209,6 +236,7 @@ pub const MetadataServer = struct {
                 alloc,
                 .{
                     .internal_service_auth_capability = cfg.api_server_cfg.internal_service_auth_capability,
+                    .secret_store = cfg.api_server_cfg.secret_store,
                 },
                 metadata_http_server.AdminSource.fromMetadataHttpService(svc),
             );
@@ -282,6 +310,13 @@ pub const MetadataServer = struct {
             owned_public_write_source = public_write_source;
 
             var api_server_cfg = cfg.api_server_cfg;
+            // Restore-owner and durable-session RPCs share the same owned
+            // data-bearing routes and transport as ordinary hosted reads and
+            // writes. An API caller need not inject a test-only executor to
+            // make remote restore work. Explicit host overrides stay intact.
+            if (api_server_cfg.session_router == null) api_server_cfg.session_router = data_router;
+            if (api_server_cfg.session_executor == null) api_server_cfg.session_executor = svc.raft.host.http_host.request_executor;
+            api_server_cfg.restore_validation = .{ .status = public_api_http_server.StatusSource.fromMetadataHttpService(svc), .factory = @import("../api/restore_catalog.zig").ValidationPort.SourceFactory.hosted(public_read_source, public_write_source) };
             api_server_cfg.shard_ops = if (owned_hosted_shard_ops) |ops| ops.adapter() else null;
             api_server_cfg.shard_db_adapter = owned_hosted_shard_db.?.adapter();
             api_server_cfg.raft_quarantine_admin = .{
@@ -729,7 +764,7 @@ const MetadataAdminHttpRuntime = struct {
     ) anyerror!httpx.Response {
         if (!MetadataAdminMux.isRestoreApiRequest(ctx.request.uri.raw)) return next.call(ctx);
         const local_leader = self.mux.ensureRestoreLeadershipIfLocalLeader() catch |err| {
-            if (!metadata_authority.isRetryableError(err)) return err;
+            if (!metadata_authority.isRetryableLeadershipPreparationError(err)) return err;
             return self.metadataNotLeader(ctx);
         };
         // A present follower row can be arbitrarily stale after leadership
@@ -787,6 +822,7 @@ fn metadataRestoreJobPersistence(svc: *service.MetadataHttpService) restore_jobs
     return restore_jobs.ReplicatedPersistence.fromLocal(svc, .{
         .delete_matching = metadataRestoreJobDeleteMatching,
         .create = metadataRestoreJobCreate,
+        .create_with_staging = metadataRestoreJobCreateWithStaging,
         .load = metadataRestoreJobLoad,
         .get = metadataRestoreJobGet,
         .put = metadataRestoreJobPut,
@@ -849,6 +885,17 @@ fn metadataRestoreJobCreate(ptr: *anyopaque, alloc: std.mem.Allocator, key: []co
         .{ .create_restore_job = .{ .key = key, .value = value } },
         leadership_term,
     );
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    return (try store.getRestoreJobValue(alloc, svc.metadata_group_id, key)) orelse error.RestoreJobCommitNotApplied;
+}
+
+fn metadataRestoreJobCreateWithStaging(ptr: *anyopaque, alloc: std.mem.Allocator, key: []const u8, value: []const u8, plan_json: []const u8, leadership_term: u64) ![]u8 {
+    const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(.{}, @import("topology_protocol.zig").coordinated_lifecycle_version);
+    svc.lockCatalogMutation();
+    defer svc.unlockCatalogMutation();
+    try svc.validateTableTopologyProtocolReadinessWithContext(.{}, readiness);
+    _ = try svc.proposeTransitionCommandAndWaitAppliedInTerm(.{ .create_restore_job_with_staging = .{ .key = key, .value = value, .plan_json = plan_json } }, leadership_term);
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
     return (try store.getRestoreJobValue(alloc, svc.metadata_group_id, key)) orelse error.RestoreJobCommitNotApplied;
 }
@@ -976,7 +1023,7 @@ fn metadataDataBearingStoreRouterGroupLeaderNodeId(ptr: *anyopaque, group_id: u6
     return candidate.node_id;
 }
 
-fn metadataDataBearingStoreRouterGroupNodeIds(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64) ![]u64 {
+fn metadataDataBearingStoreRouterGroupNodeIds(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, _: api_table_router.RouteBudget) ![]u64 {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     var snapshot = try loadMetadataRoutingSnapshot(svc, svc.alloc);
     defer snapshot.deinit(svc, svc.alloc);
@@ -999,12 +1046,7 @@ fn metadataDataBearingStoreRouterGroupNodeIds(ptr: *anyopaque, alloc: std.mem.Al
     return out;
 }
 
-fn metadataDataBearingStoreRouterGroupRoutes(
-    ptr: *anyopaque,
-    alloc: std.mem.Allocator,
-    group_ids: []const u64,
-    policy: api_table_router.RoutePolicy,
-) !?[]api_table_router.GroupRoute {
+fn metadataDataBearingStoreRouterGroupRoutes(ptr: *anyopaque, alloc: std.mem.Allocator, group_ids: []const u64, policy: api_table_router.RoutePolicy, _: api_table_router.RouteBudget) !?[]api_table_router.GroupRoute {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     // Metadata nodes never own data replicas, so both policies use the same
     // remote ordering: the comparator prefers a leader and otherwise returns
@@ -1138,7 +1180,7 @@ fn metadataDataBearingStoreRouterGroupRoutes(
     return routes;
 }
 
-fn metadataStoreRouterGroupNodeIds(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64) ![]u64 {
+fn metadataStoreRouterGroupNodeIds(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, _: api_table_router.RouteBudget) ![]u64 {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     const placements = try svc.listProjectedPlacementIntents(svc.alloc);
     defer svc.freeProjectedPlacementIntents(svc.alloc, placements);
@@ -1160,7 +1202,7 @@ fn metadataStoreRouterNodeBaseUri(ptr: *anyopaque, alloc: std.mem.Allocator, nod
     return try alloc.dupe(u8, store.api_url);
 }
 
-fn metadataStoreRouterNodeBaseUriForGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, node_id: u64) !?[]u8 {
+fn metadataStoreRouterNodeBaseUriForGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, node_id: u64, _: api_table_router.RouteBudget) !?[]u8 {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     var snapshot = try loadMetadataRoutingSnapshot(svc, svc.alloc);
     defer snapshot.deinit(svc, svc.alloc);
@@ -1523,6 +1565,35 @@ test "metadata server wires hosted shard adapters by default" {
     try std.testing.expect(server.owned_hosted_shard_db != null);
     try std.testing.expect(server.svc.routed_shard_db_adapter != null);
     try std.testing.expect(server.svc.raft.transition_svc != null);
+    try std.testing.expect(server.svc.online_merge_runtime == null);
+    try std.testing.expect(server.svc.raft.transition_svc.?.online_driver == null);
+}
+
+test "metadata server online merge defaults on only for authenticated native deployments" {
+    var cfg: MetadataServerConfig = .{ .http = .{ .http = .{ .host = .{ .local_node_id = 1 }, .transport = .{ .snapshot = .{ .root_dir = "unused-online-config" } } } } };
+    try std.testing.expect(cfg.online_merge_enabled);
+    try std.testing.expect((try onlineMergeCapabilities(cfg)) == null);
+    cfg.api_server_cfg.internal_service_secret = "";
+    try std.testing.expect((try onlineMergeCapabilities(cfg)) == null);
+    cfg.api_server_cfg.internal_service_secret = "online-config-test-secret";
+    if (control_only_storage_sources) {
+        try (try onlineMergeCapabilities(cfg)).?.require();
+    } else try std.testing.expect((try onlineMergeCapabilities(cfg)) == null);
+    cfg.api_server_cfg.deployment_mode = .serverless;
+    try std.testing.expect((try onlineMergeCapabilities(cfg)) == null);
+    cfg.api_server_cfg.deployment_mode = .distributed;
+    var node = try @import("../common/config.zig").Config.parseFromSlice(std.testing.allocator, "{}");
+    defer node.deinit();
+    node.deployment_mode = .serverless;
+    cfg.api_server_cfg.node_config = &node;
+    try std.testing.expect((try onlineMergeCapabilities(cfg)) == null);
+    cfg.api_server_cfg.node_config = null;
+    cfg.online_merge_enabled = false;
+    // Existing transitions still need the fully capable recovery driver.
+    if (control_only_storage_sources) {
+        try (try onlineMergeCapabilities(cfg)).?.require();
+    } else try std.testing.expect((try onlineMergeCapabilities(cfg)) == null);
+    try std.testing.expect(@import("../storage/db/online_merge_io_contract.zig").max_response_bytes >= 32 * 1024 * 1024);
 }
 
 test "metadata server can expose admin listener endpoints" {
@@ -1618,6 +1689,13 @@ test "metadata server can expose admin listener endpoints" {
         },
     });
     defer server.deinit();
+    // The actual production constructor, not an injected restore fixture,
+    // supplies the transport used by executeRestoreOwner's remote branch.
+    const public_cfg = server.owned_public_http_server.?.cfg;
+    try std.testing.expect(public_cfg.session_executor != null);
+    try std.testing.expect(public_cfg.session_executor.?.ptr == server.svc.raft.host.http_host.request_executor.ptr);
+    try std.testing.expect(public_cfg.session_router != null);
+    try std.testing.expect(public_cfg.session_router.?.ptr == @as(*anyopaque, @ptrCast(server.svc)));
     try server.start();
 
     _ = try server.svc.ensureMetadataReplica(.{

@@ -86,6 +86,17 @@ pub const RoutingBudget = struct {
     }
 };
 
+/// Narrow a fence in its own clock domain. A timestamp and its clock are one
+/// budget; callers must never compare raw timestamps from different clocks.
+pub fn narrowRouteFenceBudget(fence: *metadata_api.CatalogRouteFence, source: RoutingBudget) void {
+    const target = RoutingBudget{ .io = fence.admission_deadline_io };
+    const incoming = target.deadlineFrom(source) orelse return;
+    fence.admission_deadline_ns = if (fence.admission_deadline_ns) |current|
+        @min(current, incoming)
+    else
+        incoming;
+}
+
 fn cloneGroupIdsUntil(
     alloc: std.mem.Allocator,
     source: []const u64,
@@ -124,16 +135,29 @@ pub const CatalogSource = struct {
         return self.deadlineFrom(.{ .deadline_ns = fence.admission_deadline_ns, .io = fence.admission_deadline_io });
     }
 
+    pub fn exportCatalog(self: CatalogSource, alloc: std.mem.Allocator) ![]u8 {
+        // A missing capability cannot prove that no logical catalog exists.
+        const capture = self.vtable.export_catalog orelse return error.UnsupportedOperation;
+        return capture(self.ptr, alloc);
+    }
+
     pub const VTable = struct {
+        restore_scope_for_group: ?*const fn (ptr: *anyopaque, table_name: []const u8, group_id: u64) anyerror!?[32]u8 = null,
+        restore_plan_for_group: ?*const fn (ptr: *anyopaque, table_name: []const u8, group_id: u64) anyerror!?[16]u8 = null,
         /// Snapshot slices and all transitively referenced bytes must remain
         /// valid until the matching `free_admin_snapshot` call returns.
         admin_snapshot: *const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot,
         free_admin_snapshot: *const fn (ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void,
+        export_catalog: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator) anyerror![]u8 = null,
         catalog_identity: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.CatalogIdentity = null,
         /// First-class table/range routing capability. First-party sources must
         /// override the unsupported defaults; test doubles that never route may
         /// retain them without silently falling back to an admin snapshot.
         routing_snapshot: *const fn (ptr: *anyopaque, deadline_ns: ?u64) anyerror!metadata_api.CatalogRoutingSnapshot = unsupportedRoutingSnapshot,
+        /// Retained, immutable snapshot and indexes. The returned reference is
+        /// owned by the caller. Authoritative captures must still cross the
+        /// source's read barrier; an eventual cache hit never proves absence.
+        acquire_routing_generation: ?*const fn (ptr: *anyopaque, deadline_ns: ?u64, authoritative: bool) anyerror!*RoutingGeneration = null,
         /// Allocation-efficient point projection used by mutation routing.
         /// It returns the same owned wire type with zero or one table.
         table_routing_snapshot: ?*const fn (ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) anyerror!metadata_api.CatalogRoutingSnapshot = null,
@@ -173,6 +197,14 @@ pub const CatalogSource = struct {
         return try self.vtable.admin_snapshot(self.ptr);
     }
 
+    pub fn restoreScopeForGroup(self: CatalogSource, table_name: []const u8, group_id: u64) !?[32]u8 {
+        return if (self.vtable.restore_scope_for_group) |callback| try callback(self.ptr, table_name, group_id) else null;
+    }
+
+    pub fn restorePlanForGroup(self: CatalogSource, table_name: []const u8, group_id: u64) !?[16]u8 {
+        return if (self.vtable.restore_plan_for_group) |callback| try callback(self.ptr, table_name, group_id) else null;
+    }
+
     pub fn freeAdminSnapshot(self: CatalogSource, snapshot: *metadata_api.AdminSnapshot) void {
         self.vtable.free_admin_snapshot(self.ptr, snapshot);
     }
@@ -208,6 +240,7 @@ pub const CatalogSource = struct {
                 .await_route = self.vtable.await_route,
             },
             .io = self.io,
+            .acquire_generation = self.vtable.acquire_routing_generation,
         };
     }
 
@@ -237,6 +270,7 @@ pub const CatalogSource = struct {
                 .admin_snapshot = metadataServiceAdminSnapshot,
                 .free_admin_snapshot = metadataServiceFreeAdminSnapshot,
                 .catalog_identity = metadataServiceCatalogIdentity,
+                .acquire_routing_generation = metadataServiceAcquireRoutingGeneration,
                 .routing_snapshot = metadataServiceRoutingSnapshot,
                 .table_routing_snapshot = metadataServiceTableRoutingSnapshot,
                 .linearizable_routing_snapshot = metadataServiceLinearizableRoutingSnapshot,
@@ -258,6 +292,7 @@ pub const CatalogSource = struct {
                 .admin_snapshot = metadataHttpServiceAdminSnapshot,
                 .free_admin_snapshot = metadataHttpServiceFreeAdminSnapshot,
                 .catalog_identity = metadataHttpServiceCatalogIdentity,
+                .acquire_routing_generation = metadataHttpServiceAcquireRoutingGeneration,
                 .routing_snapshot = metadataHttpServiceRoutingSnapshot,
                 .table_routing_snapshot = metadataHttpServiceTableRoutingSnapshot,
                 .linearizable_routing_snapshot = metadataHttpServiceLinearizableRoutingSnapshot,
@@ -279,6 +314,7 @@ pub const CatalogSource = struct {
                 .admin_snapshot = metadataServerAdminSnapshot,
                 .free_admin_snapshot = metadataServerFreeAdminSnapshot,
                 .catalog_identity = metadataServerCatalogIdentity,
+                .acquire_routing_generation = metadataServerAcquireRoutingGeneration,
                 .routing_snapshot = metadataServerRoutingSnapshot,
                 .table_routing_snapshot = metadataServerTableRoutingSnapshot,
                 .linearizable_routing_snapshot = metadataServerLinearizableRoutingSnapshot,
@@ -316,6 +352,7 @@ pub const CatalogRouteAuthority = struct {
 };
 
 pub const CatalogRoutingSource = struct {
+    acquire_generation: ?*const fn (ptr: *anyopaque, deadline_ns: ?u64, authoritative: bool) anyerror!*RoutingGeneration = null,
     io: ?runtime_io_abi.Borrow = null,
     projection: CatalogProjectionSource,
     authority: CatalogRouteAuthority,
@@ -361,6 +398,57 @@ pub const OwnedRoutingSnapshot = struct {
     }
 };
 
+/// A published routing generation owns its bytes and indexes independently of
+/// its publisher. Readers retain under the publisher's lock, then route without
+/// copying the catalog or holding that lock. Retirement only drops the cache's
+/// reference; active requests keep their original identity and topology fences.
+pub const RoutingGeneration = struct {
+    refs: std.atomic.Value(usize) = .init(1),
+    alloc: std.mem.Allocator,
+    indexed: RoutingSession,
+
+    pub fn create(alloc: std.mem.Allocator, snapshot: metadata_api.CatalogRoutingSnapshot, budget: RoutingBudget) !*RoutingGeneration {
+        const self = try alloc.create(RoutingGeneration);
+        errdefer alloc.destroy(self);
+        self.* = .{ .alloc = alloc, .indexed = undefined };
+        const owned = OwnedRoutingSnapshot{
+            .source = .{ .ptr = self, .snapshot = unsupportedRoutingSnapshot, .free_snapshot = freeSnapshot },
+            .value = try cloneRoutingSnapshot(alloc, snapshot, budget),
+        };
+        self.indexed = try RoutingSession.initOwned(alloc, emptyCatalogSource(), owned, false, budget);
+        return self;
+    }
+
+    fn freeSnapshot(ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
+        const self: *RoutingGeneration = @ptrCast(@alignCast(ptr));
+        freeClonedRoutingSnapshot(self.alloc, snapshot);
+    }
+
+    pub fn retain(self: *RoutingGeneration) void {
+        std.debug.assert(self.refs.fetchAdd(1, .monotonic) > 0);
+    }
+
+    pub fn release(self: *RoutingGeneration) void {
+        const previous = self.refs.fetchSub(1, .acq_rel);
+        std.debug.assert(previous > 0);
+        if (previous != 1) return;
+        const alloc = self.alloc;
+        self.indexed.deinit();
+        alloc.destroy(self);
+    }
+
+    /// Transfers the caller's reference into a session. Maps and snapshot are
+    /// read-only borrowed views; only the original generation frees them.
+    pub fn session(self: *RoutingGeneration, alloc: std.mem.Allocator, base: CatalogSource, authoritative: bool) RoutingSession {
+        var result = self.indexed;
+        result.alloc = alloc;
+        result.base = base;
+        result.authoritative = authoritative;
+        result.generation = self;
+        return result;
+    }
+};
+
 /// Immutable request-scoped catalog capability. A session captures one
 /// projection and uses it for every table touched by the request,
 /// including graph targets discovered after the source table was admitted.
@@ -371,16 +459,26 @@ pub const RoutingSession = struct {
     base: CatalogSource,
     snapshot: OwnedRoutingSnapshot,
     authoritative: bool,
+    generation: ?*RoutingGeneration = null,
     table_indexes: std.StringHashMapUnmanaged(usize) = .empty,
     table_id_indexes: std.AutoHashMapUnmanaged(u64, usize) = .empty,
     group_indexes: std.AutoHashMapUnmanaged(u64, usize) = .empty,
     topology_epochs: std.AutoHashMapUnmanaged(u64, u64) = .empty,
+    range_refs: []const *const metadata_table_manager.RangeRecord = &.{},
+    table_range_refs: std.AutoHashMapUnmanaged(u64, []const *const metadata_table_manager.RangeRecord) = .empty,
 
     pub fn init(
         alloc: std.mem.Allocator,
         base: CatalogSource,
         deadline_ns: ?u64,
     ) !RoutingSession {
+        try base.budget(deadline_ns).checkpoint();
+        if (base.vtable.acquire_routing_generation) |acquire| {
+            const generation = try acquire(base.ptr, deadline_ns, true);
+            errdefer generation.release();
+            try base.budget(deadline_ns).checkpoint();
+            return generation.session(alloc, base, true);
+        }
         const routing = try base.routingSource();
         return try initOwned(alloc, base, try routing.linearizableSnapshot(deadline_ns), true, base.budget(deadline_ns));
     }
@@ -396,25 +494,19 @@ pub const RoutingSession = struct {
     ) !RoutingSession {
         const budget = base.budget(deadline_ns);
         try budget.checkpoint();
-        const routing = try base.routingSource();
-        var snapshot = try routing.eventualSnapshot(deadline_ns);
-        const candidate = routePlanFromSnapshotWithBudget(alloc, snapshot.value, table_name, query, budget) catch |err| {
-            snapshot.deinit();
+        var session = if (base.vtable.acquire_routing_generation) |acquire|
+            (try acquire(base.ptr, deadline_ns, false)).session(alloc, base, false)
+        else blk: {
+            const routing = try base.routingSource();
+            break :blk try initOwned(alloc, base, try routing.eventualSnapshot(deadline_ns), false, budget);
+        };
+        const found = session.hasRoute(table_name, query, budget) catch |err| {
+            session.deinit();
             return err;
         };
-        if (candidate) |plan_value| {
-            var plan = plan_value;
-            plan.deinit(alloc);
-            return try initOwned(alloc, base, snapshot, false, budget);
-        }
-        snapshot.deinit();
-        return try initOwned(
-            alloc,
-            base,
-            try routing.linearizableSnapshot(deadline_ns),
-            true,
-            budget,
-        );
+        if (found) return session;
+        session.deinit();
+        return try init(alloc, base, deadline_ns);
     }
 
     fn initOwned(
@@ -424,9 +516,9 @@ pub const RoutingSession = struct {
         authoritative: bool,
         budget: RoutingBudget,
     ) !RoutingSession {
-        try budget.checkpoint();
         var snapshot = snapshot_value;
         errdefer snapshot.deinit();
+        try budget.checkpoint();
         var self: RoutingSession = .{
             .alloc = alloc,
             .base = base,
@@ -438,6 +530,7 @@ pub const RoutingSession = struct {
             self.table_id_indexes.deinit(alloc);
             self.group_indexes.deinit(alloc);
             self.topology_epochs.deinit(alloc);
+            self.table_range_refs.deinit(alloc);
         }
         try self.table_indexes.ensureTotalCapacity(alloc, @intCast(snapshot.value.tables.len));
         try self.table_id_indexes.ensureTotalCapacity(alloc, @intCast(snapshot.value.tables.len));
@@ -460,7 +553,8 @@ pub const RoutingSession = struct {
         // complete range set once avoids O(T*R) request setup on large
         // multi-tenant catalogs.
         const range_refs = try alloc.alloc(*const metadata_table_manager.RangeRecord, snapshot.value.ranges.len);
-        defer alloc.free(range_refs);
+        errdefer alloc.free(range_refs);
+        try self.table_range_refs.ensureTotalCapacity(alloc, @intCast(snapshot.value.tables.len));
         for (snapshot.value.ranges, range_refs, 0..) |*range, *ref, index| {
             try budget.checkpointIndex(index);
             ref.* = range;
@@ -487,6 +581,7 @@ pub const RoutingSession = struct {
             var end = first + 1;
             while (end < range_refs.len and range_refs[end].table_id == range_refs[first].table_id) : (end += 1) {}
             const table_id = range_refs[first].table_id;
+            self.table_range_refs.putAssumeCapacity(table_id, range_refs[first..end]);
             const table_index = self.table_id_indexes.get(table_id) orelse return error.InvalidCatalogProjection;
             self.topology_epochs.putAssumeCapacity(
                 table_id,
@@ -503,12 +598,20 @@ pub const RoutingSession = struct {
             );
         }
         try budget.checkpoint();
+        self.range_refs = range_refs;
         // Ownership moved into self; keep the errdefer from releasing it.
         snapshot = undefined;
         return self;
     }
 
     pub fn deinit(self: *RoutingSession) void {
+        if (self.generation) |generation| {
+            generation.release();
+            self.* = undefined;
+            return;
+        }
+        self.alloc.free(self.range_refs);
+        self.table_range_refs.deinit(self.alloc);
         self.table_indexes.deinit(self.alloc);
         self.table_id_indexes.deinit(self.alloc);
         self.group_indexes.deinit(self.alloc);
@@ -517,11 +620,50 @@ pub const RoutingSession = struct {
         self.* = undefined;
     }
 
+    pub const DocumentKeyRoutes = struct { span: RoutedSpanSnapshot, key_groups: []u64 };
+    pub fn documentKeyRoutes(self: *RoutingSession, alloc: std.mem.Allocator, table_name: []const u8, keys: []const []const u8, deadline: ?u64) !DocumentKeyRoutes {
+        const budget = self.base.budget(deadline);
+        try budget.checkpoint();
+        const table_index = self.table_indexes.get(table_name) orelse return error.TableNotFound;
+        const table = self.snapshot.value.tables[table_index];
+        const ranges = self.table_range_refs.get(table.table_id) orelse return error.TopologyChanged;
+        const key_groups = try alloc.alloc(u64, keys.len);
+        errdefer alloc.free(key_groups);
+        var routes: std.ArrayListUnmanaged(CatalogGroupRoute) = .empty;
+        errdefer routes.deinit(alloc);
+        var groups: std.ArrayListUnmanaged(u64) = .empty;
+        errdefer groups.deinit(alloc);
+        var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        defer seen.deinit(alloc);
+        for (keys, key_groups) |key, *group| {
+            try budget.checkpoint();
+            var low: usize = 0;
+            var high = ranges.len;
+            while (low < high) {
+                const mid = low + (high - low) / 2;
+                if (std.mem.order(u8, ranges[mid].start_key, key) != .gt) low = mid + 1 else high = mid;
+            }
+            if (low == 0 or !rangeContainsKey(ranges[low - 1].*, key)) return error.TopologyChanged;
+            const range = ranges[low - 1].*;
+            group.* = range.group_id;
+            if (seen.contains(range.group_id)) continue;
+            try seen.put(alloc, range.group_id, {});
+            const range_id = metadata_table_manager.rangeDocIdentityRangeId(range);
+            try routes.append(alloc, .{ .group_id = range.group_id, .range_id = range_id, .identity_namespace = .{ .table_id = table.table_id, .shard_id = metadata_table_manager.rangeDocIdentityShardId(range), .range_id = range_id } });
+            try groups.append(alloc, range.group_id);
+        }
+        const owned_routes = try routes.toOwnedSlice(alloc);
+        errdefer alloc.free(owned_routes);
+        return .{ .key_groups = key_groups, .span = .{ .routes = owned_routes, .group_ids = try groups.toOwnedSlice(alloc), .metadata_group_id = self.snapshot.value.metadata_group_id, .metadata_incarnation = self.snapshot.value.metadata_incarnation, .catalog_revision = self.snapshot.value.catalog_revision, .table_id = table.table_id, .topology_epoch = self.topology_epochs.get(table.table_id).? } };
+    }
+
     pub fn catalog(self: *RoutingSession) CatalogSource {
         return .{ .ptr = self, .vtable = &vtable, .io = self.base.io };
     }
 
     const vtable: CatalogSource.VTable = .{
+        .restore_scope_for_group = restoreScopeForGroup,
+        .restore_plan_for_group = restorePlanForGroup,
         .admin_snapshot = adminSnapshot,
         .free_admin_snapshot = freeAdminSnapshot,
         .routing_snapshot = routingSnapshot,
@@ -539,6 +681,14 @@ pub const RoutingSession = struct {
 
     fn cast(ptr: *anyopaque) *RoutingSession {
         return @ptrCast(@alignCast(ptr));
+    }
+
+    fn restoreScopeForGroup(ptr: *anyopaque, table_name: []const u8, group_id: u64) !?[32]u8 {
+        return cast(ptr).base.restoreScopeForGroup(table_name, group_id);
+    }
+
+    fn restorePlanForGroup(ptr: *anyopaque, table_name: []const u8, group_id: u64) !?[16]u8 {
+        return cast(ptr).base.restorePlanForGroup(table_name, group_id);
     }
 
     fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
@@ -619,6 +769,58 @@ pub const RoutingSession = struct {
         return null;
     }
 
+    fn rangeForKey(ranges: []const *const metadata_table_manager.RangeRecord, key: []const u8) ?usize {
+        var low: usize = 0;
+        var high = ranges.len;
+        while (low < high) {
+            const mid = low + (high - low) / 2;
+            if (std.mem.order(u8, ranges[mid].start_key, key) != .gt) low = mid + 1 else high = mid;
+        }
+        if (low == 0 or !rangeContainsKey(ranges[low - 1].*, key)) return null;
+        return low - 1;
+    }
+
+    fn hasRoute(self: *const RoutingSession, table_name: []const u8, query: RouteQuery, budget: RoutingBudget) !bool {
+        try budget.checkpoint();
+        const table_index = self.table_indexes.get(table_name) orelse return false;
+        const table = self.snapshot.value.tables[table_index];
+        const ranges = self.table_range_refs.get(table.table_id) orelse &.{};
+        return switch (query) {
+            .table => true,
+            .all_ranges => ranges.len > 0,
+            .key => |key| rangeForKey(ranges, key) != null,
+            .group => |id| if (self.group_indexes.get(id)) |index| self.snapshot.value.ranges[index].table_id == table.table_id else false,
+            .span => |span| blk: {
+                for (ranges, 0..) |range, i| {
+                    try budget.checkpointIndex(i);
+                    if (rangeOverlapsSpan(range.*, span.from_key, span.to_key)) break :blk true;
+                }
+                break :blk false;
+            },
+        };
+    }
+
+    fn routePlan(self: *const RoutingSession, alloc: std.mem.Allocator, table_name: []const u8, query: RouteQuery, budget: RoutingBudget) !?CatalogRoutePlan {
+        try budget.checkpoint();
+        const table_index = self.table_indexes.get(table_name) orelse return null;
+        const table = &self.snapshot.value.tables[table_index];
+        const ranges = self.table_range_refs.get(table.table_id) orelse &.{};
+        var one: [1]*const metadata_table_manager.RangeRecord = undefined;
+        const selected = switch (query) {
+            .table => &.{},
+            .key => |key| if (rangeForKey(ranges, key)) |index| ranges[index .. index + 1] else return null,
+            .group => |id| blk: {
+                const index = self.group_indexes.get(id) orelse return null;
+                const range = &self.snapshot.value.ranges[index];
+                if (range.table_id != table.table_id) return null;
+                one[0] = range;
+                break :blk &one;
+            },
+            else => ranges,
+        };
+        return routePlanFromIndexedRanges(alloc, self.snapshot.value, table, selected, self.topology_epochs.get(table.table_id).?, query, budget);
+    }
+
     fn resolvePinnedRoute(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -631,7 +833,7 @@ pub const RoutingSession = struct {
             if (self.base.budget(deadline_ns).nowNs() >= deadline) return .timed_out;
         }
         const budget = self.base.budget(deadline_ns);
-        const resolved = routePlanFromSnapshotWithBudget(alloc, self.snapshot.value, table_name, query, budget) catch |err| switch (err) {
+        const resolved = self.routePlan(alloc, table_name, query, budget) catch |err| switch (err) {
             error.CatalogRoutingSnapshotTimeout => return .timed_out,
             else => return err,
         };
@@ -782,6 +984,20 @@ pub fn TestAdminRoutingAdapter(
 ) type {
     if (!builtin.is_test) @compileError("TestAdminRoutingAdapter is test-only");
     return struct {
+        pub fn exportCatalog(ptr: *anyopaque, alloc: std.mem.Allocator) ![]u8 {
+            var snapshot = try admin_snapshot(ptr);
+            defer free_admin_snapshot(ptr, &snapshot);
+            return std.json.Stringify.valueAlloc(alloc, @import("../system_catalog/projection.zig").Export{
+                .epoch = snapshot.status.metadata_epoch,
+                .tables = snapshot.tables,
+                .ranges = snapshot.ranges,
+                .extension_packages = snapshot.extension_packages,
+                .installed_extensions = snapshot.installed_extensions,
+                .extension_members = snapshot.extension_members,
+                .extension_dependencies = snapshot.extension_dependencies,
+            }, .{});
+        }
+
         pub fn routingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
             if (deadline_ns) |deadline| {
                 if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
@@ -1539,10 +1755,10 @@ pub fn validatePinnedGroupTopologyUntil(
     if (actual_epoch != expected_epoch) return error.TopologyChanged;
 }
 
-/// Transactions may not straddle a split or merge. The transition record is
-/// published before range cutover, so checking it in addition to the range
-/// epoch closes the prepare-to-cutover window where durable intents could
-/// otherwise be left on the previous owner.
+/// Ordinary transitions exclude transactions throughout their lifetime. Online
+/// merges retain committed effects while copying and close admission only at
+/// freeze. Their native fence drains prepared participants before the final
+/// tail/cutover, including callers with a stale pre-freeze catalog snapshot.
 pub fn validateTransactionTopologyStable(
     catalog: CatalogSource,
     table_name: []const u8,
@@ -1573,6 +1789,7 @@ fn validateTransactionTopologyStableSnapshot(
     }
     for (snapshot.merge_transitions) |transition| {
         if (!transitionPhaseActive(transition.phase)) continue;
+        if (onlineMergeAllowsTransactions(transition)) continue;
         if (transition.table_contract.table_id == table.table_id or
             std.mem.eql(u8, transition.table_contract.table_name, table.name))
         {
@@ -1585,6 +1802,18 @@ fn validateTransactionTopologyStableSnapshot(
             return error.TopologyChanged;
         }
     }
+}
+
+fn onlineMergeAllowsTransactions(transition: metadata_transition_state.MergeTransitionRecord) bool {
+    const online = transition.online orelse return false;
+    switch (online.phase) {
+        .admit, .publish, .snapshot, .tail => {},
+        else => return false,
+    }
+    // The exception belongs to an authenticated admitted merge attempt, not
+    // merely an online-looking phase on an ordinary or mismatched record.
+    online.validateRecord(transition) catch return false;
+    return online.scope.authority == .raft and online.scope.fence.role == .merge_source;
 }
 
 fn transitionPhaseActive(phase: metadata_transition_state.TransitionPhase) bool {
@@ -1769,10 +1998,14 @@ pub const TableGroupDescriptorProjection = struct {
     schema_json: []u8,
     indexes_json: []u8,
     table_storage: ?@import("../common/table_storage.zig").Settings,
+    initial_range: ?@import("../storage/byte_range.zig").ByteRange = null,
+    restore: ?@import("../storage/restore_identity.zig").Identity = null,
 
     pub fn deinit(self: *TableGroupDescriptorProjection, alloc: std.mem.Allocator) void {
         alloc.free(self.schema_json);
         alloc.free(self.indexes_json);
+        @import("../storage/kernel_owner_descriptor.zig").freeInitialRange(alloc, self.initial_range);
+        if (self.restore) |*identity| identity.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -1815,6 +2048,12 @@ pub fn tableGroupDescriptorProjection(
             return projection;
     }
 
+    // A budgeted background quantum cannot fall back to an unbounded
+    // diagnostic read. Its scheduler keeps the debt until the point projection
+    // is ready. Explicit split/restore structural admission retains the full
+    // lifecycle fallback below.
+    if (deadline_ns != null) return error.CatalogRoutingUnavailable;
+
     // A split destination does not become an active routing range until
     // cutover, but its immutable descriptor is already captured in the
     // replicated transition contract. Consult the full lifecycle projection
@@ -1833,6 +2072,8 @@ pub fn tableGroupDescriptorProjection(
                 table.schema_json,
                 table.indexes_json,
                 table.storage,
+                .{ .start = range.start_key, .end = range.end_key orelse "" },
+                restoreIdentityFromRange(range),
             );
         }
     }
@@ -1852,6 +2093,8 @@ pub fn tableGroupDescriptorProjection(
             transition.table_contract.schema_json,
             transition.table_contract.indexes_json,
             null,
+            null, // The replicated split bootstrap owns its initial range.
+            null,
         );
     }
     for (admin.merge_transitions) |transition| {
@@ -1869,6 +2112,8 @@ pub fn tableGroupDescriptorProjection(
             identity.range_id,
             transition.table_contract.schema_json,
             transition.table_contract.indexes_json,
+            null,
+            null, // The replicated merge bootstrap owns its initial range.
             null,
         );
     }
@@ -1892,6 +2137,8 @@ fn descriptorProjectionFromRoutingSnapshot(
             table.schema_json,
             table.indexes_json,
             table.storage,
+            .{ .start = range.start_key, .end = range.end_key orelse "" },
+            restoreIdentityFromRange(range),
         );
     }
     return null;
@@ -1905,16 +2152,36 @@ fn descriptorProjectionFromValues(
     schema_json: []const u8,
     indexes_json: []const u8,
     table_storage: ?@import("../common/table_storage.zig").Settings,
+    initial_range: ?@import("../storage/byte_range.zig").ByteRange,
+    restore: ?@import("../storage/restore_identity.zig").Identity,
 ) !TableGroupDescriptorProjection {
     const owned_schema_json = try alloc.dupe(u8, schema_json);
     errdefer alloc.free(owned_schema_json);
+    const owned_initial_range = try @import("../storage/kernel_owner_descriptor.zig").cloneInitialRange(alloc, initial_range);
+    errdefer @import("../storage/kernel_owner_descriptor.zig").freeInitialRange(alloc, owned_initial_range);
+    const owned_indexes_json = try alloc.dupe(u8, indexes_json);
+    errdefer alloc.free(owned_indexes_json);
     return .{
         .table_id = table_id,
         .table_storage = table_storage,
+        .initial_range = owned_initial_range,
         .doc_identity_shard_id = doc_identity_shard_id,
         .doc_identity_range_id = doc_identity_range_id,
         .schema_json = owned_schema_json,
-        .indexes_json = try alloc.dupe(u8, indexes_json),
+        .indexes_json = owned_indexes_json,
+        .restore = if (restore) |identity| try identity.clone(alloc) else null,
+    };
+}
+
+fn restoreIdentityFromRange(range: metadata_table_manager.RangeRecord) ?@import("../storage/restore_identity.zig").Identity {
+    if (range.restore_backup_id.len == 0) return null;
+    return .{
+        .backup_id = range.restore_backup_id,
+        .location = range.restore_location,
+        .snapshot_path = range.restore_snapshot_path,
+        .artifact_sha256 = range.restore_artifact_sha256,
+        .native_manifest_size_bytes = range.restore_native_manifest_size_bytes,
+        .native_manifest_sha256 = range.restore_native_manifest_sha256,
     };
 }
 
@@ -2162,6 +2429,24 @@ fn resolveRouteObserved(
     query: RouteQuery,
     deadline_ns: ?u64,
 ) !ObservedRouteResult {
+    if (routing.acquire_generation) |acquire| {
+        const budget = RoutingBudget{ .deadline_ns = deadline_ns, .io = routing.io };
+        for ([_]bool{ false, true }) |authoritative| {
+            const generation = acquire(routing.projection.ptr, deadline_ns, authoritative) catch |err| switch (err) {
+                error.CatalogRoutingSnapshotTimeout => return .timed_out,
+                else => return err,
+            };
+            var session = generation.session(alloc, emptyCatalogSource(), authoritative);
+            defer session.deinit();
+            const plan = session.routePlan(alloc, table_name, query, budget) catch |err| switch (err) {
+                error.CatalogRoutingSnapshotTimeout => return .timed_out,
+                else => return err,
+            };
+            if (plan) |value| return .{ .found = value };
+            if (authoritative) return .{ .not_found = session.snapshot.value.change_token };
+        }
+        unreachable;
+    }
     var eventual = routing.eventualSnapshot(deadline_ns) catch |err| switch (err) {
         error.CatalogRoutingSnapshotTimeout => return .timed_out,
         else => return err,
@@ -2285,6 +2570,19 @@ pub fn routePlanFromSnapshotWithBudget(
 
     sortRangeRefs(ranges);
     try budget.checkpoint();
+    const epoch = try topologyEpochFromSortedRangesWithBudget(table.*, ranges, budget);
+    return routePlanFromIndexedRanges(alloc, snapshot, table, ranges, epoch, query, budget);
+}
+
+fn routePlanFromIndexedRanges(
+    alloc: std.mem.Allocator,
+    snapshot: metadata_api.CatalogRoutingSnapshot,
+    table: *const metadata_table_manager.TableRecord,
+    ranges: []const *const metadata_table_manager.RangeRecord,
+    topology_epoch: u64,
+    query: RouteQuery,
+    budget: RoutingBudget,
+) !?CatalogRoutePlan {
     var groups = std.ArrayListUnmanaged(CatalogGroupRoute).empty;
     defer groups.deinit(alloc);
     for (ranges, 0..) |range, index| {
@@ -2316,7 +2614,6 @@ pub fn routePlanFromSnapshotWithBudget(
         try budget.checkpoint();
         return null;
     }
-    const topology_epoch = try topologyEpochFromSortedRangesWithBudget(table.*, ranges, budget);
     const owned_groups = try groups.toOwnedSlice(alloc);
     errdefer alloc.free(owned_groups);
     try budget.checkpoint();
@@ -2411,6 +2708,41 @@ pub fn validateCatalogRouteFenceUntil(
 }
 
 /// Resolve a span and compute the routing epoch from one catalog snapshot.
+/// Resolve a bounded set of document keys from an already pinned routing
+/// session. No per-key metadata RPC is needed. Retain only owning groups, and
+/// fail closed if a caller supplies an unpinned source that changes mid-read.
+pub fn routedDocumentKeysSnapshotUntil(alloc: std.mem.Allocator, catalog: CatalogSource, table_name: []const u8, keys: []const []const u8, deadline_ns: ?u64) !RoutedSpanSnapshot {
+    if (keys.len == 0) return error.InvalidQueryRequest;
+    if (catalog.vtable == &RoutingSession.vtable) {
+        const result = try RoutingSession.cast(catalog.ptr).documentKeyRoutes(alloc, table_name, keys, deadline_ns);
+        alloc.free(result.key_groups);
+        return result.span;
+    }
+    var routes: std.ArrayListUnmanaged(CatalogGroupRoute) = .empty;
+    errdefer routes.deinit(alloc);
+    var groups: std.ArrayListUnmanaged(u64) = .empty;
+    errdefer groups.deinit(alloc);
+    var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    defer seen.deinit(alloc);
+    var first: ?metadata_api.CatalogRouteFence = null;
+    for (keys) |key| {
+        try catalog.budget(deadline_ns).checkpoint();
+        const routed = try routedGroupSnapshotUntil(alloc, catalog, table_name, key, deadline_ns);
+        const fence = routed.fence() orelse return error.TopologyChanged;
+        if (first) |previous| {
+            if (previous.metadata_group_id != fence.metadata_group_id or !std.meta.eql(previous.metadata_incarnation, fence.metadata_incarnation) or previous.catalog_revision != fence.catalog_revision or previous.table_id != fence.table_id or previous.topology_epoch != fence.topology_epoch) return error.TopologyChanged;
+        } else first = fence;
+        if (seen.contains(fence.route.group_id)) continue;
+        try seen.put(alloc, fence.route.group_id, {});
+        try routes.append(alloc, fence.route);
+        try groups.append(alloc, fence.route.group_id);
+    }
+    const fence = first.?;
+    const owned_routes = try routes.toOwnedSlice(alloc);
+    errdefer alloc.free(owned_routes);
+    return .{ .routes = owned_routes, .group_ids = try groups.toOwnedSlice(alloc), .metadata_group_id = fence.metadata_group_id, .metadata_incarnation = fence.metadata_incarnation, .catalog_revision = fence.catalog_revision, .table_id = fence.table_id, .topology_epoch = fence.topology_epoch };
+}
+
 pub fn routedSpanSnapshot(
     alloc: std.mem.Allocator,
     catalog: CatalogSource,
@@ -2525,6 +2857,17 @@ fn metadataServiceFreeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.Adm
     svc.freeAdminSnapshot(snapshot);
 }
 
+fn metadataServiceAcquireRoutingGeneration(ptr: *anyopaque, deadline_ns: ?u64, authoritative: bool) !*RoutingGeneration {
+    const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+    if (authoritative) {
+        svc.ensureLinearizableReadWithContext(.{ .deadline_ns = deadline_ns }) catch |err| switch (err) {
+            error.DeadlineExceeded, error.MetadataLinearizableReadTimeout => return error.CatalogRoutingSnapshotTimeout,
+            else => return err,
+        };
+    }
+    return try svc.acquireCatalogRoutingGeneration(deadline_ns);
+}
+
 fn metadataServiceRoutingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
     const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
     return try svc.catalogRoutingSnapshot(deadline_ns);
@@ -2600,6 +2943,17 @@ fn metadataHttpServiceFreeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api
     svc.freeAdminSnapshot(snapshot);
 }
 
+fn metadataHttpServiceAcquireRoutingGeneration(ptr: *anyopaque, deadline_ns: ?u64, authoritative: bool) !*RoutingGeneration {
+    const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    if (authoritative) {
+        svc.ensureLinearizableReadWithContext(.{ .deadline_ns = deadline_ns }) catch |err| switch (err) {
+            error.DeadlineExceeded, error.MetadataLinearizableReadTimeout => return error.CatalogRoutingSnapshotTimeout,
+            else => return err,
+        };
+    }
+    return try svc.acquireCatalogRoutingGeneration(deadline_ns);
+}
+
 fn metadataHttpServiceRoutingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
     const svc: *metadata_service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     return try svc.catalogRoutingSnapshot(deadline_ns);
@@ -2673,6 +3027,17 @@ fn metadataServerCatalogIdentity(ptr: *anyopaque) !metadata_api.CatalogIdentity 
 fn metadataServerFreeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
     const srv: *metadata_server.MetadataServer = @ptrCast(@alignCast(ptr));
     srv.freeAdminSnapshot(snapshot);
+}
+
+fn metadataServerAcquireRoutingGeneration(ptr: *anyopaque, deadline_ns: ?u64, authoritative: bool) !*RoutingGeneration {
+    const srv: *metadata_server.MetadataServer = @ptrCast(@alignCast(ptr));
+    if (authoritative) {
+        srv.svc.ensureLinearizableReadWithContext(.{ .deadline_ns = deadline_ns }) catch |err| switch (err) {
+            error.DeadlineExceeded, error.MetadataLinearizableReadTimeout => return error.CatalogRoutingSnapshotTimeout,
+            else => return err,
+        };
+    }
+    return try srv.svc.acquireCatalogRoutingGeneration(deadline_ns);
 }
 
 fn metadataServerRoutingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
@@ -3194,6 +3559,93 @@ fn consumerTests() type {
             try std.testing.expectError(error.TopologyChanged, validateTransactionTopologyStable(source, "docs"));
         }
 
+        test "distributed txn topology admits online copy but fences freeze cancellation and stale epochs" {
+            const Source = struct {
+                fn snapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+                    return @as(*metadata_api.AdminSnapshot, @ptrCast(@alignCast(ptr))).*;
+                }
+                fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+            };
+            var tables = [_]metadata_table_manager.TableRecord{.{ .table_id = 1, .name = "rows" }};
+            var ranges = [_]metadata_table_manager.RangeRecord{
+                .{ .table_id = 1, .group_id = 2, .range_id = 4, .start_key = "", .end_key = "m" },
+                .{ .table_id = 1, .group_id = 3, .range_id = 5, .start_key = "m", .end_key = null },
+            };
+            const initial: metadata_transition_state.MergeTransitionRecord = .{
+                .transition_id = 9,
+                .donor_group_id = 2,
+                .receiver_group_id = 3,
+                .table_contract = .{ .table_id = 1, .table_name = "rows", .source_identity = .{ .shard_id = 2, .range_id = 4 }, .target_identity = .{ .shard_id = 3, .range_id = 5 } },
+                .online = .{ .scope = .{
+                    .fence = .{ .transition_id = 9, .attempt = 1, .peer_group_id = 3, .owner_group_id = 2, .role = .merge_source, .namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 4 }, .catalog_digest = @splat(7) },
+                    .receiver_namespace = .{ .table_id = 1, .shard_id = 3, .range_id = 5 },
+                    .consumer_epoch = 6,
+                    .copy_attempt = .{ .donor_term = 8, .sequence = 1 },
+                } },
+            };
+            var merges = [_]metadata_transition_state.MergeTransitionRecord{initial};
+            var snapshot: metadata_api.AdminSnapshot = .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = &tables,
+                .ranges = &ranges,
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &merges,
+            };
+            const source: CatalogSource = .{ .ptr = &snapshot, .vtable = &.{ .admin_snapshot = Source.snapshot, .free_admin_snapshot = Source.free } };
+            const epoch = try transactionTopologyEpoch(std.testing.allocator, source, "rows");
+            inline for (std.meta.tags(@import("../metadata/online_merge.zig").Phase)) |phase| {
+                merges[0] = initial;
+                merges[0].online.?.phase = phase;
+                if (phase != .admit and phase != .publish) {
+                    merges[0].online.?.certificate = .{ .cut = .{ .namespace = initial.online.?.scope.fence.namespace, .applied_index = 19, .retained_start = 11 }, .objects = 1, .content_bytes = 100, .schema_manifest_digest = @splat(2), .ordered_content_digest = @splat(3) };
+                    merges[0].online.?.acknowledged = 11;
+                }
+                if (phase == .final_tail or phase == .cutover or phase == .release or phase == .complete) {
+                    merges[0].online.?.final_sequence = 11;
+                    merges[0].online.?.final_applied_index = 25;
+                    merges[0].online.?.final_cut_digest = @splat(9);
+                }
+                if (phase == .complete) merges[0].phase = .finalized;
+                if (phase == .cancelled) merges[0].phase = .rolled_back;
+                try merges[0].online.?.validateRecord(merges[0]);
+                switch (phase) {
+                    .admit, .publish, .snapshot, .tail, .complete, .cancelled => {
+                        try validateTransactionTopologyStable(source, "rows");
+                        try validateTransactionTopologyEpoch(std.testing.allocator, source, "rows", epoch);
+                        var routing = (try transactionRoutingSnapshot(std.testing.allocator, source, "rows")).?;
+                        defer routing.deinit(std.testing.allocator);
+                        try std.testing.expectEqual(epoch, routing.topology_epoch);
+                        try std.testing.expectEqual(@as(?u64, 2), routing.resolveGroupForKey("a"));
+                        try std.testing.expectEqual(@as(?u64, 3), routing.resolveGroupForKey("z"));
+                    },
+                    else => {
+                        try std.testing.expectError(error.TopologyChanged, validateTransactionTopologyStable(source, "rows"));
+                        try std.testing.expectError(error.TopologyChanged, transactionTopologyEpoch(std.testing.allocator, source, "rows"));
+                        try std.testing.expectError(error.TopologyChanged, validateTransactionTopologyEpoch(std.testing.allocator, source, "rows", epoch));
+                        try std.testing.expectError(error.TopologyChanged, transactionRoutingSnapshot(std.testing.allocator, source, "rows"));
+                    },
+                }
+            }
+            merges[0] = initial;
+            merges[0].online = null;
+            try std.testing.expectError(error.TopologyChanged, validateTransactionTopologyStable(source, "rows"));
+            merges[0] = initial;
+            merges[0].online.?.scope.fence.transition_id += 1;
+            try std.testing.expectError(error.TopologyChanged, validateTransactionTopologyStable(source, "rows"));
+            merges[0] = initial;
+            merges[0].online.?.phase = .snapshot; // No immutable certificate.
+            try std.testing.expectError(error.TopologyChanged, validateTransactionTopologyStable(source, "rows"));
+            merges[0] = initial;
+            ranges[0].end_key = "n";
+            ranges[1].start_key = "n";
+            try std.testing.expectError(error.TopologyChanged, validateTransactionTopologyEpoch(std.testing.allocator, source, "rows", epoch));
+            var splits = [_]metadata_transition_state.SplitTransitionRecord{.{ .transition_id = 10, .attempt_epoch = 1, .source_group_id = 2, .destination_group_id = 4, .table_contract = .{ .table_id = 1, .table_name = "rows" } }};
+            snapshot.split_transitions = &splits;
+            try std.testing.expectError(error.TopologyChanged, validateTransactionTopologyStable(source, "rows"));
+        }
+
         test "catalog source resolves a single-range table group" {
             const FakeCatalog = struct {
                 fn iface() CatalogSource {
@@ -3523,7 +3975,9 @@ fn consumerTests() type {
                     .{ .table_id = 8, .name = "authors" },
                 };
                 const ranges = [_]metadata_table_manager.RangeRecord{
-                    .{ .group_id = 7001, .range_id = 71, .table_id = 7, .start_key = "", .doc_identity_shard_id = 17, .doc_identity_range_id = 71 },
+                    .{ .group_id = 7001, .range_id = 71, .table_id = 7, .start_key = "", .end_key = "m", .doc_identity_shard_id = 17, .doc_identity_range_id = 71 },
+                    .{ .group_id = 7002, .range_id = 72, .table_id = 7, .start_key = "m", .end_key = "t", .doc_identity_shard_id = 17, .doc_identity_range_id = 72 },
+                    .{ .group_id = 7003, .range_id = 73, .table_id = 7, .start_key = "t", .doc_identity_shard_id = 17, .doc_identity_range_id = 73 },
                     .{ .group_id = 8001, .range_id = 81, .table_id = 8, .start_key = "", .doc_identity_shard_id = 18, .doc_identity_range_id = 81 },
                 };
 
@@ -3572,6 +4026,16 @@ fn consumerTests() type {
             const fence = (try source.vtable.route_fence.?(source.ptr, 8001)).?;
             try std.testing.expectEqual(@as(u64, 8), fence.table_id);
             try std.testing.expectEqual(@as(u64, 81), fence.route.identity_namespace.range_id);
+            var selected = try session.documentKeyRoutes(std.testing.allocator, "docs", &.{ "a", "z", "a" }, null);
+            defer selected.span.deinit(std.testing.allocator);
+            defer std.testing.allocator.free(selected.key_groups);
+            try std.testing.expectEqualSlices(u64, &.{ 7001, 7003 }, selected.span.group_ids);
+            try std.testing.expectEqualSlices(u64, &.{ 7001, 7003, 7001 }, selected.key_groups);
+            try std.testing.expectEqual(@as(u64, 9), selected.span.catalog_revision);
+            var boundaries = try session.documentKeyRoutes(std.testing.allocator, "docs", &.{ "m", "t" }, null);
+            defer boundaries.span.deinit(std.testing.allocator);
+            defer std.testing.allocator.free(boundaries.key_groups);
+            try std.testing.expectEqualSlices(u64, &.{ 7002, 7003 }, boundaries.key_groups);
             try std.testing.expectEqual(@as(usize, 0), state.admin_calls);
             try std.testing.expectEqual(@as(usize, 1), state.linearizable_calls);
         }
@@ -4203,4 +4667,31 @@ fn consumerTests() type {
 }
 comptime {
     if (@import("builtin").is_test) _ = consumer_tests;
+}
+
+test "system catalog routing generation survives retirement and bounds request allocation" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tables = try a.alloc(metadata_table_manager.TableRecord, 10000);
+    const ranges = try a.alloc(metadata_table_manager.RangeRecord, tables.len);
+    for (tables, ranges, 0..) |*table, *range, i| {
+        table.* = .{ .table_id = i + 1, .name = try std.fmt.allocPrint(a, "table-{d}", .{i}) };
+        range.* = .{ .table_id = i + 1, .group_id = i + 7001, .start_key = "" };
+    }
+    const generation = try RoutingGeneration.create(alloc, .{ .metadata_group_id = 1, .catalog_revision = 17, .tables = tables, .ranges = ranges }, .{});
+    generation.retain();
+    // Only the request's reference survives publisher retirement.
+    generation.release();
+    var buffer: [4096]u8 = undefined;
+    var bounded = std.heap.FixedBufferAllocator.init(&buffer);
+    var session = generation.session(bounded.allocator(), emptyCatalogSource(), true);
+    defer session.deinit();
+    var result = try session.routePlan(bounded.allocator(), "table-9999", .all_ranges, .{});
+    defer if (result) |*plan| plan.deinit(bounded.allocator());
+    try std.testing.expectEqual(@as(u64, 17), result.?.catalog_revision);
+    try std.testing.expectEqual(@as(u64, 10000), result.?.table_id);
+    try std.testing.expectEqual(@as(usize, 1), result.?.groups.len);
+    try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, session.routePlan(bounded.allocator(), "table-9999", .table, .{ .deadline_ns = 1 }));
 }

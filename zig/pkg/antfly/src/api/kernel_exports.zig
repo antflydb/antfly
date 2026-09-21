@@ -246,13 +246,21 @@ pub fn attachReplicatedRestoreStore(
     server_handle: *anyopaque,
     persistence_opaque: *const anyopaque,
 ) callconv(.c) abi.Status {
-    if (validateVersion(abi_version)) |failure| return failure;
+    if (validateVersion(abi_version)) |failure| {
+        std.log.warn("restore job attachment API ABI mismatch: caller={d} owner={d}", .{ abi_version, abi.abi_version });
+        return failure;
+    }
     const persistence: *const restore_jobs.ReplicatedPersistence = @ptrCast(@alignCast(persistence_opaque));
-    if (persistence.version != restore_jobs.ReplicatedPersistence.abi_version)
+    if (persistence.version != restore_jobs.ReplicatedPersistence.abi_version) {
+        std.log.warn("restore job persistence ABI mismatch: provider={d} consumer={d}", .{ persistence.version, restore_jobs.ReplicatedPersistence.abi_version });
         return fail(error.UnsupportedVersion);
+    }
     const state: *ServerState = @ptrCast(@alignCast(server_handle));
-    state.server.attachReplicatedRestoreJobStore(persistence.*) catch |err|
-        return fail(err);
+    state.server.attachReplicatedRestoreJobStore(persistence.*) catch |err| {
+        const status = fail(err);
+        std.log.warn("restore job persistence load failed after ABI validation: version={d} code={d} detail={d}", .{ persistence.version, status.code, status.detail });
+        return status;
+    };
     return .ok;
 }
 

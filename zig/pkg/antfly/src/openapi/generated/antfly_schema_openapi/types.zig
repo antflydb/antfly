@@ -385,10 +385,854 @@ pub const FieldMappingType = enum {
     }
 };
 
+/// Action on referencing rows when a referenced row is changed or removed.
+pub const ForeignKeyAction = enum {
+    restrict,
+    set_null,
+    cascade,
+    no_action,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .restrict => "restrict",
+            .set_null => "set_null",
+            .cascade => "cascade",
+            .no_action => "no_action",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "restrict", .restrict },
+            .{ "set_null", .set_null },
+            .{ "cascade", .cascade },
+            .{ "no_action", .no_action },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Null matching semantics of a composite foreign key. Partial requires at least one parent matching every non-null child component; all-null children are exempt. Compatible parent witnesses are guarded through commit, including concurrent deletion of alternative witnesses.
+pub const ForeignKeyMatch = enum {
+    simple,
+    full,
+    partial,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .simple => "simple",
+            .full => "full",
+            .partial => "partial",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "simple", .simple },
+            .{ "full", .full },
+            .{ "partial", .partial },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Enforcement timing for atomic mutations and transaction sessions. Deferred requires deferrable=true and validates the final transaction state. NO ACTION permits a valid final-state parent replacement; RESTRICT still rejects referenced parent removal. Existing multi-request transaction sessions retain deferred checks until commit; immediate checks apply to each staged statement. SET CONSTRAINTS is not provided.
+pub const ForeignKeyTiming = enum {
+    immediate,
+    deferred,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .immediate => "immediate",
+            .deferred => "deferred",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "immediate", .immediate },
+            .{ "deferred", .deferred },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// A typed CHECK. Supply either expression or column and op (with optional value and collation), never both forms. Expressions must return boolean and use the shared bounded immutable scalar expression vocabulary. New writes are checked from schema publication; existing rows are validated separately. SQL UNKNOWN satisfies CHECK. Comparison values must match the column type. Integer values may also use exact decimal strings to avoid client-side floating-point rounding.
+pub const RelationalCheckConstraint = struct {
+    name: []const u8,
+    column: ?[]const u8 = null,
+    op: ?RelationalComparisonOp = null,
+    /// Scalar comparison operand. Omission represents NULL. Null tests require a NULL operand.
+    value: ?std.json.Value = null,
+    /// String comparison collation; uses the same rules as ordered indexes.
+    collation: ?[]const u8 = null,
+    expression: ?RelationalScalarExpression = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "name", "name", false },
+        .{ "column", "column", true },
+        .{ "op", "op", true },
+        .{ "value", "value", true },
+        .{ "collation", "collation", true },
+        .{ "expression", "expression", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        if (self.column) |value| {
+            try jw.objectField("column");
+            try jw.write(value);
+        }
+        if (self.op) |value| {
+            try jw.objectField("op");
+            try jw.write(value);
+        }
+        if (self.value) |value| {
+            try jw.objectField("value");
+            try jw.write(value);
+        }
+        if (self.collation) |value| {
+            try jw.objectField("collation");
+            try jw.write(value);
+        }
+        if (self.expression) |value| {
+            try jw.objectField("expression");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const RelationalColumnExpression = struct {
+    column: []const u8,
+    expression: RelationalScalarExpression,
+};
+
+pub const RelationalComparisonOp = enum {
+    is_null,
+    is_not_null,
+    eq,
+    ne,
+    gt,
+    gte,
+    lt,
+    lte,
+    is_distinct,
+    is_not_distinct,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .is_null => "is_null",
+            .is_not_null => "is_not_null",
+            .eq => "eq",
+            .ne => "ne",
+            .gt => "gt",
+            .gte => "gte",
+            .lt => "lt",
+            .lte => "lte",
+            .is_distinct => "is_distinct",
+            .is_not_distinct => "is_not_distinct",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "is_null", .is_null },
+            .{ "is_not_null", .is_not_null },
+            .{ "eq", .eq },
+            .{ "ne", .ne },
+            .{ "gt", .gt },
+            .{ "gte", .gte },
+            .{ "lt", .lt },
+            .{ "lte", .lte },
+            .{ "is_distinct", .is_distinct },
+            .{ "is_not_distinct", .is_not_distinct },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Validation state of an existing-row constraint.
+pub const RelationalConstraintValidationState = enum {
+    enforced,
+    unvalidated,
+    validating,
+    invalid,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .enforced => "enforced",
+            .unvalidated => "unvalidated",
+            .validating => "validating",
+            .invalid => "invalid",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "enforced", .enforced },
+            .{ "unvalidated", .unvalidated },
+            .{ "validating", .validating },
+            .{ "invalid", .invalid },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const RelationalExpressionOp = enum {
+    literal,
+    column,
+    add,
+    subtract,
+    multiply,
+    divide,
+    negate,
+    concat,
+    coalesce,
+    lower_ascii,
+    upper_ascii,
+    eq,
+    ne,
+    gt,
+    gte,
+    lt,
+    lte,
+    is_null,
+    is_not_null,
+    is_distinct,
+    is_not_distinct,
+    @"and",
+    @"or",
+    not,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .literal => "literal",
+            .column => "column",
+            .add => "add",
+            .subtract => "subtract",
+            .multiply => "multiply",
+            .divide => "divide",
+            .negate => "negate",
+            .concat => "concat",
+            .coalesce => "coalesce",
+            .lower_ascii => "lower_ascii",
+            .upper_ascii => "upper_ascii",
+            .eq => "eq",
+            .ne => "ne",
+            .gt => "gt",
+            .gte => "gte",
+            .lt => "lt",
+            .lte => "lte",
+            .is_null => "is_null",
+            .is_not_null => "is_not_null",
+            .is_distinct => "is_distinct",
+            .is_not_distinct => "is_not_distinct",
+            .@"and" => "and",
+            .@"or" => "or",
+            .not => "not",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "literal", .literal },
+            .{ "column", .column },
+            .{ "add", .add },
+            .{ "subtract", .subtract },
+            .{ "multiply", .multiply },
+            .{ "divide", .divide },
+            .{ "negate", .negate },
+            .{ "concat", .concat },
+            .{ "coalesce", .coalesce },
+            .{ "lower_ascii", .lower_ascii },
+            .{ "upper_ascii", .upper_ascii },
+            .{ "eq", .eq },
+            .{ "ne", .ne },
+            .{ "gt", .gt },
+            .{ "gte", .gte },
+            .{ "lt", .lt },
+            .{ "lte", .lte },
+            .{ "is_null", .is_null },
+            .{ "is_not_null", .is_not_null },
+            .{ "is_distinct", .is_distinct },
+            .{ "is_not_distinct", .is_not_distinct },
+            .{ "and", .@"and" },
+            .{ "or", .@"or" },
+            .{ "not", .not },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const RelationalExpressionType = enum {
+    string,
+    blob,
+    boolean,
+    datetime,
+    integer,
+    number,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .string => "string",
+            .blob => "blob",
+            .boolean => "boolean",
+            .datetime => "datetime",
+            .integer => "integer",
+            .number => "number",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "string", .string },
+            .{ "blob", .blob },
+            .{ "boolean", .boolean },
+            .{ "datetime", .datetime },
+            .{ "integer", .integer },
+            .{ "number", .number },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Composite foreign key. Child and parent columns correspond by position and must have the same physical comparison types. The parent columns must identify a unique key. Existing-row validation is independent of new-write enforcement and is never client-writable. Enforcement and referential actions share the bounded distributed transaction path, including TTL expiry. Partial matching uses ordered support indexes on the parent; activation waits until these are ready. SET NULL requires every child column to accept explicit NULL.
+pub const RelationalForeignKeyConstraint = struct {
+    name: []const u8,
+    child_columns: []const []const u8,
+    /// Literal parent table name in the child table's database and namespace. Resolved to an immutable table identity when the constraint is declared; renaming a parent preserves the reference. Public schemas show its current name.
+    parent_table: []const u8,
+    parent_columns: []const []const u8,
+    on_delete: ?ForeignKeyAction = null,
+    on_update: ?ForeignKeyAction = null,
+    timing: ?ForeignKeyTiming = null,
+    match: ?ForeignKeyMatch = null,
+    deferrable: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "name", "name", false },
+        .{ "child_columns", "child_columns", false },
+        .{ "parent_table", "parent_table", false },
+        .{ "parent_columns", "parent_columns", false },
+        .{ "on_delete", "on_delete", true },
+        .{ "on_update", "on_update", true },
+        .{ "timing", "timing", true },
+        .{ "match", "match", true },
+        .{ "deferrable", "deferrable", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("child_columns");
+        try jw.write(self.child_columns);
+        try jw.objectField("parent_table");
+        try jw.write(self.parent_table);
+        try jw.objectField("parent_columns");
+        try jw.write(self.parent_columns);
+        if (self.on_delete) |value| {
+            try jw.objectField("on_delete");
+            try jw.write(value);
+        }
+        if (self.on_update) |value| {
+            try jw.objectField("on_update");
+            try jw.write(value);
+        }
+        if (self.timing) |value| {
+            try jw.objectField("timing");
+            try jw.write(value);
+        }
+        if (self.match) |value| {
+            try jw.objectField("match");
+            try jw.write(value);
+        }
+        if (self.deferrable) |value| {
+            try jw.objectField("deferrable");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Physical access method of a relational index.
+pub const RelationalIndexAccessMethod = enum {
+    scalar_column,
+    ordered_tuple,
+    algebraic_filter,
+    text_search,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .scalar_column => "scalar_column",
+            .ordered_tuple => "ordered_tuple",
+            .algebraic_filter => "algebraic_filter",
+            .text_search => "text_search",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "scalar_column", .scalar_column },
+            .{ "ordered_tuple", .ordered_tuple },
+            .{ "algebraic_filter", .algebraic_filter },
+            .{ "text_search", .text_search },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Declarative table-owned ordered index. Keys are compared lexicographically in the declared order, with independent direction, null placement, and string collation. Creation builds existing rows asynchronously; queries must wait for range-local coverage. Unique constraints and expression keys are not implied by this object. Optional WHERE conjuncts select only matching rows. INCLUDE columns store typed values alongside keys for index-only projected reads.
+pub const RelationalIndexDefinition = struct {
+    /// Optional human-readable description, also exposed by the shared indexes API.
+    description: ?[]const u8 = null,
+    name: []const u8,
+    keys: []const RelationalIndexKey,
+    /// Non-key columns stored in the index; must be distinct from key columns.
+    include_columns: ?[]const []const u8 = null,
+    /// Conjunction of typed predicates. Indexed queries must explicitly contain every conjunct with equivalent typed comparison semantics.
+    where: ?[]const RelationalIndexPredicate = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "description", "description", true },
+        .{ "name", "name", false },
+        .{ "keys", "keys", false },
+        .{ "include_columns", "include_columns", true },
+        .{ "where", "where", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.description) |value| {
+            try jw.objectField("description");
+            try jw.write(value);
+        }
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("keys");
+        try jw.write(self.keys);
+        if (self.include_columns) |value| {
+            try jw.objectField("include_columns");
+            try jw.write(value);
+        }
+        if (self.where) |value| {
+            try jw.objectField("where");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Ordered component of a relational ordered-tuple index key. Supply either a declared column or a deterministic typed scalar expression with its result_type. Composite keys may mix both forms. Bounds use the expression result type, not its input columns.
+pub const RelationalIndexKey = struct {
+    /// Declared relational column used by this key component.
+    column: ?[]const u8 = null,
+    expression: ?RelationalScalarExpression = null,
+    result_type: ?RelationalExpressionType = null,
+    /// String-key collation. Omission selects binary ordering. Supported binary aliases are C, POSIX, and binary. The aliases ci, case_insensitive, and antfly.case_insensitive select ASCII-only case folding, not locale-aware or Unicode case folding.
+    collation: ?[]const u8 = null,
+    direction: ?RelationalIndexKeyDirection = null,
+    nulls: ?RelationalIndexKeyNulls = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "column", "column", true },
+        .{ "expression", "expression", true },
+        .{ "result_type", "result_type", true },
+        .{ "collation", "collation", true },
+        .{ "direction", "direction", true },
+        .{ "nulls", "nulls", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.column) |value| {
+            try jw.objectField("column");
+            try jw.write(value);
+        }
+        if (self.expression) |value| {
+            try jw.objectField("expression");
+            try jw.write(value);
+        }
+        if (self.result_type) |value| {
+            try jw.objectField("result_type");
+            try jw.write(value);
+        }
+        if (self.collation) |value| {
+            try jw.objectField("collation");
+            try jw.write(value);
+        }
+        if (self.direction) |value| {
+            try jw.objectField("direction");
+            try jw.write(value);
+        }
+        if (self.nulls) |value| {
+            try jw.objectField("nulls");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Direction of one ordered index key component. Omission selects asc.
+pub const RelationalIndexKeyDirection = enum {
+    asc,
+    desc,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .asc => "asc",
+            .desc => "desc",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "asc", .asc },
+            .{ "desc", .desc },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Null placement for one ordered index key component. The default is last for ascending keys and first for descending keys. Omission selects default.
+pub const RelationalIndexKeyNulls = enum {
+    default,
+    first,
+    last,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .default => "default",
+            .first => "first",
+            .last => "last",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "default", .default },
+            .{ "first", .first },
+            .{ "last", .last },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Lifecycle of a relational index generation. Query eligibility additionally requires complete coverage and no unapplied mutations; ready alone is not an integrity proof.
+pub const RelationalIndexLifecycle = enum {
+    ready,
+    building,
+    invalid,
+    dropping,
+    catching_up,
+    stale,
+    rebuild_required,
+    failed,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .ready => "ready",
+            .building => "building",
+            .invalid => "invalid",
+            .dropping => "dropping",
+            .catching_up => "catching_up",
+            .stale => "stale",
+            .rebuild_required => "rebuild_required",
+            .failed => "failed",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "ready", .ready },
+            .{ "building", .building },
+            .{ "invalid", .invalid },
+            .{ "dropping", .dropping },
+            .{ "catching_up", .catching_up },
+            .{ "stale", .stale },
+            .{ "rebuild_required", .rebuild_required },
+            .{ "failed", .failed },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Logical schema object that owns a relational index.
+pub const RelationalIndexOwnerKind = enum {
+    relational_column,
+    unique_constraint,
+    table,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .relational_column => "relational_column",
+            .unique_constraint => "unique_constraint",
+            .table => "table",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "relational_column", .relational_column },
+            .{ "unique_constraint", .unique_constraint },
+            .{ "table", .table },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// A typed partial-index conjunct. Only TRUE is indexed; FALSE and SQL UNKNOWN are excluded.
+pub const RelationalIndexPredicate = struct {
+    column: []const u8,
+    op: RelationalComparisonOp,
+    /// Typed scalar operand; integer columns also accept exact decimal strings. Omission means NULL.
+    value: ?std.json.Value = null,
+    /// String comparison collation with the same semantics as ordered keys.
+    collation: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "column", "column", false },
+        .{ "op", "op", false },
+        .{ "value", "value", true },
+        .{ "collation", "collation", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("column");
+        try jw.write(self.column);
+        try jw.objectField("op");
+        try jw.write(self.op);
+        if (self.value) |value| {
+            try jw.objectField("value");
+            try jw.write(value);
+        }
+        if (self.collation) |value| {
+            try jw.objectField("collation");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Immutable typed scalar expression, limited to 128 nodes and 16 levels. A literal requires type; omitted value means typed null. A column requires column; other operations require args. Unknown or irrelevant fields are rejected. Arithmetic operands have the same integer or number type. Integer division truncates toward zero. Overflow and division by zero reject the write. Arithmetic and string operations propagate null. ASCII case operations leave non-ASCII bytes unchanged. No volatile functions are accepted. Allocated results are bounded to 1 MiB each. Allocations and byte-comparison operand work share a 4 MiB evaluation budget per row and expression set. An integer literal may use a decimal string for exact int64 transport; blob uses base64 and datetime uses the normal relational datetime representation. Comparisons require operands of the same type and return boolean or SQL UNKNOWN (null); is_distinct and is_not_distinct always return a boolean. Unary is_null and is_not_null test presence/null. AND and OR evaluate left to right with SQL three-valued short-circuit semantics; NOT preserves UNKNOWN. CHECK accepts TRUE and UNKNOWN, rejecting FALSE.
+pub const RelationalScalarExpression = struct {
+    op: RelationalExpressionOp,
+    type: ?RelationalExpressionType = null,
+    /// Typed literal value, including null.
+    value: ?std.json.Value = null,
+    column: ?[]const u8 = null,
+    /// Optional binary or ASCII case-insensitive collation for binary string comparison operations only; aliases match ordered indexes.
+    collation: ?[]const u8 = null,
+    args: ?[]const RelationalScalarExpression = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "op", "op", false },
+        .{ "type", "type", true },
+        .{ "value", "value", true },
+        .{ "column", "column", true },
+        .{ "collation", "collation", true },
+        .{ "args", "args", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("op");
+        try jw.write(self.op);
+        if (self.type) |value| {
+            try jw.objectField("type");
+            try jw.write(value);
+        }
+        if (self.value) |value| {
+            try jw.objectField("value");
+            try jw.write(value);
+        }
+        if (self.column) |value| {
+            try jw.objectField("column");
+            try jw.write(value);
+        }
+        if (self.collation) |value| {
+            try jw.objectField("collation");
+            try jw.write(value);
+        }
+        if (self.args) |value| {
+            try jw.objectField("args");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// A named, ordered composite unique key. Validation status is maintained by the server. TTL expiry uses the distributed integrity coordinator. Referenced unique keys are nondeferrable.
+pub const RelationalUniqueConstraint = struct {
+    name: []const u8,
+    columns: []const []const u8,
+    /// When true, NULL components compare equal for uniqueness.
+    nulls_not_distinct: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "name", "name", false },
+        .{ "columns", "columns", false },
+        .{ "nulls_not_distinct", "nulls_not_distinct", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("columns");
+        try jw.write(self.columns);
+        if (self.nulls_not_distinct) |value| {
+            try jw.objectField("nulls_not_distinct");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// Schema definition for a table with multiple document types
 pub const TableSchema = struct {
     /// Backend-managed schema generation used for migrations. Omit it from create and update requests.
-    version: ?i64 = null,
+    version: ?u32 = null,
+    storage_mode: ?TableStorageMode = null,
+    /// Immutable typed expressions applied only to absent columns on new writes, never explicit null. Defaults cannot reference columns. A column cannot have both a default and a generated expression. Omission or [] declares none. Relational tables only.
+    column_defaults: ?[]const RelationalColumnExpression = null,
+    /// Stored immutable generated columns, evaluated in dependency order on writes before validation and indexing. Cycles are rejected. Generated columns are output-only; submitted values are replaced by the computed value. Omission or [] declares none. Defaults and generated declarations together are limited to 256 columns, 4096 expression nodes, and 4 MiB of literal data. Evaluation has a shared 4 MiB allocation budget across all column expressions. Restore verifies stored results instead of silently recomputing them. Changing, adding, or removing generated semantics through an existing table's schema update requires explicit rewrite=true on the PUT or PATCH schema route. This returns a durable restore job and replaces the complete authorized dependency cohort only after distributed transformation and validation. Ordinary schema updates reject these changes, even when a table appears empty. Declaration reordering and default-only changes remain allowed. Relational tables only.
+    generated_columns: ?[]const RelationalColumnExpression = null,
+    /// Named scalar CHECK constraints for a relational schema. This is part of the complete schema: omission or [] declares no checks. New writes enforce every check. Existing-row validation status is maintained separately and is never accepted from the client.
+    checks: ?[]const RelationalCheckConstraint = null,
+    /// Complete set of composite unique declarations. Omission or [] declares none.
+    unique_constraints: ?[]const RelationalUniqueConstraint = null,
+    /// Complete set of outgoing composite foreign keys. Omission or [] declares none.
+    foreign_keys: ?[]const RelationalForeignKeyConstraint = null,
+    /// Desired ordered indexes for a relational table. Names must be unique. An explicit array replaces the declarations; an empty array drops them. Omission preserves existing declarations during schema updates. Index definitions commit atomically with the schema; build progress and readiness are local to each owning shard, not client-writable.
+    relational_indexes: ?[]const RelationalIndexDefinition = null,
     /// Default type to use from the document_types.
     default_type: ?[]const u8 = null,
     /// Whether to enforce that documents must match one of the provided document types. If false, documents not matching any type will be accepted but not indexed.
@@ -407,6 +1251,13 @@ pub const TableSchema = struct {
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "version", "version", true },
+        .{ "storage_mode", "storage_mode", true },
+        .{ "column_defaults", "column_defaults", true },
+        .{ "generated_columns", "generated_columns", true },
+        .{ "checks", "checks", true },
+        .{ "unique_constraints", "unique_constraints", true },
+        .{ "foreign_keys", "foreign_keys", true },
+        .{ "relational_indexes", "relational_indexes", true },
         .{ "default_type", "default_type", true },
         .{ "enforce_types", "enforce_types", true },
         .{ "document_schemas", "document_schemas", true },
@@ -428,6 +1279,34 @@ pub const TableSchema = struct {
         try jw.beginObject();
         if (self.version) |value| {
             try jw.objectField("version");
+            try jw.write(value);
+        }
+        if (self.storage_mode) |value| {
+            try jw.objectField("storage_mode");
+            try jw.write(value);
+        }
+        if (self.column_defaults) |value| {
+            try jw.objectField("column_defaults");
+            try jw.write(value);
+        }
+        if (self.generated_columns) |value| {
+            try jw.objectField("generated_columns");
+            try jw.write(value);
+        }
+        if (self.checks) |value| {
+            try jw.objectField("checks");
+            try jw.write(value);
+        }
+        if (self.unique_constraints) |value| {
+            try jw.objectField("unique_constraints");
+            try jw.write(value);
+        }
+        if (self.foreign_keys) |value| {
+            try jw.objectField("foreign_keys");
+            try jw.write(value);
+        }
+        if (self.relational_indexes) |value| {
+            try jw.objectField("relational_indexes");
             try jw.write(value);
         }
         if (self.default_type) |value| {
@@ -466,6 +1345,32 @@ pub const TableSchema = struct {
             try jw.write(value);
         }
         try jw.endObject();
+    }
+};
+
+/// Storage representation for the table. Omission selects "document". "relational" stores schema-bound typed rows and requires exactly one closed document schema with declared properties. It implies enforce_types; explicitly setting enforce_types to false is invalid. Existing JSON document write and read APIs remain available. This setting alone does not declare primary keys or unique constraints.
+pub const TableStorageMode = enum {
+    document,
+    relational,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .document => "document",
+            .relational => "relational",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "document", .document },
+            .{ "relational", .relational },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
     }
 };
 

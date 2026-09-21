@@ -124,6 +124,12 @@ pub const Server = struct {
         }
     };
 
+    // Called before taking state_mutex; catalog writers may acquire that mutex.
+    pub const CatalogEmptySource = struct {
+        ptr: *anyopaque,
+        read_fn: *const fn (ptr: *anyopaque) anyerror!bool,
+    };
+
     pub const SeedCaptureHook = struct {
         ptr: *anyopaque,
         run_fn: *const fn (
@@ -225,6 +231,7 @@ pub const Server = struct {
         standby_status_extras: ?StandbyStatusExtras = null,
         state_mutex: ?*std.atomic.Mutex = null,
         seed_capture: ?SeedCaptureHook = null,
+        catalog_empty: ?CatalogEmptySource = null,
         standby_upstream: ?StandbyUpstreamHook = null,
         lifecycle_receipts: ?LifecycleReceipts = null,
         lease_watchdog_proof: ?LeaseWatchdogProofSource = null,
@@ -303,6 +310,15 @@ pub const Server = struct {
             if (req.method != .get) return try textResponse(self.alloc, 405, "method not allowed");
             return try self.handleAdminWatchdogProof();
         }
+        // Catalog writers acquire the catalog lock before the HA state lock.
+        // Observe readiness before taking state_mutex to avoid reversing that
+        // order. This is an advisory observation; the primary role and HA
+        // snapshot are still checked under state_mutex below.
+        const waiting_for_tables: ?bool = if (req.method == .get and
+            std.mem.eql(u8, path, admin_api.routes.ha_primary_status))
+        blk: {
+            break :blk if (self.auth.catalog_empty) |source| try source.read_fn(source.ptr) else null;
+        } else null;
         var primary_fence_lease: ?mutation_barrier.MutationBarrier.ExclusiveLease = null;
         if (req.method == .post and std.mem.eql(u8, path, admin_api.routes.ha_fence)) {
             if (self.auth.primary_fence_barrier) |barrier| {
@@ -327,7 +343,7 @@ pub const Server = struct {
                     return try textResponse(self.alloc, 503, "not ready");
                 }
                 if (std.mem.eql(u8, path, admin_api.routes.ha_primary_status)) {
-                    return try self.handleAdminPrimaryStatus(req);
+                    return try self.handleAdminPrimaryStatus(req, waiting_for_tables);
                 }
                 if (std.mem.eql(u8, path, admin_api.routes.ha_standby_status)) {
                     return try self.handleAdminStandbyStatus(req);
@@ -445,7 +461,7 @@ pub const Server = struct {
         return try admin_api.routes.replicationSlotNameFromPathAlloc(self.alloc, path, suffix);
     }
 
-    fn handleAdminPrimaryStatus(self: *Server, req: http_operation.Request) !http_operation.OwnedResponse {
+    fn handleAdminPrimaryStatus(self: *Server, req: http_operation.Request, waiting_for_tables: ?bool) !http_operation.OwnedResponse {
         const primary = self.ctx.primary orelse return try textResponse(self.alloc, 409, "PrimaryUnavailable");
         const query = requestQuery(req.target);
         const max_lag_lsn = if (queryValue(query, "max_lag_lsn")) |raw|
@@ -481,6 +497,7 @@ pub const Server = struct {
             .snapshot = blk: {
                 var result = try adminPrimarySnapshot(self.alloc, snapshot, node_id);
                 result.lease_watchdog = watchdog_proof;
+                result.waiting_for_tables = waiting_for_tables;
                 break :blk result;
             },
         };
@@ -654,7 +671,7 @@ pub const Server = struct {
         };
         return try self.handleTypedJson(admin_api.HACommitAppendResponse{
             .schema_version = 1,
-            .lsn = try adminI64(result.lsn),
+            .lsn = result.lsn,
             .gate = try adminCommitGate(result.gate),
         });
     }
@@ -801,8 +818,8 @@ pub const Server = struct {
             },
             .slot_name = result.slot_name,
             .manifest_id = result.manifest_id,
-            .backup_lsn = try adminI64(result.backup_lsn),
-            .start_record_lsn = try adminI64(result.start_record_lsn),
+            .backup_lsn = result.backup_lsn,
+            .start_record_lsn = result.start_record_lsn,
         });
     }
 
@@ -843,8 +860,8 @@ pub const Server = struct {
                         .node_id = node_id,
                     },
                     .manifest_id = seed.manifest_id,
-                    .backup_lsn = try adminI64(seed.backup_lsn),
-                    .end_record_lsn = try adminI64(seed.end_record_lsn),
+                    .backup_lsn = seed.backup_lsn,
+                    .end_record_lsn = seed.end_record_lsn,
                 });
             },
             else => unreachable,
@@ -927,24 +944,24 @@ pub const Server = struct {
             .slot_name = value.slot_name,
             .generation = value.generation,
             .topology_id = value.topology_id,
-            .topology_generation = try adminI64(value.topology_generation),
+            .topology_generation = value.topology_generation,
             .node_id = value.node_id,
             .target_pvc_name = value.target_pvc_name,
             .target_pvc_uid = value.target_pvc_uid,
-            .cluster_id = try adminI64(value.cluster_id),
-            .shard_id = try adminI64(value.shard_id),
-            .table_id = try adminI64(value.table_id),
-            .timeline_id = try adminI64(value.timeline_id),
-            .epoch = try adminI64(value.epoch),
+            .cluster_id = value.cluster_id,
+            .shard_id = value.shard_id,
+            .table_id = value.table_id,
+            .timeline_id = value.timeline_id,
+            .epoch = value.epoch,
             .manifest_id = value.manifest_id,
             .source_plan_sha256 = value.source_plan_sha256,
-            .backup_lsn = try adminI64(value.backup_lsn),
-            .checkpoint_lsn = try adminI64(value.checkpoint_lsn),
-            .end_record_lsn = try adminI64(value.end_record_lsn),
+            .backup_lsn = value.backup_lsn,
+            .checkpoint_lsn = value.checkpoint_lsn,
+            .end_record_lsn = value.end_record_lsn,
             .manifest_sha256 = value.manifest_sha256,
             .capture_receipt_sha256 = &capture_receipt_sha256,
-            .file_count = try adminI64(@intCast(value.file_count)),
-            .total_bytes = try adminI64(value.total_bytes),
+            .file_count = @intCast(value.file_count),
+            .total_bytes = value.total_bytes,
             .generation_root = result.capture.generation_root,
             .content_root = result.capture.content_root,
             .manifest_path = result.capture.manifest_path,
@@ -993,18 +1010,18 @@ pub const Server = struct {
         defer self.alloc.free(entries);
         for (page.entries, 0..) |entry, index| {
             entries[index] = .{
-                .cursor = try adminI64(entry.cursor),
+                .cursor = entry.cursor,
                 .kind = @tagName(entry.kind),
                 .generation = entry.generation,
                 .slot_name = entry.slot_name,
                 .topology_id = entry.topology_id,
-                .topology_generation = try adminI64(entry.topology_generation),
+                .topology_generation = entry.topology_generation,
                 .node_id = entry.node_id,
                 .target_pvc_name = entry.target_pvc_name,
                 .target_pvc_uid = entry.target_pvc_uid,
                 .receipt_sha256 = entry.receipt_sha256,
                 .receipt_json = entry.receipt_json,
-                .recorded_at_unix_ns = try adminI64(entry.recorded_at_unix_ns),
+                .recorded_at_unix_ns = entry.recorded_at_unix_ns,
                 .pod_uid = if (entry.pod_uid) |pod_uid| .{ .value = pod_uid } else .null_value,
                 .authoritative_state = @tagName(entry.authoritative_state),
             };
@@ -1012,9 +1029,9 @@ pub const Server = struct {
         return try self.handleTypedJson(admin_api.HASeedLifecycleReceiptInventoryResponse{
             .schema_version = 1,
             .entries = entries,
-            .first_cursor = try adminI64(page.first_cursor),
-            .end_cursor = try adminI64(page.end_cursor),
-            .next_cursor = try adminI64(page.next_cursor),
+            .first_cursor = page.first_cursor,
+            .end_cursor = page.end_cursor,
+            .next_cursor = page.next_cursor,
             .history_truncated = page.history_truncated,
             .gap = page.gap,
             .has_more = page.has_more,
@@ -1023,7 +1040,7 @@ pub const Server = struct {
                 .role = @tagName(page.runtime.role),
                 .pod_uid = if (page.runtime.pod_uid) |pod_uid| .{ .value = pod_uid } else .null_value,
                 .fenced = page.runtime.fenced,
-                .observed_at_unix_ns = try adminI64(page.runtime.observed_at_unix_ns),
+                .observed_at_unix_ns = page.runtime.observed_at_unix_ns,
             },
         });
     }
@@ -1129,8 +1146,8 @@ pub const Server = struct {
                         .node_id = node_id,
                     },
                     .manifest_id = seed.manifest_id,
-                    .backup_lsn = try adminI64(seed.backup_lsn),
-                    .checkpoint_lsn = try adminI64(seed.checkpoint_lsn),
+                    .backup_lsn = seed.backup_lsn,
+                    .checkpoint_lsn = seed.checkpoint_lsn,
                 });
             },
             else => unreachable,
@@ -1600,7 +1617,10 @@ pub const Server = struct {
 
     fn executeTyped(ptr: *anyopaque, req: http_operation.Request) !http_operation.OwnedResponse {
         const self: *Server = @ptrCast(@alignCast(ptr));
-        return self.executeOperation(req);
+        return self.executeOperation(req) catch |err| {
+            std.log.warn("HA admin operation failed err={s}", .{@errorName(err)});
+            return err;
+        };
     }
 
     fn ready(self: *const Server) bool {
@@ -1737,13 +1757,13 @@ fn promotionDocument(alloc: Allocator, result: ha_admin.FencedPromotionResult) !
         .assessment = try adminPromotionAssessment(result.assessment),
         .promotion = .{
             .node_id = result.promoted_node_id,
-            .switch_lsn = try adminI64(result.promotion.switch_lsn),
+            .switch_lsn = result.promotion.switch_lsn,
             .old_identity = try adminIdentity(result.promotion.old_identity),
             .new_identity = try adminIdentity(result.promotion.new_identity),
             .forced = result.promotion.forced,
             .data_loss_possible = result.promotion.data_loss_possible,
         },
-        .fence_generation = try adminI64(result.fence_generation),
+        .fence_generation = result.fence_generation,
         .fence_token = result.fence_token,
         .forced = result.forced,
     };
@@ -1751,7 +1771,7 @@ fn promotionDocument(alloc: Allocator, result: ha_admin.FencedPromotionResult) !
 
 fn adminCommitGate(gate: commit_gate.GateResult) !admin_api.HACommitGate {
     return .{
-        .target_lsn = try adminI64(gate.target_lsn),
+        .target_lsn = gate.target_lsn,
         .action = @tagName(gate.action),
         .durability = try adminDurabilityDecision(gate.decision),
     };
@@ -1762,12 +1782,12 @@ fn adminDurabilityDecision(decision: primary_mod.DurabilityDecision) !admin_api.
         .status = @tagName(decision.status),
         .mode = @tagName(decision.mode),
         .selection = @tagName(decision.selection),
-        .target_lsn = try adminI64(decision.target_lsn),
-        .progress_lsn = try adminI64(decision.progress_lsn),
-        .missing_lsn_count = try adminI64(decision.missing_lsn_count),
-        .satisfied_count = try adminI64(decision.satisfied_count),
-        .required_count = try adminI64(decision.required_count),
-        .candidate_count = try adminI64(decision.candidate_count),
+        .target_lsn = decision.target_lsn,
+        .progress_lsn = decision.progress_lsn,
+        .missing_lsn_count = decision.missing_lsn_count,
+        .satisfied_count = decision.satisfied_count,
+        .required_count = decision.required_count,
+        .candidate_count = decision.candidate_count,
     };
 }
 
@@ -1775,15 +1795,15 @@ fn adminReadDecision(decision: read_gate.Decision) !admin_api.HAReadDecision {
     return .{
         .action = @tagName(decision.action),
         .consistency = @tagName(decision.consistency),
-        .required_lsn = if (decision.required_lsn) |value| .{ .value = try adminI64(value) } else .null_value,
-        .required_metadata_lsn = if (decision.required_metadata_lsn) |value| .{ .value = try adminI64(value) } else .null_value,
-        .received_lsn = try adminI64(decision.received_lsn),
-        .applied_lsn = try adminI64(decision.applied_lsn),
-        .safe_read_lsn = try adminI64(decision.safe_read_lsn),
-        .metadata_applied_lsn = if (decision.metadata_applied_lsn) |value| .{ .value = try adminI64(value) } else .null_value,
-        .serve_lsn = if (decision.serve_lsn) |value| .{ .value = try adminI64(value) } else .null_value,
-        .missing_lsn_count = try adminI64(decision.missing_lsn_count),
-        .metadata_missing_lsn_count = try adminI64(decision.metadata_missing_lsn_count),
+        .required_lsn = if (decision.required_lsn) |value| .{ .value = value } else .null_value,
+        .required_metadata_lsn = if (decision.required_metadata_lsn) |value| .{ .value = value } else .null_value,
+        .received_lsn = decision.received_lsn,
+        .applied_lsn = decision.applied_lsn,
+        .safe_read_lsn = decision.safe_read_lsn,
+        .metadata_applied_lsn = if (decision.metadata_applied_lsn) |value| .{ .value = value } else .null_value,
+        .serve_lsn = if (decision.serve_lsn) |value| .{ .value = value } else .null_value,
+        .missing_lsn_count = decision.missing_lsn_count,
+        .metadata_missing_lsn_count = decision.metadata_missing_lsn_count,
     };
 }
 
@@ -1792,8 +1812,8 @@ fn adminWriteDecision(decision: write_gate.Decision) !admin_api.HAWriteDecision 
         .role = @tagName(decision.role),
         .action = @tagName(decision.action),
         .identity = try adminIdentity(decision.identity),
-        .durable_lsn = try adminI64(decision.durable_lsn),
-        .next_lsn = try adminI64(decision.next_lsn),
+        .durable_lsn = decision.durable_lsn,
+        .next_lsn = decision.next_lsn,
         .promotion_handoff = if (decision.promotion_handoff) |handoff| try adminPromotionHandoff(handoff) else null,
     };
 }
@@ -1804,8 +1824,8 @@ fn adminOwnerJobDecision(decision: owner_job_gate.Decision) !admin_api.HAOwnerJo
         .role = @tagName(decision.role),
         .action = @tagName(decision.action),
         .identity = try adminIdentity(decision.identity),
-        .durable_lsn = try adminI64(decision.durable_lsn),
-        .next_lsn = try adminI64(decision.next_lsn),
+        .durable_lsn = decision.durable_lsn,
+        .next_lsn = decision.next_lsn,
         .promotion_handoff = if (decision.promotion_handoff) |handoff| try adminPromotionHandoff(handoff) else null,
     };
 }
@@ -1813,8 +1833,8 @@ fn adminOwnerJobDecision(decision: owner_job_gate.Decision) !admin_api.HAOwnerJo
 fn adminPromotionHandoff(handoff: standby_mod.PromotionHandoff) !admin_api.HAPromotionHandoff {
     return .{
         .identity = try adminIdentity(handoff.identity),
-        .switch_lsn = try adminI64(handoff.switch_lsn),
-        .next_lsn = try adminI64(handoff.next_lsn),
+        .switch_lsn = handoff.switch_lsn,
+        .next_lsn = handoff.next_lsn,
     };
 }
 
@@ -1823,7 +1843,7 @@ fn adminPrimarySnapshot(alloc: Allocator, snapshot: status_mod.PrimarySnapshot, 
         .role = @tagName(snapshot.role),
         .node_id = node_id,
         .identity = try adminIdentity(snapshot.identity),
-        .current_lsn = try adminI64(snapshot.current_lsn),
+        .current_lsn = snapshot.current_lsn,
         .slots = try adminSlotSnapshots(alloc, snapshot.slots),
         .retention = try adminRetentionSnapshot(snapshot.retention),
         .durability = if (snapshot.durability) |decision| try adminDurabilityDecision(decision) else null,
@@ -1835,18 +1855,18 @@ fn adminStandbySnapshot(snapshot: status_mod.StandbySnapshot, node_id: []const u
         .role = @tagName(snapshot.role),
         .node_id = node_id,
         .identity = try adminIdentity(snapshot.identity),
-        .received_lsn = try adminI64(snapshot.received_lsn),
-        .applied_lsn = try adminI64(snapshot.applied_lsn),
-        .safe_read_lsn = try adminI64(snapshot.safe_read_lsn),
-        .upstream_lsn = if (snapshot.upstream_lsn) |value| .{ .value = try adminI64(value) } else .null_value,
-        .write_lag_lsn = if (snapshot.write_lag_lsn) |value| .{ .value = try adminI64(value) } else .null_value,
-        .receive_lag_lsn = if (snapshot.receive_lag_lsn) |value| .{ .value = try adminI64(value) } else .null_value,
-        .apply_lag_lsn = if (snapshot.apply_lag_lsn) |value| .{ .value = try adminI64(value) } else .null_value,
+        .received_lsn = snapshot.received_lsn,
+        .applied_lsn = snapshot.applied_lsn,
+        .safe_read_lsn = snapshot.safe_read_lsn,
+        .upstream_lsn = if (snapshot.upstream_lsn) |value| .{ .value = value } else .null_value,
+        .write_lag_lsn = if (snapshot.write_lag_lsn) |value| .{ .value = value } else .null_value,
+        .receive_lag_lsn = if (snapshot.receive_lag_lsn) |value| .{ .value = value } else .null_value,
+        .apply_lag_lsn = if (snapshot.apply_lag_lsn) |value| .{ .value = value } else .null_value,
         .last_error = if (snapshot.last_error) |last_error| .{ .value = last_error } else .null_value,
-        .last_attempt_ns = if (snapshot.last_attempt_ns) |value| .{ .value = try adminI64(value) } else .null_value,
-        .last_success_ns = if (snapshot.last_success_ns) |value| .{ .value = try adminI64(value) } else .null_value,
-        .replication_failures_total = if (snapshot.replication_failures_total) |value| .{ .value = try adminI64(value) } else .null_value,
-        .unapplied_lsn_count = try adminI64(snapshot.unapplied_lsn_count),
+        .last_attempt_ns = if (snapshot.last_attempt_ns) |value| .{ .value = value } else .null_value,
+        .last_success_ns = if (snapshot.last_success_ns) |value| .{ .value = value } else .null_value,
+        .replication_failures_total = if (snapshot.replication_failures_total) |value| .{ .value = value } else .null_value,
+        .unapplied_lsn_count = snapshot.unapplied_lsn_count,
         .caught_up_to_received = snapshot.caught_up_to_received,
         .can_serve_safe_reads = snapshot.can_serve_safe_reads,
     };
@@ -1858,17 +1878,17 @@ fn adminSlotSnapshots(alloc: Allocator, slots: []const status_mod.SlotSnapshot) 
     for (slots, 0..) |slot, idx| {
         admin_slots[idx] = .{
             .name = slot.name,
-            .timeline_id = try adminI64(slot.timeline_id),
+            .timeline_id = slot.timeline_id,
             .active = slot.active,
             .reseed_required = slot.reseed_required,
-            .restart_lsn = try adminI64(slot.restart_lsn),
-            .received_lsn = try adminI64(slot.received_lsn),
-            .applied_lsn = try adminI64(slot.applied_lsn),
-            .safe_read_lsn = try adminI64(slot.safe_read_lsn),
-            .write_lag_lsn = try adminI64(slot.write_lag_lsn),
-            .apply_lag_lsn = try adminI64(slot.apply_lag_lsn),
-            .safe_read_lag_lsn = try adminI64(slot.safe_read_lag_lsn),
-            .retention_lag_lsn = try adminI64(slot.retention_lag_lsn),
+            .restart_lsn = slot.restart_lsn,
+            .received_lsn = slot.received_lsn,
+            .applied_lsn = slot.applied_lsn,
+            .safe_read_lsn = slot.safe_read_lsn,
+            .write_lag_lsn = slot.write_lag_lsn,
+            .apply_lag_lsn = slot.apply_lag_lsn,
+            .safe_read_lag_lsn = slot.safe_read_lag_lsn,
+            .retention_lag_lsn = slot.retention_lag_lsn,
             .status = @tagName(slot.status),
             .last_error = if (slot.last_error) |last_error| .{ .value = last_error } else .null_value,
         };
@@ -1878,21 +1898,21 @@ fn adminSlotSnapshots(alloc: Allocator, slots: []const status_mod.SlotSnapshot) 
 
 fn adminRetentionSnapshot(snapshot: slot_store.RetentionSnapshot) !admin_api.HARetentionSnapshot {
     return .{
-        .primary_lsn = try adminI64(snapshot.primary_lsn),
-        .oldest_restart_lsn = try adminI64(snapshot.oldest_restart_lsn),
-        .retained_lsn_count = try adminI64(snapshot.retained_lsn_count),
-        .retained_byte_count = try adminI64(snapshot.retained_byte_count),
-        .retained_age_ns = try adminI64(snapshot.retained_age_ns),
-        .active_slots = try adminI64(snapshot.active_slots),
-        .reseed_recommended = try adminI64(snapshot.reseed_recommended),
+        .primary_lsn = snapshot.primary_lsn,
+        .oldest_restart_lsn = snapshot.oldest_restart_lsn,
+        .retained_lsn_count = snapshot.retained_lsn_count,
+        .retained_byte_count = snapshot.retained_byte_count,
+        .retained_age_ns = snapshot.retained_age_ns,
+        .active_slots = snapshot.active_slots,
+        .reseed_recommended = snapshot.reseed_recommended,
     };
 }
 
 fn adminPromotionAssessment(assessment: status_mod.PromotionAssessment) !admin_api.HAPromotionAssessment {
     return .{
-        .required_lsn = try adminI64(assessment.required_lsn),
-        .received_lsn = try adminI64(assessment.received_lsn),
-        .applied_lsn = try adminI64(assessment.applied_lsn),
+        .required_lsn = assessment.required_lsn,
+        .received_lsn = assessment.received_lsn,
+        .applied_lsn = assessment.applied_lsn,
         .has_required_lsn = assessment.has_required_lsn,
         .caught_up_to_received = assessment.caught_up_to_received,
         .fencing_confirmed = assessment.fencing_confirmed,
@@ -1911,16 +1931,16 @@ fn adminRejoinAssessment(assessment: rejoin.Assessment) !admin_api.HARejoinAsses
         .action = @tagName(assessment.action),
         .reason = @tagName(assessment.reason),
         .former_node_id = assessment.former_node_id,
-        .target_timeline_id = try adminI64(assessment.target_timeline_id),
-        .target_epoch = try adminI64(assessment.target_epoch),
-        .parent_cluster_id = try adminI64(assessment.parent_cluster_id),
-        .parent_shard_id = try adminI64(assessment.parent_shard_id),
-        .parent_table_id = try adminI64(assessment.parent_table_id),
-        .parent_timeline_id = try adminI64(assessment.parent_timeline_id),
-        .parent_epoch = try adminI64(assessment.parent_epoch),
-        .fork_lsn = try adminI64(assessment.fork_lsn),
-        .former_last_lsn = try adminI64(assessment.former_last_lsn),
-        .retained_from_lsn = try adminI64(assessment.retained_from_lsn),
+        .target_timeline_id = assessment.target_timeline_id,
+        .target_epoch = assessment.target_epoch,
+        .parent_cluster_id = assessment.parent_cluster_id,
+        .parent_shard_id = assessment.parent_shard_id,
+        .parent_table_id = assessment.parent_table_id,
+        .parent_timeline_id = assessment.parent_timeline_id,
+        .parent_epoch = assessment.parent_epoch,
+        .fork_lsn = assessment.fork_lsn,
+        .former_last_lsn = assessment.former_last_lsn,
+        .retained_from_lsn = assessment.retained_from_lsn,
         .data_loss_discarded = assessment.data_loss_discarded,
     };
 }
@@ -1928,13 +1948,13 @@ fn adminRejoinAssessment(assessment: rejoin.Assessment) !admin_api.HARejoinAsses
 fn adminRejoinRewindResult(result: rejoin.RewindResult) !admin_api.HARejoinRewindResult {
     return .{
         .node_id = result.node_id,
-        .fork_lsn = try adminI64(result.fork_lsn),
-        .previous_last_lsn = try adminI64(result.previous_last_lsn),
-        .current_last_lsn = try adminI64(result.current_last_lsn),
-        .next_lsn = try adminI64(result.next_lsn),
-        .discarded_lsn_count = try adminI64(result.discarded_lsn_count),
-        .target_timeline_id = try adminI64(result.target_timeline_id),
-        .target_epoch = try adminI64(result.target_epoch),
+        .fork_lsn = result.fork_lsn,
+        .previous_last_lsn = result.previous_last_lsn,
+        .current_last_lsn = result.current_last_lsn,
+        .next_lsn = result.next_lsn,
+        .discarded_lsn_count = result.discarded_lsn_count,
+        .target_timeline_id = result.target_timeline_id,
+        .target_epoch = result.target_epoch,
         .data_loss_discarded = result.data_loss_discarded,
     };
 }
@@ -1943,10 +1963,10 @@ fn adminRejoinReseedResult(result: rejoin.ReseedResult) !admin_api.HARejoinResee
     return .{
         .node_id = result.node_id,
         .slot_name = result.slot_name,
-        .target_timeline_id = try adminI64(result.target_timeline_id),
-        .target_epoch = try adminI64(result.target_epoch),
-        .fork_lsn = try adminI64(result.fork_lsn),
-        .former_last_lsn = try adminI64(result.former_last_lsn),
+        .target_timeline_id = result.target_timeline_id,
+        .target_epoch = result.target_epoch,
+        .fork_lsn = result.fork_lsn,
+        .former_last_lsn = result.former_last_lsn,
         .reseed_required = result.reseed_required,
         .base_backup_required = result.base_backup_required,
     };
@@ -1954,11 +1974,11 @@ fn adminRejoinReseedResult(result: rejoin.ReseedResult) !admin_api.HARejoinResee
 
 fn adminIdentity(identity: standby_mod.Identity) !admin_api.HAIdentity {
     return .{
-        .cluster_id = try adminI64(identity.cluster_id),
-        .shard_id = try adminI64(identity.shard_id),
-        .table_id = try adminI64(identity.table_id),
-        .timeline_id = try adminI64(identity.timeline_id),
-        .epoch = try adminI64(identity.epoch),
+        .cluster_id = identity.cluster_id,
+        .shard_id = identity.shard_id,
+        .table_id = identity.table_id,
+        .timeline_id = identity.timeline_id,
+        .epoch = identity.epoch,
     };
 }
 
@@ -1967,22 +1987,17 @@ fn adminFenceReceipt(receipt: fencing.Receipt) !admin_api.HAFenceReceipt {
         .identity = try adminIdentity(receipt.identity),
         .old_primary_id = receipt.old_primary_id,
         .promoted_node_id = receipt.promoted_node_id,
-        .parent_timeline_id = try adminI64(receipt.parent_timeline_id),
-        .parent_epoch = try adminI64(receipt.parent_epoch),
-        .new_timeline_id = try adminI64(receipt.new_timeline_id),
-        .new_epoch = try adminI64(receipt.new_epoch),
-        .required_lsn = try adminI64(receipt.required_lsn),
-        .observed_lsn = try adminI64(receipt.observed_lsn),
-        .generation = try adminI64(receipt.generation),
+        .parent_timeline_id = receipt.parent_timeline_id,
+        .parent_epoch = receipt.parent_epoch,
+        .new_timeline_id = receipt.new_timeline_id,
+        .new_epoch = receipt.new_epoch,
+        .required_lsn = receipt.required_lsn,
+        .observed_lsn = receipt.observed_lsn,
+        .generation = receipt.generation,
         .forced = receipt.forced,
         .token = receipt.token,
         .reason = receipt.reason,
     };
-}
-
-fn adminI64(value: u64) !i64 {
-    if (value > @as(u64, @intCast(std.math.maxInt(i64)))) return error.AdminOpenAPIIntegerOverflow;
-    return @intCast(value);
 }
 
 fn slotListDocuments(alloc: Allocator, snapshot: status_mod.PrimarySnapshot) ![]admin_api.HAReplicationSlot {
@@ -1991,15 +2006,15 @@ fn slotListDocuments(alloc: Allocator, snapshot: status_mod.PrimarySnapshot) ![]
     for (snapshot.slots, 0..) |slot, idx| {
         slots[idx] = .{
             .slot_name = slot.name,
-            .timeline_id = try adminI64(slot.timeline_id),
-            .restart_lsn = try adminI64(slot.restart_lsn),
-            .received_lsn = try adminI64(slot.received_lsn),
-            .applied_lsn = try adminI64(slot.applied_lsn),
-            .safe_read_lsn = try adminI64(slot.safe_read_lsn),
+            .timeline_id = slot.timeline_id,
+            .restart_lsn = slot.restart_lsn,
+            .received_lsn = slot.received_lsn,
+            .applied_lsn = slot.applied_lsn,
+            .safe_read_lsn = slot.safe_read_lsn,
             .active = slot.active,
             .reseed_required = slot.reseed_required,
             .last_error = if (slot.last_error) |last_error| .{ .value = last_error } else .null_value,
-            .current_lsn = try adminI64(snapshot.current_lsn),
+            .current_lsn = snapshot.current_lsn,
         };
     }
     return slots;
@@ -2026,15 +2041,15 @@ fn slotActionDocument(
         .slot_action = action,
         .slot = .{
             .slot_name = slot.slot_name,
-            .timeline_id = try adminI64(slot.timeline_id),
-            .restart_lsn = try adminI64(slot.restart_lsn),
-            .received_lsn = try adminI64(slot.received_lsn),
-            .applied_lsn = try adminI64(slot.applied_lsn),
-            .safe_read_lsn = try adminI64(slot.safe_read_lsn),
+            .timeline_id = slot.timeline_id,
+            .restart_lsn = slot.restart_lsn,
+            .received_lsn = slot.received_lsn,
+            .applied_lsn = slot.applied_lsn,
+            .safe_read_lsn = slot.safe_read_lsn,
             .active = slot.active,
             .reseed_required = slot.reseed_required,
             .last_error = if (slot.last_error) |last_error| .{ .value = last_error } else .null_value,
-            .current_lsn = try adminI64(slot.current_lsn),
+            .current_lsn = slot.current_lsn,
             .dropped = if (dropped) |value| .{ .value = value } else .null_value,
         },
     };
@@ -2549,12 +2564,12 @@ fn adminIdentityFromOpenApi(identity: admin_api.HAIdentity) !standby_mod.Identit
     };
 }
 
-fn uint64FromJson(value: i64) !u64 {
+fn uint64FromJson(value: anytype) !u64 {
     if (value < 0) return error.InvalidAdminRequest;
     return @intCast(value);
 }
 
-fn positiveUint64FromJson(value: i64) !u64 {
+fn positiveUint64FromJson(value: anytype) !u64 {
     const parsed = try uint64FromJson(value);
     if (parsed == 0) return error.InvalidAdminRequest;
     return parsed;
@@ -5045,4 +5060,55 @@ test "storage.hot_standby http admin preserves omitted commit append shard and t
 
 fn expectContains(haystack: []const u8, needle: []const u8) !void {
     try std.testing.expect(std.mem.indexOf(u8, haystack, needle) != null);
+}
+
+test "storage.ha HTTP identities preserve the full unsigned range" {
+    const alloc = std.testing.allocator;
+    const identity = standby_mod.Identity{
+        .cluster_id = std.math.maxInt(u64),
+        .shard_id = @as(u64, 1) << 63,
+        .table_id = std.math.maxInt(u64) - 1,
+        .timeline_id = std.math.maxInt(u64),
+        .epoch = std.math.maxInt(u64),
+    };
+    const encoded = try std.json.Stringify.valueAlloc(alloc, try adminIdentity(identity), .{});
+    defer alloc.free(encoded);
+    var parsed = try std.json.parseFromSlice(admin_api.HAIdentity, alloc, encoded, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualDeep(identity, try adminIdentityFromOpenApi(parsed.value));
+    try std.testing.expectError(error.Overflow, std.json.parseFromSlice(admin_api.HAIdentity, alloc, "{\"cluster_id\":-1,\"shard_id\":0,\"table_id\":0,\"timeline_id\":1,\"epoch\":1}", .{}));
+}
+
+test "storage.hot_standby primary status observes catalog outside the HA lock without creating slots" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "catalog-readiness");
+    defer paths.deinit(alloc);
+    var primary = try primary_mod.Primary.open(alloc, paths.primary_log.ptr, paths.primary_slots.ptr, testIdentity(), .{});
+    defer primary.close();
+    const Catalog = struct {
+        empty: bool = true,
+        state_mutex: std.atomic.Mutex = .unlocked,
+        fn read(ptr: *anyopaque) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            // Model a catalog writer acquiring HA state while the catalog is
+            // observed. Fail deterministically instead of hanging on inversion.
+            if (!self.state_mutex.tryLock()) return error.CatalogReadUnderHAStateLock;
+            defer self.state_mutex.unlock();
+            return self.empty;
+        }
+    };
+    var catalog = Catalog{};
+    var server = Server.initWithOptions(alloc, .{ .primary = &primary, .primary_node_id = "primary-a" }, .{
+        .catalog_empty = .{ .ptr = &catalog, .read_fn = Catalog.read },
+        .state_mutex = &catalog.state_mutex,
+    });
+    defer server.deinit();
+    for ([_]bool{ true, false, true }) |empty| {
+        catalog.empty = empty;
+        var response = try server.handle(.{ .method = .GET, .uri = admin_api.routes.ha_primary_status });
+        defer response.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 200), response.status);
+        try expectContains(response.body, if (empty) "\"waiting_for_tables\":true" else "\"waiting_for_tables\":false");
+        try expectContains(response.body, "\"slots\":[]");
+    }
 }

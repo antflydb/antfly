@@ -35,6 +35,13 @@ const ml = @import("ml");
 /// (native CPU uses f32 slices, device backends use opaque handles). Tensors are always
 /// freed via the ComputeBackend that created them.
 pub const CT = backend_contracts.CT;
+pub const gliner_boundary_device = @import("gliner_boundary_device_ops.zig");
+pub const resident_training = @import("resident_training_ops.zig");
+pub const record_loss_math = @import("record_loss_math.zig");
+pub const elementwise_loss_math = @import("elementwise_loss_math.zig");
+pub const consistency_loss_math = @import("consistency_loss_math.zig");
+pub const listwise_loss_math = @import("listwise_loss_math.zig");
+pub const deberta_training_attention = @import("deberta_training_attention.zig");
 
 pub const UnaryConsumeOp = enum {
     gelu,
@@ -80,6 +87,55 @@ pub const LinearNoBiasTripleResult = struct {
     second: CT,
     third: CT,
 };
+
+/// `a + b` alongside `layer_norm(a + b)`; see `ComputeBackend.addLayerNormSum`.
+pub const AddLayerNormSumResult = struct {
+    sum: CT,
+    normed: CT,
+};
+
+/// Constraints for `whisperLogitsStatsEncode`: which tokens may be chosen
+/// this step. Text tokens are `[0, ts_begin)`; timestamps `[ts_begin,
+/// out_dim)` are allowed within `[ts_min, ts_max)`; `eot` is always
+/// allowed; `suppress_count` explicit ids are removed; `probe_id`'s raw
+/// logit is reported (`out_dim` or more disables the probe).
+pub const WhisperLogitsParams = extern struct {
+    out_dim: u32,
+    suppress_count: u32,
+    ts_begin: u32,
+    text_allowed: u32,
+    ts_min: u32,
+    ts_max: u32,
+    eot: u32,
+    probe_id: u32,
+    /// Bit set of `whisper_logits_mode_*`.
+    mode: u32 = 0,
+    /// Token buffer slot the device writes the chosen token to.
+    token_slot: u32 = 0,
+    /// Which of the two statistics slots receives this step's output.
+    stats_slot: u32 = 0,
+    reserved: u32 = 0,
+};
+
+/// Take the timestamp window from the device grammar state.
+pub const whisper_logits_mode_device_window: u32 = 1;
+/// Choose the token on the device, publish it to the token buffer slot and
+/// advance the grammar state; the stats then carry the choice in
+/// positions 14 (token bits) and 15 (log-probability).
+pub const whisper_logits_mode_choose: u32 = 2;
+/// Timestamps are on: the timestamp-mass rule applies to the choice.
+pub const whisper_logits_mode_timestamps: u32 = 4;
+/// End-of-text may be chosen.
+pub const whisper_logits_mode_eot_allowed: u32 = 8;
+
+/// Device grammar state: window for the next step (text_allowed, ts_min,
+/// ts_max), then last_is_ts, penult_is_ts, has_last_ts, last_ts, and the
+/// last chosen token.
+pub const WhisperGrammarState = [8]u32;
+
+/// Sixteen floats written by the Whisper logits kernel. Ids are u32 bit
+/// patterns; 0xffffffff means "no candidate".
+pub const WhisperLogitsStatsRaw = [16]f32;
 
 pub const RmsNormTripleResult = struct {
     first: CT,
@@ -172,6 +228,7 @@ pub const TrainingAdamWBatchInput = struct {
     elem_count: usize,
     bias_correction1: f32,
     bias_correction2: f32,
+    adam_step: u32 = 0,
 };
 
 pub const TrainingAdamWBatchOptions = struct {
@@ -181,12 +238,11 @@ pub const TrainingAdamWBatchOptions = struct {
     eps: f32,
     weight_decay: f32,
     grad_scale: f32 = 1.0,
+    pytorch_fused: ?struct { lr: f64, optimizer: @import("ml").graph.optimizers.AdamWConfig64 } = null,
 };
 
-pub const TrainingSumSquaresInput = struct {
-    tensor: CT,
-    elem_count: usize,
-};
+pub const TrainingSumSquaresInput = resident_training.NormInput;
+pub const resident_program = @import("resident_program_ops.zig");
 
 pub const MaskedBceWithLogitsRequest = struct {
     logits: CT,
@@ -517,6 +573,7 @@ pub const DebertaEmbeddingsRequest = struct {
     total: usize,
     hidden_size: usize,
     eps: f32,
+    control: ?InferenceExecutionControl = null,
 };
 
 /// Fused MoE forward: route selection + expert compute + scatter-add,
@@ -587,6 +644,25 @@ pub const DecoderRuntimeApplyLinearArgmaxRequest = backend_contracts.DecoderRunt
 pub const DecoderRuntimeApplyLinearPairRequest = backend_contracts.DecoderRuntimeApplyLinearPairRequest;
 pub const DecoderRuntimeApplyLinearQkvRequest = backend_contracts.DecoderRuntimeApplyLinearQkvRequest;
 pub const DecoderRuntimeActivationKind = backend_contracts.DecoderRuntimeActivationKind;
+
+/// Gemma 4 audio conformer local attention. Queries attend inside their
+/// `chunk`-sized block plus `context_left - 1` past keys; every query/key pair
+/// adds a relative position bias row (`rel`, `[context_left, hidden]`), the
+/// query is scaled per head dim (`q_dim_scales`, `[head_dim]`) and keys by
+/// `k_scale`, logits are tanh-capped and masked keys take `invalid_value`.
+/// `valid` is a `[rows]` 0/1 float mask.
+pub const Gemma4AudioLocalAttentionParams = struct {
+    rows: usize,
+    hidden: usize,
+    heads: usize,
+    head_dim: usize,
+    chunk: usize,
+    context_left: usize,
+    context: usize,
+    k_scale: f32,
+    logit_cap: f32,
+    invalid_value: f32,
+};
 pub const DecoderRuntimeApplyActivationRequest = backend_contracts.DecoderRuntimeApplyActivationRequest;
 pub const DecoderRuntimeApplyGeluBackwardRequest = backend_contracts.DecoderRuntimeApplyGeluBackwardRequest;
 pub const DecoderRuntimeFfnGeluBackwardChainRequest = backend_contracts.DecoderRuntimeFfnGeluBackwardChainRequest;
@@ -1378,6 +1454,68 @@ pub const ComputeBackend = struct {
         if (self.execution_control) |control| try control.check();
     }
 
+    /// Executes only a resident implementation. This contract intentionally has
+    /// no generic/host fallback and is safe to use with request-local budgets.
+    pub fn glinerBoundaryDevice(self: *const ComputeBackend, request: *const gliner_boundary_device.Request) !CT {
+        errdefer self.cancelGlinerBoundaryOwnedScope();
+        try self.checkExecutionControl();
+        const op = self.vtable.glinerBoundaryDevice orelse return error.UnsupportedGlinerBoundaryDevice;
+        const output = try op(self.ptr, request);
+        errdefer self.free(output);
+        try self.checkExecutionControl();
+        return output;
+    }
+
+    pub fn glinerBoundaryDownload(self: *const ComputeBackend, tensor: CT, output: []f32) !void {
+        errdefer self.cancelGlinerBoundaryOwnedScope();
+        try self.checkExecutionControl();
+        const op = self.vtable.glinerBoundaryDownload orelse return error.UnsupportedGlinerBoundaryDevice;
+        try op(self.ptr, tensor, output);
+        try self.checkExecutionControl();
+    }
+
+    fn cancelGlinerBoundaryOwnedScope(self: *const ComputeBackend) void {
+        const op = self.vtable.glinerBoundaryScope orelse return;
+        const state = op(self.ptr, &.{ .snapshot = {} }) catch return;
+        if (state.active) _ = op(self.ptr, &.{ .cancel = .{ .generation = state.generation } }) catch {};
+    }
+
+    /// Explicit ownership of the existing serial Metal frame. Cleanup and
+    /// snapshots must remain available after a request's control is cancelled.
+    pub fn glinerBoundaryScope(self: *const ComputeBackend, request: *const gliner_boundary_device.ScopeRequest) !gliner_boundary_device.ScopeStats {
+        const op = self.vtable.glinerBoundaryScope orelse return error.UnsupportedGlinerBoundaryScope;
+        switch (request.*) {
+            .snapshot, .cancel => return op(self.ptr, request),
+            .begin => {
+                try self.checkExecutionControl();
+                const result = try op(self.ptr, request);
+                errdefer _ = op(self.ptr, &.{ .cancel = .{ .generation = result.generation } }) catch {};
+                try self.checkExecutionControl();
+                return result;
+            },
+            .finish => |finish| {
+                self.checkExecutionControl() catch |err| {
+                    _ = op(self.ptr, &.{ .cancel = .{ .generation = finish.generation } }) catch {};
+                    return err;
+                };
+                const result = try op(self.ptr, request);
+                try self.checkExecutionControl();
+                return result;
+            },
+        }
+    }
+
+    /// Private session preparation grant on a freshly leased request wrapper.
+    /// It never persists request controls or CT handles in the physical owner.
+    pub fn glinerBoundaryResidentPreparation(self: *const ComputeBackend, enabled: bool) !void {
+        const op = self.vtable.glinerBoundaryResidentPreparation orelse return error.UnsupportedGlinerBoundaryResidentWeights;
+        if (!enabled) return op(self.ptr, false);
+        try self.checkExecutionControl();
+        try op(self.ptr, true);
+        errdefer op(self.ptr, false) catch {};
+        try self.checkExecutionControl();
+    }
+
     pub fn kind(self: *const ComputeBackend) BackendKind {
         return self.vtable.backendKind(self.ptr);
     }
@@ -1537,6 +1675,14 @@ pub const ComputeBackend = struct {
         decoderRuntimePopPlannedComputeBarrierSuppression: ?*const fn (ctx: *anyopaque) anyerror!void = null,
 
         convertDType: ?*const fn (ctx: *anyopaque, tensor: CT, target: GraphDType) anyerror!?CT = null,
+        glinerBoundaryDevice: ?*const fn (ctx: *anyopaque, request: *const gliner_boundary_device.Request) anyerror!CT = null,
+        glinerBoundaryScope: ?*const fn (ctx: *anyopaque, request: *const gliner_boundary_device.ScopeRequest) anyerror!gliner_boundary_device.ScopeStats = null,
+        glinerBoundaryResidentPreparation: ?*const fn (ctx: *anyopaque, enabled: bool) anyerror!void = null,
+        recordLossGradient: ?*const fn (ctx: *anyopaque, request: *const record_loss_math.Request) anyerror!void = null,
+        listwiseLossGradient: ?*const fn (ctx: *anyopaque, request: *const listwise_loss_math.Request) anyerror!void = null,
+        consistencyLossGradient: ?*const fn (ctx: *anyopaque, request: *const consistency_loss_math.Request) anyerror!void = null,
+        elementwiseLossGradient: ?*const fn (ctx: *anyopaque, request: *const elementwise_loss_math.Request) anyerror!void = null,
+        glinerBoundaryDownload: ?*const fn (ctx: *anyopaque, tensor: CT, output: []f32) anyerror!void = null,
 
         debugCudaGraphCaptureBegin: ?*const fn (ctx: *anyopaque, label: []const u8) anyerror!bool = null,
         debugCudaGraphPrepareDecodeScalars: ?*const fn (ctx: *anyopaque, position_offset: usize, query_position_offset: usize, kv_seq_len: usize, total_sequence_len: usize, kv_position_offset: usize) anyerror!bool = null,
@@ -1653,6 +1799,30 @@ pub const ComputeBackend = struct {
         /// callers fall back to creating a broadcast scalar tensor.
         multiplyScalar: ?*const fn (ctx: *anyopaque, input: CT, scale: f32) anyerror!?CT = null,
 
+        /// Y = clamp(X, min, max) with scalar bounds; either bound may be
+        /// absent. Callers fall back to a host clamp.
+        clampScalar: ?*const fn (ctx: *anyopaque, input: CT, min_value: ?f32, max_value: ?f32) anyerror!?CT = null,
+
+        /// Gated linear unit over the last dim: X is `[rows, 2 * dim]` and
+        /// Y[r, c] = X[r, c] * sigmoid(X[r, dim + c]).
+        gluRows: ?*const fn (ctx: *anyopaque, input: CT, rows: usize, dim: usize) anyerror!?CT = null,
+
+        /// Depthwise causal conv1d over `[rows, dim]` with a `[kernel_size, dim]`
+        /// weight and `kernel_size - 1` implicit left padding.
+        depthwiseCausalConv1d: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, rows: usize, dim: usize, kernel_size: usize) anyerror!?CT = null,
+
+        /// `[channels, time_steps, freq_bins]` -> `[time_steps, freq_bins * channels]`
+        /// (the Gemma 4 audio conv-stack flatten).
+        flattenChannelsTimeFreq: ?*const fn (ctx: *anyopaque, input: CT, time_steps: usize, freq_bins: usize, channels: usize) anyerror!?CT = null,
+
+        /// Layer norm over the channel axis of `[channels, positions]` (biasless,
+        /// per-channel weight) followed by relu.
+        channelLayerNormRelu: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, channels: usize, positions: usize, eps: f32) anyerror!?CT = null,
+
+        /// Gemma 4 audio conformer chunked local attention with relative
+        /// position bias; see `Gemma4AudioLocalAttentionParams`.
+        gemma4AudioLocalAttention: ?*const fn (ctx: *anyopaque, q: CT, k: CT, v: CT, rel: CT, q_dim_scales: CT, valid: CT, params: Gemma4AudioLocalAttentionParams) anyerror!?CT = null,
+
         /// Y = X + value. Backends may keep scalar adds on device; callers
         /// fall back to host materialization or a broadcast scalar tensor.
         addScalar: ?*const fn (ctx: *anyopaque, input: CT, value: f32) anyerror!?CT = null,
@@ -1711,6 +1881,16 @@ pub const ComputeBackend = struct {
         /// Y = layer_norm(A + B). Backends may fuse residual add and layer norm;
         /// callers fall back to add + layerNorm.
         addLayerNorm: ?*const fn (ctx: *anyopaque, a: CT, b: CT, gamma: CT, beta: CT, dim: usize, eps: f32) anyerror!?CT = null,
+        addLayerNormSum: ?*const fn (ctx: *anyopaque, a: CT, b: CT, gamma: CT, beta: CT, dim: usize, eps: f32) anyerror!?AddLayerNormSumResult = null,
+        ensureDeviceResident: ?*const fn (ctx: *anyopaque, tensor: CT) anyerror!?CT = null,
+        conv1dIm2col: ?*const fn (ctx: *anyopaque, input: CT, batch: usize, in_channels: usize, time_steps: usize, kernel_size: usize, stride: usize, padding: usize, time_major: bool) anyerror!?CT = null,
+        whisperLogitsStatsEncode: ?*const fn (ctx: *anyopaque, logits: CT, params: *const WhisperLogitsParams, suppress_ids: []const i32) anyerror!bool = null,
+        whisperLogitsStatsRead: ?*const fn (ctx: *anyopaque, slot: usize, out: *WhisperLogitsStatsRaw) bool = null,
+        whisperGrammarWrite: ?*const fn (ctx: *anyopaque, state: *const WhisperGrammarState) bool = null,
+        embeddingLookupDeviceToken: ?*const fn (ctx: *anyopaque, weight: CT, token_slot: usize, dim: usize) anyerror!?CT = null,
+        decoderRuntimeSetWhisperPipelinedFrames: ?*const fn (ctx: *anyopaque, enabled: bool) bool = null,
+        decoderRuntimeSubmitFrame: ?*const fn (ctx: *anyopaque) anyerror!void = null,
+        decoderRuntimeWaitSubmittedFrame: ?*const fn (ctx: *anyopaque) anyerror!void = null,
 
         /// Planned variant for graph executors that already selected a
         /// backend-specific operator. Backends that leave this null use
@@ -2059,6 +2239,11 @@ pub const ComputeBackend = struct {
         /// Returns [batch*seq_len, num_heads*head_dim].
         disentangledRelativeAttention: *const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, Q_r: CT, K_r: CT, mask: []const i64, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT,
 
+        /// Optional cooperative form. The control is borrowed synchronously;
+        /// tiled native kernels check it between bounded GEMM calls. Backends
+        /// without this form retain the pre/post-checked legacy operation.
+        disentangledRelativeAttentionWithControl: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, Q_r: CT, K_r: CT, mask: []const i64, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize, control: ?InferenceExecutionControl) anyerror!CT = null,
+
         /// Optional accelerator-native packed form. This avoids materializing
         /// five slices and downloading the additive attention bias merely to
         /// reconstruct a padding mask. qkv is [Q;K;V], qr_kr is [Qr;Kr], and
@@ -2078,6 +2263,13 @@ pub const ComputeBackend = struct {
         /// Packed/mask counterpart of disentangledRelativeAttentionBackward;
         /// attn_bias has the same mask-only threshold contract as the forward op.
         disentangledRelativeAttentionBackwardPacked: ?*const fn (ctx: *anyopaque, qkv: CT, qr_kr: CT, attn_bias: CT, dO: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT = null,
+
+        /// Versioned training attention with source query-and-key masking,
+        /// compact relative buckets, and counter-based probability dropout.
+        /// The integer control tensor is a physical i32 leaf. These operations
+        /// must not fall back to the inference attention mask or host execution.
+        debertaTrainingAttentionV1: ?*const fn (ctx: *anyopaque, qkv: CT, relative: CT, control_i32: CT, attrs: ml.graph.DebertaTrainingAttentionAttrs, control: ?InferenceExecutionControl) anyerror!CT = null,
+        debertaTrainingAttentionBackwardV1: ?*const fn (ctx: *anyopaque, qkv: CT, relative: CT, control_i32: CT, dO: CT, attrs: ml.graph.DebertaTrainingAttentionAttrs, control: ?InferenceExecutionControl) anyerror!CT = null,
 
         /// Optional destructive softmax over the last dimension. When this
         /// returns a tensor, the backend may have reused `input`'s storage, so
@@ -2229,6 +2421,17 @@ pub const ComputeBackend = struct {
         /// shape without requiring host materialization. Backends may alias
         /// immutable device storage when lifetime/refcounting makes that safe.
         cloneTensorShape: ?*const fn (ctx: *anyopaque, tensor: CT, shape: []const i32) anyerror!?CT = null,
+
+        /// Strict retained-training operations. Unsupported geometry or
+        /// storage must return an error, never execute a host fallback.
+        residentTrainingPrimitive: ?*const fn (ctx: *anyopaque, request: *const resident_training.Request, limits: resident_training.Limits, control: ?InferenceExecutionControl) anyerror!CT = null,
+
+        /// Physically independent resident capture. A retained alias is not
+        /// sufficient because a later graph operation may donate its input.
+        snapshotTensorShape: ?*const fn (ctx: *anyopaque, tensor: CT, shape: []const i32) anyerror!CT = null,
+        residentTrainingNorm: ?*const fn (ctx: *anyopaque, inputs: []const resident_training.NormInput, limits: resident_training.NormLimits, control: ?InferenceExecutionControl) anyerror!resident_training.NormSummary = null,
+        residentTrainingValidate: ?*const fn (ctx: *anyopaque, inputs: []const resident_training.ValidationInput, limits: resident_training.ValidationLimits, control: ?InferenceExecutionControl) anyerror!resident_training.ValidationSummary = null,
+        residentTrainingInstruction: ?*const fn (ctx: *anyopaque, instruction: *const resident_program.Instruction, inputs: []const CT, limits: resident_program.Limits, control: ?InferenceExecutionControl) anyerror!CT = null,
 
         /// Copy a tensor from another backend instance into this backend
         /// without host materialization when the two backends are compatible.
@@ -2565,6 +2768,10 @@ pub const ComputeBackend = struct {
         /// Apply three previously prepared q/k/v linear slots to the same
         /// input and return all projected outputs.
         decoderRuntimeApplyLinearQkv: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyLinearQkvRequest) anyerror!?LinearNoBiasTripleResult = null,
+        decoderRuntimeApplyLinearQkvInto: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyLinearQkvRequest, k_out: CT, v_out: CT) anyerror!?CT = null,
+        decoderRuntimeApplyLinearInto: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyLinearRequest, out: CT) anyerror!bool = null,
+        decoderRuntimeBeginPlannedComputeScope: ?*const fn (ctx: *anyopaque) anyerror!bool = null,
+        decoderRuntimeEndPlannedComputeScope: ?*const fn (ctx: *anyopaque) void = null,
 
         /// Apply an activation inside the backend-owned decoder runtime.
         decoderRuntimeApplyActivation: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyActivationRequest) anyerror!?CT = null,
@@ -2841,8 +3048,14 @@ pub const ComputeBackend = struct {
     }
 
     pub fn debertaEmbeddings(self: *const ComputeBackend, request: DebertaEmbeddingsRequest) !?CT {
+        var controlled = request;
+        controlled.control = self.execution_control orelse request.control;
+        if (controlled.control) |active| try active.check();
         if (self.vtable.debertaEmbeddings) |op| {
-            return op(self.ptr, &request);
+            const output = try op(self.ptr, &controlled);
+            errdefer if (output) |tensor| self.free(tensor);
+            if (controlled.control) |active| try active.check();
+            return output;
         }
         return null;
     }
@@ -3459,6 +3672,98 @@ pub const ComputeBackend = struct {
         return null;
     }
 
+    /// Unfold a conv1d input into `[batch * out_time, in_channels * kernel]`
+    /// rows so the convolution runs as a dense linear over the backend's
+    /// matmul path. `time_major` reads `[batch * time, channels]` input
+    /// instead of `[batch, channels, time]`. Null when unsupported.
+    pub fn conv1dIm2col(self: *const ComputeBackend, input: CT, batch: usize, in_channels: usize, time_steps: usize, kernel_size: usize, stride: usize, padding: usize, time_major: bool) !?CT {
+        if (self.vtable.conv1dIm2col) |f| return f(self.ptr, input, batch, in_channels, time_steps, kernel_size, stride, padding, time_major);
+        return null;
+    }
+
+    /// Copy a host-side tensor to the accelerator once, for values that many
+    /// later device ops will read (Whisper's projected encoder keys and
+    /// values). Returns the resident copy, which replaces `tensor` (the
+    /// caller frees the original), or null when the tensor is already
+    /// resident or the backend has no device memory.
+    pub fn ensureDeviceResident(self: *const ComputeBackend, tensor: CT) !?CT {
+        if (self.vtable.ensureDeviceResident) |f| return f(self.ptr, tensor);
+        return null;
+    }
+
+    /// `ensureDeviceResident` for a tensor this call owns. A successful
+    /// upload releases the host copy and returns the device tensor; a
+    /// backend that keeps host tensors returns the input unchanged; an
+    /// upload error releases the input before propagating. Callers hand
+    /// over ownership at the call and never hold a tensor that may be gone.
+    pub fn ensureDeviceResidentOwned(self: *const ComputeBackend, tensor: CT) !CT {
+        errdefer self.free(tensor);
+        if (try self.ensureDeviceResident(tensor)) |device| {
+            self.free(tensor);
+            return device;
+        }
+        return tensor;
+    }
+
+    /// Fused residual add and layer norm returning both the sum (the new
+    /// residual stream) and the normalized tensor. Null when the backend has
+    /// no fused kernel or an input is not device resident.
+    pub fn addLayerNormSum(self: *const ComputeBackend, a: CT, b: CT, gamma: CT, beta: CT, dim: usize, eps: f32) !?AddLayerNormSumResult {
+        if (self.vtable.addLayerNormSum) |f| return f(self.ptr, a, b, gamma, beta, dim, eps);
+        return null;
+    }
+
+    /// Encode Whisper's constrained argmax and log-sum-exp statistics over a
+    /// `[1, vocab]` device logits row. The values are read back with
+    /// `whisperLogitsStatsRead` once the enclosing frame has completed (or
+    /// immediately when no frame is active). False means the caller must
+    /// fall back to reading the logits row.
+    pub fn whisperLogitsStatsEncode(self: *const ComputeBackend, logits: CT, params: *const WhisperLogitsParams, suppress_ids: []const i32) !bool {
+        if (self.vtable.whisperLogitsStatsEncode) |f| return f(self.ptr, logits, params, suppress_ids);
+        return false;
+    }
+
+    pub fn whisperLogitsStatsRead(self: *const ComputeBackend, slot: usize, out: *WhisperLogitsStatsRaw) bool {
+        if (self.vtable.whisperLogitsStatsRead) |f| return f(self.ptr, slot, out);
+        return false;
+    }
+
+    /// Seed the device timestamp-grammar state read by `whisperLogitsStatsEncode`
+    /// in device-window mode. Only valid while no frame is in flight.
+    pub fn whisperGrammarWrite(self: *const ComputeBackend, state: *const WhisperGrammarState) bool {
+        if (self.vtable.whisperGrammarWrite) |f| return f(self.ptr, state);
+        return false;
+    }
+
+    /// Embed the token a previous frame's choice kernel left in the
+    /// backend's token buffer slot, inside the active frame. Null when the
+    /// backend cannot.
+    pub fn embeddingLookupDeviceToken(self: *const ComputeBackend, weight: CT, token_slot: usize, dim: usize) !?CT {
+        if (self.vtable.embeddingLookupDeviceToken) |f| return f(self.ptr, weight, token_slot, dim);
+        return null;
+    }
+
+    /// Allow `decoderRuntimeBeginFrame` while a submitted frame is still
+    /// running, so the caller can keep one frame in flight behind the one
+    /// it encodes. Returns false when the backend cannot pipeline.
+    pub fn decoderRuntimeSetWhisperPipelinedFrames(self: *const ComputeBackend, enabled: bool) bool {
+        if (self.vtable.decoderRuntimeSetWhisperPipelinedFrames) |f| return f(self.ptr, enabled);
+        return false;
+    }
+
+    /// Submit the active frame without waiting; pair with
+    /// `decoderRuntimeWaitSubmittedFrame`.
+    pub fn decoderRuntimeSubmitFrame(self: *const ComputeBackend) !void {
+        if (self.vtable.decoderRuntimeSubmitFrame) |op| return op(self.ptr);
+        return error.UnsupportedOperation;
+    }
+
+    /// Wait for the frame submitted by `decoderRuntimeSubmitFrame`; a no-op
+    /// when none is in flight.
+    pub fn decoderRuntimeWaitSubmittedFrame(self: *const ComputeBackend) !void {
+        if (self.vtable.decoderRuntimeWaitSubmittedFrame) |op| return op(self.ptr);
+    }
+
     pub fn addLayerNorm(self: *const ComputeBackend, a: CT, b: CT, gamma: CT, beta: CT, dim: usize, eps: f32) !?CT {
         if (self.vtable.addLayerNorm) |f| return f(self.ptr, a, b, gamma, beta, dim, eps);
         return null;
@@ -3702,12 +4007,39 @@ pub const ComputeBackend = struct {
     }
 
     pub fn disentangledRelativeAttention(self: *const ComputeBackend, Q: CT, K: CT, V: CT, Q_r: CT, K_r: CT, mask: []const i64, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) !CT {
-        return self.vtable.disentangledRelativeAttention(self.ptr, Q, K, V, Q_r, K_r, mask, batch, seq_len, num_heads, head_dim);
+        try self.checkExecutionControl();
+        const output = if (self.vtable.disentangledRelativeAttentionWithControl) |op|
+            try op(self.ptr, Q, K, V, Q_r, K_r, mask, batch, seq_len, num_heads, head_dim, self.execution_control)
+        else
+            try self.vtable.disentangledRelativeAttention(self.ptr, Q, K, V, Q_r, K_r, mask, batch, seq_len, num_heads, head_dim);
+        errdefer self.free(output);
+        try self.checkExecutionControl();
+        return output;
     }
 
     pub fn disentangledRelativeAttentionPacked(self: *const ComputeBackend, qkv: CT, qr_kr: CT, attn_bias: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) !?CT {
         const op = self.vtable.disentangledRelativeAttentionPacked orelse return null;
         return try op(self.ptr, qkv, qr_kr, attn_bias, batch, seq_len, num_heads, head_dim);
+    }
+
+    pub fn debertaTrainingAttentionV1(self: *const ComputeBackend, qkv: CT, relative: CT, control_i32: CT, attrs: ml.graph.DebertaTrainingAttentionAttrs) !CT {
+        _ = try attrs.layout();
+        try self.checkExecutionControl();
+        const op = self.vtable.debertaTrainingAttentionV1 orelse return error.DebertaTrainingAttentionProfileUnavailable;
+        const output = try op(self.ptr, qkv, relative, control_i32, attrs, self.execution_control);
+        errdefer self.free(output);
+        try self.checkExecutionControl();
+        return output;
+    }
+
+    pub fn debertaTrainingAttentionBackwardV1(self: *const ComputeBackend, qkv: CT, relative: CT, control_i32: CT, dO: CT, attrs: ml.graph.DebertaTrainingAttentionAttrs) !CT {
+        _ = try attrs.layout();
+        try self.checkExecutionControl();
+        const op = self.vtable.debertaTrainingAttentionBackwardV1 orelse return error.DebertaTrainingAttentionProfileUnavailable;
+        const output = try op(self.ptr, qkv, relative, control_i32, dO, attrs, self.execution_control);
+        errdefer self.free(output);
+        try self.checkExecutionControl();
+        return output;
     }
 
     pub fn softmaxConsume(self: *const ComputeBackend, input: CT, dim: u32) !?CT {
@@ -3846,6 +4178,36 @@ pub const ComputeBackend = struct {
     pub fn multiplyScalar(self: *const ComputeBackend, input: CT, scale: f32) !?CT {
         const op = self.vtable.multiplyScalar orelse return null;
         return op(self.ptr, input, scale);
+    }
+
+    pub fn clampScalar(self: *const ComputeBackend, input: CT, min_value: ?f32, max_value: ?f32) !?CT {
+        const op = self.vtable.clampScalar orelse return null;
+        return op(self.ptr, input, min_value, max_value);
+    }
+
+    pub fn gluRows(self: *const ComputeBackend, input: CT, rows: usize, dim: usize) !?CT {
+        const op = self.vtable.gluRows orelse return null;
+        return op(self.ptr, input, rows, dim);
+    }
+
+    pub fn depthwiseCausalConv1d(self: *const ComputeBackend, input: CT, weight: CT, rows: usize, dim: usize, kernel_size: usize) !?CT {
+        const op = self.vtable.depthwiseCausalConv1d orelse return null;
+        return op(self.ptr, input, weight, rows, dim, kernel_size);
+    }
+
+    pub fn flattenChannelsTimeFreq(self: *const ComputeBackend, input: CT, time_steps: usize, freq_bins: usize, channels: usize) !?CT {
+        const op = self.vtable.flattenChannelsTimeFreq orelse return null;
+        return op(self.ptr, input, time_steps, freq_bins, channels);
+    }
+
+    pub fn channelLayerNormRelu(self: *const ComputeBackend, input: CT, weight: CT, channels: usize, positions: usize, eps: f32) !?CT {
+        const op = self.vtable.channelLayerNormRelu orelse return null;
+        return op(self.ptr, input, weight, channels, positions, eps);
+    }
+
+    pub fn gemma4AudioLocalAttention(self: *const ComputeBackend, q: CT, k: CT, v: CT, rel: CT, q_dim_scales: CT, valid: CT, params: Gemma4AudioLocalAttentionParams) !?CT {
+        const op = self.vtable.gemma4AudioLocalAttention orelse return null;
+        return op(self.ptr, q, k, v, rel, q_dim_scales, valid, params);
     }
 
     pub fn addScalar(self: *const ComputeBackend, input: CT, value: f32) !?CT {
@@ -3995,6 +4357,7 @@ pub const ComputeBackend = struct {
     }
 
     pub fn trainingAdamWManyF32(self: *const ComputeBackend, inputs: []const TrainingAdamWBatchInput, opts: TrainingAdamWBatchOptions) !void {
+        if (opts.pytorch_fused != null and self.kind() != .cuda) return error.DeviceTrainingUnavailable;
         const op = self.vtable.trainingAdamWManyF32 orelse return error.DeviceTrainingUnavailable;
         return op(self.ptr, inputs, opts);
     }
@@ -4041,6 +4404,63 @@ pub const ComputeBackend = struct {
             return clone_tensor_shape(self.ptr, tensor, shape);
         }
         return null;
+    }
+
+    pub fn residentTrainingPrimitive(self: *const ComputeBackend, request: *const resident_training.Request, limits: resident_training.Limits) !CT {
+        try self.checkExecutionControl();
+        const op = self.vtable.residentTrainingPrimitive orelse return error.UnsupportedResidentTrainingPrimitive;
+        const result = try op(self.ptr, request, limits, self.execution_control);
+        errdefer self.free(result);
+        try self.checkExecutionControl();
+        return result;
+    }
+
+    pub fn snapshotTensorShape(self: *const ComputeBackend, tensor: CT, shape: []const i32) !CT {
+        try self.checkExecutionControl();
+        const op = self.vtable.snapshotTensorShape orelse return error.UnsupportedResidentTrainingCapture;
+        const result = try op(self.ptr, tensor, shape);
+        errdefer self.free(result);
+        try self.checkExecutionControl();
+        return result;
+    }
+
+    /// Reads back bounded norm scalars (one total for pytorch_f32). No gradient values
+    /// are copied to the host, and no implicit uploads are permitted.
+    pub fn residentTrainingNorm(self: *const ComputeBackend, inputs: []const resident_training.NormInput, limits: resident_training.NormLimits) !resident_training.NormSummary {
+        try self.checkExecutionControl();
+        if (limits.profile == .pytorch_f32 and self.kind() != .cuda) return error.UnsupportedResidentTrainingPrimitive;
+        const op = self.vtable.residentTrainingNorm orelse return error.UnsupportedResidentTrainingPrimitive;
+        const result = try op(self.ptr, inputs, limits, self.execution_control);
+        try self.checkExecutionControl();
+        return result;
+    }
+
+    /// Retains the scaled-norm validation on backends without a boolean-only
+    /// primitive. This fallback reads only norm scalars, never tensor payloads.
+    pub fn residentTrainingValidate(self: *const ComputeBackend, inputs: []const resident_training.ValidationInput, limits: resident_training.ValidationLimits) !resident_training.ValidationSummary {
+        try self.checkExecutionControl();
+        if (self.vtable.residentTrainingValidate) |op| {
+            const result = try op(self.ptr, inputs, limits, self.execution_control);
+            try self.checkExecutionControl();
+            return result;
+        }
+        const summary = try self.residentTrainingNorm(inputs, .{
+            .primitive = limits.primitive,
+            .max_tensors = limits.max_tensors,
+            .max_total_elements = limits.max_total_elements,
+            .max_partial_bytes = limits.max_partial_bytes,
+        });
+        const finite = summary.finite and std.math.isFinite(summary.sum_squares) and summary.sum_squares >= 0;
+        return .{ .finite = finite, .all_zero = finite and summary.sum_squares == 0, .tensor_count = summary.tensor_count, .partial_bytes = summary.partial_bytes, .download_bytes = summary.download_bytes };
+    }
+
+    pub fn residentTrainingInstruction(self: *const ComputeBackend, instruction: *const resident_program.Instruction, inputs: []const CT, limits: resident_program.Limits) !CT {
+        try self.checkExecutionControl();
+        const op = self.vtable.residentTrainingInstruction orelse return error.UnsupportedResidentProgramBackend;
+        const result = try op(self.ptr, instruction, inputs, limits, self.execution_control);
+        errdefer self.free(result);
+        try self.checkExecutionControl();
+        return result;
     }
 
     pub fn copyTensorFromBackend(self: *const ComputeBackend, src_backend: *const ComputeBackend, src_tensor: CT) !?CT {
@@ -4606,6 +5026,35 @@ pub const ComputeBackend = struct {
         return null;
     }
 
+    /// Dense linear written into `out`, a `rows x out_dim` device tensor
+    /// such as rows of a resident cache. False (nothing written) when the
+    /// backend cannot place the output.
+    pub fn decoderRuntimeApplyLinearInto(self: *const ComputeBackend, request: *const DecoderRuntimeApplyLinearRequest, out: CT) !bool {
+        if (self.vtable.decoderRuntimeApplyLinearInto) |op| return op(self.ptr, request, out);
+        return false;
+    }
+
+    /// Single-row fused Q/K/V where K and V are written into `k_out` and
+    /// `v_out` (device row views, e.g. rows of a resident cache) and Q is
+    /// returned. Null when the backend cannot place the outputs.
+    pub fn decoderRuntimeApplyLinearQkvInto(self: *const ComputeBackend, request: *const DecoderRuntimeApplyLinearQkvRequest, k_out: CT, v_out: CT) !?CT {
+        if (self.vtable.decoderRuntimeApplyLinearQkvInto) |op| return op(self.ptr, request, k_out, v_out);
+        return null;
+    }
+
+    /// Open one compute encoder that every subsequent runtime op joins until
+    /// the frame is submitted, so a decode step is a single command sequence
+    /// instead of one encoder per op. Requires an active frame; returns
+    /// false when unsupported.
+    pub fn decoderRuntimeBeginPlannedComputeScope(self: *const ComputeBackend) !bool {
+        if (self.vtable.decoderRuntimeBeginPlannedComputeScope) |op| return op(self.ptr);
+        return false;
+    }
+
+    pub fn decoderRuntimeEndPlannedComputeScope(self: *const ComputeBackend) void {
+        if (self.vtable.decoderRuntimeEndPlannedComputeScope) |op| op(self.ptr);
+    }
+
     pub fn decoderRuntimeApplyLinearQkv(self: *const ComputeBackend, request: *const DecoderRuntimeApplyLinearQkvRequest) !?LinearNoBiasTripleResult {
         if (self.vtable.decoderRuntimeApplyLinearQkv) |op| {
             return op(self.ptr, request);
@@ -4954,4 +5403,99 @@ fn fallbackLinearLoRA(
     _ = rank;
     _ = .{ self, input, base_weight, bias, lora_a, lora_b, alpha, rows, in_dim, out_dim };
     return error.LinearLoRANotImplemented;
+}
+
+test "DeBERTa embeddings forward controls and release cancelled backend outputs" {
+    const Probe = struct {
+        checks: usize = 0,
+        cancelled: bool = false,
+
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.checks += 1;
+            if (self.cancelled) return error.Cancelled;
+        }
+
+        fn control(self: *@This()) InferenceExecutionControl {
+            return .{ .ptr = self, .check_fn = check };
+        }
+    };
+    const Fake = struct {
+        expected_control: *Probe,
+        cancel_during: bool,
+        return_null: bool,
+        calls: usize = 0,
+        frees: usize = 0,
+        output_live: bool = false,
+        marker: u8 = 0,
+
+        fn embeddings(raw: *anyopaque, request: *const DebertaEmbeddingsRequest) !?CT {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            const control = request.control orelse return error.MissingForwardedControl;
+            try std.testing.expectEqual(@as(?*anyopaque, self.expected_control), control.ptr);
+            try control.check();
+            if (self.cancel_during) self.expected_control.cancelled = true;
+            if (self.return_null) return null;
+            self.output_live = true;
+            return @ptrCast(&self.marker);
+        }
+
+        fn free(raw: *anyopaque, tensor: CT) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(tensor == @as(CT, @ptrCast(&self.marker)));
+            std.debug.assert(self.output_live);
+            self.output_live = false;
+            self.frees += 1;
+        }
+    };
+    const Case = enum { success, pre_cancel, post_cancel, null_output, cancelled_null };
+    // A cancelled request-local fallback must not replace an installed backend
+    // control. Repeat the ownership cases with each supported control source.
+    for ([_]bool{ false, true }) |has_backend_control| {
+        for (std.enums.values(Case)) |case| {
+            var request_probe = Probe{ .cancelled = has_backend_control };
+            var backend_probe = Probe{};
+            const selected = if (has_backend_control) &backend_probe else &request_probe;
+            selected.cancelled = case == .pre_cancel;
+            var fake = Fake{
+                .expected_control = selected,
+                .cancel_during = case == .post_cancel or case == .cancelled_null,
+                .return_null = case == .null_output or case == .cancelled_null,
+            };
+            var vtable: ComputeBackend.VTable = undefined;
+            vtable.debertaEmbeddings = Fake.embeddings;
+            vtable.freeTensor = Fake.free;
+            const cb = ComputeBackend{
+                .ptr = &fake,
+                .vtable = &vtable,
+                .execution_control = if (has_backend_control) backend_probe.control() else null,
+            };
+            defer if (fake.output_live) cb.free(@ptrCast(&fake.marker));
+            const request = DebertaEmbeddingsRequest{
+                .word_embeddings = @ptrCast(&fake.marker),
+                .layer_norm_weight = @ptrCast(&fake.marker),
+                .layer_norm_bias = @ptrCast(&fake.marker),
+                .input_ids = &.{0},
+                .attention_mask = &.{1},
+                .total = 1,
+                .hidden_size = 1,
+                .eps = 1e-7,
+                .control = request_probe.control(),
+            };
+            if (case == .pre_cancel or fake.cancel_during) {
+                try std.testing.expectError(error.Cancelled, cb.debertaEmbeddings(request));
+            } else {
+                const output = try cb.debertaEmbeddings(request);
+                try std.testing.expectEqual(!fake.return_null, output != null);
+                try std.testing.expectEqual(@as(usize, 0), fake.frees);
+                if (output) |tensor| cb.free(tensor);
+            }
+            try std.testing.expectEqual(@as(usize, if (case == .pre_cancel) 0 else 1), fake.calls);
+            try std.testing.expectEqual(@as(usize, if (case == .pre_cancel) 1 else 3), selected.checks);
+            try std.testing.expectEqual(@as(usize, if (case == .success or case == .post_cancel) 1 else 0), fake.frees);
+            try std.testing.expect(!fake.output_live);
+            if (has_backend_control) try std.testing.expectEqual(@as(usize, 0), request_probe.checks);
+        }
+    }
 }

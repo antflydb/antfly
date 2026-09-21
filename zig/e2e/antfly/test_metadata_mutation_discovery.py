@@ -12,9 +12,10 @@
 # Elastic License 2.0 for the specific language governing permissions and
 # limitations.
 
-"""A stalled metadata status endpoint must not hide a reachable leader."""
+"""A stalled metadata discovery endpoint must not hide a reachable leader."""
 
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -25,29 +26,42 @@ three_by_three_backup_cluster = backups.three_by_three_backup_cluster
 
 
 @pytest.fixture
-def stalled_metadata_status(monkeypatch):
+def stalled_metadata_discovery(monkeypatch, request):
     stopped = threading.Event()
     observed = threading.Event()
     enabled = threading.Event()
-    upstream = [None]
+    fault_lock = threading.Lock()
+    proxies = []
+    threads = []
+    stall_all = getattr(request, "param", None) == "all"
+    fault_path = "/metadata/v1/status" if stall_all else "/metadata/v1/runtime-topology"
 
     class Proxy(BaseHTTPRequestHandler):
         def forward(self):
-            if (
-                enabled.is_set()
-                and self.command == "GET"
-                and self.path == "/metadata/v1/status"
-            ):
-                observed.set()
+            with fault_lock:
+                stall = (
+                    enabled.is_set()
+                    and (stall_all or not observed.is_set())
+                    and self.command == "GET"
+                    and self.path == fault_path
+                )
+                if stall:
+                    observed.set()
+            if stall:
                 # Keep the request pending beyond the complete mutation budget.
-                # Every direct metadata node address also remains reachable.
+                # Other routes continue forwarding normally.
                 stopped.wait(30.0)
                 self.close_connection = True
                 return
+            # Descriptor admission is remote I/O, not an index-build quantum.
+            # Keep it slower than the 25 ms repair slice so restore must make
+            # progress even when catalog requests have ordinary network latency.
+            if enabled.is_set() and self.path.startswith("/internal/v2/catalog/"):
+                time.sleep(0.05)
             body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
             with requests.request(
                 self.command,
-                upstream[0] + self.path,
+                self.server.upstream + self.path,
                 data=body,
                 headers={
                     key: value
@@ -67,8 +81,12 @@ def stalled_metadata_status(monkeypatch):
                         self.send_header(key, value)
                 self.send_header("Content-Length", str(len(response.content)))
                 self.send_header("Connection", "close")
-                self.end_headers()
-                self.wfile.write(response.content)
+                try:
+                    self.end_headers()
+                    self.wfile.write(response.content)
+                except (BrokenPipeError, ConnectionResetError):
+                    # Bounded/fanned-out catalog callers may abandon a response.
+                    self.close_connection = True
 
         do_GET = forward
         do_POST = forward
@@ -78,53 +96,75 @@ def stalled_metadata_status(monkeypatch):
         def log_message(self, *args):
             pass
 
-    proxy = ThreadingHTTPServer(("127.0.0.1", 0), Proxy)
-    proxy.daemon_threads = False
-    thread = threading.Thread(target=proxy.serve_forever, daemon=True)
-    thread.start()
     original_command = backups.ThreeByThreeBackupCluster._data_command
 
-    def command_with_stalled_status(cluster, index):
+    def command_with_stalled_discovery(cluster, index):
         command = original_command(cluster, index)
         if index != 0:
             return command
-        # Keep every direct node address reachable even if leadership changes.
-        # The first address is an alternate route with a stalled status handler.
-        upstream[0] = cluster.metadata_admin_urls[0]
-        endpoints = [
-            f"http://127.0.0.1:{proxy.server_port}",
-            *cluster.metadata_admin_urls,
-        ]
+        # Wrap every configured route so leader affinity cannot bypass the
+        # fault. By default stall the first topology request after activation;
+        # the all variant stalls every diagnostic status request.
+        endpoints = []
+        for upstream in cluster.metadata_admin_urls:
+            proxy = ThreadingHTTPServer(("127.0.0.1", 0), Proxy)
+            proxy.upstream = upstream
+            proxy.daemon_threads = False
+            thread = threading.Thread(target=proxy.serve_forever, daemon=True)
+            thread.start()
+            proxies.append(proxy)
+            threads.append(thread)
+            endpoints.append(f"http://127.0.0.1:{proxy.server_port}")
         command = command[: command.index("--metadata-api")]
         for url in endpoints:
             command.extend(["--metadata-api", url])
         return command
 
     monkeypatch.setattr(
-        backups.ThreeByThreeBackupCluster, "_data_command", command_with_stalled_status
+        backups.ThreeByThreeBackupCluster,
+        "_data_command",
+        command_with_stalled_discovery,
     )
     try:
         yield enabled, observed
     finally:
         stopped.set()
-        proxy.shutdown()
-        proxy.server_close()
-        thread.join()
+        for proxy in proxies:
+            proxy.shutdown()
+            proxy.server_close()
+        for thread in threads:
+            thread.join()
 
 
 @pytest.fixture
-def stalled_status_backup_cluster(
-    stalled_metadata_status, three_by_three_backup_cluster
+def stalled_discovery_backup_cluster(
+    stalled_metadata_discovery, three_by_three_backup_cluster
 ):
     # Isolate mutation discovery from the fixture's initial bootstrap reads.
-    stalled_metadata_status[0].set()
+    stalled_metadata_discovery[0].set()
     return three_by_three_backup_cluster
 
 
-def test_backup_restore_discovers_leader_past_stalled_status(
-    stalled_status_backup_cluster, stalled_metadata_status
+def test_backup_restore_discovers_leader_past_stalled_topology(
+    stalled_discovery_backup_cluster, stalled_metadata_discovery
 ):
     backups.test_three_by_three_cluster_backup_restore_through_metadata_public_api(
-        stalled_status_backup_cluster
+        stalled_discovery_backup_cluster
     )
-    assert stalled_metadata_status[1].is_set()
+    assert stalled_metadata_discovery[1].is_set()
+
+
+@pytest.mark.parametrize("stalled_metadata_discovery", ["all"], indirect=True)
+def test_catalog_mutations_do_not_wait_for_diagnostic_status(
+    stalled_discovery_backup_cluster,
+):
+    cluster = stalled_discovery_backup_cluster
+    # All diagnostic status requests remain stalled beyond the mutation budget.
+    # The compact topology route and actual mutations continue serving normally.
+    for index in range(3):
+        response = requests.post(
+            cluster.data_api_urls[0] + f"/databases/compact_discovery_{index}",
+            json={},
+            timeout=15,
+        )
+        assert response.ok, (response.status_code, response.text)

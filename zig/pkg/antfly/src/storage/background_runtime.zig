@@ -1997,7 +1997,7 @@ const ThreadedDurableJobLane = if (builtin.os.tag == .freestanding) struct {
     owners: *OwnerRegistry,
     mutex: std.atomic.Mutex = .unlocked,
     reap_mutex: std.atomic.Mutex = .unlocked,
-    shutdown_reaper: std.atomic.Value(bool) = .init(false),
+    shutdown_reaper: Io.Event = .unset,
     completed_count: std.atomic.Value(usize) = .init(0),
     accepting: std.atomic.Value(bool) = .init(true),
     reaper_future: ?Io.Future(void) = null,
@@ -2024,7 +2024,7 @@ const ThreadedDurableJobLane = if (builtin.os.tag == .freestanding) struct {
 
     fn deinit(self: *ThreadedDurableJobLane) void {
         self.accepting.store(false, .release);
-        self.shutdown_reaper.store(true, .release);
+        self.shutdown_reaper.set(self.io_impl.io());
         if (self.reaper_future) |*future| {
             _ = future.await(self.io_impl.io());
             self.reaper_future = null;
@@ -2117,8 +2117,12 @@ const ThreadedDurableJobLane = if (builtin.os.tag == .freestanding) struct {
     }
 
     fn reaperLoop(self: *ThreadedDurableJobLane) void {
+        self.reaperLoopWithIo(self.io_impl.io());
+    }
+
+    fn reaperLoopWithIo(self: *ThreadedDurableJobLane, io: Io) void {
         var next_maintenance_probe_ns = platform.time.monotonicNs();
-        while (!self.shutdown_reaper.load(.acquire)) {
+        while (!self.shutdown_reaper.isSet()) {
             const now_ns = platform.time.monotonicNs();
             if (now_ns >= next_maintenance_probe_ns) {
                 _ = self.owners.runMaintenanceProbes(reap_batch_limit);
@@ -2126,9 +2130,12 @@ const ThreadedDurableJobLane = if (builtin.os.tag == .freestanding) struct {
             }
             const reaped = self.reapCompleted(reap_batch_limit);
             // Drain a backlog without an artificial rate cap. At idle, a
-            // short sleep avoids scanning the active set continuously.
+            // timed wait avoids scanning the active set continuously. Shutdown
+            // wakes it immediately, including a signal before wait enrollment.
             if (reaped == reap_batch_limit or self.completed_count.load(.monotonic) > 0) continue;
-            self.io_impl.io().sleep(Io.Duration.fromMilliseconds(idle_reap_interval_ms), .awake) catch {};
+            self.shutdown_reaper.waitTimeout(io, .{
+                .duration = .{ .raw = .fromMilliseconds(idle_reap_interval_ms), .clock = .awake },
+            }) catch {};
         }
         while (self.reapCompleted(reap_batch_limit) > 0) {}
     }
@@ -3929,6 +3936,62 @@ test "backend runtime concurrent owner drains both wait for payload teardown" {
     second.await(std.testing.io);
     try std.testing.expectEqual(@as(usize, 2), ctx.finished_drains.load(.acquire));
     try std.testing.expectEqual(@as(usize, 1), ctx.deinits.load(.acquire));
+}
+
+test "backend runtime idle reaper waits on shutdown instead of an unconditional sleep" {
+    if (builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const Probe = struct {
+        lane: *ThreadedDurableJobLane,
+        waits: usize = 0,
+        sleeps: usize = 0,
+        fn wait(ptr: ?*anyopaque, _: *const u32, _: u32, _: Io.Timeout) Io.Cancelable!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.waits += 1;
+            self.lane.shutdown_reaper.set(std.testing.io);
+        }
+        fn sleep(ptr: ?*anyopaque, _: Io.Timeout) Io.Cancelable!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.sleeps += 1;
+            self.lane.shutdown_reaper.set(std.testing.io);
+        }
+    };
+    var io_impl = IoImpl.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    var owners = OwnerRegistry.init(std.testing.allocator);
+    defer owners.deinit();
+    var lane = ThreadedDurableJobLane.init(std.testing.allocator, &io_impl, &owners);
+    defer lane.deinit();
+    var probe: Probe = .{ .lane = &lane };
+    var vtable = std.testing.io.vtable.*;
+    vtable.futexWait = Probe.wait;
+    vtable.sleep = Probe.sleep;
+    const io: Io = .{ .userdata = &probe, .vtable = &vtable };
+    lane.reaperLoopWithIo(io);
+    try std.testing.expectEqual(@as(usize, 1), probe.waits);
+    try std.testing.expectEqual(@as(usize, 0), probe.sleeps);
+    // A shutdown published before enrollment must perform no further wait.
+    lane.reaperLoopWithIo(io);
+    try std.testing.expectEqual(@as(usize, 1), probe.waits);
+}
+
+test "backend runtime idle reaper shutdown survives wait enrollment" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    for ([_]bool{ false, true }) |wait_for_enrollment| {
+        var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{});
+        defer handle.deinit();
+        const jobs = handle.ptr().threaded_jobs.?;
+        if (wait_for_enrollment) {
+            // Observing .waiting is enough: Event.set also covers the race
+            // between publishing enrollment and entering the kernel wait.
+            while (@atomicLoad(Io.Event, &jobs.shutdown_reaper, .acquire) != .waiting)
+                std.atomic.spinLoopHint();
+        }
+        jobs.shutdown_reaper.set(jobs.io_impl.io());
+        jobs.reaper_future.?.await(jobs.io_impl.io());
+        jobs.reaper_future = null;
+        // A shutdown signal remains set; it must never be reset after a wake.
+        try std.testing.expect(jobs.shutdown_reaper.isSet());
+    }
 }
 
 test "backend runtime durable lane deinits threaded job payload after completion" {

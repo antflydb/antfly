@@ -4391,7 +4391,7 @@ pub const IndexManager = struct {
             self.vector_block_build_mu.unlock();
             locked = false;
             prepared.reclaimObsolete();
-            std.log.info("shared vector-block native generations compacted sequence={} vectors={}", .{ covered_source_sequence, entry.index.stats().active_count });
+            std.log.debug("shared vector-block native generations compacted sequence={} vectors={}", .{ covered_source_sequence, entry.index.stats().active_count });
             return true;
         }
         return error.VectorBlockSnapshotAdvancedWithoutWal;
@@ -4422,6 +4422,8 @@ pub const IndexManager = struct {
             break :blk true;
         };
         if (!current_exists) {
+            // A reader may open while the writer is staging its first base.
+            // Only the writer can distinguish live staging from crash debt.
             if (read_only) return;
             // A crash may leave first-generation blocks before CURRENT. Avoid
             // creating vector state for tables that have never staged it, but
@@ -4439,9 +4441,11 @@ pub const IndexManager = struct {
             try vector_block_store_mod.Store.openWithBlocks(self.alloc, self.vector_block_storage.?, root);
         var opened_owned = true;
         errdefer if (opened_owned) opened.deinit();
-        if (!read_only) _ = opened.store.reclaimUnreferencedFiles() catch |err| {
-            std.log.warn("shared vector-block startup cleanup deferred root={s} err={s}", .{ root, @errorName(err) });
-        };
+        if (!read_only) {
+            _ = opened.store.reclaimUnreferencedFiles() catch |err| {
+                std.log.warn("shared vector-block startup cleanup deferred root={s} err={s}", .{ root, @errorName(err) });
+            };
+        }
         if (opened.store.manifest == null) {
             opened.deinit();
             opened_owned = false;
@@ -4453,7 +4457,28 @@ pub const IndexManager = struct {
     }
 
     pub fn ensureVectorBlockBaseAtAppliedSequence(self: *IndexManager, name: []const u8, applied_sequence: u64) !void {
+        return self.ensureVectorBlockBaseAtAppliedSequenceWithEncoding(name, applied_sequence, false);
+    }
+
+    fn vectorBlockUsesDesiredEncoding(self: *IndexManager) bool {
+        const generation = self.acquireVectorBlockGeneration() orelse return false;
+        defer generation.release();
+        return generation.opened.usesBaseEncoding(self.vectorBlockStorageEncoding());
+    }
+
+    pub fn sourceMigrationServingComplete(self: *IndexManager) bool {
+        if (self.dense_indexes.items.len == 0) return true;
+        if (self.source_payload_store == null or !self.vectorBlockUsesDesiredEncoding()) return false;
+        for (self.dense_indexes.items) |*entry| {
+            if (!entry.native_physical_v2 or !self.vectorBlockReadyForDenseIndex(entry.config.name) or
+                self.repairUnavailable(entry.config.name)) return false;
+        }
+        return true;
+    }
+
+    fn ensureVectorBlockBaseAtAppliedSequenceWithEncoding(self: *IndexManager, name: []const u8, applied_sequence: u64, require_storage_encoding: bool) !void {
         if (self.vector_block_storage == null) return;
+        const converting = require_storage_encoding and !self.vectorBlockUsesDesiredEncoding();
         const entry = self.denseIndex(name) orelse return error.IndexNotFound;
         if (entry.index.experimentalPostingDurableAppliedSequence()) |posting_sequence| {
             // A stable source snapshot may legitimately be ahead of the last
@@ -4507,7 +4532,7 @@ pub const IndexManager = struct {
         // maintenance lane. The empty-bootstrap exception remains enforced
         // by vectorBlockGenerationReadyAtSequenceAndCount, so initial
         // publication still produces a cardinality-certified base.
-        if (self.vectorBlockReadyAtSequenceAndCount(
+        if (!converting and self.vectorBlockReadyAtSequenceAndCount(
             applied_sequence,
             entry,
             entry.index.stats().active_count,
@@ -4521,7 +4546,7 @@ pub const IndexManager = struct {
         // without cloning/scanning primary LSM artifacts. Missing, lossy, or
         // sequence-mismatched native state falls through to the pinned primary
         // snapshot repair path below.
-        if (try self.compactVectorBlockGenerationAtStableTip(entry, applied_sequence)) return;
+        if (!converting and try self.compactVectorBlockGenerationAtStableTip(entry, applied_sequence)) return;
 
         // Only one snapshot builder may reserve the next immutable generation.
         // Ordinary WAL appends continue under vector_block_build_mu while the
@@ -4611,7 +4636,7 @@ pub const IndexManager = struct {
         defer store.deinit();
         if (store.manifest != null and store.covered_source_sequence == applied_sequence) {
             try self.loadVectorBlockGenerationIfPresent(false);
-            if (self.vectorBlockReadyAtSequenceAndCount(
+            if (!converting and self.vectorBlockReadyAtSequenceAndCount(
                 applied_sequence,
                 entry,
                 entry.index.stats().active_count,
@@ -4645,7 +4670,7 @@ pub const IndexManager = struct {
             try hook.call(hook.ctx);
         const started = platform_time.monotonicNs();
         if (builtin.is_test) test_vector_block_primary_snapshot_builds += 1;
-        std.log.info(
+        std.log.debug(
             "shared vector-block primary snapshot build started index={s} generation={} sequence={} vectors={}",
             .{ entry.config.name, generation, applied_sequence, entry.index.stats().active_count },
         );
@@ -4785,7 +4810,7 @@ pub const IndexManager = struct {
         build_mu_locked = false;
         prepared.reclaimObsolete();
 
-        std.log.info(
+        std.log.debug(
             "shared vector-block base published generation={} sequence={} vectors={} vector_bytes={} artifact_bytes={} block_bytes={} elapsed_ms={}",
             .{
                 generation,
@@ -6371,17 +6396,46 @@ pub const IndexManager = struct {
         cancel_check: ?types.RepairCancelCheck,
         capacity_check: ?types.RepairCapacityCheck,
     ) !u64 {
+        var slice = try self.rebuildFullTextIndexFromReadTxnSlice(store, read_txn, index_name, null, .{
+            .cancel_check = cancel_check,
+            .capacity_check = capacity_check,
+        });
+        defer slice.deinit(self.alloc);
+        std.debug.assert(slice.resume_key == null);
+        return slice.rebuilt;
+    }
+
+    pub const FullTextRebuildSlice = struct {
+        rebuilt: u64,
+        resume_key: ?[]u8 = null,
+
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
+            if (self.resume_key) |key| alloc.free(key);
+        }
+    };
+
+    /// The candidate is private. Sync its page before returning a cursor that
+    /// the durable repair intent can publish; reopening never resets a prefix.
+    pub fn rebuildFullTextIndexFromReadTxnSlice(
+        self: *IndexManager,
+        store: *docstore_mod.DocStore,
+        read_txn: *docstore_mod.DocStore.Txn,
+        index_name: []const u8,
+        resume_from: ?[]const u8,
+        options: types.ArtifactRepairRunOptions,
+    ) !FullTextRebuildSlice {
         const entry = self.textIndexEntry(index_name) orelse return error.IndexNotFound;
         const rebuild_state = self.rebuildState(.full_text, entry.rebuild_root_path, entry.config);
-
-        try checkRepairCancelled(cancel_check);
-        try entry.persistent.resetAllForRebuild();
-        try rebuild_state.updateWithIo(self.checkpointIo(), "");
-        try self.backfillTextIndexFromReadTxn(store, read_txn, entry, null, cancel_check, capacity_check);
-        try checkRepairCancelled(cancel_check);
+        try checkRepairCancelled(options.cancel_check);
+        if (resume_from == null) {
+            try entry.persistent.resetAllForRebuild();
+            try rebuild_state.updateWithIo(self.checkpointIo(), "");
+        }
+        const cursor = try self.backfillTextIndexFromReadTxn(store, read_txn, entry, resume_from, options.cancel_check, options.capacity_check, options.yield_check);
+        errdefer if (cursor) |key| self.alloc.free(key);
+        try checkRepairCancelled(options.cancel_check);
         try entry.persistent.sync(true);
-
-        return entry.persistent.snapshot().liveDocCount();
+        return .{ .rebuilt = entry.persistent.snapshot().liveDocCount(), .resume_key = cursor };
     }
 
     pub fn clearDenseHbcCaches(self: *IndexManager) void {
@@ -8008,6 +8062,26 @@ pub const IndexManager = struct {
         alloc: Allocator,
         artifacts: std.ArrayListUnmanaged(Artifact) = .empty,
         native_files: ?native_backup.PinnedGeneratedArtifacts = null,
+
+        pub fn walPrefixBytes(self: *const NativeBackupCheckpoints) !u64 {
+            return if (self.native_files) |*files| try files.walPrefixBytes() else 0;
+        }
+
+        pub fn seal(self: *NativeBackupCheckpoints, io: std.Io, root: []const u8, cancellation: CancellationToken, wal_budget: u64) !u64 {
+            if (try self.walPrefixBytes() > wal_budget) return error.BackupSealWalBudgetExceeded;
+            var total: u64 = 0;
+            for (self.artifacts.items) |*artifact| {
+                const destination = try std.fmt.allocPrint(self.alloc, "{s}/indexes/{s}/{s}", .{ root, artifact.index_name, artifact.backend_root });
+                defer self.alloc.free(destination);
+                const bytes = switch (artifact.checkpoint) {
+                    .lsm => |*checkpoint| try checkpoint.seal(io, destination, cancellation),
+                    .text_segments => |*checkpoint| try checkpoint.seal(self.alloc, io, destination, cancellation),
+                };
+                total = std.math.add(u64, total, bytes) catch return error.FileTooBig;
+            }
+            if (self.native_files) |*files| total = std.math.add(u64, total, try files.seal(root, cancellation, wal_budget)) catch return error.FileTooBig;
+            return total;
+        }
 
         const Artifact = struct {
             index_name: []u8,
@@ -10400,7 +10474,7 @@ pub const IndexManager = struct {
         for (self.dense_indexes.items) |*entry| {
             if (!entry.apply_mutex.tryLock()) continue;
             defer entry.apply_mutex.unlock();
-            if (entry.index.posting_refresh_clean_epoch == entry.index.published_mutation_epoch.load(.acquire)) continue;
+            if (!entry.index.postingRefreshPending()) continue;
             if (entry.index.resource_manager) |resources| if (resources.shouldDeferPostingRefreshForForegroundWrites()) continue;
             if (entry.index.treeLinkRepairPending() or
                 (if (entry.index.resource_manager) |resources| resources.dense_posting_row_deltas else @import("../../dense_perf_experiments.zig").enabled("ANTFLY_EXPERIMENT_POSTING_ROW_DELTAS")))
@@ -10583,6 +10657,10 @@ pub const IndexManager = struct {
     }
 
     pub const OnlineVectorBlockPublicationOptions = struct {
+        /// Source ownership conversion calls this only after physical primary
+        /// values are all references. Preserve healthy serving while replacing
+        /// the old full-payload exact-vector plane.
+        require_storage_encoding: bool = false,
         cancel_check: ?types.RepairCancelCheck = null,
         /// The repair owner has verified terminal source-outcome coverage for
         /// this rebuilding index. This permits staging only; serving and the
@@ -10626,7 +10704,9 @@ pub const IndexManager = struct {
             if (options.only_index) |name| if (!std.mem.eql(u8, name, entry.config.name)) continue;
             if (self.repairUnavailable(entry.config.name) and
                 !(options.covered_rebuilding_index != null and std.mem.eql(u8, options.covered_rebuilding_index.?, entry.config.name))) continue;
-            if (self.vectorBlockReadyForDenseIndex(entry.config.name) and !entry.index.nativePostingAccelerationPending()) continue;
+            const healthy = self.vectorBlockReadyForDenseIndex(entry.config.name);
+            if (healthy and !entry.index.nativePostingAccelerationPending() and
+                (!options.require_storage_encoding or self.vectorBlockUsesDesiredEncoding())) continue;
             const sequence = entry.index.experimentalPostingDurableAppliedSequence() orelse continue;
             if (sequence != primary.lastReplaySequence(0)) {
                 deferred = true;
@@ -10646,16 +10726,20 @@ pub const IndexManager = struct {
                     continue;
                 }
             }
-            if (self.vector_block_stable_tip_finalizing.cmpxchgStrong(false, true, .acq_rel, .acquire) != null)
-                return .{ .published = published, .deferred = true };
-            self.vector_block_stable_tip_index.store(@intFromPtr(entry), .release);
-            self.vector_block_stable_tip_sequence.store(sequence, .release);
-            defer {
+            // Healthy replacements are serialized by the DB projection owner
+            // and base-staging reservation. They do not close serving admission.
+            if (!healthy) {
+                if (self.vector_block_stable_tip_finalizing.cmpxchgStrong(false, true, .acq_rel, .acquire) != null)
+                    return .{ .published = published, .deferred = true };
+                self.vector_block_stable_tip_index.store(@intFromPtr(entry), .release);
+                self.vector_block_stable_tip_sequence.store(sequence, .release);
+            }
+            defer if (!healthy) {
                 self.vector_block_stable_tip_sequence.store(0, .release);
                 self.vector_block_stable_tip_index.store(0, .release);
                 self.vector_block_stable_tip_finalizing.store(false, .release);
-            }
-            self.ensureVectorBlockBaseAtAppliedSequence(entry.config.name, sequence) catch |err| switch (err) {
+            };
+            self.ensureVectorBlockBaseAtAppliedSequenceWithEncoding(entry.config.name, sequence, options.require_storage_encoding) catch |err| switch (err) {
                 error.PostingCheckpointSequenceMismatch,
                 error.VectorBlockSnapshotAdvancedWithoutWal,
                 error.VectorBlockGenerationReservationLost,
@@ -11100,7 +11184,10 @@ pub const IndexManager = struct {
 
     pub fn setIo(self: *IndexManager, io: ?std.Io) void {
         self.io = io;
-        for (self.text_indexes.items) |*entry| entry.io = self.checkpointIo();
+        for (self.text_indexes.items) |*entry| {
+            entry.io = self.checkpointIo();
+            entry.persistent.io = io;
+        }
         for (self.dense_indexes.items) |*entry| entry.index.setIo(io);
     }
 
@@ -11481,6 +11568,13 @@ pub const IndexManager = struct {
         updated_no_backfill,
     };
 
+    pub fn resolverConfigMatches(self: *IndexManager, cfg: resolver_catalog.ResolverConfig) bool {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        const existing = self.getResolver(cfg.name) orelse return false;
+        return existing.eql(cfg);
+    }
+
     fn resolverMaterialConfigChanged(existing: resolver_catalog.ResolverConfig, next: resolver_catalog.ResolverConfig) bool {
         return !std.mem.eql(u8, existing.table, next.table) or
             !std.mem.eql(u8, existing.key_template, next.key_template) or
@@ -11519,6 +11613,7 @@ pub const IndexManager = struct {
         defer self.catalog_mutex.unlockExclusive();
         for (self.resolvers.items) |*entry| {
             if (!std.mem.eql(u8, entry.name, cfg.name)) continue;
+            if (entry.eql(cfg)) return .updated_no_backfill;
             if (!std.mem.eql(u8, entry.source_artifact, cfg.source_artifact)) return error.ResolverSourceArtifactImmutable;
             if (entry.source_artifact_kind != cfg.source_artifact_kind) return error.ResolverSourceArtifactImmutable;
             if (!std.mem.eql(u8, entry.resolution_artifact, cfg.resolution_artifact)) return error.ResolverArtifactImmutable;
@@ -18619,7 +18714,8 @@ pub const IndexManager = struct {
         resume_from: ?[]const u8,
         cancel_check: ?types.RepairCancelCheck,
         capacity_check: ?types.RepairCapacityCheck,
-    ) !void {
+        yield_check: ?types.RepairYieldCheck,
+    ) !?[]u8 {
         self.beginTextBackfill();
         defer self.endTextBackfill();
         const rebuild_state = self.rebuildState(.full_text, entry.rebuild_root_path, entry.config);
@@ -18661,6 +18757,7 @@ pub const IndexManager = struct {
                 identity_txn: *docstore_mod.DocStore.Txn,
                 check: ?types.RepairCancelCheck,
                 capacity: ?types.RepairCapacityCheck,
+                resumable: bool,
             ) !void {
                 try checkRepairCancelled(check);
                 if (capacity) |admission| try admission.boundary();
@@ -18674,12 +18771,20 @@ pub const IndexManager = struct {
                 defer manager.alloc.free(ordinals);
                 for (docs_buf.items, ordinals) |*doc, ordinal| doc.doc_ordinal = ordinal;
 
+                var page = @import("../../persistent.zig").PersistentIndex.RebuildPage{
+                    .index = &text_entry.persistent,
+                    .cursor = last_doc_key,
+                };
+                if (resumable) try page.begin();
+                defer page.deinit();
                 const stats = try manager.indexTextProjectionDocsMaybeChunked(doc_store, text_entry, docs_buf.items);
+                if (resumable) try page.commit();
                 try manager.finalizeTextBatchMutations(text_entry, .{
                     .compact_text = false,
-                    .compact_text_segment_threshold = text_backfill_compact_segment_threshold,
+                    .compact_text_segment_threshold = if (resumable) null else text_backfill_compact_segment_threshold,
+                    .defer_text_compaction = resumable,
                 }, stats);
-                try rebuild.updateWithIo(manager.checkpointIo(), last_doc_key);
+                if (!resumable) try rebuild.updateWithIo(manager.checkpointIo(), last_doc_key);
                 for (docs_buf.items) |doc| {
                     manager.alloc.free(@constCast(doc.key));
                     manager.alloc.free(@constCast(doc.value));
@@ -18698,10 +18803,22 @@ pub const IndexManager = struct {
             }
         }.run;
 
-        var scan_lower_buf: ?[]u8 = if (resume_from) |buf| try self.alloc.dupe(u8, buf) else null;
+        const durable_cursor = try entry.persistent.rebuildCursorAlloc(self.alloc);
+        const resumable = yield_check != null or durable_cursor != null;
+        defer if (durable_cursor) |cursor| self.alloc.free(cursor);
+        // The candidate page transaction is authoritative if the separate
+        // primary repair-intent cursor was not persisted before a crash.
+        const effective_resume = if (durable_cursor) |cursor|
+            if (resume_from == null or std.mem.order(u8, cursor, resume_from.?) == .gt) cursor else resume_from
+        else
+            resume_from;
+        var scan_lower_buf: ?[]u8 = if (effective_resume) |buf| try self.alloc.dupe(u8, buf) else null;
         defer if (scan_lower_buf) |buf| self.alloc.free(buf);
-        const backfill_doc_limit = if (@import("builtin").is_test) test_text_backfill_batch_size orelse text_backfill_batch_size else text_backfill_batch_size;
-        const backfill_source_target_bytes = textProjectionSourceBuildTargetBytes();
+        const configured_doc_limit = if (@import("builtin").is_test) test_text_backfill_batch_size orelse text_backfill_batch_size else text_backfill_batch_size;
+        // Bulk throughput settings are not scheduler quanta. Bound both rows
+        // and retained source bytes before checking the repair deadline.
+        const backfill_doc_limit = if (yield_check != null) @min(configured_doc_limit, 256) else configured_doc_limit;
+        const backfill_source_target_bytes = if (yield_check != null) @min(textProjectionSourceBuildTargetBytes(), 256 * 1024) else textProjectionSourceBuildTargetBytes();
         const scan_budget_per_page = @max(backfill_doc_limit * 2, 256);
         var reached_end = false;
 
@@ -18830,15 +18947,26 @@ pub const IndexManager = struct {
                     read_txn,
                     cancel_check,
                     capacity_check,
+                    resumable,
                 );
                 if (batch_last_doc_key) |old| self.alloc.free(old);
                 batch_last_doc_key = null;
             }
+            if (!reached_end) if (yield_check) |check| {
+                if (check.requested()) {
+                    try entry.persistent.sync(true);
+                    try entry.persistent.checkpointLsmWalAfterDurableBoundary();
+                    return try self.alloc.dupe(u8, scan_lower_buf.?);
+                }
+            };
         }
 
-        if (flushed_batches > 0) try self.compactTextIndex(&entry.persistent, activeTextMergePolicy());
+        // Cooperative builds leave merging to the normal bounded text merge
+        // scheduler instead of adding a whole-index compaction to their tail.
+        if (flushed_batches > 0 and !resumable) try self.compactTextIndex(&entry.persistent, activeTextMergePolicy());
         if (!saw_visible_doc or flushed_batches > 0) try rebuild_state.clearWithIo(self.checkpointIo());
         if (flushed_batches > 0) try entry.persistent.checkpointLsmWalAfterDurableBoundary();
+        return null;
     }
 
     fn indexPath(self: *const IndexManager, name: []const u8) ![]u8 {
@@ -19916,6 +20044,7 @@ pub const IndexManager = struct {
 
                 const persistent_opts = persistent_mod.PersistentIndexOptions{
                     .path = zpath,
+                    .io = self.io,
                     .main_backend = self.text_main_backend,
                     .main_lsm_storage = self.text_lsm_storage,
                     .wal_storage = self.text_lsm_storage,
@@ -20271,7 +20400,7 @@ pub const IndexManager = struct {
                         };
                     }
                     if (index.experimentalPostingReadsEnabled()) {
-                        std.log.info("dense posting sidecar activated index={s} sequence={}", .{ cfg.name, posting_sequence });
+                        std.log.debug("dense posting sidecar activated index={s} sequence={}", .{ cfg.name, posting_sequence });
                     }
                 }
                 // A legacy v1 index may maintain a posting sidecar, but its
@@ -20748,6 +20877,7 @@ pub const IndexManager = struct {
         defer runtime_store.deinit();
         var txn = try runtime_store.store.beginWrite();
         errdefer txn.abort();
+        try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, enrichment_catalog_key, data);
         try txn.put(enrichment_catalog_key, data);
         try txn.commit();
         // Enrichment definitions are part of the immutable foreground write
@@ -20826,6 +20956,7 @@ pub const IndexManager = struct {
         defer runtime_store.deinit();
         var txn = try runtime_store.store.beginWrite();
         errdefer txn.abort();
+        try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, resolver_catalog_key, data);
         try txn.put(resolver_catalog_key, data);
         if (mode == .mark_reresolve_dirty) {
             try txn.put(resolver_catalog.reresolve_resume_key, "");
@@ -43562,6 +43693,42 @@ test "completed native publication defers to capture ownership without starting 
     try std.testing.expectEqual(@as(usize, 0), idle.published);
     try std.testing.expect(!idle.deferred);
     try std.testing.expect(entry.index.experimental_posting_checkpoint_build == null);
+}
+
+test "read-only vector generation load preserves unpublished writer files" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = indexManagerTmpPathWithSuffix(&path_buf, "readonly-vector-staging");
+    defer cleanupIndexManagerDir(path);
+
+    var store = try docstore_mod.DocStore.open(alloc, path, .{});
+    defer store.close();
+    var writer = try IndexManager.init(alloc, std.mem.span(path));
+    defer writer.deinit();
+    const storage = writer.vector_block_storage.?;
+    const root = try writer.vectorBlockRootAlloc();
+    defer alloc.free(root);
+    var publisher = try vector_block_store_mod.Store.open(alloc, storage, root);
+    defer publisher.deinit();
+    const staged_path = try std.fs.path.join(alloc, &.{ root, "block-2-0.afvb" });
+    defer alloc.free(staged_path);
+    const current_path = try std.fs.path.join(alloc, &.{ root, "CURRENT" });
+    defer alloc.free(current_path);
+
+    // Exercise both first-base staging and replacement-base staging. A
+    // read-only catalog open must neither recover nor reclaim writer files.
+    inline for (.{ false, true }) |published| {
+        if (published) try publisher.publishEmptyBase(1, 0, .{});
+        try storage.writeFileAbsolute(staged_path, "unpublished writer block");
+        var reader = try IndexManager.init(alloc, std.mem.span(path));
+        defer reader.deinit();
+        try reader.loadNoBackfill(&store);
+        try std.testing.expectEqual(@as(u64, "unpublished writer block".len), try storage.fileSize(staged_path));
+        const generation = reader.acquireVectorBlockGeneration();
+        defer if (generation) |lease| lease.release();
+        try std.testing.expectEqual(published, generation != null);
+        if (!published) try std.testing.expectError(error.FileNotFound, storage.fileSize(current_path));
+    }
 }
 
 test "stable native finalization certifies an empty dense index" {

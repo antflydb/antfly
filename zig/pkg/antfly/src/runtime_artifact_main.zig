@@ -76,6 +76,16 @@ fn mainImpl(init: std.process.Init) anyerror!void {
     if (worker_invocation) command = "inference";
     const runtime_arguments = if (worker_invocation) argument_views.items[1..] else argument_views.items;
 
+    if (comptime role_options.role == .inference) {
+        const one_shot = @import("antfly_platform").one_shot_process;
+        if (one_shot.isTrainingInvocation(init.minimal.args)) {
+            // Preserve the executable's invocation before the runtime ABI
+            // substitutes its synthetic argv vector. Ignore inherited claims.
+            const original = try one_shot.encodeOriginalArguments(init.gpa, init.minimal.args);
+            defer init.gpa.free(original);
+            try init.environ_map.put(one_shot.original_argv_env, original);
+        }
+    }
     const environment_names = init.environ_map.keys();
     const environment_values = init.environ_map.values();
     std.debug.assert(environment_names.len == environment_values.len);

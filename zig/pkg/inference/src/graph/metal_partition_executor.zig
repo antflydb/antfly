@@ -15029,8 +15029,9 @@ fn executeRuntimeConvGeneral(
     const weight_shape = graph.node(inputs[1]).output_shape;
     if (attrs.transposed) return null;
     if (@as(usize, attrs.num_spatial) > attrs.dilations.len) return null;
+    if (attrs.hasDilation()) return null;
     for (0..attrs.num_spatial) |axis| {
-        if (attrs.dilations[axis] != 1 or attrs.output_padding[axis] != 0) return null;
+        if (attrs.output_padding[axis] != 0) return null;
     }
 
     if (attrs.num_spatial == 1 and attrs.groups == 1 and input_shape.rank() == 3 and weight_shape.rank() == 3 and attrs.padding[0][0] == attrs.padding[0][1]) {

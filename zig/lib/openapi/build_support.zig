@@ -22,6 +22,9 @@ pub const GenerateOptions = struct {
     generate: []const u8,
     import_mappings: []const [2][]const u8 = &.{},
     zig_type_mappings: []const [2][]const u8 = &.{},
+    /// Named component -> JSON pointer into the original document. Keeps
+    /// vendored specs intact when their operation schemas are inline.
+    schema_aliases: []const [2][]const u8 = &.{},
 };
 
 /// All callers share the same declared conversion inputs and generator protocol.
@@ -35,6 +38,9 @@ pub fn addGeneratedDirectory(b: *std.Build, options: GenerateOptions) std.Build.
     convert.addFileInput(options.scripts_root.path(b, "uv.lock"));
     convert.addFileArg(options.spec);
     const json_spec = convert.addOutputFileArg(b.fmt("{s}.json", .{options.package_name}));
+    for (options.schema_aliases) |alias| {
+        convert.addArgs(&.{ "--schema-alias", b.fmt("{s}={s}", .{ alias[0], alias[1] }) });
+    }
 
     const codegen = b.addRunArtifact(options.compiler);
     codegen.addArg("--spec");

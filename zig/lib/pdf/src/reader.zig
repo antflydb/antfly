@@ -22298,7 +22298,12 @@ test "graphics matrices pre-concatenate PDF cm operators" {
 }
 
 test "reader preserves canonical bytes when inherited stream font loses glyphs" {
-    const alloc = std.testing.allocator;
+    // Exhaustively inject every allocation failure, without recording a stack
+    // for every successful allocation in every replay. Keep leak/safety checks.
+    var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
+    defer std.debug.assert(allocator_state.deinit() == .ok);
+    const traces = try std.testing.environ.containsUnempty(std.testing.allocator, "ANTFLY_TEST_ALLOCATOR_TRACES");
+    const alloc = if (traces) std.testing.allocator else allocator_state.allocator();
     const first_content = "q BT /F1 12 Tf\n";
     const second_content = "(FOURTH EDITION) Tj ET Q\n";
     // This two-byte font deliberately recognizes only the first two code

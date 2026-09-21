@@ -1,5 +1,287 @@
 # Zig E2E flakes
 
+## 2026-09-18: concurrent aggregations stalled hydration and raced primary generations
+
+[Run 35304355356, Antfly E2E](https://github.com/antflydb/antfly/actions/runs/35304355356/job/105482406606)
+failed `test_aggregations_remain_exact_during_concurrent_inserts` in its read-only
+phase: all ten readers exceeded the unchanged 15-second request deadline.
+The workflow ran from `20fb9f572a`, but checked out candidate
+`3136b34eb0fc08749a91da6f8c465dbd5d5c425c` (storage-performance follow-up).
+The exact Linux artifact reproduced the failure. Fresh `origin/main` builds at
+`20fb9f572a` reproduced it on both native macOS ARM64 and Linux x86 under emulation,
+so it is not specific to that candidate's storage changes.
+
+Initial count searches completed in about 56 ms. The full-result aggregation
+rerun hydrated each text hit through a separate primary probe. Native stack
+samples caught readers busy-spinning in `DocStore.lockPayloadPolicy`, with its
+holder waiting for the LSM backend lock. The payload-policy lock covers primary
+view and payload-session capture; an unbounded spin there consumes the CPUs
+needed by publication/reclamation and amplifies thousands of per-hit probes.
+An isolated single-reader run completed 16 queries in its read phase.
+
+Payload-policy contention now uses the existing bounded-spin/yield primitive.
+Text hydration uses the same projected batch loader as match-all, retaining the
+selected hit order, existing stored rows, projection fields, missing-row errors,
+and request deadline. Regression coverage includes allocation-failure cleanup,
+malformed batch cardinality, missing rows, and admission after deadline expiry.
+The focused DB query suite passes 205 tests with two skips and no leaks.
+The E2E phase always performs the required two reads per worker; its five-second
+window adds contention without imposing a machine-dependent throughput floor.
+The 15-second request deadline and every exact aggregation assertion remain.
+
+With batched hydration, the Linux ReleaseFast executable passed the original
+concurrency case in 24 seconds: each reader completed 19–33 queries during the
+five-second read-only phase, followed by three successful concurrent-write
+phases. A two-worker soak then passed 40/40 cases across normal and 256-FD
+profiles: ten aggregation and ten savepoint commits per profile, with no skips.
+These Linux x86 executions used local container emulation, not native ARC.
+The macOS ARM64 ReleaseSafe build, including yielding payload-policy
+admission, passed all 23 aggregation and transaction E2E cases. Its ten readers
+each completed 41–42 queries in the read-only phase; all concurrent-write
+phases retained exact results.
+
+A subsequent native two-worker soak passed 39/40 cases: one concurrent-write
+phase returned HTTP 409 after 24 `IdentityReadGenerationChanged` retries.
+Inspection found a post-capture race: the full-result path consulted current
+DB generation after capturing all stored rows, so continuous writes could
+invalidate every completed search. Reruns now use the same captured-row context
+as the first-search fast path: if generation has advanced, they aggregate the
+immutable rows without mixing in newer index acceleration state. Incomplete
+captures and requests that require unavailable index context remain rejected.
+A deterministic regression updates a captured document and inserts another
+before aggregation, requiring the original count and values.
+
+That correction alone passed 37/40 native soak cases, with three remaining
+generation-change 409s in the constrained profile. Selection and the full-result
+rerun still released writer admission between searches. Local aggregations now
+own one DB read lease through selection, rerun, and aggregation. Raft read safety
+is established before acquiring that lease; reruns use it directly and must not
+wait on an apply barrier while holding it. The lease is released before public
+post-processing and encoding. A deterministic regression checks writer exclusion
+between phases, a single pre-lease Raft barrier, exact aggregation results, and
+successful mutation after release. Distributed cross-shard generation fencing
+is unchanged. All 85 table-read contract tests pass without failures or leaks,
+including both new regressions and the existing stale-generation rejection test.
+
+The legacy-adapter lease build passed another 40/40 native repetitions, but a
+route audit showed that linked production queries still crossed the storage ABI
+between selection and collection. That pass did not qualify lease ownership on
+the production path. Ordinary single-shard aggregations now finalize inside the
+physical local-query provider using the same lease and shared collection/budget
+rules. An explicit raw-result execution option keeps aggregation specifications
+on shard searches (where they also control exact candidate totals) while leaving
+finalization to the coordinator. The option uses a reserved byte without changing
+the ABI layout. Reranking, pruning, and cross-table aggregation remain
+coordinator-owned.
+Routing coverage requires one complete local-owner call, and a provider-ABI
+regression uses the production storage-request encoder, checks exact aggregates
+over all matches while preserving both zero- and one-hit pages, and verifies raw
+shard responses omit final aggregates. The storage encoder preserves aggregation
+specifications; generic inter-node forwarding keeps coordinator finalization. No
+lease or storage internals cross the ABI.
+The final linked table-read suite passes all 88 tests (17 implementation and
+71 consumer contracts), with no failures or leaks.
+
+The linked macOS ARM64 ReleaseSafe production executable with provider
+finalization and request serialization passed all 25 aggregation/transaction
+E2Es, including the new one- and three-shard page-limit checks and existing
+aggregation budget rejection. Its two-worker soak passed 40/40 fresh-server
+cases: ten aggregation and ten savepoint cases per normal and 256-FD profile,
+with no failures, errors, or skips. The executable SHA-256 is
+`8e8e152fb83a39fe93ce3ddb609df818705227e9d079981f3215aedf2b467fec`.
+
+The final Linux x86_64 Debug executable also passed all 25 aggregation/transaction
+E2Es under local container emulation, including all concurrent-write phases with
+the unchanged request deadline. Its SHA-256 is
+`72c5cd8eacc4ca783741ff62af869ca6e4db3a226e84470d63bf16a4b3547b22`.
+This is additional architecture coverage, not native ARC qualification.
+
+Before publishing, merge `origin/main` at `addc7fa2ca` (#790). Its concurrent
+aggregation fixture independently switched to two barrier-synchronized rounds
+and the ordinary 30-second public request timeout. Preserve that upstream fixture
+behavior alongside the new page-limit regression. The results above precede this
+merge and used the original 15-second request deadline; the production fixes do
+not depend on the upstream timeout increase.
+
+## 2026-09-18: stable transaction recovery overlapped foreground execution
+
+The same job failed `test_session_transform_savepoint_rollback` with HTTP 503,
+`transaction coordinator is temporarily unavailable`. That response covers begin
+failure and a non-durable abort; the original server log did not identify which
+internal outcome occurred.
+
+Inspection exposed a concrete race: publishing `commit_execution_started` adds
+recoverable work before foreground 2PC completes. Maintenance could replay that
+same transaction immediately, including during the terminal-response/coordinator
+acknowledgement gap. Durable record mutation locks do not serialize this execution.
+Local execution ownership now spans commit validation through the durable handoff;
+maintenance skips occupied execution stripes and leaves recovery indexed for the
+next pass. HTTP retries wait through their own cancellable I/O authority.
+The durable owner lease still fences cross-node adoption, and restart loses only
+in-memory execution ownership, preserving the existing crash-recovery path.
+
+A deterministic regression invokes maintenance from inside both foreground commit
+and acknowledgement. Another forces cancellation and handoff through caller I/O.
+All 22 session maintenance tests and all 21 production transaction E2E tests pass.
+The original intermittent 503 was not independently reproduced; the forced
+interleaving establishes the corrected race without attributing an unrecorded
+internal error to the original run.
+
+`scripts/ci/zig-e2e-query-transaction-soak.sh` repeats both cases in the VOPR
+workflow's native production lane: 50 executions of each case per normal and
+256-FD profile. The evidence gate requires all 200 reports and rejects skips.
+This native contention coverage complements the deterministic transaction
+interleaving; it does not claim an exact-replay VOPR history for a CPU starvation
+failure.
+
+## 2026-09-17: large catalog mutation failed during fast native elections
+
+[Run 35298670343's Antfly E2E job](https://github.com/antflydb/antfly/actions/runs/35298670343/job/105470606625)
+failed only `test_large_inventory_uses_bounded_control_and_diagnostic_transfers`:
+creating database `large_8` returned HTTP 503. The control/diagnostic byte bounds,
+10,000-group inventory, isolated capture admission, and table create/delete had
+already passed. The job tested candidate `d9c4ef1f939d7f615cf95b235b08deef675f720c`;
+the workflow run's head SHA is a different ref. This is distinct from the earlier
+restore failures below. Its retained cluster root is `antfly-zig-scaling-e2e-c0fz2o1t`.
+
+Metadata logs show repeated elections and real WAL commits taking more than one
+second, including a 1,632 ms commit. The shared scaling fixture forced 25 ms Raft
+and control ticks. Catalog resilience now opts into the executable's production
+cadence, as the restore fixture already does; other scaling callers keep their
+existing cadence. Mutation failures retain status, body, and response headers.
+The original exception discarded the response body, so its precise 503 error
+identity and admission outcome remain unknown. No failed mutation is retried,
+and the catalog size, page bounds, admission isolation, writes, and process
+liveness assertions remain required.
+
+The original Linux CI executable passed one baseline repetition with 25 ms ticks.
+With production cadence it passed all eight catalog resilience cases, followed
+by 20 fresh-cluster repetitions of the failing case using two workers: ten normal
+and ten under a 256-descriptor limit. Every JUnit case passed without skips or
+errors. These are Linux x86_64 executions under local container emulation; they
+do not establish reproduction of the original HTTP 503 or qualification on ARC.
+
+`scripts/ci/zig-e2e-catalog-soak.sh` now runs in the scheduled VOPR workflow's
+production E2E job: 50 cases per descriptor profile, 100 total. Exact cohort
+counts, binary digest, and failed-root retention remain required. This native
+large-inventory/disk/scheduler stress complements deterministic VOPR; no new
+replay scenario is claimed without an identified production defect and a
+deterministic failing regression.
+
+## 2026-09-17: stalled-discovery restore poll and production-soak leadership churn
+
+[PR #781's E2E job](https://github.com/antflydb/antfly/actions/runs/35247545305/job/105310030026)
+failed `test_backup_restore_discovers_leader_past_stalled_status` while polling
+restore job `7733568408289635401`: HTTP 500 with `INTERNAL_ERROR`. Its artifact
+pattern omitted metadata-backup fixture roots, and that ephemeral runner's logs
+are no longer available. The exact handler error for this request is unproven.
+The unchanged CI executable passed 10 serial and 50 two-worker Linux repetitions;
+20 local macOS repetitions also passed. Passing repeats do not establish a cause.
+
+The concurrently running [production soak](https://github.com/antflydb/antfly/actions/runs/35247508165/job/105291344795)
+provided retained evidence of proposal supersession/apply timeout, metadata
+leadership churn, and incomplete restores. See [the runtime record](../FLAKES.md#2026-09-17-restore-leadership-recovery-lost-proposal-error-identity)
+for the stable error-transport and scoped recovery fixes. The native fixture now
+uses production clock settings; its former 5 ms ticks gave real disk syncs longer
+than the election budget. Completion deadlines, exact restored-content checks,
+and failure-on-500 behavior remain unchanged.
+
+Both backup/restore variants now run in the scheduled normal and 256-descriptor
+profiles: 50 repetitions per variant per profile, 200 cases total. Evidence checks
+require all four cohorts and reject failed, missing, or skipped cases. Standard
+E2E CI uploads metadata-backup server logs and failure diagnostics. A failed job
+poll also includes fresh metadata observations and server log tails in its JUnit
+failure, so a future error remains diagnosable even if artifact collection fails.
+
+A bounded Linux check using the unchanged CI executable and corrected native
+cadence passed 40/40 cases: ten per variant per profile. That isolates the fixture
+change; it does not validate the new production recovery code. An additional
+20-case concurrent-poll probe passed, with no reproduction of the original 500.
+The rebuilt macOS ARM64 executable containing the production restore-recovery
+changes passed another 20/20 serial cases (five per variant per profile), with
+no failures, errors, or skips. This precedes the later status-publication deadline
+change. Both variants also pass a final two-case smoke on the executable containing
+the publication and separate schema-progress budgets. Final Linux CI and the
+complete scheduled soak remain required.
+
+## 2026-09-16: 3x3 backup/delete/restore admission stall
+
+`test_three_by_three_cluster_backup_restore_through_metadata_public_api` timed out
+waiting for restore job `3531487279743073036` in
+[PR #771's E2E job](https://github.com/antflydb/antfly/actions/runs/35163796459/job/105028671150).
+A local two-worker, 20-case baseline reproduced the stall: an owner opened before
+import pinned an empty generation and indefinitely blocked Raft restore bootstrap.
+See [the runtime flake record](../FLAKES.md#2026-09-16-3x3-restore-owner-admission-blocked-its-own-bootstrap)
+for evidence, the compiled-owner regression, and production admission fix.
+
+Scheduled VOPR qualification now runs the seeded admission histories; the production
+soak runs this E2E and its stalled-discovery variant 50 times each with normal
+limits and 50 times each with 256 descriptors.
+The test preserves one restore idempotency key across uncertain admission, accepts
+documented committed or uncertain delete outcomes only after observing catalog
+absence, and retains the original 120-second completion assertion. An uncertain
+seed batch is never replayed and must converge to every expected document's exact
+payload within its existing budget. Unresolved or partial outcomes still fail. Timeout diagnostics include fresh metadata and observed jobs.
+Run profiles sequentially at the scheduled two-cluster limit: a four-cluster local
+experiment exhausted TCP ports. Its fatal generic HTTP write error also led to a
+deterministic socket-reset regression and transport-identity fix; see the runtime
+record for the failed experiment and its limits.
+The merged executable also exposed a redundant topology-probe failure after a
+successful restore and replication check. The check now returns the same agreed
+table/group identities it validated across all metadata nodes, removing the second
+optional read while retaining the incarnation and per-data-node content checks.
+A later two-worker macOS run also exhausted local TCP ports (51,921 `TIME_WAIT`
+sockets and explicit `EADDRNOTAVAIL` before restore). For the current 200-case
+local run on macOS (both variants and profiles), set `ANTFLY_E2E_REGRESSION_WORKERS=1` and
+`ANTFLY_E2E_REGRESSION_REPEATS=50`; the scheduled Linux job keeps two workers.
+Neither uncertain mutation failures nor host resource exhaustion count as passes.
+Final macOS ARM64 ReleaseSafe validation passed 100/100 serial cases (50 normal,
+50 constrained), with complete JUnit evidence and an unchanged executable hash.
+The deterministic admission histories and all 110 harness/script checks also pass.
+Linux parallel qualification remains separate from this local result.
+
+## 2026-09-16: constrained Autograph restart exited during teardown
+
+The [second PR #704 production soak](https://github.com/antflydb/antfly/actions/runs/35126679231/job/104951437450)
+failed `test_multinode_autograph_recovers_after_data_restart` at constrained
+worker 2, iteration 16: node 102 exited with `StorageBusy` during committed Raft
+apply. The same root logged lost `DistributedQueryUnavailable` error identity.
+The test body passed; the teardown assertion correctly caught the failed process.
+The workflow's `tee` pipeline hid the script failure until JUnit verification.
+See [the runtime investigation](../FLAKES.md#2026-09-16-constrained-autograph-restart-lost-retryable-owner-admission)
+for the admission/replay fix, error transport, and deterministic regressions.
+
+## 2026-09-15: Autograph promotion and read-timeout boundary
+
+The first corrected local executable still failed 3/10 data-restart cases and
+exposed a promotion callback using a freed Raft service during shutdown. The
+compiled-owner shutdown barrier and resolver activation ordering are corrected.
+Revision `256bb99782` passed ten restart probes and the full local 200-case
+Autograph soak: 100 normal and 100 descriptor-limited cases, with 50 ordinary
+and 50 restart cases per profile, zero failures/errors/skips, and an unchanged
+executable hash. This result precedes the subsequent apply-lock handoff fix;
+Linux CI and full VOPR qualification must validate the final revision. The restart test now rejects
+spontaneous assertion/segmentation crashes instead of silently replacing the
+process. See `../FLAKES.md` for exact executable hashes and evidence.
+
+`test_resolution.py::test_multinode_autograph_resolves_promotes_and_hydrates_entities`
+failed in [run 34928784180](https://github.com/antflydb/antfly/actions/runs/34928784180/job/104259435053)
+with missing promoted entities and an HTTP 500 caused by an untransportable
+`ReadIndexTimeout`. See [the runtime investigation](../FLAKES.md#2026-09-15-multi-node-autograph-promotion-stalls-with-an-untransportable-read-timeout)
+for the exact revision, retained journal evidence, and deterministic reopen fix.
+The merged-main production binary reproduced two failures in 100 local cases:
+pending promotion at journal sequence 3 was absent from the reopened runtime's
+target of 2. A later 50/50 pass does not invalidate those failures.
+The poller now rejects unexpected 500s immediately. The scheduled production
+soak runs 50 normal and 50 constrained-descriptor repetitions of each of the
+original case and `test_multinode_autograph_recovers_after_data_restart`, using
+`scripts/ci/zig-e2e-autograph-soak.sh`, with exact JUnit counts and retained native
+failure diagnostics (GDB on Linux, `sample` on macOS). The restart case exposed
+an additional untransportable `AddressUnavailable`; known read-transport failures
+now preserve the existing retryable read-availability contract. A passing helper
+or deterministic test does not qualify the post-fix production soak.
+
+
 ## 2026-09-13: artifact coverage restart failure reproduced locally (#722)
 
 [CI run 34789270919, job 103815319126](https://github.com/antflydb/antfly/actions/runs/34789270919/job/103815319126?pr=722)
@@ -922,3 +1204,37 @@ root are retained under the worktree's ignored
 `soak-debug-100.log` records all 100 final passing executions.
 The probe sources are not part of test collection. Linux CI validation remains
 outstanding.
+
+
+## 2026-09-19: VOPR runner loss and cluster-restore soak
+
+Run `35446473661`, qualification job `105906153405`, lost its runner during
+checkout. Retained GKE audit logs identify `PreemptionByScheduler` at
+`2026-09-19T13:41:16Z`: the system `konnectivity-agent` pod needed 60 MiB and
+reported insufficient memory on the available nodes. The runner exited with
+SIGTERM (143), before compiling or testing. Recovery is limited to one retry of
+this scheduled qualification job after a confirmed checkout shutdown; executed
+tests and campaigns are never retried by that policy.
+
+The separate production job completed the normal cluster-restore profile in
+about 67 minutes, then hit the shared 90-minute budget during the constrained
+profile. Give each profile its own job, reusing one production binary and
+retaining two workers, 25 repetitions, and both test cases per profile. A local
+single-profile run can set `ANTFLY_E2E_REGRESSION_PROFILE=normal` or `constrained`.
+The default shell entrypoint still runs both profiles.
+
+Every regression invocation now owns its process group, with a default
+600-second timeout (`ANTFLY_E2E_CASE_TIMEOUT_SECONDS`). Timeout/cancellation and
+normal parent exit stop remaining server descendants before returning. Reports
+and executable evidence upload separately from retained database roots so a
+root collection error cannot discard the reports.
+
+The failed restore published its table but never completed; metadata contained
+completion records for nodes 5 and 6, while proxied node 4 repeatedly logged
+`CatalogRoutingSnapshotTimeout`. Startup catch-up applied the schema-index
+25 ms admission/yield quantum even to ordinary startup and restore. A controlled
+50 ms point-catalog delay reproduced the same stuck job on main (142.54 s,
+failed). Scoping those controls to schema-index work completed the identical
+three-metadata/three-data-node test in 30.24 s. Restore retains cancellation and
+ownership fences; index repair retains its scheduling quantum. The E2E proxy
+keeps the latency injection as a regression alongside the stalled status route.

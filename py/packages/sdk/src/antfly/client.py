@@ -26,15 +26,21 @@ from antfly.client_generated.models import (
     CreatedEmbeddingsIndex,
     CreatedFullTextIndex,
     CreatedGraphIndex,
+    CreatedRelationalIndex,
     CreateEmbeddingsIndexRequest,
     CreateFullTextIndexRequest,
     CreateGraphIndexRequest,
+    CreateRelationalIndexRequest,
     Error,
+    ExtractionRequest,
+    ExtractionResponse,
     GraphKShortestPathsQuery,
     GraphMatchQuery,
     GraphQueries,
     GraphShortestPathQuery,
     GraphTraverseQuery,
+    IndexMaintenanceRequest,
+    IndexMaintenanceResponse,
     InferenceGenerateChunk,
     InferenceGenerateRequest,
     InferenceGenerateResponse,
@@ -69,6 +75,7 @@ INDEX_MUTATION_TEMPORARILY_UNAVAILABLE_CODES = frozenset(
 )
 MAX_INFERENCE_ERROR_BYTES = 1 << 20
 MAX_GENERATION_RESPONSE_BYTES = 16 << 20
+MAX_EXTRACTION_RESPONSE_BYTES = 16 << 20
 MAX_GENERATION_SSE_EVENT_BYTES = 16 << 20
 MAX_GENERATION_SSE_LINE_BYTES = 16 << 20
 MAX_GRAPH_EDGE_TYPES = 64
@@ -76,21 +83,29 @@ MAX_GRAPH_EDGE_TYPE_UTF8_BYTES = 64 << 10
 MAX_GRAPH_MATCH_QUERIES = 8
 
 CreateIndexRequest: TypeAlias = (
-    CreateFullTextIndexRequest | CreateEmbeddingsIndexRequest | CreateGraphIndexRequest | CreateAlgebraicIndexRequest
+    CreateFullTextIndexRequest
+    | CreateEmbeddingsIndexRequest
+    | CreateGraphIndexRequest
+    | CreateAlgebraicIndexRequest
+    | CreateRelationalIndexRequest
 )
 IndexEmbedderConfig: TypeAlias = (
     AntflyEmbedderConfig | BedrockEmbedderConfig | OllamaEmbedderConfig | OpenAIEmbedderConfig
 )
-CreatedIndex: TypeAlias = CreatedFullTextIndex | CreatedEmbeddingsIndex | CreatedGraphIndex | CreatedAlgebraicIndex
+CreatedIndex: TypeAlias = (
+    CreatedFullTextIndex | CreatedEmbeddingsIndex | CreatedGraphIndex | CreatedAlgebraicIndex | CreatedRelationalIndex
+)
 GraphQueryInput: TypeAlias = GraphMatchQuery | GraphTraverseQuery | GraphShortestPathQuery | GraphKShortestPathsQuery
 GraphQueriesInput: TypeAlias = GraphQueries | Mapping[str, GraphQueryInput | Mapping[str, Any]]
 _CREATE_INDEX_REQUEST_TYPES = (
+    CreateRelationalIndexRequest,
     CreateFullTextIndexRequest,
     CreateEmbeddingsIndexRequest,
     CreateGraphIndexRequest,
     CreateAlgebraicIndexRequest,
 )
 _CREATED_INDEX_TYPES = {
+    "relational": CreatedRelationalIndex,
     "full_text": CreatedFullTextIndex,
     "embeddings": CreatedEmbeddingsIndex,
     "graph": CreatedGraphIndex,
@@ -365,10 +380,30 @@ def _read_limited_response(response: Response, max_bytes: int) -> tuple[bytes, b
     return bytes(body), False
 
 
+def _validate_extraction_v2_response(payload: dict[str, Any], request: dict[str, Any]) -> None:
+    if type(payload.get("schema_version")) is not int or payload["schema_version"] != 2:
+        raise ValueError("version 2 response has an invalid schema version")
+    if not isinstance(payload.get("model"), str) or payload["model"] != request.get("model"):
+        raise ValueError("version 2 response model does not match the request")
+    inputs = request.get("inputs", [])
+    rows = payload.get("data")
+    if not isinstance(rows, list) or len(rows) != len(inputs):
+        raise ValueError("version 2 response has an invalid item cardinality")
+    for index, (item, row) in enumerate(zip(inputs, rows, strict=True)):
+        if not isinstance(row, dict):
+            raise ValueError(f"version 2 response item {index} must be an object")
+        if "id" in row and not isinstance(row["id"], str):
+            raise ValueError(f"version 2 response item {index} id must be a string")
+        if row.get("id") != item.get("id"):
+            raise ValueError(f"version 2 response item {index} id does not match the request")
+
+
 def _raise_inference_error(response: Response) -> None:
     body, truncated = _read_limited_response(response, MAX_INFERENCE_ERROR_BYTES)
     code: str | None = None
     retryable: bool | None = None
+    input_index: int | None = None
+    stage: str | None = None
     capacity: tuple[str, str, int] | None = None
     message = body.decode("utf-8", errors="replace").strip()
     if not truncated:
@@ -383,6 +418,10 @@ def _raise_inference_error(response: Response) -> None:
                     message = code
                 if isinstance(payload.get("retryable"), bool):
                     retryable = payload["retryable"]
+                if type(payload.get("input_index")) is int and payload["input_index"] >= 0:
+                    input_index = payload["input_index"]
+                if isinstance(payload.get("stage"), str):
+                    stage = payload["stage"]
                 reason = payload.get("reason")
                 retry_after_ms = payload.get("retry_after_ms")
                 if (
@@ -403,7 +442,7 @@ def _raise_inference_error(response: Response) -> None:
     if capacity is not None:
         capacity_code, reason, retry_after_ms = capacity
         raise InferenceCapacityError(capacity_code, message, reason, retry_after_ms)
-    raise InferenceAPIError(response.status_code, code, message, retryable)
+    raise InferenceAPIError(response.status_code, code, message, retryable, input_index, stage)
 
 
 def _iter_bounded_response_lines(response: Response, max_line_bytes: int) -> Iterator[bytes]:
@@ -502,6 +541,37 @@ class IndexOperations:
 
     def __init__(self, client: "AntflyClient") -> None:
         self._client = client
+
+    def retry(self, table: str, name: str, request: IndexMaintenanceRequest) -> IndexMaintenanceResponse:
+        """Resume failed maintenance using exact status proofs, without automatic retries.
+
+        Owner admissions are independently atomic. After a partial/lost
+        acknowledgement, resubmit the identical request; do not refresh proofs.
+        """
+        return self._maintain("retry", table, name, request)
+
+    def repair(self, table: str, name: str, request: IndexMaintenanceRequest) -> IndexMaintenanceResponse:
+        """Start primary-authoritative repair with exact status proofs.
+
+        Selected owners do not form one global transaction. After an ambiguous
+        acknowledgement, resubmit the identical request rather than new proofs.
+        """
+        return self._maintain("repair", table, name, request)
+
+    def _maintain(
+        self, action: str, table: str, name: str, request: IndexMaintenanceRequest
+    ) -> IndexMaintenanceResponse:
+        from .index_maintenance import validate_request, validate_response
+
+        groups = validate_request(request)
+        result = self._client._request(
+            "POST",
+            f"/db/v1/tables/{quote(table, safe='')}/indexes/{quote(name, safe='')}/{action}",
+            json=request.to_dict(),
+            _max_response_bytes=32 << 10,
+            _expected_status=200,
+        )
+        return validate_response(result, groups)
 
     def create(
         self,
@@ -629,7 +699,15 @@ class AntflyClient:
             )
         self.indexes = IndexOperations(self)
 
-    def _request(self, method: str, path: str, **kwargs: Any) -> Any:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        _max_response_bytes: int | None = None,
+        _expected_status: int | None = None,
+        **kwargs: Any,
+    ) -> Any:
         """Make an HTTP request using the underlying httpx client.
 
         Args:
@@ -644,7 +722,9 @@ class AntflyClient:
             AntflyException: If the request fails
         """
         with self._client.get_httpx_client().stream(method, path, **kwargs) as response:
-            if response.status_code >= 400:
+            if response.status_code >= 400 or (
+                _expected_status is not None and response.status_code != _expected_status
+            ):
                 body, truncated = _read_limited_response(response, self.max_error_response_bytes)
                 if truncated:
                     msg = (
@@ -716,9 +796,14 @@ class AntflyClient:
             if response.status_code == 204:
                 return None
 
-            body, truncated = _read_limited_response(response, self.max_json_response_bytes)
+            response_limit = (
+                min(self.max_json_response_bytes, _max_response_bytes)
+                if _max_response_bytes is not None
+                else self.max_json_response_bytes
+            )
+            body, truncated = _read_limited_response(response, response_limit)
             if truncated:
-                raise AntflyException(f"response exceeded {self.max_json_response_bytes} bytes")
+                raise AntflyException(f"response exceeded {response_limit} bytes")
             try:
                 return json.loads(body)
             except (TypeError, ValueError) as exc:
@@ -734,6 +819,43 @@ class AntflyClient:
                 f"{self.max_write_request_bytes}"
             )
         return encoded
+
+    def extract(self, request: ExtractionRequest | Mapping[str, Any]) -> ExtractionResponse:
+        """Run canonical atomic extraction, preserving explicit schema versions.
+
+        Mapping input preserves omitted options, explicit null and empty
+        replacements. For generated model inputs, use ``from_dict`` or UNSET
+        for omitted fields so legacy constructor defaults remain explicit.
+        """
+        body = request.to_dict() if isinstance(request, ExtractionRequest) else dict(request)
+        with self._client.get_httpx_client().stream(
+            "POST", "/ai/v1/extract", json=body, headers={"Accept": "application/json"}
+        ) as response:
+            if response.status_code < 200 or response.status_code >= 300:
+                _raise_inference_error(response)
+            limit = min(self.max_json_response_bytes, MAX_EXTRACTION_RESPONSE_BYTES)
+            raw, truncated = _read_limited_response(response, limit)
+            if truncated:
+                raise AntflyException(f"extraction response exceeded {limit} bytes")
+            try:
+                payload = json.loads(raw)
+                if not isinstance(payload, dict) or payload.get("object") != "extraction":
+                    raise ValueError("response must be a canonical extraction object")
+                if body.get("schema_version") == 2:
+                    _validate_extraction_v2_response(payload, body)
+                return ExtractionResponse.from_dict(payload)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise AntflyException(f"extraction returned invalid JSON: {exc}") from exc
+
+    def extract_v2(self, request: Mapping[str, Any]) -> ExtractionResponse:
+        """Run strict mixed-task extraction with whole per-input replacements.
+
+        Plain mappings retain omitted fields without injecting the legacy
+        generated classifier's NLI template or mode defaults.
+        """
+        body = dict(request)
+        body["schema_version"] = 2
+        return self.extract(body)
 
     def generate(self, request: InferenceGenerateRequest) -> InferenceGenerateResponse:
         """Generate one non-streaming chat completion."""

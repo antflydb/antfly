@@ -25,6 +25,9 @@
 #     scripts/ci/zig-e2e-regression-loop.sh \
 #     e2e/antfly/test_resolution.py::test_multinode_autograph_resolves_promotes_and_hydrates_entities
 #
+# Each invocation owns its server process group and has a ten-minute limit.
+# Override ANTFLY_E2E_CASE_TIMEOUT_SECONDS for deliberately longer scenarios.
+#
 # Local settings may be kept in the ignored repository-root .env file. Override
 # the path with ANTFLY_E2E_ENV_FILE when a different settings file is useful.
 
@@ -92,12 +95,15 @@ if [[ -n "$nofile_limit" ]]; then
 fi
 
 if ((workers > 1)); then
-  log_root="$(mktemp -d "${TMPDIR:-/tmp}/antfly-e2e-regression.XXXXXX")"
+  log_parent="${ANTFLY_E2E_REGRESSION_REPORT_DIR:-${TMPDIR:-/tmp}}"
+  mkdir -p "$log_parent"
+  log_root="$(mktemp -d "$log_parent/antfly-e2e-regression.XXXXXX")"
   preserve_log_root=0
   pids=()
 
   # shellcheck disable=SC2329 # Invoked indirectly by the signal traps below.
   terminate_workers() {
+    preserve_log_root=1
     local pid
     for pid in "${pids[@]}"; do
       kill "$pid" 2>/dev/null || true
@@ -105,6 +111,7 @@ if ((workers > 1)); then
     wait 2>/dev/null || true
     exit 130
   }
+  # shellcheck disable=SC2329 # Invoked indirectly by the EXIT trap below.
   cleanup_worker_logs() {
     if ((preserve_log_root == 0)); then
       rm -rf -- "$log_root"
@@ -160,6 +167,22 @@ export PYTHONFAULTHANDLER="${PYTHONFAULTHANDLER:-1}"
 failures=0
 preserved_failures=0
 worker_id="${ANTFLY_E2E_REGRESSION_WORKER_ID:-1}"
+report_dir="${ANTFLY_E2E_REGRESSION_REPORT_DIR:-}"
+if [[ -n "$report_dir" ]]; then
+  mkdir -p "$report_dir"
+fi
+case_number=0
+active_case=""
+# Signal the supervisor, which owns pytest and every server in its session.
+# shellcheck disable=SC2329
+interrupt_case() {
+  if [[ -n "$active_case" ]]; then
+    kill -TERM "$active_case" 2>/dev/null || true
+    wait "$active_case" 2>/dev/null || true
+  fi
+  exit 130
+}
+trap interrupt_case INT TERM
 for ((iteration = 1; iteration <= repeats; iteration++)); do
   for test_name in "${tests[@]}"; do
     printf '\nE2E regression worker=%s iteration=%d/%d test=%s\n' \
@@ -168,11 +191,39 @@ for ((iteration = 1; iteration <= repeats; iteration++)); do
     if ((preserved_failures < preserve_failure_limit)); then
       preserve_root=1
     fi
-    if ANTFLY_E2E_PRESERVE_ROOT_ON_FAILURE="$preserve_root" \
-      uv run --project e2e/antfly pytest -q -s --durations=10 "$test_name"; then
+    case_number=$((case_number + 1))
+    report_args=()
+    if [[ -n "$report_dir" ]]; then
+      report_path="$report_dir/worker-$worker_id-case-$case_number.xml"
+      # Never accept stale evidence from another invocation.
+      if [[ -e "$report_path" ]]; then
+        echo "regression report already exists: $report_path" >&2
+        exit 2
+      fi
+      report_args=("--junitxml=$report_path")
+    fi
+    ANTFLY_E2E_PRESERVE_ROOT_ON_FAILURE="$preserve_root" \
+      python3 "$script_dir/run_e2e_case.py" \
+      uv run --project e2e/antfly pytest -q -s --durations=10 "${report_args[@]}" "$test_name" &
+    active_case=$!
+    if wait "$active_case"; then
       status=0
     else
       status=$?
+    fi
+    active_case=""
+    if ((status == 0)) && [[ -n "$report_dir" ]]; then
+      if ! python3 - "$report_path" <<'PYREPORT'
+import sys
+import xml.etree.ElementTree as ET
+
+cases = ET.parse(sys.argv[1]).getroot().findall(".//testcase")
+assert cases, "regression report contains no executed tests"
+assert all(not any(case.find(tag) is not None for tag in ("failure", "error", "skipped")) for case in cases), "regression requires passes, not skipped or failed cases"
+PYREPORT
+      then
+        status=1
+      fi
     fi
     if ((status == 130 || status == 143)); then
       printf '\nE2E regression loop interrupted with exit code %d\n' "$status" >&2
