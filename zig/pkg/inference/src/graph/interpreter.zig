@@ -3977,6 +3977,12 @@ pub fn executeNode(
         },
         .cumulative_sum => |attrs| {
             if (try cb.tryCumulativeSum(V.get(ins[0]), attrs.axis, attrs.exclusive, attrs.reverse)) |result| return result;
+            // An unimplemented integer backend must fail rather than silently
+            // change dtype and lose precision in the floating-point fallback.
+            switch (try cb.tensorDType(V.get(ins[0]))) {
+                .i8, .i16, .i32, .i64, .u8, .bool_ => return error.UnsupportedTensorType,
+                else => {},
+            }
             // Like runtime shape/range evaluation, use the actual tensor
             // dimensions. BGE uses this small scan for dynamic position IDs.
             const alloc = graph.allocator;
@@ -7174,4 +7180,31 @@ test "runtime CumSum scans dynamic axes including reverse exclusive and padding"
             try std.testing.expectEqual(expected, actual[batch * 4 + position]);
         };
     };
+}
+
+test "runtime CumSum preserves exact integers and dtype" {
+    const a = std.testing.allocator;
+    var g = Graph.init(a);
+    defer g.deinit();
+    var builder = ml.graph.Builder.init(&g);
+    const x = try builder.parameter("x", Shape.init(.i32, &.{2}));
+    const out = try g.addNode(.{
+        .op = .{ .cumulative_sum = .{ .axis = 0 } },
+        .output_shape = Shape.init(.i32, &.{2}),
+        .inputs = .{ x, null_node, null_node, null_node },
+        .num_inputs = 1,
+    });
+    try g.markOutput(out);
+    var ws = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(a, &ws, null);
+    defer compute.deinit();
+    var cb = compute.computeBackend();
+    const input = (try cb.fromInt32Shape(&.{ 16777217, 1 }, &.{2})).?;
+    defer cb.free(input);
+    var result = try execute(a, &g, &cb, .{ .runtime_inputs = &.{.{ .node_id = x, .value = input }} });
+    defer result.deinit(&cb);
+    const exported = (try cb.exportTensorData(result.outputs[0], a)).?;
+    defer a.free(exported.payload.bytes);
+    try std.testing.expectEqual(.i32, exported.dtype);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]i32{ 16777217, 16777218 }), exported.payload.bytes);
 }

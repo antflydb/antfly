@@ -277,6 +277,7 @@ pub const ModelManifest = struct {
     config_path: ?[]const u8 = null,
     model_manifest_path: ?[]const u8 = null,
     tokenizer_json_path: ?[]const u8 = null,
+    vocab_txt_path: ?[]const u8 = null,
     tokenizer_config_path: ?[]const u8 = null,
     special_tokens_map_path: ?[]const u8 = null,
     preprocessor_config_path: ?[]const u8 = null,
@@ -390,6 +391,7 @@ pub const ModelManifest = struct {
         if (self.config_path) |p| self.allocator.free(p);
         if (self.model_manifest_path) |p| self.allocator.free(p);
         if (self.tokenizer_json_path) |p| self.allocator.free(p);
+        if (self.vocab_txt_path) |p| self.allocator.free(p);
         if (self.tokenizer_config_path) |p| self.allocator.free(p);
         if (self.special_tokens_map_path) |p| self.allocator.free(p);
         if (self.preprocessor_config_path) |p| self.allocator.free(p);
@@ -1193,6 +1195,7 @@ fn loadFromCatalog(allocator: std.mem.Allocator, catalog: *const ArtifactCatalog
     if (manifest.config_path == null) manifest.config_path = try findFileInSubdirs(allocator, catalog, &.{"config.json"}, &.{""});
     if (manifest.model_manifest_path == null) manifest.model_manifest_path = try findFileInSubdirs(allocator, catalog, &.{"model_manifest.json"}, &.{""});
     if (manifest.tokenizer_json_path == null) manifest.tokenizer_json_path = try findFileInSubdirs(allocator, catalog, &.{"tokenizer.json"}, &.{""});
+    if (manifest.vocab_txt_path == null) manifest.vocab_txt_path = try findFileInSubdirs(allocator, catalog, &.{"vocab.txt"}, &.{""});
     if (manifest.tokenizer_config_path == null) manifest.tokenizer_config_path = try findFileInSubdirs(allocator, catalog, &.{"tokenizer_config.json"}, &.{""});
     if (manifest.special_tokens_map_path == null) manifest.special_tokens_map_path = try findFileInSubdirs(allocator, catalog, &.{"special_tokens_map.json"}, &.{""});
     if (manifest.preprocessor_config_path == null) manifest.preprocessor_config_path = try findFileInSubdirs(allocator, catalog, &.{"preprocessor_config.json"}, &.{""});
@@ -1333,6 +1336,7 @@ pub fn loadListingFromDir(allocator: std.mem.Allocator, model_dir_path: []const 
     if (manifest.config_path == null) manifest.config_path = try findFileInSubdirs(allocator, &catalog, &.{"config.json"}, &.{""});
     if (manifest.model_manifest_path == null) manifest.model_manifest_path = try findFileInSubdirs(allocator, &catalog, &.{"model_manifest.json"}, &.{""});
     if (manifest.tokenizer_json_path == null) manifest.tokenizer_json_path = try findFileInSubdirs(allocator, &catalog, &.{"tokenizer.json"}, &.{""});
+    if (manifest.vocab_txt_path == null) manifest.vocab_txt_path = try findFileInSubdirs(allocator, &catalog, &.{"vocab.txt"}, &.{""});
     if (manifest.tokenizer_config_path == null) manifest.tokenizer_config_path = try findFileInSubdirs(allocator, &catalog, &.{"tokenizer_config.json"}, &.{""});
     if (manifest.preprocessor_config_path == null) manifest.preprocessor_config_path = try findFileInSubdirs(allocator, &catalog, &.{"preprocessor_config.json"}, &.{""});
     if (manifest.processor_config_path == null) manifest.processor_config_path = try findFileInSubdirs(allocator, &catalog, &.{"processor_config.json"}, &.{""});

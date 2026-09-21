@@ -61,9 +61,8 @@ test {
     _ = qwen3_reranker_catalog;
 }
 
-/// Friendly short names accepted by user-facing commands in place of a full
-/// HuggingFace `owner/name[:variant][@revision]` reference. Aliases name either
-/// a public repository or an explicitly qualified multi-repository bundle.
+/// Legacy short names accepted by runtime lookup and chat. Pull requires an
+/// explicit HuggingFace `owner/name[:variant][@revision]` reference.
 pub const FriendlyAlias = struct {
     alias: []const u8,
     ref: []const u8,
@@ -80,18 +79,6 @@ pub const friendly_aliases = [_]FriendlyAlias{
     .{ .alias = "gemma4-e4b", .ref = "google/gemma-4-E4B-it-qat-q4_0-gguf:gguf" },
     .{ .alias = "gemma-4-e4b", .ref = "google/gemma-4-E4B-it-qat-q4_0-gguf:gguf" },
     .{ .alias = "gemma4-e4b-it", .ref = "google/gemma-4-E4B-it-qat-q4_0-gguf:gguf" },
-    .{ .alias = "qwen3-vl-2b", .ref = "Qwen/Qwen3-VL-2B-Instruct-GGUF:q4-k-m-bundle-v1" },
-    .{ .alias = "qwen3-vl-2b-bf16", .ref = "Qwen/Qwen3-VL-2B-Instruct:bf16-safetensors-bundle-v1" },
-    .{ .alias = "qwen3-vl-4b", .ref = "Qwen/Qwen3-VL-4B-Instruct-GGUF:q4-k-m-bundle-v1" },
-    .{ .alias = "qwen3-vl-8b", .ref = "Qwen/Qwen3-VL-8B-Instruct-GGUF:q4-k-m-bundle-v1" },
-    .{ .alias = "qwen3-vl-reranker-2b", .ref = "Qwen/Qwen3-VL-Reranker-2B:bf16-safetensors-bundle-v1" },
-    .{ .alias = "qwen3-embedding", .ref = "Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1" },
-    .{ .alias = "qwen3-embedding-0.6b", .ref = "Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1" },
-    .{ .alias = "qwen3-embedding-0.6b-f16", .ref = "Qwen/Qwen3-Embedding-0.6B-GGUF:f16-bundle-v1" },
-    .{ .alias = "qwen3-embedding-0.6b-safetensors", .ref = "Qwen/Qwen3-Embedding-0.6B:bf16-safetensors-bundle-v1" },
-    .{ .alias = "qwen3-reranker", .ref = "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:q8-0-bundle-v1" },
-    .{ .alias = "qwen3-reranker-0.6b", .ref = "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:q8-0-bundle-v1" },
-    .{ .alias = "qwen3-reranker-0.6b-safetensors", .ref = "Qwen/Qwen3-Reranker-0.6B:bf16-safetensors-bundle-v1" },
 };
 
 /// Resolve a friendly alias to its public repository or explicit bundle reference.
@@ -131,21 +118,7 @@ test "friendly alias refs parse as public model refs" {
         try std.testing.expect(ref.owner.len > 0);
         try std.testing.expect(ref.name.len > 0);
         if (!std.mem.eql(u8, entry.alias, "bge-m3")) try std.testing.expect(!std.mem.eql(u8, "auto", ref.variant));
-        if (std.mem.eql(u8, entry.alias, "qwen3-vl-reranker-2b")) {
-            try std.testing.expectEqualStrings(qwen3vl_catalog.reranker_bundle_variant, ref.variant);
-        } else if (std.mem.eql(u8, entry.alias, "qwen3-vl-2b-bf16")) {
-            try std.testing.expectEqualStrings(qwen3vl_catalog.generation_safetensors_bundle_variant, ref.variant);
-        } else if (std.mem.startsWith(u8, entry.alias, "qwen3-vl-")) {
-            try std.testing.expectEqualStrings(qwen3vl_catalog.generation_bundle_variant, ref.variant);
-        } else if (std.mem.startsWith(u8, entry.alias, "qwen3-embedding")) {
-            try std.testing.expect(
-                qwen3_embedding_catalog.findBundleForHubRef(ref.owner, ref.name, ref.variant) != null,
-            );
-        } else if (std.mem.startsWith(u8, entry.alias, "qwen3-reranker")) {
-            try std.testing.expect(
-                qwen3_reranker_catalog.findBundleForHubRef(ref.owner, ref.name, ref.variant) != null,
-            );
-        } else if (std.mem.eql(u8, entry.alias, "bge-m3")) {
+        if (std.mem.eql(u8, entry.alias, "bge-m3")) {
             try std.testing.expectEqualStrings("auto", ref.variant);
         } else {
             try std.testing.expectEqualStrings("gguf", ref.variant);
@@ -153,22 +126,23 @@ test "friendly alias refs parse as public model refs" {
     }
 }
 
-/// Pull and runtime lookup share the same alias table. Canonical repository
-/// references are never silently redirected to a historical snapshot.
+/// Pull always names the public repository explicitly; format and revision
+/// selection must not depend on a friendly runtime alias.
 fn parsePullModelRef(value: []const u8) !ModelRef {
-    return parseModelRefOrAlias(value);
+    return ModelRef.parse(value);
 }
 
-test "pull and runtime use identical friendly references" {
-    const bge = try parsePullModelRef("bge-m3");
-    try std.testing.expectEqualStrings("BAAI", bge.owner);
-    try std.testing.expectEqualStrings("auto", bge.variant);
+test "pull model refs require owner and model even for runtime aliases" {
+    const a = std.testing.allocator;
     for (friendly_aliases) |entry| {
-        const pull = try parsePullModelRef(entry.alias);
-        const runtime = try parseModelRefOrAlias(entry.alias);
-        try std.testing.expectEqualStrings(runtime.owner, pull.owner);
-        try std.testing.expectEqualStrings(runtime.name, pull.name);
-        try std.testing.expectEqualStrings(runtime.variant, pull.variant);
+        _ = try parseModelRefOrAlias(entry.alias);
+        _ = try parsePullModelRef(entry.ref);
+        for ([_][]const u8{ "", ":onnx", "@main", ":onnx@feature/export", "@feature/export" }) |suffix| {
+            const value = try std.fmt.allocPrint(a, "hf:{s}{s}", .{ entry.alias, suffix });
+            defer a.free(value);
+            try std.testing.expectError(error.InvalidModelRef, parsePullModelRef(value));
+            try std.testing.expectError(error.InvalidModelRef, parsePullModelRef(value[3..]));
+        }
     }
 }
 
@@ -176,26 +150,29 @@ fn parseModelRefOrAlias(value: []const u8) !ModelRef {
     return ModelRef.parse(resolveFriendlyRef(value) orelse value);
 }
 
-test "pull model refs accept friendly Qwen aliases" {
-    const generation = try parseModelRefOrAlias("qwen3-vl-2b");
-    try std.testing.expectEqualStrings("Qwen", generation.owner);
-    try std.testing.expectEqualStrings("Qwen3-VL-2B-Instruct-GGUF", generation.name);
-    try std.testing.expectEqualStrings(qwen3vl_catalog.generation_bundle_variant, generation.variant);
-
-    const bf16_generation = try parseModelRefOrAlias("qwen3-vl-2b-bf16");
-    try std.testing.expectEqualStrings("Qwen", bf16_generation.owner);
-    try std.testing.expectEqualStrings("Qwen3-VL-2B-Instruct", bf16_generation.name);
-    try std.testing.expectEqualStrings(qwen3vl_catalog.generation_safetensors_bundle_variant, bf16_generation.variant);
-
-    const reranker = try parseModelRefOrAlias("QWEN3-VL-RERANKER-2B");
-    try std.testing.expectEqualStrings("Qwen", reranker.owner);
-    try std.testing.expectEqualStrings("Qwen3-VL-Reranker-2B", reranker.name);
-    try std.testing.expectEqualStrings(qwen3vl_catalog.reranker_bundle_variant, reranker.variant);
-
-    const text_reranker = try parseModelRefOrAlias("QWEN3-RERANKER-0.6B");
-    try std.testing.expectEqualStrings("ggml-org", text_reranker.owner);
-    try std.testing.expectEqualStrings("Qwen3-Reranker-0.6B-Q8_0-GGUF", text_reranker.name);
-    try std.testing.expectEqualStrings(qwen3_reranker_catalog.q8_0_bundle_variant, text_reranker.variant);
+test "Qwen model refs require canonical repositories and preserve bundle variants" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "qwen3-vl-2b",                      "qwen3-vl-2b-bf16", "qwen3-vl-4b",          "qwen3-vl-8b",
+        "qwen3-vl-reranker-2b",             "qwen3-embedding",  "qwen3-embedding-0.6b", "qwen3-embedding-0.6b-f16",
+        "qwen3-embedding-0.6b-safetensors", "qwen3-reranker",   "qwen3-reranker-0.6b",  "qwen3-reranker-0.6b-safetensors",
+    }) |alias| {
+        try std.testing.expect(resolveFriendlyRef(alias) == null);
+        for ([_][]const u8{ "", "@main", ":gguf@feature/export" }) |suffix| {
+            const value = try std.fmt.allocPrint(a, "hf:{s}{s}", .{ alias, suffix });
+            defer a.free(value);
+            try std.testing.expectError(error.InvalidModelRef, parsePullModelRef(value));
+            try std.testing.expectError(error.InvalidModelRef, parseModelRefOrAlias(value));
+        }
+    }
+    const embedding = try parsePullModelRef("Qwen/Qwen3-Embedding-0.6B-GGUF:f16-bundle-v1");
+    try std.testing.expect(qwen3_embedding_catalog.findBundleForHubRef(embedding.owner, embedding.name, embedding.variant) != null);
+    const reranker = try parsePullModelRef("ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:q8-0-bundle-v1");
+    try std.testing.expect(qwen3_reranker_catalog.findBundleForHubRef(reranker.owner, reranker.name, reranker.variant) != null);
+    const explicit = try parsePullModelRef("Qwen/Qwen3-Embedding-0.6B-GGUF:f16-bundle-v1@main");
+    const parts = try download.parseVariantRevision(explicit.variant);
+    try std.testing.expectEqualStrings("f16-bundle-v1", parts.variant);
+    try std.testing.expectEqualStrings("main", parts.revision.?);
 }
 
 test "gemma4 qat gguf pulls derive the MTP assistant companion ref" {
@@ -227,19 +204,6 @@ pub const ModelRef = struct {
         var input = ref;
         if (std.mem.startsWith(u8, input, "hf:")) {
             input = input[3..];
-        }
-
-        // Alias suffixes override format/revision without changing the selected
-        // repository. Every caller uses this parser, including server lookup.
-        if (std.mem.indexOfAny(u8, input, ":@")) |separator| {
-            if (resolveFriendlyRef(input[0..separator])) |alias| {
-                var base = try ModelRef.parse(alias);
-                base.variant = if (input[separator] == ':') input[separator + 1 ..] else input[separator..];
-                if (!modelVariantIsSafe(base.variant)) return error.InvalidModelRef;
-                return base;
-            }
-        } else if (resolveFriendlyRef(input)) |alias| {
-            return ModelRef.parse(alias);
         }
 
         // Parse "owner/name:variant" or "owner/name"
@@ -533,7 +497,6 @@ pub const ModelRegistry = struct {
         projector_selection: download.ProjectorSelection,
     ) !void {
         const ref = try parsePullModelRef(ref_str);
-        if (resolveFriendlyRef(ref_str)) |resolved| std.debug.print("Resolved alias {s} to {s}\n", .{ ref_str, resolved });
         const resolved_models_dir = try resolveModelsDirForWriteAlloc(self.allocator, io, self.models_dir);
         defer self.allocator.free(resolved_models_dir);
 
@@ -2186,8 +2149,8 @@ test "pull preserves the pinned Qwen3 BF16 executable profile through manifest f
     try std.testing.expectEqual(manifest_mod.PoolingStrategy.last, loaded.pooling);
 }
 
-test "model refs accept independent revisions and alias format overrides" {
-    for ([_][]const u8{ "BAAI/bge-m3@main", "BAAI/bge-m3:onnx@feature/export", "bge-m3:onnx@v1.0", "hf:bge-m3@main" }) |raw| {
+test "model refs accept independent formats and revisions" {
+    for ([_][]const u8{ "BAAI/bge-m3@main", "BAAI/bge-m3:onnx@feature/export", "BAAI/bge-m3:onnx@v1.0", "hf:BAAI/bge-m3@main" }) |raw| {
         const ref = try ModelRef.parse(raw);
         try std.testing.expectEqualStrings("BAAI", ref.owner);
         try std.testing.expectEqualStrings("bge-m3", ref.name);

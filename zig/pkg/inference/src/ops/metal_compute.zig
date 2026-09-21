@@ -39181,3 +39181,40 @@ test "metal_compute: resident scans and exact mixed integer comparisons" {
         try std.testing.expectEqualSlices(f32, if (swap) &.{ 1, 0, 0, 0 } else &.{ 0, 1, 1, 0 }, actual);
     }
 }
+
+test "metal_compute: integer CumSum matches native for batched strided scans" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var weights = testMetalWeightStoreInit(a);
+    defer weights.lazy_weights.deinit(a);
+    var compute = try MetalCompute.init(a, &weights, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    var cpu_weights = @import("native_compute.zig").WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var cpu_compute = @import("native_compute.zig").NativeCompute.init(a, &cpu_weights, null);
+    defer cpu_compute.deinit();
+    const cpu = cpu_compute.computeBackend();
+    const dims = [_]i32{ 2, 513, 3 };
+    const values = try a.alloc(i32, 2 * 513 * 3);
+    defer a.free(values);
+    const pattern = [_]i32{ 16777217, 1, -16777217, 2147483647, 1, -2147483648, -1 };
+    for (values, 0..) |*value, i| value.* = pattern[i % pattern.len];
+    const gpu_input = (try cb.fromInt32Shape(values, &dims)).?;
+    defer cb.free(gpu_input);
+    const cpu_input = (try cpu.fromInt32Shape(values, &dims)).?;
+    defer cpu.free(cpu_input);
+    for ([_]bool{ false, true }) |reverse| for ([_]bool{ false, true }) |exclusive| {
+        const output = (try cb.tryCumulativeSum(gpu_input, 1, exclusive, reverse)).?;
+        defer cb.free(output);
+        try std.testing.expect(MetalCompute.toBuf(output).metal_tensor.?.isDevice());
+        const expected = (try cpu.tryCumulativeSum(cpu_input, 1, exclusive, reverse)).?;
+        defer cpu.free(expected);
+        const actual_bytes = (try cb.exportTensorData(output, a)).?;
+        defer a.free(actual_bytes.payload.bytes);
+        const expected_bytes = (try cpu.exportTensorData(expected, a)).?;
+        defer a.free(expected_bytes.payload.bytes);
+        try std.testing.expectEqual(.i32, actual_bytes.dtype);
+        try std.testing.expectEqualSlices(u8, expected_bytes.payload.bytes, actual_bytes.payload.bytes);
+    };
+}

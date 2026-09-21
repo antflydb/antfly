@@ -4701,6 +4701,7 @@ pub const vtable_impl = ComputeBackend.VTable{
     .fromFloat32 = &fromFloat32Op,
     .fromFloat32Shape = &fromFloat32ShapeOp,
     .fromInt32Shape = &fromInt32ShapeOp,
+    .cumulativeSum = &cumulativeSumOp,
     .cloneTensorShape = &cloneTensorShapeOp,
     .toFloat32 = &toFloat32Op,
     .exportTensorData = &exportTensorDataOp,
@@ -38859,6 +38860,54 @@ fn primDotGeneralOp(ctx: *anyopaque, lhs: CT, rhs: CT, lhs_shape: []const i64, r
     return error.UnsupportedPrimitiveOp;
 }
 
+/// Scan each independent axis lane in place. Integer addition wraps just as
+/// the Metal integer scan does, without rounding through floating point.
+fn scanAxis(comptime T: type, values: []align(1) T, outer: usize, width: usize, inner: usize, exclusive: bool, reverse: bool) void {
+    for (0..outer) |batch| for (0..inner) |channel| {
+        var sum: T = 0;
+        for (0..width) |step| {
+            const index = (batch * width + (if (reverse) width - 1 - step else step)) * inner + channel;
+            const value = values[index];
+            if (exclusive) values[index] = sum;
+            sum = if (@typeInfo(T) == .int) sum +% value else sum + value;
+            if (!exclusive) values[index] = sum;
+        }
+    };
+}
+
+fn cumulativeSumOp(ctx: *anyopaque, input: CT, axis: u8, exclusive: bool, reverse: bool) anyerror!?CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const shape = tensorStoredShape(input) orelse return error.InvalidTensorShape;
+    if (shape.len > 8 or axis >= shape.len) return error.InvalidTensorShape;
+    const count = typedShapeNumel(shape) orelse return error.InvalidTensorShape;
+    const outer = typedShapeNumel(shape[0..axis]) orelse return error.InvalidTensorShape;
+    const inner = typedShapeNumel(shape[axis + 1 ..]) orelse return error.InvalidTensorShape;
+    const width: usize = @intCast(shape[axis]);
+    if (integerSource(input)) |source| {
+        if (try integerTensorCount(source) != count) return error.ShapeMismatch;
+        const output = try copyIntegerTensorWithShape(self, source, shape);
+        const data = toBuf(output).owned_source_tensor.?.data;
+        switch (source.dtype) {
+            .i32 => scanAxis(i32, std.mem.bytesAsSlice(i32, data), outer, width, inner, exclusive, reverse),
+            .i64 => scanAxis(i64, std.mem.bytesAsSlice(i64, data), outer, width, inner, exclusive, reverse),
+            else => unreachable,
+        }
+        return output;
+    }
+    // Other physical integer types must not fall through the float scan.
+    switch (try tensorDTypeOp(ctx, input)) {
+        .i8, .i16, .i32, .i64, .u8, .bool_ => return error.UnsupportedTensorType,
+        else => {},
+    }
+    const source = try getDataChecked(input);
+    if (source.len != count) return error.ShapeMismatch;
+    const data = try self.allocator.dupe(f32, source);
+    const output = try self.makeOwnedBuf(data);
+    errdefer self.computeBackend().free(output);
+    scanAxis(f32, data, outer, width, inner, exclusive, reverse);
+    return self.withLogicalShape(output, shape);
+}
+
 fn integerSource(input: CT) ?*const tensor_mod.Tensor {
     const source = toBuf(input).source_tensor orelse return null;
     return if (source.dtype == .i32 or source.dtype == .i64) source else null;
@@ -50479,4 +50528,50 @@ test "gather source-backed 2d table with unshaped vector indices" {
         1, 2,
         7, 8,
     }, getData(out_ct));
+}
+
+test "native CumSum preserves batched strided i32 and i64 scans" {
+    const a = std.testing.allocator;
+    var ws = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(a, &ws, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    inline for (.{ i32, i64 }) |T| {
+        const large: T = if (T == i32) 16777217 else 9007199254740993;
+        const values = [_]T{ large, 1, 1, -large, std.math.maxInt(T), -1, 1, std.math.minInt(T), 2, 3, 4, 5 };
+        const host = if (T == i32)
+            try tensor_mod.Tensor.initInt32(a, "", &.{ 2, 3, 2 }, &values)
+        else
+            try tensor_mod.Tensor.initInt64(a, "", &.{ 2, 3, 2 }, &values);
+        const input = try compute.importOwnedStaticTensor(host);
+        defer cb.free(input);
+        for ([_]bool{ false, true }) |reverse| for ([_]bool{ false, true }) |exclusive| {
+            const output = (try cb.tryCumulativeSum(input, 1, exclusive, reverse)).?;
+            defer cb.free(output);
+            const exported = (try cb.exportTensorData(output, a)).?;
+            defer a.free(exported.payload.bytes);
+            try std.testing.expectEqual(if (T == i32) .i32 else .i64, exported.dtype);
+            const actual = std.mem.bytesAsSlice(T, exported.payload.bytes);
+            for (0..2) |batch| for (0..2) |channel| for (0..3) |position| {
+                var expected: T = 0;
+                for (0..3) |source| {
+                    const included = if (reverse) source > position or (!exclusive and source == position) else source < position or (!exclusive and source == position);
+                    if (included) expected +%= values[(batch * 3 + source) * 2 + channel];
+                }
+                try std.testing.expectEqual(expected, actual[(batch * 3 + position) * 2 + channel]);
+            };
+        };
+        // Inputs remain reusable across scans and invalid requests.
+        const original = (try cb.exportTensorData(input, a)).?;
+        defer a.free(original.payload.bytes);
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&values), original.payload.bytes);
+        try std.testing.expectError(error.InvalidTensorShape, cb.tryCumulativeSum(input, 3, false, false));
+    }
+    const empty = (try cb.fromInt32Shape(&.{}, &.{ 2, 0, 3 })).?;
+    defer cb.free(empty);
+    const empty_output = (try cb.tryCumulativeSum(empty, 1, true, true)).?;
+    defer cb.free(empty_output);
+    const shape = try cb.tensorShape(empty_output, a);
+    defer a.free(shape);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 0, 3 }, shape);
 }
