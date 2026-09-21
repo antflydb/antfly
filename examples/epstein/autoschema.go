@@ -646,19 +646,25 @@ func verifyAutoschemaGraphIndexConfig(status antfly.IndexStatus, tableName, inde
 		want any
 		got  any
 	}
+	// kind + template + neighbor_context: the template carries the stage
+	// prompt and neighbor_context carries the conceptualizer's grounding
+	// configuration — a right-prompt enrichment with missing or drifted
+	// neighbor context must fail verification, not silently run without
+	// its intended context. (A zero neighbor context normalizes to {} on
+	// both sides, so enrichments without one still verify.)
 	wantEnrichments := map[string]map[string]any{}
 	for _, e := range wantGraph.Enrichments {
-		wantEnrichments[e.Name] = map[string]any{"kind": e.Kind, "template": e.Template}
+		wantEnrichments[e.Name] = map[string]any{"kind": e.Kind, "template": e.Template, "neighbor_context": e.NeighborContext}
 	}
 	gotEnrichments := map[string]map[string]any{}
 	for _, e := range gotGraph.Enrichments {
-		gotEnrichments[e.Name] = map[string]any{"kind": e.Kind, "template": e.Template}
+		gotEnrichments[e.Name] = map[string]any{"kind": e.Kind, "template": e.Template, "neighbor_context": e.NeighborContext}
 	}
 	sections := []section{
 		{"sources", wantGraph.Sources, gotGraph.Sources},
 		{"resolvers", wantGraph.Resolvers, gotGraph.Resolvers},
 		{"metrics", wantGraph.Metrics, gotGraph.Metrics},
-		{"enrichment templates", wantEnrichments, gotEnrichments},
+		{"enrichment configuration", wantEnrichments, gotEnrichments},
 	}
 	for _, sec := range sections {
 		if err := verifyConfigSubset(sec.want, sec.got); err != nil {

@@ -401,8 +401,31 @@ func TestVerifyAutoschemaGraphIndexConfigDetectsDrift(t *testing.T) {
 		enrichments[0].(map[string]any)["template"] = "{{ canonical_name }}"
 	})
 	err = verifyAutoschemaGraphIndexConfig(got, "entities", AutoschemaTaxonomyIndex, *request)
-	if err == nil || !strings.Contains(err.Error(), "enrichment templates") {
+	if err == nil || !strings.Contains(err.Error(), "enrichment configuration") {
 		t.Fatalf("drifted enrichment template must fail verification, got: %v", err)
+	}
+
+	// A missing or drifted conceptualizer neighbor_context must fail: the
+	// prompt alone does not prove the grounding configuration.
+	got = statusFromCreateRequest(t, *request)
+	mutateStatusJSON(t, &got, func(m map[string]any) {
+		enrichments := m["enrichments"].([]any)
+		delete(enrichments[0].(map[string]any), "neighbor_context")
+	})
+	err = verifyAutoschemaGraphIndexConfig(got, "entities", AutoschemaTaxonomyIndex, *request)
+	if err == nil || !strings.Contains(err.Error(), "neighbor_context") {
+		t.Fatalf("missing neighbor_context must fail verification, got: %v", err)
+	}
+
+	got = statusFromCreateRequest(t, *request)
+	mutateStatusJSON(t, &got, func(m map[string]any) {
+		enrichments := m["enrichments"].([]any)
+		nc := enrichments[0].(map[string]any)["neighbor_context"].(map[string]any)
+		nc["graph_index"] = "wrong_index"
+	})
+	err = verifyAutoschemaGraphIndexConfig(got, "entities", AutoschemaTaxonomyIndex, *request)
+	if err == nil || !strings.Contains(err.Error(), "neighbor_context") {
+		t.Fatalf("drifted neighbor_context must fail verification, got: %v", err)
 	}
 }
 
