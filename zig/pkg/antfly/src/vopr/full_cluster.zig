@@ -4303,7 +4303,12 @@ test "full cluster production data plane baseline exact replay" {
         history_allocator.allocator(),
         Scenario.mode_ids[ordinal],
         ordinal,
-        30_000,
+        // ReadIndex admission can wait up to five virtual seconds while real
+        // HTTP, Raft, and apply owners continue running. The old 30k bound
+        // could stop a healthy schedule before two seconds had elapsed. Use
+        // the production witness budget; completion, public read correctness,
+        // cleanup, and exact replay remain mandatory.
+        240_000,
         .complete,
     );
 }
