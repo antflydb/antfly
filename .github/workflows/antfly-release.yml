@@ -560,7 +560,11 @@ jobs:
     needs:
       - prepare-release-promotion
       - begin-release-channel
-    if: ${{ needs.prepare-release-promotion.outputs.publish_pypi == 'true' }}
+    if: >-
+      ${{ !cancelled() &&
+          needs.prepare-release-promotion.result == 'success' &&
+          needs.begin-release-channel.result == 'success' &&
+          needs.prepare-release-promotion.outputs.publish_pypi == 'true' }}
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -608,7 +612,11 @@ jobs:
     needs:
       - prepare-release-promotion
       - begin-release-channel
-    if: ${{ needs.prepare-release-promotion.outputs.publish_npm == 'true' }}
+    if: >-
+      ${{ !cancelled() &&
+          needs.prepare-release-promotion.result == 'success' &&
+          needs.begin-release-channel.result == 'success' &&
+          needs.prepare-release-promotion.outputs.publish_npm == 'true' }}
     runs-on: ubuntu-latest
     environment: npm
     permissions:
@@ -901,6 +909,14 @@ jobs:
       - preflight-release-channel
       - preflight-publication
       - stage-container
+    # RCs intentionally skip Homebrew. Override the implicit success() check
+    # across that dependency chain, while requiring every admission gate.
+    if: >-
+      ${{ !cancelled() &&
+          needs.prepare-release-promotion.result == 'success' &&
+          needs.preflight-release-channel.result == 'success' &&
+          needs.preflight-publication.result == 'success' &&
+          needs.stage-container.result == 'success' }}
     runs-on: arc-antfly-standard
     concurrency:
       group: antfly-release-storage
