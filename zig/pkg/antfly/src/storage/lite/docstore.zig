@@ -213,7 +213,10 @@ pub const Store = struct {
         var source = blk: {
             lockStore(self);
             defer self.mutex.unlock();
-            if (self.file.change_capture != null) return error.FileBusy;
+            if (self.file.change_capture != null) {
+                std.log.warn("lite vacuum refused: another vacuum already holds the change capture", .{});
+                return error.FileBusy;
+            }
             if (self.file.checkpoint_publication_uncertain or self.secret_store_uncertain) return error.OutcomeUnknown;
             var snapshot = try native.NativeFile.openWithIo(self.allocator, io, self.file.path, .{ .read_only = true, .no_sync = self.file.no_sync, .resource_manager = self.resource_manager });
             snapshot.page_cache_policy = .metadata_only;
@@ -267,7 +270,10 @@ pub const Store = struct {
                 defer self.generation_lock.unlock(io);
                 lockStore(self);
                 defer self.mutex.unlock();
-                if (capture.overflow) return error.FileBusy;
+                if (capture.overflow) {
+                    std.log.warn("lite vacuum gave up: change capture overflowed while holding the writer slot round={d} captured={d}", .{ round, capture.count });
+                    return error.FileBusy;
+                }
                 if (capture.count == 0) {
                     if (self.file.checkpoint_publication_uncertain or self.secret_store_uncertain) return error.OutcomeUnknown;
                     image.report.before_size = (try self.file.file.stat(io)).size;
@@ -283,6 +289,7 @@ pub const Store = struct {
             if (final_round) break;
             try self.applyResidualVacuumChanges(&image, &capture, cancel);
         }
+        std.log.warn("lite vacuum gave up: every round found captured changes after taking the writer slot captured={d} overflow={}", .{ capture.count, capture.overflow });
         return error.FileBusy;
     }
 
@@ -303,7 +310,10 @@ pub const Store = struct {
         var latest = blk: {
             lockStore(self);
             defer self.mutex.unlock();
-            if (capture.overflow) return error.FileBusy;
+            if (capture.overflow) {
+                std.log.warn("lite vacuum gave up: change capture overflowed before catch-up captured={d} key_bytes={d}", .{ capture.count, capture.key_bytes });
+                return error.FileBusy;
+            }
             var snapshot = try native.NativeFile.openWithIo(self.allocator, io, self.file.path, .{ .read_only = true, .no_sync = true, .resource_manager = self.resource_manager });
             snapshot.page_cache_policy = .metadata_only;
             snapshot.header = self.file.header;
