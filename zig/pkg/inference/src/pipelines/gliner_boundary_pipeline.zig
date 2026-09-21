@@ -1052,7 +1052,7 @@ fn optionsForSample(common: Options, item: Options) Options {
 /// Scores a heterogeneous batch once, then applies each complete item option
 /// replacement. Empty per_sample selects the common options for every item.
 pub fn runNativePerSample(cb: *const compute.ComputeBackend, allocator: Allocator, config: *const model.Config, prepared: *const processor.PreparedBatch, schemas: []const *const schema_mod.CompiledSchema, core: CoreView, options: Options, per_sample: []const Options) !Result {
-    if (cb.kind() != .native) return error.UnsupportedGlinerBoundaryBackend;
+    if (cb.kind() != .native and cb.kind() != .wasm) return error.UnsupportedGlinerBoundaryBackend;
     try cb.checkExecutionControl();
     if (options.control) |control| try control.check();
     try validateOptions(options);

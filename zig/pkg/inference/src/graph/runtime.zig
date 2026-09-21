@@ -401,6 +401,7 @@ const FallbackNativeBackend = struct {
     backend: ComputeBackend,
 
     fn deinit(self: *FallbackNativeBackend, allocator: std.mem.Allocator) void {
+        if (comptime @import("builtin").os.tag == .freestanding) unreachable;
         self.backend.deinit();
         native_mod.deinitPrefetchQueue(self.weight_store);
         self.weight_store.resident_weights.deinit(allocator);

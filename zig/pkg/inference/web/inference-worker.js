@@ -15,6 +15,7 @@
 import { createWasmAbi } from './runtime/wasm-abi.js';
 import { streamRegisterSafetensors } from './runtime/safetensors-stream.js';
 import { streamRegisterGguf } from './runtime/gguf-stream.js';
+import { ExtractionSession } from './runtime/extraction-session.js';
 
 // Inference Worker: runs Antfly inference WASM module in a dedicated Web Worker.
 //
@@ -44,6 +45,7 @@ let wasm = null;
 let abi = null;
 let sab = null;   // SharedArrayBuffer
 let ctrl = null;  // Int32Array view of control region (first 16 ints)
+let extraction = null;
 
 // ONNX Runtime Web (lazy, optional)
 let ort = null;
@@ -59,7 +61,7 @@ const TEXT_DECODER = new TextDecoder();
 function gpuSync(msg) {
   Atomics.store(ctrl, 0, 0);   // response not ready
   self.postMessage({ type: 'gpu-sync', ...msg });
-  Atomics.wait(ctrl, 0, 0);    // block until main thread signals
+  if (Atomics.wait(ctrl, 0, 0, 30000) === 'timed-out') throw new Error('WebGPU bridge timed out');
   return ctrl[1];               // result value
 }
 
@@ -178,6 +180,9 @@ function getGpuImports(memoryFn) {
     gpu_matmul_transb: (a, b, out, m, n, k) => {
       gpuAsync({ cmd: 'matmul_transb', a, b, out, m, n, k });
     },
+    gpu_matmul_transb_f16: (a, b, out, m, n, k) => gpuAsync({ cmd: 'matmul_transb_f16', a, b, out, m, n, k }),
+    gpu_modern_op: (input, indices, out, len, mode, dim, stride, offset, seq, theta) => gpuAsync({ cmd: 'modern_op', input, indices, out, len, mode, dim, stride, offset, seq, theta }),
+    gpu_attention_local: (q, k, v, mask, out, batch, seqLen, numHeads, headDim, window) => gpuAsync({ cmd: 'attention_local', q, k, v, mask, out, batch, seqLen, numHeads, headDim, window }),
 
     gpu_add: (a, b, out, len) => {
       gpuAsync({ cmd: 'add', a, b, out, len });
@@ -512,7 +517,7 @@ self.onmessage = async (e) => {
     switch (type) {
       case 'init': {
         sab = e.data.sharedBuffer;
-        ctrl = new Int32Array(sab, 0, 16);
+        ctrl = sab ? new Int32Array(sab, 0, 16) : null;
 
         const wasmUrls = e.data.wasmUrls ?? (e.data.wasmUrl ? [e.data.wasmUrl] : []);
         const hasGpu = e.data.hasGpu;
@@ -634,11 +639,27 @@ self.onmessage = async (e) => {
         abi = createWasmAbi(wasm);
         wasmMemory = wasm.memory;
         wasm.init();
+        extraction = new ExtractionSession(wasm, abi);
 
         self.postMessage({ type: 'init-done', id });
         break;
       }
 
+      case 'extraction-load': {
+        const model = await extraction.load(e.data.files, e.data.precision, progress => self.postMessage({ type: 'progress', id, ...progress }));
+        self.postMessage({ type: 'extraction-load-done', id, model });
+        break;
+      }
+      case 'extraction-run': {
+        const result = extraction.run(e.data.request, e.data.validateOnly);
+        self.postMessage({ type: 'extraction-run-done', id, result });
+        break;
+      }
+      case 'extraction-unload': {
+        extraction.unload();
+        self.postMessage({ type: 'extraction-unload-done', id });
+        break;
+      }
       case 'load-model': {
         const { modelBytes, configJson, format } = e.data;
 

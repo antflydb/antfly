@@ -1,0 +1,77 @@
+.highlighted {
+  padding: 16px;
+  background: #f1f4e9;
+  border-radius: 6px;
+  line-height: 2.2;
+  font-size: 14px;
+  white-space: pre-wrap;
+}
+.highlighted mark {
+  background: #dceac7;
+  border-radius: 4px;
+  padding: 3px 5px;
+  color: #244e2b;
+}
+.highlighted small {
+  font-size: 9px;
+  margin-left: 6px;
+  text-transform: uppercase;
+}
+.record-table {
+  overflow: auto;
+  margin: 18px 0;
+}
+table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 12px;
+  text-align: left;
+}
+caption {
+  text-align: left;
+  font-weight: 700;
+  padding: 8px 0;
+}
+th,
+td {
+  border-bottom: 1px solid #d8e0d0;
+  padding: 9px;
+  vertical-align: top;
+}
+th {
+  background: #edf2e5;
+}
+.relation-list > div {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 0;
+  border-bottom: 1px solid #d8e0d0;
+  font-size: 12px;
+  flex-wrap: wrap;
+}
+.relation-list small {
+  margin-left: auto;
+  color: #65765d;
+}
+.entity-list details {
+  max-width: 100%;
+}
+.entity-list > div {
+  flex-wrap: wrap;
+}
+.decision {
+  padding: 16px;
+  margin: 16px 0;
+  border: 1px solid #d8e0d0;
+  border-radius: 6px;
+  overflow-wrap: anywhere;
+}
+.decision h3 {
+  margin: 0 0 8px;
+  font-size: 16px;
+}
+.decision p {
+  color: #526649;
+  font-size: 12px;
+}

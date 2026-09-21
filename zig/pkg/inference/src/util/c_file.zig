@@ -212,6 +212,8 @@ pub const MmapRegion = struct {
     }
 
     pub fn deinit(self: *MmapRegion) void {
+        // Freestanding model stores are byte-backed and cannot own mappings.
+        if (comptime builtin.os.tag == .freestanding) unreachable;
         const mapped_len = self.data.len;
         const fd = self.fd;
         // Model eviction must release both the process mapping and its clean

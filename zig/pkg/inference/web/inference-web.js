@@ -200,7 +200,7 @@ export class InferenceWeb {
 
   async _initWorker(wasmCandidates, options) {
     const sabSize = options.sabSize ?? DEFAULT_SAB_SIZE;
-    this._sab = new SharedArrayBuffer(sabSize);
+    this._sab = this.gpu ? new SharedArrayBuffer(sabSize) : null;
     this._pendingCalls = new Map();
 
     const baseWasmUrl = wasmCandidates[0];
@@ -212,6 +212,8 @@ export class InferenceWeb {
     this._worker = new Worker(workerUrl, { type: 'module' });
 
     this._worker.onmessage = (e) => this._onWorkerMessage(e);
+    this._worker.onerror = (event) => this._rejectPending(new Error(event.message || 'Inference worker failed'));
+    this._worker.onmessageerror = () => this._rejectPending(new Error('Invalid inference worker message'));
 
     // Resolve wasm candidates to absolute URLs for the worker's fetch() fallback chain.
     const absWasmUrls = wasmCandidates.map((candidate) =>
@@ -236,7 +238,11 @@ export class InferenceWeb {
         // For gpu-sync, handleWorkerCommand signals the worker when done
         // For gpu (fire-and-forget), we still process it through the handler
         // but the worker isn't blocking
-        this.gpu.handleWorkerCommand(e.data, this._sab);
+        Promise.resolve(this.gpu.handleWorkerCommand(e.data, this._sab)).catch(error => {
+          this._rejectPending(error);
+          this.gpu?.onFatalError?.(error);
+          this.destroy();
+        });
       }
       return;
     }
@@ -277,11 +283,28 @@ export class InferenceWeb {
 
   _workerCall(type, extra = {}, transfer = [], callbacks = {}) {
     return new Promise((resolve, reject) => {
+      if (!this._worker || !this._pendingCalls) { reject(new Error('Inference worker is not running')); return; }
       const id = this._nextCallId++;
       this._pendingCalls.set(id, { resolve, reject, ...callbacks });
-      this._worker.postMessage({ type, id, ...extra }, transfer);
+      try { this._worker.postMessage({ type, id, ...extra }, transfer); }
+      catch (error) { this._pendingCalls.delete(id); reject(error); }
     });
   }
+
+  _rejectPending(error) {
+    for (const call of this._pendingCalls?.values() ?? []) call.reject(error);
+    this._pendingCalls?.clear();
+  }
+
+  loadExtractionBundle(files, precision, onProgress) {
+    return this._workerCall('extraction-load', { files, precision }, [], { onProgress }).then(r => r.model);
+  }
+
+  runExtraction(request, validateOnly = false) {
+    return this._workerCall('extraction-run', { request, validateOnly }).then(r => r.result);
+  }
+
+  unloadExtraction() { return this._workerCall('extraction-unload'); }
 
   _getAbi() {
     if (!this.abi || !this.wasm) {
@@ -2017,8 +2040,9 @@ export class InferenceWeb {
   /**
    * Terminate the inference worker (worker mode only).
    */
-  destroy() {
+  destroy(reason) {
     this.abi = null;
+    this._rejectPending(reason ?? new DOMException('Inference worker terminated; reload the model to continue', 'AbortError'));
     if (this._worker) {
       this._worker.terminate();
       this._worker = null;

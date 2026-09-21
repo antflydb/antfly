@@ -130,6 +130,10 @@ pub fn dispatchJobsIo(io: std.Io, jobs: []const Job) std.Io.Cancelable!void {
 /// Run the final job on the caller and drain bounded async jobs before return.
 /// Preserve the existing sequential fallback outside Linux or over capacity.
 pub fn dispatchJobs(jobs: []const Job) void {
+    if (comptime @import("builtin").single_threaded) {
+        for (jobs) |job| job.fn_ptr(job.ctx);
+        return;
+    }
     if (jobs.len <= 1 or ensurePool(jobs.len - 1) < jobs.len - 1) {
         for (jobs) |job| job.fn_ptr(job.ctx);
         return;

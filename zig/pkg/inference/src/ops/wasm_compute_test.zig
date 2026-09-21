@@ -22,6 +22,49 @@ const std = @import("std");
 const wasm_compute = @import("wasm_compute.zig");
 const bert_arch = @import("../architectures/bert.zig");
 
+test "WasmCompute shaped browser weights own bytes and packed embeddings decode one row" {
+    const a = std.testing.allocator;
+    var compute = wasm_compute.WasmCompute.init(a);
+    var cb = compute.computeBackend();
+    defer cb.deinit();
+    var packed_bytes = [_]u8{1} ** 34;
+    packed_bytes[0] = 0;
+    packed_bytes[1] = 0x3c; // f16 scale 1, then 32 signed int8 values of 1
+    try compute.registerShapedWeight("embedding", &.{ 1, 32 }, &packed_bytes, .Q8_0);
+    @memset(&packed_bytes, 0); // registration must own its byte snapshot
+    try std.testing.expectError(error.DuplicateWeight, compute.registerShapedWeight("embedding", &.{ 1, 32 }, &packed_bytes, .Q8_0));
+    const weight = try cb.getWeight("embedding");
+    const shape = try cb.tensorShape(weight, a);
+    defer a.free(shape);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 32 }, shape);
+    const output = try cb.embeddingLookup(weight, &.{0}, 1, 32);
+    defer cb.free(output);
+    const values = try cb.toFloat32(output, a);
+    defer a.free(values);
+    for (values) |value| try std.testing.expectEqual(@as(f32, 1), value);
+    try std.testing.expectError(error.InvalidTokenId, cb.embeddingLookup(weight, &.{1}, 1, 32));
+    try std.testing.expectError(error.InvalidWeightByteLength, compute.registerShapedWeight("bad", &.{ 2, 32 }, &packed_bytes, .Q8_0));
+}
+
+test "WasmCompute layer norm accepts a packed f16 input weight" {
+    const a = std.testing.allocator;
+    var compute = wasm_compute.WasmCompute.init(a);
+    var cb = compute.computeBackend();
+    defer cb.deinit();
+    const input = [_]f16{ 1, 3 };
+    const gamma = [_]f32{ 1, 1 };
+    const beta = [_]f32{ 0, 0 };
+    try compute.registerShapedWeight("input", &.{ 1, 2 }, std.mem.sliceAsBytes(&input), .F16);
+    try compute.registerShapedWeight("gamma", &.{2}, std.mem.sliceAsBytes(&gamma), .F32);
+    try compute.registerShapedWeight("beta", &.{2}, std.mem.sliceAsBytes(&beta), .F32);
+    const output = try cb.layerNorm(try cb.getWeight("input"), try cb.getWeight("gamma"), try cb.getWeight("beta"), 2, 0.00001);
+    defer cb.free(output);
+    const values = try cb.toFloat32(output, a);
+    defer a.free(values);
+    try std.testing.expectApproxEqAbs(@as(f32, -1), values[0], 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), values[1], 0.0001);
+}
+
 // Tiny BERT config: 1 layer, 4 heads, 32-dim, 64 intermediate.
 const test_config = bert_arch.Config{
     .model_type = .bert,

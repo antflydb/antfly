@@ -39,7 +39,15 @@ pub const Limits = struct {
     max_attention_scratch_bytes: usize = 8 * 1024 * 1024,
 };
 
-pub const Options = struct { limits: Limits = .{}, control: ?Control = null };
+/// Optional owner-managed scope for a hybrid host backend. Browser sessions
+/// enable WebGPU only around the encoder and restore CPU mode before heads.
+/// Native serving leaves this null; it confers no qualification or admission.
+pub const EncoderScope = struct {
+    ptr: *anyopaque,
+    enter: *const fn (*anyopaque) void,
+    leave: *const fn (*anyopaque) void,
+};
+pub const Options = struct { limits: Limits = .{}, control: ?Control = null, scope: ?EncoderScope = null };
 
 pub const RelationRoute = struct {
     group_index: usize,
@@ -355,9 +363,13 @@ const CombinedControl = struct {
 /// The caller owns beginRequest/endRequest and backend workspace admission.
 /// All returned states are owned; the full subword tensor is released here.
 pub fn encodeNative(cb: *const compute.ComputeBackend, allocator: Allocator, config: *const boundary.Config, prepared: *const processor.PreparedBatch, options: Options) !Result {
-    if (cb.kind() != .native) return error.UnsupportedGlinerBoundaryBackend;
+    // The host encoder contract is also implemented by WasmCompute. Device
+    // admission/qualification remains the responsibility of the caller.
+    if (cb.kind() != .native and cb.kind() != .wasm) return error.UnsupportedGlinerBoundaryBackend;
     try cb.checkExecutionControl();
     const checked = try plan(config, prepared, options);
+    if (options.scope) |scope| scope.enter(scope.ptr);
+    defer if (options.scope) |scope| scope.leave(scope.ptr);
     var combined = CombinedControl{ .first = cb.execution_control, .second = options.control };
     var request_backend = cb.*;
     request_backend.execution_control = combined.view();

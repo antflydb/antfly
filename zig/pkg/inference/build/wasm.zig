@@ -59,6 +59,7 @@ pub fn addWasm(ctx: Context, wasm_jinja_mod: *std.Build.Module, wasm_platform_mo
     wasm_lib.root_module.addOptions("build_options", runtime_build.addBuildOptions(b, wasmBackend(ctx.backend)));
     wasm_lib.entry = .disabled;
     wasm_lib.rdynamic = true;
+    if (!is_wasm64) wasm_lib.max_memory = 2 * 1024 * 1024 * 1024;
     // ReleaseSafe: works around LLVM WASM backend miscompilation at -Os/-O3
     // that produces NaN in BERT encoder FFN linear ops. 1.2 MB binary.
 
@@ -142,6 +143,11 @@ pub fn addWasm(ctx: Context, wasm_jinja_mod: *std.Build.Module, wasm_platform_mo
 
     const wasm_step = ctx.step("wasm", "Build WASM module for browser inference");
     wasm_step.dependOn(&wasm_install.step);
+    const browser_name = if (ctx.backend.enable_webgpu) "antfly-extraction-webgpu.wasm" else "antfly-extraction-cpu.wasm";
+    if (!is_wasm64) {
+        const browser_install = b.addInstallFile(wasm_lib.getEmittedBin(), browser_name);
+        wasm_step.dependOn(&browser_install.step);
+    }
     if (!is_wasm64) {
         const wasm_compat_install = b.addInstallFile(wasm_lib.getEmittedBin(), "antfly-inference.wasm");
         wasm_step.dependOn(&wasm_compat_install.step);

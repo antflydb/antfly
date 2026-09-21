@@ -143,6 +143,7 @@ const WasmBuf = struct {
     data: []f32,
     len: usize, // logical element count
     owned: bool,
+    owned_weight_data: bool = false,
     allocator: std.mem.Allocator,
     shape: ?[]i64 = null,
     i32_data: ?[]i32 = null,
@@ -231,7 +232,7 @@ const WasmBuf = struct {
     }
 
     fn deinit(self: *WasmBuf) void {
-        if (self.owned) {
+        if (self.owned or self.owned_weight_data) {
             self.allocator.free(self.data);
         }
         if (self.shape) |shape| {
@@ -428,6 +429,10 @@ const GpuWeightStore = struct {
         return self.buffers.contains(weight);
     }
 
+    fn release(self: *GpuWeightStore, weight: *WasmBuf) void {
+        if (self.buffers.fetchRemove(weight)) |entry| wasm_extern.freeBuffer(entry.value);
+    }
+
     fn ensureResident(self: *GpuWeightStore, weight: *WasmBuf) !wasm_extern.GpuBufferId {
         if (!build_options.enable_webgpu) return error.WebGpuUnavailable;
         if (self.buffers.get(weight)) |gpu_buf| return gpu_buf;
@@ -453,8 +458,18 @@ const GpuWeightStore = struct {
             break :blk id;
         };
 
+        errdefer wasm_extern.freeBuffer(gpu_buf);
         try self.buffers.put(weight, gpu_buf);
         return gpu_buf;
+    }
+
+    fn ensurePackedF16(self: *GpuWeightStore, weight: *WasmBuf) !wasm_extern.GpuBufferId {
+        if (self.buffers.get(weight)) |id| return id;
+        const raw = std.mem.sliceAsBytes(weight.f16_data orelse return error.UnsupportedTensorType);
+        const id = try createUploadedQuantStorageBuffer(self.allocator, raw);
+        errdefer wasm_extern.freeBuffer(id);
+        try self.buffers.put(weight, id);
+        return id;
     }
 
     fn putResident(self: *GpuWeightStore, weight: *WasmBuf, gpu_buf: wasm_extern.GpuBufferId) !void {
@@ -998,8 +1013,14 @@ pub const WasmCompute = struct {
 
     allocator: std.mem.Allocator,
     weights: std.StringHashMap(*WasmBuf),
+    owned_weight_names: std.ArrayListUnmanaged([]const u8) = .empty,
     gpu_weights: GpuWeightStore,
+    gpu_f16_weights: GpuWeightStore,
     use_gpu: bool,
+    /// Dense browser encoders can exceed the GPU budget when all FP16 weights
+    /// are expanded to FP32. Release uploads when callers release weight handles.
+    stream_gpu_weights: bool = false,
+    resident_dense_gpu: bool = false,
     active_kv_cache: ?*WasmKvCache = null,
     active_gpu_kv_cache: ?*GpuKvCache = null,
     graph_plan_buffers: std.AutoHashMap(usize, GraphPlanBuffer),
@@ -1013,6 +1034,7 @@ pub const WasmCompute = struct {
             .allocator = allocator,
             .weights = std.StringHashMap(*WasmBuf).init(allocator),
             .gpu_weights = GpuWeightStore.init(allocator),
+            .gpu_f16_weights = GpuWeightStore.init(allocator),
             .use_gpu = wasm_extern.isAvailable(),
             .graph_plan_buffers = std.AutoHashMap(usize, GraphPlanBuffer).init(allocator),
             .decoder_runtime_layer_norm_slots = std.AutoHashMap(usize, DecoderRuntimeLayerNormSlot).init(allocator),
@@ -1058,6 +1080,48 @@ pub const WasmCompute = struct {
         return .{ .ptr = @ptrCast(self), .vtable = &vtable };
     }
 
+    /// Browser streaming loader: retain shape and packed storage, with explicit
+    /// ownership and no eager upload of large embedding tables. Unlike legacy
+    /// registration this is fallible and never discards CPU fallback weights.
+    pub fn registerShapedWeight(self: *WasmCompute, name: []const u8, shape: []const i64, raw: []const u8, kind: tensor_types.KnownTensorType) !void {
+        if (self.weights.contains(name)) return error.DuplicateWeight;
+        if (shape.len == 0 or shape.len > 4) return error.UnsupportedShape;
+        var dims: [4]u64 = undefined;
+        var count: usize = 1;
+        for (shape, 0..) |dim, i| {
+            if (dim <= 0) return error.UnsupportedShape;
+            count = try std.math.mul(usize, count, @intCast(dim));
+            dims[shape.len - i - 1] = @intCast(dim);
+        }
+        const qtype = tensor_types.TensorType{ .known = kind };
+        if (raw.len != (tensor_types.byteLen(qtype, dims[0..shape.len]) orelse return error.UnsupportedTensorType)) return error.InvalidWeightByteLength;
+        const buf = try self.allocator.create(WasmBuf);
+        buf.* = .{ .data = &.{}, .len = count, .owned = false, .allocator = self.allocator };
+        errdefer buf.deinit();
+        buf.shape = try self.allocator.dupe(i64, shape);
+        switch (kind) {
+            .F32 => {
+                buf.data = try self.allocator.alloc(f32, count);
+                buf.owned_weight_data = true;
+                @memcpy(std.mem.sliceAsBytes(buf.data), raw);
+            },
+            .F16 => {
+                buf.f16_data = try self.allocator.alloc(f16, count);
+                @memcpy(std.mem.sliceAsBytes(buf.f16_data.?), raw);
+            },
+            .Q8_0, .Q4_0, .Q4_K => {
+                buf.quant_raw = try self.allocator.dupe(u8, raw);
+                buf.quant_type = qtype;
+            },
+            else => return error.UnsupportedTensorType,
+        }
+        const key = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(key);
+        try self.owned_weight_names.ensureUnusedCapacity(self.allocator, 1);
+        try self.weights.put(key, buf);
+        self.owned_weight_names.appendAssumeCapacity(key);
+    }
+
     fn getWeightOp(ctx: *anyopaque, name: []const u8) anyerror!CT {
         const self: *WasmCompute = @ptrCast(@alignCast(ctx));
         const buf = self.weights.get(name) orelse return error.WeightNotFound;
@@ -1079,8 +1143,14 @@ pub const WasmCompute = struct {
     }
 
     fn freeTensorOp(ctx: *anyopaque, tensor: CT) void {
-        _ = ctx;
+        const self: *WasmCompute = @ptrCast(@alignCast(ctx));
         const buf: *WasmBuf = @ptrCast(@alignCast(tensor));
+        // Temporary norm parameters must never leave pointer-keyed cache entries
+        // behind after their allocation is reused, even with persistent weights.
+        if (buf.owned or self.stream_gpu_weights) {
+            self.gpu_weights.release(toBuf(tensor));
+            self.gpu_f16_weights.release(toBuf(tensor));
+        }
         if (buf.weight_source != null) {
             buf.allocator.destroy(buf);
             return;
@@ -1095,7 +1165,13 @@ pub const WasmCompute = struct {
         const self: *WasmCompute = @ptrCast(@alignCast(ctx));
         const w = toBuf(weight);
         const out = try self.allocator.alloc(f32, total * dim);
-        if (w.f16_data) |f16d| {
+        errdefer self.allocator.free(out);
+        if (dim == 0 or total != ids.len) return error.InvalidInputShape;
+        for (ids) |id| if (id < 0 or @as(u64, @intCast(id)) >= w.len / dim) return error.InvalidTokenId;
+        if (w.quant_type) |kind| {
+            const raw = w.quant_raw orelse return error.HostQuantizedWeightUnavailable;
+            for (ids, 0..) |id, i| try quant_codec.dequantizeRow(kind, raw, dim, @intCast(id), out[i * dim ..][0..dim]);
+        } else if (w.f16_data) |f16d| {
             for (0..total) |i| {
                 const idx: usize = @intCast(ids[i]);
                 const src = f16d[idx * dim ..][0..dim];
@@ -1134,6 +1210,13 @@ pub const WasmCompute = struct {
         const total_rows = @divExact(input.len, request.dim);
         if (total_rows * request.dim != input.len) return error.UnexpectedOutputShape;
         if (request.row_ids.len != request.rows) return error.UnexpectedOutputShape;
+        for (request.row_ids) |id| if (id >= total_rows) return error.UnexpectedOutputShape;
+        if (build_options.enable_webgpu and self.use_gpu and self.resident_dense_gpu) {
+            const indices = try createUploadedQuantStorageBuffer(self.allocator, std.mem.sliceAsBytes(request.row_ids));
+            defer wasm_extern.freeBuffer(indices);
+            return try self.modernGpuOp(input, indices, request.rows * request.dim, 4, request.dim, 0, 0, 0, 0);
+        }
+        try input.ensureHostData();
 
         const out = try self.allocator.alloc(f32, request.rows * request.dim);
         for (request.row_ids, 0..) |row_id, out_row| {
@@ -1151,12 +1234,12 @@ pub const WasmCompute = struct {
 
     fn shouldPreferGpuLinear(self: *WasmCompute, inp: *WasmBuf, weight: *WasmBuf, rows: usize, out_dim: usize) bool {
         if (!(build_options.enable_webgpu and self.use_gpu)) return false;
-        return inp.gpu_tensor != null or self.gpu_weights.hasResident(weight) or rows * out_dim >= WEBGPU_MATMUL_THRESHOLD;
+        return self.resident_dense_gpu or inp.gpu_tensor != null or self.gpu_weights.hasResident(weight) or rows * out_dim >= WEBGPU_MATMUL_THRESHOLD;
     }
 
     fn shouldPreferGpuNorm(self: *WasmCompute, inp: *WasmBuf, dim: usize) bool {
         if (!(build_options.enable_webgpu and self.use_gpu)) return false;
-        return inp.gpu_tensor != null or (dim >= 4096 and inp.len >= 65536);
+        return self.resident_dense_gpu or inp.gpu_tensor != null or (dim >= 4096 and inp.len >= 65536);
     }
 
     fn shouldPreferGpuElementwise(self: *WasmCompute, a: *WasmBuf, b: ?*WasmBuf, len: usize) bool {
@@ -1201,12 +1284,10 @@ pub const WasmCompute = struct {
                     linalg.sgemmTransBSync(rows, out_dim, in_dim, 1.0, inp.data, w_view.data, 0.0, out);
                 }
             } else {
-                const w_gpu_buf = try self.gpu_weights.ensureResident(w);
-                var out_gpu = gpuSgemmTransB(rows, out_dim, in_dim, inp_gpu.id, w_gpu_buf, out);
+                var out_gpu = try self.denseGpuMatmul(w, inp_gpu.id, rows, out_dim, in_dim, out);
                 defer out_gpu.deinit();
-                var bias_gpu = GpuInputTensor.fromBuf(b);
-                defer bias_gpu.deinit();
-                var biased_gpu = gpuBinaryBroadcast(out_gpu.id, bias_gpu.id, out.len, b.len, out, .add);
+                const bias_gpu = try self.gpu_weights.ensureResident(b);
+                var biased_gpu = gpuBinaryBroadcast(out_gpu.id, bias_gpu, out.len, b.len, out, .add);
                 return fromBuf(try setBufShape2D(WasmBuf.fromSliceWithGpu(self.allocator, out, true, biased_gpu.detach(), true), rows, out_dim));
             }
         } else {
@@ -1238,6 +1319,7 @@ pub const WasmCompute = struct {
         const inp = toBuf(input);
         const w = toBuf(weight);
         const out = try self.allocator.alloc(f32, rows * out_dim);
+        errdefer self.allocator.free(out);
 
         // GPU path for quantized weights (keep quantized in GPU store and dequant in shader).
         if (shouldPreferGpuLinear(self, inp, w, rows, out_dim)) {
@@ -1257,16 +1339,15 @@ pub const WasmCompute = struct {
             }
         }
 
-        const w_view = try w.viewF32(self.allocator);
-        defer if (w_view.allocated) self.allocator.free(@constCast(w_view.data));
-
         if (shouldPreferGpuLinear(self, inp, w, rows, out_dim)) {
-            const w_gpu_buf = try self.gpu_weights.ensureResident(w);
             var inp_gpu = GpuInputTensor.fromBuf(inp);
             defer inp_gpu.deinit();
-            var out_gpu = gpuSgemmTransB(rows, out_dim, in_dim, inp_gpu.id, w_gpu_buf, out);
+            var out_gpu = try self.denseGpuMatmul(w, inp_gpu.id, rows, out_dim, in_dim, out);
             return fromBuf(try setBufShape2D(WasmBuf.fromSliceWithGpu(self.allocator, out, true, out_gpu.detach(), true), rows, out_dim));
         } else {
+            try inp.ensureHostData();
+            const w_view = try w.viewF32(self.allocator);
+            defer if (w_view.allocated) self.allocator.free(@constCast(w_view.data));
             linalg.sgemmTransBSync(rows, out_dim, in_dim, 1.0, inp.data, w_view.data, 0.0, out);
         }
         return fromBuf(try setBufShape2D(WasmBuf.fromSlice(self.allocator, out, true), rows, out_dim));
@@ -1345,8 +1426,11 @@ pub const WasmCompute = struct {
         defer if (g_view.allocated) self.allocator.free(@constCast(g_view.data));
         const b_view = try b.viewF32(self.allocator);
         defer if (b_view.allocated) self.allocator.free(@constCast(b_view.data));
+        const input_view = try inp.viewF32(self.allocator);
+        defer if (input_view.allocated) self.allocator.free(input_view.data);
+        if (dim == 0 or inp.len % dim != 0 or g_view.data.len != dim or b_view.data.len != dim) return error.InvalidInputShape;
         const out = try self.allocator.alloc(f32, inp.len);
-        @memcpy(out, inp.data);
+        @memcpy(out, input_view.data);
         activations.layerNorm(out, g_view.data, b_view.data, dim, eps);
         return fromBuf(try copyBufShape(WasmBuf.fromSlice(self.allocator, out, true), inp));
     }
@@ -1402,6 +1486,9 @@ pub const WasmCompute = struct {
     fn geluExactOp(ctx: *anyopaque, input: CT) anyerror!CT {
         const self: *WasmCompute = @ptrCast(@alignCast(ctx));
         const inp = toBuf(input);
+        if (build_options.enable_webgpu and self.use_gpu and self.resident_dense_gpu)
+            return self.modernGpuOp(inp, 0, inp.len, 1, 0, 0, 0, 0, 0);
+        try inp.ensureHostData();
         const out = try self.allocator.alloc(f32, inp.len);
         @memcpy(out, inp.data);
         activations.geluExact(out);
@@ -1411,6 +1498,9 @@ pub const WasmCompute = struct {
     fn reluOp(ctx: *anyopaque, input: CT) anyerror!CT {
         const self: *WasmCompute = @ptrCast(@alignCast(ctx));
         const inp = toBuf(input);
+        if (build_options.enable_webgpu and self.use_gpu and self.resident_dense_gpu)
+            return self.modernGpuOp(inp, 0, inp.len, 2, 0, 0, 0, 0, 0);
+        try inp.ensureHostData();
         const out = try self.allocator.alloc(f32, inp.len);
         @memcpy(out, inp.data);
         activations.relu(out);
@@ -1420,6 +1510,7 @@ pub const WasmCompute = struct {
     fn siluOp(ctx: *anyopaque, input: CT) anyerror!CT {
         const self: *WasmCompute = @ptrCast(@alignCast(ctx));
         const inp = toBuf(input);
+        try inp.ensureHostData();
         const out = try self.allocator.alloc(f32, inp.len);
         @memcpy(out, inp.data);
         activations.silu(out);
@@ -1429,6 +1520,7 @@ pub const WasmCompute = struct {
     fn quickGeluOp(ctx: *anyopaque, input: CT) anyerror!CT {
         const self: *WasmCompute = @ptrCast(@alignCast(ctx));
         const inp = toBuf(input);
+        try inp.ensureHostData();
         const out = try self.allocator.alloc(f32, inp.len);
         @memcpy(out, inp.data);
         activations.quickGelu(out);
@@ -1438,6 +1530,7 @@ pub const WasmCompute = struct {
     fn sigmoidOp(ctx: *anyopaque, input: CT) anyerror!CT {
         const self: *WasmCompute = @ptrCast(@alignCast(ctx));
         const inp = toBuf(input);
+        try inp.ensureHostData();
         const out = try self.allocator.alloc(f32, inp.len);
         @memcpy(out, inp.data);
         activations.sigmoid(out);
@@ -1447,6 +1540,7 @@ pub const WasmCompute = struct {
     fn tanhOp(ctx: *anyopaque, input: CT) anyerror!CT {
         const self: *WasmCompute = @ptrCast(@alignCast(ctx));
         const inp = toBuf(input);
+        try inp.ensureHostData();
         const out = try self.allocator.alloc(f32, inp.len);
         @memcpy(out, inp.data);
         for (out) |*x| x.* = std.math.tanh(x.*);
@@ -1497,6 +1591,8 @@ pub const WasmCompute = struct {
         const self: *WasmCompute = @ptrCast(@alignCast(ctx));
         const a_buf = toBuf(a);
         const b_buf = toBuf(b_ct);
+        try a_buf.ensureHostData();
+        try b_buf.ensureHostData();
         const out_dim = dim_a + dim_b;
         const out = try self.allocator.alloc(f32, total * out_dim);
         for (0..total) |row| {
@@ -1532,10 +1628,11 @@ pub const WasmCompute = struct {
         const attn_bias: ?[]const f32 = if (attn_bias_view) |v| v.data else null;
 
         const out = try self.allocator.alloc(f32, out_len);
+        errdefer self.allocator.free(out);
 
         // GPU path: fused attention shader (avoids intermediate transfers)
         if (build_options.enable_webgpu and self.use_gpu and
-            out_len >= WEBGPU_ATTN_THRESHOLD and seq_len <= WEBGPU_ATTN_MAX_SEQ and
+            (self.resident_dense_gpu or out_len >= WEBGPU_ATTN_THRESHOLD) and seq_len <= WEBGPU_ATTN_MAX_SEQ and
             attn_bias == null)
         {
             var q_gpu = GpuInputTensor.fromBuf(Q);
@@ -1544,11 +1641,14 @@ pub const WasmCompute = struct {
             defer k_gpu.deinit();
             var v_gpu = GpuInputTensor.fromBuf(V);
             defer v_gpu.deinit();
-            var out_gpu = gpuAttention(batch, seq_len, num_heads, head_dim, scale, q_gpu.id, k_gpu.id, v_gpu.id, mask, out);
+            var out_gpu = gpuAttention(batch, seq_len, num_heads, head_dim, scale, q_gpu.id, k_gpu.id, v_gpu.id, mask, out, 0);
             return fromBuf(try setBufShape2D(WasmBuf.fromSliceWithGpu(self.allocator, out, true, out_gpu.detach(), true), total, num_heads * head_dim));
         }
 
         // SIMD path: per-head attention on CPU
+        try Q.ensureHostData();
+        try K.ensureHostData();
+        try V.ensureHostData();
         const scores = try self.allocator.alloc(f32, seq_len * seq_len);
         defer self.allocator.free(scores);
 
@@ -1598,6 +1698,32 @@ pub const WasmCompute = struct {
         }
 
         return fromBuf(try setBufShape2D(WasmBuf.fromSlice(self.allocator, out, true), total, num_heads * head_dim));
+    }
+
+    fn modernGpuOp(self: *WasmCompute, input: *WasmBuf, indices: wasm_extern.GpuBufferId, len: usize, mode: u32, dim: usize, stride: usize, offset: usize, seq: usize, theta: f32) !CT {
+        if (!build_options.enable_webgpu) return error.WebGpuUnavailable;
+        const out = try self.allocator.alloc(f32, len);
+        var inp = GpuInputTensor.fromBuf(input);
+        defer inp.deinit();
+        var result = GpuTensor.create(len * 4);
+        wasm_extern.gpu_modern_op(inp.id, indices, result.id, @intCast(len), mode, @intCast(dim), @intCast(stride), @intCast(offset), @intCast(seq), theta);
+        const buf = WasmBuf.fromSliceWithGpu(self.allocator, out, true, result.detach(), true);
+        if (mode == 3 or mode == 4) return fromBuf(try setBufShape2D(buf, len / dim, dim));
+        return fromBuf(try copyBufShape(buf, input));
+    }
+
+    fn slidingWindowAttentionOp(ctx: *anyopaque, q: CT, k: CT, v: CT, mask: []const i64, batch: usize, seq: usize, heads: usize, dim: usize, half: usize) anyerror!?CT {
+        const self: *WasmCompute = @ptrCast(@alignCast(ctx));
+        if (!build_options.enable_webgpu or !self.use_gpu or !self.resident_dense_gpu or seq > WEBGPU_ATTN_MAX_SEQ) return null;
+        const out = try self.allocator.alloc(f32, batch * seq * heads * dim);
+        var q_gpu = GpuInputTensor.fromBuf(toBuf(q));
+        defer q_gpu.deinit();
+        var k_gpu = GpuInputTensor.fromBuf(toBuf(k));
+        defer k_gpu.deinit();
+        var v_gpu = GpuInputTensor.fromBuf(toBuf(v));
+        defer v_gpu.deinit();
+        var result = gpuAttention(batch, seq, heads, dim, 1 / @sqrt(@as(f32, @floatFromInt(dim))), q_gpu.id, k_gpu.id, v_gpu.id, mask, out, half + 1);
+        return fromBuf(try setBufShape2D(WasmBuf.fromSliceWithGpu(self.allocator, out, true, result.detach(), true), batch * seq, heads * dim));
     }
 
     fn fromFloat32Op(ctx: *anyopaque, data: []const f32) anyerror!CT {
@@ -1782,6 +1908,7 @@ pub const WasmCompute = struct {
     fn deinitBackendOp(ctx: *anyopaque) void {
         const self: *WasmCompute = @ptrCast(@alignCast(ctx));
         self.gpu_weights.deinit();
+        self.gpu_f16_weights.deinit();
         var graph_plan_it = self.graph_plan_buffers.valueIterator();
         while (graph_plan_it.next()) |buffer| {
             if (buffer.id != wasm_extern.invalid_buffer) wasm_extern.freeBuffer(buffer.id);
@@ -1795,6 +1922,8 @@ pub const WasmCompute = struct {
             buf.*.deinit();
         }
         self.weights.deinit();
+        for (self.owned_weight_names.items) |name| self.allocator.free(name);
+        self.owned_weight_names.deinit(self.allocator);
     }
 
     fn noopPrefetch(_: *anyopaque, _: []const u8, _: u32) void {}
@@ -2631,6 +2760,11 @@ pub const WasmCompute = struct {
             return fromBuf(try setBufShape2D(WasmBuf.fromSliceWithGpu(self.allocator, out, true, out_gpu.detach(), true), batch * seq_len, num_heads * head_dim));
         }
 
+        try Q.ensureHostData();
+        try K.ensureHostData();
+        try V.ensureHostData();
+        try Q_r.ensureHostData();
+        try K_r.ensureHostData();
         const out = try linalg.debertaDisentangledAttentionHost(self.allocator, Q.data, K.data, V.data, Q_r.data, K_r.data, mask, batch, seq_len, num_heads, head_dim);
         return fromBuf(try setBufShape2D(WasmBuf.fromSlice(self.allocator, out, true), batch * seq_len, num_heads * head_dim));
     }
@@ -3198,6 +3332,9 @@ pub const WasmCompute = struct {
 
     fn ropeOp(ctx: *anyopaque, input: CT, seq_len: usize, head_dim: usize, rope_dim: usize, theta: f32, freq_scale: f32, position_offset: usize, consecutive_pairs: bool) anyerror!CT {
         const self: *WasmCompute = @ptrCast(@alignCast(ctx));
+        if (build_options.enable_webgpu and self.use_gpu and self.resident_dense_gpu and seq_len > 0 and head_dim > 0 and head_dim % 2 == 0 and toBuf(input).len / head_dim >= seq_len and (toBuf(input).len / head_dim) % seq_len == 0 and rope_dim == head_dim and freq_scale == 1 and position_offset == 0)
+            return self.modernGpuOp(toBuf(input), 0, toBuf(input).len, 0, head_dim, 0, @intFromBool(consecutive_pairs), seq_len, theta);
+        try toBuf(input).ensureHostData();
         const data = toBuf(input).data;
         const total_chunks = data.len / head_dim;
         if (seq_len == 0) return error.InvalidRoPEInput;
@@ -3656,6 +3793,16 @@ pub const WasmCompute = struct {
     }
 
     /// Dispatch matmul C = A @ B^T to WebGPU compute shader.
+    fn denseGpuMatmul(self: *WasmCompute, weight: *WasmBuf, input: wasm_extern.GpuBufferId, rows: usize, cols: usize, inner: usize, out: []f32) !GpuTensor {
+        if (build_options.enable_webgpu and self.resident_dense_gpu and weight.f16_data != null) {
+            const w = try self.gpu_f16_weights.ensurePackedF16(weight);
+            const result = GpuTensor.create(out.len * 4);
+            wasm_extern.gpu_matmul_transb_f16(input, w, result.id, @intCast(rows), @intCast(cols), @intCast(inner));
+            return result;
+        }
+        return gpuSgemmTransB(rows, cols, inner, input, try self.gpu_weights.ensureResident(weight), out);
+    }
+
     fn gpuSgemmTransB(m: usize, n: usize, k: usize, a_buf: wasm_extern.GpuBufferId, b_buf: wasm_extern.GpuBufferId, out: []f32) GpuTensor {
         if (!build_options.enable_webgpu) unreachable;
 
@@ -3776,6 +3923,7 @@ pub const WasmCompute = struct {
         v_buf: wasm_extern.GpuBufferId,
         mask: []const i64,
         out: []f32,
+        window: usize,
     ) GpuTensor {
         if (!build_options.enable_webgpu) unreachable;
 
@@ -3796,9 +3944,11 @@ pub const WasmCompute = struct {
 
         // Scale is baked into the params uniform on the JS side
         _ = scale;
-        wasm_extern.attention(q_buf, k_buf, v_buf, mask_buf, out_buf.id, @intCast(batch), @intCast(seq_len), @intCast(num_heads), @intCast(head_dim));
-
-        out_buf.downloadF32(out);
+        if (window == 0) {
+            wasm_extern.attention(q_buf, k_buf, v_buf, mask_buf, out_buf.id, @intCast(batch), @intCast(seq_len), @intCast(num_heads), @intCast(head_dim));
+        } else {
+            wasm_extern.gpu_attention_local(q_buf, k_buf, v_buf, mask_buf, out_buf.id, @intCast(batch), @intCast(seq_len), @intCast(num_heads), @intCast(head_dim), @intCast(window));
+        }
 
         wasm_extern.freeBuffer(mask_buf);
         return out_buf;
@@ -4696,6 +4846,8 @@ pub const WasmCompute = struct {
         if (start > stop or stop > cols) return error.UnexpectedOutputShape;
 
         const out_cols = stop - start;
+        if (build_options.enable_webgpu and self.use_gpu and self.resident_dense_gpu and out_cols > 0)
+            return self.modernGpuOp(buf, 0, rows * out_cols, 3, out_cols, cols, start, 0, 0);
         const output = try self.allocator.alloc(f32, rows * out_cols);
         for (0..rows) |row| {
             const src_base = row * cols + start;
@@ -5181,6 +5333,7 @@ pub const WasmCompute = struct {
         .add = addOp,
         .multiply = multiplyOp,
         .scaledDotProductAttention = scaledDotProductAttentionOp,
+        .slidingWindowAttention = slidingWindowAttentionOp,
         .causalSelfAttention = causalSelfAttentionOp,
         .crossAttention = crossAttentionOp,
         .relativePositionBias = relativePositionBiasOp,
@@ -5625,4 +5778,34 @@ fn exerciseActivationDotAllocationFailures(allocator: std.mem.Allocator, use_gpu
 test "wasm_compute: activation dot allocation failures preserve operands and metadata ownership" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseActivationDotAllocationFailures, .{false});
     try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseActivationDotAllocationFailures, .{true});
+}
+
+test "wasm_compute: streamed weight and temporary parameter releases invalidate GPU cache" {
+    var compute = WasmCompute.init(std.testing.allocator);
+    defer WasmCompute.deinitBackendOp(&compute);
+    var values = [_]f32{1};
+    var weight = WasmBuf{ .allocator = std.testing.allocator, .data = &values, .len = 1, .owned = false };
+    try compute.gpu_weights.putResident(&weight, 0);
+    WasmCompute.freeTensorOp(&compute, fromBuf(&weight));
+    try std.testing.expect(compute.gpu_weights.hasResident(&weight));
+    compute.stream_gpu_weights = true;
+    WasmCompute.freeTensorOp(&compute, fromBuf(&weight));
+    try std.testing.expect(!compute.gpu_weights.hasResident(&weight));
+    compute.stream_gpu_weights = false;
+    const temporary = try WasmCompute.fromFloat32Op(&compute, &.{0});
+    try compute.gpu_weights.putResident(toBuf(temporary), 0);
+    WasmCompute.freeTensorOp(&compute, temporary);
+    try std.testing.expectEqual(@as(usize, 0), compute.gpu_weights.buffers.count());
+}
+
+test "wasm_compute: ModernBERT CPU fallbacks reject unavailable host mirrors" {
+    var compute = WasmCompute.init(std.testing.allocator);
+    defer WasmCompute.deinitBackendOp(&compute);
+    compute.use_gpu = false;
+    var values = [_]f32{ 1, 2 };
+    var stale = WasmBuf{ .allocator = std.testing.allocator, .data = &values, .len = 2, .owned = false, .host_data_valid = false };
+    const input = fromBuf(&stale);
+    try std.testing.expectError(error.HostTensorUnavailable, WasmCompute.ropeOp(&compute, input, 1, 2, 2, 10000, 1, 0, false));
+    try std.testing.expectError(error.HostTensorUnavailable, WasmCompute.scaledDotProductAttentionOp(&compute, input, input, input, &.{1}, null, 1, 1, 1, 2));
+    try std.testing.expectError(error.HostTensorUnavailable, WasmCompute.linearNoBiasOp(&compute, input, input, 1, 2, 1));
 }

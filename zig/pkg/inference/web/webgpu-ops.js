@@ -27,6 +27,8 @@
 const SHADER_PATHS = {
   matmul: './shaders/matmul.wgsl',
   matmulTransB: './shaders/matmul_transb.wgsl',
+  matmulTransBF16: './shaders/matmul_transb_f16.wgsl',
+  modernOps: './shaders/modern_ops.wgsl',
   matmulTransBQ4_0: './shaders/matmul_transb_q4_0.wgsl',
   matmulTransBQ4_1: './shaders/matmul_transb_q4_1.wgsl',
   matmulTransBQ5_0: './shaders/matmul_transb_q5_0.wgsl',
@@ -170,7 +172,15 @@ export class WebGPUOps {
     }
 
     try {
-      this.device = await adapter.requestDevice();
+      // The largest bundled pipeline uses 16,448 bytes of workgroup storage,
+      // slightly above WebGPU's 16 KiB default. Never create an invalid pipeline
+      // and defer its error until the first model operation.
+      const workgroupStorage = 16448;
+      if (adapter.limits.maxComputeWorkgroupStorageSize < workgroupStorage) {
+        this.lastInitError = 'Adapter workgroup storage is insufficient for the bundled shaders';
+        return false;
+      }
+      this.device = await adapter.requestDevice({ requiredLimits: { maxComputeWorkgroupStorageSize: workgroupStorage } });
     } catch (err) {
       this.lastInitError = `requestDevice failed: ${err?.message ?? err}`;
       return false;
@@ -216,6 +226,15 @@ export class WebGPUOps {
         module: this.device.createShaderModule({ code: shaderSources.matmulTransB }),
         entryPoint: 'matmul_transb',
       },
+    });
+
+    this.pipelines.matmulTransBF16 = this.device.createComputePipeline({
+      layout: matmulPipelineLayout,
+      compute: { module: this.device.createShaderModule({ code: shaderSources.matmulTransBF16 }), entryPoint: 'matmul_transb_f16' },
+    });
+    this.pipelines.modernOps = this.device.createComputePipeline({
+      layout: matmulPipelineLayout,
+      compute: { module: this.device.createShaderModule({ code: shaderSources.modernOps }), entryPoint: 'modern_op' },
     });
 
     this.pipelines.matmulTransBQ4_0 = this.device.createComputePipeline({
@@ -661,6 +680,10 @@ export class WebGPUOps {
 
   createBuffer(sizeBytes) {
     const size = toJsIndex(sizeBytes, 'GPU buffer size');
+    if (this.maxBufferBytes !== undefined) {
+      const live = [...this.buffers.values()].reduce((sum, buffer) => sum + buffer.size, 0);
+      if (size > this.device.limits.maxBufferSize || size > this.device.limits.maxStorageBufferBindingSize || live + size > this.maxBufferBytes) throw new Error('WebGPU memory budget exceeded; select WASM CPU');
+    }
     const buf = this.device.createBuffer({
       size,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
@@ -753,6 +776,9 @@ export class WebGPUOps {
       gpu_matmul_transb: (aId, bId, outId, m, n, k) => {
         this._dispatchMatmul('matmulTransB', aId, bId, outId, m, n, k);
       },
+      gpu_matmul_transb_f16: (a, b, out, m, n, k) => this._dispatchMatmul('matmulTransBF16', a, b, out, m, n, k),
+      gpu_modern_op: (...args) => this._dispatchModern(...args),
+      gpu_attention_local: (...args) => this._dispatchAttention(...args),
 
       gpu_add: (aId, bId, outId, len) => {
         this._dispatchVectorBinary('add', aId, bId, outId, len);
@@ -1402,7 +1428,25 @@ export class WebGPUOps {
     paramsBuffer.destroy();
   }
 
-  _dispatchAttention(qId, kId, vId, maskId, outId, batch, seqLen, numHeads, headDim) {
+  _dispatchModern(input, indices, out, len, mode, dim, stride, offset, seq, theta) {
+    const data = new ArrayBuffer(32);
+    new Uint32Array(data).set([len, mode, dim, stride, offset, seq]);
+    new Float32Array(data)[6] = theta;
+    const params = this.device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.device.queue.writeBuffer(params, 0, data);
+    const group = this.device.createBindGroup({ layout: this.matmulBindGroupLayout, entries: [
+      { binding: 0, resource: { buffer: this.buffers.get(input) } },
+      { binding: 1, resource: { buffer: this.buffers.get(indices || input) } },
+      { binding: 2, resource: { buffer: this.buffers.get(out) } },
+      { binding: 3, resource: { buffer: params } },
+    ] });
+    const encoder = this.device.createCommandEncoder(), pass = encoder.beginComputePass();
+    pass.setPipeline(this.pipelines.modernOps); pass.setBindGroup(0, group);
+    pass.dispatchWorkgroups(Math.ceil(len / 256)); pass.end();
+    this.device.queue.submit([encoder.finish()]); params.destroy();
+  }
+
+  _dispatchAttention(qId, kId, vId, maskId, outId, batch, seqLen, numHeads, headDim, window = 0) {
     const qBuf = this.buffers.get(qId);
     const kBuf = this.buffers.get(kId);
     const vBuf = this.buffers.get(vId);
@@ -1412,16 +1456,17 @@ export class WebGPUOps {
 
     // Params: seq_len, num_heads, head_dim, scale (16 bytes, matches Params struct)
     const scale = 1.0 / Math.sqrt(headDim);
-    const paramsAB = new ArrayBuffer(16);
+    const paramsAB = new ArrayBuffer(32);
     const paramsU32 = new Uint32Array(paramsAB);
     const paramsF32 = new Float32Array(paramsAB);
     paramsU32[0] = seqLen;
     paramsU32[1] = numHeads;
     paramsU32[2] = headDim;
     paramsF32[3] = scale;
+    paramsU32[4] = window;
 
     const paramsBuffer = this.device.createBuffer({
-      size: 16,
+      size: 32,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
     this.device.queue.writeBuffer(paramsBuffer, 0, paramsAB);
@@ -1903,15 +1948,18 @@ export class WebGPUOps {
         result = this.device ? 1 : 0;
         break;
 
+      case 'modern_op':
+        this._dispatchModern(msg.input, msg.indices, msg.out, msg.len, msg.mode, msg.dim, msg.stride, msg.offset, msg.seq, msg.theta);
+        break;
+      case 'matmul_transb_f16':
+        this._dispatchMatmul('matmulTransBF16', msg.a, msg.b, msg.out, msg.m, msg.n, msg.k);
+        break;
+      case 'attention_local':
+        this._dispatchAttention(msg.q, msg.k, msg.v, msg.mask, msg.out, msg.batch, msg.seqLen, msg.numHeads, msg.headDim, msg.window);
+        break;
+
       case 'create_buffer': {
-        const size = toJsIndex(msg.size, 'GPU buffer size');
-        const buf = this.device.createBuffer({
-          size,
-          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
-        });
-        const id = this.nextId++;
-        this.buffers.set(id, buf);
-        result = id;
+        result = this.createBuffer(msg.size);
         break;
       }
 

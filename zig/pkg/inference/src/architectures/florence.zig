@@ -4081,6 +4081,7 @@ fn logFlorenceProfileStageLayerOp(phase: []const u8, stage: usize, layer: usize,
 }
 
 fn nowNs() u64 {
+    if (comptime @import("builtin").os.tag == .freestanding) return 0;
     var ts: std.posix.timespec = undefined;
     switch (std.posix.errno(std.posix.system.clock_gettime(std.posix.CLOCK.MONOTONIC, &ts))) {
         .SUCCESS => return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),

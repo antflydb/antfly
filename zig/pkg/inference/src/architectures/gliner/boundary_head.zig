@@ -244,7 +244,7 @@ fn validate(config: *const boundary.Config, input: Input, limits: Limits) !void 
 /// Complete shared-pool boundary inference math for the published configs.
 /// Returns intermediates for exact oracle comparison and later task decoding.
 pub fn forwardNative(cb: *const compute.ComputeBackend, allocator: std.mem.Allocator, config: *const boundary.Config, input: Input, limits: Limits) !Result {
-    if (cb.kind() != .native) return error.UnsupportedGlinerBoundaryBackend;
+    if (cb.kind() != .native and cb.kind() != .wasm) return error.UnsupportedGlinerBoundaryBackend;
     try cb.checkExecutionControl();
     if (input.control) |control| try control.check();
     try validate(config, input, limits);
@@ -571,7 +571,7 @@ pub fn scoreExplicitSpansNative(
     explicit: ExplicitInput,
     limits: Limits,
 ) !ExplicitResult {
-    if (cb.kind() != .native) return error.UnsupportedGlinerBoundaryBackend;
+    if (cb.kind() != .native and cb.kind() != .wasm) return error.UnsupportedGlinerBoundaryBackend;
     try cb.checkExecutionControl();
     if (input.control) |control| try control.check();
     try validate(config, input, limits);

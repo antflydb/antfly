@@ -3509,7 +3509,7 @@ fn metalEagerArenaMinBytes() u64 {
 }
 
 fn metalEagerArenaMaxBytes() u64 {
-    return @intCast(platform.env.getenvUsize("TERMITE_METAL_EAGER_ARENA_MAX_BYTES") orelse (4 * 1024 * 1024 * 1024));
+    return if (platform.env.getenvUsize("TERMITE_METAL_EAGER_ARENA_MAX_BYTES")) |n| @intCast(n) else @as(u64, 4) * 1024 * 1024 * 1024;
 }
 
 fn metalEagerArenaReclaimAliasesEnabled() bool {
@@ -3525,7 +3525,7 @@ fn metalChunkLocalOutputsMinBytes() u64 {
 }
 
 fn metalChunkLocalOutputsMaxBytes() u64 {
-    return @intCast(platform.env.getenvUsize("TERMITE_METAL_CHUNK_LOCAL_OUTPUT_MAX_BYTES") orelse (4 * 1024 * 1024 * 1024));
+    return if (platform.env.getenvUsize("TERMITE_METAL_CHUNK_LOCAL_OUTPUT_MAX_BYTES")) |n| @intCast(n) else @as(u64, 4) * 1024 * 1024 * 1024;
 }
 
 fn metalFrameChunkExpiredBytesThreshold() u64 {

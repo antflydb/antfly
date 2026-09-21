@@ -161,9 +161,32 @@ pub const GlinerPipeline = struct {
         labels: []const []const u8,
         label_token: i32,
     ) !usize {
-        var prepared = try self.prepareGlinerInput(text, labels, label_token);
-        defer prepared.deinit(self.allocator);
-        return prepared.input_ids.len;
+        // Admission needs the *untruncated* prompt length. Preparing the
+        // inference tensors first clamps to max_length and conceals overflow.
+        const a = self.allocator;
+        var schema = try self.prepareGlinerSchema(labels, label_token);
+        defer schema.deinit(a);
+        var words: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer words.deinit(a);
+        var starts: std.ArrayListUnmanaged(usize) = .empty;
+        defer starts.deinit(a);
+        var ends: std.ArrayListUnmanaged(usize) = .empty;
+        defer ends.deinit(a);
+        try splitIntoWords(a, text, &words, &starts, &ends);
+        var lowercase: std.ArrayListUnmanaged(u8) = .empty;
+        defer lowercase.deinit(a);
+        var ids: std.ArrayListUnmanaged(i32) = .empty;
+        defer ids.deinit(a);
+        var count = schema.ids.len;
+        for (words.items) |word| {
+            lowercase.clearRetainingCapacity();
+            try lowercase.ensureUnusedCapacity(a, word.len);
+            for (word) |c| lowercase.appendAssumeCapacity(std.ascii.toLower(c));
+            ids.clearRetainingCapacity();
+            try self.tok.encodeInto(a, lowercase.items, &ids);
+            count = try std.math.add(usize, count, ids.items.len);
+        }
+        return count;
     }
 
     /// Returns the largest exact classification row. Empty texts are handled
@@ -1845,6 +1868,7 @@ fn glinerPipelineProfileEnabled() bool {
 }
 
 fn glinerProfileNowNs() u128 {
+    if (comptime @import("builtin").os.tag == .freestanding) return 0;
     var ts: std.posix.timespec = undefined;
     return switch (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts))) {
         .SUCCESS => @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),

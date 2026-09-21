@@ -22,4 +22,5 @@ comptime {
     }
     _ = exports_core;
     _ = exports_generation;
+    _ = @import("exports_extraction.zig");
 }

@@ -155,7 +155,7 @@ pub const NativeContext = struct {
     }
     fn checkNative(raw: *anyopaque) !void {
         const self = get(raw);
-        if (self.cb.kind() != .native) return error.UnsupportedGlinerBoundaryBackend;
+        if (self.cb.kind() != .native and self.cb.kind() != .wasm) return error.UnsupportedGlinerBoundaryBackend;
         try self.cb.checkExecutionControl();
     }
     fn checkSample(self: *NativeContext, sample: usize, control: ?Control) !void {

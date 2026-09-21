@@ -1,0 +1,29 @@
+{
+  "name": "@antfly/gliner-playground",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "prepare:runtime": "node scripts/prepare-runtime.mjs",
+    "dev": "pnpm prepare:runtime && vite --host 127.0.0.1",
+    "build": "pnpm prepare:runtime && tsc --noEmit && vite build",
+    "preview": "vite preview --host 127.0.0.1",
+    "typecheck": "tsc --noEmit",
+    "test:browser": "node --test test/browser.test.mjs"
+  },
+  "dependencies": {
+    "@antfly/design-system": "workspace:*",
+    "@antfly/inference-web": "workspace:*",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.61.0",
+    "@types/node": "^25.9.3",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.2",
+    "typescript": "~5.9.3",
+    "vite": "^8.0.16"
+  }
+}

@@ -40,6 +40,9 @@ extern "webgpu" fn gpu_download(id: GpuBufferId, ptr: [*]u8, size_bytes: u32) vo
 extern "webgpu" fn gpu_copy_buffer_to_buffer(src: GpuBufferId, src_offset_bytes: u32, dst: GpuBufferId, dst_offset_bytes: u32, size_bytes: u32) void;
 extern "webgpu" fn gpu_matmul(a: GpuBufferId, b: GpuBufferId, out: GpuBufferId, m: u32, n: u32, k: u32) void;
 extern "webgpu" fn gpu_matmul_transb(a: GpuBufferId, b: GpuBufferId, out: GpuBufferId, m: u32, n: u32, k: u32) void;
+pub extern "webgpu" fn gpu_matmul_transb_f16(a: GpuBufferId, b: GpuBufferId, out: GpuBufferId, m: u32, n: u32, k: u32) void;
+pub extern "webgpu" fn gpu_modern_op(input: GpuBufferId, indices: GpuBufferId, out: GpuBufferId, len: u32, mode: u32, dim: u32, stride: u32, offset: u32, seq: u32, theta: f32) void;
+pub extern "webgpu" fn gpu_attention_local(q: GpuBufferId, k: GpuBufferId, v: GpuBufferId, mask: GpuBufferId, out: GpuBufferId, batch: u32, seq: u32, heads: u32, dim: u32, window: u32) void;
 extern "webgpu" fn gpu_add(a: GpuBufferId, b: GpuBufferId, out: GpuBufferId, len: u32) void;
 extern "webgpu" fn gpu_add_broadcast(a: GpuBufferId, b: GpuBufferId, out: GpuBufferId, len: u32, a_len: u32, b_len: u32) void;
 extern "webgpu" fn gpu_mul(a: GpuBufferId, b: GpuBufferId, out: GpuBufferId, len: u32, a_len: u32, b_len: u32) void;
