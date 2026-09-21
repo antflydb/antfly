@@ -210,6 +210,11 @@ const Fixture = struct {
             }
             self.validations += 1;
         }
+        const reserved = blk: {
+            var before = (try self.dbs[i].restoreStagingStatus(alloc)).?;
+            defer before.deinit();
+            break :blk before.value.phase == .reserved;
+        };
         var apply: Apply = .{ .fixture = self, .index = i };
         const result = try @import("../storage/restore_owner.zig").executeResident(alloc, self.dbs[i], .{ .io = std.testing.io, .runtime = self.runtime, .location_options = .{ .filesystem_io = std.testing.io, .node_config = self.node_config }, .cache_path = self.cache_paths[i], .proposer = .{ .ptr = &apply, .propose = Apply.propose } }, request, context);
         if (self.rewrite_mode and !self.tail_injected and result.rewrite != null and result.rewrite.?.snapshot_complete) {
@@ -218,8 +223,11 @@ const Fixture = struct {
         }
         if (request.action == .import_page) self.imports += 1;
         if (request.action == .publish) self.publications += 1;
-        const fault_bit: u8 = switch (request.action) {
-            .begin => 1,
+        // Fault the durable admission transition, whether it came from an
+        // explicit begin or the first idempotent snapshot import. Binding the
+        // fault to the RPC spelling silently misses implicit admissions.
+        const fault_bit: u8 = if (reserved and result.phase == .importing) 1 else switch (request.action) {
+            .begin => 0,
             .import_page => if (result.rows != 0 or result.phase == .imported) 2 else 0,
             .validate => if (result.phase == .validated) 4 else 0,
             .publish => 8,

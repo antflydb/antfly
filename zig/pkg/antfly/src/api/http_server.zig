@@ -16016,7 +16016,7 @@ pub const ApiHttpServer = struct {
         var validation_session: ?*@import("restore_catalog.zig").ValidationSession = null;
         defer if (validation_session) |session| session.deinit();
         var slices: usize = 0;
-        const rewrite_slice_deadline = platform_time.monotonicNs() +| 250 * std.time.ns_per_ms;
+        const work_slice_deadline = platform_time.monotonicNs() +| 250 * std.time.ns_per_ms;
         while (slices < 64) : (slices += 1) {
             // Persist only verified prefix progress. The phase is that of the
             // receipt, even if its final acknowledgement advanced metadata.
@@ -16026,6 +16026,13 @@ pub const ApiHttpServer = struct {
                 saved_owner_cursor = owner_cursor;
                 saved_owner_phase = phase;
             }
+            // All phases share the cooperative budget. Validation, cutover and
+            // owner publication also perform durable RPCs; a count-only bound
+            // can exhaust the request deadline and misclassify steady progress
+            // as a failed attempt (with exponential backoff). Check AFTER the
+            // acknowledged prefix is saved, and always allow one step so slow
+            // storage cannot starve a job. A single RPC retains its hard deadline.
+            if (slices != 0 and platform_time.monotonicNs() >= work_slice_deadline) return error.RestoreStagingYield;
             try context.ensureActive();
             const attempt_state = try self.restore_job_store.attemptState(self.alloc, restore.job_id, restore.attempt_id);
             if (attempt_state == .fenced) return error.RestoreJobFenced;
@@ -16046,7 +16053,7 @@ pub const ApiHttpServer = struct {
                 rewrite_diagnostic = worker_state.value.rewrite_progress;
                 // Bound CPU/IO work and yield on a pending full owner pass,
                 // not after every successful, durably checkpointed owner step.
-                if (platform_time.monotonicNs() >= rewrite_slice_deadline or driver.completedPendingPass(before, worker_state.value.rewrite_progress)) return error.RestoreStagingYield;
+                if (driver.completedPendingPass(before, worker_state.value.rewrite_progress)) return error.RestoreStagingYield;
                 continue;
             }
             if (is_rewrite and phase == .canceling and job.value.plan.preparing_sources) {
@@ -20581,6 +20588,9 @@ test "staged restore published metadata wins cancellation only after every owner
             try std.testing.expectEqual(.publish, request.action);
             const index = group - 701;
             self.calls[index] += 1;
+            // One successful slow RPC consumes the cooperative budget, not the
+            // hard request deadline. Its durable prefix must survive the yield.
+            if (index == 0 and self.calls[index] == 1) try std.testing.io.sleep(.fromMilliseconds(300), .awake);
             if (index == 128 and self.calls[index] == 1) return error.Timeout;
             return .{ .phase = .published, .rows = 1, .receipt = @splat(9) };
         }
@@ -20637,14 +20647,28 @@ test "staged restore published metadata wins cancellation only after every owner
     defer alloc.free(encoded);
     const restore: ApiHttpServer.RestoreCancellation = .{ .job_id = worker.value.job_id, .attempt_id = worker.value.attempt_id };
     try std.testing.expectError(error.RestoreStagingYield, server.driveStagedRestore(restore, worker.value.attempt_id, encoded, &.{"docs"}));
-    try std.testing.expectError(error.RestoreStagingYield, server.driveStagedRestore(restore, worker.value.attempt_id, encoded, &.{"docs"}));
-    try std.testing.expectError(error.Timeout, server.driveStagedRestore(restore, worker.value.attempt_id, encoded, &.{"docs"}));
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls[0]);
+    for (fixture.calls[1..]) |count| try std.testing.expectEqual(@as(usize, 0), count);
+    for (0..130) |_| {
+        const unexpected = server.driveStagedRestore(restore, worker.value.attempt_id, encoded, &.{"docs"}) catch |err| {
+            if (err == error.RestoreStagingYield) continue;
+            try std.testing.expectEqual(error.Timeout, err);
+            break;
+        };
+        alloc.free(unexpected);
+        return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
     const incomplete = (try server.restore_job_store.load(alloc, worker.value.job_id)).?;
     defer alloc.free(incomplete);
     const progress = try std.json.parseFromSlice(restore_jobs.JobState, alloc, incomplete, .{});
     defer progress.deinit();
     try std.testing.expectEqual(.active, progress.value.staging_resolution);
-    const result = try server.driveStagedRestore(restore, worker.value.attempt_id, encoded, &.{"docs"});
+    const result = for (0..3) |_| {
+        break server.driveStagedRestore(restore, worker.value.attempt_id, encoded, &.{"docs"}) catch |err| {
+            if (err == error.RestoreStagingYield) continue;
+            return err;
+        };
+    } else return error.TestUnexpectedResult;
     defer alloc.free(result);
     try std.testing.expect(std.mem.indexOf(u8, result, "committed") != null);
     const finished = try server.restore_job_store.finish(alloc, worker.value, result);

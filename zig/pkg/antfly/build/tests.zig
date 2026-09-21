@@ -1469,6 +1469,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     lib_bedrock_test_step.dependOn(&run_lib_bedrock_tests.step);
 
     const api_http_runtime_default_filters = [_][]const u8{
+        "staged restore published metadata wins cancellation only after every owner opens",
+        "staged restore worker publishes a dependency complete mixed native cohort",
+        "staged restore worker rebuilds a dependency complete mixed portable cohort",
+        "staged restore worker rewrites retained acknowledged writes and reopens hidden mixed owners",
         "httpx antfly schema update returns full table status after projection",
         "httpx antfly schema update owns self partial support and rejects public index forgery",
         "httpx schema rewrite authorizes incoming dependencies before source admission",

@@ -414,7 +414,9 @@ def owner_link_fault(request, monkeypatch):
             yield fault
         finally:
             print(f"restore owner progress: {list(fault.owner_progress)}")
-            print(f"restore owner timings (count/total/max seconds): {fault.owner_timings}")
+            print(
+                f"restore owner timings (count/total/max seconds): {fault.owner_timings}"
+            )
 
 
 @pytest.fixture
