@@ -2358,6 +2358,10 @@ pub const ComputeBackend = struct {
         /// Backends may leave this null when they do not support integer tensors.
         fromInt32Shape: ?*const fn (ctx: *anyopaque, data: []const i32, shape: []const i32) anyerror!?CT = null,
 
+        /// Optional exact graph-constant import. Copies bytes and shape; return
+        /// null to retain the backend's legacy numeric-constant path.
+        fromConstantBytes: ?*const fn (ctx: *anyopaque, data: []const u8, dtype: GraphDType, shape: []const i64) anyerror!?CT = null,
+
         /// Copy tensor data to a caller-owned f32 slice.
         toFloat32: *const fn (ctx: *anyopaque, tensor: CT, allocator: std.mem.Allocator) anyerror![]f32,
 
@@ -4272,6 +4276,11 @@ pub const ComputeBackend = struct {
         if (self.vtable.fromInt32Shape) |op| {
             return op(self.ptr, data, shape);
         }
+        return null;
+    }
+
+    pub fn fromConstantBytes(self: *const ComputeBackend, data: []const u8, dtype: GraphDType, shape: []const i64) !?CT {
+        if (self.vtable.fromConstantBytes) |op| return op(self.ptr, data, dtype, shape);
         return null;
     }
 

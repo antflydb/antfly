@@ -974,6 +974,10 @@ fn getData(ct: CT) []f32 {
             buf.shared_data_refcount = null;
         };
     }
+    materializeIntegerNumericView(buf) catch |err| {
+        std.log.warn("failed to materialize integer numeric view: {s}", .{@errorName(err)});
+        return &.{};
+    };
     return buf.data;
 }
 
@@ -982,7 +986,20 @@ fn getData(ct: CT) []f32 {
 fn getDataChecked(ct: CT) ![]f32 {
     const buf = toBuf(ct);
     if (buf.view_strides != null) try materializeViewData(buf);
+    try materializeIntegerNumericView(buf);
     return buf.data;
+}
+
+// Legacy arithmetic consumes numeric f32 views. Keep the original integer
+// payload for exact operators and export, and materialize its numeric view
+// only on demand. Source-backed buffers cannot be donated to in-place ops.
+fn materializeIntegerNumericView(buf: *Buf) !void {
+    if (buf.data.len != 0) return;
+    const source = buf.source_tensor orelse return;
+    if (source.dtype != .i32 and source.dtype != .i64) return;
+    const data = try convertTensorToOwnedF32(buf.allocator, source);
+    buf.data = data;
+    buf.owned = true;
 }
 
 test "native tensor view readback preserves materialization OOM and nullable clone fallback" {
@@ -4701,6 +4718,7 @@ pub const vtable_impl = ComputeBackend.VTable{
     .fromFloat32 = &fromFloat32Op,
     .fromFloat32Shape = &fromFloat32ShapeOp,
     .fromInt32Shape = &fromInt32ShapeOp,
+    .fromConstantBytes = &fromConstantBytesOp,
     .cumulativeSum = &cumulativeSumOp,
     .cloneTensorShape = &cloneTensorShapeOp,
     .toFloat32 = &toFloat32Op,
@@ -38877,7 +38895,11 @@ fn scanAxis(comptime T: type, values: []align(1) T, outer: usize, width: usize, 
 
 fn cumulativeSumOp(ctx: *anyopaque, input: CT, axis: u8, exclusive: bool, reverse: bool) anyerror!?CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
-    const shape = tensorStoredShape(input) orelse return error.InvalidTensorShape;
+    var flat_shape: [1]i64 = undefined;
+    const shape = tensorStoredShape(input) orelse blk: {
+        flat_shape[0] = @intCast((try getDataChecked(input)).len);
+        break :blk &flat_shape;
+    };
     if (shape.len > 8 or axis >= shape.len) return error.InvalidTensorShape;
     const count = typedShapeNumel(shape) orelse return error.InvalidTensorShape;
     const outer = typedShapeNumel(shape[0..axis]) orelse return error.InvalidTensorShape;
@@ -40039,6 +40061,24 @@ fn fromFloat32ShapeOp(ctx: *anyopaque, data: []const f32, shape: []const i32) an
     const buf = try self.makeBuf(owned, true);
     toBuf(buf).logical_shape = logical_shape;
     return buf;
+}
+
+fn fromConstantBytesOp(ctx: *anyopaque, data: []const u8, dtype: ops.GraphDType, shape: []const i64) anyerror!?CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const storage_dtype: tensor_mod.DType = switch (dtype) {
+        .i32 => .i32,
+        .i64 => .i64,
+        else => return null,
+    };
+    if (shape.len > 8) return error.InvalidTensorShape;
+    const count = typedShapeNumel(shape) orelse return error.InvalidTensorShape;
+    if (data.len != try std.math.mul(usize, count, storage_dtype.byteSize())) return error.InvalidTensorShape;
+    const raw = try self.allocator.dupe(u8, data);
+    var transferred = false;
+    errdefer if (!transferred) self.allocator.free(raw);
+    const owned_shape = try self.allocator.dupe(i64, shape);
+    transferred = true;
+    return self.makeBufWithOwnedSourceTensor(.{ .data = raw, .dtype = storage_dtype, .shape = owned_shape, .name = "", .allocator = self.allocator, .owns_data = true, .owns_shape = true });
 }
 
 fn fromInt32ShapeOp(ctx: *anyopaque, data: []const i32, shape: []const i32) anyerror!?CT {
@@ -50574,4 +50614,43 @@ test "native CumSum preserves batched strided i32 and i64 scans" {
     const shape = try cb.tensorShape(empty_output, a);
     defer a.free(shape);
     try std.testing.expectEqualSlices(i64, &.{ 2, 0, 3 }, shape);
+}
+
+test "native CumSum accepts the flat float tensor constructor" {
+    const a = std.testing.allocator;
+    var ws = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(a, &ws, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const input = try cb.fromFloat32(&.{ 1, 2, 3 });
+    defer cb.free(input);
+    const output = (try cb.tryCumulativeSum(input, 0, false, false)).?;
+    defer cb.free(output);
+    const values = try cb.toFloat32(output, a);
+    defer a.free(values);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 3, 6 }, values);
+}
+
+test "native integer numeric views retain exact bytes and propagate allocation failure" {
+    const a = std.testing.allocator;
+    var failing = std.testing.FailingAllocator.init(a, .{});
+    var ws = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(failing.allocator(), &ws, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const input = (try cb.fromConstantBytes(std.mem.sliceAsBytes(&[_]i64{ 9007199254740993, 1 }), .i64, &.{2})).?;
+    defer cb.free(input);
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, getDataChecked(input));
+    try std.testing.expectEqual(@as(usize, 0), toBuf(input).data.len);
+    failing.fail_index = std.math.maxInt(usize);
+    const numeric = try getDataChecked(input);
+    const before = failing.alloc_index;
+    try std.testing.expectEqual(numeric.ptr, (try getDataChecked(input)).ptr);
+    try std.testing.expectEqual(before, failing.alloc_index);
+    const output = (try cb.tryCumulativeSum(input, 0, false, false)).?;
+    defer cb.free(output);
+    const exact = (try cb.exportTensorData(output, a)).?;
+    defer a.free(exact.payload.bytes);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]i64{ 9007199254740993, 9007199254740994 }), exact.payload.bytes);
 }

@@ -136,7 +136,7 @@ These artifacts were checked for a meaningful result, not merely a successful re
 | Transcription | `openai/whisper-tiny` | transcribes recorded speech |
 | Generation | Gemma 3, Gemma 4, Llama 3.x, Qwen3 dense GGUF | see below |
 
-`bge-m3` and `BAAI/bge-m3` resolve to the official repository at `main`, whose current supported artifact is ONNX. A pull records the immutable commit it resolved. The historical safetensors checkpoint remains available explicitly as `BAAI/bge-m3:safetensors@84790c1a606f60d06c6932e4ecdd174b466d84ac`; community GGUF conversions also require an explicit repository reference. See [Model Downloads](/docs/guides/model-downloads) for the format qualification and commands. The local embeddings API exposes BGE-M3's normalized 1024-dimensional dense vector; its sparse lexical weights and ColBERT token vectors require separate response contracts and are not exposed by the dense embeddings endpoint.
+`antfly inference pull BAAI/bge-m3` resolves to the official repository at `main`, whose current supported artifact is ONNX. A pull records the immutable commit it resolved. The historical safetensors checkpoint remains available explicitly as `BAAI/bge-m3:safetensors@84790c1a606f60d06c6932e4ecdd174b466d84ac`; community GGUF conversions also require an explicit repository reference. See [Model Downloads](/docs/guides/model-downloads) for the format qualification and commands. The local embeddings API exposes BGE-M3's normalized 1024-dimensional dense vector; its sparse lexical weights and ColBERT token vectors require separate response contracts and are not exposed by the dense embeddings endpoint.
 
 ### Generation Families
 

@@ -12885,3 +12885,50 @@ test "ONNX WordPiece loading and admission use export artifacts with root fallba
         try std.testing.expectEqualSlices(i32, &.{ 2, 5, 3 }, encoded.ids);
     }
 }
+
+test "ONNX export tokenizer format takes precedence over root JSON" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |export_json| {
+        var dir = std.testing.tmpDir(.{});
+        defer dir.cleanup();
+        try dir.dir.createDirPath(io, "onnx");
+        const paths = [_][]const u8{ "onnx/model.onnx", "onnx/config.json", "onnx/vocab.txt", "tokenizer_config.json", "tokenizer.json" };
+        const bodies = [_][]const u8{ "onnx", "{\"model_type\":\"bert\",\"hidden_size\":8}", "[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\nhello\n", "{\"do_lower_case\":true}", "{\"model\":{\"type\":\"WordPiece\",\"unk_token\":\"[UNK]\",\"vocab\":{\"[UNK]\":0,\"hello\":1}}}" };
+        var artifacts: [paths.len + 1]managed_receipt.ArtifactReceipt = undefined;
+        for (paths, bodies, 0..) |path, body, i| {
+            try dir.dir.writeFile(io, .{ .sub_path = path, .data = body });
+            artifacts[i] = .{ .path = path, .size = body.len };
+        }
+        const local_json = "{\"model\":{\"type\":\"WordPiece\",\"unk_token\":\"[UNK]\",\"vocab\":{\"[UNK]\":0,\"hello\":7}}}";
+        // An unreceipted JSON file must not shadow the export vocabulary.
+        try dir.dir.writeFile(io, .{ .sub_path = "onnx/tokenizer.json", .data = if (export_json) local_json else "not a tokenizer" });
+        artifacts[paths.len] = .{ .path = "onnx/tokenizer.json", .size = local_json.len };
+        const receipt = try std.json.Stringify.valueAlloc(a, managed_receipt.DownloadReceipt{
+            .version = 2,
+            .source = .{ .owner = "owner", .name = "model", .variant = "onnx", .selected_format = "onnx" },
+            .artifacts = artifacts[0 .. paths.len + @intFromBool(export_json)],
+        }, .{});
+        defer a.free(receipt);
+        try dir.dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = receipt });
+        const root = try dir.dir.realPathFileAlloc(io, ".", a);
+        defer a.free(root);
+        var man = try manifest_mod.loadFromDir(a, root);
+        defer man.deinit();
+        try std.testing.expectEqual(.huggingface, man.tokenizer_type);
+        var listing = try manifest_mod.loadListingFromDir(a, root);
+        defer listing.deinit();
+        try std.testing.expectEqual(export_json, man.tokenizer_json_path != null);
+        try std.testing.expectEqual(export_json, listing.tokenizer_json_path != null);
+        const expected_plan = if (export_json)
+            try tokenizerAdmissionPlan(local_json.len, .huggingface)
+        else
+            try tokenizerAdmissionPlan(bodies[2].len + bodies[3].len, .wordpiece);
+        try std.testing.expectEqualDeep(expected_plan, try tokenizerLoadAdmissionPlan(a, root, &man, .huggingface));
+        const tok = try loadHuggingFaceTokenizerFromManifest(a, &man);
+        defer tok.deinitSelf();
+        const ids = try tok.tokenizer().encode(a, "hello");
+        defer a.free(ids);
+        try std.testing.expectEqualSlices(i32, if (export_json) &.{7} else &.{5}, ids);
+    }
+}

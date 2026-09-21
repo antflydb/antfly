@@ -30276,6 +30276,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.fromFloat32 = fromFloat32Op;
         vt.fromFloat32Shape = fromFloat32ShapeOp;
         vt.fromInt32Shape = fromInt32ShapeOp;
+        vt.fromConstantBytes = null; // Keep legacy ONNX constants until all integer primitives are supported.
         vt.convertDType = convertDTypeOp;
         vt.cumulativeSum = cumulativeSumOp;
         vt.glinerBoundaryDevice = glinerBoundaryDeviceOp;

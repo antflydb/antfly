@@ -846,6 +846,13 @@ const ArtifactCatalog = struct {
                         var path_buf: [4096]u8 = undefined;
                         const local = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ directory, relative_path }) catch continue;
                         if (receipt.find(local)) |found| return found;
+                        // Select the export's tokenizer before falling back to
+                        // a different format at the repository root. This also
+                        // keeps metadata parsing and admission on that choice.
+                        if (std.mem.eql(u8, relative_path, "tokenizer.json")) {
+                            const vocab = std.fmt.bufPrint(&path_buf, "{s}/vocab.txt", .{directory}) catch continue;
+                            if (receipt.find(vocab) != null) return null;
+                        }
                     }
                 }
             }

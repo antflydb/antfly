@@ -5,8 +5,8 @@ order: 4
 description: Model revisions, artifact formats, dependencies, and reproducible local installs
 ---
 
-`antfly inference pull` accepts a Hugging Face repository or a documented friendly
-alias. Revision and format are independent:
+`antfly inference pull` requires a Hugging Face `owner/model` reference. The
+optional `hf:` prefix is accepted. Revision and format are independent:
 
 ```sh
 antfly inference pull BAAI/bge-m3
@@ -35,12 +35,12 @@ antfly inference pull hf:owner/tree-model@release/v2 --type predictor
 Their selected artifact's size and available SHA-256 or Git blob digest are
 verified before conversion and atomic installation.
 
-Friendly aliases work in pull and inference. `bge-m3` resolves to `BAAI/bge-m3`;
-it does not substitute an older revision or a community conversion. Explicit
-format and revision suffixes also work on aliases, such as `bge-m3:onnx@main`.
-Qualified multi-repository Qwen bundle aliases continue to select their declared
-immutable bundles. Use a canonical repository reference for an ordinary Hub
-snapshot instead of a curated bundle.
+Pull rejects all short aliases, including names with format or revision suffixes.
+Qwen shortcuts such as `qwen3-embedding` and `qwen3-vl-2b` are no longer expanded
+by inference or chat. Legacy BGE and Gemma shortcuts remain available for runtime
+lookup and chat. Explicit canonical Qwen bundle references, such as
+`Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1`, still select their immutable
+multi-repository bundles.
 
 ## Format selection
 

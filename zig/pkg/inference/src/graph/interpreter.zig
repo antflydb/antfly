@@ -2465,6 +2465,7 @@ pub fn executeNode(
         },
 
         .constant => |attrs| {
+            if (n.output_shape.rank() > 8) return error.UnsupportedShape;
             if (state.options.strict_integer_constants) switch (n.output_shape.dtype) {
                 .i32 => {
                     const byte_count = std.math.mul(usize, attrs.data_len, @sizeOf(i32)) catch return error.UnsupportedShape;
@@ -2485,6 +2486,9 @@ pub fn executeNode(
                 .i8, .i16, .i64, .u8, .bool_ => return error.UnsupportedIntegerTensor,
                 else => {},
             };
+            const byte_count = std.math.mul(usize, attrs.data_len, n.output_shape.dtype.byteSize()) catch return error.UnsupportedShape;
+            if (attrs.data_offset > graph.constant_pool.items.len or byte_count > graph.constant_pool.items.len - attrs.data_offset) return error.UnsupportedShape;
+            if (try cb.fromConstantBytes(graph.constant_pool.items[attrs.data_offset..][0..byte_count], n.output_shape.dtype, n.output_shape.dims[0..n.output_shape.rank()])) |tensor| return tensor;
             const constant = try graph.constantDataAsF32(
                 graph.allocator,
                 n.output_shape.dtype,
@@ -2492,15 +2496,12 @@ pub fn executeNode(
                 attrs.data_len,
             );
             defer constant.deinit(graph.allocator);
-            if (n.output_shape.rank() > 1) {
-                var shape_buf: [8]i32 = undefined;
-                const rank = n.output_shape.rank();
-                for (0..rank) |ax| {
-                    shape_buf[ax] = @intCast(n.output_shape.dim(@intCast(ax)));
-                }
-                return cb.fromFloat32Shape(constant.data, shape_buf[0..rank]);
+            var shape_buf: [8]i32 = undefined;
+            const rank = n.output_shape.rank();
+            for (0..rank) |axis| {
+                shape_buf[axis] = std.math.cast(i32, n.output_shape.dim(@intCast(axis))) orelse return error.UnsupportedShape;
             }
-            return cb.fromFloat32(constant.data);
+            return cb.fromFloat32Shape(constant.data, shape_buf[0..rank]);
         },
 
         // ── Fused ops → backend dispatch ──────────────────────────────
@@ -7207,4 +7208,36 @@ test "runtime CumSum preserves exact integers and dtype" {
     defer a.free(exported.payload.bytes);
     try std.testing.expectEqual(.i32, exported.dtype);
     try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]i32{ 16777217, 16777218 }), exported.payload.bytes);
+}
+
+test "runtime CumSum retains vector constant shape and exact native dtype" {
+    const a = std.testing.allocator;
+    inline for (.{ i32, i64, f32 }) |T| {
+        const dtype: ml.graph.DType = if (T == i32) .i32 else if (T == i64) .i64 else .f32;
+        const large: T = if (T == i32) 16777217 else if (T == i64) 9007199254740993 else 1;
+        var g = Graph.init(a);
+        defer g.deinit();
+        var builder = ml.graph.Builder.init(&g);
+        const x = try builder.tensorConstBytes(std.mem.sliceAsBytes(&[_]T{ large, 1 }), Shape.init(dtype, &.{2}));
+        const out = try g.addNode(.{
+            .op = .{ .cumulative_sum = .{ .axis = 0 } },
+            .output_shape = Shape.init(dtype, &.{2}),
+            .inputs = .{ x, null_node, null_node, null_node },
+            .num_inputs = 1,
+        });
+        try g.markOutput(out);
+        var ws = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+        var compute = NativeCompute.init(a, &ws, null);
+        defer compute.deinit();
+        var cb = compute.computeBackend();
+        var result = try execute(a, &g, &cb, .{});
+        defer result.deinit(&cb);
+        const exported = (try cb.exportTensorData(result.outputs[0], a)).?;
+        defer a.free(exported.payload.bytes);
+        try std.testing.expectEqualStrings(@tagName(dtype), @tagName(exported.dtype));
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]T{ large, large + 1 }), exported.payload.bytes);
+        const shape = try cb.tensorShape(result.outputs[0], a);
+        defer a.free(shape);
+        try std.testing.expectEqualSlices(i64, &.{2}, shape);
+    }
 }
