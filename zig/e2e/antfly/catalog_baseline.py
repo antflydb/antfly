@@ -36,6 +36,7 @@ def canonical_report(header, groups, runtimes):
     # Version 1 hashes the complete StoreStatusReport wire schema. The golden
     # end-to-end test checks this independently against the production encoder.
     report = {
+        "relational_topology_protocol_version": 0,
         "store_id": header["store_id"],
         "runtime_reference": False,
         "embedding_activity_protocol_version": 0,

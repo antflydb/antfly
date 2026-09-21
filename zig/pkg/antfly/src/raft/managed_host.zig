@@ -49,6 +49,7 @@ pub const ManagedHostConfig = struct {
 };
 
 pub const ManagedHostDeps = struct {
+    native_snapshot_delegate: ?@import("native_snapshot_delegate.zig").Delegate = null,
     host: host_mod.HostDeps = .{},
     metadata_snapshot_builder: ?state_machine.SnapshotBuilder = null,
     data_snapshot_builder: ?state_machine.SnapshotBuilder = null,
@@ -66,6 +67,7 @@ pub const ManagedHttpHostConfig = struct {
 };
 
 pub const ManagedHttpHostDeps = struct {
+    native_snapshot_delegate: ?@import("native_snapshot_delegate.zig").Delegate = null,
     http: host_mod.HttpHostDeps = .{},
     metadata_snapshot_builder: ?state_machine.SnapshotBuilder = null,
     data_snapshot_builder: ?state_machine.SnapshotBuilder = null,
@@ -161,6 +163,7 @@ pub const ManagedHost = struct {
             deps.data_snapshot_builder,
             deps.read_state_observer,
             deps.data_apply_storage_context,
+            deps.native_snapshot_delegate,
         );
         errdefer prepared_deps.deinit(alloc);
 
@@ -487,6 +490,7 @@ pub const ManagedHttpHost = struct {
             deps.data_snapshot_builder,
             deps.read_state_observer,
             deps.data_apply_storage_context,
+            deps.native_snapshot_delegate,
         );
         errdefer prepared_deps.deinit(alloc);
 
@@ -842,6 +846,12 @@ const DataApplySnapshotBuilder = struct {
         const store: *data_apply_client.RaftApplyStore = @ptrCast(@alignCast(ptr));
         var prepared = (try store.prepareSnapshot(group_id, applied_index)) orelse return null;
         errdefer prepared.deinit();
+        if (prepared.requiresNative()) {
+            const delegate = store.native_snapshot_delegate orelse return error.NativeSnapshotRequired;
+            const capture = try delegate.capture(delegate.ptr, group_id, applied_index);
+            errdefer kernel_owner_abi.antfly_storage_snapshot_capture_destroy(capture);
+            try prepared.attachNative(capture);
+        }
         const source = try std.heap.page_allocator.create(DataApplyPreparedSnapshotSource);
         source.* = .{ .prepared = prepared };
         return source.source();
@@ -849,12 +859,16 @@ const DataApplySnapshotBuilder = struct {
 
     fn installSnapshot(
         ptr: *anyopaque,
-        _: std.mem.Allocator,
+        alloc: std.mem.Allocator,
         group_id: u64,
         commit_index: u64,
         snapshot: []const u8,
     ) !void {
         const store: *data_apply_client.RaftApplyStore = @ptrCast(@alignCast(ptr));
+        if (@import("native_snapshot_delegate.zig").isNative(snapshot)) {
+            const delegate = store.native_snapshot_delegate orelse return error.NativeSnapshotRequired;
+            return delegate.install(delegate.ptr, alloc, store.handle.?, group_id, commit_index, snapshot);
+        }
         try store.installSnapshot(group_id, commit_index, snapshot);
     }
 
@@ -1027,6 +1041,7 @@ fn prepareHostDeps(
     data_snapshot_builder: ?state_machine.SnapshotBuilder,
     read_state_observer: ?state_machine.ReadStateObserver,
     data_apply_storage_context: ?*anyopaque,
+    native_snapshot_delegate: ?@import("native_snapshot_delegate.zig").Delegate,
 ) !PreparedHostDeps {
     var prepared = PreparedHostDeps{ .host = base };
     var effective_metadata_builder = metadata_snapshot_builder;
@@ -1080,6 +1095,7 @@ fn prepareHostDeps(
                     .root_dir = replica_root_dir,
                     .no_sync = replica_apply_store_no_sync,
                     .context = data_apply_storage_context,
+                    .native_source_delegate = prepared.host.runtime_hooks.state_machine != null,
                 })
             else
                 try data_storage.RaftApplyStore.init(alloc, .{
@@ -1087,8 +1103,10 @@ fn prepareHostDeps(
                     .no_sync = replica_apply_store_no_sync,
                     .io = if (backend_runtime) |runtime| runtime.apiIo() else null,
                     .backend_runtime = backend_runtime,
+                    .native_source_delegate = prepared.host.runtime_hooks.state_machine != null,
                 });
             prepared.owned_data_store = owned_store;
+            if (comptime linked_storage) owned_store.native_snapshot_delegate = native_snapshot_delegate;
             effective_data_builder = if (comptime linked_storage)
                 (DataApplySnapshotBuilder{ .store = owned_store }).builder()
             else

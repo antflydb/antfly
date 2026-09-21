@@ -17,6 +17,7 @@ const raft_batch = @import("data/raft_batch.zig");
 const runtime_status = @import("api/runtime_status.zig");
 const indexes = @import("api/indexes.zig");
 const table_writes = @import("antfly_source_root").antfly_sources.table_writes;
+const private_provisioning = @import("data/private_provisioning.zig");
 
 // The auth storage adapter deliberately receives storage through an injected
 // module to avoid a production import cycle. Focused runtime tests expose the
@@ -30,6 +31,7 @@ test {
     _ = runtime_status;
     _ = indexes;
     _ = table_writes;
+    _ = private_provisioning;
 }
 
 /// Implementation source choices for this compilation root.

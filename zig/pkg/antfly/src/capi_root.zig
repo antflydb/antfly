@@ -75,3 +75,5 @@ pub const test_error_logs = @import("test_error_logs.zig");
 
 pub const kernel_runtime_services = @import("storage/kernel_runtime_services.zig");
 pub const memory_budget = @import("storage/memory_budget.zig");
+
+pub const capi_dependencies = @import("capi_dependencies.zig");

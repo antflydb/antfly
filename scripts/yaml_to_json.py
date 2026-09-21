@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+import argparse
+import copy
 import json
 import sys
 from pathlib import Path
@@ -51,13 +53,38 @@ def normalize(value: object) -> None:
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 2:
-        raise SystemExit("usage: yaml_to_json.py <input.yaml> <output.json>")
-
-    input_path = Path(argv[0])
-    output_path = Path(argv[1])
+    parser = argparse.ArgumentParser(description="Convert OpenAPI YAML to JSON")
+    parser.add_argument("input", type=Path)
+    parser.add_argument("output", type=Path)
+    parser.add_argument(
+        "--schema-alias",
+        action="append",
+        default=[],
+        metavar="NAME=/JSON/POINTER",
+        help="Expose an existing inline schema as a named component for type generation",
+    )
+    args = parser.parse_args(argv)
+    input_path = args.input
+    output_path = args.output
     with input_path.open("r", encoding="utf-8") as fh:
         data = yaml.load(fh, Loader=OpenApiLoader)
+    for alias in args.schema_alias:
+        name, separator, pointer = alias.partition("=")
+        if not name or not separator or not pointer.startswith("/"):
+            parser.error(f"invalid schema alias: {alias}")
+        schema = data
+        try:
+            for token in pointer[1:].split("/"):
+                key = token.replace("~1", "/").replace("~0", "~")
+                schema = schema[int(key)] if isinstance(schema, list) else schema[key]
+        except (KeyError, IndexError, TypeError, ValueError):
+            parser.error(f"schema alias target not found: {alias}")
+        if not isinstance(schema, dict):
+            parser.error(f"schema alias target is not an object: {alias}")
+        schemas = data.setdefault("components", {}).setdefault("schemas", {})
+        if name in schemas:
+            parser.error(f"schema alias would replace an existing component: {name}")
+        schemas[name] = copy.deepcopy(schema)
     normalize(data)
     output_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
     return 0

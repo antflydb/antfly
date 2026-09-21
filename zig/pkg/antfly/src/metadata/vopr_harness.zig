@@ -8154,6 +8154,7 @@ pub const VoprPublicClusterFixture = struct {
             },
             .resource_pressure => {
                 try self.saturateNodeMemory();
+                self.resource_pressure_observed = self.allNodeMemorySaturated();
                 _ = self.sim.io().async(runResourcePressure, .{self});
             },
         }
@@ -8732,16 +8733,27 @@ pub const VoprPublicClusterFixture = struct {
     }
 
     fn runResourcePressure(self: *VoprPublicClusterFixture) void {
-        self.resource_pressure_observed = self.allNodeMemorySaturated();
-        if (self.client.fetchBatch(self.api_base_uris[self.client_index], "docs",
+        // Background owners can release bytes after injection. Observe the
+        // actual admission rejection, not exact occupancy at a later tick.
+        var rejections_before: u64 = 0;
+        for (self.resource_managers[0..self.resource_manager_count]) |*manager|
+            rejections_before +|= manager.snapshot().memory.hard_limit_rejections;
+        if (self.client.fetchBatchResponse(self.api_base_uris[self.client_index], "docs",
             \\{"inserts":{"pressure:probe":{"title":"pressure","body":"node-local-resource-pressure"}}}
         )) |response| {
-            var unexpected = response;
-            unexpected.deinit(self.alloc);
+            var denied = response;
+            defer denied.deinit(self.alloc);
+            var rejections_after: u64 = 0;
+            for (self.resource_managers[0..self.resource_manager_count]) |*manager|
+                rejections_after +|= manager.snapshot().memory.hard_limit_rejections;
+            self.resource_denial_sound = self.resource_pressure_observed and
+                denied.status == 503 and rejections_after > rejections_before;
+            if (!self.resource_denial_sound) std.debug.print("resource pressure status={d} body={s} injected={} rejections={d}->{d}\n", .{
+                denied.status, denied.body, self.resource_pressure_observed, rejections_before, rejections_after,
+            });
         } else |err| {
             self.resource_denial_error_code = @intFromError(err);
-            self.resource_denial_sound = self.resource_pressure_observed and
-                (err == error.LeaderUnavailable or err == error.UnexpectedHttpStatus);
+            std.debug.print("resource pressure transport error={s}\n", .{@errorName(err)});
         }
 
         self.releaseNodeMemory();
@@ -11384,7 +11396,7 @@ test "metadata VOPR http cluster serves public lifecycle from a non-host node af
     var query_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.heap.page_allocator, query.body, .{});
     defer query_responses.deinit();
     const query_result = query_responses.value.responses.?[0];
-    try std.testing.expectEqual(@as(i64, 2), query_result.hits.?.total.?.value);
+    try std.testing.expectEqual(@as(u64, 2), query_result.hits.?.total.?.value);
     try std.testing.expectEqual(@as(usize, 0), query_result.hits.?.hits.?.len);
     try std.testing.expect(query_result.profile != null);
     try std.testing.expectEqual(@as(i64, 1), query_result.profile.?.object.get("shards").?.object.get("total").?.integer);

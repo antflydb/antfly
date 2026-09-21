@@ -12,6 +12,71 @@ import (
 	"github.com/antflydb/antfly/go/pkg/sdk/oapi"
 )
 
+func TestRelationalIndexUsesSharedDiscriminatedContract(t *testing.T) {
+	data := []byte(`{"name":"recent","type":"relational","keys":[{"column":"tenant"},{"column":"created_at","direction":"desc","nulls":"last"}]}`)
+	var created CreatedIndex
+	if err := json.Unmarshal(data, &created); err != nil {
+		t.Fatal(err)
+	}
+	value, err := created.AsCreatedRelationalIndex()
+	if err != nil || value.Name != "recent" || len(value.Keys) != 2 || value.Keys[1].Column != "created_at" {
+		t.Fatalf("relational response = %+v, %v", value, err)
+	}
+	if _, err := created.AsCreatedGraphIndex(); err == nil {
+		t.Fatal("relational response accepted as graph")
+	}
+	var request CreateIndexRequest
+	if err := json.Unmarshal([]byte(`{"type":"relational","keys":[{"column":"tenant"},{"column":"created_at","direction":"desc"}]}`), &request); err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := request.AsCreateRelationalIndexRequest()
+	if err != nil || len(decoded.Keys) != 2 || decoded.Type != CreateRelationalIndexRequestTypeRelational {
+		t.Fatalf("relational request = %+v, %v", decoded, err)
+	}
+	if err := json.Unmarshal([]byte(`{"name":"bad","type":"relational","keys":[]}`), &created); err == nil {
+		t.Fatal("accepted empty relational keys")
+	}
+}
+
+func TestRelationalExpressionsAndPartialIndexesUseGeneratedTypes(t *testing.T) {
+	input := []byte(`{"version":1,"storage_mode":"relational","generated_columns":[{"column":"total","expression":{"op":"add","args":[{"op":"column","column":"amount"},{"op":"literal","type":"integer","value":"9007199254740993"}]}}],"relational_indexes":[{"name":"active","keys":[{"column":"total"}],"where":[{"column":"total","op":"gt","value":"9007199254740993"}]}]}`)
+	var schema TableSchema
+	if err := json.Unmarshal(input, &schema); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(encoded), `"9007199254740993"`) != 2 || !strings.Contains(string(encoded), `"where"`) {
+		t.Fatalf("lost exact scalar expressions or partial predicate: %s", encoded)
+	}
+	var expression RelationalScalarExpression
+	if err := json.Unmarshal([]byte(`{"op":"literal","type":"integer","value":null}`), &expression); err != nil {
+		t.Fatal(err)
+	}
+	if expression.Op != RelationalExpressionOp("literal") || expression.Value != nil {
+		t.Fatalf("unexpected typed null literal: %+v", expression)
+	}
+}
+
+func TestComputedIndexAndBooleanCheckGeneratedRoundTrip(t *testing.T) {
+	input := []byte(`{"relational_indexes":[{"name":"computed","keys":[{"column":"tenant"},{"expression":{"op":"add","args":[{"op":"column","column":"id"},{"op":"literal","type":"integer","value":"9007199254740993"}]},"result_type":"integer"}],"include_columns":["id"]}],"checks":[{"name":"positive","expression":{"op":"gt","args":[{"op":"column","column":"id"},{"op":"literal","type":"integer","value":0}]}}]}`)
+	var schema TableSchema
+	if err := json.Unmarshal(input, &schema); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{`"9007199254740993"`, `"result_type":"integer"`, `"op":"gt"`, `"include_columns":["id"]`} {
+		if !strings.Contains(string(encoded), required) {
+			t.Fatalf("lost generated expression contract %s: %s", required, encoded)
+		}
+	}
+}
+
 func TestNewEmbedderConfigSupportsAntfly(t *testing.T) {
 	cfg, err := NewEmbedderConfig(AntflyEmbedderConfig{
 		Model: "antflydb/clipclap",

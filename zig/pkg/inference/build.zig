@@ -1984,7 +1984,35 @@ pub fn build(b: *std.Build) void {
         "decode real silk and hybrid opus fixtures to interleaved pcm",
         "mdct backward produces a bounded sinusoid for a single coefficient",
         "fixed point helpers match the reference definitions",
+        // MP3 low sampling frequencies: the checked-in corpus is what keeps a
+        // 24 kHz or 22.05 kHz file from reaching a band table that has no
+        // entry for it, which used to abort the whole process.
+        "checked-in mp3 conformance corpus passes through zig backend",
+        "checked-in mp3 conformance corpus passes through facade backend selection",
+        "a silent frame keeps its place in the timeline",
+        "a truncated final frame decodes from the reservoir",
+        "a leading vbr tag frame is metadata, not a frame of silence",
+        "low sampling frequency mp3 fixtures decode instead of aborting",
+        "low sampling frequency short scalefactor band tables cover mpeg2 and mpeg2.5",
+        "8 kHz long scalefactor bands are its own table, not the 48 kHz fallback",
+        "every sample rate a frame header can carry has well formed band tables",
+        "side info parsing rejects a sample rate the band tables do not cover",
+        "mpeg2.5 8 kHz decodes with its own long bands, not the 48 kHz fallback",
     };
+    // The curated filters below keep individual tests addressable, but a
+    // filtered run analyzes only what the filter names, which is how whole
+    // codec suites went years without running. This one runs the lot.
+    const audio_module_tests_all = b.addTest(.{
+        .name = "audio-internals-all",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(b.fmt("{s}/lib/audio/audio_module_test_root.zig", .{shared_lib_root})),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    audio_module_tests_all.root_module.link_libc = true;
+    audio_module_test_step.dependOn(&b.addRunArtifact(audio_module_tests_all).step);
+
     for (audio_module_test_filters, 0..) |filter, filter_index| {
         const audio_module_tests = b.addTest(.{
             .name = b.fmt("audio-internal-{d}", .{filter_index}),

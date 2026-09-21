@@ -264,6 +264,66 @@ fn expectValue(store: *Store, key: []const u8, expected: []const u8, revision: u
     try std.testing.expectEqualSlices(u8, expected, value.value.?.secret.bytes);
 }
 
+test "lite secrets embedding host retains live resolver through rotation snapshot and reopen" {
+    const alloc = std.testing.allocator;
+    const Handle = @import("backend.zig").Handle;
+    const resolver = @import("../../common/secrets.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp);
+    defer alloc.free(path);
+    const snapshot_path = try std.fmt.allocPrint(alloc, "{s}.backup.aflite", .{path});
+    defer alloc.free(snapshot_path);
+    var keys = TestProvider{};
+    var reference = (try resolver.SecretValue.initConfig(alloc, "${secret:provider.api_key}")).?;
+    defer reference.deinit(alloc);
+    {
+        var handle = try Handle.create(alloc, path, true);
+        defer handle.deinit();
+        var native_store = try handle.secretStore(alloc, "host-scope", keys.provider());
+        defer native_store.deinit();
+        var facade = try resolver.FileStore.initConfiguredWithIo(alloc, std.testing.io, .{
+            // Embedding hosts supply the native capability directly.
+            .native = .{ .backend = .distributed, .scope = "host-scope", .keyring_path = "host-provider" },
+            .environment = false,
+        });
+        defer facade.deinit();
+        const native_handle = native_store.nativeStore().?;
+        facade.attachNative(native_handle.source, native_handle.writer);
+        for ([_][]const u8{ "initial-host-credential", "rotated-host-credential" }) |expected| {
+            var metadata = try facade.put(alloc, "provider.api_key", expected);
+            defer metadata.deinit(alloc);
+            const actual = (try reference.resolveOwned(alloc, &facade)).?;
+            defer alloc.free(actual);
+            try std.testing.expectEqualStrings(expected, actual);
+        }
+        keys.unavailable = true;
+        try std.testing.expectError(error.Unavailable, reference.resolveOwned(alloc, &facade));
+        keys.unavailable = false;
+        _ = try handle.copyStableSnapshot(snapshot_path, false);
+    }
+    for ([_][]const u8{ path, snapshot_path }) |reopen_path| {
+        var reopened = try Handle.open(alloc, reopen_path, .{ .read_only = true });
+        defer reopened.deinit();
+        var native_store = try reopened.secretStore(alloc, "host-scope", keys.provider());
+        defer native_store.deinit();
+        try std.testing.expect(native_store.nativeStore() == null);
+        var facade = try resolver.FileStore.initConfiguredWithIo(alloc, std.testing.io, .{
+            .native = .{ .backend = .distributed, .scope = "host-scope", .keyring_path = "host-provider" },
+            .environment = false,
+        });
+        defer facade.deinit();
+        facade.attachNative(native_store.source(), null);
+        const actual = (try reference.resolveOwned(alloc, &facade)).?;
+        defer alloc.free(actual);
+        try std.testing.expectEqualStrings("rotated-host-credential", actual);
+        try std.testing.expectError(error.WriteUnavailable, facade.put(alloc, "provider.api_key", "denied"));
+        const raw = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, reopen_path, alloc, .limited(16 * 1024 * 1024));
+        defer alloc.free(raw);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "rotated-host-credential") == null);
+    }
+}
+
 test "lite secrets persist encrypted scoped values alongside documents through vacuum and reopen" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
