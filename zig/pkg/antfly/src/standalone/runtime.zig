@@ -2238,6 +2238,18 @@ const LocalStandaloneMetadata = struct {
         };
     }
 
+    fn bindExtensionMemberTablesLocked(self: *LocalStandaloneMetadata, extension_name: []const u8) !void {
+        for (self.extension_catalog.members.items) |*member| {
+            if (!std.mem.eql(u8, member.extension_name, extension_name)) continue;
+            const name = if (member.table_name.len != 0) member.table_name else if (member.scope.kind == .table) member.scope.table_name else continue;
+            if (self.findTableByNameLocked(name) != null) continue;
+            const table = (try self.resolveSystemCatalogLocked(try system_catalog.Target.literal(name))) orelse return error.TableNotFound;
+            const owned = try self.alloc.dupe(u8, table.name);
+            if (member.table_name.len > 0) self.alloc.free(member.table_name);
+            member.table_name = owned;
+        }
+    }
+
     fn installExtension(ptr: *anyopaque, alloc: std.mem.Allocator, extension_name: []const u8, req: antfly.extensions.InstallExtensionRequest) !antfly.extensions.InstalledExtension {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         lockAtomic(&self.mutex);
@@ -2257,6 +2269,7 @@ const LocalStandaloneMetadata = struct {
         try mutation.extensions(self);
         var installed = try self.extension_catalog.installManifestOnly(extension_name, extension_name, persisted_req, installed_at_ms);
         defer installed.deinitOwned(self.alloc);
+        try self.bindExtensionMemberTablesLocked(extension_name);
         self.epoch +|= 1;
         try mutation.commit(self);
         return try self.extension_catalog.getInstalledAlloc(alloc, extension_name);
@@ -2280,6 +2293,7 @@ const LocalStandaloneMetadata = struct {
         try mutation.extensions(self);
         var installed = try self.extension_catalog.updateManifestOnly(extension_name, persisted_req);
         defer installed.deinitOwned(self.alloc);
+        try self.bindExtensionMemberTablesLocked(extension_name);
         self.epoch +|= 1;
         try mutation.commit(self);
         return try self.extension_catalog.getInstalledAlloc(alloc, extension_name);
