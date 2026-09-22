@@ -89,6 +89,11 @@ pub const document_extraction_unit_spool_kind: u8 = 0x41;
 /// These attempts and their registry must stay outside document ranges: shard
 /// transfer must not copy temporary rows without their recovery metadata.
 pub const shared_pdf_consumer_kind: u8 = 0x42;
+/// Companion row of a resolution artifact recording the entity keys its
+/// canonical mentions last promoted (local id -> doc ref). The promoter
+/// diffs it on replay so a re-keyed mention tombstones the previously
+/// promoted document with a merged_into redirect instead of orphaning it.
+pub const promoted_keys_state_kind: u8 = 0x44;
 /// Store-wide index of outstanding shared-PDF attempts. Recovery is independent
 /// of document existence and the current enrichment configuration.
 pub const shared_pdf_consumer_attempt_prefix = [_]u8{ replay_namespace, 0xff, 0x43 };
