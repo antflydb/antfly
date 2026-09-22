@@ -24,6 +24,7 @@ const builtin = @import("builtin");
 const managed_receipt = @import("managed_receipt.zig");
 const qwen3vl_catalog = @import("qwen3vl_catalog.zig");
 const qwen3_embedding_catalog = @import("qwen3_embedding_catalog.zig");
+const artifact_dependencies = @import("artifact_dependencies.zig");
 const qwen3_reranker_catalog = @import("qwen3_reranker_catalog.zig");
 
 pub const default_max_artifact_bytes: u64 = 64 * 1024 * 1024 * 1024;
@@ -34,9 +35,8 @@ pub const HubConfig = struct {
     token: ?[]const u8 = null,
     /// Base URL for the Hub API.
     base_url: []const u8 = "https://huggingface.co",
-    /// Hub commit used for metadata and artifact requests. Public callers
-    /// normally leave this at `main`; revision-qualified model variants replace
-    /// it with a validated immutable commit before any request.
+    /// Requested Hub branch, tag or commit (main by default). Metadata resolves
+    /// this once; all files in a pull then use the returned immutable commit.
     revision: []const u8 = "main",
     /// Maximum bytes accepted for one downloaded model artifact.
     ///
@@ -71,27 +71,48 @@ const VariantRevision = struct {
     revision: ?[]const u8,
 };
 
-fn hubRevisionIsSafe(revision: []const u8) bool {
-    return std.mem.eql(u8, revision, "main") or isSha1Hex(revision);
+pub fn hubRevisionIsSafe(revision: []const u8) bool {
+    if (revision.len == 0 or revision.len > 256) return false;
+    var parts = std.mem.splitScalar(u8, revision, '/');
+    while (parts.next()) |part| {
+        if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return false;
+        for (part) |c| {
+            if (!std.ascii.isAlphanumeric(c) and c != '-' and c != '_' and c != '.') return false;
+        }
+    }
+    return true;
 }
 
-/// Split `<variant>@<commit>` while deliberately accepting only immutable
-/// 40-hex Hub commits. Branch and tag names are moving inputs and must not be
-/// used as managed-cache identities.
-fn parseVariantRevision(variant: []const u8) !VariantRevision {
+fn encodeHubPathAlloc(allocator: std.mem.Allocator, path: []const u8, preserve_slashes: bool) ![]u8 {
+    var result: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer result.deinit(allocator);
+    const hex = "0123456789ABCDEF";
+    for (path) |c| {
+        if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~' or (preserve_slashes and c == '/')) {
+            try result.append(allocator, c);
+        } else {
+            try result.appendSlice(allocator, &.{ '%', hex[c >> 4], hex[c & 15] });
+        }
+    }
+    return result.toOwnedSlice(allocator);
+}
+
+/// Split the requested format and revision. Moving refs are resolved once by
+/// the metadata request; all artifact requests then use its immutable commit.
+pub fn parseVariantRevision(variant: []const u8) !VariantRevision {
     const at = std.mem.indexOfScalar(u8, variant, '@') orelse return .{
         .variant = variant,
         .revision = null,
     };
-    if (at == 0 or at + 1 >= variant.len or
+    if (at + 1 >= variant.len or
         std.mem.indexOfScalar(u8, variant[at + 1 ..], '@') != null)
     {
         return error.InvalidHubRevision;
     }
     const revision = variant[at + 1 ..];
-    if (!isSha1Hex(revision)) return error.InvalidHubRevision;
+    if (!hubRevisionIsSafe(revision)) return error.InvalidHubRevision;
     return .{
-        .variant = variant[0..at],
+        .variant = if (at == 0) "auto" else variant[0..at],
         .revision = revision,
     };
 }
@@ -106,10 +127,6 @@ fn downloadConfigForVariant(config: HubConfig, variant_revision: VariantRevision
             return error.InvalidHubRevision;
         }
         effective.revision = revision;
-    } else if (!std.mem.eql(u8, config.revision, "main")) {
-        // Managed receipts identify their source through the complete variant.
-        // Never permit a non-main download whose receipt would omit revision.
-        return error.InvalidHubRevision;
     }
     return effective;
 }
@@ -122,11 +139,11 @@ fn modelFileUrlAlloc(
     filename: []const u8,
 ) ![]u8 {
     if (!hubRevisionIsSafe(config.revision)) return error.InvalidHubRevision;
-    return std.fmt.allocPrint(
-        allocator,
-        "{s}/{s}/{s}/resolve/{s}/{s}",
-        .{ config.base_url, owner, name, config.revision, filename },
-    );
+    const revision = try encodeHubPathAlloc(allocator, config.revision, false);
+    defer allocator.free(revision);
+    const encoded_filename = try encodeHubPathAlloc(allocator, filename, true);
+    defer allocator.free(encoded_filename);
+    return std.fmt.allocPrint(allocator, "{s}/{s}/{s}/resolve/{s}/{s}", .{ config.base_url, owner, name, revision, encoded_filename });
 }
 
 pub const ManagedDownloadState = enum {
@@ -209,6 +226,7 @@ const always_files = [_][]const u8{
     "tokenizer_config.json",
     "special_tokens_map.json",
     "tokenizer.model", // SentencePiece fallback
+    "sentencepiece.bpe.model",
     "vocab.txt",
     "vocab.json",
     "merges.txt",
@@ -422,6 +440,13 @@ pub fn noModelFilesAdviceAlloc(
         try out.appendSlice(alloc, " This repo appears to publish framework weights only, such as PyTorch, TensorFlow, or Flax files.");
     }
     try out.append(alloc, '\n');
+    try out.appendSlice(alloc, "Available formats:");
+    if (summary.has_gguf) try out.appendSlice(alloc, " gguf");
+    if (summary.has_safetensors) try out.appendSlice(alloc, " safetensors");
+    if (summary.has_onnx) try out.appendSlice(alloc, " onnx");
+    if (summary.has_framework_weights) try out.appendSlice(alloc, " framework weights (explicit conversion required)");
+    if (!summary.hasCompatiblePayload() and !summary.has_framework_weights) try out.appendSlice(alloc, " none recognized");
+    try out.appendSlice(alloc, ". Format availability does not guarantee runtime architecture support.\n");
 
     if (isOpenAiClipRef(owner, name)) {
         try out.appendSlice(alloc, "For v0.2 CLIP/CLAP embeddings, use:\n");
@@ -888,67 +913,15 @@ fn splitDirAndBase(path: []const u8) struct { dir: []const u8, base: []const u8 
     return .{ .dir = "", .base = path };
 }
 
-fn allDigits(value: []const u8) bool {
-    if (value.len == 0) return false;
-    for (value) |ch| {
-        if (!std.ascii.isDigit(ch)) return false;
-    }
-    return true;
-}
-
-fn isSafetensorsShardForIndex(index_name: []const u8, candidate_name: []const u8) bool {
-    const index_parts = splitDirAndBase(index_name);
-    const candidate_parts = splitDirAndBase(candidate_name);
-    if (!std.mem.eql(u8, index_parts.dir, candidate_parts.dir)) return false;
-
-    const index_suffix = ".safetensors.index.json";
-    if (!std.mem.endsWith(u8, index_parts.base, index_suffix)) return false;
-    const stem = index_parts.base[0 .. index_parts.base.len - index_suffix.len];
-
-    const shard_suffix = ".safetensors";
-    if (!std.mem.endsWith(u8, candidate_parts.base, shard_suffix)) return false;
-    const shard_stem = candidate_parts.base[0 .. candidate_parts.base.len - shard_suffix.len];
-
-    const prefix_len = stem.len + 1;
-    if (shard_stem.len <= prefix_len) return false;
-    if (!std.mem.startsWith(u8, shard_stem, stem) or shard_stem[stem.len] != '-') return false;
-
-    const shard_numbers = shard_stem[prefix_len..];
-    const of_marker = "-of-";
-    const of_index = std.mem.indexOf(u8, shard_numbers, of_marker) orelse return false;
-    if (std.mem.indexOfPos(u8, shard_numbers, of_index + of_marker.len, of_marker) != null) return false;
-
-    const shard_number = shard_numbers[0..of_index];
-    const shard_total = shard_numbers[of_index + of_marker.len ..];
-    return allDigits(shard_number) and allDigits(shard_total);
-}
-
 fn appendSafetensorsIndexAndShards(
     allocator: std.mem.Allocator,
     to_download: *std.ArrayListUnmanaged(HubFile),
     files: []const HubFile,
     index_name: []const u8,
 ) !bool {
-    var index_file: ?HubFile = null;
-    var shard_count: usize = 0;
-
-    for (files) |file| {
-        if (std.mem.eql(u8, file.name, index_name)) {
-            index_file = file;
-        } else if (isSafetensorsShardForIndex(index_name, file.name)) {
-            shard_count += 1;
-        }
-    }
-
-    if (index_file == null or shard_count == 0) return false;
-
-    try to_download.append(allocator, index_file.?);
-    for (files) |file| {
-        if (isSafetensorsShardForIndex(index_name, file.name)) {
-            try to_download.append(allocator, file);
-        }
-    }
-    return true;
+    // The index is authoritative, including nonstandard shard names. Expand
+    // its weight_map only after fetching it from the resolved snapshot.
+    return appendMatchingFileIfMissing(allocator, to_download, files, index_name);
 }
 
 fn appendPreferredSafetensorsPayload(
@@ -1871,21 +1844,18 @@ pub fn downloadModel(
     }
     const variant_revision = try parseVariantRevision(variant);
     const payload_variant = variant_revision.variant;
-    const effective_config = try downloadConfigForVariant(config, variant_revision);
+    var effective_config = try downloadConfigForVariant(config, variant_revision);
+    const requested_revision = effective_config.revision;
 
     // Create destination directory (pure Zig, cross-platform)
     try std.Io.Dir.cwd().createDirPath(io, dest_dir);
 
     // List model files from Hub API
-    const files = try listModelFiles(allocator, io, owner, name, effective_config);
-    defer {
-        for (files) |f| {
-            allocator.free(f.name);
-            if (f.sha256) |sum| allocator.free(sum);
-            if (f.git_blob_sha1) |sum| allocator.free(sum);
-        }
-        allocator.free(files);
-    }
+    var snapshot = try resolveModelSnapshot(allocator, io, owner, name, effective_config);
+    defer snapshot.deinit(allocator);
+    const files = snapshot.files;
+    effective_config.revision = snapshot.commit;
+    std.debug.print("Resolved {s}/{s}@{s} to {s}\n", .{ owner, name, requested_revision, snapshot.commit });
 
     // Determine which files to download
     var to_download = std.ArrayListUnmanaged(HubFile).empty;
@@ -1923,8 +1893,15 @@ pub fn downloadModel(
     // that ships several speaker models) is fetched verbatim.
     const want_named_onnx = std.mem.endsWith(u8, payload_variant, ".onnx") and
         std.mem.indexOfScalar(u8, payload_variant, '/') == null;
-    // Auto-detect: no specific format requested — grab everything available.
-    const auto_detect = !want_gguf and !want_onnx and !want_safetensors and !want_hybrid and !want_mmproj and !want_named_onnx;
+    // Prefer one complete native artifact set, then ONNX. Explicit hybrid is
+    // the opt-in to fetching more than one format.
+    // `native` predates format-specific selection and was accepted as auto.
+    // Keep that exact compatibility alias; it is not an artifact format or
+    // an execution-backend requirement. Unknown variants remain errors.
+    const auto_detect = std.mem.eql(u8, payload_variant, "auto") or
+        std.mem.eql(u8, payload_variant, "native");
+    if (!auto_detect and !want_gguf and !want_onnx and !want_safetensors and !want_hybrid and !want_mmproj and !want_named_onnx)
+        return error.InvalidModelVariant;
 
     if (want_named_onnx) {
         if (try appendMatchingFile(allocator, &to_download, files, payload_variant)) {
@@ -1956,8 +1933,14 @@ pub fn downloadModel(
             found_model_payload = true;
     }
 
+    // SafeTensors
+    if (want_safetensors or want_hybrid or (auto_detect and !found_model_payload)) {
+        if (try appendPreferredSafetensorsPayload(allocator, &to_download, files))
+            found_model_payload = true;
+    }
+
     // ONNX
-    if (want_onnx or want_hybrid or auto_detect) {
+    if (want_onnx or want_hybrid or (auto_detect and !found_model_payload)) {
         if (std.mem.eql(u8, payload_variant, "i8")) {
             if (try appendFirstMatchingFile(allocator, &to_download, files, &[_][]const u8{ "model_i8.onnx", "model_quantized.onnx", "onnx/model_quantized.onnx" }))
                 found_model_payload = true;
@@ -1978,15 +1961,6 @@ pub fn downloadModel(
         }
     }
 
-    // SafeTensors
-    if (want_safetensors or want_hybrid or auto_detect or
-        // Legacy: "onnx"/"f32" falls back to safetensors when no ONNX found
-        (want_onnx and !found_model_payload))
-    {
-        if (try appendPreferredSafetensorsPayload(allocator, &to_download, files))
-            found_model_payload = true;
-    }
-
     if (!found_model_payload) {
         const advice = noModelFilesAdviceAlloc(allocator, owner, name, variant, files) catch null;
         if (advice) |message| {
@@ -1995,6 +1969,8 @@ pub fn downloadModel(
         }
         return error.NoModelFilesFound;
     }
+
+    try expandArtifactDependencies(allocator, io, owner, name, files, &to_download, dest_dir, effective_config);
 
     var resolved = std.ArrayListUnmanaged(ResolvedArtifact).empty;
     defer resolved.deinit(allocator);
@@ -2109,7 +2085,7 @@ pub fn downloadModel(
         allocator,
         ManagedDownloadReceipt{
             .version = 2,
-            .source = .{ .owner = owner, .name = name, .variant = variant },
+            .source = .{ .owner = owner, .name = name, .variant = variant, .requested_revision = requested_revision, .resolved_revision = snapshot.commit, .selected_format = selectedFormat(to_download.items) },
             .artifacts = receipts.items,
         },
         .{},
@@ -2124,6 +2100,67 @@ pub fn downloadModel(
     const plan_path = try managedPath(allocator, dest_dir, managed_download_plan_filename);
     defer allocator.free(plan_path);
     try writeFileAtomically(allocator, io, plan_path, receipt_json);
+}
+
+fn selectedFormat(files: []const HubFile) []const u8 {
+    const summary = summarizePayloadSupport(files);
+    if (summary.has_onnx and (summary.has_gguf or summary.has_safetensors)) return "hybrid";
+    if (summary.has_gguf) return "gguf";
+    if (summary.has_safetensors) return "safetensors";
+    return "onnx";
+}
+
+fn expandArtifactDependencies(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    owner: []const u8,
+    name: []const u8,
+    files: []const HubFile,
+    selected: *std.ArrayListUnmanaged(HubFile),
+    dest_dir: []const u8,
+    config: HubConfig,
+) !void {
+    var descriptor_bytes: u64 = 0;
+    var index: usize = 0;
+    while (index < selected.items.len) : (index += 1) {
+        const file = selected.items[index];
+        const is_index = std.mem.endsWith(u8, file.name, ".safetensors.index.json");
+        const is_onnx = std.mem.endsWith(u8, file.name, ".onnx");
+        if (!is_index and !is_onnx) continue;
+        var descriptor_config = config;
+        descriptor_config.max_artifact_bytes = @min(config.max_artifact_bytes, config.max_model_bytes - descriptor_bytes);
+        if (descriptor_config.max_artifact_bytes == 0) return error.ModelSizeLimitExceeded;
+        _ = try downloadFile(allocator, io, owner, name, file.name, dest_dir, descriptor_config, .{}, 0, 1, file.size, file.sha256, file.git_blob_sha1);
+        const path = try std.fs.path.join(allocator, &.{ dest_dir, file.name });
+        defer allocator.free(path);
+        descriptor_bytes = try addKnownModelBytes(descriptor_bytes, try requiredFileSize(std.Io.Dir.cwd(), io, path), config.max_model_bytes);
+        var mapped = try @import("../util/c_file.zig").MmapRegion.initLimited(allocator, path, @intCast(config.max_artifact_bytes));
+        defer mapped.deinit();
+        var dependencies = if (is_index)
+            try artifact_dependencies.safetensors(allocator, file.name, mapped.data)
+        else
+            try artifact_dependencies.onnx(allocator, file.name, mapped.data);
+        defer dependencies.deinit();
+        var paths = dependencies.items.keyIterator();
+        while (paths.next()) |dependency| {
+            if (!hasFile(files, dependency.*)) {
+                std.debug.print("Missing artifact {s}, referenced by {s}\n", .{ dependency.*, file.name });
+                return error.MissingModelArtifact;
+            }
+            _ = try appendMatchingFileIfMissing(allocator, selected, files, dependency.*);
+        }
+        // Keep the export's own metadata and tokenizer alongside its graph.
+        // Managed readers prefer these over repository-root metadata.
+        if (is_onnx) {
+            if (std.fs.path.dirname(file.name)) |directory| {
+                for (always_files) |sidecar| {
+                    const candidate = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ directory, sidecar });
+                    defer allocator.free(candidate);
+                    _ = try appendMatchingFileIfMissing(allocator, selected, files, candidate);
+                }
+            }
+        }
+    }
 }
 
 fn probeDownloadSize(
@@ -2218,14 +2255,41 @@ fn existingFinalFileProgressSize(
     return total_bytes;
 }
 
-/// List all files in a HuggingFace model repo.
-pub fn listModelFiles(
+pub const ModelSnapshot = struct {
+    commit: []u8,
+    files: []HubFile,
+
+    pub fn deinit(self: *ModelSnapshot, allocator: std.mem.Allocator) void {
+        allocator.free(self.commit);
+        freeHubFiles(allocator, self.files);
+    }
+};
+
+fn freeHubFiles(allocator: std.mem.Allocator, files: []HubFile) void {
+    for (files) |file| {
+        allocator.free(file.name);
+        if (file.sha256) |sum| allocator.free(sum);
+        if (file.git_blob_sha1) |sum| allocator.free(sum);
+    }
+    allocator.free(files);
+}
+
+/// For discovery only. Downloads must retain resolveModelSnapshot().commit
+/// and use it for every artifact request from the returned file list.
+pub fn listModelFiles(allocator: std.mem.Allocator, io: std.Io, owner: []const u8, name: []const u8, config: HubConfig) ![]HubFile {
+    const snapshot = try resolveModelSnapshot(allocator, io, owner, name, config);
+    allocator.free(snapshot.commit);
+    return snapshot.files;
+}
+
+/// Resolve one metadata snapshot, including the immutable commit and files.
+pub fn resolveModelSnapshot(
     allocator: std.mem.Allocator,
     io: std.Io,
     owner: []const u8,
     name: []const u8,
     config: HubConfig,
-) ![]HubFile {
+) !ModelSnapshot {
     if (!hubRevisionIsSafe(config.revision)) return error.InvalidHubRevision;
     // `blobs=true` is required for artifact sizes and content digests. Without it,
     // Hugging Face returns only filenames and every completed managed pull must be
@@ -2274,7 +2338,15 @@ pub fn listModelFiles(
 
     const body = resp.body orelse return error.EmptyResponse;
 
-    return parseHubFiles(allocator, body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidResponse;
+    const sha = parsed.value.object.get("sha") orelse return error.MissingHubCommit;
+    if (sha != .string or !isSha1Hex(sha.string)) return error.InvalidHubRevision;
+    if (isSha1Hex(config.revision) and !std.ascii.eqlIgnoreCase(config.revision, sha.string)) return error.HubRevisionMismatch;
+    const commit = try allocator.dupe(u8, sha.string);
+    errdefer allocator.free(commit);
+    return .{ .commit = commit, .files = try parseHubFiles(allocator, body) };
 }
 
 fn modelInfoUrlAlloc(
@@ -2288,10 +2360,12 @@ fn modelInfoUrlAlloc(
     if (std.mem.eql(u8, revision, "main")) {
         return std.fmt.allocPrint(allocator, "{s}/api/models/{s}/{s}?blobs=true", .{ base_url, owner, name });
     }
+    const encoded_revision = try encodeHubPathAlloc(allocator, revision, false);
+    defer allocator.free(encoded_revision);
     return std.fmt.allocPrint(
         allocator,
         "{s}/api/models/{s}/{s}/revision/{s}?blobs=true",
-        .{ base_url, owner, name, revision },
+        .{ base_url, owner, name, encoded_revision },
     );
 }
 
@@ -2758,7 +2832,7 @@ fn downloadFile(
         io,
         owner,
         name,
-        "main",
+        config.revision,
         filename,
         dest_dir,
         config,
@@ -2788,9 +2862,8 @@ fn downloadFileAtRevision(
     expected_git_blob_sha1: ?[]const u8,
 ) !bool {
     if (!managed_receipt.artifactPathIsSafe(filename)) return error.InvalidModelArtifactPath;
+    if (!hubRevisionIsSafe(revision)) return error.InvalidHubRevision;
     const deadline = try DownloadDeadline.init(io, config.artifact_timeout_ms);
-    if ((!std.mem.eql(u8, revision, "main") and !isSha1Hex(revision)) or
-        std.mem.indexOfAny(u8, revision, "/\\") != null) return error.InvalidHubRevision;
     const max_response_size = try downloadResponseLimit(config);
     if (total_bytes) |total| {
         if (total > config.max_artifact_bytes) return error.DownloadSizeLimitExceeded;
@@ -2821,7 +2894,9 @@ fn downloadFileAtRevision(
         n_headers += 1;
     }
 
-    const url = try std.fmt.allocPrint(allocator, "{s}/{s}/{s}/resolve/{s}/{s}", .{ config.base_url, owner, name, revision, filename });
+    var revision_config = config;
+    revision_config.revision = revision;
+    const url = try modelFileUrlAlloc(allocator, revision_config, owner, name, filename);
     defer allocator.free(url);
 
     // Create parent dirs if filename has slashes (e.g., "onnx/model.onnx")
@@ -3580,68 +3655,19 @@ test "gguf selection can skip projector sidecar" {
     try std.testing.expectEqualStrings("gemma-4-E4B-it-Q4_K_M.gguf", to_download.items[0].name);
 }
 
-test "safetensors selection prefers model index and matching shards" {
+test "safetensors selection defers shard names to the index" {
     const allocator = std.testing.allocator;
-
     const files = [_]HubFile{
         .{ .name = "model.safetensors" },
         .{ .name = "model.safetensors.index.json" },
-        .{ .name = "model-00001-of-00002.safetensors" },
-        .{ .name = "model-00002-of-00002.safetensors" },
-        .{ .name = "pytorch_model-00001-of-00002.safetensors" },
-        .{ .name = "nested/model-00001-of-00002.safetensors" },
+        .{ .name = "custom.safetensors" },
+        .{ .name = "model-00001-of-00001.safetensors" },
     };
-
-    var to_download = std.ArrayListUnmanaged(HubFile).empty;
-    defer to_download.deinit(allocator);
-
-    try std.testing.expect(try appendPreferredSafetensorsPayload(allocator, &to_download, &files));
-
-    try std.testing.expectEqual(@as(usize, 3), to_download.items.len);
-    try std.testing.expectEqualStrings("model.safetensors.index.json", to_download.items[0].name);
-    try std.testing.expectEqualStrings("model-00001-of-00002.safetensors", to_download.items[1].name);
-    try std.testing.expectEqualStrings("model-00002-of-00002.safetensors", to_download.items[2].name);
-}
-
-test "safetensors selection includes pytorch index and shards" {
-    const allocator = std.testing.allocator;
-
-    const files = [_]HubFile{
-        .{ .name = "pytorch_model.safetensors.index.json" },
-        .{ .name = "pytorch_model-00001-of-00003.safetensors" },
-        .{ .name = "pytorch_model-00002-of-00003.safetensors" },
-        .{ .name = "pytorch_model-00003-of-00003.safetensors" },
-        .{ .name = "pytorch_model-final-of-00003.safetensors" },
-    };
-
-    var to_download = std.ArrayListUnmanaged(HubFile).empty;
-    defer to_download.deinit(allocator);
-
-    try std.testing.expect(try appendPreferredSafetensorsPayload(allocator, &to_download, &files));
-
-    try std.testing.expectEqual(@as(usize, 4), to_download.items.len);
-    try std.testing.expectEqualStrings("pytorch_model.safetensors.index.json", to_download.items[0].name);
-    try std.testing.expectEqualStrings("pytorch_model-00001-of-00003.safetensors", to_download.items[1].name);
-    try std.testing.expectEqualStrings("pytorch_model-00002-of-00003.safetensors", to_download.items[2].name);
-    try std.testing.expectEqualStrings("pytorch_model-00003-of-00003.safetensors", to_download.items[3].name);
-}
-
-test "safetensors selection falls back to single file without usable index" {
-    const allocator = std.testing.allocator;
-
-    const files = [_]HubFile{
-        .{ .name = "model.safetensors.index.json" },
-        .{ .name = "model.safetensors" },
-        .{ .name = "pytorch_model.safetensors" },
-    };
-
-    var to_download = std.ArrayListUnmanaged(HubFile).empty;
-    defer to_download.deinit(allocator);
-
-    try std.testing.expect(try appendPreferredSafetensorsPayload(allocator, &to_download, &files));
-
-    try std.testing.expectEqual(@as(usize, 1), to_download.items.len);
-    try std.testing.expectEqualStrings("model.safetensors", to_download.items[0].name);
+    var selected: std.ArrayListUnmanaged(HubFile) = .empty;
+    defer selected.deinit(allocator);
+    try std.testing.expect(try appendPreferredSafetensorsPayload(allocator, &selected, &files));
+    try std.testing.expectEqual(@as(usize, 1), selected.items.len);
+    try std.testing.expectEqualStrings("model.safetensors.index.json", selected.items[0].name);
 }
 
 test "adapter artifact selection includes jina task adapter sidecars" {
@@ -3762,7 +3788,7 @@ test "immutable Hub revision qualifies metadata and artifact URLs" {
     );
 }
 
-test "revision-qualified variants require immutable commit hashes" {
+test "revision-qualified variants accept branches tags and immutable commits" {
     const revision = "84790c1a606f60d06c6932e4ecdd174b466d84ac";
     const pinned = try parseVariantRevision("safetensors@" ++ revision);
     try std.testing.expectEqualStrings("safetensors", pinned.variant);
@@ -3772,16 +3798,18 @@ test "revision-qualified variants require immutable commit hashes" {
     try std.testing.expectEqualStrings("gguf:Q4_K_M", unpinned.variant);
     try std.testing.expect(unpinned.revision == null);
 
-    try std.testing.expectError(error.InvalidHubRevision, parseVariantRevision("safetensors@main"));
+    try std.testing.expectEqualStrings("main", (try parseVariantRevision("safetensors@main")).revision.?);
+    try std.testing.expectEqualStrings("feature/export", (try parseVariantRevision("onnx@feature/export")).revision.?);
+    try std.testing.expectEqualStrings("auto", (try parseVariantRevision("@v1.0")).variant);
+    const url = try modelInfoUrlAlloc(std.testing.allocator, "https://huggingface.co", "owner", "name", "feature/export");
+    defer std.testing.allocator.free(url);
+    try std.testing.expect(std.mem.indexOf(u8, url, "feature%2Fexport") != null);
     try std.testing.expectError(error.InvalidHubRevision, parseVariantRevision("safetensors@../../main"));
     try std.testing.expectError(error.InvalidHubRevision, parseVariantRevision("safetensors@"));
 
     const effective = try downloadConfigForVariant(.{}, pinned);
     try std.testing.expectEqualStrings(revision, effective.revision);
-    try std.testing.expectError(
-        error.InvalidHubRevision,
-        downloadConfigForVariant(.{ .revision = revision }, unpinned),
-    );
+    try std.testing.expectEqualStrings(revision, (try downloadConfigForVariant(.{ .revision = revision }, unpinned)).revision);
     try std.testing.expectError(
         error.InvalidHubRevision,
         downloadConfigForVariant(.{ .revision = "0123456789abcdef0123456789abcdef01234567" }, pinned),
@@ -4548,6 +4576,58 @@ test "offset file writer enforces the final artifact size across resumed writes"
     try std.testing.expectEqual(@as(u64, 5), writer.offset);
 }
 
+test "downloadFile fetches bytes from the configured immutable revision" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const revision = "84790c1a606f60d06c6932e4ecdd174b466d84ac";
+    const payload = "pinned tokenizer configuration";
+    const script =
+        \\import sys
+        \\from http.server import BaseHTTPRequestHandler, HTTPServer
+        \\class Handler(BaseHTTPRequestHandler):
+        \\    def respond(self, send_body):
+        \\        pinned = '/resolve/84790c1a606f60d06c6932e4ecdd174b466d84ac/' in self.path
+        \\        body = b'pinned tokenizer configuration' if pinned else b'main'
+        \\        self.send_response(200)
+        \\        self.send_header('Content-Length', str(len(body)))
+        \\        self.end_headers()
+        \\        if send_body: self.wfile.write(body)
+        \\    def do_HEAD(self): self.respond(False)
+        \\    def do_GET(self): self.respond(True)
+        \\    def log_message(self, *args): pass
+        \\HTTPServer(('127.0.0.1', int(sys.argv[1])), Handler).serve_forever()
+    ;
+    try tmp.dir.writeFile(io, .{ .sub_path = "server.py", .data = script });
+    const port = try reserveEphemeralPort(io);
+    var port_buf: [16]u8 = undefined;
+    const port_arg = try std.fmt.bufPrint(&port_buf, "{d}", .{port});
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "python3", "server.py", port_arg },
+        .cwd = .{ .dir = tmp.dir },
+        .stdin = .ignore,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    });
+    defer child.kill(io);
+    try io.sleep(std.Io.Duration.fromMilliseconds(200), .awake);
+    const dest_dir = try testTmpPath(allocator, tmp, "downloads");
+    defer allocator.free(dest_dir);
+    try std.Io.Dir.cwd().createDirPath(io, dest_dir);
+    const base_url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{port});
+    defer allocator.free(base_url);
+    _ = try downloadFile(allocator, io, "BAAI", "bge-m3", "tokenizer_config.json", dest_dir, .{
+        .base_url = base_url,
+        .revision = revision,
+    }, .{}, 0, 1, payload.len, null, null);
+    const final_path = try std.fs.path.join(allocator, &.{ dest_dir, "tokenizer_config.json" });
+    defer allocator.free(final_path);
+    const actual = try std.Io.Dir.cwd().readFileAlloc(io, final_path, allocator, .limited(1024));
+    defer allocator.free(actual);
+    try std.testing.expectEqualStrings(payload, actual);
+}
+
 test "downloadFile resumes from partial file with 206 response" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -4969,4 +5049,87 @@ test "downloadFile deletes partial file on checksum mismatch" {
     const part_path = try std.fs.path.join(allocator, &.{ dest_dir, "tokenizer.json.part" });
     defer allocator.free(part_path);
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openFile(io, part_path, .{}));
+}
+
+fn exerciseHubSnapshot(mode: []const u8, variant: []const u8, expected_format: ?[]const u8, expected_error: ?anyerror) !void {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "server.py", .data = @embedFile("testdata/hub_snapshot_server.py") });
+    const port = try reserveEphemeralPort(io);
+    var port_buf: [16]u8 = undefined;
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "python3", "server.py", try std.fmt.bufPrint(&port_buf, "{d}", .{port}), mode },
+        .cwd = .{ .dir = tmp.dir },
+        .stdin = .ignore,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    });
+    defer child.kill(io);
+    try io.sleep(std.Io.Duration.fromMilliseconds(200), .awake);
+    const dest = try testTmpPath(allocator, tmp, "downloads");
+    defer allocator.free(dest);
+    const base_url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{port});
+    defer allocator.free(base_url);
+    try beginManagedDownload(allocator, io, dest);
+    const result = downloadModel(allocator, io, "owner", "model", variant, dest, .{ .base_url = base_url }, .auto, .{});
+    if (expected_error) |err| {
+        try std.testing.expectError(err, result);
+        try std.testing.expectEqual(ManagedDownloadState.incomplete, managedDownloadState(allocator, io, dest));
+        return;
+    }
+    try result;
+    try completeManagedDownload(allocator, io, dest);
+    var receipt = (try managed_receipt.loadValidated(allocator, io, dest)).?;
+    defer receipt.deinit();
+    const source = receipt.parsed.value.source.?;
+    try std.testing.expectEqualStrings("0123456789abcdef0123456789abcdef01234567", source.resolved_revision.?);
+    try std.testing.expectEqualStrings((try parseVariantRevision(variant)).revision orelse "main", source.requested_revision.?);
+    try std.testing.expectEqualStrings(expected_format.?, source.selected_format.?);
+    try std.testing.expectEqualStrings(variant, source.variant);
+    if (std.mem.eql(u8, expected_format.?, "gguf")) {
+        try std.testing.expect(receipt.find("onnx/model.onnx") == null);
+        try std.testing.expect(receipt.find("custom.safetensors") == null);
+    } else if (std.mem.eql(u8, expected_format.?, "onnx")) {
+        try std.testing.expect(receipt.find("onnx/weights.bin") != null);
+        try std.testing.expect(receipt.find("onnx/Constant_7_attr__value") != null);
+        try std.testing.expect(receipt.find("onnx/tokenizer.json") != null);
+    } else if (std.mem.eql(u8, expected_format.?, "safetensors")) {
+        try std.testing.expect(receipt.find("custom.safetensors") != null);
+        try std.testing.expect(receipt.find("model-00001-of-00001.safetensors") == null);
+        try std.testing.expect(receipt.find("onnx/model.onnx") == null);
+    }
+    const log = try tmp.dir.readFileAlloc(io, "requests.log", allocator, .limited(64 * 1024));
+    defer allocator.free(log);
+    try std.testing.expect(std.mem.indexOf(u8, log, "/resolve/main/") == null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, log, "GET /api/models/"));
+}
+
+test "Hub snapshot uses one resolved commit when main moves and auto selects only GGUF" {
+    try exerciseHubSnapshot("all", "auto", "gguf", null);
+}
+
+test "Hub snapshot resolves slash branches and downloads every ONNX dependency" {
+    try exerciseHubSnapshot("all", "onnx@feature/export", "onnx", null);
+}
+
+test "Hub snapshot follows exact safetensors index references" {
+    try exerciseHubSnapshot("all", "safetensors@v1.0", "safetensors", null);
+}
+
+test "Hub snapshot enforces explicit formats and rejects missing or unsafe dependencies" {
+    try exerciseHubSnapshot("onnx-only", "safetensors", null, error.NoModelFilesFound);
+    try exerciseHubSnapshot("all", "typo", null, error.InvalidModelVariant);
+    try exerciseHubSnapshot("missing-dependency", "onnx", null, error.MissingModelArtifact);
+    try exerciseHubSnapshot("unsafe-dependency", "onnx", null, error.InvalidModelArtifactPath);
+    try exerciseHubSnapshot("missing-commit", "auto", null, error.InvalidHubRevision);
+}
+
+test "Hub snapshot native compatibility alias selects one artifact format" {
+    try exerciseHubSnapshot("all", "native", "gguf", null);
+    try exerciseHubSnapshot("safetensors-only", "native@feature/export", "safetensors", null);
+    try exerciseHubSnapshot("onnx-only", "native@v1.0", "onnx", null);
+    try exerciseHubSnapshot("all", "nativ", null, error.InvalidModelVariant);
+    try exerciseHubSnapshot("onnx-only", "gguf", null, error.NoModelFilesFound);
 }

@@ -719,7 +719,8 @@ def _wait_for_restore_job(
             )
         if time.monotonic() >= deadline:
             raise AssertionError(
-                f"restore job {job_id} did not complete within {timeout_s}s: {job}"
+                f"restore job {job_id} did not complete within {timeout_s}s: {job}\n"
+                f"{_bounded_failure_log_tail(debug_logs()) if debug_logs else ''}"
             )
         time.sleep(0.1)
 

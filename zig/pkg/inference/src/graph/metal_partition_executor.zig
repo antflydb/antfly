@@ -1547,8 +1547,11 @@ pub const MetalPartitionExecutor = struct {
         }
 
         const chunk_ops = frameChunkOpsForExecution(exec_ctx.options);
+        const planned_primitives = if (exec_ctx.options) |opts| opts.planned_device_execution else false;
         const graph_plan_start_ns = if (collect_loop_profile) metalPartitionNowNs() else 0;
-        if (reservePartitionGraphPlanForExecution(chunk_ops)) {
+        if (reservePartitionGraphPlanForExecution(chunk_ops) or
+            (planned_primitives and !platform.env.getenvBoolDefault("TERMITE_METAL_DISABLE_PARTITION_GRAPH_PLAN", false)))
+        {
             var metal_graph_plan = try buildMetalGraphPlan(allocator, buffer_plan, partition_view);
             defer metal_graph_plan.deinit(allocator);
             if (trace_nodes) printMetalGraphPlanTrace(partition_index, metal_graph_plan);
@@ -1701,7 +1704,7 @@ pub const MetalPartitionExecutor = struct {
         if (trace_nodes) std.debug.print("graph_executor_node_trace: begin_frame_begin partition={d}\n", .{partition_index});
         if (trace_progress) std.debug.print("metal_partition_progress: phase=begin_frame_begin partition={d}\n", .{partition_index});
         const begin_frame_start_ns = if (collect_loop_profile) metalPartitionNowNs() else 0;
-        var frame_active = if (metalPartitionFrameDisabled() or runtime_region_plan.region_count == 0) false else try cb.decoderRuntimeBeginFrame();
+        var frame_active = if (metalPartitionFrameDisabled() or (!planned_primitives and runtime_region_plan.region_count == 0)) false else try cb.decoderRuntimeBeginFrame();
         errdefer if (frame_active) cb.decoderRuntimeCancelFrame() catch {};
         if (collect_loop_profile) loop_profile.begin_frame_ns += metalPartitionElapsedNs(begin_frame_start_ns, metalPartitionNowNs());
         if (trace_progress) std.debug.print("metal_partition_progress: phase=begin_frame_end partition={d} active={}\n", .{ partition_index, frame_active });

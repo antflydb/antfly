@@ -84,8 +84,13 @@ pub fn build(b: *std.Build) void {
                     b.step("cache-lmdb-tests", "Exercise actual LMDB consumer imports and options").dependOn(&b.addRunArtifact(artifact).step);
                     lmdb_test_found = true;
                 }
-                if (artifact.kind.isTest() and std.mem.endsWith(u8, path.sub_path, "/api_http_runtime_test_root.zig")) {
-                    // Keep the actual API test's imports, flags, and runner.
+                if (artifact.kind.isTest() and std.mem.eql(u8, artifact.name, "test") and
+                    artifact.test_runner != null and artifact.test_runner.?.mode == .simple and
+                    std.mem.endsWith(u8, path.sub_path, "/api_http_runtime_test_root.zig"))
+                {
+                    // Several artifacts share this root module. Select the owning
+                    // API suite before mutating it; pointer-hash iteration must
+                    // not choose a different runner or compiler profile per build.
                     artifact.root_module.root_source_file = sources.add("vopr_test.zig",
                         \\test "VOPR cache probe" {
                         \\    const revision = @import("vopr").cache_test_revision;

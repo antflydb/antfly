@@ -3049,6 +3049,29 @@ pub const IndexManager = struct {
         };
     }
 
+    // Keep publication, cleanup, and pointer validation on the same adapter
+    // as backend open. Resolve at use time so option setters stay consistent;
+    // text main and WAL adapters may intentionally be different.
+    fn effectiveTextMainStorage(self: *const IndexManager) ?lsm_backend_mod.Storage {
+        return self.text_lsm_storage orelse self.text_main_lsm_options.storage;
+    }
+
+    fn effectiveDenseStorage(self: *const IndexManager) ?lsm_backend_mod.Storage {
+        return self.dense_lsm_storage orelse self.dense_lsm_options.storage;
+    }
+
+    fn effectiveSparseStorage(self: *const IndexManager) ?lsm_backend_mod.Storage {
+        return self.sparse_lsm_storage orelse self.sparse_lsm_options.storage;
+    }
+
+    fn effectiveGraphStorage(self: *const IndexManager) ?lsm_backend_mod.Storage {
+        return self.graph_lsm_storage orelse self.graph_reverse_lsm_options.storage;
+    }
+
+    fn effectiveTextWalStorage(self: *const IndexManager) ?lsm_backend_mod.Storage {
+        return self.text_lsm_storage orelse self.text_wal_lsm_options.storage;
+    }
+
     pub fn setTextMainBackend(self: *IndexManager, backend: persistent_mod.MainBackend) void {
         self.text_main_backend = backend;
     }
@@ -4997,7 +5020,7 @@ pub const IndexManager = struct {
     ) bool {
         if (native_physical_v2) return true;
         if (!self.configuredDenseNativePostingStoreSupported()) return false;
-        if (!nativeBackupStoragePublicationCompatible(self.dense_lsm_storage)) return false;
+        if (!nativeBackupStoragePublicationCompatible(self.effectiveDenseStorage())) return false;
         if (self.dense_native_migration_policy_source) |source| {
             if (!source.authorityPermitted()) return false;
         }
@@ -5029,7 +5052,7 @@ pub const IndexManager = struct {
         // authority until their adapter exposes an equivalent staged
         // generation/promote contract; repeatedly scheduling an impossible
         // migration only creates permanent repair debt.
-        if (!nativeBackupStoragePublicationCompatible(self.dense_lsm_storage)) return false;
+        if (!nativeBackupStoragePublicationCompatible(self.effectiveDenseStorage())) return false;
         if (self.dense_native_migration_policy_source) |source| {
             if (!source.authorityPermitted()) return false;
         }
@@ -6215,7 +6238,7 @@ pub const IndexManager = struct {
             .no_meta_sync = self.relaxed_split_durability,
         }, .{
             .backend_options = self.dense_lsm_options,
-            .storage = self.dense_lsm_storage,
+            .storage = self.effectiveDenseStorage(),
             .cache = self.lsm_cache,
             .root_generation = self.lsm_root_generation,
         });
@@ -6308,7 +6331,7 @@ pub const IndexManager = struct {
             .no_sync = self.relaxed_split_durability,
             .no_meta_sync = self.relaxed_split_durability,
             .backend = self.sparse_backend,
-            .lsm_storage = self.sparse_lsm_storage,
+            .lsm_storage = self.effectiveSparseStorage(),
             .lsm_cache = self.lsm_cache,
             .lsm_options = self.sparse_lsm_options,
             .lsm_root_generation = self.lsm_root_generation,
@@ -6340,7 +6363,7 @@ pub const IndexManager = struct {
             .no_sync = self.relaxed_split_durability,
             .no_meta_sync = self.relaxed_split_durability,
             .reverse_backend = self.graph_reverse_backend,
-            .reverse_lsm_storage = self.graph_lsm_storage,
+            .reverse_lsm_storage = self.effectiveGraphStorage(),
             .reverse_lsm_cache = self.lsm_cache,
             .reverse_lsm_options = self.graph_reverse_lsm_options,
             .reverse_lsm_root_generation = self.lsm_root_generation,
@@ -8035,19 +8058,19 @@ pub const IndexManager = struct {
     /// immutable files that remain stable after capture admission reopens.
     pub fn nativeBackupSupportsImmutableCheckpoint(self: *IndexManager, name: []const u8, kind: types.IndexKind) bool {
         return switch (kind) {
-            .full_text => self.text_main_backend == .lsm and nativeBackupStoragePublicationCompatible(self.text_lsm_storage),
+            .full_text => self.text_main_backend == .lsm and nativeBackupStoragePublicationCompatible(self.effectiveTextMainStorage()),
             .dense_vector => if (self.denseIndex(name)) |entry|
                 if (entry.index.experimentalPostingWalAuthoritative())
                     // Native postings are the projection authority. Shared
                     // vector blocks are optional acceleration and therefore
                     // must not make an otherwise complete backup unsupported.
-                    nativeBackupStoragePublicationCompatible(self.dense_lsm_storage)
+                    nativeBackupStoragePublicationCompatible(self.effectiveDenseStorage())
                 else
-                    self.dense_storage_backend == .lsm and nativeBackupStoragePublicationCompatible(self.dense_lsm_storage)
+                    self.dense_storage_backend == .lsm and nativeBackupStoragePublicationCompatible(self.effectiveDenseStorage())
             else
                 false,
-            .sparse_vector => self.sparse_backend == .lsm and nativeBackupStoragePublicationCompatible(self.sparse_lsm_storage),
-            .graph => self.graph_reverse_backend == .lsm and nativeBackupStoragePublicationCompatible(self.graph_lsm_storage),
+            .sparse_vector => self.sparse_backend == .lsm and nativeBackupStoragePublicationCompatible(self.effectiveSparseStorage()),
+            .graph => self.graph_reverse_backend == .lsm and nativeBackupStoragePublicationCompatible(self.effectiveGraphStorage()),
             .algebraic => true,
         };
     }
@@ -11207,10 +11230,10 @@ pub const IndexManager = struct {
         cfg: types.IndexConfig,
     ) backfill_state_mod.RebuildState {
         const storage = switch (kind) {
-            .full_text => self.text_lsm_storage,
-            .dense_vector => self.dense_lsm_storage,
-            .sparse_vector => self.sparse_lsm_storage,
-            .graph => self.graph_lsm_storage,
+            .full_text => self.effectiveTextMainStorage(),
+            .dense_vector => self.effectiveDenseStorage(),
+            .sparse_vector => self.effectiveSparseStorage(),
+            .graph => self.effectiveGraphStorage(),
             .algebraic => null,
         };
         return backfill_state_mod.RebuildState.initOwned(
@@ -19106,10 +19129,10 @@ pub const IndexManager = struct {
 
     fn provisionConfiguredIndexDirDurable(self: *IndexManager, cfg: types.IndexConfig) !void {
         const storage = switch (cfg.kind) {
-            .full_text => self.text_lsm_storage,
-            .dense_vector => self.dense_lsm_storage,
-            .sparse_vector => self.sparse_lsm_storage,
-            .graph => self.graph_lsm_storage,
+            .full_text => self.effectiveTextMainStorage(),
+            .dense_vector => self.effectiveDenseStorage(),
+            .sparse_vector => self.effectiveSparseStorage(),
+            .graph => self.effectiveGraphStorage(),
             .algebraic => return,
         };
         const path = try self.indexPath(cfg.name);
@@ -19143,7 +19166,7 @@ pub const IndexManager = struct {
         // (Lite, object storage, modeled devices) may use the native posting
         // format, but cannot safely share that locator unless it explicitly
         // proves its logical paths are the host paths being published.
-        if (!nativeBackupStoragePublicationCompatible(self.dense_lsm_storage)) return false;
+        if (!nativeBackupStoragePublicationCompatible(self.effectiveDenseStorage())) return false;
         if (self.dense_native_migration_policy_source) |source| return source.authorityPermitted();
         return true;
     }
@@ -19545,7 +19568,7 @@ pub const IndexManager = struct {
             &.{ index_path, "posting-segments", posting_segment_store_mod.authority_name },
         );
         defer self.alloc.free(marker_path);
-        const authority = if (self.dense_lsm_storage) |storage|
+        const authority = if (self.effectiveDenseStorage()) |storage|
             storage.readFileAlloc(
                 self.alloc,
                 marker_path,
@@ -20087,22 +20110,22 @@ pub const IndexManager = struct {
 
         switch (cfg.kind) {
             .full_text => {
-                if (self.text_lsm_storage == null) {
+                if (self.effectiveTextMainStorage() == null) {
                     try ensureIndexDir(self.alloc, self.base_path, path);
                 }
             },
             .dense_vector => {
-                if (self.dense_lsm_storage == null) {
+                if (self.effectiveDenseStorage() == null) {
                     try ensureIndexDir(self.alloc, self.base_path, path);
                 }
             },
             .sparse_vector => {
-                if (self.sparse_lsm_storage == null) {
+                if (self.effectiveSparseStorage() == null) {
                     try ensureIndexDir(self.alloc, self.base_path, path);
                 }
             },
             .graph => {
-                if (self.graph_lsm_storage == null) {
+                if (self.effectiveGraphStorage() == null) {
                     try ensureIndexDir(self.alloc, self.base_path, path);
                 }
             },
@@ -20177,8 +20200,8 @@ pub const IndexManager = struct {
                     .path = zpath,
                     .io = self.io,
                     .main_backend = self.text_main_backend,
-                    .main_lsm_storage = self.text_lsm_storage,
-                    .wal_storage = self.text_lsm_storage,
+                    .main_lsm_storage = self.effectiveTextMainStorage(),
+                    .wal_storage = self.effectiveTextWalStorage(),
                     .main_lsm_options = self.text_main_lsm_options,
                     .wal_lsm_options = self.text_wal_lsm_options,
                     .lsm_cache = self.lsm_cache,
@@ -20429,7 +20452,7 @@ pub const IndexManager = struct {
                     .no_meta_sync = self.relaxed_split_durability,
                 }, .{
                     .backend_options = self.dense_lsm_options,
-                    .storage = self.dense_lsm_storage,
+                    .storage = self.effectiveDenseStorage(),
                     .cache = self.lsm_cache,
                     .root_generation = self.lsm_root_generation,
                 });
@@ -20671,7 +20694,7 @@ pub const IndexManager = struct {
                     .no_sync = self.relaxed_split_durability,
                     .no_meta_sync = self.relaxed_split_durability,
                     .backend = self.sparse_backend,
-                    .lsm_storage = self.sparse_lsm_storage,
+                    .lsm_storage = self.effectiveSparseStorage(),
                     .lsm_cache = self.lsm_cache,
                     .lsm_options = self.sparse_lsm_options,
                     .lsm_root_generation = self.lsm_root_generation,
@@ -20769,7 +20792,7 @@ pub const IndexManager = struct {
                 defer self.alloc.free(forward_path);
                 const reverse_path = try std.fmt.allocPrint(self.alloc, "{s}/reverse", .{path});
                 defer self.alloc.free(reverse_path);
-                const reverse_store_missing = if (self.graph_lsm_storage != null) false else if (comptime builtin.os.tag == .freestanding) true else blk: {
+                const reverse_store_missing = if (self.effectiveGraphStorage() != null) false else if (comptime builtin.os.tag == .freestanding) true else blk: {
                     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
                     defer io_impl.deinit();
                     var reverse_dir = std.Io.Dir.cwd().openDir(io_impl.io(), reverse_path, .{}) catch |err| switch (err) {
@@ -20793,7 +20816,7 @@ pub const IndexManager = struct {
                     .no_sync = self.relaxed_split_durability,
                     .no_meta_sync = self.relaxed_split_durability,
                     .reverse_backend = self.graph_reverse_backend,
-                    .reverse_lsm_storage = self.graph_lsm_storage,
+                    .reverse_lsm_storage = self.effectiveGraphStorage(),
                     .reverse_lsm_cache = self.lsm_cache,
                     .reverse_lsm_options = self.graph_reverse_lsm_options,
                     .reverse_lsm_root_generation = self.lsm_root_generation,
@@ -32473,39 +32496,48 @@ test "native pointer validation reads authority through configured storage" {
     const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     var dense_storage = lsm_backend_mod.MemoryStorage.init(alloc);
     defer dense_storage.deinit();
-    var manager = try IndexManager.initWithOptions(alloc, path, .{
-        .dense_lsm_storage = dense_storage.storage(),
-    });
-    defer manager.deinit();
+    // The explicit adapter wins when both forms are provided. Otherwise the
+    // nested LSM adapter must also govern publication and pointer validation.
+    var unused_storage = lsm_backend_mod.MemoryStorage.init(alloc);
+    defer unused_storage.deinit();
+    const Configuration = enum { nested, explicit_override, reconfigured };
+    for (std.enums.values(Configuration)) |configuration| {
+        var manager = try IndexManager.initWithOptions(alloc, path, .{
+            .dense_lsm_storage = if (configuration == .explicit_override) dense_storage.storage() else null,
+            .dense_lsm_options = .{ .storage = if (configuration == .nested) dense_storage.storage() else unused_storage.storage() },
+        });
+        defer manager.deinit();
+        if (configuration == .reconfigured) manager.setDenseLsmOptions(.{ .storage = dense_storage.storage() });
 
-    const index_name = "dv_v2";
-    const relative = ".repair-shadow-configured/indexes/dv_v2";
-    const active_path = try std.fs.path.join(alloc, &.{ path, relative });
-    defer alloc.free(active_path);
-    try std.Io.Dir.cwd().createDirPath(std.testing.io, active_path);
-    try index_generation_manifest.writeReadyForPhysicalFormat(
-        alloc,
-        active_path,
-        17,
-        index_name,
-        23,
-        29,
-        .dense_native_v2,
-    );
-    const posting_path = try std.fs.path.join(alloc, &.{ active_path, "posting-segments" });
-    defer alloc.free(posting_path);
-    try dense_storage.storage().createDirPath(posting_path);
-    const authority_path = try std.fs.path.join(alloc, &.{ posting_path, posting_segment_store_mod.authority_name });
-    defer alloc.free(authority_path);
-    try dense_storage.storage().writeFileAbsolute(authority_path, posting_segment_store_mod.authority_value);
+        const index_name = "dv_v2";
+        const relative = ".repair-shadow-configured/indexes/dv_v2";
+        const active_path = try std.fs.path.join(alloc, &.{ path, relative });
+        defer alloc.free(active_path);
+        try std.Io.Dir.cwd().createDirPath(std.testing.io, active_path);
+        try index_generation_manifest.writeReadyForPhysicalFormat(
+            alloc,
+            active_path,
+            17,
+            index_name,
+            23,
+            29,
+            .dense_native_v2,
+        );
+        const posting_path = try std.fs.path.join(alloc, &.{ active_path, "posting-segments" });
+        defer alloc.free(posting_path);
+        try dense_storage.storage().createDirPath(posting_path);
+        const authority_path = try std.fs.path.join(alloc, &.{ posting_path, posting_segment_store_mod.authority_name });
+        defer alloc.free(authority_path);
+        try dense_storage.storage().writeFileAbsolute(authority_path, posting_segment_store_mod.authority_value);
 
-    const canonical_path = try manager.indexPath(index_name);
-    defer alloc.free(canonical_path);
-    try manager.writeActiveIndexRootPointer(canonical_path, relative);
-    const selected = (try manager.readActiveIndexRootPointer(canonical_path, index_name)) orelse
-        return error.TestUnexpectedResult;
-    defer alloc.free(selected);
-    try std.testing.expectEqualStrings(relative, selected);
+        const canonical_path = try manager.indexPath(index_name);
+        defer alloc.free(canonical_path);
+        try manager.writeActiveIndexRootPointer(canonical_path, relative);
+        const selected = (try manager.readActiveIndexRootPointer(canonical_path, index_name)) orelse
+            return error.TestUnexpectedResult;
+        defer alloc.free(selected);
+        try std.testing.expectEqualStrings(relative, selected);
+    }
 }
 
 test "fresh dense admission remains legacy before the native capability floor" {
