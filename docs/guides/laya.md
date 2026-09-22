@@ -20,6 +20,14 @@ existing directory. Native support requires a ModernBERT-backed checkpoint with
 the Laya decision heads. The runtime validates tensor shapes before execution.
 Unprepared upstream checkpoints are not automatically converted by `inference pull`.
 
+CUDA execution is available for Laya checkpoints with sequence lengths up to 512
+and encoder head dimensions up to 128. It uses FP32 resident weights and bounded
+internal batches. The English checkpoint passed the L4 fatbin qualification gate.
+See [Laya CUDA qualification](../design/laya-cuda-qualification.md) for reproducible
+builds, measurements, and the portable-PTX driver requirement.
+The [CUDA performance notes](../design/laya-cuda-performance.md) describe
+attention, fusion, length bucketing, and the matched PyTorch benchmark.
+
 Submit a text request to the server's AI endpoint:
 
 ```json
@@ -115,4 +123,5 @@ compares token IDs and probabilities against upstream PyTorch on labeled data,
 checks accuracy, and measures warm batches through 128 rows. See
 [qualification results and reproduction](../design/laya-qualification.md).
 
-These checks qualify native CPU and Metal. CUDA remains unqualified.
+These checks cover native CPU and Metal. CUDA has a separate
+[L4 qualification gate](../design/laya-cuda-qualification.md).

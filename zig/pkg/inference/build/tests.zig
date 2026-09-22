@@ -187,6 +187,19 @@ pub fn addDefault(ctx: Context, suite: Suite, checks: Checks) *std.Build.Step {
     test_step.dependOn(&cuda_artifact_source_policy_check.step);
     test_step.dependOn(&run_quant_kernel_metal_runtime_check_tests.step);
     test_step.dependOn(&run_tests.step);
+    const laya_cuda_tests = b.addTest(.{
+        .name = "laya-cuda-tests",
+        .max_rss = 9 * 1024 * 1024 * 1024,
+        .root_module = suite.tests.root_module,
+        .filters = &.{ "laya ", "cuda support gate", "readiness inventory" },
+        .test_runner = .{ .path = ctx.path("src/test_runner_filter.zig"), .mode = .simple },
+    });
+    const install_laya_cuda_tests = b.addInstallArtifact(laya_cuda_tests, .{});
+    ctx.step("laya-cuda-test-build", "Build Laya CUDA qualification executable without running it").dependOn(&install_laya_cuda_tests.step);
+    const run_laya_cuda_tests = ctx.addRunArtifact(laya_cuda_tests);
+    run_laya_cuda_tests.setEnvironmentVariable("ANTFLY_LAYA_REQUIRE_TESTS", "1");
+    run_laya_cuda_tests.setEnvironmentVariable("ANTFLY_LAYA_BACKEND", "cuda");
+    ctx.step("laya-cuda-test", "Require CUDA and pinned Laya fixtures").dependOn(&run_laya_cuda_tests.step);
     // Dedicated hardware gate: reuse the inference test module and frozen
     // CPU/Metal exercises, but missing CUDA must never become a successful skip.
     const gliner25_cuda_tests = b.addTest(.{

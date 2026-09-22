@@ -183,6 +183,10 @@ tmp_sm89="$(mktemp "${TMPDIR:-/tmp}/inference_cuda_kernels.XXXXXX.sm89.cubin")"
 trap 'rm -f "$tmp_ptx" "$tmp_fatbin" "$tmp_sm89"' EXIT
 
 required_symbols=(
+  termite_laya_local_attention_f32
+  termite_laya_attention_warp_f32
+  termite_laya_packed_geglu_f32
+  termite_laya_action_features_f32
   termite_fill_f32
   termite_copy_f32
   termite_copy_u8

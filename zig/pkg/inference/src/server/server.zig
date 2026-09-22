@@ -4168,7 +4168,7 @@ pub const Node = struct {
     /// Build the initial readiness view before listener publication and start
     /// one runtime-owned refresher for model changes made by external pull
     /// commands. Repeated calls are harmless (the runtime cannot be replaced).
-    pub fn startReadinessInventory(self: *Node, io: std.Io) void {
+    pub fn startReadinessInventory(self: *Node, io: std.Io) !void {
         if (self.readiness_refresh_started) return;
         self.refreshReadinessInventory(io) catch |err| {
             // Liveness should still come up when a model volume is temporarily
@@ -4179,9 +4179,11 @@ pub const Node = struct {
                 .{@errorName(err)},
             );
         };
+        // This loop lives until shutdown. Group.async may run inline when the
+        // worker pool is full, which would prevent publishing the HTTP listener.
+        try self.readiness_refresh_group.concurrent(io, readinessRefreshLoop, .{ self, io });
         self.readiness_refresh_started = true;
         self.readiness_refresh_io = io;
-        self.readiness_refresh_group.async(io, readinessRefreshLoop, .{ self, io });
     }
 
     pub fn detachPromptCacheResourceUsageObserver(self: *Node) void {
@@ -8872,7 +8874,7 @@ pub const Node = struct {
         defer handle.release();
         const loaded = handle.get();
         const config = session_factory.getLayaConfig(loaded.session) orelse return error.UnsupportedExtractionModel;
-        if (loaded.session.backend() != .native and loaded.session.backend() != .metal) return error.UnsupportedExtractionBackend;
+        if (loaded.session.backend() != .native and loaded.session.backend() != .metal and loaded.session.backend() != .cuda) return error.UnsupportedExtractionBackend;
         const mutex = loaded.targetInferenceExecutionMutex();
         if (mutex) |lock| try effective.lock(lock);
         defer if (mutex) |lock| lock.unlock();
@@ -19450,7 +19452,7 @@ pub const Node = struct {
             return err;
         };
         try self.attachIo(io);
-        self.startReadinessInventory(io);
+        try self.startReadinessInventory(io);
         var server = httpx.Server.initWithConfig(allocator, io, self.httpServerConfig(host, port));
         defer server.deinit();
 
@@ -27632,14 +27634,29 @@ test "readiness inventory initializes once and owns its refresh task" {
 
     var node = try Node.init(allocator, .{ .models_dir = models_path });
     defer node.deinit();
-    node.startReadinessInventory(std.testing.io);
-    node.startReadinessInventory(std.testing.io);
+    try node.startReadinessInventory(std.testing.io);
+    try node.startReadinessInventory(std.testing.io);
 
     const snapshot = node.readiness_inventory.load();
     try std.testing.expect(snapshot.initialized);
     try std.testing.expectEqual(@as(usize, 0), snapshot.counts.total());
     try std.testing.expect(node.readiness_refresh_started);
     try std.testing.expect(node.readiness_refresh_io != null);
+}
+
+test "readiness inventory starts with no async worker capacity" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{ .async_limit = .nothing });
+    defer threaded.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(path);
+    var node = try Node.init(allocator, .{ .models_dir = path });
+    defer node.deinit();
+    try node.startReadinessInventory(threaded.io());
+    try std.testing.expect(node.readiness_refresh_started);
+    try std.testing.expect(node.readiness_inventory.load().initialized);
 }
 
 test "internal error response hides implementation error names" {
@@ -33536,7 +33553,7 @@ test "laya extraction v2 serves typed decisions over HTTP and embedded calls" {
     var node = try Node.init(a, .{ .models_dir = root, .allow_unknown_models = true, .max_concurrent_requests = 1, .process_termination_available = true });
     defer node.deinit();
     try node.attachIo(std.testing.io);
-    const backend: backends_mod.BackendType = if (platform.env.getenv("ANTFLY_LAYA_METAL") != null) .metal else .native;
+    const backend = try @import("../util/laya_test_support.zig").selectedBackend();
     node.session_manager.required_backend = backend;
     node.model_manager.session_manager.required_backend = backend;
     const body =

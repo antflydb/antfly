@@ -1,0 +1,230 @@
+{
+  "schema": "antfly.laya.cuda_qualification.v1",
+  "status": "passed",
+  "started_at_utc": "2026-09-22T01:44:29.292426+00:00",
+  "gpu": "NVIDIA L4, GPU-52712518-cc49-cc9f-ec0d-1006ee5e12a8, 580.159.03, 8.9, 23034 MiB\n",
+  "artifact_identity": "cuda_artifact_identity_schema: antfly.cuda_artifact_identity.v1\ncuda_artifact_mode: fatbin\ncuda_artifact_format: fatbin\ncuda_artifact_target: fatbin\ncuda_artifact_image_bytes: 47689856\ncuda_artifact_image_sha256: dd5d6ba6c2b81447cc290487d03355a8c767abd1d14038363b688a7d91a78098\n",
+  "cuda_runtime": "cuda: available\ndriver_version: 13000\ndevice_count: 1\nselected_device: 0\ndevice_name: NVIDIA L4\ncompute_capability: sm_89\nartifacts: fatbin\n+2026-09-22T01:44:29Z info  [default] cuda_gqa_decode_profile: status=configured profile=off source=default\n+2026-09-22T01:44:29Z info  [default] cuda_gqa_prefill_profile: status=configured profile=automatic source=default\n+2026-09-22T01:44:29Z info  [default] cuda_gqa_score_prework_consumer: event=configured configured=serial consumer=none route=none head_dim=0 fallback_reason=none source=default\n+2026-09-22T01:44:29Z info  [default] cuda_cublaslt_bf16_tuning: status=configured source=default profile=sm89-prefill candidates=8 warmups=3 iterations=10 min_rows=32 compute=8.9\ncapability_clipclap: true\ncapability_laya: true\ncapability_deberta_reranker: true\ncapability_florence2: true\ncapability_gliner2: true\ncapability_gemma4: true\ncapability_qwen3_embedding: true\ncapability_qwen3_vl_generation: true\n",
+  "binary_sha256": "e098cdae8dce0ad8c4c4bb6f48d59f462eb14d97c30b7556535f34d9f8c6bb1b",
+  "tests_sha256": "fbba2ed9ddcc19275177f4646003acd640ef551362db4fe58278aa5b66b6a294",
+  "git_commit": "5bb5fb1570f44f11ddf0770e2529df9b419934c5",
+  "working_tree_dirty": true,
+  "oracle": {
+    "source": {
+      "repository": "convaiinnovations/laya",
+      "revision": "c5d78730f3493e4fe16d61507ef4b78eef7318cf"
+    },
+    "seed": 714,
+    "dataset_revisions": {
+      "sh0416/ag_news": "70e3fa1915be9a8daebec5e840f20df9a8e18793",
+      "google/boolq": "35b264d03638db9f4ce671b711558bf7ff0f80d5",
+      "SetFit/sst5": "e51bdcd8cd3a30da231967c1a249ba59361279a3"
+    },
+    "file_sha256": {
+      "common.py": "f948ee606abe2ed2463f830c051f1a60dccc1b9f5ca1fdc15635cfcbe0cff7b2",
+      "ag-news.jsonl": "2db61b7d9f5806b146a7575dc8074d9f29732a879cf319dc3677f65a286a317e",
+      "boolq.parquet": "52355d11524b4b874a9b9dcc278feb10f672d52c4f4eff9872e695ede59820f8",
+      "sst5.jsonl": "1384216112a34f3d70b6fa210762f3399bb080410c0456ac6e54a5cb413f04b2"
+    },
+    "excluded_overlength": {
+      "ag_news": 0,
+      "boolq": 0,
+      "sst5": 0
+    },
+    "torch_version": "2.6.0+cpu",
+    "transformers_attention": "eager",
+    "threads": 8,
+    "forward_seconds": 2914.570099179109,
+    "metrics": {
+      "ag_news": {
+        "count": 64,
+        "accuracy": 0.953125
+      },
+      "boolq": {
+        "count": 64,
+        "accuracy": 0.703125
+      },
+      "sst5": {
+        "count": 64,
+        "accuracy": 0.328125,
+        "expected_level_mae": 1.0034139722993132
+      }
+    }
+  },
+  "fixture_sha256": "e133c50690e42c4c6429875256cbe40843ea02461edafde48f5f71cd7fabeeb5",
+  "model_sha256": "891102d372688fc2a094dac56a384bc537b87c63f21f9f3dac0be2b7cbc8d86c",
+  "cpu_measurements": [
+    "Laya qualification backend=native load_ms=54.99",
+    "Laya evaluated 8/192, max_probability_error=0.0000025",
+    "Laya evaluated 16/192, max_probability_error=0.0000052",
+    "Laya evaluated 24/192, max_probability_error=0.0000052",
+    "Laya evaluated 32/192, max_probability_error=0.0000052",
+    "Laya evaluated 40/192, max_probability_error=0.0000052",
+    "Laya evaluated 48/192, max_probability_error=0.0000052",
+    "Laya evaluated 56/192, max_probability_error=0.0000052",
+    "Laya evaluated 64/192, max_probability_error=0.0000052",
+    "Laya evaluated 72/192, max_probability_error=0.0000052",
+    "Laya evaluated 80/192, max_probability_error=0.0000052",
+    "Laya evaluated 88/192, max_probability_error=0.0000052",
+    "Laya evaluated 96/192, max_probability_error=0.0000052",
+    "Laya evaluated 104/192, max_probability_error=0.0000052",
+    "Laya evaluated 112/192, max_probability_error=0.0000052",
+    "Laya evaluated 120/192, max_probability_error=0.0000052",
+    "Laya evaluated 128/192, max_probability_error=0.0000052",
+    "Laya evaluated 136/192, max_probability_error=0.0000052",
+    "Laya evaluated 144/192, max_probability_error=0.0000052",
+    "Laya evaluated 152/192, max_probability_error=0.0000052",
+    "Laya evaluated 160/192, max_probability_error=0.0000052",
+    "Laya evaluated 168/192, max_probability_error=0.0000052",
+    "Laya evaluated 176/192, max_probability_error=0.0000052",
+    "Laya evaluated 184/192, max_probability_error=0.0000052",
+    "Laya evaluated 192/192, max_probability_error=0.0000052",
+    "Laya accuracy choice=61/64 score=21/64 boolean=45/64; ordinal_mae=1.003414; disagreements=0; max_probability_error=0.0000052; max_action_error=0.0000000",
+    "Laya performance profile=fixed backend=native tokens=61 batch=1 p50_ms=2267.585 p95_ms=2276.752 questions_per_second=0.44 max_batch_error=0.0000000",
+    "Laya performance profile=fixed backend=native tokens=61 batch=8 p50_ms=9665.956 p95_ms=9758.369 questions_per_second=0.83 max_batch_error=0.0000000",
+    "Laya performance profile=mixed backend=native batch=1 p50_ms=2269.563 p95_ms=2299.141 questions_per_second=0.44 max_batch_error=0.0000000",
+    "Laya performance profile=mixed backend=native batch=8 p50_ms=27898.042 p95_ms=28206.074 questions_per_second=0.29 max_batch_error=0.0000025"
+  ],
+  "pytorch_cuda": {
+    "torch_version": "2.6.0+cu124",
+    "cuda_version": "12.4",
+    "dtype": "float32",
+    "tf32": false,
+    "scope": "resident forward only; excludes preprocessing and transfers",
+    "warmups": 5,
+    "samples": 30,
+    "measurements": [
+      {
+        "profile": "fixed",
+        "batch": 1,
+        "p50_ms": 31.11961600370705,
+        "p95_ms": 32.652921974658966,
+        "questions_per_second": 32.13407260169526
+      },
+      {
+        "profile": "fixed",
+        "batch": 8,
+        "p50_ms": 50.88135501137003,
+        "p95_ms": 52.58986301487312,
+        "questions_per_second": 157.228517169252
+      },
+      {
+        "profile": "mixed",
+        "batch": 1,
+        "p50_ms": 31.077870982699096,
+        "p95_ms": 32.30486600659788,
+        "questions_per_second": 32.17723635434021
+      },
+      {
+        "profile": "mixed",
+        "batch": 8,
+        "p50_ms": 134.39692498650402,
+        "p95_ms": 139.55781504046172,
+        "questions_per_second": 59.52517143382076
+      }
+    ]
+  },
+  "pipeline_measurements": [
+    "Laya parity backend: cuda",
+    "Laya intermediates encoder_max_error=0.0000005 head_max_error=0.0000010",
+    "Laya qualification backend=cuda load_ms=1817.75",
+    "Laya evaluated 8/192, max_probability_error=0.0000016",
+    "Laya evaluated 16/192, max_probability_error=0.0000075",
+    "Laya evaluated 24/192, max_probability_error=0.0000075",
+    "Laya evaluated 32/192, max_probability_error=0.0000075",
+    "Laya evaluated 40/192, max_probability_error=0.0000075",
+    "Laya evaluated 48/192, max_probability_error=0.0000078",
+    "Laya evaluated 56/192, max_probability_error=0.0000078",
+    "Laya evaluated 64/192, max_probability_error=0.0000078",
+    "Laya evaluated 72/192, max_probability_error=0.0000078",
+    "Laya evaluated 80/192, max_probability_error=0.0000078",
+    "Laya evaluated 88/192, max_probability_error=0.0000078",
+    "Laya evaluated 96/192, max_probability_error=0.0000078",
+    "Laya evaluated 104/192, max_probability_error=0.0000078",
+    "Laya evaluated 112/192, max_probability_error=0.0000078",
+    "Laya evaluated 120/192, max_probability_error=0.0000078",
+    "Laya evaluated 128/192, max_probability_error=0.0000078",
+    "Laya evaluated 136/192, max_probability_error=0.0000117",
+    "Laya evaluated 144/192, max_probability_error=0.0000117",
+    "Laya evaluated 152/192, max_probability_error=0.0000117",
+    "Laya evaluated 160/192, max_probability_error=0.0000117",
+    "Laya evaluated 168/192, max_probability_error=0.0000117",
+    "Laya evaluated 176/192, max_probability_error=0.0000117",
+    "Laya evaluated 184/192, max_probability_error=0.0000117",
+    "Laya evaluated 192/192, max_probability_error=0.0000117",
+    "Laya accuracy choice=61/64 score=21/64 boolean=45/64; ordinal_mae=1.003414; disagreements=0; max_probability_error=0.0000117; max_action_error=0.0000000",
+    "Laya released stress tasks=512 parity=passed",
+    "Laya performance profile=fixed backend=cuda tokens=61 batch=1 p50_ms=16.373 p95_ms=16.586 questions_per_second=61.08 max_batch_error=0.0000000",
+    "Laya performance profile=fixed backend=cuda tokens=61 batch=2 p50_ms=26.213 p95_ms=27.291 questions_per_second=76.30 max_batch_error=0.0000001",
+    "Laya performance profile=fixed backend=cuda tokens=61 batch=4 p50_ms=45.476 p95_ms=45.590 questions_per_second=87.96 max_batch_error=0.0000001",
+    "Laya performance profile=fixed backend=cuda tokens=61 batch=8 p50_ms=83.112 p95_ms=83.674 questions_per_second=96.26 max_batch_error=0.0000001",
+    "Laya performance profile=fixed backend=cuda tokens=61 batch=16 p50_ms=159.684 p95_ms=160.915 questions_per_second=100.20 max_batch_error=0.0000001",
+    "Laya performance profile=fixed backend=cuda tokens=61 batch=32 p50_ms=311.510 p95_ms=314.110 questions_per_second=102.73 max_batch_error=0.0000002",
+    "Laya performance profile=fixed backend=cuda tokens=61 batch=64 p50_ms=599.776 p95_ms=600.190 questions_per_second=106.71 max_batch_error=0.0000002",
+    "Laya performance profile=fixed backend=cuda tokens=61 batch=128 p50_ms=1490.175 p95_ms=1500.333 questions_per_second=85.90 max_batch_error=0.0000002",
+    "Laya performance profile=mixed backend=cuda batch=1 p50_ms=16.641 p95_ms=16.821 questions_per_second=60.09 max_batch_error=0.0000000",
+    "Laya performance profile=mixed backend=cuda batch=2 p50_ms=44.868 p95_ms=46.718 questions_per_second=44.58 max_batch_error=0.0000002",
+    "Laya performance profile=mixed backend=cuda batch=4 p50_ms=81.997 p95_ms=82.740 questions_per_second=48.78 max_batch_error=0.0000013",
+    "Laya performance profile=mixed backend=cuda batch=8 p50_ms=261.752 p95_ms=262.718 questions_per_second=30.56 max_batch_error=0.0000016",
+    "Laya performance profile=mixed backend=cuda batch=16 p50_ms=526.790 p95_ms=530.241 questions_per_second=30.37 max_batch_error=0.0000075",
+    "Laya performance profile=mixed backend=cuda batch=32 p50_ms=2191.706 p95_ms=2198.090 questions_per_second=14.60 max_batch_error=0.0000075",
+    "Laya performance profile=mixed backend=cuda batch=64 p50_ms=5293.377 p95_ms=5305.668 questions_per_second=12.09 max_batch_error=0.0000078",
+    "Laya performance profile=mixed backend=cuda batch=128 p50_ms=10557.569 p95_ms=10578.918 questions_per_second=12.12 max_batch_error=0.0000079"
+  ],
+  "server_config": {
+    "max_concurrent_requests": 4,
+    "max_loaded_models": 1,
+    "scratch_budget_mib": 3072
+  },
+  "model_reload": {
+    "alternate_model_ms": 5417.117248987779,
+    "original_model_ms": 5237.3205900075845,
+    "parity": true
+  },
+  "cancellation": {
+    "disconnect": "TCP RST",
+    "gpu_activity_observed": true,
+    "parity_after_recovery": true,
+    "recovery_ms": 5691.885273030493
+  },
+  "http": {
+    "first_use_ms": 5447.315221012104,
+    "requests": 7961,
+    "mixed_p50_ms": 147.07178302342072,
+    "mixed_p95_ms": 600.5203499807976,
+    "soak_seconds": 1800.1896381279803,
+    "memory_before": {
+      "host_rss_bytes": 446767104,
+      "device_used_bytes": 3076521984
+    },
+    "memory_after": {
+      "host_rss_bytes": 490016768,
+      "device_used_bytes": 3087007744
+    },
+    "device_memory_sampling": {
+      "interval_ms": 200,
+      "samples": 9473,
+      "peak_device_used_bytes": 5681184768,
+      "scope": "whole GPU during HTTP cold start, reload, stress, and soak"
+    }
+  },
+  "backend_selections": [
+    [
+      "cuda",
+      "/tmp/laya-cuda-qualification/released/model"
+    ],
+    [
+      "cuda",
+      "/tmp/laya-cuda-qualification/released/laya-reload-6_6h8k79"
+    ],
+    [
+      "cuda",
+      "/tmp/laya-cuda-qualification/released/model"
+    ],
+    [
+      "cuda",
+      "/tmp/laya-cuda-qualification/released/model"
+    ]
+  ],
+  "finished_at_utc": "2026-09-22T03:09:56.830814+00:00"
+}

@@ -575,6 +575,7 @@ jobs:
         run: |
           python3 -m unittest discover -s scripts -p test_run_db_query_matrix.py
           python3 -m unittest discover -s scripts -p test_conformance_fixtures.py
+          python3 -m unittest discover -s scripts -p 'test_laya_cuda*.py'
           python3 -m unittest discover -s scripts/bench/pdf -p 'test_*.py'
 
       - name: Check inference kernels through the root build graph
@@ -964,6 +965,7 @@ jobs:
         run: |
           python3 -m unittest discover -s scripts -p test_run_db_query_matrix.py
           python3 -m unittest discover -s scripts -p test_conformance_fixtures.py
+          python3 -m unittest discover -s scripts -p 'test_laya_cuda*.py'
           python3 -m unittest discover -s scripts/bench/pdf -p 'test_*.py'
 
       # Keep normal build-step parallelism while bounding aggregate compiler

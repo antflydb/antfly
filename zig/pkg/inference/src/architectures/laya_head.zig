@@ -43,7 +43,7 @@ fn exactGelu(cb: *const CB, x: CT) !CT {
 }
 
 pub fn forward(cb: *const CB, a: std.mem.Allocator, cfg: Config, encoder: CT, mask: []const i64, kinds: []const i64, markers: []const i64, batch: usize, seq: usize, count: usize, dim: usize) ![]Tensor {
-    if (batch == 0 or count < 2 or count > 20 or dim < 64 or dim % 64 != 0 or seq > cfg.max_len or kinds.len != batch or markers.len != batch * count) return error.InvalidLayaInputs;
+    if (batch == 0 or seq == 0 or mask.len != batch * seq or count < 2 or count > 20 or dim < 64 or dim % 64 != 0 or seq > cfg.max_len or kinds.len != batch or markers.len != batch * count) return error.InvalidLayaInputs;
     for (kinds) |kind| if (kind < 0 or kind > 2) return error.InvalidLayaInputs;
     for (0..batch) |row| {
         var valid: usize = 0;
@@ -54,52 +54,9 @@ pub fn forward(cb: *const CB, a: std.mem.Allocator, cfg: Config, encoder: CT, ma
         }
         if (valid < 2) return error.InvalidLayaInputs;
     }
-    const repeated = try a.alloc(i64, batch * seq);
-    defer a.free(repeated);
-    for (kinds, 0..) |kind, row| @memset(repeated[row * seq ..][0..seq], kind);
-    const type_weight = try cb.getWeight("model.type_emb.weight");
-    defer cb.free(type_weight);
-    const types = try cb.embeddingLookup(type_weight, repeated, batch * seq, dim);
-    defer cb.free(types);
-    var hidden = try cb.add(encoder, types);
+    const hidden = try transform(cb, a, cfg, encoder, mask, kinds, batch, seq, dim);
     defer cb.free(hidden);
-    for (0..cfg.head_layers) |layer| {
-        try cb.checkExecutionControl();
-        var name: [128]u8 = undefined;
-        const prefix = try std.fmt.bufPrint(&name, "head.layers.{d}", .{layer});
-        var buf: [160]u8 = undefined;
-        const n1 = try norm(cb, hidden, try std.fmt.bufPrint(&buf, "{s}.norm1", .{prefix}), dim);
-        defer cb.free(n1);
-        const qw = try weight(cb, prefix, "self_attn.in_proj_weight");
-        defer cb.free(qw);
-        const qb = try weight(cb, prefix, "self_attn.in_proj_bias");
-        defer cb.free(qb);
-        const qkv = try cb.linear(n1, qw, qb, batch * seq, dim, dim * 3);
-        defer cb.free(qkv);
-        const q = try cb.sliceLastDim(qkv, 0, dim);
-        defer cb.free(q);
-        const k = try cb.sliceLastDim(qkv, dim, dim * 2);
-        defer cb.free(k);
-        const v = try cb.sliceLastDim(qkv, dim * 2, dim * 3);
-        defer cb.free(v);
-        const attn = try cb.scaledDotProductAttention(q, k, v, mask, null, batch, seq, dim / 64, 64);
-        defer cb.free(attn);
-        const proj = try linear(cb, attn, try std.fmt.bufPrint(&buf, "{s}.self_attn.out_proj", .{prefix}), batch * seq, dim, dim);
-        defer cb.free(proj);
-        const residual = try cb.add(hidden, proj);
-        defer cb.free(residual);
-        const n2 = try norm(cb, residual, try std.fmt.bufPrint(&buf, "{s}.norm2", .{prefix}), dim);
-        defer cb.free(n2);
-        const up = try linear(cb, n2, try std.fmt.bufPrint(&buf, "{s}.linear1", .{prefix}), batch * seq, dim, dim * 4);
-        defer cb.free(up);
-        const relu = try cb.relu(up);
-        defer cb.free(relu);
-        const down = try linear(cb, relu, try std.fmt.bufPrint(&buf, "{s}.linear2", .{prefix}), batch * seq, dim * 4, dim);
-        defer cb.free(down);
-        const next = try cb.add(residual, down);
-        cb.free(hidden);
-        hidden = next;
-    }
+    if (cb.kind() == .cuda) return forwardCudaTail(cb, a, cfg, hidden, markers, batch, seq, count, dim);
     const host = try cb.toFloat32(hidden, a);
     defer a.free(host);
     if (host.len != batch * seq * dim) return error.UnexpectedOutputShape;
@@ -176,4 +133,95 @@ pub fn forward(cb: *const CB, a: std.mem.Allocator, cfg: Config, encoder: CT, ma
     errdefer result[0].deinit();
     result[1] = try Tensor.initFloat32(a, "action_logits", &.{ @intCast(batch), @intCast(cfg.n_act) }, act);
     return result;
+}
+
+fn forwardCudaTail(cb: *const CB, a: std.mem.Allocator, cfg: Config, hidden: CT, markers: []const i64, batch: usize, seq: usize, count: usize, dim: usize) ![]Tensor {
+    const indices = try a.alloc(i64, markers.len);
+    defer a.free(indices);
+    for (markers, indices, 0..) |pos, *index, i| index.* = @intCast((i / count) * seq + @as(usize, @intCast(@max(pos, 0))));
+    const gathered = try cb.embeddingLookup(hidden, indices, batch * count, dim);
+    defer cb.free(gathered);
+    const normalized = try norm(cb, gathered, "scorer.0", dim);
+    defer cb.free(normalized);
+    const s1 = try linear(cb, normalized, "scorer.1", batch * count, dim, dim);
+    defer cb.free(s1);
+    const sg = try exactGelu(cb, s1);
+    defer cb.free(sg);
+    const scores = try linear(cb, sg, "scorer.3", batch * count, dim, 1);
+    defer cb.free(scores);
+    const features = (try cb.layaActionFeatures(&.{ .hidden = hidden, .logits = scores, .markers = markers, .batch = batch, .sequence = seq, .options = count, .hidden_size = dim })) orelse return error.UnsupportedLayaBackend;
+    defer cb.free(features);
+    const act1 = try linear(cb, features, "act_head.0", batch, dim + 4, 256);
+    defer cb.free(act1);
+    const actg = try exactGelu(cb, act1);
+    defer cb.free(actg);
+    const actions = try linear(cb, actg, "act_head.2", batch, 256, cfg.n_act);
+    defer cb.free(actions);
+    try cb.checkExecutionControl();
+    // These are the only CUDA tensor readbacks in the complete Laya forward.
+    const logits = try cb.toFloat32(scores, a);
+    defer a.free(logits);
+    const acts = try cb.toFloat32(actions, a);
+    defer a.free(acts);
+    if (logits.len != batch * count or acts.len != batch * cfg.n_act) return error.UnexpectedOutputShape;
+    for (markers, logits) |pos, *logit| if (pos < 0) {
+        logit.* = -1e4;
+    };
+    const result = try a.alloc(Tensor, 2);
+    errdefer a.free(result);
+    result[0] = try Tensor.initFloat32(a, "logits", &.{ @intCast(batch), @intCast(count) }, logits);
+    errdefer result[0].deinit();
+    result[1] = try Tensor.initFloat32(a, "action_logits", &.{ @intCast(batch), @intCast(cfg.n_act) }, acts);
+    return result;
+}
+
+/// Resident TransformerEncoder portion, also used by intermediate parity tests.
+pub fn transform(cb: *const CB, a: std.mem.Allocator, cfg: Config, encoder: CT, mask: []const i64, kinds: []const i64, batch: usize, seq: usize, dim: usize) !CT {
+    const repeated = try a.alloc(i64, batch * seq);
+    defer a.free(repeated);
+    for (kinds, 0..) |kind, row| @memset(repeated[row * seq ..][0..seq], kind);
+    const type_weight = try cb.getWeight("model.type_emb.weight");
+    defer cb.free(type_weight);
+    const types = try cb.embeddingLookup(type_weight, repeated, batch * seq, dim);
+    defer cb.free(types);
+    var hidden = try cb.add(encoder, types);
+    errdefer cb.free(hidden);
+    for (0..cfg.head_layers) |layer| {
+        try cb.checkExecutionControl();
+        var name: [128]u8 = undefined;
+        const prefix = try std.fmt.bufPrint(&name, "head.layers.{d}", .{layer});
+        var buf: [160]u8 = undefined;
+        const n1 = try norm(cb, hidden, try std.fmt.bufPrint(&buf, "{s}.norm1", .{prefix}), dim);
+        defer cb.free(n1);
+        const qw = try weight(cb, prefix, "self_attn.in_proj_weight");
+        defer cb.free(qw);
+        const qb = try weight(cb, prefix, "self_attn.in_proj_bias");
+        defer cb.free(qb);
+        const qkv = try cb.linear(n1, qw, qb, batch * seq, dim, dim * 3);
+        defer cb.free(qkv);
+        const q = try cb.sliceLastDim(qkv, 0, dim);
+        defer cb.free(q);
+        const k = try cb.sliceLastDim(qkv, dim, dim * 2);
+        defer cb.free(k);
+        const v = try cb.sliceLastDim(qkv, dim * 2, dim * 3);
+        defer cb.free(v);
+        const attn = try cb.scaledDotProductAttention(q, k, v, mask, null, batch, seq, dim / 64, 64);
+        defer cb.free(attn);
+        const proj = try linear(cb, attn, try std.fmt.bufPrint(&buf, "{s}.self_attn.out_proj", .{prefix}), batch * seq, dim, dim);
+        defer cb.free(proj);
+        const residual = try cb.add(hidden, proj);
+        defer cb.free(residual);
+        const n2 = try norm(cb, residual, try std.fmt.bufPrint(&buf, "{s}.norm2", .{prefix}), dim);
+        defer cb.free(n2);
+        const up = try linear(cb, n2, try std.fmt.bufPrint(&buf, "{s}.linear1", .{prefix}), batch * seq, dim, dim * 4);
+        defer cb.free(up);
+        const relu = try cb.relu(up);
+        defer cb.free(relu);
+        const down = try linear(cb, relu, try std.fmt.bufPrint(&buf, "{s}.linear2", .{prefix}), batch * seq, dim * 4, dim);
+        defer cb.free(down);
+        const next = try cb.add(residual, down);
+        cb.free(hidden);
+        hidden = next;
+    }
+    return hidden;
 }

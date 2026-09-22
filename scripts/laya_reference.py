@@ -153,6 +153,23 @@ def main():
         ids, markers = common.build_sequence(tok, state, q, 128, 64)
         items.append({"ids": ids, "markers": markers, "qtype": common.QTYPES[q["t"]]})
     batch = common.collate_items([items], tok.pad_token_id)
+    intermediates = {}
+
+    def capture(name, tensor):
+        intermediates[name] = tensor.detach().float().flatten().tolist()
+
+    model.encoder.register_forward_hook(
+        lambda _module, _inputs, output: capture("encoder", output.last_hidden_state)
+    )
+    model.head.layers[-1].register_forward_hook(
+        lambda _module, _inputs, output: capture("head_hidden", output)
+    )
+    model.scorer.register_forward_hook(
+        lambda _module, _inputs, output: capture("marker_scores", output)
+    )
+    model.act_head.register_forward_pre_hook(
+        lambda _module, inputs: capture("action_features", inputs[0])
+    )
     with torch.no_grad():
         logits, actions = model(
             batch["input_ids"],
@@ -162,6 +179,8 @@ def main():
             batch["qtype"],
         )
     fixture = {
+        "intermediates": intermediates,
+        "torch_version": torch.__version__,
         "states": states,
         "questions": questions,
         "sequences": items,

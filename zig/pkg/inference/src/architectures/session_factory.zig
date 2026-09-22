@@ -82,6 +82,7 @@ pub const CudaRuntimeStats = if (build_options.enable_cuda) cuda_compute_mod.Run
 const CudaCapabilityProfile = if (build_options.enable_cuda) cuda_compute_mod.CapabilityProfile else enum {
     clipclap,
     bert_encoder,
+    laya,
     deberta_reranker,
     gliner2,
     florence2,
@@ -1537,6 +1538,9 @@ pub fn createCudaSessionWithTaskOverrideAndKernelJitAndLoadContext(
 
     if (debug_cuda_session) std.log.info("cuda-session: require profile {s}", .{@tagName(cuda_profile)});
     try cuda_compute.requireProfile(cuda_profile);
+    cuda_compute.strict_f32_weights = cuda_profile == .laya;
+    cuda_compute.laya_optimizations = cuda_profile == .laya and platform.env.getenvBoolDefault("ANTFLY_CUDA_LAYA_OPTIMIZATIONS", true);
+    cuda_compute.laya_fusion = cuda_compute.laya_optimizations and platform.env.getenvBoolDefault("ANTFLY_CUDA_LAYA_FUSION", true);
     if (a4b_inference != null and
         (cuda_compute.ctx.info.compute_major != 8 or cuda_compute.ctx.info.compute_minor != 9))
     {
@@ -1709,6 +1713,7 @@ fn cudaProfileForArch(
     return switch (arch_config) {
         .clip, .clap => .clipclap,
         .bert => .bert_encoder,
+        .modern_bert => |cfg| if (cfg.laya != null and cfg.laya.?.max_len <= 512 and cfg.num_attention_heads > 0 and cfg.hidden_size / cfg.num_attention_heads <= 128) .laya else null,
         .deberta => .deberta_reranker,
         .gliner => .gliner2,
         .florence => .florence2,
@@ -1745,6 +1750,9 @@ test "cuda support gate admits only supported model roles" {
     try std.testing.expect(cudaSupportsArch(.{ .clip = .{} }, &generic_manifest));
     try std.testing.expect(cudaSupportsArch(.{ .clap = .{} }, &generic_manifest));
     try std.testing.expect(cudaSupportsArch(.{ .bert = .{} }, &generic_manifest));
+    try std.testing.expect(!cudaSupportsArch(.{ .modern_bert = .{} }, &generic_manifest));
+    try std.testing.expect(cudaSupportsArch(.{ .modern_bert = .{ .laya = .{} } }, &generic_manifest));
+    try std.testing.expect(!cudaSupportsArch(.{ .modern_bert = .{ .laya = .{ .max_len = 1024 } } }, &generic_manifest));
     try std.testing.expect(cudaSupportsArch(.{ .deberta = .{} }, &generic_manifest));
     try std.testing.expect(cudaSupportsArch(.{ .gliner = .{} }, &generic_manifest));
     try std.testing.expect(cudaSupportsArch(.{ .florence = .{} }, &generic_manifest));
@@ -9078,7 +9086,10 @@ fn archRunGeometry(ptr: *anyopaque, inputs: @import("../backends/session.zig").S
                 if (markers.shape.len != 2 or markers.shape[1] < 2 or markers.shape[1] > 20 or input_seq > laya.max_len) return error.InvalidLayaInputs;
                 const count: usize = @intCast(markers.shape[1]);
                 output_seq = 1;
-                workspace_bytes = try std.math.mul(usize, 2, try whisperStageWorkspace(batch, input_seq, input_seq, cfg.hidden_size, @max(cfg.num_attention_heads, cfg.hidden_size / 64), cfg.hidden_size * 4));
+                workspace_bytes = if (self.backend_type == .cuda)
+                    try layaCudaWorkspace(batch, input_seq, count, cfg.hidden_size, cfg.intermediate_size)
+                else
+                    try std.math.mul(usize, 2, try whisperStageWorkspace(batch, input_seq, input_seq, cfg.hidden_size, @max(cfg.num_attention_heads, cfg.hidden_size / 64), cfg.hidden_size * 4));
                 break :blk count + laya.n_act;
             }
             break :blk cfg.hidden_size;
@@ -9112,6 +9123,19 @@ fn archRunGeometry(ptr: *anyopaque, inputs: @import("../backends/session.zig").S
     const bytes = std.math.mul(usize, elements, @sizeOf(f32)) catch return error.ResourceLimitExceeded;
     const shape_elements: usize = if (self.arch_config == .modern_bert and self.arch_config.modern_bert.laya != null) 4 else 3;
     return .{ .sequence = sequence, .output_bytes = std.math.add(usize, bytes, shape_elements * @sizeOf(i64)) catch return error.ResourceLimitExceeded, .workspace_bytes = workspace_bytes };
+}
+
+/// Conservative simultaneous-live-tensor bound for the eager CUDA encoder/head.
+/// Attention scores live in block shared memory; no B*heads*S*S device tensor.
+fn layaCudaWorkspace(batch: usize, sequence: usize, options: usize, hidden: usize, intermediate: usize) !usize {
+    const mul = std.math.mul;
+    const add = std.math.add;
+    const encoder_width = try add(usize, try mul(usize, hidden, 20), try mul(usize, intermediate, 6));
+    const head_width = try mul(usize, hidden, 32);
+    const activations = try mul(usize, try mul(usize, batch, sequence), @max(encoder_width, head_width));
+    const scorer = try mul(usize, try mul(usize, batch, options), try mul(usize, hidden, 8));
+    // Include integer staging, action features, and allocator alignment headroom.
+    return add(usize, try mul(usize, try add(usize, activations, scorer), 4), 1024 * 1024);
 }
 
 fn whisperStageWorkspace(batch: usize, queries: usize, keys: usize, hidden: usize, heads: usize, ffn: usize) !usize {
