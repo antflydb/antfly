@@ -1005,7 +1005,7 @@ pub const CublasLt = struct {
     }
 
     pub fn matmulF32BiasF32Out(self: *CublasLt, ctx: *context_mod.CudaContext, dst: buffer_mod.DeviceBuffer, input: buffer_mod.DeviceBuffer, weight: buffer_mod.DeviceBuffer, bias: buffer_mod.DeviceBuffer, workspace: buffer_mod.DeviceBuffer, rows: usize, in_dim: usize, out_dim: usize) Error!void {
-        _ = try self.matmulWeightF32Out(ctx, dst, input, weight, workspace, rows, in_dim, out_dim, CUDA_R_32F, .{}, if (bias != null) .dense_bias else .dense, bias);
+        _ = try self.matmulWeightF32Out(ctx, dst, input, weight, workspace, rows, in_dim, out_dim, CUDA_R_32F, .{}, .dense_bias, bias);
     }
 
     fn setBias(self: *const CublasLt, desc: MatmulDesc, bias: buffer_mod.DeviceBuffer) Error!void {
