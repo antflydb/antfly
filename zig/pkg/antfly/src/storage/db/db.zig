@@ -2281,6 +2281,7 @@ const ProfiledApplyLock = struct {
 
 const EnrichmentAppendContext = struct {
     alloc: Allocator,
+    clock: platform_clock.Clock = platform_clock.Clock.real(),
     store: *docstore_mod.DocStore,
     applied_sequence_checkpoint_path: ?[]const u8,
     index_repair_checkpoint: ?index_repair_state.Location = null,
@@ -7097,8 +7098,11 @@ pub const DB = struct {
         }
     }
 
-    pub fn sourceVectorStats(self: *DB) ?vector_payload_store_mod.Stats {
-        return if (self.source_vectors.load(.acquire)) |source| source.tryStatsSnapshot() else null;
+    /// Null means source storage is disabled. Contention is retryable, never
+    /// evidence that a configured source store or its accounting is absent.
+    pub fn sourceVectorStats(self: *DB) error{StorageBusy}!?vector_payload_store_mod.Stats {
+        const source = self.source_vectors.load(.acquire) orelse return null;
+        return source.tryStatsSnapshot() orelse error.StorageBusy;
     }
 
     fn refreshSourceVectorOwnershipScopes(self: *DB) !void {
@@ -7594,6 +7598,7 @@ pub const DB = struct {
         const resources = self.core.batchExecutionResources();
         append_ctx.* = .{
             .alloc = self.runtime_alloc,
+            .clock = runtime_cfg.clock orelse self.backend_runtime.clock(),
             .store = resources.store,
             .applied_sequence_checkpoint_path = resources.applied_sequence_checkpoint_path,
             .index_repair_checkpoint = resources.index_repair_checkpoint,
@@ -30936,7 +30941,8 @@ pub const DB = struct {
             outcome catch |err| switch (err) {
                 error.EnrichmentRetryInProgress => {
                     if (!options.wait_for_enrichment_retries) return err;
-                    sleepNs(25 * std.time.ns_per_ms);
+                    const io = self.backend_runtime.io() orelse return error.MissingBackendRuntimeIo;
+                    try io.sleep(.fromMilliseconds(25), .awake);
                     continue;
                 },
                 else => return err,
@@ -57900,6 +57906,7 @@ fn appendGeneratedBatchFromEnrichment(
     };
     const LeaseFenceGuard = struct {
         fence: enrichment_runtime_mod.GeneratedWriteFence,
+        clock: platform_clock.Clock,
 
         fn validate(ptr: *anyopaque, alloc: Allocator, txn: *docstore_mod.DocStore.Batch.BatchTxn) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -57912,7 +57919,7 @@ fn appendGeneratedBatchFromEnrichment(
             defer parsed.deinit();
             if (!std.mem.eql(u8, parsed.value.owner_id, self.fence.owner_id) or
                 parsed.value.epoch != self.fence.epoch or
-                parsed.value.expires_at_ms <= platform_clock.Clock.real().nowRealtimeMs())
+                parsed.value.expires_at_ms <= self.clock.nowRealtimeMs())
             {
                 return error.EnrichmentLeaseFenceLost;
             }
@@ -57925,7 +57932,7 @@ fn appendGeneratedBatchFromEnrichment(
     var split_delta_builder: SplitDeltaBuilder = undefined;
     var lease_fence_guard: LeaseFenceGuard = undefined;
     const transactional_guard: ?docstore_mod.DocStore.TransactionalGuard = if (fence) |active_fence| blk: {
-        lease_fence_guard = .{ .fence = active_fence };
+        lease_fence_guard = .{ .fence = active_fence, .clock = ctx.clock };
         break :blk .{ .ptr = &lease_fence_guard, .validate = LeaseFenceGuard.validate };
     } else null;
     var transactional_split_delta: ?docstore_mod.DocStore.TransactionalWriteBuilder = null;
@@ -137239,7 +137246,7 @@ test "source vector table persists references without an ANN index and reopens" 
         if (collection_turns == 1024) return error.CollectionDidNotFinish;
         platform_time.yieldBriefly();
     }
-    try std.testing.expectEqual(@as(u64, 2), reopened.sourceVectorStats().?.live_payloads_at_collection);
+    try std.testing.expectEqual(@as(u64, 2), (try reopened.sourceVectorStats()).?.live_payloads_at_collection);
 }
 
 test "source vector table collection defers until an old read transaction releases its payload session" {
@@ -137278,10 +137285,10 @@ test "source vector table collection defers until an old read transaction releas
         var reader = try db.core.store.beginReadTxn();
         defer reader.abort();
         try db.core.store.put(key, replacement);
-        try std.testing.expectEqual(@as(u64, 2), db.sourceVectorStats().?.retained_payloads);
-        const before = db.sourceVectorStats().?;
+        try std.testing.expectEqual(@as(u64, 2), (try db.sourceVectorStats()).?.retained_payloads);
+        const before = (try db.sourceVectorStats()).?;
         try std.testing.expect(!try db.collectSourceVectorGarbage());
-        const deferred = db.sourceVectorStats().?;
+        const deferred = (try db.sourceVectorStats()).?;
         try std.testing.expectEqual(before.collections, deferred.collections);
         try std.testing.expectEqual(before.collection_deferrals + 1, deferred.collection_deferrals);
         try std.testing.expectEqual(@as(u64, 2), deferred.retained_payloads);
@@ -137295,8 +137302,8 @@ test "source vector table collection defers until an old read transaction releas
         if (collection_turns == 1024) return error.CollectionDidNotFinish;
         platform_time.yieldBriefly();
     }
-    try std.testing.expectEqual(@as(u64, 1), db.sourceVectorStats().?.live_payloads_at_collection);
-    try std.testing.expectEqual(@as(u64, 1), db.sourceVectorStats().?.retained_payloads);
+    try std.testing.expectEqual(@as(u64, 1), (try db.sourceVectorStats()).?.live_payloads_at_collection);
+    try std.testing.expectEqual(@as(u64, 1), (try db.sourceVectorStats()).?.retained_payloads);
     const current = try db.core.store.get(alloc, key);
     defer alloc.free(current);
     try std.testing.expectEqualSlices(u8, replacement, current);

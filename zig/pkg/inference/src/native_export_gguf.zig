@@ -4091,6 +4091,7 @@ fn buildBertMetadataEntries(
     try appendMetadataU32Entry(allocator, &entries, "bert.attention.head_count", config.num_attention_heads);
     try appendMetadataU32Entry(allocator, &entries, "bert.feed_forward_length", config.intermediate_size);
     try appendMetadataU32Entry(allocator, &entries, "bert.context_length", config.max_position_embeddings);
+    try appendMetadataU32Entry(allocator, &entries, "bert.position_embedding_offset", config.position_embedding_offset);
     try appendMetadataU32Entry(allocator, &entries, "bert.token_type_count", config.type_vocab_size);
     try appendMetadataU32Entry(allocator, &entries, "bert.label_count", config.num_labels);
     try entries.append(allocator, .{

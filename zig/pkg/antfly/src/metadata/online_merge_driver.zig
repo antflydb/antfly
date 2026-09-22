@@ -151,6 +151,7 @@ fn Adapter(comptime Service: type) type {
             donor_uri: []const u8,
             receiver_uri: []const u8,
             donor_replica_uris: []const []const u8,
+            receiver_status: ?io_contract.ReceiverStatus = null,
             fn uri(self: Owned, group: u64) ![]const u8 {
                 if (group == self.context.record.donor_group_id) return self.donor_uri;
                 if (group == self.context.record.receiver_group_id) return self.receiver_uri;
@@ -233,6 +234,7 @@ fn Adapter(comptime Service: type) type {
                 alloc.destroy(arena);
             }
             observation.owned_arena = null;
+            observation.execution_context = null;
         }
         fn begin(self: *Self, state: online.State) !Owned {
             const arena = try self.alloc.create(std.heap.ArenaAllocator);
@@ -243,7 +245,7 @@ fn Adapter(comptime Service: type) type {
             }
             const request: operation.RequestContext = .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() + 2 * std.time.ns_per_s };
             const context = try @import("service.zig").onlineMergeContext(self.service, arena.allocator(), state, request);
-            const resolved = try @import("service.zig").onlineMergeRoutes(self.service, arena.allocator(), state.scope.fence.owner_group_id, state.scope.fence.peer_group_id, request);
+            const resolved = try @import("service.zig").onlineMergeRoutes(self.service, arena.allocator(), state.scope.fence.owner_group_id, if (state.needsReceiver()) state.scope.fence.peer_group_id else null, request);
             return .{ .arena = arena, .context = context, .request = request, .donor_uri = resolved.donor_uri, .receiver_uri = resolved.receiver_uri, .donor_replica_uris = resolved.donor_replica_uris };
         }
         fn client(self: *Self, alloc: Allocator) api.ApiHttpClient {
@@ -307,7 +309,7 @@ fn Adapter(comptime Service: type) type {
         }
         fn observe(ptr: *anyopaque, state: online.State) !online.Observation {
             const self: *Self = @ptrCast(@alignCast(ptr));
-            const owned = try self.begin(state);
+            var owned = try self.begin(state);
             errdefer {
                 owned.arena.deinit();
                 self.alloc.destroy(owned.arena);
@@ -317,24 +319,32 @@ fn Adapter(comptime Service: type) type {
                 if (!std.meta.eql(donor.scope, state.scope)) return error.OnlineMergeReceiptMismatch;
                 return .{ .owned_arena = owned.arena, .scope = state.scope, .source_progress = donor.progress, .ordinary_conflict = true };
             }
-            const receiver = try self.fetch(io_contract.ReceiverStatus, owned, state, .{ .status = .receiver });
-            if (!std.meta.eql(donor.scope, state.scope) or !std.meta.eql(receiver.scope, state.scope)) return error.OnlineMergeReceiptMismatch;
+            if (!std.meta.eql(donor.scope, state.scope)) return error.OnlineMergeReceiptMismatch;
+            if (state.needsReceiver()) {
+                const receiver = try self.fetch(io_contract.ReceiverStatus, owned, state, .{ .status = .receiver });
+                if (!std.meta.eql(receiver.scope, state.scope)) return error.OnlineMergeReceiptMismatch;
+                owned.receiver_status = receiver;
+            }
             if (!donor.row_derived_indexes and owned.context.record.rollback_reason == null and
                 state.phase != .cancel_receiver and state.phase != .cancel_release and state.phase != .release and !state.terminal())
                 return error.OnlineMergeArtifactTailsUnsupported;
-            const finalized = if (receiver.state) |value| value.phase == .finalized and value.bootstrap_complete and value.bootstrap_applied_index == state.final_applied_index else false;
+            const receiver_state = if (owned.receiver_status) |receiver| receiver.state else null;
+            const finalized = if (receiver_state) |value| value.phase == .finalized and value.bootstrap_complete and value.bootstrap_applied_index == state.final_applied_index else false;
+            const retained = try owned.arena.allocator().create(Owned);
+            retained.* = owned;
             return .{
                 .owned_arena = owned.arena,
+                .execution_context = retained,
                 .scope = state.scope,
                 .source_progress = donor.progress,
                 .certificate = donor.certificate,
-                .receiver = receiver.progress,
+                .receiver = if (owned.receiver_status) |receiver| receiver.progress else null,
                 .retained_head = donor.retained_head,
                 .retained_reclaimed = donor.retained_reclaimed,
                 .retained_reclaimable = donor.retained_reclaimable,
-                .frozen = donor.drained and donor.fence != null and donor.fence.?.eql(state.scope.fence),
+                .source_fence = if (donor.fence != null and donor.fence.?.eql(state.scope.fence)) (if (donor.drained) .drained else .draining) else .absent,
                 .cutover_prepared = state.phase == .cutover and finalized,
-                .receiver_cancelled = if (receiver.state) |value| value.phase == .rolled_back else false,
+                .receiver_cancelled = if (receiver_state) |value| value.phase == .rolled_back else false,
                 .source_admission_closed = donor.next_epoch > state.scope.fence.admission_epoch and donor.fence == null and !donor.ordinary_scope_conflict,
             };
         }
@@ -360,13 +370,15 @@ fn Adapter(comptime Service: type) type {
                 try self.submit(owned, state, state.scope.fence.peer_group_id, request);
             }
         }
-        fn execute(ptr: *anyopaque, state: online.State, action: online.Action) !void {
+        fn execute(ptr: *anyopaque, state: online.State, action: online.Action, observation: *const online.Observation) !void {
             const self: *Self = @ptrCast(@alignCast(ptr));
-            const owned = try self.begin(state);
-            defer {
-                owned.arena.deinit();
-                self.alloc.destroy(owned.arena);
-            }
+            const retained: *const Owned = @ptrCast(@alignCast(observation.execution_context orelse return error.OnlineMergeReceiptMismatch));
+            var owned = retained.*;
+            // Reuse this step's authenticated receipt and routing snapshot.
+            // Preparation and apply compare the exact receipt; submit still
+            // revalidates metadata authority immediately before every write.
+            // Preserve the existing separate bounded execution deadline.
+            owned.request.deadline_ns = @import("antfly_platform").time.monotonicNs() + 2 * std.time.ns_per_s;
             switch (action) {
                 .source_command => |command| try self.submit(owned, state, state.scope.fence.owner_group_id, .{ .online_source = command }),
                 .prepare_certificate => {
@@ -382,7 +394,7 @@ fn Adapter(comptime Service: type) type {
                     try self.submit(owned, state, state.scope.fence.owner_group_id, batch);
                 },
                 .snapshot_page, .tail_page, .cutover, .cancel_receiver => {
-                    const receiver = try self.fetch(io_contract.ReceiverStatus, owned, state, .{ .status = .receiver });
+                    const receiver = owned.receiver_status orelse return error.OnlineMergeReceiptMismatch;
                     if (!std.meta.eql(receiver.scope, state.scope)) return error.OnlineMergeReceiptMismatch;
                     if (receiver.state == null) return self.prepared(owned, state, .{ .checkpoint = try checkpoint(state, owned.context, .accept) });
                     // Even cancellation before initialization needs a durable

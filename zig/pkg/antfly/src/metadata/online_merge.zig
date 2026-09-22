@@ -36,6 +36,12 @@ pub const State = struct {
     pub fn terminal(self: State) bool {
         return self.phase == .complete or self.phase == .cancelled;
     }
+    pub fn needsReceiver(self: State) bool {
+        return switch (self.phase) {
+            .snapshot, .tail, .final_tail, .cutover, .cancel_receiver => true,
+            .admit, .publish, .freeze, .release, .cancel_release, .complete, .cancelled => false,
+        };
+    }
     pub fn validate(self: State) !void {
         try self.scope.validate();
         if (self.version != 1 or self.revision == 0) return error.InvalidOnlineMergeState;
@@ -116,6 +122,8 @@ pub const Capabilities = struct {
 pub const Observation = struct {
     ordinary_conflict: bool = false,
     owned_arena: ?*std.heap.ArenaAllocator = null,
+    /// Adapter-owned immutable context, valid until release_observation.
+    execution_context: ?*const anyopaque = null,
     scope: source.Scope,
     source_progress: ?@import("../storage/db/online_source.zig").Progress = null,
     certificate: ?snapshot.Certificate = null,
@@ -123,8 +131,9 @@ pub const Observation = struct {
     retained_head: u64 = 0,
     retained_reclaimed: u64 = 0,
     retained_reclaimable: u64 = 0,
-    /// Exact scoped topology fence is durably active and participants drained.
-    frozen: bool = false,
+    /// Installing a fence and draining existing participants are distinct:
+    /// observing an installed fence must not enqueue another durable begin.
+    source_fence: enum { absent, draining, drained } = .absent,
     /// Metadata range publication for this exact attempt, not local readiness.
     cutover_committed: bool = false,
     /// Native receiver finalization is proven, but ranges are still private.
@@ -245,7 +254,11 @@ pub fn decide(current: State, observation: Observation, cancel: bool) !Decision 
         .freeze => {
             const value = progress orelse return error.OnlineMergeReceiptMismatch;
             if (value.phase == .released) return error.OnlineMergeReceiptMismatch;
-            if (!observation.frozen) return .{ .execute = .freeze_and_drain };
+            switch (observation.source_fence) {
+                .absent => return .{ .execute = .freeze_and_drain },
+                .draining => return .wait,
+                .drained => {},
+            }
             if (value.phase != .fenced) return .{ .execute = .{ .source_command = .{ .final_fence = .{ .scope = current.scope, .expected_sequence = observation.retained_head } } } };
             var next = current;
             next.phase = .final_tail;
@@ -284,7 +297,7 @@ pub const Driver = struct {
     ptr: *anyopaque,
     capabilities: Capabilities,
     observe: *const fn (*anyopaque, State) anyerror!Observation,
-    execute: *const fn (*anyopaque, State, Action) anyerror!void,
+    execute: *const fn (*anyopaque, State, Action, *const Observation) anyerror!void,
     /// Also compare durable rollback-intent presence with expected_cancel;
     /// cancellation and a pending cutover must not race through a state-only CAS.
     compare_and_set: *const fn (*anyopaque, State, State, expected_cancel: bool) anyerror!bool,
@@ -308,7 +321,7 @@ pub const Driver = struct {
         switch (try decide(current, observation, canceled)) {
             .wait => return current,
             .execute => |action| {
-                try self.execute(self.ptr, current, action);
+                try self.execute(self.ptr, current, action, &observation);
                 return current;
             },
             .advance => |next| {
@@ -449,7 +462,9 @@ test "metadata transition driver online durable phases authenticate exact receiv
     current = (try decide(current, observation, false)).advance;
     try std.testing.expectEqual(Phase.freeze, current.phase);
     try std.testing.expectEqual(Action.freeze_and_drain, (try decide(current, observation, false)).execute);
-    observation.frozen = true;
+    observation.source_fence = .draining;
+    for (0..8) |_| try std.testing.expectEqual(Decision.wait, try decide(current, observation, false));
+    observation.source_fence = .drained;
     const final_control = (try decide(current, observation, false)).execute.source_command.final_fence;
     try std.testing.expectEqual(@as(u64, 11), final_control.expected_sequence);
     observation.source_progress.?.phase = .fenced;
@@ -477,6 +492,52 @@ test "metadata transition driver online durable phases authenticate exact receiv
     try std.testing.expect(current.terminal());
 }
 
+test "metadata transition driver online observation lives through ambiguous effect and is released" {
+    const Fake = struct {
+        releases: usize = 0,
+        fail: bool = true,
+        fn observe(_: *anyopaque, state: State) !Observation {
+            const arena = try std.testing.allocator.create(std.heap.ArenaAllocator);
+            arena.* = std.heap.ArenaAllocator.init(std.testing.allocator);
+            errdefer {
+                arena.deinit();
+                std.testing.allocator.destroy(arena);
+            }
+            const scope = try arena.allocator().create(source.Scope);
+            scope.* = state.scope;
+            return .{ .scope = state.scope, .owned_arena = arena, .execution_context = scope };
+        }
+        fn execute(ptr: *anyopaque, state: State, action: Action, observation: *const Observation) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const scope: *const source.Scope = @ptrCast(@alignCast(observation.execution_context.?));
+            try std.testing.expect(std.meta.eql(state.scope, scope.*));
+            try std.testing.expect(std.meta.eql(action.source_command.admit.scope, scope.*));
+            if (self.fail) return error.TestLostReply;
+        }
+        fn release(ptr: *anyopaque, observation: *Observation) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const arena = observation.owned_arena.?;
+            arena.deinit();
+            std.testing.allocator.destroy(arena);
+            observation.owned_arena = null;
+            observation.execution_context = null;
+            self.releases += 1;
+        }
+        fn cas(_: *anyopaque, _: State, _: State, _: bool) !bool {
+            return error.UnexpectedMetadataWrite;
+        }
+    };
+    var fake: Fake = .{};
+    var driver: Driver = .{ .ptr = &fake, .capabilities = .{}, .observe = Fake.observe, .execute = Fake.execute, .compare_and_set = Fake.cas, .release_observation = Fake.release };
+    inline for (std.meta.fields(Capabilities)) |field| @field(driver.capabilities, field.name) = true;
+    const initial = testState();
+    try std.testing.expectError(error.TestLostReply, driver.step(initial, false));
+    try std.testing.expectEqual(@as(usize, 1), fake.releases);
+    fake.fail = false;
+    try std.testing.expect(initial.eql(try driver.step(initial, false)));
+    try std.testing.expectEqual(@as(usize, 2), fake.releases);
+}
+
 test "metadata transition driver online bounded effect retries survive lost metadata CAS" {
     const Fake = struct {
         durable: State,
@@ -493,7 +554,7 @@ test "metadata transition driver online bounded effect retries survive lost meta
             self.observations += 1;
             return self.observation;
         }
-        fn execute(ptr: *anyopaque, _: State, action: Action) !void {
+        fn execute(ptr: *anyopaque, _: State, action: Action, _: *const Observation) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             _ = action.source_command.admit;
             self.effects += 1;
@@ -589,7 +650,7 @@ test "metadata transition driver online reconstructs every forward phase after e
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.released_observations += 1;
         }
-        fn execute(ptr: *anyopaque, state: State, action: Action) !void {
+        fn execute(ptr: *anyopaque, state: State, action: Action, _: *const Observation) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.fail_before_effect) {
                 self.fail_before_effect = false;
@@ -616,7 +677,7 @@ test "metadata transition driver online reconstructs every forward phase after e
                         self.endpoint.source_progress.?.acknowledged = value.next;
                     },
                     .final_fence => |value| {
-                        try std.testing.expect(self.endpoint.frozen);
+                        try std.testing.expectEqual(.drained, self.endpoint.source_fence);
                         try std.testing.expectEqual(self.endpoint.retained_head, value.expected_sequence);
                         self.endpoint.source_progress.?.phase = .fenced;
                         self.endpoint.source_progress.?.through_sequence = value.expected_sequence;
@@ -661,7 +722,7 @@ test "metadata transition driver online reconstructs every forward phase after e
                     }
                 },
                 .freeze_and_drain => {
-                    self.endpoint.frozen = true;
+                    self.endpoint.source_fence = .drained;
                     // A final ordinary write arrived before the fence.
                     self.endpoint.retained_head = 14;
                 },
@@ -781,7 +842,7 @@ test "metadata transition driver online cancellation racing metadata CAS refresh
             self.cancel = true;
             return self.observation;
         }
-        fn execute(_: *anyopaque, _: State, _: Action) !void {
+        fn execute(_: *anyopaque, _: State, _: Action, _: *const Observation) !void {
             return error.UnexpectedEffect;
         }
         fn cas(ptr: *anyopaque, previous: State, next: State, expected_cancel: bool) !bool {

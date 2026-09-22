@@ -17940,6 +17940,8 @@ components:
                 omitted.
         error:
           type: string
+          description: Most recent retry or terminal failure reason. Retained while queued or running,
+            including across progress checkpoints and recovery; omitted after successful completion.
         created_at_ms:
           type: integer
           format: int64

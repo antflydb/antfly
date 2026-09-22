@@ -7,13 +7,16 @@ Call only when no build or test using this job-local cache is running. Keep
 executables, generated sources, tools, small objects, and global dependencies.
 Zig can report a cache hit without checking that its executable still exists;
 removing an output directory leaves a live manifest pointing at a missing binary.
-Only completed test link inputs are disposable. A cache miss recompiles them.
+The default mode removes only completed test link inputs. A cache miss
+recompiles them. --release-phase instead retires the entire private zig-local
+cache, including manifests, after every user of that phase's cache has exited.
 """
 
 import argparse
 import os
-from pathlib import Path
 import re
+import shutil
+from pathlib import Path
 
 
 def prune(cache: Path, min_bytes: int = 64 * 1024 * 1024) -> int:
@@ -56,8 +59,30 @@ def prune(cache: Path, min_bytes: int = 64 * 1024 * 1024) -> int:
     return removed
 
 
+def release_completed_phase(cache: Path) -> None:
+    """Release a quiescent CI phase's complete, private compiler cache.
+
+    Self-hosted Debug emits only executables, so object-only pruning cannot
+    bound disk use across phases. Remove manifests with outputs: retaining a
+    manifest after removing its executable produces a false Zig cache hit.
+    Global dependency caches and installed zig-out artifacts are outside this
+    directory and remain available to subsequent phases.
+    """
+    cache = cache.absolute()
+    if cache.name != "zig-local" or cache.resolve() != cache:
+        raise ValueError("phase release requires a real job-owned zig-local directory")
+    if cache.exists():
+        shutil.rmtree(cache)
+    cache.mkdir(parents=True)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("cache", type=Path)
+    parser.add_argument("--release-phase", action="store_true")
     args = parser.parse_args()
-    print(f"Pruned link inputs from {prune(args.cache)} completed test artifacts")
+    if args.release_phase:
+        release_completed_phase(args.cache)
+        print("Released completed phase compiler cache")
+    else:
+        print(f"Pruned link inputs from {prune(args.cache)} completed test artifacts")

@@ -7506,7 +7506,7 @@ pub fn storageOwnerRuntimeStatusJson(
 
     var status = runtime_status.LocalTableRuntimeStatus{
         .group_id = handle.storage_owner_group_id,
-        .source_vectors = handle.db.sourceVectorStats(),
+        .source_vectors = handle.db.sourceVectorStats() catch |err| return storageOwnerStatusFromError(err),
         .created_at_millis = (handle.db.getGroupCreatedAtMillis(
             handle.alloc,
             handle.storage_owner_group_id,
@@ -7572,6 +7572,54 @@ test "storage owner runtime status does not wait behind apply writer" {
         ),
     );
     try std.testing.expectEqual(@as(u64, 0), response.len);
+}
+
+test "storage owner runtime status distinguishes absent and busy source vectors" {
+    const alloc = std.testing.allocator;
+    var test_tmp = try TestDirectory.init("storage-owner-source-status-busy");
+    defer test_tmp.cleanup();
+    for ([_]bool{ false, true }) |with_source| {
+        const path = try tempTestPath(alloc, test_tmp.path(), if (with_source) "with-source" else "without-source");
+        defer alloc.free(path);
+        defer cleanupTestDir(path);
+        var handle = Handle{
+            .alloc = alloc,
+            .db = try db_mod.DB.open(alloc, path, .{
+                .table_storage = .{ .dense_embeddings = if (with_source) .vector_store else .primary_lsm },
+                .start_index_workers = false,
+                .start_optional_runtimes = false,
+                .ttl_cleanup = .{ .enabled = false },
+            }),
+            .storage_owner_table_name = @constCast("docs"),
+            .storage_owner_group_id = 7,
+        };
+        defer handle.db.close();
+        handle.db.backend_runtime.durable_jobs.drainOwner(handle.db.repair_cleanup_owner_id);
+        var response: kernel_owner_abi.OwnedBytes = .{};
+        if (handle.db.source_vectors.load(.acquire)) |source| {
+            // Holding the mutex on this thread makes both the missing-field
+            // bug and any blocking-lock replacement deterministic.
+            while (!source.mutex.tryLock()) antfly.platform_time.yieldBriefly();
+            defer source.mutex.unlock();
+            try std.testing.expectEqual(kernel_owner_abi.Status.busy, storageOwnerRuntimeStatusJson(
+                &handle,
+                &.{ .table_name = .fromSlice("docs") },
+                &response,
+            ));
+            try std.testing.expectEqual(@as(u64, 0), response.len);
+            try std.testing.expect(response.ptr == null);
+        } else try std.testing.expect(!with_source);
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, storageOwnerRuntimeStatusJson(
+            &handle,
+            &.{ .table_name = .fromSlice("docs") },
+            &response,
+        ));
+        defer alloc.free(response.ptr.?[0..@intCast(response.len)]);
+        const Status = struct { source_vectors: ?struct { retained_payloads: u64 } = null };
+        var parsed = try std.json.parseFromSlice(Status, alloc, response.ptr.?[0..@intCast(response.len)], .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        try std.testing.expectEqual(with_source, parsed.value.source_vectors != null);
+    }
 }
 
 const StorageOwnerObservationCancellation = struct {
