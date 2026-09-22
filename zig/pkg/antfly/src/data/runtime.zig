@@ -6074,6 +6074,7 @@ pub const DataServer = struct {
             _ = apply_sm.write_source.withRaftBatcher(if (self.data_raft != null) self.localRaftBatcher() else null);
         }
         const promotion_leadership = self.promotionLeadershipSource();
+        api_server_cfg.relational_maintenance_leadership = self.relationalMaintenanceLeadershipSource();
         _ = self.write_source.withPromotionLeadershipSource(promotion_leadership);
         if (self.data_raft_apply) |apply_sm| {
             _ = apply_sm.write_source.withPromotionLeadershipSource(promotion_leadership);
@@ -9917,6 +9918,27 @@ pub const DataServer = struct {
         return .{
             .ptr = self,
             .write_fn = localRaftBatchGroupForwarded,
+        };
+    }
+
+    fn relationalMaintenanceLeadershipSource(self: *DataServer) ?antfly.public_api.table_writes.PromotionLeadershipSource {
+        if (self.group_leadership_source == null) return null;
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .is_local_leader = struct {
+                    fn isLocalLeader(ptr: *anyopaque, group_id: u64) bool {
+                        const server: *DataServer = @ptrCast(@alignCast(ptr));
+                        // Maintenance yields to Raft instead of waiting behind slow
+                        // persistence. Protect the mutable host/group lookup using
+                        // the same lock as membership changes and foreground reads.
+                        const lock_host = server.data_raft != null;
+                        if (lock_host and !server.data_raft_mutex.tryLock()) return false;
+                        defer if (lock_host) server.data_raft_mutex.unlock();
+                        return server.group_leadership_source.?.isLocalLeader(group_id);
+                    }
+                }.isLocalLeader,
+            },
         };
     }
 
@@ -41798,6 +41820,40 @@ pub const implementation_tests = implementationTests();
 fn implementationTests() type {
     if (!(@import("builtin").is_test and !control_only_storage_sources)) return struct {};
     const Suite = struct {
+        test "data relational maintenance yields to raft persistence and follows elections" {
+            const Fake = struct {
+                leader: bool = true,
+                calls: usize = 0,
+                fn owns(ptr: *anyopaque, _: u64) bool {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.calls += 1;
+                    return self.leader;
+                }
+            };
+            var fake: Fake = .{};
+            // This callback only borrows the leadership port and host mutex. The host
+            // sentinel establishes distributed mode and is never dereferenced.
+            var host: antfly.raft.ManagedHttpHostService = undefined;
+            var server: DataServer = undefined;
+            server.data_raft = &host;
+            server.data_raft_mutex = .unlocked;
+            server.group_leadership_source = .{ .ptr = &fake, .vtable = &.{ .is_local_leader = Fake.owns } };
+            const source = server.relationalMaintenanceLeadershipSource().?;
+            try std.testing.expect(server.data_raft_mutex.tryLock());
+            try std.testing.expect(!source.isLocalLeader(7));
+            try std.testing.expectEqual(@as(usize, 0), fake.calls);
+            server.data_raft_mutex.unlock();
+            try std.testing.expect(source.isLocalLeader(7));
+            fake.leader = false;
+            try std.testing.expect(!source.isLocalLeader(7));
+            fake.leader = true;
+            try std.testing.expect(source.isLocalLeader(7));
+            try std.testing.expectEqual(@as(usize, 3), fake.calls);
+            server.group_leadership_source = null;
+            server.data_raft = null;
+            try std.testing.expectEqual(null, server.relationalMaintenanceLeadershipSource());
+        }
+
         test "data runtime status refresh skips opening the active startup group when no cached snapshot exists yet" {
             const alloc = std.testing.allocator;
 

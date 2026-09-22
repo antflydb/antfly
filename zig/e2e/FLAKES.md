@@ -1,5 +1,54 @@
 # Zig E2E flakes
 
+## 2026-09-21: #842 donor readiness and concurrent restore observations
+
+[Issue #842](https://github.com/antflydb/antfly/issues/842) failed the
+`snapshot-owner` foreign-key merge recovery case because it treated stable
+metadata leadership as proof that the donor group's asynchronous leader report
+had arrived. The shared cluster helper now polls that specific group under one
+absolute deadline, follows metadata leader changes, checks process liveness,
+and retains the last observation on timeout. Both recovery hooks use it.
+Deterministic tests cover absent/delayed reports, leader changes, deadline
+exhaustion, and process failure. The affected production test passed 4/4 with
+two workers and two repetitions using `zig-e2e-regression-loop.sh`. No fault
+window, merge deadline, or data-integrity assertion changed.
+
+[Full run 35641562828](https://github.com/antflydb/antfly/actions/runs/35641562828)
+also reported a 404 from a concurrent restore observer. A point lookup can
+resolve a physical table just before restore replaces the logical binding and
+retires that table. On absence, validate the original catalog identity before
+returning 404. A changed or temporarily unavailable binding returns a retryable
+503; the request never silently follows a replacement table. Deterministic
+HTTP coverage checks both missing-table and missing-document paths, unchanged,
+replaced, and deleted bindings, and catalog unavailability.
+
+The unchanged observer reproduced a separate 409 topology-change response in
+one of six runs. Its retry classifier already defines that response as
+retryable; the observer now invokes that classifier for both 409 and 503.
+404s remain failures. The rebuilt Linux server passes all five extension cases
+and this restore observer (6/6), without a diagnostic shim. Final native
+separate-cache server qualification passes the same six tests plus the
+controlled standby ACK-withholding case (7/7).
+
+Linux extension crashes and the full-unit failures from
+this run are recorded in [the runtime flake history](../FLAKES.md#2026-09-21-full-lane-cache-vopr-storage-and-extension-failures).
+
+The standby-startup ACK-pending 503 from the later PR lane did not reproduce in
+four unchanged runs (two workers, two repetitions). One successful round does
+not promise that every subsequent ACK arrives within the two-second response
+budget. The streaming/restart test now sends each write once and reconciles only
+the explicit locally-committed, ACK-pending response through both standby apply
+and the primary's recorded ACK within one 20-second observation budget. Document,
+restart, and remote-durability assertions still run. Other 503s fail; no mutation
+is retried. Deterministic tests require both observations for success and failure
+paths. A real authenticated proxy withholds all write ACKs until the original
+write returns the exact post-commit 503, then releases them. The reconciliation
+case fails with the old write handling and passed 4/4 with the correction on
+two workers and two repetitions, preserving all restart,
+content, and remote-durability assertions. Production acknowledgement policy and
+explicit outage-rejection tests remain unchanged; these changes do not claim to
+establish the CI latency cause.
+
 ## 2026-09-21: online merge recovery exceeded phase deadlines in PR #832 CI
 
 [Run 35633482490's recovery-1 job](https://github.com/antflydb/antfly/actions/runs/35633482490/job/106465550834)
@@ -23,8 +72,70 @@ fix these failures.
 
 Evidence is retained under `.benchmark-results/issue-828/` in the PR worktree:
 `ci-832-recovery.log` and `ci-832-recovery-artifacts/`, including both failed
-clusters' metadata/data logs and native stacks. These remain open recovery
-qualification failures pending targeted reproduction.
+clusters' metadata/data logs and native stacks.
+
+An unchanged native macOS ARM64 run passed 8/8 targeted cases (two workers,
+two repetitions); the exact CI Linux binary passed both cases under local x86
+emulation. Injecting an 800 ms delay into every eighth `fsync`/`fdatasync`,
+starting 30 seconds after each server starts, reproduced both timeout assertions.
+However, the second reproduction stalled in `snapshot`, not CI's `freeze`.
+This is evidence of persistence sensitivity, not proof of the original wait chain.
+
+The controller performed a receiver ReadIndex twice per effect and reacquired
+the same metadata context before preparing it. It also required receiver
+leadership during donor-only phases, and conflated an installed source fence
+with drained transactions, reproposing durable `begin` while waiting for drain.
+It now borrows one authenticated observation for each step, resolves/reads the
+receiver only when needed, and waits on an already-installed fence. Metadata
+authority is still revalidated immediately before every write; preparation and
+apply retain exact scope/receipt checks. No RPC or E2E deadline was raised.
+
+The 13 focused controller tests cover ownership through ambiguous replies,
+lost effects/CAS replies, cancellation, drain waiting, and donor-only routing
+without a receiver leader. All six owner-link/crash scenarios passed on two
+native workers (12/12). Five proxy diagnostics/CLI tests pass. The same sustained
+800 ms injection still times out after these changes: fewer reads do not make
+arbitrary persistence stalls fit the existing budgets. Both failed runs remain
+retained and must not be presented as passing pressure qualification or as a
+reproduction of CI's exact freeze stall. Bounded proxy diagnostics now retain
+receipt sequence, fence identity, drain status, and observation time.
+
+Reproduction uses `scripts/ci/zig-e2e-regression-loop.sh` with explicit selectors,
+`SKIP_BUILD=1`, `ANTFLY_BIN`, `ANTFLY_E2E_REGRESSION_WORKERS=2`, and a fresh
+`ANTFLY_E2E_REGRESSION_REPORT_DIR`. Local evidence is `merge-before*`,
+`merge-linux-before*`, `merge-linux-pressure3*`, `merge-linux-pressure-fixed2*`,
+and `merge-native-soak*` under the directory above. The Linux experiment used
+four emulated CPUs and an 8 GiB container, not native ARC hardware.
+
+## 2026-09-21: dependency-cohort seeding lost leadership after readiness (#841)
+
+[Issue #841](https://github.com/antflydb/antfly/issues/841) links
+[run 35647014305](https://github.com/antflydb/antfly/actions/runs/35647014305/job/106507526474):
+the child-table seed in `test_schema_rewrite_recovers_dependency_cohort`
+exhausted its 30-second write budget. The fixture already waits for all three
+replicas, known leaders, and enforced constraints before seeding. The retained
+logs show subsequent leader unavailability and activation `ConcurrencyUnavailable`;
+they do not establish that a first election never completed.
+
+Every data-node supervisor was scheduling activation and retirement against
+the entire cluster catalog. Duplicate attempts are fenced by durable progress
+CAS, but still consume remote reads, transaction slots, and persistence work.
+Maintenance now samples current local group leadership before doing that work.
+It yields if the Raft host mutex is busy, so maintenance does not queue behind
+slow persistence merely to discover that it is a follower. Elections transfer
+work on the next pass; native progress remains authoritative, and no completion
+cache can hide a new schema generation. Standalone ownership is unchanged.
+
+Deterministic regressions exercise follower suppression, leader transfer,
+standalone behavior, and contention with the Raft host. The maintenance suite
+also exposed a duplicated `expectErrorLogs(1)` declaration around one injected
+session-store failure; remove the duplicate, preserving strict error accounting.
+Before the ownership change, both #841 scenarios passed on two native workers
+(4/4). Consequently, the original seed failure has not been reproduced locally;
+the scheduling defect is independently established, not a proven explanation
+for every `LeaderUnavailable` in that CI run. Seed budgets and mutation retry
+rules are unchanged. Evidence: `ci-841-recovery.log`, `merge-native-soak*`, and
+`activation-*` beside the merge evidence above.
 
 ## 2026-09-21: catalog reporter startup preceded protocol readiness
 

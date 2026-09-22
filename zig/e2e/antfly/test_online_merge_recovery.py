@@ -54,6 +54,7 @@ class OwnerLinkFault:
         # Never change matching, forwarding, or decision tracking below.
         self.failed_owner_responses = deque(maxlen=128)
         self.owner_progress = deque(maxlen=32)
+        self.merge_progress = deque(maxlen=32)
         self.owner_timings = {}
 
     @staticmethod
@@ -110,6 +111,36 @@ class OwnerLinkFault:
                                 "snapshot_complete": rewrite.get("snapshot_complete"),
                                 "sequence": rewrite.get("sequence"),
                                 "final_cut": rewrite.get("final_cut") is not None,
+                            },
+                        )
+                    )
+                except ValueError:
+                    pass
+            operation = body.get("operation")
+            if (
+                response.status_code == 200
+                and path.endswith("/online-merge-io")
+                and isinstance(operation, dict)
+                and "status" in operation
+            ):
+                try:
+                    value = response.json()
+                    progress = value.get("progress") or {}
+                    scope = value.get("scope") or {}
+                    self.merge_progress.append(
+                        (
+                            index,
+                            operation["status"],
+                            {
+                                "observed_at": round(time.monotonic(), 3),
+                                "phase": progress.get("phase"),
+                                "sequence": progress.get("sequence"),
+                                "drained": value.get("drained"),
+                                "fenced": value.get("fence") is not None
+                                and value.get("fence") == scope.get("fence"),
+                                "acknowledged": progress.get("acknowledged"),
+                                "retained_head": value.get("retained_head"),
+                                "tail_sequence": progress.get("tail_sequence"),
                             },
                         )
                     )
@@ -232,6 +263,48 @@ def test_owner_link_failed_response_diagnostics_survive_heal_and_stay_bounded():
     assert not fault.transaction_observations
 
 
+def test_owner_link_merge_diagnostics_retain_bounded_progress_after_heal():
+    response = requests.Response()
+    response.status_code = 200
+    fence = {"transition_id": 7}
+    value = {
+        "scope": {"fence": fence},
+        "fence": fence,
+        "drained": False,
+        "progress": {"phase": "retaining", "sequence": 3},
+        "ignored_large_payload": "x" * 10000,
+    }
+    response._content = json.dumps(value).encode()
+    fault = OwnerLinkFault("snapshot")
+    fault.heal()
+    body = {
+        "_fault_path": "/internal/online-merge-io",
+        "operation": {"status": "donor"},
+    }
+    for index in range(40):
+        fault.observe_response(index, body, response)
+    assert len(fault.merge_progress) == 32
+    assert fault.merge_progress[0][0] == 8
+    assert fault.merge_progress[-1][2]["fenced"] is True
+    assert fault.merge_progress[-1][2]["drained"] is False
+    assert "ignored_large_payload" not in fault.merge_progress[-1][2]
+    assert not fault.observed()
+    assert not fault.transaction_observations
+
+    # Snapshot/transfer bodies can be large. Diagnostics must not decode them.
+    class PreparedResponse:
+        status_code = 200
+
+        def json(self):
+            raise AssertionError("decoded an unrelated prepared page")
+
+    fault.observe_response(
+        0,
+        {"_fault_path": body["_fault_path"], "operation": {"snapshot": {}}},
+        PreparedResponse(),
+    )
+
+
 def test_owner_link_timings_are_bounded_and_group_requests_by_operation():
     from datetime import timedelta
 
@@ -254,6 +327,76 @@ def test_owner_link_timings_are_bounded_and_group_requests_by_operation():
         fault.observe_response(0, {"_fault_path": f"/internal/{operation}"}, response)
     assert len(fault.owner_timings) <= 33
     assert "other" in fault.owner_timings
+
+
+@pytest.mark.parametrize("ready", [False, True])
+def test_group_leader_wait_follows_reports_with_one_deadline(monkeypatch, ready):
+    class Clock:
+        now = 0.0
+
+        def monotonic(self):
+            return self.now
+
+        def sleep(self, seconds):
+            self.now += seconds
+
+    clock = Clock()
+    monkeypatch.setattr(backups, "time", clock)
+
+    class Cluster:
+        def __init__(self):
+            self.polls = 0
+            self.leaders = []
+
+        def assert_processes_alive(self):
+            pass
+
+        def metadata_leader_id_once(self, *, request_timeout_s):
+            assert 0 < request_timeout_s <= 0.5 - clock.now + 1e-9
+            self.polls += 1
+            return 1 if self.polls == 1 else 2
+
+        def metadata_snapshot(self, index, *, request_timeout_s):
+            assert 0 < request_timeout_s <= 0.5 - clock.now + 1e-9
+            self.leaders.append(index)
+            rows = (
+                []
+                if self.polls == 1
+                else [
+                    {
+                        "group_id": 7,
+                        "leader_known": ready and self.polls >= 3,
+                        "leader_store_id": 4 if ready else 0,
+                    }
+                ]
+            )
+            return {"merged_group_statuses": rows}
+
+    cluster = Cluster()
+    if ready:
+        row = backups.ThreeByThreeBackupCluster.wait_for_group_leader(
+            cluster, 7, timeout_s=0.5
+        )
+        assert row["leader_store_id"] == 4
+        assert cluster.leaders == [0, 1, 1]
+    else:
+        with pytest.raises(
+            AssertionError, match="group 7 has no reported leader.*leader_known.*False"
+        ):
+            backups.ThreeByThreeBackupCluster.wait_for_group_leader(
+                cluster, 7, timeout_s=0.5
+            )
+        assert clock.now == pytest.approx(0.5)
+        assert cluster.polls <= 6
+
+
+def test_group_leader_wait_preserves_process_failure():
+    class Cluster:
+        def assert_processes_alive(self):
+            raise AssertionError("owner exited")
+
+    with pytest.raises(AssertionError, match="owner exited"):
+        backups.ThreeByThreeBackupCluster.wait_for_group_leader(Cluster(), 7)
 
 
 def set_command_option(command, option, value):
@@ -414,6 +557,7 @@ def owner_link_fault(request, monkeypatch):
             yield fault
         finally:
             print(f"restore owner progress: {list(fault.owner_progress)}")
+            print(f"online merge progress: {list(fault.merge_progress)}")
             print(
                 f"restore owner timings (count/total/max seconds): {fault.owner_timings}"
             )
@@ -442,9 +586,9 @@ def test_online_merge_recovers_after_owner_link_outage_and_crash(
     fault = owner_link_fault
 
     def interrupt(cluster, table_id, donor, receiver, table_name, documents):
-        assert wait_until(fault.observed, timeout_s=90, interval_s=0.1), (
-            f"never reached {fault.window}\n{cluster.debug_logs()}"
-        )
+        assert wait_until(
+            fault.observed, timeout_s=90, interval_s=0.1
+        ), f"never reached {fault.window}\n{cluster.debug_logs()}"
         leader = cluster.metadata_stable_leader_id(timeout_s=30)
         assert leader is not None, cluster.debug_logs()
         snapshot = cluster.metadata_snapshot(leader - 1, request_timeout_s=3)
@@ -480,9 +624,9 @@ def test_online_merge_recovers_after_owner_link_outage_and_crash(
             documents.update(tail)
         if crash == "reply_loss":
             fault.heal_with_lost_reply()
-            assert fault.reply_dropped.wait(30), (
-                "release never returned a successful reply"
-            )
+            assert fault.reply_dropped.wait(
+                30
+            ), "release never returned a successful reply"
             return online
         if crash == "raft_quorum":
             fault.raft_cut.set()
@@ -510,16 +654,8 @@ def test_online_merge_recovers_after_owner_link_outage_and_crash(
         if metadata:
             index = leader - 1
         else:
-            current = cluster.metadata_stable_leader_id(timeout_s=30)
-            assert current is not None
-            snapshot = cluster.metadata_snapshot(current - 1, request_timeout_s=3)
             group = donor if fault.window == "snapshot" else receiver
-            status = next(
-                value
-                for value in snapshot["merged_group_statuses"]
-                if int(value["group_id"]) == group
-            )
-            assert status["leader_known"], status
+            status = cluster.wait_for_group_leader(group, timeout_s=30)
             index = int(status["leader_store_id"]) - 4
             assert 0 <= index < len(cluster.data_procs), status
         procs = cluster.metadata_procs if metadata else cluster.data_procs
@@ -529,9 +665,9 @@ def test_online_merge_recovers_after_owner_link_outage_and_crash(
         try:
             if metadata:
                 successor = cluster.metadata_stable_leader_id(timeout_s=30)
-                assert successor is not None and successor != leader, (
-                    cluster.debug_logs()
-                )
+                assert (
+                    successor is not None and successor != leader
+                ), cluster.debug_logs()
             else:
                 assert wait_until(
                     lambda: fault.observed() - {index}, timeout_s=45, interval_s=0.1
@@ -636,9 +772,9 @@ def test_online_fk_merge_preserves_shadow_claims_and_retained_references(
         backups._seed_online_merge_setup_docs(owner, session, child, children)
 
     def interrupt(owner, table_id, donor, receiver, table, rows):
-        assert wait_until(fault.observed, timeout_s=90, interval_s=0.1), (
-            owner.debug_logs()
-        )
+        assert wait_until(
+            fault.observed, timeout_s=90, interval_s=0.1
+        ), owner.debug_logs()
         leader = owner.metadata_stable_leader_id(timeout_s=30)
         assert leader is not None, owner.debug_logs()
         state = owner.metadata_snapshot(leader - 1)
@@ -684,15 +820,7 @@ def test_online_fk_merge_preserves_shadow_claims_and_retained_references(
             children.pop(deleted_child)
         # Kill the current donor leader only after the source has retained
         # inserts, replacement, cascading deletes and companion reference effects.
-        latest = owner.metadata_snapshot(
-            owner.metadata_stable_leader_id(timeout_s=30) - 1
-        )
-        status = next(
-            value
-            for value in latest["merged_group_statuses"]
-            if int(value["group_id"]) == donor
-        )
-        assert status["leader_known"], status
+        status = owner.wait_for_group_leader(donor, timeout_s=30)
         index = int(status["leader_store_id"]) - 4
         assert 0 <= index < len(owner.data_procs)
         owner.data_procs[index].kill()

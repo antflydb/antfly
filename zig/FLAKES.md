@@ -8,6 +8,125 @@ The later [Antfly E2E failures](e2e/FLAKES.md#2026-09-18-concurrent-aggregations
 add full-text hydration contention, aggregation generation races, and overlapping transaction session recovery;
 their deterministic regressions and native soak evidence are recorded there.
 
+## 2026-09-21: source-vector status disappeared under contention (#845)
+
+[Issue #845](https://github.com/antflydb/antfly/issues/845) observed
+`MissingSourceVectorStatus` immediately after reopening an opaque owner under
+concurrent E2E load. Source storage was already open: `sourceVectorStats`
+returned null both when storage was disabled and when `tryStatsSnapshot` could
+not acquire its mutex. JSON omitted that null field and incorrectly reported a
+successful, incomplete observation.
+
+The DB observation now distinguishes disabled storage from `StorageBusy`.
+The owner ABI returns busy with no response bytes, allowing the existing bounded
+`ownerStatusEventually` retry to work. Fresh server status publication similarly
+retries contention through its existing `WriterLocked` path; best-effort cached
+overlays retain their previous observation. No source mutex wait is introduced
+under a shared owner lease, and the reopen test still rejects a successful
+response with missing source status.
+
+The deterministic C ABI regression holds the source mutex on the calling thread,
+requires busy and empty output, then releases it and requires source status
+without another query or write. It also checks a genuinely disabled source store
+and runs alongside the existing apply-writer contention regression. Both are
+registered in the default C API test selection.
+
+```sh
+cd zig
+zig build capi-test --cache-dir /tmp/antfly-832-local-cache -- \
+  --test-filter 'storage owner runtime status'
+zig build antfly-storage-owner-test --cache-dir /tmp/antfly-832-local-cache \
+  '-Dstorage-owner-test-filter=opaque storage owner preserves source-vector policy and status across reopen'
+```
+
+The old contention-to-null behavior fails the deterministic regression with
+`expected .busy, found .ok`. The corrected pair passes 20 invocations on two
+workers (40 tests), and the unchanged immediate-reopen test passes another
+20 invocations on two workers while compiler work is active. The original issue
+used `antfly-storage-test`; the focused current partitioned build target is
+`antfly-storage-owner-test`. A separate-cache qualification also passes all
+45 compiled owner tests and all 16 index-race/embedded lifecycle VOPR tests.
+Do not share a mutable local compiler cache with another active worktree: the
+initial broad run mixed consumer artifacts from a schema-format-14 worktree
+with this branch's format-13 provider and failed restore digest checks; the
+separate-cache build passes those same unchanged tests.
+
+## 2026-09-21: full-lane cache, VOPR storage, and extension failures
+
+[Full run 35641562828](https://github.com/antflydb/antfly/actions/runs/35641562828)
+contained independent failures; passing the smaller required lanes did not cover
+them. The full unit aggregate itself passed 2,120 tests (eight skipped).
+
+- The runtime-cache fixture selected an arbitrary compile artifact sharing the
+  HTTP runtime module. Different test runners produced different cache keys.
+  Select the intended simple-runner artifact before mutating its module. The
+  unchanged fixture reproduced its recompile failure; the corrected cache
+  contract passes, including the unchanged-build cache hit.
+- The index-manager and embedded VOPR roots omitted `antfly_schema_openapi`.
+  Register the dependency at each module boundary, including the WASM consumer
+  of the embedded configuration helper.
+- Native index-root validation consulted only the top-level storage override,
+  while backend open also honored nested LSM options. Canonicalize both onto
+  the same effective adapter. The regression covers nested configuration and
+  explicit-override precedence and later option reconfiguration. Main and WAL
+  adapters remain independent. The original exact-replay case reproduced
+  `InvalidIndexRootPointer`; advancing past it exposed wall-clock sleeping in
+  a virtual-time drain and real-clock validation of a virtual-time lease.
+  Drain through the owning I/O, carry the enrichment runtime's clock into its
+  transactional fence, and schedule readiness steps as recorded VOPR tasks.
+  All 13 index-race and three embedded lifecycle tests pass; exact replay
+  retains five repeats per scenario. No lease or timeout was relaxed.
+- The 49 GiB CI filesystem filled after the unit phase retained about 38 GiB
+  of compiler outputs. Linux self-hosted Debug often emits no disposable link
+  objects, so object-only pruning freed nothing. At completed full-job phase
+  boundaries, release the job-private `zig-local` outputs **and manifests**;
+  preserve global dependencies and installed artifacts. Tests cover symlink
+  rejection, sibling preservation, repeated release, and an actual Zig rebuild
+  after release. Never invoke phase release while a cache user is running.
+
+The extension failures are deterministic on the full Linux binary. Its static
+TLS is 2,099,440 bytes, already larger than Rayon's default 2 MiB compiler-worker
+stack. A diagnostic signal handler located the fault in Cranelift's
+`Compiler::compile_function` writing to its stack. An isolated invocation works
+with small TLS and exits 139 when given a matching large TLS reservation.
+Wasmtime core and component engines now disable the global parallel compiler
+pool and compile on the existing host worker. This bounds compilation fanout
+and uses the host's stack policy; it can reduce cold compilation parallelism.
+The large-TLS component invocation then passes, including host write and thread
+teardown. Existing full-server extension tests remain the integration gate.
+
+The retained isolated reproducer uses the real component, not a mocked engine:
+
+```sh
+cargo build --manifest-path extensions/memoryaf/Cargo.toml --release --target wasm32-wasip2
+# Set ANTFLY_WASMTIME_LIB to the pinned v45.0.2 C API shared library.
+zig test -O ReleaseSafe -lc --dep wasmtime \
+  -Mroot=zig/tools/fixtures/wasmtime_thread_stacks.zig \
+  -Mwasmtime=zig/pkg/antfly/src/extensions/wasmtime_runtime.zig
+```
+
+Run from the repository root on Linux/glibc. Restoring parallel compilation is
+the negative control. Local Linux evidence uses x86 emulation; ARC remains a
+separate qualification gate.
+
+## 2026-09-21: avoid duplicate recovery work during persistence pressure
+
+The [online-merge and #841 E2E records](e2e/FLAKES.md#2026-09-21-online-merge-recovery-exceeded-phase-deadlines-in-pr-832-ci)
+track the original failures, unchanged runs, and the limits of injected slow-sync
+experiments. The merge driver now borrows one step's validated observation,
+removes receiver dependencies from donor-only phases, and distinguishes fence
+installation from transaction drain. Relational maintenance schedules work on
+the current group leader and yields to a contended Raft host mutex. Durable
+receipt/authority checks remain responsible for safety across elections.
+
+The owning metadata and session-maintenance suites include regressions for
+observation lifetime, drain waiting, unavailable receiver routing, and ownership
+transfer without follower RPCs. The data-runtime suite covers the nonblocking
+host-lock check. `activation-ownership-negative.log` and
+`merge-fence-negative.log` under `.benchmark-results/issue-828/` retain the
+controlled old-behavior failures. Severe sustained slow-sync runs still fail;
+these changes are not evidence of an arbitrary disk-latency guarantee.
+
 ## 2026-09-21: TLA trace producers truncated each other's output
 
 [Issue #828](https://github.com/antflydb/antfly/issues/828) records

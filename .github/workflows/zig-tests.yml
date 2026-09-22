@@ -1024,11 +1024,12 @@ jobs:
 
       - name: Release completed phase compiler cache
         run: |
-          # The preceding build has finished. Release its large test link inputs
-          # while retaining cached executables, dependencies, and generators.
+          # The completed phase owns this private cache. Self-hosted Debug
+          # emits no disposable link objects; retire outputs and manifests
+          # together before the next phase. Global dependencies and zig-out stay.
           cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
           du -sh "$cache"
-          python3 zig/tools/prune_completed_test_cache.py "$cache"
+          python3 zig/tools/prune_completed_test_cache.py --release-phase "$cache"
           df -h "$cache"
           df -i "$cache"
 
@@ -1067,11 +1068,12 @@ jobs:
       # fixed maintenance seed is already part of the zig-base unit aggregate.
       - name: Release completed phase compiler cache
         run: |
-          # The preceding build has finished. Release its large test link inputs
-          # while retaining cached executables, dependencies, and generators.
+          # The completed phase owns this private cache. Self-hosted Debug
+          # emits no disposable link objects; retire outputs and manifests
+          # together before the next phase. Global dependencies and zig-out stay.
           cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
           du -sh "$cache"
-          python3 zig/tools/prune_completed_test_cache.py "$cache"
+          python3 zig/tools/prune_completed_test_cache.py --release-phase "$cache"
           df -h "$cache"
           df -i "$cache"
 
@@ -1109,11 +1111,12 @@ jobs:
       # no graph-specific CLI or promotion matrix is built here.
       - name: Release completed phase compiler cache
         run: |
-          # The preceding build has finished. Release its large test link inputs
-          # while retaining cached executables, dependencies, and generators.
+          # The completed phase owns this private cache. Self-hosted Debug
+          # emits no disposable link objects; retire outputs and manifests
+          # together before the next phase. Global dependencies and zig-out stay.
           cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
           du -sh "$cache"
-          python3 zig/tools/prune_completed_test_cache.py "$cache"
+          python3 zig/tools/prune_completed_test_cache.py --release-phase "$cache"
           df -h "$cache"
           df -i "$cache"
 
