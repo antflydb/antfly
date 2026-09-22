@@ -2,10 +2,10 @@
 
 import os
 import signal
-import sys
-import time
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -23,6 +23,7 @@ class RegressionEvidenceTests(unittest.TestCase):
         autograph=False,
         cluster_restore=False,
         profile="",
+        report=True,
     ):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -33,7 +34,8 @@ class RegressionEvidenceTests(unittest.TestCase):
                 "#!/usr/bin/env python3\n"
                 "import os, sys, resource\n"
                 "from pathlib import Path\n"
-                "path = next(arg.split('=', 1)[1] for arg in sys.argv if arg.startswith('--junitxml='))\n"
+                "path = next((arg.split('=', 1)[1] for arg in sys.argv if arg.startswith('--junitxml=')), None)\n"
+                "if path is None: print('stub invoked without junit'); sys.exit(0)\n"
                 "mode = os.environ['STUB_JUNIT_MODE']\n"
                 "if mode != 'missing':\n"
                 "    child = '<skipped/>' if mode == 'skip' or (mode == 'normal-skip' and '/normal/' in path) else ''\n"
@@ -44,11 +46,15 @@ class RegressionEvidenceTests(unittest.TestCase):
             if stale:
                 (reports / "worker-1-case-1.xml").write_text("previous run")
             result = subprocess.run(
-                [str(SCRIPT.with_name("zig-e2e-cluster-restore-soak.sh"))]
-                if cluster_restore
-                else [str(SCRIPT.with_name("zig-e2e-autograph-soak.sh"))]
-                if autograph
-                else [str(SCRIPT), "example.py::test_restore"],
+                (
+                    [str(SCRIPT.with_name("zig-e2e-cluster-restore-soak.sh"))]
+                    if cluster_restore
+                    else (
+                        [str(SCRIPT.with_name("zig-e2e-autograph-soak.sh"))]
+                        if autograph
+                        else [str(SCRIPT), "example.py::test_restore"]
+                    )
+                ),
                 env={
                     **os.environ,
                     "PATH": f"{root}{os.pathsep}{os.environ['PATH']}",
@@ -56,7 +62,7 @@ class RegressionEvidenceTests(unittest.TestCase):
                     "ANTFLY_E2E_ENV_LOADED": "1",
                     "ANTFLY_E2E_REGRESSION_REPEATS": str(repeats),
                     "ANTFLY_E2E_REGRESSION_WORKERS": str(workers),
-                    "ANTFLY_E2E_REGRESSION_REPORT_DIR": str(reports),
+                    "ANTFLY_E2E_REGRESSION_REPORT_DIR": str(reports) if report else "",
                     "STUB_JUNIT_MODE": mode,
                     "ANTFLY_E2E_REGRESSION_PROFILE": profile,
                 },
@@ -69,6 +75,12 @@ class RegressionEvidenceTests(unittest.TestCase):
                 str(p.relative_to(reports)): p.read_text()
                 for p in reports.rglob("*.xml")
             }
+
+    def test_without_report_directory_supports_empty_argument_array(self):
+        result, reports = self.run_loop(report=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("stub invoked without junit", result.stdout)
+        self.assertEqual(reports, {})
 
     def test_cancellation_stops_parallel_workers_and_their_servers(self):
         with tempfile.TemporaryDirectory() as directory:

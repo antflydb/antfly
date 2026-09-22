@@ -47,6 +47,7 @@ pub const AntflyTraceWriter = struct {
 pub const AntflyNdjsonTraceWriter = struct {
     mutex: std.atomic.Mutex = .unlocked,
     writer: *std.Io.Writer,
+    shared_mutex: ?*std.atomic.Mutex = null,
 
     pub fn traceWriter(self: *AntflyNdjsonTraceWriter) AntflyTraceWriter {
         return .{
@@ -59,8 +60,9 @@ pub const AntflyNdjsonTraceWriter = struct {
 
     fn traceEvent(ptr: *anyopaque, event: *const AntflyTracingEvent) void {
         const self: *AntflyNdjsonTraceWriter = @ptrCast(@alignCast(ptr));
-        platform_sync.lockYielding(&self.mutex);
-        defer self.mutex.unlock();
+        const mutex = self.shared_mutex orelse &self.mutex;
+        platform_sync.lockYielding(mutex);
+        defer mutex.unlock();
         self.writeEvent(event) catch {};
         self.writer.flush() catch {};
     }

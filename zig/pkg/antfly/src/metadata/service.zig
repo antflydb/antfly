@@ -1835,10 +1835,10 @@ pub const OnlineMergeRoutes = struct {
     }
 };
 
-/// Capture both routes and artifact-recovery peers from one non-observational
+/// Capture needed routes and artifact-recovery peers from one non-observational
 /// projection. The transition driver holds its own mutex: administrative
 /// snapshots would recursively invoke transition observation under that mutex.
-pub fn onlineMergeRoutes(service: anytype, alloc: std.mem.Allocator, donor: u64, receiver: u64, request: api_operation.RequestContext) !OnlineMergeRoutes {
+pub fn onlineMergeRoutes(service: anytype, alloc: std.mem.Allocator, donor: u64, receiver: ?u64, request: api_operation.RequestContext) !OnlineMergeRoutes {
     try request.ensureActive();
     service.lockRuntime();
     defer service.unlockRuntime();
@@ -1886,10 +1886,10 @@ fn onlineRouteLeader(stores: []const metadata_table_manager.StoreRecord, placeme
     return error.GroupLeaderUnavailable;
 }
 
-fn selectOnlineMergeRoutes(alloc: std.mem.Allocator, stores: []const metadata_table_manager.StoreRecord, placements: []const raft_reconciler.PlacementIntent, donor: u64, receiver: u64) !OnlineMergeRoutes {
+fn selectOnlineMergeRoutes(alloc: std.mem.Allocator, stores: []const metadata_table_manager.StoreRecord, placements: []const raft_reconciler.PlacementIntent, donor: u64, receiver: ?u64) !OnlineMergeRoutes {
     const donor_uri = try alloc.dupe(u8, try onlineRouteLeader(stores, placements, donor));
     errdefer alloc.free(donor_uri);
-    const receiver_uri = try alloc.dupe(u8, try onlineRouteLeader(stores, placements, receiver));
+    const receiver_uri = try alloc.dupe(u8, if (receiver) |group| try onlineRouteLeader(stores, placements, group) else "");
     errdefer alloc.free(receiver_uri);
     var replicas: std.ArrayListUnmanaged([]const u8) = .empty;
     errdefer {
@@ -1967,6 +1967,14 @@ test "metadata transition driver online routes capture one projection without ad
     donor_current[0].local_leader = true;
     placements[2].serving_state = .retiring;
     try std.testing.expectError(error.GroupLeaderUnavailable, onlineMergeRoutes(&fake, std.testing.allocator, 77, 88, .{}));
+    // Freeze and donor cleanup have no receiver dependency. A missing
+    // receiver leader must not prevent installing/releasing the source fence.
+    {
+        const routes = try onlineMergeRoutes(&fake, std.testing.allocator, 77, null, .{});
+        defer routes.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings("http://current", routes.donor_uri);
+        try std.testing.expectEqualStrings("", routes.receiver_uri);
+    }
     try std.testing.expectEqual(@as(usize, 0), fake.admin_calls);
     try std.testing.expect(!fake.locked);
 }

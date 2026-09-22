@@ -7,7 +7,7 @@ Web search is a first-class external capability. It should not be modeled as
 plain HTTP access because it has query semantics, ranking, freshness, snippets,
 citations, provider display rules, and agent-tool behavior.
 
-## Retrieval Agent: Exa
+## Retrieval Agent: Exa and Tavily
 
 Exa's provider wire types are generated from `zig/specs/exa-openapi.yaml`,
 vendored from `exa-labs/openapi-spec` at commit
@@ -106,7 +106,7 @@ A request may supply a named connection plus inline options to narrow its
 result limit, timeout, domains, or content settings. It cannot replace the
 connection's provider, endpoint, credentials, or expand content/domain access.
 Configure custom endpoints on the server's named connection; inline requests
-are restricted to `https://api.exa.ai/search`. Redirects are disabled. Provider
+are restricted to the selected provider's default endpoint. Redirects are disabled. Provider
 responses are capped at 1 MiB and text/highlights at 4,000 bytes each per result;
 web, database, and navigation evidence retained in model history shares one
 cumulative context budget. Retrieval returns `incomplete` if another result
@@ -115,7 +115,47 @@ aggregations, and other summaries can still support an answer when document
 bodies are pruned, provided the summaries fit within the remaining budget. Configuration belongs
 in either top-level `tools` or `steps.retrieval.tools`, not both. Both tool
 allowlists still apply. Other provider tokens describe the shared connection
-contract below; this retrieval adapter currently implements Exa only.
+contract below; this retrieval adapter implements Exa and Tavily.
+
+### Tavily
+
+For Tavily, set the named connection's `provider` to `tavily`, use
+`${secret:tavily.api_key}` (or omit `api_key` to use `TAVILY_API_KEY`), and set
+`include_content: true` to retain search snippets as evidence. Omit
+`include_highlights`, which Tavily does not support. The default endpoint is
+`https://api.tavily.com/search`, authenticated with a bearer token.
+
+Inline configuration uses `provider: tavily` and supports `max_results`,
+`timeout_ms`, `safe_search`, `include_content`, domain filters, `search_depth`
+(`basic` or `advanced`), `include_answer`, and `include_raw_content`. The default
+search depth is `basic`. Raw content is returned as bounded `_source.text`, with
+snippet fallback when unavailable. A named connection must allow content before
+an inline request can enable raw content. Provider-generated answers are not
+source evidence and are never added to hits or model history. Region, language,
+and enabled highlights are rejected rather than silently ignored.
+
+The wire types are generated from the unmodified official
+[Tavily OpenAPI spec](https://docs.tavily.com/documentation/api-reference/openapi.json),
+vendored at `zig/specs/tavily-openapi.json` on 2026-09-22 (SHA-256
+`cddb9b1828c10e323584d495dbd768cd70f0ce86878f4749335d1dd8769b30c4`).
+The existing OpenAPI generation pipeline aliases its inline request and result
+schemas. Tavily documents nullable `raw_content` and `published_date` but omits
+`nullable` in the schema; the adapter treats those nulls as absent before typed
+decoding. Unused response metadata, including the conditionally present
+`answer`, is not required for source retrieval.
+
+An opt-in live smoke test exercises real Tavily search through Antfly's public
+retrieval endpoint in JSON and SSE modes, with a deterministic local generator.
+It performs two basic searches (up to two results each):
+
+```sh
+# Set TAVILY_API_KEY securely in the environment first.
+cd zig
+ANTFLY_BIN="$PWD/zig-out/bin/antfly" uv run --project e2e/antfly \
+  pytest e2e/antfly/test_web_search.py -k tavily_live
+```
+
+The remaining tests in that file use local mock providers and do not need keys.
 
 ## Goals
 

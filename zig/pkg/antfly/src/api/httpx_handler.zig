@@ -5363,29 +5363,67 @@ pub const AntflyApiHandler = struct {
         return respondOwnedApiResponseWithAllocator(ctx, &response, ctx.allocator);
     }
 
+    const PublicTableBinding = struct {
+        physical: []u8,
+        logical: ?[]u8 = null,
+        table_id: ?u64 = null,
+
+        fn deinit(self: @This(), alloc: std.mem.Allocator) void {
+            alloc.free(self.physical);
+            if (self.logical) |logical| alloc.free(logical);
+        }
+
+        // A lookup may finish after restore retires its resolved physical
+        // table. Absence is authoritative only while that original binding
+        // remains current; never silently follow a replacement incarnation.
+        fn validateAbsence(self: @This(), server: *ApiHttpServer, alloc: std.mem.Allocator, context: operation_contract.RequestContext) !void {
+            const logical = self.logical orelse return;
+            const bytes = server.source.systemCatalog(alloc, context, .{ .resolve = try system_catalog.Target.parse(logical) }) catch |err| switch (system_catalog.httpStatus(err)) {
+                404, 409, 503 => return error.GenerationTransitionActive,
+                else => return err,
+            };
+            defer alloc.free(bytes);
+            const parsed = try std.json.parseFromSlice(?system_catalog.ResolvedTable, alloc, bytes, .{ .ignore_unknown_fields = true });
+            defer parsed.deinit();
+            const current = parsed.value orelse return error.GenerationTransitionActive;
+            if (current.table_id != self.table_id.? or !std.mem.eql(u8, current.name, self.physical))
+                return error.GenerationTransitionActive;
+        }
+    };
+
     fn resolvePublicTableName(self: *AntflyApiHandler, ctx: *httpx.Context, encoded: []const u8, identity: *?AuthenticatedIdentity) !?[]u8 {
+        const binding = (try self.resolvePublicTableBinding(ctx, encoded, identity)) orelse return null;
+        if (binding.logical) |logical| ctx.allocator.free(logical);
+        return binding.physical;
+    }
+
+    fn resolvePublicTableBinding(self: *AntflyApiHandler, ctx: *httpx.Context, encoded: []const u8, identity: *?AuthenticatedIdentity) !?PublicTableBinding {
         const alloc = ctx.allocator;
         const name = (try decodePathParamOrBadRequest(ctx, encoded)) orelse {
             _ = try ctx.response.text("invalid path parameter");
             return null;
         };
-        errdefer alloc.free(name);
+        var name_owned = true;
+        defer if (name_owned) alloc.free(name);
         const route = system_catalog_routes.parseAlloc(alloc, http_server_mod.stripApiPrefix(ctx.request.uri.path)) catch |err| {
             if (err == error.OutOfMemory) return err;
-            alloc.free(name);
             _ = try ctx.response.status(400).text("invalid path parameter");
             return null;
         };
         defer if (route) |value| value.deinit(alloc);
-        if (route == null and self.api_server.source.vtable.system_catalog == null) return name;
+        if (route == null and self.api_server.source.vtable.system_catalog == null) {
+            name_owned = false;
+            return .{ .physical = name };
+        }
         const target: system_catalog.Target = (if (route) |value| value.target() else system_catalog.Target.literal(name)) catch {
-            alloc.free(name);
             _ = try ctx.response.status(400).text("invalid path parameter");
             return null;
         };
         const bytes = self.api_server.source.systemCatalog(alloc, operationContext(ctx, identity.*), .{ .resolve = target }) catch |err| {
-            if (route == null and err == error.UnsupportedOperation) return name;
-            alloc.free(name);
+            if (route == null and err == error.UnsupportedOperation) {
+                name_owned = false;
+                return .{ .physical = name };
+            }
             _ = try ctx.response.status(system_catalog.httpStatus(err)).text(@errorName(err));
             return null;
         };
@@ -5393,16 +5431,14 @@ pub const AntflyApiHandler = struct {
         const parsed = try std.json.parseFromSlice(?system_catalog.ResolvedTable, alloc, bytes, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
         const table = parsed.value orelse {
-            alloc.free(name);
             _ = try ctx.response.status(404).text("not found");
             return null;
         };
         const logical = try target.resourceNameAlloc(alloc);
-        defer alloc.free(logical);
+        errdefer alloc.free(logical);
         if (identity.*) |*value| try http_server_mod.projectCatalogIdentity(self.api_server.alloc, value, logical, table.name);
         const physical = try alloc.dupe(u8, table.name);
-        alloc.free(name);
-        return physical;
+        return .{ .physical = physical, .logical = logical, .table_id = table.table_id };
     }
 
     fn resolveRestoreTableName(self: *AntflyApiHandler, ctx: *httpx.Context, encoded: []const u8, identity: *?AuthenticatedIdentity) !?[]u8 {
@@ -6764,8 +6800,9 @@ pub const AntflyApiHandler = struct {
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const alloc = ctx.allocator;
-        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.response.build();
-        defer alloc.free(decoded_table_name);
+        const binding = (try self.resolvePublicTableBinding(ctx, table_name, &authenticated_identity)) orelse return ctx.response.build();
+        defer binding.deinit(alloc);
+        const decoded_table_name = binding.physical;
         const decoded_key = (try decodePathParamOrBadRequest(ctx, key)) orelse return ctx.text("invalid path parameter");
         defer alloc.free(decoded_key);
         const source = self.api_server.table_reads orelse {
@@ -6790,6 +6827,11 @@ pub const AntflyApiHandler = struct {
             operationContext(ctx, authenticated_identity),
         ) catch |err| switch (err) {
             error.TableNotFound => {
+                binding.validateAbsence(self.api_server, alloc, operationContext(ctx, authenticated_identity)) catch |binding_err| {
+                    if (binding_err != error.GenerationTransitionActive) return binding_err;
+                    var response = try public_table_http.storageReadTemporarilyUnavailableOwnedResponse(alloc);
+                    return respondOwnedApiResponse(ctx, &response);
+                };
                 _ = ctx.status(404);
                 return ctx.text("not found");
             },
@@ -6842,6 +6884,11 @@ pub const AntflyApiHandler = struct {
             },
             else => return err,
         }) orelse {
+            binding.validateAbsence(self.api_server, alloc, operationContext(ctx, authenticated_identity)) catch |binding_err| {
+                if (binding_err != error.GenerationTransitionActive) return binding_err;
+                var response = try public_table_http.storageReadTemporarilyUnavailableOwnedResponse(alloc);
+                return respondOwnedApiResponse(ctx, &response);
+            };
             _ = ctx.status(404);
             return ctx.text("not found");
         };
@@ -10954,6 +11001,64 @@ test "httpx antfly reads preserve availability and terminal failures" {
             var wire = WireResponse{ .status = internal_response.status.code, .body = internal_response.body.? };
             var client = http_client.ApiHttpClient.init(alloc, .{ .ptr = &wire, .vtable = &.{ .execute = WireResponse.execute } });
             try std.testing.expectError(error.ReadIndexTimeout, client.fetchGroupLookup("http://127.0.0.1", 7, "docs", "doc:a", null));
+        }
+    }
+}
+
+test "httpx lookup revalidates missing catalog bindings across restore" {
+    const Fake = struct {
+        replacement: []const u8,
+        missing_table: bool,
+        resolves: usize = 0,
+        lookups: usize = 0,
+
+        const original = "{\"table_id\":7,\"name\":\"physical-old\"}";
+
+        fn catalog(ptr: *anyopaque, alloc: std.mem.Allocator, _: operation_contract.RequestContext, call: system_catalog.Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const target = switch (call) {
+                .resolve => |target| target,
+                else => return error.UnexpectedTestCall,
+            };
+            try std.testing.expectEqualStrings("docs", target.table);
+            self.resolves += 1;
+            if (self.resolves > 1 and std.mem.eql(u8, self.replacement, "unavailable")) return error.CatalogRoutingUnavailable;
+            return alloc.dupe(u8, if (self.resolves == 1) original else self.replacement);
+        }
+
+        fn lookup(ptr: *anyopaque, _: std.mem.Allocator, name: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.lookups += 1;
+            try std.testing.expectEqualStrings("physical-old", name);
+            if (self.missing_table) return error.TableNotFound;
+            return null;
+        }
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            return error.UnexpectedTestCall;
+        }
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return error.UnexpectedTestCall;
+        }
+    };
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ Fake.original, "null", "unavailable", "{\"table_id\":8,\"name\":\"physical-new\"}", "{\"table_id\":8,\"name\":\"physical-old\"}" }, 0..) |replacement, index| {
+        for ([_]bool{ false, true }) |missing_table| {
+            var fake = Fake{ .replacement = replacement, .missing_table = missing_table };
+            var server = ApiHttpServer.init(alloc, .{}, .{
+                .ptr = &fake,
+                .vtable = &.{ .status = LookupStatusSource.status, .system_catalog = Fake.catalog },
+            }, .{ .ptr = &fake, .vtable = &.{ .lookup = Fake.lookup, .scan = Fake.scan, .query = Fake.query } }, null);
+            var handler = AntflyApiHandler{ .api_server = &server };
+            var request = try httpx.Request.init(alloc, .GET, "http://127.0.0.1/db/v1/tables/docs/documents/key");
+            defer request.deinit();
+            var ctx = httpx.Context.init(alloc, undefined, &request);
+            defer ctx.deinit();
+            var response = try handler.lookupKey(&ctx, "docs", "key", .{});
+            defer response.deinit();
+            try std.testing.expectEqual(@as(u16, if (index == 0) 404 else 503), response.status.code);
+            if (index != 0) try std.testing.expectEqualStrings("1", response.header("Retry-After").?);
+            try std.testing.expectEqual(@as(usize, 2), fake.resolves);
+            try std.testing.expectEqual(@as(usize, 1), fake.lookups);
         }
     }
 }

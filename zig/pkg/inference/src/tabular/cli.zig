@@ -67,6 +67,7 @@ const PullOptions = struct {
 const HfRef = struct {
     owner: []const u8,
     name: []const u8,
+    revision: []const u8 = "main",
 };
 
 const HfArtifact = struct {
@@ -360,25 +361,27 @@ fn pullHuggingFace(alloc: std.mem.Allocator, io: std.Io, ref: []const u8, opts: 
     const base_url_env = try getEnvVarOwned(alloc, "ANTFLY_INFERENCE_HF_BASE_URL");
     defer if (base_url_env) |value| alloc.free(value);
     const base_url = base_url_env orelse "https://huggingface.co";
-    const config: hub_download.HubConfig = .{
+    var config: hub_download.HubConfig = .{
         .token = token,
         .base_url = base_url,
+        .revision = hf_ref.revision,
     };
 
-    const files = try hub_download.listModelFiles(alloc, io, hf_ref.owner, hf_ref.name, config);
-    defer {
-        for (files) |f| {
-            alloc.free(f.name);
-            if (f.sha256) |sum| alloc.free(sum);
-        }
-        alloc.free(files);
-    }
+    var snapshot = try hub_download.resolveModelSnapshot(alloc, io, hf_ref.owner, hf_ref.name, config);
+    defer snapshot.deinit(alloc);
+    config.revision = snapshot.commit;
 
-    const artifact = try selectHfArtifact(files, opts.file, opts.framework);
+    const artifact = try selectHfArtifact(snapshot.files, opts.file, opts.framework);
     print("pulling hf:{s}/{s}:{s}...\n", .{ hf_ref.owner, hf_ref.name, artifact.path });
     const body = try hub_download.readModelFileAlloc(alloc, io, hf_ref.owner, hf_ref.name, artifact.path, config, maxBytesForSource(artifact.source));
     defer alloc.free(body);
     if (artifact.sha256) |sum| try verifyBytesSha256(body, sum);
+    for (snapshot.files) |file| {
+        if (!std.mem.eql(u8, file.name, artifact.path)) continue;
+        if (file.size) |size| if (size != body.len) return error.SizeMismatch;
+        if (file.git_blob_sha1) |sum| try verifyBytesGitBlobSha1(body, sum);
+        break;
+    }
 
     try installPulledModel(alloc, io, opts.ml_dir, model_name, body, artifact.source, opts.optimize);
 }
@@ -390,11 +393,15 @@ fn getEnvVarOwned(allocator: std.mem.Allocator, comptime name: [:0]const u8) !?[
 
 fn parseHuggingFaceRef(ref: []const u8) ?HfRef {
     if (!isHuggingFaceRef(ref)) return null;
-    const repo = ref["hf:".len..];
+    const source = ref["hf:".len..];
+    const at = std.mem.indexOfScalar(u8, source, '@');
+    const repo = if (at) |index| source[0..index] else source;
+    const revision = if (at) |index| source[index + 1 ..] else "main";
+    if (revision.len == 0 or std.mem.indexOfScalar(u8, revision, '@') != null) return null;
     if (repo.len == 0 or std.mem.indexOfScalar(u8, repo, ':') != null) return null;
     const slash = std.mem.indexOfScalar(u8, repo, '/') orelse return null;
-    if (slash == 0 or slash + 1 >= repo.len) return null;
-    return .{ .owner = repo[0..slash], .name = repo[slash + 1 ..] };
+    if (slash == 0 or slash + 1 >= repo.len or std.mem.indexOfScalar(u8, repo[slash + 1 ..], '/') != null) return null;
+    return .{ .owner = repo[0..slash], .name = repo[slash + 1 ..], .revision = revision };
 }
 
 fn selectHfArtifact(files: []const hub_download.HubFile, explicit_file: ?[]const u8, framework_hint: ?tabular.convert.Framework) HfPullError!HfArtifact {
@@ -482,6 +489,18 @@ fn verifyBytesSha256(bytes: []const u8, expected_hex: []const u8) HfPullError!vo
     if (!std.mem.eql(u8, &actual_hex, expected_hex)) return HfPullError.ChecksumMismatch;
 }
 
+fn verifyBytesGitBlobSha1(bytes: []const u8, expected_hex: []const u8) !void {
+    var header_buf: [64]u8 = undefined;
+    const header = try std.fmt.bufPrint(&header_buf, "blob {d}\x00", .{bytes.len});
+    var hasher = std.crypto.hash.Sha1.init(.{});
+    hasher.update(header);
+    hasher.update(bytes);
+    var digest: [20]u8 = undefined;
+    hasher.final(&digest);
+    const actual = std.fmt.bytesToHex(digest, .lower);
+    if (!std.ascii.eqlIgnoreCase(&actual, expected_hex)) return error.ChecksumMismatch;
+}
+
 fn maxBytesForSource(source: InstallSource) usize {
     return switch (source) {
         .ir => limits.max_model_json_bytes,
@@ -542,7 +561,7 @@ fn printConvertUsage() void {
 fn printPullUsage() void {
     print(
         \\usage: antfly inference pull <url> --name <name> [options]
-        \\       antfly inference pull hf:<owner>/<repo> --type predictor [options]
+        \\       antfly inference pull hf:<owner>/<repo>[@revision] --type predictor [options]
         \\
         \\Download a hosted tabular predictor artifact and install it as a local predictor.
         \\
@@ -610,4 +629,20 @@ test "tabular hf selection supports explicit nested artifact" {
     try std.testing.expectEqualStrings("models/stump.txt", selected.path);
     try std.testing.expect(selected.source == .framework);
     try std.testing.expectEqual(tabular.convert.Framework.lightgbm, selected.source.framework);
+}
+
+test "tabular hf references separate repository and revision" {
+    const main = parseHuggingFaceRef("hf:owner/model").?;
+    try std.testing.expectEqualStrings("main", main.revision);
+    const branch = parseHuggingFaceRef("hf:owner/model@release/v2").?;
+    try std.testing.expectEqualStrings("model", branch.name);
+    try std.testing.expectEqualStrings("release/v2", branch.revision);
+    try std.testing.expect(parseHuggingFaceRef("hf:owner/model@") == null);
+    try std.testing.expect(parseHuggingFaceRef("hf:owner/model@a@b") == null);
+    try std.testing.expect(parseHuggingFaceRef("hf:owner/model/extra") == null);
+}
+
+test "tabular hf verifies non-LFS git blob checksums" {
+    try verifyBytesGitBlobSha1("test\n", "9daeafb9864cf43055ae93beb0afd6c7d144bfa4");
+    try std.testing.expectError(error.ChecksumMismatch, verifyBytesGitBlobSha1("changed", "9daeafb9864cf43055ae93beb0afd6c7d144bfa4"));
 }

@@ -34,6 +34,7 @@ pub const QueryResponse = query_contract.QueryResponse;
 pub const QueryResponseMeta = query_contract.QueryResponseMeta;
 pub const OwnedQueryRequest = query_contract.OwnedQueryRequest;
 pub const PublicFilterQueryErrorKind = query_contract.PublicFilterQueryErrorKind;
+pub const SemanticResolver = query_contract.SemanticResolver;
 
 pub const parseQueryRequest = query_contract.parseQueryRequest;
 pub const parseGraphMetricRequestsAlloc = query_contract.parseGraphMetricRequestsAlloc;

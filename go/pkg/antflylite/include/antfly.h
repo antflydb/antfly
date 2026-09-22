@@ -150,6 +150,18 @@ typedef struct antfly_lite_open_options {
     uint64_t ttl_cleanup_lease_ttl_ms;
     uint64_t ttl_cleanup_interval_ms;
     uint64_t ttl_cleanup_grace_period_ns;
+    /* Explicit embedded-inference resource-budget overrides in MiB, 0
+     * meaning automatic/host-detected sizing. Only consulted when `flags`
+     * carries ANTFLY_LITE_OPEN_FLAG_LOCAL_RUNTIME_CONFIGURED; mirror the
+     * antfly CLI's --inference-host-budget-mb/--inference-backend-budget-mb/
+     * --process-memory-budget-mb. Older callers built against a smaller
+     * abi_size implicitly get 0/automatic. */
+    uint32_t inference_host_budget_mb;
+    uint32_t inference_backend_budget_mb;
+    uint32_t inference_process_memory_budget_mb;
+    uint32_t inference_combined_budget_mb;
+    uint32_t inference_kv_budget_mb;
+    uint32_t inference_scratch_budget_mb;
     uint64_t reserved[8];
 } antfly_lite_open_options;
 

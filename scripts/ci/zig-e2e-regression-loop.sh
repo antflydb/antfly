@@ -204,7 +204,7 @@ for ((iteration = 1; iteration <= repeats; iteration++)); do
     fi
     ANTFLY_E2E_PRESERVE_ROOT_ON_FAILURE="$preserve_root" \
       python3 "$script_dir/run_e2e_case.py" \
-      uv run --project e2e/antfly pytest -q -s --durations=10 "${report_args[@]}" "$test_name" &
+      uv run --project e2e/antfly pytest -q -s --durations=10 ${report_args[@]+"${report_args[@]}"} "$test_name" &
     active_case=$!
     if wait "$active_case"; then
       status=0

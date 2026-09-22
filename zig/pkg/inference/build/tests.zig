@@ -51,6 +51,7 @@ pub fn create(ctx: Context) Suite {
     tests.root_module.addImport("build_options", ctx.graph.qualification_build_options_mod);
     tests.root_module.addImport("antfly-json", ctx.graph.json_mod);
     tests.root_module.addImport("httpx", ctx.graph.httpx_mod);
+    tests.root_module.addImport("protobuf", ctx.graph.protobuf_mod);
     tests.root_module.addImport("inference_api", ctx.graph.inference_api_mod);
     tests.root_module.addImport("antfly_generating_openapi", ctx.graph.generating_openapi_mod);
     tests.root_module.addImport("antfly_extraction_openapi", ctx.graph.extraction_openapi_mod);
