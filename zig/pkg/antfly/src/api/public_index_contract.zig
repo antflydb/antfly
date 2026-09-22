@@ -527,7 +527,8 @@ fn graphResolverFieldValueMatches(field: []const u8, value: std.json.Value) bool
         std.mem.eql(u8, field, "config_generation")) return isInteger(value);
     if (std.mem.eql(u8, field, "fusion_trust") or
         std.mem.eql(u8, field, "fusion_prior") or
-        std.mem.eql(u8, field, "fusion_prior_weight")) return isNumber(value);
+        std.mem.eql(u8, field, "fusion_prior_weight") or
+        std.mem.eql(u8, field, "min_confidence")) return isNumber(value);
     return isString(value);
 }
 
@@ -709,6 +710,7 @@ pub fn isAllowedGraphResolverField(field: []const u8) bool {
         std.mem.eql(u8, field, "fusion_trust") or
         std.mem.eql(u8, field, "fusion_prior") or
         std.mem.eql(u8, field, "fusion_prior_weight") or
+        std.mem.eql(u8, field, "min_confidence") or
         std.mem.eql(u8, field, "config_generation");
 }
 

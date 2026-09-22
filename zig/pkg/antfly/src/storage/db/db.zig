@@ -28320,6 +28320,7 @@ pub const DB = struct {
             max_weight,
             null,
             null,
+            "",
         );
     }
 
@@ -28362,6 +28363,7 @@ pub const DB = struct {
             max_weight,
             null,
             null,
+            "",
         );
     }
 
@@ -28482,6 +28484,7 @@ pub const DB = struct {
             true,
             null,
             &work_budget,
+            .{},
         );
     }
 
@@ -28498,6 +28501,7 @@ pub const DB = struct {
         include_paths: bool,
         node_admission: ?NodeAdmission,
         work_budget: *graph_pattern_mod.WorkBudget,
+        scope: graph_query_mod.ExecutionScope,
     ) ![]graph_pattern_mod.PatternMatch {
         if (start_keys.len == 0) return try alloc.alloc(graph_pattern_mod.PatternMatch, 0);
         var filter_ctx = PatternNodeFilterContext.init(self, alloc);
@@ -28514,6 +28518,7 @@ pub const DB = struct {
             },
             .node_admission = node_admission,
             .work_budget = work_budget,
+            .owning_table = scope.owning_table,
         });
     }
 
@@ -28527,6 +28532,7 @@ pub const DB = struct {
         return_aliases: []const []const u8,
         node_admission: ?NodeAdmission,
         work_budget: *graph_pattern_mod.WorkBudget,
+        scope: graph_query_mod.ExecutionScope,
     ) ![]graph_pattern_mod.PatternMatch {
         if (start_keys.len == 0) return try alloc.alloc(graph_pattern_mod.PatternMatch, 0);
         var filter_ctx = PatternNodeFilterContext.init(self, alloc);
@@ -28538,6 +28544,7 @@ pub const DB = struct {
             .evaluator = .{ .ctx = &filter_ctx, .func = patternNodeFilterEvaluator },
             .node_admission = node_admission,
             .work_budget = work_budget,
+            .owning_table = scope.owning_table,
         });
     }
 
@@ -28548,6 +28555,7 @@ pub const DB = struct {
         start_keys: []const []const u8,
         node_admission: ?NodeAdmission,
         budgets: db_query_graph.RequestGraphBudgets,
+        scope: graph_query_mod.ExecutionScope,
     ) ![]types.GraphAggregateResult {
         if (start_keys.len == 0) {
             const empty = try alloc.alloc(types.GraphAggregateResult, named.query.aggregates.len);
@@ -28582,6 +28590,7 @@ pub const DB = struct {
                 .node_admission = node_admission,
                 .work_budget = budgets.work,
                 .distinct_budget = budgets.distinct,
+                .owning_table = scope.owning_table,
             },
         );
         defer {
@@ -36301,6 +36310,7 @@ pub const DB = struct {
                         visible_doc_count = @max(visible_doc_count, item.doc_count);
                     }
                     item.text_merge = self.core.index_manager.textMergeStatsSnapshotForIndex(item.name);
+                    try self.populateConfiguredDerivedCoverageCounts(item.name, item);
                 },
                 .dense_vector => {
                     if (self.core.denseIndex(item.name)) |entry| {
@@ -36335,6 +36345,7 @@ pub const DB = struct {
                         item.graph_counts_pending = graph_stats.counts_pending;
                         applyGraphAlgebraicRuntimeStats(item, &entry.index);
                     }
+                    try self.populateConfiguredDerivedCoverageCounts(item.name, item);
                     if (!item.graph_counts_pending) visible_doc_count = @max(visible_doc_count, item.doc_count);
                 },
                 .algebraic => {
@@ -38126,6 +38137,11 @@ pub const DB = struct {
                         term_doc_freq_cache_misses += text_snapshot.term_doc_freq_cache_misses;
                     }
                     item.text_merge = self.core.index_manager.textMergeStatsSnapshotForIndex(cfg.name);
+                    // Artifact-fed full-text projections carry the same
+                    // durable per-document generation outcomes as embeddings
+                    // indexes; surface them so terminal failures are settled
+                    // coverage, not invisible pending work.
+                    try self.populateConfiguredDerivedCoverageCounts(cfg.name, &item);
                 },
                 .dense_vector => {
                     if (self.core.denseIndex(cfg.name)) |entry| {
@@ -38198,6 +38214,12 @@ pub const DB = struct {
                         applyGraphAlgebraicRuntimeStats(&item, &entry.index);
                         try populateGraphMetricStatusStats(alloc, &item, &entry.index);
                     }
+                    // Extraction-fed graph indexes (the autoschema pipeline)
+                    // record per-document generation outcomes under the
+                    // consuming index's coverage generation; without this the
+                    // knowledge graph's terminal extraction failures were
+                    // reported nowhere on the index itself.
+                    try self.populateConfiguredDerivedCoverageCounts(cfg.name, &item);
                 },
                 .algebraic => {
                     try self.populateAlgebraicIndexStats(alloc, cfg.name, &item, false);
@@ -40132,7 +40154,7 @@ pub const DB = struct {
         try self.populateCanonicalGroupedMatches(alloc, execution_req, exec_ctx, &base);
 
         if (execution_req.graph_metric_queries.len > 0) {
-            base.graph_metric_results = try self.executeGraphMetricQueries(alloc, execution_req.graph_metric_queries);
+            base.graph_metric_results = try self.executeGraphMetricQueries(alloc, execution_req.graph_metric_queries, execution_req.cancellation);
         }
         try self.applyGraphMetricRerank(&base, execution_req);
 
@@ -40151,6 +40173,7 @@ pub const DB = struct {
         self: *DB,
         alloc: Allocator,
         queries: []const types.NamedGraphMetricQuery,
+        cancellation: ?types.CancellationToken,
     ) ![]types.GraphMetricResult {
         if (queries.len == 0) return &.{};
         const results = try alloc.alloc(types.GraphMetricResult, queries.len);
@@ -40160,7 +40183,7 @@ pub const DB = struct {
             alloc.free(results);
         }
         for (queries, 0..) |named, i| {
-            results[i] = try self.executeGraphMetricQuery(alloc, named);
+            results[i] = try self.executeGraphMetricQuery(alloc, named, cancellation);
             initialized += 1;
         }
         return results;
@@ -40180,11 +40203,12 @@ pub const DB = struct {
             // unpersonalized scores, so seeds require fresh and skip the
             // publication requirements below.
             if (rerank.freshness != .fresh) return error.GraphMetricPersonalizationRequiresFresh;
-            break :blk try entry.index.personalizedPageRankScoreSnapshotAlloc(
+            break :blk try entry.index.personalizedPageRankScoreSnapshotAllocWithControls(
                 rerank.metric_name,
                 rerank.seed_nodes,
                 rerank.damping,
                 node_ids,
+                .{ .cancellation = req.cancellation orelse .none },
             );
         } else try entry.index.graphMetricScoreSnapshotWithPolicyAlloc(rerank.metric_name, node_ids, .{
             .require_published = true,
@@ -40252,6 +40276,7 @@ pub const DB = struct {
         self: *DB,
         alloc: Allocator,
         named: types.NamedGraphMetricQuery,
+        cancellation: ?types.CancellationToken,
     ) !types.GraphMetricResult {
         const entry = self.core.graphIndex(named.query.index_name) orelse return error.IndexNotFound;
         if (named.query.damping != null and named.query.seed_nodes.len == 0) return error.InvalidQueryRequest;
@@ -40259,13 +40284,17 @@ pub const DB = struct {
             // Personalized rankings are computed fresh from the current edge
             // snapshot; published generations are global-only, so seeded
             // reads against published freshness fail closed and the fresh
-            // publication-state check below does not apply.
+            // publication-state check below does not apply. The fresh
+            // computation scans the filtered edge snapshot BEFORE kernel
+            // admission, so it carries the request's cancellation and the
+            // default scan caps (PersonalizedReadControls).
             if (named.query.freshness != .fresh) return error.GraphMetricPersonalizationRequiresFresh;
-            break :blk try entry.index.personalizedPageRankTopKSnapshotAlloc(
+            break :blk try entry.index.personalizedPageRankTopKSnapshotAllocWithControls(
                 named.query.metric_name,
                 named.query.seed_nodes,
                 named.query.damping,
                 named.query.top_k,
+                .{ .cancellation = cancellation orelse .none },
             );
         } else try entry.index.graphMetricTopKSnapshotAlloc(
             named.query.metric_name,
@@ -43125,6 +43154,16 @@ pub const DB = struct {
         return try self.core.scanStoreRangeWithContext(lower, upper, options, scan_ctx, callback);
     }
 
+    /// Local graph execution scope from the request: the API read source
+    /// sets `graph_owning_table` and `graph_index_complete_snapshot` when it
+    /// admits a single-group query for local (non-coordinated) execution.
+    fn graphExecutionScope(req: types.SearchRequest) graph_query_mod.ExecutionScope {
+        return .{
+            .owning_table = req.graph_owning_table,
+            .expand_cross_table_local = req.graph_index_complete_snapshot,
+        };
+    }
+
     fn searchGraph(self: *DB, alloc: Allocator, req: types.SearchRequest, graph_query: graph_query_mod.GraphQuery, base_hits: ?[]const types.SearchHit) !types.SearchResult {
         _ = req.index_name;
         const predicate_aware = graphRequestRequiresAdmission(req, graph_query.params.node_filter);
@@ -43138,6 +43177,7 @@ pub const DB = struct {
             .ctx = self,
             .graph_ctx = if (predicate_aware) &execution else null,
             .predicate_aware = predicate_aware,
+            .scope = graphExecutionScope(req),
             .execute_graph_query = if (predicate_aware)
                 executeSearchGraphQueryWithAdmissionCallback
             else
@@ -43212,6 +43252,7 @@ pub const DB = struct {
                 .ctx = self,
                 .graph_ctx = if (predicate_aware) &execution else null,
                 .predicate_aware = predicate_aware,
+                .scope = graphExecutionScope(req),
                 .find_shortest_path = if (predicate_aware)
                     executeShortestPathWithAdmissionCallback
                 else
@@ -43369,6 +43410,7 @@ pub const DB = struct {
             .ctx = self,
             .graph_ctx = if (predicate_aware) execution else null,
             .predicate_aware = predicate_aware,
+            .scope = graphExecutionScope(req),
             .match_pattern = if (predicate_aware)
                 executePatternMatchWithAdmissionCallback
             else
@@ -43688,6 +43730,7 @@ pub const DB = struct {
         start_key_refs: []const []const u8,
         target_nodes: []const graph_node_identity.Ref,
         budgets: db_query_graph.RequestGraphBudgets,
+        scope: graph_query_mod.ExecutionScope,
     ) anyerror![]graph_pattern_mod.PatternMatch {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         return try self.matchPatternWithNodeAdmission(
@@ -43702,6 +43745,7 @@ pub const DB = struct {
             named.query.params.include_paths,
             null,
             budgets.work,
+            scope,
         );
     }
 
@@ -43712,6 +43756,7 @@ pub const DB = struct {
         start_key_refs: []const []const u8,
         target_nodes: []const graph_node_identity.Ref,
         budgets: db_query_graph.RequestGraphBudgets,
+        scope: graph_query_mod.ExecutionScope,
     ) anyerror![]graph_pattern_mod.PatternMatch {
         const execution: *GraphPredicateExecutionContext = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         return try execution.db.matchPatternWithNodeAdmission(
@@ -43726,6 +43771,7 @@ pub const DB = struct {
             named.query.params.include_paths,
             execution.admission.iface(),
             budgets.work,
+            scope,
         );
     }
 
@@ -43735,6 +43781,7 @@ pub const DB = struct {
         named: *const types.NamedGraphQuery,
         start_key_refs: []const []const u8,
         budgets: db_query_graph.RequestGraphBudgets,
+        scope: graph_query_mod.ExecutionScope,
     ) anyerror![]graph_pattern_mod.PatternMatch {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         return try self.matchConjunctivePatternWithNodeAdmission(
@@ -43746,6 +43793,7 @@ pub const DB = struct {
             named.query.return_aliases,
             null,
             budgets.work,
+            scope,
         );
     }
 
@@ -43755,6 +43803,7 @@ pub const DB = struct {
         named: *const types.NamedGraphQuery,
         start_key_refs: []const []const u8,
         budgets: db_query_graph.RequestGraphBudgets,
+        scope: graph_query_mod.ExecutionScope,
     ) anyerror![]graph_pattern_mod.PatternMatch {
         const execution: *GraphPredicateExecutionContext = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         return try execution.db.matchConjunctivePatternWithNodeAdmission(
@@ -43766,6 +43815,7 @@ pub const DB = struct {
             named.query.return_aliases,
             execution.admission.iface(),
             budgets.work,
+            scope,
         );
     }
 
@@ -43775,9 +43825,10 @@ pub const DB = struct {
         named: *const types.NamedGraphQuery,
         start_key_refs: []const []const u8,
         budgets: db_query_graph.RequestGraphBudgets,
+        scope: graph_query_mod.ExecutionScope,
     ) anyerror![]types.GraphAggregateResult {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return try self.aggregateConjunctivePatternWithNodeAdmission(alloc, named, start_key_refs, null, budgets);
+        return try self.aggregateConjunctivePatternWithNodeAdmission(alloc, named, start_key_refs, null, budgets, scope);
     }
 
     fn executeConjunctiveAggregateWithAdmissionCallback(
@@ -43786,6 +43837,7 @@ pub const DB = struct {
         named: *const types.NamedGraphQuery,
         start_key_refs: []const []const u8,
         budgets: db_query_graph.RequestGraphBudgets,
+        scope: graph_query_mod.ExecutionScope,
     ) anyerror![]types.GraphAggregateResult {
         const execution: *GraphPredicateExecutionContext = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         return try execution.db.aggregateConjunctivePatternWithNodeAdmission(
@@ -43794,6 +43846,7 @@ pub const DB = struct {
             start_key_refs,
             execution.admission.iface(),
             budgets,
+            scope,
         );
     }
 
@@ -43846,6 +43899,7 @@ pub const DB = struct {
         source: []const u8,
         target: []const u8,
         work_budget: *graph_pattern_mod.WorkBudget,
+        scope: graph_query_mod.ExecutionScope,
     ) anyerror!?types.GraphPath {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         return try self.core.graphFindShortestPath(
@@ -43861,6 +43915,7 @@ pub const DB = struct {
             named.query.params.max_weight,
             null,
             work_budget,
+            scope.owning_table,
         );
     }
 
@@ -43871,6 +43926,7 @@ pub const DB = struct {
         source: []const u8,
         target: []const u8,
         work_budget: *graph_pattern_mod.WorkBudget,
+        scope: graph_query_mod.ExecutionScope,
     ) anyerror!?types.GraphPath {
         const execution: *GraphPredicateExecutionContext = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         return try execution.db.core.graphFindShortestPath(
@@ -43886,6 +43942,7 @@ pub const DB = struct {
             named.query.params.max_weight,
             execution.admission.iface(),
             work_budget,
+            scope.owning_table,
         );
     }
 
@@ -43896,6 +43953,7 @@ pub const DB = struct {
         source: []const u8,
         target: []const u8,
         work_budget: *graph_pattern_mod.WorkBudget,
+        scope: graph_query_mod.ExecutionScope,
     ) anyerror![]types.GraphPath {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         return try self.core.graphFindKShortestPaths(
@@ -43912,6 +43970,7 @@ pub const DB = struct {
             named.query.params.max_weight,
             null,
             work_budget,
+            scope.owning_table,
         );
     }
 
@@ -43922,6 +43981,7 @@ pub const DB = struct {
         source: []const u8,
         target: []const u8,
         work_budget: *graph_pattern_mod.WorkBudget,
+        scope: graph_query_mod.ExecutionScope,
     ) anyerror![]types.GraphPath {
         const execution: *GraphPredicateExecutionContext = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         return try execution.db.core.graphFindKShortestPaths(
@@ -43938,6 +43998,7 @@ pub const DB = struct {
             named.query.params.max_weight,
             execution.admission.iface(),
             work_budget,
+            scope.owning_table,
         );
     }
 
@@ -43948,9 +44009,10 @@ pub const DB = struct {
         start_key_refs: []const []const u8,
         target_keys: [][]u8,
         work_budget: *graph_pattern_mod.WorkBudget,
+        scope: graph_query_mod.ExecutionScope,
     ) anyerror!graph_query_mod.GraphQueryResult {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return try executeGraphQueryWithTargets(self, alloc, named.query, start_key_refs, target_keys, work_budget);
+        return try executeGraphQueryWithTargets(self, alloc, named.query, start_key_refs, target_keys, work_budget, scope);
     }
 
     fn executeGraphQueryWithAdmissionCallback(
@@ -43960,6 +44022,7 @@ pub const DB = struct {
         start_key_refs: []const []const u8,
         target_keys: [][]u8,
         work_budget: *graph_pattern_mod.WorkBudget,
+        scope: graph_query_mod.ExecutionScope,
     ) anyerror!graph_query_mod.GraphQueryResult {
         const execution: *GraphPredicateExecutionContext = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         return try executeGraphQueryWithAdmission(
@@ -43970,6 +44033,7 @@ pub const DB = struct {
             target_keys,
             execution.admission.iface(),
             work_budget,
+            scope,
         );
     }
 
@@ -44043,9 +44107,10 @@ pub const DB = struct {
         graph_query: graph_query_mod.GraphQuery,
         start_key_refs: []const []const u8,
         target_keys: [][]u8,
+        scope: graph_query_mod.ExecutionScope,
     ) anyerror!graph_query_mod.GraphQueryResult {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return try executeGraphQueryWithTargets(self, alloc, graph_query, start_key_refs, target_keys, null);
+        return try executeGraphQueryWithTargets(self, alloc, graph_query, start_key_refs, target_keys, null, scope);
     }
 
     fn executeSearchGraphQueryWithAdmissionCallback(
@@ -44054,6 +44119,7 @@ pub const DB = struct {
         graph_query: graph_query_mod.GraphQuery,
         start_key_refs: []const []const u8,
         target_keys: [][]u8,
+        scope: graph_query_mod.ExecutionScope,
     ) anyerror!graph_query_mod.GraphQueryResult {
         const execution: *GraphPredicateExecutionContext = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         return try executeGraphQueryWithAdmission(
@@ -44064,6 +44130,7 @@ pub const DB = struct {
             target_keys,
             execution.admission.iface(),
             null,
+            scope,
         );
     }
 
@@ -44110,6 +44177,7 @@ pub const DB = struct {
             .ctx = self,
             .graph_ctx = if (predicate_aware) &execution else null,
             .predicate_aware = predicate_aware,
+            .scope = graphExecutionScope(req),
             .execute_graph_query = if (predicate_aware)
                 executeSearchGraphQueryWithAdmissionCallback
             else
@@ -44143,6 +44211,7 @@ pub const DB = struct {
         start_key_refs: []const []const u8,
         target_keys: [][]u8,
         work_budget: ?*graph_pattern_mod.WorkBudget,
+        scope: graph_query_mod.ExecutionScope,
     ) !graph_query_mod.GraphQueryResult {
         const entry = self.core.graphIndex(graph_query.index_name) orelse {
             try self.failIfIndexQuarantined(graph_query.index_name);
@@ -44167,6 +44236,7 @@ pub const DB = struct {
         var graph_engine = graph_query_mod.GraphQueryEngine{
             .alloc = alloc,
             .work_budget = work_budget,
+            .scope = scope,
         };
         return try graph_engine.execute(&entry.index, resolved_query, start_key_refs);
     }
@@ -44179,6 +44249,7 @@ pub const DB = struct {
         target_keys: [][]u8,
         admission: NodeAdmission,
         work_budget: ?*graph_pattern_mod.WorkBudget,
+        scope: graph_query_mod.ExecutionScope,
     ) !graph_query_mod.GraphQueryResult {
         const entry = self.core.graphIndex(graph_query.index_name) orelse {
             try self.failIfIndexQuarantined(graph_query.index_name);
@@ -44201,6 +44272,7 @@ pub const DB = struct {
             .alloc = alloc,
             .node_admission = admission,
             .work_budget = work_budget,
+            .scope = scope,
         };
         return try graph_engine.execute(&entry.index, resolved_query, start_key_refs);
     }
@@ -45344,6 +45416,14 @@ fn encodeThinReplayRecordPayload(
         if (internal_keys.isAssetArtifactKey(key)) {
             try appendUniqueReplayRecordHint(alloc, &target_hints, .resolution);
         }
+        // A committed resolution artifact re-drives sibling resolvers over
+        // the same source (compositional event identity composes sibling
+        // canonical keys). The runtime maps the key back to its source
+        // extraction; byte-stable recomputes emit no further resolution
+        // record, so the fan-back terminates.
+        if (internal_keys.isResolutionArtifactKey(key)) {
+            try appendUniqueReplayRecordHint(alloc, &target_hints, .resolution);
+        }
     }
 
     // Asset enrichments with `neighbor_context` sample a document's graph
@@ -46288,7 +46368,30 @@ fn computeAssetRequestDerived(
 
     const text_indexes: []const []const u8 = request.consumer_indexes;
 
-    const source_text = try extractAssetSourceValue(alloc, db, doc_value, request);
+    // Asset-consumes-asset: the source is another asset's produced bytes.
+    // Requests are planned upstream-first, so a producer computed earlier in
+    // this same batch sits in `artifact_writes` rather than the store; the
+    // overlay scan (newest first) keeps the chain convergent within one
+    // synchronous pass. A missing upstream takes the delete path below and
+    // is re-driven by the per-document replay record once the upstream lands.
+    const consumes_upstream = request.upstream_artifact_name.len > 0 and
+        producer_cfg.type != .document_extraction;
+    const source_text: ?[]const u8 = if (consumes_upstream) blk: {
+        const upstream_key = try internal_keys.artifactNamedPrefixAlloc(alloc, request.doc_key, "asset", request.upstream_artifact_name);
+        defer alloc.free(upstream_key);
+        var i = artifact_writes.items.len;
+        while (i > 0) {
+            i -= 1;
+            const write = artifact_writes.items[i];
+            if (std.mem.eql(u8, write.key, upstream_key)) {
+                break :blk try alloc.dupe(u8, write.value);
+            }
+        }
+        for (artifact_delete_keys.items) |delete_key| {
+            if (std.mem.eql(u8, delete_key, upstream_key)) break :blk null;
+        }
+        break :blk try db.core.getStoreValue(alloc, upstream_key);
+    } else try extractAssetSourceValue(alloc, db, doc_value, request);
     if (source_text == null or source_text.?.len == 0) {
         if (source_text) |s| alloc.free(s);
         try appendFullTextDeleteDocument(alloc, documents, key, text_indexes);
@@ -64543,10 +64646,17 @@ fn appendRelationItem(
     // extraction entity that has no canonical identity yet is dropped, like
     // the matching target rule: the resolution replay re-renders it. A source
     // that matches no extraction entity keeps the legacy document source.
+    var source_table: ?[]const u8 = null;
     const source_doc = blk: {
         const source_value = item.object.get("source") orelse break :blk doc_key;
         if (resolveGraphEndpointEntity(source_value, artifact_value)) |entity| {
-            break :blk canonicalEntityDocumentId(entity) orelse return;
+            const canonical = canonicalEntityDocumentId(entity) orelse return;
+            // The resolved SOURCE endpoint's home table must survive into
+            // edge metadata like the target's: a backward traversal from
+            // the target otherwise assigns the source an unqualified
+            // identity and hydrates it against the wrong table.
+            source_table = canonicalEntityTable(entity);
+            break :blk canonical;
         }
         // A plain-string source matching no extraction entity is an external
         // node id; any other unresolvable shape (e.g. legacy inline endpoint
@@ -64600,7 +64710,13 @@ fn appendRelationItem(
         try prependTargetTableToItemMetadataAlloc(alloc, table, item)
     else
         try std.json.Stringify.valueAlloc(alloc, item, .{});
-    errdefer alloc.free(metadata_json);
+    var owned_metadata = metadata_json;
+    errdefer alloc.free(owned_metadata);
+    if (source_table) |table| {
+        const tagged = try prependTableTagToMetadataJsonAlloc(alloc, "source_table", table, owned_metadata);
+        alloc.free(owned_metadata);
+        owned_metadata = tagged;
+    }
 
     const owned_index_name = try alloc.dupe(u8, index_name);
     errdefer alloc.free(owned_index_name);
@@ -64620,7 +64736,7 @@ fn appendRelationItem(
         .weight = weight,
         .created_at = 0,
         .updated_at = 0,
-        .metadata_json = metadata_json,
+        .metadata_json = owned_metadata,
         .owner = owned_owner,
     });
 }
@@ -64945,18 +65061,18 @@ fn canonicalEntityTable(entity: std.json.Value) ?[]const u8 {
     return null;
 }
 
-/// Prepend the cross-table endpoint tag to an already-rendered metadata JSON
-/// object, preserving an explicit `target_table` the template rendered
-/// itself. Non-object metadata passes through untouched (the tag has nowhere
+/// Prepend a cross-table endpoint tag to an already-rendered metadata JSON
+/// object, preserving an explicit tag the template rendered itself.
+/// Non-object metadata passes through untouched (the tag has nowhere
 /// coherent to live, and traversal's substring scan would misread it).
-fn prependTargetTableToMetadataJsonAlloc(alloc: Allocator, target_table: []const u8, metadata_json: []const u8) ![]u8 {
+fn prependTableTagToMetadataJsonAlloc(alloc: Allocator, comptime tag: []const u8, table: []const u8, metadata_json: []const u8) ![]u8 {
     if (metadata_json.len < 2 or metadata_json[0] != '{' or
-        std.mem.indexOf(u8, metadata_json, "\"target_table\":") != null)
+        std.mem.indexOf(u8, metadata_json, "\"" ++ tag ++ "\":") != null)
         return try alloc.dupe(u8, metadata_json);
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
-    try out.appendSlice(alloc, "{\"target_table\":");
-    const quoted = try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .string = target_table }, .{});
+    try out.appendSlice(alloc, "{\"" ++ tag ++ "\":");
+    const quoted = try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .string = table }, .{});
     defer alloc.free(quoted);
     try out.appendSlice(alloc, quoted);
     if (!std.mem.eql(u8, metadata_json, "{}")) {
@@ -64966,6 +65082,10 @@ fn prependTargetTableToMetadataJsonAlloc(alloc: Allocator, target_table: []const
         try out.append(alloc, '}');
     }
     return try out.toOwnedSlice(alloc);
+}
+
+fn prependTargetTableToMetadataJsonAlloc(alloc: Allocator, target_table: []const u8, metadata_json: []const u8) ![]u8 {
+    return try prependTableTagToMetadataJsonAlloc(alloc, "target_table", target_table, metadata_json);
 }
 
 fn prependTargetTableToItemMetadataAlloc(alloc: Allocator, target_table: []const u8, item: std.json.Value) ![]u8 {
@@ -67341,6 +67461,15 @@ fn finalizeSplitLocked(self: *DB, new_range: types.ByteRange) !void {
     // Prepare all private ownership tasks before the authoritative range can
     // narrow. Partial preparation/failure leaves the old graph visible, and
     // primary range adoption activates the prepared fences infallibly.
+    //
+    // Entity-sourced edges first: their physical rows are keyed by the
+    // canonical SOURCE entity, which can fall outside the moved document
+    // range, so the source-keyed fence below never retires them. Withdraw
+    // each moved document's contribution explicitly (owner-scoped deletes;
+    // graph membership keeps edges that a remaining document still asserts)
+    // while the moved owners are still inside this shard's range and before
+    // the fence starts rejecting out-of-scope sources.
+    try retireSplitEntitySourcedEdgesLocked(self, split_state);
     try self.core.index_manager.fenceGraphSplitRange(split_state.split_key, split_state.original_range_end);
     const split_lower = try documentRangeLowerAlloc(self.alloc, split_state.split_key);
     defer self.alloc.free(split_lower);
@@ -67360,6 +67489,59 @@ fn finalizeSplitLocked(self: *DB, new_range: types.ByteRange) !void {
     try self.refreshManagedIndexWorkersLocked();
     try self.closeShadowIndexManagerLocked();
     try self.refreshManagedIndexWorkersLocked();
+}
+
+/// Withdraw every moved document's entity-sourced edge contributions from
+/// this (source) shard. The destination re-applies them from the copied
+/// owner-scoped artifacts; without this sweep the source shard strands
+/// physical rows whose source key lies outside the moved range (the
+/// source-keyed split fence cannot see them) while their owning documents
+/// leave.
+fn retireSplitEntitySourcedEdgesLocked(self: *DB, split_state: shard_mod.SplitState) !void {
+    const alloc = self.alloc;
+    const lower = try documentRangeLowerAlloc(alloc, split_state.split_key);
+    defer alloc.free(lower);
+    const upper = if (split_state.original_range_end.len > 0)
+        try documentRangeUpperAlloc(alloc, split_state.original_range_end)
+    else
+        null;
+    defer if (upper) |key| alloc.free(key);
+
+    const scanned = try self.core.scanStoreRange(alloc, lower, if (upper) |key| key else "");
+    defer docstore_mod.DocStore.freeResults(alloc, scanned);
+
+    var deletes = std.ArrayListUnmanaged(types.GraphEdgeDelete).empty;
+    defer {
+        for (deletes.items) |delete| {
+            alloc.free(@constCast(delete.index_name));
+            alloc.free(@constCast(delete.source));
+            alloc.free(@constCast(delete.target));
+            alloc.free(@constCast(delete.edge_type));
+            if (delete.owner.len > 0) alloc.free(@constCast(delete.owner));
+        }
+        deletes.deinit(alloc);
+    }
+    for (scanned) |row| {
+        if (!internal_keys.isGraphEdgeArtifactKey(row.key)) continue;
+        const parsed = (try internal_keys.parseGraphEdgeArtifactKeyAlloc(alloc, row.key)) orelse continue;
+        defer {
+            alloc.free(parsed.doc_key);
+            alloc.free(parsed.index_name);
+            alloc.free(parsed.edge_type);
+            alloc.free(parsed.target_doc_key);
+            if (parsed.source_node) |source| alloc.free(source);
+        }
+        const source_node = parsed.source_node orelse continue;
+        try deletes.append(alloc, .{
+            .index_name = try alloc.dupe(u8, parsed.index_name),
+            .source = try alloc.dupe(u8, source_node),
+            .target = try alloc.dupe(u8, parsed.target_doc_key),
+            .edge_type = try alloc.dupe(u8, parsed.edge_type),
+            .owner = try alloc.dupe(u8, parsed.doc_key),
+        });
+    }
+    if (deletes.items.len == 0) return;
+    try self.core.index_manager.applyGraphDeletes(deletes.items);
 }
 
 fn markSplitOffDocumentArtifactChildRangesLocked(
@@ -85465,6 +85647,143 @@ test "db direct generated chunks feed multi-source text and graph indexes" {
     try std.testing.expectEqual(@as(usize, 0), after_delete.len);
 }
 
+test "db asset consumes another asset artifact and re-derives on upstream change" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .enable_without_producers = true,
+        },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "summary_text_v1",
+        .kind = .asset,
+        .field = "summary",
+        .content_type = "text/plain",
+        .producer_json = "{\"type\":\"copy\"}",
+    });
+    try db.addEnrichment(.{
+        .name = "summary_echo_v1",
+        .kind = .asset,
+        .source_artifact_name = "summary_text_v1",
+        .content_type = "text/plain",
+        .producer_json = "{\"type\":\"copy\"}",
+    });
+    try db.addIndex(.{
+        .name = "echo_text",
+        .kind = .full_text,
+        .config_json = "{\"sources\":[{\"artifact\":\"summary_echo_v1\"}]}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"summary\":\"firstupstreamtoken concise summary\"}",
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const echo_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "summary_echo_v1");
+    defer alloc.free(echo_key);
+    const first = try db.core.store.get(alloc, echo_key);
+    defer alloc.free(first);
+    try std.testing.expectEqualStrings("firstupstreamtoken concise summary", first);
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"summary\":\"secondupstreamtoken concise summary\"}",
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+    const second = try db.core.store.get(alloc, echo_key);
+    defer alloc.free(second);
+    try std.testing.expectEqualStrings("secondupstreamtoken concise summary", second);
+
+    // Removing the upstream source retires the producer and, through the
+    // same batch's delete overlay, the consumer.
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{}",
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, echo_key));
+}
+
+test "db asset consuming asset validates upstream references at admission" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .enable_without_producers = true,
+        },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "a_v1",
+        .kind = .asset,
+        .field = "summary",
+        .producer_json = "{\"type\":\"copy\"}",
+    });
+    // Self-reference is the one-hop cycle.
+    try std.testing.expectError(error.InvalidEnrichmentConfig, db.addEnrichment(.{
+        .name = "self_v1",
+        .kind = .asset,
+        .source_artifact_name = "self_v1",
+        .producer_json = "{\"type\":\"copy\"}",
+    }));
+    // The upstream must already be an admitted asset.
+    try std.testing.expectError(error.InvalidEnrichmentConfig, db.addEnrichment(.{
+        .name = "b_v1",
+        .kind = .asset,
+        .source_artifact_name = "missing_v1",
+        .producer_json = "{\"type\":\"copy\"}",
+    }));
+    // Consuming assets read produced bytes; a document field cannot also be
+    // the source.
+    try std.testing.expectError(error.InvalidEnrichmentConfig, db.addEnrichment(.{
+        .name = "c_v1",
+        .kind = .asset,
+        .field = "summary",
+        .source_artifact_name = "a_v1",
+        .producer_json = "{\"type\":\"copy\"}",
+    }));
+    // Media-locator producers dereference the source as a URL and stay closed.
+    try std.testing.expectError(error.InvalidEnrichmentConfig, db.addEnrichment(.{
+        .name = "r_v1",
+        .kind = .asset,
+        .source_artifact_name = "a_v1",
+        .producer_json = "{\"type\":\"reader\"}",
+    }));
+    // A valid chain admits.
+    try db.addEnrichment(.{
+        .name = "d_v1",
+        .kind = .asset,
+        .source_artifact_name = "a_v1",
+        .producer_json = "{\"type\":\"copy\"}",
+    });
+}
+
 test "db multi-source full text unions chunk and textual asset streams across deletion and reopen" {
     const alloc = std.testing.allocator;
 
@@ -86478,6 +86797,105 @@ test "db rewriteEntityEdges repoints provenance edges to a merge survivor" {
         try std.testing.expectEqual(@as(usize, 1), new_inbound.len);
         try std.testing.expectEqualStrings("doc:a", new_inbound[0].source);
         try std.testing.expectEqualStrings("person/ada_canonical", new_inbound[0].target);
+    }
+}
+
+test "db complete-snapshot scope expands graph traversal through tagged entity nodes" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "prov_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"artifact":"relations_v1","mention_edge_type":"mentions",
+        \\    "format":"extraction_relation","path":"$.relations[*]"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
+        \\}
+        ,
+    });
+    try db.addResolver(.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    });
+    try db.batch(.{
+        .writes = &.{
+            .{
+                .key = "doc:a",
+                .value =
+                \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"}]}}
+                ,
+            },
+            .{
+                .key = "doc:b",
+                .value =
+                \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"}]}}
+                ,
+            },
+        },
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const walk = graph_query_mod.GraphQuery{
+        .query_type = .traverse,
+        .index_name = "prov_graph",
+        .start_nodes = .{ .keys = &.{"doc:a"} },
+        .params = .{
+            .edge_types = &.{"mentions"},
+            .direction = .both,
+            .max_depth = 2,
+            .deduplicate = true,
+        },
+    };
+
+    // Without the scope the tagged entity node stays terminal: doc:b is
+    // unreachable through it.
+    {
+        var result = try db.search(alloc, .{
+            .graph_queries = &.{.{ .name = "walk", .query = walk }},
+        });
+        defer result.deinit();
+        for (result.graph_results[0].nodes) |node| {
+            try std.testing.expect(!std.mem.eql(u8, node.key, "doc:b"));
+        }
+    }
+
+    // The API read source marks admitted single-group requests as
+    // complete-snapshot; the local executor then walks doc -> entity -> doc
+    // THROUGH the tagged node in one traversal.
+    {
+        var result = try db.search(alloc, .{
+            .graph_queries = &.{.{ .name = "walk", .query = walk }},
+            .graph_owning_table = "docs",
+            .graph_index_complete_snapshot = true,
+        });
+        defer result.deinit();
+        var saw_entity = false;
+        var saw_doc_b = false;
+        for (result.graph_results[0].nodes) |node| {
+            if (std.mem.eql(u8, node.key, "person/ada_lovelace")) {
+                try std.testing.expectEqualStrings("entities", node.table.?);
+                saw_entity = true;
+            }
+            if (std.mem.eql(u8, node.key, "doc:b")) {
+                try std.testing.expect(node.table == null);
+                saw_doc_b = true;
+            }
+        }
+        try std.testing.expect(saw_entity and saw_doc_b);
     }
 }
 

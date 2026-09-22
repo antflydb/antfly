@@ -1923,6 +1923,7 @@ pub const DBCore = struct {
         max_weight: ?f64,
         node_admission: ?NodeAdmission,
         work_budget: ?*graph_pattern_mod.WorkBudget,
+        owning_table: []const u8,
     ) !?paths_mod.Path {
         const entry = self.index_manager.graphIndex(index_name) orelse return error.IndexNotFound;
         return try paths_mod.findShortestPath(alloc, &entry.index, source, target, .{
@@ -1934,6 +1935,9 @@ pub const DBCore = struct {
             .max_weight = max_weight,
             .node_admission = node_admission,
             .work_budget = work_budget,
+            .owning_table = owning_table,
+            // Same single-index justification as graphTraverseEdges above.
+            .expand_cross_table_local = true,
         });
     }
 
@@ -1952,6 +1956,7 @@ pub const DBCore = struct {
         max_weight: ?f64,
         node_admission: ?NodeAdmission,
         work_budget: ?*graph_pattern_mod.WorkBudget,
+        owning_table: []const u8,
     ) ![]paths_mod.Path {
         const entry = self.index_manager.graphIndex(index_name) orelse return error.IndexNotFound;
         return try paths_mod.findKShortestPaths(alloc, &entry.index, source, target, k, .{
@@ -1963,6 +1968,9 @@ pub const DBCore = struct {
             .max_weight = max_weight,
             .node_admission = node_admission,
             .work_budget = work_budget,
+            .owning_table = owning_table,
+            // Same single-index justification as graphTraverseEdges above.
+            .expand_cross_table_local = true,
         });
     }
 
@@ -1975,7 +1983,11 @@ pub const DBCore = struct {
         opts: graph_pattern_mod.MatchOptions,
     ) ![]graph_pattern_mod.PatternMatch {
         const entry = self.index_manager.graphIndex(index_name) orelse return error.IndexNotFound;
-        return try graph_pattern_mod.matchPattern(alloc, &entry.index, start_keys, pattern, opts);
+        // Same single-index justification as graphTraverseEdges above: the
+        // local edge reader serves a cross-table tagged node by bare key.
+        var effective = opts;
+        effective.expand_cross_table_local = true;
+        return try graph_pattern_mod.matchPattern(alloc, &entry.index, start_keys, pattern, effective);
     }
 
     pub fn graphMatchConjunctivePattern(
@@ -1987,7 +1999,10 @@ pub const DBCore = struct {
         opts: graph_pattern_mod.MatchOptions,
     ) ![]graph_pattern_mod.PatternMatch {
         const entry = self.index_manager.graphIndex(index_name) orelse return error.IndexNotFound;
-        return try graph_pattern_mod.matchConjunctivePattern(alloc, &entry.index, start_keys, pattern, opts);
+        // Same single-index justification as graphTraverseEdges above.
+        var effective = opts;
+        effective.expand_cross_table_local = true;
+        return try graph_pattern_mod.matchConjunctivePattern(alloc, &entry.index, start_keys, pattern, effective);
     }
 
     pub fn graphAggregateConjunctivePattern(
@@ -2000,7 +2015,10 @@ pub const DBCore = struct {
         opts: graph_pattern_mod.MatchOptions,
     ) ![]graph_pattern_mod.CountAggregateResult {
         const entry = self.index_manager.graphIndex(index_name) orelse return error.IndexNotFound;
-        return try graph_pattern_mod.aggregateConjunctivePattern(alloc, &entry.index, start_keys, pattern, specs, opts);
+        // Same single-index justification as graphTraverseEdges above.
+        var effective = opts;
+        effective.expand_cross_table_local = true;
+        return try graph_pattern_mod.aggregateConjunctivePattern(alloc, &entry.index, start_keys, pattern, specs, effective);
     }
 
     pub fn documentRangeLowerAlloc(self: *DBCore, raw_key: []const u8) ![]u8 {

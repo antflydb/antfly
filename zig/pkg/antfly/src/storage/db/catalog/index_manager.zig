@@ -11620,6 +11620,10 @@ pub const IndexManager = struct {
             existing.fusion_trust != next.fusion_trust or
             existing.fusion_prior != next.fusion_prior or
             existing.fusion_prior_weight != next.fusion_prior_weight or
+            // A changed admission floor re-resolves the corpus: raising it
+            // must retire existing low-confidence resolutions and their
+            // edges, not leave them in place until an unrelated change.
+            existing.min_confidence != next.min_confidence or
             existing.config_generation != next.config_generation;
     }
 
@@ -13589,21 +13593,49 @@ pub const IndexManager = struct {
             requests.deinit(alloc);
         }
 
-        for (self.enrichments.items) |entry| {
-            if (entry.kind != .asset) continue;
-            try requests.append(alloc, .{
-                .kind = .asset,
-                .index_name = try alloc.dupe(u8, entry.name),
-                .artifact_name = try alloc.dupe(u8, entry.name),
-                .doc_key = try alloc.dupe(u8, doc_key),
-                .source_field = try alloc.dupe(u8, entry.source_field),
-                .source_template = if (entry.source_template.len > 0) try alloc.dupe(u8, entry.source_template) else "",
-                .full_text_index = entry.full_text_index,
-                .content_type = if (entry.content_type.len > 0) try alloc.dupe(u8, entry.content_type) else "",
-                .producer_json = if (entry.producer_json.len > 0) try alloc.dupe(u8, entry.producer_json) else "",
-                .neighbor_context_json = if (entry.neighbor_context_json.len > 0) try alloc.dupe(u8, entry.neighbor_context_json) else "",
-                .execution_json = if (entry.execution_json.len > 0) try alloc.dupe(u8, entry.execution_json) else "",
-            });
+        // Assets are emitted upstream-first so a consumer that names another
+        // asset via `source_artifact_name` runs after its producer in the
+        // same quantum. Entries whose upstream cannot be scheduled first
+        // (defensive: admission rejects cycles) fall out in catalog order.
+        const asset_emitted = try alloc.alloc(bool, self.enrichments.items.len);
+        defer alloc.free(asset_emitted);
+        @memset(asset_emitted, false);
+        var emit_final_pass = false;
+        emit_loop: while (true) {
+            var emit_progress = false;
+            for (self.enrichments.items, 0..) |entry, entry_index| {
+                if (entry.kind != .asset or asset_emitted[entry_index]) continue;
+                if (!emit_final_pass and entry.source_artifact_name.len > 0) {
+                    var upstream_pending = false;
+                    for (self.enrichments.items, 0..) |candidate, candidate_index| {
+                        if (candidate.kind != .asset or asset_emitted[candidate_index]) continue;
+                        if (candidate_index == entry_index) continue;
+                        if (std.mem.eql(u8, candidate.name, entry.source_artifact_name)) {
+                            upstream_pending = true;
+                            break;
+                        }
+                    }
+                    if (upstream_pending) continue;
+                }
+                asset_emitted[entry_index] = true;
+                emit_progress = true;
+                try requests.append(alloc, .{
+                    .kind = .asset,
+                    .index_name = try alloc.dupe(u8, entry.name),
+                    .artifact_name = try alloc.dupe(u8, entry.name),
+                    .doc_key = try alloc.dupe(u8, doc_key),
+                    .source_field = try alloc.dupe(u8, entry.source_field),
+                    .source_template = if (entry.source_template.len > 0) try alloc.dupe(u8, entry.source_template) else "",
+                    .upstream_artifact_name = if (entry.source_artifact_name.len > 0) try alloc.dupe(u8, entry.source_artifact_name) else "",
+                    .full_text_index = entry.full_text_index,
+                    .content_type = if (entry.content_type.len > 0) try alloc.dupe(u8, entry.content_type) else "",
+                    .producer_json = if (entry.producer_json.len > 0) try alloc.dupe(u8, entry.producer_json) else "",
+                    .neighbor_context_json = if (entry.neighbor_context_json.len > 0) try alloc.dupe(u8, entry.neighbor_context_json) else "",
+                    .execution_json = if (entry.execution_json.len > 0) try alloc.dupe(u8, entry.execution_json) else "",
+                });
+            }
+            if (emit_final_pass) break :emit_loop;
+            if (!emit_progress) emit_final_pass = true;
         }
 
         for (self.text_indexes.items) |entry| {
@@ -21203,6 +21235,7 @@ pub const IndexManager = struct {
         if (self.getEnrichment(.asset, cfg.name)) |existing| {
             if (!std.mem.eql(u8, existing.source_field, cfg.source_field) or
                 !std.mem.eql(u8, existing.source_template, cfg.source_template) or
+                !std.mem.eql(u8, existing.source_artifact_name, cfg.source_artifact_name) or
                 !std.mem.eql(u8, existing.content_type, cfg.content_type) or
                 !try enrichment_config_validation.producerJsonValuesEqual(self.alloc, existing.producer_json, cfg.producer_json) or
                 !std.mem.eql(u8, existing.neighbor_context_json, cfg.neighbor_context_json) or
@@ -21218,7 +21251,9 @@ pub const IndexManager = struct {
     }
 
     fn validateEnrichmentConfig(self: *const IndexManager, cfg: enrichment_catalog.EnrichmentConfig) !void {
-        if (cfg.name.len == 0 or (cfg.source_field.len == 0 and cfg.source_template.len == 0)) return error.InvalidEnrichmentConfig;
+        if (cfg.name.len == 0) return error.InvalidEnrichmentConfig;
+        const consumes_asset_artifact = cfg.kind == .asset and cfg.source_artifact_name.len > 0;
+        if (cfg.source_field.len == 0 and cfg.source_template.len == 0 and !consumes_asset_artifact) return error.InvalidEnrichmentConfig;
         if (cfg.execution_json.len > 0) _ = try enrichment_types.parseExecutionPolicyJson(self.alloc, cfg.execution_json);
         if (cfg.full_text_index and cfg.kind == .embedding) return error.InvalidEnrichmentConfig;
         switch (cfg.kind) {
@@ -21243,6 +21278,23 @@ pub const IndexManager = struct {
                 if (cfg.neighbor_context_json.len > 0) {
                     var context = try enrichment_neighbor_context.parseConfigJson(self.alloc, cfg.neighbor_context_json);
                     context.deinit(self.alloc);
+                }
+                if (cfg.source_artifact_name.len > 0) {
+                    // Asset-consumes-asset: the upstream chain must resolve
+                    // to admitted assets and terminate without revisiting
+                    // this config. Cycles that exclude `cfg` are caught when
+                    // their own members are validated.
+                    if (cfg.source_field.len > 0 or cfg.source_template.len > 0) return error.InvalidEnrichmentConfig;
+                    try enrichment_config_validation.validateUpstreamAssetProducer(self.alloc, cfg.producer_json);
+                    var hops: usize = 0;
+                    var current: []const u8 = cfg.source_artifact_name;
+                    while (current.len > 0) {
+                        if (std.mem.eql(u8, current, cfg.name)) return error.InvalidEnrichmentConfig;
+                        const upstream = self.getEnrichment(.asset, current) orelse return error.InvalidEnrichmentConfig;
+                        current = upstream.source_artifact_name;
+                        hops += 1;
+                        if (hops > self.enrichments.items.len) return error.InvalidEnrichmentConfig;
+                    }
                 }
             },
         }
@@ -24567,7 +24619,13 @@ pub const IndexManager = struct {
         defer batch_deletes.deinit(self.alloc);
 
         for (writes) |write| {
-            if (!self.keyInRange(write.source)) continue;
+            // Range admission follows the OWNING document, exactly like the
+            // artifact key: an entity-sourced edge's canonical source key
+            // (write.owner non-empty) can hash into a different shard range
+            // than the producing document, and filtering by it would make
+            // the owner's shard silently drop the mutation.
+            const range_key = if (write.owner.len > 0) write.owner else write.source;
+            if (!self.keyInRange(range_key)) continue;
             if (!std.mem.eql(u8, write.index_name, entry.config.name)) continue;
             try batch_writes.append(self.alloc, .{
                 .source = write.source,
@@ -24577,16 +24635,19 @@ pub const IndexManager = struct {
                 .created_at = write.created_at,
                 .updated_at = write.updated_at,
                 .metadata_json = write.metadata_json,
+                .owner = write.owner,
             });
         }
 
         for (deletes) |delete| {
-            if (!self.keyInRange(delete.source)) continue;
+            const range_key = if (delete.owner.len > 0) delete.owner else delete.source;
+            if (!self.keyInRange(range_key)) continue;
             if (!std.mem.eql(u8, delete.index_name, entry.config.name)) continue;
             try batch_deletes.append(self.alloc, .{
                 .source = delete.source,
                 .target = delete.target,
                 .edge_type = delete.edge_type,
+                .owner = delete.owner,
             });
         }
 

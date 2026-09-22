@@ -113,11 +113,31 @@ pub fn metadataTargetTable(metadata: []const u8) ?[]const u8 {
     return metadata[value_start..end];
 }
 
+/// Extract `source_table` from an edge's metadata JSON — the resolved SOURCE
+/// endpoint's home table, written by the materializer alongside
+/// `target_table` so a backward arrival at the source keeps its qualified
+/// identity.
+pub fn metadataSourceTable(metadata: []const u8) ?[]const u8 {
+    const marker = "\"source_table\":\"";
+    const start = std.mem.indexOf(u8, metadata, marker) orelse return null;
+    const value_start = start + marker.len;
+    const end = std.mem.indexOfScalarPos(u8, metadata, value_start, '"') orelse return null;
+    if (end == value_start) return null;
+    return metadata[value_start..end];
+}
+
 /// `metadataTargetTable` canonicalized against the index-owning table: a tag
 /// naming the owning table itself is the same namespace, not a cross-table
 /// node.
 fn canonicalMetadataTargetTable(rules: *const TraversalRules, metadata: []const u8) ?[]const u8 {
     const table = metadataTargetTable(metadata) orelse return null;
+    if (rules.owning_table.len > 0 and std.mem.eql(u8, table, rules.owning_table)) return null;
+    return table;
+}
+
+/// Backward-arrival counterpart: the SOURCE endpoint's canonicalized table.
+fn canonicalMetadataSourceTable(rules: *const TraversalRules, metadata: []const u8) ?[]const u8 {
+    const table = metadataSourceTable(metadata) orelse return null;
     if (rules.owning_table.len > 0 and std.mem.eql(u8, table, rules.owning_table)) return null;
     return table;
 }
@@ -340,7 +360,7 @@ pub fn traverseWithEdgeReader(
                     const target_table = if (std.mem.eql(u8, next_key, edge.target))
                         canonicalMetadataTargetTable(&effective_rules, edge.metadata)
                     else
-                        null;
+                        canonicalMetadataSourceTable(&effective_rules, edge.metadata);
                     if (effective_rules.deduplicate and visited.contains(.{
                         .table = target_table,
                         .key = next_key,
@@ -374,7 +394,7 @@ pub fn traverseWithEdgeReader(
                 const target_table = if (std.mem.eql(u8, next_key, edge.target))
                     canonicalMetadataTargetTable(&effective_rules, edge.metadata)
                 else
-                    null;
+                    canonicalMetadataSourceTable(&effective_rules, edge.metadata);
                 if (effective_rules.deduplicate and !try putVisitedRetained(
                     alloc,
                     &visited,

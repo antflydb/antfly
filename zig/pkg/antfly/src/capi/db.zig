@@ -923,20 +923,30 @@ const LiteCatalogRollback = struct {
     handle: *Handle,
     /// Full pre-call enrichment catalog (owned).
     prior: []db_mod.types.EnrichmentConfig,
+    /// Full pre-call resolver catalog (owned).
+    prior_resolvers: []db_mod.ResolverConfig,
     touched: std.ArrayListUnmanaged(TouchedEnrichment) = .empty,
+    touched_resolvers: std.ArrayListUnmanaged([]u8) = .empty,
 
     fn init(handle: *Handle) !LiteCatalogRollback {
+        const prior = try handle.db.listEnrichments(handle.alloc);
+        errdefer db_mod.types.freeEnrichmentConfigs(handle.alloc, prior);
         return .{
             .handle = handle,
-            .prior = try handle.db.listEnrichments(handle.alloc),
+            .prior = prior,
+            .prior_resolvers = try handle.db.listResolvers(handle.alloc),
         };
     }
 
     fn deinit(self: *LiteCatalogRollback) void {
         const alloc = self.handle.alloc;
         db_mod.types.freeEnrichmentConfigs(alloc, self.prior);
+        for (self.prior_resolvers) |*cfg| cfg.deinit(alloc);
+        alloc.free(self.prior_resolvers);
         for (self.touched.items) |touch| alloc.free(touch.name);
         self.touched.deinit(alloc);
+        for (self.touched_resolvers.items) |name| alloc.free(name);
+        self.touched_resolvers.deinit(alloc);
     }
 
     fn willTouchEnrichment(self: *LiteCatalogRollback, kind: db_mod.types.EnrichmentKind, name: []const u8) !void {
@@ -947,11 +957,36 @@ const LiteCatalogRollback = struct {
         try self.touched.append(alloc, .{ .kind = kind, .name = try alloc.dupe(u8, name) });
     }
 
+    fn willTouchResolver(self: *LiteCatalogRollback, name: []const u8) !void {
+        const alloc = self.handle.alloc;
+        for (self.touched_resolvers.items) |touched| {
+            if (std.mem.eql(u8, touched, name)) return;
+        }
+        try self.touched_resolvers.append(alloc, try alloc.dupe(u8, name));
+    }
+
     /// Best-effort restore of every touched enrichment to its pre-call
     /// configuration: re-upsert the prior config, or delete an enrichment
     /// this call introduced. Restore failures are logged, never masked over
     /// the admission error the caller is already returning.
     fn restore(self: *LiteCatalogRollback) void {
+        for (self.touched_resolvers.items) |name| {
+            const prior = blk: {
+                for (self.prior_resolvers) |cfg| {
+                    if (std.mem.eql(u8, cfg.name, name)) break :blk cfg;
+                }
+                break :blk null;
+            };
+            if (prior) |cfg| {
+                _ = self.handle.db.upsertResolverWithResultOptions(cfg, .{ .drain_backfill = false }) catch |err| {
+                    std.log.warn("lite AddIndex rollback failed to restore resolver {s}: {s}", .{ name, @errorName(err) });
+                };
+            } else {
+                _ = self.handle.db.removeResolverWithoutDrain(name) catch |err| {
+                    std.log.warn("lite AddIndex rollback failed to remove resolver {s}: {s}", .{ name, @errorName(err) });
+                };
+            }
+        }
         for (self.touched.items) |touch| {
             const prior = blk: {
                 for (self.prior) |cfg| {
@@ -982,7 +1017,7 @@ const LiteCatalogRollback = struct {
 /// index's resolvers are gone, so nothing is removed here. `upsertResolver`
 /// is idempotent for an unchanged config; backfill is deferred to the
 /// resolver workers (or the next `antfly_lite_run_until_idle`).
-fn registerLiteIndexResolvers(handle: *Handle, config_json: []const u8) !void {
+fn registerLiteIndexResolvers(handle: *Handle, config_json: []const u8, rollback: *LiteCatalogRollback) !void {
     var arena_impl = std.heap.ArenaAllocator.init(handle.alloc);
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
@@ -996,6 +1031,10 @@ fn registerLiteIndexResolvers(handle: *Handle, config_json: []const u8) !void {
             .allocate = .alloc_always,
             .ignore_unknown_fields = true,
         });
+        // Record the touch before mutating, so a mid-loop failure (an
+        // invalid later resolver, a label conflict) still restores every
+        // earlier insertion or replacement this call made.
+        try rollback.willTouchResolver(cfg.value.name);
         _ = try handle.db.upsertResolverWithResultOptions(cfg.value, .{ .drain_backfill = false });
     }
 }
@@ -13059,7 +13098,7 @@ pub export fn antfly_db_add_index_json(
     // the just-admitted index and the enrichment catalog so the call is
     // all-or-nothing.
     if (handle.lite_profile == .native and kind == .graph) {
-        registerLiteIndexResolvers(handle, parsed.value.config_json) catch |err| {
+        registerLiteIndexResolvers(handle, parsed.value.config_json, &rollback.?) catch |err| {
             _ = handle.db.deleteIndex(parsed.value.name) catch |delete_err| {
                 std.log.warn("lite AddIndex rollback failed to remove index {s}: {s}", .{ parsed.value.name, @errorName(delete_err) });
             };

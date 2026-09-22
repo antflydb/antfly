@@ -433,7 +433,23 @@ pub fn validateArtifactEnrichmentConfigs(
                     return error.InvalidEnrichmentConfig;
                 }
             },
-            .asset => {},
+            .asset => {
+                // Walk the asset-consumes-asset chain: every upstream must
+                // resolve to an admitted asset, and the chain must terminate
+                // without revisiting this config (self-reference is the
+                // one-hop cycle). A cycle that excludes `cfg` is caught when
+                // its own members are validated.
+                var hops: usize = 0;
+                var current: []const u8 = cfg.source_artifact_name;
+                while (current.len > 0) {
+                    if (std.mem.eql(u8, current, cfg.name)) return error.InvalidEnrichmentConfig;
+                    const upstream = findArtifactEnrichmentConfig(configs, .asset, current) orelse
+                        return error.InvalidEnrichmentConfig;
+                    current = upstream.source_artifact_name;
+                    hops += 1;
+                    if (hops > configs.len) return error.InvalidEnrichmentConfig;
+                }
+            },
         }
     }
 }
@@ -4106,6 +4122,74 @@ fn appendSingleIndexRuntimeStatusWithGraphMetricRuntime(
         }
         try out.appendSlice(alloc, ",\"complete\":");
         try out.appendSlice(alloc, if (coverage_complete) "true" else "false");
+        try out.appendSlice(alloc, ",\"healthy\":");
+        try out.appendSlice(alloc, if (coverage.healthy) "true" else "false");
+        try out.appendSlice(alloc, ",\"degraded\":");
+        try out.appendSlice(alloc, if (coverage.degraded) "true" else "false");
+        try out.append(alloc, '}');
+    } else if ((index_type == .graph or index_type == .full_text) and
+        @hasField(@TypeOf(item), "coverage_identity_ready") and item.coverage_identity_ready and
+        @hasField(@TypeOf(item), "coverage_summary_ready"))
+    {
+        // Artifact-fed graph and full-text projections record the same
+        // durable per-document generation outcomes as embeddings indexes
+        // (the autoschema knowledge graph in particular). Without this block
+        // a corpus of terminally failed extractions reported NOTHING on the
+        // consuming index: settled failures looked like invisible pending
+        // work. The shape matches the embeddings `coverage` object so
+        // consumers read one contract; embeddings-only publication and
+        // activity fields are simply absent.
+        const skipped_count = if (@hasField(@TypeOf(item), "coverage_skipped_count")) item.coverage_skipped_count else 0;
+        const terminal_failed_count = if (@hasField(@TypeOf(item), "coverage_terminal_failed_count")) item.coverage_terminal_failed_count else 0;
+        const produced_count = if (@hasField(@TypeOf(item), "coverage_produced_count")) item.coverage_produced_count else 0;
+        const counters_valid = coverageCountersValid(table_doc_count, produced_count, skipped_count, terminal_failed_count);
+        const replay_current = coverageReplayCurrent(replay_applied_sequence, replay_target_sequence, replay_catch_up_required);
+        const observation_complete = coverage_runtime_present and item.coverage_summary_ready and counters_valid;
+        const coverage = evaluateCoverage(
+            .strict,
+            table_doc_count,
+            produced_count,
+            skipped_count,
+            terminal_failed_count,
+            observation_complete,
+            replay_current,
+        );
+        try out.appendSlice(alloc, ",\"coverage\":{");
+        try appendJsonString(alloc, out, "policy");
+        try out.append(alloc, ':');
+        try appendJsonString(alloc, out, "strict");
+        try out.appendSlice(alloc, ",\"observation_complete\":");
+        try out.appendSlice(alloc, if (observation_complete) "true" else "false");
+        try out.appendSlice(alloc, ",\"config_fingerprint\":");
+        try appendCoverageFingerprint(alloc, out, coverage_config_hash);
+        try out.appendSlice(alloc, ",\"summary_ready\":");
+        try out.appendSlice(alloc, if (item.coverage_summary_ready) "true" else "false");
+        try out.appendSlice(alloc, ",\"source_total\":");
+        try appendIntValue(alloc, out, table_doc_count);
+        try out.appendSlice(alloc, ",\"produced\":");
+        try appendIntValue(alloc, out, produced_count);
+        try out.appendSlice(alloc, ",\"skipped\":");
+        try appendIntValue(alloc, out, skipped_count);
+        try out.appendSlice(alloc, ",\"terminal_failed\":");
+        try appendIntValue(alloc, out, terminal_failed_count);
+        try out.appendSlice(alloc, ",\"covered\":");
+        try appendIntValue(alloc, out, coverage.covered);
+        try out.appendSlice(alloc, ",\"settled\":");
+        try appendIntValue(alloc, out, coverage.settled);
+        try out.appendSlice(alloc, ",\"uncovered\":");
+        if (coverage.uncovered) |uncovered| {
+            try appendIntValue(alloc, out, uncovered);
+        } else {
+            try out.appendSlice(alloc, "null");
+        }
+        try out.appendSlice(alloc, ",\"pending\":");
+        if (coverage.pending) |pending| {
+            try appendIntValue(alloc, out, pending);
+        } else {
+            try out.appendSlice(alloc, "null");
+        }
+        try out.appendSlice(alloc, ",\"complete\":");
+        try out.appendSlice(alloc, if (coverage.complete) "true" else "false");
         try out.appendSlice(alloc, ",\"healthy\":");
         try out.appendSlice(alloc, if (coverage.healthy) "true" else "false");
         try out.appendSlice(alloc, ",\"degraded\":");
@@ -8210,6 +8294,34 @@ fn consumerTests() type {
             ));
             try std.testing.expectError(error.InvalidEnrichmentConfig, collectArtifactEnrichmentsFromTableIndexesJson(std.testing.allocator,
                 \\{"enrichments":[{"name":"t","kind":"asset","field":"url","transcriber":{"model":"m"}}]}
+            ));
+        }
+
+        test "asset enrichment may consume another asset artifact" {
+            // A valid producer-consumer chain admits.
+            try validateArtifactEnrichmentsForTableIndexesJson(std.testing.allocator,
+                \\{"enrichments":[{"name":"summary_text","kind":"asset","field":"summary"},{"name":"summary_echo","kind":"asset","source_artifact_name":"summary_text"}]}
+            );
+            // Self-reference is the one-hop cycle.
+            try std.testing.expectError(error.InvalidEnrichmentConfig, validateArtifactEnrichmentsForTableIndexesJson(std.testing.allocator,
+                \\{"enrichments":[{"name":"loop","kind":"asset","source_artifact_name":"loop"}]}
+            ));
+            // A two-hop cycle never terminates and is rejected.
+            try std.testing.expectError(error.InvalidEnrichmentConfig, validateArtifactEnrichmentsForTableIndexesJson(std.testing.allocator,
+                \\{"enrichments":[{"name":"a","kind":"asset","source_artifact_name":"b"},{"name":"b","kind":"asset","source_artifact_name":"a"}]}
+            ));
+            // The upstream must be an admitted asset.
+            try std.testing.expectError(error.InvalidEnrichmentConfig, validateArtifactEnrichmentsForTableIndexesJson(std.testing.allocator,
+                \\{"enrichments":[{"name":"echo","kind":"asset","source_artifact_name":"missing"}]}
+            ));
+            // Consuming assets read produced bytes; a field cannot also be set.
+            try std.testing.expectError(error.InvalidEnrichmentConfig, validateArtifactEnrichmentsForTableIndexesJson(std.testing.allocator,
+                \\{"enrichments":[{"name":"summary_text","kind":"asset","field":"summary"},{"name":"echo","kind":"asset","field":"summary","source_artifact_name":"summary_text"}]}
+            ));
+            // Media-locator producers dereference the source as a URL and
+            // stay closed to artifact consumption.
+            try std.testing.expectError(error.InvalidEnrichmentConfig, validateArtifactEnrichmentsForTableIndexesJson(std.testing.allocator,
+                \\{"enrichments":[{"name":"summary_text","kind":"asset","field":"summary"},{"name":"echo","kind":"asset","source_artifact_name":"summary_text","producer_json":"{\"type\":\"reader\",\"config\":{}}"}]}
             ));
         }
 

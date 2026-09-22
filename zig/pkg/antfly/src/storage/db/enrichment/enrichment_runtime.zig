@@ -11391,7 +11391,23 @@ fn processAsset(
         runtime.alloc.free(text_indexes);
     }
 
-    var source_text = try extractAssetSourceValue(runtime.alloc, runtime.config, raw, request) orelse {
+    // Asset-consumes-asset: the source is another asset's produced bytes,
+    // not a document field. A missing upstream takes the null-source retire
+    // path below; the per-document replay record written when the upstream
+    // artifact lands re-plans this consumer, so the pipeline converges
+    // without bespoke retry state.
+    const consumes_upstream = request.upstream_artifact_name.len > 0 and
+        producer_cfg.type != .document_extraction;
+    var source_text = (if (consumes_upstream) blk: {
+        const upstream_key = try internal_keys.artifactNamedPrefixAlloc(
+            runtime.alloc,
+            request.doc_key,
+            "asset",
+            request.upstream_artifact_name,
+        );
+        defer runtime.alloc.free(upstream_key);
+        break :blk try storeGetOptionalAllocWithRetry(runtime, upstream_key);
+    } else try extractAssetSourceValue(runtime.alloc, runtime.config, raw, request)) orelse {
         const state_key = try assetStateKeyAlloc(runtime.alloc, request.doc_key, artifact_name);
         defer runtime.alloc.free(state_key);
         if (producer_cfg.type == .document_extraction) {
@@ -11530,34 +11546,116 @@ fn neighborContextBlockAlloc(
     };
     defer config.deinit(runtime.alloc);
 
-    var neighbors = std.ArrayListUnmanaged(enrichment_neighbor_context.NeighborEdge).empty;
-    defer neighbors.deinit(runtime.alloc);
-    var edges: []graph_mod.Edge = &.{};
-    defer graph_mod.GraphIndex.freeEdges(runtime.alloc, edges);
+    // Bounded streaming selection: a high-degree node must not make this
+    // "bounded" enrichment input materialize (or sort) its complete
+    // adjacency. Edges are read in bounded pages and folded into a
+    // limit-sized selection buffer ordered by the same deterministic
+    // comparator the renderer uses, so the output is byte-identical to the
+    // previous sort-everything-then-truncate implementation while peak
+    // retained state is O(limit + one page).
+    const alloc = runtime.alloc;
+    var selected = std.ArrayListUnmanaged(enrichment_neighbor_context.NeighborEdge).empty;
+    defer {
+        for (selected.items) |edge| {
+            alloc.free(@constCast(edge.edge_type));
+            alloc.free(@constCast(edge.neighbor));
+        }
+        selected.deinit(alloc);
+    }
     if (runtime.index_manager.graphIndex(config.graph_index)) |entry| {
         const direction: graph_mod.EdgeDirection = switch (config.direction) {
             .out => .out,
             .in => .in,
             .both => .both,
         };
-        edges = entry.index.getEdgesByTypes(runtime.alloc, request.doc_key, config.edge_types, direction) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            // Unreadable local graph state renders empty neighbors rather
-            // than parking the producer behind a sidecar dependency.
-            else => &.{},
+        const page_limits = graph_mod.EdgePageLimits{
+            .max_edges = 256,
+            .max_owned_bytes = 512 * 1024,
         };
-        try neighbors.ensureTotalCapacity(runtime.alloc, edges.len);
-        for (edges) |edge| {
-            const outgoing = std.mem.eql(u8, edge.source, request.doc_key);
-            neighbors.appendAssumeCapacity(.{
-                .edge_type = edge.edge_type,
-                .orientation = if (outgoing) .out else .in,
-                .neighbor = if (outgoing) edge.target else edge.source,
-                .weight = edge.weight,
-            });
+        var cursor: ?graph_mod.EdgeScanCursor = null;
+        defer if (cursor) |*value| value.deinit(alloc);
+        scan: while (true) {
+            var page = entry.index.getEdgesByTypesPage(
+                alloc,
+                request.doc_key,
+                config.edge_types,
+                direction,
+                cursor,
+                page_limits,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                // Unreadable local graph state renders empty neighbors rather
+                // than parking the producer behind a sidecar dependency.
+                else => break :scan,
+            };
+            defer graph_mod.GraphIndex.freeEdges(alloc, page.edges);
+            for (page.edges) |edge| {
+                const outgoing = std.mem.eql(u8, edge.source, request.doc_key);
+                try insertBoundedNeighbor(alloc, &selected, config.limit, .{
+                    .edge_type = edge.edge_type,
+                    .orientation = if (outgoing) .out else .in,
+                    .neighbor = if (outgoing) edge.target else edge.source,
+                    .weight = edge.weight,
+                });
+            }
+            if (cursor) |*value| value.deinit(alloc);
+            cursor = page.next_cursor;
+            page.next_cursor = null;
+            if (cursor == null) break;
         }
     }
-    return try enrichment_neighbor_context.renderNeighborsBlockAlloc(runtime.alloc, neighbors.items, config.limit);
+    return try enrichment_neighbor_context.renderNeighborsBlockAlloc(alloc, selected.items, config.limit);
+}
+
+fn neighborEdgeLessThan(lhs: enrichment_neighbor_context.NeighborEdge, rhs: enrichment_neighbor_context.NeighborEdge) bool {
+    switch (std.mem.order(u8, lhs.edge_type, rhs.edge_type)) {
+        .lt => return true,
+        .gt => return false,
+        .eq => {},
+    }
+    switch (std.mem.order(u8, lhs.neighbor, rhs.neighbor)) {
+        .lt => return true,
+        .gt => return false,
+        .eq => {},
+    }
+    if (lhs.orientation != rhs.orientation) return lhs.orientation == .out;
+    return false;
+}
+
+/// Keep the `limit` smallest neighbors (renderer order) with owned strings.
+/// Insertion into a limit-sized sorted buffer keeps peak retained state
+/// independent of node degree.
+fn insertBoundedNeighbor(
+    alloc: Allocator,
+    selected: *std.ArrayListUnmanaged(enrichment_neighbor_context.NeighborEdge),
+    limit: u32,
+    candidate: enrichment_neighbor_context.NeighborEdge,
+) !void {
+    if (limit == 0) return;
+    if (selected.items.len >= limit and !neighborEdgeLessThan(candidate, selected.items[selected.items.len - 1])) return;
+
+    var insert_at: usize = selected.items.len;
+    for (selected.items, 0..) |existing, i| {
+        if (neighborEdgeLessThan(candidate, existing)) {
+            insert_at = i;
+            break;
+        }
+    }
+    const owned_type = try alloc.dupe(u8, candidate.edge_type);
+    errdefer alloc.free(owned_type);
+    const owned_neighbor = try alloc.dupe(u8, candidate.neighbor);
+    errdefer alloc.free(owned_neighbor);
+    try selected.insert(alloc, insert_at, .{
+        .edge_type = owned_type,
+        .orientation = candidate.orientation,
+        .neighbor = owned_neighbor,
+        .weight = candidate.weight,
+    });
+    if (selected.items.len > limit) {
+        const evicted = selected.pop().?;
+        alloc.free(@constCast(evicted.edge_type));
+        alloc.free(@constCast(evicted.neighbor));
+    }
 }
 
 /// Producers whose rendered template produced content parts consume the parts
@@ -20785,10 +20883,13 @@ fn runtimeAppendRelationItem(
     // topological source may resolve canonically; an entity-referencing
     // source with no canonical identity drops the edge (resolution replay
     // re-renders it), and legacy inline endpoint objects keep the document.
+    var source_table: ?[]const u8 = null;
     const source_doc = blk: {
         const source_value = item.object.get("source") orelse break :blk doc_key;
         if (runtimeResolveGraphEndpointEntity(source_value, artifact_value)) |entity| {
-            break :blk runtimeCanonicalEntityDocumentId(entity) orelse return;
+            const canonical = runtimeCanonicalEntityDocumentId(entity) orelse return;
+            source_table = runtimeCanonicalEntityTable(entity);
+            break :blk canonical;
         }
         break :blk switch (source_value) {
             .string => |external| if (external.len > 0) external else doc_key,
@@ -20834,7 +20935,13 @@ fn runtimeAppendRelationItem(
         try runtimePrependTargetTableToItemMetadataAlloc(alloc, table, item)
     else
         try std.json.Stringify.valueAlloc(alloc, item, .{});
-    errdefer alloc.free(metadata_json);
+    var owned_metadata = metadata_json;
+    errdefer alloc.free(owned_metadata);
+    if (source_table) |table| {
+        const tagged = try runtimePrependTableTagToMetadataJsonAlloc(alloc, "source_table", table, owned_metadata);
+        alloc.free(owned_metadata);
+        owned_metadata = tagged;
+    }
 
     const owned_index_name = try alloc.dupe(u8, index_name);
     errdefer alloc.free(owned_index_name);
@@ -20852,7 +20959,7 @@ fn runtimeAppendRelationItem(
         .target = owned_target,
         .edge_type = owned_edge_type,
         .weight = weight,
-        .metadata_json = metadata_json,
+        .metadata_json = owned_metadata,
         .owner = owned_owner,
     });
 }
@@ -21090,17 +21197,17 @@ fn runtimeCanonicalEntityTable(entity: std.json.Value) ?[]const u8 {
     return null;
 }
 
-/// Mirrors db.zig's prependTargetTableToMetadataJsonAlloc for the runtime
-/// renderer: tag an already-rendered metadata object with the resolved
+/// Mirrors db.zig's prependTableTagToMetadataJsonAlloc for the runtime
+/// renderer: tag an already-rendered metadata object with a resolved
 /// endpoint's home table unless the template rendered its own tag.
-fn runtimePrependTargetTableToMetadataJsonAlloc(alloc: Allocator, target_table: []const u8, metadata_json: []const u8) ![]u8 {
+fn runtimePrependTableTagToMetadataJsonAlloc(alloc: Allocator, comptime tag: []const u8, table: []const u8, metadata_json: []const u8) ![]u8 {
     if (metadata_json.len < 2 or metadata_json[0] != '{' or
-        std.mem.indexOf(u8, metadata_json, "\"target_table\":") != null)
+        std.mem.indexOf(u8, metadata_json, "\"" ++ tag ++ "\":") != null)
         return try alloc.dupe(u8, metadata_json);
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
-    try out.appendSlice(alloc, "{\"target_table\":");
-    const quoted = try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .string = target_table }, .{});
+    try out.appendSlice(alloc, "{\"" ++ tag ++ "\":");
+    const quoted = try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .string = table }, .{});
     defer alloc.free(quoted);
     try out.appendSlice(alloc, quoted);
     if (!std.mem.eql(u8, metadata_json, "{}")) {
@@ -21110,6 +21217,10 @@ fn runtimePrependTargetTableToMetadataJsonAlloc(alloc: Allocator, target_table: 
         try out.append(alloc, '}');
     }
     return try out.toOwnedSlice(alloc);
+}
+
+fn runtimePrependTargetTableToMetadataJsonAlloc(alloc: Allocator, target_table: []const u8, metadata_json: []const u8) ![]u8 {
+    return try runtimePrependTableTagToMetadataJsonAlloc(alloc, "target_table", target_table, metadata_json);
 }
 
 fn runtimePrependTargetTableToItemMetadataAlloc(alloc: Allocator, target_table: []const u8, item: std.json.Value) ![]u8 {

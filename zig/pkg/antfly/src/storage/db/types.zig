@@ -1678,6 +1678,21 @@ pub const SearchRequest = struct {
     document_lookup_groups: []const u64 = &.{},
     /// Borrowed coordinator label; routing and storage continue using immutable identities.
     response_table_name: ?[]const u8 = null,
+    /// Borrowed physical name of the queried table, set by the API read
+    /// source together with `graph_index_complete_snapshot`. Graph executors
+    /// canonicalize a `target_table` tag naming this table to the local
+    /// (null) identity, mirroring the distributed coordinator's
+    /// canonicalGraphNodeTable, so a self-table tag never stops expansion or
+    /// splits node identity. Never populated by public JSON.
+    graph_owning_table: []const u8 = "",
+    /// True when the executing snapshot holds the graph index's COMPLETE
+    /// row set: the table has exactly one group and the query was admitted
+    /// for local (non-coordinated) graph execution. Local graph executors
+    /// may then expand THROUGH cross-table tagged nodes — entity-sourced
+    /// edges are document-owned rows in this same index, so the walk is a
+    /// same-snapshot single-index read (the embedded DBCore entry points'
+    /// justification). Never populated by public JSON.
+    graph_index_complete_snapshot: bool = false,
     query: Query = .{ .match_all = {} },
     index_name: ?[]const u8 = null,
     primary_text_index_name: ?[]const u8 = null,
@@ -1826,6 +1841,8 @@ const hierarchy_children_supported_internal_fields = [_][]const u8{
     "execution_deadline_ns",
     "cancellation",
     "graph_execution_limits",
+    "graph_owning_table",
+    "graph_index_complete_snapshot",
 };
 
 const hierarchy_children_rejected_fields = [_][]const u8{

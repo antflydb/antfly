@@ -31,7 +31,9 @@ pub fn producerJsonValuesEqual(alloc: Allocator, lhs: []const u8, rhs: []const u
 /// Dependency edges are validated by the catalog-aware caller, while this
 /// function is intentionally shared by API admission and local provisioning.
 pub fn validatePublicConfig(alloc: Allocator, cfg: types.EnrichmentConfig) !void {
-    if (cfg.name.len == 0 or (cfg.field.len == 0 and cfg.template.len == 0))
+    if (cfg.name.len == 0) return error.InvalidEnrichmentConfig;
+    const consumes_asset_artifact = cfg.kind == .asset and cfg.source_artifact_name.len > 0;
+    if (cfg.field.len == 0 and cfg.template.len == 0 and !consumes_asset_artifact)
         return error.InvalidEnrichmentConfig;
     if (cfg.execution) |execution| {
         if (execution.batch_items) |items| if (items == 0)
@@ -54,7 +56,29 @@ pub fn validatePublicConfig(alloc: Allocator, cfg: types.EnrichmentConfig) !void
         .asset => {
             try validateAssetProducerConfig(alloc, cfg.producer_json);
             if (cfg.neighbor_context) |context| try validateNeighborContextConfig(alloc, context, cfg.producer_json);
+            if (cfg.source_artifact_name.len > 0) {
+                if (cfg.field.len > 0 or cfg.template.len > 0) return error.InvalidEnrichmentConfig;
+                try validateUpstreamAssetProducer(alloc, cfg.producer_json);
+            }
         },
+    }
+}
+
+/// An asset that names `source_artifact_name` consumes another asset's
+/// produced bytes instead of a document field. Media-locator producers
+/// (`document_extraction`, `reader`, `transcriber`) treat the source as a
+/// URL and would dereference artifact bytes as a location, so the option is
+/// closed to them at admission. Shared by the API config walk and the
+/// catalog validator.
+pub fn validateUpstreamAssetProducer(alloc: Allocator, producer_json: []const u8) !void {
+    var producer = asset_producer.parseProducerConfig(alloc, producer_json) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidAssetProducerConfig,
+    };
+    defer producer.deinit(alloc);
+    switch (producer.type) {
+        .copy, .generator, .extractor => {},
+        .document_extraction, .reader, .transcriber => return error.InvalidEnrichmentConfig,
     }
 }
 
