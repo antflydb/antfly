@@ -24,7 +24,6 @@ pub fn configureModule(
     lmdb_engine_mod: *std.Build.Module,
     json_mod: *std.Build.Module,
     public_openapi_mod: *std.Build.Module,
-    schema_openapi_mod: *std.Build.Module,
     query_openapi_mod: *std.Build.Module,
     indexes_openapi_mod: *std.Build.Module,
     sort_openapi_mod: *std.Build.Module,
@@ -53,7 +52,6 @@ pub fn configureModule(
     mod.addImport("lmdb_engine", lmdb_engine_mod);
     mod.addImport("antfly-json", json_mod);
     mod.addImport("antfly_public_openapi", public_openapi_mod);
-    mod.addImport("antfly_schema_openapi", schema_openapi_mod);
     mod.addImport("antfly_query_openapi", query_openapi_mod);
     mod.addImport("antfly_indexes_openapi", indexes_openapi_mod);
     mod.addImport("antfly_sort_openapi", sort_openapi_mod);
@@ -158,7 +156,6 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         lmdb_engine_mod,
         json_mod,
         public_openapi_mod,
-        antfly_imports.schema_openapi,
         query_openapi_mod,
         indexes_openapi_mod,
         sort_openapi_mod,
