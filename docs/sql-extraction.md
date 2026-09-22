@@ -98,15 +98,22 @@ prepared registry and binding-identity fences. Statements survive transaction
 commit and release on deallocation/disconnect. EXECUTE evaluates typed scalar
 arguments in an empty binding environment, never interpolating SQL or opening
 table readers; JSON null remains distinct from SQL NULL. Eligible executions
-use the existing backpressured pull stream. HTTP has no durable connection-owned
-prepared resource, and SQL-language DECLARE/FETCH cursor ownership is still open.
+use the existing backpressured pull stream. Forward-only SQL-language
+DECLARE/FETCH/CLOSE cursors now retain that same bounded pull stream under the
+connection owner. DECLARE is transaction-bound, pins its binding identity and
+transaction read-your-writes overlay, and stages stronger-isolation range proofs
+before releasing transaction admission. FETCH pages are bounded and flushed
+before another page is pulled; exhausted, failed, closed, committed and
+disconnected cursors release their stream. Scrollable and WITH HOLD cursors are
+explicitly rejected. HTTP still has no durable connection-owned prepared
+resource.
 
 Remaining major items include broader isolation deployment and fault validation,
-advanced unique-arbiter inference and correlated subquery shapes,
-durable HTTP prepared sessions and SQL-language cursor ownership, and the complete parity,
-fault-injection and workload benchmark gates. Passing focused component tests is
-not completion of S2. Partial/expression/deferrable unique arbiters require native
-integrity-plan support, not just SQL inference; they remain unsupported.
+advanced unique-arbiter inference and correlated subquery shapes, durable HTTP
+prepared sessions, and the complete parity, fault-injection and workload
+benchmark gates. Passing focused component tests is not completion of S2.
+Partial/expression/deferrable unique arbiters require native integrity-plan
+support, not just SQL inference; they remain unsupported.
 
 ### Latest local validation
 
@@ -125,6 +132,13 @@ integrity-plan support, not just SQL inference; they remain unsupported.
 - Native LSM bookkeeping workload (Debug, 100 batches of 32 common-prefix rows):
   tracking inactive 452 ms versus active 485 ms, about 7.3% overhead in one run.
   This is preliminary, not a statistically rigorous production throughput claim.
+- Forward-cursor follow-up: pgwire suite passes 30 tests, including real
+  BEGIN/DECLARE/FETCH FORWARD/FETCH ALL/COMMIT protocol lifecycle with bounded
+  pages and a failed-fetch/transaction-abort path with retained-stream release;
+  parser coverage includes quoted identifiers, FETCH ALL, CLOSE ALL, and
+  rejected scroll/hold options. SQL-filtered API integration passes 31 tests
+  with no leaks. These focused checks do not replace the full S2 parity and
+  distributed-fault gates.
 
 - Expanded SQL runtime/compiler/binder: 156 tests in ReleaseSafe; pgwire:
   25 tests; native SQL pgwire adapter and mounted route: seven tests. Final

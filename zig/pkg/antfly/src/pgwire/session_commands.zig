@@ -8,6 +8,9 @@ pub const Command = union(enum) {
     prepare: struct { name: []const u8, types: []const Type, statement: []const u8 },
     execute: struct { name: []const u8, expressions: []const []const u8 },
     deallocate: ?[]const u8,
+    declare_cursor: struct { name: []const u8, statement: []const u8 },
+    fetch_cursor: struct { name: []const u8, count: u32 },
+    close_cursor: ?[]const u8,
 };
 
 const Parser = struct {
@@ -168,6 +171,64 @@ pub fn parse(alloc: std.mem.Allocator, input: []const u8, max_parameters: usize)
         try p.finish();
         return .{ .deallocate = if (!quoted_name and std.ascii.eqlIgnoreCase(name, "all")) null else name };
     }
+    if (std.ascii.eqlIgnoreCase(verb, "declare")) {
+        const name = try p.name();
+        try p.space();
+        if (p.pos == input.len or input[p.pos] == ';') return error.InvalidSqlSyntax;
+        const modifier = try p.word();
+        if (std.ascii.eqlIgnoreCase(modifier, "scroll")) return error.UnsupportedSqlExecution;
+        if (std.ascii.eqlIgnoreCase(modifier, "no")) {
+            if (!std.ascii.eqlIgnoreCase(try p.word(), "scroll")) return error.InvalidSqlSyntax;
+        } else if (!std.ascii.eqlIgnoreCase(modifier, "cursor")) return error.InvalidSqlSyntax;
+        if (std.ascii.eqlIgnoreCase(modifier, "no") and !std.ascii.eqlIgnoreCase(try p.word(), "cursor")) return error.InvalidSqlSyntax;
+        const following = try p.word();
+        if (std.ascii.eqlIgnoreCase(following, "with")) return error.UnsupportedSqlExecution;
+        // The statement body owns the remainder; verify FOR is the next token
+        // and let the SQL compiler validate the full SELECT shape.
+        if (!std.ascii.eqlIgnoreCase(following, "for")) return error.InvalidSqlSyntax;
+        try p.space();
+        if (p.pos == input.len) return error.InvalidSqlSyntax;
+        const statement = std.mem.trim(u8, input[p.pos..], " \r\n\t;");
+        if (statement.len == 0) return error.InvalidSqlSyntax;
+        return .{ .declare_cursor = .{ .name = name, .statement = statement } };
+    }
+    if (std.ascii.eqlIgnoreCase(verb, "fetch")) {
+        try p.space();
+        const number = struct {
+            fn parse(parser: *Parser) !?u32 {
+                try parser.space();
+                const start = parser.pos;
+                while (parser.pos < parser.input.len and std.ascii.isDigit(parser.input[parser.pos])) parser.pos += 1;
+                if (start == parser.pos) return null;
+                return std.fmt.parseInt(u32, parser.input[start..parser.pos], 10) catch error.UnsupportedSqlExecution;
+            }
+        }.parse;
+        const first_count = try number(&p);
+        const count: u32 = if (first_count) |n| n else blk: {
+            const direction = try p.word();
+            if (std.ascii.eqlIgnoreCase(direction, "all")) break :blk std.math.maxInt(u32);
+            if (std.ascii.eqlIgnoreCase(direction, "next")) break :blk 1;
+            if (!std.ascii.eqlIgnoreCase(direction, "forward")) return error.UnsupportedSqlExecution;
+            const saved = p.pos;
+            const optional_direction = p.word() catch "";
+            if (std.ascii.eqlIgnoreCase(optional_direction, "all")) break :blk std.math.maxInt(u32);
+            p.pos = saved;
+            break :blk (try number(&p)) orelse 1;
+        };
+        const source = try p.word();
+        if (!std.ascii.eqlIgnoreCase(source, "from") and !std.ascii.eqlIgnoreCase(source, "in")) return error.InvalidSqlSyntax;
+        const name = try p.name();
+        try p.finish();
+        return .{ .fetch_cursor = .{ .name = name, .count = count } };
+    }
+    if (std.ascii.eqlIgnoreCase(verb, "close")) {
+        try p.space();
+        const quoted_name = p.pos < input.len and input[p.pos] == '"';
+        const name = try p.name();
+        const all = !quoted_name and std.ascii.eqlIgnoreCase(name, "all");
+        try p.finish();
+        return .{ .close_cursor = if (all) null else name };
+    }
     return null;
 }
 
@@ -187,6 +248,21 @@ test "pgwire SQL session command parser preserves scalar spans and quoted names"
             try std.testing.expectEqualStrings("concat('a,b', /* , ) */ 'c''d')", executed.expressions[1]);
             try std.testing.expectEqualStrings("ALL", (try parse(a, "DEALLOCATE \"ALL\"", 2)).?.deallocate.?);
             try std.testing.expect((try parse(a, "DEALLOCATE PREPARE ALL", 2)).?.deallocate == null);
+            const declared = (try parse(a, "DECLARE c CURSOR FOR SELECT id FROM users", 2)).?.declare_cursor;
+            try std.testing.expectEqualStrings("c", declared.name);
+            try std.testing.expectEqualStrings("SELECT id FROM users", declared.statement);
+            const quoted = (try parse(a, "DECLARE \"Mixed\" NO SCROLL CURSOR FOR SELECT 1", 2)).?.declare_cursor;
+            try std.testing.expectEqualStrings("Mixed", quoted.name);
+            const fetched = (try parse(a, "FETCH FORWARD 10 FROM c", 2)).?.fetch_cursor;
+            try std.testing.expectEqualStrings("c", fetched.name);
+            try std.testing.expectEqual(@as(u32, 10), fetched.count);
+            try std.testing.expectEqual(@as(u32, 1), (try parse(a, "FETCH NEXT FROM c", 2)).?.fetch_cursor.count);
+            try std.testing.expectEqual(std.math.maxInt(u32), (try parse(a, "FETCH FORWARD ALL FROM c", 2)).?.fetch_cursor.count);
+            try std.testing.expectEqual(std.math.maxInt(u32), (try parse(a, "FETCH ALL IN c", 2)).?.fetch_cursor.count);
+            try std.testing.expect((try parse(a, "CLOSE ALL", 2)).?.close_cursor == null);
+            try std.testing.expectEqualStrings("ALL", (try parse(a, "CLOSE \"ALL\"", 2)).?.close_cursor.?);
+            try std.testing.expectError(error.UnsupportedSqlExecution, parse(a, "DECLARE c SCROLL CURSOR FOR SELECT 1", 2));
+            try std.testing.expectError(error.UnsupportedSqlExecution, parse(a, "DECLARE c CURSOR WITH HOLD FOR SELECT 1", 2));
             try std.testing.expectError(error.InvalidSqlSyntax, parse(a, "EXECUTE x('unterminated)", 2));
             try std.testing.expectError(error.ProgramLimitExceeded, parse(a, "EXECUTE x(1,2,3)", 2));
             try std.testing.expectError(error.InvalidSqlSyntax, parse(a, "DEALLOCATE x; DROP TABLE users", 2));

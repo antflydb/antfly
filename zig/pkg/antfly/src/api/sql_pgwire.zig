@@ -77,7 +77,19 @@ pub const Adapter = struct {
     server: *http.ApiHttpServer,
 
     pub fn backend(self: *Adapter) wire.Backend {
-        return .{ .context = self, .vtable = &.{ .authenticate = authenticate, .describe = describe, .execute = execute, .evaluate_parameters = evaluateParameters, .open_stream = openStream, .disconnect = disconnect } };
+        return .{ .context = self, .vtable = &.{ .authenticate = authenticate, .describe = describe, .execute = execute, .evaluate_parameters = evaluateParameters, .fail_transaction = failTransaction, .open_stream = openStream, .disconnect = disconnect } };
+    }
+
+    fn failTransaction(raw: *anyopaque, identity: wire.Identity, request: wire.Request) !void {
+        const self: *Adapter = @ptrCast(@alignCast(raw));
+        const credential: *Credential = @ptrCast(@alignCast(identity.context));
+        const encoded = request.session_id orelse return error.SqlTransactionNotActive;
+        const id = try @import("distributed_txn.zig").parseTxnIdHex(encoded);
+        if (try self.server.txn_sessions.principalAccess(self.server.alloc, id, credential.principal) != .allowed) return error.SqlTransactionNotActive;
+        var state = (try self.server.txn_sessions.getSqlState(self.server.alloc, id)) orelse return error.SqlTransactionNotActive;
+        defer state.deinit(self.server.alloc);
+        if (state.terminal != null or !std.mem.eql(u8, state.metadata.database, request.database orelse "default") or !std.mem.eql(u8, state.metadata.namespace, request.namespace orelse "public")) return error.SqlTransactionNotActive;
+        try self.server.txn_sessions.setSqlFailed(self.server.alloc, id, true);
     }
 
     fn evaluateParameters(_: *anyopaque, alloc: std.mem.Allocator, identity: wire.Identity, request: wire.Request, expressions: []const []const u8) ![]const std.json.Value {
@@ -199,6 +211,9 @@ const OwnedRead = struct {
     identity: ?http.AuthenticatedIdentity,
     authority: Authority,
     native_adapter: execution.Adapter,
+    session_id: ?[]u8 = null,
+    staged: @import("transactions.zig").OwnedTransactionCommitRequest = .{},
+    range_guards: @import("transactions.zig").OwnedTransactionCommitRequest = .{},
     guarded: GuardedCatalog,
     plan: @import("../sql/plan_cache.zig").Lease,
     admission: http.RequestAdmission.Lease,
@@ -208,7 +223,6 @@ const OwnedRead = struct {
     const Policy = struct { table: []const u8, filter: ?[]const u8 };
 
     fn open(adapter: *Adapter, alloc: std.mem.Allocator, credential: *Credential, request: wire.Request) !?wire.ReadStream {
-        if (request.session_id != null) return null;
         const server = adapter.server;
         var preparation = server.sql_preparation_admission.tryAcquireLease() orelse return error.SqlWriteCapacityUnavailable;
         defer preparation.release();
@@ -225,7 +239,11 @@ const OwnedRead = struct {
         self.adapter = adapter;
         self.arena = std.heap.ArenaAllocator.init(alloc);
         errdefer self.arena.deinit();
+        errdefer self.staged.deinit(alloc);
+        errdefer self.range_guards.deinit(server.alloc);
         const arena = self.arena.allocator();
+        if (request.session_id) |encoded| self.session_id = try server.alloc.dupe(u8, encoded);
+        errdefer if (self.session_id) |id| server.alloc.free(id);
         // Native catalog resolution extends this identity with aliases using
         // server.alloc; every allocation in the mutable identity must share it.
         self.identity = try credential.identity(server.alloc);
@@ -233,18 +251,44 @@ const OwnedRead = struct {
         // Statement, parameter and binding-guard data are portal-owned. Keep a
         // private request capsule so I/O borrows point to a stable address.
         self.authority = .{ .credential = credential, .identity = &self.identity, .request = request };
-        self.native_adapter = .{ .server = server, .identity = &self.identity, .context = try self.authority.context(), .database = request.database orelse "default", .namespace = request.namespace orelse "public" };
+        self.authority.request.session_id = self.session_id;
+        self.native_adapter = .{ .server = server, .identity = &self.identity, .context = try self.authority.context(), .database = request.database orelse "default", .namespace = request.namespace orelse "public", .session_id = self.session_id };
+        var transaction_lease: ?@import("transactions.zig").SessionRegistry.CommitExecution = null;
+        defer if (transaction_lease) |lease| lease.release();
+        if (self.session_id) |id_hex| {
+            const id = @import("distributed_txn.zig").parseTxnIdHex(id_hex) catch return error.SqlTransactionNotActive;
+            if (try server.txn_sessions.principalAccess(server.alloc, id, credential.principal) != .allowed) return error.SqlTransactionNotActive;
+            transaction_lease = server.txn_sessions.tryAcquireCommitExecution(id) orelse return error.SqlWriteCapacityUnavailable;
+            var state = (try server.txn_sessions.getSqlState(server.alloc, id)) orelse return error.SqlTransactionNotActive;
+            defer state.deinit(server.alloc);
+            if (state.metadata.failed or state.terminal != null) return error.SqlTransactionAborted;
+            self.staged = try server.txn_sessions.cloneSqlStaged(alloc, id);
+            self.native_adapter.active_transaction = id;
+            self.native_adapter.staged = &self.staged;
+            if (state.metadata.isolation != .read_committed) self.native_adapter.range_reads = &self.range_guards;
+        }
         self.guarded = .{ .native = self.native_adapter.backend(), .authority = &self.authority, .revision = &self.native_adapter.revision, .expected_guard = request.binding_guard };
         const parameters = try normalizeParameters(arena, request.parameters, request.parameter_types);
         const opened = try Pull.Stream.open(alloc, self.guarded.backend(), plan.compiled(), parameters, .{ .result_rows = request.limit, .page_rows = 256 });
         if (opened == null) {
             self.identity.?.deinit(server.alloc);
             self.arena.deinit();
+            self.staged.deinit(alloc);
+            self.range_guards.deinit(server.alloc);
+            if (self.session_id) |id| server.alloc.free(id);
             alloc.destroy(self);
             return null;
         }
         self.stream = opened.?;
         errdefer self.stream.close();
+        if (self.session_id) |id_hex| if (self.range_guards.tables.len != 0) {
+            const id = try @import("distributed_txn.zig").parseTxnIdHex(id_hex);
+            _ = (try server.txn_sessions.stage(server.alloc, id, &self.range_guards)) orelse return error.SqlTransactionNotActive;
+        };
+        if (transaction_lease) |lease| {
+            lease.release();
+            transaction_lease = null;
+        }
         const binding = self.stream.context.binding;
         const policies = try arena.alloc(Policy, if (binding.relation) |relation| relation.scans.len else 1);
         for (policies, 0..) |*policy, i| {
@@ -274,6 +318,13 @@ const OwnedRead = struct {
         // later Execute messages carry a newer per-request deadline.
         try self.authority.request.check();
         try self.authority.credential.validate();
+        if (self.session_id) |id_hex| {
+            const id = try @import("distributed_txn.zig").parseTxnIdHex(id_hex);
+            if (try self.adapter.server.txn_sessions.principalAccess(self.adapter.server.alloc, id, self.authority.credential.principal) != .allowed) return error.SqlTransactionNotActive;
+            var state = (try self.adapter.server.txn_sessions.getSqlState(self.adapter.server.alloc, id)) orelse return error.SqlTransactionNotActive;
+            defer state.deinit(self.adapter.server.alloc);
+            if (state.metadata.failed or state.terminal != null) return error.SqlTransactionNotActive;
+        }
         var fresh = try self.authority.credential.identity(alloc);
         defer fresh.deinit(alloc);
         try validatePolicies(alloc, &fresh, self.identity.?, self.policies);
@@ -323,6 +374,9 @@ const OwnedRead = struct {
         self.plan.release(self.adapter.server.sqlPlanCacheIo());
         self.admission.release();
         self.identity.?.deinit(self.adapter.server.alloc);
+        self.staged.deinit(self.alloc);
+        self.range_guards.deinit(self.adapter.server.alloc);
+        if (self.session_id) |id| self.adapter.server.alloc.free(id);
         self.arena.deinit();
         self.alloc.destroy(self);
     }

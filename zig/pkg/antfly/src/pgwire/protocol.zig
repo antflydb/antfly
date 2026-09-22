@@ -61,6 +61,16 @@ const Portal = struct {
     failed: bool = false,
 };
 
+const SqlCursor = struct {
+    arena: std.heap.ArenaAllocator,
+    statement: []const u8,
+    description: backend.Description,
+    stream: ?backend.ReadStream,
+    session_id: []const u8,
+    fetched: u64 = 0,
+    exhausted: bool = false,
+};
+
 pub const Session = struct {
     alloc: std.mem.Allocator,
     io: std.Io,
@@ -76,6 +86,7 @@ pub const Session = struct {
     status: backend.TransactionStatus = .idle,
     prepared: std.StringHashMapUnmanaged(Prepared) = .empty,
     portals: std.StringHashMapUnmanaged(Portal) = .empty,
+    sql_cursors: std.StringHashMapUnmanaged(SqlCursor) = .empty,
     skip_until_sync: bool = false,
     backend_pid: i32 = 0,
     cancel_key: i32 = 0,
@@ -92,11 +103,13 @@ pub const Session = struct {
         // Retained readers may still reference the authenticated credential.
         // Close them before disconnecting/releasing that credential.
         self.clearPortals();
+        self.clearSqlCursors();
         if (self.identity) |identity| {
             self.source.vtable.disconnect(self.source.context, identity, self.session_id);
             identity.release(identity.context, self.alloc);
         }
         self.portals.deinit(self.alloc);
+        self.sql_cursors.deinit(self.alloc);
         var it = self.prepared.iterator();
         while (it.next()) |entry| {
             self.alloc.free(entry.key_ptr.*);
@@ -149,6 +162,7 @@ pub const Session = struct {
                         self.session_id = null;
                     }
                 } else if (self.status == .in_transaction) self.status = .failed;
+                if (self.status != .in_transaction) self.clearSqlCursors();
                 if (self.mutation_ack_pending) self.diagnostic.set("40003", "mutation committed but its acknowledgement failed; do not replay this statement", self.diagnostic.transaction_id, false);
                 if (self.diagnostic.code != null) try self.sendDiagnostic('E', self.diagnostic, null) else try self.sendError(sqlstate(err), @errorName(err));
                 if (tag == 'Q') try self.ready();
@@ -299,6 +313,7 @@ pub const Session = struct {
         if (self.session_id) |old| self.alloc.free(old);
         self.session_id = session;
         self.status = result.transaction_status;
+        if (self.status == .idle) self.clearSqlCursors();
         return result;
     }
 
@@ -316,7 +331,10 @@ pub const Session = struct {
                     var arena = std.heap.ArenaAllocator.init(self.alloc);
                     defer arena.deinit();
                     if (try self.sessionCommand(arena.allocator(), statement)) {
-                        if (self.status == .idle) self.clearPortals();
+                        if (self.status == .idle) {
+                            self.clearPortals();
+                            self.clearSqlCursors();
+                        }
                         try self.ready();
                         return;
                     }
@@ -332,7 +350,10 @@ pub const Session = struct {
                     for (result.rows, 0..) |row, index| try self.dataRow(result.columns, &.{}, row, if (result.sql_nulls) |flags| flags[index] else null);
                     try self.complete(result);
                 }
-                if (self.status == .idle) self.clearPortals();
+                if (self.status == .idle) {
+                    self.clearPortals();
+                    self.clearSqlCursors();
+                }
                 try self.ready();
             },
             'P' => {
@@ -565,9 +586,149 @@ pub const Session = struct {
                 try self.complete(result);
                 return true;
             },
+            .declare_cursor => |declaration| {
+                self.declareCursor(declaration.name, declaration.statement) catch |err| {
+                    self.markTransactionFailed(declaration.statement);
+                    return err;
+                };
+                return true;
+            },
+            .fetch_cursor => |fetch| {
+                self.fetchCursor(fetch.name, fetch.count) catch |err| {
+                    self.markTransactionFailed("");
+                    return err;
+                };
+                return true;
+            },
+            .close_cursor => |name| {
+                if (name) |cursor_name| {
+                    if (!self.sql_cursors.contains(cursor_name)) return error.InvalidCursorName;
+                    self.removeSqlCursor(cursor_name);
+                } else self.clearSqlCursors();
+                try self.command("CLOSE CURSOR");
+                return true;
+            },
         }
-        try self.complete(.{ .command_tag = if (parsed_command == .prepare) "PREPARE" else "DEALLOCATE", .transaction_status = self.status });
+        try self.complete(.{ .command_tag = switch (parsed_command) {
+            .prepare => "PREPARE",
+            .deallocate => "DEALLOCATE",
+            else => unreachable,
+        }, .transaction_status = self.status });
         return true;
+    }
+
+    fn declareCursor(self: *Session, name: []const u8, statement: []const u8) !void {
+        if (self.status != .in_transaction or self.session_id == null) return error.CursorMustBeInTransaction;
+        if (self.sql_cursors.contains(name)) return error.DuplicateCursorName;
+        if (self.sql_cursors.count() >= self.limits.portals) return error.ProgramLimitExceeded;
+        const open = self.source.vtable.open_stream orelse return error.UnsupportedSqlExecution;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        var arena_moved = false;
+        defer if (!arena_moved) arena.deinit();
+        const description = try self.describe(arena.allocator(), statement, &.{});
+        if (description.parameter_types.len != 0) return error.InvalidParameter;
+        self.cancel_requested.store(false, .release);
+        self.executing.store(true, .release);
+        defer self.executing.store(false, .release);
+        var req = self.request(statement, &.{}, &.{});
+        req.binding_guard = description.binding_guard;
+        try req.check();
+        const stream = open(self.source.context, self.alloc, self.identity orelse return error.AuthenticationFailed, req) catch |err| {
+            return err;
+        } orelse {
+            return error.UnsupportedSqlExecution;
+        };
+        var stream_moved = false;
+        defer if (!stream_moved) stream.close(stream.context);
+        if (!columnsEqual(description.columns, stream.columns)) return error.InvalidResult;
+        const owned_statement = try arena.allocator().dupe(u8, statement);
+        const session_id = try arena.allocator().dupe(u8, self.session_id.?);
+        const key = try self.alloc.dupe(u8, name);
+        var key_moved = false;
+        defer if (!key_moved) self.alloc.free(key);
+        try self.sql_cursors.put(self.alloc, key, .{ .arena = arena, .statement = owned_statement, .description = description, .stream = stream, .session_id = session_id });
+        key_moved = true;
+        arena_moved = true;
+        stream_moved = true;
+        try self.command("DECLARE CURSOR");
+    }
+
+    fn fetchCursor(self: *Session, name: []const u8, count: u32) !void {
+        if (self.status != .in_transaction or self.session_id == null) return error.CursorMustBeInTransaction;
+        const cursor = self.sql_cursors.getPtr(name) orelse return error.InvalidCursorName;
+        if (!std.mem.eql(u8, cursor.session_id, self.session_id.?)) return error.InvalidCursorName;
+        self.cancel_requested.store(false, .release);
+        self.executing.store(true, .release);
+        defer self.executing.store(false, .release);
+        var req = self.request(cursor.statement, &.{}, &.{});
+        req.binding_guard = cursor.description.binding_guard;
+        try req.check();
+        var completed = false;
+        const fetched_before = cursor.fetched;
+        errdefer if (!completed) {
+            if (cursor.stream) |stream| {
+                cursor.stream = null;
+                stream.close(stream.context);
+            }
+        };
+        try self.rowDescription(cursor.description.columns, &.{});
+        var remaining: usize = if (count == std.math.maxInt(u32)) std.math.maxInt(usize) else count;
+        while (!cursor.exhausted and remaining != 0) {
+            try req.check();
+            const stream = cursor.stream orelse {
+                cursor.exhausted = true;
+                break;
+            };
+            var page_arena = std.heap.ArenaAllocator.init(self.alloc);
+            defer page_arena.deinit();
+            const wanted: u32 = @intCast(@min(remaining, @min(self.limits.result_rows, 256)));
+            var page = stream.next(stream.context, page_arena.allocator(), req, wanted) catch |err| {
+                cursor.stream = null;
+                stream.close(stream.context);
+                return err;
+            };
+            defer page.result.deinit();
+            if (page.result.mutation_outcome != null or page.result.continuation != null or page.result.session_id != null or page.result.rows.len > wanted or !columnsEqual(cursor.description.columns, page.result.columns)) return error.InvalidResult;
+            if (page.result.rows.len == 0 and !page.exhausted) return error.InvalidResult;
+            if (page.result.sql_nulls) |flags| if (flags.len != page.result.rows.len) return error.InvalidResult;
+            for (page.result.rows, 0..) |row, index| try self.dataRow(page.result.columns, &.{}, row, if (page.result.sql_nulls) |flags| flags[index] else null);
+            cursor.fetched += page.result.rows.len;
+            remaining -= page.result.rows.len;
+            cursor.exhausted = page.exhausted;
+            if (cursor.exhausted) {
+                cursor.stream = null;
+                stream.close(stream.context);
+            }
+            try self.writer.flush();
+        }
+        var tag: [64]u8 = undefined;
+        try self.command(try std.fmt.bufPrint(&tag, "FETCH {d}", .{cursor.fetched - fetched_before}));
+        completed = true;
+    }
+
+    fn markTransactionFailed(self: *Session, statement: []const u8) void {
+        const fail = self.source.vtable.fail_transaction orelse return;
+        const identity = self.identity orelse return;
+        fail(self.source.context, identity, self.request(statement, &.{}, &.{})) catch {};
+    }
+
+    fn removeSqlCursor(self: *Session, name: []const u8) void {
+        if (self.sql_cursors.fetchRemove(name)) |entry| {
+            self.alloc.free(entry.key);
+            var cursor = entry.value;
+            if (cursor.stream) |stream| stream.close(stream.context);
+            cursor.arena.deinit();
+        }
+    }
+
+    fn clearSqlCursors(self: *Session) void {
+        var iterator = self.sql_cursors.iterator();
+        while (iterator.next()) |entry| {
+            self.alloc.free(entry.key_ptr.*);
+            if (entry.value_ptr.stream) |stream| stream.close(stream.context);
+            entry.value_ptr.arena.deinit();
+        }
+        self.sql_cursors.clearRetainingCapacity();
     }
 
     fn removePrepared(self: *Session, name: []const u8) void {
@@ -825,13 +986,16 @@ fn sqlstate(err: anyerror) []const u8 {
         error.InvalidParameter => "22P02",
         error.InvalidStatementName => "26000",
         error.InvalidPortalName => "34000",
+        error.InvalidCursorName => "34000",
         error.DuplicatePreparedStatement => "42P05",
         error.DuplicatePortal => "42P03",
+        error.DuplicateCursorName => "42P03",
         error.ProtocolViolation => "08P01",
         error.OutOfMemory, error.ProgramLimitExceeded => "54000",
         error.SyntaxError => "42601",
         error.InvalidSqlSyntax => "42601",
         error.InFailedSqlTransaction => "25P02",
+        error.CursorMustBeInTransaction => "25P01",
         error.InvalidSqlParameters, error.InvalidSqlParameter, error.InvalidSqlNumber, error.SqlTypeMismatch, error.InvalidSqlLimit => "22023",
         error.SqlNotNullViolation => "23502",
         error.SqlProgramLimitExceeded, error.SqlResultTooLarge, error.SqlLimitExceeded => "54000",

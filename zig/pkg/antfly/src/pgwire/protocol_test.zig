@@ -40,10 +40,15 @@ const Mock = struct {
     stream_closes: usize = 0,
     stream_pulls: usize = 0,
     stream_fail_at: ?usize = null,
+    failed_transactions: usize = 0,
     canceled: std.atomic.Value(bool) = .init(false),
 
     fn source(self: *Mock) backend.Backend {
-        return .{ .context = self, .vtable = &.{ .authenticate = authenticate, .describe = describe, .execute = Mock.execute, .evaluate_parameters = evaluateParameters, .open_stream = openStream, .disconnect = disconnect } };
+        return .{ .context = self, .vtable = &.{ .authenticate = authenticate, .describe = describe, .execute = Mock.execute, .evaluate_parameters = evaluateParameters, .fail_transaction = failTransaction, .open_stream = openStream, .disconnect = disconnect } };
+    }
+    fn failTransaction(raw: *anyopaque, _: backend.Identity, _: backend.Request) anyerror!void {
+        const self: *Mock = @ptrCast(@alignCast(raw));
+        self.failed_transactions += 1;
     }
     fn evaluateParameters(_: *anyopaque, alloc: std.mem.Allocator, _: backend.Identity, request: backend.Request, expressions: []const []const u8) ![]const std.json.Value {
         try request.check();
@@ -53,7 +58,7 @@ const Mock = struct {
     }
     fn openStream(raw: *anyopaque, _: std.mem.Allocator, _: backend.Identity, request: backend.Request) !?backend.ReadStream {
         const self: *Mock = @ptrCast(@alignCast(raw));
-        if (self.stream_rows == 0) return null;
+        if (self.stream_rows == 0 or !std.mem.startsWith(u8, std.mem.trimStart(u8, request.statement, " \t\r\n"), "SELECT")) return null;
         try request.check();
         if (request.parameters.len > 0) self.seen_parameter = request.parameters[0].integer;
         self.saw_binding_guard = if (request.binding_guard) |guard| std.mem.eql(u8, guard, "immutable-catalog-binding") else false;
@@ -91,6 +96,8 @@ const Mock = struct {
     fn execute(raw: *anyopaque, alloc: std.mem.Allocator, _: backend.Identity, request: backend.Request) !backend.Result {
         const self: *Mock = @ptrCast(@alignCast(raw));
         self.executions += 1;
+        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, request.statement, " \t\r\n;"), "begin")) return .{ .command_tag = "BEGIN", .transaction_status = .in_transaction, .session_id = "0123456789abcdef0123456789abcdef" };
+        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, request.statement, " \t\r\n;"), "commit")) return .{ .command_tag = "COMMIT", .transaction_status = .idle };
         self.saw_binding_guard = if (request.binding_guard) |guard| std.mem.eql(u8, guard, "immutable-catalog-binding") else false;
         if (self.entered) |event| event.set(request.io);
         while (self.blocked) {
@@ -245,6 +252,48 @@ test "pgwire pull portals stream beyond result cap without replay and release on
         try std.testing.expect(mock.stream_pulls > 1);
         try std.testing.expect(std.mem.indexOf(u8, output.written(), "SELECT 600") != null);
     }
+}
+
+test "pgwire forward cursors stream bounded fetches and close with transaction" {
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    try frame(&input.writer, 'Q', "BEGIN\x00");
+    try frame(&input.writer, 'Q', "DECLARE rows CURSOR FOR SELECT n FROM t\x00");
+    try frame(&input.writer, 'Q', "FETCH FORWARD 2 FROM rows\x00");
+    try frame(&input.writer, 'Q', "FETCH ALL FROM rows\x00");
+    try frame(&input.writer, 'Q', "COMMIT\x00");
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .stream_rows = 5 };
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    const messages = try tags(std.testing.allocator, output.written());
+    defer std.testing.allocator.free(messages);
+    try std.testing.expectEqual(@as(usize, 5), std.mem.count(u8, messages, "D"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, messages, "E"));
+    try std.testing.expectEqual(@as(usize, 1), mock.stream_closes);
+    try std.testing.expectEqual(@as(usize, 2), mock.stream_pulls);
+    try std.testing.expectEqual(@as(usize, 2), mock.executions);
+}
+
+test "pgwire failed cursor fetch marks transaction aborted and releases retained stream" {
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    try frame(&input.writer, 'Q', "BEGIN\x00");
+    try frame(&input.writer, 'Q', "DECLARE rows CURSOR FOR SELECT n FROM t\x00");
+    try frame(&input.writer, 'Q', "FETCH ALL FROM rows\x00");
+    try frame(&input.writer, 'Q', "ROLLBACK\x00");
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .stream_rows = 5, .stream_fail_at = 0 };
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    const messages = try tags(std.testing.allocator, output.written());
+    defer std.testing.allocator.free(messages);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, messages, "E"));
+    try std.testing.expectEqual(@as(usize, 1), mock.failed_transactions);
+    try std.testing.expectEqual(@as(usize, 1), mock.stream_closes);
+    try std.testing.expectEqual(@as(usize, 2), mock.executions);
 }
 
 test "pgwire pull failure and disconnect close snapshots before releasing identity" {
