@@ -51773,6 +51773,12 @@ fn appendPrecomputedArtifactCoverageOutcomes(
         alloc.free(consumers);
     }
     for (consumers) |index_name| {
+        // A produced artifact says nothing about its dense/sparse
+        // consumers, whose embedding lanes settle their own outcomes; only
+        // graph and full_text consumers are settled by the producer.
+        const applies = db.derivedCoverageAppliesToIndex(.graph, index_name) or
+            db.derivedCoverageAppliesToIndex(.full_text, index_name);
+        if (!applies) continue;
         const owned_index_name = try alloc.dupe(u8, index_name);
         errdefer alloc.free(owned_index_name);
         const owned_doc_key = try alloc.dupe(u8, request.doc_key);

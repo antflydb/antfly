@@ -11420,7 +11420,7 @@ fn processAsset(
         try materializeGraphAssetDeleteForRuntime(runtime, request, window);
         // A null source is intentional no-output: settle graph/full_text
         // consumer coverage as skipped instead of leaving it pending.
-        try queueCoverageOutcomeForRequest(runtime, window, request, .skipped);
+        try queueArtifactCoverageOutcomeForRequest(runtime, window, request, .skipped);
         return;
     };
     var source_text_owned = true;
@@ -11436,7 +11436,7 @@ fn processAsset(
         }
         try appendFullTextDeleteDocumentToWindow(runtime, window, key, text_indexes);
         try materializeGraphAssetDeleteForRuntime(runtime, request, window);
-        try queueCoverageOutcomeForRequest(runtime, window, request, .skipped);
+        try queueArtifactCoverageOutcomeForRequest(runtime, window, request, .skipped);
         return;
     }
 
@@ -11460,7 +11460,7 @@ fn processAsset(
             try materializeGraphAssetForRuntime(runtime, request, source_text, raw, window);
             // The artifact exists and is current: produced coverage, so an
             // idempotent replay converges the consumer summary.
-            try queueCoverageOutcomeForRequest(runtime, window, request, .produced);
+            try queueArtifactCoverageOutcomeForRequest(runtime, window, request, .produced);
             return;
         }
         try storePutWithRetry(runtime, key, source_text);
@@ -11468,7 +11468,7 @@ fn processAsset(
         try appendInlineFullTextDocumentToWindow(runtime, window, key, source_text, text_indexes);
         try materializeGraphAssetForRuntime(runtime, request, source_text, raw, window);
         recordArtifactBytes(runtime, .asset, source_text.len);
-        try queueCoverageOutcomeForRequest(runtime, window, request, .produced);
+        try queueArtifactCoverageOutcomeForRequest(runtime, window, request, .produced);
         return;
     }
 
@@ -11511,7 +11511,7 @@ fn processAsset(
             try materializeGraphAssetForRuntime(runtime, request, value, raw, window);
             // The artifact exists and matches its skip state: produced
             // coverage, so an idempotent replay converges the summary.
-            try queueCoverageOutcomeForRequest(runtime, window, request, .produced);
+            try queueArtifactCoverageOutcomeForRequest(runtime, window, request, .produced);
             return;
         }
     }
@@ -12026,7 +12026,7 @@ fn applyAssetProducerBatchOutput(
     try appendInlineFullTextDocumentToWindow(runtime, window, item.artifact_key, produced, text_indexes);
     try materializeGraphAssetForRuntime(runtime, item.request, produced, item.raw_doc, window);
     recordArtifactBytes(runtime, .asset, produced.len);
-    try queueCoverageOutcomeForRequest(runtime, window, item.request, .produced);
+    try queueArtifactCoverageOutcomeForRequest(runtime, window, item.request, .produced);
 }
 
 /// Use the same completed-state gate for metadata fingerprints known before a
@@ -23081,7 +23081,7 @@ fn processChunkText(
         try mergeOwnedDeletedKeysIntoWindow(runtime, window, stale_vector_keys);
         // A source that chunks to nothing is intentional no-output for the
         // artifact's consumers.
-        try queueCoverageOutcomeForRequest(runtime, window, request, .skipped);
+        try queueArtifactCoverageOutcomeForRequest(runtime, window, request, .skipped);
         return;
     }
 
@@ -23135,7 +23135,7 @@ fn processChunkText(
 
     if (text_indexes.len == 0) {
         try mergeOwnedDeletedKeysIntoWindow(runtime, window, stale_vector_keys);
-        try queueCoverageOutcomeForRequest(runtime, window, request, .produced);
+        try queueArtifactCoverageOutcomeForRequest(runtime, window, request, .produced);
         return;
     }
 
@@ -23145,7 +23145,7 @@ fn processChunkText(
     }
     if (text_chunk_count == 0) {
         try mergeOwnedDeletedKeysIntoWindow(runtime, window, stale_vector_keys);
-        try queueCoverageOutcomeForRequest(runtime, window, request, .produced);
+        try queueArtifactCoverageOutcomeForRequest(runtime, window, request, .produced);
         return;
     }
 
@@ -23204,7 +23204,7 @@ fn processChunkText(
     try mergeOwnedDeletedKeysIntoWindow(runtime, window, stale_vector_keys);
     try appendOwnedDocumentsToWindow(runtime, window, &docs);
     initialized_docs = 0;
-    try queueCoverageOutcomeForRequest(runtime, window, request, .produced);
+    try queueArtifactCoverageOutcomeForRequest(runtime, window, request, .produced);
 }
 
 fn processPdfPageImageEmbedding(
@@ -25984,6 +25984,32 @@ fn queueCoverageOutcomeForRequest(
     const indexes = try affectedIndexesForRequestAlloc(runtime, request);
     defer freeAffectedIndexes(runtime, indexes);
     try queueDerivedCoverageOutcome(runtime, window, request, indexes, outcome);
+}
+
+/// Producer-settled coverage for asset/chunk artifacts, attributed ONLY to
+/// graph and full_text consumers: a produced chunk says nothing about its
+/// dense/sparse consumers, whose embedding lanes settle their own outcomes
+/// (a chunk-level produced marker under a dense index's generation would
+/// corrupt its publication accounting).
+fn queueArtifactCoverageOutcomeForRequest(
+    runtime: *EnrichmentRuntime,
+    window: *GeneratedReplayWindow,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    outcome: CoverageOutcome,
+) !void {
+    const indexes = try affectedIndexesForRequestAlloc(runtime, request);
+    defer freeAffectedIndexes(runtime, indexes);
+    for (indexes) |index_name| {
+        const is_graph = runtime.index_manager.graphIndex(index_name) != null;
+        const is_full_text = !is_graph and full_text: {
+            for (runtime.index_manager.text_indexes.items) |entry| {
+                if (std.mem.eql(u8, entry.config.name, index_name)) break :full_text true;
+            }
+            break :full_text false;
+        };
+        if (!is_graph and !is_full_text) continue;
+        try queueDerivedCoverageOutcomeForIndex(runtime, window, index_name, request, outcome);
+    }
 }
 
 fn finalizeEmptyDocumentExtractionCoverage(
