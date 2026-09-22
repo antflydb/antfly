@@ -5,7 +5,7 @@
 //! primitive. Pinned Python fixtures are a separate numerical qualification.
 const std = @import("std");
 const attention = @import("deberta_training_attention.zig");
-const encoder = @import("../finetune/gliner_boundary_encoder_graph.zig");
+const encoder = @import("../finetune/gliner/boundary_encoder_graph.zig");
 const relative = @import("../models/deberta.zig");
 const Shape = @import("ml").graph.Shape;
 const Allocator = std.mem.Allocator;

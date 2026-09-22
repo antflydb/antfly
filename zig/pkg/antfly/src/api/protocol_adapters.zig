@@ -1247,6 +1247,12 @@ fn callExtensionMcpTool(alloc: std.mem.Allocator, server: anytype, authenticated
                 .ai_embed = ExtensionHostContext(@TypeOf(server), @TypeOf(authenticated_identity)).aiEmbed,
             },
         })) |body| {
+            // A guest may swallow a host error and claim the write succeeded.
+            // A stale table binding must remain an error at the MCP boundary.
+            if (host_context.binding_failed) {
+                alloc.free(body);
+                return try mcpError(alloc, "extension table binding is no longer current");
+            }
             return try mcpResultFromExtensionJson(alloc, body);
         } else |err| switch (err) {
             error.WasmtimeUnavailable,
@@ -1332,6 +1338,8 @@ fn ExtensionHostContext(comptime Server: type, comptime Identity: type) type {
         }
 
         fn resolveTableName(ctx: *@This(), requested: []const u8) ![]const u8 {
+            if (ctx.installed.scope.kind == .table and ctx.expected_storage_name == null)
+                return error.ExtensionTableBindingMissing;
             return switch (ctx.installed.scope.kind) {
                 .table => ctx.installed.scope.table_name,
                 .cluster => requested,

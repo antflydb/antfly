@@ -36,6 +36,22 @@ type StorageStatus struct {
 // InferenceStatus reports the configured inference execution mode for a Lite
 // handle. A fresh core Lite database normally reports Configured=false and
 // NoInferenceConfiguredOK=true.
+//
+// HostBudgetMB, BackendBudgetMB, CombinedBudgetMB, KVBudgetMB,
+// ScratchBudgetMB, and ProcessMemoryBudgetMB initially echo the OpenOptions
+// resource-budget overrides requested for the local embedded runtime (0
+// meaning the embedded node's own host-clamped default, not automatic/
+// unbounded). Once a local runtime actually starts, all six are overwritten
+// with the resolved effective values the node installed -- either the
+// explicit override, or the host-clamped default from antfly's
+// inference_provider.zig (default_host_budget_mb and friends) -- so none of
+// the five generation-budget fields read 0 for a started local runtime.
+// ProcessMemoryLimitBytes and ProcessMemoryLimitSource report the process
+// memory envelope the embedded node resolved: either the explicit
+// ProcessMemoryBudgetMB override, or the same host/cgroup-detected policy
+// `antfly inference run` and `antfly standalone` report at startup. All of
+// these stay at their zero-value/"automatic" defaults until a local runtime
+// is actually started.
 type InferenceStatus struct {
 	Mode                     string   `json:"mode"`
 	AvailableModes           []string `json:"available_modes"`
@@ -45,6 +61,14 @@ type InferenceStatus struct {
 	LocalRuntimeAvailable    bool     `json:"local_runtime_available"`
 	CallerSuppliedArtifacts  bool     `json:"caller_supplied_artifacts"`
 	NoInferenceConfiguredOK  bool     `json:"no_inference_configured_ok"`
+	HostBudgetMB             uint32   `json:"host_budget_mb"`
+	BackendBudgetMB          uint32   `json:"backend_budget_mb"`
+	CombinedBudgetMB         uint32   `json:"combined_budget_mb"`
+	KVBudgetMB               uint32   `json:"kv_budget_mb"`
+	ScratchBudgetMB          uint32   `json:"scratch_budget_mb"`
+	ProcessMemoryBudgetMB    uint32   `json:"process_memory_budget_mb"`
+	ProcessMemoryLimitBytes  uint64   `json:"process_memory_limit_bytes"`
+	ProcessMemoryLimitSource string   `json:"process_memory_limit_source"`
 }
 
 // Capabilities describes the Lite feature contract advertised by a handle.

@@ -18,6 +18,7 @@ pub const artifact_sources_protocol_version: u16 = 1;
 /// The store understands native HBC authority markers, WAL recovery, and the
 /// fail-closed placement contract used during rolling upgrades.
 pub const dense_native_storage_protocol_version: u16 = 1;
+pub const relational_topology_protocol_version: u16 = 1;
 pub const embedding_activity_protocol_version: u16 = 2;
 const group_ids = @import("../common/group_ids.zig");
 const topology_records = @import("../common/topology_records.zig");
@@ -51,6 +52,7 @@ pub fn tableDefinitionsEqual(lhs: TableDefinition, rhs: TableDefinition) bool {
         std.mem.eql(u8, lhs.description, rhs.description) and
         std.mem.eql(u8, lhs.schema_json, rhs.schema_json) and
         std.mem.eql(u8, lhs.read_schema_json, rhs.read_schema_json) and
+        std.mem.eql(u8, lhs.relational_retirement_json, rhs.relational_retirement_json) and
         std.mem.eql(u8, lhs.indexes_json, rhs.indexes_json) and
         std.mem.eql(u8, lhs.replication_sources_json, rhs.replication_sources_json) and
         std.mem.eql(u8, lhs.placement_role, rhs.placement_role) and
@@ -108,6 +110,7 @@ pub fn tableDefinitionFingerprint(table: TableDefinition) TableDefinitionFingerp
     hashTableDefinitionPart(&hasher, table.description);
     hashTableDefinitionPart(&hasher, table.schema_json);
     hashTableDefinitionPart(&hasher, table.read_schema_json);
+    if (table.relational_retirement_json.len != 0) hashTableDefinitionPart(&hasher, table.relational_retirement_json);
     hashTableDefinitionPart(&hasher, table.indexes_json);
     hashTableDefinitionPart(&hasher, table.replication_sources_json);
     hashTableDefinitionPart(&hasher, table.placement_role);
@@ -478,6 +481,7 @@ pub const StoreRecord = struct {
     artifact_sources_protocol_version: u16 = 0,
     native_generation_restore_version: u16 = 0,
     dense_native_storage_protocol_version: u16 = 0,
+    relational_topology_protocol_version: u16 = 0,
     api_url: []const u8 = "",
     raft_url: []const u8 = "",
     role: []const u8 = "data",
@@ -824,6 +828,7 @@ pub fn voterSetFingerprint(node_ids: []const u64, required_node_id: ?u64) VoterS
 pub const store_runtime_reference_header = "X-Antfly-Store-Runtime-Reference";
 
 pub const StoreStatusReport = struct {
+    relational_topology_protocol_version: u16 = 0,
     store_id: u64,
     /// Internal heartbeat endpoint only: retain committed runtime observations
     /// for this exact reporter incarnation and status generation.
@@ -1367,6 +1372,7 @@ pub const SplitIntent = struct {
 };
 
 pub const MergeIntent = struct {
+    projected_online: ?@import("online_merge.zig").State = null,
     transition_id: u64,
     table_id: u64,
     donor_group_id: u64,
@@ -1382,12 +1388,19 @@ pub const TableManager = struct {
     alloc: std.mem.Allocator,
     tables: std.AutoHashMapUnmanaged(u64, TableRecord) = .empty,
     table_names: std.StringHashMapUnmanaged(u64) = .empty,
+    // Provisioning holds published and unpublished generations with the same
+    // name. It is an ID-only topology, never a public name-resolution source.
+    index_table_names: bool = true,
     ranges: std.AutoHashMapUnmanaged(u64, RangeRecord) = .empty,
     split_intents: std.AutoHashMapUnmanaged(u64, SplitIntent) = .empty,
     merge_intents: std.AutoHashMapUnmanaged(u64, MergeIntent) = .empty,
 
     pub fn init(alloc: std.mem.Allocator) TableManager {
         return .{ .alloc = alloc };
+    }
+
+    pub fn initProvisioning(alloc: std.mem.Allocator) TableManager {
+        return .{ .alloc = alloc, .index_table_names = false };
     }
 
     pub fn deinit(self: *TableManager) void {
@@ -1452,13 +1465,13 @@ pub const TableManager = struct {
         // Complete every allocation before changing either index or freeing a
         // borrowed name. Replacement/rollback cannot publish half an index.
         try self.tables.ensureUnusedCapacity(self.alloc, 1);
-        try self.table_names.ensureUnusedCapacity(self.alloc, 1);
+        if (self.index_table_names) try self.table_names.ensureUnusedCapacity(self.alloc, 1);
         if (self.tables.getPtr(record.table_id)) |existing| {
             _ = self.table_names.remove(existing.name);
             freeTable(self.alloc, existing.*);
             existing.* = owned;
         } else self.tables.putAssumeCapacity(record.table_id, owned);
-        self.table_names.putAssumeCapacity(owned.name, owned.table_id);
+        if (self.index_table_names) self.table_names.putAssumeCapacity(owned.name, owned.table_id);
     }
 
     pub fn upsertRange(self: *TableManager, record: RangeRecord) !void {
@@ -1759,6 +1772,7 @@ pub const TableManager = struct {
                 return error.InvalidProjectedMergeTransition;
 
             const owned = try cloneMergeIntent(self.alloc, .{
+                .projected_online = record.online,
                 .transition_id = record.transition_id,
                 .table_id = record.table_contract.table_id,
                 .donor_group_id = record.donor_group_id,
@@ -2004,6 +2018,7 @@ pub const TableManager = struct {
             return error.TransitionTableContractViolated;
         if (!std.mem.eql(u8, table.name, contract.table_name) or
             !std.mem.eql(u8, table.schema_json, contract.schema_json) or
+            !std.mem.eql(u8, table.read_schema_json, contract.read_schema_json) or
             !std.mem.eql(u8, table.indexes_json, contract.indexes_json))
         {
             return error.TransitionTableContractViolated;
@@ -2054,6 +2069,7 @@ pub const TableManager = struct {
                 break :blk transitionTableContract(table, donor, receiver);
             };
             const owned = try cloneMergeTransitionRecord(alloc, .{
+                .online = intent.projected_online,
                 .transition_id = intent.transition_id,
                 .donor_group_id = intent.donor_group_id,
                 .receiver_group_id = intent.receiver_group_id,
@@ -2123,6 +2139,7 @@ fn transitionTableContract(
         .table_id = table.table_id,
         .table_name = table.name,
         .schema_json = table.schema_json,
+        .read_schema_json = table.read_schema_json,
         .indexes_json = table.indexes_json,
         .source_identity = .{
             .shard_id = rangeDocIdentityShardId(source),
@@ -2191,6 +2208,8 @@ fn freeOwnedOptional(alloc: std.mem.Allocator, value: ?[]const u8) void {
 }
 
 pub fn cloneTable(alloc: std.mem.Allocator, record: TableRecord) !TableRecord {
+    const relational_retirement_json = try alloc.dupe(u8, record.relational_retirement_json);
+    errdefer alloc.free(relational_retirement_json);
     var storage_migration = record.storage_migration;
     if (storage_migration) |*migration| migration.request.job_id = try alloc.dupe(u8, migration.request.job_id);
     errdefer if (storage_migration) |migration| alloc.free(migration.request.job_id);
@@ -2214,6 +2233,7 @@ pub fn cloneTable(alloc: std.mem.Allocator, record: TableRecord) !TableRecord {
     errdefer alloc.free(restore_location);
     return .{
         .storage = record.storage,
+        .relational_retirement_json = relational_retirement_json,
         .storage_migration = storage_migration,
         .table_id = record.table_id,
         .name = name,
@@ -2270,16 +2290,7 @@ pub fn cloneRoutingTable(alloc: std.mem.Allocator, record: TableRecord) !TableRe
 }
 
 pub fn freeTable(alloc: std.mem.Allocator, record: TableRecord) void {
-    if (record.storage_migration) |migration| alloc.free(migration.request.job_id);
-    alloc.free(record.name);
-    alloc.free(record.description);
-    alloc.free(record.schema_json);
-    alloc.free(record.read_schema_json);
-    alloc.free(record.indexes_json);
-    alloc.free(record.replication_sources_json);
-    alloc.free(record.placement_role);
-    alloc.free(record.restore_backup_id);
-    alloc.free(record.restore_location);
+    @import("restore_provisioning_contract.zig").freeTable(alloc, record);
 }
 
 pub fn cloneRange(alloc: std.mem.Allocator, record: RangeRecord) !RangeRecord {
@@ -2378,15 +2389,7 @@ fn rangeMatchesTransitionIdentity(
 }
 
 pub fn freeRange(alloc: std.mem.Allocator, record: RangeRecord) void {
-    alloc.free(record.start_key);
-    freeOwnedOptional(alloc, record.end_key);
-    alloc.free(record.restore_backup_id);
-    alloc.free(record.restore_artifact_backup_id);
-    alloc.free(record.restore_location);
-    alloc.free(record.restore_snapshot_path);
-    alloc.free(record.restore_connection);
-    alloc.free(record.restore_artifact_sha256);
-    alloc.free(record.restore_native_manifest_sha256);
+    @import("restore_provisioning_contract.zig").freeRange(alloc, record);
 }
 
 test "routing clones exclude operational and schema payloads" {
@@ -2585,6 +2588,7 @@ pub fn cloneStore(alloc: std.mem.Allocator, record: StoreRecord) !StoreRecord {
         .artifact_sources_protocol_version = record.artifact_sources_protocol_version,
         .native_generation_restore_version = record.native_generation_restore_version,
         .dense_native_storage_protocol_version = record.dense_native_storage_protocol_version,
+        .relational_topology_protocol_version = record.relational_topology_protocol_version,
         .api_url = api_url,
         .raft_url = raft_url,
         .role = role,
@@ -2903,6 +2907,7 @@ fn cloneMergeIntent(alloc: std.mem.Allocator, intent: MergeIntent) !MergeIntent 
     else
         null;
     return .{
+        .projected_online = intent.projected_online,
         .transition_id = intent.transition_id,
         .table_id = intent.table_id,
         .donor_group_id = intent.donor_group_id,
@@ -2965,6 +2970,7 @@ pub fn cloneMergeTransitionRecord(alloc: std.mem.Allocator, record: transition_s
         owned_contract.deinitOwned(alloc);
     }
     return .{
+        .online = record.online,
         .transition_id = record.transition_id,
         .donor_group_id = record.donor_group_id,
         .receiver_group_id = record.receiver_group_id,

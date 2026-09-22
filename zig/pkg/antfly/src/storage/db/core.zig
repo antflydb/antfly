@@ -37,6 +37,8 @@ const range_state_mod = @import("range_state.zig");
 const schema_mod = @import("../schema.zig");
 const public_schema_mod = @import("../../schema/mod.zig");
 const schema_registry_mod = @import("schema_registry.zig");
+const relational_index_catalog_mod = @import("relational_index_catalog.zig");
+const integrity_catalog_mod = @import("relational_integrity_catalog.zig");
 const table_catalog_mod = @import("table_catalog.zig");
 const public_schema_json_key = "\x00\x00__metadata__:schema_json";
 const shard_mod = @import("../shard.zig");
@@ -83,7 +85,11 @@ pub const PreparedSchemaMetadata = struct {
     epoch: ?*schema_registry_mod.Epoch,
     publication: ?schema_registry_mod.Registry.PublishReservation = null,
     base_schema_view: ?schema_registry_mod.SchemaView = null,
+    base_relational_indexes: ?relational_index_catalog_mod.WriteSnapshot = null,
+    relational_indexes: ?relational_index_catalog_mod.PreparedPublication = null,
+    integrity_catalog: ?integrity_catalog_mod.Update = null,
     same_version_layout_matches: bool = false,
+    generated_semantics_match: bool = true,
     combined_writes: []docstore_mod.KVPair,
 
     fn init(
@@ -123,6 +129,9 @@ pub const PreparedSchemaMetadata = struct {
     }
 
     pub fn deinit(self: *PreparedSchemaMetadata) void {
+        if (self.integrity_catalog) |*catalog| catalog.deinit();
+        if (self.relational_indexes) |*indexes| indexes.deinit();
+        if (self.base_relational_indexes) |*indexes| indexes.deinit();
         if (self.publication) |*publication| publication.deinit();
         if (self.base_schema_view) |*view| view.release();
         if (self.epoch) |epoch| epoch.release();
@@ -501,6 +510,7 @@ pub const DBCore = struct {
     log_mutex: *std.atomic.Mutex,
     schema: ?schema_mod.TableSchema,
     schema_registry: *schema_registry_mod.Registry,
+    relational_indexes: relational_index_catalog_mod.Controller,
     table_catalog: table_catalog_mod.Catalog,
     identity_namespace: doc_identity.Namespace,
     artifact_cleanup_maybe: std.atomic.Value(bool),
@@ -509,7 +519,10 @@ pub const DBCore = struct {
     pub fn fromOpened(alloc: Allocator, io: std.Io, opened: OpenedCoreResources) !DBCore {
         const schema_registry = try alloc.create(schema_registry_mod.Registry);
         errdefer alloc.destroy(schema_registry);
-        schema_registry.* = try schema_registry_mod.Registry.initCloned(alloc, io, opened.schema);
+        // Install the complete active epoch once. Publishing a layout-only
+        // epoch first would make same-version deduplication discard its public
+        // validator, silently losing enforcement after every reopen.
+        schema_registry.* = try schema_registry_mod.Registry.initCloned(alloc, io, null);
         errdefer schema_registry.deinit();
         // Historical layouts remain durable and are installed lazily on the
         // first row that references them. Large, long-lived tables should not
@@ -522,10 +535,10 @@ pub const DBCore = struct {
             defer if (public_json) |json| alloc.free(json);
             if (active_schema.requires_public_schema and public_json == null)
                 return error.InvalidSchemaUpdateRequest;
-            if (public_json) |json| {
-                var validator = try public_schema_mod.CompiledTableValidator.init(alloc, json);
+            {
+                var validator = if (public_json) |json| try public_schema_mod.CompiledTableValidator.init(alloc, json) else null;
                 var validator_owned = true;
-                errdefer if (validator_owned) validator.deinit(alloc);
+                errdefer if (validator_owned) if (validator) |*compiled| compiled.deinit(alloc);
                 const active_encoded = try schema_mod.serializeSchema(alloc, active_schema);
                 defer alloc.free(active_encoded);
                 const active_clone = try schema_mod.deserializeSchema(alloc, active_encoded);
@@ -537,6 +550,9 @@ pub const DBCore = struct {
                 try schema_registry.publishPrepared(active_epoch);
             }
         }
+        var index_schema_view = schema_registry.acquire();
+        defer if (index_schema_view) |*view| view.release();
+        const relational_indexes = try relational_index_catalog_mod.Controller.init(alloc, io, opened.store, index_schema_view);
         opened.index_manager.setSchemaRegistry(schema_registry);
         return .{
             .alloc = alloc,
@@ -556,6 +572,7 @@ pub const DBCore = struct {
             .log_mutex = opened.log_mutex,
             .schema = opened.schema,
             .schema_registry = schema_registry,
+            .relational_indexes = relational_indexes,
             .table_catalog = opened.table_catalog,
             .identity_namespace = opened.identity_namespace,
             .artifact_cleanup_maybe = .init(opened.artifact_cleanup_maybe),
@@ -565,6 +582,7 @@ pub const DBCore = struct {
 
     pub fn deinit(self: *DBCore) void {
         self.index_manager.deinit();
+        self.relational_indexes.deinit();
         self.schema_registry.deinit();
         self.alloc.destroy(self.schema_registry);
         self.identity_visibility.clearLive();
@@ -1331,9 +1349,11 @@ pub const DBCore = struct {
         table_schema: schema_mod.TableSchema,
         metadata_writes: []const docstore_mod.KVPair,
     ) !PreparedSchemaMetadata {
+        try relational_index_catalog_mod.Controller.validateExtraMetadata(metadata_writes, &.{});
         var prepared = try PreparedSchemaMetadata.init(self.alloc, table_schema, metadata_writes);
         errdefer prepared.deinit();
         prepared.base_schema_view = self.schema_registry.acquire();
+        prepared.base_relational_indexes = self.relational_indexes.acquire();
         if (prepared.base_schema_view) |view| {
             if (view.version() == table_schema.version) {
                 const base_encoded = try schema_mod.serializeSchema(self.alloc, view.tableSchema().*);
@@ -1341,7 +1361,72 @@ pub const DBCore = struct {
                 prepared.same_version_layout_matches = std.mem.eql(u8, base_encoded, prepared.encoded);
             }
         }
+        const next_view = schema_registry_mod.SchemaView{ .epoch = prepared.epoch.? };
+        const expressions = @import("../../schema/relational_expression.zig");
+        const previous_generated = expressions.generatedFingerprint(if (prepared.base_schema_view) |view| if (view.validator()) |validator| validator.execution.expressions else null else null);
+        const next_generated = expressions.generatedFingerprint(if (next_view.validator()) |validator| validator.execution.expressions else null);
+        prepared.generated_semantics_match = std.mem.eql(u8, &previous_generated, &next_generated);
+        // Same-version publication deliberately preserves the registry's
+        // existing immutable epoch. Bind the index plan to that exact epoch,
+        // not the candidate which publication will discard. Owner startup and
+        // idempotent schema retries both exercise this path.
+        const index_view = if (prepared.same_version_layout_matches) prepared.base_schema_view.? else next_view;
+        prepared.relational_indexes = declarations: {
+            if (next_view.validator()) |validator| {
+                var arena = std.heap.ArenaAllocator.init(self.alloc);
+                defer arena.deinit();
+                if (try validator.schema.relationalIndexDefinitions(arena.allocator())) |definitions|
+                    break :declarations try self.relational_indexes.prepare(index_view, definitions);
+            }
+            break :declarations try self.relational_indexes.prepareSchemaChange(index_view);
+        };
         prepared.publication = try self.schema_registry.preparePublish(table_schema.version);
+        var declaration_arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer declaration_arena.deinit();
+        const definitions = if (next_view.validator()) |validator|
+            try @import("../../schema/relational_declarations.zig").definitionFingerprints(declaration_arena.allocator(), validator.schema, table_schema)
+        else
+            &.{};
+        const previous_integrity = try self.getStoreValue(self.alloc, integrity_catalog_mod.key);
+        defer if (previous_integrity) |bytes| self.alloc.free(bytes);
+        const checks_digest: [32]u8 = if (next_view.validator()) |validator| checks: {
+            if (validator.execution.checks) |checks| break :checks checks.fingerprint();
+            break :checks @splat(0);
+        } else @splat(0);
+        // Even an unconstrained relational schema has an authoritative empty
+        // catalog. Missing relational integrity metadata is then distinguishable
+        // from a genuinely empty definition set on restore/online source paths.
+        if (definitions.len != 0 or previous_integrity != null or (self.identity_namespace.table_id != 0 and
+            (table_schema.storage_mode == .relational or !std.mem.allEqual(u8, &checks_digest, 0))))
+        {
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.Blake3.hash(prepared.encoded, &digest, .{});
+            prepared.integrity_catalog = try integrity_catalog_mod.prepareWithChecks(
+                self.alloc,
+                previous_integrity,
+                try integrity_catalog_mod.incarnationFromTableId(self.identity_namespace.table_id),
+                table_schema.version,
+                digest,
+                definitions,
+                checks_digest,
+            );
+            if (previous_integrity) |previous| {
+                var prior = try integrity_catalog_mod.decode(self.alloc, previous);
+                defer prior.deinit();
+                for (prior.bindings) |binding| {
+                    if (binding.retired) continue;
+                    const next = prepared.integrity_catalog.?.catalog.findGeneration(binding.generation) orelse return error.IntegrityCatalogChanged;
+                    // Retaining a descriptor is necessary for recovery, but
+                    // is not proof that cross-table dependents have retired.
+                    if (next.retired) {
+                        const proof = (try self.getStoreValue(self.alloc, @import("relational_integrity_retirement.zig").key)) orelse return error.ConstraintRetirementRequired;
+                        defer self.alloc.free(proof);
+                        const retirement = try @import("relational_integrity_retirement.zig").Progress.decode(proof);
+                        if (retirement.phase != .ready or !retirement.includes(binding.generation) or !std.mem.eql(u8, &retirement.target_schema_digest, &digest)) return error.ConstraintRetirementRequired;
+                    }
+                }
+            }
+        }
         return prepared;
     }
 
@@ -1356,7 +1441,9 @@ pub const DBCore = struct {
         defer completion_transition.deinit();
         if (prepared.combined_writes.len != metadata_writes.len + 1)
             return error.InvalidSchemaUpdateRequest;
+        try relational_index_catalog_mod.Controller.validateExtraMetadata(metadata_writes, metadata_deletes);
         if (!prepared.publication.?.isCurrent()) return error.PreparedGenerationChanged;
+        if (!self.relational_indexes.isCurrent(prepared.base_relational_indexes)) return error.PreparedGenerationChanged;
         if (prepared.base_schema_view) |view| {
             if (!self.schema_registry.isCurrent(view)) return error.PreparedGenerationChanged;
         } else if (self.schema != null) {
@@ -1372,7 +1459,23 @@ pub const DBCore = struct {
             if (current.version == table_schema.version and !same_active_epoch)
                 return error.InvalidSchemaUpdateRequest;
         }
+        // Check under the apply fence, not during compilation: writes may
+        // arrive between preparation and publication. The durable presence
+        // bit follows transactional range cardinality without scanning rows.
+        if (!prepared.generated_semantics_match and
+            (self.table_catalog.row_count != 0 or (reconciled_row_count orelse 0) != 0))
+            return error.GeneratedColumnRewriteRequired;
         if (self.schema == null and table_schema.storage_mode == .relational) {
+            var manager = try self.initTxnManager();
+            defer manager.deinit();
+            if (try manager.hasSchemaLeases()) return error.SchemaInUse;
+        }
+        // An outstanding durable intent cannot be reinterpreted under a new
+        // index generation. Ordinary request pins may retry, but transaction
+        // leases must finish before an indexed table changes its schema.
+        const check_constraints = (if (prepared.base_schema_view) |view| if (view.validator()) |validator| validator.execution.checks != null else false else false) or
+            (if (prepared.epoch.?.validator) |validator| validator.execution.checks != null else false);
+        if (!same_active_epoch and (prepared.base_relational_indexes != null or prepared.relational_indexes != null or check_constraints or prepared.integrity_catalog != null)) {
             var manager = try self.initTxnManager();
             defer manager.deinit();
             if (try manager.hasSchemaLeases()) return error.SchemaInUse;
@@ -1389,7 +1492,12 @@ pub const DBCore = struct {
         next_catalog.active_schema_version = table_schema.version;
         if (reconciled_row_count) |row_count| next_catalog.row_count = @intFromBool(row_count != 0);
         next_catalog.reconciled = true;
-        next_catalog.index_state = if (self.indexCount() == 0) .none else .pending;
+        const same_index_catalog = if (prepared.relational_indexes) |indexes|
+            if (indexes.metadata.expected) |expected| expected.eql(indexes.metadata.head) else false
+        else
+            true;
+        if (!same_active_epoch or !same_index_catalog)
+            next_catalog.index_state = if (self.indexCount() == 0) .none else .pending;
         const previous_catalog_data = self.table_catalog.encode();
         const candidate_catalog_data = next_catalog.encode();
         if (!std.mem.eql(u8, &previous_catalog_data, &candidate_catalog_data))
@@ -1398,13 +1506,59 @@ pub const DBCore = struct {
         const catalog_data = next_catalog.encodeForPersistence(&catalog_buffer);
         @memcpy(prepared.combined_writes[0..metadata_writes.len], metadata_writes);
         prepared.combined_writes[metadata_writes.len] = .{ .key = table_catalog_mod.key, .value = catalog_data };
-        const changed = try schema_mod.saveEncodedSchemaWithMetadata(
+        const Participants = struct {
+            prepared: *PreparedSchemaMetadata,
+            row_count: u64,
+            namespace: doc_identity.Namespace,
+
+            pub fn stage(participants: @This(), txn: anytype) !void {
+                var source_namespace: [24]u8 = undefined;
+                doc_identity.encodeNamespace(&source_namespace, participants.namespace);
+                try @import("../source_pin_state.zig").requireNoPrepared(txn, source_namespace);
+                if (try @import("../retained_effects.zig").load(txn)) |retention| {
+                    if (retention.active() and std.mem.eql(u8, &retention.namespace, &source_namespace)) return error.IntegrityTopologyBusy;
+                }
+                try @import("relational_integrity_topology.zig").requireUnfenced(txn);
+                try @import("online_integrity_shadow.zig").requireCatalogMutable(txn);
+                try participants.stageChanges(txn);
+            }
+
+            pub fn stageChanges(participants: @This(), txn: anytype) !void {
+                if (participants.prepared.relational_indexes) |*indexes| _ = try indexes.metadata.stage(txn);
+                if (participants.prepared.integrity_catalog) |*catalog| {
+                    const retirement_mod = @import("relational_integrity_retirement.zig");
+                    if (catalog.changed) if (try retirement_mod.current(txn)) |retirement| {
+                        if (retirement.phase != .ready or !std.mem.eql(u8, &retirement.target_schema_digest, &catalog.catalog.schema_digest)) return error.ConstraintRetirementInProgress;
+                        for (retirement.generations) |generation| {
+                            const binding = catalog.catalog.findGeneration(generation) orelse return error.IntegrityCatalogChanged;
+                            if (!binding.retired) return error.ConstraintRetirementRequired;
+                        }
+                        try txn.delete(retirement_mod.key);
+                    };
+                    if (try doc_identity.loadNamespaceTxn(txn)) |stored| {
+                        if (!stored.eql(participants.namespace)) return error.IdentityNamespaceMismatch;
+                    } else {
+                        var encoded_namespace: [24]u8 = undefined;
+                        doc_identity.encodeNamespace(&encoded_namespace, participants.namespace);
+                        try txn.put(&internal_keys.identity_namespace_key, &encoded_namespace);
+                    }
+                    try catalog.stage(txn);
+                    try @import("relational_integrity_activation.zig").stageSchema(participants.prepared.alloc, txn, catalog.catalog, participants.row_count);
+                }
+            }
+        };
+        const participants = Participants{ .prepared = prepared, .row_count = next_catalog.row_count, .namespace = self.identity_namespace };
+        // The current resident epoch and index snapshot were fenced above and
+        // already describe these exact bytes. Keep their identities stable so
+        // reopening/configuring an owner does not invalidate prepared writes.
+        const changed = try schema_mod.saveEncodedSchemaWithMetadataAndStage(
             self.store,
             self.alloc,
             table_schema.version,
             prepared.encoded,
             prepared.combined_writes,
             metadata_deletes,
+            participants,
         );
         const next_schema = prepared.resident_schema orelse unreachable;
         if (!changed or self.schema == null) {
@@ -1424,6 +1578,7 @@ pub const DBCore = struct {
         prepared.epoch = null;
         prepared.publication.?.publish(next_epoch);
         prepared.publication = null;
+        if (prepared.relational_indexes) |*indexes| self.relational_indexes.publishCommitted(indexes);
         self.table_catalog = next_catalog;
         return changed;
     }
@@ -1573,7 +1728,9 @@ pub const DBCore = struct {
         var replacement = try self.schema_registry.prepareReplaceAll(next_epoch);
         epoch_owned = false;
         defer replacement.deinit();
-        self.replaceSchemaOwnedPrepared(next_schema, &replacement);
+        var indexes = try relational_index_catalog_mod.Controller.loadSnapshot(self.alloc, self.store, if (next_epoch) |epoch| .{ .epoch = epoch } else null);
+        defer if (indexes) |*snapshot| snapshot.deinit();
+        self.replaceSchemaOwnedPrepared(next_schema, &replacement, &indexes);
     }
 
     pub fn prepareSchemaRegistryReplacement(
@@ -1615,12 +1772,15 @@ pub const DBCore = struct {
         self: *DBCore,
         next_schema: ?schema_mod.TableSchema,
         replacement: *schema_registry_mod.Registry.PreparedReplacement,
+        indexes: *?relational_index_catalog_mod.WriteSnapshot,
     ) void {
         std.debug.assert((next_schema == null) == (replacement.current == null));
         if (next_schema) |schema| std.debug.assert(replacement.current.?.schema.version == schema.version);
+        if (indexes.*) |snapshot| std.debug.assert(snapshot.plan.schemaView().epoch == replacement.current.?);
         if (self.schema) |existing| schema_mod.freeSchema(self.alloc, existing);
         self.schema = next_schema;
         self.schema_registry.replaceAllPrepared(replacement);
+        self.relational_indexes.replacePrepared(indexes);
     }
 
     pub fn saveSchemaCloneTo(self: *DBCore, dest_store: *docstore_mod.DocStore) !void {
@@ -1870,7 +2030,7 @@ pub const DBCore = struct {
         if (workspace.?.capacity < required) return error.TransactionCompletionCapacityMismatch;
     }
 
-    fn initTxnManager(self: *DBCore) !transactions_mod.TxnManager {
+    pub fn initTxnManager(self: *DBCore) !transactions_mod.TxnManager {
         var manager = try transactions_mod.TxnManager.init(self.alloc, self.store);
         manager.completion_limits = .{
             .max_transaction_bytes = if (self.table_catalog.transaction_recovery_max_count != 0) self.table_catalog.transaction_admission_bytes else 0,

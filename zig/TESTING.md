@@ -563,3 +563,13 @@ Algebraic behavior uses the normal DB, API, metadata, and graph owner suites.
 `antfly-unit-test` retains the dynamic-template/cardinality-cache selections.
 There are no separate algebraic test or guardrail targets. Benchmark sweeps use
 `scripts/run_db_query_matrix.py --suite analytics`; see [BENCHMARKS.md](BENCHMARKS.md#analytics-comparisons).
+
+## Retrieval agent contracts
+
+`zig build antfly-retrieval-test -Doptimize=ReleaseFast` runs the retrieval
+contracts, including tree retrieval and model-directed graph navigation, without
+the separate HTTP-linked serving harness. To select the navigation regressions:
+
+```sh
+zig build antfly-retrieval-test -Doptimize=ReleaseFast -- --test-filter 'retrieval graph navigation'
+```

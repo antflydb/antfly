@@ -218,15 +218,7 @@ pub const MergeSourceTransitionMutation = struct {
 
 /// Receiver-persisted fencing identity for one copy, ordered by the donor's
 /// elected Raft term and then its per-process attempt sequence.
-pub const MergeCopyAttempt = struct {
-    donor_term: u64 = 0,
-    sequence: u64 = 0,
-
-    pub fn order(a: MergeCopyAttempt, b: MergeCopyAttempt) std.math.Order {
-        const term_order = std.math.order(a.donor_term, b.donor_term);
-        return if (term_order == .eq) std.math.order(a.sequence, b.sequence) else term_order;
-    }
-};
+pub const MergeCopyAttempt = @import("relational_integrity_handoff_contract.zig").MergeCopyAttempt;
 
 /// Replay identity for receiver-side merge copy batches. Unlike an ordinary
 /// write, these entries must reopen the already-provisioned receiver from its
@@ -266,6 +258,10 @@ pub const MergeReplicationCheckpoint = struct {
     copy_attempt: MergeCopyAttempt = .{},
     allow_doc_identity_reassignment: bool = false,
     receiver_identity_reassignment_namespace: ?doc_identity_mod.Namespace = null,
+    /// Opt-in immutable source binding for atomic, resumable receiver pages.
+    /// Only begin_copy may install it; ordinary checkpoint payloads stay empty.
+    page_source: ?@import("merge_page_contract.zig").Source = null,
+    page_receiver_namespace: ?doc_identity_mod.Namespace = null,
 };
 
 /// Private data-Raft command used by the distributed transaction protocol.
@@ -309,12 +305,32 @@ pub const TransactionMutation = union(enum) {
 };
 
 pub const BatchRequest = struct {
+    /// Private, replicated source-retention lifecycle. Never accepted by public JSON.
+    online_source: ?@import("online_source_contract.zig").Command = null,
+    /// Private replicated hidden-owner lifecycle; public JSON cannot set it.
+    restore_staging: ?@import("restore_staging_contract.zig").Control = null,
+    restore_staging_scope: ?[32]u8 = null,
+    /// Private metadata lookup identity, authenticated together with the scope.
+    restore_staging_plan_id: ?[16]u8 = null,
+    /// Authenticated owner lifecycle control; never populated by public JSON.
+    relational_topology: ?@import("relational_integrity_topology_contract.zig").Command = null,
+    relational_schema_version: ?u32 = null,
+    /// Internal coordinator evidence; never populated from public request JSON.
+    relational_integrity_generation_set: ?[32]u8 = null,
+    /// Authenticated administrative repair, still subject to integrity checks.
+    relational_repair: bool = false,
     writes: []const BatchWrite = &.{},
     deletes: []const []const u8 = &.{},
     transforms: []const DocumentTransform = &.{},
     graph_writes: []const GraphEdgeWrite = &.{},
     graph_deletes: []const GraphEdgeDelete = &.{},
     predicates: []const TransactionVersionPredicate = &.{},
+    /// Internal transaction-only effects; never accepted from public batch JSON.
+    integrity: []const TransactionIntegrityOperation = &.{},
+    integrity_commands: []const @import("relational_integrity_contract.zig").Command = &.{},
+    relational_activation: ?@import("relational_integrity_activation_contract.zig").Command = null,
+    relational_retirement: ?@import("relational_integrity_retirement_contract.zig").Command = null,
+    relational_index_maintenance: ?@import("relational_index_maintenance_contract.zig").Command = null,
     timestamp_ns: u64 = 0,
     sync_level: SyncLevel = .write,
     /// Internal single-participant transaction contract. Transform expansion
@@ -336,11 +352,53 @@ pub const BatchRequest = struct {
     /// Internal identity context for receiver-side merge copy and rollback
     /// batches. Public batch parsing never sets it.
     merge_replication: ?MergeReplicationContext = null,
+    /// Separate effect-bearing command; never combined with a checkpoint.
+    merge_page: ?@import("merge_page_contract.zig").Command = null,
     /// Authoritative document-scoped store rows, not original write inputs.
     /// Ordered after primary copy and before the receiver completion checkpoint.
     merge_artifacts: []const BatchWrite = &.{},
     /// Internal 2PC phase. Public batch parsing never accepts this field.
     transaction: ?TransactionMutation = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        inline for (std.meta.fields(@This())) |field| {
+            try jw.objectField(field.name);
+            if (comptime std.mem.eql(u8, field.name, "relational_integrity_generation_set") or std.mem.eql(u8, field.name, "restore_staging_scope") or std.mem.eql(u8, field.name, "restore_staging_plan_id")) {
+                if (@field(self, field.name)) |digest| {
+                    try jw.beginArray();
+                    for (digest) |byte| try jw.write(byte);
+                    try jw.endArray();
+                } else try jw.write(null);
+            } else if (comptime std.mem.eql(u8, field.name, "merge_page")) {
+                // The same bounded chunk encoding crosses HTTP, native replay
+                // and projection storage; never expand payload bytes to nodes.
+                try jw.write(self.merge_page);
+            } else if (comptime std.mem.eql(u8, field.name, "split_checkpoint") or
+                std.mem.eql(u8, field.name, "split_transition") or
+                std.mem.eql(u8, field.name, "merge_checkpoint") or
+                std.mem.eql(u8, field.name, "merge_artifacts"))
+            {
+                // Lifecycle ranges and physical artifacts are opaque bytes,
+                // including when replayed through the native HA envelope.
+                try @import("relational_integrity_json.zig").write(@field(self, field.name), jw);
+            } else if (comptime std.mem.eql(u8, field.name, "writes") or std.mem.eql(u8, field.name, "deletes")) {
+                // Final transaction effects can contain binary private keys
+                // and values in live HA as well as staged restore. Preserve
+                // those bytes without expanding ordinary JSON primary rows.
+                try jw.beginArray();
+                for (@field(self, field.name)) |item| {
+                    const key = if (comptime std.mem.eql(u8, field.name, "writes")) item.key else item;
+                    if (std.mem.startsWith(u8, key, "\x00\x00__metadata__:"))
+                        try @import("relational_integrity_json.zig").write(item, jw)
+                    else
+                        try jw.write(item);
+                }
+                try jw.endArray();
+            } else try jw.write(@field(self, field.name));
+        }
+        try jw.endObject();
+    }
 };
 
 pub fn validateMergeArtifacts(req: BatchRequest) !void {
@@ -1232,6 +1290,8 @@ pub const LookupOptions = struct {
 
 pub const LookupResult = struct {
     json: []u8,
+    version: ?u64 = null,
+    expected_content_digest: ?[32]u8 = null,
 
     pub fn deinit(self: *LookupResult, alloc: Allocator) void {
         alloc.free(self.json);
@@ -1325,9 +1385,12 @@ pub const ScanHash = struct {
     id: []u8,
     hash: u64,
     content_hash: ?DocumentContentHash = null,
+    relational_schema_version: ?u32 = null,
+    relational_cursor: ?[]u8 = null,
 
     pub fn deinit(self: *ScanHash, alloc: Allocator) void {
         alloc.free(self.id);
+        if (self.relational_cursor) |cursor| alloc.free(cursor);
         self.* = undefined;
     }
 };
@@ -1338,6 +1401,8 @@ pub const ScanVisitEntry = struct {
     id: []const u8,
     hash: u64,
     content_hash: ?DocumentContentHash = null,
+    relational_schema_version: ?u32 = null,
+    relational_cursor: ?[]const u8 = null,
     document_json: ?[]const u8 = null,
 };
 
@@ -1438,13 +1503,32 @@ pub const TransactionWrite = struct {
 pub const TransactionVersionPredicate = struct {
     key: []const u8,
     expected_version: u64,
+    /// Internal observation guard. TTL timestamps need not change on updates.
+    /// SHA-256 binds the exact primary row read before planning FK actions.
+    expected_content_digest: ?[32]u8 = null,
 };
 
+/// Server-compiled integrity effects. The logical routing key is separate from
+/// the protected physical key: routing a metadata prefix would concentrate all
+/// claims on the first shard. Public mutation parsers must never populate this
+/// envelope directly. Participants validate its namespace before admission.
+pub const TransactionIntegrityOperation = @import("relational_integrity_contract.zig").Operation;
+
 pub const TransactionIntentRequest = struct {
+    relational_index_maintenance: ?@import("relational_index_maintenance_contract.zig").Command = null,
+    restore_staging_scope: ?[32]u8 = null,
+    restore_staging_plan_id: ?[16]u8 = null,
+    relational_activation: ?@import("relational_integrity_activation_contract.zig").Command = null,
+    relational_retirement: ?@import("relational_integrity_retirement_contract.zig").Command = null,
+    relational_schema_version: ?u32 = null,
+    relational_integrity_generation_set: ?[32]u8 = null,
+    relational_repair: bool = false,
     writes: []const TransactionWrite = &.{},
     deletes: []const []const u8 = &.{},
     transforms: []const DocumentTransform = &.{},
     predicates: []const TransactionVersionPredicate = &.{},
+    integrity: []const TransactionIntegrityOperation = &.{},
+    integrity_commands: []const @import("relational_integrity_contract.zig").Command = &.{},
 };
 
 pub const SplitState = struct {

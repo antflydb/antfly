@@ -26,13 +26,10 @@ class CudaQualificationPolicyTests(unittest.TestCase):
         )
 
     def test_model_reference_derives_cuda_tier(self) -> None:
-        self.assertEqual("q8_0", qualify.model_tier("qwen3-embedding"))
-        self.assertEqual("q8_0", qualify.model_tier("qwen3-embedding-0.6b"))
         self.assertEqual(
             "q8_0",
             qualify.model_tier("hf:Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1"),
         )
-        self.assertEqual("bf16", qualify.model_tier("qwen3-embedding-0.6b-safetensors"))
         self.assertEqual(
             "bf16",
             qualify.model_tier("Qwen/Qwen3-Embedding-0.6B:bf16-safetensors-bundle-v1"),
@@ -41,6 +38,9 @@ class CudaQualificationPolicyTests(unittest.TestCase):
     def test_unpromoted_model_references_fail_closed(self) -> None:
         for model in (
             "qwen3-embedding-0.6b-f16",
+            "qwen3-embedding",
+            "qwen3-embedding-0.6b",
+            "qwen3-embedding-0.6b-safetensors",
             "Qwen/Qwen3-Embedding-0.6B-GGUF:f16-bundle-v1",
             "Qwen/Qwen3-Embedding-0.6B-GGUF",
         ):
@@ -56,7 +56,7 @@ class CudaQualificationPolicyTests(unittest.TestCase):
                 "--base-url",
                 "http://127.0.0.1:8080",
                 "--model",
-                "qwen3-embedding-0.6b-safetensors",
+                "Qwen/Qwen3-Embedding-0.6B:bf16-safetensors-bundle-v1",
             ]
         )
         self.assertEqual("bf16", parsed.tier)
@@ -124,7 +124,7 @@ class CudaQualificationPolicyTests(unittest.TestCase):
                             "--base-url",
                             "http://localhost:8080",
                             "--model",
-                            "qwen3-embedding-0.6b-safetensors",
+                            "Qwen/Qwen3-Embedding-0.6B:bf16-safetensors-bundle-v1",
                             "--report",
                             str(report_path),
                             *extra_args,

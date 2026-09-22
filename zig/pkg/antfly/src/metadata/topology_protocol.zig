@@ -43,6 +43,11 @@ pub fn tableStorageVersion(settings: @import("../common/table_storage.zig").Sett
 }
 pub const durable_activation_version: u16 = 9;
 pub const store_report_update_version: u16 = 8;
+// Preflight and final append require the same complete decoder capability.
+pub const relational_integrity_topology_version: u16 = coordinated_lifecycle_version;
+pub const coordinated_lifecycle_version: u16 = 11;
+pub const table_storage_metadata_version: u16 = 11;
+pub const source_scope_version: u16 = 11;
 pub const restore_job_admission_version: u16 = 5;
 pub const restore_job_expiry_version: u16 = 6;
 pub const system_catalog_version: u16 = 7;

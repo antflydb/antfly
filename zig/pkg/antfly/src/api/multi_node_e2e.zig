@@ -438,6 +438,7 @@ const PublicApiStatusSource = struct {
                 .create_table = createTable,
                 .drop_table = dropTable,
                 .update_schema = updateSchema,
+                .mutate_schema = mutateSchema,
                 .replace_table_definition = replaceTableDefinition,
                 .drop_index = dropIndex,
             },
@@ -486,6 +487,21 @@ const PublicApiStatusSource = struct {
         const updated = try api_tables.applySchemaUpdateRecord(alloc, table, schema_json);
         defer metadata_table_manager.freeTable(alloc, updated);
         try self.node.upsertTable(updated);
+    }
+
+    fn mutateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, mode: api_tables.SchemaMutationMode, body: []const u8, expected_version: ?u32) !api_tables.SchemaMutationResult {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        var snapshot = try self.node.adminSnapshot();
+        defer self.node.freeAdminSnapshot(&snapshot);
+        const table = api_tables.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+        if (expected_version) |version| if (try api_tables.schemaVersion(table.schema_json) != version)
+            return error.SchemaVersionChanged;
+        const updated = try api_tables.applySchemaMutationRecord(alloc, table, mode, body);
+        defer metadata_table_manager.freeTable(alloc, updated);
+        const response_schema = try alloc.dupe(u8, updated.schema_json);
+        errdefer alloc.free(response_schema);
+        try self.node.replaceTableDefinition(table.*, updated);
+        return .{ .version = try api_tables.schemaVersion(updated.schema_json), .schema_json = response_schema };
     }
 
     fn createIndex(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {

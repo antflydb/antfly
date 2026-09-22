@@ -315,13 +315,13 @@ const WasmtimeFunc = extern struct {
     private: ?*anyopaque = null,
 };
 
+const WasmtimeStoreIndex = extern struct {
+    store_id: u64 = 0,
+    index: u32 = 0,
+};
+
 const WasmtimeMemory = extern struct {
-    // wasmtime_memory_t nests its store/index pair; preserve that subobject's
-    // tail padding before the outer memory index (Wasmtime 45 C API).
-    private1: extern struct {
-        store_id: u64 = 0,
-        index: u32 = 0,
-    } = .{},
+    store: WasmtimeStoreIndex = .{},
     private2: u32 = 0,
 };
 
@@ -337,12 +337,12 @@ const WASMTIME_EXTERN_MEMORY: WasmtimeExternKind = 3;
 const WasmtimeExternUnion = extern union {
     func: WasmtimeFunc,
     memory: WasmtimeMemory,
-    bytes: [32]u8,
+    bytes: [24]u8,
 };
 
 const WasmtimeExtern = extern struct {
     kind: WasmtimeExternKind = 0,
-    of: WasmtimeExternUnion = .{ .bytes = [_]u8{0} ** 32 },
+    of: WasmtimeExternUnion = .{ .bytes = [_]u8{0} ** 24 },
 };
 
 const WasmtimeValRaw = extern union {
@@ -358,8 +358,7 @@ const WasmtimeComponentInstance = extern struct {
 };
 
 const WasmtimeComponentFunc = extern struct {
-    store_id: u64 = 0,
-    private1: u32 = 0,
+    store: WasmtimeStoreIndex = .{},
     private2: u32 = 0,
 };
 

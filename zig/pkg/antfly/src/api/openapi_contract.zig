@@ -737,6 +737,16 @@ test "generated route policy inventory is unique and describes wire modes" {
     try std.testing.expectEqual(.write, request_admission_policy.publicOperationClass("linearMerge").?);
     try std.testing.expectEqual(.write, request_admission_policy.publicOperationClass("commitTransaction").?);
     try std.testing.expectEqual(.write, request_admission_policy.publicOperationClass("commitTransactionSession").?);
+    inline for (.{
+        .{ "queryRelationalRows", "queryNamespaceRelationalRows" },
+        .{ "mutateRelationalRows", "mutateNamespaceRelationalRows" },
+        .{ "getRelationalConstraintStatus", "getNamespaceRelationalConstraintStatus" },
+        .{ "repairRelationalConstraints", "repairNamespaceRelationalConstraints" },
+        .{ "retryRelationalConstraints", "retryNamespaceRelationalConstraints" },
+        .{ "retireRelationalConstraints", "retireNamespaceRelationalConstraints" },
+        .{ "repairIndex", "repairNamespaceIndex" },
+        .{ "retryIndex", "retryNamespaceIndex" },
+    }) |pair| try std.testing.expectEqual(request_admission_policy.publicOperationClass(pair[0]).?, request_admission_policy.publicOperationClass(pair[1]).?);
 }
 
 test "bleve and metadata openapi modules are generated and wired" {
@@ -948,7 +958,10 @@ test "metadata openapi module resolves shared refs through owner modules" {
     try std.testing.expect(@hasField(metadata_generated.QueryBuilderRequest, "output"));
     try std.testing.expect(@hasField(metadata_generated.QueryBuilderRequest, "constraints"));
     try std.testing.expect(@FieldType(metadata_generated.QueryBuilderResult, "query_request") == ?metadata_generated.QueryRequest);
-    try std.testing.expect(@FieldType(metadata_generated.QueryBuilderResult, "retrieval_query_request") == ?metadata_generated.RetrievalQueryRequest);
+    try std.testing.expect(@FieldType(metadata_generated.QueryBuilderResult, "retrieval_query_request") == ?metadata_generated.QueryRequest);
+    try std.testing.expect(@FieldType(metadata_generated.QueryBuilderResult, "retrieval_navigation") == ?metadata_generated.RetrievalNavigationConfig);
+    try std.testing.expect(!@hasField(metadata_generated.QueryRequest, "tree_search"));
+    try std.testing.expect(!@hasField(metadata_generated.QueryRequest, "graph_navigation"));
     try std.testing.expect(@hasField(metadata_generated.QueryBuilderResult, "specialist"));
     try std.testing.expect(@hasField(metadata_generated.QueryBuilderResult, "plan"));
     try std.testing.expect(@FieldType(metadata_generated.QueryRequest, "reranker") == ?reranking_generated.RerankerConfig);
@@ -1114,6 +1127,22 @@ test "public openapi module resolves shared refs through owner modules" {
 }
 
 test "client openapi module resolves shared refs through owner modules" {
+    // Real public schema mutations have two HTTP success statuses and two
+    // structurally distinct accepted payloads. Neither 202 body is a Table.
+    inline for (.{ client_generated.client.UpdateSchemaResponse, client_generated.client.PatchSchemaResponse }) |Response| {
+        var table = try Response.parseResponse(std.testing.allocator, 200, "{\"name\":\"docs\",\"indexes\":{},\"shards\":{}}");
+        defer table.deinit();
+        try std.testing.expectEqualStrings("docs", table.value.status_200.name);
+        var job = try Response.parseResponse(std.testing.allocator, 202,
+            \\{"job_id":"rewrite-1","attempt_id":1,"scope":"table","backup_id":"","phase":"queued","cancel_requested":false,"durability_pending_table_count":0,"published_table_count":0,"completed_table_count":0,"created_at_ms":1,"updated_at_ms":1}
+        );
+        defer job.deinit();
+        try std.testing.expectEqualStrings("rewrite-1", job.value.status_202.restore_job.job_id);
+        var committed = try Response.parseResponse(std.testing.allocator, 202, "{\"status\":\"committed_durability_pending\"}");
+        defer committed.deinit();
+        try std.testing.expectEqualStrings("committed_durability_pending", committed.value.status_202.committed_mutation_outcome.status);
+        try std.testing.expectError(error.UnexpectedToken, Response.parseResponse(std.testing.allocator, 202, "{\"name\":\"docs\",\"indexes\":{},\"shards\":{}}"));
+    }
     try std.testing.expect(@hasDecl(client_generated, "Client"));
     try std.testing.expect(@hasDecl(client_generated.Client, "getStatus"));
     try std.testing.expect(@hasDecl(client_generated.Client, "listSecrets"));

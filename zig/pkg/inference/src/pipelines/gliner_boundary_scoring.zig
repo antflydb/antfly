@@ -8,9 +8,9 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const compute = @import("../ops/ops.zig");
 const model = @import("../models/gliner_boundary.zig");
-const head = @import("../architectures/gliner_boundary_head.zig");
-const tasks = @import("../architectures/gliner_boundary_tasks.zig");
-const ops = @import("../architectures/gliner_boundary_ops.zig");
+const head = @import("../architectures/gliner/boundary_head.zig");
+const tasks = @import("../architectures/gliner/boundary_tasks.zig");
+const ops = @import("../architectures/gliner/boundary_ops.zig");
 const processor = @import("gliner_boundary_processor.zig");
 pub const Control = @import("../execution_control.zig").InferenceExecutionControl;
 

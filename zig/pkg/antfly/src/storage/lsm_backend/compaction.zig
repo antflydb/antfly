@@ -921,10 +921,16 @@ fn resumeClosureToSelectionForTest(backend: anytype, slot: *?*PendingDirectoryCl
 }
 
 test "compaction phase handoff bounds memory and preserves epoch validation" {
+    try testCompactionPhaseHandoff(513, 768, 128 * 1024, .{ .max_inputs = 32 });
+}
+
+test "compaction phase handoff production scale" {
+    try testCompactionPhaseHandoff(20001, 30000, 3 * 1024 * 1024, .{});
+}
+
+fn testCompactionPhaseHandoff(inputs: usize, count: usize, cap: u64, planning_budget: DirectoryPlanningBudget) !void {
     const Backend = @import("../lsm_backend.zig").Backend;
     const allocator = std.testing.allocator;
-    const inputs = 20001;
-    const cap = 3 * 1024 * 1024;
     for (0..3) |mode| {
         var budgets = resource_manager_mod.Options.defaultBudgets();
         budgets[@intFromEnum(resource_manager_mod.Slice.lsm_table_builder_working_set)] = .{ .hard_limit_bytes = cap };
@@ -932,7 +938,7 @@ test "compaction phase handoff bounds memory and preserves epoch validation" {
         defer std.debug.assert(manager.sliceStats(.lsm_table_builder_working_set).used_bytes == 0);
         var backend = Backend.init(allocator, .{ .level_target_runs_base = 1000000, .level_target_bytes_base = 0 });
         defer backend.close();
-        try populateClosureDirectoryWithInputsForTest(&backend, 30000, inputs);
+        try populateClosureDirectoryWithInputsForTest(&backend, count, inputs);
         // Any persisted tombstone requires coverage validation, including when
         // there was no concurrent publication during discovery.
         const initial = try (try backend.planningDirectory()).fork(allocator);
@@ -945,7 +951,7 @@ test "compaction phase handoff bounds memory and preserves epoch validation" {
         defer runtime_mod.unlockBackend(Backend, &backend, locked);
         const started = @import("antfly_platform").time.monotonicNs();
         var stats: CompactionSelectionStats = .{};
-        try std.testing.expect(try selectDomainPlan(&backend, 0, false, 0, false, &stats) == null);
+        try std.testing.expect(try selectDirectoryPlanBudgeted(&backend, 0, false, 0, false, &stats, planning_budget) == null);
         const pending = backend.pending_directory_closure.?;
         for (0..4096) |_| {
             if (pending.phase == .reclaim_discovery) break;
@@ -973,7 +979,7 @@ test "compaction phase handoff bounds memory and preserves epoch validation" {
         // Publish either an unrelated edit or a replacement of an input while
         // its discovery scratch is being retired. Handles/epoch stay pinned.
         const changed = try (try backend.planningDirectory()).fork(allocator);
-        var replacement = changed.at(if (mode == 0) 29999 else 1).run.*;
+        var replacement = changed.at(if (mode == 0) count - 1 else 1).run.*;
         replacement.gc_requested = true;
         try changed.put(&backend, replacement);
         backend.invalidateReadVersion();
@@ -986,6 +992,8 @@ test "compaction phase handoff bounds memory and preserves epoch validation" {
         try std.testing.expect(pending.phase == .validate);
         try std.testing.expectEqual(@as(u64, 0), pending.scratch.?.live_bytes);
         const retained = manager.sliceStats(.lsm_table_builder_working_set).used_bytes;
+        if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_WORK_PROFILE"))
+            std.debug.print("\nWORK compaction mode={d} inputs={d} discovery_bytes={d} retained_bytes={d} validation_bytes={d} cap={d}\n", .{ mode, inputs, used_before, retained, validation_bytes, cap });
         try std.testing.expect(retained + validation_bytes <= cap);
         var accepted = false;
         for (0..4096) |_| {

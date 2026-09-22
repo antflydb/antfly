@@ -427,6 +427,7 @@ pub fn applyReplicatedTransactionMutationInternal(
     raft_entry: ?db_mod.RaftAppliedEntryIdentity,
 ) !void {
     const mutation = req.transaction orelse return error.InvalidBatchRequest;
+    if (req.relational_index_maintenance) |command| if (command.owner_group_id != group_id) return error.PreparedGenerationChanged;
     switch (mutation) {
         .begin => |begin| {
             var selection = try selectBeginParticipants(alloc, table_name, group_id, begin.participants);
@@ -436,7 +437,7 @@ pub fn applyReplicatedTransactionMutationInternal(
             // than every participant retrying every other participant.
             const durable_participants = selection.durableParticipants(begin.participants);
             if (raft_entry) |entry|
-                _ = try db.beginReplicatedTransactionAtRaftEntry(
+                _ = try db.beginReplicatedTransactionScoped(
                     begin.txn_id,
                     begin.begin_timestamp,
                     begin.created_at_ns,
@@ -444,15 +445,17 @@ pub fn applyReplicatedTransactionMutationInternal(
                     selection.coordinator,
                     begin.retain_terminal,
                     entry,
+                    req.restore_staging_scope,
                 )
             else
-                _ = try db.beginTransactionWithIdAndParticipantsCreatedAtRoleAndRetention(
+                _ = try db.beginTransactionScoped(
                     begin.txn_id,
                     begin.begin_timestamp,
                     begin.created_at_ns,
                     durable_participants,
                     selection.coordinator,
                     begin.retain_terminal,
+                    req.restore_staging_scope,
                 );
         },
         .prepare => |prepare| {
@@ -461,6 +464,16 @@ pub fn applyReplicatedTransactionMutationInternal(
                 .deletes = req.deletes,
                 .transforms = req.transforms,
                 .predicates = req.predicates,
+                .integrity = req.integrity,
+                .integrity_commands = req.integrity_commands,
+                .relational_activation = req.relational_activation,
+                .relational_retirement = req.relational_retirement,
+                .relational_index_maintenance = req.relational_index_maintenance,
+                .relational_schema_version = req.relational_schema_version,
+                .relational_integrity_generation_set = req.relational_integrity_generation_set,
+                .restore_staging_scope = req.restore_staging_scope,
+                .restore_staging_plan_id = req.restore_staging_plan_id,
+                .relational_repair = req.relational_repair,
             };
             if (raft_entry) |entry|
                 try db.writeReplicatedTransactionAtRaftEntry(prepare.txn_id, intents, entry)
@@ -468,7 +481,7 @@ pub fn applyReplicatedTransactionMutationInternal(
                 try db.writeTransaction(prepare.txn_id, intents);
         },
         .resolve => |resolve| {
-            const local_participant = try distributed_txn.participantIdForGroup(alloc, table_name, group_id);
+            const local_participant = try distributed_txn.participantIdForGroupScoped(alloc, table_name, group_id, req.restore_staging_scope, req.restore_staging_plan_id);
             defer alloc.free(local_participant);
             if (raft_entry) |entry| {
                 // Retained coordinators keep their own acknowledgement pending
@@ -594,6 +607,10 @@ pub fn corruptEmbeddingArtifactInDb(
 }
 
 pub const ManagedDbOpenOptions = struct {
+    /// Private restore installs its historical read schema before physical
+    /// projections. The ordinary empty producer config must not drop persisted
+    /// projections on reopen; exact reservation reconciliation follows open.
+    private_restore_bootstrap: bool = false,
     /// Identity captured with the route that selected the group. Supplying it
     /// prevents a cache miss from performing a second, potentially older,
     /// catalog read before creating the database.
@@ -638,6 +655,40 @@ pub const ManagedDbOpenOptions = struct {
     reuse_cached_writer_for_metadata_reconcile: bool = false,
 };
 
+/// Install the exact private reservation before an owner is adopted. A
+/// canceled owner may only reopen for authenticated cancellation recovery.
+pub fn configureRestoreOwnerDb(alloc: std.mem.Allocator, db: *db_mod.DB, bootstrap: @import("db/restore_staging_contract.zig").OwnerBootstrap, allow_canceled: bool, ha_replay: bool) !void {
+    if (allow_canceled and ha_replay) return error.InvalidRestoreStagingCommand;
+    try bootstrap.validate();
+    if (!db.core.identity_namespace.eql(bootstrap.scope.target_namespace)) return error.RestoreStagingScopeChanged;
+    if (try db.restoreStagingStatus(alloc)) |loaded| {
+        var progress = loaded;
+        defer progress.deinit();
+        if (!std.mem.eql(u8, &progress.value.scope.digest(), &bootstrap.scope.digest())) return error.RestoreStagingScopeChanged;
+        if (progress.value.phase == .canceled) {
+            if (!allow_canceled and !ha_replay) return error.RestoreStagingCanceled;
+            // Recovery authority binds the entire immutable owner descriptor,
+            // not merely its scope digest. Reject mismatched schema/index or
+            // range bytes even after the target is terminal.
+            try db.installRestoreStagingBootstrap(alloc, bootstrap);
+            return;
+        }
+        if (progress.value.phase == .published) {
+            if (allow_canceled) return error.RestoreStagingScopeChanged;
+            try db.installRestoreStagingBootstrap(alloc, bootstrap);
+            return;
+        }
+    } else {
+        if (db.core.table_catalog.row_count != 0) return error.RestoreStagingTargetNotEmpty;
+        if (bootstrap.schema_json.len != 0) try db.setSchemaJson(alloc, bootstrap.schema_json);
+    }
+    try db.installRestoreStagingReadSchema(alloc, bootstrap.scope, bootstrap.read_schema_json);
+    _ = try @import("../metadata/table_provisioner.zig").reconcileDbIndexesWithOptions(alloc, db, bootstrap.indexes_json, .{ .restore_build_only = true });
+    try db.updateRange(bootstrap.byte_range);
+    try db.reserveRestoreStagingScoped(alloc, bootstrap.scope);
+    try db.installRestoreStagingBootstrap(alloc, bootstrap);
+}
+
 pub const ManagedDbEnrichmentSet = struct {
     dense: ?db_embedder.DenseEmbedder = null,
     sparse: ?db_embedder.SparseEmbedder = null,
@@ -677,7 +728,7 @@ pub const ManagedDbEnrichmentSet = struct {
         self.generated = false;
     }
 
-    fn takeConfig(self: *@This()) db_mod.enrichment_runtime.Config {
+    pub fn takeConfig(self: *@This()) db_mod.enrichment_runtime.Config {
         const owned = self.config();
         self.forgetTransferred();
         return owned;
@@ -808,6 +859,11 @@ pub fn prepareManagedSchemaBeforeIndexLoad(
     schema_json: ?[]const u8,
 ) !?db_mod.SchemaBeforeIndexLoad {
     if (mode == .query_readonly or mode == .status_only) return null;
+    // A restore descriptor binds the source's exact schema, including the
+    // absence of one. Applying table-creation defaults here changes both the
+    // public schema and runtime digest before the staged owner is verified.
+    if (mode == .restore_repair and schema_json != null and schema_json.?.len == 0)
+        return null;
     // Null means no authoritative contract was supplied; an explicit empty
     // contract means the default schema, even when there are no indexes.
     const effective = tables_api.effectiveSchemaJson(schema_json orelse return null);
@@ -817,6 +873,15 @@ pub fn prepareManagedSchemaBeforeIndexLoad(
         .runtime_schema = try tables_api.deriveRuntimeTableSchema(alloc, parsed),
         .public_schema_json = effective,
     };
+}
+
+test "managed schema preparation preserves absent restore schema and normal create defaults" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect((try prepareManagedSchemaBeforeIndexLoad(alloc, .restore_repair, null)) == null);
+    try std.testing.expect((try prepareManagedSchemaBeforeIndexLoad(alloc, .restore_repair, "")) == null);
+    const created = (try prepareManagedSchemaBeforeIndexLoad(alloc, .default, "")).?;
+    defer storage_schema.freeSchema(alloc, created.runtime_schema);
+    try std.testing.expectEqualStrings(tables_api.default_schema_json, created.public_schema_json.?);
 }
 
 pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
@@ -1205,6 +1270,10 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
     );
     if (mode == .status_only or mode == .query_readonly) return db;
 
+    if (options.private_restore_bootstrap) {
+        if (mode != .restore_repair) return error.InvalidNativeRestoreOpenMode;
+        return db;
+    }
     if ((mode == .startup_catch_up or mode == .restore_repair) and db.core.index_manager.hasLoadFailures()) {
         // Startup maintenance must preserve the failed generation so status
         // publication and repair discovery can report the original failure.
@@ -1435,22 +1504,27 @@ pub fn exportPortableBackupShard(
     group_id: u64,
     shared_io: ?std.Io,
 ) ![]backups_api.ShardSnapshot {
-    const rel_path = try portableBackupShardRelPath(alloc, backup_id, group_id);
-    errdefer alloc.free(rel_path);
+    return exportPortableBackupShardWithSeal(alloc, db, backup_root, backup_id, group_id, shared_io, null, .none);
+}
 
-    const dest_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ backup_root, rel_path });
+pub fn exportPortableBackupShardWithSeal(alloc: std.mem.Allocator, db: *db_mod.DB, backup_root: []const u8, backup_id: []const u8, group_id: u64, shared_io: ?std.Io, sealed: ?@import("../api/backup_contract.zig").SealedHandle, cancellation: db_mod.types.CancellationToken) ![]backups_api.ShardSnapshot {
+    try cancellation.check();
+    const shards = try alloc.alloc(backups_api.ShardSnapshot, 1);
+    errdefer alloc.free(shards);
+    shards[0] = .{ .group_id = group_id, .start_key = "", .snapshot_path = "" };
+    errdefer shards[0].deinit(alloc);
+    shards[0].snapshot_path = try portableBackupShardRelPath(alloc, backup_id, group_id);
+    const dest_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ backup_root, shards[0].snapshot_path });
     defer alloc.free(dest_path);
-    try exportPortableBackupFile(alloc, db.core.store, dest_path, shared_io);
+    if (sealed) |proof| {
+        const io = shared_io orelse db.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
+        try exportPortableBackupFileWithSource(alloc, db.core.store, dest_path, io, .{ .db = db, .handle = proof.handle, .cancellation = cancellation });
+    } else try exportPortableBackupFile(alloc, db.core.store, dest_path, shared_io);
 
     const byte_range = db.getRange();
-    const shards = try alloc.alloc(backups_api.ShardSnapshot, 1);
-    shards[0] = .{
-        .group_id = group_id,
-        .start_key = try alloc.dupe(u8, byte_range.start),
-        .end_key = if (byte_range.end.len > 0) try alloc.dupe(u8, byte_range.end) else null,
-        .snapshot_path = rel_path,
-    };
-    errdefer shards[0].deinit(alloc);
+    shards[0].start_key = try alloc.dupe(u8, byte_range.start);
+    shards[0].end_key = if (byte_range.end.len > 0) try alloc.dupe(u8, byte_range.end) else null;
+    try cancellation.check();
     try backups_api.populateShardArtifactIntegrity(alloc, shared_io, .portable, dest_path, &shards[0]);
     return shards;
 }
@@ -1516,7 +1590,12 @@ pub fn prepareNativeBackupShardSnapshot(
         platform_time.realtimeNs(),
     );
     errdefer snapshot_attempt.deinit();
-    _ = try db.snapshotNativeWithCancellation(snapshot_token, plan.cancellation);
+    _ = if (try @import("../api/backup_contract.zig").sealedHandleForGroup(plan.sealed_handles, group_id)) |handle|
+        try db.exportBackupCohort(handle.handle, snapshot_token, plan.cancellation)
+    else if (plan.relational_cohort_fence) |cohort|
+        try db.snapshotRelationalCohort(snapshot_token, cohort, plan.cancellation)
+    else
+        try db.snapshotNativeWithCancellation(snapshot_token, plan.cancellation);
 
     const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/{s}", .{ db_path, snapshot_token });
     errdefer alloc.free(snapshot_root);
@@ -1582,16 +1661,30 @@ pub fn backupStorageKernelOwnerDb(
     backup_id: []const u8,
     format: backups_api.BackupFormat,
 ) ![]backups_api.ShardSnapshot {
+    return backupStorageKernelOwnerDbWithControl(alloc, db, db_path, group_id, backup_root, backup_id, format, null, null, .{ .deadline_ns = std.math.maxInt(u64) });
+}
+
+pub fn backupStorageKernelOwnerDbWithControl(alloc: std.mem.Allocator, db: *db_mod.DB, db_path: []const u8, group_id: u64, backup_root: []const u8, backup_id: []const u8, format: backups_api.BackupFormat, cohort: ?@import("db/relational_integrity_topology_contract.zig").Fence, sealed: ?@import("db/native_backup_seal_contract.zig").Handle, control: backups_api.BackupOperationControl) ![]backups_api.ShardSnapshot {
+    try control.ensureActive();
+    if (cohort) |fence| {
+        const proof = sealed orelse return error.BackupSealMismatch;
+        if (!proof.fence.eql(fence)) return error.BackupSealMismatch;
+    }
+    if (sealed) |proof| if (proof.fence.owner_group_id != group_id) return error.BackupSealMismatch;
+    const handles = [_]@import("../api/backup_contract.zig").SealedHandle{.{ .handle = sealed orelse undefined, .source_node_id = 0 }};
     const plan: backups_api.TableBackupPlan = .{
         .backup_root = backup_root,
         .backup_id = backup_id,
         .format = format,
         // std.Io is intentionally not an ABI type. The storage unit creates
         // and owns the filesystem scheduler used by this coarse operation.
-        .io = null,
+        .io = db.backend_runtime.filesystemIo(),
+        .relational_cohort_fence = cohort,
+        .sealed_handles = if (sealed != null) &handles else &.{},
+        .cancellation = control.token(),
     };
     if (format == .portable)
-        return try exportPortableBackupShard(alloc, db, backup_root, backup_id, group_id, null);
+        return try exportPortableBackupShardWithSeal(alloc, db, backup_root, backup_id, group_id, plan.io, if (sealed != null) handles[0] else null, control.token());
     var native_snapshot = try prepareNativeBackupShardSnapshot(
         alloc,
         db,
@@ -1611,37 +1704,7 @@ pub fn exportPortableBackupFile(alloc: std.mem.Allocator, store: *db_mod.docstor
 }
 
 pub fn exportPortableBackupFileWithIo(alloc: std.mem.Allocator, store: *db_mod.docstore.DocStore, path: []const u8, io: std.Io) !void {
-    if (std.fs.path.dirname(path)) |parent| try fs_paths.createDirPathPortable(io, parent);
-    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp-{d}", .{ path, platform_time.monotonicNs() });
-    defer alloc.free(tmp_path);
-    errdefer if (std.fs.path.isAbsolute(tmp_path))
-        std.Io.Dir.deleteFileAbsolute(io, tmp_path) catch {}
-    else
-        std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
-    var file = try fs_paths.createFilePortable(io, tmp_path, .{ .truncate = true });
-    var file_open = true;
-    defer if (file_open) file.close(io);
-    const spool_path = try std.fmt.allocPrint(alloc, "{s}.spool", .{tmp_path});
-    defer alloc.free(spool_path);
-    defer if (std.fs.path.isAbsolute(spool_path))
-        std.Io.Dir.deleteFileAbsolute(io, spool_path) catch {}
-    else
-        std.Io.Dir.cwd().deleteFile(io, spool_path) catch {};
-    var spool_file = try fs_paths.createFilePortable(io, spool_path, .{ .read = true, .truncate = true });
-    defer spool_file.close(io);
-    var buf: [64 * 1024]u8 = undefined;
-    var writer = file.writer(io, &buf);
-    try portable_backup.exportPortableToWriterWithOptions(alloc, store, &writer.interface, .{
-        .spool = .{ .io = io, .file = spool_file },
-    });
-    try writer.end();
-    try file.sync(io);
-    file.close(io);
-    file_open = false;
-    if (std.fs.path.isAbsolute(path))
-        try std.Io.Dir.renameAbsolute(tmp_path, path, io)
-    else
-        try std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), path, io);
+    return exportPortableBackupFileWithSource(alloc, store, path, io, null);
 }
 
 pub fn resolveWritesForSchemaValidation(
@@ -1720,7 +1783,10 @@ pub fn applyLocalTableSchemaJson(
     const effective_schema_json = if (schema_json.len == 0) tables_api.default_schema_json else schema_json;
     // Install the public and runtime forms together so storage-boundary writes
     // immediately use the same authoritative validator as API writes.
-    try db.setSchemaJson(alloc, effective_schema_json);
+    // A cold owner may reopen while its durable backup fence is held. Opening
+    // an exact descriptor is a read, not a schema mutation or a new HA event.
+    if (!try db.rehydrateSchemaJson(effective_schema_json))
+        try db.setSchemaJson(alloc, effective_schema_json);
     // Propagate schema-derived changes to live algebraic indexes so dynamic
     // template updates take effect without a reopen.
     try db.reloadAlgebraicSchemaConfigs(effective_schema_json);
@@ -1764,6 +1830,7 @@ pub fn configureStorageKernelOwnerDb(
     indexes_json: []const u8,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
     antfly_provider: ?managed_embedder.AntflyProvider,
+    secret_store: ?*common_secrets.FileStore,
     remote_content: ?*const scraping.RemoteContentConfig,
     installed: ?*OwnerManagedConfig,
 ) !void {
@@ -1779,7 +1846,7 @@ pub fn configureStorageKernelOwnerDb(
             null,
             null,
             table_name,
-            null,
+            secret_store,
             remote_content,
         );
         _ = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, db, indexes_json, .{
@@ -1828,7 +1895,7 @@ pub fn repairStorageKernelRestoreDb(
     indexes_json: []const u8,
     cancellation: db_mod.types.CancellationToken,
 ) !void {
-    try configureStorageKernelOwnerDb(alloc, db, "", schema_json, indexes_json, null, null, null, null);
+    try configureStorageKernelOwnerDb(alloc, db, "", schema_json, indexes_json, null, null, null, null, null);
     const io = db.backend_runtime.filesystemIo() orelse std.Io.Threaded.global_single_threaded.io();
     var repair_cancellation = db_mod.types.RepairCancellation{ .token = cancellation };
     var attempts: usize = 0;
@@ -2203,4 +2270,42 @@ pub fn reconfigureManagedDbEnrichmentRuntimePaused(
     );
     defer enrichments.deinit(db.runtime_alloc);
     try db.reconfigureEnrichmentRuntimePaused(enrichments.takeConfig());
+}
+
+pub const PortableCohortSource = struct { db: *db_mod.DB, handle: @import("db/native_backup_seal.zig").Handle, cancellation: @import("../api/operation.zig").CancellationToken };
+
+pub fn exportPortableBackupFileWithSource(alloc: std.mem.Allocator, store: *db_mod.docstore.DocStore, path: []const u8, io: std.Io, sealed: ?PortableCohortSource) !void {
+    if (std.fs.path.dirname(path)) |parent| try fs_paths.createDirPathPortable(io, parent);
+    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp-{d}", .{ path, platform_time.monotonicNs() });
+    defer alloc.free(tmp_path);
+    errdefer if (std.fs.path.isAbsolute(tmp_path))
+        std.Io.Dir.deleteFileAbsolute(io, tmp_path) catch {}
+    else
+        std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+    var file = try fs_paths.createFilePortable(io, tmp_path, .{ .truncate = true });
+    var file_open = true;
+    defer if (file_open) file.close(io);
+    const spool_path = try std.fmt.allocPrint(alloc, "{s}.spool", .{tmp_path});
+    defer alloc.free(spool_path);
+    defer if (std.fs.path.isAbsolute(spool_path))
+        std.Io.Dir.deleteFileAbsolute(io, spool_path) catch {}
+    else
+        std.Io.Dir.cwd().deleteFile(io, spool_path) catch {};
+    var spool_file = try fs_paths.createFilePortable(io, spool_path, .{ .read = true, .truncate = true });
+    defer spool_file.close(io);
+    var buf: [64 * 1024]u8 = undefined;
+    var writer = file.writer(io, &buf);
+    const options: portable_backup.ExportOptions = .{ .spool = .{ .io = io, .file = spool_file } };
+    if (sealed) |source|
+        try source.db.exportBackupCohortPortable(source.handle, &writer.interface, options, source.cancellation)
+    else
+        try portable_backup.exportPortableToWriterWithOptions(alloc, store, &writer.interface, options);
+    try writer.end();
+    try file.sync(io);
+    file.close(io);
+    file_open = false;
+    if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.renameAbsolute(tmp_path, path, io)
+    else
+        try std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), path, io);
 }

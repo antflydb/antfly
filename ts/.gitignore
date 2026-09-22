@@ -4,6 +4,7 @@ node_modules/
 # Build output
 dist/
 .next/
+out/
 tsconfig.tsbuildinfo
 *.tgz
 # Generated declaration files at package root (not src/types/)

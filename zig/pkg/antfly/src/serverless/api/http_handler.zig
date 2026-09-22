@@ -914,6 +914,11 @@ pub const HttpHandler = struct {
         if (try self.requireMutableRoute()) |resp| return resp;
         var req = parseEnsureTableRequest(self.alloc, body) catch return try textResponse(self.alloc, 400, "invalid table request");
         defer req.deinit(self.alloc);
+        @import("../catalog/storage_capabilities.zig").requireDefinition(self.alloc, req.schema_json orelse "", req.read_schema_json orelse "", req.indexes_json orelse "") catch |err| switch (err) {
+            error.RelationalStorageUnavailable => return try textResponse(self.alloc, 405, "relational tables and constraints require the native storage-owner runtime"),
+            error.OutOfMemory => return err,
+            else => return try textResponse(self.alloc, 400, "invalid table definition"),
+        };
         const policy = req.policy orelse catalog_mod.NamespacePolicy{};
         const indexes_json = req.indexes_json orelse tables_api.default_indexes_json;
         tables_api.validatePublicAlgebraicIndexesJson(self.alloc, indexes_json) catch |err| switch (err) {
@@ -1177,6 +1182,7 @@ pub const HttpHandler = struct {
     fn handleIngestBatch(self: *HttpHandler, namespace: []const u8, body: []const u8) !HttpResponse {
         if (try self.requireMutableRoute()) |resp| return resp;
         self.catalog.ensureNamespaceWritesAllowed(namespace) catch |err| switch (err) {
+            error.RelationalStorageUnavailable => return try textResponse(self.alloc, 405, "relational writes require the native storage-owner runtime"),
             error.ExternalTableReadOnly => return try textResponse(self.alloc, 405, "external table is read-only"),
             else => return try textResponse(self.alloc, 500, "write admission failed"),
         };
@@ -1197,6 +1203,7 @@ pub const HttpHandler = struct {
     fn handleIngestTableBatch(self: *HttpHandler, table_name: []const u8, body: []const u8) !HttpResponse {
         if (try self.requireMutableRoute()) |resp| return resp;
         self.catalog.ensureTableWritesAllowed(table_name) catch |err| switch (err) {
+            error.RelationalStorageUnavailable => return try textResponse(self.alloc, 405, "relational writes require the native storage-owner runtime"),
             error.NamespaceNotFound => return try textResponse(self.alloc, 404, "not found"),
             error.ExternalTableReadOnly => return try textResponse(self.alloc, 405, "external table is read-only"),
             else => return try textResponse(self.alloc, 500, "write admission failed"),
@@ -6081,6 +6088,7 @@ pub const HttpHandler = struct {
 
         self.catalog.ensureTableWritesAllowed(table_name) catch |err| switch (err) {
             error.NamespaceNotFound => return error.NotFound,
+            error.RelationalStorageUnavailable => return error.MethodNotAllowed,
             error.ExternalTableReadOnly => return error.MethodNotAllowed,
             else => {
                 std.log.err("serverless public table batch write admission failed table={s} err={}", .{ table_name, err });
@@ -6488,6 +6496,8 @@ pub const HttpHandler = struct {
             return error.InvalidIndexRequest;
         };
         defer alloc.free(index_json);
+        if (@import("../../api/relational_index_mutation.zig").isRelational(alloc, index_json) catch return error.InvalidIndexRequest) return error.MethodNotAllowed;
+        if (@import("../../api/relational_index_mutation.zig").contains(alloc, table.schema_json, index_name) catch return error.InternalFailure) return error.Conflict;
         tables_api.validatePublicAlgebraicIndexJson(alloc, index_json) catch {
             return error.InvalidIndexRequest;
         };
@@ -6565,6 +6575,7 @@ pub const HttpHandler = struct {
         if (self.runtime_status.role == .query_only) return error.MethodNotAllowed;
         var table = (self.catalog.getTableAlloc(self.alloc, table_name) catch return error.InternalFailure) orelse return error.NotFound;
         defer table.deinit(self.alloc);
+        if (@import("../../api/relational_index_mutation.zig").contains(alloc, table.schema_json, index_name) catch return error.InternalFailure) return error.MethodNotAllowed;
 
         const next_indexes_json = (indexes_api.removeIndexFromTableIndexesJson(alloc, table.indexes_json, index_name) catch return error.InternalFailure) orelse {
             return error.NotFound;
@@ -9579,6 +9590,10 @@ fn serverlessIndexStatus(
         .embeddings => "embeddings",
         .graph => "graph",
         .algebraic => "algebraic",
+        // Relational definitions belong to the schema catalog, not the
+        // artifact publication journal. Never infer their readiness from a
+        // full-text/vector WAL head if corrupt metadata puts one here.
+        .relational => return error.InvalidTableIndexMetadata,
     };
 
     const has_documents = status.enrichment_total_document_count != 0 or status.latest_wal_lsn != 0;
@@ -13813,6 +13828,29 @@ test "http handler accepts structured table updates for metadata-only republish 
     defer parsed_semantic_index.deinit();
     try std.testing.expectEqualStrings("rebuild", parsed_semantic_index.value.status.head_publication_action.?);
     try std.testing.expectEqual(@as(?bool, false), parsed_semantic_index.value.status.materialization_blocked);
+
+    var before_partial = (try catalog.getTableAlloc(alloc, "docs")).?;
+    defer before_partial.deinit(alloc);
+    var partial = try handler.handle(.{ .method = .put, .path = "/tables/docs", .body = "{\"schema\":{\"version\":3}}" });
+    defer partial.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), partial.status);
+    var after_partial = (try catalog.getTableAlloc(alloc, "docs")).?;
+    defer after_partial.deinit(alloc);
+    try std.testing.expectEqualStrings(before_partial.indexes_json, after_partial.indexes_json);
+
+    // Retained unsupported metadata must return an actionable capability error,
+    // not mutate the table or silently discard its indexes during a partial PUT.
+    try std.testing.expect(try catalog_store.setTableDefinition("docs", "{}", "{\"storage_mode\":\"relational\"}", after_partial.indexes_json));
+    var unavailable = try handler.handle(.{ .method = .put, .path = "/tables/docs", .body = "{\"schema\":{\"version\":4}}" });
+    defer unavailable.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 405), unavailable.status);
+    var unchanged = (try catalog.getTableAlloc(alloc, "docs")).?;
+    defer unchanged.deinit(alloc);
+    try std.testing.expectEqualStrings("{}", unchanged.schema_json);
+    var refused = try handler.handle(.{ .method = .put, .path = "/tables/unsupported", .body = "{\"schema\":{\"storage_mode\":\"relational\"}}" });
+    defer refused.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 405), refused.status);
+    try std.testing.expect((try catalog.getTableAlloc(alloc, "unsupported")) == null);
 }
 
 test "http handler query publication exposes vector compaction targets" {

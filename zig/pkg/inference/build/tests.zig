@@ -33,9 +33,11 @@ pub fn create(ctx: Context) Suite {
         .path = ctx.path("src/test_runner_filter.zig"),
         .mode = .simple,
     };
-    // Full CPU inference tests measured about 6 GiB to compile.
+    // Full CPU inference tests including GLiNER2.5 measured 7.2 GiB; the
+    // macOS build with Metal measured 11.2 GiB. Reserve target-specific
+    // headroom rather than rejecting successful accelerator compilations.
     const tests = b.addTest(.{
-        .max_rss = 7 * 1024 * 1024 * 1024,
+        .max_rss = @as(usize, if (ctx.target.result.os.tag == .macos) 14 else 9) * 1024 * 1024 * 1024,
         .root_module = b.createModule(.{
             .root_source_file = ctx.path("src/inference.zig"),
             .target = ctx.target,
@@ -49,6 +51,7 @@ pub fn create(ctx: Context) Suite {
     tests.root_module.addImport("build_options", ctx.graph.qualification_build_options_mod);
     tests.root_module.addImport("antfly-json", ctx.graph.json_mod);
     tests.root_module.addImport("httpx", ctx.graph.httpx_mod);
+    tests.root_module.addImport("protobuf", ctx.graph.protobuf_mod);
     tests.root_module.addImport("inference_api", ctx.graph.inference_api_mod);
     tests.root_module.addImport("antfly_generating_openapi", ctx.graph.generating_openapi_mod);
     tests.root_module.addImport("antfly_extraction_openapi", ctx.graph.extraction_openapi_mod);
@@ -128,6 +131,12 @@ pub fn create(ctx: Context) Suite {
         run_tests.addArgs(&.{ "--test-filter", filter });
     }
     build_test_filters.addRuntimeControls(run_tests, ctx.args orelse &.{});
+    // Focused inference invocations retain their historical reachability;
+    // the default gates assign these tests to the shared finetuning owner.
+    if (selected_test_filters.len == 0) {
+        for (@import("finetune/tests.zig").inference_overlap_filters) |filter|
+            run_tests.addArgs(&.{ "--skip-test-filter", filter });
+    }
     return .{
         .tests = tests,
         .selected_test_filters = selected_test_filters,
@@ -179,6 +188,21 @@ pub fn addDefault(ctx: Context, suite: Suite, checks: Checks) *std.Build.Step {
     test_step.dependOn(&cuda_artifact_source_policy_check.step);
     test_step.dependOn(&run_quant_kernel_metal_runtime_check_tests.step);
     test_step.dependOn(&run_tests.step);
+    // Dedicated hardware gate: reuse the inference test module and frozen
+    // CPU/Metal exercises, but missing CUDA must never become a successful skip.
+    const gliner25_cuda_tests = b.addTest(.{
+        .name = "gliner25-cuda-tests",
+        .max_rss = 7 * 1024 * 1024 * 1024,
+        .root_module = suite.tests.root_module,
+        .filters = &.{ "CUDA boundary", "deberta training CUDA", "trainer CUDA", "adapter CUDA" },
+        .test_runner = .{ .path = ctx.path("src/test_runner_filter.zig"), .mode = .simple },
+    });
+    const run_gliner25_cuda_tests = ctx.addRunArtifact(gliner25_cuda_tests);
+    run_gliner25_cuda_tests.setEnvironmentVariable("TERMITE_REQUIRE_CUDA_TESTS", "1");
+    const cuda_step = ctx.step("test-gliner25-cuda", "Run required-hardware GLiNER2.5 CUDA parity, optimizer and lifecycle tests");
+    cuda_step.dependOn(&run_gliner25_cuda_tests.step);
+    cuda_step.dependOn(&quant_kernel_codegen_test_check.step);
+    cuda_step.dependOn(&cuda_artifact_source_policy_check.step);
     // A focused server/library filter need not match an executable-root test.
     // The default aggregate still owns the complete executable-root suites.
     if (selected_test_filters.len == 0) {

@@ -2,11 +2,13 @@
 // Package: antfly_indexes_openapi
 
 const std = @import("std");
+const antfly_audio_openapi = @import("antfly_audio_openapi");
 const antfly_chunking_openapi = @import("antfly_chunking_openapi");
 const antfly_embeddings_openapi = @import("antfly_embeddings_openapi");
 const antfly_generating_openapi = @import("antfly_generating_openapi");
 const antfly_graph_identifier_openapi = @import("antfly_graph_identifier_openapi");
 const antfly_query_openapi = @import("antfly_query_openapi");
+const antfly_schema_openapi = @import("antfly_schema_openapi");
 const antfly_sort_openapi = @import("antfly_sort_openapi");
 
 /// Schema-derived algebraic sidecar configuration. Public requests may opt into schema derivation, while materializations remain engine-owned.
@@ -1072,6 +1074,7 @@ pub const CreateIndexRequest = union(enum) {
     create_embeddings_index_request: CreateEmbeddingsIndexRequest,
     create_graph_index_request: CreateGraphIndexRequest,
     create_algebraic_index_request: CreateAlgebraicIndexRequest,
+    create_relational_index_request: CreateRelationalIndexRequest,
 
     pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
         const DiscriminatorProbe = union(enum) {
@@ -1103,6 +1106,9 @@ pub const CreateIndexRequest = union(enum) {
         if (std.mem.eql(u8, disc_str, "algebraic")) {
             return .{ .create_algebraic_index_request = try std.json.parseFromSliceLeaky(CreateAlgebraicIndexRequest, allocator, input, options) };
         }
+        if (std.mem.eql(u8, disc_str, "relational")) {
+            return .{ .create_relational_index_request = try std.json.parseFromSliceLeaky(CreateRelationalIndexRequest, allocator, input, options) };
+        }
         return error.UnexpectedToken;
     }
 
@@ -1132,6 +1138,9 @@ pub const CreateIndexRequest = union(enum) {
         if (std.mem.eql(u8, disc_str, "algebraic")) {
             return .{ .create_algebraic_index_request = try std.json.parseFromValueLeaky(CreateAlgebraicIndexRequest, allocator, source, options) };
         }
+        if (std.mem.eql(u8, disc_str, "relational")) {
+            return .{ .create_relational_index_request = try std.json.parseFromValueLeaky(CreateRelationalIndexRequest, allocator, source, options) };
+        }
         return error.UnexpectedToken;
     }
 
@@ -1141,7 +1150,65 @@ pub const CreateIndexRequest = union(enum) {
             .create_embeddings_index_request => |v| try jw.write(v),
             .create_graph_index_request => |v| try jw.write(v),
             .create_algebraic_index_request => |v| try jw.write(v),
+            .create_relational_index_request => |v| try jw.write(v),
         }
+    }
+};
+
+/// Create a composite ordered index through the shared index resource.
+pub const CreateRelationalIndexRequest = struct {
+    keys: []const antfly_schema_openapi.RelationalIndexKey,
+    /// Non-key columns stored for index-only projection; distinct from keys.
+    include_columns: ?[]const []const u8 = null,
+    /// Optional conjunction selecting index members. Queries must explicitly include all typed conjuncts.
+    where: ?[]const antfly_schema_openapi.RelationalIndexPredicate = null,
+    /// Optional description of the index and its purpose.
+    description: ?[]const u8 = null,
+    /// Index implementation version. Only zero is supported; the schema epoch is managed by the server.
+    version: ?i64 = null,
+    type: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "keys", "keys", false },
+        .{ "include_columns", "include_columns", true },
+        .{ "where", "where", true },
+        .{ "description", "description", true },
+        .{ "version", "version", true },
+        .{ "type", "type", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("keys");
+        try jw.write(self.keys);
+        if (self.include_columns) |value| {
+            try jw.objectField("include_columns");
+            try jw.write(value);
+        }
+        if (self.where) |value| {
+            try jw.objectField("where");
+            try jw.write(value);
+        }
+        if (self.description) |value| {
+            try jw.objectField("description");
+            try jw.write(value);
+        }
+        if (self.version) |value| {
+            try jw.objectField("version");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.endObject();
     }
 };
 
@@ -2001,6 +2068,7 @@ pub const CreatedIndex = union(enum) {
     created_embeddings_index: CreatedEmbeddingsIndex,
     created_graph_index: CreatedGraphIndex,
     created_algebraic_index: CreatedAlgebraicIndex,
+    created_relational_index: CreatedRelationalIndex,
 
     pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
         const DiscriminatorProbe = union(enum) {
@@ -2032,6 +2100,9 @@ pub const CreatedIndex = union(enum) {
         if (std.mem.eql(u8, disc_str, "algebraic")) {
             return .{ .created_algebraic_index = try std.json.parseFromSliceLeaky(CreatedAlgebraicIndex, allocator, input, options) };
         }
+        if (std.mem.eql(u8, disc_str, "relational")) {
+            return .{ .created_relational_index = try std.json.parseFromSliceLeaky(CreatedRelationalIndex, allocator, input, options) };
+        }
         return error.UnexpectedToken;
     }
 
@@ -2061,6 +2132,9 @@ pub const CreatedIndex = union(enum) {
         if (std.mem.eql(u8, disc_str, "algebraic")) {
             return .{ .created_algebraic_index = try std.json.parseFromValueLeaky(CreatedAlgebraicIndex, allocator, source, options) };
         }
+        if (std.mem.eql(u8, disc_str, "relational")) {
+            return .{ .created_relational_index = try std.json.parseFromValueLeaky(CreatedRelationalIndex, allocator, source, options) };
+        }
         return error.UnexpectedToken;
     }
 
@@ -2070,6 +2144,7 @@ pub const CreatedIndex = union(enum) {
             .created_embeddings_index => |v| try jw.write(v),
             .created_graph_index => |v| try jw.write(v),
             .created_algebraic_index => |v| try jw.write(v),
+            .created_relational_index => |v| try jw.write(v),
         }
     }
 };
@@ -2264,6 +2339,75 @@ pub const CreatedProviderConfig = struct {
             try jw.objectField("timeout");
             try jw.write(value);
         }
+        try jw.endObject();
+    }
+};
+
+/// Effective schema-bound composite index configuration.
+pub const CreatedRelationalIndex = struct {
+    /// Name of the created index
+    name: []const u8,
+    /// Optional description of the index and its purpose
+    description: ?[]const u8 = null,
+    /// Version of the index implementation. Defaults to 0.
+    version: ?i64 = null,
+    /// Normalized inline managed enrichment definitions required by this index.
+    enrichments: ?[]const CreatedEnrichmentConfig = null,
+    keys: []const antfly_schema_openapi.RelationalIndexKey,
+    /// Non-key columns stored for index-only projection; distinct from keys.
+    include_columns: ?[]const []const u8 = null,
+    /// Optional conjunction selecting index members. Queries must explicitly include all typed conjuncts.
+    where: ?[]const antfly_schema_openapi.RelationalIndexPredicate = null,
+    type: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "name", "name", false },
+        .{ "description", "description", true },
+        .{ "version", "version", true },
+        .{ "enrichments", "enrichments", true },
+        .{ "keys", "keys", false },
+        .{ "include_columns", "include_columns", true },
+        .{ "where", "where", true },
+        .{ "type", "type", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        if (self.description) |value| {
+            try jw.objectField("description");
+            try jw.write(value);
+        }
+        if (self.version) |value| {
+            try jw.objectField("version");
+            try jw.write(value);
+        }
+        if (self.enrichments) |value| {
+            try jw.objectField("enrichments");
+            try jw.write(value);
+        }
+        try jw.objectField("keys");
+        try jw.write(self.keys);
+        if (self.include_columns) |value| {
+            try jw.objectField("include_columns");
+            try jw.write(value);
+        }
+        if (self.where) |value| {
+            try jw.objectField("where");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
         try jw.endObject();
     }
 };
@@ -3522,6 +3666,8 @@ pub const EnrichmentConfig = struct {
     producer_json: ?[]const u8 = null,
     /// Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity.
     execution: ?ExecutionPolicy = null,
+    /// Typed shorthand for a transcription asset enrichment. Only valid with kind=asset and without producer_json; Antfly expands it into a document_extraction producer whose audio route transcribes each recording with this speech-to-text provider. The produced units carry the transcript text, provider confidence, and per-phrase time offsets, and chunk enrichments that consume them emit _start_time_ms/_end_time_ms on every chunk. With diarization: true the phrases also carry who spoke them, and a chunk that does not straddle a turn emits _speaker. content_type defaults to application/json.
+    transcriber: ?TranscriberEnrichmentConfig = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -3539,6 +3685,7 @@ pub const EnrichmentConfig = struct {
         .{ "content_type", "content_type", true },
         .{ "producer_json", "producer_json", true },
         .{ "execution", "execution", true },
+        .{ "transcriber", "transcriber", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -3601,6 +3748,10 @@ pub const EnrichmentConfig = struct {
         }
         if (self.execution) |value| {
             try jw.objectField("execution");
+            try jw.write(value);
+        }
+        if (self.transcriber) |value| {
+            try jw.objectField("transcriber");
             try jw.write(value);
         }
         try jw.endObject();
@@ -8146,6 +8297,11 @@ pub const IndexConfig = struct {
     resolvers: ?[]const GraphResolverConfig = null,
     /// When true, derive the algebraic capability sidecar from the table schema. Internal fields and materialization definitions are not public API.
     derive_from_schema: ?bool = null,
+    keys: ?[]const antfly_schema_openapi.RelationalIndexKey = null,
+    /// Non-key columns stored for index-only projection; distinct from keys.
+    include_columns: ?[]const []const u8 = null,
+    /// Optional conjunction selecting index members. Queries must explicitly include all typed conjuncts.
+    where: ?[]const antfly_schema_openapi.RelationalIndexPredicate = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -8182,6 +8338,9 @@ pub const IndexConfig = struct {
         .{ "algebraic_planning", "algebraic_planning", true },
         .{ "resolvers", "resolvers", true },
         .{ "derive_from_schema", "derive_from_schema", true },
+        .{ "keys", "keys", true },
+        .{ "include_columns", "include_columns", true },
+        .{ "where", "where", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -8322,6 +8481,18 @@ pub const IndexConfig = struct {
             try jw.objectField("derive_from_schema");
             try jw.write(value);
         }
+        if (self.keys) |value| {
+            try jw.objectField("keys");
+            try jw.write(value);
+        }
+        if (self.include_columns) |value| {
+            try jw.objectField("include_columns");
+            try jw.write(value);
+        }
+        if (self.where) |value| {
+            try jw.objectField("where");
+            try jw.write(value);
+        }
         try jw.endObject();
     }
 };
@@ -8359,6 +8530,52 @@ pub const IndexExecutionConfig = struct {
         }
         try jw.endObject();
     }
+};
+
+pub const IndexMaintenanceAction = enum {
+    retry,
+    repair,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .retry => "retry",
+            .repair => "repair",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "retry", .retry },
+            .{ "repair", .repair },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const IndexMaintenanceOwnerProof = struct {
+    group_id: []const u8,
+    generation: []const u8,
+    slot: u32,
+    owner: []const u8,
+    comparison: []const u8,
+    progress_digest: []const u8,
+    maintenance_epoch: []const u8,
+};
+
+/// Exact observations from index status. Each selected owner is admitted atomically through the replicated transaction journal; the selection is not one global transaction. Cancellation, conflicts, or a lost acknowledgement may leave some owners admitted. Resubmit the identical request to resume safely; do not replace its observations with newer progress unless starting a new maintenance attempt.
+pub const IndexMaintenanceRequest = struct {
+    table_id: []const u8,
+    schema_version: u32,
+    owners: []const IndexMaintenanceOwnerProof,
+};
+
+pub const IndexMaintenanceResponse = struct {
+    acknowledged_groups: []const []const u8,
 };
 
 pub const IndexMilestoneStatus = struct {
@@ -8666,6 +8883,7 @@ pub const IndexStats = union(enum) {
     embeddings_index_stats: EmbeddingsIndexStats,
     graph_index_stats: GraphIndexStats,
     algebraic_index_stats: AlgebraicIndexStats,
+    relational_index_stats: RelationalIndexStats,
 
     pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
         const DiscriminatorProbe = union(enum) {
@@ -8697,6 +8915,9 @@ pub const IndexStats = union(enum) {
         if (std.mem.eql(u8, disc_str, "algebraic")) {
             return .{ .algebraic_index_stats = try std.json.parseFromSliceLeaky(AlgebraicIndexStats, allocator, input, options) };
         }
+        if (std.mem.eql(u8, disc_str, "relational")) {
+            return .{ .relational_index_stats = try std.json.parseFromSliceLeaky(RelationalIndexStats, allocator, input, options) };
+        }
         return error.UnexpectedToken;
     }
 
@@ -8726,6 +8947,9 @@ pub const IndexStats = union(enum) {
         if (std.mem.eql(u8, disc_str, "algebraic")) {
             return .{ .algebraic_index_stats = try std.json.parseFromValueLeaky(AlgebraicIndexStats, allocator, source, options) };
         }
+        if (std.mem.eql(u8, disc_str, "relational")) {
+            return .{ .relational_index_stats = try std.json.parseFromValueLeaky(RelationalIndexStats, allocator, source, options) };
+        }
         return error.UnexpectedToken;
     }
 
@@ -8735,6 +8959,7 @@ pub const IndexStats = union(enum) {
             .embeddings_index_stats => |v| try jw.write(v),
             .graph_index_stats => |v| try jw.write(v),
             .algebraic_index_stats => |v| try jw.write(v),
+            .relational_index_stats => |v| try jw.write(v),
         }
     }
 };
@@ -8745,6 +8970,7 @@ pub const IndexType = enum {
     embeddings,
     graph,
     algebraic,
+    relational,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -8752,6 +8978,7 @@ pub const IndexType = enum {
             .embeddings => "embeddings",
             .graph => "graph",
             .algebraic => "algebraic",
+            .relational => "relational",
         };
         try jw.write(s);
     }
@@ -8766,6 +8993,7 @@ pub const IndexType = enum {
             .{ "embeddings", .embeddings },
             .{ "graph", .graph },
             .{ "algebraic", .algebraic },
+            .{ "relational", .relational },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -9681,6 +9909,211 @@ pub const Pruner = struct {
     }
 };
 
+pub const RelationalIndexBuildFailure = enum {
+    incompatible_schema,
+    invalid_row,
+    key_too_large,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .incompatible_schema => "incompatible_schema",
+            .invalid_row => "invalid_row",
+            .key_too_large => "key_too_large",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "incompatible_schema", .incompatible_schema },
+            .{ "invalid_row", .invalid_row },
+            .{ "key_too_large", .key_too_large },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const RelationalIndexBuildState = enum {
+    building,
+    ready,
+    failed,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .building => "building",
+            .ready => "ready",
+            .failed => "failed",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "building", .building },
+            .{ "ready", .ready },
+            .{ "failed", .failed },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Schema-bound composite ordered index on a relational table. Keys use stable typed comparison semantics and independent direction, null placement, and string collation. Existing rows build asynchronously; indexed queries require complete owner coverage. The table schema is the single durable authority for these definitions.
+pub const RelationalIndexConfig = struct {
+    keys: []const antfly_schema_openapi.RelationalIndexKey,
+    /// Non-key columns stored for index-only projection; distinct from keys.
+    include_columns: ?[]const []const u8 = null,
+    /// Optional conjunction selecting index members. Queries must explicitly include all typed conjuncts.
+    where: ?[]const antfly_schema_openapi.RelationalIndexPredicate = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "keys", "keys", false },
+        .{ "include_columns", "include_columns", true },
+        .{ "where", "where", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("keys");
+        try jw.write(self.keys);
+        if (self.include_columns) |value| {
+            try jw.objectField("include_columns");
+            try jw.write(value);
+        }
+        if (self.where) |value| {
+            try jw.objectField("where");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const RelationalIndexRangeStatus = struct {
+    group_id: []const u8,
+    /// Exact uint64 generation encoded as decimal, never a floating-point number.
+    generation: []const u8,
+    slot: u32,
+    /// Namespace and owned-range fingerprint.
+    owner: []const u8,
+    /// Executable tuple comparison fingerprint.
+    comparison: []const u8,
+    /// Exact durable progress observation for generation-fenced maintenance.
+    progress_digest: []const u8,
+    /// Replicated desired maintenance ticket, separate from replica-local progress.
+    maintenance_epoch: []const u8,
+    /// Most recently accepted maintenance command proof for exact retry acknowledgement.
+    last_maintenance_request: ?[]const u8 = null,
+    state: RelationalIndexBuildState,
+    rows_scanned: []const u8,
+    failure: ?RelationalIndexBuildFailure = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "group_id", "group_id", false },
+        .{ "generation", "generation", false },
+        .{ "slot", "slot", false },
+        .{ "owner", "owner", false },
+        .{ "comparison", "comparison", false },
+        .{ "progress_digest", "progress_digest", false },
+        .{ "maintenance_epoch", "maintenance_epoch", false },
+        .{ "last_maintenance_request", "last_maintenance_request", true },
+        .{ "state", "state", false },
+        .{ "rows_scanned", "rows_scanned", false },
+        .{ "failure", "failure", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("group_id");
+        try jw.write(self.group_id);
+        try jw.objectField("generation");
+        try jw.write(self.generation);
+        try jw.objectField("slot");
+        try jw.write(self.slot);
+        try jw.objectField("owner");
+        try jw.write(self.owner);
+        try jw.objectField("comparison");
+        try jw.write(self.comparison);
+        try jw.objectField("progress_digest");
+        try jw.write(self.progress_digest);
+        try jw.objectField("maintenance_epoch");
+        try jw.write(self.maintenance_epoch);
+        if (self.last_maintenance_request) |value| {
+            try jw.objectField("last_maintenance_request");
+            try jw.write(value);
+        }
+        try jw.objectField("state");
+        try jw.write(self.state);
+        try jw.objectField("rows_scanned");
+        try jw.write(self.rows_scanned);
+        if (self.failure) |value| {
+            try jw.objectField("failure");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const RelationalIndexStatsIndexType = enum {
+    relational,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .relational => "relational",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "relational", .relational },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const RelationalIndexStats = struct {
+    index_type: RelationalIndexStatsIndexType,
+    milestones: IndexMilestones,
+    relational_index: RelationalIndexStatus,
+};
+
+pub const RelationalIndexStatus = struct {
+    table_id: []const u8,
+    schema_version: u32,
+    index_name: []const u8,
+    state: RelationalIndexBuildState,
+    ranges: []const RelationalIndexRangeStatus,
+};
+
 pub const SortDirection = antfly_sort_openapi.SortDirection;
 
 pub const SortField = antfly_sort_openapi.SortField;
@@ -9793,6 +10226,108 @@ pub const StatefulGraphResult = union(enum) {
             .graph_paths_result => |v| try jw.write(v.*),
             .legacy_graph_search_result => |v| try jw.write(v.*),
         }
+    }
+};
+
+/// Speech-to-text provider for the `transcriber` enrichment shorthand. Carries the provider's STT configuration (`provider`, `model`, `api_url`, `api_key`, ...) plus the transcription options below. The fields are declared inline rather than composed from `STTConfig` so that a generated client can leave an option out: a composed schema makes a typed client serialize every field, and a `max_download_bytes` of zero would reject every recording. **Example:** ```yaml name: call_transcripts kind: asset field: recording_url transcriber: provider: antfly model: openai/whisper-base language_code: en timestamps: true ```
+pub const TranscriberEnrichmentConfig = struct {
+    provider: antfly_audio_openapi.STTProvider,
+    /// Model name, as the provider names it (e.g. 'openai/whisper-base' for antfly, 'whisper-1' for openai).
+    model: ?[]const u8 = null,
+    /// Antfly inference API URL. Falls back to ANTFLY_INFERENCE_URL.
+    api_url: ?[]const u8 = null,
+    /// OpenAI API base URL. Falls back to OPENAI_BASE_URL.
+    base_url: ?[]const u8 = null,
+    /// Provider API key. Falls back to the provider's environment variable.
+    api_key: ?[]const u8 = null,
+    /// Google Cloud project ID for the vertex provider. Falls back to GOOGLE_CLOUD_PROJECT.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location for the vertex provider.
+    location: ?[]const u8 = null,
+    /// Path to an ADC credential JSON file for the vertex provider. Falls back to the default ADC chain.
+    credentials_path: ?[]const u8 = null,
+    /// Spoken language hint (ISO 639-1, e.g. 'en'). Omit for automatic detection where the provider supports it.
+    language_code: ?[]const u8 = null,
+    /// Request timestamped transcript segments so chunks carry recording offsets. Providers without segment timing return plain text.
+    timestamps: ?bool = null,
+    /// Request speaker labels on transcript segments where the provider supports them.
+    diarization: ?bool = null,
+    /// Largest recording fetched from a URL, in bytes. Defaults to 128 MiB, which covers a one hour voice memo or podcast.
+    max_download_bytes: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
+        .{ "model", "model", true },
+        .{ "api_url", "api_url", true },
+        .{ "base_url", "base_url", true },
+        .{ "api_key", "api_key", true },
+        .{ "project_id", "project_id", true },
+        .{ "location", "location", true },
+        .{ "credentials_path", "credentials_path", true },
+        .{ "language_code", "language_code", true },
+        .{ "timestamps", "timestamps", true },
+        .{ "diarization", "diarization", true },
+        .{ "max_download_bytes", "max_download_bytes", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.api_url) |value| {
+            try jw.objectField("api_url");
+            try jw.write(value);
+        }
+        if (self.base_url) |value| {
+            try jw.objectField("base_url");
+            try jw.write(value);
+        }
+        if (self.api_key) |value| {
+            try jw.objectField("api_key");
+            try jw.write(value);
+        }
+        if (self.project_id) |value| {
+            try jw.objectField("project_id");
+            try jw.write(value);
+        }
+        if (self.location) |value| {
+            try jw.objectField("location");
+            try jw.write(value);
+        }
+        if (self.credentials_path) |value| {
+            try jw.objectField("credentials_path");
+            try jw.write(value);
+        }
+        if (self.language_code) |value| {
+            try jw.objectField("language_code");
+            try jw.write(value);
+        }
+        if (self.timestamps) |value| {
+            try jw.objectField("timestamps");
+            try jw.write(value);
+        }
+        if (self.diarization) |value| {
+            try jw.objectField("diarization");
+            try jw.write(value);
+        }
+        if (self.max_download_bytes) |value| {
+            try jw.objectField("max_download_bytes");
+            try jw.write(value);
+        }
+        try jw.endObject();
     }
 };
 

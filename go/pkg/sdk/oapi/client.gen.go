@@ -624,6 +624,21 @@ func (e BraveSearchConfigFreshness) Valid() bool {
 	}
 }
 
+// Defines values for BraveSearchConfigProvider.
+const (
+	BraveSearchConfigProviderBrave BraveSearchConfigProvider = "brave"
+)
+
+// Valid indicates whether the value is a known member of the BraveSearchConfigProvider enum.
+func (e BraveSearchConfigProvider) Valid() bool {
+	switch e {
+	case BraveSearchConfigProviderBrave:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for CalendarInterval.
 const (
 	CalendarIntervalDay     CalendarInterval = "day"
@@ -1215,6 +1230,21 @@ func (e CreateGraphIndexRequestType) Valid() bool {
 	}
 }
 
+// Defines values for CreateRelationalIndexRequestType.
+const (
+	CreateRelationalIndexRequestTypeRelational CreateRelationalIndexRequestType = "relational"
+)
+
+// Valid indicates whether the value is a known member of the CreateRelationalIndexRequestType enum.
+func (e CreateRelationalIndexRequestType) Valid() bool {
+	switch e {
+	case CreateRelationalIndexRequestTypeRelational:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for CreatedAlgebraicIndexType.
 const (
 	CreatedAlgebraicIndexTypeAlgebraic CreatedAlgebraicIndexType = "algebraic"
@@ -1302,6 +1332,21 @@ const (
 func (e CreatedGraphIndexType) Valid() bool {
 	switch e {
 	case CreatedGraphIndexTypeGraph:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for CreatedRelationalIndexType.
+const (
+	CreatedRelationalIndexTypeRelational CreatedRelationalIndexType = "relational"
+)
+
+// Valid indicates whether the value is a known member of the CreatedRelationalIndexType enum.
+func (e CreatedRelationalIndexType) Valid() bool {
+	switch e {
+	case CreatedRelationalIndexTypeRelational:
 		return true
 	default:
 		return false
@@ -1941,6 +1986,21 @@ func (e EvaluatorName) Valid() bool {
 	}
 }
 
+// Defines values for ExaSearchConfigProvider.
+const (
+	ExaSearchConfigProviderExa ExaSearchConfigProvider = "exa"
+)
+
+// Valid indicates whether the value is a known member of the ExaSearchConfigProvider enum.
+func (e ExaSearchConfigProvider) Valid() bool {
+	switch e {
+	case ExaSearchConfigProviderExa:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for ExaSearchConfigSearchType.
 const (
 	ExaSearchConfigSearchTypeAuto    ExaSearchConfigSearchType = "auto"
@@ -2138,6 +2198,7 @@ func (e ExtractionClassificationSchemaActivation) Valid() bool {
 
 // Defines values for ExtractionClassificationSchemaMode.
 const (
+	ExtractionClassificationSchemaModeBoolean ExtractionClassificationSchemaMode = "boolean"
 	ExtractionClassificationSchemaModeMulti   ExtractionClassificationSchemaMode = "multi"
 	ExtractionClassificationSchemaModeOrdinal ExtractionClassificationSchemaMode = "ordinal"
 	ExtractionClassificationSchemaModeSingle  ExtractionClassificationSchemaMode = "single"
@@ -2146,6 +2207,8 @@ const (
 // Valid indicates whether the value is a known member of the ExtractionClassificationSchemaMode enum.
 func (e ExtractionClassificationSchemaMode) Valid() bool {
 	switch e {
+	case ExtractionClassificationSchemaModeBoolean:
+		return true
 	case ExtractionClassificationSchemaModeMulti:
 		return true
 	case ExtractionClassificationSchemaModeOrdinal:
@@ -2376,6 +2439,45 @@ const (
 func (e ExtractionConstraintOrType) Valid() bool {
 	switch e {
 	case ExtractionConstraintOrTypeOr:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for ExtractionDecisionConfidenceMethod.
+const (
+	ExtractionDecisionConfidenceMethodMaxProbability           ExtractionDecisionConfidenceMethod = "max_probability"
+	ExtractionDecisionConfidenceMethodNormalizedInverseEntropy ExtractionDecisionConfidenceMethod = "normalized_inverse_entropy"
+)
+
+// Valid indicates whether the value is a known member of the ExtractionDecisionConfidenceMethod enum.
+func (e ExtractionDecisionConfidenceMethod) Valid() bool {
+	switch e {
+	case ExtractionDecisionConfidenceMethodMaxProbability:
+		return true
+	case ExtractionDecisionConfidenceMethodNormalizedInverseEntropy:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for ExtractionDecisionType.
+const (
+	ExtractionDecisionTypeBoolean ExtractionDecisionType = "boolean"
+	ExtractionDecisionTypeChoice  ExtractionDecisionType = "choice"
+	ExtractionDecisionTypeScore   ExtractionDecisionType = "score"
+)
+
+// Valid indicates whether the value is a known member of the ExtractionDecisionType enum.
+func (e ExtractionDecisionType) Valid() bool {
+	switch e {
+	case ExtractionDecisionTypeBoolean:
+		return true
+	case ExtractionDecisionTypeChoice:
+		return true
+	case ExtractionDecisionTypeScore:
 		return true
 	default:
 		return false
@@ -3240,6 +3342,69 @@ func (e FilterSpecOperator) Valid() bool {
 	case FilterSpecOperatorPrefix:
 		return true
 	case FilterSpecOperatorRange:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for ForeignKeyAction.
+const (
+	ForeignKeyActionCascade  ForeignKeyAction = "cascade"
+	ForeignKeyActionNoAction ForeignKeyAction = "no_action"
+	ForeignKeyActionRestrict ForeignKeyAction = "restrict"
+	ForeignKeyActionSetNull  ForeignKeyAction = "set_null"
+)
+
+// Valid indicates whether the value is a known member of the ForeignKeyAction enum.
+func (e ForeignKeyAction) Valid() bool {
+	switch e {
+	case ForeignKeyActionCascade:
+		return true
+	case ForeignKeyActionNoAction:
+		return true
+	case ForeignKeyActionRestrict:
+		return true
+	case ForeignKeyActionSetNull:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for ForeignKeyMatch.
+const (
+	ForeignKeyMatchFull    ForeignKeyMatch = "full"
+	ForeignKeyMatchPartial ForeignKeyMatch = "partial"
+	ForeignKeyMatchSimple  ForeignKeyMatch = "simple"
+)
+
+// Valid indicates whether the value is a known member of the ForeignKeyMatch enum.
+func (e ForeignKeyMatch) Valid() bool {
+	switch e {
+	case ForeignKeyMatchFull:
+		return true
+	case ForeignKeyMatchPartial:
+		return true
+	case ForeignKeyMatchSimple:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for ForeignKeyTiming.
+const (
+	ForeignKeyTimingDeferred  ForeignKeyTiming = "deferred"
+	ForeignKeyTimingImmediate ForeignKeyTiming = "immediate"
+)
+
+// Valid indicates whether the value is a known member of the ForeignKeyTiming enum.
+func (e ForeignKeyTiming) Valid() bool {
+	switch e {
+	case ForeignKeyTimingDeferred:
+		return true
+	case ForeignKeyTimingImmediate:
 		return true
 	default:
 		return false
@@ -4938,6 +5103,7 @@ const (
 	IndexTypeEmbeddings IndexType = "embeddings"
 	IndexTypeFullText   IndexType = "full_text"
 	IndexTypeGraph      IndexType = "graph"
+	IndexTypeRelational IndexType = "relational"
 )
 
 // Valid indicates whether the value is a known member of the IndexType enum.
@@ -4950,6 +5116,8 @@ func (e IndexType) Valid() bool {
 	case IndexTypeFullText:
 		return true
 	case IndexTypeGraph:
+		return true
+	case IndexTypeRelational:
 		return true
 	default:
 		return false
@@ -6378,6 +6546,21 @@ func (e LinkupSearchConfigOutputType) Valid() bool {
 	}
 }
 
+// Defines values for LinkupSearchConfigProvider.
+const (
+	LinkupSearchConfigProviderLinkup LinkupSearchConfigProvider = "linkup"
+)
+
+// Valid indicates whether the value is a known member of the LinkupSearchConfigProvider enum.
+func (e LinkupSearchConfigProvider) Valid() bool {
+	switch e {
+	case LinkupSearchConfigProviderLinkup:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for MediaContentPartType.
 const (
 	MediaContentPartTypeMedia MediaContentPartType = "media"
@@ -6609,6 +6792,39 @@ const (
 func (e OpenAIGeneratorConfigProvider) Valid() bool {
 	switch e {
 	case OpenAIGeneratorConfigProviderOpenai:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for OpenAIReasoningEffort.
+const (
+	OpenAIReasoningEffortHigh    OpenAIReasoningEffort = "high"
+	OpenAIReasoningEffortLow     OpenAIReasoningEffort = "low"
+	OpenAIReasoningEffortMax     OpenAIReasoningEffort = "max"
+	OpenAIReasoningEffortMedium  OpenAIReasoningEffort = "medium"
+	OpenAIReasoningEffortMinimal OpenAIReasoningEffort = "minimal"
+	OpenAIReasoningEffortNone    OpenAIReasoningEffort = "none"
+	OpenAIReasoningEffortXhigh   OpenAIReasoningEffort = "xhigh"
+)
+
+// Valid indicates whether the value is a known member of the OpenAIReasoningEffort enum.
+func (e OpenAIReasoningEffort) Valid() bool {
+	switch e {
+	case OpenAIReasoningEffortHigh:
+		return true
+	case OpenAIReasoningEffortLow:
+		return true
+	case OpenAIReasoningEffortMax:
+		return true
+	case OpenAIReasoningEffortMedium:
+		return true
+	case OpenAIReasoningEffortMinimal:
+		return true
+	case OpenAIReasoningEffortNone:
+		return true
+	case OpenAIReasoningEffortXhigh:
 		return true
 	default:
 		return false
@@ -7020,6 +7236,384 @@ func (e QueryTemporarilyUnavailableErrorRetryable) Valid() bool {
 	}
 }
 
+// Defines values for RelationalComparisonOp.
+const (
+	RelationalComparisonOpEq            RelationalComparisonOp = "eq"
+	RelationalComparisonOpGt            RelationalComparisonOp = "gt"
+	RelationalComparisonOpGte           RelationalComparisonOp = "gte"
+	RelationalComparisonOpIsDistinct    RelationalComparisonOp = "is_distinct"
+	RelationalComparisonOpIsNotDistinct RelationalComparisonOp = "is_not_distinct"
+	RelationalComparisonOpIsNotNull     RelationalComparisonOp = "is_not_null"
+	RelationalComparisonOpIsNull        RelationalComparisonOp = "is_null"
+	RelationalComparisonOpLt            RelationalComparisonOp = "lt"
+	RelationalComparisonOpLte           RelationalComparisonOp = "lte"
+	RelationalComparisonOpNe            RelationalComparisonOp = "ne"
+)
+
+// Valid indicates whether the value is a known member of the RelationalComparisonOp enum.
+func (e RelationalComparisonOp) Valid() bool {
+	switch e {
+	case RelationalComparisonOpEq:
+		return true
+	case RelationalComparisonOpGt:
+		return true
+	case RelationalComparisonOpGte:
+		return true
+	case RelationalComparisonOpIsDistinct:
+		return true
+	case RelationalComparisonOpIsNotDistinct:
+		return true
+	case RelationalComparisonOpIsNotNull:
+		return true
+	case RelationalComparisonOpIsNull:
+		return true
+	case RelationalComparisonOpLt:
+		return true
+	case RelationalComparisonOpLte:
+		return true
+	case RelationalComparisonOpNe:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for RelationalConstraintActivationPhase.
+const (
+	RelationalConstraintActivationPhaseCheck      RelationalConstraintActivationPhase = "check"
+	RelationalConstraintActivationPhaseForeignKey RelationalConstraintActivationPhase = "foreign_key"
+	RelationalConstraintActivationPhaseUnique     RelationalConstraintActivationPhase = "unique"
+)
+
+// Valid indicates whether the value is a known member of the RelationalConstraintActivationPhase enum.
+func (e RelationalConstraintActivationPhase) Valid() bool {
+	switch e {
+	case RelationalConstraintActivationPhaseCheck:
+		return true
+	case RelationalConstraintActivationPhaseForeignKey:
+		return true
+	case RelationalConstraintActivationPhaseUnique:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for RelationalConstraintConflictReason.
+const (
+	RelationalConstraintConflictReasonForeignKeyParentMissing   RelationalConstraintConflictReason = "foreign_key_parent_missing"
+	RelationalConstraintConflictReasonForeignKeyReferenced      RelationalConstraintConflictReason = "foreign_key_referenced"
+	RelationalConstraintConflictReasonUniqueConstraintViolation RelationalConstraintConflictReason = "unique_constraint_violation"
+)
+
+// Valid indicates whether the value is a known member of the RelationalConstraintConflictReason enum.
+func (e RelationalConstraintConflictReason) Valid() bool {
+	switch e {
+	case RelationalConstraintConflictReasonForeignKeyParentMissing:
+		return true
+	case RelationalConstraintConflictReasonForeignKeyReferenced:
+		return true
+	case RelationalConstraintConflictReasonUniqueConstraintViolation:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for RelationalConstraintRetirementStatusPhase.
+const (
+	RelationalConstraintRetirementStatusPhaseFencing     RelationalConstraintRetirementStatusPhase = "fencing"
+	RelationalConstraintRetirementStatusPhaseForeignKeys RelationalConstraintRetirementStatusPhase = "foreign_keys"
+	RelationalConstraintRetirementStatusPhasePublished   RelationalConstraintRetirementStatusPhase = "published"
+	RelationalConstraintRetirementStatusPhasePublishing  RelationalConstraintRetirementStatusPhase = "publishing"
+	RelationalConstraintRetirementStatusPhaseReadyToDrop RelationalConstraintRetirementStatusPhase = "ready_to_drop"
+	RelationalConstraintRetirementStatusPhaseUnique      RelationalConstraintRetirementStatusPhase = "unique"
+)
+
+// Valid indicates whether the value is a known member of the RelationalConstraintRetirementStatusPhase enum.
+func (e RelationalConstraintRetirementStatusPhase) Valid() bool {
+	switch e {
+	case RelationalConstraintRetirementStatusPhaseFencing:
+		return true
+	case RelationalConstraintRetirementStatusPhaseForeignKeys:
+		return true
+	case RelationalConstraintRetirementStatusPhasePublished:
+		return true
+	case RelationalConstraintRetirementStatusPhasePublishing:
+		return true
+	case RelationalConstraintRetirementStatusPhaseReadyToDrop:
+		return true
+	case RelationalConstraintRetirementStatusPhaseUnique:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for RelationalConstraintRetryResponseStatus.
+const (
+	RelationalConstraintRetryResponseStatusAccepted RelationalConstraintRetryResponseStatus = "accepted"
+)
+
+// Valid indicates whether the value is a known member of the RelationalConstraintRetryResponseStatus enum.
+func (e RelationalConstraintRetryResponseStatus) Valid() bool {
+	switch e {
+	case RelationalConstraintRetryResponseStatusAccepted:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for RelationalConstraintStatusCoverageKind.
+const (
+	RelationalConstraintStatusCoverageKindUniqueForeignKeyAndCheck RelationalConstraintStatusCoverageKind = "unique_foreign_key_and_check"
+)
+
+// Valid indicates whether the value is a known member of the RelationalConstraintStatusCoverageKind enum.
+func (e RelationalConstraintStatusCoverageKind) Valid() bool {
+	switch e {
+	case RelationalConstraintStatusCoverageKindUniqueForeignKeyAndCheck:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for RelationalConstraintValidationState.
+const (
+	RelationalConstraintValidationStateEnforced    RelationalConstraintValidationState = "enforced"
+	RelationalConstraintValidationStateInvalid     RelationalConstraintValidationState = "invalid"
+	RelationalConstraintValidationStateUnvalidated RelationalConstraintValidationState = "unvalidated"
+	RelationalConstraintValidationStateValidating  RelationalConstraintValidationState = "validating"
+)
+
+// Valid indicates whether the value is a known member of the RelationalConstraintValidationState enum.
+func (e RelationalConstraintValidationState) Valid() bool {
+	switch e {
+	case RelationalConstraintValidationStateEnforced:
+		return true
+	case RelationalConstraintValidationStateInvalid:
+		return true
+	case RelationalConstraintValidationStateUnvalidated:
+		return true
+	case RelationalConstraintValidationStateValidating:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for RelationalExpressionOp.
+const (
+	RelationalExpressionOpAdd           RelationalExpressionOp = "add"
+	RelationalExpressionOpAnd           RelationalExpressionOp = "and"
+	RelationalExpressionOpCoalesce      RelationalExpressionOp = "coalesce"
+	RelationalExpressionOpColumn        RelationalExpressionOp = "column"
+	RelationalExpressionOpConcat        RelationalExpressionOp = "concat"
+	RelationalExpressionOpDivide        RelationalExpressionOp = "divide"
+	RelationalExpressionOpEq            RelationalExpressionOp = "eq"
+	RelationalExpressionOpGt            RelationalExpressionOp = "gt"
+	RelationalExpressionOpGte           RelationalExpressionOp = "gte"
+	RelationalExpressionOpIsDistinct    RelationalExpressionOp = "is_distinct"
+	RelationalExpressionOpIsNotDistinct RelationalExpressionOp = "is_not_distinct"
+	RelationalExpressionOpIsNotNull     RelationalExpressionOp = "is_not_null"
+	RelationalExpressionOpIsNull        RelationalExpressionOp = "is_null"
+	RelationalExpressionOpLiteral       RelationalExpressionOp = "literal"
+	RelationalExpressionOpLowerAscii    RelationalExpressionOp = "lower_ascii"
+	RelationalExpressionOpLt            RelationalExpressionOp = "lt"
+	RelationalExpressionOpLte           RelationalExpressionOp = "lte"
+	RelationalExpressionOpMultiply      RelationalExpressionOp = "multiply"
+	RelationalExpressionOpNe            RelationalExpressionOp = "ne"
+	RelationalExpressionOpNegate        RelationalExpressionOp = "negate"
+	RelationalExpressionOpNot           RelationalExpressionOp = "not"
+	RelationalExpressionOpOr            RelationalExpressionOp = "or"
+	RelationalExpressionOpSubtract      RelationalExpressionOp = "subtract"
+	RelationalExpressionOpUpperAscii    RelationalExpressionOp = "upper_ascii"
+)
+
+// Valid indicates whether the value is a known member of the RelationalExpressionOp enum.
+func (e RelationalExpressionOp) Valid() bool {
+	switch e {
+	case RelationalExpressionOpAdd:
+		return true
+	case RelationalExpressionOpAnd:
+		return true
+	case RelationalExpressionOpCoalesce:
+		return true
+	case RelationalExpressionOpColumn:
+		return true
+	case RelationalExpressionOpConcat:
+		return true
+	case RelationalExpressionOpDivide:
+		return true
+	case RelationalExpressionOpEq:
+		return true
+	case RelationalExpressionOpGt:
+		return true
+	case RelationalExpressionOpGte:
+		return true
+	case RelationalExpressionOpIsDistinct:
+		return true
+	case RelationalExpressionOpIsNotDistinct:
+		return true
+	case RelationalExpressionOpIsNotNull:
+		return true
+	case RelationalExpressionOpIsNull:
+		return true
+	case RelationalExpressionOpLiteral:
+		return true
+	case RelationalExpressionOpLowerAscii:
+		return true
+	case RelationalExpressionOpLt:
+		return true
+	case RelationalExpressionOpLte:
+		return true
+	case RelationalExpressionOpMultiply:
+		return true
+	case RelationalExpressionOpNe:
+		return true
+	case RelationalExpressionOpNegate:
+		return true
+	case RelationalExpressionOpNot:
+		return true
+	case RelationalExpressionOpOr:
+		return true
+	case RelationalExpressionOpSubtract:
+		return true
+	case RelationalExpressionOpUpperAscii:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for RelationalExpressionType.
+const (
+	RelationalExpressionTypeBlob     RelationalExpressionType = "blob"
+	RelationalExpressionTypeBoolean  RelationalExpressionType = "boolean"
+	RelationalExpressionTypeDatetime RelationalExpressionType = "datetime"
+	RelationalExpressionTypeInteger  RelationalExpressionType = "integer"
+	RelationalExpressionTypeNumber   RelationalExpressionType = "number"
+	RelationalExpressionTypeString   RelationalExpressionType = "string"
+)
+
+// Valid indicates whether the value is a known member of the RelationalExpressionType enum.
+func (e RelationalExpressionType) Valid() bool {
+	switch e {
+	case RelationalExpressionTypeBlob:
+		return true
+	case RelationalExpressionTypeBoolean:
+		return true
+	case RelationalExpressionTypeDatetime:
+		return true
+	case RelationalExpressionTypeInteger:
+		return true
+	case RelationalExpressionTypeNumber:
+		return true
+	case RelationalExpressionTypeString:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for RelationalIndexBuildFailure.
+const (
+	RelationalIndexBuildFailureIncompatibleSchema RelationalIndexBuildFailure = "incompatible_schema"
+	RelationalIndexBuildFailureInvalidRow         RelationalIndexBuildFailure = "invalid_row"
+	RelationalIndexBuildFailureKeyTooLarge        RelationalIndexBuildFailure = "key_too_large"
+)
+
+// Valid indicates whether the value is a known member of the RelationalIndexBuildFailure enum.
+func (e RelationalIndexBuildFailure) Valid() bool {
+	switch e {
+	case RelationalIndexBuildFailureIncompatibleSchema:
+		return true
+	case RelationalIndexBuildFailureInvalidRow:
+		return true
+	case RelationalIndexBuildFailureKeyTooLarge:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for RelationalIndexBuildState.
+const (
+	RelationalIndexBuildStateBuilding RelationalIndexBuildState = "building"
+	RelationalIndexBuildStateFailed   RelationalIndexBuildState = "failed"
+	RelationalIndexBuildStateReady    RelationalIndexBuildState = "ready"
+)
+
+// Valid indicates whether the value is a known member of the RelationalIndexBuildState enum.
+func (e RelationalIndexBuildState) Valid() bool {
+	switch e {
+	case RelationalIndexBuildStateBuilding:
+		return true
+	case RelationalIndexBuildStateFailed:
+		return true
+	case RelationalIndexBuildStateReady:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for RelationalIndexKeyDirection.
+const (
+	RelationalIndexKeyDirectionAsc  RelationalIndexKeyDirection = "asc"
+	RelationalIndexKeyDirectionDesc RelationalIndexKeyDirection = "desc"
+)
+
+// Valid indicates whether the value is a known member of the RelationalIndexKeyDirection enum.
+func (e RelationalIndexKeyDirection) Valid() bool {
+	switch e {
+	case RelationalIndexKeyDirectionAsc:
+		return true
+	case RelationalIndexKeyDirectionDesc:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for RelationalIndexKeyNulls.
+const (
+	RelationalIndexKeyNullsDefault RelationalIndexKeyNulls = "default"
+	RelationalIndexKeyNullsFirst   RelationalIndexKeyNulls = "first"
+	RelationalIndexKeyNullsLast    RelationalIndexKeyNulls = "last"
+)
+
+// Valid indicates whether the value is a known member of the RelationalIndexKeyNulls enum.
+func (e RelationalIndexKeyNulls) Valid() bool {
+	switch e {
+	case RelationalIndexKeyNullsDefault:
+		return true
+	case RelationalIndexKeyNullsFirst:
+		return true
+	case RelationalIndexKeyNullsLast:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for RelationalIndexStatsIndexType.
+const (
+	RelationalIndexStatsIndexTypeRelational RelationalIndexStatsIndexType = "relational"
+)
+
+// Valid indicates whether the value is a known member of the RelationalIndexStatsIndexType enum.
+func (e RelationalIndexStatsIndexType) Valid() bool {
+	switch e {
+	case RelationalIndexStatsIndexTypeRelational:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for RepairRunRequestControl.
 const (
 	RepairRunRequestControlCancelCurrentAttempt RepairRunRequestControl = "cancel_current_attempt"
@@ -7293,6 +7887,42 @@ func (e RestoreJobScope) Valid() bool {
 	}
 }
 
+// Defines values for RetrievalNavigationSelection.
+const (
+	RetrievalNavigationSelectionAgentic RetrievalNavigationSelection = "agentic"
+	RetrievalNavigationSelectionRanked  RetrievalNavigationSelection = "ranked"
+)
+
+// Valid indicates whether the value is a known member of the RetrievalNavigationSelection enum.
+func (e RetrievalNavigationSelection) Valid() bool {
+	switch e {
+	case RetrievalNavigationSelectionAgentic:
+		return true
+	case RetrievalNavigationSelectionRanked:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for RetrievalNavigationStrategy.
+const (
+	RetrievalNavigationStrategyGraph RetrievalNavigationStrategy = "graph"
+	RetrievalNavigationStrategyTree  RetrievalNavigationStrategy = "tree"
+)
+
+// Valid indicates whether the value is a known member of the RetrievalNavigationStrategy enum.
+func (e RetrievalNavigationStrategy) Valid() bool {
+	switch e {
+	case RetrievalNavigationStrategyGraph:
+		return true
+	case RetrievalNavigationStrategyTree:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for RetrievalStrategy.
 const (
 	RetrievalStrategyBm25     RetrievalStrategy = "bm25"
@@ -7455,6 +8085,27 @@ func (e SSEToolModeMode) Valid() bool {
 	}
 }
 
+// Defines values for STTProvider.
+const (
+	STTProviderAntfly STTProvider = "antfly"
+	STTProviderOpenai STTProvider = "openai"
+	STTProviderVertex STTProvider = "vertex"
+)
+
+// Valid indicates whether the value is a known member of the STTProvider enum.
+func (e STTProvider) Valid() bool {
+	switch e {
+	case STTProviderAntfly:
+		return true
+	case STTProviderOpenai:
+		return true
+	case STTProviderVertex:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for SecretStatus.
 const (
 	SecretStatusConfiguredBoth SecretStatus = "configured_both"
@@ -7488,6 +8139,21 @@ func (e SemanticQueryMode) Valid() bool {
 	case SemanticQueryModeHypothetical:
 		return true
 	case SemanticQueryModeRewrite:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for SerperSearchConfigProvider.
+const (
+	SerperSearchConfigProviderSerper SerperSearchConfigProvider = "serper"
+)
+
+// Valid indicates whether the value is a known member of the SerperSearchConfigProvider enum.
+func (e SerperSearchConfigProvider) Valid() bool {
+	switch e {
+	case SerperSearchConfigProviderSerper:
 		return true
 	default:
 		return false
@@ -7959,6 +8625,24 @@ func (e TableRestoreStatusStatus) Valid() bool {
 	}
 }
 
+// Defines values for TableStorageMode.
+const (
+	TableStorageModeDocument   TableStorageMode = "document"
+	TableStorageModeRelational TableStorageMode = "relational"
+)
+
+// Valid indicates whether the value is a known member of the TableStorageMode enum.
+func (e TableStorageMode) Valid() bool {
+	switch e {
+	case TableStorageModeDocument:
+		return true
+	case TableStorageModeRelational:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for TableStorageSettingsDenseEmbeddings.
 const (
 	TableStorageSettingsDenseEmbeddingsPrimaryLsm  TableStorageSettingsDenseEmbeddings = "primary_lsm"
@@ -8001,6 +8685,21 @@ const (
 func (e TableStorageUnreadableErrorRetryable) Valid() bool {
 	switch e {
 	case TableStorageUnreadableErrorRetryableFalse:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for TavilySearchConfigProvider.
+const (
+	TavilySearchConfigProviderTavily TavilySearchConfigProvider = "tavily"
+)
+
+// Valid indicates whether the value is a known member of the TavilySearchConfigProvider enum.
+func (e TavilySearchConfigProvider) Valid() bool {
+	switch e {
+	case TavilySearchConfigProviderTavily:
 		return true
 	default:
 		return false
@@ -8529,6 +9228,21 @@ func (e VertexRerankerConfigProvider) Valid() bool {
 	}
 }
 
+// Defines values for VertexSearchConfigProvider.
+const (
+	VertexSearchConfigProviderVertex VertexSearchConfigProvider = "vertex"
+)
+
+// Valid indicates whether the value is a known member of the VertexSearchConfigProvider enum.
+func (e VertexSearchConfigProvider) Valid() bool {
+	switch e {
+	case VertexSearchConfigProviderVertex:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for VertexSearchConfigService.
 const (
 	VertexSearchConfigServiceAgentSearch VertexSearchConfigService = "agent_search"
@@ -8571,6 +9285,21 @@ func (e WebSearchProvider) Valid() bool {
 	case WebSearchProviderVertex:
 		return true
 	case WebSearchProviderYou:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for YouSearchConfigProvider.
+const (
+	YouSearchConfigProviderYou YouSearchConfigProvider = "you"
+)
+
+// Valid indicates whether the value is a known member of the YouSearchConfigProvider enum.
+func (e YouSearchConfigProvider) Valid() bool {
+	switch e {
+	case YouSearchConfigProviderYou:
 		return true
 	default:
 		return false
@@ -9931,10 +10660,10 @@ type BraveSearchConfig struct {
 	Freshness BraveSearchConfigFreshness `json:"freshness,omitempty,omitzero"`
 
 	// IncludeContent Ask the provider to return extracted page content when supported
-	IncludeContent bool `json:"include_content,omitempty,omitzero"`
+	IncludeContent *bool `json:"include_content,omitempty"`
 
 	// IncludeHighlights Ask the provider to return highlighted passages when supported
-	IncludeHighlights bool `json:"include_highlights,omitempty,omitzero"`
+	IncludeHighlights *bool `json:"include_highlights,omitempty"`
 
 	// Language Preferred language for results (e.g., 'en', 'es', 'fr')
 	//
@@ -9948,18 +10677,8 @@ type BraveSearchConfig struct {
 	MaxResults int `json:"max_results,omitempty,omitzero"`
 
 	// ProjectId Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
-	ProjectId string `json:"project_id,omitempty,omitzero"`
-
-	// Provider The web search provider to use.
-	//
-	// - **exa**: Exa neural/semantic web search API
-	// - **serper**: Serper.dev Google Search API (simpler setup)
-	// - **tavily**: Tavily AI Search API (optimized for RAG)
-	// - **brave**: Brave Search API
-	// - **you**: You.com Search API for agent and research workflows
-	// - **linkup**: Linkup Search API for web search and content retrieval
-	// - **vertex**: Google Cloud Agent Search / Vertex AI Search
-	Provider WebSearchProvider `json:"provider"`
+	ProjectId string                    `json:"project_id,omitempty,omitzero"`
+	Provider  BraveSearchConfigProvider `json:"provider"`
 
 	// Region Preferred region for results (e.g., 'us', 'uk', 'de')
 	//
@@ -9984,6 +10703,9 @@ type BraveSearchConfig struct {
 
 // BraveSearchConfigFreshness Freshness filter: pd=day, pw=week, pm=month, py=year
 type BraveSearchConfigFreshness string
+
+// BraveSearchConfigProvider defines model for BraveSearchConfig.Provider.
+type BraveSearchConfigProvider string
 
 // ByteRange defines model for ByteRange.
 type ByteRange = [][]byte
@@ -10184,20 +10906,8 @@ type ChatToolsConfig struct {
 	// Prevents infinite loops in tool execution.
 	MaxToolIterations int `json:"max_tool_iterations,omitempty,omitzero"`
 
-	// WebSearchConfig A unified configuration for web search providers.
-	//
-	// Each provider has specific configuration requirements. Use the appropriate
-	// provider-specific config or set common options at the top level.
-	//
-	// **Environment Variables (fallbacks):**
-	// - EXA_API_KEY
-	// - SERPER_API_KEY
-	// - TAVILY_API_KEY
-	// - BRAVE_API_KEY
-	// - YOU_API_KEY
-	// - LINKUP_API_KEY
-	// - GOOGLE_APPLICATION_CREDENTIALS, GOOGLE_CLOUD_PROJECT, GOOGLE_CLOUD_LOCATION
-	WebSearchConfig WebSearchConfig `json:"web_search_config,omitempty,omitzero"`
+	// WebSearchConfig Provider-specific inline web search configuration.
+	WebSearchConfig WebSearchProviderConfig `json:"web_search_config,omitempty,omitzero"`
 
 	// WebSearchConnection Name of a configured connections.<id> resource with kind web_search.
 	// Request-level tool options may reduce scope, but cannot expand the
@@ -10319,7 +11029,12 @@ type ClassificationTransformationResult struct {
 	SubQuestions []string `json:"sub_questions,omitempty,omitzero"`
 }
 
-// ClusterBackupRequest defines model for ClusterBackupRequest.
+// ClusterBackupRequest Native cluster backups pin a common transaction cut across a dependency-complete
+// table set. Restart-stable LSM seals are journaled before releasing write fences;
+// artifact upload uses those immutable seals without holding the write pause.
+// Native cohorts support at most 4096 tables and 4096 ranges and require the
+// filesystem-managed LSM backend. Portable backups do not support coordinated
+// UNIQUE/FK constraints or promise a common cross-table transaction cut.
 type ClusterBackupRequest struct {
 	// BackupId Unique identifier for this backup. Used to reference the backup for restore operations.
 	// Choose a meaningful name that includes date/version information.
@@ -10469,7 +11184,15 @@ type ClusterDataStatus struct {
 // ClusterHealth Overall health status of the cluster
 type ClusterHealth string
 
-// ClusterRestoreRequest defines model for ClusterRestoreRequest.
+// ClusterRestoreRequest Native cohort restores use the existing asynchronous restore job to provision
+// hidden fresh generations, import rows, rebuild indexes and coordinated constraints,
+// and publish the dependency-complete target set atomically. Document, relational,
+// and mixed native cohorts use the same workflow (at most 128 tables/4096 ranges).
+// Skipping a live parent cannot substitute it for a parent generation required by
+// a restored child. Overwrite retains the old generation until validation and
+// cutover; cancellation after publication completes publication rather than rollback.
+// Reserved destination authorization is immutable: changing principal requires
+// canceling the old job and creating a new restore.
 type ClusterRestoreRequest struct {
 	// BackupId Unique identifier of the backup to restore from.
 	//
@@ -10989,6 +11712,26 @@ type CreateIndexRequest struct {
 	union json.RawMessage
 }
 
+// CreateRelationalIndexRequest Create a composite ordered index through the shared index resource.
+type CreateRelationalIndexRequest struct {
+	// Description Optional description of the index and its purpose.
+	Description string `json:"description,omitempty,omitzero"`
+
+	// IncludeColumns Non-key columns stored for index-only projection; distinct from keys.
+	IncludeColumns []string                         `json:"include_columns,omitempty,omitzero"`
+	Keys           []RelationalIndexKey             `json:"keys"`
+	Type           CreateRelationalIndexRequestType `json:"type"`
+
+	// Version Index implementation version. Only zero is supported; the schema epoch is managed by the server.
+	Version int `json:"version,omitempty,omitzero"`
+
+	// Where Optional conjunction selecting index members. Queries must explicitly include all typed conjuncts.
+	Where []RelationalIndexPredicate `json:"where,omitempty,omitzero"`
+}
+
+// CreateRelationalIndexRequestType defines model for CreateRelationalIndexRequest.Type.
+type CreateRelationalIndexRequestType string
+
 // CreateTableRequest defines model for CreateTableRequest.
 type CreateTableRequest struct {
 	// Description Optional human-readable description of the table and its purpose.
@@ -11410,6 +12153,32 @@ type CreatedProviderConfig struct {
 	Truncate      string  `json:"truncate,omitempty,omitzero"`
 	Url           string  `json:"url,omitempty,omitzero"`
 }
+
+// CreatedRelationalIndex Effective schema-bound composite index configuration.
+type CreatedRelationalIndex struct {
+	// Description Optional description of the index and its purpose
+	Description string `json:"description,omitempty,omitzero"`
+
+	// Enrichments Normalized inline managed enrichment definitions required by this index.
+	Enrichments []CreatedEnrichmentConfig `json:"enrichments,omitempty,omitzero"`
+
+	// IncludeColumns Non-key columns stored for index-only projection; distinct from keys.
+	IncludeColumns []string             `json:"include_columns,omitempty,omitzero"`
+	Keys           []RelationalIndexKey `json:"keys"`
+
+	// Name Name of the created index
+	Name string                     `json:"name"`
+	Type CreatedRelationalIndexType `json:"type"`
+
+	// Version Version of the index implementation. Defaults to 0.
+	Version int `json:"version,omitempty,omitzero"`
+
+	// Where Optional conjunction selecting index members. Queries must explicitly include all typed conjuncts.
+	Where []RelationalIndexPredicate `json:"where,omitempty,omitzero"`
+}
+
+// CreatedRelationalIndexType defines model for CreatedRelationalIndex.Type.
+type CreatedRelationalIndexType string
 
 // Credentials defines model for Credentials.
 type Credentials struct {
@@ -12728,6 +13497,23 @@ type EnrichmentConfig struct {
 	// Template Optional template for generated text input.
 	Template string `json:"template,omitempty,omitzero"`
 
+	// Transcriber Speech-to-text provider for the `transcriber` enrichment shorthand.
+	//
+	// Carries the provider's STT configuration (`provider`, `model`, `api_url`, `api_key`, ...) plus the transcription options below. The fields are declared inline rather than composed from `STTConfig` so that a generated client can leave an option out: a composed schema makes a typed client serialize every field, and a `max_download_bytes` of zero would reject every recording.
+	//
+	// **Example:**
+	// ```yaml
+	// name: call_transcripts
+	// kind: asset
+	// field: recording_url
+	// transcriber:
+	//   provider: antfly
+	//   model: openai/whisper-base
+	//   language_code: en
+	//   timestamps: true
+	// ```
+	Transcriber TranscriberEnrichmentConfig `json:"transcriber,omitempty,omitzero"`
+
 	// VectorSpace Optional stable model/token-space identifier for embedding artifacts. When omitted on every source, Antfly requires the effective producers to be semantically equivalent. To combine intentionally compatible but distinct producers, set the same identifier on every source. Explicit and implicit modes cannot be mixed; dimensions are always validated independently.
 	VectorSpace string `json:"vector_space,omitempty,omitzero"`
 }
@@ -12991,13 +13777,13 @@ type ExaSearchConfig struct {
 	ExcludeDomains []string `json:"exclude_domains,omitempty,omitzero"`
 
 	// IncludeContent Ask the provider to return extracted page content when supported
-	IncludeContent bool `json:"include_content,omitempty,omitzero"`
+	IncludeContent *bool `json:"include_content,omitempty"`
 
 	// IncludeDomains Only include results from these domains
 	IncludeDomains []string `json:"include_domains,omitempty,omitzero"`
 
 	// IncludeHighlights Ask the provider to return highlighted passages when supported
-	IncludeHighlights bool `json:"include_highlights,omitempty,omitzero"`
+	IncludeHighlights *bool `json:"include_highlights,omitempty"`
 
 	// Language Preferred language for results (e.g., 'en', 'es', 'fr')
 	//
@@ -13014,18 +13800,8 @@ type ExaSearchConfig struct {
 	NumResults int `json:"num_results,omitempty,omitzero"`
 
 	// ProjectId Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
-	ProjectId string `json:"project_id,omitempty,omitzero"`
-
-	// Provider The web search provider to use.
-	//
-	// - **exa**: Exa neural/semantic web search API
-	// - **serper**: Serper.dev Google Search API (simpler setup)
-	// - **tavily**: Tavily AI Search API (optimized for RAG)
-	// - **brave**: Brave Search API
-	// - **you**: You.com Search API for agent and research workflows
-	// - **linkup**: Linkup Search API for web search and content retrieval
-	// - **vertex**: Google Cloud Agent Search / Vertex AI Search
-	Provider WebSearchProvider `json:"provider"`
+	ProjectId string                  `json:"project_id,omitempty,omitzero"`
+	Provider  ExaSearchConfigProvider `json:"provider"`
 
 	// Region Preferred region for results (e.g., 'us', 'uk', 'de')
 	//
@@ -13047,6 +13823,9 @@ type ExaSearchConfig struct {
 	// TimeoutMs Request timeout in milliseconds
 	TimeoutMs int `json:"timeout_ms,omitempty,omitzero"`
 }
+
+// ExaSearchConfigProvider defines model for ExaSearchConfig.Provider.
+type ExaSearchConfigProvider string
 
 // ExaSearchConfigSearchType Search mode to request from Exa
 type ExaSearchConfigSearchType string
@@ -13275,6 +14054,8 @@ type ExtractionClassificationSchema struct {
 	MinLabels *int               `json:"min_labels,omitempty"`
 
 	// Mode Version 2 classification mode. Ordinal labels are ordered from lowest to highest.
+	// Typed-decision extractors support boolean with labels ["false", "true"] in that order.
+	// Each model rejects modes it does not support.
 	Mode *ExtractionClassificationSchemaMode `json:"mode,omitempty"`
 
 	// MultiLabel The server uses false when omitted. Version 1: return highest-ranked labels up to top_k when false, or labels meeting options.threshold when true. Version 2: selects ordinary single or multi classification unless mode is specified; classification.threshold controls the decision threshold.
@@ -13295,6 +14076,8 @@ type ExtractionClassificationSchema struct {
 type ExtractionClassificationSchemaActivation string
 
 // ExtractionClassificationSchemaMode Version 2 classification mode. Ordinal labels are ordered from lowest to highest.
+// Typed-decision extractors support boolean with labels ["false", "true"] in that order.
+// Each model rejects modes it does not support.
 type ExtractionClassificationSchemaMode string
 
 // ExtractionConstraintAnd defines model for ExtractionConstraintAnd.
@@ -13483,6 +14266,34 @@ type ExtractionConstraintOr struct {
 
 // ExtractionConstraintOrType defines model for ExtractionConstraintOr.Type.
 type ExtractionConstraintOrType string
+
+// ExtractionDecision Version 2 typed classification decision. Probabilities follow request label order; ordinal levels are zero-based.
+type ExtractionDecision struct {
+	// ActProbability Auxiliary model estimate for acting. Does not authorize or execute a tool call.
+	ActProbability float32 `json:"act_probability"`
+	Confidence     float32 `json:"confidence"`
+
+	// ConfidenceMethod Entropy confidence is not the probability that the selected label is correct.
+	ConfidenceMethod ExtractionDecisionConfidenceMethod `json:"confidence_method"`
+
+	// ExpectedValue Score decisions only; sum of zero-based level index times probability.
+	ExpectedValue *float32 `json:"expected_value,omitempty"`
+
+	// Label Highest-probability label. This is distinct from the expected ordinal value.
+	Label         string                       `json:"label"`
+	Name          string                       `json:"name"`
+	Probabilities []ExtractionLabelProbability `json:"probabilities"`
+
+	// TrueProbability Boolean decisions only; probability of the true label.
+	TrueProbability *float32               `json:"true_probability,omitempty"`
+	Type            ExtractionDecisionType `json:"type"`
+}
+
+// ExtractionDecisionConfidenceMethod Entropy confidence is not the probability that the selected label is correct.
+type ExtractionDecisionConfidenceMethod string
+
+// ExtractionDecisionType defines model for ExtractionDecision.Type.
+type ExtractionDecisionType string
 
 // ExtractionDecisionProbability Finite centered-logit decisions require a threshold strictly between zero and one.
 type ExtractionDecisionProbability = float64
@@ -13711,6 +14522,12 @@ type ExtractionLabelDefinition struct {
 	Description *string `json:"description,omitempty"`
 }
 
+// ExtractionLabelProbability defines model for ExtractionLabelProbability.
+type ExtractionLabelProbability struct {
+	Label       string  `json:"label"`
+	Probability float32 `json:"probability"`
+}
+
 // ExtractionLongDocumentMetadata defines model for ExtractionLongDocumentMetadata.
 type ExtractionLongDocumentMetadata struct {
 	ClassificationAggregation ExtractionLongDocumentMetadataClassificationAggregation `json:"classification_aggregation"`
@@ -13765,13 +14582,16 @@ type ExtractionLongDocumentOptionsRecordIdentity string
 
 // ExtractionObject defines model for ExtractionObject.
 type ExtractionObject struct {
-	Classifications []ExtractionClassification      `json:"classifications,omitempty,omitzero"`
-	Entities        []ExtractionEntity              `json:"entities,omitempty,omitzero"`
-	Id              string                          `json:"id,omitempty,omitzero"`
-	LongDocument    *ExtractionLongDocumentMetadata `json:"long_document,omitempty"`
-	OffsetUnit      *ExtractionOffsetUnit           `json:"offset_unit,omitempty"`
-	Relations       []ExtractionRelation            `json:"relations,omitempty,omitzero"`
-	Solvers         *ExtractionSolverDiagnostics    `json:"solvers,omitempty"`
+	Classifications []ExtractionClassification `json:"classifications,omitempty,omitzero"`
+
+	// Decisions Typed decision results from capable extractors, alongside compatible per-label classifications.
+	Decisions    []ExtractionDecision            `json:"decisions,omitempty,omitzero"`
+	Entities     []ExtractionEntity              `json:"entities,omitempty,omitzero"`
+	Id           string                          `json:"id,omitempty,omitzero"`
+	LongDocument *ExtractionLongDocumentMetadata `json:"long_document,omitempty"`
+	OffsetUnit   *ExtractionOffsetUnit           `json:"offset_unit,omitempty"`
+	Relations    []ExtractionRelation            `json:"relations,omitempty,omitzero"`
+	Solvers      *ExtractionSolverDiagnostics    `json:"solvers,omitempty"`
 
 	// StructureMetadata Version 2 metadata arrays aligned with each named structure's record array.
 	StructureMetadata *map[string][]ExtractionRecordMetadata `json:"structure_metadata,omitempty"`
@@ -14213,6 +15033,23 @@ type ForeignColumn struct {
 	// Example: text
 	Type string `json:"type"`
 }
+
+// ForeignKeyAction Action on referencing rows when a referenced row is changed or removed.
+type ForeignKeyAction string
+
+// ForeignKeyMatch Null matching semantics of a composite foreign key. Partial requires
+// at least one parent matching every non-null child component; all-null
+// children are exempt. Compatible parent witnesses are guarded through
+// commit, including concurrent deletion of alternative witnesses.
+type ForeignKeyMatch string
+
+// ForeignKeyTiming Enforcement timing for atomic mutations and transaction sessions. Deferred
+// requires deferrable=true and validates the final transaction state.
+// NO ACTION permits a valid final-state parent replacement; RESTRICT
+// still rejects referenced parent removal. Existing multi-request
+// transaction sessions retain deferred checks until commit; immediate
+// checks apply to each staged statement. SET CONSTRAINTS is not provided.
+type ForeignKeyTiming string
 
 // ForeignSource defines model for ForeignSource.
 type ForeignSource struct {
@@ -16874,6 +17711,29 @@ type IndexExecutionConfig struct {
 	Embedding ExecutionPolicy `json:"embedding,omitempty,omitzero"`
 }
 
+// IndexMaintenanceOwnerProof defines model for IndexMaintenanceOwnerProof.
+type IndexMaintenanceOwnerProof struct {
+	Comparison       string `json:"comparison"`
+	Generation       string `json:"generation"`
+	GroupId          string `json:"group_id"`
+	MaintenanceEpoch string `json:"maintenance_epoch"`
+	Owner            string `json:"owner"`
+	ProgressDigest   string `json:"progress_digest"`
+	Slot             uint32 `json:"slot"`
+}
+
+// IndexMaintenanceRequest Exact observations from index status. Each selected owner is admitted atomically through the replicated transaction journal; the selection is not one global transaction. Cancellation, conflicts, or a lost acknowledgement may leave some owners admitted. Resubmit the identical request to resume safely; do not replace its observations with newer progress unless starting a new maintenance attempt.
+type IndexMaintenanceRequest struct {
+	Owners        []IndexMaintenanceOwnerProof `json:"owners"`
+	SchemaVersion uint32                       `json:"schema_version"`
+	TableId       string                       `json:"table_id"`
+}
+
+// IndexMaintenanceResponse defines model for IndexMaintenanceResponse.
+type IndexMaintenanceResponse struct {
+	AcknowledgedGroups []string `json:"acknowledged_groups"`
+}
+
 // IndexMilestoneStatus defines model for IndexMilestoneStatus.
 type IndexMilestoneStatus struct {
 	// Blockers Milestone-specific, machine-readable blockers. Empty whenever reached is true.
@@ -17607,6 +18467,9 @@ type InferenceDictationEventType string
 type InferenceDictationSegment struct {
 	// EndMs Phrase end offset in the clip, in milliseconds.
 	EndMs int `json:"end_ms"`
+
+	// Speaker Speaker label from diarization (`SPEAKER_00`, ...). Absent without diarization or when the phrase had no usable audio.
+	Speaker string `json:"speaker,omitempty,omitzero"`
 
 	// StartMs Phrase start offset in the clip, in milliseconds.
 	StartMs int    `json:"start_ms"`
@@ -18925,6 +19788,9 @@ type InferenceToolChoiceFunction struct {
 
 // InferenceTranscribeObject defines model for InferenceTranscribeObject.
 type InferenceTranscribeObject struct {
+	// DurationMs Decoded clip duration in milliseconds.
+	DurationMs int `json:"duration_ms,omitempty,omitzero"`
+
 	// Index Input audio index.
 	Index int `json:"index"`
 
@@ -18933,6 +19799,12 @@ type InferenceTranscribeObject struct {
 	// Example: en
 	Language string                          `json:"language,omitempty,omitzero"`
 	Object   InferenceTranscribeObjectObject `json:"object"`
+
+	// Segments Timestamped phrases in clip order, so a transcript can be indexed and linked back to a moment in the recording. Clips longer than 30 s are transcribed in windows; segment offsets are relative to the whole clip.
+	Segments []InferenceDictationSegment `json:"segments,omitempty,omitzero"`
+
+	// Speakers Speaker labels found by diarization, in order of first appearance. Present only when `diarization` was requested.
+	Speakers []string `json:"speakers,omitempty,omitzero"`
 
 	// Text Transcribed text from the audio
 	//
@@ -18945,8 +19817,11 @@ type InferenceTranscribeObjectObject string
 
 // InferenceTranscribeRequest defines model for InferenceTranscribeRequest.
 type InferenceTranscribeRequest struct {
-	// Audio Base64-encoded audio data (WAV, MP3, FLAC, etc.). Clips longer than 30 s are transcribed in windows cut at pauses; silent clips return an empty transcript.
+	// Audio Base64-encoded audio data (WAV, MP3, AAC/M4A, MP4/MOV audio, Ogg/Opus, WebM/Matroska, FLAC, etc.). Clips longer than 30 s are transcribed in windows cut at pauses; silent clips return an empty transcript.
 	Audio []byte `json:"audio"`
+
+	// Diarization Label each segment with a speaker. Runs a local speaker-embedding model (pull `csukuangfj/speaker-embedding-models:3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx`) and clusters phrases by voice; labels are `SPEAKER_00`, `SPEAKER_01`, ... in order of first appearance.
+	Diarization bool `json:"diarization,omitempty,omitzero"`
 
 	// Language Force specific language for transcription (optional, model-dependent)
 	//
@@ -19646,10 +20521,10 @@ type LinkupSearchConfig struct {
 	Endpoint string `json:"endpoint,omitempty,omitzero"`
 
 	// IncludeContent Ask the provider to return extracted page content when supported
-	IncludeContent bool `json:"include_content,omitempty,omitzero"`
+	IncludeContent *bool `json:"include_content,omitempty"`
 
 	// IncludeHighlights Ask the provider to return highlighted passages when supported
-	IncludeHighlights bool `json:"include_highlights,omitempty,omitzero"`
+	IncludeHighlights *bool `json:"include_highlights,omitempty"`
 
 	// Language Preferred language for results (e.g., 'en', 'es', 'fr')
 	//
@@ -19666,18 +20541,8 @@ type LinkupSearchConfig struct {
 	OutputType LinkupSearchConfigOutputType `json:"output_type,omitempty,omitzero"`
 
 	// ProjectId Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
-	ProjectId string `json:"project_id,omitempty,omitzero"`
-
-	// Provider The web search provider to use.
-	//
-	// - **exa**: Exa neural/semantic web search API
-	// - **serper**: Serper.dev Google Search API (simpler setup)
-	// - **tavily**: Tavily AI Search API (optimized for RAG)
-	// - **brave**: Brave Search API
-	// - **you**: You.com Search API for agent and research workflows
-	// - **linkup**: Linkup Search API for web search and content retrieval
-	// - **vertex**: Google Cloud Agent Search / Vertex AI Search
-	Provider WebSearchProvider `json:"provider"`
+	ProjectId string                     `json:"project_id,omitempty,omitzero"`
+	Provider  LinkupSearchConfigProvider `json:"provider"`
 
 	// Region Preferred region for results (e.g., 'us', 'uk', 'de')
 	//
@@ -19699,6 +20564,9 @@ type LinkupSearchConfigDepth string
 
 // LinkupSearchConfigOutputType Linkup response shape to request
 type LinkupSearchConfigOutputType string
+
+// LinkupSearchConfigProvider defines model for LinkupSearchConfig.Provider.
+type LinkupSearchConfigProvider string
 
 // LsmStorageStatus Compact LSM backend operational status. Detailed low-level counters are available through metrics.
 type LsmStorageStatus struct {
@@ -20168,6 +21036,10 @@ type OpenAIGeneratorConfig struct {
 	// FrequencyPenalty Penalty for token frequency (-2.0 to 2.0).
 	FrequencyPenalty float32 `json:"frequency_penalty,omitempty,omitzero"`
 
+	// MaxCompletionTokens OpenAI completion budget, including visible output and reasoning tokens.
+	// Use for reasoning models instead of max_tokens; the two are mutually exclusive.
+	MaxCompletionTokens int `json:"max_completion_tokens,omitempty,omitzero"`
+
 	// MaxTokens Maximum number of tokens to generate.
 	MaxTokens int `json:"max_tokens,omitempty,omitzero"`
 
@@ -20179,6 +21051,9 @@ type OpenAIGeneratorConfig struct {
 	// PresencePenalty Penalty for token presence (-2.0 to 2.0).
 	PresencePenalty float32                       `json:"presence_penalty,omitempty,omitzero"`
 	Provider        OpenAIGeneratorConfigProvider `json:"provider"`
+
+	// ReasoningEffort OpenAI reasoning effort; model support varies. Omit to use the model default.
+	ReasoningEffort OpenAIReasoningEffort `json:"reasoning_effort,omitempty,omitzero"`
 
 	// Temperature Controls randomness in generation (0.0-2.0).
 	Temperature float32 `json:"temperature,omitempty,omitzero"`
@@ -20192,6 +21067,9 @@ type OpenAIGeneratorConfig struct {
 
 // OpenAIGeneratorConfigProvider defines model for OpenAIGeneratorConfig.Provider.
 type OpenAIGeneratorConfigProvider string
+
+// OpenAIReasoningEffort OpenAI reasoning effort; model support varies. Omit to use the model default.
+type OpenAIReasoningEffort string
 
 // OpenRouterEmbedderConfig Configuration for the OpenRouter embedding provider.
 //
@@ -20639,13 +21517,15 @@ type QueryBuilderResult struct {
 	// RemainingUserClarifications Remaining clarification turns allowed for this interaction.
 	RemainingUserClarifications int `json:"remaining_user_clarifications,omitempty,omitzero"`
 
-	// RetrievalQueryRequest A canonical query in the retrieval pipeline with an optional tree search
-	// configuration. Each query specifies its own table. Deprecated stateful
-	// graph_searches compatibility is intentionally unavailable here.
-	//
-	// When both search fields (semantic_search, full_text_search) and tree_search
-	// are provided, the search results are used as start nodes for tree navigation.
-	RetrievalQueryRequest RetrievalQueryRequest `json:"retrieval_query_request,omitempty,omitzero"`
+	// RetrievalNavigation Retrieval-step navigation targeting one ordinary query. Graph navigation
+	// follows one path; tree navigation explores a retained branch frontier.
+	// Agentic selection uses the enclosing model and budgets. Ranked selection
+	// is supported for trees and uses the existing deterministic tree traversal.
+	// Agentic selection requires agentic mode and a retrieval generator. Search
+	// starts exploration; navigation selects only an offered, unvisited node.
+	// All reads enforce mandatory predicates and authenticated row filters.
+	RetrievalNavigation   RetrievalNavigationConfig `json:"retrieval_navigation,omitempty,omitzero"`
+	RetrievalQueryRequest QueryRequest              `json:"retrieval_query_request,omitempty,omitzero"`
 
 	// SessionId Correlation identifier for client-carried continuation.
 	SessionId string `json:"session_id,omitempty,omitzero"`
@@ -21419,6 +22299,488 @@ type RegexpQuery struct {
 	Regexp string `json:"regexp"`
 }
 
+// RelationalCheckConstraint A typed CHECK. Supply either expression or column and op (with optional
+// value and collation), never both forms. Expressions must return boolean
+// and use the shared bounded immutable scalar expression vocabulary.
+// New writes are checked from schema publication;
+// existing rows are validated separately. SQL UNKNOWN satisfies CHECK.
+// Comparison values must match the column type. Integer values may also
+// use exact decimal strings to avoid client-side floating-point rounding.
+type RelationalCheckConstraint struct {
+	// Collation String comparison collation; uses the same rules as ordered indexes.
+	Collation string `json:"collation,omitempty,omitzero"`
+	Column    string `json:"column,omitempty,omitzero"`
+
+	// Expression Immutable typed scalar expression, limited to 128 nodes and 16 levels.
+	// A literal requires type; omitted value means typed null. A column
+	// requires column; other
+	// operations require args. Unknown or irrelevant fields are rejected.
+	// Arithmetic operands have the same integer or number type. Integer
+	// division truncates toward zero. Overflow and division by zero reject
+	// the write. Arithmetic and string operations propagate null. ASCII case
+	// operations leave non-ASCII bytes unchanged. No volatile functions are
+	// accepted. Allocated results are bounded to 1 MiB each. Allocations
+	// and byte-comparison operand work share a 4 MiB evaluation budget per
+	// row and expression set. An integer literal may use a decimal string
+	// for exact int64 transport; blob uses base64 and datetime uses the
+	// normal relational datetime representation.
+	// Comparisons require operands of the same type and return boolean or
+	// SQL UNKNOWN (null); is_distinct and is_not_distinct always return a
+	// boolean. Unary is_null and is_not_null test presence/null. AND and OR
+	// evaluate left to right with SQL three-valued short-circuit semantics;
+	// NOT preserves UNKNOWN. CHECK accepts TRUE and UNKNOWN, rejecting FALSE.
+	Expression RelationalScalarExpression `json:"expression,omitempty,omitzero"`
+	Name       string                     `json:"name"`
+	Op         RelationalComparisonOp     `json:"op,omitempty,omitzero"`
+
+	// Value Scalar comparison operand. Omission represents NULL. Null tests require a NULL operand.
+	Value interface{} `json:"value,omitempty,omitzero"`
+}
+
+// RelationalColumnExpression defines model for RelationalColumnExpression.
+type RelationalColumnExpression struct {
+	Column string `json:"column"`
+
+	// Expression Immutable typed scalar expression, limited to 128 nodes and 16 levels.
+	// A literal requires type; omitted value means typed null. A column
+	// requires column; other
+	// operations require args. Unknown or irrelevant fields are rejected.
+	// Arithmetic operands have the same integer or number type. Integer
+	// division truncates toward zero. Overflow and division by zero reject
+	// the write. Arithmetic and string operations propagate null. ASCII case
+	// operations leave non-ASCII bytes unchanged. No volatile functions are
+	// accepted. Allocated results are bounded to 1 MiB each. Allocations
+	// and byte-comparison operand work share a 4 MiB evaluation budget per
+	// row and expression set. An integer literal may use a decimal string
+	// for exact int64 transport; blob uses base64 and datetime uses the
+	// normal relational datetime representation.
+	// Comparisons require operands of the same type and return boolean or
+	// SQL UNKNOWN (null); is_distinct and is_not_distinct always return a
+	// boolean. Unary is_null and is_not_null test presence/null. AND and OR
+	// evaluate left to right with SQL three-valued short-circuit semantics;
+	// NOT preserves UNKNOWN. CHECK accepts TRUE and UNKNOWN, rejecting FALSE.
+	Expression RelationalScalarExpression `json:"expression"`
+}
+
+// RelationalComparisonOp defines model for RelationalComparisonOp.
+type RelationalComparisonOp string
+
+// RelationalConstraintActivationPhase defines model for RelationalConstraintActivationPhase.
+type RelationalConstraintActivationPhase string
+
+// RelationalConstraintConflictReason Deterministic relational integrity failure; changing the mutation or data is required before retry.
+type RelationalConstraintConflictReason string
+
+// RelationalConstraintRangeStatus defines model for RelationalConstraintRangeStatus.
+type RelationalConstraintRangeStatus struct {
+	Failure string `json:"failure,omitempty,omitzero"`
+
+	// GroupId Exact owner group identifier as decimal text.
+	GroupId string `json:"group_id"`
+
+	// Owner Opaque namespace-and-range ownership digest.
+	Owner string                              `json:"owner"`
+	Phase RelationalConstraintActivationPhase `json:"phase"`
+
+	// RowsScanned Exact cumulative validation row count as decimal text.
+	RowsScanned string `json:"rows_scanned"`
+
+	// State Validation state of an existing-row constraint.
+	State RelationalConstraintValidationState `json:"state"`
+}
+
+// RelationalConstraintRetirementRequest Supply exactly one of target_schema or drop=true. A target schema may
+// only remove UNIQUE/FK definitions; all other schema properties must
+// remain unchanged. Its version is assigned by the server. Retirement
+// fences primary mutations while existing reference and claim records
+// are drained. External foreign keys referencing removed definitions
+// must be retired first.
+type RelationalConstraintRetirementRequest struct {
+	// Drop Prepare for explicit table deletion; this operation does not delete the table.
+	Drop          bool `json:"drop,omitempty,omitzero"`
+	SchemaVersion int  `json:"schema_version"`
+
+	// TargetSchema Schema definition for a table with multiple document types
+	TargetSchema TableSchema `json:"target_schema,omitempty,omitzero"`
+}
+
+// RelationalConstraintRetirementStatus defines model for RelationalConstraintRetirementStatus.
+type RelationalConstraintRetirementStatus struct {
+	Drop bool `json:"drop"`
+
+	// Failure Durable diagnostic that pauses the job. Retry resumes the exact
+	// checkpoint after the cause is addressed; it does not undo a partial
+	// drain or permit primary mutations while retirement is active.
+	Failure string `json:"failure,omitempty,omitzero"`
+
+	// Id Opaque retirement job identity.
+	Id                  string                                    `json:"id"`
+	Phase               RelationalConstraintRetirementStatusPhase `json:"phase"`
+	TargetSchemaVersion uint32                                    `json:"target_schema_version"`
+}
+
+// RelationalConstraintRetirementStatusPhase defines model for RelationalConstraintRetirementStatus.Phase.
+type RelationalConstraintRetirementStatusPhase string
+
+// RelationalConstraintRetryRequest defines model for RelationalConstraintRetryRequest.
+type RelationalConstraintRetryRequest struct {
+	SchemaVersion int `json:"schema_version"`
+}
+
+// RelationalConstraintRetryResponse defines model for RelationalConstraintRetryResponse.
+type RelationalConstraintRetryResponse struct {
+	Status RelationalConstraintRetryResponseStatus `json:"status"`
+}
+
+// RelationalConstraintRetryResponseStatus defines model for RelationalConstraintRetryResponse.Status.
+type RelationalConstraintRetryResponseStatus string
+
+// RelationalConstraintStatus defines model for RelationalConstraintStatus.
+type RelationalConstraintStatus struct {
+	// CoverageKind Distributed UNIQUE, foreign-key, and scalar CHECK coverage across every current table owner. Native local validation is not a substitute for this coordinated proof.
+	CoverageKind  RelationalConstraintStatusCoverageKind `json:"coverage_kind"`
+	Ranges        []RelationalConstraintRangeStatus      `json:"ranges"`
+	Retirement    RelationalConstraintRetirementStatus   `json:"retirement,omitempty,omitzero"`
+	SchemaVersion uint32                                 `json:"schema_version"`
+
+	// State Validation state of an existing-row constraint.
+	State RelationalConstraintValidationState `json:"state"`
+}
+
+// RelationalConstraintStatusCoverageKind Distributed UNIQUE, foreign-key, and scalar CHECK coverage across every current table owner. Native local validation is not a substitute for this coordinated proof.
+type RelationalConstraintStatusCoverageKind string
+
+// RelationalConstraintValidationState Validation state of an existing-row constraint.
+type RelationalConstraintValidationState string
+
+// RelationalExpressionOp defines model for RelationalExpressionOp.
+type RelationalExpressionOp string
+
+// RelationalExpressionType defines model for RelationalExpressionType.
+type RelationalExpressionType string
+
+// RelationalForeignKeyConstraint Composite foreign key. Child and parent columns correspond by position
+// and must have the same physical comparison types. The parent columns
+// must identify a unique key. Existing-row validation is independent of
+// new-write enforcement and is never client-writable.
+// Enforcement and referential actions share the bounded distributed
+// transaction path, including TTL expiry. Partial matching uses ordered
+// support indexes on the parent; activation waits until these are ready.
+// SET NULL requires every child column to accept explicit NULL.
+type RelationalForeignKeyConstraint struct {
+	ChildColumns []string `json:"child_columns"`
+	Deferrable   bool     `json:"deferrable,omitempty,omitzero"`
+
+	// Match Null matching semantics of a composite foreign key. Partial requires
+	// at least one parent matching every non-null child component; all-null
+	// children are exempt. Compatible parent witnesses are guarded through
+	// commit, including concurrent deletion of alternative witnesses.
+	Match ForeignKeyMatch `json:"match,omitempty,omitzero"`
+	Name  string          `json:"name"`
+
+	// OnDelete Action on referencing rows when a referenced row is changed or removed.
+	OnDelete ForeignKeyAction `json:"on_delete,omitempty,omitzero"`
+
+	// OnUpdate Action on referencing rows when a referenced row is changed or removed.
+	OnUpdate      ForeignKeyAction `json:"on_update,omitempty,omitzero"`
+	ParentColumns []string         `json:"parent_columns"`
+
+	// ParentTable Literal parent table name in the child table's database and namespace.
+	// Resolved to an immutable table identity when the constraint is declared;
+	// renaming a parent preserves the reference. Public schemas show its current name.
+	ParentTable string `json:"parent_table"`
+
+	// Timing Enforcement timing for atomic mutations and transaction sessions. Deferred
+	// requires deferrable=true and validates the final transaction state.
+	// NO ACTION permits a valid final-state parent replacement; RESTRICT
+	// still rejects referenced parent removal. Existing multi-request
+	// transaction sessions retain deferred checks until commit; immediate
+	// checks apply to each staged statement. SET CONSTRAINTS is not provided.
+	Timing ForeignKeyTiming `json:"timing,omitempty,omitzero"`
+}
+
+// RelationalIndexBuildFailure defines model for RelationalIndexBuildFailure.
+type RelationalIndexBuildFailure string
+
+// RelationalIndexBuildState defines model for RelationalIndexBuildState.
+type RelationalIndexBuildState string
+
+// RelationalIndexConfig Schema-bound composite ordered index on a relational table. Keys use stable typed comparison semantics and independent direction, null placement, and string collation. Existing rows build asynchronously; indexed queries require complete owner coverage. The table schema is the single durable authority for these definitions.
+type RelationalIndexConfig struct {
+	// IncludeColumns Non-key columns stored for index-only projection; distinct from keys.
+	IncludeColumns []string             `json:"include_columns,omitempty,omitzero"`
+	Keys           []RelationalIndexKey `json:"keys"`
+
+	// Where Optional conjunction selecting index members. Queries must explicitly include all typed conjuncts.
+	Where []RelationalIndexPredicate `json:"where,omitempty,omitzero"`
+}
+
+// RelationalIndexDefinition Declarative table-owned ordered index. Keys are compared lexicographically
+// in the declared order, with independent direction, null placement, and
+// string collation. Creation builds existing rows asynchronously; queries
+// must wait for range-local coverage. Unique constraints and expression
+// keys are not implied by this object. Optional WHERE conjuncts select
+// only matching rows. INCLUDE columns
+// store typed values alongside keys for index-only projected reads.
+type RelationalIndexDefinition struct {
+	// Description Optional human-readable description, also exposed by the shared indexes API.
+	Description string `json:"description,omitempty,omitzero"`
+
+	// IncludeColumns Non-key columns stored in the index; must be distinct from key columns.
+	IncludeColumns []string             `json:"include_columns,omitempty,omitzero"`
+	Keys           []RelationalIndexKey `json:"keys"`
+	Name           string               `json:"name"`
+
+	// Where Conjunction of typed predicates. Indexed queries must explicitly contain every conjunct with equivalent typed comparison semantics.
+	Where []RelationalIndexPredicate `json:"where,omitempty,omitzero"`
+}
+
+// RelationalIndexKey Ordered component of a relational ordered-tuple index key. Supply
+// either a declared column or a deterministic typed scalar expression
+// with its result_type. Composite keys may mix both forms. Bounds use
+// the expression result type, not its input columns.
+type RelationalIndexKey struct {
+	// Collation String-key collation. Omission selects binary ordering. Supported
+	// binary aliases are C, POSIX, and binary. The aliases ci,
+	// case_insensitive, and antfly.case_insensitive select ASCII-only
+	// case folding, not locale-aware or Unicode case folding.
+	Collation string `json:"collation,omitempty,omitzero"`
+
+	// Column Declared relational column used by this key component.
+	Column string `json:"column,omitempty,omitzero"`
+
+	// Direction Direction of one ordered index key component. Omission selects asc.
+	Direction RelationalIndexKeyDirection `json:"direction,omitempty,omitzero"`
+
+	// Expression Immutable typed scalar expression, limited to 128 nodes and 16 levels.
+	// A literal requires type; omitted value means typed null. A column
+	// requires column; other
+	// operations require args. Unknown or irrelevant fields are rejected.
+	// Arithmetic operands have the same integer or number type. Integer
+	// division truncates toward zero. Overflow and division by zero reject
+	// the write. Arithmetic and string operations propagate null. ASCII case
+	// operations leave non-ASCII bytes unchanged. No volatile functions are
+	// accepted. Allocated results are bounded to 1 MiB each. Allocations
+	// and byte-comparison operand work share a 4 MiB evaluation budget per
+	// row and expression set. An integer literal may use a decimal string
+	// for exact int64 transport; blob uses base64 and datetime uses the
+	// normal relational datetime representation.
+	// Comparisons require operands of the same type and return boolean or
+	// SQL UNKNOWN (null); is_distinct and is_not_distinct always return a
+	// boolean. Unary is_null and is_not_null test presence/null. AND and OR
+	// evaluate left to right with SQL three-valued short-circuit semantics;
+	// NOT preserves UNKNOWN. CHECK accepts TRUE and UNKNOWN, rejecting FALSE.
+	Expression RelationalScalarExpression `json:"expression,omitempty,omitzero"`
+
+	// Nulls Null placement for one ordered index key component. The default is
+	// last for ascending keys and first for descending keys. Omission selects default.
+	Nulls      RelationalIndexKeyNulls  `json:"nulls,omitempty,omitzero"`
+	ResultType RelationalExpressionType `json:"result_type,omitempty,omitzero"`
+}
+
+// RelationalIndexKeyDirection Direction of one ordered index key component. Omission selects asc.
+type RelationalIndexKeyDirection string
+
+// RelationalIndexKeyNulls Null placement for one ordered index key component. The default is
+// last for ascending keys and first for descending keys. Omission selects default.
+type RelationalIndexKeyNulls string
+
+// RelationalIndexPredicate A typed partial-index conjunct. Only TRUE is indexed; FALSE and SQL UNKNOWN are excluded.
+type RelationalIndexPredicate struct {
+	// Collation String comparison collation with the same semantics as ordered keys.
+	Collation string                 `json:"collation,omitempty,omitzero"`
+	Column    string                 `json:"column"`
+	Op        RelationalComparisonOp `json:"op"`
+
+	// Value Typed scalar operand; integer columns also accept exact decimal strings. Omission means NULL.
+	Value interface{} `json:"value,omitempty,omitzero"`
+}
+
+// RelationalIndexRangeStatus defines model for RelationalIndexRangeStatus.
+type RelationalIndexRangeStatus struct {
+	// Comparison Executable tuple comparison fingerprint.
+	Comparison string                      `json:"comparison"`
+	Failure    RelationalIndexBuildFailure `json:"failure,omitempty,omitzero"`
+
+	// Generation Exact uint64 generation encoded as decimal, never a floating-point number.
+	Generation string `json:"generation"`
+	GroupId    string `json:"group_id"`
+
+	// LastMaintenanceRequest Most recently accepted maintenance command proof for exact retry acknowledgement.
+	LastMaintenanceRequest string `json:"last_maintenance_request,omitempty,omitzero"`
+
+	// MaintenanceEpoch Replicated desired maintenance ticket, separate from replica-local progress.
+	MaintenanceEpoch string `json:"maintenance_epoch"`
+
+	// Owner Namespace and owned-range fingerprint.
+	Owner string `json:"owner"`
+
+	// ProgressDigest Exact durable progress observation for generation-fenced maintenance.
+	ProgressDigest string                    `json:"progress_digest"`
+	RowsScanned    string                    `json:"rows_scanned"`
+	Slot           uint32                    `json:"slot"`
+	State          RelationalIndexBuildState `json:"state"`
+}
+
+// RelationalIndexStats defines model for RelationalIndexStats.
+type RelationalIndexStats struct {
+	IndexType       RelationalIndexStatsIndexType `json:"index_type"`
+	Milestones      IndexMilestones               `json:"milestones"`
+	RelationalIndex RelationalIndexStatus         `json:"relational_index"`
+}
+
+// RelationalIndexStatsIndexType defines model for RelationalIndexStats.IndexType.
+type RelationalIndexStatsIndexType string
+
+// RelationalIndexStatus defines model for RelationalIndexStatus.
+type RelationalIndexStatus struct {
+	IndexName     string                       `json:"index_name"`
+	Ranges        []RelationalIndexRangeStatus `json:"ranges"`
+	SchemaVersion uint32                       `json:"schema_version"`
+	State         RelationalIndexBuildState    `json:"state"`
+	TableId       string                       `json:"table_id"`
+}
+
+// RelationalRow defines model for RelationalRow.
+type RelationalRow struct {
+	UnderscoreId string `json:"_id"`
+
+	// Cursor Opaque index-order continuation; present only for secondary-index queries.
+	Cursor string                 `json:"cursor,omitempty,omitzero"`
+	Row    map[string]interface{} `json:"row"`
+
+	// SchemaVersion Active pinned schema epoch, not the historical physical row layout.
+	SchemaVersion uint32 `json:"schema_version"`
+
+	// Version Exact row version for mutation preconditions, encoded as decimal text.
+	Version string `json:"version"`
+}
+
+// RelationalRowCondition defines model for RelationalRowCondition.
+type RelationalRowCondition struct {
+	Collation string                 `json:"collation,omitempty,omitzero"`
+	Column    string                 `json:"column"`
+	Op        RelationalComparisonOp `json:"op"`
+
+	// Value Typed scalar operand. Omission means NULL. Integer columns also accept exact decimal strings.
+	Value interface{} `json:"value,omitempty,omitzero"`
+}
+
+// RelationalRowIndexBound Typed left-prefix bound in declared index order, including descending components. Inclusive bounds include the entire matching prefix. Integer components accept exact decimal strings; null is an indexed null.
+type RelationalRowIndexBound struct {
+	Inclusive bool          `json:"inclusive,omitempty,omitzero"`
+	Values    []interface{} `json:"values"`
+}
+
+// RelationalRowMutation A complete row replacement, or deletion when row is omitted. No read-modify-write is implied.
+type RelationalRowMutation struct {
+	// ExpectedVersion Exact observed version. Zero requires that the row does not exist.
+	ExpectedVersion string                 `json:"expected_version"`
+	Key             string                 `json:"key"`
+	Row             map[string]interface{} `json:"row,omitempty,omitzero"`
+}
+
+// RelationalRowMutationRequest Atomic version-conditional typed-row replacements and deletions using the durable distributed transaction coordinator.
+type RelationalRowMutationRequest struct {
+	Mutations []RelationalRowMutation `json:"mutations"`
+
+	// SchemaVersion Required active relational schema epoch, fenced during every participant prepare.
+	SchemaVersion uint32 `json:"schema_version"`
+
+	// SyncLevel Synchronization level for batch operations:
+	// - "propose": Wait for Raft proposal acceptance (fastest, default)
+	// - "write": Wait for Pebble KV write
+	// - "full_text": Wait for full-text index WAL write
+	// - "enrichments": Precompute enrichments before committing the document. A synchronous
+	//   producer failure rejects the write; post-commit worker failures retain the document
+	//   and may return `committed_repair_required`.
+	// - "full_index": Wait for all index writes to complete (full-text + enrichments + vector indexes)
+	SyncLevel SyncLevel `json:"sync_level,omitempty,omitzero"`
+}
+
+// RelationalRowQueryRequest Bounded relational scan in primary-key order, or composite index order
+// when index is supplied. Index queries require schema_version and every
+// owning shard must have the selected generation ready. Partial indexes
+// require their WHERE predicates to be implied by the query conditions.
+// The bounded proof combines per-column equality, tighter ranges,
+// exclusions, and NULL-aware predicates using exact typed values and
+// matching collations. Unsupported implications fail closed. Explicit
+// scan bounds alone are not an implication proof. Equal tuples are
+// ordered by primary key. Each shard read pins its own immutable schema
+// and row snapshot; this is not a table-wide consistent snapshot.
+// Resume with the last returned _id as from for primary scans, or its
+// cursor as after for index scans. A resumed request opens a fresh snapshot,
+// not a retained cursor; concurrent mutations may move rows across the
+// continuation boundary. Keep index, bounds and conditions unchanged when paging.
+// An empty projection returns row identities and versions only.
+type RelationalRowQueryRequest struct {
+	// After Opaque exclusive index-order cursor from the last returned row. Binds the immutable schema version, logical index name, and comparison semantics, independent of owner-local physical generations. Each owner must still prove its current local index is ready.
+	After      string                   `json:"after,omitempty,omitzero"`
+	Conditions []RelationalRowCondition `json:"conditions,omitempty,omitzero"`
+	Fields     []string                 `json:"fields"`
+
+	// From Exclusive lower primary-key bound, including pagination continuation.
+	From string `json:"from,omitempty,omitzero"`
+
+	// Index Ready composite secondary index. Requires schema_version; cannot be combined with from/to.
+	Index string `json:"index,omitempty,omitzero"`
+	Limit uint32 `json:"limit,omitempty,omitzero"`
+
+	// Lower Typed left-prefix bound in declared index order, including descending components. Inclusive bounds include the entire matching prefix. Integer components accept exact decimal strings; null is an indexed null.
+	Lower RelationalRowIndexBound `json:"lower,omitempty,omitzero"`
+
+	// SchemaVersion Reject the read if an owning shard has a different active schema epoch. Zero is a valid epoch and is distinct from omission.
+	SchemaVersion *uint32 `json:"schema_version,omitempty"`
+
+	// To Exclusive upper primary-key bound.
+	To string `json:"to,omitempty,omitzero"`
+
+	// Upper Typed left-prefix bound in declared index order, including descending components. Inclusive bounds include the entire matching prefix. Integer components accept exact decimal strings; null is an indexed null.
+	Upper RelationalRowIndexBound `json:"upper,omitempty,omitzero"`
+}
+
+// RelationalScalarExpression Immutable typed scalar expression, limited to 128 nodes and 16 levels.
+// A literal requires type; omitted value means typed null. A column
+// requires column; other
+// operations require args. Unknown or irrelevant fields are rejected.
+// Arithmetic operands have the same integer or number type. Integer
+// division truncates toward zero. Overflow and division by zero reject
+// the write. Arithmetic and string operations propagate null. ASCII case
+// operations leave non-ASCII bytes unchanged. No volatile functions are
+// accepted. Allocated results are bounded to 1 MiB each. Allocations
+// and byte-comparison operand work share a 4 MiB evaluation budget per
+// row and expression set. An integer literal may use a decimal string
+// for exact int64 transport; blob uses base64 and datetime uses the
+// normal relational datetime representation.
+// Comparisons require operands of the same type and return boolean or
+// SQL UNKNOWN (null); is_distinct and is_not_distinct always return a
+// boolean. Unary is_null and is_not_null test presence/null. AND and OR
+// evaluate left to right with SQL three-valued short-circuit semantics;
+// NOT preserves UNKNOWN. CHECK accepts TRUE and UNKNOWN, rejecting FALSE.
+type RelationalScalarExpression struct {
+	Args []RelationalScalarExpression `json:"args,omitempty,omitzero"`
+
+	// Collation Optional binary or ASCII case-insensitive collation for binary string comparison operations only; aliases match ordered indexes.
+	Collation string                   `json:"collation,omitempty,omitzero"`
+	Column    string                   `json:"column,omitempty,omitzero"`
+	Op        RelationalExpressionOp   `json:"op"`
+	Type      RelationalExpressionType `json:"type,omitempty,omitzero"`
+
+	// Value Typed literal value, including null.
+	Value interface{} `json:"value,omitempty,omitzero"`
+}
+
+// RelationalUniqueConstraint A named, ordered composite unique key. Validation status is maintained
+// by the server. TTL expiry uses the distributed integrity coordinator.
+// Referenced unique keys are nondeferrable.
+type RelationalUniqueConstraint struct {
+	Columns []string `json:"columns"`
+	Name    string   `json:"name"`
+
+	// NullsNotDistinct When true, NULL components compare equal for uniqueness.
+	NullsNotDistinct bool `json:"nulls_not_distinct,omitempty,omitzero"`
+}
+
 // RenameCatalogResourceRequest defines model for RenameCatalogResourceRequest.
 type RenameCatalogResourceRequest struct {
 	// Name New logical name. The durable resource identity remains unchanged.
@@ -21843,7 +23205,8 @@ type RestoreRequest struct {
 }
 
 // RetrievalAgentRequest Request for the retrieval agent. Queries define which tables and indexes
-// to search, each as a QueryRequest with optional tree search configuration.
+// to search, each as an ordinary QueryRequest. Optional tree or graph exploration
+// is configured by steps.retrieval.navigation, targeting one query by index.
 //
 // **Pipeline mode** (default, max_internal_iterations=0): Queries are executed
 // directly without an LLM tool-calling loop.
@@ -21927,7 +23290,7 @@ type RetrievalAgentRequest struct {
 	//
 	//
 	// Example: [{"indexes":["doc_embeddings"],"limit":10,"semantic_search":"How do I configure OAuth?","table":"docs"}]
-	Queries []RetrievalQueryRequest `json:"queries"`
+	Queries []QueryRequest `json:"queries"`
 
 	// Query User's natural language query
 	//
@@ -22107,166 +23470,51 @@ type RetrievalAgentUsage struct {
 	TotalTokens int `json:"total_tokens,omitempty,omitzero"`
 }
 
-// RetrievalQueryRequest A canonical query in the retrieval pipeline with an optional tree search
-// configuration. Each query specifies its own table. Deprecated stateful
-// graph_searches compatibility is intentionally unavailable here.
-//
-// When both search fields (semantic_search, full_text_search) and tree_search
-// are provided, the search results are used as start nodes for tree navigation.
-type RetrievalQueryRequest struct {
-	// Aggregations Aggregation requests for computing metrics and bucketing results.
-	// Each key is a user-defined name for the aggregation, and the value specifies the aggregation configuration.
-	//
-	// When `hierarchy.group_by` is present, aggregations operate on the complete
-	// set of top-level grouped source or unit records. Nested `group_by.matches` are
-	// bounded evidence projections and are not counted as aggregation rows.
-	//
-	// Supports metric aggregations (sum, avg, min, max, count, stats, cardinality),
-	// bucketing aggregations (terms, range, date_range, histogram, date_histogram),
-	// geo aggregations (geohash_grid, geo_distance), and analytics (significant_terms).
-	//
-	// Example:
-	// ```json
-	// {
-	//   "price_stats": {
-	//     "type": "stats",
-	//     "field": "price"
-	//   },
-	//   "categories": {
-	//     "type": "terms",
-	//     "field": "category",
-	//     "size": 10
-	//   }
-	// }
-	// ```
-	Aggregations map[string]AggregationRequest `json:"aggregations,omitempty,omitzero"`
-	Analyses     *Analyses                     `json:"analyses,omitempty"`
+// RetrievalNavigationConfig Retrieval-step navigation targeting one ordinary query. Graph navigation
+// follows one path; tree navigation explores a retained branch frontier.
+// Agentic selection uses the enclosing model and budgets. Ranked selection
+// is supported for trees and uses the existing deterministic tree traversal.
+// Agentic selection requires agentic mode and a retrieval generator. Search
+// starts exploration; navigation selects only an offered, unvisited node.
+// All reads enforce mandatory predicates and authenticated row filters.
+type RetrievalNavigationConfig struct {
+	// BeamWidth Tree-only maximum children offered per expansion; defaults to 3.
+	BeamWidth int `json:"beam_width,omitempty,omitzero"`
 
-	// Count If true, returns only the total count of matching documents without retrieving the actual documents.
-	// Useful for pagination and displaying result counts. Count-only requests
-	// do not return an ordered result page, so `order_by`, `search_after`,
-	// and `search_before` are not supported when this is true.
-	//
-	//
-	// Example: false
-	Count bool `json:"count,omitempty,omitzero"`
+	// Direction Direction of edges to query:
+	// - out: Outgoing edges from the node
+	// - in: Incoming edges to the node
+	// - both: Both outgoing and incoming edges
+	Direction EdgeDirection   `json:"direction,omitempty,omitzero"`
+	EdgeTypes []GraphEdgeType `json:"edge_types,omitempty,omitzero"`
 
-	// DistanceOver Minimum distance threshold for semantic similarity search. Results with distance
-	// less than this value are excluded.
-	//
-	// Useful for excluding near-exact duplicates or finding dissimilar documents.
-	//
-	//
-	// Example: 0.1
-	DistanceOver *float32 `json:"distance_over,omitempty"`
+	// Index Graph index used for every neighbor read.
+	Index string `json:"index"`
 
-	// DistanceUnder Maximum distance threshold for semantic similarity search. Results with distance
-	// greater than this value are excluded. Lower distances indicate higher similarity.
-	//
-	// Useful for filtering out low-confidence matches.
-	//
-	//
-	// Example: 0.5
-	DistanceUnder *float32 `json:"distance_under,omitempty"`
+	// Instruction Optional caller-supplied workflow instruction retained in agent history.
+	Instruction string `json:"instruction,omitempty,omitzero"`
 
-	// DocumentRenderer Optional Handlebars template string for rendering document content in RAG queries.
-	// Template has access to document fields via `{{this.fields.fieldName}}`.
-	//
-	// **Default**: Uses TOON (Token-Oriented Object Notation) format for 30-60% token reduction:
-	// ```handlebars
-	// {{encodeToon this.fields}}
-	// ```
-	//
-	// **Available Helpers**:
-	// - `encodeToon` - Renders fields in compact TOON format with configurable options:
-	//   - `lengthMarker` (bool): Add # prefix to array counts (default: true)
-	//   - `indent` (int): Indentation spacing (default: 2)
-	//   - `delimiter` (string): Field separator for tabular arrays
-	// - `scrubHtml` - Removes HTML tags and extracts text
-	// - `media` - Wraps data URIs for GenKit multimodal support
-	// - `eq` - Equality comparison for conditionals
-	//
-	// **Examples**:
-	// - Basic TOON: `{{encodeToon this.fields}}`
-	// - Compact TOON: `{{encodeToon this.fields lengthMarker=false indent=0}}`
-	// - Tabular data: `{{encodeToon this.fields delimiter="\t"}}`
-	// - Custom template: `Title: {{this.fields.title}}\nBody: {{this.fields.body}}`
-	// - Traditional format: `{{#each this.fields}}{{@key}}: {{this}}\n{{/each}}`
-	//
-	// TOON format produces compact, LLM-optimized output like:
-	// ```
-	// title: Introduction to Vector Search
-	// author: Jane Doe
-	// tags[#3]: ai,search,ml
-	// ```
-	//
-	// **References**:
-	// - TOON Specification: https://github.com/toon-format/toon
-	// - Go Implementation: https://github.com/alpkeskin/gotoon
-	//
-	//
-	// Example: {{encodeToon this.fields}}
-	DocumentRenderer string `json:"document_renderer,omitempty,omitzero"`
+	// InstructionField Explicitly opt in to following instructions from this top-level string
+	// field of each visited document. Instructions accumulate in agent history.
+	// Other document fields and unvisited neighbors remain untrusted evidence.
+	// The field must be included if the query uses a fields projection.
+	InstructionField string `json:"instruction_field,omitempty,omitzero"`
 
-	// EmbeddingTemplate Optional Handlebars template for multimodal embedding of the semantic_search query.
-	// The template has access to `this` which contains the semantic_search string value.
-	//
-	// UTF-8 template input is limited to 64 KiB.
-	//
-	// Use this when you want to embed template-time multimodal content instead of
-	// just text. The template is rendered using dotprompt with access to remote content helpers.
-	//
-	// **Available Helpers**:
-	// - `remoteMedia url=<url>` - Fetches and embeds remote images/media
-	// - `remotePDF url=<url>` - **Deprecated.** Fetches and extracts text from born-digital PDFs
-	// - `remoteText url=<url>` - Fetches and includes remote text content
-	//
-	// Use a `document_extraction` asset producer when PDF pages and chunks must be persisted
-	// and reprocessed. `remoteMedia` and the other helpers only prepare template-time inference input.
-	//
-	// **Examples**:
-	// - Legacy PDF search: `{{remotePDF url=this}}`
-	// - Image search: `{{remoteMedia url=this}}`
-	// - Mixed: `Search for: {{this}} {{#if this}}{{remoteMedia url=this}}{{/if}}`
-	//
-	// When not specified, the semantic_search string is embedded as plain text.
-	//
-	//
-	// Example: {{remoteMedia url=this}}
-	EmbeddingTemplate string `json:"embedding_template,omitempty,omitzero"`
+	// MaxDepth Tree-only maximum depth from the start node (depth zero); defaults to 5.
+	MaxDepth int `json:"max_depth,omitempty,omitzero"`
 
-	// Embeddings Pre-computed embeddings to use for semantic searches instead of embedding the semantic_search string.
-	// The keys are the index names. Values can be either:
-	// - **Dense (array)**: an array of floats, e.g. `[0.1, 0.2, 0.3]`
-	// - **Dense (packed)**: a base64 string of little-endian float32 bytes (~4x more compact)
-	// - **Sparse**: an object with `indices` (array of ints) and `values` (array of floats),
-	//   e.g. `{"indices": [1, 5, 100], "values": [0.3, 0.7, 0.1]}`
-	// - **Sparse (packed)**: an object with `packed_indices` (base64 uint32 LE) and `packed_values` (base64 float32 LE)
-	//
-	// Use when you've already generated embeddings on the client side to avoid redundant embedding calls.
-	Embeddings map[string]Embedding `json:"embeddings,omitempty,omitzero"`
+	// MaxSteps Graph-only maximum moves after the start node (default 8). The enclosing agent's iteration and tool limits also apply.
+	MaxSteps int `json:"max_steps,omitempty,omitzero"`
 
-	// ExclusionQuery An Antfly query expression retained as syntactically validated JSON and compiled by the query engine.
-	ExclusionQuery RawQuery `json:"exclusion_query,omitempty,omitzero"`
+	// NeighborLimit Graph-only maximum candidate neighbors per node (default 8), further limited by the context budget.
+	NeighborLimit int `json:"neighbor_limit,omitempty,omitzero"`
 
-	// Fields List of fields to include in the results. If not specified, all fields are returned.
-	// Use to reduce response size and improve performance. This field is required when
-	// hierarchy.group_by is present so a grouped query cannot accidentally hydrate an
-	// entire grouped document. Use an empty array for identity-only groups.
-	// This projection is also required for hierarchy.children traversal.
-	//
-	//
-	// Example: ["title","url","summary","created_at"]
-	Fields *[]string `json:"fields,omitempty"`
+	// QueryIndex Zero-based index into the enclosing request queries.
+	QueryIndex int                          `json:"query_index"`
+	Selection  RetrievalNavigationSelection `json:"selection"`
 
-	// FilterPrefix Filter results by key prefix. Only returns documents whose keys start with this string.
-	// Applied before scoring to improve performance.
-	//
-	// Common use cases:
-	// - Multi-tenant filtering: `"tenant:acme:"`
-	// - User-specific data: `"user:123:"`
-	// - Document type filtering: `"article:"`
-	FilterPrefix []byte `json:"filter_prefix,omitempty,omitzero"`
+	// StartKey Literal start document key. Agentic selection defaults to the first query hit; ranked selection defaults to seed results or prior query hits.
+	StartKey string `json:"start_key,omitempty,omitzero"`
 
 	// FilterQuery An Antfly query expression retained as syntactically validated JSON and compiled by the query engine.
 	FilterQuery RawQuery `json:"filter_query,omitempty,omitzero"`
@@ -22520,9 +23768,24 @@ type RetrievalQueryRequest struct {
 	TreeSearch TreeSearchConfig `json:"tree_search,omitempty,omitzero"`
 }
 
+// RetrievalNavigationSelection defines model for RetrievalNavigationSelection.
+type RetrievalNavigationSelection string
+
+// RetrievalNavigationStrategy defines model for RetrievalNavigationStrategy.
+type RetrievalNavigationStrategy string
+
 // RetrievalStepConfig Configuration for the retrieval step. Retrieval tools are constrained by
 // the top-level request tools policy when both are present.
 type RetrievalStepConfig struct {
+	// Navigation Retrieval-step navigation targeting one ordinary query. Graph navigation
+	// follows one path; tree navigation explores a retained branch frontier.
+	// Agentic selection uses the enclosing model and budgets. Ranked selection
+	// is supported for trees and uses the existing deterministic tree traversal.
+	// Agentic selection requires agentic mode and a retrieval generator. Search
+	// starts exploration; navigation selects only an offered, unvisited node.
+	// All reads enforce mandatory predicates and authenticated row filters.
+	Navigation RetrievalNavigationConfig `json:"navigation,omitempty,omitzero"`
+
 	// Tools Configuration for retrieval agent tools.
 	//
 	// If `enabled_tools` is empty/omitted, retrieval agents default to all retrieval tools
@@ -22682,6 +23945,9 @@ type SSEToolMode struct {
 // SSEToolModeMode Tool calling mode selected
 type SSEToolModeMode string
 
+// STTProvider The STT provider to use.
+type STTProvider string
+
 // ScanKeysRequest Request to scan keys in a table within a key range.
 // If no range is specified, scans all keys in the table.
 type ScanKeysRequest struct {
@@ -22750,6 +24016,15 @@ type SecretEntry struct {
 	// Key Secret name (e.g., openai.api_key)
 	Key string `json:"key"`
 
+	// Managed Whether this key has an Antfly-managed override that can be deleted.
+	Managed bool `json:"managed,omitempty,omitzero"`
+
+	// Revision Committed native entry revision, when supported by the configured backend.
+	Revision uint64 `json:"revision,omitempty,omitzero"`
+
+	// Source Name of the winning source, or environment.
+	Source string `json:"source,omitempty,omitzero"`
+
 	// Status Source of the secret configuration
 	Status    SecretStatus `json:"status"`
 	UpdatedAt time.Time    `json:"updated_at,omitempty,omitzero"`
@@ -22758,6 +24033,9 @@ type SecretEntry struct {
 // SecretList defines model for SecretList.
 type SecretList struct {
 	Secrets []SecretEntry `json:"secrets"`
+
+	// Writable Whether this server has a native store for secret API writes.
+	Writable bool `json:"writable,omitempty,omitzero"`
 }
 
 // SecretStatus Source of the secret configuration
@@ -22818,10 +24096,10 @@ type SerperSearchConfig struct {
 	Endpoint string `json:"endpoint,omitempty,omitzero"`
 
 	// IncludeContent Ask the provider to return extracted page content when supported
-	IncludeContent bool `json:"include_content,omitempty,omitzero"`
+	IncludeContent *bool `json:"include_content,omitempty"`
 
 	// IncludeHighlights Ask the provider to return highlighted passages when supported
-	IncludeHighlights bool `json:"include_highlights,omitempty,omitzero"`
+	IncludeHighlights *bool `json:"include_highlights,omitempty"`
 
 	// Language Preferred language for results (e.g., 'en', 'es', 'fr')
 	//
@@ -22835,18 +24113,8 @@ type SerperSearchConfig struct {
 	MaxResults int `json:"max_results,omitempty,omitzero"`
 
 	// ProjectId Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
-	ProjectId string `json:"project_id,omitempty,omitzero"`
-
-	// Provider The web search provider to use.
-	//
-	// - **exa**: Exa neural/semantic web search API
-	// - **serper**: Serper.dev Google Search API (simpler setup)
-	// - **tavily**: Tavily AI Search API (optimized for RAG)
-	// - **brave**: Brave Search API
-	// - **you**: You.com Search API for agent and research workflows
-	// - **linkup**: Linkup Search API for web search and content retrieval
-	// - **vertex**: Google Cloud Agent Search / Vertex AI Search
-	Provider WebSearchProvider `json:"provider"`
+	ProjectId string                     `json:"project_id,omitempty,omitzero"`
+	Provider  SerperSearchConfigProvider `json:"provider"`
 
 	// Region Preferred region for results (e.g., 'us', 'uk', 'de')
 	//
@@ -22868,6 +24136,9 @@ type SerperSearchConfig struct {
 	// TimeoutMs Request timeout in milliseconds
 	TimeoutMs int `json:"timeout_ms,omitempty,omitzero"`
 }
+
+// SerperSearchConfigProvider defines model for SerperSearchConfig.Provider.
+type SerperSearchConfigProvider string
 
 // SerperSearchConfigSearchType Type of search to perform
 type SerperSearchConfigSearchType string
@@ -24023,6 +25294,18 @@ type TableRestoreStatusStatus string
 
 // TableSchema Schema definition for a table with multiple document types
 type TableSchema struct {
+	// Checks Named scalar CHECK constraints for a relational schema. This is
+	// part of the complete schema: omission or [] declares no checks.
+	// New writes enforce every check. Existing-row validation status is
+	// maintained separately and is never accepted from the client.
+	Checks []RelationalCheckConstraint `json:"checks,omitempty,omitzero"`
+
+	// ColumnDefaults Immutable typed expressions applied only to absent columns on new
+	// writes, never explicit null. Defaults cannot reference columns.
+	// A column cannot have both a default and a generated expression.
+	// Omission or [] declares none. Relational tables only.
+	ColumnDefaults []RelationalColumnExpression `json:"column_defaults,omitempty,omitzero"`
+
 	// DefaultType Default type to use from the document_types.
 	DefaultType string `json:"default_type,omitempty,omitzero"`
 
@@ -24038,6 +25321,42 @@ type TableSchema struct {
 	// If false, documents not matching any type will be accepted but not indexed.
 	EnforceTypes bool `json:"enforce_types,omitempty,omitzero"`
 
+	// ForeignKeys Complete set of outgoing composite foreign keys. Omission or [] declares none.
+	ForeignKeys []RelationalForeignKeyConstraint `json:"foreign_keys,omitempty,omitzero"`
+
+	// GeneratedColumns Stored immutable generated columns, evaluated in dependency order
+	// on writes before validation and indexing. Cycles are rejected.
+	// Generated columns are output-only; submitted values are replaced
+	// by the computed value. Omission or [] declares none. Defaults
+	// and generated declarations together are limited to 256 columns,
+	// 4096 expression nodes, and 4 MiB of literal data. Evaluation has
+	// a shared 4 MiB allocation budget across all column expressions.
+	// Restore verifies stored results instead of silently recomputing
+	// them. Changing, adding, or removing generated semantics through
+	// an existing table's schema update requires explicit rewrite=true
+	// on the PUT or PATCH schema route. This returns a durable restore
+	// job and replaces the complete authorized dependency cohort only
+	// after distributed transformation and validation. Ordinary schema
+	// updates reject these changes, even when a table appears empty.
+	// Declaration reordering and default-only changes remain allowed.
+	// Relational tables only.
+	GeneratedColumns []RelationalColumnExpression `json:"generated_columns,omitempty,omitzero"`
+
+	// RelationalIndexes Desired ordered indexes for a relational table. Names must be unique.
+	// An explicit array replaces the declarations; an empty array drops
+	// them. Omission preserves existing declarations during schema updates.
+	// Index definitions commit atomically with the schema; build progress
+	// and readiness are local to each owning shard, not client-writable.
+	RelationalIndexes *[]RelationalIndexDefinition `json:"relational_indexes,omitempty"`
+
+	// StorageMode Storage representation for the table. Omission selects "document".
+	// "relational" stores schema-bound typed rows and requires exactly one
+	// closed document schema with declared properties. It implies
+	// enforce_types; explicitly setting enforce_types to false is invalid.
+	// Existing JSON document write and read APIs remain available. This
+	// setting alone does not declare primary keys or unique constraints.
+	StorageMode TableStorageMode `json:"storage_mode,omitempty,omitzero"`
+
 	// Ttl Automatic document expiration. Set this object to enable TTL and
 	// set it to null to disable an existing TTL policy.
 	Ttl TtlConfig `json:"ttl,omitempty,omitzero"`
@@ -24049,6 +25368,9 @@ type TableSchema struct {
 	// TtlField Deprecated compatibility alias for `ttl.field`. Cannot be combined with `ttl`.
 	// Deprecated: this property has been marked as deprecated upstream, but no `x-deprecated-reason` was set
 	TtlField string `json:"ttl_field,omitempty,omitzero"`
+
+	// UniqueConstraints Complete set of composite unique declarations. Omission or [] declares none.
+	UniqueConstraints []RelationalUniqueConstraint `json:"unique_constraints,omitempty,omitzero"`
 
 	// Version Backend-managed schema generation used for migrations. Omit it from create and update requests.
 	Version uint32 `json:"version,omitempty,omitzero"`
@@ -24109,6 +25431,14 @@ type TableStatus struct {
 	// TableId Immutable physical table identity, preserved by catalog renames.
 	TableId string `json:"table_id,omitempty,omitzero"`
 }
+
+// TableStorageMode Storage representation for the table. Omission selects "document".
+// "relational" stores schema-bound typed rows and requires exactly one
+// closed document schema with declared properties. It implies
+// enforce_types; explicitly setting enforce_types to false is invalid.
+// Existing JSON document write and read APIs remain available. This
+// setting alone does not declare primary keys or unique constraints.
+type TableStorageMode string
 
 // TableStorageSettings Immutable source embedding ownership. Omit storage when creating a table to select vector_store for a local single-shard standalone table without HA or replication, and primary_lsm for other deployments. Existing tables retain their recorded ownership; changing the creation default does not migrate data. Snapshot/backup and split operations currently reject vector_store tables; explicitly select primary_lsm when these operations are required.
 type TableStorageSettings struct {
@@ -24193,13 +25523,13 @@ type TavilySearchConfig struct {
 	IncludeAnswer bool `json:"include_answer,omitempty,omitzero"`
 
 	// IncludeContent Ask the provider to return extracted page content when supported
-	IncludeContent bool `json:"include_content,omitempty,omitzero"`
+	IncludeContent *bool `json:"include_content,omitempty"`
 
 	// IncludeDomains Only include results from these domains
 	IncludeDomains []string `json:"include_domains,omitempty,omitzero"`
 
 	// IncludeHighlights Ask the provider to return highlighted passages when supported
-	IncludeHighlights bool `json:"include_highlights,omitempty,omitzero"`
+	IncludeHighlights *bool `json:"include_highlights,omitempty"`
 
 	// IncludeRawContent Include raw HTML content of pages
 	IncludeRawContent bool `json:"include_raw_content,omitempty,omitzero"`
@@ -24216,18 +25546,8 @@ type TavilySearchConfig struct {
 	MaxResults int `json:"max_results,omitempty,omitzero"`
 
 	// ProjectId Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
-	ProjectId string `json:"project_id,omitempty,omitzero"`
-
-	// Provider The web search provider to use.
-	//
-	// - **exa**: Exa neural/semantic web search API
-	// - **serper**: Serper.dev Google Search API (simpler setup)
-	// - **tavily**: Tavily AI Search API (optimized for RAG)
-	// - **brave**: Brave Search API
-	// - **you**: You.com Search API for agent and research workflows
-	// - **linkup**: Linkup Search API for web search and content retrieval
-	// - **vertex**: Google Cloud Agent Search / Vertex AI Search
-	Provider WebSearchProvider `json:"provider"`
+	ProjectId string                     `json:"project_id,omitempty,omitzero"`
+	Provider  TavilySearchConfigProvider `json:"provider"`
 
 	// Region Preferred region for results (e.g., 'us', 'uk', 'de')
 	//
@@ -24248,6 +25568,9 @@ type TavilySearchConfig struct {
 	// TimeoutMs Request timeout in milliseconds
 	TimeoutMs int `json:"timeout_ms,omitempty,omitzero"`
 }
+
+// TavilySearchConfigProvider defines model for TavilySearchConfig.Provider.
+type TavilySearchConfigProvider string
 
 // TavilySearchConfigSearchDepth Search depth:
 // - basic: Fast search with standard results
@@ -24479,6 +25802,9 @@ type TransactionConflict struct {
 	// Participant Participant location and 2PC phase where the conflict occurred.
 	Participant TransactionConflictParticipant `json:"participant,omitempty,omitzero"`
 
+	// Reason Deterministic relational integrity failure; changing the mutation or data is required before retry.
+	Reason RelationalConstraintConflictReason `json:"reason,omitempty,omitzero"`
+
 	// RetryAfterMs Minimum suggested delay before retrying a retryable conflict.
 	RetryAfterMs uint32 `json:"retry_after_ms,omitempty,omitzero"`
 
@@ -24670,6 +25996,61 @@ type TransactionStatusResponse struct {
 	TransactionId string `json:"transaction_id"`
 }
 
+// TranscriberEnrichmentConfig Speech-to-text provider for the `transcriber` enrichment shorthand.
+//
+// Carries the provider's STT configuration (`provider`, `model`, `api_url`, `api_key`, ...) plus the transcription options below. The fields are declared inline rather than composed from `STTConfig` so that a generated client can leave an option out: a composed schema makes a typed client serialize every field, and a `max_download_bytes` of zero would reject every recording.
+//
+// **Example:**
+// ```yaml
+// name: call_transcripts
+// kind: asset
+// field: recording_url
+// transcriber:
+//
+//	provider: antfly
+//	model: openai/whisper-base
+//	language_code: en
+//	timestamps: true
+//
+// ```
+type TranscriberEnrichmentConfig struct {
+	// ApiKey Provider API key. Falls back to the provider's environment variable.
+	ApiKey string `json:"api_key,omitempty,omitzero"`
+
+	// ApiUrl Antfly inference API URL. Falls back to ANTFLY_INFERENCE_URL.
+	ApiUrl string `json:"api_url,omitempty,omitzero"`
+
+	// BaseUrl OpenAI API base URL. Falls back to OPENAI_BASE_URL.
+	BaseUrl string `json:"base_url,omitempty,omitzero"`
+
+	// CredentialsPath Path to an ADC credential JSON file for the vertex provider. Falls back to the default ADC chain.
+	CredentialsPath string `json:"credentials_path,omitempty,omitzero"`
+
+	// Diarization Request speaker labels on transcript segments where the provider supports them.
+	Diarization bool `json:"diarization,omitempty,omitzero"`
+
+	// LanguageCode Spoken language hint (ISO 639-1, e.g. 'en'). Omit for automatic detection where the provider supports it.
+	LanguageCode string `json:"language_code,omitempty,omitzero"`
+
+	// Location Google Cloud location for the vertex provider.
+	Location string `json:"location,omitempty,omitzero"`
+
+	// MaxDownloadBytes Largest recording fetched from a URL, in bytes. Defaults to 128 MiB, which covers a one hour voice memo or podcast.
+	MaxDownloadBytes int `json:"max_download_bytes,omitempty,omitzero"`
+
+	// Model Model name, as the provider names it (e.g. 'openai/whisper-base' for antfly, 'whisper-1' for openai).
+	Model string `json:"model,omitempty,omitzero"`
+
+	// ProjectId Google Cloud project ID for the vertex provider. Falls back to GOOGLE_CLOUD_PROJECT.
+	ProjectId string `json:"project_id,omitempty,omitzero"`
+
+	// Provider The STT provider to use.
+	Provider STTProvider `json:"provider"`
+
+	// Timestamps Request timestamped transcript segments so chunks carry recording offsets. Providers without segment timing return plain text.
+	Timestamps *bool `json:"timestamps,omitempty"`
+}
+
 // Transform In-place document transformation using MongoDB-style operators. Transforms are applied atomically
 // at the storage layer, eliminating read-modify-write races.
 //
@@ -24762,31 +26143,6 @@ type TraverseResponse struct {
 	// Count Total number of results
 	Count   int               `json:"count,omitempty,omitzero"`
 	Results []TraversalResult `json:"results,omitempty,omitzero"`
-}
-
-// TreeSearchConfig Configuration for tree search strategy. Tree search navigates hierarchical
-// document structures by evaluating summaries at each level.
-type TreeSearchConfig struct {
-	// BeamWidth Number of branches to explore at each level
-	BeamWidth int `json:"beam_width,omitempty,omitzero"`
-
-	// Index Name of the graph index to use for tree navigation
-	//
-	// Example: doc_hierarchy
-	Index string `json:"index"`
-
-	// MaxDepth Maximum depth to traverse in the tree
-	MaxDepth int `json:"max_depth,omitempty,omitzero"`
-
-	// StartNodes Starting nodes for tree search:
-	// - "$roots" - Query for root nodes (nodes with no parents)
-	// - Comma-separated explicit node IDs
-	// When omitted and combined with a QueryRequest in a RetrievalQueryRequest,
-	// the query results are used as start nodes.
-	//
-	//
-	// Example: $roots
-	StartNodes string `json:"start_nodes,omitempty,omitzero"`
 }
 
 // TtlConfig Automatic document-expiration policy for a table.
@@ -25259,10 +26615,10 @@ type VertexSearchConfig struct {
 	Endpoint string `json:"endpoint,omitempty,omitzero"`
 
 	// IncludeContent Ask the provider to return extracted page content when supported
-	IncludeContent bool `json:"include_content,omitempty,omitzero"`
+	IncludeContent *bool `json:"include_content,omitempty"`
 
 	// IncludeHighlights Ask the provider to return highlighted passages when supported
-	IncludeHighlights bool `json:"include_highlights,omitempty,omitzero"`
+	IncludeHighlights *bool `json:"include_highlights,omitempty"`
 
 	// Language Preferred language for results (e.g., 'en', 'es', 'fr')
 	//
@@ -25276,18 +26632,8 @@ type VertexSearchConfig struct {
 	MaxResults int `json:"max_results,omitempty,omitzero"`
 
 	// ProjectId Google Cloud project ID. Falls back to GOOGLE_CLOUD_PROJECT.
-	ProjectId string `json:"project_id,omitempty,omitzero"`
-
-	// Provider The web search provider to use.
-	//
-	// - **exa**: Exa neural/semantic web search API
-	// - **serper**: Serper.dev Google Search API (simpler setup)
-	// - **tavily**: Tavily AI Search API (optimized for RAG)
-	// - **brave**: Brave Search API
-	// - **you**: You.com Search API for agent and research workflows
-	// - **linkup**: Linkup Search API for web search and content retrieval
-	// - **vertex**: Google Cloud Agent Search / Vertex AI Search
-	Provider WebSearchProvider `json:"provider"`
+	ProjectId string                     `json:"project_id,omitempty,omitzero"`
+	Provider  VertexSearchConfigProvider `json:"provider"`
 
 	// Region Preferred region for results (e.g., 'us', 'uk', 'de')
 	//
@@ -25307,6 +26653,9 @@ type VertexSearchConfig struct {
 	TimeoutMs int `json:"timeout_ms,omitempty,omitzero"`
 }
 
+// VertexSearchConfigProvider defines model for VertexSearchConfig.Provider.
+type VertexSearchConfigProvider string
+
 // VertexSearchConfigService Google Cloud search service flavor
 type VertexSearchConfigService string
 
@@ -25314,6 +26663,12 @@ type VertexSearchConfigService string
 //
 // Each provider has specific configuration requirements. Use the appropriate
 // provider-specific config or set common options at the top level.
+//
+// Omitted options inherit the named connection when one is supplied.
+// Inline configurations preserve omission; clients must not materialize
+// defaults as overrides. Without a connection, the server applies provider
+// defaults (Exa: 5 results, 10000 ms timeout, safe search enabled, content
+// and highlights disabled, and auto search).
 //
 // **Environment Variables (fallbacks):**
 // - EXA_API_KEY
@@ -25337,10 +26692,10 @@ type WebSearchConfig struct {
 	Endpoint string `json:"endpoint,omitempty,omitzero"`
 
 	// IncludeContent Ask the provider to return extracted page content when supported
-	IncludeContent bool `json:"include_content,omitempty,omitzero"`
+	IncludeContent *bool `json:"include_content,omitempty"`
 
 	// IncludeHighlights Ask the provider to return highlighted passages when supported
-	IncludeHighlights bool `json:"include_highlights,omitempty,omitzero"`
+	IncludeHighlights *bool `json:"include_highlights,omitempty"`
 
 	// Language Preferred language for results (e.g., 'en', 'es', 'fr')
 	//
@@ -25444,6 +26799,11 @@ type WebSearchConnection struct {
 // - **vertex**: Google Cloud Agent Search / Vertex AI Search
 type WebSearchProvider string
 
+// WebSearchProviderConfig Provider-specific inline web search configuration.
+type WebSearchProviderConfig struct {
+	union json.RawMessage
+}
+
 // WildcardQuery defines model for WildcardQuery.
 type WildcardQuery struct {
 	// Boost A floating-point number used to decrease or increase the relevance scores of a query.
@@ -25476,10 +26836,10 @@ type YouSearchConfig struct {
 	Endpoint string `json:"endpoint,omitempty,omitzero"`
 
 	// IncludeContent Ask the provider to return extracted page content when supported
-	IncludeContent bool `json:"include_content,omitempty,omitzero"`
+	IncludeContent *bool `json:"include_content,omitempty"`
 
 	// IncludeHighlights Ask the provider to return highlighted passages when supported
-	IncludeHighlights bool `json:"include_highlights,omitempty,omitzero"`
+	IncludeHighlights *bool `json:"include_highlights,omitempty"`
 
 	// Language Preferred language for results (e.g., 'en', 'es', 'fr')
 	//
@@ -25493,18 +26853,8 @@ type YouSearchConfig struct {
 	MaxResults int `json:"max_results,omitempty,omitzero"`
 
 	// ProjectId Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
-	ProjectId string `json:"project_id,omitempty,omitzero"`
-
-	// Provider The web search provider to use.
-	//
-	// - **exa**: Exa neural/semantic web search API
-	// - **serper**: Serper.dev Google Search API (simpler setup)
-	// - **tavily**: Tavily AI Search API (optimized for RAG)
-	// - **brave**: Brave Search API
-	// - **you**: You.com Search API for agent and research workflows
-	// - **linkup**: Linkup Search API for web search and content retrieval
-	// - **vertex**: Google Cloud Agent Search / Vertex AI Search
-	Provider WebSearchProvider `json:"provider"`
+	ProjectId string                  `json:"project_id,omitempty,omitzero"`
+	Provider  YouSearchConfigProvider `json:"provider"`
 
 	// Region Preferred region for results (e.g., 'us', 'uk', 'de')
 	//
@@ -25520,6 +26870,9 @@ type YouSearchConfig struct {
 	// TimeoutMs Request timeout in milliseconds
 	TimeoutMs int `json:"timeout_ms,omitempty,omitzero"`
 }
+
+// YouSearchConfigProvider defines model for YouSearchConfig.Provider.
+type YouSearchConfigProvider string
 
 // KeyIdPathParameter Example: aBcDeFgHiJkLmNoPqRsT
 type KeyIdPathParameter = string
@@ -25635,6 +26988,38 @@ type TransientCapacity = InferenceTransientCapacityError
 
 // UnsupportedMediaType defines model for UnsupportedMediaType.
 type UnsupportedMediaType = Error
+
+// GenerateEmbeddingsParams defines parameters for GenerateEmbeddings.
+type GenerateEmbeddingsParams struct {
+	// Accept Set to `application/vnd.antfly.numeric.v1` to receive the values as a binary
+	// frame instead of JSON, which avoids serializing every float as text. Any
+	// other value, or none, returns the JSON body.
+	Accept string `json:"Accept,omitempty,omitzero"`
+}
+
+// CreateEmbeddingParams defines parameters for CreateEmbedding.
+type CreateEmbeddingParams struct {
+	// Accept Set to `application/vnd.antfly.numeric.v1` to receive the values as a binary
+	// frame instead of JSON, which avoids serializing every float as text. Any
+	// other value, or none, returns the JSON body.
+	Accept string `json:"Accept,omitempty,omitzero"`
+}
+
+// RerankPromptsParams defines parameters for RerankPrompts.
+type RerankPromptsParams struct {
+	// Accept Set to `application/vnd.antfly.numeric.v1` to receive the values as a binary
+	// frame instead of JSON, which avoids serializing every float as text. Any
+	// other value, or none, returns the JSON body.
+	Accept string `json:"Accept,omitempty,omitzero"`
+}
+
+// RerankMultimodalPromptsParams defines parameters for RerankMultimodalPrompts.
+type RerankMultimodalPromptsParams struct {
+	// Accept Set to `application/vnd.antfly.numeric.v1` to receive the values as a binary
+	// frame instead of JSON, which avoids serializing every float as text. Any
+	// other value, or none, returns the JSON body.
+	Accept string `json:"Accept,omitempty,omitzero"`
+}
 
 // StreamTranscriptionAudioParams defines parameters for StreamTranscriptionAudio.
 type StreamTranscriptionAudioParams struct {
@@ -25922,14 +27307,54 @@ type RestoreTableParams struct {
 
 // PatchSchemaParams defines parameters for PatchSchema.
 type PatchSchemaParams struct {
+	// Rewrite Explicitly enqueue a durable fresh-generation schema rewrite instead
+	// of changing the live schema. Requires administrator permission on the
+	// entire dependency cohort. Sources remain writable during snapshot and
+	// catch-up; final validation and publication are atomic across the cohort.
+	// Returns a restore job (202), whose existing status/cancel routes apply.
+	// Independent graph/vector artifacts without a retained row-derived
+	// source proof are rejected before admission. The default false retains
+	// ordinary schema-update behavior. Existing absent values remain absent
+	// rather than retroactively receiving defaults. Stored column type
+	// changes and destructive column removal are rejected.
+	Rewrite bool `form:"rewrite,omitempty" json:"rewrite,omitempty,omitzero"`
+
 	// IfMatch Strong schema ETag returned by a previous schema mutation, for example `"schema-0"`. A mismatch returns 409 instead of overwriting a concurrent update.
 	IfMatch string `json:"If-Match,omitempty,omitzero"`
+
+	// IdempotencyKey Retry identity for rewrite=true admission. Reusing a key for a different rewrite returns 409.
+	IdempotencyKey string `json:"Idempotency-Key,omitempty,omitzero"`
+}
+
+// PatchSchema202JSONResponseBody defines parameters for PatchSchema.
+type PatchSchema202JSONResponseBody struct {
+	union json.RawMessage
 }
 
 // UpdateSchemaParams defines parameters for UpdateSchema.
 type UpdateSchemaParams struct {
+	// Rewrite Explicitly enqueue a durable fresh-generation schema rewrite instead
+	// of changing the live schema. Requires administrator permission on the
+	// entire dependency cohort. Sources remain writable during snapshot and
+	// catch-up; final validation and publication are atomic across the cohort.
+	// Returns a restore job (202), whose existing status/cancel routes apply.
+	// Independent graph/vector artifacts without a retained row-derived
+	// source proof are rejected before admission. The default false retains
+	// ordinary schema-update behavior. Existing absent values remain absent
+	// rather than retroactively receiving defaults. Stored column type
+	// changes and destructive column removal are rejected.
+	Rewrite bool `form:"rewrite,omitempty" json:"rewrite,omitempty,omitzero"`
+
 	// IfMatch Strong schema ETag returned by a previous schema mutation, for example `"schema-0"`. A mismatch returns 409 instead of overwriting a concurrent update.
 	IfMatch string `json:"If-Match,omitempty,omitzero"`
+
+	// IdempotencyKey Retry identity for rewrite=true admission. Reusing a key for a different rewrite returns 409.
+	IdempotencyKey string `json:"Idempotency-Key,omitempty,omitzero"`
+}
+
+// UpdateSchema202JSONResponseBody defines parameters for UpdateSchema.
+type UpdateSchema202JSONResponseBody struct {
+	union json.RawMessage
 }
 
 // CreateTableStorageMigrationJSONBody defines parameters for CreateTableStorageMigration.
@@ -26053,8 +27478,23 @@ type BackupNamespaceTableJSONRequestBody = BackupRequest
 // BatchNamespaceTableJSONRequestBody defines body for BatchNamespaceTable for application/json ContentType.
 type BatchNamespaceTableJSONRequestBody = BatchRequest
 
+// RepairNamespaceRelationalConstraintsJSONRequestBody defines body for RepairNamespaceRelationalConstraints for application/json ContentType.
+type RepairNamespaceRelationalConstraintsJSONRequestBody = RelationalRowMutationRequest
+
+// RetireNamespaceRelationalConstraintsJSONRequestBody defines body for RetireNamespaceRelationalConstraints for application/json ContentType.
+type RetireNamespaceRelationalConstraintsJSONRequestBody = RelationalConstraintRetirementRequest
+
+// RetryNamespaceRelationalConstraintsJSONRequestBody defines body for RetryNamespaceRelationalConstraints for application/json ContentType.
+type RetryNamespaceRelationalConstraintsJSONRequestBody = RelationalConstraintRetryRequest
+
 // CreateNamespaceTableIndexJSONRequestBody defines body for CreateNamespaceTableIndex for application/json ContentType.
 type CreateNamespaceTableIndexJSONRequestBody = CreateIndexRequest
+
+// RepairNamespaceIndexJSONRequestBody defines body for RepairNamespaceIndex for application/json ContentType.
+type RepairNamespaceIndexJSONRequestBody = IndexMaintenanceRequest
+
+// RetryNamespaceIndexJSONRequestBody defines body for RetryNamespaceIndex for application/json ContentType.
+type RetryNamespaceIndexJSONRequestBody = IndexMaintenanceRequest
 
 // QueryNamespaceTableJSONRequestBody defines body for QueryNamespaceTable for application/json ContentType.
 type QueryNamespaceTableJSONRequestBody = StatefulQueryRequest
@@ -26064,6 +27504,12 @@ type RenameNamespaceTableJSONRequestBody = RenameCatalogResourceRequest
 
 // RestoreNamespaceTableJSONRequestBody defines body for RestoreNamespaceTable for application/json ContentType.
 type RestoreNamespaceTableJSONRequestBody = RestoreRequest
+
+// MutateNamespaceRelationalRowsJSONRequestBody defines body for MutateNamespaceRelationalRows for application/json ContentType.
+type MutateNamespaceRelationalRowsJSONRequestBody = RelationalRowMutationRequest
+
+// QueryNamespaceRelationalRowsJSONRequestBody defines body for QueryNamespaceRelationalRows for application/json ContentType.
+type QueryNamespaceRelationalRowsJSONRequestBody = RelationalRowQueryRequest
 
 // PatchNamespaceTableSchemaJSONRequestBody defines body for PatchNamespaceTableSchema for application/json ContentType.
 type PatchNamespaceTableSchemaJSONRequestBody = TableSchemaPatch
@@ -26116,11 +27562,26 @@ type BackupTableJSONRequestBody = BackupRequest
 // BatchWriteJSONRequestBody defines body for BatchWrite for application/json ContentType.
 type BatchWriteJSONRequestBody = BatchRequest
 
+// RepairRelationalConstraintsJSONRequestBody defines body for RepairRelationalConstraints for application/json ContentType.
+type RepairRelationalConstraintsJSONRequestBody = RelationalRowMutationRequest
+
+// RetireRelationalConstraintsJSONRequestBody defines body for RetireRelationalConstraints for application/json ContentType.
+type RetireRelationalConstraintsJSONRequestBody = RelationalConstraintRetirementRequest
+
+// RetryRelationalConstraintsJSONRequestBody defines body for RetryRelationalConstraints for application/json ContentType.
+type RetryRelationalConstraintsJSONRequestBody = RelationalConstraintRetryRequest
+
 // ScanKeysJSONRequestBody defines body for ScanKeys for application/json ContentType.
 type ScanKeysJSONRequestBody = ScanKeysRequest
 
 // CreateIndexJSONRequestBody defines body for CreateIndex for application/json ContentType.
 type CreateIndexJSONRequestBody = CreateIndexRequest
+
+// RepairIndexJSONRequestBody defines body for RepairIndex for application/json ContentType.
+type RepairIndexJSONRequestBody = IndexMaintenanceRequest
+
+// RetryIndexJSONRequestBody defines body for RetryIndex for application/json ContentType.
+type RetryIndexJSONRequestBody = IndexMaintenanceRequest
 
 // LinearMergeJSONRequestBody defines body for LinearMerge for application/json ContentType.
 type LinearMergeJSONRequestBody = LinearMergeRequest
@@ -26142,6 +27603,12 @@ type RunTableRepairJSONRequestBody = RepairRunRequest
 
 // RestoreTableJSONRequestBody defines body for RestoreTable for application/json ContentType.
 type RestoreTableJSONRequestBody = RestoreRequest
+
+// MutateRelationalRowsJSONRequestBody defines body for MutateRelationalRows for application/json ContentType.
+type MutateRelationalRowsJSONRequestBody = RelationalRowMutationRequest
+
+// QueryRelationalRowsJSONRequestBody defines body for QueryRelationalRows for application/json ContentType.
+type QueryRelationalRowsJSONRequestBody = RelationalRowQueryRequest
 
 // PatchSchemaJSONRequestBody defines body for PatchSchema for application/json ContentType.
 type PatchSchemaJSONRequestBody = TableSchemaPatch
@@ -26652,6 +28119,14 @@ func (a *ExtractionObject) UnmarshalJSON(b []byte) error {
 		delete(object, "classifications")
 	}
 
+	if raw, found := object["decisions"]; found {
+		err = json.Unmarshal(raw, &a.Decisions)
+		if err != nil {
+			return fmt.Errorf("error reading 'decisions': %w", err)
+		}
+		delete(object, "decisions")
+	}
+
 	if raw, found := object["entities"]; found {
 		err = json.Unmarshal(raw, &a.Entities)
 		if err != nil {
@@ -26739,6 +28214,13 @@ func (a ExtractionObject) MarshalJSON() ([]byte, error) {
 		object["classifications"], err = json.Marshal(a.Classifications)
 		if err != nil {
 			return nil, fmt.Errorf("error marshaling 'classifications': %w", err)
+		}
+	}
+
+	if a.Decisions != nil {
+		object["decisions"], err = json.Marshal(a.Decisions)
+		if err != nil {
+			return nil, fmt.Errorf("error marshaling 'decisions': %w", err)
 		}
 	}
 
@@ -28401,6 +29883,40 @@ func (t *CreateIndexRequest) MergeCreateAlgebraicIndexRequest(v CreateAlgebraicI
 	return err
 }
 
+// AsCreateRelationalIndexRequest returns the union data inside the CreateIndexRequest as a CreateRelationalIndexRequest
+func (t CreateIndexRequest) AsCreateRelationalIndexRequest() (CreateRelationalIndexRequest, error) {
+	var body CreateRelationalIndexRequest
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromCreateRelationalIndexRequest overwrites any union data inside the CreateIndexRequest as the provided CreateRelationalIndexRequest
+func (t *CreateIndexRequest) FromCreateRelationalIndexRequest(v CreateRelationalIndexRequest) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	b, err = runtime.JSONMerge(b, []byte(`{"type":"relational"}`))
+	t.union = b
+	return err
+}
+
+// MergeCreateRelationalIndexRequest performs a merge with any union data inside the CreateIndexRequest, using the provided CreateRelationalIndexRequest
+func (t *CreateIndexRequest) MergeCreateRelationalIndexRequest(v CreateRelationalIndexRequest) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	b, err = runtime.JSONMerge(b, []byte(`{"type":"relational"}`))
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
 func (t CreateIndexRequest) Discriminator() (string, error) {
 	var discriminator struct {
 		Discriminator string `json:"type"`
@@ -28423,6 +29939,8 @@ func (t CreateIndexRequest) ValueByDiscriminator() (interface{}, error) {
 		return t.AsCreateFullTextIndexRequest()
 	case "graph":
 		return t.AsCreateGraphIndexRequest()
+	case "relational":
+		return t.AsCreateRelationalIndexRequest()
 	default:
 		return nil, errors.New("unknown discriminator value: " + discriminator)
 	}
@@ -28574,6 +30092,40 @@ func (t *CreatedIndex) MergeCreatedAlgebraicIndex(v CreatedAlgebraicIndex) error
 	return err
 }
 
+// AsCreatedRelationalIndex returns the union data inside the CreatedIndex as a CreatedRelationalIndex
+func (t CreatedIndex) AsCreatedRelationalIndex() (CreatedRelationalIndex, error) {
+	var body CreatedRelationalIndex
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromCreatedRelationalIndex overwrites any union data inside the CreatedIndex as the provided CreatedRelationalIndex
+func (t *CreatedIndex) FromCreatedRelationalIndex(v CreatedRelationalIndex) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	b, err = runtime.JSONMerge(b, []byte(`{"type":"relational"}`))
+	t.union = b
+	return err
+}
+
+// MergeCreatedRelationalIndex performs a merge with any union data inside the CreatedIndex, using the provided CreatedRelationalIndex
+func (t *CreatedIndex) MergeCreatedRelationalIndex(v CreatedRelationalIndex) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	b, err = runtime.JSONMerge(b, []byte(`{"type":"relational"}`))
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
 func (t CreatedIndex) Discriminator() (string, error) {
 	var discriminator struct {
 		Discriminator string `json:"type"`
@@ -28596,6 +30148,8 @@ func (t CreatedIndex) ValueByDiscriminator() (interface{}, error) {
 		return t.AsCreatedFullTextIndex()
 	case "graph":
 		return t.AsCreatedGraphIndex()
+	case "relational":
+		return t.AsCreatedRelationalIndex()
 	default:
 		return nil, errors.New("unknown discriminator value: " + discriminator)
 	}
@@ -32114,6 +33668,32 @@ func (t *IndexConfig) MergeAlgebraicIndexConfig(v AlgebraicIndexConfig) error {
 	return err
 }
 
+// AsRelationalIndexConfig returns the union data inside the IndexConfig as a RelationalIndexConfig
+func (t IndexConfig) AsRelationalIndexConfig() (RelationalIndexConfig, error) {
+	var body RelationalIndexConfig
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromRelationalIndexConfig overwrites any union data inside the IndexConfig as the provided RelationalIndexConfig
+func (t *IndexConfig) FromRelationalIndexConfig(v RelationalIndexConfig) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeRelationalIndexConfig performs a merge with any union data inside the IndexConfig, using the provided RelationalIndexConfig
+func (t *IndexConfig) MergeRelationalIndexConfig(v RelationalIndexConfig) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
 func (t IndexConfig) MarshalJSON() ([]byte, error) {
 	b, err := t.union.MarshalJSON()
 	if err != nil {
@@ -32660,6 +34240,40 @@ func (t *IndexStats) MergeAlgebraicIndexStats(v AlgebraicIndexStats) error {
 	return err
 }
 
+// AsRelationalIndexStats returns the union data inside the IndexStats as a RelationalIndexStats
+func (t IndexStats) AsRelationalIndexStats() (RelationalIndexStats, error) {
+	var body RelationalIndexStats
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromRelationalIndexStats overwrites any union data inside the IndexStats as the provided RelationalIndexStats
+func (t *IndexStats) FromRelationalIndexStats(v RelationalIndexStats) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	b, err = runtime.JSONMerge(b, []byte(`{"index_type":"relational"}`))
+	t.union = b
+	return err
+}
+
+// MergeRelationalIndexStats performs a merge with any union data inside the IndexStats, using the provided RelationalIndexStats
+func (t *IndexStats) MergeRelationalIndexStats(v RelationalIndexStats) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	b, err = runtime.JSONMerge(b, []byte(`{"index_type":"relational"}`))
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
 func (t IndexStats) Discriminator() (string, error) {
 	var discriminator struct {
 		Discriminator string `json:"index_type"`
@@ -32682,6 +34296,8 @@ func (t IndexStats) ValueByDiscriminator() (interface{}, error) {
 		return t.AsFullTextIndexStats()
 	case "graph":
 		return t.AsGraphIndexStats()
+	case "relational":
+		return t.AsRelationalIndexStats()
 	default:
 		return nil, errors.New("unknown discriminator value: " + discriminator)
 	}
@@ -34673,6 +36289,287 @@ func (t *TableBackupConflictError) UnmarshalJSON(b []byte) error {
 	return err
 }
 
+// AsExaSearchConfig returns the union data inside the WebSearchProviderConfig as a ExaSearchConfig
+func (t WebSearchProviderConfig) AsExaSearchConfig() (ExaSearchConfig, error) {
+	var body ExaSearchConfig
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromExaSearchConfig overwrites any union data inside the WebSearchProviderConfig as the provided ExaSearchConfig
+func (t *WebSearchProviderConfig) FromExaSearchConfig(v ExaSearchConfig) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	b, err = runtime.JSONMerge(b, []byte(`{"provider":"exa"}`))
+	t.union = b
+	return err
+}
+
+// MergeExaSearchConfig performs a merge with any union data inside the WebSearchProviderConfig, using the provided ExaSearchConfig
+func (t *WebSearchProviderConfig) MergeExaSearchConfig(v ExaSearchConfig) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	b, err = runtime.JSONMerge(b, []byte(`{"provider":"exa"}`))
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsSerperSearchConfig returns the union data inside the WebSearchProviderConfig as a SerperSearchConfig
+func (t WebSearchProviderConfig) AsSerperSearchConfig() (SerperSearchConfig, error) {
+	var body SerperSearchConfig
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromSerperSearchConfig overwrites any union data inside the WebSearchProviderConfig as the provided SerperSearchConfig
+func (t *WebSearchProviderConfig) FromSerperSearchConfig(v SerperSearchConfig) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	b, err = runtime.JSONMerge(b, []byte(`{"provider":"serper"}`))
+	t.union = b
+	return err
+}
+
+// MergeSerperSearchConfig performs a merge with any union data inside the WebSearchProviderConfig, using the provided SerperSearchConfig
+func (t *WebSearchProviderConfig) MergeSerperSearchConfig(v SerperSearchConfig) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	b, err = runtime.JSONMerge(b, []byte(`{"provider":"serper"}`))
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsTavilySearchConfig returns the union data inside the WebSearchProviderConfig as a TavilySearchConfig
+func (t WebSearchProviderConfig) AsTavilySearchConfig() (TavilySearchConfig, error) {
+	var body TavilySearchConfig
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromTavilySearchConfig overwrites any union data inside the WebSearchProviderConfig as the provided TavilySearchConfig
+func (t *WebSearchProviderConfig) FromTavilySearchConfig(v TavilySearchConfig) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	b, err = runtime.JSONMerge(b, []byte(`{"provider":"tavily"}`))
+	t.union = b
+	return err
+}
+
+// MergeTavilySearchConfig performs a merge with any union data inside the WebSearchProviderConfig, using the provided TavilySearchConfig
+func (t *WebSearchProviderConfig) MergeTavilySearchConfig(v TavilySearchConfig) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	b, err = runtime.JSONMerge(b, []byte(`{"provider":"tavily"}`))
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsBraveSearchConfig returns the union data inside the WebSearchProviderConfig as a BraveSearchConfig
+func (t WebSearchProviderConfig) AsBraveSearchConfig() (BraveSearchConfig, error) {
+	var body BraveSearchConfig
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromBraveSearchConfig overwrites any union data inside the WebSearchProviderConfig as the provided BraveSearchConfig
+func (t *WebSearchProviderConfig) FromBraveSearchConfig(v BraveSearchConfig) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	b, err = runtime.JSONMerge(b, []byte(`{"provider":"brave"}`))
+	t.union = b
+	return err
+}
+
+// MergeBraveSearchConfig performs a merge with any union data inside the WebSearchProviderConfig, using the provided BraveSearchConfig
+func (t *WebSearchProviderConfig) MergeBraveSearchConfig(v BraveSearchConfig) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	b, err = runtime.JSONMerge(b, []byte(`{"provider":"brave"}`))
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsYouSearchConfig returns the union data inside the WebSearchProviderConfig as a YouSearchConfig
+func (t WebSearchProviderConfig) AsYouSearchConfig() (YouSearchConfig, error) {
+	var body YouSearchConfig
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromYouSearchConfig overwrites any union data inside the WebSearchProviderConfig as the provided YouSearchConfig
+func (t *WebSearchProviderConfig) FromYouSearchConfig(v YouSearchConfig) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	b, err = runtime.JSONMerge(b, []byte(`{"provider":"you"}`))
+	t.union = b
+	return err
+}
+
+// MergeYouSearchConfig performs a merge with any union data inside the WebSearchProviderConfig, using the provided YouSearchConfig
+func (t *WebSearchProviderConfig) MergeYouSearchConfig(v YouSearchConfig) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	b, err = runtime.JSONMerge(b, []byte(`{"provider":"you"}`))
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsLinkupSearchConfig returns the union data inside the WebSearchProviderConfig as a LinkupSearchConfig
+func (t WebSearchProviderConfig) AsLinkupSearchConfig() (LinkupSearchConfig, error) {
+	var body LinkupSearchConfig
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromLinkupSearchConfig overwrites any union data inside the WebSearchProviderConfig as the provided LinkupSearchConfig
+func (t *WebSearchProviderConfig) FromLinkupSearchConfig(v LinkupSearchConfig) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	b, err = runtime.JSONMerge(b, []byte(`{"provider":"linkup"}`))
+	t.union = b
+	return err
+}
+
+// MergeLinkupSearchConfig performs a merge with any union data inside the WebSearchProviderConfig, using the provided LinkupSearchConfig
+func (t *WebSearchProviderConfig) MergeLinkupSearchConfig(v LinkupSearchConfig) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	b, err = runtime.JSONMerge(b, []byte(`{"provider":"linkup"}`))
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsVertexSearchConfig returns the union data inside the WebSearchProviderConfig as a VertexSearchConfig
+func (t WebSearchProviderConfig) AsVertexSearchConfig() (VertexSearchConfig, error) {
+	var body VertexSearchConfig
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromVertexSearchConfig overwrites any union data inside the WebSearchProviderConfig as the provided VertexSearchConfig
+func (t *WebSearchProviderConfig) FromVertexSearchConfig(v VertexSearchConfig) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	b, err = runtime.JSONMerge(b, []byte(`{"provider":"vertex"}`))
+	t.union = b
+	return err
+}
+
+// MergeVertexSearchConfig performs a merge with any union data inside the WebSearchProviderConfig, using the provided VertexSearchConfig
+func (t *WebSearchProviderConfig) MergeVertexSearchConfig(v VertexSearchConfig) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	b, err = runtime.JSONMerge(b, []byte(`{"provider":"vertex"}`))
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+func (t WebSearchProviderConfig) Discriminator() (string, error) {
+	var discriminator struct {
+		Discriminator string `json:"provider"`
+	}
+	err := json.Unmarshal(t.union, &discriminator)
+	return discriminator.Discriminator, err
+}
+
+func (t WebSearchProviderConfig) ValueByDiscriminator() (interface{}, error) {
+	discriminator, err := t.Discriminator()
+	if err != nil {
+		return nil, err
+	}
+	switch discriminator {
+	case "brave":
+		return t.AsBraveSearchConfig()
+	case "exa":
+		return t.AsExaSearchConfig()
+	case "linkup":
+		return t.AsLinkupSearchConfig()
+	case "serper":
+		return t.AsSerperSearchConfig()
+	case "tavily":
+		return t.AsTavilySearchConfig()
+	case "vertex":
+		return t.AsVertexSearchConfig()
+	case "you":
+		return t.AsYouSearchConfig()
+	default:
+		return nil, errors.New("unknown discriminator value: " + discriminator)
+	}
+}
+
+func (t WebSearchProviderConfig) MarshalJSON() ([]byte, error) {
+	b, err := t.union.MarshalJSON()
+	return b, err
+}
+
+func (t *WebSearchProviderConfig) UnmarshalJSON(b []byte) error {
+	err := t.union.UnmarshalJSON(b)
+	return err
+}
+
 // AsQueryTemporarilyUnavailableError returns the union data inside the AgentTemporarilyUnavailable as a QueryTemporarilyUnavailableError
 func (t AgentTemporarilyUnavailable) AsQueryTemporarilyUnavailableError() (QueryTemporarilyUnavailableError, error) {
 	var body QueryTemporarilyUnavailableError
@@ -34983,6 +36880,130 @@ func (t *RestoreAdmissionUnavailable) UnmarshalJSON(b []byte) error {
 	return err
 }
 
+// AsRestoreJob returns the union data inside the PatchSchema202JSONResponseBody as a RestoreJob
+func (t PatchSchema202JSONResponseBody) AsRestoreJob() (RestoreJob, error) {
+	var body RestoreJob
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromRestoreJob overwrites any union data inside the PatchSchema202JSONResponseBody as the provided RestoreJob
+func (t *PatchSchema202JSONResponseBody) FromRestoreJob(v RestoreJob) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeRestoreJob performs a merge with any union data inside the PatchSchema202JSONResponseBody, using the provided RestoreJob
+func (t *PatchSchema202JSONResponseBody) MergeRestoreJob(v RestoreJob) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsCommittedMutationOutcome returns the union data inside the PatchSchema202JSONResponseBody as a CommittedMutationOutcome
+func (t PatchSchema202JSONResponseBody) AsCommittedMutationOutcome() (CommittedMutationOutcome, error) {
+	var body CommittedMutationOutcome
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromCommittedMutationOutcome overwrites any union data inside the PatchSchema202JSONResponseBody as the provided CommittedMutationOutcome
+func (t *PatchSchema202JSONResponseBody) FromCommittedMutationOutcome(v CommittedMutationOutcome) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeCommittedMutationOutcome performs a merge with any union data inside the PatchSchema202JSONResponseBody, using the provided CommittedMutationOutcome
+func (t *PatchSchema202JSONResponseBody) MergeCommittedMutationOutcome(v CommittedMutationOutcome) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+func (t PatchSchema202JSONResponseBody) MarshalJSON() ([]byte, error) {
+	b, err := t.union.MarshalJSON()
+	return b, err
+}
+
+func (t *PatchSchema202JSONResponseBody) UnmarshalJSON(b []byte) error {
+	err := t.union.UnmarshalJSON(b)
+	return err
+}
+
+// AsRestoreJob returns the union data inside the UpdateSchema202JSONResponseBody as a RestoreJob
+func (t UpdateSchema202JSONResponseBody) AsRestoreJob() (RestoreJob, error) {
+	var body RestoreJob
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromRestoreJob overwrites any union data inside the UpdateSchema202JSONResponseBody as the provided RestoreJob
+func (t *UpdateSchema202JSONResponseBody) FromRestoreJob(v RestoreJob) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeRestoreJob performs a merge with any union data inside the UpdateSchema202JSONResponseBody, using the provided RestoreJob
+func (t *UpdateSchema202JSONResponseBody) MergeRestoreJob(v RestoreJob) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsCommittedMutationOutcome returns the union data inside the UpdateSchema202JSONResponseBody as a CommittedMutationOutcome
+func (t UpdateSchema202JSONResponseBody) AsCommittedMutationOutcome() (CommittedMutationOutcome, error) {
+	var body CommittedMutationOutcome
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromCommittedMutationOutcome overwrites any union data inside the UpdateSchema202JSONResponseBody as the provided CommittedMutationOutcome
+func (t *UpdateSchema202JSONResponseBody) FromCommittedMutationOutcome(v CommittedMutationOutcome) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeCommittedMutationOutcome performs a merge with any union data inside the UpdateSchema202JSONResponseBody, using the provided CommittedMutationOutcome
+func (t *UpdateSchema202JSONResponseBody) MergeCommittedMutationOutcome(v CommittedMutationOutcome) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+func (t UpdateSchema202JSONResponseBody) MarshalJSON() ([]byte, error) {
+	b, err := t.union.MarshalJSON()
+	return b, err
+}
+
+func (t *UpdateSchema202JSONResponseBody) UnmarshalJSON(b []byte) error {
+	err := t.union.UnmarshalJSON(b)
+	return err
+}
+
 // RequestEditorFn is the function signature for the RequestEditor callback function
 type RequestEditorFn func(ctx context.Context, req *http.Request) error
 
@@ -35216,7 +37237,7 @@ type ClientInterface interface {
 	// Takes any type of body and a specified content type.
 	//
 	// Corresponds with POST /ai/v1/embed (the `GenerateEmbeddings` operationId).
-	GenerateEmbeddingsWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+	GenerateEmbeddingsWithBody(ctx context.Context, params *GenerateEmbeddingsParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// GenerateEmbeddings Create embeddings (alias of `/embeddings`)
 	//
@@ -35231,7 +37252,7 @@ type ClientInterface interface {
 	// Takes a body of the `application/json` content type.
 	//
 	// Corresponds with POST /ai/v1/embed (the `GenerateEmbeddings` operationId).
-	GenerateEmbeddings(ctx context.Context, body GenerateEmbeddingsJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+	GenerateEmbeddings(ctx context.Context, params *GenerateEmbeddingsParams, body GenerateEmbeddingsJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// CreateEmbeddingWithBody Create embeddings (OpenAI-compatible)
 	//
@@ -35247,7 +37268,7 @@ type ClientInterface interface {
 	// Takes any type of body and a specified content type.
 	//
 	// Corresponds with POST /ai/v1/embeddings (the `CreateEmbedding` operationId).
-	CreateEmbeddingWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+	CreateEmbeddingWithBody(ctx context.Context, params *CreateEmbeddingParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// CreateEmbedding Create embeddings (OpenAI-compatible)
 	//
@@ -35263,7 +37284,7 @@ type ClientInterface interface {
 	// Takes a body of the `application/json` content type.
 	//
 	// Corresponds with POST /ai/v1/embeddings (the `CreateEmbedding` operationId).
-	CreateEmbedding(ctx context.Context, body CreateEmbeddingJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+	CreateEmbedding(ctx context.Context, params *CreateEmbeddingParams, body CreateEmbeddingJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// ExtractWithBody Extract entities, relations, classifications, and structures
 	//
@@ -35624,7 +37645,7 @@ type ClientInterface interface {
 	// Takes any type of body and a specified content type.
 	//
 	// Corresponds with POST /ai/v1/rerank (the `RerankPrompts` operationId).
-	RerankPromptsWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+	RerankPromptsWithBody(ctx context.Context, params *RerankPromptsParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// RerankPrompts Rerank prompts by relevance
 	//
@@ -35655,7 +37676,7 @@ type ClientInterface interface {
 	// Takes a body of the `application/json` content type.
 	//
 	// Corresponds with POST /ai/v1/rerank (the `RerankPrompts` operationId).
-	RerankPrompts(ctx context.Context, body RerankPromptsJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+	RerankPrompts(ctx context.Context, params *RerankPromptsParams, body RerankPromptsJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// RerankMultimodalPromptsWithBody Rerank multimodal documents by relevance
 	//
@@ -35671,7 +37692,7 @@ type ClientInterface interface {
 	// Takes any type of body and a specified content type.
 	//
 	// Corresponds with POST /ai/v1/rerank_multimodal (the `RerankMultimodalPrompts` operationId).
-	RerankMultimodalPromptsWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+	RerankMultimodalPromptsWithBody(ctx context.Context, params *RerankMultimodalPromptsParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// RerankMultimodalPrompts Rerank multimodal documents by relevance
 	//
@@ -35687,7 +37708,7 @@ type ClientInterface interface {
 	// Takes a body of the `application/json` content type.
 	//
 	// Corresponds with POST /ai/v1/rerank_multimodal (the `RerankMultimodalPrompts` operationId).
-	RerankMultimodalPrompts(ctx context.Context, body RerankMultimodalPromptsJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+	RerankMultimodalPrompts(ctx context.Context, params *RerankMultimodalPromptsParams, body RerankMultimodalPromptsJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// RewriteTextWithBody Rewrite text using Seq2Seq models
 	//
@@ -36603,6 +38624,97 @@ type ClientInterface interface {
 	// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/batch (the `BatchNamespaceTable` operationId).
 	BatchNamespaceTable(ctx context.Context, databaseName string, namespaceName string, tableName string, body BatchNamespaceTableJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
+	// RepairNamespaceRelationalConstraintsWithBody Repair version-conditional rows after failed or diagnosed constraint activation
+	//
+	// Requires table administrator permission. Each affected target range must
+	// have failed UNIQUE/FK/CHECK activation or a validating MATCH PARTIAL
+	// missing-parent diagnostic. Replacement values still satisfy all
+	// constraints, and referential actions require write permission on every
+	// affected table. Existing dependencies remain protected. Repairs do not
+	// mark historical coverage valid. Invoke constraint retry after repairing
+	// failed activation; validating diagnostics resume validation automatically.
+	//
+	// Takes any type of body and a specified content type.
+	//
+	// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/repair (the `RepairNamespaceRelationalConstraints` operationId).
+	RepairNamespaceRelationalConstraintsWithBody(ctx context.Context, databaseName string, namespaceName string, tableName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// RepairNamespaceRelationalConstraints Repair version-conditional rows after failed or diagnosed constraint activation
+	//
+	// Requires table administrator permission. Each affected target range must
+	// have failed UNIQUE/FK/CHECK activation or a validating MATCH PARTIAL
+	// missing-parent diagnostic. Replacement values still satisfy all
+	// constraints, and referential actions require write permission on every
+	// affected table. Existing dependencies remain protected. Repairs do not
+	// mark historical coverage valid. Invoke constraint retry after repairing
+	// failed activation; validating diagnostics resume validation automatically.
+	//
+	// Takes a body of the `application/json` content type.
+	//
+	// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/repair (the `RepairNamespaceRelationalConstraints` operationId).
+	RepairNamespaceRelationalConstraints(ctx context.Context, databaseName string, namespaceName string, tableName string, body RepairNamespaceRelationalConstraintsJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// RetireNamespaceRelationalConstraintsWithBody Retire unique and foreign-key definitions safely
+	//
+	// Requires table administrator permission. Starts a durable, bounded
+	// all-owner drain. Poll constraints/status for progress. A target schema
+	// is published automatically after the drain. With drop=true the table
+	// remains fenced at ready_to_drop until an administrator explicitly
+	// deletes it with the existing table deletion endpoint.
+	//
+	// Takes any type of body and a specified content type.
+	//
+	// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/retire (the `RetireNamespaceRelationalConstraints` operationId).
+	RetireNamespaceRelationalConstraintsWithBody(ctx context.Context, databaseName string, namespaceName string, tableName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// RetireNamespaceRelationalConstraints Retire unique and foreign-key definitions safely
+	//
+	// Requires table administrator permission. Starts a durable, bounded
+	// all-owner drain. Poll constraints/status for progress. A target schema
+	// is published automatically after the drain. With drop=true the table
+	// remains fenced at ready_to_drop until an administrator explicitly
+	// deletes it with the existing table deletion endpoint.
+	//
+	// Takes a body of the `application/json` content type.
+	//
+	// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/retire (the `RetireNamespaceRelationalConstraints` operationId).
+	RetireNamespaceRelationalConstraints(ctx context.Context, databaseName string, namespaceName string, tableName string, body RetireNamespaceRelationalConstraintsJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// RetryNamespaceRelationalConstraintsWithBody Restart failed UNIQUE/FK/CHECK validation after administrative repair
+	//
+	// Requires table administrator permission. Resets each failed owner using
+	// an exact checkpoint precondition. Owners already validating or enforced
+	// are unchanged. Retrying after partial progress is safe. Inspect the
+	// constraint status endpoint for coverage and diagnostics.
+	// When a retirement job is active, clears its paused diagnostic and
+	// resumes that job instead of restarting activation. Retirement remains
+	// fenced and retains all prior drain progress.
+	//
+	// Takes any type of body and a specified content type.
+	//
+	// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/retry (the `RetryNamespaceRelationalConstraints` operationId).
+	RetryNamespaceRelationalConstraintsWithBody(ctx context.Context, databaseName string, namespaceName string, tableName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// RetryNamespaceRelationalConstraints Restart failed UNIQUE/FK/CHECK validation after administrative repair
+	//
+	// Requires table administrator permission. Resets each failed owner using
+	// an exact checkpoint precondition. Owners already validating or enforced
+	// are unchanged. Retrying after partial progress is safe. Inspect the
+	// constraint status endpoint for coverage and diagnostics.
+	// When a retirement job is active, clears its paused diagnostic and
+	// resumes that job instead of restarting activation. Retirement remains
+	// fenced and retains all prior drain progress.
+	//
+	// Takes a body of the `application/json` content type.
+	//
+	// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/retry (the `RetryNamespaceRelationalConstraints` operationId).
+	RetryNamespaceRelationalConstraints(ctx context.Context, databaseName string, namespaceName string, tableName string, body RetryNamespaceRelationalConstraintsJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// GetNamespaceRelationalConstraintStatus Read distributed UNIQUE, foreign-key, and CHECK validation coverage
+	//
+	// Corresponds with GET /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/status (the `GetNamespaceRelationalConstraintStatus` operationId).
+	GetNamespaceRelationalConstraintStatus(ctx context.Context, databaseName string, namespaceName string, tableName string, reqEditors ...RequestEditorFn) (*http.Response, error)
+
 	// LookupNamespaceTableDocument Retrieve a document by key from an explicit namespace table
 	//
 	// Retrieves a document through an explicit database and namespace route. While storage APIs are still bare-table-name based, the server fails closed when the resolved catalog table does not map to a unique physical table name.
@@ -36654,6 +38766,42 @@ type ClientInterface interface {
 	// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}:{action} (the `ExecuteNamespaceTableGraphMetricAction` operationId).
 	ExecuteNamespaceTableGraphMetricAction(ctx context.Context, databaseName string, namespaceName string, tableName string, indexName string, metricName string, action string, reqEditors ...RequestEditorFn) (*http.Response, error)
 
+	// RepairNamespaceIndexWithBody Repair an index generation
+	//
+	// Generation-fenced relational index maintenance. Requires table ADMIN permission. Repair accepts ready or failed generations and rebuilds their derived records. Owners are admitted independently and durably; exact request replay resumes after partial acknowledgements. Unsupported index types return 405.
+	//
+	// Takes any type of body and a specified content type.
+	//
+	// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/repair (the `RepairNamespaceIndex` operationId).
+	RepairNamespaceIndexWithBody(ctx context.Context, databaseName string, namespaceName string, tableName string, indexName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// RepairNamespaceIndex Repair an index generation
+	//
+	// Generation-fenced relational index maintenance. Requires table ADMIN permission. Repair accepts ready or failed generations and rebuilds their derived records. Owners are admitted independently and durably; exact request replay resumes after partial acknowledgements. Unsupported index types return 405.
+	//
+	// Takes a body of the `application/json` content type.
+	//
+	// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/repair (the `RepairNamespaceIndex` operationId).
+	RepairNamespaceIndex(ctx context.Context, databaseName string, namespaceName string, tableName string, indexName string, body RepairNamespaceIndexJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// RetryNamespaceIndexWithBody Retry a failed index build
+	//
+	// Generation-fenced relational index maintenance. Requires table ADMIN permission. Retry accepts failed generations. Owners are admitted independently and durably; exact request replay resumes after partial acknowledgements. Unsupported index types return 405.
+	//
+	// Takes any type of body and a specified content type.
+	//
+	// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/retry (the `RetryNamespaceIndex` operationId).
+	RetryNamespaceIndexWithBody(ctx context.Context, databaseName string, namespaceName string, tableName string, indexName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// RetryNamespaceIndex Retry a failed index build
+	//
+	// Generation-fenced relational index maintenance. Requires table ADMIN permission. Retry accepts failed generations. Owners are admitted independently and durably; exact request replay resumes after partial acknowledgements. Unsupported index types return 405.
+	//
+	// Takes a body of the `application/json` content type.
+	//
+	// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/retry (the `RetryNamespaceIndex` operationId).
+	RetryNamespaceIndex(ctx context.Context, databaseName string, namespaceName string, tableName string, indexName string, body RetryNamespaceIndexJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
 	// QueryNamespaceTableWithBody Query an explicit namespace table
 	//
 	// Queries a table through an explicit database and namespace route. While storage APIs are still bare-table-name based, the server fails closed when the resolved catalog table does not map to a unique physical table name.
@@ -36699,6 +38847,34 @@ type ClientInterface interface {
 	//
 	// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/restore (the `RestoreNamespaceTable` operationId).
 	RestoreNamespaceTable(ctx context.Context, databaseName string, namespaceName string, tableName string, params *RestoreNamespaceTableParams, body RestoreNamespaceTableJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// MutateNamespaceRelationalRowsWithBody Atomically replace or delete version-conditional typed rows
+	//
+	// Takes any type of body and a specified content type.
+	//
+	// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rows/mutate (the `MutateNamespaceRelationalRows` operationId).
+	MutateNamespaceRelationalRowsWithBody(ctx context.Context, databaseName string, namespaceName string, tableName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// MutateNamespaceRelationalRows Atomically replace or delete version-conditional typed rows
+	//
+	// Takes a body of the `application/json` content type.
+	//
+	// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rows/mutate (the `MutateNamespaceRelationalRows` operationId).
+	MutateNamespaceRelationalRows(ctx context.Context, databaseName string, namespaceName string, tableName string, body MutateNamespaceRelationalRowsJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// QueryNamespaceRelationalRowsWithBody Query projected typed relational rows
+	//
+	// Takes any type of body and a specified content type.
+	//
+	// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rows/query (the `QueryNamespaceRelationalRows` operationId).
+	QueryNamespaceRelationalRowsWithBody(ctx context.Context, databaseName string, namespaceName string, tableName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// QueryNamespaceRelationalRows Query projected typed relational rows
+	//
+	// Takes a body of the `application/json` content type.
+	//
+	// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rows/query (the `QueryNamespaceRelationalRows` operationId).
+	QueryNamespaceRelationalRows(ctx context.Context, databaseName string, namespaceName string, tableName string, body QueryNamespaceRelationalRowsJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// PatchNamespaceTableSchemaWithBody Patch a table's schema
 	//
@@ -37510,6 +39686,97 @@ type ClientInterface interface {
 	// Corresponds with POST /db/v1/tables/{tableName}/batch (the `BatchWrite` operationId).
 	BatchWrite(ctx context.Context, tableName string, body BatchWriteJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
+	// RepairRelationalConstraintsWithBody Repair version-conditional rows after failed or diagnosed constraint activation
+	//
+	// Requires table administrator permission. Each affected target range must
+	// have failed UNIQUE/FK/CHECK activation or a validating MATCH PARTIAL
+	// missing-parent diagnostic. Replacement values still satisfy all
+	// constraints, and referential actions require write permission on every
+	// affected table. Existing dependencies remain protected. Repairs do not
+	// mark historical coverage valid. Invoke constraint retry after repairing
+	// failed activation; validating diagnostics resume validation automatically.
+	//
+	// Takes any type of body and a specified content type.
+	//
+	// Corresponds with POST /db/v1/tables/{tableName}/constraints/repair (the `RepairRelationalConstraints` operationId).
+	RepairRelationalConstraintsWithBody(ctx context.Context, tableName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// RepairRelationalConstraints Repair version-conditional rows after failed or diagnosed constraint activation
+	//
+	// Requires table administrator permission. Each affected target range must
+	// have failed UNIQUE/FK/CHECK activation or a validating MATCH PARTIAL
+	// missing-parent diagnostic. Replacement values still satisfy all
+	// constraints, and referential actions require write permission on every
+	// affected table. Existing dependencies remain protected. Repairs do not
+	// mark historical coverage valid. Invoke constraint retry after repairing
+	// failed activation; validating diagnostics resume validation automatically.
+	//
+	// Takes a body of the `application/json` content type.
+	//
+	// Corresponds with POST /db/v1/tables/{tableName}/constraints/repair (the `RepairRelationalConstraints` operationId).
+	RepairRelationalConstraints(ctx context.Context, tableName string, body RepairRelationalConstraintsJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// RetireRelationalConstraintsWithBody Retire unique and foreign-key definitions safely
+	//
+	// Requires table administrator permission. Starts a durable, bounded
+	// all-owner drain. Poll constraints/status for progress. A target schema
+	// is published automatically after the drain. With drop=true the table
+	// remains fenced at ready_to_drop until an administrator explicitly
+	// deletes it with the existing table deletion endpoint.
+	//
+	// Takes any type of body and a specified content type.
+	//
+	// Corresponds with POST /db/v1/tables/{tableName}/constraints/retire (the `RetireRelationalConstraints` operationId).
+	RetireRelationalConstraintsWithBody(ctx context.Context, tableName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// RetireRelationalConstraints Retire unique and foreign-key definitions safely
+	//
+	// Requires table administrator permission. Starts a durable, bounded
+	// all-owner drain. Poll constraints/status for progress. A target schema
+	// is published automatically after the drain. With drop=true the table
+	// remains fenced at ready_to_drop until an administrator explicitly
+	// deletes it with the existing table deletion endpoint.
+	//
+	// Takes a body of the `application/json` content type.
+	//
+	// Corresponds with POST /db/v1/tables/{tableName}/constraints/retire (the `RetireRelationalConstraints` operationId).
+	RetireRelationalConstraints(ctx context.Context, tableName string, body RetireRelationalConstraintsJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// RetryRelationalConstraintsWithBody Restart failed UNIQUE/FK/CHECK validation after administrative repair
+	//
+	// Requires table administrator permission. Resets each failed owner using
+	// an exact checkpoint precondition. Owners already validating or enforced
+	// are unchanged. Retrying after partial progress is safe. Inspect the
+	// constraint status endpoint for coverage and diagnostics.
+	// When a retirement job is active, clears its paused diagnostic and
+	// resumes that job instead of restarting activation. Retirement remains
+	// fenced and retains all prior drain progress.
+	//
+	// Takes any type of body and a specified content type.
+	//
+	// Corresponds with POST /db/v1/tables/{tableName}/constraints/retry (the `RetryRelationalConstraints` operationId).
+	RetryRelationalConstraintsWithBody(ctx context.Context, tableName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// RetryRelationalConstraints Restart failed UNIQUE/FK/CHECK validation after administrative repair
+	//
+	// Requires table administrator permission. Resets each failed owner using
+	// an exact checkpoint precondition. Owners already validating or enforced
+	// are unchanged. Retrying after partial progress is safe. Inspect the
+	// constraint status endpoint for coverage and diagnostics.
+	// When a retirement job is active, clears its paused diagnostic and
+	// resumes that job instead of restarting activation. Retirement remains
+	// fenced and retains all prior drain progress.
+	//
+	// Takes a body of the `application/json` content type.
+	//
+	// Corresponds with POST /db/v1/tables/{tableName}/constraints/retry (the `RetryRelationalConstraints` operationId).
+	RetryRelationalConstraints(ctx context.Context, tableName string, body RetryRelationalConstraintsJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// GetRelationalConstraintStatus Read distributed UNIQUE, foreign-key, and CHECK validation coverage
+	//
+	// Corresponds with GET /db/v1/tables/{tableName}/constraints/status (the `GetRelationalConstraintStatus` operationId).
+	GetRelationalConstraintStatus(ctx context.Context, tableName string, reqEditors ...RequestEditorFn) (*http.Response, error)
+
 	// ReauthorizeTableDestinations Adopt stored write destinations with the current credential
 	//
 	// Reauthorizes the table's existing CDC routes and graph resolver destinations
@@ -37621,6 +39888,42 @@ type ClientInterface interface {
 	//
 	// Corresponds with POST /db/v1/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}:{action} (the `ExecuteGraphMetricAction` operationId).
 	ExecuteGraphMetricAction(ctx context.Context, tableName string, indexName string, metricName string, action string, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// RepairIndexWithBody Repair an index generation
+	//
+	// Generation-fenced relational index maintenance. Requires table ADMIN permission. Repair accepts ready or failed generations and rebuilds their derived records. Owners are admitted independently and durably; exact request replay resumes after partial acknowledgements. Unsupported index types return 405.
+	//
+	// Takes any type of body and a specified content type.
+	//
+	// Corresponds with POST /db/v1/tables/{tableName}/indexes/{indexName}/repair (the `RepairIndex` operationId).
+	RepairIndexWithBody(ctx context.Context, tableName string, indexName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// RepairIndex Repair an index generation
+	//
+	// Generation-fenced relational index maintenance. Requires table ADMIN permission. Repair accepts ready or failed generations and rebuilds their derived records. Owners are admitted independently and durably; exact request replay resumes after partial acknowledgements. Unsupported index types return 405.
+	//
+	// Takes a body of the `application/json` content type.
+	//
+	// Corresponds with POST /db/v1/tables/{tableName}/indexes/{indexName}/repair (the `RepairIndex` operationId).
+	RepairIndex(ctx context.Context, tableName string, indexName string, body RepairIndexJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// RetryIndexWithBody Retry a failed index build
+	//
+	// Generation-fenced relational index maintenance. Requires table ADMIN permission. Retry accepts failed generations. Owners are admitted independently and durably; exact request replay resumes after partial acknowledgements. Unsupported index types return 405.
+	//
+	// Takes any type of body and a specified content type.
+	//
+	// Corresponds with POST /db/v1/tables/{tableName}/indexes/{indexName}/retry (the `RetryIndex` operationId).
+	RetryIndexWithBody(ctx context.Context, tableName string, indexName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// RetryIndex Retry a failed index build
+	//
+	// Generation-fenced relational index maintenance. Requires table ADMIN permission. Retry accepts failed generations. Owners are admitted independently and durably; exact request replay resumes after partial acknowledgements. Unsupported index types return 405.
+	//
+	// Takes a body of the `application/json` content type.
+	//
+	// Corresponds with POST /db/v1/tables/{tableName}/indexes/{indexName}/retry (the `RetryIndex` operationId).
+	RetryIndex(ctx context.Context, tableName string, indexName string, body RetryIndexJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// LinearMergeWithBody Synchronize data from external sources (Shopify, Postgres, S3) using a linear merge
 	//
@@ -37841,6 +40144,34 @@ type ClientInterface interface {
 	//
 	// Corresponds with POST /db/v1/tables/{tableName}/restore (the `RestoreTable` operationId).
 	RestoreTable(ctx context.Context, tableName string, params *RestoreTableParams, body RestoreTableJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// MutateRelationalRowsWithBody Atomically replace or delete version-conditional typed rows
+	//
+	// Takes any type of body and a specified content type.
+	//
+	// Corresponds with POST /db/v1/tables/{tableName}/rows/mutate (the `MutateRelationalRows` operationId).
+	MutateRelationalRowsWithBody(ctx context.Context, tableName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// MutateRelationalRows Atomically replace or delete version-conditional typed rows
+	//
+	// Takes a body of the `application/json` content type.
+	//
+	// Corresponds with POST /db/v1/tables/{tableName}/rows/mutate (the `MutateRelationalRows` operationId).
+	MutateRelationalRows(ctx context.Context, tableName string, body MutateRelationalRowsJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// QueryRelationalRowsWithBody Query projected typed relational rows
+	//
+	// Takes any type of body and a specified content type.
+	//
+	// Corresponds with POST /db/v1/tables/{tableName}/rows/query (the `QueryRelationalRows` operationId).
+	QueryRelationalRowsWithBody(ctx context.Context, tableName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// QueryRelationalRows Query projected typed relational rows
+	//
+	// Takes a body of the `application/json` content type.
+	//
+	// Corresponds with POST /db/v1/tables/{tableName}/rows/query (the `QueryRelationalRows` operationId).
+	QueryRelationalRows(ctx context.Context, tableName string, body QueryRelationalRowsJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// PatchSchemaWithBody Patch a table's schema
 	//
@@ -38528,8 +40859,8 @@ func (c *Client) Dictate(ctx context.Context, body DictateJSONRequestBody, reqEd
 // Takes any type of body and a specified content type.
 //
 // Corresponds with POST /ai/v1/embed (the `GenerateEmbeddings` operationId).
-func (c *Client) GenerateEmbeddingsWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewGenerateEmbeddingsRequestWithBody(c.Server, contentType, body)
+func (c *Client) GenerateEmbeddingsWithBody(ctx context.Context, params *GenerateEmbeddingsParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewGenerateEmbeddingsRequestWithBody(c.Server, params, contentType, body)
 	if err != nil {
 		return nil, err
 	}
@@ -38553,8 +40884,8 @@ func (c *Client) GenerateEmbeddingsWithBody(ctx context.Context, contentType str
 // Takes a body of the `application/json` content type.
 //
 // Corresponds with POST /ai/v1/embed (the `GenerateEmbeddings` operationId).
-func (c *Client) GenerateEmbeddings(ctx context.Context, body GenerateEmbeddingsJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewGenerateEmbeddingsRequest(c.Server, body)
+func (c *Client) GenerateEmbeddings(ctx context.Context, params *GenerateEmbeddingsParams, body GenerateEmbeddingsJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewGenerateEmbeddingsRequest(c.Server, params, body)
 	if err != nil {
 		return nil, err
 	}
@@ -38579,8 +40910,8 @@ func (c *Client) GenerateEmbeddings(ctx context.Context, body GenerateEmbeddings
 // Takes any type of body and a specified content type.
 //
 // Corresponds with POST /ai/v1/embeddings (the `CreateEmbedding` operationId).
-func (c *Client) CreateEmbeddingWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewCreateEmbeddingRequestWithBody(c.Server, contentType, body)
+func (c *Client) CreateEmbeddingWithBody(ctx context.Context, params *CreateEmbeddingParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewCreateEmbeddingRequestWithBody(c.Server, params, contentType, body)
 	if err != nil {
 		return nil, err
 	}
@@ -38605,8 +40936,8 @@ func (c *Client) CreateEmbeddingWithBody(ctx context.Context, contentType string
 // Takes a body of the `application/json` content type.
 //
 // Corresponds with POST /ai/v1/embeddings (the `CreateEmbedding` operationId).
-func (c *Client) CreateEmbedding(ctx context.Context, body CreateEmbeddingJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewCreateEmbeddingRequest(c.Server, body)
+func (c *Client) CreateEmbedding(ctx context.Context, params *CreateEmbeddingParams, body CreateEmbeddingJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewCreateEmbeddingRequest(c.Server, params, body)
 	if err != nil {
 		return nil, err
 	}
@@ -39066,8 +41397,8 @@ func (c *Client) ReadImages(ctx context.Context, body ReadImagesJSONRequestBody,
 // Takes any type of body and a specified content type.
 //
 // Corresponds with POST /ai/v1/rerank (the `RerankPrompts` operationId).
-func (c *Client) RerankPromptsWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewRerankPromptsRequestWithBody(c.Server, contentType, body)
+func (c *Client) RerankPromptsWithBody(ctx context.Context, params *RerankPromptsParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewRerankPromptsRequestWithBody(c.Server, params, contentType, body)
 	if err != nil {
 		return nil, err
 	}
@@ -39107,8 +41438,8 @@ func (c *Client) RerankPromptsWithBody(ctx context.Context, contentType string, 
 // Takes a body of the `application/json` content type.
 //
 // Corresponds with POST /ai/v1/rerank (the `RerankPrompts` operationId).
-func (c *Client) RerankPrompts(ctx context.Context, body RerankPromptsJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewRerankPromptsRequest(c.Server, body)
+func (c *Client) RerankPrompts(ctx context.Context, params *RerankPromptsParams, body RerankPromptsJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewRerankPromptsRequest(c.Server, params, body)
 	if err != nil {
 		return nil, err
 	}
@@ -39133,8 +41464,8 @@ func (c *Client) RerankPrompts(ctx context.Context, body RerankPromptsJSONReques
 // Takes any type of body and a specified content type.
 //
 // Corresponds with POST /ai/v1/rerank_multimodal (the `RerankMultimodalPrompts` operationId).
-func (c *Client) RerankMultimodalPromptsWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewRerankMultimodalPromptsRequestWithBody(c.Server, contentType, body)
+func (c *Client) RerankMultimodalPromptsWithBody(ctx context.Context, params *RerankMultimodalPromptsParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewRerankMultimodalPromptsRequestWithBody(c.Server, params, contentType, body)
 	if err != nil {
 		return nil, err
 	}
@@ -39159,8 +41490,8 @@ func (c *Client) RerankMultimodalPromptsWithBody(ctx context.Context, contentTyp
 // Takes a body of the `application/json` content type.
 //
 // Corresponds with POST /ai/v1/rerank_multimodal (the `RerankMultimodalPrompts` operationId).
-func (c *Client) RerankMultimodalPrompts(ctx context.Context, body RerankMultimodalPromptsJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewRerankMultimodalPromptsRequest(c.Server, body)
+func (c *Client) RerankMultimodalPrompts(ctx context.Context, params *RerankMultimodalPromptsParams, body RerankMultimodalPromptsJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewRerankMultimodalPromptsRequest(c.Server, params, body)
 	if err != nil {
 		return nil, err
 	}
@@ -40833,6 +43164,167 @@ func (c *Client) BatchNamespaceTable(ctx context.Context, databaseName string, n
 	return c.Client.Do(req)
 }
 
+// RepairNamespaceRelationalConstraintsWithBody Repair version-conditional rows after failed or diagnosed constraint activation
+//
+// Requires table administrator permission. Each affected target range must
+// have failed UNIQUE/FK/CHECK activation or a validating MATCH PARTIAL
+// missing-parent diagnostic. Replacement values still satisfy all
+// constraints, and referential actions require write permission on every
+// affected table. Existing dependencies remain protected. Repairs do not
+// mark historical coverage valid. Invoke constraint retry after repairing
+// failed activation; validating diagnostics resume validation automatically.
+//
+// Takes any type of body and a specified content type.
+//
+// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/repair (the `RepairNamespaceRelationalConstraints` operationId).
+func (c *Client) RepairNamespaceRelationalConstraintsWithBody(ctx context.Context, databaseName string, namespaceName string, tableName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewRepairNamespaceRelationalConstraintsRequestWithBody(c.Server, databaseName, namespaceName, tableName, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// RepairNamespaceRelationalConstraints Repair version-conditional rows after failed or diagnosed constraint activation
+//
+// Requires table administrator permission. Each affected target range must
+// have failed UNIQUE/FK/CHECK activation or a validating MATCH PARTIAL
+// missing-parent diagnostic. Replacement values still satisfy all
+// constraints, and referential actions require write permission on every
+// affected table. Existing dependencies remain protected. Repairs do not
+// mark historical coverage valid. Invoke constraint retry after repairing
+// failed activation; validating diagnostics resume validation automatically.
+//
+// Takes a body of the `application/json` content type.
+//
+// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/repair (the `RepairNamespaceRelationalConstraints` operationId).
+func (c *Client) RepairNamespaceRelationalConstraints(ctx context.Context, databaseName string, namespaceName string, tableName string, body RepairNamespaceRelationalConstraintsJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewRepairNamespaceRelationalConstraintsRequest(c.Server, databaseName, namespaceName, tableName, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// RetireNamespaceRelationalConstraintsWithBody Retire unique and foreign-key definitions safely
+//
+// Requires table administrator permission. Starts a durable, bounded
+// all-owner drain. Poll constraints/status for progress. A target schema
+// is published automatically after the drain. With drop=true the table
+// remains fenced at ready_to_drop until an administrator explicitly
+// deletes it with the existing table deletion endpoint.
+//
+// Takes any type of body and a specified content type.
+//
+// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/retire (the `RetireNamespaceRelationalConstraints` operationId).
+func (c *Client) RetireNamespaceRelationalConstraintsWithBody(ctx context.Context, databaseName string, namespaceName string, tableName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewRetireNamespaceRelationalConstraintsRequestWithBody(c.Server, databaseName, namespaceName, tableName, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// RetireNamespaceRelationalConstraints Retire unique and foreign-key definitions safely
+//
+// Requires table administrator permission. Starts a durable, bounded
+// all-owner drain. Poll constraints/status for progress. A target schema
+// is published automatically after the drain. With drop=true the table
+// remains fenced at ready_to_drop until an administrator explicitly
+// deletes it with the existing table deletion endpoint.
+//
+// Takes a body of the `application/json` content type.
+//
+// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/retire (the `RetireNamespaceRelationalConstraints` operationId).
+func (c *Client) RetireNamespaceRelationalConstraints(ctx context.Context, databaseName string, namespaceName string, tableName string, body RetireNamespaceRelationalConstraintsJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewRetireNamespaceRelationalConstraintsRequest(c.Server, databaseName, namespaceName, tableName, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// RetryNamespaceRelationalConstraintsWithBody Restart failed UNIQUE/FK/CHECK validation after administrative repair
+//
+// Requires table administrator permission. Resets each failed owner using
+// an exact checkpoint precondition. Owners already validating or enforced
+// are unchanged. Retrying after partial progress is safe. Inspect the
+// constraint status endpoint for coverage and diagnostics.
+// When a retirement job is active, clears its paused diagnostic and
+// resumes that job instead of restarting activation. Retirement remains
+// fenced and retains all prior drain progress.
+//
+// Takes any type of body and a specified content type.
+//
+// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/retry (the `RetryNamespaceRelationalConstraints` operationId).
+func (c *Client) RetryNamespaceRelationalConstraintsWithBody(ctx context.Context, databaseName string, namespaceName string, tableName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewRetryNamespaceRelationalConstraintsRequestWithBody(c.Server, databaseName, namespaceName, tableName, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// RetryNamespaceRelationalConstraints Restart failed UNIQUE/FK/CHECK validation after administrative repair
+//
+// Requires table administrator permission. Resets each failed owner using
+// an exact checkpoint precondition. Owners already validating or enforced
+// are unchanged. Retrying after partial progress is safe. Inspect the
+// constraint status endpoint for coverage and diagnostics.
+// When a retirement job is active, clears its paused diagnostic and
+// resumes that job instead of restarting activation. Retirement remains
+// fenced and retains all prior drain progress.
+//
+// Takes a body of the `application/json` content type.
+//
+// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/retry (the `RetryNamespaceRelationalConstraints` operationId).
+func (c *Client) RetryNamespaceRelationalConstraints(ctx context.Context, databaseName string, namespaceName string, tableName string, body RetryNamespaceRelationalConstraintsJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewRetryNamespaceRelationalConstraintsRequest(c.Server, databaseName, namespaceName, tableName, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// GetNamespaceRelationalConstraintStatus Read distributed UNIQUE, foreign-key, and CHECK validation coverage
+//
+// Corresponds with GET /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/status (the `GetNamespaceRelationalConstraintStatus` operationId).
+func (c *Client) GetNamespaceRelationalConstraintStatus(ctx context.Context, databaseName string, namespaceName string, tableName string, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewGetNamespaceRelationalConstraintStatusRequest(c.Server, databaseName, namespaceName, tableName)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
 // LookupNamespaceTableDocument Retrieve a document by key from an explicit namespace table
 //
 // Retrieves a document through an explicit database and namespace route. While storage APIs are still bare-table-name based, the server fails closed when the resolved catalog table does not map to a unique physical table name.
@@ -40954,6 +43446,82 @@ func (c *Client) ExecuteNamespaceTableGraphMetricAction(ctx context.Context, dat
 	return c.Client.Do(req)
 }
 
+// RepairNamespaceIndexWithBody Repair an index generation
+//
+// Generation-fenced relational index maintenance. Requires table ADMIN permission. Repair accepts ready or failed generations and rebuilds their derived records. Owners are admitted independently and durably; exact request replay resumes after partial acknowledgements. Unsupported index types return 405.
+//
+// Takes any type of body and a specified content type.
+//
+// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/repair (the `RepairNamespaceIndex` operationId).
+func (c *Client) RepairNamespaceIndexWithBody(ctx context.Context, databaseName string, namespaceName string, tableName string, indexName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewRepairNamespaceIndexRequestWithBody(c.Server, databaseName, namespaceName, tableName, indexName, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// RepairNamespaceIndex Repair an index generation
+//
+// Generation-fenced relational index maintenance. Requires table ADMIN permission. Repair accepts ready or failed generations and rebuilds their derived records. Owners are admitted independently and durably; exact request replay resumes after partial acknowledgements. Unsupported index types return 405.
+//
+// Takes a body of the `application/json` content type.
+//
+// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/repair (the `RepairNamespaceIndex` operationId).
+func (c *Client) RepairNamespaceIndex(ctx context.Context, databaseName string, namespaceName string, tableName string, indexName string, body RepairNamespaceIndexJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewRepairNamespaceIndexRequest(c.Server, databaseName, namespaceName, tableName, indexName, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// RetryNamespaceIndexWithBody Retry a failed index build
+//
+// Generation-fenced relational index maintenance. Requires table ADMIN permission. Retry accepts failed generations. Owners are admitted independently and durably; exact request replay resumes after partial acknowledgements. Unsupported index types return 405.
+//
+// Takes any type of body and a specified content type.
+//
+// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/retry (the `RetryNamespaceIndex` operationId).
+func (c *Client) RetryNamespaceIndexWithBody(ctx context.Context, databaseName string, namespaceName string, tableName string, indexName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewRetryNamespaceIndexRequestWithBody(c.Server, databaseName, namespaceName, tableName, indexName, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// RetryNamespaceIndex Retry a failed index build
+//
+// Generation-fenced relational index maintenance. Requires table ADMIN permission. Retry accepts failed generations. Owners are admitted independently and durably; exact request replay resumes after partial acknowledgements. Unsupported index types return 405.
+//
+// Takes a body of the `application/json` content type.
+//
+// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/retry (the `RetryNamespaceIndex` operationId).
+func (c *Client) RetryNamespaceIndex(ctx context.Context, databaseName string, namespaceName string, tableName string, indexName string, body RetryNamespaceIndexJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewRetryNamespaceIndexRequest(c.Server, databaseName, namespaceName, tableName, indexName, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
 // QueryNamespaceTableWithBody Query an explicit namespace table
 //
 // Queries a table through an explicit database and namespace route. While storage APIs are still bare-table-name based, the server fails closed when the resolved catalog table does not map to a unique physical table name.
@@ -41050,6 +43618,74 @@ func (c *Client) RestoreNamespaceTableWithBody(ctx context.Context, databaseName
 // Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/restore (the `RestoreNamespaceTable` operationId).
 func (c *Client) RestoreNamespaceTable(ctx context.Context, databaseName string, namespaceName string, tableName string, params *RestoreNamespaceTableParams, body RestoreNamespaceTableJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewRestoreNamespaceTableRequest(c.Server, databaseName, namespaceName, tableName, params, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// MutateNamespaceRelationalRowsWithBody Atomically replace or delete version-conditional typed rows
+//
+// Takes any type of body and a specified content type.
+//
+// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rows/mutate (the `MutateNamespaceRelationalRows` operationId).
+func (c *Client) MutateNamespaceRelationalRowsWithBody(ctx context.Context, databaseName string, namespaceName string, tableName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewMutateNamespaceRelationalRowsRequestWithBody(c.Server, databaseName, namespaceName, tableName, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// MutateNamespaceRelationalRows Atomically replace or delete version-conditional typed rows
+//
+// Takes a body of the `application/json` content type.
+//
+// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rows/mutate (the `MutateNamespaceRelationalRows` operationId).
+func (c *Client) MutateNamespaceRelationalRows(ctx context.Context, databaseName string, namespaceName string, tableName string, body MutateNamespaceRelationalRowsJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewMutateNamespaceRelationalRowsRequest(c.Server, databaseName, namespaceName, tableName, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// QueryNamespaceRelationalRowsWithBody Query projected typed relational rows
+//
+// Takes any type of body and a specified content type.
+//
+// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rows/query (the `QueryNamespaceRelationalRows` operationId).
+func (c *Client) QueryNamespaceRelationalRowsWithBody(ctx context.Context, databaseName string, namespaceName string, tableName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewQueryNamespaceRelationalRowsRequestWithBody(c.Server, databaseName, namespaceName, tableName, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// QueryNamespaceRelationalRows Query projected typed relational rows
+//
+// Takes a body of the `application/json` content type.
+//
+// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rows/query (the `QueryNamespaceRelationalRows` operationId).
+func (c *Client) QueryNamespaceRelationalRows(ctx context.Context, databaseName string, namespaceName string, tableName string, body QueryNamespaceRelationalRowsJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewQueryNamespaceRelationalRowsRequest(c.Server, databaseName, namespaceName, tableName, body)
 	if err != nil {
 		return nil, err
 	}
@@ -42398,6 +45034,167 @@ func (c *Client) BatchWrite(ctx context.Context, tableName string, body BatchWri
 	return c.Client.Do(req)
 }
 
+// RepairRelationalConstraintsWithBody Repair version-conditional rows after failed or diagnosed constraint activation
+//
+// Requires table administrator permission. Each affected target range must
+// have failed UNIQUE/FK/CHECK activation or a validating MATCH PARTIAL
+// missing-parent diagnostic. Replacement values still satisfy all
+// constraints, and referential actions require write permission on every
+// affected table. Existing dependencies remain protected. Repairs do not
+// mark historical coverage valid. Invoke constraint retry after repairing
+// failed activation; validating diagnostics resume validation automatically.
+//
+// Takes any type of body and a specified content type.
+//
+// Corresponds with POST /db/v1/tables/{tableName}/constraints/repair (the `RepairRelationalConstraints` operationId).
+func (c *Client) RepairRelationalConstraintsWithBody(ctx context.Context, tableName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewRepairRelationalConstraintsRequestWithBody(c.Server, tableName, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// RepairRelationalConstraints Repair version-conditional rows after failed or diagnosed constraint activation
+//
+// Requires table administrator permission. Each affected target range must
+// have failed UNIQUE/FK/CHECK activation or a validating MATCH PARTIAL
+// missing-parent diagnostic. Replacement values still satisfy all
+// constraints, and referential actions require write permission on every
+// affected table. Existing dependencies remain protected. Repairs do not
+// mark historical coverage valid. Invoke constraint retry after repairing
+// failed activation; validating diagnostics resume validation automatically.
+//
+// Takes a body of the `application/json` content type.
+//
+// Corresponds with POST /db/v1/tables/{tableName}/constraints/repair (the `RepairRelationalConstraints` operationId).
+func (c *Client) RepairRelationalConstraints(ctx context.Context, tableName string, body RepairRelationalConstraintsJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewRepairRelationalConstraintsRequest(c.Server, tableName, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// RetireRelationalConstraintsWithBody Retire unique and foreign-key definitions safely
+//
+// Requires table administrator permission. Starts a durable, bounded
+// all-owner drain. Poll constraints/status for progress. A target schema
+// is published automatically after the drain. With drop=true the table
+// remains fenced at ready_to_drop until an administrator explicitly
+// deletes it with the existing table deletion endpoint.
+//
+// Takes any type of body and a specified content type.
+//
+// Corresponds with POST /db/v1/tables/{tableName}/constraints/retire (the `RetireRelationalConstraints` operationId).
+func (c *Client) RetireRelationalConstraintsWithBody(ctx context.Context, tableName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewRetireRelationalConstraintsRequestWithBody(c.Server, tableName, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// RetireRelationalConstraints Retire unique and foreign-key definitions safely
+//
+// Requires table administrator permission. Starts a durable, bounded
+// all-owner drain. Poll constraints/status for progress. A target schema
+// is published automatically after the drain. With drop=true the table
+// remains fenced at ready_to_drop until an administrator explicitly
+// deletes it with the existing table deletion endpoint.
+//
+// Takes a body of the `application/json` content type.
+//
+// Corresponds with POST /db/v1/tables/{tableName}/constraints/retire (the `RetireRelationalConstraints` operationId).
+func (c *Client) RetireRelationalConstraints(ctx context.Context, tableName string, body RetireRelationalConstraintsJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewRetireRelationalConstraintsRequest(c.Server, tableName, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// RetryRelationalConstraintsWithBody Restart failed UNIQUE/FK/CHECK validation after administrative repair
+//
+// Requires table administrator permission. Resets each failed owner using
+// an exact checkpoint precondition. Owners already validating or enforced
+// are unchanged. Retrying after partial progress is safe. Inspect the
+// constraint status endpoint for coverage and diagnostics.
+// When a retirement job is active, clears its paused diagnostic and
+// resumes that job instead of restarting activation. Retirement remains
+// fenced and retains all prior drain progress.
+//
+// Takes any type of body and a specified content type.
+//
+// Corresponds with POST /db/v1/tables/{tableName}/constraints/retry (the `RetryRelationalConstraints` operationId).
+func (c *Client) RetryRelationalConstraintsWithBody(ctx context.Context, tableName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewRetryRelationalConstraintsRequestWithBody(c.Server, tableName, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// RetryRelationalConstraints Restart failed UNIQUE/FK/CHECK validation after administrative repair
+//
+// Requires table administrator permission. Resets each failed owner using
+// an exact checkpoint precondition. Owners already validating or enforced
+// are unchanged. Retrying after partial progress is safe. Inspect the
+// constraint status endpoint for coverage and diagnostics.
+// When a retirement job is active, clears its paused diagnostic and
+// resumes that job instead of restarting activation. Retirement remains
+// fenced and retains all prior drain progress.
+//
+// Takes a body of the `application/json` content type.
+//
+// Corresponds with POST /db/v1/tables/{tableName}/constraints/retry (the `RetryRelationalConstraints` operationId).
+func (c *Client) RetryRelationalConstraints(ctx context.Context, tableName string, body RetryRelationalConstraintsJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewRetryRelationalConstraintsRequest(c.Server, tableName, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// GetRelationalConstraintStatus Read distributed UNIQUE, foreign-key, and CHECK validation coverage
+//
+// Corresponds with GET /db/v1/tables/{tableName}/constraints/status (the `GetRelationalConstraintStatus` operationId).
+func (c *Client) GetRelationalConstraintStatus(ctx context.Context, tableName string, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewGetRelationalConstraintStatusRequest(c.Server, tableName)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
 // ReauthorizeTableDestinations Adopt stored write destinations with the current credential
 //
 // Reauthorizes the table's existing CDC routes and graph resolver destinations
@@ -42630,6 +45427,82 @@ func (c *Client) CreateIndex(ctx context.Context, tableName string, indexName st
 // Corresponds with POST /db/v1/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}:{action} (the `ExecuteGraphMetricAction` operationId).
 func (c *Client) ExecuteGraphMetricAction(ctx context.Context, tableName string, indexName string, metricName string, action string, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewExecuteGraphMetricActionRequest(c.Server, tableName, indexName, metricName, action)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// RepairIndexWithBody Repair an index generation
+//
+// Generation-fenced relational index maintenance. Requires table ADMIN permission. Repair accepts ready or failed generations and rebuilds their derived records. Owners are admitted independently and durably; exact request replay resumes after partial acknowledgements. Unsupported index types return 405.
+//
+// Takes any type of body and a specified content type.
+//
+// Corresponds with POST /db/v1/tables/{tableName}/indexes/{indexName}/repair (the `RepairIndex` operationId).
+func (c *Client) RepairIndexWithBody(ctx context.Context, tableName string, indexName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewRepairIndexRequestWithBody(c.Server, tableName, indexName, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// RepairIndex Repair an index generation
+//
+// Generation-fenced relational index maintenance. Requires table ADMIN permission. Repair accepts ready or failed generations and rebuilds their derived records. Owners are admitted independently and durably; exact request replay resumes after partial acknowledgements. Unsupported index types return 405.
+//
+// Takes a body of the `application/json` content type.
+//
+// Corresponds with POST /db/v1/tables/{tableName}/indexes/{indexName}/repair (the `RepairIndex` operationId).
+func (c *Client) RepairIndex(ctx context.Context, tableName string, indexName string, body RepairIndexJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewRepairIndexRequest(c.Server, tableName, indexName, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// RetryIndexWithBody Retry a failed index build
+//
+// Generation-fenced relational index maintenance. Requires table ADMIN permission. Retry accepts failed generations. Owners are admitted independently and durably; exact request replay resumes after partial acknowledgements. Unsupported index types return 405.
+//
+// Takes any type of body and a specified content type.
+//
+// Corresponds with POST /db/v1/tables/{tableName}/indexes/{indexName}/retry (the `RetryIndex` operationId).
+func (c *Client) RetryIndexWithBody(ctx context.Context, tableName string, indexName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewRetryIndexRequestWithBody(c.Server, tableName, indexName, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// RetryIndex Retry a failed index build
+//
+// Generation-fenced relational index maintenance. Requires table ADMIN permission. Retry accepts failed generations. Owners are admitted independently and durably; exact request replay resumes after partial acknowledgements. Unsupported index types return 405.
+//
+// Takes a body of the `application/json` content type.
+//
+// Corresponds with POST /db/v1/tables/{tableName}/indexes/{indexName}/retry (the `RetryIndex` operationId).
+func (c *Client) RetryIndex(ctx context.Context, tableName string, indexName string, body RetryIndexJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewRetryIndexRequest(c.Server, tableName, indexName, body)
 	if err != nil {
 		return nil, err
 	}
@@ -43020,6 +45893,74 @@ func (c *Client) RestoreTableWithBody(ctx context.Context, tableName string, par
 // Corresponds with POST /db/v1/tables/{tableName}/restore (the `RestoreTable` operationId).
 func (c *Client) RestoreTable(ctx context.Context, tableName string, params *RestoreTableParams, body RestoreTableJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewRestoreTableRequest(c.Server, tableName, params, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// MutateRelationalRowsWithBody Atomically replace or delete version-conditional typed rows
+//
+// Takes any type of body and a specified content type.
+//
+// Corresponds with POST /db/v1/tables/{tableName}/rows/mutate (the `MutateRelationalRows` operationId).
+func (c *Client) MutateRelationalRowsWithBody(ctx context.Context, tableName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewMutateRelationalRowsRequestWithBody(c.Server, tableName, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// MutateRelationalRows Atomically replace or delete version-conditional typed rows
+//
+// Takes a body of the `application/json` content type.
+//
+// Corresponds with POST /db/v1/tables/{tableName}/rows/mutate (the `MutateRelationalRows` operationId).
+func (c *Client) MutateRelationalRows(ctx context.Context, tableName string, body MutateRelationalRowsJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewMutateRelationalRowsRequest(c.Server, tableName, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// QueryRelationalRowsWithBody Query projected typed relational rows
+//
+// Takes any type of body and a specified content type.
+//
+// Corresponds with POST /db/v1/tables/{tableName}/rows/query (the `QueryRelationalRows` operationId).
+func (c *Client) QueryRelationalRowsWithBody(ctx context.Context, tableName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewQueryRelationalRowsRequestWithBody(c.Server, tableName, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// QueryRelationalRows Query projected typed relational rows
+//
+// Takes a body of the `application/json` content type.
+//
+// Corresponds with POST /db/v1/tables/{tableName}/rows/query (the `QueryRelationalRows` operationId).
+func (c *Client) QueryRelationalRows(ctx context.Context, tableName string, body QueryRelationalRowsJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewQueryRelationalRowsRequest(c.Server, tableName, body)
 	if err != nil {
 		return nil, err
 	}
@@ -44173,18 +47114,18 @@ func NewDictateRequestWithBody(server string, contentType string, body io.Reader
 }
 
 // NewGenerateEmbeddingsRequest calls the generic GenerateEmbeddings builder with application/json body
-func NewGenerateEmbeddingsRequest(server string, body GenerateEmbeddingsJSONRequestBody) (*http.Request, error) {
+func NewGenerateEmbeddingsRequest(server string, params *GenerateEmbeddingsParams, body GenerateEmbeddingsJSONRequestBody) (*http.Request, error) {
 	var bodyReader io.Reader
 	buf, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
 	}
 	bodyReader = bytes.NewReader(buf)
-	return NewGenerateEmbeddingsRequestWithBody(server, "application/json", bodyReader)
+	return NewGenerateEmbeddingsRequestWithBody(server, params, "application/json", bodyReader)
 }
 
 // NewGenerateEmbeddingsRequestWithBody constructs an http.Request for the GenerateEmbeddings method, with any body, and a specified content type
-func NewGenerateEmbeddingsRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
+func NewGenerateEmbeddingsRequestWithBody(server string, params *GenerateEmbeddingsParams, contentType string, body io.Reader) (*http.Request, error) {
 	var err error
 
 	serverURL, err := url.Parse(server)
@@ -44209,22 +47150,35 @@ func NewGenerateEmbeddingsRequestWithBody(server string, contentType string, bod
 
 	req.Header.Add("Content-Type", contentType)
 
+	if params != nil {
+
+		var headerParam0 string
+
+		headerParam0, err = runtime.StyleParamWithOptions("simple", false, "Accept", params.Accept, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationHeader, Type: "string", Format: ""})
+		if err != nil {
+			return nil, err
+		}
+
+		req.Header.Set("Accept", headerParam0)
+
+	}
+
 	return req, nil
 }
 
 // NewCreateEmbeddingRequest calls the generic CreateEmbedding builder with application/json body
-func NewCreateEmbeddingRequest(server string, body CreateEmbeddingJSONRequestBody) (*http.Request, error) {
+func NewCreateEmbeddingRequest(server string, params *CreateEmbeddingParams, body CreateEmbeddingJSONRequestBody) (*http.Request, error) {
 	var bodyReader io.Reader
 	buf, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
 	}
 	bodyReader = bytes.NewReader(buf)
-	return NewCreateEmbeddingRequestWithBody(server, "application/json", bodyReader)
+	return NewCreateEmbeddingRequestWithBody(server, params, "application/json", bodyReader)
 }
 
 // NewCreateEmbeddingRequestWithBody constructs an http.Request for the CreateEmbedding method, with any body, and a specified content type
-func NewCreateEmbeddingRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
+func NewCreateEmbeddingRequestWithBody(server string, params *CreateEmbeddingParams, contentType string, body io.Reader) (*http.Request, error) {
 	var err error
 
 	serverURL, err := url.Parse(server)
@@ -44248,6 +47202,19 @@ func NewCreateEmbeddingRequestWithBody(server string, contentType string, body i
 	}
 
 	req.Header.Add("Content-Type", contentType)
+
+	if params != nil {
+
+		var headerParam0 string
+
+		headerParam0, err = runtime.StyleParamWithOptions("simple", false, "Accept", params.Accept, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationHeader, Type: "string", Format: ""})
+		if err != nil {
+			return nil, err
+		}
+
+		req.Header.Set("Accept", headerParam0)
+
+	}
 
 	return req, nil
 }
@@ -44440,18 +47407,18 @@ func NewReadImagesRequestWithBody(server string, contentType string, body io.Rea
 }
 
 // NewRerankPromptsRequest calls the generic RerankPrompts builder with application/json body
-func NewRerankPromptsRequest(server string, body RerankPromptsJSONRequestBody) (*http.Request, error) {
+func NewRerankPromptsRequest(server string, params *RerankPromptsParams, body RerankPromptsJSONRequestBody) (*http.Request, error) {
 	var bodyReader io.Reader
 	buf, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
 	}
 	bodyReader = bytes.NewReader(buf)
-	return NewRerankPromptsRequestWithBody(server, "application/json", bodyReader)
+	return NewRerankPromptsRequestWithBody(server, params, "application/json", bodyReader)
 }
 
 // NewRerankPromptsRequestWithBody constructs an http.Request for the RerankPrompts method, with any body, and a specified content type
-func NewRerankPromptsRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
+func NewRerankPromptsRequestWithBody(server string, params *RerankPromptsParams, contentType string, body io.Reader) (*http.Request, error) {
 	var err error
 
 	serverURL, err := url.Parse(server)
@@ -44476,22 +47443,35 @@ func NewRerankPromptsRequestWithBody(server string, contentType string, body io.
 
 	req.Header.Add("Content-Type", contentType)
 
+	if params != nil {
+
+		var headerParam0 string
+
+		headerParam0, err = runtime.StyleParamWithOptions("simple", false, "Accept", params.Accept, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationHeader, Type: "string", Format: ""})
+		if err != nil {
+			return nil, err
+		}
+
+		req.Header.Set("Accept", headerParam0)
+
+	}
+
 	return req, nil
 }
 
 // NewRerankMultimodalPromptsRequest calls the generic RerankMultimodalPrompts builder with application/json body
-func NewRerankMultimodalPromptsRequest(server string, body RerankMultimodalPromptsJSONRequestBody) (*http.Request, error) {
+func NewRerankMultimodalPromptsRequest(server string, params *RerankMultimodalPromptsParams, body RerankMultimodalPromptsJSONRequestBody) (*http.Request, error) {
 	var bodyReader io.Reader
 	buf, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
 	}
 	bodyReader = bytes.NewReader(buf)
-	return NewRerankMultimodalPromptsRequestWithBody(server, "application/json", bodyReader)
+	return NewRerankMultimodalPromptsRequestWithBody(server, params, "application/json", bodyReader)
 }
 
 // NewRerankMultimodalPromptsRequestWithBody constructs an http.Request for the RerankMultimodalPrompts method, with any body, and a specified content type
-func NewRerankMultimodalPromptsRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
+func NewRerankMultimodalPromptsRequestWithBody(server string, params *RerankMultimodalPromptsParams, contentType string, body io.Reader) (*http.Request, error) {
 	var err error
 
 	serverURL, err := url.Parse(server)
@@ -44515,6 +47495,19 @@ func NewRerankMultimodalPromptsRequestWithBody(server string, contentType string
 	}
 
 	req.Header.Add("Content-Type", contentType)
+
+	if params != nil {
+
+		var headerParam0 string
+
+		headerParam0, err = runtime.StyleParamWithOptions("simple", false, "Accept", params.Accept, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationHeader, Type: "string", Format: ""})
+		if err != nil {
+			return nil, err
+		}
+
+		req.Header.Set("Accept", headerParam0)
+
+	}
 
 	return req, nil
 }
@@ -47165,6 +50158,237 @@ func NewBatchNamespaceTableRequestWithBody(server string, databaseName string, n
 	return req, nil
 }
 
+// NewRepairNamespaceRelationalConstraintsRequest calls the generic RepairNamespaceRelationalConstraints builder with application/json body
+func NewRepairNamespaceRelationalConstraintsRequest(server string, databaseName string, namespaceName string, tableName string, body RepairNamespaceRelationalConstraintsJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewRepairNamespaceRelationalConstraintsRequestWithBody(server, databaseName, namespaceName, tableName, "application/json", bodyReader)
+}
+
+// NewRepairNamespaceRelationalConstraintsRequestWithBody constructs an http.Request for the RepairNamespaceRelationalConstraints method, with any body, and a specified content type
+func NewRepairNamespaceRelationalConstraintsRequestWithBody(server string, databaseName string, namespaceName string, tableName string, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "databaseName", databaseName, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam1 string
+
+	pathParam1, err = runtime.StyleParamWithOptions("simple", false, "namespaceName", namespaceName, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam2 string
+
+	pathParam2, err = runtime.StyleParamWithOptions("simple", false, "tableName", tableName, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/db/v1/databases/%s/namespaces/%s/tables/%s/constraints/repair", pathParam0, pathParam1, pathParam2)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
+// NewRetireNamespaceRelationalConstraintsRequest calls the generic RetireNamespaceRelationalConstraints builder with application/json body
+func NewRetireNamespaceRelationalConstraintsRequest(server string, databaseName string, namespaceName string, tableName string, body RetireNamespaceRelationalConstraintsJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewRetireNamespaceRelationalConstraintsRequestWithBody(server, databaseName, namespaceName, tableName, "application/json", bodyReader)
+}
+
+// NewRetireNamespaceRelationalConstraintsRequestWithBody constructs an http.Request for the RetireNamespaceRelationalConstraints method, with any body, and a specified content type
+func NewRetireNamespaceRelationalConstraintsRequestWithBody(server string, databaseName string, namespaceName string, tableName string, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "databaseName", databaseName, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam1 string
+
+	pathParam1, err = runtime.StyleParamWithOptions("simple", false, "namespaceName", namespaceName, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam2 string
+
+	pathParam2, err = runtime.StyleParamWithOptions("simple", false, "tableName", tableName, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/db/v1/databases/%s/namespaces/%s/tables/%s/constraints/retire", pathParam0, pathParam1, pathParam2)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
+// NewRetryNamespaceRelationalConstraintsRequest calls the generic RetryNamespaceRelationalConstraints builder with application/json body
+func NewRetryNamespaceRelationalConstraintsRequest(server string, databaseName string, namespaceName string, tableName string, body RetryNamespaceRelationalConstraintsJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewRetryNamespaceRelationalConstraintsRequestWithBody(server, databaseName, namespaceName, tableName, "application/json", bodyReader)
+}
+
+// NewRetryNamespaceRelationalConstraintsRequestWithBody constructs an http.Request for the RetryNamespaceRelationalConstraints method, with any body, and a specified content type
+func NewRetryNamespaceRelationalConstraintsRequestWithBody(server string, databaseName string, namespaceName string, tableName string, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "databaseName", databaseName, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam1 string
+
+	pathParam1, err = runtime.StyleParamWithOptions("simple", false, "namespaceName", namespaceName, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam2 string
+
+	pathParam2, err = runtime.StyleParamWithOptions("simple", false, "tableName", tableName, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/db/v1/databases/%s/namespaces/%s/tables/%s/constraints/retry", pathParam0, pathParam1, pathParam2)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
+// NewGetNamespaceRelationalConstraintStatusRequest constructs an http.Request for the GetNamespaceRelationalConstraintStatus method
+func NewGetNamespaceRelationalConstraintStatusRequest(server string, databaseName string, namespaceName string, tableName string) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "databaseName", databaseName, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam1 string
+
+	pathParam1, err = runtime.StyleParamWithOptions("simple", false, "namespaceName", namespaceName, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam2 string
+
+	pathParam2, err = runtime.StyleParamWithOptions("simple", false, "tableName", tableName, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/db/v1/databases/%s/namespaces/%s/tables/%s/constraints/status", pathParam0, pathParam1, pathParam2)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
 // NewLookupNamespaceTableDocumentRequest constructs an http.Request for the LookupNamespaceTableDocument method
 func NewLookupNamespaceTableDocumentRequest(server string, databaseName string, namespaceName string, tableName string, key string, params *LookupNamespaceTableDocumentParams) (*http.Request, error) {
 	var err error
@@ -47546,6 +50770,142 @@ func NewExecuteNamespaceTableGraphMetricActionRequest(server string, databaseNam
 	return req, nil
 }
 
+// NewRepairNamespaceIndexRequest calls the generic RepairNamespaceIndex builder with application/json body
+func NewRepairNamespaceIndexRequest(server string, databaseName string, namespaceName string, tableName string, indexName string, body RepairNamespaceIndexJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewRepairNamespaceIndexRequestWithBody(server, databaseName, namespaceName, tableName, indexName, "application/json", bodyReader)
+}
+
+// NewRepairNamespaceIndexRequestWithBody constructs an http.Request for the RepairNamespaceIndex method, with any body, and a specified content type
+func NewRepairNamespaceIndexRequestWithBody(server string, databaseName string, namespaceName string, tableName string, indexName string, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "databaseName", databaseName, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam1 string
+
+	pathParam1, err = runtime.StyleParamWithOptions("simple", false, "namespaceName", namespaceName, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam2 string
+
+	pathParam2, err = runtime.StyleParamWithOptions("simple", false, "tableName", tableName, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam3 string
+
+	pathParam3, err = runtime.StyleParamWithOptions("simple", false, "indexName", indexName, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/db/v1/databases/%s/namespaces/%s/tables/%s/indexes/%s/repair", pathParam0, pathParam1, pathParam2, pathParam3)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
+// NewRetryNamespaceIndexRequest calls the generic RetryNamespaceIndex builder with application/json body
+func NewRetryNamespaceIndexRequest(server string, databaseName string, namespaceName string, tableName string, indexName string, body RetryNamespaceIndexJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewRetryNamespaceIndexRequestWithBody(server, databaseName, namespaceName, tableName, indexName, "application/json", bodyReader)
+}
+
+// NewRetryNamespaceIndexRequestWithBody constructs an http.Request for the RetryNamespaceIndex method, with any body, and a specified content type
+func NewRetryNamespaceIndexRequestWithBody(server string, databaseName string, namespaceName string, tableName string, indexName string, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "databaseName", databaseName, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam1 string
+
+	pathParam1, err = runtime.StyleParamWithOptions("simple", false, "namespaceName", namespaceName, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam2 string
+
+	pathParam2, err = runtime.StyleParamWithOptions("simple", false, "tableName", tableName, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam3 string
+
+	pathParam3, err = runtime.StyleParamWithOptions("simple", false, "indexName", indexName, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/db/v1/databases/%s/namespaces/%s/tables/%s/indexes/%s/retry", pathParam0, pathParam1, pathParam2, pathParam3)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
 // NewQueryNamespaceTableRequest calls the generic QueryNamespaceTable builder with application/json body
 func NewQueryNamespaceTableRequest(server string, databaseName string, namespaceName string, tableName string, body QueryNamespaceTableJSONRequestBody) (*http.Request, error) {
 	var bodyReader io.Reader
@@ -47740,6 +51100,128 @@ func NewRestoreNamespaceTableRequestWithBody(server string, databaseName string,
 		}
 
 	}
+
+	return req, nil
+}
+
+// NewMutateNamespaceRelationalRowsRequest calls the generic MutateNamespaceRelationalRows builder with application/json body
+func NewMutateNamespaceRelationalRowsRequest(server string, databaseName string, namespaceName string, tableName string, body MutateNamespaceRelationalRowsJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewMutateNamespaceRelationalRowsRequestWithBody(server, databaseName, namespaceName, tableName, "application/json", bodyReader)
+}
+
+// NewMutateNamespaceRelationalRowsRequestWithBody constructs an http.Request for the MutateNamespaceRelationalRows method, with any body, and a specified content type
+func NewMutateNamespaceRelationalRowsRequestWithBody(server string, databaseName string, namespaceName string, tableName string, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "databaseName", databaseName, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam1 string
+
+	pathParam1, err = runtime.StyleParamWithOptions("simple", false, "namespaceName", namespaceName, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam2 string
+
+	pathParam2, err = runtime.StyleParamWithOptions("simple", false, "tableName", tableName, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/db/v1/databases/%s/namespaces/%s/tables/%s/rows/mutate", pathParam0, pathParam1, pathParam2)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
+// NewQueryNamespaceRelationalRowsRequest calls the generic QueryNamespaceRelationalRows builder with application/json body
+func NewQueryNamespaceRelationalRowsRequest(server string, databaseName string, namespaceName string, tableName string, body QueryNamespaceRelationalRowsJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewQueryNamespaceRelationalRowsRequestWithBody(server, databaseName, namespaceName, tableName, "application/json", bodyReader)
+}
+
+// NewQueryNamespaceRelationalRowsRequestWithBody constructs an http.Request for the QueryNamespaceRelationalRows method, with any body, and a specified content type
+func NewQueryNamespaceRelationalRowsRequestWithBody(server string, databaseName string, namespaceName string, tableName string, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "databaseName", databaseName, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam1 string
+
+	pathParam1, err = runtime.StyleParamWithOptions("simple", false, "namespaceName", namespaceName, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam2 string
+
+	pathParam2, err = runtime.StyleParamWithOptions("simple", false, "tableName", tableName, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/db/v1/databases/%s/namespaces/%s/tables/%s/rows/query", pathParam0, pathParam1, pathParam2)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
 
 	return req, nil
 }
@@ -49319,6 +52801,181 @@ func NewBatchWriteRequestWithBody(server string, tableName string, contentType s
 	return req, nil
 }
 
+// NewRepairRelationalConstraintsRequest calls the generic RepairRelationalConstraints builder with application/json body
+func NewRepairRelationalConstraintsRequest(server string, tableName string, body RepairRelationalConstraintsJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewRepairRelationalConstraintsRequestWithBody(server, tableName, "application/json", bodyReader)
+}
+
+// NewRepairRelationalConstraintsRequestWithBody constructs an http.Request for the RepairRelationalConstraints method, with any body, and a specified content type
+func NewRepairRelationalConstraintsRequestWithBody(server string, tableName string, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "tableName", tableName, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/db/v1/tables/%s/constraints/repair", pathParam0)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
+// NewRetireRelationalConstraintsRequest calls the generic RetireRelationalConstraints builder with application/json body
+func NewRetireRelationalConstraintsRequest(server string, tableName string, body RetireRelationalConstraintsJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewRetireRelationalConstraintsRequestWithBody(server, tableName, "application/json", bodyReader)
+}
+
+// NewRetireRelationalConstraintsRequestWithBody constructs an http.Request for the RetireRelationalConstraints method, with any body, and a specified content type
+func NewRetireRelationalConstraintsRequestWithBody(server string, tableName string, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "tableName", tableName, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/db/v1/tables/%s/constraints/retire", pathParam0)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
+// NewRetryRelationalConstraintsRequest calls the generic RetryRelationalConstraints builder with application/json body
+func NewRetryRelationalConstraintsRequest(server string, tableName string, body RetryRelationalConstraintsJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewRetryRelationalConstraintsRequestWithBody(server, tableName, "application/json", bodyReader)
+}
+
+// NewRetryRelationalConstraintsRequestWithBody constructs an http.Request for the RetryRelationalConstraints method, with any body, and a specified content type
+func NewRetryRelationalConstraintsRequestWithBody(server string, tableName string, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "tableName", tableName, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/db/v1/tables/%s/constraints/retry", pathParam0)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
+// NewGetRelationalConstraintStatusRequest constructs an http.Request for the GetRelationalConstraintStatus method
+func NewGetRelationalConstraintStatusRequest(server string, tableName string) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "tableName", tableName, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/db/v1/tables/%s/constraints/status", pathParam0)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
 // NewReauthorizeTableDestinationsRequest constructs an http.Request for the ReauthorizeTableDestinations method
 func NewReauthorizeTableDestinationsRequest(server string, tableName string) (*http.Request, error) {
 	var err error
@@ -49880,6 +53537,114 @@ func NewExecuteGraphMetricActionRequest(server string, tableName string, indexNa
 	return req, nil
 }
 
+// NewRepairIndexRequest calls the generic RepairIndex builder with application/json body
+func NewRepairIndexRequest(server string, tableName string, indexName string, body RepairIndexJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewRepairIndexRequestWithBody(server, tableName, indexName, "application/json", bodyReader)
+}
+
+// NewRepairIndexRequestWithBody constructs an http.Request for the RepairIndex method, with any body, and a specified content type
+func NewRepairIndexRequestWithBody(server string, tableName string, indexName string, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "tableName", tableName, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam1 string
+
+	pathParam1, err = runtime.StyleParamWithOptions("simple", false, "indexName", indexName, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/db/v1/tables/%s/indexes/%s/repair", pathParam0, pathParam1)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
+// NewRetryIndexRequest calls the generic RetryIndex builder with application/json body
+func NewRetryIndexRequest(server string, tableName string, indexName string, body RetryIndexJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewRetryIndexRequestWithBody(server, tableName, indexName, "application/json", bodyReader)
+}
+
+// NewRetryIndexRequestWithBody constructs an http.Request for the RetryIndex method, with any body, and a specified content type
+func NewRetryIndexRequestWithBody(server string, tableName string, indexName string, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "tableName", tableName, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam1 string
+
+	pathParam1, err = runtime.StyleParamWithOptions("simple", false, "indexName", indexName, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/db/v1/tables/%s/indexes/%s/retry", pathParam0, pathParam1)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
 // NewLinearMergeRequest calls the generic LinearMerge builder with application/json body
 func NewLinearMergeRequest(server string, tableName string, body LinearMergeJSONRequestBody) (*http.Request, error) {
 	var bodyReader io.Reader
@@ -50347,6 +54112,100 @@ func NewRestoreTableRequestWithBody(server string, tableName string, params *Res
 	return req, nil
 }
 
+// NewMutateRelationalRowsRequest calls the generic MutateRelationalRows builder with application/json body
+func NewMutateRelationalRowsRequest(server string, tableName string, body MutateRelationalRowsJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewMutateRelationalRowsRequestWithBody(server, tableName, "application/json", bodyReader)
+}
+
+// NewMutateRelationalRowsRequestWithBody constructs an http.Request for the MutateRelationalRows method, with any body, and a specified content type
+func NewMutateRelationalRowsRequestWithBody(server string, tableName string, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "tableName", tableName, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/db/v1/tables/%s/rows/mutate", pathParam0)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
+// NewQueryRelationalRowsRequest calls the generic QueryRelationalRows builder with application/json body
+func NewQueryRelationalRowsRequest(server string, tableName string, body QueryRelationalRowsJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewQueryRelationalRowsRequestWithBody(server, tableName, "application/json", bodyReader)
+}
+
+// NewQueryRelationalRowsRequestWithBody constructs an http.Request for the QueryRelationalRows method, with any body, and a specified content type
+func NewQueryRelationalRowsRequestWithBody(server string, tableName string, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "tableName", tableName, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/db/v1/tables/%s/rows/query", pathParam0)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
 // NewPatchSchemaRequest calls the generic PatchSchema builder with application/json body
 func NewPatchSchemaRequest(server string, tableName string, params *PatchSchemaParams, body PatchSchemaJSONRequestBody) (*http.Request, error) {
 	var bodyReader io.Reader
@@ -50395,6 +54254,29 @@ func NewPatchSchemaRequestWithBody(server string, tableName string, params *Patc
 		return nil, err
 	}
 
+	if params != nil {
+		// queryValues collects non-styled parameters (passthrough, JSON)
+		// that are safe to round-trip through url.Values.Encode().
+		queryValues := queryURL.Query()
+		// rawQueryFragments collects pre-encoded query fragments from
+		// styled parameters, preserving literal commas as delimiters
+		// per the OpenAPI spec (e.g. "color=blue,black,brown").
+		var rawQueryFragments []string
+
+		if queryFrag, err := runtime.StyleParamWithOptions("form", true, "rewrite", params.Rewrite, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "boolean", Format: ""}); err != nil {
+			return nil, err
+		} else {
+			for _, qp := range strings.Split(queryFrag, "&") {
+				rawQueryFragments = append(rawQueryFragments, qp)
+			}
+		}
+
+		if encoded := queryValues.Encode(); encoded != "" {
+			rawQueryFragments = append(rawQueryFragments, encoded)
+		}
+		queryURL.RawQuery = strings.Join(rawQueryFragments, "&")
+	}
+
 	req, err := http.NewRequest(http.MethodPatch, queryURL.String(), body)
 	if err != nil {
 		return nil, err
@@ -50412,6 +54294,15 @@ func NewPatchSchemaRequestWithBody(server string, tableName string, params *Patc
 		}
 
 		req.Header.Set("If-Match", headerParam0)
+
+		var headerParam1 string
+
+		headerParam1, err = runtime.StyleParamWithOptions("simple", false, "Idempotency-Key", params.IdempotencyKey, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationHeader, Type: "string", Format: ""})
+		if err != nil {
+			return nil, err
+		}
+
+		req.Header.Set("Idempotency-Key", headerParam1)
 
 	}
 
@@ -50455,6 +54346,29 @@ func NewUpdateSchemaRequestWithBody(server string, tableName string, params *Upd
 		return nil, err
 	}
 
+	if params != nil {
+		// queryValues collects non-styled parameters (passthrough, JSON)
+		// that are safe to round-trip through url.Values.Encode().
+		queryValues := queryURL.Query()
+		// rawQueryFragments collects pre-encoded query fragments from
+		// styled parameters, preserving literal commas as delimiters
+		// per the OpenAPI spec (e.g. "color=blue,black,brown").
+		var rawQueryFragments []string
+
+		if queryFrag, err := runtime.StyleParamWithOptions("form", true, "rewrite", params.Rewrite, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "boolean", Format: ""}); err != nil {
+			return nil, err
+		} else {
+			for _, qp := range strings.Split(queryFrag, "&") {
+				rawQueryFragments = append(rawQueryFragments, qp)
+			}
+		}
+
+		if encoded := queryValues.Encode(); encoded != "" {
+			rawQueryFragments = append(rawQueryFragments, encoded)
+		}
+		queryURL.RawQuery = strings.Join(rawQueryFragments, "&")
+	}
+
 	req, err := http.NewRequest(http.MethodPut, queryURL.String(), body)
 	if err != nil {
 		return nil, err
@@ -50472,6 +54386,15 @@ func NewUpdateSchemaRequestWithBody(server string, tableName string, params *Upd
 		}
 
 		req.Header.Set("If-Match", headerParam0)
+
+		var headerParam1 string
+
+		headerParam1, err = runtime.StyleParamWithOptions("simple", false, "Idempotency-Key", params.IdempotencyKey, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationHeader, Type: "string", Format: ""})
+		if err != nil {
+			return nil, err
+		}
+
+		req.Header.Set("Idempotency-Key", headerParam1)
 
 	}
 
@@ -52067,7 +55990,7 @@ type ClientWithResponsesInterface interface {
 	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
 	//
 	// Corresponds with POST /ai/v1/embed (the `GenerateEmbeddings` operationId).
-	GenerateEmbeddingsWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*GenerateEmbeddingsResponse, error)
+	GenerateEmbeddingsWithBodyWithResponse(ctx context.Context, params *GenerateEmbeddingsParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*GenerateEmbeddingsResponse, error)
 
 	// GenerateEmbeddingsWithResponse Create embeddings (alias of `/embeddings`)
 	//
@@ -52082,7 +56005,7 @@ type ClientWithResponsesInterface interface {
 	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
 	//
 	// Corresponds with POST /ai/v1/embed (the `GenerateEmbeddings` operationId).
-	GenerateEmbeddingsWithResponse(ctx context.Context, body GenerateEmbeddingsJSONRequestBody, reqEditors ...RequestEditorFn) (*GenerateEmbeddingsResponse, error)
+	GenerateEmbeddingsWithResponse(ctx context.Context, params *GenerateEmbeddingsParams, body GenerateEmbeddingsJSONRequestBody, reqEditors ...RequestEditorFn) (*GenerateEmbeddingsResponse, error)
 
 	// CreateEmbeddingWithBodyWithResponse Create embeddings (OpenAI-compatible)
 	//
@@ -52098,7 +56021,7 @@ type ClientWithResponsesInterface interface {
 	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
 	//
 	// Corresponds with POST /ai/v1/embeddings (the `CreateEmbedding` operationId).
-	CreateEmbeddingWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*CreateEmbeddingResponse, error)
+	CreateEmbeddingWithBodyWithResponse(ctx context.Context, params *CreateEmbeddingParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*CreateEmbeddingResponse, error)
 
 	// CreateEmbeddingWithResponse Create embeddings (OpenAI-compatible)
 	//
@@ -52114,7 +56037,7 @@ type ClientWithResponsesInterface interface {
 	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
 	//
 	// Corresponds with POST /ai/v1/embeddings (the `CreateEmbedding` operationId).
-	CreateEmbeddingWithResponse(ctx context.Context, body CreateEmbeddingJSONRequestBody, reqEditors ...RequestEditorFn) (*CreateEmbeddingResponse, error)
+	CreateEmbeddingWithResponse(ctx context.Context, params *CreateEmbeddingParams, body CreateEmbeddingJSONRequestBody, reqEditors ...RequestEditorFn) (*CreateEmbeddingResponse, error)
 
 	// ExtractWithBodyWithResponse Extract entities, relations, classifications, and structures
 	//
@@ -52477,7 +56400,7 @@ type ClientWithResponsesInterface interface {
 	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
 	//
 	// Corresponds with POST /ai/v1/rerank (the `RerankPrompts` operationId).
-	RerankPromptsWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*RerankPromptsResponse, error)
+	RerankPromptsWithBodyWithResponse(ctx context.Context, params *RerankPromptsParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*RerankPromptsResponse, error)
 
 	// RerankPromptsWithResponse Rerank prompts by relevance
 	//
@@ -52508,7 +56431,7 @@ type ClientWithResponsesInterface interface {
 	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
 	//
 	// Corresponds with POST /ai/v1/rerank (the `RerankPrompts` operationId).
-	RerankPromptsWithResponse(ctx context.Context, body RerankPromptsJSONRequestBody, reqEditors ...RequestEditorFn) (*RerankPromptsResponse, error)
+	RerankPromptsWithResponse(ctx context.Context, params *RerankPromptsParams, body RerankPromptsJSONRequestBody, reqEditors ...RequestEditorFn) (*RerankPromptsResponse, error)
 
 	// RerankMultimodalPromptsWithBodyWithResponse Rerank multimodal documents by relevance
 	//
@@ -52524,7 +56447,7 @@ type ClientWithResponsesInterface interface {
 	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
 	//
 	// Corresponds with POST /ai/v1/rerank_multimodal (the `RerankMultimodalPrompts` operationId).
-	RerankMultimodalPromptsWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*RerankMultimodalPromptsResponse, error)
+	RerankMultimodalPromptsWithBodyWithResponse(ctx context.Context, params *RerankMultimodalPromptsParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*RerankMultimodalPromptsResponse, error)
 
 	// RerankMultimodalPromptsWithResponse Rerank multimodal documents by relevance
 	//
@@ -52540,7 +56463,7 @@ type ClientWithResponsesInterface interface {
 	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
 	//
 	// Corresponds with POST /ai/v1/rerank_multimodal (the `RerankMultimodalPrompts` operationId).
-	RerankMultimodalPromptsWithResponse(ctx context.Context, body RerankMultimodalPromptsJSONRequestBody, reqEditors ...RequestEditorFn) (*RerankMultimodalPromptsResponse, error)
+	RerankMultimodalPromptsWithResponse(ctx context.Context, params *RerankMultimodalPromptsParams, body RerankMultimodalPromptsJSONRequestBody, reqEditors ...RequestEditorFn) (*RerankMultimodalPromptsResponse, error)
 
 	// RewriteTextWithBodyWithResponse Rewrite text using Seq2Seq models
 	//
@@ -53522,6 +57445,99 @@ type ClientWithResponsesInterface interface {
 	// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/batch (the `BatchNamespaceTable` operationId).
 	BatchNamespaceTableWithResponse(ctx context.Context, databaseName string, namespaceName string, tableName string, body BatchNamespaceTableJSONRequestBody, reqEditors ...RequestEditorFn) (*BatchNamespaceTableResponse, error)
 
+	// RepairNamespaceRelationalConstraintsWithBodyWithResponse Repair version-conditional rows after failed or diagnosed constraint activation
+	//
+	// Requires table administrator permission. Each affected target range must
+	// have failed UNIQUE/FK/CHECK activation or a validating MATCH PARTIAL
+	// missing-parent diagnostic. Replacement values still satisfy all
+	// constraints, and referential actions require write permission on every
+	// affected table. Existing dependencies remain protected. Repairs do not
+	// mark historical coverage valid. Invoke constraint retry after repairing
+	// failed activation; validating diagnostics resume validation automatically.
+	//
+	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/repair (the `RepairNamespaceRelationalConstraints` operationId).
+	RepairNamespaceRelationalConstraintsWithBodyWithResponse(ctx context.Context, databaseName string, namespaceName string, tableName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*RepairNamespaceRelationalConstraintsResponse, error)
+
+	// RepairNamespaceRelationalConstraintsWithResponse Repair version-conditional rows after failed or diagnosed constraint activation
+	//
+	// Requires table administrator permission. Each affected target range must
+	// have failed UNIQUE/FK/CHECK activation or a validating MATCH PARTIAL
+	// missing-parent diagnostic. Replacement values still satisfy all
+	// constraints, and referential actions require write permission on every
+	// affected table. Existing dependencies remain protected. Repairs do not
+	// mark historical coverage valid. Invoke constraint retry after repairing
+	// failed activation; validating diagnostics resume validation automatically.
+	//
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/repair (the `RepairNamespaceRelationalConstraints` operationId).
+	RepairNamespaceRelationalConstraintsWithResponse(ctx context.Context, databaseName string, namespaceName string, tableName string, body RepairNamespaceRelationalConstraintsJSONRequestBody, reqEditors ...RequestEditorFn) (*RepairNamespaceRelationalConstraintsResponse, error)
+
+	// RetireNamespaceRelationalConstraintsWithBodyWithResponse Retire unique and foreign-key definitions safely
+	//
+	// Requires table administrator permission. Starts a durable, bounded
+	// all-owner drain. Poll constraints/status for progress. A target schema
+	// is published automatically after the drain. With drop=true the table
+	// remains fenced at ready_to_drop until an administrator explicitly
+	// deletes it with the existing table deletion endpoint.
+	//
+	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/retire (the `RetireNamespaceRelationalConstraints` operationId).
+	RetireNamespaceRelationalConstraintsWithBodyWithResponse(ctx context.Context, databaseName string, namespaceName string, tableName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*RetireNamespaceRelationalConstraintsResponse, error)
+
+	// RetireNamespaceRelationalConstraintsWithResponse Retire unique and foreign-key definitions safely
+	//
+	// Requires table administrator permission. Starts a durable, bounded
+	// all-owner drain. Poll constraints/status for progress. A target schema
+	// is published automatically after the drain. With drop=true the table
+	// remains fenced at ready_to_drop until an administrator explicitly
+	// deletes it with the existing table deletion endpoint.
+	//
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/retire (the `RetireNamespaceRelationalConstraints` operationId).
+	RetireNamespaceRelationalConstraintsWithResponse(ctx context.Context, databaseName string, namespaceName string, tableName string, body RetireNamespaceRelationalConstraintsJSONRequestBody, reqEditors ...RequestEditorFn) (*RetireNamespaceRelationalConstraintsResponse, error)
+
+	// RetryNamespaceRelationalConstraintsWithBodyWithResponse Restart failed UNIQUE/FK/CHECK validation after administrative repair
+	//
+	// Requires table administrator permission. Resets each failed owner using
+	// an exact checkpoint precondition. Owners already validating or enforced
+	// are unchanged. Retrying after partial progress is safe. Inspect the
+	// constraint status endpoint for coverage and diagnostics.
+	// When a retirement job is active, clears its paused diagnostic and
+	// resumes that job instead of restarting activation. Retirement remains
+	// fenced and retains all prior drain progress.
+	//
+	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/retry (the `RetryNamespaceRelationalConstraints` operationId).
+	RetryNamespaceRelationalConstraintsWithBodyWithResponse(ctx context.Context, databaseName string, namespaceName string, tableName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*RetryNamespaceRelationalConstraintsResponse, error)
+
+	// RetryNamespaceRelationalConstraintsWithResponse Restart failed UNIQUE/FK/CHECK validation after administrative repair
+	//
+	// Requires table administrator permission. Resets each failed owner using
+	// an exact checkpoint precondition. Owners already validating or enforced
+	// are unchanged. Retrying after partial progress is safe. Inspect the
+	// constraint status endpoint for coverage and diagnostics.
+	// When a retirement job is active, clears its paused diagnostic and
+	// resumes that job instead of restarting activation. Retirement remains
+	// fenced and retains all prior drain progress.
+	//
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/retry (the `RetryNamespaceRelationalConstraints` operationId).
+	RetryNamespaceRelationalConstraintsWithResponse(ctx context.Context, databaseName string, namespaceName string, tableName string, body RetryNamespaceRelationalConstraintsJSONRequestBody, reqEditors ...RequestEditorFn) (*RetryNamespaceRelationalConstraintsResponse, error)
+
+	// GetNamespaceRelationalConstraintStatusWithResponse Read distributed UNIQUE, foreign-key, and CHECK validation coverage
+	//
+	// Returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with GET /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/status (the `GetNamespaceRelationalConstraintStatus` operationId).
+	GetNamespaceRelationalConstraintStatusWithResponse(ctx context.Context, databaseName string, namespaceName string, tableName string, reqEditors ...RequestEditorFn) (*GetNamespaceRelationalConstraintStatusResponse, error)
+
 	// LookupNamespaceTableDocumentWithResponse Retrieve a document by key from an explicit namespace table
 	//
 	// Retrieves a document through an explicit database and namespace route. While storage APIs are still bare-table-name based, the server fails closed when the resolved catalog table does not map to a unique physical table name.
@@ -53583,6 +57599,42 @@ type ClientWithResponsesInterface interface {
 	// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}:{action} (the `ExecuteNamespaceTableGraphMetricAction` operationId).
 	ExecuteNamespaceTableGraphMetricActionWithResponse(ctx context.Context, databaseName string, namespaceName string, tableName string, indexName string, metricName string, action string, reqEditors ...RequestEditorFn) (*ExecuteNamespaceTableGraphMetricActionResponse, error)
 
+	// RepairNamespaceIndexWithBodyWithResponse Repair an index generation
+	//
+	// Generation-fenced relational index maintenance. Requires table ADMIN permission. Repair accepts ready or failed generations and rebuilds their derived records. Owners are admitted independently and durably; exact request replay resumes after partial acknowledgements. Unsupported index types return 405.
+	//
+	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/repair (the `RepairNamespaceIndex` operationId).
+	RepairNamespaceIndexWithBodyWithResponse(ctx context.Context, databaseName string, namespaceName string, tableName string, indexName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*RepairNamespaceIndexResponse, error)
+
+	// RepairNamespaceIndexWithResponse Repair an index generation
+	//
+	// Generation-fenced relational index maintenance. Requires table ADMIN permission. Repair accepts ready or failed generations and rebuilds their derived records. Owners are admitted independently and durably; exact request replay resumes after partial acknowledgements. Unsupported index types return 405.
+	//
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/repair (the `RepairNamespaceIndex` operationId).
+	RepairNamespaceIndexWithResponse(ctx context.Context, databaseName string, namespaceName string, tableName string, indexName string, body RepairNamespaceIndexJSONRequestBody, reqEditors ...RequestEditorFn) (*RepairNamespaceIndexResponse, error)
+
+	// RetryNamespaceIndexWithBodyWithResponse Retry a failed index build
+	//
+	// Generation-fenced relational index maintenance. Requires table ADMIN permission. Retry accepts failed generations. Owners are admitted independently and durably; exact request replay resumes after partial acknowledgements. Unsupported index types return 405.
+	//
+	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/retry (the `RetryNamespaceIndex` operationId).
+	RetryNamespaceIndexWithBodyWithResponse(ctx context.Context, databaseName string, namespaceName string, tableName string, indexName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*RetryNamespaceIndexResponse, error)
+
+	// RetryNamespaceIndexWithResponse Retry a failed index build
+	//
+	// Generation-fenced relational index maintenance. Requires table ADMIN permission. Retry accepts failed generations. Owners are admitted independently and durably; exact request replay resumes after partial acknowledgements. Unsupported index types return 405.
+	//
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/retry (the `RetryNamespaceIndex` operationId).
+	RetryNamespaceIndexWithResponse(ctx context.Context, databaseName string, namespaceName string, tableName string, indexName string, body RetryNamespaceIndexJSONRequestBody, reqEditors ...RequestEditorFn) (*RetryNamespaceIndexResponse, error)
+
 	// QueryNamespaceTableWithBodyWithResponse Query an explicit namespace table
 	//
 	// Queries a table through an explicit database and namespace route. While storage APIs are still bare-table-name based, the server fails closed when the resolved catalog table does not map to a unique physical table name.
@@ -53628,6 +57680,34 @@ type ClientWithResponsesInterface interface {
 	//
 	// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/restore (the `RestoreNamespaceTable` operationId).
 	RestoreNamespaceTableWithResponse(ctx context.Context, databaseName string, namespaceName string, tableName string, params *RestoreNamespaceTableParams, body RestoreNamespaceTableJSONRequestBody, reqEditors ...RequestEditorFn) (*RestoreNamespaceTableResponse, error)
+
+	// MutateNamespaceRelationalRowsWithBodyWithResponse Atomically replace or delete version-conditional typed rows
+	//
+	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rows/mutate (the `MutateNamespaceRelationalRows` operationId).
+	MutateNamespaceRelationalRowsWithBodyWithResponse(ctx context.Context, databaseName string, namespaceName string, tableName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*MutateNamespaceRelationalRowsResponse, error)
+
+	// MutateNamespaceRelationalRowsWithResponse Atomically replace or delete version-conditional typed rows
+	//
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rows/mutate (the `MutateNamespaceRelationalRows` operationId).
+	MutateNamespaceRelationalRowsWithResponse(ctx context.Context, databaseName string, namespaceName string, tableName string, body MutateNamespaceRelationalRowsJSONRequestBody, reqEditors ...RequestEditorFn) (*MutateNamespaceRelationalRowsResponse, error)
+
+	// QueryNamespaceRelationalRowsWithBodyWithResponse Query projected typed relational rows
+	//
+	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rows/query (the `QueryNamespaceRelationalRows` operationId).
+	QueryNamespaceRelationalRowsWithBodyWithResponse(ctx context.Context, databaseName string, namespaceName string, tableName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*QueryNamespaceRelationalRowsResponse, error)
+
+	// QueryNamespaceRelationalRowsWithResponse Query projected typed relational rows
+	//
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rows/query (the `QueryNamespaceRelationalRows` operationId).
+	QueryNamespaceRelationalRowsWithResponse(ctx context.Context, databaseName string, namespaceName string, tableName string, body QueryNamespaceRelationalRowsJSONRequestBody, reqEditors ...RequestEditorFn) (*QueryNamespaceRelationalRowsResponse, error)
 
 	// PatchNamespaceTableSchemaWithBodyWithResponse Patch a table's schema
 	//
@@ -54473,6 +58553,99 @@ type ClientWithResponsesInterface interface {
 	// Corresponds with POST /db/v1/tables/{tableName}/batch (the `BatchWrite` operationId).
 	BatchWriteWithResponse(ctx context.Context, tableName string, body BatchWriteJSONRequestBody, reqEditors ...RequestEditorFn) (*BatchWriteResponse, error)
 
+	// RepairRelationalConstraintsWithBodyWithResponse Repair version-conditional rows after failed or diagnosed constraint activation
+	//
+	// Requires table administrator permission. Each affected target range must
+	// have failed UNIQUE/FK/CHECK activation or a validating MATCH PARTIAL
+	// missing-parent diagnostic. Replacement values still satisfy all
+	// constraints, and referential actions require write permission on every
+	// affected table. Existing dependencies remain protected. Repairs do not
+	// mark historical coverage valid. Invoke constraint retry after repairing
+	// failed activation; validating diagnostics resume validation automatically.
+	//
+	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /db/v1/tables/{tableName}/constraints/repair (the `RepairRelationalConstraints` operationId).
+	RepairRelationalConstraintsWithBodyWithResponse(ctx context.Context, tableName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*RepairRelationalConstraintsResponse, error)
+
+	// RepairRelationalConstraintsWithResponse Repair version-conditional rows after failed or diagnosed constraint activation
+	//
+	// Requires table administrator permission. Each affected target range must
+	// have failed UNIQUE/FK/CHECK activation or a validating MATCH PARTIAL
+	// missing-parent diagnostic. Replacement values still satisfy all
+	// constraints, and referential actions require write permission on every
+	// affected table. Existing dependencies remain protected. Repairs do not
+	// mark historical coverage valid. Invoke constraint retry after repairing
+	// failed activation; validating diagnostics resume validation automatically.
+	//
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /db/v1/tables/{tableName}/constraints/repair (the `RepairRelationalConstraints` operationId).
+	RepairRelationalConstraintsWithResponse(ctx context.Context, tableName string, body RepairRelationalConstraintsJSONRequestBody, reqEditors ...RequestEditorFn) (*RepairRelationalConstraintsResponse, error)
+
+	// RetireRelationalConstraintsWithBodyWithResponse Retire unique and foreign-key definitions safely
+	//
+	// Requires table administrator permission. Starts a durable, bounded
+	// all-owner drain. Poll constraints/status for progress. A target schema
+	// is published automatically after the drain. With drop=true the table
+	// remains fenced at ready_to_drop until an administrator explicitly
+	// deletes it with the existing table deletion endpoint.
+	//
+	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /db/v1/tables/{tableName}/constraints/retire (the `RetireRelationalConstraints` operationId).
+	RetireRelationalConstraintsWithBodyWithResponse(ctx context.Context, tableName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*RetireRelationalConstraintsResponse, error)
+
+	// RetireRelationalConstraintsWithResponse Retire unique and foreign-key definitions safely
+	//
+	// Requires table administrator permission. Starts a durable, bounded
+	// all-owner drain. Poll constraints/status for progress. A target schema
+	// is published automatically after the drain. With drop=true the table
+	// remains fenced at ready_to_drop until an administrator explicitly
+	// deletes it with the existing table deletion endpoint.
+	//
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /db/v1/tables/{tableName}/constraints/retire (the `RetireRelationalConstraints` operationId).
+	RetireRelationalConstraintsWithResponse(ctx context.Context, tableName string, body RetireRelationalConstraintsJSONRequestBody, reqEditors ...RequestEditorFn) (*RetireRelationalConstraintsResponse, error)
+
+	// RetryRelationalConstraintsWithBodyWithResponse Restart failed UNIQUE/FK/CHECK validation after administrative repair
+	//
+	// Requires table administrator permission. Resets each failed owner using
+	// an exact checkpoint precondition. Owners already validating or enforced
+	// are unchanged. Retrying after partial progress is safe. Inspect the
+	// constraint status endpoint for coverage and diagnostics.
+	// When a retirement job is active, clears its paused diagnostic and
+	// resumes that job instead of restarting activation. Retirement remains
+	// fenced and retains all prior drain progress.
+	//
+	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /db/v1/tables/{tableName}/constraints/retry (the `RetryRelationalConstraints` operationId).
+	RetryRelationalConstraintsWithBodyWithResponse(ctx context.Context, tableName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*RetryRelationalConstraintsResponse, error)
+
+	// RetryRelationalConstraintsWithResponse Restart failed UNIQUE/FK/CHECK validation after administrative repair
+	//
+	// Requires table administrator permission. Resets each failed owner using
+	// an exact checkpoint precondition. Owners already validating or enforced
+	// are unchanged. Retrying after partial progress is safe. Inspect the
+	// constraint status endpoint for coverage and diagnostics.
+	// When a retirement job is active, clears its paused diagnostic and
+	// resumes that job instead of restarting activation. Retirement remains
+	// fenced and retains all prior drain progress.
+	//
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /db/v1/tables/{tableName}/constraints/retry (the `RetryRelationalConstraints` operationId).
+	RetryRelationalConstraintsWithResponse(ctx context.Context, tableName string, body RetryRelationalConstraintsJSONRequestBody, reqEditors ...RequestEditorFn) (*RetryRelationalConstraintsResponse, error)
+
+	// GetRelationalConstraintStatusWithResponse Read distributed UNIQUE, foreign-key, and CHECK validation coverage
+	//
+	// Returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with GET /db/v1/tables/{tableName}/constraints/status (the `GetRelationalConstraintStatus` operationId).
+	GetRelationalConstraintStatusWithResponse(ctx context.Context, tableName string, reqEditors ...RequestEditorFn) (*GetRelationalConstraintStatusResponse, error)
+
 	// ReauthorizeTableDestinationsWithResponse Adopt stored write destinations with the current credential
 	//
 	// Reauthorizes the table's existing CDC routes and graph resolver destinations
@@ -54602,6 +58775,42 @@ type ClientWithResponsesInterface interface {
 	//
 	// Corresponds with POST /db/v1/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}:{action} (the `ExecuteGraphMetricAction` operationId).
 	ExecuteGraphMetricActionWithResponse(ctx context.Context, tableName string, indexName string, metricName string, action string, reqEditors ...RequestEditorFn) (*ExecuteGraphMetricActionResponse, error)
+
+	// RepairIndexWithBodyWithResponse Repair an index generation
+	//
+	// Generation-fenced relational index maintenance. Requires table ADMIN permission. Repair accepts ready or failed generations and rebuilds their derived records. Owners are admitted independently and durably; exact request replay resumes after partial acknowledgements. Unsupported index types return 405.
+	//
+	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /db/v1/tables/{tableName}/indexes/{indexName}/repair (the `RepairIndex` operationId).
+	RepairIndexWithBodyWithResponse(ctx context.Context, tableName string, indexName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*RepairIndexResponse, error)
+
+	// RepairIndexWithResponse Repair an index generation
+	//
+	// Generation-fenced relational index maintenance. Requires table ADMIN permission. Repair accepts ready or failed generations and rebuilds their derived records. Owners are admitted independently and durably; exact request replay resumes after partial acknowledgements. Unsupported index types return 405.
+	//
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /db/v1/tables/{tableName}/indexes/{indexName}/repair (the `RepairIndex` operationId).
+	RepairIndexWithResponse(ctx context.Context, tableName string, indexName string, body RepairIndexJSONRequestBody, reqEditors ...RequestEditorFn) (*RepairIndexResponse, error)
+
+	// RetryIndexWithBodyWithResponse Retry a failed index build
+	//
+	// Generation-fenced relational index maintenance. Requires table ADMIN permission. Retry accepts failed generations. Owners are admitted independently and durably; exact request replay resumes after partial acknowledgements. Unsupported index types return 405.
+	//
+	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /db/v1/tables/{tableName}/indexes/{indexName}/retry (the `RetryIndex` operationId).
+	RetryIndexWithBodyWithResponse(ctx context.Context, tableName string, indexName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*RetryIndexResponse, error)
+
+	// RetryIndexWithResponse Retry a failed index build
+	//
+	// Generation-fenced relational index maintenance. Requires table ADMIN permission. Retry accepts failed generations. Owners are admitted independently and durably; exact request replay resumes after partial acknowledgements. Unsupported index types return 405.
+	//
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /db/v1/tables/{tableName}/indexes/{indexName}/retry (the `RetryIndex` operationId).
+	RetryIndexWithResponse(ctx context.Context, tableName string, indexName string, body RetryIndexJSONRequestBody, reqEditors ...RequestEditorFn) (*RetryIndexResponse, error)
 
 	// LinearMergeWithBodyWithResponse Synchronize data from external sources (Shopify, Postgres, S3) using a linear merge
 	//
@@ -54828,6 +59037,34 @@ type ClientWithResponsesInterface interface {
 	//
 	// Corresponds with POST /db/v1/tables/{tableName}/restore (the `RestoreTable` operationId).
 	RestoreTableWithResponse(ctx context.Context, tableName string, params *RestoreTableParams, body RestoreTableJSONRequestBody, reqEditors ...RequestEditorFn) (*RestoreTableResponse, error)
+
+	// MutateRelationalRowsWithBodyWithResponse Atomically replace or delete version-conditional typed rows
+	//
+	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /db/v1/tables/{tableName}/rows/mutate (the `MutateRelationalRows` operationId).
+	MutateRelationalRowsWithBodyWithResponse(ctx context.Context, tableName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*MutateRelationalRowsResponse, error)
+
+	// MutateRelationalRowsWithResponse Atomically replace or delete version-conditional typed rows
+	//
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /db/v1/tables/{tableName}/rows/mutate (the `MutateRelationalRows` operationId).
+	MutateRelationalRowsWithResponse(ctx context.Context, tableName string, body MutateRelationalRowsJSONRequestBody, reqEditors ...RequestEditorFn) (*MutateRelationalRowsResponse, error)
+
+	// QueryRelationalRowsWithBodyWithResponse Query projected typed relational rows
+	//
+	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /db/v1/tables/{tableName}/rows/query (the `QueryRelationalRows` operationId).
+	QueryRelationalRowsWithBodyWithResponse(ctx context.Context, tableName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*QueryRelationalRowsResponse, error)
+
+	// QueryRelationalRowsWithResponse Query projected typed relational rows
+	//
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /db/v1/tables/{tableName}/rows/query (the `QueryRelationalRows` operationId).
+	QueryRelationalRowsWithResponse(ctx context.Context, tableName string, body QueryRelationalRowsJSONRequestBody, reqEditors ...RequestEditorFn) (*QueryRelationalRowsResponse, error)
 
 	// PatchSchemaWithBodyWithResponse Patch a table's schema
 	//
@@ -59888,6 +64125,233 @@ func (r BatchNamespaceTableResponse) ContentType() string {
 	return ""
 }
 
+type RepairNamespaceRelationalConstraintsResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON201 the response for an HTTP 201 `application/json` response
+	JSON201 *BatchResponse
+	// JSON202 the response for an HTTP 202 `application/json` response
+	JSON202 *BatchResponse
+	// JSON400 the response for an HTTP 400 `application/json` response
+	JSON400 *BadRequest
+	// JSON404 the response for an HTTP 404 `application/json` response
+	JSON404 *NotFound
+}
+
+// GetJSON201 returns the response for an HTTP 201 `application/json` response
+func (r RepairNamespaceRelationalConstraintsResponse) GetJSON201() *BatchResponse {
+	return r.JSON201
+}
+
+// GetJSON202 returns the response for an HTTP 202 `application/json` response
+func (r RepairNamespaceRelationalConstraintsResponse) GetJSON202() *BatchResponse {
+	return r.JSON202
+}
+
+// GetJSON400 returns the response for an HTTP 400 `application/json` response
+func (r RepairNamespaceRelationalConstraintsResponse) GetJSON400() *BadRequest {
+	return r.JSON400
+}
+
+// GetJSON404 returns the response for an HTTP 404 `application/json` response
+func (r RepairNamespaceRelationalConstraintsResponse) GetJSON404() *NotFound {
+	return r.JSON404
+}
+
+// GetBody returns the raw response body bytes
+func (r RepairNamespaceRelationalConstraintsResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r RepairNamespaceRelationalConstraintsResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r RepairNamespaceRelationalConstraintsResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r RepairNamespaceRelationalConstraintsResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type RetireNamespaceRelationalConstraintsResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON202 the response for an HTTP 202 `application/json` response
+	JSON202 *RelationalConstraintRetryResponse
+	// JSON400 the response for an HTTP 400 `application/json` response
+	JSON400 *BadRequest
+	// JSON404 the response for an HTTP 404 `application/json` response
+	JSON404 *NotFound
+}
+
+// GetJSON202 returns the response for an HTTP 202 `application/json` response
+func (r RetireNamespaceRelationalConstraintsResponse) GetJSON202() *RelationalConstraintRetryResponse {
+	return r.JSON202
+}
+
+// GetJSON400 returns the response for an HTTP 400 `application/json` response
+func (r RetireNamespaceRelationalConstraintsResponse) GetJSON400() *BadRequest {
+	return r.JSON400
+}
+
+// GetJSON404 returns the response for an HTTP 404 `application/json` response
+func (r RetireNamespaceRelationalConstraintsResponse) GetJSON404() *NotFound {
+	return r.JSON404
+}
+
+// GetBody returns the raw response body bytes
+func (r RetireNamespaceRelationalConstraintsResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r RetireNamespaceRelationalConstraintsResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r RetireNamespaceRelationalConstraintsResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r RetireNamespaceRelationalConstraintsResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type RetryNamespaceRelationalConstraintsResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON202 the response for an HTTP 202 `application/json` response
+	JSON202 *RelationalConstraintRetryResponse
+	// JSON400 the response for an HTTP 400 `application/json` response
+	JSON400 *BadRequest
+	// JSON404 the response for an HTTP 404 `application/json` response
+	JSON404 *NotFound
+}
+
+// GetJSON202 returns the response for an HTTP 202 `application/json` response
+func (r RetryNamespaceRelationalConstraintsResponse) GetJSON202() *RelationalConstraintRetryResponse {
+	return r.JSON202
+}
+
+// GetJSON400 returns the response for an HTTP 400 `application/json` response
+func (r RetryNamespaceRelationalConstraintsResponse) GetJSON400() *BadRequest {
+	return r.JSON400
+}
+
+// GetJSON404 returns the response for an HTTP 404 `application/json` response
+func (r RetryNamespaceRelationalConstraintsResponse) GetJSON404() *NotFound {
+	return r.JSON404
+}
+
+// GetBody returns the raw response body bytes
+func (r RetryNamespaceRelationalConstraintsResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r RetryNamespaceRelationalConstraintsResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r RetryNamespaceRelationalConstraintsResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r RetryNamespaceRelationalConstraintsResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type GetNamespaceRelationalConstraintStatusResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *RelationalConstraintStatus
+	// JSON400 the response for an HTTP 400 `application/json` response
+	JSON400 *BadRequest
+	// JSON404 the response for an HTTP 404 `application/json` response
+	JSON404 *NotFound
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r GetNamespaceRelationalConstraintStatusResponse) GetJSON200() *RelationalConstraintStatus {
+	return r.JSON200
+}
+
+// GetJSON400 returns the response for an HTTP 400 `application/json` response
+func (r GetNamespaceRelationalConstraintStatusResponse) GetJSON400() *BadRequest {
+	return r.JSON400
+}
+
+// GetJSON404 returns the response for an HTTP 404 `application/json` response
+func (r GetNamespaceRelationalConstraintStatusResponse) GetJSON404() *NotFound {
+	return r.JSON404
+}
+
+// GetBody returns the raw response body bytes
+func (r GetNamespaceRelationalConstraintStatusResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r GetNamespaceRelationalConstraintStatusResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r GetNamespaceRelationalConstraintStatusResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r GetNamespaceRelationalConstraintStatusResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
 // LookupNamespaceTableDocumentResponse200Headers the declared response headers of an HTTP 200 response for LookupNamespaceTableDocument
 type LookupNamespaceTableDocumentResponse200Headers struct {
 	XAntflyVersion string
@@ -60246,6 +64710,214 @@ func (r ExecuteNamespaceTableGraphMetricActionResponse) ContentType() string {
 	return ""
 }
 
+// RepairNamespaceIndexResponse409Headers the declared response headers of an HTTP 409 response for RepairNamespaceIndex
+type RepairNamespaceIndexResponse409Headers struct {
+	XAntflyRaftMutationOutcome string
+}
+
+// RepairNamespaceIndexResponse429Headers the declared response headers of an HTTP 429 response for RepairNamespaceIndex
+type RepairNamespaceIndexResponse429Headers struct {
+	RetryAfter int
+}
+
+// RepairNamespaceIndexResponse503Headers the declared response headers of an HTTP 503 response for RepairNamespaceIndex
+type RepairNamespaceIndexResponse503Headers struct {
+	RetryAfter int
+}
+
+type RepairNamespaceIndexResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *IndexMaintenanceResponse
+	// JSON400 the response for an HTTP 400 `application/json` response
+	JSON400 *BadRequest
+	// JSON404 the response for an HTTP 404 `application/json` response
+	JSON404 *NotFound
+	// JSON405 the response for an HTTP 405 `application/json` response
+	JSON405 *MethodNotAllowed
+	// JSON409 the response for an HTTP 409 `application/json` response
+	JSON409 *IndexMutationConflict
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *StorageResourceExhausted
+	// JSON503 the response for an HTTP 503 `application/json` response
+	JSON503 *IndexMutationServiceUnavailable
+	// Headers409 the parsed response headers for an HTTP 409 response
+	Headers409 *RepairNamespaceIndexResponse409Headers
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *RepairNamespaceIndexResponse429Headers
+	// Headers503 the parsed response headers for an HTTP 503 response
+	Headers503 *RepairNamespaceIndexResponse503Headers
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r RepairNamespaceIndexResponse) GetJSON200() *IndexMaintenanceResponse {
+	return r.JSON200
+}
+
+// GetJSON400 returns the response for an HTTP 400 `application/json` response
+func (r RepairNamespaceIndexResponse) GetJSON400() *BadRequest {
+	return r.JSON400
+}
+
+// GetJSON404 returns the response for an HTTP 404 `application/json` response
+func (r RepairNamespaceIndexResponse) GetJSON404() *NotFound {
+	return r.JSON404
+}
+
+// GetJSON405 returns the response for an HTTP 405 `application/json` response
+func (r RepairNamespaceIndexResponse) GetJSON405() *MethodNotAllowed {
+	return r.JSON405
+}
+
+// GetJSON409 returns the response for an HTTP 409 `application/json` response
+func (r RepairNamespaceIndexResponse) GetJSON409() *IndexMutationConflict {
+	return r.JSON409
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r RepairNamespaceIndexResponse) GetJSON429() *StorageResourceExhausted {
+	return r.JSON429
+}
+
+// GetJSON503 returns the response for an HTTP 503 `application/json` response
+func (r RepairNamespaceIndexResponse) GetJSON503() *IndexMutationServiceUnavailable {
+	return r.JSON503
+}
+
+// GetBody returns the raw response body bytes
+func (r RepairNamespaceIndexResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r RepairNamespaceIndexResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r RepairNamespaceIndexResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r RepairNamespaceIndexResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+// RetryNamespaceIndexResponse409Headers the declared response headers of an HTTP 409 response for RetryNamespaceIndex
+type RetryNamespaceIndexResponse409Headers struct {
+	XAntflyRaftMutationOutcome string
+}
+
+// RetryNamespaceIndexResponse429Headers the declared response headers of an HTTP 429 response for RetryNamespaceIndex
+type RetryNamespaceIndexResponse429Headers struct {
+	RetryAfter int
+}
+
+// RetryNamespaceIndexResponse503Headers the declared response headers of an HTTP 503 response for RetryNamespaceIndex
+type RetryNamespaceIndexResponse503Headers struct {
+	RetryAfter int
+}
+
+type RetryNamespaceIndexResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *IndexMaintenanceResponse
+	// JSON400 the response for an HTTP 400 `application/json` response
+	JSON400 *BadRequest
+	// JSON404 the response for an HTTP 404 `application/json` response
+	JSON404 *NotFound
+	// JSON405 the response for an HTTP 405 `application/json` response
+	JSON405 *MethodNotAllowed
+	// JSON409 the response for an HTTP 409 `application/json` response
+	JSON409 *IndexMutationConflict
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *StorageResourceExhausted
+	// JSON503 the response for an HTTP 503 `application/json` response
+	JSON503 *IndexMutationServiceUnavailable
+	// Headers409 the parsed response headers for an HTTP 409 response
+	Headers409 *RetryNamespaceIndexResponse409Headers
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *RetryNamespaceIndexResponse429Headers
+	// Headers503 the parsed response headers for an HTTP 503 response
+	Headers503 *RetryNamespaceIndexResponse503Headers
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r RetryNamespaceIndexResponse) GetJSON200() *IndexMaintenanceResponse {
+	return r.JSON200
+}
+
+// GetJSON400 returns the response for an HTTP 400 `application/json` response
+func (r RetryNamespaceIndexResponse) GetJSON400() *BadRequest {
+	return r.JSON400
+}
+
+// GetJSON404 returns the response for an HTTP 404 `application/json` response
+func (r RetryNamespaceIndexResponse) GetJSON404() *NotFound {
+	return r.JSON404
+}
+
+// GetJSON405 returns the response for an HTTP 405 `application/json` response
+func (r RetryNamespaceIndexResponse) GetJSON405() *MethodNotAllowed {
+	return r.JSON405
+}
+
+// GetJSON409 returns the response for an HTTP 409 `application/json` response
+func (r RetryNamespaceIndexResponse) GetJSON409() *IndexMutationConflict {
+	return r.JSON409
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r RetryNamespaceIndexResponse) GetJSON429() *StorageResourceExhausted {
+	return r.JSON429
+}
+
+// GetJSON503 returns the response for an HTTP 503 `application/json` response
+func (r RetryNamespaceIndexResponse) GetJSON503() *IndexMutationServiceUnavailable {
+	return r.JSON503
+}
+
+// GetBody returns the raw response body bytes
+func (r RetryNamespaceIndexResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r RetryNamespaceIndexResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r RetryNamespaceIndexResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r RetryNamespaceIndexResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
 type QueryNamespaceTableResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -60391,6 +65063,116 @@ func (r RestoreNamespaceTableResponse) StatusCode() int {
 
 // ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
 func (r RestoreNamespaceTableResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type MutateNamespaceRelationalRowsResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON201 the response for an HTTP 201 `application/json` response
+	JSON201 *BatchResponse
+	// JSON202 the response for an HTTP 202 `application/json` response
+	JSON202 *BatchResponse
+	// JSON400 the response for an HTTP 400 `application/json` response
+	JSON400 *BadRequest
+	// JSON404 the response for an HTTP 404 `application/json` response
+	JSON404 *NotFound
+}
+
+// GetJSON201 returns the response for an HTTP 201 `application/json` response
+func (r MutateNamespaceRelationalRowsResponse) GetJSON201() *BatchResponse {
+	return r.JSON201
+}
+
+// GetJSON202 returns the response for an HTTP 202 `application/json` response
+func (r MutateNamespaceRelationalRowsResponse) GetJSON202() *BatchResponse {
+	return r.JSON202
+}
+
+// GetJSON400 returns the response for an HTTP 400 `application/json` response
+func (r MutateNamespaceRelationalRowsResponse) GetJSON400() *BadRequest {
+	return r.JSON400
+}
+
+// GetJSON404 returns the response for an HTTP 404 `application/json` response
+func (r MutateNamespaceRelationalRowsResponse) GetJSON404() *NotFound {
+	return r.JSON404
+}
+
+// GetBody returns the raw response body bytes
+func (r MutateNamespaceRelationalRowsResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r MutateNamespaceRelationalRowsResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r MutateNamespaceRelationalRowsResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r MutateNamespaceRelationalRowsResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type QueryNamespaceRelationalRowsResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON400 the response for an HTTP 400 `application/json` response
+	JSON400 *BadRequest
+	// JSON404 the response for an HTTP 404 `application/json` response
+	JSON404 *NotFound
+}
+
+// GetJSON400 returns the response for an HTTP 400 `application/json` response
+func (r QueryNamespaceRelationalRowsResponse) GetJSON400() *BadRequest {
+	return r.JSON400
+}
+
+// GetJSON404 returns the response for an HTTP 404 `application/json` response
+func (r QueryNamespaceRelationalRowsResponse) GetJSON404() *NotFound {
+	return r.JSON404
+}
+
+// GetBody returns the raw response body bytes
+func (r QueryNamespaceRelationalRowsResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r QueryNamespaceRelationalRowsResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r QueryNamespaceRelationalRowsResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r QueryNamespaceRelationalRowsResponse) ContentType() string {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.Header.Get("Content-Type")
 	}
@@ -62644,6 +67426,233 @@ func (r BatchWriteResponse) ContentType() string {
 	return ""
 }
 
+type RepairRelationalConstraintsResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON201 the response for an HTTP 201 `application/json` response
+	JSON201 *BatchResponse
+	// JSON202 the response for an HTTP 202 `application/json` response
+	JSON202 *BatchResponse
+	// JSON400 the response for an HTTP 400 `application/json` response
+	JSON400 *BadRequest
+	// JSON404 the response for an HTTP 404 `application/json` response
+	JSON404 *NotFound
+}
+
+// GetJSON201 returns the response for an HTTP 201 `application/json` response
+func (r RepairRelationalConstraintsResponse) GetJSON201() *BatchResponse {
+	return r.JSON201
+}
+
+// GetJSON202 returns the response for an HTTP 202 `application/json` response
+func (r RepairRelationalConstraintsResponse) GetJSON202() *BatchResponse {
+	return r.JSON202
+}
+
+// GetJSON400 returns the response for an HTTP 400 `application/json` response
+func (r RepairRelationalConstraintsResponse) GetJSON400() *BadRequest {
+	return r.JSON400
+}
+
+// GetJSON404 returns the response for an HTTP 404 `application/json` response
+func (r RepairRelationalConstraintsResponse) GetJSON404() *NotFound {
+	return r.JSON404
+}
+
+// GetBody returns the raw response body bytes
+func (r RepairRelationalConstraintsResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r RepairRelationalConstraintsResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r RepairRelationalConstraintsResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r RepairRelationalConstraintsResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type RetireRelationalConstraintsResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON202 the response for an HTTP 202 `application/json` response
+	JSON202 *RelationalConstraintRetryResponse
+	// JSON400 the response for an HTTP 400 `application/json` response
+	JSON400 *BadRequest
+	// JSON404 the response for an HTTP 404 `application/json` response
+	JSON404 *NotFound
+}
+
+// GetJSON202 returns the response for an HTTP 202 `application/json` response
+func (r RetireRelationalConstraintsResponse) GetJSON202() *RelationalConstraintRetryResponse {
+	return r.JSON202
+}
+
+// GetJSON400 returns the response for an HTTP 400 `application/json` response
+func (r RetireRelationalConstraintsResponse) GetJSON400() *BadRequest {
+	return r.JSON400
+}
+
+// GetJSON404 returns the response for an HTTP 404 `application/json` response
+func (r RetireRelationalConstraintsResponse) GetJSON404() *NotFound {
+	return r.JSON404
+}
+
+// GetBody returns the raw response body bytes
+func (r RetireRelationalConstraintsResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r RetireRelationalConstraintsResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r RetireRelationalConstraintsResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r RetireRelationalConstraintsResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type RetryRelationalConstraintsResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON202 the response for an HTTP 202 `application/json` response
+	JSON202 *RelationalConstraintRetryResponse
+	// JSON400 the response for an HTTP 400 `application/json` response
+	JSON400 *BadRequest
+	// JSON404 the response for an HTTP 404 `application/json` response
+	JSON404 *NotFound
+}
+
+// GetJSON202 returns the response for an HTTP 202 `application/json` response
+func (r RetryRelationalConstraintsResponse) GetJSON202() *RelationalConstraintRetryResponse {
+	return r.JSON202
+}
+
+// GetJSON400 returns the response for an HTTP 400 `application/json` response
+func (r RetryRelationalConstraintsResponse) GetJSON400() *BadRequest {
+	return r.JSON400
+}
+
+// GetJSON404 returns the response for an HTTP 404 `application/json` response
+func (r RetryRelationalConstraintsResponse) GetJSON404() *NotFound {
+	return r.JSON404
+}
+
+// GetBody returns the raw response body bytes
+func (r RetryRelationalConstraintsResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r RetryRelationalConstraintsResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r RetryRelationalConstraintsResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r RetryRelationalConstraintsResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type GetRelationalConstraintStatusResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *RelationalConstraintStatus
+	// JSON400 the response for an HTTP 400 `application/json` response
+	JSON400 *BadRequest
+	// JSON404 the response for an HTTP 404 `application/json` response
+	JSON404 *NotFound
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r GetRelationalConstraintStatusResponse) GetJSON200() *RelationalConstraintStatus {
+	return r.JSON200
+}
+
+// GetJSON400 returns the response for an HTTP 400 `application/json` response
+func (r GetRelationalConstraintStatusResponse) GetJSON400() *BadRequest {
+	return r.JSON400
+}
+
+// GetJSON404 returns the response for an HTTP 404 `application/json` response
+func (r GetRelationalConstraintStatusResponse) GetJSON404() *NotFound {
+	return r.JSON404
+}
+
+// GetBody returns the raw response body bytes
+func (r GetRelationalConstraintStatusResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r GetRelationalConstraintStatusResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r GetRelationalConstraintStatusResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r GetRelationalConstraintStatusResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
 type ReauthorizeTableDestinationsResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -63438,6 +68447,214 @@ func (r ExecuteGraphMetricActionResponse) StatusCode() int {
 
 // ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
 func (r ExecuteGraphMetricActionResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+// RepairIndexResponse409Headers the declared response headers of an HTTP 409 response for RepairIndex
+type RepairIndexResponse409Headers struct {
+	XAntflyRaftMutationOutcome string
+}
+
+// RepairIndexResponse429Headers the declared response headers of an HTTP 429 response for RepairIndex
+type RepairIndexResponse429Headers struct {
+	RetryAfter int
+}
+
+// RepairIndexResponse503Headers the declared response headers of an HTTP 503 response for RepairIndex
+type RepairIndexResponse503Headers struct {
+	RetryAfter int
+}
+
+type RepairIndexResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *IndexMaintenanceResponse
+	// JSON400 the response for an HTTP 400 `application/json` response
+	JSON400 *BadRequest
+	// JSON404 the response for an HTTP 404 `application/json` response
+	JSON404 *NotFound
+	// JSON405 the response for an HTTP 405 `application/json` response
+	JSON405 *MethodNotAllowed
+	// JSON409 the response for an HTTP 409 `application/json` response
+	JSON409 *IndexMutationConflict
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *StorageResourceExhausted
+	// JSON503 the response for an HTTP 503 `application/json` response
+	JSON503 *IndexMutationServiceUnavailable
+	// Headers409 the parsed response headers for an HTTP 409 response
+	Headers409 *RepairIndexResponse409Headers
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *RepairIndexResponse429Headers
+	// Headers503 the parsed response headers for an HTTP 503 response
+	Headers503 *RepairIndexResponse503Headers
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r RepairIndexResponse) GetJSON200() *IndexMaintenanceResponse {
+	return r.JSON200
+}
+
+// GetJSON400 returns the response for an HTTP 400 `application/json` response
+func (r RepairIndexResponse) GetJSON400() *BadRequest {
+	return r.JSON400
+}
+
+// GetJSON404 returns the response for an HTTP 404 `application/json` response
+func (r RepairIndexResponse) GetJSON404() *NotFound {
+	return r.JSON404
+}
+
+// GetJSON405 returns the response for an HTTP 405 `application/json` response
+func (r RepairIndexResponse) GetJSON405() *MethodNotAllowed {
+	return r.JSON405
+}
+
+// GetJSON409 returns the response for an HTTP 409 `application/json` response
+func (r RepairIndexResponse) GetJSON409() *IndexMutationConflict {
+	return r.JSON409
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r RepairIndexResponse) GetJSON429() *StorageResourceExhausted {
+	return r.JSON429
+}
+
+// GetJSON503 returns the response for an HTTP 503 `application/json` response
+func (r RepairIndexResponse) GetJSON503() *IndexMutationServiceUnavailable {
+	return r.JSON503
+}
+
+// GetBody returns the raw response body bytes
+func (r RepairIndexResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r RepairIndexResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r RepairIndexResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r RepairIndexResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+// RetryIndexResponse409Headers the declared response headers of an HTTP 409 response for RetryIndex
+type RetryIndexResponse409Headers struct {
+	XAntflyRaftMutationOutcome string
+}
+
+// RetryIndexResponse429Headers the declared response headers of an HTTP 429 response for RetryIndex
+type RetryIndexResponse429Headers struct {
+	RetryAfter int
+}
+
+// RetryIndexResponse503Headers the declared response headers of an HTTP 503 response for RetryIndex
+type RetryIndexResponse503Headers struct {
+	RetryAfter int
+}
+
+type RetryIndexResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *IndexMaintenanceResponse
+	// JSON400 the response for an HTTP 400 `application/json` response
+	JSON400 *BadRequest
+	// JSON404 the response for an HTTP 404 `application/json` response
+	JSON404 *NotFound
+	// JSON405 the response for an HTTP 405 `application/json` response
+	JSON405 *MethodNotAllowed
+	// JSON409 the response for an HTTP 409 `application/json` response
+	JSON409 *IndexMutationConflict
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *StorageResourceExhausted
+	// JSON503 the response for an HTTP 503 `application/json` response
+	JSON503 *IndexMutationServiceUnavailable
+	// Headers409 the parsed response headers for an HTTP 409 response
+	Headers409 *RetryIndexResponse409Headers
+	// Headers429 the parsed response headers for an HTTP 429 response
+	Headers429 *RetryIndexResponse429Headers
+	// Headers503 the parsed response headers for an HTTP 503 response
+	Headers503 *RetryIndexResponse503Headers
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r RetryIndexResponse) GetJSON200() *IndexMaintenanceResponse {
+	return r.JSON200
+}
+
+// GetJSON400 returns the response for an HTTP 400 `application/json` response
+func (r RetryIndexResponse) GetJSON400() *BadRequest {
+	return r.JSON400
+}
+
+// GetJSON404 returns the response for an HTTP 404 `application/json` response
+func (r RetryIndexResponse) GetJSON404() *NotFound {
+	return r.JSON404
+}
+
+// GetJSON405 returns the response for an HTTP 405 `application/json` response
+func (r RetryIndexResponse) GetJSON405() *MethodNotAllowed {
+	return r.JSON405
+}
+
+// GetJSON409 returns the response for an HTTP 409 `application/json` response
+func (r RetryIndexResponse) GetJSON409() *IndexMutationConflict {
+	return r.JSON409
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r RetryIndexResponse) GetJSON429() *StorageResourceExhausted {
+	return r.JSON429
+}
+
+// GetJSON503 returns the response for an HTTP 503 `application/json` response
+func (r RetryIndexResponse) GetJSON503() *IndexMutationServiceUnavailable {
+	return r.JSON503
+}
+
+// GetBody returns the raw response body bytes
+func (r RetryIndexResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r RetryIndexResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r RetryIndexResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r RetryIndexResponse) ContentType() string {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.Header.Get("Content-Type")
 	}
@@ -64251,9 +69468,124 @@ func (r RestoreTableResponse) ContentType() string {
 	return ""
 }
 
+type MutateRelationalRowsResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON201 the response for an HTTP 201 `application/json` response
+	JSON201 *BatchResponse
+	// JSON202 the response for an HTTP 202 `application/json` response
+	JSON202 *BatchResponse
+	// JSON400 the response for an HTTP 400 `application/json` response
+	JSON400 *BadRequest
+	// JSON404 the response for an HTTP 404 `application/json` response
+	JSON404 *NotFound
+}
+
+// GetJSON201 returns the response for an HTTP 201 `application/json` response
+func (r MutateRelationalRowsResponse) GetJSON201() *BatchResponse {
+	return r.JSON201
+}
+
+// GetJSON202 returns the response for an HTTP 202 `application/json` response
+func (r MutateRelationalRowsResponse) GetJSON202() *BatchResponse {
+	return r.JSON202
+}
+
+// GetJSON400 returns the response for an HTTP 400 `application/json` response
+func (r MutateRelationalRowsResponse) GetJSON400() *BadRequest {
+	return r.JSON400
+}
+
+// GetJSON404 returns the response for an HTTP 404 `application/json` response
+func (r MutateRelationalRowsResponse) GetJSON404() *NotFound {
+	return r.JSON404
+}
+
+// GetBody returns the raw response body bytes
+func (r MutateRelationalRowsResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r MutateRelationalRowsResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r MutateRelationalRowsResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r MutateRelationalRowsResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type QueryRelationalRowsResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON400 the response for an HTTP 400 `application/json` response
+	JSON400 *BadRequest
+	// JSON404 the response for an HTTP 404 `application/json` response
+	JSON404 *NotFound
+}
+
+// GetJSON400 returns the response for an HTTP 400 `application/json` response
+func (r QueryRelationalRowsResponse) GetJSON400() *BadRequest {
+	return r.JSON400
+}
+
+// GetJSON404 returns the response for an HTTP 404 `application/json` response
+func (r QueryRelationalRowsResponse) GetJSON404() *NotFound {
+	return r.JSON404
+}
+
+// GetBody returns the raw response body bytes
+func (r QueryRelationalRowsResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r QueryRelationalRowsResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r QueryRelationalRowsResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r QueryRelationalRowsResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
 // PatchSchemaResponse200Headers the declared response headers of an HTTP 200 response for PatchSchema
 type PatchSchemaResponse200Headers struct {
 	ETag string
+}
+
+// PatchSchemaResponse202Headers the declared response headers of an HTTP 202 response for PatchSchema
+type PatchSchemaResponse202Headers struct {
+	Location string
 }
 
 type PatchSchemaResponse struct {
@@ -64262,7 +69594,7 @@ type PatchSchemaResponse struct {
 	// JSON200 the response for an HTTP 200 `application/json` response
 	JSON200 *Table
 	// JSON202 the response for an HTTP 202 `application/json` response
-	JSON202 *CommittedMutationAccepted
+	JSON202 *PatchSchema202JSONResponseBody
 	// JSON400 the response for an HTTP 400 `application/json` response
 	JSON400 *BadRequest
 	// JSON404 the response for an HTTP 404 `application/json` response
@@ -64273,6 +69605,8 @@ type PatchSchemaResponse struct {
 	JSON500 *InternalServerError
 	// Headers200 the parsed response headers for an HTTP 200 response
 	Headers200 *PatchSchemaResponse200Headers
+	// Headers202 the parsed response headers for an HTTP 202 response
+	Headers202 *PatchSchemaResponse202Headers
 }
 
 // GetJSON200 returns the response for an HTTP 200 `application/json` response
@@ -64281,7 +69615,7 @@ func (r PatchSchemaResponse) GetJSON200() *Table {
 }
 
 // GetJSON202 returns the response for an HTTP 202 `application/json` response
-func (r PatchSchemaResponse) GetJSON202() *CommittedMutationAccepted {
+func (r PatchSchemaResponse) GetJSON202() *PatchSchema202JSONResponseBody {
 	return r.JSON202
 }
 
@@ -64339,13 +69673,18 @@ type UpdateSchemaResponse200Headers struct {
 	ETag string
 }
 
+// UpdateSchemaResponse202Headers the declared response headers of an HTTP 202 response for UpdateSchema
+type UpdateSchemaResponse202Headers struct {
+	Location string
+}
+
 type UpdateSchemaResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
 	// JSON200 the response for an HTTP 200 `application/json` response
 	JSON200 *Table
 	// JSON202 the response for an HTTP 202 `application/json` response
-	JSON202 *CommittedMutationAccepted
+	JSON202 *UpdateSchema202JSONResponseBody
 	// JSON400 the response for an HTTP 400 `application/json` response
 	JSON400 *BadRequest
 	// JSON404 the response for an HTTP 404 `application/json` response
@@ -64356,6 +69695,8 @@ type UpdateSchemaResponse struct {
 	JSON500 *InternalServerError
 	// Headers200 the parsed response headers for an HTTP 200 response
 	Headers200 *UpdateSchemaResponse200Headers
+	// Headers202 the parsed response headers for an HTTP 202 response
+	Headers202 *UpdateSchemaResponse202Headers
 }
 
 // GetJSON200 returns the response for an HTTP 200 `application/json` response
@@ -64364,7 +69705,7 @@ func (r UpdateSchemaResponse) GetJSON200() *Table {
 }
 
 // GetJSON202 returns the response for an HTTP 202 `application/json` response
-func (r UpdateSchemaResponse) GetJSON202() *CommittedMutationAccepted {
+func (r UpdateSchemaResponse) GetJSON202() *UpdateSchema202JSONResponseBody {
 	return r.JSON202
 }
 
@@ -66562,8 +71903,8 @@ func (c *ClientWithResponses) DictateWithResponse(ctx context.Context, body Dict
 // Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
 //
 // Corresponds with POST /ai/v1/embed (the `GenerateEmbeddings` operationId).
-func (c *ClientWithResponses) GenerateEmbeddingsWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*GenerateEmbeddingsResponse, error) {
-	rsp, err := c.GenerateEmbeddingsWithBody(ctx, contentType, body, reqEditors...)
+func (c *ClientWithResponses) GenerateEmbeddingsWithBodyWithResponse(ctx context.Context, params *GenerateEmbeddingsParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*GenerateEmbeddingsResponse, error) {
+	rsp, err := c.GenerateEmbeddingsWithBody(ctx, params, contentType, body, reqEditors...)
 	if err != nil {
 		return nil, err
 	}
@@ -66583,8 +71924,8 @@ func (c *ClientWithResponses) GenerateEmbeddingsWithBodyWithResponse(ctx context
 // Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
 //
 // Corresponds with POST /ai/v1/embed (the `GenerateEmbeddings` operationId).
-func (c *ClientWithResponses) GenerateEmbeddingsWithResponse(ctx context.Context, body GenerateEmbeddingsJSONRequestBody, reqEditors ...RequestEditorFn) (*GenerateEmbeddingsResponse, error) {
-	rsp, err := c.GenerateEmbeddings(ctx, body, reqEditors...)
+func (c *ClientWithResponses) GenerateEmbeddingsWithResponse(ctx context.Context, params *GenerateEmbeddingsParams, body GenerateEmbeddingsJSONRequestBody, reqEditors ...RequestEditorFn) (*GenerateEmbeddingsResponse, error) {
+	rsp, err := c.GenerateEmbeddings(ctx, params, body, reqEditors...)
 	if err != nil {
 		return nil, err
 	}
@@ -66605,8 +71946,8 @@ func (c *ClientWithResponses) GenerateEmbeddingsWithResponse(ctx context.Context
 // Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
 //
 // Corresponds with POST /ai/v1/embeddings (the `CreateEmbedding` operationId).
-func (c *ClientWithResponses) CreateEmbeddingWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*CreateEmbeddingResponse, error) {
-	rsp, err := c.CreateEmbeddingWithBody(ctx, contentType, body, reqEditors...)
+func (c *ClientWithResponses) CreateEmbeddingWithBodyWithResponse(ctx context.Context, params *CreateEmbeddingParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*CreateEmbeddingResponse, error) {
+	rsp, err := c.CreateEmbeddingWithBody(ctx, params, contentType, body, reqEditors...)
 	if err != nil {
 		return nil, err
 	}
@@ -66627,8 +71968,8 @@ func (c *ClientWithResponses) CreateEmbeddingWithBodyWithResponse(ctx context.Co
 // Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
 //
 // Corresponds with POST /ai/v1/embeddings (the `CreateEmbedding` operationId).
-func (c *ClientWithResponses) CreateEmbeddingWithResponse(ctx context.Context, body CreateEmbeddingJSONRequestBody, reqEditors ...RequestEditorFn) (*CreateEmbeddingResponse, error) {
-	rsp, err := c.CreateEmbedding(ctx, body, reqEditors...)
+func (c *ClientWithResponses) CreateEmbeddingWithResponse(ctx context.Context, params *CreateEmbeddingParams, body CreateEmbeddingJSONRequestBody, reqEditors ...RequestEditorFn) (*CreateEmbeddingResponse, error) {
+	rsp, err := c.CreateEmbedding(ctx, params, body, reqEditors...)
 	if err != nil {
 		return nil, err
 	}
@@ -67050,8 +72391,8 @@ func (c *ClientWithResponses) ReadImagesWithResponse(ctx context.Context, body R
 // Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
 //
 // Corresponds with POST /ai/v1/rerank (the `RerankPrompts` operationId).
-func (c *ClientWithResponses) RerankPromptsWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*RerankPromptsResponse, error) {
-	rsp, err := c.RerankPromptsWithBody(ctx, contentType, body, reqEditors...)
+func (c *ClientWithResponses) RerankPromptsWithBodyWithResponse(ctx context.Context, params *RerankPromptsParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*RerankPromptsResponse, error) {
+	rsp, err := c.RerankPromptsWithBody(ctx, params, contentType, body, reqEditors...)
 	if err != nil {
 		return nil, err
 	}
@@ -67087,8 +72428,8 @@ func (c *ClientWithResponses) RerankPromptsWithBodyWithResponse(ctx context.Cont
 // Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
 //
 // Corresponds with POST /ai/v1/rerank (the `RerankPrompts` operationId).
-func (c *ClientWithResponses) RerankPromptsWithResponse(ctx context.Context, body RerankPromptsJSONRequestBody, reqEditors ...RequestEditorFn) (*RerankPromptsResponse, error) {
-	rsp, err := c.RerankPrompts(ctx, body, reqEditors...)
+func (c *ClientWithResponses) RerankPromptsWithResponse(ctx context.Context, params *RerankPromptsParams, body RerankPromptsJSONRequestBody, reqEditors ...RequestEditorFn) (*RerankPromptsResponse, error) {
+	rsp, err := c.RerankPrompts(ctx, params, body, reqEditors...)
 	if err != nil {
 		return nil, err
 	}
@@ -67109,8 +72450,8 @@ func (c *ClientWithResponses) RerankPromptsWithResponse(ctx context.Context, bod
 // Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
 //
 // Corresponds with POST /ai/v1/rerank_multimodal (the `RerankMultimodalPrompts` operationId).
-func (c *ClientWithResponses) RerankMultimodalPromptsWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*RerankMultimodalPromptsResponse, error) {
-	rsp, err := c.RerankMultimodalPromptsWithBody(ctx, contentType, body, reqEditors...)
+func (c *ClientWithResponses) RerankMultimodalPromptsWithBodyWithResponse(ctx context.Context, params *RerankMultimodalPromptsParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*RerankMultimodalPromptsResponse, error) {
+	rsp, err := c.RerankMultimodalPromptsWithBody(ctx, params, contentType, body, reqEditors...)
 	if err != nil {
 		return nil, err
 	}
@@ -67131,8 +72472,8 @@ func (c *ClientWithResponses) RerankMultimodalPromptsWithBodyWithResponse(ctx co
 // Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
 //
 // Corresponds with POST /ai/v1/rerank_multimodal (the `RerankMultimodalPrompts` operationId).
-func (c *ClientWithResponses) RerankMultimodalPromptsWithResponse(ctx context.Context, body RerankMultimodalPromptsJSONRequestBody, reqEditors ...RequestEditorFn) (*RerankMultimodalPromptsResponse, error) {
-	rsp, err := c.RerankMultimodalPrompts(ctx, body, reqEditors...)
+func (c *ClientWithResponses) RerankMultimodalPromptsWithResponse(ctx context.Context, params *RerankMultimodalPromptsParams, body RerankMultimodalPromptsJSONRequestBody, reqEditors ...RequestEditorFn) (*RerankMultimodalPromptsResponse, error) {
+	rsp, err := c.RerankMultimodalPrompts(ctx, params, body, reqEditors...)
 	if err != nil {
 		return nil, err
 	}
@@ -68571,6 +73912,141 @@ func (c *ClientWithResponses) BatchNamespaceTableWithResponse(ctx context.Contex
 	return ParseBatchNamespaceTableResponse(rsp)
 }
 
+// RepairNamespaceRelationalConstraintsWithBodyWithResponse Repair version-conditional rows after failed or diagnosed constraint activation
+//
+// Requires table administrator permission. Each affected target range must
+// have failed UNIQUE/FK/CHECK activation or a validating MATCH PARTIAL
+// missing-parent diagnostic. Replacement values still satisfy all
+// constraints, and referential actions require write permission on every
+// affected table. Existing dependencies remain protected. Repairs do not
+// mark historical coverage valid. Invoke constraint retry after repairing
+// failed activation; validating diagnostics resume validation automatically.
+//
+// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/repair (the `RepairNamespaceRelationalConstraints` operationId).
+func (c *ClientWithResponses) RepairNamespaceRelationalConstraintsWithBodyWithResponse(ctx context.Context, databaseName string, namespaceName string, tableName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*RepairNamespaceRelationalConstraintsResponse, error) {
+	rsp, err := c.RepairNamespaceRelationalConstraintsWithBody(ctx, databaseName, namespaceName, tableName, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseRepairNamespaceRelationalConstraintsResponse(rsp)
+}
+
+// RepairNamespaceRelationalConstraintsWithResponse Repair version-conditional rows after failed or diagnosed constraint activation
+//
+// Requires table administrator permission. Each affected target range must
+// have failed UNIQUE/FK/CHECK activation or a validating MATCH PARTIAL
+// missing-parent diagnostic. Replacement values still satisfy all
+// constraints, and referential actions require write permission on every
+// affected table. Existing dependencies remain protected. Repairs do not
+// mark historical coverage valid. Invoke constraint retry after repairing
+// failed activation; validating diagnostics resume validation automatically.
+//
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/repair (the `RepairNamespaceRelationalConstraints` operationId).
+func (c *ClientWithResponses) RepairNamespaceRelationalConstraintsWithResponse(ctx context.Context, databaseName string, namespaceName string, tableName string, body RepairNamespaceRelationalConstraintsJSONRequestBody, reqEditors ...RequestEditorFn) (*RepairNamespaceRelationalConstraintsResponse, error) {
+	rsp, err := c.RepairNamespaceRelationalConstraints(ctx, databaseName, namespaceName, tableName, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseRepairNamespaceRelationalConstraintsResponse(rsp)
+}
+
+// RetireNamespaceRelationalConstraintsWithBodyWithResponse Retire unique and foreign-key definitions safely
+//
+// Requires table administrator permission. Starts a durable, bounded
+// all-owner drain. Poll constraints/status for progress. A target schema
+// is published automatically after the drain. With drop=true the table
+// remains fenced at ready_to_drop until an administrator explicitly
+// deletes it with the existing table deletion endpoint.
+//
+// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/retire (the `RetireNamespaceRelationalConstraints` operationId).
+func (c *ClientWithResponses) RetireNamespaceRelationalConstraintsWithBodyWithResponse(ctx context.Context, databaseName string, namespaceName string, tableName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*RetireNamespaceRelationalConstraintsResponse, error) {
+	rsp, err := c.RetireNamespaceRelationalConstraintsWithBody(ctx, databaseName, namespaceName, tableName, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseRetireNamespaceRelationalConstraintsResponse(rsp)
+}
+
+// RetireNamespaceRelationalConstraintsWithResponse Retire unique and foreign-key definitions safely
+//
+// Requires table administrator permission. Starts a durable, bounded
+// all-owner drain. Poll constraints/status for progress. A target schema
+// is published automatically after the drain. With drop=true the table
+// remains fenced at ready_to_drop until an administrator explicitly
+// deletes it with the existing table deletion endpoint.
+//
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/retire (the `RetireNamespaceRelationalConstraints` operationId).
+func (c *ClientWithResponses) RetireNamespaceRelationalConstraintsWithResponse(ctx context.Context, databaseName string, namespaceName string, tableName string, body RetireNamespaceRelationalConstraintsJSONRequestBody, reqEditors ...RequestEditorFn) (*RetireNamespaceRelationalConstraintsResponse, error) {
+	rsp, err := c.RetireNamespaceRelationalConstraints(ctx, databaseName, namespaceName, tableName, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseRetireNamespaceRelationalConstraintsResponse(rsp)
+}
+
+// RetryNamespaceRelationalConstraintsWithBodyWithResponse Restart failed UNIQUE/FK/CHECK validation after administrative repair
+//
+// Requires table administrator permission. Resets each failed owner using
+// an exact checkpoint precondition. Owners already validating or enforced
+// are unchanged. Retrying after partial progress is safe. Inspect the
+// constraint status endpoint for coverage and diagnostics.
+// When a retirement job is active, clears its paused diagnostic and
+// resumes that job instead of restarting activation. Retirement remains
+// fenced and retains all prior drain progress.
+//
+// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/retry (the `RetryNamespaceRelationalConstraints` operationId).
+func (c *ClientWithResponses) RetryNamespaceRelationalConstraintsWithBodyWithResponse(ctx context.Context, databaseName string, namespaceName string, tableName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*RetryNamespaceRelationalConstraintsResponse, error) {
+	rsp, err := c.RetryNamespaceRelationalConstraintsWithBody(ctx, databaseName, namespaceName, tableName, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseRetryNamespaceRelationalConstraintsResponse(rsp)
+}
+
+// RetryNamespaceRelationalConstraintsWithResponse Restart failed UNIQUE/FK/CHECK validation after administrative repair
+//
+// Requires table administrator permission. Resets each failed owner using
+// an exact checkpoint precondition. Owners already validating or enforced
+// are unchanged. Retrying after partial progress is safe. Inspect the
+// constraint status endpoint for coverage and diagnostics.
+// When a retirement job is active, clears its paused diagnostic and
+// resumes that job instead of restarting activation. Retirement remains
+// fenced and retains all prior drain progress.
+//
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/retry (the `RetryNamespaceRelationalConstraints` operationId).
+func (c *ClientWithResponses) RetryNamespaceRelationalConstraintsWithResponse(ctx context.Context, databaseName string, namespaceName string, tableName string, body RetryNamespaceRelationalConstraintsJSONRequestBody, reqEditors ...RequestEditorFn) (*RetryNamespaceRelationalConstraintsResponse, error) {
+	rsp, err := c.RetryNamespaceRelationalConstraints(ctx, databaseName, namespaceName, tableName, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseRetryNamespaceRelationalConstraintsResponse(rsp)
+}
+
+// GetNamespaceRelationalConstraintStatusWithResponse Read distributed UNIQUE, foreign-key, and CHECK validation coverage
+//
+// Returns a wrapper object for the known response body format(s).
+//
+// Corresponds with GET /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/status (the `GetNamespaceRelationalConstraintStatus` operationId).
+func (c *ClientWithResponses) GetNamespaceRelationalConstraintStatusWithResponse(ctx context.Context, databaseName string, namespaceName string, tableName string, reqEditors ...RequestEditorFn) (*GetNamespaceRelationalConstraintStatusResponse, error) {
+	rsp, err := c.GetNamespaceRelationalConstraintStatus(ctx, databaseName, namespaceName, tableName, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseGetNamespaceRelationalConstraintStatusResponse(rsp)
+}
+
 // LookupNamespaceTableDocumentWithResponse Retrieve a document by key from an explicit namespace table
 //
 // Retrieves a document through an explicit database and namespace route. While storage APIs are still bare-table-name based, the server fails closed when the resolved catalog table does not map to a unique physical table name.
@@ -68674,6 +74150,66 @@ func (c *ClientWithResponses) ExecuteNamespaceTableGraphMetricActionWithResponse
 	return ParseExecuteNamespaceTableGraphMetricActionResponse(rsp)
 }
 
+// RepairNamespaceIndexWithBodyWithResponse Repair an index generation
+//
+// Generation-fenced relational index maintenance. Requires table ADMIN permission. Repair accepts ready or failed generations and rebuilds their derived records. Owners are admitted independently and durably; exact request replay resumes after partial acknowledgements. Unsupported index types return 405.
+//
+// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/repair (the `RepairNamespaceIndex` operationId).
+func (c *ClientWithResponses) RepairNamespaceIndexWithBodyWithResponse(ctx context.Context, databaseName string, namespaceName string, tableName string, indexName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*RepairNamespaceIndexResponse, error) {
+	rsp, err := c.RepairNamespaceIndexWithBody(ctx, databaseName, namespaceName, tableName, indexName, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseRepairNamespaceIndexResponse(rsp)
+}
+
+// RepairNamespaceIndexWithResponse Repair an index generation
+//
+// Generation-fenced relational index maintenance. Requires table ADMIN permission. Repair accepts ready or failed generations and rebuilds their derived records. Owners are admitted independently and durably; exact request replay resumes after partial acknowledgements. Unsupported index types return 405.
+//
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/repair (the `RepairNamespaceIndex` operationId).
+func (c *ClientWithResponses) RepairNamespaceIndexWithResponse(ctx context.Context, databaseName string, namespaceName string, tableName string, indexName string, body RepairNamespaceIndexJSONRequestBody, reqEditors ...RequestEditorFn) (*RepairNamespaceIndexResponse, error) {
+	rsp, err := c.RepairNamespaceIndex(ctx, databaseName, namespaceName, tableName, indexName, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseRepairNamespaceIndexResponse(rsp)
+}
+
+// RetryNamespaceIndexWithBodyWithResponse Retry a failed index build
+//
+// Generation-fenced relational index maintenance. Requires table ADMIN permission. Retry accepts failed generations. Owners are admitted independently and durably; exact request replay resumes after partial acknowledgements. Unsupported index types return 405.
+//
+// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/retry (the `RetryNamespaceIndex` operationId).
+func (c *ClientWithResponses) RetryNamespaceIndexWithBodyWithResponse(ctx context.Context, databaseName string, namespaceName string, tableName string, indexName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*RetryNamespaceIndexResponse, error) {
+	rsp, err := c.RetryNamespaceIndexWithBody(ctx, databaseName, namespaceName, tableName, indexName, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseRetryNamespaceIndexResponse(rsp)
+}
+
+// RetryNamespaceIndexWithResponse Retry a failed index build
+//
+// Generation-fenced relational index maintenance. Requires table ADMIN permission. Retry accepts failed generations. Owners are admitted independently and durably; exact request replay resumes after partial acknowledgements. Unsupported index types return 405.
+//
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/retry (the `RetryNamespaceIndex` operationId).
+func (c *ClientWithResponses) RetryNamespaceIndexWithResponse(ctx context.Context, databaseName string, namespaceName string, tableName string, indexName string, body RetryNamespaceIndexJSONRequestBody, reqEditors ...RequestEditorFn) (*RetryNamespaceIndexResponse, error) {
+	rsp, err := c.RetryNamespaceIndex(ctx, databaseName, namespaceName, tableName, indexName, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseRetryNamespaceIndexResponse(rsp)
+}
+
 // QueryNamespaceTableWithBodyWithResponse Query an explicit namespace table
 //
 // Queries a table through an explicit database and namespace route. While storage APIs are still bare-table-name based, the server fails closed when the resolved catalog table does not map to a unique physical table name.
@@ -68754,6 +74290,58 @@ func (c *ClientWithResponses) RestoreNamespaceTableWithResponse(ctx context.Cont
 		return nil, err
 	}
 	return ParseRestoreNamespaceTableResponse(rsp)
+}
+
+// MutateNamespaceRelationalRowsWithBodyWithResponse Atomically replace or delete version-conditional typed rows
+//
+// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rows/mutate (the `MutateNamespaceRelationalRows` operationId).
+func (c *ClientWithResponses) MutateNamespaceRelationalRowsWithBodyWithResponse(ctx context.Context, databaseName string, namespaceName string, tableName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*MutateNamespaceRelationalRowsResponse, error) {
+	rsp, err := c.MutateNamespaceRelationalRowsWithBody(ctx, databaseName, namespaceName, tableName, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseMutateNamespaceRelationalRowsResponse(rsp)
+}
+
+// MutateNamespaceRelationalRowsWithResponse Atomically replace or delete version-conditional typed rows
+//
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rows/mutate (the `MutateNamespaceRelationalRows` operationId).
+func (c *ClientWithResponses) MutateNamespaceRelationalRowsWithResponse(ctx context.Context, databaseName string, namespaceName string, tableName string, body MutateNamespaceRelationalRowsJSONRequestBody, reqEditors ...RequestEditorFn) (*MutateNamespaceRelationalRowsResponse, error) {
+	rsp, err := c.MutateNamespaceRelationalRows(ctx, databaseName, namespaceName, tableName, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseMutateNamespaceRelationalRowsResponse(rsp)
+}
+
+// QueryNamespaceRelationalRowsWithBodyWithResponse Query projected typed relational rows
+//
+// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rows/query (the `QueryNamespaceRelationalRows` operationId).
+func (c *ClientWithResponses) QueryNamespaceRelationalRowsWithBodyWithResponse(ctx context.Context, databaseName string, namespaceName string, tableName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*QueryNamespaceRelationalRowsResponse, error) {
+	rsp, err := c.QueryNamespaceRelationalRowsWithBody(ctx, databaseName, namespaceName, tableName, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseQueryNamespaceRelationalRowsResponse(rsp)
+}
+
+// QueryNamespaceRelationalRowsWithResponse Query projected typed relational rows
+//
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rows/query (the `QueryNamespaceRelationalRows` operationId).
+func (c *ClientWithResponses) QueryNamespaceRelationalRowsWithResponse(ctx context.Context, databaseName string, namespaceName string, tableName string, body QueryNamespaceRelationalRowsJSONRequestBody, reqEditors ...RequestEditorFn) (*QueryNamespaceRelationalRowsResponse, error) {
+	rsp, err := c.QueryNamespaceRelationalRows(ctx, databaseName, namespaceName, tableName, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseQueryNamespaceRelationalRowsResponse(rsp)
 }
 
 // PatchNamespaceTableSchemaWithBodyWithResponse Patch a table's schema
@@ -69928,6 +75516,141 @@ func (c *ClientWithResponses) BatchWriteWithResponse(ctx context.Context, tableN
 	return ParseBatchWriteResponse(rsp)
 }
 
+// RepairRelationalConstraintsWithBodyWithResponse Repair version-conditional rows after failed or diagnosed constraint activation
+//
+// Requires table administrator permission. Each affected target range must
+// have failed UNIQUE/FK/CHECK activation or a validating MATCH PARTIAL
+// missing-parent diagnostic. Replacement values still satisfy all
+// constraints, and referential actions require write permission on every
+// affected table. Existing dependencies remain protected. Repairs do not
+// mark historical coverage valid. Invoke constraint retry after repairing
+// failed activation; validating diagnostics resume validation automatically.
+//
+// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /db/v1/tables/{tableName}/constraints/repair (the `RepairRelationalConstraints` operationId).
+func (c *ClientWithResponses) RepairRelationalConstraintsWithBodyWithResponse(ctx context.Context, tableName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*RepairRelationalConstraintsResponse, error) {
+	rsp, err := c.RepairRelationalConstraintsWithBody(ctx, tableName, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseRepairRelationalConstraintsResponse(rsp)
+}
+
+// RepairRelationalConstraintsWithResponse Repair version-conditional rows after failed or diagnosed constraint activation
+//
+// Requires table administrator permission. Each affected target range must
+// have failed UNIQUE/FK/CHECK activation or a validating MATCH PARTIAL
+// missing-parent diagnostic. Replacement values still satisfy all
+// constraints, and referential actions require write permission on every
+// affected table. Existing dependencies remain protected. Repairs do not
+// mark historical coverage valid. Invoke constraint retry after repairing
+// failed activation; validating diagnostics resume validation automatically.
+//
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /db/v1/tables/{tableName}/constraints/repair (the `RepairRelationalConstraints` operationId).
+func (c *ClientWithResponses) RepairRelationalConstraintsWithResponse(ctx context.Context, tableName string, body RepairRelationalConstraintsJSONRequestBody, reqEditors ...RequestEditorFn) (*RepairRelationalConstraintsResponse, error) {
+	rsp, err := c.RepairRelationalConstraints(ctx, tableName, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseRepairRelationalConstraintsResponse(rsp)
+}
+
+// RetireRelationalConstraintsWithBodyWithResponse Retire unique and foreign-key definitions safely
+//
+// Requires table administrator permission. Starts a durable, bounded
+// all-owner drain. Poll constraints/status for progress. A target schema
+// is published automatically after the drain. With drop=true the table
+// remains fenced at ready_to_drop until an administrator explicitly
+// deletes it with the existing table deletion endpoint.
+//
+// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /db/v1/tables/{tableName}/constraints/retire (the `RetireRelationalConstraints` operationId).
+func (c *ClientWithResponses) RetireRelationalConstraintsWithBodyWithResponse(ctx context.Context, tableName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*RetireRelationalConstraintsResponse, error) {
+	rsp, err := c.RetireRelationalConstraintsWithBody(ctx, tableName, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseRetireRelationalConstraintsResponse(rsp)
+}
+
+// RetireRelationalConstraintsWithResponse Retire unique and foreign-key definitions safely
+//
+// Requires table administrator permission. Starts a durable, bounded
+// all-owner drain. Poll constraints/status for progress. A target schema
+// is published automatically after the drain. With drop=true the table
+// remains fenced at ready_to_drop until an administrator explicitly
+// deletes it with the existing table deletion endpoint.
+//
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /db/v1/tables/{tableName}/constraints/retire (the `RetireRelationalConstraints` operationId).
+func (c *ClientWithResponses) RetireRelationalConstraintsWithResponse(ctx context.Context, tableName string, body RetireRelationalConstraintsJSONRequestBody, reqEditors ...RequestEditorFn) (*RetireRelationalConstraintsResponse, error) {
+	rsp, err := c.RetireRelationalConstraints(ctx, tableName, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseRetireRelationalConstraintsResponse(rsp)
+}
+
+// RetryRelationalConstraintsWithBodyWithResponse Restart failed UNIQUE/FK/CHECK validation after administrative repair
+//
+// Requires table administrator permission. Resets each failed owner using
+// an exact checkpoint precondition. Owners already validating or enforced
+// are unchanged. Retrying after partial progress is safe. Inspect the
+// constraint status endpoint for coverage and diagnostics.
+// When a retirement job is active, clears its paused diagnostic and
+// resumes that job instead of restarting activation. Retirement remains
+// fenced and retains all prior drain progress.
+//
+// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /db/v1/tables/{tableName}/constraints/retry (the `RetryRelationalConstraints` operationId).
+func (c *ClientWithResponses) RetryRelationalConstraintsWithBodyWithResponse(ctx context.Context, tableName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*RetryRelationalConstraintsResponse, error) {
+	rsp, err := c.RetryRelationalConstraintsWithBody(ctx, tableName, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseRetryRelationalConstraintsResponse(rsp)
+}
+
+// RetryRelationalConstraintsWithResponse Restart failed UNIQUE/FK/CHECK validation after administrative repair
+//
+// Requires table administrator permission. Resets each failed owner using
+// an exact checkpoint precondition. Owners already validating or enforced
+// are unchanged. Retrying after partial progress is safe. Inspect the
+// constraint status endpoint for coverage and diagnostics.
+// When a retirement job is active, clears its paused diagnostic and
+// resumes that job instead of restarting activation. Retirement remains
+// fenced and retains all prior drain progress.
+//
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /db/v1/tables/{tableName}/constraints/retry (the `RetryRelationalConstraints` operationId).
+func (c *ClientWithResponses) RetryRelationalConstraintsWithResponse(ctx context.Context, tableName string, body RetryRelationalConstraintsJSONRequestBody, reqEditors ...RequestEditorFn) (*RetryRelationalConstraintsResponse, error) {
+	rsp, err := c.RetryRelationalConstraints(ctx, tableName, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseRetryRelationalConstraintsResponse(rsp)
+}
+
+// GetRelationalConstraintStatusWithResponse Read distributed UNIQUE, foreign-key, and CHECK validation coverage
+//
+// Returns a wrapper object for the known response body format(s).
+//
+// Corresponds with GET /db/v1/tables/{tableName}/constraints/status (the `GetRelationalConstraintStatus` operationId).
+func (c *ClientWithResponses) GetRelationalConstraintStatusWithResponse(ctx context.Context, tableName string, reqEditors ...RequestEditorFn) (*GetRelationalConstraintStatusResponse, error) {
+	rsp, err := c.GetRelationalConstraintStatus(ctx, tableName, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseGetRelationalConstraintStatusResponse(rsp)
+}
+
 // ReauthorizeTableDestinationsWithResponse Adopt stored write destinations with the current credential
 //
 // Reauthorizes the table's existing CDC routes and graph resolver destinations
@@ -70134,6 +75857,66 @@ func (c *ClientWithResponses) ExecuteGraphMetricActionWithResponse(ctx context.C
 		return nil, err
 	}
 	return ParseExecuteGraphMetricActionResponse(rsp)
+}
+
+// RepairIndexWithBodyWithResponse Repair an index generation
+//
+// Generation-fenced relational index maintenance. Requires table ADMIN permission. Repair accepts ready or failed generations and rebuilds their derived records. Owners are admitted independently and durably; exact request replay resumes after partial acknowledgements. Unsupported index types return 405.
+//
+// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /db/v1/tables/{tableName}/indexes/{indexName}/repair (the `RepairIndex` operationId).
+func (c *ClientWithResponses) RepairIndexWithBodyWithResponse(ctx context.Context, tableName string, indexName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*RepairIndexResponse, error) {
+	rsp, err := c.RepairIndexWithBody(ctx, tableName, indexName, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseRepairIndexResponse(rsp)
+}
+
+// RepairIndexWithResponse Repair an index generation
+//
+// Generation-fenced relational index maintenance. Requires table ADMIN permission. Repair accepts ready or failed generations and rebuilds their derived records. Owners are admitted independently and durably; exact request replay resumes after partial acknowledgements. Unsupported index types return 405.
+//
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /db/v1/tables/{tableName}/indexes/{indexName}/repair (the `RepairIndex` operationId).
+func (c *ClientWithResponses) RepairIndexWithResponse(ctx context.Context, tableName string, indexName string, body RepairIndexJSONRequestBody, reqEditors ...RequestEditorFn) (*RepairIndexResponse, error) {
+	rsp, err := c.RepairIndex(ctx, tableName, indexName, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseRepairIndexResponse(rsp)
+}
+
+// RetryIndexWithBodyWithResponse Retry a failed index build
+//
+// Generation-fenced relational index maintenance. Requires table ADMIN permission. Retry accepts failed generations. Owners are admitted independently and durably; exact request replay resumes after partial acknowledgements. Unsupported index types return 405.
+//
+// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /db/v1/tables/{tableName}/indexes/{indexName}/retry (the `RetryIndex` operationId).
+func (c *ClientWithResponses) RetryIndexWithBodyWithResponse(ctx context.Context, tableName string, indexName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*RetryIndexResponse, error) {
+	rsp, err := c.RetryIndexWithBody(ctx, tableName, indexName, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseRetryIndexResponse(rsp)
+}
+
+// RetryIndexWithResponse Retry a failed index build
+//
+// Generation-fenced relational index maintenance. Requires table ADMIN permission. Retry accepts failed generations. Owners are admitted independently and durably; exact request replay resumes after partial acknowledgements. Unsupported index types return 405.
+//
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /db/v1/tables/{tableName}/indexes/{indexName}/retry (the `RetryIndex` operationId).
+func (c *ClientWithResponses) RetryIndexWithResponse(ctx context.Context, tableName string, indexName string, body RetryIndexJSONRequestBody, reqEditors ...RequestEditorFn) (*RetryIndexResponse, error) {
+	rsp, err := c.RetryIndex(ctx, tableName, indexName, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseRetryIndexResponse(rsp)
 }
 
 // LinearMergeWithBodyWithResponse Synchronize data from external sources (Shopify, Postgres, S3) using a linear merge
@@ -70462,6 +76245,58 @@ func (c *ClientWithResponses) RestoreTableWithResponse(ctx context.Context, tabl
 		return nil, err
 	}
 	return ParseRestoreTableResponse(rsp)
+}
+
+// MutateRelationalRowsWithBodyWithResponse Atomically replace or delete version-conditional typed rows
+//
+// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /db/v1/tables/{tableName}/rows/mutate (the `MutateRelationalRows` operationId).
+func (c *ClientWithResponses) MutateRelationalRowsWithBodyWithResponse(ctx context.Context, tableName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*MutateRelationalRowsResponse, error) {
+	rsp, err := c.MutateRelationalRowsWithBody(ctx, tableName, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseMutateRelationalRowsResponse(rsp)
+}
+
+// MutateRelationalRowsWithResponse Atomically replace or delete version-conditional typed rows
+//
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /db/v1/tables/{tableName}/rows/mutate (the `MutateRelationalRows` operationId).
+func (c *ClientWithResponses) MutateRelationalRowsWithResponse(ctx context.Context, tableName string, body MutateRelationalRowsJSONRequestBody, reqEditors ...RequestEditorFn) (*MutateRelationalRowsResponse, error) {
+	rsp, err := c.MutateRelationalRows(ctx, tableName, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseMutateRelationalRowsResponse(rsp)
+}
+
+// QueryRelationalRowsWithBodyWithResponse Query projected typed relational rows
+//
+// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /db/v1/tables/{tableName}/rows/query (the `QueryRelationalRows` operationId).
+func (c *ClientWithResponses) QueryRelationalRowsWithBodyWithResponse(ctx context.Context, tableName string, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*QueryRelationalRowsResponse, error) {
+	rsp, err := c.QueryRelationalRowsWithBody(ctx, tableName, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseQueryRelationalRowsResponse(rsp)
+}
+
+// QueryRelationalRowsWithResponse Query projected typed relational rows
+//
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /db/v1/tables/{tableName}/rows/query (the `QueryRelationalRows` operationId).
+func (c *ClientWithResponses) QueryRelationalRowsWithResponse(ctx context.Context, tableName string, body QueryRelationalRowsJSONRequestBody, reqEditors ...RequestEditorFn) (*QueryRelationalRowsResponse, error) {
+	rsp, err := c.QueryRelationalRows(ctx, tableName, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseQueryRelationalRowsResponse(rsp)
 }
 
 // PatchSchemaWithBodyWithResponse Patch a table's schema
@@ -71633,6 +77468,9 @@ func ParseGenerateEmbeddingsResponse(rsp *http.Response) (*GenerateEmbeddingsRes
 		}
 		response.JSON503 = &dest
 
+	case rsp.StatusCode == 200:
+		// Content-type (application/vnd.antfly.numeric.v1) unsupported
+
 	}
 
 	switch {
@@ -71727,6 +77565,9 @@ func ParseCreateEmbeddingResponse(rsp *http.Response) (*CreateEmbeddingResponse,
 			return nil, err
 		}
 		response.JSON503 = &dest
+
+	case rsp.StatusCode == 200:
+		// Content-type (application/vnd.antfly.numeric.v1) unsupported
 
 	}
 
@@ -72232,6 +78073,9 @@ func ParseRerankPromptsResponse(rsp *http.Response) (*RerankPromptsResponse, err
 		}
 		response.JSON503 = &dest
 
+	case rsp.StatusCode == 200:
+		// Content-type (application/vnd.antfly.numeric.v1) unsupported
+
 	}
 
 	switch {
@@ -72326,6 +78170,9 @@ func ParseRerankMultimodalPromptsResponse(rsp *http.Response) (*RerankMultimodal
 			return nil, err
 		}
 		response.JSON503 = &dest
+
+	case rsp.StatusCode == 200:
+		// Content-type (application/vnd.antfly.numeric.v1) unsupported
 
 	}
 
@@ -75057,6 +80904,206 @@ func ParseBatchNamespaceTableResponse(rsp *http.Response) (*BatchNamespaceTableR
 	return response, nil
 }
 
+// ParseRepairNamespaceRelationalConstraintsResponse parses an HTTP response from a RepairNamespaceRelationalConstraintsWithResponse call
+func ParseRepairNamespaceRelationalConstraintsResponse(rsp *http.Response) (*RepairNamespaceRelationalConstraintsResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &RepairNamespaceRelationalConstraintsResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 201:
+		var dest BatchResponse
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON201 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 202:
+		var dest BatchResponse
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON202 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest BadRequest
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON400 = &dest
+
+	case rsp.StatusCode == 403:
+		break // No content-type
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest NotFound
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON404 = &dest
+
+	case rsp.StatusCode == 409:
+		break // No content-type
+
+	case rsp.StatusCode == 503:
+		break // No content-type
+
+	}
+
+	return response, nil
+}
+
+// ParseRetireNamespaceRelationalConstraintsResponse parses an HTTP response from a RetireNamespaceRelationalConstraintsWithResponse call
+func ParseRetireNamespaceRelationalConstraintsResponse(rsp *http.Response) (*RetireNamespaceRelationalConstraintsResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &RetireNamespaceRelationalConstraintsResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 202:
+		var dest RelationalConstraintRetryResponse
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON202 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest BadRequest
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON400 = &dest
+
+	case rsp.StatusCode == 403:
+		break // No content-type
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest NotFound
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON404 = &dest
+
+	case rsp.StatusCode == 409:
+		break // No content-type
+
+	case rsp.StatusCode == 503:
+		break // No content-type
+
+	}
+
+	return response, nil
+}
+
+// ParseRetryNamespaceRelationalConstraintsResponse parses an HTTP response from a RetryNamespaceRelationalConstraintsWithResponse call
+func ParseRetryNamespaceRelationalConstraintsResponse(rsp *http.Response) (*RetryNamespaceRelationalConstraintsResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &RetryNamespaceRelationalConstraintsResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 202:
+		var dest RelationalConstraintRetryResponse
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON202 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest BadRequest
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON400 = &dest
+
+	case rsp.StatusCode == 403:
+		break // No content-type
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest NotFound
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON404 = &dest
+
+	case rsp.StatusCode == 409:
+		break // No content-type
+
+	case rsp.StatusCode == 503:
+		break // No content-type
+
+	}
+
+	return response, nil
+}
+
+// ParseGetNamespaceRelationalConstraintStatusResponse parses an HTTP response from a GetNamespaceRelationalConstraintStatusWithResponse call
+func ParseGetNamespaceRelationalConstraintStatusResponse(rsp *http.Response) (*GetNamespaceRelationalConstraintStatusResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &GetNamespaceRelationalConstraintStatusResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest RelationalConstraintStatus
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest BadRequest
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON400 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest NotFound
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON404 = &dest
+
+	case rsp.StatusCode == 409:
+		break // No content-type
+
+	case rsp.StatusCode == 503:
+		break // No content-type
+
+	}
+
+	return response, nil
+}
+
 // ParseLookupNamespaceTableDocumentResponse parses an HTTP response from a LookupNamespaceTableDocumentWithResponse call
 func ParseLookupNamespaceTableDocumentResponse(rsp *http.Response) (*LookupNamespaceTableDocumentResponse, error) {
 	bodyBytes, err := io.ReadAll(rsp.Body)
@@ -75349,6 +81396,208 @@ func ParseExecuteNamespaceTableGraphMetricActionResponse(rsp *http.Response) (*E
 	return response, nil
 }
 
+// ParseRepairNamespaceIndexResponse parses an HTTP response from a RepairNamespaceIndexWithResponse call
+func ParseRepairNamespaceIndexResponse(rsp *http.Response) (*RepairNamespaceIndexResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &RepairNamespaceIndexResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest IndexMaintenanceResponse
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest BadRequest
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON400 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest NotFound
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON404 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 405:
+		var dest MethodNotAllowed
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON405 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 409:
+		var dest IndexMutationConflict
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON409 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest StorageResourceExhausted
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 503:
+		var dest IndexMutationServiceUnavailable
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON503 = &dest
+
+	}
+
+	switch {
+	case rsp.StatusCode == 409:
+		var headers RepairNamespaceIndexResponse409Headers
+		if values := rsp.Header.Values("X-Antfly-Raft-Mutation-Outcome"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Antfly-Raft-Mutation-Outcome", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XAntflyRaftMutationOutcome = value
+		}
+		response.Headers409 = &headers
+	case rsp.StatusCode == 429:
+		var headers RepairNamespaceIndexResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = value
+		}
+		response.Headers429 = &headers
+	case rsp.StatusCode == 503:
+		var headers RepairNamespaceIndexResponse503Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = value
+		}
+		response.Headers503 = &headers
+	}
+
+	return response, nil
+}
+
+// ParseRetryNamespaceIndexResponse parses an HTTP response from a RetryNamespaceIndexWithResponse call
+func ParseRetryNamespaceIndexResponse(rsp *http.Response) (*RetryNamespaceIndexResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &RetryNamespaceIndexResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest IndexMaintenanceResponse
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest BadRequest
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON400 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest NotFound
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON404 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 405:
+		var dest MethodNotAllowed
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON405 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 409:
+		var dest IndexMutationConflict
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON409 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest StorageResourceExhausted
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 503:
+		var dest IndexMutationServiceUnavailable
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON503 = &dest
+
+	}
+
+	switch {
+	case rsp.StatusCode == 409:
+		var headers RetryNamespaceIndexResponse409Headers
+		if values := rsp.Header.Values("X-Antfly-Raft-Mutation-Outcome"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Antfly-Raft-Mutation-Outcome", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XAntflyRaftMutationOutcome = value
+		}
+		response.Headers409 = &headers
+	case rsp.StatusCode == 429:
+		var headers RetryNamespaceIndexResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = value
+		}
+		response.Headers429 = &headers
+	case rsp.StatusCode == 503:
+		var headers RetryNamespaceIndexResponse503Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = value
+		}
+		response.Headers503 = &headers
+	}
+
+	return response, nil
+}
+
 // ParseQueryNamespaceTableResponse parses an HTTP response from a QueryNamespaceTableWithResponse call
 func ParseQueryNamespaceTableResponse(rsp *http.Response) (*QueryNamespaceTableResponse, error) {
 	bodyBytes, err := io.ReadAll(rsp.Body)
@@ -75449,6 +81698,98 @@ func ParseRestoreNamespaceTableResponse(rsp *http.Response) (*RestoreNamespaceTa
 			return nil, err
 		}
 		response.JSON500 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseMutateNamespaceRelationalRowsResponse parses an HTTP response from a MutateNamespaceRelationalRowsWithResponse call
+func ParseMutateNamespaceRelationalRowsResponse(rsp *http.Response) (*MutateNamespaceRelationalRowsResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &MutateNamespaceRelationalRowsResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 201:
+		var dest BatchResponse
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON201 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 202:
+		var dest BatchResponse
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON202 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest BadRequest
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON400 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest NotFound
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON404 = &dest
+
+	case rsp.StatusCode == 409:
+		break // No content-type
+
+	case rsp.StatusCode == 503:
+		break // No content-type
+
+	}
+
+	return response, nil
+}
+
+// ParseQueryNamespaceRelationalRowsResponse parses an HTTP response from a QueryNamespaceRelationalRowsWithResponse call
+func ParseQueryNamespaceRelationalRowsResponse(rsp *http.Response) (*QueryNamespaceRelationalRowsResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &QueryNamespaceRelationalRowsResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest BadRequest
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON400 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest NotFound
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON404 = &dest
+
+	case rsp.StatusCode == 409:
+		break // No content-type
+
+	case rsp.StatusCode == 503:
+		break // No content-type
 
 	}
 
@@ -77312,6 +83653,206 @@ func ParseBatchWriteResponse(rsp *http.Response) (*BatchWriteResponse, error) {
 	return response, nil
 }
 
+// ParseRepairRelationalConstraintsResponse parses an HTTP response from a RepairRelationalConstraintsWithResponse call
+func ParseRepairRelationalConstraintsResponse(rsp *http.Response) (*RepairRelationalConstraintsResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &RepairRelationalConstraintsResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 201:
+		var dest BatchResponse
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON201 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 202:
+		var dest BatchResponse
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON202 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest BadRequest
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON400 = &dest
+
+	case rsp.StatusCode == 403:
+		break // No content-type
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest NotFound
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON404 = &dest
+
+	case rsp.StatusCode == 409:
+		break // No content-type
+
+	case rsp.StatusCode == 503:
+		break // No content-type
+
+	}
+
+	return response, nil
+}
+
+// ParseRetireRelationalConstraintsResponse parses an HTTP response from a RetireRelationalConstraintsWithResponse call
+func ParseRetireRelationalConstraintsResponse(rsp *http.Response) (*RetireRelationalConstraintsResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &RetireRelationalConstraintsResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 202:
+		var dest RelationalConstraintRetryResponse
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON202 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest BadRequest
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON400 = &dest
+
+	case rsp.StatusCode == 403:
+		break // No content-type
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest NotFound
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON404 = &dest
+
+	case rsp.StatusCode == 409:
+		break // No content-type
+
+	case rsp.StatusCode == 503:
+		break // No content-type
+
+	}
+
+	return response, nil
+}
+
+// ParseRetryRelationalConstraintsResponse parses an HTTP response from a RetryRelationalConstraintsWithResponse call
+func ParseRetryRelationalConstraintsResponse(rsp *http.Response) (*RetryRelationalConstraintsResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &RetryRelationalConstraintsResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 202:
+		var dest RelationalConstraintRetryResponse
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON202 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest BadRequest
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON400 = &dest
+
+	case rsp.StatusCode == 403:
+		break // No content-type
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest NotFound
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON404 = &dest
+
+	case rsp.StatusCode == 409:
+		break // No content-type
+
+	case rsp.StatusCode == 503:
+		break // No content-type
+
+	}
+
+	return response, nil
+}
+
+// ParseGetRelationalConstraintStatusResponse parses an HTTP response from a GetRelationalConstraintStatusWithResponse call
+func ParseGetRelationalConstraintStatusResponse(rsp *http.Response) (*GetRelationalConstraintStatusResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &GetRelationalConstraintStatusResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest RelationalConstraintStatus
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest BadRequest
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON400 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest NotFound
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON404 = &dest
+
+	case rsp.StatusCode == 409:
+		break // No content-type
+
+	case rsp.StatusCode == 503:
+		break // No content-type
+
+	}
+
+	return response, nil
+}
+
 // ParseReauthorizeTableDestinationsResponse parses an HTTP response from a ReauthorizeTableDestinationsWithResponse call
 func ParseReauthorizeTableDestinationsResponse(rsp *http.Response) (*ReauthorizeTableDestinationsResponse, error) {
 	bodyBytes, err := io.ReadAll(rsp.Body)
@@ -77966,6 +84507,208 @@ func ParseExecuteGraphMetricActionResponse(rsp *http.Response) (*ExecuteGraphMet
 		}
 		response.JSON500 = &dest
 
+	}
+
+	return response, nil
+}
+
+// ParseRepairIndexResponse parses an HTTP response from a RepairIndexWithResponse call
+func ParseRepairIndexResponse(rsp *http.Response) (*RepairIndexResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &RepairIndexResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest IndexMaintenanceResponse
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest BadRequest
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON400 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest NotFound
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON404 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 405:
+		var dest MethodNotAllowed
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON405 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 409:
+		var dest IndexMutationConflict
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON409 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest StorageResourceExhausted
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 503:
+		var dest IndexMutationServiceUnavailable
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON503 = &dest
+
+	}
+
+	switch {
+	case rsp.StatusCode == 409:
+		var headers RepairIndexResponse409Headers
+		if values := rsp.Header.Values("X-Antfly-Raft-Mutation-Outcome"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Antfly-Raft-Mutation-Outcome", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XAntflyRaftMutationOutcome = value
+		}
+		response.Headers409 = &headers
+	case rsp.StatusCode == 429:
+		var headers RepairIndexResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = value
+		}
+		response.Headers429 = &headers
+	case rsp.StatusCode == 503:
+		var headers RepairIndexResponse503Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = value
+		}
+		response.Headers503 = &headers
+	}
+
+	return response, nil
+}
+
+// ParseRetryIndexResponse parses an HTTP response from a RetryIndexWithResponse call
+func ParseRetryIndexResponse(rsp *http.Response) (*RetryIndexResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &RetryIndexResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest IndexMaintenanceResponse
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest BadRequest
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON400 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest NotFound
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON404 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 405:
+		var dest MethodNotAllowed
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON405 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 409:
+		var dest IndexMutationConflict
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON409 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest StorageResourceExhausted
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 503:
+		var dest IndexMutationServiceUnavailable
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON503 = &dest
+
+	}
+
+	switch {
+	case rsp.StatusCode == 409:
+		var headers RetryIndexResponse409Headers
+		if values := rsp.Header.Values("X-Antfly-Raft-Mutation-Outcome"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "X-Antfly-Raft-Mutation-Outcome", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.XAntflyRaftMutationOutcome = value
+		}
+		response.Headers409 = &headers
+	case rsp.StatusCode == 429:
+		var headers RetryIndexResponse429Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = value
+		}
+		response.Headers429 = &headers
+	case rsp.StatusCode == 503:
+		var headers RetryIndexResponse503Headers
+		if values := rsp.Header.Values("Retry-After"); len(values) > 0 {
+			var value int
+			if err := runtime.BindStyledParameterWithOptions("simple", "Retry-After", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.RetryAfter = value
+		}
+		response.Headers503 = &headers
 	}
 
 	return response, nil
@@ -78682,6 +85425,98 @@ func ParseRestoreTableResponse(rsp *http.Response) (*RestoreTableResponse, error
 	return response, nil
 }
 
+// ParseMutateRelationalRowsResponse parses an HTTP response from a MutateRelationalRowsWithResponse call
+func ParseMutateRelationalRowsResponse(rsp *http.Response) (*MutateRelationalRowsResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &MutateRelationalRowsResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 201:
+		var dest BatchResponse
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON201 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 202:
+		var dest BatchResponse
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON202 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest BadRequest
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON400 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest NotFound
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON404 = &dest
+
+	case rsp.StatusCode == 409:
+		break // No content-type
+
+	case rsp.StatusCode == 503:
+		break // No content-type
+
+	}
+
+	return response, nil
+}
+
+// ParseQueryRelationalRowsResponse parses an HTTP response from a QueryRelationalRowsWithResponse call
+func ParseQueryRelationalRowsResponse(rsp *http.Response) (*QueryRelationalRowsResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &QueryRelationalRowsResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest BadRequest
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON400 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest NotFound
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON404 = &dest
+
+	case rsp.StatusCode == 409:
+		break // No content-type
+
+	case rsp.StatusCode == 503:
+		break // No content-type
+
+	}
+
+	return response, nil
+}
+
 // ParsePatchSchemaResponse parses an HTTP response from a PatchSchemaWithResponse call
 func ParsePatchSchemaResponse(rsp *http.Response) (*PatchSchemaResponse, error) {
 	bodyBytes, err := io.ReadAll(rsp.Body)
@@ -78704,7 +85539,7 @@ func ParsePatchSchemaResponse(rsp *http.Response) (*PatchSchemaResponse, error) 
 		response.JSON200 = &dest
 
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 202:
-		var dest CommittedMutationAccepted
+		var dest PatchSchema202JSONResponseBody
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
 			return nil, err
 		}
@@ -78751,6 +85586,16 @@ func ParsePatchSchemaResponse(rsp *http.Response) (*PatchSchemaResponse, error) 
 			headers.ETag = value
 		}
 		response.Headers200 = &headers
+	case rsp.StatusCode == 202:
+		var headers PatchSchemaResponse202Headers
+		if values := rsp.Header.Values("Location"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "Location", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.Location = value
+		}
+		response.Headers202 = &headers
 	}
 
 	return response, nil
@@ -78778,7 +85623,7 @@ func ParseUpdateSchemaResponse(rsp *http.Response) (*UpdateSchemaResponse, error
 		response.JSON200 = &dest
 
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 202:
-		var dest CommittedMutationAccepted
+		var dest UpdateSchema202JSONResponseBody
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
 			return nil, err
 		}
@@ -78825,6 +85670,16 @@ func ParseUpdateSchemaResponse(rsp *http.Response) (*UpdateSchemaResponse, error
 			headers.ETag = value
 		}
 		response.Headers200 = &headers
+	case rsp.StatusCode == 202:
+		var headers UpdateSchemaResponse202Headers
+		if values := rsp.Header.Values("Location"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "Location", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.Location = value
+		}
+		response.Headers202 = &headers
 	}
 
 	return response, nil

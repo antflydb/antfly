@@ -53,16 +53,16 @@ pub const architectures = struct {
     pub const clipclap_format = @import("architectures/clipclap_format.zig");
     pub const deberta = @import("architectures/deberta.zig");
     pub const deberta_graph = @import("architectures/deberta_graph.zig");
-    pub const gliner_boundary_ops = @import("architectures/gliner_boundary_ops.zig");
-    pub const gliner_boundary_engine = @import("architectures/gliner_boundary_engine.zig");
-    pub const gliner_boundary_engine_device = @import("architectures/gliner_boundary_engine_device.zig");
-    pub const gliner_boundary_head = @import("architectures/gliner_boundary_head.zig");
-    pub const gliner_boundary_graph = @import("architectures/gliner_boundary_graph.zig");
-    pub const gliner_boundary_device = @import("architectures/gliner_boundary_device.zig");
-    pub const gliner_boundary_tasks = @import("architectures/gliner_boundary_tasks.zig");
-    pub const gliner_boundary_tasks_device = @import("architectures/gliner_boundary_tasks_device.zig");
-    pub const gliner_boundary_scorer_device = @import("architectures/gliner_boundary_scorer_device.zig");
-    pub const gliner_boundary_request_device = @import("architectures/gliner_boundary_request_device.zig");
+    pub const gliner_boundary_ops = @import("architectures/gliner/boundary_ops.zig");
+    pub const gliner_boundary_engine = @import("architectures/gliner/boundary_engine.zig");
+    pub const gliner_boundary_engine_device = @import("architectures/gliner/boundary_engine_device.zig");
+    pub const gliner_boundary_head = @import("architectures/gliner/boundary_head.zig");
+    pub const gliner_boundary_graph = @import("architectures/gliner/boundary_graph.zig");
+    pub const gliner_boundary_device = @import("architectures/gliner/boundary_device.zig");
+    pub const gliner_boundary_tasks = @import("architectures/gliner/boundary_tasks.zig");
+    pub const gliner_boundary_tasks_device = @import("architectures/gliner/boundary_tasks_device.zig");
+    pub const gliner_boundary_scorer_device = @import("architectures/gliner/boundary_scorer_device.zig");
+    pub const gliner_boundary_request_device = @import("architectures/gliner/boundary_request_device.zig");
     pub const projector_format = @import("architectures/projector_format.zig");
     pub const qwen3vl_plan = @import("architectures/qwen3vl_plan.zig");
     pub const qwen3vl_projector = @import("architectures/qwen3vl_projector.zig");
@@ -113,6 +113,10 @@ pub const native_compute = struct {
 };
 
 test {
+    _ = @import("models/laya.zig");
+    _ = @import("pipelines/laya.zig");
+    _ = @import("pipelines/laya_parity_test.zig");
+    _ = @import("extractors/laya.zig");
     _ = backends;
     _ = execution_control;
     _ = sentencepiece;
@@ -148,12 +152,12 @@ test {
     _ = @import("ops/wasm_compute.zig");
     _ = architectures.gliner_boundary_ops;
     _ = architectures.gliner_boundary_engine;
-    _ = @import("architectures/gliner_boundary_parity_test.zig");
-    _ = @import("architectures/gliner_boundary_device_test.zig");
-    _ = @import("architectures/gliner_boundary_engine_device_test.zig");
-    _ = @import("architectures/gliner_boundary_reduced_device_test.zig");
-    _ = @import("architectures/gliner_boundary_scorer_device_test.zig");
-    _ = @import("architectures/gliner_boundary_request_device_test.zig");
+    _ = @import("architectures/gliner/boundary_parity_test.zig");
+    _ = @import("architectures/gliner/boundary_device_test.zig");
+    _ = @import("architectures/gliner/boundary_engine_device_test.zig");
+    _ = @import("architectures/gliner/boundary_reduced_device_test.zig");
+    _ = @import("architectures/gliner/boundary_scorer_device_test.zig");
+    _ = @import("architectures/gliner/boundary_request_device_test.zig");
     _ = @import("extractors/gliner_boundary_long_tasks_test.zig");
     _ = @import("ops/native_activation_policy_test.zig");
     _ = @import("ops/native_integer_test.zig");
@@ -161,16 +165,16 @@ test {
     _ = @import("ops/deberta_training_attention_source_test.zig");
     _ = @import("ops/deberta_training_attention_device_test.zig");
     _ = @import("graph/recomputed_training_test.zig");
-    _ = @import("finetune/gliner_boundary_replay_bindings.zig");
-    _ = @import("finetune/gliner_boundary_recomputed_graph.zig");
-    _ = @import("finetune/gliner_boundary_recomputed_admission.zig");
-    _ = @import("finetune/gliner_boundary_recomputed_execution.zig");
+    _ = @import("finetune/gliner/boundary_replay_bindings.zig");
+    _ = @import("finetune/gliner/boundary_recomputed_graph.zig");
+    _ = @import("finetune/gliner/boundary_recomputed_admission.zig");
+    _ = @import("finetune/gliner/boundary_recomputed_execution.zig");
     _ = @import("ops/resident_training_ops.zig");
     _ = @import("ops/resident_training_groups.zig");
     _ = @import("ops/resident_training_metal_test.zig");
     _ = @import("ops/gliner_boundary_device_ops.zig");
     _ = @import("graph/seeded_training_test.zig");
-    _ = @import("architectures/gliner_boundary_graph_test.zig");
+    _ = @import("architectures/gliner/boundary_graph_test.zig");
     _ = architectures.clipclap_format;
     _ = architectures.projector_format;
     _ = architectures.qwen3vl_plan;
@@ -229,6 +233,10 @@ test {
         _ = native_compute.cuda;
         _ = @import("ops/cuda/a4b_prepared_pack.zig");
         _ = @import("ops/cuda/kernels.zig");
+        // Keep focused boundary-kernel tests discoverable without relying on
+        // an unrelated device test to instantiate the resident adapter.
+        _ = @import("ops/cuda/gliner25.zig");
+        _ = @import("ops/resident_program_ops.zig");
     }
     _ = @import("ml");
 }

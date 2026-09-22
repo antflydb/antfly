@@ -18,6 +18,7 @@ const metadata_openapi = @import("antfly_metadata_openapi");
 const tables_api = @import("tables.zig");
 const indexes_api = @import("indexes.zig");
 const coverage_policy = @import("coverage_policy.zig");
+const enrichment_config_validation = @import("../storage/db/enrichment/config_validation.zig");
 const public_index_contract = @import("public_index_contract.zig");
 const table_index_config = @import("table_index_config.zig");
 
@@ -65,6 +66,10 @@ pub fn classifyCreateTableRequestError(err: anyerror) CreateTableRequestErrorDis
 
 pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tables_api.CreateTableRequest {
     if (body.len == 0) return .{ .indexes_json = try coverage_policy.withMissingIncarnationsAlloc(alloc, tables_api.default_indexes_json) };
+    if (try @import("relational_index_mutation.zig").normalizeCreateTableBody(alloc, body)) |normalized| {
+        defer alloc.free(normalized);
+        return parseCreateTableRequest(alloc, normalized);
+    }
 
     // Validate and normalize indexes from the raw request before invoking the
     // generated parser. The generated OpenAPI parser rejects unknown enum
@@ -109,6 +114,7 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
             alloc,
             fallback.indexes_json orelse tables_api.default_indexes_json,
         );
+        try @import("../schema/relational_index_namespace.zig").validate(alloc, fallback.schema_json orelse "", fallback.indexes_json orelse tables_api.default_indexes_json);
         return fallback;
     };
     defer parsed.deinit();
@@ -138,7 +144,12 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
     }
     try validateCreateTableIndexSemantics(alloc, req.indexes_json.?);
 
-    if (raw_root.get("schema")) |schema_value| {
+    // The generated scalar parser and artifact validators use machine
+    // numbers. Extract only schema separately so typed literals retain their
+    // original tokens instead of rounding before schema validation.
+    var exact_schema = try std.json.parseFromSlice(struct { schema: ?std.json.Value = null }, alloc, body, .{ .ignore_unknown_fields = true, .parse_numbers = false });
+    defer exact_schema.deinit();
+    if (exact_schema.value.schema) |schema_value| {
         if (schema_value != .null) {
             const raw_schema = try stringifyJsonAlloc(alloc, schema_value);
             defer alloc.free(raw_schema);
@@ -156,6 +167,8 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
     if (parsed.value.replication_sources) |replication_sources| {
         req.replication_sources_json = try stringifyJsonAlloc(alloc, replication_sources);
     }
+
+    try @import("../schema/relational_index_namespace.zig").validate(alloc, req.schema_json orelse "", req.indexes_json.?);
 
     if (req.num_shards) |num_shards| {
         if (num_shards == 0) return error.InvalidCreateTableRequest;
@@ -361,7 +374,10 @@ pub fn createTableRequestErrorMessage(err: anyerror, body: []const u8) []const u
 pub fn parseCreateIndexRequest(alloc: std.mem.Allocator, index_name: []const u8, body: []const u8) ![]u8 {
     if (body.len == 0) return error.InvalidCreateIndexRequest;
 
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    // Typed literal binding must see the caller's exact numeric token. Keep
+    // artifact validation's established numeric representation unchanged.
+    const relational = try @import("relational_index_mutation.zig").isRelational(alloc, body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{ .parse_numbers = !relational });
     defer parsed.deinit();
     const root = switch (parsed.value) {
         .object => |object| object,
@@ -610,6 +626,13 @@ fn validatePublicIndexFieldRelationships(object: anytype, index_type: public_ind
             }
         },
         .algebraic => {},
+        .relational => {
+            const keys = indexObjectGet(object, "keys") orelse return error.InvalidCreateIndexRequest;
+            try validatePublicCreatedShape(keys, .relational_keys);
+            if (indexObjectGet(object, "where")) |conditions| {
+                if (conditions != .null) try validatePublicCreatedShape(conditions, .relational_predicates);
+            }
+        },
     }
 }
 
@@ -784,9 +807,31 @@ fn normalizeArtifactEnrichmentConfigJson(
         try appendField(alloc, &out, "name", .{ .string = artifact_name }, &first);
     }
 
+    // The `transcriber` shorthand is expanded here so the stored index config
+    // carries the same write-only `producer_json` a hand-written request
+    // would, and every reader downstream sees one enrichment shape.
+    const transcriber = if (@hasField(Object, "map")) object.map.get("transcriber") else object.get("transcriber");
+    const has_producer_json = if (@hasField(Object, "map")) object.map.contains("producer_json") else object.contains("producer_json");
+    const has_content_type = if (@hasField(Object, "map")) object.map.contains("content_type") else object.contains("content_type");
+    if (transcriber) |shorthand| {
+        if (shorthand != .null) {
+            const kind = if (@hasField(Object, "map")) object.map.get("kind") else object.get("kind");
+            if (kind == null or kind.? != .string or !std.mem.eql(u8, kind.?.string, "asset") or has_producer_json)
+                return error.InvalidArtifactEnrichmentRequest;
+            const producer_json = enrichment_config_validation.transcriberShorthandProducerJsonAlloc(alloc, shorthand) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidArtifactEnrichmentRequest,
+            };
+            defer alloc.free(producer_json);
+            try appendField(alloc, &out, "producer_json", .{ .string = producer_json }, &first);
+            if (!has_content_type) try appendField(alloc, &out, "content_type", .{ .string = "application/json" }, &first);
+        }
+    }
+
     if (@hasField(Object, "map")) {
         var it = object.map.iterator();
         while (it.next()) |entry| {
+            if (std.mem.eql(u8, entry.key_ptr.*, "transcriber")) continue;
             if (std.mem.eql(u8, entry.key_ptr.*, "producer_json") and entry.value_ptr.* == .object) {
                 const producer_json = try stringifyJsonAlloc(alloc, entry.value_ptr.*);
                 defer alloc.free(producer_json);
@@ -798,6 +843,7 @@ fn normalizeArtifactEnrichmentConfigJson(
     } else {
         var it = object.iterator();
         while (it.next()) |entry| {
+            if (std.mem.eql(u8, entry.key_ptr.*, "transcriber")) continue;
             if (std.mem.eql(u8, entry.key_ptr.*, "producer_json") and entry.value_ptr.* == .object) {
                 const producer_json = try stringifyJsonAlloc(alloc, entry.value_ptr.*);
                 defer alloc.free(producer_json);
@@ -1622,6 +1668,55 @@ test "table contract accepts public full text create index" {
             std.testing.allocator,
             "default",
             "{}",
+        ),
+    );
+}
+
+test "table contract accepts the transcriber enrichment shorthand" {
+    const transcript_index =
+        "{\"type\":\"full_text\",\"field\":\"text\",\"artifact_name\":\"call_chunks_v1\",\"enrichments\":[{\"name\":\"call_transcripts_v1\",\"kind\":\"asset\",\"field\":\"recording_url\",\"transcriber\":{\"provider\":\"antfly\",\"model\":\"openai/whisper-small\",\"language_code\":\"en\",\"timestamps\":true}},{\"name\":\"call_chunks_v1\",\"kind\":\"chunk\",\"source_artifact_name\":\"call_transcripts_v1\",\"field\":\"text\",\"chunk_size\":256}]}";
+    const config_json = try parseCreateIndexRequest(std.testing.allocator, "call_text", transcript_index);
+    defer std.testing.allocator.free(config_json);
+    // The shorthand is expanded at admission into the write-only producer
+    // document plus a JSON content type, so nothing downstream sees it.
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"transcriber\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"content_type\":\"application/json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"producer_json\":\"{\\\"type\\\":\\\"document_extraction\\\",\\\"config\\\":{\\\"transcription\\\":{\\\"enabled\\\":true,\\\"config\\\":{\\\"provider\\\":\\\"antfly\\\"") != null);
+
+    var table_req = try parseCreateTableRequest(
+        std.testing.allocator,
+        "{\"indexes\":{\"call_text\":" ++ transcript_index ++ "}}",
+    );
+    defer table_req.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, table_req.indexes_json.?, "\"transcriber\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, table_req.indexes_json.?, "document_extraction") != null);
+
+    // A chunk stream cannot hold transcripts, and the shorthand does not
+    // combine with a hand-written producer.
+    try std.testing.expectError(
+        error.InvalidCreateIndexRequest,
+        parseCreateIndexRequest(
+            std.testing.allocator,
+            "call_text",
+            "{\"type\":\"full_text\",\"field\":\"text\",\"enrichments\":[{\"name\":\"t\",\"kind\":\"chunk\",\"field\":\"url\",\"chunk_size\":8,\"transcriber\":{\"provider\":\"antfly\",\"model\":\"m\"}}]}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidCreateIndexRequest,
+        parseCreateIndexRequest(
+            std.testing.allocator,
+            "call_text",
+            "{\"type\":\"full_text\",\"field\":\"text\",\"enrichments\":[{\"name\":\"t\",\"kind\":\"asset\",\"field\":\"url\",\"producer_json\":\"{}\",\"transcriber\":{\"provider\":\"antfly\",\"model\":\"m\"}}]}",
+        ),
+    );
+
+    // The shorthand is an object; anything else is a malformed request.
+    try std.testing.expectError(
+        error.InvalidCreateIndexRequest,
+        parseCreateIndexRequest(
+            std.testing.allocator,
+            "call_text",
+            "{\"type\":\"full_text\",\"field\":\"text\",\"enrichments\":[{\"name\":\"t\",\"kind\":\"asset\",\"field\":\"url\",\"transcriber\":\"antfly\"}]}",
         ),
     );
 }

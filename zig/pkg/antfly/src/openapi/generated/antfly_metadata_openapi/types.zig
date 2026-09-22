@@ -1808,6 +1808,7 @@ pub const CdcConnection = struct {
     }
 };
 
+/// Native cluster backups pin a common transaction cut across a dependency-complete table set. Restart-stable LSM seals are journaled before releasing write fences; artifact upload uses those immutable seals without holding the write pause. Native cohorts support at most 4096 tables and 4096 ranges and require the filesystem-managed LSM backend. Portable backups do not support coordinated UNIQUE/FK constraints or promise a common cross-table transaction cut.
 pub const ClusterBackupRequest = struct {
     /// Unique identifier for this backup. Used to reference the backup for restore operations. Choose a meaningful name that includes date/version information.
     backup_id: []const u8,
@@ -2333,6 +2334,7 @@ pub const ClusterHealth = enum {
     }
 };
 
+/// Native cohort restores use the existing asynchronous restore job to provision hidden fresh generations, import rows, rebuild indexes and coordinated constraints, and publish the dependency-complete target set atomically. Document, relational, and mixed native cohorts use the same workflow (at most 128 tables/4096 ranges). Skipping a live parent cannot substitute it for a parent generation required by a restored child. Overwrite retains the old generation until validation and cutover; cancellation after publication completes publication rather than rollback. Reserved destination authorization is immutable: changing principal requires canceling the old job and creating a new restore.
 pub const ClusterRestoreRequest = struct {
     /// Unique identifier of the backup to restore from.
     backup_id: []const u8,
@@ -6937,8 +6939,10 @@ pub const QueryBuilderResult = struct {
     query: std.json.ArrayHashMap(std.json.Value),
     /// Antfly query request assembled by the coordinator. New clients should prefer this field when they want an executable Antfly query object.
     query_request: ?QueryRequest = null,
-    /// Antfly retrieval query assembled by the coordinator when the requested artifact needs retrieval-only features such as tree_search. This is additive to query_request for clients that execute through the retrieval agent pipeline.
-    retrieval_query_request: ?RetrievalQueryRequest = null,
+    /// Antfly retrieval query assembled by the coordinator when the requested artifact is intended for retrieval. Apply retrieval_navigation to steps.retrieval.navigation. This is additive to query_request for clients that execute through the retrieval agent pipeline.
+    retrieval_query_request: ?QueryRequest = null,
+    /// Optional retrieval-step navigation policy for the returned query at query_index zero.
+    retrieval_navigation: ?RetrievalNavigationConfig = null,
     /// Specialist or strategy used to build the query, such as `full_text`, `filter`, or `hybrid`.
     specialist: ?[]const u8 = null,
     /// Optional machine-readable coordination plan for observability.
@@ -6963,6 +6967,7 @@ pub const QueryBuilderResult = struct {
         .{ "query", "query", false },
         .{ "query_request", "query_request", true },
         .{ "retrieval_query_request", "retrieval_query_request", true },
+        .{ "retrieval_navigation", "retrieval_navigation", true },
         .{ "specialist", "specialist", true },
         .{ "plan", "plan", true },
         .{ "explanation", "explanation", true },
@@ -7020,6 +7025,10 @@ pub const QueryBuilderResult = struct {
         }
         if (self.retrieval_query_request) |value| {
             try jw.objectField("retrieval_query_request");
+            try jw.write(value);
+        }
+        if (self.retrieval_navigation) |value| {
+            try jw.objectField("retrieval_navigation");
             try jw.write(value);
         }
         if (self.specialist) |value| {
@@ -8270,6 +8279,521 @@ pub const QueryUnprocessableError = union(enum) {
 /// An Antfly query expression retained as syntactically validated JSON and compiled by the query engine.
 pub const RawQuery = @import("antfly-json").RawValue;
 
+pub const RelationalConstraintActivationPhase = enum {
+    unique,
+    foreign_key,
+    check,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .unique => "unique",
+            .foreign_key => "foreign_key",
+            .check => "check",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "unique", .unique },
+            .{ "foreign_key", .foreign_key },
+            .{ "check", .check },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Deterministic relational integrity failure; changing the mutation or data is required before retry.
+pub const RelationalConstraintConflictReason = enum {
+    unique_constraint_violation,
+    foreign_key_parent_missing,
+    foreign_key_referenced,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .unique_constraint_violation => "unique_constraint_violation",
+            .foreign_key_parent_missing => "foreign_key_parent_missing",
+            .foreign_key_referenced => "foreign_key_referenced",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "unique_constraint_violation", .unique_constraint_violation },
+            .{ "foreign_key_parent_missing", .foreign_key_parent_missing },
+            .{ "foreign_key_referenced", .foreign_key_referenced },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const RelationalConstraintRangeStatus = struct {
+    /// Exact owner group identifier as decimal text.
+    group_id: []const u8,
+    state: antfly_schema_openapi.RelationalConstraintValidationState,
+    phase: RelationalConstraintActivationPhase,
+    /// Exact cumulative validation row count as decimal text.
+    rows_scanned: []const u8,
+    /// Opaque namespace-and-range ownership digest.
+    owner: []const u8,
+    failure: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "group_id", "group_id", false },
+        .{ "state", "state", false },
+        .{ "phase", "phase", false },
+        .{ "rows_scanned", "rows_scanned", false },
+        .{ "owner", "owner", false },
+        .{ "failure", "failure", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("group_id");
+        try jw.write(self.group_id);
+        try jw.objectField("state");
+        try jw.write(self.state);
+        try jw.objectField("phase");
+        try jw.write(self.phase);
+        try jw.objectField("rows_scanned");
+        try jw.write(self.rows_scanned);
+        try jw.objectField("owner");
+        try jw.write(self.owner);
+        if (self.failure) |value| {
+            try jw.objectField("failure");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Supply exactly one of target_schema or drop=true. A target schema may only remove UNIQUE/FK definitions; all other schema properties must remain unchanged. Its version is assigned by the server. Retirement fences primary mutations while existing reference and claim records are drained. External foreign keys referencing removed definitions must be retired first.
+pub const RelationalConstraintRetirementRequest = struct {
+    schema_version: i64,
+    target_schema: ?antfly_schema_openapi.TableSchema = null,
+    /// Prepare for explicit table deletion; this operation does not delete the table.
+    drop: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "schema_version", "schema_version", false },
+        .{ "target_schema", "target_schema", false },
+        .{ "drop", "drop", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("schema_version");
+        try jw.write(self.schema_version);
+        if (self.target_schema) |value| {
+            try jw.objectField("target_schema");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("target_schema");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.drop) |value| {
+            try jw.objectField("drop");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const RelationalConstraintRetirementStatus = struct {
+    /// Opaque retirement job identity.
+    id: []const u8,
+    phase: []const u8,
+    drop: bool,
+    target_schema_version: u32,
+    /// Durable diagnostic that pauses the job. Retry resumes the exact checkpoint after the cause is addressed; it does not undo a partial drain or permit primary mutations while retirement is active.
+    failure: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", false },
+        .{ "phase", "phase", false },
+        .{ "drop", "drop", false },
+        .{ "target_schema_version", "target_schema_version", false },
+        .{ "failure", "failure", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("phase");
+        try jw.write(self.phase);
+        try jw.objectField("drop");
+        try jw.write(self.drop);
+        try jw.objectField("target_schema_version");
+        try jw.write(self.target_schema_version);
+        if (self.failure) |value| {
+            try jw.objectField("failure");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const RelationalConstraintRetryRequest = struct {
+    schema_version: i64,
+};
+
+pub const RelationalConstraintRetryResponse = struct {
+    status: []const u8,
+};
+
+pub const RelationalConstraintStatus = struct {
+    schema_version: u32,
+    /// Distributed UNIQUE, foreign-key, and scalar CHECK coverage across every current table owner. Native local validation is not a substitute for this coordinated proof.
+    coverage_kind: []const u8,
+    state: antfly_schema_openapi.RelationalConstraintValidationState,
+    ranges: []const RelationalConstraintRangeStatus,
+    retirement: ?RelationalConstraintRetirementStatus = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "schema_version", "schema_version", false },
+        .{ "coverage_kind", "coverage_kind", false },
+        .{ "state", "state", false },
+        .{ "ranges", "ranges", false },
+        .{ "retirement", "retirement", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("schema_version");
+        try jw.write(self.schema_version);
+        try jw.objectField("coverage_kind");
+        try jw.write(self.coverage_kind);
+        try jw.objectField("state");
+        try jw.write(self.state);
+        try jw.objectField("ranges");
+        try jw.write(self.ranges);
+        if (self.retirement) |value| {
+            try jw.objectField("retirement");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const RelationalRow = struct {
+    /// Opaque index-order continuation; present only for secondary-index queries.
+    cursor: ?[]const u8 = null,
+    _id: []const u8,
+    row: std.json.ArrayHashMap(std.json.Value),
+    /// Exact row version for mutation preconditions, encoded as decimal text.
+    version: []const u8,
+    /// Active pinned schema epoch, not the historical physical row layout.
+    schema_version: u32,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "cursor", "cursor", true },
+        .{ "_id", "_id", false },
+        .{ "row", "row", false },
+        .{ "version", "version", false },
+        .{ "schema_version", "schema_version", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.cursor) |value| {
+            try jw.objectField("cursor");
+            try jw.write(value);
+        }
+        try jw.objectField("_id");
+        try jw.write(self._id);
+        try jw.objectField("row");
+        try jw.write(self.row);
+        try jw.objectField("version");
+        try jw.write(self.version);
+        try jw.objectField("schema_version");
+        try jw.write(self.schema_version);
+        try jw.endObject();
+    }
+};
+
+pub const RelationalRowCondition = struct {
+    column: []const u8,
+    op: antfly_schema_openapi.RelationalComparisonOp,
+    /// Typed scalar operand. Omission means NULL. Integer columns also accept exact decimal strings.
+    value: ?std.json.Value = null,
+    collation: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "column", "column", false },
+        .{ "op", "op", false },
+        .{ "value", "value", true },
+        .{ "collation", "collation", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("column");
+        try jw.write(self.column);
+        try jw.objectField("op");
+        try jw.write(self.op);
+        if (self.value) |value| {
+            try jw.objectField("value");
+            try jw.write(value);
+        }
+        if (self.collation) |value| {
+            try jw.objectField("collation");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Typed left-prefix bound in declared index order, including descending components. Inclusive bounds include the entire matching prefix. Integer components accept exact decimal strings; null is an indexed null.
+pub const RelationalRowIndexBound = struct {
+    values: []const std.json.Value,
+    inclusive: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "values", "values", false },
+        .{ "inclusive", "inclusive", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("values");
+        try jw.write(self.values);
+        if (self.inclusive) |value| {
+            try jw.objectField("inclusive");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// A complete row replacement, or deletion when row is omitted. No read-modify-write is implied.
+pub const RelationalRowMutation = struct {
+    key: []const u8,
+    /// Exact observed version. Zero requires that the row does not exist.
+    expected_version: []const u8,
+    row: ?std.json.ArrayHashMap(std.json.Value) = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "key", "key", false },
+        .{ "expected_version", "expected_version", false },
+        .{ "row", "row", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("key");
+        try jw.write(self.key);
+        try jw.objectField("expected_version");
+        try jw.write(self.expected_version);
+        if (self.row) |value| {
+            try jw.objectField("row");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Atomic version-conditional typed-row replacements and deletions using the durable distributed transaction coordinator.
+pub const RelationalRowMutationRequest = struct {
+    /// Required active relational schema epoch, fenced during every participant prepare.
+    schema_version: u32,
+    mutations: []const RelationalRowMutation,
+    sync_level: ?SyncLevel = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "schema_version", "schema_version", false },
+        .{ "mutations", "mutations", false },
+        .{ "sync_level", "sync_level", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("schema_version");
+        try jw.write(self.schema_version);
+        try jw.objectField("mutations");
+        try jw.write(self.mutations);
+        if (self.sync_level) |value| {
+            try jw.objectField("sync_level");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Bounded relational scan in primary-key order, or composite index order when index is supplied. Index queries require schema_version and every owning shard must have the selected generation ready. Partial indexes require their WHERE predicates to be implied by the query conditions. The bounded proof combines per-column equality, tighter ranges, exclusions, and NULL-aware predicates using exact typed values and matching collations. Unsupported implications fail closed. Explicit scan bounds alone are not an implication proof. Equal tuples are ordered by primary key. Each shard read pins its own immutable schema and row snapshot; this is not a table-wide consistent snapshot. Resume with the last returned _id as from for primary scans, or its cursor as after for index scans. A resumed request opens a fresh snapshot, not a retained cursor; concurrent mutations may move rows across the continuation boundary. Keep index, bounds and conditions unchanged when paging. An empty projection returns row identities and versions only.
+pub const RelationalRowQueryRequest = struct {
+    /// Ready composite secondary index. Requires schema_version; cannot be combined with from/to.
+    index: ?[]const u8 = null,
+    /// Opaque exclusive index-order cursor from the last returned row. Binds the immutable schema version, logical index name, and comparison semantics, independent of owner-local physical generations. Each owner must still prove its current local index is ready.
+    after: ?[]const u8 = null,
+    lower: ?RelationalRowIndexBound = null,
+    upper: ?RelationalRowIndexBound = null,
+    fields: []const []const u8,
+    conditions: ?[]const RelationalRowCondition = null,
+    /// Exclusive lower primary-key bound, including pagination continuation.
+    from: ?[]const u8 = null,
+    /// Exclusive upper primary-key bound.
+    to: ?[]const u8 = null,
+    limit: ?u32 = null,
+    /// Reject the read if an owning shard has a different active schema epoch. Zero is a valid epoch and is distinct from omission.
+    schema_version: ?u32 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "index", "index", true },
+        .{ "after", "after", true },
+        .{ "lower", "lower", true },
+        .{ "upper", "upper", true },
+        .{ "fields", "fields", false },
+        .{ "conditions", "conditions", true },
+        .{ "from", "from", true },
+        .{ "to", "to", true },
+        .{ "limit", "limit", true },
+        .{ "schema_version", "schema_version", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.index) |value| {
+            try jw.objectField("index");
+            try jw.write(value);
+        }
+        if (self.after) |value| {
+            try jw.objectField("after");
+            try jw.write(value);
+        }
+        if (self.lower) |value| {
+            try jw.objectField("lower");
+            try jw.write(value);
+        }
+        if (self.upper) |value| {
+            try jw.objectField("upper");
+            try jw.write(value);
+        }
+        try jw.objectField("fields");
+        try jw.write(self.fields);
+        if (self.conditions) |value| {
+            try jw.objectField("conditions");
+            try jw.write(value);
+        }
+        if (self.from) |value| {
+            try jw.objectField("from");
+            try jw.write(value);
+        }
+        if (self.to) |value| {
+            try jw.objectField("to");
+            try jw.write(value);
+        }
+        if (self.limit) |value| {
+            try jw.objectField("limit");
+            try jw.write(value);
+        }
+        if (self.schema_version) |value| {
+            try jw.objectField("schema_version");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 pub const RenameCatalogResourceRequest = struct {
     /// New logical name. The durable resource identity remains unchanged.
     name: []const u8,
@@ -9037,12 +9561,12 @@ pub const RestoreRequest = struct {
     connection: []const u8,
 };
 
-/// Request for the retrieval agent. Queries define which tables and indexes to search, each as a QueryRequest with optional tree search configuration. **Pipeline mode** (default, max_internal_iterations=0): Queries are executed directly without an LLM tool-calling loop. **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to call, using the queries to determine available tables and indexes. A query may contain only a table scope and caller constraints: build_query delegates to the query-builder agent, then search executes its validated QueryRequest. Refinements use the same canonical full-DSL validator, not keyword substitution. Authenticated row filters are enforced on every initial and generated operation in both modes, including scans, aggregates, and graph/tree traversal. They cannot be replaced or weakened by model tool arguments.
+/// Request for the retrieval agent. Queries define which tables and indexes to search, each as an ordinary QueryRequest. Optional tree or graph exploration is configured by steps.retrieval.navigation, targeting one query by index. **Pipeline mode** (default, max_internal_iterations=0): Queries are executed directly without an LLM tool-calling loop. **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to call, using the queries to determine available tables and indexes. A query may contain only a table scope and caller constraints: build_query delegates to the query-builder agent, then search executes its validated QueryRequest. Refinements use the same canonical full-DSL validator, not keyword substitution. Authenticated row filters are enforced on every initial and generated operation in both modes, including scans, aggregates, and graph/tree traversal. They cannot be replaced or weakened by model tool arguments.
 pub const RetrievalAgentRequest = struct {
     /// User's natural language query
     query: []const u8,
     /// Queries to execute. Each query carries its own table via the QueryRequest table field. In pipeline mode (max_internal_iterations=0), these are executed directly. In agentic mode, these declare which table and indexes are available. `filter_query` and `exclusion_query` are mandatory table predicates for retrieval-agent execution. Predicates declared by any query for a table are conjoined (or unioned for exclusions) and applied to every initial query, generated refinement, probe, aggregation, graph/tree traversal, root scan, and follow-up for that table. They cannot be weakened by generated operations.
-    queries: []const RetrievalQueryRequest,
+    queries: []const QueryRequest,
     /// Optional conversational context for the current turn. Decisions remain the authoritative continuation input for bounded agent interactions.
     messages: ?[]const antfly_generating_openapi.ChatMessage = null,
     /// Domain-specific knowledge to include in the agent's system prompt. Useful for providing context about the document collection.
@@ -9532,119 +10056,51 @@ pub const RetrievalAgentUsage = struct {
     }
 };
 
-/// A canonical query in the retrieval pipeline with an optional tree search configuration. Each query specifies its own table. Deprecated stateful graph_searches compatibility is intentionally unavailable here. When both search fields (semantic_search, full_text_search) and tree_search are provided, the search results are used as start nodes for tree navigation.
-pub const RetrievalQueryRequest = struct {
-    table_target: ?CatalogTableTarget = null,
-    /// Literal table name in default.public. Global queries require exactly one of table or table_target.
-    table: ?[]const u8 = null,
-    /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is non-scoring query input. - `bool.must_not` is non-scoring exclusion query input. Filter branches accept the same query variants as `filter_query` and `exclusion_query`. Structured clauses use the native document-value path; text clauses are resolved through the text index before scoring.
-    query: ?std.json.Value = null,
-    /// Antfly query for full-text search. Supports all Antfly query types. See specs/openapi/antfly/query.yaml for complete type definitions. Examples: - Simple: `{"query": "computer"}` - Field-specific: `{"query": "body:computer"}` - Boolean: `{"query": "+artificial +intelligence"}` - Range: `{"query": "year:>2020"}` - Phrase: `{"query": "\"exact phrase\""}`
-    full_text_search: ?RawQuery = null,
-    /// Full-text index used by `full_text_search` and by scoring text clauses in `query`. Use this to query a named document- or artifact-backed full-text index. The selected index must exist and have type `full_text`. Omit this field to use the table's active schema full-text index, preserving v0.2 behavior. Structured document filters continue to use the active schema index even when retrieval uses a named artifact index. This selector is invalid without `full_text_search` or a scoring text clause in `query` and receives HTTP 422. This semantic relationship is enforced after the recursive query AST is normalized; OpenAPI presence checks cannot accurately distinguish scoring clauses from filter-only or exclusion-only trees.
-    full_text_index: ?[]const u8 = null,
-    /// Natural language query for vector similarity search. Results are ranked by semantic similarity to the query and can be combined with full_text_search using Reciprocal Rank Fusion (RRF). The semantic_search string is automatically embedded using the configured embedding model for the specified indexes. UTF-8 input is limited to 1 MiB. Use `embedding_template` for multimodal queries.
-    semantic_search: ?[]const u8 = null,
-    /// Optional Handlebars template for multimodal embedding of the semantic_search query. The template has access to `this` which contains the semantic_search string value. UTF-8 template input is limited to 64 KiB. Use this when you want to embed template-time multimodal content instead of just text. The template is rendered using dotprompt with access to remote content helpers. **Available Helpers**: - `remoteMedia url=<url>` - Fetches and embeds remote images/media - `remotePDF url=<url>` - **Deprecated.** Fetches and extracts text from born-digital PDFs - `remoteText url=<url>` - Fetches and includes remote text content Use a `document_extraction` asset producer when PDF pages and chunks must be persisted and reprocessed. `remoteMedia` and the other helpers only prepare template-time inference input. **Examples**: - Legacy PDF search: `{{remotePDF url=this}}` - Image search: `{{remoteMedia url=this}}` - Mixed: `Search for: {{this}} {{#if this}}{{remoteMedia url=this}}{{/if}}` When not specified, the semantic_search string is embedded as plain text.
-    embedding_template: ?[]const u8 = null,
-    /// Embedding index names selected for `semantic_search` or explicit `embeddings`. Dense and sparse indexes are supported when the corresponding query representation is supplied. Provisioned deployments require at least one index for `semantic_search`; serverless may infer its single published dense index when this field is omitted. When `embeddings` is supplied without this field, the embedding map keys select the indexes. Provisioned results from multiple indexes are merged using RRF. Serverless currently executes at most one dense and one sparse index per request; it rejects multiple same-kind selectors and omitted selectors when more than one corresponding index is published rather than choosing an index by catalog order.
-    indexes: ?[]const []const u8 = null,
-    /// Filter results by key prefix. Only returns documents whose keys start with this string. Applied before scoring to improve performance. Common use cases: - Multi-tenant filtering: `"tenant:acme:"` - User-specific data: `"user:123:"` - Document type filtering: `"article:"`
-    filter_prefix: ?[]const u8 = null,
-    /// Antfly query applied as an AND condition. Documents must match both the main query and this filter. Applied before scoring for better performance. See specs/openapi/antfly/query.yaml for complete type definitions. Use for: - Status filtering: `"status:published"` - Date ranges: `"created_at:>2023-01-01"` - Category filtering: `"+category:technology +language:en"` - Geo bounding boxes: `{"geo_bbox":{"field":"location","min_lat":-1,"min_lon":179.5,"max_lat":1,"max_lon":-179.5}}` For structured `geo_bbox`, `min_lon > max_lon` intentionally represents a bounding box that crosses the antimeridian.
-    filter_query: ?RawQuery = null,
-    /// Antfly query applied as a NOT condition. Documents matching this query are excluded from results. Applied before scoring. See specs/openapi/antfly/query.yaml for complete type definitions. Use for: - Excluding drafts: `"status:draft"` - Removing deprecated content: `"deprecated:true"` - Filtering out archived items: `"status:archived"`
-    exclusion_query: ?RawQuery = null,
-    /// Aggregation requests for computing metrics and bucketing results. Each key is a user-defined name for the aggregation, and the value specifies the aggregation configuration. When `hierarchy.group_by` is present, aggregations operate on the complete set of top-level grouped source or unit records. Nested `group_by.matches` are bounded evidence projections and are not counted as aggregation rows. Supports metric aggregations (sum, avg, min, max, count, stats, cardinality), bucketing aggregations (terms, range, date_range, histogram, date_histogram), geo aggregations (geohash_grid, geo_distance), and analytics (significant_terms). Example: ```json { "price_stats": { "type": "stats", "field": "price" }, "categories": { "type": "terms", "field": "category", "size": 10 } } ```
-    aggregations: ?std.json.ArrayHashMap(AggregationRequest) = null,
-    /// Pre-computed embeddings to use for semantic searches instead of embedding the semantic_search string. The keys are the index names. Values can be either: - **Dense (array)**: an array of floats, e.g. `[0.1, 0.2, 0.3]` - **Dense (packed)**: a base64 string of little-endian float32 bytes (~4x more compact) - **Sparse**: an object with `indices` (array of ints) and `values` (array of floats), e.g. `{"indices": [1, 5, 100], "values": [0.3, 0.7, 0.1]}` - **Sparse (packed)**: an object with `packed_indices` (base64 uint32 LE) and `packed_values` (base64 float32 LE) Use when you've already generated embeddings on the client side to avoid redundant embedding calls.
-    embeddings: ?std.json.ArrayHashMap(Embedding) = null,
-    /// Controls the vector search recall/latency tradeoff for semantic searches. - `0.0` = fastest, lowest recall - `0.5` = balanced default - `1.0` = highest recall When omitted, Antfly uses the balanced default effort (`0.5`) unless lower-level vector search overrides are provided internally.
-    search_effort: ?f32 = null,
-    /// List of fields to include in the results. If not specified, all fields are returned. Use to reduce response size and improve performance. This field is required when hierarchy.group_by is present so a grouped query cannot accidentally hydrate an entire grouped document. Use an empty array for identity-only groups. This projection is also required for hierarchy.children traversal.
-    fields: ?[]const []const u8 = null,
-    hierarchy: ?QueryHierarchy = null,
-    /// Maximum number of top-level results to return. For semantic_search, this is the topk parameter. This does not limit nested matches attached through hierarchy.group_by.matches; use hierarchy.group_by.matches.limit for that. Default varies by query type (typically 10). Queries using hierarchy.group_by.matches are limited to 100 top-level groups and a groups-times-matches execution budget of 1,000.
-    limit: ?i64 = null,
-    /// Number of results to skip for pagination. Supported for text-backed, match_all, and filter-only requests. Approximate semantic requests do not support offset on their own. Semantic and hybrid requests support it when a reranker is configured: Antfly retrieves a bounded candidate window and applies offset after coordinator-owned reranking.
-    offset: ?i64 = null,
-    /// Optional query execution deadline in milliseconds. The server applies this as a cooperative deadline across admission waiting, query planning, search execution, aggregation reruns, sorting, and response post-processing. If the deadline expires before the query completes, the HTTP API returns 504. When omitted, semantic query embedding planning and provider I/O use a 30-second default deadline. NDJSON batches share their submission time and use the shortest explicit timeout in the batch. Waiting, retries, and later batch lines do not reset this budget.
-    timeout_ms: ?i64 = null,
-    /// Sort order for results. Array of sort fields with direction. Antfly appends `_id` ascending as a stable tie-breaker when it is omitted. Hierarchy child traversal requires `_hierarchy.position` ascending; its opaque, sortable value is bound to the complete source hierarchy revision. Supported for exact text-backed, match_all, and filter-only requests when each non-`_id` field is a mapped exact scalar field with sortable native doc-value coverage. Sortable mapping types are keyword, numeric/number/integer, boolean/bool, datetime/date/timestamp, and link. Declare the field with `x-antfly-field` and `sortable: true`; `x-antfly-types` shorthand declarations alone are not sortable. Analyzed `text` fields and `search_as_you_type`, geo, embedding, blob, html, object, and array fields are not directly sortable; sort on an exact scalar mapping such as `title.keyword` instead. Requests that cannot be executed through an exact native sort path return 422 rather than falling back to stored JSON sorting. Semantic searches are always sorted by similarity score. Not supported when `count` is true.
-    order_by: ?[]const SortField = null,
-    /// Cursor for forward pagination. Pass the `_sort` values from the last hit of the previous page exactly, including the appended `_id` tie-breaker. Values preserve their JSON types; for example numbers remain numbers, booleans remain booleans, and strings remain strings. Cursor values must be replayable JSON scalars; nulls, arrays, objects, and non-finite numbers are rejected. Mutually exclusive with `offset`. When `order_by` is omitted, Antfly uses `_id` ascending as the effective order and the cursor tuple must contain exactly one `_id` string. Supported for exact text-backed, match_all, and filter-only requests; not supported for semantic_search or count-only requests. For hierarchy child traversal, a cursor whose source-artifact revision changed returns `409 hierarchy_cursor_stale`; restart the same traversal without `search_after` rather than retrying the stale tuple.
-    search_after: ?[]const std.json.Value = null,
-    /// Cursor for backward pagination. Pass the `_sort` values from the first hit of the current page exactly, including the appended `_id` tie-breaker. Values preserve their JSON types; for example numbers remain numbers, booleans remain booleans, and strings remain strings. Cursor values must be replayable JSON scalars; nulls, arrays, objects, and non-finite numbers are rejected. Mutually exclusive with `offset`. When `order_by` is omitted, Antfly uses `_id` ascending as the effective order and the cursor tuple must contain exactly one `_id` string. Supported for exact text-backed, match_all, and filter-only requests; not supported for semantic_search or count-only requests.
-    search_before: ?[]const std.json.Value = null,
-    /// Maximum distance threshold for semantic similarity search. Results with distance greater than this value are excluded. Lower distances indicate higher similarity. Useful for filtering out low-confidence matches.
-    distance_under: ?f32 = null,
-    /// Minimum distance threshold for semantic similarity search. Results with distance less than this value are excluded. Useful for excluding near-exact duplicates or finding dissimilar documents.
-    distance_over: ?f32 = null,
-    /// Configuration for merging full-text and semantic search results. Only applies when both `full_text_search` and `semantic_search` are specified.
-    merge_config: ?antfly_indexes_openapi.MergeConfig = null,
-    /// If true, returns only the total count of matching documents without retrieving the actual documents. Useful for pagination and displaying result counts. Count-only requests do not return an ordered result page, so `order_by`, `search_after`, and `search_before` are not supported when this is true.
-    count: ?bool = null,
-    /// If true, includes detailed execution profiling in the response. Adds a `profile` object with per-phase timing breakdowns, shard statistics, join metadata, reranker stats, and merge details. Has minor performance overhead — not recommended for production traffic.
-    profile: ?bool = null,
-    /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Set `candidate_count` to the bounded retrieval window (often 50-100) and use the query `limit` for the final page size. Antfly retrieves and globally merges that window, calls the reranker once, then applies pruning, offset, and limit at the coordinator. Example: ```json { "provider": "antfly", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
-    reranker: ?antfly_reranking_openapi.RerankerConfig = null,
-    /// Direct top-k read from a published graph metric generation. Results are returned in graph_metric_results under the requested name or the metric name when no explicit name is supplied.
-    graph_metric: ?antfly_indexes_openapi.GraphMetricQuery = null,
-    /// Blend a published graph metric feature into ordinary search hit scores. Requests may require either any published generation or a generation that is fresh with respect to graph writes.
-    graph_metric_rerank: ?antfly_indexes_openapi.GraphMetricRerank = null,
-    analyses: ?Analyses = null,
-    /// Declarative graph matching, traversal, and path queries. A nested node `filter` is a typed, non-scoring stored-document predicate. It shares familiar scalar syntax with document queries but deliberately excludes analyzer-backed and index-only clauses. A request may contain at most 64 named graph operations, of which at most 8 may be named `match` operations. Each operation key is a GraphIdentifier under the versioned policy published in the GraphIdentifier schema. Put multiple counts over one pattern in the same `match` return object so they share one complete anchor scan.
-    graph_queries: ?antfly_indexes_openapi.GraphQueries = null,
-    /// Optional Handlebars template string for rendering document content in RAG queries. Template has access to document fields via `{{this.fields.fieldName}}`. **Default**: Uses TOON (Token-Oriented Object Notation) format for 30-60% token reduction: ```handlebars {{encodeToon this.fields}} ``` **Available Helpers**: - `encodeToon` - Renders fields in compact TOON format with configurable options: - `lengthMarker` (bool): Add # prefix to array counts (default: true) - `indent` (int): Indentation spacing (default: 2) - `delimiter` (string): Field separator for tabular arrays - `scrubHtml` - Removes HTML tags and extracts text - `media` - Wraps data URIs for GenKit multimodal support - `eq` - Equality comparison for conditionals **Examples**: - Basic TOON: `{{encodeToon this.fields}}` - Compact TOON: `{{encodeToon this.fields lengthMarker=false indent=0}}` - Tabular data: `{{encodeToon this.fields delimiter="\t"}}` - Custom template: `Title: {{this.fields.title}}\nBody: {{this.fields.body}}` - Traditional format: `{{#each this.fields}}{{@key}}: {{this}}\n{{/each}}` TOON format produces compact, LLM-optimized output like: ``` title: Introduction to Vector Search author: Jane Doe tags[#3]: ai,search,ml ``` **References**: - TOON Specification: https://github.com/toon-format/toon - Go Implementation: https://github.com/alpkeskin/gotoon
-    document_renderer: ?[]const u8 = null,
-    /// Optional result pruning configuration to filter low-relevance results. Pruning helps detect "elbows" in score distributions and removes results that are significantly worse than top matches. It runs once on globally merged results, after optional reranking and before the final offset/limit page is selected. **Common patterns:** - RAG queries: Use `max_score_gap_percent: 30` to stop at quality drop-offs - Strict matching: Use `min_score_ratio: 0.7` for high-quality results only - Combine both for best results Example: ```json { "min_score_ratio": 0.5, "max_score_gap_percent": 25.0, "min_absolute_score": 0.3 } ```
-    pruner: ?antfly_indexes_openapi.Pruner = null,
-    /// Cross-table join configuration for combining results from multiple tables. Joins allow you to enrich query results with data from related tables, similar to SQL JOINs but optimized for distributed execution. **Join Types:** - `inner`: Only return rows that have matches in both tables - `left`: Return all rows from the primary table, with NULL for non-matching right rows - `right`: Return all rows from the joined table, with NULL for non-matching left rows **Join Strategies** (auto-selected based on table sizes): - `broadcast`: Small table broadcast to all shards (best for dimension tables < 10MB) - `index_lookup`: Batch key lookups using indexes (best for selective joins) - `shuffle`: Hash-partition both tables (best for large-large joins) **Example - Enrich orders with customer data:** ```json { "table": "orders", "full_text_search": {"query": "status:pending"}, "join": { "right_table": "customers", "join_type": "inner", "on": { "left_field": "customer_id", "right_field": "id" }, "right_filters": { "filter_query": {"query": "tier:premium"} } }, "fields": ["order_id", "amount", "customers.name", "customers.email"] } ``` **Multi-way joins** (nested): ```json { "table": "orders", "join": { "right_table": "customers", "on": {"left_field": "customer_id", "right_field": "id"}, "nested_join": { "right_table": "addresses", "on": {"left_field": "customers.address_id", "right_field": "id"} } } } ``` **Performance Tips:** - Filter the driving table first to reduce join input size - Put the smaller table on the right side for broadcast joins - Use indexed fields in join conditions for index_lookup strategy - Limit result fields to reduce data transfer
-    join: ?JoinClause = null,
-    /// Map of table name to foreign data source configuration for query-time federated access. When a table name referenced in this query (or in a join's `right_table`) appears as a key here, the query is routed to the external database instead of Antfly shards. This enables joining Antfly search results with structured relational data (customer records, product catalogs, etc.) without ingesting that data into Antfly. **Supported operations on foreign tables:** filter_query, field selection, limit/offset. **Not supported:** full_text_search, semantic_search, graph_queries, aggregations, reranker. **Example - Join Antfly products with Postgres customers:** ```json { "table": "products", "full_text_search": {"query": "category:electronics"}, "join": { "right_table": "pg_customers", "on": {"left_field": "customer_id", "right_field": "id"} }, "foreign_sources": { "pg_customers": { "type": "postgres", "dsn": "${secret:pg_dsn}", "postgres_table": "customers" } } } ```
-    foreign_sources: ?std.json.ArrayHashMap(ForeignSource) = null,
-    /// Optional tree search configuration
-    tree_search: ?TreeSearchConfig = null,
+/// Retrieval-step navigation targeting one ordinary query. Graph navigation follows one path; tree navigation explores a retained branch frontier. Agentic selection uses the enclosing model and budgets. Ranked selection is supported for trees and uses the existing deterministic tree traversal. Agentic selection requires agentic mode and a retrieval generator. Search starts exploration; navigation selects only an offered, unvisited node. All reads enforce mandatory predicates and authenticated row filters.
+pub const RetrievalNavigationConfig = struct {
+    /// Zero-based index into the enclosing request queries.
+    query_index: i64,
+    strategy: RetrievalNavigationStrategy,
+    /// Ranked selection is supported only with strategy tree.
+    selection: RetrievalNavigationSelection,
+    /// Tree-only maximum depth from the start node (depth zero); defaults to 5.
+    max_depth: ?i64 = null,
+    /// Tree-only maximum children offered per expansion; defaults to 3.
+    beam_width: ?i64 = null,
+    /// Graph index used for every neighbor read.
+    index: []const u8,
+    /// Ranked-tree-only seed selector (comma-separated keys, $roots, or a prior-result selector). Mutually exclusive with start_key.
+    start_nodes: ?[]const u8 = null,
+    /// Literal start document key. Agentic selection defaults to the first query hit; ranked selection defaults to seed results or prior query hits.
+    start_key: ?[]const u8 = null,
+    /// Direction for every hop; defaults to out.
+    direction: ?antfly_indexes_openapi.EdgeDirection = null,
+    edge_types: ?[]const antfly_indexes_openapi.GraphEdgeType = null,
+    /// Graph-only maximum moves after the start node (default 8). The enclosing agent's iteration and tool limits also apply.
+    max_steps: ?i64 = null,
+    /// Graph-only maximum candidate neighbors per node (default 8), further limited by the context budget.
+    neighbor_limit: ?i64 = null,
+    /// Optional caller-supplied workflow instruction retained in agent history.
+    instruction: ?[]const u8 = null,
+    /// Explicitly opt in to following instructions from this top-level string field of each visited document. Instructions accumulate in agent history. Other document fields and unvisited neighbors remain untrusted evidence. The field must be included if the query uses a fields projection.
+    instruction_field: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
-        .{ "table_target", "table_target", true },
-        .{ "table", "table", true },
-        .{ "query", "query", true },
-        .{ "full_text_search", "full_text_search", true },
-        .{ "full_text_index", "full_text_index", true },
-        .{ "semantic_search", "semantic_search", true },
-        .{ "embedding_template", "embedding_template", true },
-        .{ "indexes", "indexes", true },
-        .{ "filter_prefix", "filter_prefix", true },
-        .{ "filter_query", "filter_query", true },
-        .{ "exclusion_query", "exclusion_query", true },
-        .{ "aggregations", "aggregations", true },
-        .{ "embeddings", "embeddings", true },
-        .{ "search_effort", "search_effort", true },
-        .{ "fields", "fields", true },
-        .{ "hierarchy", "hierarchy", true },
-        .{ "limit", "limit", true },
-        .{ "offset", "offset", true },
-        .{ "timeout_ms", "timeout_ms", true },
-        .{ "order_by", "order_by", true },
-        .{ "search_after", "search_after", true },
-        .{ "search_before", "search_before", true },
-        .{ "distance_under", "distance_under", true },
-        .{ "distance_over", "distance_over", true },
-        .{ "merge_config", "merge_config", false },
-        .{ "count", "count", true },
-        .{ "profile", "profile", true },
-        .{ "reranker", "reranker", false },
-        .{ "graph_metric", "graph_metric", false },
-        .{ "graph_metric_rerank", "graph_metric_rerank", false },
-        .{ "analyses", "analyses", true },
-        .{ "graph_queries", "graph_queries", false },
-        .{ "document_renderer", "document_renderer", true },
-        .{ "pruner", "pruner", false },
-        .{ "join", "join", true },
-        .{ "foreign_sources", "foreign_sources", true },
-        .{ "tree_search", "tree_search", true },
+        .{ "query_index", "query_index", false },
+        .{ "strategy", "strategy", false },
+        .{ "selection", "selection", false },
+        .{ "max_depth", "max_depth", true },
+        .{ "beam_width", "beam_width", true },
+        .{ "index", "index", false },
+        .{ "start_nodes", "start_nodes", true },
+        .{ "start_key", "start_key", true },
+        .{ "direction", "direction", false },
+        .{ "edge_types", "edge_types", true },
+        .{ "max_steps", "max_steps", true },
+        .{ "neighbor_limit", "neighbor_limit", true },
+        .{ "instruction", "instruction", true },
+        .{ "instruction_field", "instruction_field", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -9657,180 +10113,147 @@ pub const RetrievalQueryRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
-        if (self.table_target) |value| {
-            try jw.objectField("table_target");
+        try jw.objectField("query_index");
+        try jw.write(self.query_index);
+        try jw.objectField("strategy");
+        try jw.write(self.strategy);
+        try jw.objectField("selection");
+        try jw.write(self.selection);
+        if (self.max_depth) |value| {
+            try jw.objectField("max_depth");
             try jw.write(value);
         }
-        if (self.table) |value| {
-            try jw.objectField("table");
+        if (self.beam_width) |value| {
+            try jw.objectField("beam_width");
             try jw.write(value);
         }
-        if (self.query) |value| {
-            try jw.objectField("query");
+        try jw.objectField("index");
+        try jw.write(self.index);
+        if (self.start_nodes) |value| {
+            try jw.objectField("start_nodes");
             try jw.write(value);
         }
-        if (self.full_text_search) |value| {
-            try jw.objectField("full_text_search");
+        if (self.start_key) |value| {
+            try jw.objectField("start_key");
             try jw.write(value);
         }
-        if (self.full_text_index) |value| {
-            try jw.objectField("full_text_index");
-            try jw.write(value);
-        }
-        if (self.semantic_search) |value| {
-            try jw.objectField("semantic_search");
-            try jw.write(value);
-        }
-        if (self.embedding_template) |value| {
-            try jw.objectField("embedding_template");
-            try jw.write(value);
-        }
-        if (self.indexes) |value| {
-            try jw.objectField("indexes");
-            try jw.write(value);
-        }
-        if (self.filter_prefix) |value| {
-            try jw.objectField("filter_prefix");
-            try jw.write(value);
-        }
-        if (self.filter_query) |value| {
-            try jw.objectField("filter_query");
-            try jw.write(value);
-        }
-        if (self.exclusion_query) |value| {
-            try jw.objectField("exclusion_query");
-            try jw.write(value);
-        }
-        if (self.aggregations) |value| {
-            try jw.objectField("aggregations");
-            try jw.write(value);
-        }
-        if (self.embeddings) |value| {
-            try jw.objectField("embeddings");
-            try jw.write(value);
-        }
-        if (self.search_effort) |value| {
-            try jw.objectField("search_effort");
-            try jw.write(value);
-        }
-        if (self.fields) |value| {
-            try jw.objectField("fields");
-            try jw.write(value);
-        }
-        if (self.hierarchy) |value| {
-            try jw.objectField("hierarchy");
-            try jw.write(value);
-        }
-        if (self.limit) |value| {
-            try jw.objectField("limit");
-            try jw.write(value);
-        }
-        if (self.offset) |value| {
-            try jw.objectField("offset");
-            try jw.write(value);
-        }
-        if (self.timeout_ms) |value| {
-            try jw.objectField("timeout_ms");
-            try jw.write(value);
-        }
-        if (self.order_by) |value| {
-            try jw.objectField("order_by");
-            try jw.write(value);
-        }
-        if (self.search_after) |value| {
-            try jw.objectField("search_after");
-            try jw.write(value);
-        }
-        if (self.search_before) |value| {
-            try jw.objectField("search_before");
-            try jw.write(value);
-        }
-        if (self.distance_under) |value| {
-            try jw.objectField("distance_under");
-            try jw.write(value);
-        }
-        if (self.distance_over) |value| {
-            try jw.objectField("distance_over");
-            try jw.write(value);
-        }
-        if (self.merge_config) |value| {
-            try jw.objectField("merge_config");
+        if (self.direction) |value| {
+            try jw.objectField("direction");
             try jw.write(value);
         } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("merge_config");
+            try jw.objectField("direction");
             try jw.write(@as(?u8, null));
         }
-        if (self.count) |value| {
-            try jw.objectField("count");
+        if (self.edge_types) |value| {
+            try jw.objectField("edge_types");
             try jw.write(value);
         }
-        if (self.profile) |value| {
-            try jw.objectField("profile");
+        if (self.max_steps) |value| {
+            try jw.objectField("max_steps");
             try jw.write(value);
         }
-        if (self.reranker) |value| {
-            try jw.objectField("reranker");
-            try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("reranker");
-            try jw.write(@as(?u8, null));
-        }
-        if (self.graph_metric) |value| {
-            try jw.objectField("graph_metric");
-            try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("graph_metric");
-            try jw.write(@as(?u8, null));
-        }
-        if (self.graph_metric_rerank) |value| {
-            try jw.objectField("graph_metric_rerank");
-            try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("graph_metric_rerank");
-            try jw.write(@as(?u8, null));
-        }
-        if (self.analyses) |value| {
-            try jw.objectField("analyses");
+        if (self.neighbor_limit) |value| {
+            try jw.objectField("neighbor_limit");
             try jw.write(value);
         }
-        if (self.graph_queries) |value| {
-            try jw.objectField("graph_queries");
-            try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("graph_queries");
-            try jw.write(@as(?u8, null));
-        }
-        if (self.document_renderer) |value| {
-            try jw.objectField("document_renderer");
+        if (self.instruction) |value| {
+            try jw.objectField("instruction");
             try jw.write(value);
         }
-        if (self.pruner) |value| {
-            try jw.objectField("pruner");
-            try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("pruner");
-            try jw.write(@as(?u8, null));
-        }
-        if (self.join) |value| {
-            try jw.objectField("join");
-            try jw.write(value);
-        }
-        if (self.foreign_sources) |value| {
-            try jw.objectField("foreign_sources");
-            try jw.write(value);
-        }
-        if (self.tree_search) |value| {
-            try jw.objectField("tree_search");
+        if (self.instruction_field) |value| {
+            try jw.objectField("instruction_field");
             try jw.write(value);
         }
         try jw.endObject();
     }
 };
 
+pub const RetrievalNavigationSelection = enum {
+    agentic,
+    ranked,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .agentic => "agentic",
+            .ranked => "ranked",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "agentic", .agentic },
+            .{ "ranked", .ranked },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const RetrievalNavigationStrategy = enum {
+    tree,
+    graph,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .tree => "tree",
+            .graph => "graph",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "tree", .tree },
+            .{ "graph", .graph },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Configuration for the retrieval step. Retrieval tools are constrained by the top-level request tools policy when both are present.
 pub const RetrievalStepConfig = struct {
+    /// Navigation policy for one query; incompatible with graph_queries on that query.
+    navigation: ?RetrievalNavigationConfig = null,
     /// Tool configuration for the retrieval step. When set, this narrows the top-level tools policy for retrieval execution.
     tools: ?antfly_generating_api_openapi.ChatToolsConfig = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "navigation", "navigation", true },
+        .{ "tools", "tools", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.navigation) |value| {
+            try jw.objectField("navigation");
+            try jw.write(value);
+        }
+        if (self.tools) |value| {
+            try jw.objectField("tools");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("tools");
+            try jw.write(@as(?u8, null));
+        }
+        try jw.endObject();
+    }
 };
 
 /// Strategy for document retrieval: - semantic: Vector similarity search using embeddings - bm25: Full-text search using BM25 scoring - metadata: Structured query on document fields - tree: Iterative tree navigation with summarization - graph: Relationship-based traversal - hybrid: Combine multiple strategies with RRF or rerank
@@ -10198,6 +10621,12 @@ pub const SecretEntry = struct {
     /// Secret name (e.g., openai.api_key)
     key: []const u8,
     status: SecretStatus,
+    /// Name of the winning source, or environment.
+    source: ?[]const u8 = null,
+    /// Whether this key has an Antfly-managed override that can be deleted.
+    managed: ?bool = null,
+    /// Committed native entry revision, when supported by the configured backend.
+    revision: ?u64 = null,
     /// Corresponding environment variable name (e.g., OPENAI_API_KEY)
     env_var: ?[]const u8 = null,
     created_at: ?[]const u8 = null,
@@ -10207,6 +10636,9 @@ pub const SecretEntry = struct {
     pub const openApiFieldMetadata = .{
         .{ "key", "key", false },
         .{ "status", "status", false },
+        .{ "source", "source", true },
+        .{ "managed", "managed", true },
+        .{ "revision", "revision", true },
         .{ "env_var", "env_var", true },
         .{ "created_at", "created_at", true },
         .{ "updated_at", "updated_at", true },
@@ -10226,6 +10658,18 @@ pub const SecretEntry = struct {
         try jw.write(self.key);
         try jw.objectField("status");
         try jw.write(self.status);
+        if (self.source) |value| {
+            try jw.objectField("source");
+            try jw.write(value);
+        }
+        if (self.managed) |value| {
+            try jw.objectField("managed");
+            try jw.write(value);
+        }
+        if (self.revision) |value| {
+            try jw.objectField("revision");
+            try jw.write(value);
+        }
         if (self.env_var) |value| {
             try jw.objectField("env_var");
             try jw.write(value);
@@ -10243,7 +10687,34 @@ pub const SecretEntry = struct {
 };
 
 pub const SecretList = struct {
+    /// Whether this server has a native store for secret API writes.
+    writable: ?bool = null,
     secrets: []const SecretEntry,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "writable", "writable", true },
+        .{ "secrets", "secrets", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.writable) |value| {
+            try jw.objectField("writable");
+            try jw.write(value);
+        }
+        try jw.objectField("secrets");
+        try jw.write(self.secrets);
+        try jw.endObject();
+    }
 };
 
 /// Source of the secret configuration
@@ -12359,6 +12830,7 @@ pub const TransactionConflict = struct {
     key: []const u8,
     /// Human-readable conflict description.
     message: []const u8,
+    reason: ?RelationalConstraintConflictReason = null,
     /// Stable machine-readable conflict classification.
     kind: []const u8,
     /// Whether retrying the transaction may succeed without changing its writes.
@@ -12378,6 +12850,7 @@ pub const TransactionConflict = struct {
         .{ "table", "table", false },
         .{ "key", "key", false },
         .{ "message", "message", false },
+        .{ "reason", "reason", true },
         .{ "kind", "kind", false },
         .{ "retryable", "retryable", false },
         .{ "retry_after_ms", "retry_after_ms", true },
@@ -12403,6 +12876,10 @@ pub const TransactionConflict = struct {
         try jw.write(self.key);
         try jw.objectField("message");
         try jw.write(self.message);
+        if (self.reason) |value| {
+            try jw.objectField("reason");
+            try jw.write(value);
+        }
         try jw.objectField("kind");
         try jw.write(self.kind);
         try jw.objectField("retryable");
@@ -13164,53 +13641,6 @@ pub const TraverseResponse = struct {
         }
         if (self.count) |value| {
             try jw.objectField("count");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
-
-/// Configuration for tree search strategy. Tree search navigates hierarchical document structures by evaluating summaries at each level.
-pub const TreeSearchConfig = struct {
-    /// Name of the graph index to use for tree navigation
-    index: []const u8,
-    /// Starting nodes for tree search: - "$roots" - Query for root nodes (nodes with no parents) - Comma-separated explicit node IDs When omitted and combined with a QueryRequest in a RetrievalQueryRequest, the query results are used as start nodes.
-    start_nodes: ?[]const u8 = null,
-    /// Maximum depth to traverse in the tree
-    max_depth: ?i64 = null,
-    /// Number of branches to explore at each level
-    beam_width: ?i64 = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "index", "index", false },
-        .{ "start_nodes", "start_nodes", true },
-        .{ "max_depth", "max_depth", true },
-        .{ "beam_width", "beam_width", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        try jw.objectField("index");
-        try jw.write(self.index);
-        if (self.start_nodes) |value| {
-            try jw.objectField("start_nodes");
-            try jw.write(value);
-        }
-        if (self.max_depth) |value| {
-            try jw.objectField("max_depth");
-            try jw.write(value);
-        }
-        if (self.beam_width) |value| {
-            try jw.objectField("beam_width");
             try jw.write(value);
         }
         try jw.endObject();
@@ -14040,6 +14470,134 @@ pub const WebSearchConnection = struct {
             try jw.write(value);
         }
         try jw.endObject();
+    }
+};
+
+pub const OpenApiUpdateSchemaResponse202 = union(enum) {
+    restore_job: *RestoreJob,
+    committed_mutation_outcome: *CommittedMutationOutcome,
+
+    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
+        inline for (keys) |key| {
+            if (object.contains(key)) return true;
+        }
+        return false;
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        if (objectHasAnyKey(source.object, &.{
+            "job_id",
+            "attempt_id",
+            "scope",
+            "table_name",
+            "backup_id",
+            "phase",
+            "cancel_requested",
+            "durability_pending_table_count",
+            "published_table_count",
+            "completed_table_count",
+            "total_table_count",
+            "result",
+            "error",
+            "created_at_ms",
+            "updated_at_ms",
+            "expires_at_ms",
+        })) {
+            if (try parseStructuralVariant(RestoreJob, allocator, source, options)) |parsed| return .{ .restore_job = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "status",
+        })) {
+            if (try parseStructuralVariant(CommittedMutationOutcome, allocator, source, options)) |parsed| return .{ .committed_mutation_outcome = parsed };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .restore_job => |v| try jw.write(v.*),
+            .committed_mutation_outcome => |v| try jw.write(v.*),
+        }
+    }
+};
+
+pub const OpenApiPatchSchemaResponse202 = union(enum) {
+    restore_job: *RestoreJob,
+    committed_mutation_outcome: *CommittedMutationOutcome,
+
+    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
+        inline for (keys) |key| {
+            if (object.contains(key)) return true;
+        }
+        return false;
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        if (objectHasAnyKey(source.object, &.{
+            "job_id",
+            "attempt_id",
+            "scope",
+            "table_name",
+            "backup_id",
+            "phase",
+            "cancel_requested",
+            "durability_pending_table_count",
+            "published_table_count",
+            "completed_table_count",
+            "total_table_count",
+            "result",
+            "error",
+            "created_at_ms",
+            "updated_at_ms",
+            "expires_at_ms",
+        })) {
+            if (try parseStructuralVariant(RestoreJob, allocator, source, options)) |parsed| return .{ .restore_job = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "status",
+        })) {
+            if (try parseStructuralVariant(CommittedMutationOutcome, allocator, source, options)) |parsed| return .{ .committed_mutation_outcome = parsed };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .restore_job => |v| try jw.write(v.*),
+            .committed_mutation_outcome => |v| try jw.write(v.*),
+        }
     }
 };
 

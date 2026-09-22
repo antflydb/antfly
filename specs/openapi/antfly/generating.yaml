@@ -293,7 +293,7 @@ components:
             tools available for the request.
           example: ["add_filter", "semantic_search", "web_search"]
         web_search_config:
-          $ref: "websearch.yaml#/components/schemas/WebSearchConfig"
+          $ref: "websearch.yaml#/components/schemas/WebSearchProviderConfig"
           description: |
             Inline web search provider configuration. Prefer web_search_connection for
             configured production agents; inline config remains useful for CLI/dev

@@ -13,6 +13,12 @@
 // limitations.
 
 pub const replication_record = @import("replication_record.zig");
+pub const metadata_effects = @import("metadata_effects.zig");
+pub const metadata_effect_chunks = @import("metadata_effect_chunks.zig");
+pub const replay_floor = @import("replay_floor.zig");
+pub const restore_owner_contract = @import("restore_owner_contract.zig");
+pub const restore_owner_registry = @import("restore_owner_registry.zig");
+pub const restore_terminal_ledger = @import("restore_terminal_ledger.zig");
 pub const replication_log = @import("replication_log.zig");
 pub const slot_store = @import("slot_store.zig");
 pub const standby = @import("standby.zig");

@@ -140,6 +140,10 @@ pub const HttpRequest = struct {
     authorization: ?[]const u8 = null,
     content_type: ?[]const u8 = null,
     timeout_ms: ?u32 = null,
+    /// Optional decoded response-body ceiling. Buffered executors may lower,
+    /// never raise, their configured ceiling. For streaming, null preserves
+    /// sink-owned budgeting; a supplied ceiling also bounds transport output.
+    max_response_bytes: ?usize = null,
     body: []const u8 = &.{},
     cancellation: ?*const RequestCancellation = null,
     delivery_tracker: ?*RequestDeliveryTracker = null,
@@ -149,6 +153,10 @@ pub const HttpRequest = struct {
             if (std.ascii.eqlIgnoreCase(entry.name, name)) return entry.value;
         }
         return null;
+    }
+
+    pub fn responseLimit(self: HttpRequest, configured_limit: usize) usize {
+        return @min(self.max_response_bytes orelse configured_limit, configured_limit);
     }
 };
 

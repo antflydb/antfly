@@ -28,6 +28,7 @@ const docstore = @import("docstore.zig");
 const DocStore = docstore.DocStore;
 const internal_keys = @import("internal_keys.zig");
 const lsm_backend = @import("lsm_backend.zig");
+const retained_effects = @import("retained_effects.zig");
 const mem_backend = @import("mem_backend.zig");
 const platform_time = @import("antfly_platform").time;
 const build_options = @import("build_options");
@@ -64,7 +65,27 @@ pub fn makeIntentLockKeyAlloc(alloc: Allocator, user_key: []const u8) ![]u8 {
 const intent_keys_prefix = @import("completion_control_budget.zig").intent_keys_prefix;
 const intent_members_prefix = "\x00\x00__txn_intent_members__:";
 const intent_admission_prefix = @import("completion_control_budget.zig").intent_admission_prefix;
-const IntentAdmission = struct { count: u64 = 0, bytes: u64 = 0 };
+const IntentAdmission = struct {
+    count: u64 = 0,
+    bytes: u64 = 0,
+    retained_bytes: u64 = 0,
+    retained_keys: u64 = 0,
+    retention_tracked: bool = true,
+
+    fn reservation(self: @This()) u64 {
+        if (!self.retention_tracked or self.retained_keys == 0) return 0;
+        if (self.retained_keys > retained_effects.max_keys) return @max(self.retained_bytes +| 48, retained_effects.max_frame_bytes + 1);
+        return self.retained_bytes +| 48;
+    }
+};
+const IntentCost = struct { bytes: u64, retained: u64 };
+// Durable read dependencies share key-oriented guards and retain a per-transaction
+// member list so resolution work remains proportional to the transaction's reads.
+const read_guards_prefix = "\x00\x00__txn_read_guards__:";
+const read_members_prefix = "\x00\x00__txn_read_members__:";
+const read_admission_prefix = "\x00\x00__txn_read_admission__:";
+const read_guard_count_key = "\x00\x00__txn_read_guard_count";
+const max_read_guards_per_transaction = 65_536;
 const completion_prefix = @import("completion_control_budget.zig").completion_prefix;
 const completion_summary_key = @import("completion_control_budget.zig").completion_summary_key;
 pub const CompletionLimits = struct {
@@ -189,6 +210,48 @@ pub fn intentAdmissionBytes(intent: WriteIntent) !u64 {
     return std.math.add(u64, bytes, std.math.add(u64, keys, 4096) catch return error.TransactionTooLarge) catch error.TransactionTooLarge;
 }
 
+/// REF3 contains final primary effects/timestamps and integrity records, not
+/// derived index/vector writes. AROW metadata replacement preserves length.
+/// Document numbers retain their exact source spelling. Only special-field
+/// stripping serializes JSON; count its exact output with a bounded writer.
+fn isRawMetadataIntentKey(key: []const u8) bool {
+    return std.mem.startsWith(u8, key, "\x00\x00__metadata__:relational_integrity:") or
+        std.mem.eql(u8, key, "\x00\x00__metadata__:relational_integrity_activation") or
+        std.mem.eql(u8, key, "\x00\x00__metadata__:relational_integrity_retirement") or
+        std.mem.eql(u8, key, "\x00\x00__metadata__:restore_staging_owner") or
+        @import("db/relational_index_maintenance_contract.zig").isControlKey(key);
+}
+
+fn retainedIntentBytes(alloc: Allocator, intent: WriteIntent) !u64 {
+    if (@import("db/relational_integrity_contract.zig").isKey(intent.key)) {
+        _ = try @import("db/relational_integrity_contract.zig").parseKey(intent.key);
+        return std.math.add(u64, 16 + intent.key.len, if (intent.value) |value| value.len else 0) catch error.TransactionTooLarge;
+    }
+    if (isRawMetadataIntentKey(intent.key)) return 0;
+    var payload: u64 = if (intent.prepared_row) |row| row.len else if (intent.value) |value| value.len else 0;
+    if (intent.prepared_row == null) if (intent.value) |value| {
+        // No escaped property name and no special spelling means the mapper
+        // borrows original bytes; do not parse or allocate on that common path.
+        if (std.mem.indexOf(u8, value, "_edges") != null or std.mem.indexOf(u8, value, "_embeddings") != null or std.mem.indexOfScalar(u8, value, '\\') != null) {
+            var parsed = std.json.parseFromSlice(std.json.Value, alloc, value, .{ .parse_numbers = false }) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidTxnRecord,
+            };
+            defer parsed.deinit();
+            if (parsed.value == .object) {
+                var buffer: [1024]u8 = undefined;
+                var counter = std.Io.Writer.Discarding.init(&buffer);
+                try std.json.Stringify.value(parsed.value, .{}, &counter.writer);
+                // Native DB removes special/vector fields, while the generic
+                // transaction manager can preserve raw document bytes. Cover
+                // both authorities; removing fields never grows this encoding.
+                payload = @max(payload, counter.fullCount());
+            }
+        }
+    };
+    return std.math.add(u64, 16 + 2 + internal_keys.encodedComponentLen(intent.key), payload) catch error.TransactionTooLarge;
+}
+
 fn appendOwnedBytes(alloc: Allocator, list: *std.ArrayListUnmanaged([]u8), bytes: []u8) !void {
     errdefer alloc.free(bytes);
     try list.append(alloc, bytes);
@@ -207,8 +270,44 @@ pub const OwnedIntentMutation = struct {
 
 pub const VersionPredicate = struct {
     key: []const u8,
-    expected_version: u64, // 0 = key must not exist
+    expected_version: u64 = 0, // 0 = key must not exist
+    expected_content_digest: ?[32]u8 = null,
+    /// Internal integrity records are raw metadata, not timestamped primary
+    /// rows. Their CAS compares complete bytes and retains the same shared
+    /// dependency guard as a document predicate. NULL means absent, not empty.
+    comparison: enum { document_version, exact_value } = .document_version,
+    expected_value: ?[]const u8 = null,
+    // Successful prepare retains this dependency through terminal resolution.
+    // A predicate on a write key uses that write's exclusive intent instead.
 };
+
+fn validReadMember(bytes: []const u8) bool {
+    return bytes.len == 8 or (bytes.len == 33 and (bytes[0] == 2 or bytes[0] == 3 or bytes[0] == 4));
+}
+
+fn readPredicateIdentity(predicate: VersionPredicate, out: *[33]u8) []const u8 {
+    switch (predicate.comparison) {
+        .document_version => {
+            if (predicate.expected_content_digest) |digest| {
+                var version: [8]u8 = undefined;
+                std.mem.writeInt(u64, &version, predicate.expected_version, .little);
+                var hash = std.crypto.hash.sha2.Sha256.init(.{});
+                hash.update(&version);
+                hash.update(&digest);
+                out[0] = 4;
+                hash.final(out[1..33]);
+                return out;
+            }
+            std.mem.writeInt(u64, out[0..8], predicate.expected_version, .little);
+            return out[0..8];
+        },
+        .exact_value => {
+            out[0] = if (predicate.expected_value != null) 3 else 2;
+            std.crypto.hash.Blake3.hash(predicate.expected_value orelse "", out[1..33], .{});
+            return out;
+        },
+    }
+}
 
 pub const TxnError = error{
     VersionConflict,
@@ -1021,7 +1120,7 @@ pub const TxnManager = struct {
 
         const previous_admission = try self.loadIntentAdmission(self.alloc, txn_id);
         var admission = previous_admission orelse IntentAdmission{};
-        var pending_costs = std.StringHashMapUnmanaged(u64).empty;
+        var pending_costs = std.StringHashMapUnmanaged(IntentCost).empty;
         defer pending_costs.deinit(self.alloc);
         var last_intents = std.StringHashMapUnmanaged(usize).empty;
         defer last_intents.deinit(self.alloc);
@@ -1043,26 +1142,32 @@ pub const TxnManager = struct {
         // Only transactions from released document-storage versions need this
         // one-time conversion. New prepares never reread their prior payloads
         // or rewrite a growing list of keys.
-        if (previous_admission == null and record.intent_revision != 0) {
+        if ((previous_admission == null or !previous_admission.?.retention_tracked) and record.intent_revision != 0) {
+            admission = .{};
             var previous = try self.collectIntentBatch(self.alloc, txn_id);
             defer previous.deinit(self.alloc);
             for (previous.owned_entries.?) |entry| {
                 const key = entry.key[intents_prefix.len + 17 ..];
                 const decoded = try IntentValue.decode(entry.value);
-                const cost = try intentAdmissionBytes(.{ .key = key, .value = decoded.value, .prepared_row = decoded.prepared_row });
+                const previous_intent: WriteIntent = .{ .key = key, .value = decoded.value, .prepared_row = decoded.prepared_row };
+                const cost = try intentAdmissionBytes(previous_intent);
+                const retained = try retainedIntentBytes(self.alloc, previous_intent);
                 admission.count += 1;
                 admission.bytes = std.math.add(u64, admission.bytes, cost) catch return error.TransactionTooLarge;
-                try pending_costs.put(self.alloc, key, cost);
+                admission.retained_bytes = std.math.add(u64, admission.retained_bytes, retained) catch return error.TransactionTooLarge;
+                admission.retained_keys += @intFromBool(retained != 0);
+                try pending_costs.put(self.alloc, key, .{ .bytes = cost, .retained = retained });
                 const member_key = try makeIntentMemberKey(self.alloc, txn_id, key);
                 try appendOwnedBytes(self.alloc, &write_keys, member_key);
-                const member_value = try self.alloc.alloc(u8, 8);
+                const member_value = try self.alloc.alloc(u8, 16);
                 try appendOwnedBytes(self.alloc, &write_vals, member_value);
                 std.mem.writeInt(u64, member_value[0..8], cost, .little);
+                std.mem.writeInt(u64, member_value[8..16], retained, .little);
                 try writes.append(self.alloc, .{ .key = member_key, .value = member_value });
             }
             // Hash-map keys must outlive the snapshot.
             pending_costs.clearRetainingCapacity();
-            for (writes.items) |write| try pending_costs.put(self.alloc, write.key[intent_members_prefix.len + 17 ..], std.mem.readInt(u64, write.value[0..8], .little));
+            for (writes.items) |write| try pending_costs.put(self.alloc, write.key[intent_members_prefix.len + 17 ..], .{ .bytes = std.mem.readInt(u64, write.value[0..8], .little), .retained = std.mem.readInt(u64, write.value[8..16], .little) });
         }
 
         // Compute the final replacement-aware ledger before allocating any
@@ -1076,21 +1181,29 @@ pub const TxnManager = struct {
                     else => return err,
                 };
                 defer self.alloc.free(raw);
-                if (raw.len != 8) return error.InvalidTxnRecord;
-                break :blk std.mem.readInt(u64, raw[0..8], .little);
+                if (raw.len != 16) return error.InvalidTxnRecord;
+                break :blk IntentCost{ .bytes = std.mem.readInt(u64, raw[0..8], .little), .retained = std.mem.readInt(u64, raw[8..16], .little) };
             };
             const cost = try intentAdmissionBytes(intent);
+            const retained = try retainedIntentBytes(self.alloc, intent);
             if (prior) |old| {
-                admission.bytes = std.math.sub(u64, admission.bytes, old) catch return error.InvalidTxnRecord;
+                admission.bytes = std.math.sub(u64, admission.bytes, old.bytes) catch return error.InvalidTxnRecord;
+                admission.retained_bytes = std.math.sub(u64, admission.retained_bytes, old.retained) catch return error.InvalidTxnRecord;
+                admission.retained_keys = std.math.sub(u64, admission.retained_keys, @intFromBool(old.retained != 0)) catch return error.InvalidTxnRecord;
             } else {
                 admission.count = std.math.add(u64, admission.count, 1) catch return error.TransactionTooLarge;
             }
             admission.bytes = std.math.add(u64, admission.bytes, cost) catch return error.TransactionTooLarge;
-            try pending_costs.put(self.alloc, intent.key, cost);
+            admission.retained_bytes = std.math.add(u64, admission.retained_bytes, retained) catch return error.TransactionTooLarge;
+            admission.retained_keys += @intFromBool(retained != 0);
+            try pending_costs.put(self.alloc, intent.key, .{ .bytes = cost, .retained = retained });
             try last_intents.put(self.alloc, intent.key, index);
         }
-        if (extra_batch.max_intent_admission_bytes != 0 and admission.bytes > extra_batch.max_intent_admission_bytes and
-            admission.bytes > (if (previous_admission) |previous| previous.bytes else 0))
+        const read_admission = try self.stageReadGuards(txn_id, predicates, &last_intents, &write_keys, &write_vals, &writes);
+        const total_bytes = std.math.add(u64, admission.bytes, read_admission.next.bytes) catch return error.TransactionTooLarge;
+        const previous_bytes = std.math.add(u64, if (previous_admission) |previous| previous.bytes else 0, read_admission.previous.bytes) catch return error.InvalidTxnRecord;
+        if (extra_batch.max_intent_admission_bytes != 0 and total_bytes > extra_batch.max_intent_admission_bytes and
+            total_bytes > previous_bytes)
             return error.TransactionTooLarge;
 
         var completion: ?CompletionChange = null;
@@ -1105,8 +1218,9 @@ pub const TxnManager = struct {
             if (last_intents.get(intent.key).? != index) continue;
             const member_key = try makeIntentMemberKey(self.alloc, txn_id, intent.key);
             try appendOwnedBytes(self.alloc, &write_keys, member_key);
-            const member_value = try self.alloc.alloc(u8, 8);
-            std.mem.writeInt(u64, member_value[0..8], pending_costs.get(intent.key).?, .little);
+            const member_value = try self.alloc.alloc(u8, 16);
+            std.mem.writeInt(u64, member_value[0..8], pending_costs.get(intent.key).?.bytes, .little);
+            std.mem.writeInt(u64, member_value[8..16], pending_costs.get(intent.key).?.retained, .little);
             try appendOwnedBytes(self.alloc, &write_vals, member_value);
             try writes.append(self.alloc, .{ .key = member_key, .value = member_value });
             const intent_key = try self.makeIntentKey(txn_id, intent.key);
@@ -1152,9 +1266,11 @@ pub const TxnManager = struct {
         try writes.append(self.alloc, .{ .key = &record_key, .value = record_value });
 
         const intent_keys_key = makeSidecarKey(intent_admission_prefix, txn_id);
-        const intent_keys_value = try self.alloc.alloc(u8, 16);
+        const intent_keys_value = try self.alloc.alloc(u8, 32);
         std.mem.writeInt(u64, intent_keys_value[0..8], admission.count, .little);
         std.mem.writeInt(u64, intent_keys_value[8..16], admission.bytes, .little);
+        std.mem.writeInt(u64, intent_keys_value[16..24], admission.retained_bytes, .little);
+        std.mem.writeInt(u64, intent_keys_value[24..32], admission.retained_keys, .little);
         try appendOwnedBytes(self.alloc, &write_vals, intent_keys_value);
         try writes.append(self.alloc, .{ .key = &intent_keys_key, .value = intent_keys_value });
         if (extra_batch.schema_binding != null)
@@ -1461,11 +1577,17 @@ pub const TxnManager = struct {
             try self.loadIntentEntries(self.alloc, txn_id, scan_prefix);
         defer if (extra_batch.captured_intents == null) backend_scan.freeResults(self.alloc, intent_entries);
 
+        const read_prefix = makeSidecarKey(read_members_prefix, txn_id);
+        const read_admission = try self.loadReadAdmission(txn_id);
+        const read_entries: []backend_scan.OwnedKVPair = if (read_admission.count != 0) try self.scanPrefix(self.alloc, &read_prefix) else &.{};
+        defer backend_scan.freeResults(self.alloc, read_entries);
+        if (read_entries.len != read_admission.count) return error.InvalidTxnRecord;
+
         // A resolve retry after the terminal record and all intents are already
         // durable must not apply the caller's derived batch again. In
         // particular, doing so could overwrite a newer user write with the
         // transaction's old value.
-        if (was_terminal and intent_entries.len == 0) {
+        if (was_terminal and intent_entries.len == 0 and read_entries.len == 0) {
             record.intents_resolved = true;
             record.intents_resolved_known = true;
             const marker_value = try self.encodeRecord(record);
@@ -1514,6 +1636,27 @@ pub const TxnManager = struct {
             owned_apply_keys.deinit(self.alloc);
         }
 
+        var read_count_value: [8]u8 = undefined;
+        if (read_entries.len != 0) {
+            const remaining = std.math.sub(u64, try self.readGuardCount(), read_entries.len) catch return error.InvalidTxnRecord;
+            for (read_entries) |entry| {
+                if (!validReadMember(entry.value)) return error.InvalidTxnRecord;
+                const user_key = entry.key[read_prefix.len..];
+                const guard_key = try makeReadGuardKey(self.alloc, user_key, txn_id);
+                try appendOwnedBytes(self.alloc, &owned_apply_keys, guard_key);
+                try deletes.append(self.alloc, guard_key);
+                try deletes.append(self.alloc, entry.key);
+            }
+            if (remaining == 0) {
+                try deletes.append(self.alloc, read_guard_count_key);
+            } else {
+                std.mem.writeInt(u64, &read_count_value, remaining, .little);
+                try writes.append(self.alloc, .{ .key = read_guard_count_key, .value = &read_count_value });
+            }
+        }
+        const read_admission_key = makeSidecarKey(read_admission_prefix, txn_id);
+        try deletes.append(self.alloc, &read_admission_key);
+
         // Always delete the intent keys
         for (intent_entries) |entry| {
             try deletes.append(self.alloc, entry.key);
@@ -1540,6 +1683,15 @@ pub const TxnManager = struct {
 
                 const intent = try IntentValue.decode(entry.value);
                 if (intent.prepared_row != null) return error.PreparedIntentRequiresMaterialization;
+                // Integrity participants store private physical records, not
+                // primary JSON rows. Recovery without a DB materialization
+                // hook must preserve exactly the same physical namespace.
+                if (isRawMetadataIntentKey(user_key)) {
+                    if (intent.value) |value| {
+                        try writes.append(self.alloc, .{ .key = user_key, .value = value });
+                    } else try deletes.append(self.alloc, user_key);
+                    continue;
+                }
                 if (intent.value == null) {
                     // Delete — also remove the timestamp entry
                     const store_key = try internal_keys.documentKeyAlloc(self.alloc, user_key);
@@ -1680,6 +1832,7 @@ pub const TxnManager = struct {
     pub fn hasIntents(self: *TxnManager, txn_id: TxnId) !bool {
         const record = try self.loadTransactionRecord(txn_id);
         if (record.intents_resolved_known and record.intents_resolved) return false;
+        if ((try self.loadReadAdmission(txn_id)).count != 0) return true;
         if (try self.loadIntentAdmission(self.alloc, txn_id)) |admission| return admission.count != 0;
         var intent_prefix_buf: [intents_prefix.len + 17]u8 = undefined;
         @memcpy(intent_prefix_buf[0..intents_prefix.len], intents_prefix);
@@ -1849,6 +2002,8 @@ pub const TxnManager = struct {
         // than opening an intent cursor for every retained terminal record.
         if (try readHasPrefix(&read, intents_prefix) or
             try readHasPrefix(&read, intent_locks_prefix) or
+            try readHasPrefix(&read, read_guards_prefix) or
+            try readHasPrefix(&read, read_members_prefix) or
             try readHasPrefix(&read, ha_batch_outbox_prefix) or
             try readHasPrefix(&read, ha_replay_outbox_prefix))
         {
@@ -1971,7 +2126,7 @@ pub const TxnManager = struct {
 
         var next = try self.alloc.alloc([]u8, resolved.len + 1);
         var initialized: usize = 0;
-        errdefer {
+        defer {
             for (next[0..initialized]) |entry| self.alloc.free(entry);
             self.alloc.free(next);
         }
@@ -1981,7 +2136,6 @@ pub const TxnManager = struct {
         }
         next[resolved.len] = try self.alloc.dupe(u8, participant);
         initialized += 1;
-        defer freeParticipantList(self.alloc, next);
         const key = makeSidecarKey(resolved_participants_prefix, txn_id);
         const encoded = try encodeParticipantList(self.alloc, next);
         defer self.alloc.free(encoded);
@@ -2151,7 +2305,8 @@ pub const TxnManager = struct {
                 const stale_manifest_key = makeSidecarKey(intent_keys_prefix, txn_id);
                 const stale_lease_key = makeSidecarKey(schema_leases_prefix, txn_id);
                 const stale_admission_key = makeSidecarKey(intent_admission_prefix, txn_id);
-                try self.applyBatch(&.{.{ .key = &upgraded_key, .value = upgraded_value }}, &.{ &stale_manifest_key, &stale_lease_key, &stale_admission_key }, null);
+                const admission = try self.loadIntentAdmission(self.alloc, txn_id);
+                try self.applyBatchWithReservation(&.{.{ .key = &upgraded_key, .value = upgraded_value }}, &.{ &stale_manifest_key, &stale_lease_key, &stale_admission_key }, null, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 });
             }
 
             const unresolved = try self.getUnresolvedParticipants(self.alloc, txn_id);
@@ -2193,13 +2348,62 @@ pub const TxnManager = struct {
         predicates: []const VersionPredicate,
         exclude_txn: ?TxnId,
     ) !void {
+        var relational_primary: ?bool = null;
         for (predicates) |pred| {
-            const current_ts = try self.readTimestamp(pred.key);
-            if (pred.expected_version == 0) {
-                if (current_ts != null) return TxnError.VersionConflict;
-            } else {
-                const ts = current_ts orelse return TxnError.VersionConflict;
-                if (ts != pred.expected_version) return TxnError.VersionConflict;
+            switch (pred.comparison) {
+                .document_version => {
+                    const current_ts = try self.readTimestamp(pred.key);
+                    if (pred.expected_version == 0) {
+                        if (current_ts != null) return TxnError.VersionConflict;
+                    } else {
+                        const ts = current_ts orelse return TxnError.VersionConflict;
+                        if (ts != pred.expected_version) return TxnError.VersionConflict;
+                    }
+                    if (pred.expected_content_digest) |expected| {
+                        if (pred.expected_version == 0) return error.InvalidArgument;
+                        if (relational_primary == null) {
+                            const table_catalog = @import("db/table_catalog.zig");
+                            const catalog_bytes = self.getAlloc(self.alloc, table_catalog.key) catch |err| switch (err) {
+                                error.NotFound => null,
+                                else => return err,
+                            };
+                            defer if (catalog_bytes) |bytes| self.alloc.free(bytes);
+                            if (catalog_bytes) |bytes| {
+                                const catalog = try table_catalog.Catalog.decode(bytes);
+                                relational_primary = catalog.mode_initialized and catalog.storage_mode == .relational;
+                            } else {
+                                // Legacy document stores predate the fixed catalog.
+                                const schema = try @import("schema.zig").loadSchema(self.store, self.alloc);
+                                defer if (schema) |value| @import("schema.zig").freeSchema(self.alloc, value);
+                                relational_primary = schema != null and schema.?.storage_mode == .relational;
+                            }
+                        }
+                        const primary_key = if (relational_primary.?)
+                            try internal_keys.relationalRowKeyAlloc(self.alloc, pred.key)
+                        else
+                            try internal_keys.documentKeyAlloc(self.alloc, pred.key);
+                        defer self.alloc.free(primary_key);
+                        const current = self.getAlloc(self.alloc, primary_key) catch |err| switch (err) {
+                            error.NotFound => return TxnError.VersionConflict,
+                            else => return err,
+                        };
+                        defer self.alloc.free(current);
+                        var digest: [32]u8 = undefined;
+                        std.crypto.hash.sha2.Sha256.hash(current, &digest, .{});
+                        if (!std.mem.eql(u8, &digest, &expected)) return TxnError.VersionConflict;
+                    }
+                },
+                .exact_value => {
+                    if (!isRawMetadataIntentKey(pred.key)) return error.InvalidArgument;
+                    const current = self.getAlloc(self.alloc, pred.key) catch |err| switch (err) {
+                        error.NotFound => null,
+                        else => return err,
+                    };
+                    defer if (current) |bytes| self.alloc.free(bytes);
+                    if (pred.expected_value) |expected| {
+                        if (!std.mem.eql(u8, current orelse return TxnError.VersionConflict, expected)) return TxnError.VersionConflict;
+                    } else if (current != null) return TxnError.VersionConflict;
+                },
             }
 
             if (try self.hasPendingIntentForKey(pred.key, exclude_txn)) {
@@ -2218,6 +2422,13 @@ pub const TxnManager = struct {
                 return TxnError.IntentConflict;
             }
         }
+        if (try self.readGuardCount() != 0) {
+            var scan = try self.store.beginCurrentScan();
+            defer scan.abort();
+            var cursor = try scan.openCursor();
+            defer cursor.close();
+            for (intents) |intent| try self.checkReadGuardCursor(&cursor, intent.key, exclude_txn);
+        }
     }
 
     /// Check if any other pending transaction has an intent on this key.
@@ -2235,7 +2446,7 @@ pub const TxnManager = struct {
     }
 
     pub fn checkOrdinaryWriteConflict(self: *TxnManager, key: []const u8) !void {
-        if (try self.hasPendingIntentForKey(key, null)) return TxnError.IntentConflict;
+        try self.checkIntentConflicts(&.{.{ .key = key, .value = null }}, null);
     }
 
     /// Check a complete ordinary write batch with one sorted point probe.
@@ -2269,14 +2480,139 @@ pub const TxnManager = struct {
         defer self.alloc.free(owners);
         @memset(owners, null);
 
-        var probe = try self.store.beginProbe();
-        defer probe.abort();
-        try probe.getManySorted(key_refs, owners);
-        for (owners) |maybe_owner| {
-            const owner = maybe_owner orelse continue;
-            if (owner.len != @sizeOf(TxnId)) return TxnError.InvalidTxnRecord;
-            return TxnError.IntentConflict;
+        const have_readers = blk: {
+            var probe = try self.store.beginProbe();
+            defer probe.abort();
+            try probe.getManySorted(key_refs, owners);
+            for (owners) |maybe_owner| {
+                const owner = maybe_owner orelse continue;
+                if (owner.len != @sizeOf(TxnId)) return TxnError.InvalidTxnRecord;
+                return TxnError.IntentConflict;
+            }
+            const raw = probe.get(read_guard_count_key) catch |err| switch (err) {
+                error.NotFound => break :blk false,
+                else => return err,
+            };
+            if (raw.len != 8 or std.mem.readInt(u64, raw[0..8], .little) == 0) return error.InvalidTxnRecord;
+            break :blk true;
+        };
+        if (have_readers) {
+            var scan = try self.store.beginCurrentScan();
+            defer scan.abort();
+            var cursor = try scan.openCursor();
+            defer cursor.close();
+            for (user_keys) |key| try self.checkReadGuardCursor(&cursor, key, null);
         }
+    }
+
+    fn readGuardCount(self: *TxnManager) !u64 {
+        const raw = self.getAlloc(self.alloc, read_guard_count_key) catch |err| switch (err) {
+            error.NotFound => return 0,
+            else => return err,
+        };
+        defer self.alloc.free(raw);
+        if (raw.len != 8) return error.InvalidTxnRecord;
+        const count = std.mem.readInt(u64, raw[0..8], .little);
+        if (count == 0) return error.InvalidTxnRecord;
+        return count;
+    }
+
+    fn loadReadAdmission(self: *TxnManager, txn_id: TxnId) !IntentAdmission {
+        const key = makeSidecarKey(read_admission_prefix, txn_id);
+        const raw = self.getAlloc(self.alloc, &key) catch |err| switch (err) {
+            error.NotFound => return .{},
+            else => return err,
+        };
+        defer self.alloc.free(raw);
+        if (raw.len != 16) return error.InvalidTxnRecord;
+        const result = IntentAdmission{ .count = std.mem.readInt(u64, raw[0..8], .little), .bytes = std.mem.readInt(u64, raw[8..16], .little) };
+        if (result.count == 0 or result.count > max_read_guards_per_transaction or result.bytes < result.count * 4096) return error.InvalidTxnRecord;
+        return result;
+    }
+
+    fn makeReadGuardKey(alloc: Allocator, user_key: []const u8, txn_id: ?TxnId) ![]u8 {
+        const length = std.math.cast(u32, user_key.len) orelse return error.TransactionTooLarge;
+        const prefix_length = read_guards_prefix.len + 4 + user_key.len;
+        const key = try alloc.alloc(u8, prefix_length + @as(usize, if (txn_id != null) 16 else 0));
+        @memcpy(key[0..read_guards_prefix.len], read_guards_prefix);
+        std.mem.writeInt(u32, key[read_guards_prefix.len..][0..4], length, .big);
+        @memcpy(key[read_guards_prefix.len + 4 ..][0..user_key.len], user_key);
+        if (txn_id) |id| @memcpy(key[prefix_length..], &id);
+        return key;
+    }
+
+    /// At most two entries: our own shared guard and the first other reader.
+    /// Exact length framing prevents a guard for "a" locking "a\x00" or "ab".
+    fn checkReadGuardCursor(self: *TxnManager, cursor: anytype, key: []const u8, exclude_txn: ?TxnId) !void {
+        const prefix = try makeReadGuardKey(self.alloc, key, null);
+        defer self.alloc.free(prefix);
+        var entry = try cursor.seekAtOrAfter(prefix);
+        while (entry) |item| : (entry = try cursor.next()) {
+            if (!std.mem.startsWith(u8, item.key, prefix)) break;
+            if (item.key.len != prefix.len + 16 or item.value.len != 0) return error.InvalidTxnRecord;
+            if (exclude_txn) |id| if (std.mem.eql(u8, item.key[prefix.len..], &id)) continue;
+            return error.IntentConflict;
+        }
+    }
+
+    const ReadAdmissionChange = struct { previous: IntentAdmission, next: IntentAdmission };
+
+    fn stageReadGuards(
+        self: *TxnManager,
+        txn_id: TxnId,
+        predicates: []const VersionPredicate,
+        write_set: *const std.StringHashMapUnmanaged(usize),
+        owned_keys: *std.ArrayListUnmanaged([]u8),
+        owned_values: *std.ArrayListUnmanaged([]u8),
+        writes: *std.ArrayListUnmanaged(docstore.KVPair),
+    ) !ReadAdmissionChange {
+        if (predicates.len > max_read_guards_per_transaction) return error.TransactionTooLarge;
+        const previous = try self.loadReadAdmission(txn_id);
+        var next = previous;
+        var seen = std.StringHashMapUnmanaged(void).empty;
+        defer seen.deinit(self.alloc);
+        const member_prefix = makeSidecarKey(read_members_prefix, txn_id);
+        for (predicates) |predicate| {
+            if (write_set.contains(predicate.key) or (try seen.getOrPut(self.alloc, predicate.key)).found_existing) continue;
+            const member = try std.mem.concat(self.alloc, u8, &.{ &member_prefix, predicate.key });
+            try appendOwnedBytes(self.alloc, owned_keys, member);
+            const old = self.getAlloc(self.alloc, member) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            defer if (old) |bytes| self.alloc.free(bytes);
+            var identity_buf: [33]u8 = undefined;
+            const identity = readPredicateIdentity(predicate, &identity_buf);
+            if (old) |bytes| {
+                if (!validReadMember(bytes)) return error.InvalidTxnRecord;
+                if (!std.mem.eql(u8, bytes, identity)) return error.VersionConflict;
+                continue;
+            }
+            next.count = std.math.add(u64, next.count, 1) catch return error.TransactionTooLarge;
+            if (next.count > max_read_guards_per_transaction) return error.TransactionTooLarge;
+            next.bytes = std.math.add(u64, next.bytes, try intentAdmissionBytes(.{ .key = predicate.key, .value = null })) catch return error.TransactionTooLarge;
+            const version = try self.alloc.dupe(u8, identity);
+            try appendOwnedBytes(self.alloc, owned_values, version);
+            try writes.append(self.alloc, .{ .key = member, .value = version });
+            const guard = try makeReadGuardKey(self.alloc, predicate.key, txn_id);
+            try appendOwnedBytes(self.alloc, owned_keys, guard);
+            try writes.append(self.alloc, .{ .key = guard, .value = "" });
+        }
+        if (next.count != previous.count) {
+            const admission_key = try self.alloc.dupe(u8, &makeSidecarKey(read_admission_prefix, txn_id));
+            try appendOwnedBytes(self.alloc, owned_keys, admission_key);
+            const admission_value = try self.alloc.alloc(u8, 16);
+            try appendOwnedBytes(self.alloc, owned_values, admission_value);
+            std.mem.writeInt(u64, admission_value[0..8], next.count, .little);
+            std.mem.writeInt(u64, admission_value[8..16], next.bytes, .little);
+            try writes.append(self.alloc, .{ .key = admission_key, .value = admission_value });
+            const count = std.math.add(u64, try self.readGuardCount(), next.count - previous.count) catch return error.TransactionTooLarge;
+            const count_value = try self.alloc.alloc(u8, 8);
+            try appendOwnedBytes(self.alloc, owned_values, count_value);
+            std.mem.writeInt(u64, count_value[0..8], count, .little);
+            try writes.append(self.alloc, .{ .key = read_guard_count_key, .value = count_value });
+        }
+        return .{ .previous = previous, .next = next };
     }
 
     /// Build an intent key: intents_prefix + txn_id + ':' + user_key
@@ -2423,8 +2759,8 @@ pub const TxnManager = struct {
             else => return err,
         };
         defer alloc.free(raw);
-        if (raw.len != 16) return error.InvalidTxnRecord;
-        return .{ .count = std.mem.readInt(u64, raw[0..8], .little), .bytes = std.mem.readInt(u64, raw[8..16], .little) };
+        if (raw.len != 16 and raw.len != 32) return error.InvalidTxnRecord;
+        return .{ .count = std.mem.readInt(u64, raw[0..8], .little), .bytes = std.mem.readInt(u64, raw[8..16], .little), .retained_bytes = if (raw.len == 32) std.mem.readInt(u64, raw[16..24], .little) else 0, .retained_keys = if (raw.len == 32) std.mem.readInt(u64, raw[24..32], .little) else 0, .retention_tracked = raw.len == 32 };
     }
 
     fn makeIntentMemberKey(alloc: Allocator, txn_id: TxnId, key: []const u8) ![]u8 {
@@ -2629,6 +2965,21 @@ pub const TxnManager = struct {
         return self.applyBatchWithCompletion(writes, deletes, replay, null);
     }
 
+    const ReservationChange = struct { previous: u64, next: u64 };
+
+    fn applyBatchWithReservation(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend, reservation: ?ReservationChange) !void {
+        var batch = try self.store.beginBatch();
+        errdefer batch.abort();
+        if (reservation) |change| try retained_effects.replaceReservation(&batch, change.previous, change.next);
+        for (deletes) |key| batch.delete(key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+        for (writes) |kv| try batch.put(kv.key, kv.value);
+        if (replay) |entry| try batch.setReplayOpaque(entry.sequence, entry.payload);
+        try batch.commit();
+    }
+
     fn applyBatchWithCompletion(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend, completion: ?CompletionChange) !void {
         return self.emitOrApplyCompletionBatch(writes, deletes, replay, completion, null);
     }
@@ -2701,13 +3052,14 @@ pub const TxnManager = struct {
         // allocate columnar dirty/manifest or external payload ownership rows.
         if (internal_keys.isPrimaryDocumentKey(key) or internal_keys.isTtlKey(key) or
             std.mem.eql(u8, key, completion_summary_key)) return;
-        inline for (.{ records_prefix, schema_leases_prefix, participants_prefix, resolved_participants_prefix, intent_keys_prefix, intent_admission_prefix, completion_prefix }) |prefix| {
+        inline for (.{ records_prefix, schema_leases_prefix, participants_prefix, resolved_participants_prefix, intent_keys_prefix, intent_admission_prefix, read_admission_prefix, completion_prefix }) |prefix| {
             if (key.len == prefix.len + 16 and std.mem.startsWith(u8, key, prefix)) return;
         }
-        inline for (.{ intents_prefix, intent_members_prefix }) |prefix| {
+        inline for (.{ intents_prefix, intent_members_prefix, read_members_prefix }) |prefix| {
             if (key.len > prefix.len + 17 and std.mem.startsWith(u8, key, prefix) and key[prefix.len + 16] == ':') return;
         }
         if (key.len > intent_locks_prefix.len and std.mem.startsWith(u8, key, intent_locks_prefix)) return;
+        if (std.mem.eql(u8, key, read_guard_count_key)) return;
         return error.UnsupportedCompletionMutation;
     }
 
@@ -3251,6 +3603,7 @@ test "workload admission completion compiler derives native control ownership fr
             .txn_id = id,
             .timestamp = 100,
             .created_at = 90,
+            .topology_epoch = 0,
             .participants = participants,
             .coordinator = coordinator,
             .retain_terminal = retain_terminal,
@@ -4148,7 +4501,7 @@ test "transaction cumulative admission is atomic and membership metadata is incr
     const header_key = makeSidecarKey(intent_admission_prefix, txn);
     const header = try mgr.getAlloc(alloc, &header_key);
     defer alloc.free(header);
-    try std.testing.expectEqual(@as(usize, 16), header.len);
+    try std.testing.expectEqual(@as(usize, 32), header.len);
     try mgr.resolveIntents(txn, .aborted, 200);
     try std.testing.expectEqual(@as(?IntentAdmission, null), try mgr.loadIntentAdmission(alloc, txn));
     const member_key = try TxnManager.makeIntentMemberKey(alloc, txn, "a");
@@ -4665,6 +5018,129 @@ test "version predicate conflict" {
     });
 }
 
+test "transaction shared read guards fence writes and survive restart until resolution" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const first: TxnId = .{71} ** 16;
+    const second: TxnId = .{72} ** 16;
+    const writer: TxnId = .{73} ** 16;
+    {
+        var backend = try lsm_backend.Backend.open(alloc, path, .{ .flush_threshold = 2 });
+        defer backend.close();
+        const runtime_store = try backend.runtimeStore(alloc, .{});
+        var store = try DocStore.openRuntime(alloc, runtime_store);
+        defer store.close();
+        var manager = try TxnManager.init(alloc, &store);
+        defer manager.deinit();
+        try putVisibleDoc(&store, alloc, "parent", "parent row");
+        try ttl.writeTimestamp(&store, "parent", 500);
+        try manager.initTransaction(first, 600);
+        try manager.initTransaction(second, 601);
+        try manager.initTransaction(writer, 602);
+        const parent = [_]VersionPredicate{.{ .key = "parent", .expected_version = 500 }};
+        try manager.writeIntents(first, &.{}, &parent);
+        // Shared readers do not serialize all inserts into the same parent.
+        try manager.writeIntents(second, &.{}, &parent);
+        try std.testing.expect(try manager.hasIntents(first));
+        try std.testing.expect(try manager.hasTopologySensitiveTransactions());
+        try std.testing.expectEqual(@as(u64, 2), try manager.readGuardCount());
+        const before = backend.snapshotMaintenanceStats();
+        try std.testing.expectError(error.IntentConflict, manager.checkOrdinaryWriteConflict("parent"));
+        try std.testing.expectError(error.IntentConflict, manager.checkOrdinaryWriteConflicts(&.{ "free", "parent" }));
+        try std.testing.expectError(error.IntentConflict, manager.writeIntents(writer, &.{.{ .key = "parent", .value = null }}, &.{}));
+        try std.testing.expectError(error.IntentConflict, manager.writeIntents(first, &.{.{ .key = "parent", .value = "new" }}, &.{}));
+        try manager.checkOrdinaryWriteConflicts(&.{ "parent\x00", "parents", "paren" });
+        // This cold-key shared-lock probe must not clone the LSM memtable.
+        const after = backend.snapshotMaintenanceStats();
+        try std.testing.expectEqual(
+            before.mutable_snapshot_clone_by_reason[@intFromEnum(lsm_backend.MutableSnapshotReason.bound_read_txn)].calls,
+            after.mutable_snapshot_clone_by_reason[@intFromEnum(lsm_backend.MutableSnapshotReason.bound_read_txn)].calls,
+        );
+        try manager.writeIntents(first, &.{}, &parent);
+        try std.testing.expectEqual(@as(u64, 2), try manager.readGuardCount());
+    }
+    {
+        var backend = try lsm_backend.Backend.open(alloc, path, .{});
+        defer backend.close();
+        const runtime_store = try backend.runtimeStore(alloc, .{});
+        var store = try DocStore.openRuntime(alloc, runtime_store);
+        defer store.close();
+        var manager = try TxnManager.init(alloc, &store);
+        defer manager.deinit();
+        try std.testing.expectError(error.IntentConflict, manager.checkOrdinaryWriteConflict("parent"));
+        try manager.resolveIntents(second, .aborted, 700);
+        try std.testing.expectEqual(@as(u64, 1), try manager.readGuardCount());
+        // Sole reader can upgrade without releasing its dependency first.
+        try manager.writeIntents(first, &.{.{ .key = "parent", .value = "updated" }}, &.{});
+        try manager.resolveIntents(first, .committed, 701);
+        try std.testing.expectEqual(@as(u64, 0), try manager.readGuardCount());
+        try manager.checkOrdinaryWriteConflict("parent");
+        try std.testing.expect(!try manager.hasIntents(first));
+        const value = try getVisibleDocRuntime(&manager.store, alloc, "parent");
+        defer alloc.free(value);
+        try std.testing.expectEqualStrings("updated", value);
+        try manager.resolveIntents(first, .committed, 701);
+        try std.testing.expectEqual(@as(u64, 0), try manager.readGuardCount());
+    }
+}
+
+test "transaction read guards protect absence and reject write skew" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(alloc, .{});
+    defer runtime.deinit();
+    var manager = try TxnManager.init(alloc, &runtime);
+    defer manager.deinit();
+    const a: TxnId = .{81} ** 16;
+    const b: TxnId = .{82} ** 16;
+    try manager.initTransaction(a, 100);
+    try manager.initTransaction(b, 100);
+    try manager.writeIntents(a, &.{.{ .key = "a", .value = "a" }}, &.{.{ .key = "b", .expected_version = 0 }});
+    try std.testing.expectError(error.IntentConflict, manager.writeIntents(b, &.{.{ .key = "b", .value = "b" }}, &.{}));
+    try manager.resolveIntents(a, .committed, 200);
+    try manager.writeIntents(b, &.{.{ .key = "b", .value = "b" }}, &.{});
+    try manager.resolveIntents(b, .aborted, 201);
+    try std.testing.expectEqual(@as(u64, 0), try manager.readGuardCount());
+}
+
+test "transaction read guard admission is cumulative retry safe and atomic on allocation failure" {
+    const Check = struct {
+        fn run(failing: Allocator) !void {
+            const alloc = std.testing.allocator;
+            var backend = mem_backend.Backend.init(alloc, .{});
+            defer backend.close();
+            var runtime = try backend.runtimeStore(alloc, .{});
+            defer runtime.deinit();
+            var manager = try TxnManager.init(alloc, &runtime);
+            defer manager.deinit();
+            const id: TxnId = .{83} ** 16;
+            try manager.initTransaction(id, 100);
+            manager.alloc = failing;
+            defer manager.alloc = alloc;
+            manager.writeIntentsExtraBatch(id, &.{}, &.{ .{ .key = "a", .expected_version = 0 }, .{ .key = "a", .expected_version = 0 } }, .{ .max_intent_admission_bytes = 8192 }) catch |err| {
+                manager.alloc = alloc;
+                try std.testing.expectEqual(@as(u64, 0), try manager.readGuardCount());
+                try std.testing.expect(!(try manager.loadTransactionRecord(id)).prepared);
+                try manager.checkOrdinaryWriteConflict("a");
+                return err;
+            };
+            manager.alloc = alloc;
+            try std.testing.expectEqual(@as(u64, 1), try manager.readGuardCount());
+            try manager.writeIntentsExtraBatch(id, &.{}, &.{.{ .key = "a", .expected_version = 0 }}, .{ .max_intent_admission_bytes = 1 });
+            try std.testing.expectError(error.TransactionTooLarge, manager.writeIntentsExtraBatch(id, &.{}, &.{.{ .key = "b", .expected_version = 0 }}, .{ .max_intent_admission_bytes = 8192 }));
+            try std.testing.expectEqual(@as(u64, 1), try manager.readGuardCount());
+            try manager.checkOrdinaryWriteConflict("b");
+            try manager.resolveIntents(id, .aborted, 200);
+            try std.testing.expectEqual(@as(u64, 0), try manager.readGuardCount());
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
 test "concurrent intent conflict" {
     const alloc = std.testing.allocator;
     const path = try tempTestPath(alloc, "txn-conflict");
@@ -5131,6 +5607,27 @@ test "recoverTransactions cleans aborted orphaned intents and old record" {
         try std.testing.expect(err == error.NotFound);
     };
     try std.testing.expectError(TxnError.TxnNotFound, mgr.getTransactionStatus(txn_id));
+}
+
+test "transaction participant resolution releases allocations once on every failure" {
+    const Check = struct {
+        fn run(failing: Allocator) !void {
+            const alloc = std.testing.allocator;
+            var backend = mem_backend.Backend.init(alloc, .{});
+            defer backend.close();
+            var runtime = try backend.runtimeStore(alloc, .{});
+            defer runtime.deinit();
+            var mgr = try TxnManager.init(alloc, &runtime);
+            defer mgr.deinit();
+            const txn: TxnId = @splat(38);
+            try mgr.initTransactionWithParticipants(txn, 100, &.{ "first", "second" });
+            try mgr.markParticipantResolved(txn, "first");
+            mgr.alloc = failing;
+            defer mgr.alloc = alloc;
+            try mgr.markParticipantResolved(txn, "second");
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }
 
 test "transaction participants track unresolved members" {

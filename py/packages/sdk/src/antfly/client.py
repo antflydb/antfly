@@ -26,9 +26,11 @@ from antfly.client_generated.models import (
     CreatedEmbeddingsIndex,
     CreatedFullTextIndex,
     CreatedGraphIndex,
+    CreatedRelationalIndex,
     CreateEmbeddingsIndexRequest,
     CreateFullTextIndexRequest,
     CreateGraphIndexRequest,
+    CreateRelationalIndexRequest,
     Error,
     ExtractionRequest,
     ExtractionResponse,
@@ -37,6 +39,8 @@ from antfly.client_generated.models import (
     GraphQueries,
     GraphShortestPathQuery,
     GraphTraverseQuery,
+    IndexMaintenanceRequest,
+    IndexMaintenanceResponse,
     InferenceGenerateChunk,
     InferenceGenerateRequest,
     InferenceGenerateResponse,
@@ -81,21 +85,29 @@ MAX_GRAPH_EDGE_TYPE_UTF8_BYTES = 64 << 10
 MAX_GRAPH_MATCH_QUERIES = 8
 
 CreateIndexRequest: TypeAlias = (
-    CreateFullTextIndexRequest | CreateEmbeddingsIndexRequest | CreateGraphIndexRequest | CreateAlgebraicIndexRequest
+    CreateFullTextIndexRequest
+    | CreateEmbeddingsIndexRequest
+    | CreateGraphIndexRequest
+    | CreateAlgebraicIndexRequest
+    | CreateRelationalIndexRequest
 )
 IndexEmbedderConfig: TypeAlias = (
     AntflyEmbedderConfig | BedrockEmbedderConfig | OllamaEmbedderConfig | OpenAIEmbedderConfig
 )
-CreatedIndex: TypeAlias = CreatedFullTextIndex | CreatedEmbeddingsIndex | CreatedGraphIndex | CreatedAlgebraicIndex
+CreatedIndex: TypeAlias = (
+    CreatedFullTextIndex | CreatedEmbeddingsIndex | CreatedGraphIndex | CreatedAlgebraicIndex | CreatedRelationalIndex
+)
 GraphQueryInput: TypeAlias = GraphMatchQuery | GraphTraverseQuery | GraphShortestPathQuery | GraphKShortestPathsQuery
 GraphQueriesInput: TypeAlias = GraphQueries | Mapping[str, GraphQueryInput | Mapping[str, Any]]
 _CREATE_INDEX_REQUEST_TYPES = (
+    CreateRelationalIndexRequest,
     CreateFullTextIndexRequest,
     CreateEmbeddingsIndexRequest,
     CreateGraphIndexRequest,
     CreateAlgebraicIndexRequest,
 )
 _CREATED_INDEX_TYPES = {
+    "relational": CreatedRelationalIndex,
     "full_text": CreatedFullTextIndex,
     "embeddings": CreatedEmbeddingsIndex,
     "graph": CreatedGraphIndex,
@@ -532,6 +544,37 @@ class IndexOperations:
     def __init__(self, client: "AntflyClient") -> None:
         self._client = client
 
+    def retry(self, table: str, name: str, request: IndexMaintenanceRequest) -> IndexMaintenanceResponse:
+        """Resume failed maintenance using exact status proofs, without automatic retries.
+
+        Owner admissions are independently atomic. After a partial/lost
+        acknowledgement, resubmit the identical request; do not refresh proofs.
+        """
+        return self._maintain("retry", table, name, request)
+
+    def repair(self, table: str, name: str, request: IndexMaintenanceRequest) -> IndexMaintenanceResponse:
+        """Start primary-authoritative repair with exact status proofs.
+
+        Selected owners do not form one global transaction. After an ambiguous
+        acknowledgement, resubmit the identical request rather than new proofs.
+        """
+        return self._maintain("repair", table, name, request)
+
+    def _maintain(
+        self, action: str, table: str, name: str, request: IndexMaintenanceRequest
+    ) -> IndexMaintenanceResponse:
+        from .index_maintenance import validate_request, validate_response
+
+        groups = validate_request(request)
+        result = self._client._request(
+            "POST",
+            f"/db/v1/tables/{quote(table, safe='')}/indexes/{quote(name, safe='')}/{action}",
+            json=request.to_dict(),
+            _max_response_bytes=32 << 10,
+            _expected_status=200,
+        )
+        return validate_response(result, groups)
+
     def create(
         self,
         table: str,
@@ -676,7 +719,15 @@ class AntflyClient:
                 self._client.set_async_httpx_client(ReadRetryAsyncHTTPClient(read_retries, pool, **args))
         self.indexes = IndexOperations(self)
 
-    def _request(self, method: str, path: str, **kwargs: Any) -> Any:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        _max_response_bytes: int | None = None,
+        _expected_status: int | None = None,
+        **kwargs: Any,
+    ) -> Any:
         """Make an HTTP request using the underlying httpx client.
 
         Args:
@@ -691,7 +742,9 @@ class AntflyClient:
             AntflyException: If the request fails
         """
         with self._client.get_httpx_client().stream(method, path, **kwargs) as response:
-            if response.status_code >= 400:
+            if response.status_code >= 400 or (
+                _expected_status is not None and response.status_code != _expected_status
+            ):
                 body, truncated = _read_limited_response(response, self.max_error_response_bytes)
                 if truncated:
                     msg = (
@@ -763,9 +816,14 @@ class AntflyClient:
             if response.status_code == 204:
                 return None
 
-            body, truncated = _read_limited_response(response, self.max_json_response_bytes)
+            response_limit = (
+                min(self.max_json_response_bytes, _max_response_bytes)
+                if _max_response_bytes is not None
+                else self.max_json_response_bytes
+            )
+            body, truncated = _read_limited_response(response, response_limit)
             if truncated:
-                raise AntflyException(f"response exceeded {self.max_json_response_bytes} bytes")
+                raise AntflyException(f"response exceeded {response_limit} bytes")
             try:
                 return json.loads(body)
             except (TypeError, ValueError) as exc:

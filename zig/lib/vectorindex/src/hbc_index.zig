@@ -1897,6 +1897,11 @@ fn primeDeferredLeafNonQuantCacheWithAddedVectors(
 }
 
 pub fn computeNodeSplitRange(self: anytype, txn: anytype, node: *const types.Node, is_not_found: fn (anyerror) bool) !?types.NodeSplitRange {
+    const Index = switch (@typeInfo(@TypeOf(self))) {
+        .pointer => |pointer| pointer.child,
+        else => @TypeOf(self),
+    };
+    if (comptime @hasField(Index, "write_profile")) self.write_profile.range_nodes_examined += 1;
     if (node.is_leaf) {
         var min_key: ?[]u8 = null;
         errdefer if (min_key) |key| self.alloc.free(key);
@@ -8000,6 +8005,46 @@ pub fn insertWithMetadataTxnOptions(
     now_fn_u64: fn () u64,
     elapsed_fn_u64: fn (u64) u64,
 ) !void {
+    return insertWithMetadataTxnOptionsRouted(self, txn, vector_id, vector_data, pretransformed_vector, metadata_value, transformed_vector, options, now_fn_u64, elapsed_fn_u64, null);
+}
+
+// Valid only until the next mutation in this transaction. The batch fast path
+// already found both postings before deciding that this vector must relocate.
+// Reuse that routing decision rather than traversing the identical tree twice.
+const MutationRoute = struct {
+    existing_leaf: u64,
+    target_leaf: u64,
+    centroid_cache: ?*RelocationCentroidCache = null,
+};
+
+// A bounded, transaction-local authoritative sum. It is never reconstructed
+// from a normalized cosine centroid or retained across external revisions.
+// Any intervening mutation (including a destination append or merge) invalidates
+// the entry. Removals may interleave across sources when their versions match.
+const RelocationCentroidCache = struct {
+    leaf_id: u64 = 0,
+    version: u64 = 0,
+    count: usize = 0,
+    sum: []f64 = &.{},
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(self.sum);
+    }
+};
+
+fn insertWithMetadataTxnOptionsRouted(
+    self: anytype,
+    txn: anytype,
+    vector_id: u64,
+    vector_data: []const f32,
+    pretransformed_vector: ?[]const f32,
+    metadata_value: []const u8,
+    transformed_vector: []f32,
+    options: anytype,
+    now_fn_u64: fn () u64,
+    elapsed_fn_u64: fn (u64) u64,
+    route: ?MutationRoute,
+) !void {
     try self.bindTxnLike(txn);
     self.write_profile.insert_calls += 1;
     const Options = @TypeOf(options);
@@ -8046,7 +8091,7 @@ pub fn insertWithMetadataTxnOptions(
     var previous_transformed_storage: ?[]f32 = null;
     defer if (previous_transformed_storage) |buf| self.alloc.free(buf);
 
-    const existing_leaf_id = if (assume_absent_ids)
+    const existing_leaf_id = if (route) |resolved| resolved.existing_leaf else if (assume_absent_ids)
         0
     else
         self.getVecLeaf(txn, vector_id) catch |err| blk: {
@@ -8066,9 +8111,13 @@ pub fn insertWithMetadataTxnOptions(
 
     const target_leaf_id = blk_leaf: {
         if (existing_leaf_id != 0) {
-            const find_leaf_start = now_fn_u64();
-            const leaf_id = try posting.CentroidDirectory.findPosting(self, txn, self.metadata.root_node, effective_transformed, allow_quantized_routing);
-            self.write_profile.insert_find_leaf_ns += elapsed_fn_u64(find_leaf_start);
+            const leaf_id = if (route) |resolved| resolved.target_leaf else route_leaf: {
+                const find_leaf_start = now_fn_u64();
+                const found = try posting.CentroidDirectory.findPosting(self, txn, self.metadata.root_node, effective_transformed, allow_quantized_routing);
+                self.write_profile.insert_find_leaf_ns += elapsed_fn_u64(find_leaf_start);
+                self.write_profile.insert_find_leaf_calls += 1;
+                break :route_leaf found;
+            };
             if (existing_leaf_id == leaf_id) {
                 if (try tryUpdateExistingVectorInLeafTxnOptions(
                     self,
@@ -8086,7 +8135,7 @@ pub fn insertWithMetadataTxnOptions(
                     return;
                 }
             } else {
-                removeFromLeaf(self, txn, existing_leaf_id, vector_id) catch |err| switch (err) {
+                removeFromLeafWithCachedCentroid(self, txn, existing_leaf_id, vector_id, batch_insert_options, if (route) |r| r.centroid_cache else null) catch |err| switch (err) {
                     error.NotFound => {},
                     else => return err,
                 };
@@ -8097,6 +8146,7 @@ pub fn insertWithMetadataTxnOptions(
         const find_leaf_start = now_fn_u64();
         const leaf_id = try posting.CentroidDirectory.findPosting(self, txn, self.metadata.root_node, effective_transformed, allow_quantized_routing);
         self.write_profile.insert_find_leaf_ns += elapsed_fn_u64(find_leaf_start);
+        self.write_profile.insert_find_leaf_calls += 1;
         break :blk_leaf leaf_id;
     };
 
@@ -8160,7 +8210,7 @@ pub fn insertWithMetadataTxnOptions(
     const leaf_overflows = leaf.members.len > self.config.leaf_size;
     const defer_leaf_split = shouldDeferOversizedLeafSplit(self, &leaf, batch_insert_options);
     var save_options = batch_insert_options;
-    save_options.suppress_quantized_payload_persist = defer_leaf_split;
+    save_options.suppress_quantized_payload_persist = save_options.suppress_quantized_payload_persist or defer_leaf_split;
 
     if (metadata_value.len > 0) {
         var range_changed = false;
@@ -8353,17 +8403,94 @@ fn existingVectorMatchesNoOp(
 }
 
 pub fn removeFromLeaf(self: anytype, txn: anytype, leaf_id: u64, vector_id: u64) !void {
+    return removeFromLeafWithOptions(self, txn, leaf_id, vector_id, .{});
+}
+
+fn removeFromLeafWithOptions(self: anytype, txn: anytype, leaf_id: u64, vector_id: u64, options: hbc_runtime.BatchInsertOptions) !void {
+    return removeFromLeafWithCachedCentroid(self, txn, leaf_id, vector_id, options, null);
+}
+
+fn refreshRelocationCentroid(self: anytype, txn: anytype, leaf: *types.Node, removed: u64, previous_version: u64, previous_count: usize, options: hbc_runtime.BatchInsertOptions, cache: *RelocationCentroidCache) anyerror!void {
+    const dims = self.config.dims;
+    if (cache.leaf_id == leaf.id and cache.version == previous_version and
+        cache.count == previous_count and leaf.members.len + 1 == previous_count and
+        cache.sum.len == dims and leaf.centroid.len == dims)
+    {
+        const removed_vector = try self.alloc.alloc(f32, dims);
+        defer self.alloc.free(removed_vector);
+        try loadPostingVectorsTransformedWithOptions(self, txn, &.{removed}, removed_vector, options);
+        // Subtractive cancellation and non-finite source values must not turn
+        // a valid remaining mean into a poisoned incremental sum.
+        for (cache.sum, removed_vector) |sum, value| {
+            const remaining = sum - value;
+            const magnitude = @abs(sum) + @abs(@as(f64, value));
+            if (!std.math.isFinite(remaining) or (magnitude > 0 and
+                @abs(remaining) <= magnitude * std.math.floatEps(f64) * @as(f64, @floatFromInt(previous_count))))
+            {
+                cache.leaf_id = 0;
+                return refreshRelocationCentroid(self, txn, leaf, removed, previous_version, previous_count, options, cache);
+            }
+        }
+        const old_center = try self.alloc.dupe(f32, leaf.centroid);
+        defer self.alloc.free(old_center);
+        for (cache.sum, removed_vector, leaf.centroid) |*sum, value, *center| {
+            sum.* -= value;
+            center.* = @floatCast(sum.* / @as(f64, @floatFromInt(leaf.members.len)));
+        }
+        normalizeCentroidForMetric(self, leaf.centroid);
+        // Removing a point cannot enlarge the old ball. Moving its center may:
+        // expand by the metric center displacement, never tighten speculatively.
+        const shift = if (self.config.metric == .l2_squared) l2_shift: {
+            var squared: f64 = 0;
+            for (leaf.centroid, old_center) |next, old| {
+                const delta = @as(f64, next) - old;
+                squared += delta * delta;
+            }
+            break :l2_shift posting.conservativeCosineRadius(@floatCast(@sqrt(squared)));
+        } else posting.coveringRadiusForMatrix(self.config.metric, leaf.centroid, old_center, 1);
+        leaf.covering_radius = if (std.math.isFinite(shift) and std.math.isFinite(leaf.covering_radius))
+            posting.conservativeCosineRadius(leaf.covering_radius + shift)
+        else
+            std.math.nan(f32);
+        posting.PostingStore.noteCentroidRefreshed(leaf);
+        self.write_profile.centroid_delta_removals += 1;
+    } else {
+        cache.leaf_id = 0;
+        const vectors = try self.alloc.alloc(f32, try std.math.mul(usize, leaf.members.len, dims));
+        defer self.alloc.free(vectors);
+        try loadPostingVectorsTransformedWithOptions(self, txn, leaf.members, vectors, options);
+        try posting.PostingStore.recomputeCentroidFromTransformedVectors(self, leaf, vectors);
+        if (cache.sum.len != dims) {
+            const sum = try self.alloc.alloc(f64, dims);
+            self.alloc.free(cache.sum);
+            cache.sum = sum;
+        }
+        @memset(cache.sum, 0);
+        for (0..leaf.members.len) |row| {
+            for (cache.sum, vectors[row * dims ..][0..dims]) |*sum, value| sum.* += value;
+        }
+    }
+    cache.leaf_id = leaf.id;
+    cache.version = leaf.posting_state.mutation_version;
+    cache.count = leaf.members.len;
+}
+
+fn removeFromLeafWithCachedCentroid(self: anytype, txn: anytype, leaf_id: u64, vector_id: u64, options: hbc_runtime.BatchInsertOptions, cache: ?*RelocationCentroidCache) !void {
     try self.bindTxnLike(txn);
     var leaf = try loadNode(self, txn, leaf_id);
     defer leaf.deinit(self.alloc);
     try leaf.ensureUnbacked(self.alloc);
 
+    const previous_version = leaf.posting_state.mutation_version;
+    const previous_count = leaf.members.len;
     try posting.PostingStore.removeMember(self.alloc, &leaf, vector_id);
 
     if (leaf.members.len > 0 and shouldDeferPostingCentroidRefresh(self, &leaf)) {
         self.write_profile.posting_lazy_centroid_deferrals += 1;
     } else if (leaf.members.len > 0) {
-        try posting.PostingStore.recomputeCentroid(self, txn, &leaf);
+        if (cache) |entry| {
+            try refreshRelocationCentroid(self, txn, &leaf, vector_id, previous_version, previous_count, options, entry);
+        } else try posting.PostingStore.recomputeCentroid(self, txn, &leaf);
     } else {
         @memset(leaf.centroid, 0);
     }
@@ -8381,16 +8508,19 @@ pub fn removeFromLeaf(self: anytype, txn: anytype, leaf_id: u64, vector_id: u64)
         try parent.ensureUnbacked(self.alloc);
         if (try removeChildLink(self, &parent, leaf_id)) {
             try recomputeInternalCentroid(self, txn, &parent);
-            try self.saveNodeWithOptionsMode(txn, &parent, .{}, false);
+            try self.saveNodeWithOptionsMode(txn, &parent, options, false);
             try deleteNode(self, txn, leaf_id);
-            try collapseSingleChildParents(self, txn, leaf.parent);
+            try collapseSingleChildParentsOptions(self, txn, leaf.parent, options);
         } else {
             try deleteNode(self, txn, leaf_id);
         }
         return;
     }
 
-    try self.saveNodeWithOptionsMode(txn, &leaf, .{}, false);
+    // Relocation is part of the enclosing batch: source leaves must retain
+    // its deferred payload policy just like destination leaves do. Rebuild
+    // touched nodes once at finalization, not once for every moved vector.
+    try self.saveNodeWithOptionsMode(txn, &leaf, options, false);
 
     if (leaf.parent != 0 and leaf.members.len < minLeafOccupancy(self)) {
         var parent = loadNode(self, txn, leaf.parent) catch |err| {
@@ -8438,14 +8568,14 @@ pub fn removeFromLeaf(self: anytype, txn: anytype, leaf_id: u64, vector_id: u64)
             // transfer, including every subsequent error path.
             merged_owned = false;
             try posting.PostingStore.recomputeCentroid(self, txn, &sibling);
-            try self.saveNodeWithOptionsMode(txn, &sibling, .{}, false);
+            try self.saveNodeWithOptionsMode(txn, &sibling, options, false);
             for (leaf.members) |mid| try self.putVecLeaf(txn, mid, best_sibling_id);
 
             if (try removeChildLink(self, &parent, leaf_id)) {
                 try recomputeInternalCentroid(self, txn, &parent);
-                try self.saveNodeWithOptionsMode(txn, &parent, .{}, false);
+                try self.saveNodeWithOptionsMode(txn, &parent, options, false);
                 try deleteNode(self, txn, leaf_id);
-                try collapseSingleChildParents(self, txn, leaf.parent);
+                try collapseSingleChildParentsOptions(self, txn, leaf.parent, options);
             } else {
                 try deleteNode(self, txn, leaf_id);
             }
@@ -9891,7 +10021,7 @@ fn batchInsertAssumeAbsentGroupedTxnOptions(
         } else {
             const save_start = now_fn();
             var save_options = options;
-            save_options.suppress_quantized_payload_persist = defer_leaf_split;
+            save_options.suppress_quantized_payload_persist = save_options.suppress_quantized_payload_persist or defer_leaf_split;
             try saveExistingNodeBodyWithAddedVectorsOptions(self, txn, &leaf, added_vectors, group_len, save_options, now_fn_u64_adapter(now_fn), elapsed_fn_u64_adapter(elapsed_fn));
             self.write_profile.save_node_ns += elapsed_fn(save_start);
             self.write_profile.save_node_calls += 1;
@@ -11084,7 +11214,13 @@ pub fn batchInsertWithMetadataTxnOptions(
     var deferred_ancestor_centroid_refresh_ids = std.ArrayListUnmanaged(u64).empty;
     defer deferred_ancestor_centroid_refresh_ids.deinit(self.alloc);
     var membership_changed = options.recompute_coalesced_centroids;
+    // Bound temporary sums independently of batch size. A direct-mapped cache
+    // retains interleaved source leaves without weakening mutation-version
+    // checks; collisions simply rebuild. At 1536 dimensions this is 192 KiB.
+    var centroid_cache: [16]RelocationCentroidCache = @splat(.{});
+    defer for (&centroid_cache) |*entry| entry.deinit(self.alloc);
     for (items) |item| {
+        var route: ?MutationRoute = null;
         self.write_profile.insert_calls += 1;
         const effective_transformed = blk: {
             const transform_start = nowNsU64Fixed();
@@ -11115,6 +11251,8 @@ pub fn batchInsertWithMetadataTxnOptions(
                     !options.centroid_only_routing;
                 const leaf_id = try posting.CentroidDirectory.findPosting(self, txn, self.metadata.root_node, effective_transformed, allow_quantized_routing);
                 self.write_profile.insert_find_leaf_ns += elapsedSinceU64Fixed(find_leaf_start);
+                self.write_profile.insert_find_leaf_calls += 1;
+                route = .{ .existing_leaf = existing_leaf_id, .target_leaf = leaf_id, .centroid_cache = if (options.skip_vector_store and options.defer_quantized_rebuild) &centroid_cache[existing_leaf_id % centroid_cache.len] else null };
                 if (existing_leaf_id == leaf_id) {
                     if (try tryCoalesceExistingVectorInLeafTxnOptions(
                         self,
@@ -11153,7 +11291,7 @@ pub fn batchInsertWithMetadataTxnOptions(
         }
 
         membership_changed = true;
-        try self.insertWithMetadataTxnOptions(txn, item.vector_id, item.vector, item.transformed, item.metadata, transformed_vector, options);
+        try insertWithMetadataTxnOptionsRouted(self, txn, item.vector_id, item.vector, effective_transformed, item.metadata, transformed_vector, options, nowNsU64Fixed, elapsedSinceU64Fixed, route);
     }
 
     for (deferred_leaf_centroid_deltas.items) |entry| {

@@ -29,8 +29,16 @@ pub const ParseOptions = struct {
 };
 pub const LongDocument = struct {
     mode: enum { reject, window } = .reject,
-    window_words: usize = 4096,
-    overlap_words: usize = 128,
+    // 1024, not the encoder's declared 4096-word single-window capacity
+    // (config.max_len): attention cost is quadratic in window length, and a
+    // live Metal throughput sweep across real repository sections showed
+    // 1024-word windows completing several times faster overall than
+    // 4096-word windows, even accounting for the extra windows a long
+    // document then needs (see GLINER25.md's long-document throughput
+    // section). The qualified LengthContract's window_words bound stays wide
+    // (a client may still opt into up to 4096); only this default changed.
+    window_words: usize = 1024,
+    overlap_words: usize = 32,
     max_windows: usize = 128,
     record_identity: @import("../pipelines/gliner_boundary_long_document.zig").RecordIdentity = .occurrence,
 };
@@ -260,8 +268,8 @@ pub fn parseOptions(value: Value) !Options {
         const config = try asObject(raw);
         try keys(config, &.{ "mode", "window_words", "overlap_words", "max_windows", "record_identity" });
         options.long_document.mode = try enumeration(@FieldType(LongDocument, "mode"), config, "mode", .reject);
-        options.long_document.window_words = try unsigned(config, "window_words", 4096, 1, 4096);
-        options.long_document.overlap_words = try unsigned(config, "overlap_words", 128, 0, 4095);
+        options.long_document.window_words = try unsigned(config, "window_words", 1024, 1, 4096);
+        options.long_document.overlap_words = try unsigned(config, "overlap_words", 32, 0, 4095);
         options.long_document.max_windows = try unsigned(config, "max_windows", 128, 1, 128);
         options.long_document.record_identity = try enumeration(@FieldType(LongDocument, "record_identity"), config, "record_identity", .occurrence);
         if (options.long_document.mode == .reject and config.count() > @intFromBool(config.contains("mode"))) return error.ConflictingExtractionOptions;
@@ -293,7 +301,7 @@ pub fn parseOptions(value: Value) !Options {
     return options;
 }
 
-fn textContent(allocator: Allocator, value: Value, limit: usize) ![]const u8 {
+pub fn textContent(allocator: Allocator, value: Value, limit: usize) ![]const u8 {
     if (value == .string) {
         const text = try string(value);
         if (text.len > limit) return error.ExtractionTextLimitExceeded;
@@ -413,12 +421,27 @@ pub fn errorDetails(err: anyerror) ?ErrorDetails {
     // Keep a closed allowlist: corrupt model routing, invalid native output,
     // allocation and cancellation errors must never be relabeled client input.
     return switch (err) {
+        error.InvalidLayaQuestion => .{ .status = 400, .code = "INVALID_EXTRACTION_SCHEMA", .message = "Laya requires named single, ordinal, or boolean questions with instructions and 2 to 20 distinct labels; boolean labels must be false, true" },
         error.LongDocumentClassificationSearchExhausted, error.LongDocumentJointSearchExhausted, error.LongDocumentRecordSearchExhausted => .{ .status = 422, .code = "EXTRACTION_SEARCH_EXHAUSTED", .message = "bounded document-level extraction search did not complete with an accepted feasible result" },
         error.LongDocumentClassificationInfeasible, error.LongDocumentJointInfeasible, error.LongDocumentRequiredRecordFieldMissing, error.AmbiguousLongDocumentRecordOccurrence => .{ .status = 422, .code = "EXTRACTION_CONSTRAINTS_INFEASIBLE", .message = "document-level extraction could not satisfy the requested record or graph constraints" },
         error.LongDocumentWindowLimitExceeded, error.LongDocumentWorkLimitExceeded, error.LongDocumentCandidateLimitExceeded, error.LongDocumentTextLimitExceeded, error.LongDocumentJointIdentityLimitExceeded => .{ .status = 413, .code = "EXTRACTION_LIMIT_EXCEEDED", .message = "document-level extraction exceeds its configured window, candidate, work, or output limit" },
         error.ClassificationSearchExhausted, error.ConstraintSearchExhausted, error.JointSearchExhausted => .{ .status = 422, .code = "EXTRACTION_SEARCH_EXHAUSTED", .message = "bounded extraction search did not complete with an accepted feasible result" },
         error.ClassificationConstraintsInfeasible, error.JointConstraintsInfeasible, error.RequiredRecordFieldMissing, error.AmbiguousRecordOccurrence => .{ .status = 422, .code = "EXTRACTION_CONSTRAINTS_INFEASIBLE", .message = "extraction could not satisfy the requested record or graph constraints" },
         error.ExtractionRequestLimitExceeded, error.ExtractionTextLimitExceeded, error.ExtractionSchemaLimitExceeded, error.ExtractionOptionLimitExceeded, error.ExtractionOutputLimitExceeded, error.ExtractionCandidateLimitExceeded, error.ExtractionRecordLimitExceeded, error.ExtractionAssignmentLimitExceeded, error.ExtractionLiteralLimitExceeded, error.ConstraintCandidateLimitExceeded, error.ConstraintLimitExceeded, error.JointCandidateLimitExceeded, error.JointScoringLimitExceeded, error.JointValidationLimitExceeded, error.BoundaryBatchLimitExceeded, error.BoundaryFragmentLimitExceeded, error.BoundaryGroupLimitExceeded, error.BoundaryQueryLimitExceeded, error.BoundarySequenceLimitExceeded, error.BoundaryTextLimitExceeded, error.RelationDedupLimitExceeded, error.RelationProposalLimitExceeded, error.EnumMatchingLimitExceeded => .{ .status = 413, .code = "EXTRACTION_LIMIT_EXCEEDED", .message = "extraction exceeds a configured text, schema, candidate, work, or output limit" },
+        // A bounded-length rejection: the GLiNER boundary model's identity,
+        // backend, and every required feature already matched a reviewed
+        // qualification row (see models/gliner_boundary_qualification.zig's
+        // LengthContract), but this specific dimension of the request falls
+        // outside every row's reviewed range. Distinct from the generic
+        // UnsupportedGlinerBoundaryRuntime arm below (an unreviewed identity,
+        // backend, feature, or malformed table) so the response names the
+        // dimension instead of reporting a generic unsupported feature.
+        error.GlinerBoundaryRequestItemsLimitExceeded => .{ .status = 413, .code = "EXTRACTION_LIMIT_EXCEEDED", .message = "GLiNER boundary extraction exceeds the qualified request_items (batch size) limit" },
+        error.GlinerBoundaryDocumentBytesLimitExceeded => .{ .status = 413, .code = "EXTRACTION_LIMIT_EXCEEDED", .message = "GLiNER boundary extraction exceeds the qualified document_bytes limit" },
+        error.GlinerBoundaryDocumentWordsLimitExceeded => .{ .status = 413, .code = "EXTRACTION_LIMIT_EXCEEDED", .message = "GLiNER boundary extraction exceeds the qualified document_words limit" },
+        error.GlinerBoundaryWindowCountLimitExceeded => .{ .status = 413, .code = "EXTRACTION_LIMIT_EXCEEDED", .message = "GLiNER boundary extraction exceeds the qualified long-document window_count limit" },
+        error.GlinerBoundaryWindowWordsLimitExceeded => .{ .status = 413, .code = "EXTRACTION_LIMIT_EXCEEDED", .message = "GLiNER boundary extraction exceeds the qualified window_words limit" },
+        error.GlinerBoundaryPaddedSequenceLimitExceeded => .{ .status = 413, .code = "EXTRACTION_LIMIT_EXCEEDED", .message = "GLiNER boundary extraction exceeds the qualified padded_sequence_tokens limit" },
         error.AdvancedExtractionSchemaRequiresVersion2, error.UnsupportedExtractionSchemaVersion, error.UnsupportedExtractionFeature, error.UnsupportedExtractionLongDocument, error.UnsupportedExtractionModel, error.UnsupportedExtractionBackend, error.UnsupportedGlinerBoundaryRuntime, error.UnsupportedExtractionInput, error.UnsupportedExtractionFieldType, error.UnsupportedExtractionValidator, error.UnsupportedBoundaryHypothesisTemplate, error.ConstrainedClassificationTopKUnsupported, error.UnsupportedGlinerBoundaryBackend, error.UnsupportedGlinerBoundaryTask, error.RegexValidationUnavailable => .{ .status = 400, .code = "UNSUPPORTED_EXTRACTION_FEATURE", .message = "the selected extraction version or runtime does not support a requested feature" },
         error.InvalidExtractionRequest, error.UnknownExtractionRequestField, error.InvalidExtractionOptions, error.ConflictingExtractionOptions, error.ClassificationConstraintsRequireTasks, error.ConflictingClassificationMode, error.ConflictingClassificationPrompt, error.ConflictingExtractionFieldType, error.ConflictingFieldCardinality, error.ConflictingStructureChoices, error.DuplicateClassificationTask, error.DuplicateClassificationLabel, error.DuplicateExtractionLabel, error.DuplicateRelation, error.EmptyExtractionSchema, error.EmptyStructureFields, error.EntityAttributesRequireEntities, error.EntityDefinitionsRequireEntities, error.InvalidClassificationExample, error.InvalidClassificationTopK, error.InvalidClassificationCalibration, error.InvalidClassificationCardinality, error.InvalidClassificationDefault, error.InvalidClassificationLabel, error.InvalidClassificationTask, error.InvalidExtractionBoolean, error.InvalidExtractionEnum, error.InvalidExtractionLabels, error.InvalidExtractionName, error.InvalidExtractionNumber, error.InvalidExtractionReference, error.InvalidExtractionRegex, error.InvalidExtractionSchema, error.InvalidExtractionThreshold, error.InvalidInverseRelation, error.InvalidJointCandidateLimit, error.InvalidJointConstraint, error.InvalidJointSchema, error.InvalidRelationEndpoints, error.InvalidStructureAnchor, error.InvalidSymmetricRelation, error.MissingExtractionSchemaField, error.MixedExtractionOperations, error.MixedJointExtractionSchema, error.ReservedAttributeGroup, error.ReservedExtractionMarker, error.UnknownExtractionReference, error.UnknownExtractionSchemaField, error.UnknownJointConstraintType, error.InvalidConstraint, error.InvalidConstraintCardinality, error.InvalidOrdinalConstraint, error.InvalidOrdinalTask, error.MissingClassificationDefault, error.UnknownConstraintField, error.UnknownConstraintLabel, error.UnknownConstraintTask, error.UnknownConstraintType, error.InvalidJointDecisionThreshold, error.InvalidUtf8, error.DuplicateField, error.UnexpectedToken, error.SyntaxError, error.UnexpectedEndOfInput, error.InvalidNumber, error.Overflow => .{ .status = 400, .code = "INVALID_EXTRACTION_REQUEST", .message = "extraction request, schema, references, or options are invalid" },
         error.UnsupportedExtractionRegex, error.UnsupportedExtractionRegexFlags => .{ .status = 400, .code = "UNSUPPORTED_EXTRACTION_FEATURE", .message = "the requested regex construct or flags are not supported by the bounded validator" },
@@ -856,6 +879,29 @@ test "extraction v2 wire exposes search ceilings and fails closed on unsupported
     try std.testing.expectEqual(@as(u16, 413), errorDetails(error.ExtractionOutputLimitExceeded).?.status);
     for ([_]anyerror{ error.Cancelled, error.OutOfMemory, error.InvalidBoundaryPipelineRouting, error.InvalidExtractionOutput, error.MissingBoundaryScores, error.UnsupportedModel }) |err|
         try std.testing.expectEqual(@as(?ErrorDetails, null), errorDetails(err));
+}
+
+test "a GLiNER boundary bounded-length rejection reports the exceeded dimension, not a generic unsupported feature" {
+    // These name the dimension and use the same EXTRACTION_LIMIT_EXCEEDED
+    // 413 family as every other bounded extraction limit, distinct from the
+    // generic 400 UNSUPPORTED_EXTRACTION_FEATURE reserved for an unreviewed
+    // identity, backend, or feature (error.UnsupportedGlinerBoundaryRuntime).
+    for ([_]anyerror{
+        error.GlinerBoundaryRequestItemsLimitExceeded,
+        error.GlinerBoundaryDocumentBytesLimitExceeded,
+        error.GlinerBoundaryDocumentWordsLimitExceeded,
+        error.GlinerBoundaryWindowCountLimitExceeded,
+        error.GlinerBoundaryWindowWordsLimitExceeded,
+        error.GlinerBoundaryPaddedSequenceLimitExceeded,
+    }) |err| {
+        const details = errorDetails(err).?;
+        try std.testing.expectEqual(@as(u16, 413), details.status);
+        try std.testing.expectEqualStrings("EXTRACTION_LIMIT_EXCEEDED", details.code);
+        try std.testing.expect(std.mem.indexOf(u8, details.message, "GLiNER boundary extraction exceeds the qualified") != null);
+    }
+    const generic = errorDetails(error.UnsupportedGlinerBoundaryRuntime).?;
+    try std.testing.expectEqual(@as(u16, 400), generic.status);
+    try std.testing.expectEqualStrings("UNSUPPORTED_EXTRACTION_FEATURE", generic.code);
 }
 
 test "extraction v2 wire serializes attributes source-free enums and explicit offsets" {

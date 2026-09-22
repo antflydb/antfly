@@ -140,6 +140,10 @@ pub const Frame = struct {
     crc_bytes: []const u8,
     side_info_bytes: []const u8,
     main_data_bytes: []const u8,
+    /// The stream ended before the frame's declared length. Its header and side
+    /// info are complete, and Layer III keeps most of a frame's main data in
+    /// earlier frames, so it is usually still decodable from the reservoir.
+    truncated: bool = false,
 
     pub fn parseSideInfo(self: Frame) !SideInfo {
         return parseLayer3SideInfo(self.header, self.side_info_bytes);
@@ -177,6 +181,14 @@ pub const FrameIterator = struct {
                                     break :blk self.cursor;
                                 }
                             }
+                            // The stream ends inside this frame. It still
+                            // continues the stream being decoded, so hand it
+                            // over truncated instead of dropping the audio;
+                            // `findNextFrame` keeps refusing partial frames it
+                            // has no stream to compare against.
+                            if (candidate_len != 0 and self.cursor + candidate_len > self.bytes.len) {
+                                break :blk self.cursor;
+                            }
                         }
                     } else |_| {}
                 }
@@ -189,15 +201,25 @@ pub const FrameIterator = struct {
             try self.resolveFreeFormatFrameLength(frame_offset, header)
         else
             try header.frameLengthBytes();
-        if (frame_offset + frame_len > self.bytes.len) return error.Mp3TruncatedFrame;
+        // A frame can only overrun the buffer at the end of the stream. Keep it
+        // when it continues the stream already being decoded and its side info
+        // arrived, because its main data is mostly in the reservoir already;
+        // a stray sync word that happens to sit near the end is not a frame.
+        const available = self.bytes.len - frame_offset;
+        const truncated = frame_len > available;
+        if (truncated) {
+            const expected = self.stream_header orelse return error.Mp3TruncatedFrame;
+            if (!headersAreCompatibleStream(expected, header)) return error.Mp3TruncatedFrame;
+        }
+        const present_len = @min(frame_len, available);
 
-        const frame_bytes = self.bytes[frame_offset .. frame_offset + frame_len];
+        const frame_bytes = self.bytes[frame_offset .. frame_offset + present_len];
         const crc_len: usize = if (header.has_crc) 2 else 0;
         const side_info_len = header.sideInfoLengthBytes();
         const data_start = 4 + crc_len + side_info_len;
         if (data_start > frame_bytes.len) return error.Mp3TruncatedFrame;
 
-        self.cursor = frame_offset + frame_len;
+        self.cursor = frame_offset + present_len;
         self.stream_header = header;
         return .{
             .offset = frame_offset,
@@ -206,6 +228,7 @@ pub const FrameIterator = struct {
             .crc_bytes = frame_bytes[4 .. 4 + crc_len],
             .side_info_bytes = frame_bytes[4 + crc_len .. data_start],
             .main_data_bytes = frame_bytes[data_start..],
+            .truncated = truncated,
         };
     }
 
@@ -248,6 +271,7 @@ const default_granule_channel = GranuleChannelInfo{
 
 pub fn parseLayer3SideInfo(header: FrameHeader, side_info_bytes: []const u8) !SideInfo {
     if (header.layer != .layer3) return error.Mp3UnsupportedLayer;
+    if (!supportsSampleRate(header.sample_rate)) return error.Mp3UnsupportedSampleRate;
     if (side_info_bytes.len != header.sideInfoLengthBytes()) return error.Mp3InvalidSideInfoLength;
 
     var reader = BitReader{ .bytes = side_info_bytes };
@@ -514,6 +538,17 @@ pub fn looksLikeSync(first: u8, second: u8) bool {
     return (second & 0xE0) == 0xE0;
 }
 
+/// Every rate a Layer III header can carry, each of which has long and short
+/// scalefactor band tables in `requantize.zig`. Rejecting anything else before
+/// a granule is decoded keeps one unreadable file from reaching a table lookup
+/// that has no answer for it.
+pub fn supportsSampleRate(sample_rate: u32) bool {
+    return switch (sample_rate) {
+        44100, 48000, 32000, 22050, 24000, 16000, 12000, 11025, 8000 => true,
+        else => false,
+    };
+}
+
 fn sampleRate(version: MpegVersion, sample_rate_index: u2) u32 {
     const table = switch (version) {
         .mpeg1 => [_]u32{ 44100, 48000, 32000 },
@@ -633,6 +668,24 @@ test "joint stereo helpers reflect mode extension bits" {
     try std.testing.expectEqual(ChannelMode.joint_stereo, intensity_only.channel_mode);
     try std.testing.expect(!intensity_only.usesMsStereo());
     try std.testing.expect(intensity_only.usesIntensityStereo());
+}
+
+test "side info parsing rejects a sample rate the band tables do not cover" {
+    // Every rate a header can carry is supported, so this stands in for a
+    // future rate arriving before its tables do: the frame fails its own
+    // request instead of reaching a lookup with no answer for it.
+    const header = FrameHeader{
+        .version = .mpeg2,
+        .layer = .layer3,
+        .has_crc = false,
+        .free_format = false,
+        .bitrate_kbps = 64,
+        .sample_rate = 7350,
+        .padding = false,
+        .channel_mode = .mono,
+    };
+    const side_info_bytes = [_]u8{0} ** 9;
+    try std.testing.expectError(error.Mp3UnsupportedSampleRate, parseLayer3SideInfo(header, &side_info_bytes));
 }
 
 test "skip id3v2 header" {

@@ -27,17 +27,17 @@ const applied_sink = @import("../state_machine/applied_sink.zig");
 const magic: u32 = 0x41524654; // ARFT
 const legacy_inline_snapshot_version: u32 = 2;
 const legacy_external_snapshot_version: u32 = 3;
-// Version 4 checkpoints persist the Raft log compaction boundary separately
-// from the transferable state snapshot metadata.
-const version: u32 = 4;
+// Version 5 also persists state-machine completion separately from snapshot
+// persistence. Older checkpoints have no completion proof.
+const version: u32 = 5;
 const delta_magic: u32 = 0x4152444c; // ARDL
 // Delta versions 1 and 2 embed snapshot payloads. Version 1 predates the
 // optional ready-level ConfState tail; version 3 externalizes payloads.
 const legacy_inline_delta_version: u32 = 2;
 const delta_version: u32 = 3;
 const applied_watermark_magic: u32 = 0x4152574d; // ARWM
-const applied_watermark_version: u32 = 2;
-const applied_watermark_payload_len = 20;
+const applied_watermark_version: u32 = 3;
+const applied_watermark_payload_len = 28;
 const max_conf_state_nodes: usize = 1024;
 const min_encoded_entry_len = 8 + 8 + 1 + 4;
 
@@ -265,6 +265,11 @@ pub const WalReplicaState = struct {
         return result;
     }
 
+    /// Snapshot persistence is deliberately not state-machine completion.
+    pub fn completedAppliedIndex(self: *const WalReplicaState) u64 {
+        return self.completed_applied_index;
+    }
+
     pub fn statsSnapshot(self: *const WalReplicaState) WalReplicaStateStats {
         var stats = self.stats;
         stats.replay_debt_records = self.delta_records_since_checkpoint;
@@ -284,8 +289,11 @@ pub const WalReplicaState = struct {
     }
 
     pub fn setAppliedIndex(self: *WalReplicaState, index: raft_engine.core.types.Index) !void {
-        if (index <= self.applied_index) return;
-        self.applied_index = index;
+        if (index <= self.completed_applied_index) return;
+        const previous_completed = self.completed_applied_index;
+        errdefer self.completed_applied_index = previous_completed;
+        self.completed_applied_index = index;
+        self.applied_index = @max(self.applied_index, index);
         self.stats.applied_index_updates += 1;
         if (self.shouldPersistAppliedWatermark(index)) try self.persistAppliedWatermark();
         try self.persistCheckpointIfNeeded();
@@ -487,6 +495,7 @@ pub const WalReplicaState = struct {
         }
         try self.loadAppliedWatermark();
         self.durable_applied_index = self.applied_index;
+        self.durable_completed_applied_index = self.completed_applied_index;
         try self.refreshLastCompactedIndex();
         if (requires_migration) {
             // Validate the sidecar before retiring any self-contained legacy
@@ -631,6 +640,7 @@ pub const WalReplicaState = struct {
         if (initial_state.hard_state.voted_for) |voted_for| try appendInt(u64, self.alloc, &buffer, voted_for);
         try appendInt(u64, self.alloc, &buffer, initial_state.hard_state.commit_index);
         try appendInt(u64, self.alloc, &buffer, self.applied_index);
+        try appendInt(u64, self.alloc, &buffer, self.completed_applied_index);
         try encodeConfState(self.alloc, &buffer, initial_state.conf_state);
 
         const snapshot = try self.store.storage().snapshot(self.alloc);
@@ -732,6 +742,7 @@ pub const WalReplicaState = struct {
     fn persistCheckpoint(self: *WalReplicaState) !void {
         try self.persist(.checkpoint);
         self.durable_applied_index = self.applied_index;
+        self.durable_completed_applied_index = self.completed_applied_index;
     }
 
     fn persistAppliedWatermark(self: *WalReplicaState) !void {
@@ -741,19 +752,26 @@ pub const WalReplicaState = struct {
         std.mem.writeInt(u32, payload[0..4], applied_watermark_magic, .little);
         std.mem.writeInt(u32, payload[4..8], applied_watermark_version, .little);
         std.mem.writeInt(u64, payload[8..16], self.applied_index, .little);
-        std.mem.writeInt(u32, payload[16..20], Crc32.hash(payload[0..16]), .little);
+        std.mem.writeInt(u64, payload[16..24], self.completed_applied_index, .little);
+        std.mem.writeInt(u32, payload[24..28], Crc32.hash(payload[0..24]), .little);
         try writeFileAtomically(self.io_impl.io(), self.applied_watermark_path, &payload);
         self.durable_applied_index = self.applied_index;
+        self.durable_completed_applied_index = self.completed_applied_index;
         self.stats.applied_watermark_persist_ns += elapsedSince(started_ns);
         self.stats.applied_watermark_bytes += payload.len;
     }
 
     fn shouldPersistAppliedWatermark(self: *const WalReplicaState, index: raft_engine.core.types.Index) bool {
-        if (index <= self.durable_applied_index) return false;
-        if (self.durable_applied_index == 0) return true;
+        if (index <= self.durable_completed_applied_index) return false;
+        if (self.durable_completed_applied_index == 0) return true;
+        // A persisted snapshot may already have advanced the general cursor.
+        // Certify its separate installation at this existing completion-write
+        // boundary; ordinary log progress retains the configured batching.
+        const snapshot_index = self.store.snapshot_state.metadata.index;
+        if (self.durable_completed_applied_index < snapshot_index and index >= snapshot_index) return true;
         const interval = self.cfg.applied_watermark_persist_interval;
         if (interval == 0) return false;
-        return index - self.durable_applied_index >= interval;
+        return index - self.durable_completed_applied_index >= interval;
     }
 
     fn loadAppliedWatermark(self: *WalReplicaState) !void {
@@ -762,21 +780,28 @@ pub const WalReplicaState = struct {
             else => return err,
         };
         defer file.close(self.io_impl.io());
-        if (try file.length(self.io_impl.io()) != applied_watermark_payload_len)
+        const payload_len = try file.length(self.io_impl.io());
+        if (payload_len != applied_watermark_payload_len and payload_len != 20)
             return error.InvalidReplicaState;
 
         var reader = file.reader(self.io_impl.io(), &.{});
         var payload: [applied_watermark_payload_len]u8 = undefined;
-        try reader.interface.readSliceAll(&payload);
+        try reader.interface.readSliceAll(payload[0..@intCast(payload_len)]);
 
         const file_magic = std.mem.readInt(u32, payload[0..4], .little);
         if (file_magic != applied_watermark_magic) return error.InvalidReplicaState;
         const file_version = std.mem.readInt(u32, payload[4..8], .little);
-        if (file_version != applied_watermark_version) return error.UnsupportedReplicaStateVersion;
-        if (std.mem.readInt(u32, payload[16..20], .little) != Crc32.hash(payload[0..16]))
+        if (file_version != 2 and file_version != applied_watermark_version) return error.UnsupportedReplicaStateVersion;
+        if (payload_len != (if (file_version == 2) @as(u64, 20) else applied_watermark_payload_len))
+            return error.InvalidReplicaState;
+        const checksum_offset: usize = @intCast(payload_len - 4);
+        if (std.mem.readInt(u32, payload[checksum_offset..][0..4], .little) != Crc32.hash(payload[0..checksum_offset]))
             return error.InvalidReplicaState;
         const watermark = std.mem.readInt(u64, payload[8..16], .little);
+        const completed = if (file_version >= 3) std.mem.readInt(u64, payload[16..24], .little) else 0;
+        if (completed > watermark) return error.InvalidReplicaState;
         if (watermark > self.applied_index) self.applied_index = watermark;
+        self.completed_applied_index = @max(completed, self.completed_applied_index);
     }
 
     fn refreshLastCompactedIndex(self: *WalReplicaState) !void {
@@ -820,6 +845,8 @@ pub const WalReplicaState = struct {
             try readInt(u64, bytes, &cursor)
         else
             self.store.hard_state.commit_index;
+        self.completed_applied_index = if (file_version >= 5) try readInt(u64, bytes, &cursor) else 0;
+        if (self.completed_applied_index > self.applied_index) return error.InvalidReplicaState;
 
         var conf_state = try decodeConfState(self.alloc, bytes, &cursor);
         defer conf_state.deinit(self.alloc);
@@ -1297,6 +1324,7 @@ test "wal replica state migrates legacy checkpoints and delta tails" {
             var state = try WalReplicaState.init(std.testing.allocator, layout, .{});
             defer state.deinit();
             try std.testing.expectEqual(@as(u64, 6), state.appliedIndex());
+            try std.testing.expectEqual(@as(u64, 0), state.completedAppliedIndex());
             try std.testing.expectEqual(@as(u64, 7), try state.storage().firstIndex());
             try std.testing.expectEqual(@as(u64, 7), try state.storage().lastIndex());
             var snapshot = try state.storage().snapshot(std.testing.allocator);
@@ -1650,6 +1678,80 @@ test "wal replica state persists applied watermark in sidecar and replays only u
         try std.testing.expectEqual(@as(u64, 11), rd.committed_entries[0].index);
         try std.testing.expectEqualStrings("eleven", rd.committed_entries[0].data);
     }
+}
+
+test "wal replica completion survives checkpoint and pending snapshot reopen" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/completed-wal", .{tmp.sub_path});
+    defer alloc.free(root);
+    var layout = try storage_mod.ReplicaPathLayout.initForReplica(alloc, root, 79, 4);
+    defer layout.deinit(alloc);
+    const cfg = WalReplicaStateConfig{ .checkpoint_replay_records_threshold = 1 };
+    {
+        var state = try WalReplicaState.init(alloc, layout, cfg);
+        defer state.deinit();
+        try state.groupStorage().persistReady(79, .{
+            .hard_state = .{ .current_term = 2, .commit_index = 5 },
+            .snapshot = .{ .metadata = .{ .index = 5, .term = 2 }, .data = @constCast("five") },
+        });
+        try state.setAppliedIndex(5);
+        try state.groupStorage().persistReady(79, .{
+            .hard_state = .{ .current_term = 2, .commit_index = 10 },
+            .snapshot = .{ .metadata = .{ .index = 10, .term = 2 }, .data = @constCast("ten") },
+        });
+        try std.testing.expectEqual(@as(u64, 10), state.appliedIndex());
+        try std.testing.expectEqual(@as(u64, 5), state.completedAppliedIndex());
+    }
+    {
+        var state = try WalReplicaState.init(alloc, layout, cfg);
+        defer state.deinit();
+        try std.testing.expectEqual(@as(u64, 5), state.completedAppliedIndex());
+        const writes = state.statsSnapshot().applied_index_persist_calls;
+        try state.setAppliedIndex(10);
+        try std.testing.expectEqual(writes + 1, state.statsSnapshot().applied_index_persist_calls);
+    }
+    {
+        var state = try WalReplicaState.init(alloc, layout, cfg);
+        defer state.deinit();
+        try std.testing.expectEqual(@as(u64, 10), state.completedAppliedIndex());
+        try state.persistCheckpoint();
+        // Checkpoint remains authoritative even without the optional batched
+        // watermark file, as after WAL compaction or a stale sidecar.
+        try std.Io.Dir.cwd().deleteFile(std.testing.io, state.applied_watermark_path);
+    }
+    var state = try WalReplicaState.init(alloc, layout, cfg);
+    defer state.deinit();
+    try std.testing.expectEqual(@as(u64, 10), state.completedAppliedIndex());
+}
+
+test "wal replica completion never infers native completion from legacy watermark" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/legacy-completed-wal", .{tmp.sub_path});
+    defer alloc.free(root);
+    var layout = try storage_mod.ReplicaPathLayout.initForReplica(alloc, root, 79, 4);
+    defer layout.deinit(alloc);
+    {
+        var state = try WalReplicaState.init(alloc, layout, .{});
+        defer state.deinit();
+        try state.groupStorage().persistReady(79, .{
+            .hard_state = .{ .current_term = 2, .commit_index = 1 },
+            .entries = &.{.{ .term = 2, .index = 1, .data = @constCast("one") }},
+        });
+        var legacy: [20]u8 = undefined;
+        std.mem.writeInt(u32, legacy[0..4], applied_watermark_magic, .little);
+        std.mem.writeInt(u32, legacy[4..8], 2, .little);
+        std.mem.writeInt(u64, legacy[8..16], 1, .little);
+        std.mem.writeInt(u32, legacy[16..20], Crc32.hash(legacy[0..16]), .little);
+        try WalReplicaState.writeFileAtomically(std.testing.io, state.applied_watermark_path, &legacy);
+    }
+    var state = try WalReplicaState.init(alloc, layout, .{});
+    defer state.deinit();
+    try std.testing.expectEqual(@as(u64, 1), state.appliedIndex());
+    try std.testing.expectEqual(@as(u64, 0), state.completedAppliedIndex());
 }
 
 test "wal replica state tracks persist reasons separately" {

@@ -137,7 +137,7 @@ pub const QueryBuilderPlanValidator = struct {
             alloc: std.mem.Allocator,
             request: metadata_openapi.QueryBuilderRequest,
             query_request: metadata_openapi.QueryRequest,
-            retrieval_query_request: ?metadata_openapi.RetrievalQueryRequest,
+            retrieval_query_request: ?metadata_openapi.QueryRequest,
             specialist: []const u8,
         ) anyerror!?[]const u8 = null,
     };
@@ -167,7 +167,7 @@ pub const QueryBuilderPlanValidator = struct {
         alloc: std.mem.Allocator,
         request: metadata_openapi.QueryBuilderRequest,
         query_request: metadata_openapi.QueryRequest,
-        retrieval_query_request: ?metadata_openapi.RetrievalQueryRequest,
+        retrieval_query_request: ?metadata_openapi.QueryRequest,
         specialist: []const u8,
     ) !?[]const u8 {
         const func = self.vtable.validate_query_request orelse return null;
@@ -794,7 +794,7 @@ fn metadataValidateQueryRequest(
     alloc: std.mem.Allocator,
     request: metadata_openapi.QueryBuilderRequest,
     query_request: metadata_openapi.QueryRequest,
-    retrieval_query_request: ?metadata_openapi.RetrievalQueryRequest,
+    retrieval_query_request: ?metadata_openapi.QueryRequest,
     specialist: []const u8,
 ) !?[]const u8 {
     const context: *const QueryBuilderTableContext = @ptrCast(@alignCast(ptr));
@@ -810,7 +810,7 @@ fn metadataValidateQueryRequestAgainstContext(
     alloc: std.mem.Allocator,
     context: *const QueryBuilderTableContext,
     query_request: metadata_openapi.QueryRequest,
-    retrieval_query_request: ?metadata_openapi.RetrievalQueryRequest,
+    retrieval_query_request: ?metadata_openapi.QueryRequest,
 ) !?[]const u8 {
     var preflight = try preflightQueryRequestAgainstContext(alloc, context, .{ .intent = "" }, query_request, retrieval_query_request, "query_builder", .{});
     defer preflight.deinit(alloc);
@@ -825,7 +825,7 @@ pub fn preflightQueryRequest(
     collected_context: *const QueryBuilderCollectedContext,
     request: metadata_openapi.QueryBuilderRequest,
     query_request: metadata_openapi.QueryRequest,
-    retrieval_query_request: ?metadata_openapi.RetrievalQueryRequest,
+    retrieval_query_request: ?metadata_openapi.QueryRequest,
     specialist: []const u8,
     opts: QueryPreflightOptions,
 ) !QueryPreflightResult {
@@ -863,11 +863,10 @@ fn preflightQueryRequestAgainstContext(
     context: *const QueryBuilderTableContext,
     request: metadata_openapi.QueryBuilderRequest,
     query_request: metadata_openapi.QueryRequest,
-    retrieval_query_request: ?metadata_openapi.RetrievalQueryRequest,
+    retrieval_query_request: ?metadata_openapi.QueryRequest,
     specialist: []const u8,
     opts: QueryPreflightOptions,
 ) !QueryPreflightResult {
-    _ = request;
     _ = specialist;
     _ = opts.require_executable;
 
@@ -975,17 +974,20 @@ fn preflightQueryRequestAgainstContext(
             try appendQueryPreflightDiagnostic(alloc, &diagnostics, .@"error", "invalid_graph_result_ref", "query_request.graph_queries", feedback);
         }
     }
-    if (retrieval_query_request) |retrieval_query| {
-        if (retrieval_query.tree_search) |tree_search| {
+    if (retrieval_query_request != null) {
+        var tree_arena = std.heap.ArenaAllocator.init(alloc);
+        defer tree_arena.deinit();
+        const tree_indexes = try queryBuilderGraphIndexNames(tree_arena.allocator(), context.graph_index_metadata, context.graph_indexes);
+        if (try queryBuilderConstraintTreeSearch(tree_arena.allocator(), request, tree_indexes)) |tree_search| {
             if (!metadataContextHasGraphIndex(context, tree_search.index)) {
-                const feedback = try std.fmt.allocPrint(alloc, "retrieval_query_request.tree_search references unknown graph index '{s}'", .{tree_search.index});
+                const feedback = try std.fmt.allocPrint(alloc, "retrieval_navigation references unknown graph index '{s}'", .{tree_search.index});
                 defer alloc.free(feedback);
-                try appendQueryPreflightDiagnostic(alloc, &diagnostics, .@"error", "unknown_tree_index", "retrieval_query_request.tree_search.index", feedback);
+                try appendQueryPreflightDiagnostic(alloc, &diagnostics, .@"error", "unknown_tree_index", "retrieval_navigation.index", feedback);
             }
             if (!metadataGraphIndexSupportsTreeSearch(context, tree_search.index)) {
-                const feedback = try std.fmt.allocPrint(alloc, "retrieval_query_request.tree_search references graph index '{s}' without tree topology metadata", .{tree_search.index});
+                const feedback = try std.fmt.allocPrint(alloc, "retrieval_navigation references graph index '{s}' without tree topology metadata", .{tree_search.index});
                 defer alloc.free(feedback);
-                try appendQueryPreflightDiagnostic(alloc, &diagnostics, .@"error", "invalid_tree_index", "retrieval_query_request.tree_search.index", feedback);
+                try appendQueryPreflightDiagnostic(alloc, &diagnostics, .@"error", "invalid_tree_index", "retrieval_navigation.index", feedback);
             }
         }
     }
@@ -2259,6 +2261,16 @@ pub fn buildQueryBuilderResponseWithContext(
             return error.InvalidQueryBuilderGeneration,
         .query_request = query_request,
         .retrieval_query_request = retrieval_query_request,
+        .retrieval_navigation = if (try queryBuilderConstraintTreeSearch(alloc, request, graph_indexes)) |tree| .{
+            .query_index = 0,
+            .strategy = .tree,
+            .selection = .ranked,
+            .index = tree.index,
+            .start_nodes = tree.start.selectorText(),
+            .start_key = tree.start.literalKey(),
+            .max_depth = tree.max_depth,
+            .beam_width = tree.beam_width,
+        } else null,
         .specialist = specialist,
         .plan = plan,
         .explanation = explanation,
@@ -4635,21 +4647,16 @@ fn buildQueryBuilderRetrievalQueryRequest(
     request: metadata_openapi.QueryBuilderRequest,
     query_request: metadata_openapi.QueryRequest,
     graph_indexes: []const []const u8,
-) !?metadata_openapi.RetrievalQueryRequest {
-    const tree_search = try queryBuilderConstraintTreeSearch(alloc, request, graph_indexes) orelse return null;
-    const encoded = try std.json.Stringify.valueAlloc(alloc, query_request, .{});
-    var out = try std.json.parseFromSliceLeaky(metadata_openapi.RetrievalQueryRequest, alloc, encoded, .{
-        .ignore_unknown_fields = true,
-    });
-    out.tree_search = tree_search;
-    return out;
+) !?metadata_openapi.QueryRequest {
+    _ = try queryBuilderConstraintTreeSearch(alloc, request, graph_indexes) orelse return null;
+    return query_request;
 }
 
 fn queryBuilderConstraintTreeSearch(
     alloc: std.mem.Allocator,
     request: metadata_openapi.QueryBuilderRequest,
     graph_indexes: []const []const u8,
-) !?metadata_openapi.TreeSearchConfig {
+) !?@import("retrieval_plan.zig").TreeSearchConfig {
     const constraints = request.constraints;
     if (constraints) |value| {
         if (value.map.get("tree_search")) |raw| {
@@ -4661,7 +4668,7 @@ fn queryBuilderConstraintTreeSearch(
     if (trimmed_index.len == 0) return null;
     return .{
         .index = try alloc.dupe(u8, trimmed_index),
-        .start_nodes = try queryBuilderTreeStartNodes(alloc, request, constraints),
+        .start = @import("retrieval_plan.zig").TreeStart.fromSelector(try queryBuilderTreeStartNodes(alloc, request, constraints)),
         .max_depth = queryBuilderConstraintInteger(constraints, "tree_max_depth") orelse
             queryBuilderConstraintInteger(constraints, "max_depth"),
         .beam_width = queryBuilderConstraintInteger(constraints, "tree_beam_width") orelse
@@ -4683,7 +4690,7 @@ fn queryBuilderTreeSearchFromValue(
     alloc: std.mem.Allocator,
     constraints: JsonObject,
     value: std.json.Value,
-) !?metadata_openapi.TreeSearchConfig {
+) !?@import("retrieval_plan.zig").TreeSearchConfig {
     switch (value) {
         .string => |index| {
             const trimmed = std.mem.trim(u8, index, " \t\r\n");
@@ -4697,7 +4704,7 @@ fn queryBuilderTreeSearchFromValue(
             if (trimmed.len == 0) return null;
             return .{
                 .index = try alloc.dupe(u8, trimmed),
-                .start_nodes = try queryBuilderObjectOptionalStringDup(alloc, object, "start_nodes"),
+                .start = @import("retrieval_plan.zig").TreeStart.fromSelector(try queryBuilderObjectOptionalStringDup(alloc, object, "start_nodes")),
                 .max_depth = queryBuilderObjectInteger(object, "max_depth") orelse
                     queryBuilderConstraintInteger(constraints, "tree_max_depth"),
                 .beam_width = queryBuilderObjectInteger(object, "beam_width") orelse
@@ -5715,7 +5722,7 @@ fn validateRequiredExecutableQueryBuilderRequest(
     request: metadata_openapi.QueryBuilderRequest,
     built: BuiltQueryBuilderQuery,
     query_request: metadata_openapi.QueryRequest,
-    retrieval_query_request: ?metadata_openapi.RetrievalQueryRequest,
+    retrieval_query_request: ?metadata_openapi.QueryRequest,
     clarification_pending: bool,
 ) !void {
     if (!queryBuilderConstraintBool(request.constraints, "require_executable")) return;
@@ -5728,7 +5735,7 @@ fn validateRequiredExecutableQueryBuilderRequest(
         if ((semantic_mode and built.query_kind != .semantic) or (hybrid_mode and built.query_kind != .hybrid)) {
             return error.InvalidQueryBuilderRequest;
         }
-        if (std.ascii.eqlIgnoreCase(mode, "tree") and (retrieval_query_request == null or retrieval_query_request.?.tree_search == null)) {
+        if (std.ascii.eqlIgnoreCase(mode, "tree") and (retrieval_query_request == null)) {
             return error.InvalidQueryBuilderRequest;
         }
         if (std.ascii.eqlIgnoreCase(mode, "graph") and query_request.graph_queries == null) {
@@ -6080,7 +6087,7 @@ fn buildQueryBuilderClarificationQuestion(
     if (tree_mode and queryBuilderTreeIndex(request, graph_indexes) == null) {
         if (graph_indexes.len == 0) {
             const options = try alloc.dupe([]const u8, &[_][]const u8{"constraints.tree_index"});
-            const affects = try alloc.dupe([]const u8, &[_][]const u8{ "retrieval_query_request.tree_search.index", "specialist" });
+            const affects = try alloc.dupe([]const u8, &[_][]const u8{ "retrieval_navigation.index", "specialist" });
             return .{
                 .id = "select_tree_index",
                 .kind = .free_text,
@@ -6093,7 +6100,7 @@ fn buildQueryBuilderClarificationQuestion(
         }
         if (graph_indexes.len > 1) {
             const options = try cloneStringSlice(alloc, graph_indexes);
-            const affects = try alloc.dupe([]const u8, &[_][]const u8{ "retrieval_query_request.tree_search.index", "specialist" });
+            const affects = try alloc.dupe([]const u8, &[_][]const u8{ "retrieval_navigation.index", "specialist" });
             return .{
                 .id = "select_tree_index",
                 .kind = .single_choice,
@@ -8950,7 +8957,7 @@ test "query builder appends final plan validator feedback" {
             alloc: std.mem.Allocator,
             _: metadata_openapi.QueryBuilderRequest,
             query_request: metadata_openapi.QueryRequest,
-            _: ?metadata_openapi.RetrievalQueryRequest,
+            _: ?metadata_openapi.QueryRequest,
             specialist: []const u8,
         ) !?[]const u8 {
             try std.testing.expectEqualStrings("full_text", specialist);
@@ -8987,7 +8994,7 @@ test "query builder require executable rejects final plan validator feedback" {
             alloc: std.mem.Allocator,
             _: metadata_openapi.QueryBuilderRequest,
             _: metadata_openapi.QueryRequest,
-            _: ?metadata_openapi.RetrievalQueryRequest,
+            _: ?metadata_openapi.QueryRequest,
             _: []const u8,
         ) !?[]const u8 {
             return try alloc.dupe(u8, "query request validator rejected final plan");
@@ -10085,7 +10092,7 @@ test "query builder infers graph multi hop pattern from intent" {
     try std.testing.expectEqualStrings("c", match_query.@"return".graph_bindings_return.bindings[0]);
 }
 
-test "query builder maps tree search into retrieval query request" {
+test "query builder maps tree search into retrieval step navigation" {
     var constraints_tree = try std.json.parseFromSlice(JsonObject, std.testing.allocator,
         \\{"tree_search":{"index":"doc_hierarchy","start_nodes":"$roots","max_depth":2,"beam_width":4},"limit":5}
     , .{});
@@ -10105,10 +10112,12 @@ test "query builder maps tree search into retrieval query request" {
     try std.testing.expect(result.query_request != null);
     try std.testing.expect(result.retrieval_query_request != null);
     try std.testing.expect(result.retrieval_query_request.?.full_text_search != null);
-    try std.testing.expectEqualStrings("doc_hierarchy", result.retrieval_query_request.?.tree_search.?.index);
-    try std.testing.expectEqualStrings("$roots", result.retrieval_query_request.?.tree_search.?.start_nodes.?);
-    try std.testing.expectEqual(@as(i64, 2), result.retrieval_query_request.?.tree_search.?.max_depth.?);
-    try std.testing.expectEqual(@as(i64, 4), result.retrieval_query_request.?.tree_search.?.beam_width.?);
+    try std.testing.expectEqualStrings("doc_hierarchy", result.retrieval_navigation.?.index);
+    try std.testing.expectEqual(metadata_openapi.RetrievalNavigationSelection.ranked, result.retrieval_navigation.?.selection);
+    try std.testing.expectEqual(@as(i64, 0), result.retrieval_navigation.?.query_index);
+    try std.testing.expectEqualStrings("$roots", result.retrieval_navigation.?.start_nodes.?);
+    try std.testing.expectEqual(@as(i64, 2), result.retrieval_navigation.?.max_depth.?);
+    try std.testing.expectEqual(@as(i64, 4), result.retrieval_navigation.?.beam_width.?);
     try std.testing.expectEqualStrings("retrieval_query_request", result.plan.?.map.get("artifact").?.string);
 }
 
@@ -10128,9 +10137,9 @@ test "query builder maps tree shorthand constraints" {
 
     try std.testing.expectEqualStrings("tree", result.specialist.?);
     try std.testing.expect(result.retrieval_query_request != null);
-    try std.testing.expectEqualStrings("doc_hierarchy", result.retrieval_query_request.?.tree_search.?.index);
-    try std.testing.expectEqualStrings("doc:a,doc:b", result.retrieval_query_request.?.tree_search.?.start_nodes.?);
-    try std.testing.expectEqual(@as(i64, 3), result.retrieval_query_request.?.tree_search.?.max_depth.?);
+    try std.testing.expectEqualStrings("doc_hierarchy", result.retrieval_navigation.?.index);
+    try std.testing.expectEqualStrings("doc:a,doc:b", result.retrieval_navigation.?.start_nodes.?);
+    try std.testing.expectEqual(@as(i64, 3), result.retrieval_navigation.?.max_depth.?);
 }
 
 test "query builder infers tree index from table context" {
@@ -10147,7 +10156,7 @@ test "query builder infers tree index from table context" {
 
     try std.testing.expectEqualStrings("tree", result.specialist.?);
     try std.testing.expect(result.retrieval_query_request != null);
-    try std.testing.expectEqualStrings("doc_hierarchy", result.retrieval_query_request.?.tree_search.?.index);
+    try std.testing.expectEqualStrings("doc_hierarchy", result.retrieval_navigation.?.index);
 }
 
 test "query builder require executable rejects tree search without tree topology metadata" {
@@ -10194,7 +10203,7 @@ test "query builder infers tree start node from intent" {
     }, null);
 
     try std.testing.expectEqualStrings("tree", result.specialist.?);
-    try std.testing.expectEqualStrings("doc:root", result.retrieval_query_request.?.tree_search.?.start_nodes.?);
+    try std.testing.expectEqualStrings("doc:root", result.retrieval_navigation.?.start_nodes.?);
 }
 
 test "query builder asks for tree index when table has multiple graph indexes" {
@@ -10240,7 +10249,7 @@ test "query builder uses tree index decision answer" {
     try std.testing.expectEqual(AgentStatus.completed, result.status.?);
     try std.testing.expect(result.questions == null);
     try std.testing.expect(result.retrieval_query_request != null);
-    try std.testing.expectEqualStrings("topic_graph", result.retrieval_query_request.?.tree_search.?.index);
+    try std.testing.expectEqualStrings("topic_graph", result.retrieval_navigation.?.index);
 }
 
 test "query builder asks for graph index when table has multiple graph indexes" {

@@ -660,6 +660,17 @@ pub fn collectArtifactEnrichmentsFromValueWithOptions(
                     defer parsed.deinit();
                     var owned = try db_mod.types.EnrichmentConfig.clone(alloc, parsed.value);
                     errdefer owned.deinit(alloc);
+                    if (item.object.get("transcriber")) |transcriber| {
+                        // The typed shorthand replaces producer_json rather
+                        // than layering on it, and only an asset stream can
+                        // hold transcripts.
+                        if (owned.kind != .asset or owned.producer_json.len > 0) return error.InvalidEnrichmentConfig;
+                        owned.producer_json = enrichment_config_validation.transcriberShorthandProducerJsonAlloc(alloc, transcriber) catch |err| switch (err) {
+                            error.OutOfMemory => return err,
+                            else => return error.InvalidEnrichmentConfig,
+                        };
+                        if (owned.content_type.len == 0) owned.content_type = try alloc.dupe(u8, "application/json");
+                    }
                     if (owned.kind == .embedding) {
                         if (embedding_producer_json) |raw| {
                             if (owned.producer_json.len > 0) alloc.free(owned.producer_json);
@@ -1153,7 +1164,7 @@ fn configuredArtifactSourceNames(config: std.json.Value, index_type: ApiIndexTyp
             if (source != .object) break :blk null;
             break :blk source.object.get("artifact");
         },
-        .algebraic => null,
+        .algebraic, .relational => null,
     };
     if (singular) |artifact| {
         if (artifact == .string and artifact.string.len > 0) {
@@ -1205,7 +1216,9 @@ fn appendIndexConfig(
     index_name: []const u8,
     config: std.json.Value,
 ) !void {
-    return appendPublicIndexConfig(alloc, out, index_name, config, true);
+    // GET/list use the same CreatedIndex contract as create: inline
+    // enrichments are credential-free definitions, not catalog names.
+    return appendPublicIndexConfig(alloc, out, index_name, config, false);
 }
 
 fn appendPublicIndexConfig(
@@ -1231,6 +1244,7 @@ fn appendPublicIndexConfig(
             .embeddings => "embeddings",
             .graph => "graph",
             .algebraic => "algebraic",
+            .relational => "relational",
         });
     }
     // Public configuration is an effective contract, not a byte-for-byte
@@ -1393,9 +1407,9 @@ fn appendPublicConfigValue(
                 // deny-list cannot safely project them into a public response,
                 // so preserve the table-status invariant and omit the entire
                 // write-only document.
-                // Metric map keys are user-owned names, not credential fields;
-                // their values are still projected through a closed schema.
-                if (object_shape != .graph_metrics) {
+                // Metric names and typed predicate literals are user data,
+                // not credential references. Both have closed public schemas.
+                if (object_shape != .graph_metrics and object_shape != .relational_predicate and object_shape != .relational_expression) {
                     if (public_index_contract.isWriteOnlyConfigField(entry.key_ptr.*)) continue;
                     if (isSensitivePublicConfigField(entry.key_ptr.*)) continue;
                     if (isSensitivePublicConfigValue(entry.key_ptr.*, entry.value_ptr.*)) continue;
@@ -1467,7 +1481,9 @@ fn canonicalIndexConfigJson(
 ) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
-    try appendIndexConfig(alloc, &out, index_name, config);
+    // Internal mutation comparison deliberately compares enrichment identity.
+    // This name-only representation must never be used for public responses.
+    try appendPublicIndexConfig(alloc, &out, index_name, config, true);
     return try out.toOwnedSlice(alloc);
 }
 
@@ -1525,6 +1541,7 @@ fn indexTypeName(index_type: ApiIndexType) []const u8 {
         .embeddings => "embeddings",
         .graph => "graph",
         .algebraic => "algebraic",
+        .relational => "relational",
     };
 }
 
@@ -3769,7 +3786,7 @@ fn appendSingleIndexRuntimeStatusWithGraphMetricRuntime(
     try out.appendSlice(alloc, "\"rebuilding\":");
     try out.appendSlice(alloc, if (backfill_active) "true" else "false");
     switch (index_type) {
-        .full_text, .embeddings, .algebraic => {
+        .full_text, .embeddings, .algebraic, .relational => {
             try out.appendSlice(alloc, ",\"total_indexed\":");
             try appendIntValue(alloc, out, visible_doc_count);
         },
@@ -4916,6 +4933,7 @@ pub fn inferIndexType(index_name: []const u8, config: std.json.Value) ?ApiIndexT
         if (std.mem.eql(u8, type_value.string, "embeddings")) return .embeddings;
         if (std.mem.eql(u8, type_value.string, "graph")) return .graph;
         if (std.mem.eql(u8, type_value.string, "algebraic")) return .algebraic;
+        if (std.mem.eql(u8, type_value.string, "relational")) return .relational;
         return null;
     }
     if (config.object.get("dimension") != null or
@@ -7123,6 +7141,8 @@ fn consumerTests() type {
                 .doc_count = 1,
                 .node_count = 1,
                 .coverage_produced_count = 1,
+                .publication_target_count = 1,
+                .publication_target_ready = true,
                 .coverage_generation = 7,
                 .coverage_config_hash = 41,
                 .coverage_identity_ready = true,
@@ -7626,7 +7646,7 @@ fn consumerTests() type {
             defer std.testing.allocator.free(encoded_single);
             try ant_json.testing.expectEqualJsonText(
                 std.testing.allocator,
-                "{\"name\":\"embed_idx\",\"type\":\"embeddings\",\"publication_policy\":\"progressive\",\"dimension\":384,\"embedder\":{\"provider\":\"openai\",\"model\":\"text-embedding-3-small\"},\"summarizer\":{\"provider\":\"gemini\",\"model\":\"gemini-2.5-flash\"},\"chunker\":{\"provider\":\"antfly\",\"model\":\"fixed\",\"api_url\":\"https://chunker.example.com\",\"store_chunks\":true,\"max_chunks\":50,\"threshold\":0.75,\"text\":{\"target_tokens\":500,\"overlap_tokens\":50,\"separator\":\"---\"},\"audio\":{\"window_duration_ms\":30000,\"overlap_duration_ms\":500},\"full_text_index\":{\"analyzer\":\"standard\"}},\"execution\":{\"embedding\":{\"batch_items\":32}},\"enrichments\":[\"asset_v1\"]}",
+                "{\"name\":\"embed_idx\",\"type\":\"embeddings\",\"publication_policy\":\"progressive\",\"dimension\":384,\"embedder\":{\"provider\":\"openai\",\"model\":\"text-embedding-3-small\"},\"summarizer\":{\"provider\":\"gemini\",\"model\":\"gemini-2.5-flash\"},\"chunker\":{\"provider\":\"antfly\",\"model\":\"fixed\",\"api_url\":\"https://chunker.example.com\",\"store_chunks\":true,\"max_chunks\":50,\"threshold\":0.75,\"text\":{\"target_tokens\":500,\"overlap_tokens\":50,\"separator\":\"---\"},\"audio\":{\"window_duration_ms\":30000,\"overlap_duration_ms\":500},\"full_text_index\":{\"analyzer\":\"standard\"}},\"execution\":{\"embedding\":{\"batch_items\":32}},\"enrichments\":[{\"name\":\"asset_v1\",\"kind\":\"asset\",\"execution\":{\"batch_items\":4}}]}",
                 encoded_single,
             );
 
@@ -7726,15 +7746,20 @@ fn consumerTests() type {
             try std.testing.expect(first_incarnation != coverage_policy_mod.incarnation(changed_lookup.config).?);
         }
 
-        test "index status encoder projects inline enrichment configs as names" {
+        test "public index config encoders preserve enrichment objects on read" {
+            // Based on the document import GET /indexes response that failed the v0.2
+            // SDK decoder: document_vectors and document_text returned enrichment
+            // names instead of CreatedEnrichmentConfig objects. Reconstruct the stored
+            // inline definitions and use synthetic producer credentials for redaction.
+            const indexes_json =
+                \\{"full_text_index_v0":{"type":"full_text"},"document_text":{"type":"full_text","field":"text","sources":[{"artifact":"document_chunks_v1"}],"enrichments":[{"name":"document_units_v1","kind":"asset","field":"url","producer_json":"{\"api_key\":\"do-not-return\"}"},{"name":"document_chunks_v1","kind":"chunk","field":"text","source_artifact_name":"document_units_v1","chunk_size":512,"chunk_overlap":50}]},"document_vectors":{"type":"embeddings","dimension":512,"distance_metric":"cosine","embedder":{"provider":"antfly","model":"antflydb/clipclap","api_url":"http://inference.example:8080","api_key":"do-not-return"},"sources":[{"artifact":"document_vectors"}],"enrichments":[{"name":"document_vectors","kind":"embedding","field":"text","source_artifact_name":"document_chunks_v1","expected_dims":512,"producer_json":"{\"api_key\":\"do-not-return\"}"}]}}
+            ;
             const snapshot: metadata_api.AdminSnapshot = .{
                 .status = .{ .metadata_group_id = 1, .metrics = .{} },
                 .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
                     .table_id = 7,
                     .name = "docs",
-                    .indexes_json =
-                    \\{"document_text":{"type":"full_text","enrichments":[{"name":"document_units_v1","kind":"asset"},{"name":"document_chunks_v1","kind":"chunk"}]},"document_vectors":{"type":"embeddings","external":true,"dimension":3,"enrichments":[{"name":"document_chunk_dense_v1","kind":"embedding"}]}}
-                    ,
+                    .indexes_json = indexes_json,
                     .placement_role = "data",
                 }})[0..]),
                 .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
@@ -7746,8 +7771,53 @@ fn consumerTests() type {
 
             const encoded_list = (try encodeIndexList(std.testing.allocator, &snapshot, "docs", null)).?;
             defer std.testing.allocator.free(encoded_list);
-            try std.testing.expect(std.mem.indexOf(u8, encoded_list, "\"enrichments\":[\"document_units_v1\",\"document_chunks_v1\"]") != null);
-            try std.testing.expect(std.mem.indexOf(u8, encoded_list, "\"enrichments\":[\"document_chunk_dense_v1\"]") != null);
+            const PublicIndexStatus = struct { config: indexes_openapi.CreatedIndex };
+            var listed = try std.json.parseFromSlice([]const PublicIndexStatus, std.testing.allocator, encoded_list, .{ .ignore_unknown_fields = true });
+            defer listed.deinit();
+            try std.testing.expectEqual(@as(usize, 3), listed.value.len);
+            try std.testing.expect(listed.value[0].config.created_full_text_index.enrichments == null);
+            const text_config = listed.value[1].config.created_full_text_index;
+            try std.testing.expectEqual(@as(usize, 2), text_config.enrichments.?.len);
+            try std.testing.expectEqualStrings("document_units_v1", text_config.enrichments.?[0].name);
+            try std.testing.expectEqual(indexes_openapi.EnrichmentKind.asset, text_config.enrichments.?[0].kind);
+            try std.testing.expectEqualStrings("document_chunks_v1", text_config.enrichments.?[1].name);
+            try std.testing.expectEqual(indexes_openapi.EnrichmentKind.chunk, text_config.enrichments.?[1].kind);
+            try std.testing.expectEqualStrings("document_units_v1", text_config.enrichments.?[1].source_artifact_name.?);
+            try std.testing.expectEqualStrings("document_chunks_v1", text_config.sources.?[0].artifact);
+            const vector_config = listed.value[2].config.created_embeddings_index;
+            try std.testing.expectEqual(@as(usize, 1), vector_config.enrichments.?.len);
+            try std.testing.expectEqualStrings("document_vectors", vector_config.enrichments.?[0].name);
+            try std.testing.expectEqual(indexes_openapi.EnrichmentKind.embedding, vector_config.enrichments.?[0].kind);
+            try std.testing.expectEqualStrings("document_chunks_v1", vector_config.enrichments.?[0].source_artifact_name.?);
+            try std.testing.expectEqual(@as(?i64, 512), vector_config.enrichments.?[0].expected_dims);
+            try std.testing.expectEqualStrings("document_vectors", vector_config.sources.?[0].artifact);
+            try std.testing.expect(std.mem.indexOf(u8, encoded_list, "producer_json") == null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded_list, "do-not-return") == null);
+
+            const encoded_map = try encodeIndexConfigMap(std.testing.allocator, indexes_json);
+            defer std.testing.allocator.free(encoded_map);
+            var configs = try std.json.parseFromSlice(std.json.ArrayHashMap(indexes_openapi.CreatedIndex), std.testing.allocator, encoded_map, .{});
+            defer configs.deinit();
+            for (listed.value) |listed_index| {
+                const expected = try std.json.Stringify.valueAlloc(std.testing.allocator, listed_index.config, .{ .emit_null_optional_fields = false });
+                defer std.testing.allocator.free(expected);
+                var value = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, expected, .{});
+                defer value.deinit();
+                const name = value.value.object.get("name").?.string;
+
+                const encoded_single = (try encodeSingleIndex(std.testing.allocator, &snapshot, "docs", name, null)).?;
+                defer std.testing.allocator.free(encoded_single);
+                var single = try std.json.parseFromSlice(PublicIndexStatus, std.testing.allocator, encoded_single, .{ .ignore_unknown_fields = true });
+                defer single.deinit();
+                try std.testing.expectEqualDeep(listed_index.config, single.value.config);
+                try std.testing.expectEqualDeep(listed_index.config, configs.value.map.get(name).?);
+
+                const stored = (try storedIndexConfigJsonAlloc(std.testing.allocator, indexes_json, name)).?;
+                defer std.testing.allocator.free(stored);
+                const created = try encodeCreatedIndexConfig(std.testing.allocator, name, stored);
+                defer std.testing.allocator.free(created);
+                try ant_json.testing.expectEqualJsonText(std.testing.allocator, expected, created);
+            }
         }
 
         test "single index config encoder isolates requested index" {
@@ -8006,6 +8076,32 @@ fn consumerTests() type {
             defer db_mod.types.freeEnrichmentConfigs(std.testing.allocator, effective);
             try std.testing.expectEqual(@as(usize, 1), effective.len);
             try std.testing.expect(std.mem.indexOf(u8, effective[0].producer_json, "https://inference.example/ai/v1") != null);
+        }
+
+        test "transcriber enrichment shorthand expands into a document extraction producer" {
+            const configs = try collectArtifactEnrichmentsFromTableIndexesJson(std.testing.allocator,
+                \\{"enrichments":[{"name":"call_transcripts","kind":"asset","field":"recording_url","transcriber":{"provider":"antfly","model":"openai/whisper-base","language_code":"en","timestamps":true}},{"name":"call_chunks","kind":"chunk","field":"text","source_artifact_name":"call_transcripts","chunk_size":256}]}
+            );
+            defer db_mod.types.freeEnrichmentConfigs(std.testing.allocator, configs);
+            try std.testing.expectEqual(@as(usize, 2), configs.len);
+            try std.testing.expectEqualStrings("application/json", configs[0].content_type);
+            try std.testing.expectEqualStrings(
+                "{\"type\":\"document_extraction\",\"config\":{\"transcription\":{\"enabled\":true,\"config\":{\"provider\":\"antfly\",\"model\":\"openai/whisper-base\",\"language_code\":\"en\",\"timestamps\":true}}}}",
+                configs[0].producer_json,
+            );
+            try validateArtifactEnrichmentConfigs(std.testing.allocator, configs);
+
+            // A chunk stream cannot hold transcripts, and the shorthand does
+            // not combine with a hand-written producer.
+            try std.testing.expectError(error.InvalidEnrichmentConfig, collectArtifactEnrichmentsFromTableIndexesJson(std.testing.allocator,
+                \\{"enrichments":[{"name":"t","kind":"chunk","field":"url","chunk_size":8,"transcriber":{"provider":"antfly","model":"m"}}]}
+            ));
+            try std.testing.expectError(error.InvalidEnrichmentConfig, collectArtifactEnrichmentsFromTableIndexesJson(std.testing.allocator,
+                \\{"enrichments":[{"name":"t","kind":"asset","field":"url","producer_json":"{\"type\":\"reader\",\"config\":{}}","transcriber":{"provider":"antfly","model":"m"}}]}
+            ));
+            try std.testing.expectError(error.InvalidEnrichmentConfig, collectArtifactEnrichmentsFromTableIndexesJson(std.testing.allocator,
+                \\{"enrichments":[{"name":"t","kind":"asset","field":"url","transcriber":{"model":"m"}}]}
+            ));
         }
 
         test "index metadata rejects artifact enrichment deletion with dependents" {

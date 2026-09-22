@@ -62,25 +62,38 @@ pub const HostBuffer = struct {
 pub const DeviceBuffer = struct {
     ptr: driver_mod.CUdeviceptr = 0,
     len: usize = 0,
+    /// Original allocation size, independent of a logical view's length.
+    /// Non-owning descriptors constructed from pointers have no charge.
+    allocation_bytes: usize = 0,
 
     pub fn alloc(ctx: *context_mod.CudaContext, len: usize) driver_mod.Error!DeviceBuffer {
         if (len == 0) return .{};
         try ctx.makeCurrent();
+        try ctx.device_allocations.reserve(len);
+        errdefer ctx.device_allocations.release(len);
         var ptr: driver_mod.CUdeviceptr = 0;
         const result = ctx.driver.fns.cuMemAlloc(&ptr, len);
         if (result != driver_mod.CUDA_SUCCESS) {
             std.log.err("CUDA cuMemAlloc failed: bytes={d} error={s} ({s})", .{ len, ctx.driver.errorName(result), ctx.driver.errorString(result) });
             return error.CudaDriverError;
         }
-        return .{ .ptr = ptr, .len = len };
+        return .{ .ptr = ptr, .len = len, .allocation_bytes = len };
     }
 
     pub fn free(self: *DeviceBuffer, ctx: *context_mod.CudaContext) void {
         if (self.ptr != 0) {
             ctx.makeCurrent() catch {};
-            _ = ctx.driver.fns.cuMemFree(self.ptr);
+            const result = ctx.driver.fns.cuMemFree(self.ptr);
+            if (result == driver_mod.CUDA_SUCCESS) {
+                ctx.device_allocations.release(self.allocation_bytes);
+            } else {
+                // Keep the failed free charged; it cannot authorize a later
+                // allocation. Context teardown remains the final cleanup.
+                std.log.err("CUDA cuMemFree failed: bytes={d} error={s}", .{ self.allocation_bytes, ctx.driver.errorName(result) });
+            }
             self.ptr = 0;
             self.len = 0;
+            self.allocation_bytes = 0;
         }
     }
 

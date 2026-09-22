@@ -1920,16 +1920,38 @@ def test_progressive_publication_remains_queryable_across_process_restart(
         restarted_at = __import__("time").monotonic()
         restart_last_searchable = searchable_vectors
 
-        def restored_queryability() -> dict | None:
+        def note_searchable(status: dict) -> None:
+            """Fail with the complete observation when the count regresses.
+
+            pytest abbreviates a dict assertion message, which hides the
+            fields (freshness, publication, backfill) needed to diagnose a
+            restart that momentarily hides the durable checkpoint.
+            """
             nonlocal restart_last_searchable
+            current_searchable = int(status.get("searchable_vectors", 0))
+            if current_searchable < restart_last_searchable:
+                pytest.fail(
+                    "searchable_vectors regressed after restart: "
+                    f"{current_searchable} < {restart_last_searchable}\n"
+                    + json.dumps(
+                        {
+                            "index": stateful_api.get_index(table_name, index_name),
+                            "logs": stateful_api.debug_logs(),
+                            "status": status,
+                        },
+                        indent=2,
+                        sort_keys=True,
+                    )
+                )
+            restart_last_searchable = current_searchable
+
+        def restored_queryability() -> dict | None:
             status = stateful_api.get_index(table_name, index_name)["status"]
             if status.get("incarnation") != incarnation:
                 return None
             if not (status.get("milestones") or {}).get("queryable", {}).get("reached"):
                 return None
-            current_searchable = int(status.get("searchable_vectors", 0))
-            assert current_searchable >= restart_last_searchable, status
-            restart_last_searchable = current_searchable
+            note_searchable(status)
             return status
 
         after = wait_until(
@@ -1956,14 +1978,11 @@ def test_progressive_publication_remains_queryable_across_process_restart(
         # delay queries or erase last-known facts, and the current pending
         # count should become authoritative promptly afterward.
         def restored_convergence() -> dict | None:
-            nonlocal restart_last_searchable
             status = stateful_api.get_index(table_name, index_name)["status"]
             pending = (status.get("source_coverage") or {}).get("pending")
             if status.get("incarnation") != incarnation:
                 return None
-            current_searchable = int(status.get("searchable_vectors", 0))
-            assert current_searchable >= restart_last_searchable, status
-            restart_last_searchable = current_searchable
+            note_searchable(status)
             if not isinstance(pending, int) or pending <= 0:
                 return None
             return status

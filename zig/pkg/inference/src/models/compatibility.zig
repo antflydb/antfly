@@ -299,7 +299,7 @@ fn assessWithRuntimeFacts(
             }
         },
         .reranker => {},
-        .chunker, .recognizer, .transcriber => {},
+        .chunker, .extractor, .transcriber => {},
         .generator => unreachable,
     }
 
@@ -755,7 +755,7 @@ test "release encoder contracts cover DeBERTa reranking and GLiNER2" {
     try std.testing.expectEqual(Level.compatible, assess(&reranker, "deberta-v2").level);
 
     var gliner = manifest_mod.ModelManifest{ .allocator = std.testing.allocator };
-    gliner.model_type = .recognizer;
+    gliner.model_type = .extractor;
     gliner.gliner_model_type = "gliner2";
     try std.testing.expectEqual(Level.compatible, assess(&gliner, "extractor").level);
 }
@@ -847,7 +847,7 @@ test "known unsafe local site models stay blocked even with unknown opt in" {
     try std.testing.expect(!clap_result.allowed(true));
 
     var rebel = manifest_mod.ModelManifest{ .allocator = std.testing.allocator };
-    rebel.model_type = .recognizer;
+    rebel.model_type = .extractor;
     const rebel_result = assess(&rebel, "bart");
     try std.testing.expectEqual(Level.incompatible, rebel_result.level);
     try std.testing.expect(!rebel_result.allowed(true));

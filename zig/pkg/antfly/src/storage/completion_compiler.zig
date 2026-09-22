@@ -8,6 +8,7 @@ const std = @import("std");
 const erased = @import("backend_erased.zig");
 const types = @import("backend_types.zig");
 const mutations = @import("completion_mutations.zig");
+const retained_effects = @import("retained_effects.zig");
 pub const slot = @import("lsm_backend/completion_slot.zig");
 const Allocator = std.mem.Allocator;
 
@@ -85,6 +86,7 @@ pub const Template = struct {
 pub const PhysicalSink = struct {
     baseline: *erased.Batch,
     plan: *mutations.Plan,
+    retained: retained_effects.Capture = .{},
     columns_invalidated: bool = false,
     columnar_mutation: ?@import("internal_keys.zig").ColumnarMutationToken = null,
 
@@ -92,7 +94,7 @@ pub const PhysicalSink = struct {
         return .{ .allocator = alloc, .ptr = self, .vtable = &vtable };
     }
     pub fn writer(self: *PhysicalSink, alloc: Allocator, batch: *erased.Batch) @import("docstore.zig").DocStore.Batch.BatchTxn {
-        return .{ .alloc = alloc, .runtime = batch, .columns_invalidated = &self.columns_invalidated, .columnar_mutation = &self.columnar_mutation };
+        return .{ .retained = &self.retained, .alloc = alloc, .runtime = batch, .columns_invalidated = &self.columns_invalidated, .columnar_mutation = &self.columnar_mutation };
     }
     fn cast(raw: *anyopaque) *PhysicalSink {
         return @ptrCast(@alignCast(raw));

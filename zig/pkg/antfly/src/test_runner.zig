@@ -123,16 +123,25 @@ pub fn main(init: std.process.Init.Minimal) void {
         return;
     }
 
+    // Use independent I/O so teardown of the test's I/O remains measurable.
+    const trace_timings = getenvBool("ANTFLY_TEST_TIMINGS");
+    var timing_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer timing_io.deinit();
+    const clock_io = timing_io.io();
+    const progress = Progress.open(arena, clock_io, args);
+    defer if (progress) |p| p.file.close(p.io);
     const trace_cleanup = getenvBool("ANTFLY_TEST_CLEANUP_TRACE");
     const fail_on_error_logs = getenvBool("ANTFLY_TEST_FAIL_ON_ERROR_LOGS");
     var current_count: usize = 0;
     for (test_fns) |test_fn| {
         if (!matchesFilter(test_fn.name)) continue;
         current_count += 1;
+        if (progress) |p| p.record("START", test_fn.name);
         // Print attribution before initializing per-test I/O. If platform I/O
         // setup itself terminates the process, CI still identifies the test
         // boundary instead of reporting an anonymous signal.
         std.debug.print("{d}/{d} {s}...", .{ current_count, total_count, test_fn.name });
+        const setup_start = timingNow(trace_timings, clock_io);
         testing.allocator_instance = .{};
         testing.io_instance = .init(testing.allocator, .{
             .argv0 = .init(init.args),
@@ -145,6 +154,7 @@ pub fn main(init: std.process.Init.Minimal) void {
 
         const Outcome = enum { passed, skipped, failed };
         var outcome: Outcome = .passed;
+        const body_start = timingNow(trace_timings, clock_io);
         if (test_fn.func()) |_| {} else |err| switch (err) {
             error.SkipZigTest => {
                 outcome = .skipped;
@@ -161,13 +171,29 @@ pub fn main(init: std.process.Init.Minimal) void {
             },
         }
 
+        const body_end = timingNow(trace_timings, clock_io);
+        if (progress) |p| p.record("IO_DEINIT", test_fn.name);
         if (trace_cleanup) std.debug.print("CLEANUP io_deinit begin {s}\n", .{test_fn.name});
         testing.io_instance.deinit();
+        const io_end = timingNow(trace_timings, clock_io);
+        if (progress) |p| p.record("ALLOCATOR_DEINIT", test_fn.name);
         if (trace_cleanup) std.debug.print("CLEANUP allocator_deinit begin {s}\n", .{test_fn.name});
         if (testing.allocator_instance.deinit() == .leak) {
             leak_count += 1;
         }
+        const allocator_end = timingNow(trace_timings, clock_io);
+        if (trace_timings) {
+            // Nanoseconds and full names survive buffered/prefixed CI output.
+            std.debug.print("\nTIMING\t{d}\t{d}\t{d}\t{d}\t{s}\n", .{
+                body_start - setup_start,
+                body_end - body_start,
+                io_end - body_end,
+                allocator_end - io_end,
+                test_fn.name,
+            });
+        }
         if (trace_cleanup) std.debug.print("CLEANUP done {s}\n", .{test_fn.name});
+        if (progress) |p| p.record("DONE", test_fn.name);
 
         const error_logs_after = log_err_count.load(.acquire);
         const actual_error_logs = error_logs_after -| error_logs_before;
@@ -218,6 +244,33 @@ pub fn main(init: std.process.Init.Minimal) void {
         std.process.exit(1);
     }
 }
+
+// Checked build runs buffer stderr until exit. Keep attribution outside that
+// pipe, using I/O independent of the per-test owner so a teardown hang is visible.
+const Progress = struct {
+    io: std.Io,
+    file: std.Io.File,
+
+    fn open(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) ?Progress {
+        if (!builtin.link_libc or builtin.os.tag == .windows) return null;
+        const directory = std.c.getenv("ANTFLY_TEST_LOG_DIR") orelse return null;
+        const path = std.fmt.allocPrint(alloc, "{s}/test-{d}.log", .{
+            std.mem.span(directory), std.posix.system.getpid(),
+        }) catch @panic("cannot allocate test progress path");
+        const file = std.Io.Dir.cwd().createFile(io, path, .{}) catch |err|
+            std.debug.panic("cannot create test progress log {s}: {t}", .{ path, err });
+        const result: Progress = .{ .io = io, .file = file };
+        for (args) |arg| result.record("ARG", arg);
+        return result;
+    }
+
+    fn record(self: Progress, phase: []const u8, name: []const u8) void {
+        for ([_][]const u8{ phase, "\t", name, "\n" }) |bytes| {
+            self.file.writeStreamingAll(self.io, bytes) catch |err|
+                std.debug.panic("cannot write test progress log: {t}", .{err});
+        }
+    }
+};
 
 pub export fn antfly_test_expect_error_logs(count: usize) callconv(.c) void {
     _ = expected_error_log_count.fetchAdd(count, .monotonic);
@@ -315,4 +368,8 @@ pub fn log(
     });
     std.debug.print(format, args);
     std.debug.print("\n", .{});
+}
+
+fn timingNow(enabled: bool, io: std.Io) i96 {
+    return if (enabled) std.Io.Clock.awake.now(io).toNanoseconds() else 0;
 }

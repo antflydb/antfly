@@ -136,6 +136,11 @@ pub const ReplicaDescriptor = struct {
     /// relocation targets needed for transport before they become voters.
     initial_voters: ?[]const core.types.NodeId = null,
     bootstrap: ReplicaBootstrap = .persisted,
+    /// Persistence of an incoming snapshot does not prove that the application
+    /// installed it. Durable providers set this when their completed-apply
+    /// cursor precedes the stored snapshot. Recovery queues its exact payload
+    /// before committed log replay and ReadStates through the normal apply path.
+    recover_persisted_snapshot: bool = false,
 
     pub const Topology = struct {
         /// Nodes that must be reachable while reconciling. This is not an

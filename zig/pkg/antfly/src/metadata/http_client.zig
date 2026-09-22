@@ -159,6 +159,34 @@ pub const MetadataHttpClient = struct {
         return try self.getJsonValueWithBudget(metadata_api.MetadataStatus, base_uri, routes.Routes.status, budget);
     }
 
+    /// Leader discovery needs only identity and live Raft topology. The full
+    /// diagnostic status walks the projected catalog and can exhaust a short
+    /// discovery slice even while the leader is available for mutations.
+    pub fn fetchMutationTopologyWithBudget(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        budget: RequestBudget,
+    ) !metadata_api.MetadataRuntimeTopology {
+        const uri = try join(self.alloc, base_uri, routes.Routes.runtime_topology);
+        defer self.alloc.free(uri);
+        var response = try self.executeWithRetryBudget(.{
+            .method = .GET,
+            .uri = uri,
+            .timeout_ms = default_request_timeout_ms,
+        }, budget);
+        defer response.deinit(self.alloc);
+        // Older peers can still participate. Parse only routing fields and
+        // retain the original absolute deadline across the compatibility read.
+        if (response.status == 404 or response.status == 405) {
+            return self.getJsonValueWithBudget(metadata_api.MetadataRuntimeTopology, base_uri, routes.Routes.status, budget);
+        }
+        if (response.status < 200 or response.status >= 300) return error.UnexpectedHttpStatus;
+        const topology = try std.json.parseFromSlice(metadata_api.MetadataRuntimeTopology, self.alloc, response.body, .{ .ignore_unknown_fields = true });
+        defer topology.deinit();
+        try ensureRequestBudget(budget);
+        return metadata_api.stabilizeMetadataRuntimeTopology(topology.value);
+    }
+
     pub fn fetchTableTopologyProtocolStatusWithBudget(
         self: *MetadataHttpClient,
         base_uri: []const u8,
@@ -304,6 +332,46 @@ pub const MetadataHttpClient = struct {
         budget: ?RequestBudget,
     ) !std.json.Parsed(metadata_api.AdminSnapshot) {
         return try self.getJsonWithBudget(metadata_api.AdminSnapshot, base_uri, routes.Routes.admin_snapshot, budget);
+    }
+
+    pub fn fetchProvisioningSnapshot(self: *MetadataHttpClient, base_uri: []const u8, node_id: u64, budget: ?RequestBudget) !std.json.Parsed(@import("restore_staging.zig").ProvisioningSnapshot) {
+        const uri = try join(self.alloc, base_uri, routes.Routes.internal_provisioning_snapshot);
+        defer self.alloc.free(uri);
+        const body = try std.json.Stringify.valueAlloc(self.alloc, @import("restore_staging.zig").ProvisioningRequest{ .node_id = node_id }, .{});
+        defer self.alloc.free(body);
+        var resp = try self.executeWithRetryBudget(.{ .method = .POST, .uri = uri, .body = body, .content_type = "application/json", .timeout_ms = linearizable_snapshot_request_timeout_ms }, budget);
+        defer resp.deinit(self.alloc);
+        if (resp.status == 404 or resp.status == 405 or resp.status == 501) return error.UnsupportedOperation;
+        try mapStatus(resp.status, null, null, null);
+        if (resp.body.len > 64 * 1024 * 1024) return error.InvalidRestoreStaging;
+        var result = try parseJson(@import("restore_staging.zig").ProvisioningSnapshot, self.alloc, resp.body);
+        errdefer result.deinit();
+        if (result.value.node_id != node_id) return error.InvalidRestoreStaging;
+        try ensureRequestBudget(budget);
+        return result;
+    }
+
+    pub fn fetchRestoreStagingAuthority(self: *MetadataHttpClient, base_uri: []const u8, request: @import("restore_staging.zig").AuthorityRequest, budget: ?RequestBudget) !std.json.Parsed(@import("restore_staging.zig").AuthorityResponse) {
+        const staging = @import("restore_staging.zig");
+        try request.validate();
+        const uri = try join(self.alloc, base_uri, routes.Routes.internal_restore_staging_authority);
+        defer self.alloc.free(uri);
+        const body = try std.json.Stringify.valueAlloc(self.alloc, request, .{});
+        defer self.alloc.free(body);
+        const max_bytes: usize = if (request.include_plan) staging.max_encoded_bytes * 2 + 4096 else 4096;
+        var resp = try self.executeWithRetryBudget(.{ .method = .POST, .uri = uri, .body = body, .content_type = "application/json", .timeout_ms = linearizable_snapshot_request_timeout_ms, .max_response_bytes = max_bytes }, budget);
+        defer resp.deinit(self.alloc);
+        if (resp.status == 404 or resp.status == 405 or resp.status == 501) return error.UnsupportedOperation;
+        if (resp.status == 403) return error.RestoreStagingScopeChanged;
+        try mapStatus(resp.status, null, null, null);
+        // A full immutable plan is fetched only on a cold owner descriptor.
+        // Compact progress/receipt reads cannot grow with the restored corpus.
+        if (resp.body.len > max_bytes) return error.InvalidRestoreStaging;
+        var result = try parseJson(staging.AuthorityResponse, self.alloc, resp.body);
+        errdefer result.deinit();
+        try result.value.validate(request);
+        try ensureRequestBudget(budget);
+        return result;
     }
 
     pub fn fetchRoutingSnapshotWithBudget(
@@ -1563,6 +1631,8 @@ pub const MetadataHttpClient = struct {
         // released, including parser-owned storage for escaped JSON strings.
         if (T == metadata_api.MetadataStatus)
             return metadata_api.stabilizeMetadataStatus(parsed.value);
+        if (T == metadata_api.MetadataRuntimeTopology)
+            return metadata_api.stabilizeMetadataRuntimeTopology(parsed.value);
         return parsed.value;
     }
 
@@ -2566,6 +2636,52 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(u64, 91), head.metadata_group_id);
             try std.testing.expectEqual(@as(u64, 18), head.metadata_epoch);
             try std.testing.expectEqual(@as(usize, 1), executor.calls);
+        }
+
+        test "restore staging authority client is signed bounded and fails closed on mismatched scope" {
+            const staging = @import("restore_staging.zig");
+            const Fake = struct {
+                status: u16 = 200,
+                wrong_node: bool = false,
+                calls: usize = 0,
+                fn execute(raw: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.calls += 1;
+                    try std.testing.expectEqualStrings("http://metadata/internal/v1/catalog/restore-staging-authority", req.uri);
+                    try std.testing.expect(req.header(internal_service_auth.header_name) != null);
+                    var input = try std.json.parseFromSlice(staging.AuthorityRequest, alloc, req.body, .{});
+                    defer input.deinit();
+                    try input.value.validate();
+                    try std.testing.expectEqual(@as(?usize, if (input.value.include_plan) staging.max_encoded_bytes * 2 + 4096 else 4096), req.max_response_bytes);
+                    return .{ .status = self.status, .body = try std.json.Stringify.valueAlloc(alloc, staging.AuthorityResponse{
+                        .node_id = if (self.wrong_node) input.value.node_id + 1 else input.value.node_id,
+                        .plan_id = input.value.plan_id,
+                        .metadata_group_id = 77,
+                        .metadata_incarnation = "11111111111111111111111111111111".*,
+                        .metadata_epoch = 2,
+                        .progress = .{ .state = .published, .revision = 9 },
+                        .receipt = if (input.value.receipt != null) @splat(255) else null,
+                    }, .{}) };
+                }
+            };
+            var fake: Fake = .{};
+            var client = MetadataHttpClient.init(std.testing.allocator, .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } });
+            _ = client.withInternalServiceAuth("metadata-client-test-service-secret", "cluster-a");
+            const input: staging.AuthorityRequest = .{ .node_id = 4, .plan_id = @splat(255), .receipt = .{ .state = .validating, .owner_group = 301 } };
+            var result = try client.fetchRestoreStagingAuthority("http://metadata", input, null);
+            defer result.deinit();
+            try std.testing.expectEqual(staging.State.published, result.value.progress.?.state);
+            try std.testing.expectEqual(@as(staging.Digest, @splat(255)), result.value.receipt.?);
+            fake.wrong_node = true;
+            try std.testing.expectError(error.InvalidRestoreStaging, client.fetchRestoreStagingAuthority("http://metadata", input, null));
+            fake.status = 403;
+            try std.testing.expectError(error.RestoreStagingScopeChanged, client.fetchRestoreStagingAuthority("http://metadata", input, null));
+            fake.status = 501;
+            try std.testing.expectError(error.UnsupportedOperation, client.fetchRestoreStagingAuthority("http://metadata", input, null));
+            var invalid = input;
+            invalid.node_id = 0;
+            try std.testing.expectError(error.InvalidArgument, client.fetchRestoreStagingAuthority("http://metadata", invalid, null));
+            try std.testing.expectEqual(@as(usize, 4), fake.calls);
         }
 
         test "metadata http client signs internal routes without leaking authority to public routes" {
@@ -4103,4 +4219,41 @@ test "system catalog direct read carries identity and deadline without a discove
     try std.testing.expectError(error.Timeout, client.readSystemCatalog("http://metadata.invalid", .snapshot, 0, null));
     try std.testing.expectError(error.InvalidCatalogMutation, client.readSystemCatalog("http://metadata.invalid", .{ .mutate = .{ .mutation = .{ .action = .create, .kind = .database, .name = "denied" } } }, 25, null));
     try std.testing.expectEqual(@as(usize, 2), executor.calls);
+}
+
+test "metadata mutation topology avoids diagnostics and owns parsed roles across compatibility fallback" {
+    const a = std.testing.allocator;
+    const Executor = struct {
+        missing: bool,
+        status_code: u16 = 200,
+        compact_calls: usize = 0,
+        diagnostic_calls: usize = 0,
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (std.mem.endsWith(u8, request.uri, routes.Routes.runtime_topology)) {
+                self.compact_calls += 1;
+                if (self.missing) return .{ .status = 404, .body = try alloc.dupe(u8, "missing") };
+            } else {
+                try std.testing.expect(self.missing);
+                try std.testing.expect(std.mem.endsWith(u8, request.uri, routes.Routes.status));
+                self.diagnostic_calls += 1;
+            }
+            return .{ .status = self.status_code, .body = try alloc.dupe(u8,
+                \\{"metadata_group_id":9,"metadata_incarnation":"11111111111111111111111111111111","metadata_raft_local_node_id":2,"metadata_raft_role":"le\u0061der","metadata_raft_leader_id":2,"unrelated_diagnostics":[1,2,3]}
+            ) };
+        }
+    };
+    for ([_]bool{ false, true }) |missing| {
+        var executor = Executor{ .missing = missing };
+        var client = MetadataHttpClient.init(a, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
+        const result = try client.fetchMutationTopologyWithBudget("http://metadata.invalid", .{ .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s });
+        try std.testing.expectEqualStrings("leader", result.metadata_raft_role);
+        try std.testing.expectEqual(@as(u64, 2), result.metadata_raft_leader_id.?);
+        try std.testing.expectEqual(@as(usize, 1), executor.compact_calls);
+        try std.testing.expectEqual(@as(usize, @intFromBool(missing)), executor.diagnostic_calls);
+    }
+    var unavailable = Executor{ .missing = false, .status_code = 503 };
+    var client = MetadataHttpClient.init(a, .{ .ptr = &unavailable, .vtable = &.{ .execute = Executor.execute } });
+    try std.testing.expectError(error.UnexpectedHttpStatus, client.fetchMutationTopologyWithBudget("http://metadata.invalid", .{ .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s }));
+    try std.testing.expectEqual(@as(usize, 0), unavailable.diagnostic_calls);
 }

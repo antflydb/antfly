@@ -497,7 +497,9 @@ pub fn reassignNamespaceWithMetadataAlloc(
     try validateStoreAlloc(alloc, store);
 }
 
-fn encodeNamespace(buf: []u8, namespace: Namespace) void {
+/// Canonical durable namespace bytes, shared by identity initialization and
+/// the atomic schema/constraint activation bootstrap transaction.
+pub fn encodeNamespace(buf: []u8, namespace: Namespace) void {
     std.debug.assert(buf.len == 24);
     std.mem.writeInt(u64, buf[0..8], namespace.table_id, .big);
     std.mem.writeInt(u64, buf[8..16], namespace.shard_id, .big);
@@ -541,6 +543,55 @@ fn readVisibilitySummaryTxn(txn: anytype) !?VisibilitySummary {
         else => return err,
     };
     return try decodeVisibilitySummary(raw);
+}
+
+/// Schema/source lifecycle admission may persist the namespace before the
+/// first row. Namespace presence alone therefore cannot distinguish an old
+/// uncounted store from a pristine owner. Prove the latter with two bounded
+/// prefix probes and the ordinal head, once, when its summary is absent.
+/// Existing rows or identities keep an unknown summary unknown; never invent
+/// zero coverage for an upgrade/corrupt populated root.
+fn initialVisibilitySummaryTxn(store: *docstore_mod.DocStore) !?VisibilitySummary {
+    // The mutation fast path uses a point-probe transaction, which deliberately
+    // does not support cursors. Open a transient snapshot only for this rare
+    // missing-summary proof; callers retain the mutation/apply fence.
+    var txn = try store.beginReadTxnWithBlockCacheAdmission(.transient);
+    defer txn.abort();
+    return try pristineVisibilitySummaryTxn(&txn);
+}
+
+fn pristineVisibilitySummaryTxn(txn: *docstore_mod.DocStore.Txn) !?VisibilitySummary {
+    if (try readNextOrdinalTxn(txn) != 1) return null;
+    // This is a key-only emptiness proof, not an artifact payload read.
+    var cursor = try txn.openPhysicalCursorAdapter();
+    defer cursor.close();
+    if (try cursor.seekAtOrAfter(&.{internal_keys.user_namespace})) |entry|
+        if (internal_keys.isInternalUserKey(entry.key)) return null;
+    if (try cursor.seekAtOrAfter(&.{internal_keys.identity_namespace})) |entry|
+        if (entry.key.len > 0 and entry.key[0] == internal_keys.identity_namespace and
+            (entry.key.len < 2 or entry.key[1] != 0xff)) return null;
+    return VisibilitySummary{};
+}
+
+/// Bootstrap a fresh owner before importing non-primary artifacts. Once those
+/// artifacts exist, the generic missing-summary proof correctly cannot infer
+/// an empty corpus. The caller commits this proof with its owner scope and
+/// range counter; aborting that transaction exposes no partial bootstrap.
+pub fn initializePristineVisibilitySummaryTxn(txn: *docstore_mod.DocStore.Txn, namespace: Namespace) !?VisibilitySummary {
+    const stored_namespace = try loadNamespaceTxn(txn);
+    if (stored_namespace) |stored| if (!stored.eql(namespace)) return error.IdentityNamespaceMismatch;
+    const empty = (try pristineVisibilitySummaryTxn(txn)) orelse return null;
+    if (try readVisibilitySummaryTxn(txn)) |existing| {
+        if (!std.meta.eql(empty, existing)) return null;
+    } else {
+        try writeVisibilitySummaryTxn(txn, empty);
+    }
+    if (stored_namespace == null) {
+        var encoded: [24]u8 = undefined;
+        encodeNamespace(&encoded, namespace);
+        try txn.put(&internal_keys.identity_namespace_key, &encoded);
+    }
+    return empty;
 }
 
 pub fn lookupOrdinalTxn(alloc: Allocator, txn: anytype, doc_id: []const u8) !?DocOrdinal {
@@ -742,6 +793,16 @@ pub fn resolvedDocSetForIdsAtGenerationTxn(
     doc_ids: []const []const u8,
     generation: ?u64,
 ) !doc_set.ResolvedDocSet {
+    return resolvedDocSetForIdsAtGenerationWithPolicyTxn(alloc, txn, doc_ids, generation, .{});
+}
+
+pub fn resolvedDocSetForIdsAtGenerationWithPolicyTxn(
+    alloc: Allocator,
+    txn: anytype,
+    doc_ids: []const []const u8,
+    generation: ?u64,
+    policy: doc_set.BitmapPolicy,
+) !doc_set.ResolvedDocSet {
     const mutable_txn = txn;
     var ordinals = std.ArrayListUnmanaged(DocOrdinal).empty;
     defer ordinals.deinit(alloc);
@@ -771,7 +832,7 @@ pub fn resolvedDocSetForIdsAtGenerationTxn(
         return try doc_set.cloneDocKeysAlloc(alloc, fallback_doc_ids.items);
     }
     if (ordinals.items.len == 0) return .none;
-    return try doc_set.fromOrdinalsAlloc(alloc, ordinals.items);
+    return try doc_set.fromOrdinalsWithPolicyAlloc(alloc, ordinals.items, policy);
 }
 
 pub fn fastStatsFromStore(store: *docstore_mod.DocStore) !Stats {
@@ -2000,7 +2061,7 @@ pub fn appendBatchIdentityMetadataForNamespaceWithVisibilityDeletesAlloc(
         break :blk true;
     };
 
-    var visibility_summary = (try readVisibilitySummaryTxn(&txn)) orelse if (missing_namespace) VisibilitySummary{} else null;
+    var visibility_summary = (try readVisibilitySummaryTxn(&txn)) orelse if (missing_namespace) VisibilitySummary{} else try initialVisibilitySummaryTxn(store);
     var visibility_summary_dirty = visibility_summary != null and missing_namespace;
 
     var seen_upserts = std.StringHashMapUnmanaged(void).empty;
@@ -2151,7 +2212,7 @@ pub fn appendBatchIdentityMetadataAllNewTrustedForNamespaceAlloc(
         try seen_canonical_ids.put(alloc, canonical_doc_id, {});
     }
 
-    var visibility_summary = (try readVisibilitySummaryTxn(&txn)) orelse if (missing_namespace) VisibilitySummary{} else null;
+    var visibility_summary = (try readVisibilitySummaryTxn(&txn)) orelse if (missing_namespace) VisibilitySummary{} else try initialVisibilitySummaryTxn(store);
     if (missing_namespace) try appendNamespaceWrite(alloc, out, namespace);
 
     var next_ordinal = try readNextOrdinalTxn(&txn);
@@ -2320,7 +2381,7 @@ fn appendBatchIdentityMetadataBatchedFastPath(
     if (identityLookupsContainDuplicateKeys(canonical_lookups)) return false;
     if (!missing_namespace and try anyIdentityLookupExists(alloc, &txn, canonical_lookups)) return false;
 
-    var visibility_summary = (try readVisibilitySummaryTxn(&txn)) orelse if (missing_namespace) VisibilitySummary{} else null;
+    var visibility_summary = (try readVisibilitySummaryTxn(&txn)) orelse if (missing_namespace) VisibilitySummary{} else try initialVisibilitySummaryTxn(store);
     if (missing_namespace) try appendNamespaceWrite(alloc, out, namespace);
     var next_ordinal = try readNextOrdinalTxn(&txn);
     const available_ordinals: usize = std.math.maxInt(DocOrdinal) - next_ordinal;
@@ -2450,6 +2511,93 @@ test "identity unchanged batch proves live state and canonical mappings with thr
     const wrong = [_]u8{ 0, 0, 0, 99 };
     try store.putBatchWithReplay(null, &.{.{ .key = &canonical_key, .value = &wrong }}, &.{}, null);
     try std.testing.expectError(error.InvalidDocIdentity, appendBatchIdentityMetadataForNamespaceAlloc(alloc, &store, default_namespace, 22, &unchanged, &.{ "doc:m", "doc:z", "doc:a" }, &.{}));
+}
+
+test "restore staging pristine identity bootstrap is atomic and fail closed" {
+    const mem_backend = @import("../mem_backend.zig");
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try docstore_mod.DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    const namespace: Namespace = .{ .table_id = 7, .shard_id = 8, .range_id = 9 };
+    try writeNamespaceToStore(&store, namespace);
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.IdentityNamespaceMismatch, initializePristineVisibilitySummaryTxn(&txn, .{ .table_id = 10, .shard_id = 8, .range_id = 9 }));
+        try std.testing.expect(try initializePristineVisibilitySummaryTxn(&txn, namespace) != null);
+    }
+    try std.testing.expect(try visibilitySummaryFromStore(&store) == null);
+    const artifact = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "vector");
+    defer alloc.free(artifact);
+    const nonzero = encodeVisibilitySummary(.{ .live_ordinals = 1 });
+    const rejected = [_]docstore_mod.KVPair{
+        .{ .key = artifact, .value = "opaque-artifact" },
+        .{ .key = &.{internal_keys.identity_namespace}, .value = "malformed-identity-prefix" },
+        .{ .key = &internal_keys.identity_visibility_summary_key, .value = &nonzero },
+    };
+    for (rejected) |record| {
+        try store.putBatch(&.{record}, &.{});
+        {
+            var txn = try store.beginWriteTxn();
+            defer txn.abort();
+            try std.testing.expect(try initializePristineVisibilitySummaryTxn(&txn, namespace) == null);
+        }
+        const unchanged = try store.get(alloc, record.key);
+        defer alloc.free(unchanged);
+        try std.testing.expectEqualSlices(u8, record.value, unchanged);
+        try store.putBatch(&.{}, &.{record.key});
+        try std.testing.expect(try visibilitySummaryFromStore(&store) == null);
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try std.testing.expect(try initializePristineVisibilitySummaryTxn(&txn, namespace) != null);
+        try txn.commit();
+    }
+    try std.testing.expectEqual(@as(u64, 0), (try visibilitySummaryFromStore(&store)).?.live_ordinals);
+    try store.putBatch(&.{.{ .key = artifact, .value = "opaque-artifact" }}, &.{});
+    var txn = try store.beginWriteTxn();
+    defer txn.abort();
+    // A preexisting zero summary cannot authorize a non-pristine root either.
+    try std.testing.expect(try initializePristineVisibilitySummaryTxn(&txn, namespace) == null);
+}
+
+test "relational index system namespace preinitialization seeds first visibility summary only with bounded empty proof" {
+    const mem_backend = @import("../mem_backend.zig");
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try docstore_mod.DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    const namespace: Namespace = .{ .table_id = 7, .shard_id = 8, .range_id = 9 };
+    var namespace_bytes: [24]u8 = undefined;
+    encodeNamespace(&namespace_bytes, namespace);
+    try store.putBatch(&.{.{ .key = &internal_keys.identity_namespace_key, .value = &namespace_bytes }}, &.{});
+    {
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect(try readVisibilitySummaryTxn(&read) == null);
+        try std.testing.expect(try initialVisibilitySummaryTxn(&store) != null);
+    }
+    const old_key = try internal_keys.documentKeyAlloc(alloc, "uncounted-old-row");
+    defer alloc.free(old_key);
+    try store.putBatch(&.{.{ .key = old_key, .value = "{}" }}, &.{});
+    {
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        // Never turn a missing legacy/corrupt summary into a zero-data proof.
+        try std.testing.expect(try initialVisibilitySummaryTxn(&store) == null);
+    }
+    try store.putBatch(&.{}, &.{old_key});
+    var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer freeIdentityWrites(alloc, &writes);
+    try appendBatchIdentityMetadataForNamespaceAlloc(alloc, &store, namespace, 10, &writes, &.{ "a", "b" }, &.{});
+    const summary = (try visibilitySummaryFromWrites(writes.items)).?;
+    try std.testing.expectEqual(@as(u64, 2), summary.live_ordinals);
+    try store.putBatch(writes.items, &.{});
+    try std.testing.expectEqual(@as(u64, 2), (try visibilitySummaryFromStore(&store)).?.live_ordinals);
 }
 
 fn identityLookupsContainDuplicateKeys(lookups: []const IdentityLookup) bool {

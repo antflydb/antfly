@@ -31,6 +31,7 @@ const backend_scan = @import("backend_scan.zig");
 const backend_types = @import("backend_types.zig");
 const change_journal_mod = @import("db/derived/change_journal.zig");
 const internal_keys = @import("internal_keys.zig");
+const retained_effects = @import("retained_effects.zig");
 const artifact_payload = @import("artifact_payload.zig");
 const lsm_backend = @import("lsm_backend.zig");
 const mem_backend = @import("mem_backend.zig");
@@ -388,12 +389,15 @@ pub const DocStore = struct {
     payload_store: ?artifact_payload.Store = null,
     payload_capture_inline: bool = false,
     payload_migration_allowance: ?u64 = null,
-    payload_policy_mutex: std.atomic.Mutex = .unlocked,
+    payload_policy_mutex: std.Io.Mutex = .init,
     payload_recovery_required: std.atomic.Value(bool) = .init(false),
     alloc: Allocator,
     /// Process-local wake hint, published only after successful row/schema
     /// commits. Durable mutation IDs and timers remain the restart authority.
     columnar_revision: std.atomic.Value(u64) = .init(0),
+    // 0 unknown, 1 no retention catalog, 2 catalog may exist. Admission marks
+    // this before its commit; an aborted admission merely leaves a safe probe.
+    retained_effects_cache: std.atomic.Value(u8) = .init(0),
     kind: Kind,
     runtime_store: backend_erased.Store,
     owns_runtime_store: bool,
@@ -440,6 +444,8 @@ pub const DocStore = struct {
     });
 
     pub const Txn = struct {
+        retained: retained_effects.Capture = .{},
+        mutation_capture: ?*@import("txn_mutation_capture.zig").Capture = null,
         payload_session: ?*artifact_payload.Session = null,
         alloc: Allocator,
         raw: ?LmdbTransaction = null,
@@ -469,6 +475,7 @@ pub const DocStore = struct {
         });
 
         pub fn abort(self: *Txn) void {
+            self.retained.deinit(self.alloc);
             const reader_owner = self.portable_import_reader_owner;
             const payload_session = self.payload_session;
             defer if (payload_session) |session| session.release();
@@ -494,6 +501,8 @@ pub const DocStore = struct {
         }
 
         pub fn commit(self: *Txn) !void {
+            errdefer self.retained.poisoned = true;
+            try self.retained.stage(self.alloc, self);
             const reader_owner = self.portable_import_reader_owner;
             const columnar_owner = if (self.columnar_mutation != null or self.columns_invalidated) self.columnar_owner else null;
             const payload_session = self.payload_session;
@@ -503,6 +512,7 @@ pub const DocStore = struct {
             if (supports_lmdb) {
                 if (self.raw) |*raw| {
                     try raw.commit();
+                    self.retained.deinit(self.alloc);
                     if (columnar_owner) |owner| _ = owner.columnar_revision.fetchAdd(1, .release);
                     self.* = undefined;
                     if (reader_owner) |owner| owner.releasePortableImportReader();
@@ -518,6 +528,7 @@ pub const DocStore = struct {
                 session.committed = true;
                 session.release();
             }
+            self.retained.deinit(self.alloc);
             self.* = undefined;
             if (columnar_owner) |owner| _ = owner.columnar_revision.fetchAdd(1, .release);
             if (reader_owner) |owner| owner.releasePortableImportReader();
@@ -668,6 +679,8 @@ pub const DocStore = struct {
         }
 
         pub fn put(self: *Txn, key: []const u8, value: []const u8) !void {
+            try self.retained.touch(self.alloc, self, key, internal_keys.isStoredDocumentRowKey(key), if (self.columnar_owner) |owner| &owner.retained_effects_cache else null);
+            if (self.mutation_capture) |capture| try capture.touch(key);
             try self.markColumnarDirty(key, value);
             try self.invalidateColumns(key);
             if (supports_lmdb) {
@@ -682,6 +695,8 @@ pub const DocStore = struct {
         }
 
         pub fn delete(self: *Txn, key: []const u8) !void {
+            try self.retained.touch(self.alloc, self, key, internal_keys.isStoredDocumentRowKey(key), if (self.columnar_owner) |owner| &owner.retained_effects_cache else null);
+            if (self.mutation_capture) |capture| try capture.touch(key);
             try self.markColumnarDirty(key, null);
             try self.invalidateColumns(key);
             if (supports_lmdb) {
@@ -756,6 +771,7 @@ pub const DocStore = struct {
     };
 
     pub const Batch = struct {
+        retained: retained_effects.Capture = .{},
         columnar_owner: ?*DocStore = null,
         payload_session: ?*artifact_payload.Session = null,
         alloc: Allocator,
@@ -767,6 +783,8 @@ pub const DocStore = struct {
         runtime: ?backend_erased.Batch = null,
 
         pub const BatchTxn = struct {
+            retained: *retained_effects.Capture,
+            retained_cache: ?*std.atomic.Value(u8) = null,
             payload_session: ?*artifact_payload.Session = null,
             alloc: Allocator,
             columns_invalidated: *bool,
@@ -825,6 +843,7 @@ pub const DocStore = struct {
             }
 
             pub fn put(self: @This(), key: []const u8, value: []const u8) !void {
+                try self.retained.touch(self.alloc, self, key, internal_keys.isStoredDocumentRowKey(key), self.retained_cache);
                 try self.markColumnarDirty(key, value);
                 try self.invalidateColumns(key);
                 if (supports_lmdb) {
@@ -839,6 +858,7 @@ pub const DocStore = struct {
             }
 
             pub fn appendPut(self: @This(), key: []const u8, value: []const u8) !void {
+                try self.retained.touch(self.alloc, self, key, internal_keys.isStoredDocumentRowKey(key), self.retained_cache);
                 if (self.unordered_bulk_append_puts and internal_keys.isRelationalRowKey(key)) {
                     // Keep auxiliary records in the bulk arena too. A regular
                     // put drains that arena into a sorted mutable map, causing
@@ -860,6 +880,7 @@ pub const DocStore = struct {
             }
 
             pub fn delete(self: @This(), key: []const u8) !void {
+                try self.retained.touch(self.alloc, self, key, internal_keys.isStoredDocumentRowKey(key), self.retained_cache);
                 try self.markColumnarDirty(key, null);
                 try self.invalidateColumns(key);
                 if (supports_lmdb) {
@@ -916,7 +937,15 @@ pub const DocStore = struct {
             .delete = batchDelete,
         });
 
+        /// Preserve the transactional ordered view through runtime erasure.
+        /// Prepare-time journal accounting uses one prefix seek only when its
+        /// durable aggregate has not yet been initialized.
+        pub fn openCursor(self: *Batch) !backend_erased.Cursor {
+            return self.asTxn().openCursor();
+        }
+
         pub fn abort(self: *Batch) void {
+            self.retained.deinit(self.alloc);
             const payload_session = self.payload_session;
             defer if (payload_session) |session| session.release();
             if (supports_lmdb) {
@@ -933,6 +962,8 @@ pub const DocStore = struct {
         }
 
         pub fn commit(self: *Batch) !void {
+            errdefer self.retained.poisoned = true;
+            try self.retained.stage(self.alloc, self.asTxn());
             const columnar_owner = if (self.columnar_mutation != null or self.columns_invalidated) self.columnar_owner else null;
             const payload_session = self.payload_session;
             if (payload_session) |session| try session.stageReferenceEpoch(self);
@@ -941,6 +972,7 @@ pub const DocStore = struct {
             if (supports_lmdb) {
                 if (self.raw) |*raw| {
                     try raw.commit();
+                    self.retained.deinit(self.alloc);
                     if (columnar_owner) |owner| _ = owner.columnar_revision.fetchAdd(1, .release);
                     self.* = undefined;
                     return;
@@ -953,12 +985,15 @@ pub const DocStore = struct {
                 session.committed = true;
                 session.release();
             }
+            self.retained.deinit(self.alloc);
             self.* = undefined;
             if (columnar_owner) |owner| _ = owner.columnar_revision.fetchAdd(1, .release);
         }
 
         pub fn asTxn(self: *Batch) BatchTxn {
             return .{
+                .retained = &self.retained,
+                .retained_cache = if (self.columnar_owner) |owner| &owner.retained_effects_cache else null,
                 .payload_session = self.payload_session,
                 .alloc = self.alloc,
                 .raw = if (supports_lmdb) if (self.raw) |*raw| raw.asTransaction() else null else null,
@@ -1244,14 +1279,26 @@ pub const DocStore = struct {
     }
 
     fn lockPayloadPolicy(self: *DocStore) void {
-        while (!self.payload_policy_mutex.tryLock()) std.atomic.spinLoopHint();
+        // This synchronous ABI has no borrowed task Io. Use the non-spawning
+        // synchronization Io, as the backend's other synchronous gates do.
+        // Admission can wait for the backend lock: spinning here starves its
+        // holder under concurrent query hydration and CPU quotas.
+        self.payload_policy_mutex.lockUncancelable(payloadPolicyIo());
+    }
+
+    fn payloadPolicyIo() std.Io {
+        return if (builtin.os.tag == .freestanding) .failing else std.Io.Threaded.global_single_threaded.io();
+    }
+
+    fn unlockPayloadPolicy(self: *DocStore) void {
+        self.payload_policy_mutex.unlock(payloadPolicyIo());
     }
 
     /// DB apply admission excludes writers. Reader admission holds this mutex
     /// until its primary view and source lease have both been captured.
     pub fn configurePayloadPolicy(self: *DocStore, store: ?artifact_payload.Store, capture_inline: bool, migration_allowance: ?u64) void {
         self.lockPayloadPolicy();
-        defer self.payload_policy_mutex.unlock();
+        defer self.unlockPayloadPolicy();
         self.payload_store = store;
         self.payload_capture_inline = capture_inline;
         self.payload_migration_allowance = migration_allowance;
@@ -1299,7 +1346,7 @@ pub const DocStore = struct {
         admission: backend_types.Namespace.BlockCacheAdmission,
     ) !Txn {
         if (self.kind == .runtime) self.lockPayloadPolicy();
-        defer if (self.kind == .runtime) self.payload_policy_mutex.unlock();
+        defer if (self.kind == .runtime) self.unlockPayloadPolicy();
         const payload_session = try self.createPayloadSession();
         errdefer if (payload_session) |session| session.release();
         return switch (self.kind) {
@@ -1356,7 +1403,7 @@ pub const DocStore = struct {
         try self.acquirePortableImportReader();
         errdefer self.releasePortableImportReader();
         if (self.kind == .runtime) self.lockPayloadPolicy();
-        defer if (self.kind == .runtime) self.payload_policy_mutex.unlock();
+        defer if (self.kind == .runtime) self.unlockPayloadPolicy();
         const payload_session = try self.createPayloadSession();
         errdefer if (payload_session) |session| session.release();
         var txn: Txn = switch (self.kind) {
@@ -1383,7 +1430,7 @@ pub const DocStore = struct {
         try self.acquirePortableImportReader();
         errdefer self.releasePortableImportReader();
         if (self.kind == .runtime) self.lockPayloadPolicy();
-        defer if (self.kind == .runtime) self.payload_policy_mutex.unlock();
+        defer if (self.kind == .runtime) self.unlockPayloadPolicy();
         const payload_session = try self.createPayloadSession();
         errdefer if (payload_session) |session| session.release();
         var txn: Txn = switch (self.kind) {
@@ -1406,7 +1453,7 @@ pub const DocStore = struct {
         try self.acquirePortableImportReader();
         errdefer self.releasePortableImportReader();
         if (self.kind == .runtime) self.lockPayloadPolicy();
-        defer if (self.kind == .runtime) self.payload_policy_mutex.unlock();
+        defer if (self.kind == .runtime) self.unlockPayloadPolicy();
         const payload_session = try self.createPayloadSession();
         errdefer if (payload_session) |session| session.release();
         var txn: Txn = switch (self.kind) {
@@ -1424,7 +1471,7 @@ pub const DocStore = struct {
     pub fn beginWriteTxn(self: *DocStore) !Txn {
         try self.ensurePortableImportOperational();
         if (self.kind == .runtime) self.lockPayloadPolicy();
-        defer if (self.kind == .runtime) self.payload_policy_mutex.unlock();
+        defer if (self.kind == .runtime) self.unlockPayloadPolicy();
         const payload_session = try self.createPayloadSession();
         errdefer if (payload_session) |session| session.release();
         return switch (self.kind) {
@@ -1462,7 +1509,7 @@ pub const DocStore = struct {
     pub fn beginWriteBatchWithOptions(self: *DocStore, options: backend_types.BatchOptions) !Batch {
         try self.ensurePortableImportOperational();
         if (self.kind == .runtime) self.lockPayloadPolicy();
-        defer if (self.kind == .runtime) self.payload_policy_mutex.unlock();
+        defer if (self.kind == .runtime) self.unlockPayloadPolicy();
         const payload_session = try self.createPayloadSession();
         errdefer if (payload_session) |session| session.release();
         return switch (self.kind) {
@@ -1567,6 +1614,7 @@ pub const DocStore = struct {
     }
 
     pub fn finishPortableImportPublication(self: *DocStore) void {
+        self.retained_effects_cache.store(0, .release);
         std.debug.assert(self.portable_import_reader_state.load(.monotonic) == portable_import_publication_bit);
         self.portable_import_reader_state.store(0, .release);
     }
@@ -2973,6 +3021,495 @@ test "docstore put/get/delete" {
 
     try store.delete("doc1");
     try std.testing.expectError(lmdb.Error.NotFound, store.get(std.testing.allocator, "doc1"));
+}
+
+test "docstore retained row effects atomically coalesce and fence bounded source consumers" {
+    const alloc = std.testing.allocator;
+    var backend = lsm_backend.Backend.init(alloc, .{ .flush_threshold = 1024 });
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    try store.put(&internal_keys.identity_namespace_key, &@as(retained_effects.Namespace, @splat(1)));
+    const a = try internal_keys.documentKeyAlloc(alloc, "a");
+    defer alloc.free(a);
+    const b = try internal_keys.documentKeyAlloc(alloc, "b");
+    defer alloc.free(b);
+    // Inactive stores cache absence and allocate no capture keys/values.
+    try store.put(a, "initial");
+    try std.testing.expectEqual(@as(u8, 1), store.retained_effects_cache.load(.acquire));
+    const pin: [32]u8 = @splat(1);
+    const other: [32]u8 = @splat(2);
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try std.testing.expectEqual(@as(u64, 0), try retained_effects.admit(&txn, @splat(1), 1, pin, retained_effects.default_limit));
+        try std.testing.expectEqual(@as(u64, 0), try retained_effects.admit(&txn, @splat(1), 2, other, retained_effects.default_limit));
+        try txn.commit();
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try txn.put(a, "aborted");
+        try txn.delete(a);
+    }
+    {
+        var batch = try store.beginWriteBatch();
+        errdefer batch.abort();
+        try batch.put(a, "intermediate");
+        try batch.put(a, "final");
+        try batch.put(b, "deleted in same transaction");
+        try batch.delete(b);
+        try batch.put("unrelated-index-key", "not a row");
+        try batch.commit();
+    }
+    {
+        const raw = try store.get(alloc, &retained_effects.recordKey(1));
+        defer alloc.free(raw);
+        var reader = try retained_effects.Reader.init(raw, 1);
+        const first = (try reader.next()).?;
+        try std.testing.expectEqualStrings(a, first.key);
+        try std.testing.expectEqualStrings("final", first.value.?);
+        const second = (try reader.next()).?;
+        try std.testing.expectEqualStrings(b, second.key);
+        try std.testing.expect(second.value == null);
+        try std.testing.expect(try reader.next() == null);
+        raw[raw.len - 1] ^= 1;
+        try std.testing.expectError(error.RetainedEffectsCorrupt, retained_effects.Reader.init(raw, 1));
+    }
+    // A write transaction (including transaction-resolution adapters) shares
+    // the same capture as batches; metadata-only writes don't consume sequence.
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(a, "second");
+        try txn.commit();
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try std.testing.expectEqual(@as(u64, 2), (try retained_effects.load(&txn)).?.latest);
+        try std.testing.expectError(error.RetainedEffectsCursorMismatch, retained_effects.acknowledge(&txn, @splat(1), 1, pin, 0, 3));
+        try std.testing.expectError(error.RetainedEffectsFenceMismatch, retained_effects.acknowledge(&txn, @splat(1), 1, other, 0, 1));
+        try retained_effects.acknowledge(&txn, @splat(1), 1, pin, 0, 2);
+        // Idempotent admission returns original cut, not advanced acknowledgement.
+        try std.testing.expectEqual(@as(u64, 0), try retained_effects.admit(&txn, @splat(1), 1, pin, retained_effects.default_limit));
+        try std.testing.expectEqual(@as(usize, 0), try retained_effects.reclaim(&txn, @splat(1), 1, 1));
+        try retained_effects.acknowledge(&txn, @splat(1), 2, other, 0, 2);
+        try std.testing.expectEqual(@as(usize, 1), try retained_effects.reclaim(&txn, @splat(1), 1, 1));
+        try std.testing.expectEqual(@as(u64, 1), (try retained_effects.load(&txn)).?.reclaimed);
+        try txn.commit();
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try std.testing.expectEqual(@as(usize, 1), try retained_effects.reclaim(&txn, @splat(1), 128, 1024));
+        try std.testing.expectEqual(@as(u64, 0), (try retained_effects.load(&txn)).?.retained_bytes);
+        try retained_effects.release(&txn, @splat(1), 1, pin);
+        try retained_effects.release(&txn, @splat(1), 1, pin);
+        try retained_effects.release(&txn, @splat(1), 2, other);
+        try std.testing.expectError(error.RetainedEffectsFenceMismatch, retained_effects.admit(&txn, @splat(1), 1, pin, retained_effects.default_limit));
+        try txn.commit();
+    }
+    try store.put(a, "after release");
+    try std.testing.expectError(error.NotFound, store.get(alloc, &retained_effects.recordKey(3)));
+}
+
+test "docstore retained row effects bound admission and abort oversized atomic writes" {
+    const alloc = std.testing.allocator;
+    var backend = lsm_backend.Backend.init(alloc, .{ .flush_threshold = 1024 });
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    try store.put(&internal_keys.identity_namespace_key, &@as(retained_effects.Namespace, @splat(1)));
+    const key = try internal_keys.documentKeyAlloc(alloc, "large");
+    defer alloc.free(key);
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        _ = try retained_effects.admit(&txn, @splat(1), 1, @splat(1), retained_effects.max_frame_bytes);
+        try txn.commit();
+    }
+    const value = try alloc.alloc(u8, retained_effects.max_frame_bytes);
+    defer alloc.free(value);
+    @memset(value, 'x');
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try txn.put(key, value);
+        try std.testing.expectError(error.RetainedEffectsFull, txn.commit());
+        try std.testing.expectError(error.RetainedEffectsTransactionFailed, txn.commit());
+    }
+    try std.testing.expectError(error.NotFound, store.get(alloc, key));
+    try std.testing.expectError(error.NotFound, store.get(alloc, &retained_effects.recordKey(1)));
+    try store.put(key, "fits");
+    {
+        var txn = try store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.RetainedEffectsFull, retained_effects.admit(&txn, @splat(1), 2, @splat(2), retained_effects.max_frame_bytes));
+        try txn.put(key, "ordinary write can still use admitted space");
+        try std.testing.expectError(error.RetainedEffectsMixedControl, retained_effects.acknowledge(&txn, @splat(1), 1, @splat(1), 0, 1));
+    }
+}
+
+test "docstore retained row effects resume across LSM reopen and keep aborted GC history" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const key = try internal_keys.documentKeyAlloc(alloc, "row");
+    defer alloc.free(key);
+    const timestamp_key = try internal_keys.ttlKeyAlloc(alloc, "row");
+    defer alloc.free(timestamp_key);
+    const pin: [32]u8 = @splat(3);
+    {
+        var backend = try lsm_backend.Backend.open(alloc, path, .{ .flush_threshold_bytes = 1024 * 1024 });
+        defer backend.close();
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        try store.put(&internal_keys.identity_namespace_key, &@as(retained_effects.Namespace, @splat(1)));
+        {
+            var txn = try store.beginWriteTxn();
+            errdefer txn.abort();
+            _ = try retained_effects.admit(&txn, @splat(1), 3, pin, retained_effects.default_limit);
+            try txn.commit();
+        }
+        var timestamp: [8]u8 = undefined;
+        std.mem.writeInt(u64, &timestamp, 111, .little);
+        try store.putBatch(&.{ .{ .key = key, .value = "first epoch row bytes" }, .{ .key = timestamp_key, .value = &timestamp } }, &.{});
+    }
+    {
+        var backend = try lsm_backend.Backend.open(alloc, path, .{ .flush_threshold_bytes = 1024 * 1024 });
+        defer backend.close();
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        // A fresh DocStore discovers retention before its first primary write.
+        try store.delete(key);
+        {
+            var txn = try store.beginReadTxn();
+            defer txn.abort();
+            var first = (try retained_effects.read(&txn, @splat(1), 3, pin, 0)).?;
+            const first_effect = (try first.next()).?;
+            try std.testing.expectEqualStrings("first epoch row bytes", first_effect.value.?);
+            try std.testing.expectEqual(@as(u64, 111), first_effect.timestamp);
+            var second = (try retained_effects.read(&txn, @splat(1), 3, pin, 1)).?;
+            const deleted = (try second.next()).?;
+            try std.testing.expect(deleted.value == null);
+            try std.testing.expectEqual(@as(u64, 0), deleted.timestamp);
+            try std.testing.expect(try retained_effects.read(&txn, @splat(1), 3, pin, 2) == null);
+        }
+        {
+            var txn = try store.beginWriteTxn();
+            defer txn.abort();
+            try retained_effects.acknowledge(&txn, @splat(1), 3, pin, 0, 2);
+            try std.testing.expectEqual(@as(usize, 1), try retained_effects.reclaim(&txn, @splat(1), 1, 1));
+        }
+        {
+            var txn = try store.beginReadTxn();
+            defer txn.abort();
+            const state = (try retained_effects.load(&txn)).?;
+            try std.testing.expectEqual(@as(u64, 0), state.reclaimed);
+            try std.testing.expect(try retained_effects.read(&txn, @splat(1), 3, pin, 0) != null);
+        }
+    }
+}
+
+test "docstore retained integrity and row effects share an immutable atomic frame across reopen" {
+    const alloc = std.testing.allocator;
+    const integrity = @import("db/relational_integrity_contract.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/integrity-tail", .{tmp.sub_path});
+    defer alloc.free(path);
+    const primary = try internal_keys.documentKeyAlloc(alloc, "row");
+    defer alloc.free(primary);
+    const address = try integrity.Address.init(@splat(1), "parent");
+    const claim_key = address.claimKey();
+    const claim: integrity.Claim = .{ .tuple = "parent", .parent_table = "parents", .parent_key = "row", .schema_version = 1 };
+    const claim_bytes = try claim.encode(alloc, address);
+    defer alloc.free(claim_bytes);
+    const reference: integrity.Reference = .{ .child_table = "children", .child_key = "child", .constraint_name = "fk", .constraint_generation = @splat(2) };
+    const reference_key = try reference.key(address);
+    const reference_bytes = try reference.encode(alloc, address);
+    defer alloc.free(reference_bytes);
+    const namespace: retained_effects.Namespace = @splat(1);
+    const pin: [32]u8 = @splat(2);
+    {
+        var backend = try lsm_backend.Backend.open(alloc, path, .{});
+        defer backend.close();
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        try store.put(&internal_keys.identity_namespace_key, &namespace);
+        {
+            var txn = try store.beginWriteTxn();
+            errdefer txn.abort();
+            _ = try retained_effects.admit(&txn, namespace, 1, pin, retained_effects.default_limit);
+            try txn.commit();
+        }
+        {
+            var txn = try store.beginWriteTxn();
+            errdefer txn.abort();
+            try txn.put(primary, "first");
+            try txn.put(&claim_key, claim_bytes);
+            try txn.put(&reference_key, reference_bytes);
+            try txn.commit();
+        }
+        {
+            var txn = try store.beginWriteTxn();
+            defer txn.abort();
+            try txn.delete(&claim_key);
+            try txn.delete(primary);
+        }
+        // Integrity-only edits are retained even without a primary rewrite;
+        // coalescing records final values, not intermediate put/delete order.
+        {
+            var txn = try store.beginWriteTxn();
+            errdefer txn.abort();
+            try txn.delete(&claim_key);
+            try txn.put(&claim_key, claim_bytes);
+            try txn.delete(&reference_key);
+            try txn.commit();
+        }
+        // Invalid source metadata cannot produce an unreadable committed log.
+        try std.testing.expectError(error.RetainedEffectsCorrupt, store.put(&claim_key, "corrupt"));
+    }
+    {
+        var backend = try lsm_backend.Backend.open(alloc, path, .{});
+        defer backend.close();
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        var first = (try retained_effects.read(&txn, namespace, 1, pin, 0)).?;
+        const saved_claim = (try first.next()).?;
+        try std.testing.expect(saved_claim.isIntegrity());
+        try std.testing.expectEqualSlices(u8, &claim_key, saved_claim.key);
+        try std.testing.expectEqualSlices(u8, claim_bytes, saved_claim.value.?);
+        try std.testing.expectEqual(@as(u64, 0), saved_claim.timestamp);
+        const saved_reference = (try first.next()).?;
+        try std.testing.expectEqualSlices(u8, &reference_key, saved_reference.key);
+        try std.testing.expectEqualSlices(u8, reference_bytes, saved_reference.value.?);
+        const saved_row = (try first.next()).?;
+        try std.testing.expect(!saved_row.isIntegrity());
+        try std.testing.expectEqualStrings("first", saved_row.value.?);
+        try std.testing.expect(try first.next() == null);
+        var second = (try retained_effects.read(&txn, namespace, 1, pin, 1)).?;
+        try std.testing.expectEqualSlices(u8, claim_bytes, (try second.next()).?.value.?);
+        const deleted = (try second.next()).?;
+        try std.testing.expectEqualSlices(u8, &reference_key, deleted.key);
+        try std.testing.expect(deleted.value == null);
+        try std.testing.expect(try second.next() == null);
+        try std.testing.expect(try retained_effects.read(&txn, namespace, 1, pin, 2) == null);
+        try std.testing.expectEqualSlices(u8, claim_bytes, try txn.get(&claim_key));
+    }
+}
+
+test "docstore retained document timestamps remain paired with overwritten afterimages across reopen" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const primary = try internal_keys.documentKeyAlloc(alloc, "row\x00binary");
+    defer alloc.free(primary);
+    const timestamp_key = try internal_keys.ttlKeyAlloc(alloc, "row\x00binary");
+    defer alloc.free(timestamp_key);
+    const namespace: retained_effects.Namespace = @splat(1);
+    const pin: [32]u8 = @splat(2);
+    {
+        var backend = try lsm_backend.Backend.open(alloc, path, .{});
+        defer backend.close();
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        try store.put(&internal_keys.identity_namespace_key, &namespace);
+        {
+            var txn = try store.beginWriteTxn();
+            errdefer txn.abort();
+            _ = try retained_effects.admit(&txn, namespace, 1, pin, retained_effects.default_limit);
+            try txn.commit();
+        }
+        for ([_]u64{ 111, 222 }) |timestamp| {
+            var encoded: [8]u8 = undefined;
+            std.mem.writeInt(u64, &encoded, timestamp, .little);
+            var txn = try store.beginWriteTxn();
+            errdefer txn.abort();
+            try txn.put(primary, if (timestamp == 111) "first" else "second");
+            try txn.put(timestamp_key, &encoded);
+            try txn.commit();
+        }
+        var timestamp_only: [8]u8 = undefined;
+        std.mem.writeInt(u64, &timestamp_only, 333, .little);
+        try store.put(timestamp_key, &timestamp_only);
+        {
+            var aborted = try store.beginWriteTxn();
+            defer aborted.abort();
+            std.mem.writeInt(u64, &timestamp_only, 444, .little);
+            try aborted.put(timestamp_key, &timestamp_only);
+        }
+        const missing_timestamp = try internal_keys.ttlKeyAlloc(alloc, "not-a-row");
+        defer alloc.free(missing_timestamp);
+        try store.put(missing_timestamp, &timestamp_only);
+    }
+    {
+        var backend = try lsm_backend.Backend.open(alloc, path, .{});
+        defer backend.close();
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        for (0..3) |after| {
+            var frame = (try retained_effects.read(&txn, namespace, 1, pin, after)).?;
+            const effect = (try frame.next()).?;
+            try std.testing.expectEqualStrings(if (after == 0) "first" else "second", effect.value.?);
+            try std.testing.expectEqual(@as(u64, (after + 1) * 111), effect.timestamp);
+            try std.testing.expectEqualStrings(primary, effect.key);
+            try std.testing.expect(try frame.next() == null);
+        }
+        try std.testing.expect(try retained_effects.read(&txn, namespace, 1, pin, 3) == null);
+    }
+}
+
+test "docstore retained row effects fence foreign native adoption without blocking target writes" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const source_namespace: retained_effects.Namespace = @splat(1);
+    const target_namespace: retained_effects.Namespace = @splat(2);
+    const pin: [32]u8 = @splat(3);
+    const key = try internal_keys.documentKeyAlloc(alloc, "source");
+    defer alloc.free(key);
+    const target_key = try internal_keys.documentKeyAlloc(alloc, "target");
+    defer alloc.free(target_key);
+    {
+        var backend = try lsm_backend.Backend.open(alloc, path, .{ .flush_threshold_bytes = 1024 * 1024 });
+        defer backend.close();
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        try store.put(&internal_keys.identity_namespace_key, &source_namespace);
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        _ = try retained_effects.admit(&txn, source_namespace, 1, pin, retained_effects.max_frame_bytes);
+        try txn.commit();
+        // Two large frames leave insufficient capacity for another small
+        // mutation. Copied consumers must not impose that source pressure on
+        // a target with a new namespace.
+        const value = try alloc.alloc(u8, retained_effects.max_frame_bytes / 2 - 128);
+        defer alloc.free(value);
+        @memset(value, 'x');
+        try store.put(key, value);
+        try store.put(key, value);
+    }
+    {
+        var backend = try lsm_backend.Backend.open(alloc, path, .{ .flush_threshold_bytes = 1024 * 1024 });
+        defer backend.close();
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        {
+            var txn = try store.beginReadTxn();
+            defer txn.abort();
+            // Same logical namespace survives native transfer/reopen.
+            try std.testing.expect(try retained_effects.read(&txn, @splat(1), 1, pin, 0) != null);
+        }
+        const mutation = [_]u8{'t'} ** 2048;
+        try std.testing.expectError(error.RetainedEffectsFull, store.put(target_key, &mutation));
+        {
+            // Native namespace adoption persists identity before target rows.
+            var txn = try store.beginWriteTxn();
+            errdefer txn.abort();
+            try txn.put(&internal_keys.identity_namespace_key, &target_namespace);
+            try txn.put(target_key, &mutation);
+            try txn.commit();
+        }
+        {
+            var txn = try store.beginWriteTxn();
+            defer txn.abort();
+            const state = (try retained_effects.load(&txn)).?;
+            try std.testing.expectEqual(@as(u64, 2), state.latest);
+            try std.testing.expectEqualSlices(u8, &source_namespace, &state.namespace);
+            try std.testing.expectError(error.RetainedEffectsNamespaceMismatch, retained_effects.read(&txn, @splat(1), 1, pin, 0));
+            try std.testing.expectError(error.RetainedEffectsNamespaceMismatch, retained_effects.acknowledge(&txn, @splat(1), 1, pin, 0, 2));
+            try std.testing.expectError(error.RetainedEffectsNamespaceMismatch, retained_effects.release(&txn, @splat(1), 1, pin));
+            try std.testing.expectError(error.RetainedEffectsNamespaceMismatch, retained_effects.reclaim(&txn, @splat(1), 1, 1));
+            try std.testing.expectError(error.RetainedEffectsNamespaceMismatch, retained_effects.admit(&txn, target_namespace, 2, @splat(4), retained_effects.max_frame_bytes));
+            try std.testing.expectError(error.RetainedEffectsNamespaceMismatch, retained_effects.reclaimForeign(&txn, target_namespace, target_namespace, 1, 1));
+            try std.testing.expectError(error.RetainedEffectsNamespaceMismatch, retained_effects.reclaimForeign(&txn, target_namespace, @splat(9), 1, 1));
+            try std.testing.expectError(error.RetainedEffectsNamespaceMismatch, retained_effects.reclaimForeign(&txn, @splat(9), source_namespace, 1, 1));
+        }
+        {
+            // In particular, a disabled foreign capture cannot become a
+            // matching source after already missing a primary mutation.
+            var txn = try store.beginWriteTxn();
+            defer txn.abort();
+            try txn.put(target_key, "must abort");
+            try std.testing.expectError(error.RetainedEffectsMixedControl, txn.put(&internal_keys.identity_namespace_key, &source_namespace));
+            try std.testing.expectError(error.RetainedEffectsTransactionFailed, txn.commit());
+        }
+        const target_value = try store.get(alloc, target_key);
+        defer alloc.free(target_value);
+        try std.testing.expectEqualSlices(u8, &mutation, target_value);
+        {
+            var txn = try store.beginWriteTxn();
+            defer txn.abort();
+            try std.testing.expectEqual(@as(usize, 1), try retained_effects.reclaimForeign(&txn, target_namespace, source_namespace, 1, 1));
+        }
+        {
+            var txn = try store.beginWriteTxn();
+            errdefer txn.abort();
+            try std.testing.expectEqual(@as(u64, 0), (try retained_effects.load(&txn)).?.reclaimed);
+            try std.testing.expectEqual(@as(usize, 1), try retained_effects.reclaimForeign(&txn, target_namespace, source_namespace, 1, 1));
+            try txn.commit();
+        }
+        try store.put(target_key, "target remains writable during bounded cleanup");
+        {
+            var txn = try store.beginWriteTxn();
+            errdefer txn.abort();
+            const state = (try retained_effects.load(&txn)).?;
+            try std.testing.expectEqual(@as(u64, 1), state.reclaimed);
+            try std.testing.expect(!state.active());
+            try std.testing.expectEqual(@as(usize, 1), try retained_effects.reclaimForeign(&txn, target_namespace, source_namespace, 1, 1));
+            try std.testing.expect(try retained_effects.load(&txn) == null);
+            try std.testing.expectError(error.RetainedEffectsNamespaceMismatch, retained_effects.admit(&txn, source_namespace, 1, pin, retained_effects.max_frame_bytes));
+            // Epoch and pin may legitimately collide after adoption; the
+            // explicit namespace must still fence every delayed old request.
+            _ = try retained_effects.admit(&txn, target_namespace, 1, pin, retained_effects.max_frame_bytes);
+            try txn.commit();
+        }
+        try store.put(target_key, "new scoped history");
+        {
+            var txn = try store.beginReadTxn();
+            defer txn.abort();
+            const state = (try retained_effects.load(&txn)).?;
+            try std.testing.expectEqualSlices(u8, &target_namespace, &state.namespace);
+            try std.testing.expectEqual(@as(u64, 1), state.latest);
+            var record = (try retained_effects.read(&txn, target_namespace, 1, pin, 0)).?;
+            try std.testing.expectEqualStrings("new scoped history", (try record.next()).?.value.?);
+            try std.testing.expectError(error.RetainedEffectsNamespaceMismatch, retained_effects.read(&txn, source_namespace, 1, pin, 0));
+            try std.testing.expectError(error.RetainedEffectsNamespaceMismatch, retained_effects.acknowledge(&txn, source_namespace, 1, pin, 0, 1));
+            try std.testing.expectError(error.RetainedEffectsNamespaceMismatch, retained_effects.release(&txn, source_namespace, 1, pin));
+            try std.testing.expectError(error.RetainedEffectsNamespaceMismatch, retained_effects.reclaim(&txn, source_namespace, 1, 1));
+        }
+    }
+}
+
+test "docstore retained row effects require durable identity but preserve unretained first-write initialization" {
+    const alloc = std.testing.allocator;
+    var backend = lsm_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    const key = try internal_keys.documentKeyAlloc(alloc, "first");
+    defer alloc.free(key);
+    var txn = try store.beginWriteTxn();
+    errdefer txn.abort();
+    try std.testing.expectError(error.RetainedEffectsIdentityRequired, retained_effects.admit(&txn, @splat(1), 1, @splat(1), retained_effects.default_limit));
+    try txn.put(key, "ordinary first row");
+    try txn.put(&internal_keys.identity_namespace_key, &@as(retained_effects.Namespace, @splat(1)));
+    try txn.commit();
+    const value = try store.get(alloc, key);
+    defer alloc.free(value);
+    try std.testing.expectEqualStrings("ordinary first row", value);
 }
 
 test "docstore putBatch atomic" {

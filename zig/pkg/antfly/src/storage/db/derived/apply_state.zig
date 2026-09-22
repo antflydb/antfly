@@ -771,12 +771,16 @@ test "derived apply state lsm point load does not clone mutable snapshot" {
 }
 
 test "derived apply state keeps latest lsm value across many flushed overwrites" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    // Preserve leak checks; allocation backtraces are opt-in for diagnostics.
+    var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
+    defer std.debug.assert(allocator_state.deinit() == .ok);
+    const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
+    var tmp = @import("../../../common/test_directory.zig").fastTmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const path = path_buf[0..path_len];
 
     {
         var backend = try lsm_backend.Backend.open(alloc, path, .{
@@ -797,6 +801,11 @@ test "derived apply state keeps latest lsm value across many flushed overwrites"
             try saveAppliedSequence(runtime, "idx", sequence);
         }
         try std.testing.expectEqual(@as(u64, 1024), try loadAppliedSequence(alloc, runtime, "idx"));
+        const work = backend.snapshotWriteStats();
+        try std.testing.expectEqual(@as(u64, 1025), work.flushes);
+        try std.testing.expect(work.manifest_writes <= 2 * work.flushes);
+        if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_WORK_PROFILE"))
+            std.debug.print("\nWORK flushed-overwrites flushes={d} compactions={d} manifests={d}\n", .{ work.flushes, work.compactions, work.manifest_writes });
     }
 
     {

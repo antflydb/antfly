@@ -9,6 +9,18 @@ Use product-area names for test files. Do not use migration labels like `*_parit
 
 ## Current Coverage
 
+- `test_secrets.py`
+  - standalone, distributed metadata/data, and serverless native secrets through real background embedding requests
+  - live rotation, restart, file/environment fallback, unavailable keys, and metadata-only administration
+  - metadata follower writes, leader failover/catch-up, grant revocation, and native outage rejection
+  - serverless admin authentication and concurrent writers across two processes
+  - opt-in real S3/GCS conditional publication; see [secret-store qualification](../../SECRETS.md#secret-store-qualification) for commands and CI setup
+
+- `test_aggregations.py`
+  - exact terms and stats over 11,000 synthetic documents
+  - read-only control followed by three trials with ten readers and two concurrent writers inserting documents without the aggregated field
+  - every query, aggregate value, and write response is checked; HTTP and server-log failures are retained in test output
+  - success at the configured aggregation budget and rejection above it
 - `test_quickstart.py`
   - serverless quickstart flow
   - text search
@@ -121,6 +133,40 @@ Use product-area names for test files. Do not use migration labels like `*_parit
     - serverless: write then explicit publish
 - Keep publication/status checks in the same product-area file when they are part of that lifecycle.
   - Example: chunker-driven full-text searchability and serverless `full_text_source_mode` / publication-action assertions now both live in `test_index_lifecycle.py`.
+
+## Recovery Coverage and CI Runtime
+
+Required base CI runs the same marker selection in three Antfly lanes: ordinary
+tests and two distributed-recovery shards. Any test depending transitively on
+`three_by_three_backup_cluster` enters one recovery shard automatically. The
+partition is exhaustive and disjoint; the aggregate E2E gate requires every lane
+to pass. Local/default and full-suite runs remain unsharded.
+
+Approved PR CI dispatches its workflow from the default branch, then checks out
+the PR revision. Changes to the lane matrix or runner-local temporary directory
+must land on the default branch before they affect PR runs; changes to the test
+code and scripts are exercised from the PR revision.
+PR branches must merge main to obtain the required shard helper before running
+the new workflow. Missing helpers fail CI rather than skipping recovery coverage.
+
+To reproduce a recovery lane from the repository root without rebuilding:
+
+```bash
+SKIP_BUILD=1 ANTFLY_E2E_SUITE=antfly-recovery-0 scripts/ci/zig-e2e-base-linux.sh
+```
+
+Use `antfly-recovery-1` for the other shard, or `ANTFLY_E2E_SUITE=antfly
+ANTFLY_E2E_SHARD=ordinary` for ordinary tests. Each lane retains the existing
+bounded process/cluster concurrency. Disposable databases use runner-local
+disk, not tmpfs; crashes must still exercise durable WAL and reopen behavior.
+
+Keep deterministic protocol/state-machine combinations in unit tests or VOPR.
+Keep E2E coverage where the assertion depends on actual HTTP query semantics,
+cross-owner UNIQUE/FK routing, process death, durable restart, or publication
+reply loss. Do not remove a real-process case until its replacement exercises
+the same invariant and fault boundary. Poll observations, not deterministic
+requests after an explicit visibility barrier; replay mutations only after a
+known pre-commit rejection, never after an unknown transaction outcome.
 
 ## Objectstore Integration
 

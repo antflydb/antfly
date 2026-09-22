@@ -19,7 +19,13 @@ const serverless_http_routes = @import("serverless/api/http_routes.zig");
 const serverless_http_types = @import("serverless/api/http_types.zig");
 const IngressScope = @import("serverless/api/ingress.zig").Scope;
 
-pub const ServerlessHttpServerConfig = struct {};
+const secrets = @import("common/secrets.zig");
+pub const ServerlessHttpServerConfig = struct {
+    secret_store: ?*secrets.FileStore = null,
+    // Explicit credential required even on otherwise unauthenticated serverless
+    // deployments. TLS terminates at the deployment's trusted ingress.
+    secret_admin_token: ?[]const u8 = null,
+};
 
 test "workload admission serverless adapters retain body ownership through output drain" {
     const Owner = @import("common/workload_allocator.zig").Owner;
@@ -247,7 +253,7 @@ pub const ServerlessHttpServer = struct {
     }
 
     pub fn handle(self: *ServerlessHttpServer, req: http_common.HttpRequest) !http_common.HttpResponse {
-        _ = self.cfg;
+        if (isSecretPath(req.uri)) return self.handleSecrets(req);
         const method: serverless_http_routes.HttpMethod = switch (req.method) {
             .GET => .get,
             .POST => .post,

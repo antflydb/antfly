@@ -56,7 +56,8 @@ pub const CreateMetalRuntimeTestsResult = struct {
 pub fn createMetalRuntimeTests(ctx: Context) CreateMetalRuntimeTestsResult {
     const b = ctx.b;
     const quant_kernel_metal_runtime_check_tests = b.addTest(.{
-        .max_rss = 1024 * 1024 * 1024,
+        // ReleaseFast reaches 1.15 GB on Linux; reserve compiler headroom.
+        .max_rss = 2 * 1024 * 1024 * 1024,
         .root_module = b.createModule(.{
             .root_source_file = ctx.path("src/quant_kernel_metal_runtime_check.zig"),
             .target = ctx.target,
@@ -65,7 +66,8 @@ pub fn createMetalRuntimeTests(ctx: Context) CreateMetalRuntimeTestsResult {
         .filters = &.{"quant kernel metal runtime"},
     });
     const run_quant_kernel_metal_runtime_check_tests = ctx.addRunArtifact(quant_kernel_metal_runtime_check_tests);
-    run_quant_kernel_metal_runtime_check_tests.step.max_rss = 64 * 1024 * 1024;
+    // The ReleaseFast source-validation test peaks at 103 MB on macOS arm64.
+    run_quant_kernel_metal_runtime_check_tests.step.max_rss = 128 * 1024 * 1024;
     return .{
         .run_quant_kernel_metal_runtime_check_tests = run_quant_kernel_metal_runtime_check_tests,
     };

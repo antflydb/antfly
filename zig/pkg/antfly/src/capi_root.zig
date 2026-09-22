@@ -47,6 +47,7 @@ pub const platform_sync = @import("antfly_platform").sync;
 pub const platform_time = @import("antfly_platform").time;
 pub const portable_backup = @import("storage/portable_backup.zig");
 pub const restore_state_contract = @import("storage/restore_state_contract.zig");
+pub const restore_admission = @import("storage/restore_admission.zig");
 pub const scraping = @import("antfly_scraping");
 pub const public_api = @import("api/mod.zig");
 pub const raft = @import("raft/mod.zig");
@@ -74,3 +75,5 @@ pub const test_error_logs = @import("test_error_logs.zig");
 
 pub const kernel_runtime_services = @import("storage/kernel_runtime_services.zig");
 pub const memory_budget = @import("storage/memory_budget.zig");
+
+pub const capi_dependencies = @import("capi_dependencies.zig");

@@ -91,6 +91,7 @@ pub fn build(b: *std.Build) void {
 }
 
 pub const Artifacts = struct {
+    inference_steps: @import("pkg/inference/build/integration.zig").Steps,
     runtime: antfly_runtime_build.AddRuntimeResult,
     inference: inference_runtime_build.Graph,
     wasm: *std.Build.Step.Compile,
@@ -171,7 +172,19 @@ pub fn create(b: *std.Build) ?Artifacts {
         .optimize = optimize,
         .version = antfly_version,
     });
-    const lite_local_inference_runtime = b.option(bool, "lite-local-inference-runtime", "Advertise an embedded local inference runtime in Antfly Lite status") orelse false;
+    // Antfly Lite always links and advertises the embedded local inference
+    // runtime, matching the `antfly` executable (see COMPILATION.md's "C API
+    // composition" section and LITE.md's "Local Embedded Inference" section).
+    // This remains a build option so a caller can still opt out of
+    // advertising the capability; freestanding/wasm builds always disable it
+    // regardless of this flag (see storage/lite/capabilities.zig).
+    // Antfly Lite always links and advertises the embedded local inference
+    // runtime, matching the `antfly` executable (see COMPILATION.md's "C API
+    // composition" section and LITE.md's "Local Embedded Inference" section).
+    // This remains a build option so a caller can still opt out of
+    // advertising the capability; freestanding/wasm builds always disable it
+    // regardless of this flag (see storage/lite/capabilities.zig).
+    const lite_local_inference_runtime = b.option(bool, "lite-local-inference-runtime", "Advertise an embedded local inference runtime in Antfly Lite status") orelse true;
     const platform_tests = platform_build.addTests(b, .{
         .root = b.path("lib/platform"),
         .target = target,
@@ -283,6 +296,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const generating_api_openapi_mod = openapi_modules.generating_api;
     const extraction_openapi_mod = openapi_modules.extraction;
     const openai_api_mod = openapi_modules.openai_api;
+    const exa_api_mod = openapi_modules.exa_api;
 
     // Handlebars template engine
     const handlebars_dep = b.dependency("handlebars", .{ .target = target, .optimize = optimize });
@@ -696,6 +710,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .indexes_openapi = indexes_openapi_mod,
         .sort_openapi = sort_openapi_mod,
         .generating_api_openapi = generating_api_openapi_mod,
+        .websearch_openapi = openapi_modules.websearch,
         .eval_openapi = eval_openapi_mod,
         .query_openapi = query_openapi_mod,
         .admin_openapi = admin_openapi_mod,
@@ -750,6 +765,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .font = font_mod,
         .pdf = pdf_mod,
         .openai_api = openai_api_mod,
+        .exa_api = exa_api_mod,
         .handlebars = handlebars_mod,
         .inference_server = inference_server_mod,
         .prometheus = prometheus_mod,
@@ -945,11 +961,11 @@ pub fn create(b: *std.Build) ?Artifacts {
             .optimize = optimize,
             .link_libc = true,
         }),
-        .filters = &.{ "request gate", "request watchdog", "request task admission", "successful H1 requests do not wait" },
+        .filters = &.{ "request gate", "request watchdog", "request task admission", "request cancellation before socket publication", "successful H1 requests do not wait" },
     });
     const run_httpx_client_lifecycle_tests = b.addRunArtifact(httpx_client_lifecycle_tests);
     b.step("lib-httpx-client-lifecycle-test", "Run HTTP client admission, release, and shutdown contracts").dependOn(&run_httpx_client_lifecycle_tests.step);
-    lib_httpx_test_step.dependOn(&run_httpx_client_lifecycle_tests.step);
+    // The complete HTTP library artifact already owns these lifecycle tests.
 
     const objectstore_tests = b.addTest(.{
         .root_module = objectstore_mod,
@@ -1214,7 +1230,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const antfly_test_step = owner_tests.antfly_test_step;
     const unit_test_step = owner_tests.unit_test_step;
     unit_test_step.dependOn(&pdf_integration.run.step);
-    unit_test_step.dependOn(&run_httpx_client_lifecycle_tests.step);
+    // HTTP client lifecycle tests belong to lib-test; keep their focused target.
     const vopr_test_step = owner_tests.vopr_test_step;
     const integration_test_step = owner_tests.integration_test_step;
     const chaos_test_step = owner_tests.chaos_test_step;
@@ -1376,6 +1392,8 @@ pub fn create(b: *std.Build) ?Artifacts {
     }
 
     const storage_owner_runs = @import("pkg/antfly/build/storage_owner_tests.zig").add(b, target, optimize, production_antfly_imports, vopr_mod, runtime_library_artifacts);
+    b.step("antfly-storage-owner-test", "Run real compiled storage owner ABI regressions").dependOn(&storage_owner_runs.runs[0].step);
+    b.step("antfly-storage-owner-source-test", "Run compiled owner source and callback regressions").dependOn(&storage_owner_runs.runs[1].step);
     for (storage_owner_runs.runs) |run| {
         owner_tests.storage_test_step.dependOn(&run.step);
         owner_tests.integration_test_step.dependOn(&run.step);
@@ -1531,6 +1549,22 @@ pub fn create(b: *std.Build) ?Artifacts {
         6 * 1024 * 1024 * 1024,
     );
 
+    // The VOPR workflow also selects focused and build-only roots that need
+    // not be reachable from `test`. Account for every compile/run before the
+    // cgroup-aware wrapper admits parallel work; preserve measured claims.
+    for ([_][]const u8{
+        "antfly-raft-transport-test",  "standby-vopr-test",                "vopr-runtime-test",
+        "restore-admission-vopr-test", "vopr-determinism-audit",           "vopr-build",
+        "antfly",                      "antfly-storage-owner-source-test",
+    }) |name| {
+        assignDefaultAggregateMaxRss(
+            b,
+            &b.top_level_steps.get(name).?.step,
+            @as(usize, if (target.result.os.tag == .macos) 10 else 7) * 1024 * 1024 * 1024,
+            6 * 1024 * 1024 * 1024,
+        );
+    }
+
     const hbc_trace_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/tools/hbc_trace.zig"),
         .target = target,
@@ -1573,5 +1607,11 @@ pub fn create(b: *std.Build) ?Artifacts {
         antfly_tests_build.labelTestRuns(b, lib_test_step);
     }
     @import("pkg/antfly/build/test_support.zig").configureSimpleTestRuns(b, test_step);
-    return .{ .runtime = runtime, .inference = inference_graph, .wasm = wasm.artifact };
+    const unit_ownership_baseline = @import("pkg/antfly/build/unit_test_ownership.zig").apply(b, unit_test_step);
+    @import("pkg/antfly/build/unit_test_inventory.zig").add(b, unit_test_step, unit_ownership_baseline, &.{
+        lib_test_step,
+        &b.top_level_steps.get("inference-test").?.step,
+        &b.top_level_steps.get("inference-finetune-test").?.step,
+    });
+    return .{ .runtime = runtime, .inference = inference_graph, .wasm = wasm.artifact, .inference_steps = inference_steps };
 }

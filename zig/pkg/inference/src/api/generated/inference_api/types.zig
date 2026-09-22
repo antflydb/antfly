@@ -1037,6 +1037,42 @@ pub const DictationSegment = struct {
     end_ms: i64,
     /// Word spans estimated inside the phrase by distributing its duration over word lengths.
     words: []const DictationWord,
+    /// Speaker label from diarization (`SPEAKER_00`, ...). Absent without diarization or when the phrase had no usable audio.
+    speaker: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "text", "text", false },
+        .{ "start_ms", "start_ms", false },
+        .{ "end_ms", "end_ms", false },
+        .{ "words", "words", false },
+        .{ "speaker", "speaker", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("text");
+        try jw.write(self.text);
+        try jw.objectField("start_ms");
+        try jw.write(self.start_ms);
+        try jw.objectField("end_ms");
+        try jw.write(self.end_ms);
+        try jw.objectField("words");
+        try jw.write(self.words);
+        if (self.speaker) |value| {
+            try jw.objectField("speaker");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// How the cleanup pass rewrites the transcript. `clean` removes fillers and fixes punctuation while keeping the speaker's wording; `formal` and `casual` also adjust register; `verbatim` skips the generator and returns the raw transcript.
@@ -3762,6 +3798,12 @@ pub const TranscribeObject = struct {
     text: []const u8,
     /// Detected or forced language
     language: ?[]const u8 = null,
+    /// Decoded clip duration in milliseconds.
+    duration_ms: ?i64 = null,
+    /// Timestamped phrases in clip order, so a transcript can be indexed and linked back to a moment in the recording. Clips longer than 30 s are transcribed in windows; segment offsets are relative to the whole clip.
+    segments: ?[]const DictationSegment = null,
+    /// Speaker labels found by diarization, in order of first appearance. Present only when `diarization` was requested.
+    speakers: ?[]const []const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -3769,6 +3811,9 @@ pub const TranscribeObject = struct {
         .{ "index", "index", false },
         .{ "text", "text", false },
         .{ "language", "language", true },
+        .{ "duration_ms", "duration_ms", true },
+        .{ "segments", "segments", true },
+        .{ "speakers", "speakers", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -3791,6 +3836,18 @@ pub const TranscribeObject = struct {
             try jw.objectField("language");
             try jw.write(value);
         }
+        if (self.duration_ms) |value| {
+            try jw.objectField("duration_ms");
+            try jw.write(value);
+        }
+        if (self.segments) |value| {
+            try jw.objectField("segments");
+            try jw.write(value);
+        }
+        if (self.speakers) |value| {
+            try jw.objectField("speakers");
+            try jw.write(value);
+        }
         try jw.endObject();
     }
 };
@@ -3798,16 +3855,19 @@ pub const TranscribeObject = struct {
 pub const TranscribeRequest = struct {
     /// Explicit name of the transcriber model from models_dir/transcribers/. Required so direct and distributed execution resolve the same model.
     model: []const u8,
-    /// Base64-encoded audio data (WAV, MP3, FLAC, etc.). Clips longer than 30 s are transcribed in windows cut at pauses; silent clips return an empty transcript.
+    /// Base64-encoded audio data (WAV, MP3, AAC/M4A, MP4/MOV audio, Ogg/Opus, WebM/Matroska, FLAC, etc.). Clips longer than 30 s are transcribed in windows cut at pauses; silent clips return an empty transcript.
     audio: []const u8,
     /// Force specific language for transcription (optional, model-dependent)
     language: ?[]const u8 = null,
+    /// Label each segment with a speaker. Runs a local speaker-embedding model (pull `csukuangfj/speaker-embedding-models:3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx`) and clusters phrases by voice; labels are `SPEAKER_00`, `SPEAKER_01`, ... in order of first appearance.
+    diarization: ?bool = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "model", "model", false },
         .{ "audio", "audio", false },
         .{ "language", "language", true },
+        .{ "diarization", "diarization", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -3826,6 +3886,10 @@ pub const TranscribeRequest = struct {
         try jw.write(self.audio);
         if (self.language) |value| {
             try jw.objectField("language");
+            try jw.write(value);
+        }
+        if (self.diarization) |value| {
+            try jw.objectField("diarization");
             try jw.write(value);
         }
         try jw.endObject();

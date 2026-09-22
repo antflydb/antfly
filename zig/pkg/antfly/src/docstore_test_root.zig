@@ -14,4 +14,5 @@
 
 test {
     _ = @import("storage/docstore.zig");
+    _ = @import("storage/transactions.zig");
 }

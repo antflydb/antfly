@@ -75,17 +75,26 @@ def _post_until_hit_ids(
     expected_ids: list[str],
     timeout_s: float = 30.0,
 ) -> dict:
+    last_response = None
+
+    def matching_response():
+        nonlocal last_response
+        last_response = backup_api.post("/agents/retrieval", payload)
+        return last_response if _hit_ids(last_response) == expected_ids else None
+
     result = wait_until(
-        lambda: (
-            response
-            if _hit_ids(response := backup_api.post("/agents/retrieval", payload))
-            == expected_ids
-            else None
-        ),
+        matching_response,
         timeout_s=timeout_s,
         interval_s=0.5,
     )
-    assert result is not None
+    assert result is not None, json.dumps(
+        {
+            "expected_ids": expected_ids,
+            "last_ids": _hit_ids(last_response) if last_response is not None else None,
+            "last_response": last_response,
+        },
+        sort_keys=True,
+    )
     return result
 
 
@@ -606,6 +615,18 @@ def test_retrieval_agent_tree_search_pipeline(backup_api):
                     {
                         "query": "how does the architecture work",
                         "stream": False,
+                        "steps": {
+                            "retrieval": {
+                                "navigation": {
+                                    "query_index": 1,
+                                    "strategy": "tree",
+                                    "selection": "ranked",
+                                    "index": "doc_hierarchy",
+                                    "start_nodes": "$find_start",
+                                    "max_depth": 2,
+                                },
+                            },
+                        },
                         "queries": [
                             {
                                 "table": table_name,
@@ -614,11 +635,6 @@ def test_retrieval_agent_tree_search_pipeline(backup_api):
                             },
                             {
                                 "table": table_name,
-                                "tree_search": {
-                                    "index": "doc_hierarchy",
-                                    "start_nodes": "$find_start",
-                                    "max_depth": 2,
-                                },
                                 "limit": 5,
                             },
                         ],
@@ -682,14 +698,21 @@ def test_retrieval_agent_tree_search_from_roots(backup_api):
         {
             "query": "how does the architecture work",
             "stream": False,
-            "queries": [
-                {
-                    "table": table_name,
-                    "tree_search": {
+            "steps": {
+                "retrieval": {
+                    "navigation": {
+                        "query_index": 0,
+                        "strategy": "tree",
+                        "selection": "ranked",
                         "index": "doc_hierarchy",
                         "start_nodes": "$roots",
                         "max_depth": 2,
                     },
+                },
+            },
+            "queries": [
+                {
+                    "table": table_name,
                     "limit": 5,
                 }
             ],
@@ -758,18 +781,23 @@ def test_retrieval_agent_tree_search_generation(backup_api, inference_generator)
                                 "api_key": "test-key",
                             },
                             "steps": {
+                                "retrieval": {
+                                    "navigation": {
+                                        "query_index": 0,
+                                        "strategy": "tree",
+                                        "selection": "ranked",
+                                        "index": "doc_hierarchy",
+                                        "start_key": "doc:root",
+                                        "max_depth": 2,
+                                        "beam_width": 2,
+                                    },
+                                },
                                 "generation": {"enabled": True},
                                 "followup": {"enabled": True, "count": 2},
                             },
                             "queries": [
                                 {
                                     "table": table_name,
-                                    "tree_search": {
-                                        "index": "doc_hierarchy",
-                                        "start_nodes": "doc:root",
-                                        "max_depth": 2,
-                                        "beam_width": 2,
-                                    },
                                     "limit": 5,
                                 }
                             ],
@@ -1343,15 +1371,22 @@ def test_retrieval_agent_streaming_tree_progress(backup_api):
                     {
                         "query": "summarize the architecture tree",
                         "stream": True,
-                        "queries": [
-                            {
-                                "table": table_name,
-                                "tree_search": {
+                        "steps": {
+                            "retrieval": {
+                                "navigation": {
+                                    "query_index": 0,
+                                    "strategy": "tree",
+                                    "selection": "ranked",
                                     "index": "doc_hierarchy",
                                     "start_nodes": "$roots",
                                     "max_depth": 2,
                                     "beam_width": 2,
                                 },
+                            },
+                        },
+                        "queries": [
+                            {
+                                "table": table_name,
                                 "limit": 5,
                             }
                         ],
@@ -1956,7 +1991,14 @@ def test_retrieval_agent_bounded_agentic_can_fallback_after_a_weak_multi_hit_fir
         )
 
 
-def test_retrieval_agent_bounded_agentic_can_decompose_queries(backup_api):
+@pytest.mark.parametrize(
+    "lexical_query",
+    [{"query": "body:raft"}, {"match": "raft", "field": "body"}],
+    ids=["query-syntax", "match-text"],
+)
+def test_retrieval_agent_bounded_agentic_can_decompose_queries(
+    backup_api, lexical_query
+):
     table_name = f"retrieval_agentic_decompose_{time.time_ns()}"
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
@@ -1979,8 +2021,10 @@ def test_retrieval_agent_bounded_agentic_can_decompose_queries(backup_api):
     )
     assert batch["inserted"] == 2
 
-    result = _post_until_hit_ids(
-        backup_api,
+    # full_index is the visibility barrier. Repeating an identical deterministic
+    # plan cannot repair incorrect decomposition and only masks it as a timeout.
+    result = backup_api.post(
+        "/agents/retrieval",
         {
             "query": "Compare raft consensus and active document status",
             "stream": False,
@@ -1988,7 +2032,7 @@ def test_retrieval_agent_bounded_agentic_can_decompose_queries(backup_api):
             "queries": [
                 {
                     "table": table_name,
-                    "full_text_search": {"query": "body:raft"},
+                    "full_text_search": lexical_query,
                     "limit": 5,
                 },
                 {
@@ -1998,12 +2042,11 @@ def test_retrieval_agent_bounded_agentic_can_decompose_queries(backup_api):
                 },
             ],
         },
-        ["doc:a", "doc:b"],
     )
     assert result["tool_calls_made"] == 2
     assert result["classification"]["strategy"] == "decompose"
     assert result["strategy_used"] == "hybrid"
-    assert _hit_ids(result) == ["doc:a", "doc:b"]
+    assert _hit_ids(result) == ["doc:a", "doc:b"], result
 
 
 def test_retrieval_agent_can_require_clarification_and_continue(backup_api):
@@ -2181,6 +2224,7 @@ def test_retrieval_agent_rejects_tree_search_without_start_nodes_or_seed_hits(
     table_name = f"retrieval_invalid_{time.time_ns()}"
     created = backup_api.create_table(table_name, num_shards=1)
     assert created["name"] == table_name
+    _create_ready_tree_index(backup_api, table_name)
 
     with pytest.raises(requests.HTTPError, match="invalid retrieval agent request"):
         backup_api.post(
@@ -2188,10 +2232,19 @@ def test_retrieval_agent_rejects_tree_search_without_start_nodes_or_seed_hits(
             {
                 "query": "find retrieval docs",
                 "stream": False,
+                "steps": {
+                    "retrieval": {
+                        "navigation": {
+                            "query_index": 0,
+                            "strategy": "tree",
+                            "selection": "ranked",
+                            "index": "doc_hierarchy",
+                        },
+                    },
+                },
                 "queries": [
                     {
                         "table": table_name,
-                        "tree_search": {"index": "doc_hierarchy"},
                     }
                 ],
             },

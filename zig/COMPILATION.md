@@ -240,11 +240,13 @@ previous claims.
 
 ### C API composition
 
-`libantfly` links the sectioned PIC storage and enrichment artifacts. Function
-and data section GC retains public `antfly_db_*` and `antfly_lite_*` roots while
-discarding private executable entry points. The symbol audit rejects exported
-runtime, API-kernel, inference, storage-owner, snapshot, restore, and data-apply
-symbols.
+`libantfly` links the sectioned PIC storage and enrichment artifacts, plus the
+standalone inference runtime archive, the same as the `antfly` executable.
+Function and data section GC retains public `antfly_db_*` and `antfly_lite_*`
+roots while discarding private executable entry points. The symbol audit
+rejects exported runtime, API-kernel, storage-owner, snapshot, restore, and
+data-apply symbols; inference symbols stay hidden/non-exported even though the
+archive is now linked in-process (only the public C ABI is exported).
 
 There is one canonical Zig C API identity:
 
@@ -254,6 +256,20 @@ There is one canonical Zig C API identity:
 
 Historical references to two C API libraries in the experiment ledger predate
 this consolidation.
+
+#### Embedded inference
+
+As of 2026-09-17, `libantfly` always embeds the standalone inference runtime
+in-process (`link_anchor.zig` no longer traps
+`antfly_standalone_inference_get_function_table`; only the executable-only
+API-kernel entry point stays trapped). This is a deliberate product decision:
+it makes `libantfly`, and therefore Antfly Lite hosts (the Go/Zig `embedded`
+package and the C ABI), get local inference out of the box without building
+or shipping a separate runtime, at the cost of a much larger shared library --
+see the raised size gate below. Opening a Lite handle with the local-runtime-
+configured flag reports `inference_mode: "local_embedded"` and
+`local_inference_runtime: true` (see LITE.md's "Local Embedded Inference"
+section). There is no longer a smaller inference-free `libantfly` build.
 
 ## Why compiled boundaries are required
 
@@ -441,8 +457,10 @@ Phase 4y delta remains visible as architectural debt.
 
 For subsequent increments:
 
-- `libantfly` has a hard 20 MiB release gate and a working target at or below
-  approximately 19 MiB.
+- `libantfly` has a hard 60 MiB release gate (raised from 20 MiB on
+  2026-09-17 when the standalone inference runtime was embedded into
+  `libantfly` by default; measured stripped ReleaseFast size is
+  approximately 48 MiB, leaving headroom for other targets/platforms).
 - No single experiment should grow the executable more than approximately 5%
   without an explicit, measured critical-path benefit and approval of the
   cumulative tradeoff.
@@ -502,7 +520,8 @@ from local Apple-Silicon cross-builds.
 
 - One static `antfly` executable contains every required command and embedded
   standalone inference.
-- `libantfly` remains below 20 MiB and exposes only the public C API.
+- `libantfly` remains below 60 MiB (see the raised gate above) and exposes
+  only the public C API.
 - Production artifacts contain no LMDB implementation symbols or entry-point
   strings.
 - Executable size and emitted duplication remain within the budget above.

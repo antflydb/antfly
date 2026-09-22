@@ -9,11 +9,17 @@ pub fn ApiResponse(comptime T: type) type {
     return struct {
         status_code: u16,
         data: ?std.json.Parsed(T) = null,
+        /// Set instead of `data` when the server answered a negotiated
+        /// request in a format other than JSON; `content_type` says which.
+        bytes: ?[]const u8 = null,
+        content_type: ?[]const u8 = null,
         err_body: ?[]const u8 = null,
         allocator: std.mem.Allocator,
 
         pub fn deinit(self: *@This()) void {
             if (self.data) |*d| d.deinit();
+            if (self.bytes) |b| self.allocator.free(b);
+            if (self.content_type) |ct| self.allocator.free(ct);
             if (self.err_body) |b| self.allocator.free(b);
         }
 
@@ -22,7 +28,8 @@ pub fn ApiResponse(comptime T: type) type {
             if (resp.ok()) {
                 if (resp.status.code == 204 or resp.status.code == 205) return .{ .status_code = resp.status.code, .allocator = allocator };
                 if (resp.body) |body| {
-                    const parsed = std.json.parseFromSlice(T, allocator, body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch |err| {
+                    const parse_result = if (comptime @typeInfo(T) == .@"union" and @hasDecl(T, "parseResponse")) T.parseResponse(allocator, resp.status.code, body) else std.json.parseFromSlice(T, allocator, body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
+                    const parsed = parse_result catch |err| {
                         return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidApiResponse;
                     };
                     return .{ .status_code = resp.status.code, .data = parsed, .allocator = allocator };
@@ -31,7 +38,28 @@ pub fn ApiResponse(comptime T: type) type {
             }
             return .{ .status_code = resp.status.code, .err_body = if (resp.body) |b| try allocator.dupe(u8, b) else null, .allocator = allocator };
         }
+
+        /// Same as `fromResponse`, for an operation whose success response the
+        /// caller can negotiate: a JSON body is parsed into `data`, and any other
+        /// media type is kept verbatim in `bytes` with its `content_type`.
+        pub fn fromNegotiatedResponse(allocator: std.mem.Allocator, resp: *httpx.Response) !@This() {
+            const negotiated = resp.contentType();
+            // An empty or JSON body, and every failure, stay on the typed path.
+            if (!resp.ok() or resp.body == null or negotiated == null or isJsonContentType(negotiated.?)) return fromResponse(allocator, resp);
+            defer resp.deinit();
+            const owned = try allocator.dupe(u8, resp.body.?);
+            errdefer allocator.free(owned);
+            const owned_type = try allocator.dupe(u8, negotiated.?);
+            return .{ .status_code = resp.status.code, .bytes = owned, .content_type = owned_type, .allocator = allocator };
+        }
     };
+}
+
+/// Whether a response media type carries a JSON body.
+fn isJsonContentType(content_type: []const u8) bool {
+    const essence = std.mem.trim(u8, std.mem.sliceTo(content_type, ';'), " \t");
+    if (std.ascii.eqlIgnoreCase(essence, "application/json")) return true;
+    return std.ascii.endsWithIgnoreCase(essence, "+json");
 }
 
 pub const StreamTranscriptionAudioParams = struct {
@@ -132,6 +160,42 @@ pub const ListConnectionsParams = struct {
     refresh: ?[]const u8 = null,
 };
 
+/// Success payload selected by HTTP status, never by trial-decoding another status's schema.
+pub const CreateDatabaseResponse = union(enum) {
+    status_201: types.DatabaseCatalogRecord,
+    status_202: types.CatalogMutationVisibilityPending,
+    pub fn parseResponse(allocator: std.mem.Allocator, status: u16, body: []const u8) !std.json.Parsed(@This()) {
+        const arena = try allocator.create(std.heap.ArenaAllocator);
+        errdefer allocator.destroy(arena);
+        arena.* = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const value: @This() = switch (status) {
+            201 => .{ .status_201 = try std.json.parseFromSliceLeaky(types.DatabaseCatalogRecord, arena.allocator(), body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) },
+            202 => .{ .status_202 = try std.json.parseFromSliceLeaky(types.CatalogMutationVisibilityPending, arena.allocator(), body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) },
+            else => return error.InvalidApiResponse,
+        };
+        return .{ .arena = arena, .value = value };
+    }
+};
+
+/// Success payload selected by HTTP status, never by trial-decoding another status's schema.
+pub const CreateNamespaceResponse = union(enum) {
+    status_201: types.NamespaceCatalogRecord,
+    status_202: types.CatalogMutationVisibilityPending,
+    pub fn parseResponse(allocator: std.mem.Allocator, status: u16, body: []const u8) !std.json.Parsed(@This()) {
+        const arena = try allocator.create(std.heap.ArenaAllocator);
+        errdefer allocator.destroy(arena);
+        arena.* = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const value: @This() = switch (status) {
+            201 => .{ .status_201 = try std.json.parseFromSliceLeaky(types.NamespaceCatalogRecord, arena.allocator(), body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) },
+            202 => .{ .status_202 = try std.json.parseFromSliceLeaky(types.CatalogMutationVisibilityPending, arena.allocator(), body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) },
+            else => return error.InvalidApiResponse,
+        };
+        return .{ .arena = arena, .value = value };
+    }
+};
+
 pub const ListNamespaceTablesParams = struct {
     /// Filter tables by name prefix.
     prefix: ?[]const u8 = null,
@@ -141,11 +205,137 @@ pub const ListNamespaceTablesParams = struct {
     cursor: ?[]const u8 = null,
 };
 
+/// Success payload selected by HTTP status, never by trial-decoding another status's schema.
+pub const CreateNamespaceTableResponse = union(enum) {
+    status_201: types.TableStatus,
+    status_202: types.CommittedMutationOutcome,
+    pub fn parseResponse(allocator: std.mem.Allocator, status: u16, body: []const u8) !std.json.Parsed(@This()) {
+        const arena = try allocator.create(std.heap.ArenaAllocator);
+        errdefer allocator.destroy(arena);
+        arena.* = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const value: @This() = switch (status) {
+            201 => .{ .status_201 = try std.json.parseFromSliceLeaky(types.TableStatus, arena.allocator(), body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) },
+            202 => .{ .status_202 = try std.json.parseFromSliceLeaky(types.CommittedMutationOutcome, arena.allocator(), body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) },
+            else => return error.InvalidApiResponse,
+        };
+        return .{ .arena = arena, .value = value };
+    }
+};
+
 pub const LookupNamespaceTableDocumentParams = struct {
     /// Comma-separated list of fields to include in the response.
     fields: ?[]const u8 = null,
     /// Read consistency; defaults to read_index.
     consistency: ?[]const u8 = null,
+};
+
+/// Success payload selected by HTTP status, never by trial-decoding another status's schema.
+pub const UpdateNamespaceTableSchemaResponse = union(enum) {
+    status_200: types.Table,
+    status_202: types.CommittedMutationOutcome,
+    pub fn parseResponse(allocator: std.mem.Allocator, status: u16, body: []const u8) !std.json.Parsed(@This()) {
+        const arena = try allocator.create(std.heap.ArenaAllocator);
+        errdefer allocator.destroy(arena);
+        arena.* = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const value: @This() = switch (status) {
+            200 => .{ .status_200 = try std.json.parseFromSliceLeaky(types.Table, arena.allocator(), body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) },
+            202 => .{ .status_202 = try std.json.parseFromSliceLeaky(types.CommittedMutationOutcome, arena.allocator(), body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) },
+            else => return error.InvalidApiResponse,
+        };
+        return .{ .arena = arena, .value = value };
+    }
+};
+
+/// Success payload selected by HTTP status, never by trial-decoding another status's schema.
+pub const PatchNamespaceTableSchemaResponse = union(enum) {
+    status_200: types.Table,
+    status_202: types.CommittedMutationOutcome,
+    pub fn parseResponse(allocator: std.mem.Allocator, status: u16, body: []const u8) !std.json.Parsed(@This()) {
+        const arena = try allocator.create(std.heap.ArenaAllocator);
+        errdefer allocator.destroy(arena);
+        arena.* = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const value: @This() = switch (status) {
+            200 => .{ .status_200 = try std.json.parseFromSliceLeaky(types.Table, arena.allocator(), body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) },
+            202 => .{ .status_202 = try std.json.parseFromSliceLeaky(types.CommittedMutationOutcome, arena.allocator(), body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) },
+            else => return error.InvalidApiResponse,
+        };
+        return .{ .arena = arena, .value = value };
+    }
+};
+
+/// Success payload selected by HTTP status, never by trial-decoding another status's schema.
+pub const SetNamespaceTablespaceResponse = union(enum) {
+    status_200: types.NamespaceCatalogRecord,
+    status_202: types.CatalogMutationVisibilityPending,
+    pub fn parseResponse(allocator: std.mem.Allocator, status: u16, body: []const u8) !std.json.Parsed(@This()) {
+        const arena = try allocator.create(std.heap.ArenaAllocator);
+        errdefer allocator.destroy(arena);
+        arena.* = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const value: @This() = switch (status) {
+            200 => .{ .status_200 = try std.json.parseFromSliceLeaky(types.NamespaceCatalogRecord, arena.allocator(), body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) },
+            202 => .{ .status_202 = try std.json.parseFromSliceLeaky(types.CatalogMutationVisibilityPending, arena.allocator(), body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) },
+            else => return error.InvalidApiResponse,
+        };
+        return .{ .arena = arena, .value = value };
+    }
+};
+
+/// Success payload selected by HTTP status, never by trial-decoding another status's schema.
+pub const ClearNamespaceTablespaceResponse = union(enum) {
+    status_200: types.NamespaceCatalogRecord,
+    status_202: types.CatalogMutationVisibilityPending,
+    pub fn parseResponse(allocator: std.mem.Allocator, status: u16, body: []const u8) !std.json.Parsed(@This()) {
+        const arena = try allocator.create(std.heap.ArenaAllocator);
+        errdefer allocator.destroy(arena);
+        arena.* = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const value: @This() = switch (status) {
+            200 => .{ .status_200 = try std.json.parseFromSliceLeaky(types.NamespaceCatalogRecord, arena.allocator(), body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) },
+            202 => .{ .status_202 = try std.json.parseFromSliceLeaky(types.CatalogMutationVisibilityPending, arena.allocator(), body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) },
+            else => return error.InvalidApiResponse,
+        };
+        return .{ .arena = arena, .value = value };
+    }
+};
+
+/// Success payload selected by HTTP status, never by trial-decoding another status's schema.
+pub const SetDatabaseTablespaceResponse = union(enum) {
+    status_200: types.DatabaseCatalogRecord,
+    status_202: types.CatalogMutationVisibilityPending,
+    pub fn parseResponse(allocator: std.mem.Allocator, status: u16, body: []const u8) !std.json.Parsed(@This()) {
+        const arena = try allocator.create(std.heap.ArenaAllocator);
+        errdefer allocator.destroy(arena);
+        arena.* = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const value: @This() = switch (status) {
+            200 => .{ .status_200 = try std.json.parseFromSliceLeaky(types.DatabaseCatalogRecord, arena.allocator(), body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) },
+            202 => .{ .status_202 = try std.json.parseFromSliceLeaky(types.CatalogMutationVisibilityPending, arena.allocator(), body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) },
+            else => return error.InvalidApiResponse,
+        };
+        return .{ .arena = arena, .value = value };
+    }
+};
+
+/// Success payload selected by HTTP status, never by trial-decoding another status's schema.
+pub const ClearDatabaseTablespaceResponse = union(enum) {
+    status_200: types.DatabaseCatalogRecord,
+    status_202: types.CatalogMutationVisibilityPending,
+    pub fn parseResponse(allocator: std.mem.Allocator, status: u16, body: []const u8) !std.json.Parsed(@This()) {
+        const arena = try allocator.create(std.heap.ArenaAllocator);
+        errdefer allocator.destroy(arena);
+        arena.* = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const value: @This() = switch (status) {
+            200 => .{ .status_200 = try std.json.parseFromSliceLeaky(types.DatabaseCatalogRecord, arena.allocator(), body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) },
+            202 => .{ .status_202 = try std.json.parseFromSliceLeaky(types.CatalogMutationVisibilityPending, arena.allocator(), body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) },
+            else => return error.InvalidApiResponse,
+        };
+        return .{ .arena = arena, .value = value };
+    }
 };
 
 pub const ListRestoreJobsParams = struct {
@@ -167,6 +357,24 @@ pub const ListTablesParams = struct {
     cursor: ?[]const u8 = null,
 };
 
+/// Success payload selected by HTTP status, never by trial-decoding another status's schema.
+pub const CreateTableResponse = union(enum) {
+    status_200: types.Table,
+    status_202: types.CommittedMutationOutcome,
+    pub fn parseResponse(allocator: std.mem.Allocator, status: u16, body: []const u8) !std.json.Parsed(@This()) {
+        const arena = try allocator.create(std.heap.ArenaAllocator);
+        errdefer allocator.destroy(arena);
+        arena.* = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const value: @This() = switch (status) {
+            200 => .{ .status_200 = try std.json.parseFromSliceLeaky(types.Table, arena.allocator(), body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) },
+            202 => .{ .status_202 = try std.json.parseFromSliceLeaky(types.CommittedMutationOutcome, arena.allocator(), body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) },
+            else => return error.InvalidApiResponse,
+        };
+        return .{ .arena = arena, .value = value };
+    }
+};
+
 pub const LookupKeyParams = struct {
     /// Comma-separated list of fields to include in the response. If not specified, returns the full document. Supports: - Simple fields: "title,author" - Nested paths: "user.address.city" - Wildcards: "_chunks.*" - Exclusions: "-_chunks.*._embedding" - Special fields: "_embeddings,_summaries,_chunks"
     fields: ?[]const u8 = null,
@@ -182,6 +390,70 @@ pub const ListDocumentArtifactManifestsParams = struct {
 pub const GetDocumentArtifactManifestParams = struct {
     /// Response detail level. `summary` returns typed manifest fields only. `raw` also includes opaque manifest/state JSON and requires table admin permission when authentication is enabled.
     detail: ?[]const u8 = null,
+};
+
+/// Success payload selected by HTTP status, never by trial-decoding another status's schema.
+pub const UpdateSchemaResponse = union(enum) {
+    status_200: types.Table,
+    status_202: types.OpenApiUpdateSchemaResponse202,
+    pub fn parseResponse(allocator: std.mem.Allocator, status: u16, body: []const u8) !std.json.Parsed(@This()) {
+        const arena = try allocator.create(std.heap.ArenaAllocator);
+        errdefer allocator.destroy(arena);
+        arena.* = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const value: @This() = switch (status) {
+            200 => .{ .status_200 = try std.json.parseFromSliceLeaky(types.Table, arena.allocator(), body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) },
+            202 => .{ .status_202 = try std.json.parseFromSliceLeaky(types.OpenApiUpdateSchemaResponse202, arena.allocator(), body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) },
+            else => return error.InvalidApiResponse,
+        };
+        return .{ .arena = arena, .value = value };
+    }
+};
+
+pub const UpdateSchemaParams = struct {
+    /// Explicitly enqueue a durable fresh-generation schema rewrite instead of changing the live schema. Requires administrator permission on the entire dependency cohort. Sources remain writable during snapshot and catch-up; final validation and publication are atomic across the cohort. Returns a restore job (202), whose existing status/cancel routes apply. Independent graph/vector artifacts without a retained row-derived source proof are rejected before admission. The default false retains ordinary schema-update behavior. Existing absent values remain absent rather than retroactively receiving defaults. Stored column type changes and destructive column removal are rejected.
+    rewrite: ?[]const u8 = null,
+};
+
+/// Success payload selected by HTTP status, never by trial-decoding another status's schema.
+pub const PatchSchemaResponse = union(enum) {
+    status_200: types.Table,
+    status_202: types.OpenApiPatchSchemaResponse202,
+    pub fn parseResponse(allocator: std.mem.Allocator, status: u16, body: []const u8) !std.json.Parsed(@This()) {
+        const arena = try allocator.create(std.heap.ArenaAllocator);
+        errdefer allocator.destroy(arena);
+        arena.* = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const value: @This() = switch (status) {
+            200 => .{ .status_200 = try std.json.parseFromSliceLeaky(types.Table, arena.allocator(), body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) },
+            202 => .{ .status_202 = try std.json.parseFromSliceLeaky(types.OpenApiPatchSchemaResponse202, arena.allocator(), body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) },
+            else => return error.InvalidApiResponse,
+        };
+        return .{ .arena = arena, .value = value };
+    }
+};
+
+pub const PatchSchemaParams = struct {
+    /// Explicitly enqueue a durable fresh-generation schema rewrite instead of changing the live schema. Requires administrator permission on the entire dependency cohort. Sources remain writable during snapshot and catch-up; final validation and publication are atomic across the cohort. Returns a restore job (202), whose existing status/cancel routes apply. Independent graph/vector artifacts without a retained row-derived source proof are rejected before admission. The default false retains ordinary schema-update behavior. Existing absent values remain absent rather than retroactively receiving defaults. Stored column type changes and destructive column removal are rejected.
+    rewrite: ?[]const u8 = null,
+};
+
+/// Success payload selected by HTTP status, never by trial-decoding another status's schema.
+pub const CreateTablespaceResponse = union(enum) {
+    status_201: types.TablespaceCatalogRecord,
+    status_202: types.CatalogMutationVisibilityPending,
+    pub fn parseResponse(allocator: std.mem.Allocator, status: u16, body: []const u8) !std.json.Parsed(@This()) {
+        const arena = try allocator.create(std.heap.ArenaAllocator);
+        errdefer allocator.destroy(arena);
+        arena.* = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const value: @This() = switch (status) {
+            201 => .{ .status_201 = try std.json.parseFromSliceLeaky(types.TablespaceCatalogRecord, arena.allocator(), body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) },
+            202 => .{ .status_202 = try std.json.parseFromSliceLeaky(types.CatalogMutationVisibilityPending, arena.allocator(), body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) },
+            else => return error.InvalidApiResponse,
+        };
+        return .{ .arena = arena, .value = value };
+    }
 };
 
 pub const CleanupTransactionSessionsParams = struct {
@@ -257,24 +529,32 @@ pub const Client = struct {
 
     /// Create embeddings (alias of `/embeddings`)
     /// POST /ai/v1/embed
-    pub fn generateEmbeddings(self: *@This(), body: types.InferenceEmbedRequest) !ApiResponse(types.InferenceEmbedResponse) {
+    pub fn generateEmbeddings(self: *@This(), body: types.InferenceEmbedRequest, accept: ?[]const u8) !ApiResponse(types.InferenceEmbedResponse) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/embed", .{self.base_url});
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
-        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
-        return ApiResponse(types.InferenceEmbedResponse).fromResponse(self.allocator, &resp);
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        if (accept) |value| try request_headers.append(self.allocator, .{ "Accept", value });
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = request_headers.items });
+        return ApiResponse(types.InferenceEmbedResponse).fromNegotiatedResponse(self.allocator, &resp);
     }
 
     /// Create embeddings (OpenAI-compatible)
     /// POST /ai/v1/embeddings
-    pub fn createEmbedding(self: *@This(), body: types.InferenceEmbedRequest) !ApiResponse(types.InferenceEmbedResponse) {
+    pub fn createEmbedding(self: *@This(), body: types.InferenceEmbedRequest, accept: ?[]const u8) !ApiResponse(types.InferenceEmbedResponse) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/embeddings", .{self.base_url});
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
-        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
-        return ApiResponse(types.InferenceEmbedResponse).fromResponse(self.allocator, &resp);
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        if (accept) |value| try request_headers.append(self.allocator, .{ "Accept", value });
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = request_headers.items });
+        return ApiResponse(types.InferenceEmbedResponse).fromNegotiatedResponse(self.allocator, &resp);
     }
 
     /// Extract entities, relations, classifications, and structures
@@ -333,24 +613,32 @@ pub const Client = struct {
 
     /// Rerank prompts by relevance
     /// POST /ai/v1/rerank
-    pub fn rerankPrompts(self: *@This(), body: types.InferenceRerankRequest) !ApiResponse(types.InferenceRerankResponse) {
+    pub fn rerankPrompts(self: *@This(), body: types.InferenceRerankRequest, accept: ?[]const u8) !ApiResponse(types.InferenceRerankResponse) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/rerank", .{self.base_url});
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
-        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
-        return ApiResponse(types.InferenceRerankResponse).fromResponse(self.allocator, &resp);
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        if (accept) |value| try request_headers.append(self.allocator, .{ "Accept", value });
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = request_headers.items });
+        return ApiResponse(types.InferenceRerankResponse).fromNegotiatedResponse(self.allocator, &resp);
     }
 
     /// Rerank multimodal documents by relevance
     /// POST /ai/v1/rerank_multimodal
-    pub fn rerankMultimodalPrompts(self: *@This(), body: types.InferenceRerankMultimodalRequest) !ApiResponse(types.InferenceRerankResponse) {
+    pub fn rerankMultimodalPrompts(self: *@This(), body: types.InferenceRerankMultimodalRequest, accept: ?[]const u8) !ApiResponse(types.InferenceRerankResponse) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/rerank_multimodal", .{self.base_url});
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
-        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
-        return ApiResponse(types.InferenceRerankResponse).fromResponse(self.allocator, &resp);
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        if (accept) |value| try request_headers.append(self.allocator, .{ "Accept", value });
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = request_headers.items });
+        return ApiResponse(types.InferenceRerankResponse).fromNegotiatedResponse(self.allocator, &resp);
     }
 
     /// Rewrite text using Seq2Seq models
@@ -1191,13 +1479,13 @@ pub const Client = struct {
 
     /// Create database
     /// POST /db/v1/databases/{databaseName}
-    pub fn createDatabase(self: *@This(), database_name: []const u8) !ApiResponse(types.DatabaseCatalogRecord) {
+    pub fn createDatabase(self: *@This(), database_name: []const u8) !ApiResponse(CreateDatabaseResponse) {
         const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
         defer self.allocator.free(encoded_database_name);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}", .{ self.base_url, encoded_database_name });
         defer self.allocator.free(url);
         var resp = try self.http.post(url, .{ .headers = self.authHeaders() });
-        return ApiResponse(types.DatabaseCatalogRecord).fromResponse(self.allocator, &resp);
+        return ApiResponse(CreateDatabaseResponse).fromResponse(self.allocator, &resp);
     }
 
     /// Drop database
@@ -1224,7 +1512,7 @@ pub const Client = struct {
 
     /// Create namespace
     /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}
-    pub fn createNamespace(self: *@This(), database_name: []const u8, namespace_name: []const u8) !ApiResponse(types.NamespaceCatalogRecord) {
+    pub fn createNamespace(self: *@This(), database_name: []const u8, namespace_name: []const u8) !ApiResponse(CreateNamespaceResponse) {
         const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
         defer self.allocator.free(encoded_database_name);
         const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
@@ -1232,7 +1520,7 @@ pub const Client = struct {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}", .{ self.base_url, encoded_database_name, encoded_namespace_name });
         defer self.allocator.free(url);
         var resp = try self.http.post(url, .{ .headers = self.authHeaders() });
-        return ApiResponse(types.NamespaceCatalogRecord).fromResponse(self.allocator, &resp);
+        return ApiResponse(CreateNamespaceResponse).fromResponse(self.allocator, &resp);
     }
 
     /// Drop namespace
@@ -1325,7 +1613,7 @@ pub const Client = struct {
 
     /// Create namespace table
     /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}
-    pub fn createNamespaceTable(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, body: types.CreateTableRequest) !ApiResponse(types.TableStatus) {
+    pub fn createNamespaceTable(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, body: types.CreateTableRequest) !ApiResponse(CreateNamespaceTableResponse) {
         const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
         defer self.allocator.free(encoded_database_name);
         const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
@@ -1337,7 +1625,7 @@ pub const Client = struct {
         const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
-        return ApiResponse(types.TableStatus).fromResponse(self.allocator, &resp);
+        return ApiResponse(CreateNamespaceTableResponse).fromResponse(self.allocator, &resp);
     }
 
     /// Drop namespace table
@@ -1387,6 +1675,72 @@ pub const Client = struct {
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.BatchResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// Repair version-conditional rows after failed or diagnosed constraint activation
+    /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/repair
+    pub fn repairNamespaceRelationalConstraints(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, body: types.RelationalRowMutationRequest) !ApiResponse(types.BatchResponse) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/constraints/repair", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.BatchResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// Retire unique and foreign-key definitions safely
+    /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/retire
+    pub fn retireNamespaceRelationalConstraints(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, body: types.RelationalConstraintRetirementRequest) !ApiResponse(types.RelationalConstraintRetryResponse) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/constraints/retire", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.RelationalConstraintRetryResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// Restart failed UNIQUE/FK/CHECK validation after administrative repair
+    /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/retry
+    pub fn retryNamespaceRelationalConstraints(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, body: types.RelationalConstraintRetryRequest) !ApiResponse(types.RelationalConstraintRetryResponse) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/constraints/retry", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.RelationalConstraintRetryResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// Read distributed UNIQUE, foreign-key, and CHECK validation coverage
+    /// GET /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/status
+    pub fn getNamespaceRelationalConstraintStatus(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !ApiResponse(types.RelationalConstraintStatus) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/constraints/status", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.RelationalConstraintStatus).fromResponse(self.allocator, &resp);
     }
 
     /// Retrieve a document by key from an explicit namespace table
@@ -1519,6 +1873,44 @@ pub const Client = struct {
         return ApiResponse(types.GraphMetricActionResponse).fromResponse(self.allocator, &resp);
     }
 
+    /// Repair an index generation
+    /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/repair
+    pub fn repairNamespaceIndex(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8, body: types.IndexMaintenanceRequest) !ApiResponse(types.IndexMaintenanceResponse) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_index_name = try httpx.PercentEncoding.encode(self.allocator, index_name);
+        defer self.allocator.free(encoded_index_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/indexes/{s}/repair", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name, encoded_index_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.IndexMaintenanceResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// Retry a failed index build
+    /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/retry
+    pub fn retryNamespaceIndex(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8, body: types.IndexMaintenanceRequest) !ApiResponse(types.IndexMaintenanceResponse) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_index_name = try httpx.PercentEncoding.encode(self.allocator, index_name);
+        defer self.allocator.free(encoded_index_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/indexes/{s}/retry", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name, encoded_index_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.IndexMaintenanceResponse).fromResponse(self.allocator, &resp);
+    }
+
     /// Query an explicit namespace table
     /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/query
     pub fn queryNamespaceTable(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, body: types.StatefulQueryRequest) !ApiResponse(types.QueryResponses) {
@@ -1574,9 +1966,44 @@ pub const Client = struct {
         return ApiResponse(types.RestoreJob).fromResponse(self.allocator, &resp);
     }
 
+    /// Atomically replace or delete version-conditional typed rows
+    /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rows/mutate
+    pub fn mutateNamespaceRelationalRows(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, body: types.RelationalRowMutationRequest) !ApiResponse(types.BatchResponse) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/rows/mutate", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.BatchResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// Query projected typed relational rows
+    /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rows/query
+    pub fn queryNamespaceRelationalRows(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, body: types.RelationalRowQueryRequest) !RawResponse {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/rows/query", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        defer resp.deinit();
+        return .{ .status_code = resp.status.code, .body = if (resp.body) |b| (self.allocator.dupe(u8, b) catch null) else null, .content_type = if (resp.contentType()) |ct| (self.allocator.dupe(u8, ct) catch null) else null, .allocator = self.allocator };
+    }
+
     /// Replace a table's schema
     /// PUT /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/schema
-    pub fn updateNamespaceTableSchema(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, body: types.TableSchema, if_match: ?[]const u8) !ApiResponse(types.Table) {
+    pub fn updateNamespaceTableSchema(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, body: types.TableSchema, if_match: ?[]const u8) !ApiResponse(UpdateNamespaceTableSchemaResponse) {
         const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
         defer self.allocator.free(encoded_database_name);
         const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
@@ -1592,12 +2019,12 @@ pub const Client = struct {
         if (self.auth_header) |header| try request_headers.append(self.allocator, header);
         if (if_match) |value| try request_headers.append(self.allocator, .{ "If-Match", value });
         var resp = try self.http.put(url, .{ .json = json_body, .headers = request_headers.items });
-        return ApiResponse(types.Table).fromResponse(self.allocator, &resp);
+        return ApiResponse(UpdateNamespaceTableSchemaResponse).fromResponse(self.allocator, &resp);
     }
 
     /// Patch a table's schema
     /// PATCH /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/schema
-    pub fn patchNamespaceTableSchema(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, body: types.TableSchemaPatch, if_match: ?[]const u8) !ApiResponse(types.Table) {
+    pub fn patchNamespaceTableSchema(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, body: types.TableSchemaPatch, if_match: ?[]const u8) !ApiResponse(PatchNamespaceTableSchemaResponse) {
         const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
         defer self.allocator.free(encoded_database_name);
         const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
@@ -1613,7 +2040,7 @@ pub const Client = struct {
         if (self.auth_header) |header| try request_headers.append(self.allocator, header);
         if (if_match) |value| try request_headers.append(self.allocator, .{ "If-Match", value });
         var resp = try self.http.patch(url, .{ .json = json_body, .headers = request_headers.items });
-        return ApiResponse(types.Table).fromResponse(self.allocator, &resp);
+        return ApiResponse(PatchNamespaceTableSchemaResponse).fromResponse(self.allocator, &resp);
     }
 
     /// Set namespace tablespace
@@ -1650,7 +2077,7 @@ pub const Client = struct {
 
     /// Set namespace tablespace
     /// PUT /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tablespace
-    pub fn setNamespaceTablespace(self: *@This(), database_name: []const u8, namespace_name: []const u8, body: types.CatalogTablespaceBindingRequest) !ApiResponse(types.NamespaceCatalogRecord) {
+    pub fn setNamespaceTablespace(self: *@This(), database_name: []const u8, namespace_name: []const u8, body: types.CatalogTablespaceBindingRequest) !ApiResponse(SetNamespaceTablespaceResponse) {
         const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
         defer self.allocator.free(encoded_database_name);
         const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
@@ -1660,12 +2087,12 @@ pub const Client = struct {
         const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.put(url, .{ .json = json_body, .headers = self.authHeaders() });
-        return ApiResponse(types.NamespaceCatalogRecord).fromResponse(self.allocator, &resp);
+        return ApiResponse(SetNamespaceTablespaceResponse).fromResponse(self.allocator, &resp);
     }
 
     /// Clear namespace tablespace
     /// DELETE /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tablespace
-    pub fn clearNamespaceTablespace(self: *@This(), database_name: []const u8, namespace_name: []const u8) !ApiResponse(types.NamespaceCatalogRecord) {
+    pub fn clearNamespaceTablespace(self: *@This(), database_name: []const u8, namespace_name: []const u8) !ApiResponse(ClearNamespaceTablespaceResponse) {
         const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
         defer self.allocator.free(encoded_database_name);
         const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
@@ -1673,7 +2100,7 @@ pub const Client = struct {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tablespace", .{ self.base_url, encoded_database_name, encoded_namespace_name });
         defer self.allocator.free(url);
         var resp = try self.http.delete(url, .{ .headers = self.authHeaders() });
-        return ApiResponse(types.NamespaceCatalogRecord).fromResponse(self.allocator, &resp);
+        return ApiResponse(ClearNamespaceTablespaceResponse).fromResponse(self.allocator, &resp);
     }
 
     /// Rename catalog resource
@@ -1691,7 +2118,7 @@ pub const Client = struct {
 
     /// Set database tablespace
     /// PUT /db/v1/databases/{databaseName}/tablespace
-    pub fn setDatabaseTablespace(self: *@This(), database_name: []const u8, body: types.CatalogTablespaceBindingRequest) !ApiResponse(types.DatabaseCatalogRecord) {
+    pub fn setDatabaseTablespace(self: *@This(), database_name: []const u8, body: types.CatalogTablespaceBindingRequest) !ApiResponse(SetDatabaseTablespaceResponse) {
         const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
         defer self.allocator.free(encoded_database_name);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/tablespace", .{ self.base_url, encoded_database_name });
@@ -1699,18 +2126,18 @@ pub const Client = struct {
         const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.put(url, .{ .json = json_body, .headers = self.authHeaders() });
-        return ApiResponse(types.DatabaseCatalogRecord).fromResponse(self.allocator, &resp);
+        return ApiResponse(SetDatabaseTablespaceResponse).fromResponse(self.allocator, &resp);
     }
 
     /// Clear database tablespace
     /// DELETE /db/v1/databases/{databaseName}/tablespace
-    pub fn clearDatabaseTablespace(self: *@This(), database_name: []const u8) !ApiResponse(types.DatabaseCatalogRecord) {
+    pub fn clearDatabaseTablespace(self: *@This(), database_name: []const u8) !ApiResponse(ClearDatabaseTablespaceResponse) {
         const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
         defer self.allocator.free(encoded_database_name);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/tablespace", .{ self.base_url, encoded_database_name });
         defer self.allocator.free(url);
         var resp = try self.http.delete(url, .{ .headers = self.authHeaders() });
-        return ApiResponse(types.DatabaseCatalogRecord).fromResponse(self.allocator, &resp);
+        return ApiResponse(ClearDatabaseTablespaceResponse).fromResponse(self.allocator, &resp);
     }
 
     /// Standalone evaluation endpoint
@@ -1925,7 +2352,7 @@ pub const Client = struct {
 
     /// Create a new table
     /// POST /db/v1/tables/{tableName}
-    pub fn createTable(self: *@This(), table_name: []const u8, body: types.CreateTableRequest) !ApiResponse(types.Table) {
+    pub fn createTable(self: *@This(), table_name: []const u8, body: types.CreateTableRequest) !ApiResponse(CreateTableResponse) {
         const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
         defer self.allocator.free(encoded_table_name);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}", .{ self.base_url, encoded_table_name });
@@ -1933,7 +2360,7 @@ pub const Client = struct {
         const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
-        return ApiResponse(types.Table).fromResponse(self.allocator, &resp);
+        return ApiResponse(CreateTableResponse).fromResponse(self.allocator, &resp);
     }
 
     /// Drop a table
@@ -2091,6 +2518,56 @@ pub const Client = struct {
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.BatchResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// Repair version-conditional rows after failed or diagnosed constraint activation
+    /// POST /db/v1/tables/{tableName}/constraints/repair
+    pub fn repairRelationalConstraints(self: *@This(), table_name: []const u8, body: types.RelationalRowMutationRequest) !ApiResponse(types.BatchResponse) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/constraints/repair", .{ self.base_url, encoded_table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.BatchResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// Retire unique and foreign-key definitions safely
+    /// POST /db/v1/tables/{tableName}/constraints/retire
+    pub fn retireRelationalConstraints(self: *@This(), table_name: []const u8, body: types.RelationalConstraintRetirementRequest) !ApiResponse(types.RelationalConstraintRetryResponse) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/constraints/retire", .{ self.base_url, encoded_table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.RelationalConstraintRetryResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// Restart failed UNIQUE/FK/CHECK validation after administrative repair
+    /// POST /db/v1/tables/{tableName}/constraints/retry
+    pub fn retryRelationalConstraints(self: *@This(), table_name: []const u8, body: types.RelationalConstraintRetryRequest) !ApiResponse(types.RelationalConstraintRetryResponse) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/constraints/retry", .{ self.base_url, encoded_table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.RelationalConstraintRetryResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// Read distributed UNIQUE, foreign-key, and CHECK validation coverage
+    /// GET /db/v1/tables/{tableName}/constraints/status
+    pub fn getRelationalConstraintStatus(self: *@This(), table_name: []const u8) !ApiResponse(types.RelationalConstraintStatus) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/constraints/status", .{ self.base_url, encoded_table_name });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.RelationalConstraintStatus).fromResponse(self.allocator, &resp);
     }
 
     /// Adopt stored write destinations with the current credential
@@ -2302,6 +2779,36 @@ pub const Client = struct {
         return ApiResponse(types.GraphMetricActionResponse).fromResponse(self.allocator, &resp);
     }
 
+    /// Repair an index generation
+    /// POST /db/v1/tables/{tableName}/indexes/{indexName}/repair
+    pub fn repairIndex(self: *@This(), table_name: []const u8, index_name: []const u8, body: types.IndexMaintenanceRequest) !ApiResponse(types.IndexMaintenanceResponse) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_index_name = try httpx.PercentEncoding.encode(self.allocator, index_name);
+        defer self.allocator.free(encoded_index_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/indexes/{s}/repair", .{ self.base_url, encoded_table_name, encoded_index_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.IndexMaintenanceResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// Retry a failed index build
+    /// POST /db/v1/tables/{tableName}/indexes/{indexName}/retry
+    pub fn retryIndex(self: *@This(), table_name: []const u8, index_name: []const u8, body: types.IndexMaintenanceRequest) !ApiResponse(types.IndexMaintenanceResponse) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_index_name = try httpx.PercentEncoding.encode(self.allocator, index_name);
+        defer self.allocator.free(encoded_index_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/indexes/{s}/retry", .{ self.base_url, encoded_table_name, encoded_index_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.IndexMaintenanceResponse).fromResponse(self.allocator, &resp);
+    }
+
     /// Synchronize data from external sources (Shopify, Postgres, S3) using a linear merge
     /// POST /db/v1/tables/{tableName}/merge
     pub fn linearMerge(self: *@This(), table_name: []const u8, body: types.LinearMergeRequest) !ApiResponse(types.LinearMergeResult) {
@@ -2445,38 +2952,99 @@ pub const Client = struct {
         return ApiResponse(types.RestoreJob).fromResponse(self.allocator, &resp);
     }
 
-    /// Replace a table's schema
-    /// PUT /db/v1/tables/{tableName}/schema
-    pub fn updateSchema(self: *@This(), table_name: []const u8, body: types.TableSchema, if_match: ?[]const u8) !ApiResponse(types.Table) {
+    /// Atomically replace or delete version-conditional typed rows
+    /// POST /db/v1/tables/{tableName}/rows/mutate
+    pub fn mutateRelationalRows(self: *@This(), table_name: []const u8, body: types.RelationalRowMutationRequest) !ApiResponse(types.BatchResponse) {
         const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
         defer self.allocator.free(encoded_table_name);
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/schema", .{ self.base_url, encoded_table_name });
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/rows/mutate", .{ self.base_url, encoded_table_name });
         defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.BatchResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// Query projected typed relational rows
+    /// POST /db/v1/tables/{tableName}/rows/query
+    pub fn queryRelationalRows(self: *@This(), table_name: []const u8, body: types.RelationalRowQueryRequest) !RawResponse {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/rows/query", .{ self.base_url, encoded_table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        defer resp.deinit();
+        return .{ .status_code = resp.status.code, .body = if (resp.body) |b| (self.allocator.dupe(u8, b) catch null) else null, .content_type = if (resp.contentType()) |ct| (self.allocator.dupe(u8, ct) catch null) else null, .allocator = self.allocator };
+    }
+
+    /// Replace a table's schema
+    /// PUT /db/v1/tables/{tableName}/schema
+    pub fn updateSchema(self: *@This(), table_name: []const u8, body: types.TableSchema, idempotency_key: ?[]const u8, if_match: ?[]const u8, params: UpdateSchemaParams) !ApiResponse(UpdateSchemaResponse) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/schema", .{ self.base_url, encoded_table_name });
+        defer self.allocator.free(url);
+        var query_buf = std.ArrayListUnmanaged(u8).empty;
+        defer query_buf.deinit(self.allocator);
+        var sep: u8 = '?';
+        if (params.rewrite) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "rewrite=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (query_buf.items.len > 0) {
+            const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
+            self.allocator.free(url);
+            url = new_url;
+        }
         const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
         defer request_headers.deinit(self.allocator);
         if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        if (idempotency_key) |value| try request_headers.append(self.allocator, .{ "Idempotency-Key", value });
         if (if_match) |value| try request_headers.append(self.allocator, .{ "If-Match", value });
         var resp = try self.http.put(url, .{ .json = json_body, .headers = request_headers.items });
-        return ApiResponse(types.Table).fromResponse(self.allocator, &resp);
+        return ApiResponse(UpdateSchemaResponse).fromResponse(self.allocator, &resp);
     }
 
     /// Patch a table's schema
     /// PATCH /db/v1/tables/{tableName}/schema
-    pub fn patchSchema(self: *@This(), table_name: []const u8, body: types.TableSchemaPatch, if_match: ?[]const u8) !ApiResponse(types.Table) {
+    pub fn patchSchema(self: *@This(), table_name: []const u8, body: types.TableSchemaPatch, idempotency_key: ?[]const u8, if_match: ?[]const u8, params: PatchSchemaParams) !ApiResponse(PatchSchemaResponse) {
         const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
         defer self.allocator.free(encoded_table_name);
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/schema", .{ self.base_url, encoded_table_name });
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/schema", .{ self.base_url, encoded_table_name });
         defer self.allocator.free(url);
+        var query_buf = std.ArrayListUnmanaged(u8).empty;
+        defer query_buf.deinit(self.allocator);
+        var sep: u8 = '?';
+        if (params.rewrite) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "rewrite=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (query_buf.items.len > 0) {
+            const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
+            self.allocator.free(url);
+            url = new_url;
+        }
         const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
         defer request_headers.deinit(self.allocator);
         if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        if (idempotency_key) |value| try request_headers.append(self.allocator, .{ "Idempotency-Key", value });
         if (if_match) |value| try request_headers.append(self.allocator, .{ "If-Match", value });
         var resp = try self.http.patch(url, .{ .json = json_body, .headers = request_headers.items });
-        return ApiResponse(types.Table).fromResponse(self.allocator, &resp);
+        return ApiResponse(PatchSchemaResponse).fromResponse(self.allocator, &resp);
     }
 
     /// Create or resume a table storage migration job
@@ -2542,7 +3110,7 @@ pub const Client = struct {
 
     /// Create tablespace
     /// POST /db/v1/tablespaces/{tablespaceName}
-    pub fn createTablespace(self: *@This(), tablespace_name: []const u8, body: ?types.CreateTablespaceRequest) !ApiResponse(types.TablespaceCatalogRecord) {
+    pub fn createTablespace(self: *@This(), tablespace_name: []const u8, body: ?types.CreateTablespaceRequest) !ApiResponse(CreateTablespaceResponse) {
         const encoded_tablespace_name = try httpx.PercentEncoding.encode(self.allocator, tablespace_name);
         defer self.allocator.free(encoded_tablespace_name);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tablespaces/{s}", .{ self.base_url, encoded_tablespace_name });
@@ -2553,7 +3121,7 @@ pub const Client = struct {
             try self.http.post(url, .{ .json = value, .headers = self.authHeaders() })
         else
             try self.http.post(url, .{ .headers = self.authHeaders() });
-        return ApiResponse(types.TablespaceCatalogRecord).fromResponse(self.allocator, &resp);
+        return ApiResponse(CreateTablespaceResponse).fromResponse(self.allocator, &resp);
     }
 
     /// Drop tablespace

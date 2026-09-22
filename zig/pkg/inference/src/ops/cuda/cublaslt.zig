@@ -33,6 +33,9 @@ const CUDA_R_16BF: c_int = 14;
 const CUBLAS_COMPUTE_32F: c_int = 68;
 const CUBLASLT_MATMUL_DESC_TRANSA: c_int = 3;
 const CUBLASLT_MATMUL_DESC_TRANSB: c_int = 4;
+const CUBLASLT_MATMUL_DESC_EPILOGUE: c_int = 7;
+const CUBLASLT_MATMUL_DESC_BIAS_POINTER: c_int = 8;
+const CUBLASLT_EPILOGUE_BIAS: c_int = 4;
 const CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES: c_int = 1;
 const CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES: c_int = 5;
 const CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_B_BYTES: c_int = 6;
@@ -65,6 +68,7 @@ const MatmulHeuristicResult = extern struct {
 
 const TensorCorePlanKind = enum(u8) {
     dense,
+    dense_bias,
     strided_batched,
 };
 
@@ -185,6 +189,7 @@ const TensorCoreInvocation = struct {
     input: buffer_mod.DeviceBuffer,
     weight: buffer_mod.DeviceBuffer,
     workspace: buffer_mod.DeviceBuffer,
+    bias: ?buffer_mod.DeviceBuffer = null,
 };
 
 const TimedSelection = struct {
@@ -211,6 +216,10 @@ pub const CublasLt = struct {
     fns: Table,
     tensor_core_plans: std.AutoHashMapUnmanaged(TensorCorePlanKey, TensorCorePlan) = .empty,
     tensor_core_plans_mutex: std.atomic.Mutex = .unlocked,
+    // Bias pointers are invocation data in a cached descriptor. Serialize
+    // biased submissions through the API call that consumes that descriptor;
+    // ordinary serving plans never share this descriptor kind.
+    bias_submission_mutex: std.atomic.Mutex = .unlocked,
     // Tuning synchronizes CUDA events and can take much longer than the plan
     // map critical section. Serialize tuned cache misses separately and yield
     // while waiting so duplicate first-use requests cannot distort timings or
@@ -349,7 +358,7 @@ pub const CublasLt = struct {
         out_dim: usize,
         tuning: MatmulTuning,
     ) Error!MatmulSelection {
-        return self.matmul16WeightF32Out(ctx, dst, input_bf16, weight_bf16, workspace, rows, in_dim, out_dim, CUDA_R_16BF, tuning);
+        return self.matmulWeightF32Out(ctx, dst, input_bf16, weight_bf16, workspace, rows, in_dim, out_dim, CUDA_R_16BF, tuning, null);
     }
 
     /// Tensor-core matmul for FP16 GGUF weights. Activations are staged from
@@ -367,10 +376,10 @@ pub const CublasLt = struct {
         in_dim: usize,
         out_dim: usize,
     ) Error!void {
-        _ = try self.matmul16WeightF32Out(ctx, dst, input_f16, weight_f16, workspace, rows, in_dim, out_dim, CUDA_R_16F, .{});
+        _ = try self.matmulWeightF32Out(ctx, dst, input_f16, weight_f16, workspace, rows, in_dim, out_dim, CUDA_R_16F, .{}, null);
     }
 
-    fn matmul16WeightF32Out(
+    fn matmulWeightF32Out(
         self: *CublasLt,
         ctx: *context_mod.CudaContext,
         dst: buffer_mod.DeviceBuffer,
@@ -382,12 +391,19 @@ pub const CublasLt = struct {
         out_dim: usize,
         input_type: c_int,
         tuning: MatmulTuning,
+        bias: ?buffer_mod.DeviceBuffer,
     ) Error!MatmulSelection {
+        if (bias != null) {
+            if (input_type != CUDA_R_32F or tuning.enabled) return error.CublasLtUnsupported;
+            spinLock(&self.bias_submission_mutex);
+        }
+        defer if (bias != null) self.bias_submission_mutex.unlock();
         try self.validateContext(ctx);
         if (rows == 0 or in_dim == 0 or out_dim == 0) return .heuristic;
         if (rows > std.math.maxInt(u32) or in_dim > std.math.maxInt(u32) or out_dim > std.math.maxInt(u32)) return error.CublasLtUnsupported;
-        const input_bytes = try checkedMatrixBytes(rows, in_dim, @sizeOf(u16));
-        const weight_bytes = try checkedMatrixBytes(out_dim, in_dim, @sizeOf(u16));
+        const element_bytes: usize = if (input_type == CUDA_R_32F) @sizeOf(f32) else @sizeOf(u16);
+        const input_bytes = try checkedMatrixBytes(rows, in_dim, element_bytes);
+        const weight_bytes = try checkedMatrixBytes(out_dim, in_dim, element_bytes);
         const dst_bytes = try checkedMatrixBytes(rows, out_dim, @sizeOf(f32));
         try checkRawBytes(input, input_bytes);
         try checkRawBytes(weight, weight_bytes);
@@ -397,18 +413,26 @@ pub const CublasLt = struct {
         try requireDisjoint(workspace, workspace.len, input, input_bytes);
         try requireDisjoint(workspace, workspace.len, weight, weight_bytes);
         try requireDisjoint(workspace, workspace.len, dst, dst_bytes);
+        if (bias) |value| {
+            const bias_bytes = try checkedMatrixBytes(1, out_dim, @sizeOf(f32));
+            try checkRawBytes(value, bias_bytes);
+            try requireDisjoint(dst, dst_bytes, value, bias_bytes);
+            try requireDisjoint(workspace, workspace.len, value, bias_bytes);
+        }
 
         const invocation = TensorCoreInvocation{
             .dst = dst,
             .input = input,
             .weight = weight,
             .workspace = workspace,
+            .bias = bias,
         };
         try validateWorkspaceAlignment(workspace);
-        var plan_lease = try self.tensorCorePlanFor(.dense, input_type, 1, rows, in_dim, out_dim, workspace.len, tuning, ctx, invocation);
+        var plan_lease = try self.tensorCorePlanFor(if (bias != null) .dense_bias else .dense, input_type, 1, rows, in_dim, out_dim, workspace.len, tuning, ctx, invocation);
         defer plan_lease.deinit(self);
         const plan = plan_lease.plan;
         try checkRawBytes(workspace, plan.workspace_size);
+        if (bias) |value| try self.setBias(plan.op_desc, value);
 
         var alpha: f32 = 1.0;
         var beta: f32 = 0.0;
@@ -480,7 +504,7 @@ pub const CublasLt = struct {
             .alignment_a_bytes = cappedPointerAlignment(invocation.weight.ptr),
             .alignment_b_bytes = cappedPointerAlignment(invocation.input.ptr),
             .alignment_c_bytes = cappedPointerAlignment(invocation.dst.ptr),
-            .alignment_d_bytes = cappedPointerAlignment(invocation.dst.ptr),
+            .alignment_d_bytes = @min(cappedPointerAlignment(invocation.dst.ptr), cappedPointerAlignment(if (invocation.bias) |value| value.ptr else invocation.dst.ptr)),
             .tuning_fingerprint = effective_tuning.fingerprint(),
         };
 
@@ -552,7 +576,7 @@ pub const CublasLt = struct {
         var transa: c_int = undefined;
         var transb: c_int = undefined;
         switch (key.kind) {
-            .dense => {
+            .dense, .dense_bias => {
                 transa = CUBLAS_OP_T;
                 transb = CUBLAS_OP_N;
                 try self.check(self.fns.cublasLtMatrixLayoutCreate(&plan.a_desc, key.input_type, key.in_dim, key.out_dim, key.in_dim));
@@ -568,6 +592,7 @@ pub const CublasLt = struct {
         }
         try self.check(self.fns.cublasLtMatmulDescSetAttribute(plan.op_desc, CUBLASLT_MATMUL_DESC_TRANSA, &transa, @sizeOf(c_int)));
         try self.check(self.fns.cublasLtMatmulDescSetAttribute(plan.op_desc, CUBLASLT_MATMUL_DESC_TRANSB, &transb, @sizeOf(c_int)));
+        if (key.kind == .dense_bias) try self.setBias(plan.op_desc, invocation.bias orelse return error.CublasLtUnsupported);
         try self.check(self.fns.cublasLtMatrixLayoutCreate(&plan.c_desc, CUDA_R_32F, key.out_dim, key.rows, key.out_dim));
         try self.check(self.fns.cublasLtMatrixLayoutCreate(&plan.d_desc, CUDA_R_32F, key.out_dim, key.rows, key.out_dim));
 
@@ -926,67 +951,20 @@ pub const CublasLt = struct {
         in_dim: usize,
         out_dim: usize,
     ) Error!void {
-        try self.validateContext(ctx);
-        if (rows == 0 or in_dim == 0 or out_dim == 0) return;
-        if (rows > std.math.maxInt(u32) or in_dim > std.math.maxInt(u32) or out_dim > std.math.maxInt(u32)) return error.CublasLtUnsupported;
-        try checkRawBytes(input_f32, try checkedMatrixBytes(rows, in_dim, @sizeOf(f32)));
-        try checkRawBytes(weight_f32, try checkedMatrixBytes(out_dim, in_dim, @sizeOf(f32)));
-        try checkRawBytes(dst, try checkedMatrixBytes(rows, out_dim, @sizeOf(f32)));
+        // Reuse the bounded, alignment-aware plan cache used by F16/BF16.
+        // FP32 is part of the key, and the compute mode remains strict FP32.
+        _ = try self.matmulWeightF32Out(ctx, dst, input_f32, weight_f32, .{}, rows, in_dim, out_dim, CUDA_R_32F, .{}, null);
+    }
 
-        var op_desc: MatmulDesc = null;
-        try self.check(self.fns.cublasLtMatmulDescCreate(&op_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
-        defer _ = self.fns.cublasLtMatmulDescDestroy(op_desc);
+    pub fn matmulF32BiasF32Out(self: *CublasLt, ctx: *context_mod.CudaContext, dst: buffer_mod.DeviceBuffer, input: buffer_mod.DeviceBuffer, weight: buffer_mod.DeviceBuffer, bias: buffer_mod.DeviceBuffer, workspace: buffer_mod.DeviceBuffer, rows: usize, in_dim: usize, out_dim: usize) Error!void {
+        _ = try self.matmulWeightF32Out(ctx, dst, input, weight, workspace, rows, in_dim, out_dim, CUDA_R_32F, .{}, bias);
+    }
 
-        var transa = CUBLAS_OP_T;
-        var transb = CUBLAS_OP_N;
-        try self.check(self.fns.cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSA, &transa, @sizeOf(c_int)));
-        try self.check(self.fns.cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSB, &transb, @sizeOf(c_int)));
-
-        var a_desc: MatrixLayout = null;
-        var b_desc: MatrixLayout = null;
-        var c_desc: MatrixLayout = null;
-        var d_desc: MatrixLayout = null;
-        try self.check(self.fns.cublasLtMatrixLayoutCreate(&a_desc, CUDA_R_32F, in_dim, out_dim, @intCast(in_dim)));
-        defer _ = self.fns.cublasLtMatrixLayoutDestroy(a_desc);
-        try self.check(self.fns.cublasLtMatrixLayoutCreate(&b_desc, CUDA_R_32F, in_dim, rows, @intCast(in_dim)));
-        defer _ = self.fns.cublasLtMatrixLayoutDestroy(b_desc);
-        try self.check(self.fns.cublasLtMatrixLayoutCreate(&c_desc, CUDA_R_32F, out_dim, rows, @intCast(out_dim)));
-        defer _ = self.fns.cublasLtMatrixLayoutDestroy(c_desc);
-        try self.check(self.fns.cublasLtMatrixLayoutCreate(&d_desc, CUDA_R_32F, out_dim, rows, @intCast(out_dim)));
-        defer _ = self.fns.cublasLtMatrixLayoutDestroy(d_desc);
-
-        var pref: MatmulPreference = null;
-        try self.check(self.fns.cublasLtMatmulPreferenceCreate(&pref));
-        defer _ = self.fns.cublasLtMatmulPreferenceDestroy(pref);
-        var max_workspace: usize = 0;
-        try self.check(self.fns.cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &max_workspace, @sizeOf(usize)));
-
-        var heuristic: [1]MatmulHeuristicResult = undefined;
-        var returned: c_int = 0;
-        try self.check(self.fns.cublasLtMatmulAlgoGetHeuristic(self.handle, op_desc, a_desc, b_desc, c_desc, d_desc, pref, 1, &heuristic, &returned));
-        if (returned <= 0 or heuristic[0].state != CUBLAS_STATUS_SUCCESS) return error.CublasLtUnsupported;
-
-        var alpha: f32 = 1.0;
-        var beta: f32 = 0.0;
-        ctx.makeCurrent() catch return error.CublasLtError;
-        try self.check(self.fns.cublasLtMatmul(
-            self.handle,
-            op_desc,
-            &alpha,
-            @ptrFromInt(weight_f32.ptr),
-            a_desc,
-            @ptrFromInt(input_f32.ptr),
-            b_desc,
-            &beta,
-            @ptrFromInt(dst.ptr),
-            c_desc,
-            @ptrFromInt(dst.ptr),
-            d_desc,
-            &heuristic[0].algo,
-            null,
-            0,
-            ctx.stream,
-        ));
+    fn setBias(self: *const CublasLt, desc: MatmulDesc, bias: buffer_mod.DeviceBuffer) Error!void {
+        const epilogue: c_int = CUBLASLT_EPILOGUE_BIAS;
+        const pointer: *const anyopaque = @ptrFromInt(bias.ptr);
+        try self.check(self.fns.cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, @sizeOf(c_int)));
+        try self.check(self.fns.cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, @ptrCast(&pointer), @sizeOf(@TypeOf(pointer))));
     }
 
     fn check(self: *const CublasLt, status: Status) Error!void {

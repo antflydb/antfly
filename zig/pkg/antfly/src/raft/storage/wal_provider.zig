@@ -161,7 +161,8 @@ pub const WalReplicaProvider = struct {
         }
         try state.seedConfStateIfEmpty(desc.initial_voters orelse desc.group.raft_config.peers);
         desc.group.storage = state.storage();
-        desc.group.raft_config.applied = state.appliedIndex();
+        desc.group.raft_config.applied = state.completedAppliedIndex();
+        desc.recover_persisted_snapshot = state.completedAppliedIndex() < state.store.snapshot_state.metadata.index;
         return desc;
     }
 

@@ -328,3 +328,17 @@ test "deberta training Metal published width and wider tails match CPU five VJPs
     try std.testing.expectEqual(@as(usize, 0), owner.live);
     try std.testing.expect(owner.peak <= owner.limit and !owner.denied);
 }
+
+test "deberta training CUDA published width and wider tails match CPU five VJPs" {
+    var device = try @import("../graph/resident_training_fixture.zig").CudaDevice.init(std.testing.allocator);
+    defer device.deinit();
+    const cb = device.backend.computeBackend();
+    for ([_]u32{ 64, 128, 256 }) |dimension| {
+        for ([_]u32{ 1, 17, 65 }) |sequence| {
+            for ([_]f32{ 0, 0.1 }) |probability| {
+                const mask: WidthMask = if (probability != 0 and sequence <= 17) .fully_masked else if (sequence == 1) .valid else .ragged;
+                try widthCase(std.testing.allocator, &cb, dimension, sequence, probability, mask);
+            }
+        }
+    }
+}
