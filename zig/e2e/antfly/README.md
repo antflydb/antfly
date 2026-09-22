@@ -69,6 +69,9 @@ Use product-area names for test files. Do not use migration labels like `*_parit
   - stateful public schema update
   - migration metadata
   - full-text rebuild from `full_text_index_v0` to `full_text_index_v1`
+- `test_schema_indexing.py`
+  - `x-antfly-index: false` and non-text declarations stay unindexed under `additionalProperties: true` and `infer_types`
+  - `additionalProperties: false` rejects rows with undeclared fields
 - `test_index_lifecycle.py`
   - shared backend-agnostic table index lifecycle coverage
   - back-to-back external vector index admission installs every write path before background catch-up
