@@ -3678,10 +3678,15 @@ pub fn executeNode(
                 }
                 const declared_numel = safeNumel(in_shape);
                 if (target_known and declared_numel != null and declared_numel.? != target_numel) {
-                    const actual = try cb.tensorShape(V.get(ins[0]), std.heap.page_allocator);
-                    defer std.heap.page_allocator.free(actual);
-                    if (safeNumel(actual) == target_numel) {
-                        return cb.primReshape(V.get(ins[0]), target_dims[0..rank]);
+                    const actual = cb.tensorShape(V.get(ins[0]), std.heap.page_allocator) catch |err| switch (err) {
+                        error.UnsupportedShape => null,
+                        else => return err,
+                    };
+                    defer if (actual) |shape| std.heap.page_allocator.free(shape);
+                    if (actual) |shape| {
+                        if (safeNumel(shape) == target_numel) {
+                            return cb.primReshape(V.get(ins[0]), target_dims[0..rank]);
+                        }
                     }
                 }
             }

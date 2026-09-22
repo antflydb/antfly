@@ -2418,15 +2418,14 @@ test "imported onnx session matches dynamic quantized integer matmul semantics" 
     }
 
     try std.testing.expectEqual(@as(usize, 4), outputs.len);
-    // Native graph execution stores intermediate integer tensors in numeric
-    // f32 buffers; the graph-declared u8/i32 dtypes still drive rounding and
-    // downstream conversion semantics.
-    try std.testing.expectEqual(DType.f32, outputs[0].dtype);
-    try std.testing.expectEqualSlices(f32, &.{ 0.0, 85.0, 170.0, 255.0 }, outputs[0].asFloat32());
+    // Graph outputs preserve their declared integer storage dtype, matching
+    // ONNX's DynamicQuantizeLinear contract and the typed intermediate values.
+    try std.testing.expectEqual(DType.u8, outputs[0].dtype);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 85, 170, 255 }, outputs[0].data);
     try std.testing.expectEqual(DType.f32, outputs[1].dtype);
     try std.testing.expectApproxEqAbs(@as(f32, 0.011764706), outputs[1].asFloat32()[0], 1e-8);
-    try std.testing.expectEqual(DType.f32, outputs[2].dtype);
-    try std.testing.expectEqual(@as(f32, 170.0), outputs[2].asFloat32()[0]);
+    try std.testing.expectEqual(DType.u8, outputs[2].dtype);
+    try std.testing.expectEqualSlices(u8, &.{170}, outputs[2].data);
     try std.testing.expectEqual(DType.f32, outputs[3].dtype);
     try std.testing.expectEqualSlices(f32, &.{ -425.0, 0.0, 255.0, 340.0 }, outputs[3].asFloat32());
 }
