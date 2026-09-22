@@ -22,11 +22,9 @@ Unprepared upstream checkpoints are not automatically converted by `inference pu
 
 CUDA execution is available for Laya checkpoints with sequence lengths up to 512
 and encoder head dimensions up to 128. It uses FP32 resident weights and bounded
-internal batches. The English checkpoint passed the L4 fatbin qualification gate.
-See [Laya CUDA qualification](../design/laya-cuda-qualification.md) for reproducible
-builds, measurements, and the portable-PTX driver requirement.
-The [CUDA performance notes](../design/laya-cuda-performance.md) describe
-attention, fusion, length bucketing, and the matched PyTorch benchmark.
+internal batches. The English checkpoint was validated on NVIDIA L4 using fatbin
+artifacts. Portable PTX requires a driver compatible with the CUDA toolkit used
+to generate it.
 
 Submit a text request to the server's AI endpoint:
 
@@ -124,4 +122,6 @@ checks accuracy, and measures warm batches through 128 rows. See
 [qualification results and reproduction](../design/laya-qualification.md).
 
 These checks cover native CPU and Metal. CUDA has a separate
-[L4 qualification gate](../design/laya-cuda-qualification.md).
+[qualification script](../../scripts/laya_cuda_qualify.py) and
+[matched PyTorch performance gate](../../scripts/laya_cuda_performance.py), run
+by the [L4 CI workflow](../../.github/workflows/zig-inference-l4-spot.yml).
