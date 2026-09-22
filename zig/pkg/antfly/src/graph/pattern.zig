@@ -217,6 +217,19 @@ pub fn freeMatches(alloc: Allocator, matches: []PatternMatch) void {
 }
 
 pub const MatchOptions = struct {
+    /// Physical name of the index-owning table. In the LOCAL single-index
+    /// edge readers a table tag naming it canonicalizes to the local (null)
+    /// identity, mirroring the distributed reader's canonicalizeTable, so a
+    /// self-table tag never splits node identity. Empty disables
+    /// canonicalization.
+    owning_table: []const u8 = "",
+    /// Serve adjacency for cross-table tagged nodes from the local index by
+    /// bare key. Only valid when the caller's snapshot holds the graph
+    /// index's COMPLETE row set (a single-group table or an embedded
+    /// caller): entity-sourced edges are document-owned rows in this same
+    /// index, so a bare-key read is then exact. Off, tagged nodes keep the
+    /// historical empty-adjacency terminal behavior.
+    expand_cross_table_local: bool = false,
     max_results: u32 = 100,
     /// Disable row-oriented expansion windows. Safety still comes from the
     /// explicit node, edge, and intermediate-state budgets, which fail closed.
@@ -637,6 +650,91 @@ const ReachableCollector = struct {
     }
 };
 
+/// Local single-index edge reader shared by the concrete `*GraphIndex`
+/// entry points. A cross-table tagged node yields empty adjacency unless
+/// `expand_cross_table_local` asserts the snapshot holds the index's
+/// complete row set — entity-sourced edges are document-owned rows in this
+/// same index, so a bare-key read is then exact. `owning_table`
+/// canonicalizes self-table tags away, mirroring the distributed reader's
+/// canonicalizeTable hook.
+const LocalGraphIndexEdgeReader = struct {
+    graph_index: *graph_mod.GraphIndex,
+    owning_table: []const u8 = "",
+    expand_cross_table_local: bool = false,
+
+    fn init(graph_index: *graph_mod.GraphIndex, opts: MatchOptions) @This() {
+        return .{
+            .graph_index = graph_index,
+            .owning_table = opts.owning_table,
+            .expand_cross_table_local = opts.expand_cross_table_local,
+        };
+    }
+
+    fn servesTable(self: @This(), table: ?[]const u8) bool {
+        return self.canonicalizeTable(table) == null or self.expand_cross_table_local;
+    }
+
+    pub fn canonicalizeTable(self: @This(), table: ?[]const u8) ?[]const u8 {
+        const name = table orelse return null;
+        if (self.owning_table.len > 0 and std.mem.eql(u8, name, self.owning_table)) return null;
+        return name;
+    }
+
+    pub fn openPatternEdgeStream(self: @This(), a: Allocator, table: ?[]const u8, key: []const u8, kinds: []const []const u8, direction: graph_mod.EdgeDirection, _: bool) !edge_stream.Stream {
+        if (!self.servesTable(table)) return edge_stream.Stream.empty(a);
+        return edge_stream.openGraph(a, self.graph_index, key, kinds, direction);
+    }
+
+    pub fn getEdges(
+        self: @This(),
+        a: Allocator,
+        table: ?[]const u8,
+        key: []const u8,
+        edge_types: []const []const u8,
+        direction: graph_mod.EdgeDirection,
+    ) ![]graph_mod.Edge {
+        if (!self.servesTable(table)) return try a.alloc(graph_mod.Edge, 0);
+        return try self.graph_index.getEdgesByTypes(a, key, edge_types, direction);
+    }
+
+    pub fn getEdgesBounded(
+        self: @This(),
+        a: Allocator,
+        table: ?[]const u8,
+        key: []const u8,
+        edge_types: []const []const u8,
+        direction: graph_mod.EdgeDirection,
+        max_edges: usize,
+        max_bytes: usize,
+    ) ![]graph_mod.Edge {
+        if (!self.servesTable(table)) return try a.alloc(graph_mod.Edge, 0);
+        return try self.graph_index.getEdgesByTypesBounded(a, key, edge_types, direction, max_edges, max_bytes);
+    }
+
+    pub fn freeEdges(_: @This(), a: Allocator, edges: []graph_mod.Edge) void {
+        graph_mod.GraphIndex.freeEdges(a, edges);
+    }
+
+    pub fn probeEdgesBounded(
+        self: @This(),
+        a: Allocator,
+        table: ?[]const u8,
+        probes: []const graph_mod.EdgeProbe,
+        max_owned_bytes: usize,
+    ) ![]?graph_mod.Edge {
+        if (!self.servesTable(table)) {
+            const empty = try a.alloc(?graph_mod.Edge, probes.len);
+            @memset(empty, null);
+            return empty;
+        }
+        return try self.graph_index.probeEdgesAllocBounded(a, probes, max_owned_bytes);
+    }
+
+    pub fn freeProbedEdges(_: @This(), a: Allocator, edges: []?graph_mod.Edge) void {
+        graph_mod.GraphIndex.freeProbedEdges(a, edges);
+    }
+};
+
 pub fn matchPattern(
     alloc: Allocator,
     graph_index: *graph_mod.GraphIndex,
@@ -644,65 +742,7 @@ pub fn matchPattern(
     pattern: []const PatternStep,
     opts: MatchOptions,
 ) ![]PatternMatch {
-    const GraphIndexEdgeReader = struct {
-        graph_index: *graph_mod.GraphIndex,
-
-        pub fn openPatternEdgeStream(self: @This(), a: Allocator, table: ?[]const u8, key: []const u8, kinds: []const []const u8, direction: graph_mod.EdgeDirection, _: bool) !edge_stream.Stream {
-            if (table != null) return edge_stream.Stream.empty(a);
-            return edge_stream.openGraph(a, self.graph_index, key, kinds, direction);
-        }
-
-        pub fn getEdges(
-            self: @This(),
-            a: Allocator,
-            table: ?[]const u8,
-            key: []const u8,
-            edge_types: []const []const u8,
-            direction: graph_mod.EdgeDirection,
-        ) ![]graph_mod.Edge {
-            if (table != null) return try a.alloc(graph_mod.Edge, 0);
-            return try self.graph_index.getEdgesByTypes(a, key, edge_types, direction);
-        }
-
-        pub fn getEdgesBounded(
-            self: @This(),
-            a: Allocator,
-            table: ?[]const u8,
-            key: []const u8,
-            edge_types: []const []const u8,
-            direction: graph_mod.EdgeDirection,
-            max_edges: usize,
-            max_bytes: usize,
-        ) ![]graph_mod.Edge {
-            if (table != null) return try a.alloc(graph_mod.Edge, 0);
-            return try self.graph_index.getEdgesByTypesBounded(a, key, edge_types, direction, max_edges, max_bytes);
-        }
-
-        pub fn freeEdges(_: @This(), a: Allocator, edges: []graph_mod.Edge) void {
-            graph_mod.GraphIndex.freeEdges(a, edges);
-        }
-
-        pub fn probeEdgesBounded(
-            self: @This(),
-            a: Allocator,
-            table: ?[]const u8,
-            probes: []const graph_mod.EdgeProbe,
-            max_owned_bytes: usize,
-        ) ![]?graph_mod.Edge {
-            if (table != null) {
-                const empty = try a.alloc(?graph_mod.Edge, probes.len);
-                @memset(empty, null);
-                return empty;
-            }
-            return try self.graph_index.probeEdgesAllocBounded(a, probes, max_owned_bytes);
-        }
-
-        pub fn freeProbedEdges(_: @This(), a: Allocator, edges: []?graph_mod.Edge) void {
-            graph_mod.GraphIndex.freeProbedEdges(a, edges);
-        }
-    };
-
-    return try matchPatternWithEdgeReader(alloc, GraphIndexEdgeReader{ .graph_index = graph_index }, start_keys, pattern, opts);
+    return try matchPatternWithEdgeReader(alloc, LocalGraphIndexEdgeReader.init(graph_index, opts), start_keys, pattern, opts);
 }
 
 pub fn matchPatternWithEdgeReader(
@@ -1704,29 +1744,7 @@ pub fn matchConjunctivePattern(
     pattern: ConjunctivePattern,
     opts: MatchOptions,
 ) ![]PatternMatch {
-    const Reader = struct {
-        graph_index: *graph_mod.GraphIndex,
-
-        pub fn openPatternEdgeStream(self: @This(), a: Allocator, table: ?[]const u8, key: []const u8, kinds: []const []const u8, direction: graph_mod.EdgeDirection, _: bool) !edge_stream.Stream {
-            if (table != null) return edge_stream.Stream.empty(a);
-            return edge_stream.openGraph(a, self.graph_index, key, kinds, direction);
-        }
-
-        pub fn getEdges(self: @This(), a: Allocator, table: ?[]const u8, key: []const u8, types: []const []const u8, direction: graph_mod.EdgeDirection) ![]graph_mod.Edge {
-            if (table != null) return try a.alloc(graph_mod.Edge, 0);
-            return try self.graph_index.getEdgesByTypes(a, key, types, direction);
-        }
-
-        pub fn getEdgesBounded(self: @This(), a: Allocator, table: ?[]const u8, key: []const u8, types: []const []const u8, direction: graph_mod.EdgeDirection, max_edges: usize, max_bytes: usize) ![]graph_mod.Edge {
-            if (table != null) return try a.alloc(graph_mod.Edge, 0);
-            return try self.graph_index.getEdgesByTypesBounded(a, key, types, direction, max_edges, max_bytes);
-        }
-
-        pub fn freeEdges(_: @This(), a: Allocator, edges: []graph_mod.Edge) void {
-            graph_mod.GraphIndex.freeEdges(a, edges);
-        }
-    };
-    return try matchConjunctivePatternWithEdgeReader(alloc, Reader{ .graph_index = graph_index }, start_keys, pattern, opts);
+    return try matchConjunctivePatternWithEdgeReader(alloc, LocalGraphIndexEdgeReader.init(graph_index, opts), start_keys, pattern, opts);
 }
 
 pub fn matchConjunctivePatternWithEdgeReader(
@@ -2168,29 +2186,7 @@ pub fn aggregateConjunctivePattern(
     specs: []const CountAggregateSpec,
     opts: MatchOptions,
 ) ![]CountAggregateResult {
-    const Reader = struct {
-        graph_index: *graph_mod.GraphIndex,
-
-        pub fn openPatternEdgeStream(self: @This(), a: Allocator, table: ?[]const u8, key: []const u8, kinds: []const []const u8, direction: graph_mod.EdgeDirection, _: bool) !edge_stream.Stream {
-            if (table != null) return edge_stream.Stream.empty(a);
-            return edge_stream.openGraph(a, self.graph_index, key, kinds, direction);
-        }
-
-        pub fn getEdges(self: @This(), a: Allocator, table: ?[]const u8, key: []const u8, types: []const []const u8, direction: graph_mod.EdgeDirection) ![]graph_mod.Edge {
-            if (table != null) return try a.alloc(graph_mod.Edge, 0);
-            return try self.graph_index.getEdgesByTypes(a, key, types, direction);
-        }
-
-        pub fn getEdgesBounded(self: @This(), a: Allocator, table: ?[]const u8, key: []const u8, types: []const []const u8, direction: graph_mod.EdgeDirection, max_edges: usize, max_bytes: usize) ![]graph_mod.Edge {
-            if (table != null) return try a.alloc(graph_mod.Edge, 0);
-            return try self.graph_index.getEdgesByTypesBounded(a, key, types, direction, max_edges, max_bytes);
-        }
-
-        pub fn freeEdges(_: @This(), a: Allocator, edges: []graph_mod.Edge) void {
-            graph_mod.GraphIndex.freeEdges(a, edges);
-        }
-    };
-    return try aggregateConjunctivePatternWithEdgeReader(alloc, Reader{ .graph_index = graph_index }, start_keys, pattern, specs, opts);
+    return try aggregateConjunctivePatternWithEdgeReader(alloc, LocalGraphIndexEdgeReader.init(graph_index, opts), start_keys, pattern, specs, opts);
 }
 
 pub fn aggregateConjunctivePatternWithEdgeReader(
@@ -5398,6 +5394,62 @@ test "pattern matching preserves a table-scoped start reference" {
     try std.testing.expectEqual(@as(usize, 1), matches.len);
     try std.testing.expectEqualStrings("entities", matches[0].bindings[0].table.?);
     try std.testing.expectEqualStrings("entities", matches[0].bindings[1].table.?);
+}
+
+test "local pattern reader serves cross-table nodes only under a complete snapshot" {
+    const alloc = std.testing.allocator;
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dir_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/graph-xtable", .{tmp.sub_path});
+    defer alloc.free(dir_path);
+    const dir = try alloc.dupeZ(u8, dir_path);
+    defer alloc.free(dir);
+    var doc_store = try @import("../storage/docstore.zig").DocStore.open(arena.allocator(), dir, .{});
+    defer doc_store.close();
+
+    const reverse_dir_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/graph-xtable-rev", .{tmp.sub_path});
+    defer alloc.free(reverse_dir_path);
+    const reverse_dir = try alloc.dupeZ(u8, reverse_dir_path);
+    defer alloc.free(reverse_dir);
+    var graph_index = try graph_mod.GraphIndex.open(alloc, &doc_store, reverse_dir, "g", .{});
+    defer graph_index.close();
+
+    // The autoschema shape: a mention edge into a resolved cross-table
+    // entity node whose entity-sourced relation row lives in THIS index.
+    try graph_index.addEdge("doc:a", "entity/ada", "mentions", 1.0, 0, 0, "{\"target_table\":\"entities\"}");
+    try graph_index.addEdge("entity/ada", "event/xyz", "participates_in", 1.0, 0, 0, "{\"target_table\":\"events\"}");
+
+    const start_keys = [_][]const u8{"doc:a"};
+    const pattern = [_]PatternStep{
+        .{ .alias = "doc" },
+        .{ .alias = "entity", .edge = .{ .types = &.{"mentions"} } },
+        .{ .alias = "event", .edge = .{ .types = &.{"participates_in"} } },
+    };
+
+    // Default: the tagged entity node yields empty adjacency, so the
+    // three-step pattern cannot complete.
+    const terminal = try matchPattern(alloc, &graph_index, &start_keys, &pattern, .{ .max_results = 10 });
+    defer freeMatches(alloc, terminal);
+    try std.testing.expectEqual(@as(usize, 0), terminal.len);
+
+    // A complete snapshot serves the entity's adjacency by bare key.
+    const matches = try matchPattern(alloc, &graph_index, &start_keys, &pattern, .{
+        .max_results = 10,
+        .owning_table = "documents",
+        .expand_cross_table_local = true,
+    });
+    defer freeMatches(alloc, matches);
+    try std.testing.expectEqual(@as(usize, 1), matches.len);
+    try std.testing.expectEqual(@as(usize, 3), matches[0].bindings.len);
+    try std.testing.expectEqualStrings("entity/ada", matches[0].bindings[1].key);
+    try std.testing.expectEqualStrings("entities", matches[0].bindings[1].table.?);
+    try std.testing.expectEqualStrings("event/xyz", matches[0].bindings[2].key);
+    try std.testing.expectEqualStrings("events", matches[0].bindings[2].table.?);
 }
 
 test "pattern match supports linear alias bindings and cycles" {

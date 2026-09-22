@@ -868,12 +868,33 @@ pub const GraphQueryResult = struct {
 // Graph Query Engine
 // ============================================================================
 
+/// Per-request scope for the local graph executors, derived by the caller
+/// from what it knows about the executing snapshot. It rides the executor
+/// vtables so the storage layer, which knows neither its table's name nor
+/// its group count, can apply the caller's routing knowledge.
+pub const ExecutionScope = struct {
+    /// Physical name of the index-owning table. A `target_table` tag naming
+    /// it canonicalizes to the local (null) identity, mirroring the
+    /// distributed coordinator's canonicalGraphNodeTable, so a self-table
+    /// tag never stops expansion or splits node identity.
+    owning_table: []const u8 = "",
+    /// True when the executing snapshot holds the graph index's COMPLETE
+    /// row set (a single-group table, or an embedded caller): local
+    /// traversal, paths, and MATCH may then expand THROUGH cross-table
+    /// tagged nodes, because entity-sourced edges are document-owned rows
+    /// in this same index (same-snapshot single-index read).
+    expand_cross_table_local: bool = false,
+};
+
 pub const GraphQueryEngine = struct {
     alloc: Allocator,
     node_admission: ?NodeAdmission = null,
     /// Public request coordinators install one shared budget here. Internal
     /// callers may omit it and retain the graph algorithms' standalone limit.
     work_budget: ?*work_budget_mod.WorkBudget = null,
+    /// See ExecutionScope; defaults keep the historical terminal behavior at
+    /// cross-table tagged nodes.
+    scope: ExecutionScope = .{},
 
     /// Execute a graph query. For result_ref node selectors, the caller must
     /// resolve refs to keys and pass them as resolved_keys.
@@ -1530,6 +1551,8 @@ pub const GraphQueryEngine = struct {
             .include_paths = params.include_paths,
             .node_admission = self.node_admission,
             .work_budget = self.work_budget,
+            .owning_table = self.scope.owning_table,
+            .expand_cross_table_local = self.scope.expand_cross_table_local,
             .result_admission = .{
                 .ctx = &result_admission_context,
                 .admit_one = TraverseResultAdmissionContext.admit,
@@ -1670,6 +1693,8 @@ pub const GraphQueryEngine = struct {
             .max_weight = gq.params.max_weight,
             .node_admission = self.node_admission,
             .work_budget = self.work_budget,
+            .owning_table = self.scope.owning_table,
+            .expand_cross_table_local = self.scope.expand_cross_table_local,
         };
         const admitted_starts = try self.admittedStartKeysAlloc(start_keys, gq.params.direction);
         defer if (admitted_starts) |mask| self.alloc.free(mask);
@@ -1793,6 +1818,8 @@ pub const GraphQueryEngine = struct {
             .max_weight = gq.params.max_weight,
             .node_admission = self.node_admission,
             .work_budget = self.work_budget,
+            .owning_table = self.scope.owning_table,
+            .expand_cross_table_local = self.scope.expand_cross_table_local,
         };
         const admitted_starts = try self.admittedStartKeysAlloc(start_keys, gq.params.direction);
         defer if (admitted_starts) |mask| self.alloc.free(mask);
@@ -1861,6 +1888,8 @@ pub const GraphQueryEngine = struct {
                 .return_aliases = gq.return_aliases,
                 .node_admission = self.node_admission,
                 .work_budget = self.work_budget,
+                .owning_table = self.scope.owning_table,
+                .expand_cross_table_local = self.scope.expand_cross_table_local,
             },
         );
         errdefer pattern_mod.freeMatches(self.alloc, matches);
@@ -3090,6 +3119,67 @@ test "traverse preserves table-scoped identities across result dedup and algebra
     }
     try std.testing.expectEqual(@as(usize, 1), local_count);
     try std.testing.expectEqual(@as(usize, 1), external_count);
+}
+
+test "engine execution scope expands through cross-table nodes and canonicalizes self-table tags" {
+    const alloc = std.testing.allocator;
+    var sb: [256]u8 = undefined;
+    var rb: [256]u8 = undefined;
+    const ctx = try setupGraph(alloc, "gq-scope-s", "gq-scope-r", &sb, &rb);
+    defer {
+        ctx.deinit();
+        alloc.destroy(ctx);
+    }
+
+    // The autoschema shape: a mention edge into a resolved cross-table
+    // entity, an entity-sourced relation row in THIS index, plus a
+    // self-table tag that must canonicalize instead of splitting identity.
+    try ctx.graph.addEdge("doc:a", "entity/ada", "mentions", 1.0, 0, 0, "{\"target_table\":\"entities\"}");
+    try ctx.graph.addEdge("entity/ada", "event/xyz", "participates_in", 1.0, 0, 0, "{\"target_table\":\"events\"}");
+    try ctx.graph.addEdge("doc:a", "doc:b", "cites", 1.0, 0, 0, "{\"target_table\":\"documents\"}");
+
+    const start_keys: []const []const u8 = &.{"doc:a"};
+    const gq = GraphQuery{
+        .query_type = .traverse,
+        .index_name = "test",
+        .start_nodes = .{ .keys = start_keys },
+        .params = .{ .max_depth = 3, .max_results = 0, .deduplicate = true },
+    };
+
+    // Default scope keeps the historical terminal behavior.
+    var terminal_engine = GraphQueryEngine{ .alloc = alloc };
+    var terminal = try terminal_engine.execute(&ctx.graph, gq, start_keys);
+    defer terminal.deinit(alloc);
+    for (terminal.nodes) |node| {
+        try std.testing.expect(!std.mem.eql(u8, node.key, "event/xyz"));
+    }
+
+    // A complete-snapshot scope walks doc -> entity -> event in one
+    // traversal, and the self-table tag neither stops expansion nor
+    // qualifies the node.
+    var engine = GraphQueryEngine{
+        .alloc = alloc,
+        .scope = .{ .owning_table = "documents", .expand_cross_table_local = true },
+    };
+    var result = try engine.execute(&ctx.graph, gq, start_keys);
+    defer result.deinit(alloc);
+
+    var saw_entity = false;
+    var saw_event = false;
+    var saw_doc_b = false;
+    for (result.nodes) |node| {
+        if (std.mem.eql(u8, node.key, "entity/ada")) {
+            try std.testing.expectEqualStrings("entities", node.table.?);
+            saw_entity = true;
+        } else if (std.mem.eql(u8, node.key, "event/xyz")) {
+            try std.testing.expectEqualStrings("events", node.table.?);
+            saw_event = true;
+        } else if (std.mem.eql(u8, node.key, "doc:b")) {
+            try std.testing.expect(node.table == null);
+            saw_doc_b = true;
+        }
+    }
+    try std.testing.expect(saw_entity and saw_event and saw_doc_b);
 }
 
 test "traverse can execute through algebraic provenance semiring path" {
