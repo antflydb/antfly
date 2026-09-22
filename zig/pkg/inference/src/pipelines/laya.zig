@@ -206,6 +206,35 @@ pub fn executeWithScratch(a: std.mem.Allocator, scratch: std.mem.Allocator, sess
     initialized += 1;
     inputs[3] = try Tensor.initInt64(a, "marker_pos", &.{ @intCast(tasks.len), @intCast(count) }, markers);
     initialized += 1;
+    if (try session.runLayaDecisionsWithControl(&inputs, scratch, control)) |outputs| {
+        defer {
+            for (outputs) |*output| output.deinit();
+            scratch.free(outputs);
+        }
+        if (outputs.len != 1 or outputs[0].dtype != .f32) return error.UnexpectedOutputShape;
+        const result_values = outputs[0].asFloat32();
+        const width = count + 6;
+        if (result_values.len != tasks.len * width) return error.UnexpectedOutputShape;
+        const decisions = try a.alloc(Decision, tasks.len);
+        for (tasks, decisions, 0..) |task, *decision, i| {
+            const row = result_values[i * width ..][0..width];
+            const q = task.question;
+            if (row[count + 5] != 0 or !std.math.isFinite(row[count]) or row[count] < 0 or row[count] >= @as(f32, @floatFromInt(q.labels.len))) return error.InvalidLayaOutput;
+            const winner: usize = @intFromFloat(row[count]);
+            decision.* = .{
+                .name = q.name,
+                .kind = q.kind,
+                .label = q.labels[winner],
+                .labels = q.labels,
+                .probabilities = try a.dupe(f32, row[0..q.labels.len]),
+                .confidence = row[count + 1],
+                .expected_value = if (q.kind == .score) row[count + 2] else null,
+                .true_probability = if (q.kind == .noul) row[count + 3] else null,
+                .act_probability = row[count + 4],
+            };
+        }
+        return .{ .decisions = decisions, .prompt_tokens = tokens };
+    }
     const outputs = try session.runWithControl(&inputs, scratch, control);
     defer {
         for (outputs) |*output| output.deinit();

@@ -33533,7 +33533,10 @@ test "boundary qualification model listings reject raw explicit tasks and capabi
 test "laya extraction v2 serves typed decisions over HTTP and embedded calls" {
     const root = platform.env.getenv("ANTFLY_LAYA_QUALIFICATION") orelse platform.env.getenv("ANTFLY_LAYA_REFERENCE") orelse return error.SkipZigTest;
     const a = std.testing.allocator;
-    var node = try Node.init(a, .{ .models_dir = root, .allow_unknown_models = true, .max_concurrent_requests = 1, .process_termination_available = true });
+    // Real FP32 fixtures and the 192-question batch need explicit qualification
+    // capacity. The separate denied node below exercises insufficient budgets.
+    const gib: usize = 1024 * 1024 * 1024;
+    var node = try Node.init(a, .{ .models_dir = root, .allow_unknown_models = true, .max_concurrent_requests = 1, .process_termination_available = true, .generation_budget_overrides = .{ .host_limit_bytes = 6 * gib, .backend_limit_bytes = 12 * gib, .combined_limit_bytes = 18 * gib, .scratch_limit_bytes = 8 * gib } });
     defer node.deinit();
     try node.attachIo(std.testing.io);
     const backend: backends_mod.BackendType = if (platform.env.getenv("ANTFLY_LAYA_METAL") != null) .metal else .native;
@@ -33544,6 +33547,34 @@ test "laya extraction v2 serves typed decisions over HTTP and embedded calls" {
     ;
     var direct = try node.extractV2DirectJsonWithControl(a, body, null);
     defer direct.deinit();
+    if (backend == .metal and @import("../ops/laya_metal.zig").enabled()) {
+        const model_path = try std.fs.path.join(a, &.{ root, "model" });
+        defer a.free(model_path);
+        var handle = try node.model_manager.acquireFromDirWithControl(model_path, .{});
+        defer handle.release();
+        const loaded = handle.get();
+        const mutex = loaded.targetInferenceExecutionMutex();
+        if (mutex) |lock| try std.testing.expect(lock.tryLock());
+        defer if (mutex) |lock| lock.unlock();
+        const stats = session_factory.layaResidentStats(loaded.session) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(stats.prepared);
+        try std.testing.expect(stats.requests > 0);
+        try std.testing.expectEqual(@as(u64, 0), stats.activation_host_accesses);
+        std.debug.print("Laya managed resident requests={d} model_bytes={d}\n", .{ stats.requests, stats.model_bytes });
+    }
+    if (backend == .metal and @import("../ops/laya_metal.zig").enabled()) {
+        var denied = try Node.init(a, .{ .models_dir = root, .allow_unknown_models = true, .max_concurrent_requests = 1, .process_termination_available = true, .generation_budget_overrides = .{ .backend_limit_bytes = 1 } });
+        defer denied.deinit();
+        try denied.attachIo(std.testing.io);
+        // A CPU candidate exists; strict residency must still reject the
+        // Metal admission failure rather than select that fallback.
+        denied.session_manager.preferred_backends = &.{ .metal, .native };
+        denied.model_manager.session_manager.preferred_backends = &.{ .metal, .native };
+        const before = @import("../backends/metal_tensor.zig").memoryStatsSnapshot().device_owned_buffers_created;
+        try std.testing.expectError(error.ResourceLimitExceeded, denied.extractV2DirectJsonWithControl(a, body, null));
+        try std.testing.expectEqual(before, @import("../backends/metal_tensor.zig").memoryStatsSnapshot().device_owned_buffers_created);
+        try std.testing.expectEqual(@as(usize, 0), denied.inference_admission.inFlightUnits());
+    }
     const parsed = try std.json.parseFromSlice(std.json.Value, a, direct.json, .{});
     defer parsed.deinit();
     const item = parsed.value.object.get("data").?.array.items[0].object;

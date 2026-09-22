@@ -266,6 +266,44 @@ test "laya finetuned export probabilities and tokenization match PyTorch" {
         try std.testing.expectEqualSlices(i64, seq.ids, prepared.ids);
         try std.testing.expectEqualSlices(i64, seq.markers, prepared.markers);
     }
+    if (platform.env.getenv("ANTFLY_LAYA_BENCH_BATCH")) |batch_text| {
+        const batch = try std.fmt.parseInt(usize, batch_text, 10);
+        const samples = try std.fmt.parseInt(usize, platform.env.getenv("ANTFLY_LAYA_BENCH_SAMPLES") orelse "100", 10);
+        if (batch == 0 or batch > 512 or samples == 0 or samples > 10000) return error.InvalidLayaInputs;
+        const mixed = std.mem.eql(u8, platform.env.getenv("ANTFLY_LAYA_BENCH_PROFILE") orelse "fixed", "mixed");
+        const batch_tasks = try scratch.alloc(pipeline.Task, batch);
+        const times = try scratch.alloc(u64, samples);
+        var cold_ns: u64 = 0;
+        var resident_before: ?@import("../ops/laya_metal.zig").Stats = null;
+        for (0..samples + 10) |iteration| {
+            var request_arena = std.heap.ArenaAllocator.init(a);
+            defer request_arena.deinit();
+            for (batch_tasks, 0..) |*task, i| task.* = tasks[if (mixed) (iteration * batch + i) % tasks.len else 0];
+            const began = platform.time.monotonicNs();
+            const result = try pipeline.executeWithScratch(request_arena.allocator(), a, session, tok, cfg, batch_tasks, null, null);
+            const ns = platform.time.monotonicNs() - began;
+            if (iteration == 0) cold_ns = ns;
+            if (iteration == 9) resident_before = factory.layaResidentStats(session);
+            if (iteration >= 10) times[iteration - 10] = ns;
+            for (result.decisions, 0..) |decision, i| {
+                const index = if (mixed) (iteration * batch + i) % tasks.len else 0;
+                for (decision.probabilities, ref.probabilities[index]) |actual, expected| try std.testing.expectApproxEqAbs(expected, actual, 5e-5);
+                try std.testing.expectApproxEqAbs(ref.act_probabilities[index], decision.act_probability, 5e-5);
+            }
+        }
+        const resident_after = factory.layaResidentStats(session);
+        if (resident_before) |before| {
+            const after = resident_after.?;
+            try std.testing.expectEqual(before.weight_upload_bytes, after.weight_upload_bytes);
+            try std.testing.expectEqual(@as(u64, 0), after.activation_host_accesses);
+            try std.testing.expectEqual(@as(u64, 0), after.intermediate_readbacks);
+            try std.testing.expectEqual(@as(u64, 0), after.host_fallbacks);
+            try std.testing.expectEqual(@as(u64, 0), after.cached_activation_bytes);
+        }
+        const payload = try std.json.Stringify.valueAlloc(scratch, .{ .samples_ns = times, .cold_request_ns = cold_ns, .resident = resident_after, .batch = batch, .mixed = mixed }, .{});
+        std.debug.print("LAYA_BENCH_JSON {s}\n", .{payload});
+        return;
+    }
     var worst: f32 = 0;
     const sizes: []const usize = if (ref.records != null) &.{ 1, 4 } else &.{3};
     for (sizes) |batch_size| {

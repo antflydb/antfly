@@ -81,6 +81,25 @@ pub const MemoryStats = struct {
     to_host_device_calls: u64 = 0,
 };
 
+/// Request-thread transfer audit. GPU execution is asynchronous, but all
+/// host copies/accesses enter these synchronous APIs on the dispatch thread.
+/// Independent sessions on other threads cannot contaminate these counters.
+pub const TransferAudit = struct {
+    upload_bytes: u64 = 0,
+    download_bytes: u64 = 0,
+    host_accesses: u64 = 0,
+    upload_calls: u64 = 0,
+    download_calls: u64 = 0,
+};
+threadlocal var transfer_audit: ?*TransferAudit = null;
+pub fn beginTransferAudit(audit: *TransferAudit) !void {
+    if (transfer_audit != null) return error.MetalTransferAuditAlreadyActive;
+    transfer_audit = audit;
+}
+pub fn endTransferAudit() void {
+    transfer_audit = null;
+}
+
 var memory_stats = MemoryStats{};
 var to_host_trace_count: usize = 0;
 var owned_alloc_trace_count: usize = 0;
@@ -889,6 +908,10 @@ pub const MetalTensor = struct {
             byte_len,
         );
         if (rc != 0) return error.MetalBufferUploadFailed;
+        if (transfer_audit) |audit| {
+            audit.upload_bytes += byte_len;
+            audit.upload_calls += 1;
+        }
     }
 
     /// Explicit bounded readback into caller-owned memory. No persistent host
@@ -907,6 +930,10 @@ pub const MetalTensor = struct {
         if (termite_metal_decode_runtime_flush_active_frame(dev.ref.runtime) != 0) return error.MetalFrameSyncFailed;
         if (termite_metal_buffer_download(dev.ref.runtime, dev.ref.handle, dev.byte_offset, @ptrCast(output.ptr), dev.byte_len) != 0)
             return error.MetalBufferDownloadFailed;
+        if (transfer_audit) |audit| {
+            audit.download_bytes += output.len;
+            audit.download_calls += 1;
+        }
     }
 
     pub fn uploadBytes(self: *MetalTensor, input: []const u8) !void {
@@ -916,6 +943,10 @@ pub const MetalTensor = struct {
         self.invalidateHostMirror();
         if (termite_metal_buffer_upload(dev.ref.runtime, dev.ref.handle, dev.byte_offset, input.ptr, input.len) != 0)
             return error.MetalBufferUploadFailed;
+        if (transfer_audit) |audit| {
+            audit.upload_bytes += input.len;
+            audit.upload_calls += 1;
+        }
     }
 
     /// Return a host-backed `[]f32` view. For pure host tensors this is
@@ -923,6 +954,9 @@ pub const MetalTensor = struct {
     /// if present, otherwise aliases the Shared-storage contents pointer
     /// when available, or allocates + downloads from Private storage.
     pub fn toHostSlice(self: *MetalTensor) ![]f32 {
+        if (self.isDevice()) if (transfer_audit) |audit| {
+            audit.host_accesses += 1;
+        };
         if (self.dtype != .f32) return error.UnsupportedTensorType;
         memory_stats.to_host_calls += 1;
         if (self.device == null) return self.data[0..self.len];

@@ -8726,6 +8726,9 @@ fn estimateModelLoadAdmission(
     const uses_onnx_artifact = backend_runtime.backend == .onnx or !manifestHasNativeAssets(man);
     if (uses_onnx_artifact) return onnxModelLoadAdmission(weights, backend_runtime);
     if (backend_runtime.backend == .metal) {
+        if (try session_factory.layaResidentLoadAmounts(man, weights)) |resident| {
+            return .{ .peak = resident.peak, .resident = resident.resident };
+        }
         if (try session_factory.glinerBoundaryResidentLoadAmounts(man, weights)) |resident| {
             return .{ .peak = resident.peak, .resident = resident.resident };
         }
@@ -8932,7 +8935,12 @@ fn loadSessionForPreferredBackends(
     // actionable cause: a GGUF whose tensors could not be resolved fails with
     // MissingRequiredWeights, and callers were being told the file did not exist.
     var first_err: ?anyerror = null;
+    var laya_resident_attempted = false;
     for (effective_backends) |backend| {
+        // Once opted-in Metal residency is attempted, preserve its actionable
+        // admission/load error rather than silently publishing a CPU session.
+        if (laya_resident_attempted) return first_err orelse error.UnsupportedLayaArtifact;
+        if (backend == .metal and man.hasCapability("typed_decisions") and @import("../ops/laya_metal.zig").enabled()) laya_resident_attempted = true;
         if (control) |active| try active.check();
         if (modelBackendIsUnhealthy(manager, model_dir, backend)) {
             rememberPreferredLoadError(&first_err, error.ModelBackendUnhealthy);
@@ -9052,6 +9060,7 @@ fn loadSessionForPreferredBackends(
             defer loaded.deinit();
             if (control) |active| try active.check();
             try session_factory.prepareGlinerBoundaryResident(loaded.session, control);
+            try session_factory.prepareLayaResident(loaded.session, control);
             if (loaded.resource_lease) |*lease| try lease.retain(resident_amounts);
             if (manager.admission_enabled) {
                 const session_admission_limits = manager.admissionLimitsForSession(
@@ -9075,6 +9084,7 @@ fn loadSessionForPreferredBackends(
         }
     }
 
+    if (laya_resident_attempted) return first_err orelse error.UnsupportedLayaArtifact;
     // A missing process boundary is an expected fail-closed policy decision,
     // not an artifact/import failure.
     if (first_err) |err| if (err == error.ProcessIsolationRequired) return err;

@@ -567,6 +567,8 @@ pub const Session = struct {
     execution_gate: ?*std.atomic.Mutex = null,
 
     pub const VTable = struct {
+        hasLayaDecisions: ?*const fn (ptr: *anyopaque) bool = null,
+        runLayaDecisions: ?*const fn (ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) anyerror!?[]Tensor = null,
         run: *const fn (ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator) anyerror![]Tensor,
         inputInfo: *const fn (ptr: *anyopaque) []const TensorInfo,
         outputInfo: *const fn (ptr: *anyopaque) []const TensorInfo,
@@ -629,6 +631,29 @@ pub const Session = struct {
         errdefer deinitTensorSlice(outputs, allocator);
         try active.check();
         return attachOutputAdmission(outputs, allocator, &resource_lease);
+    }
+
+    /// Optional typed-decision route. Only an unsupported/disabled capability
+    /// returns null; execution and admission failures propagate without fallback.
+    pub fn runLayaDecisionsWithControl(self: Session, inputs: []const Tensor, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) !?[]Tensor {
+        const run_decisions = self.vtable.runLayaDecisions orelse return null;
+        if (self.vtable.hasLayaDecisions) |supported| if (!supported(self.ptr)) return null;
+        const active = control orelse InferenceExecutionControl{};
+        try active.check();
+        var protection = if (control) |c| try c.enterUninterruptible(self.interruption()) else null;
+        defer if (protection) |*p| p.deinit();
+        var lease = if (self.run_admission) |admission|
+            try admission.acquireRequest(try self.planRun(inputs, null), self.outputInfo())
+        else
+            null;
+        errdefer if (lease) |*l| l.release();
+        const outputs = (try run_decisions(self.ptr, inputs, allocator, control)) orelse {
+            if (lease) |*l| l.release();
+            return null;
+        };
+        errdefer deinitTensorSlice(outputs, allocator);
+        try active.check();
+        return try attachOutputAdmission(outputs, allocator, &lease);
     }
 
     /// Borrows outputs and the lease until success. On error the caller still

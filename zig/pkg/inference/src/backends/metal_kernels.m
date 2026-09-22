@@ -10302,6 +10302,40 @@ static NSString *termite_metal_shader_source(void) {
            "        if(scale>0.0f)for(uint i=lo+lane;i<hi;i+=32u){float x=a0[i];if(isfinite(x)){float v=x/scale;sum+=v*v;}}\n"
            "        sum=simd_sum(sum);if(lane==0u){out[chunk*3u]=scale;out[chunk*3u+1u]=sum;out[chunk*3u+2u]=float(invalid);}break;\n"
            "    }\n"
+           "    case 42u: {\n"
+           "        uint row=gid/N,d=gid%N,hd=N/C,j=d%hd,base=row*3u*N+p.dims[4]*N;\n"
+           "        float x=a0[base+d];\n"
+           "        if(p.dims[5]==0u){out[gid]=x;break;}\n"
+           "        uint half_dim=hd/2u,k=j%half_dim,other=d-j+(j<half_dim?j+half_dim:j-half_dim);\n"
+           "        float angle=float(row%D)*pow(p.scalars[0],-2.0f*float(k)/float(hd));\n"
+           "        out[gid]=x*cos(angle)+(j<half_dim?-a0[base+other]:a0[base+other])*sin(angle);break;\n"
+           "    }\n"
+           "    case 43u: {uint row=gid/N,d=gid%N;float x=a0[row*2u*N+d];out[gid]=termite_gelu_exact(x)*a0[row*2u*N+N+d];break;}\n"
+           "    case 44u: {uint q=(gid/N)%N,k=gid%N;out[gid]=(q>k?q-k:k-q)>C?-INFINITY:0.0f;break;}\n"
+           "    case 45u: {uint b=gid/(N*C),d=gid%C;int kind=((device const int*)a2)[b];out[gid]=kind>=0&&kind<3?a0[gid]+a1[uint(kind)*C+d]:NAN;break;}\n"
+           "    case 46u: {\n"
+           "        uint b=gid/(C+4u),d=gid%(C+4u);if(d<C){out[gid]=a0[b*N*C+d];break;}\n"
+           "        float best=-INFINITY;uint valid=0u;\n"
+           "        for(uint i=0;i<D;++i){bool ok=((device const int*)a2)[b*D+i]>=0;valid+=uint(ok);float z=ok?a1[b*D+i]:-1e4f;best=max(best,z);}\n"
+           "        float sum=0.0f;for(uint i=0;i<D;++i){float z=((device const int*)a2)[b*D+i]>=0?a1[b*D+i]:-1e4f;sum+=exp(z-best);}\n"
+           "        float first=0.0f,second=0.0f,entropy=0.0f;\n"
+           "        for(uint i=0;i<D;++i){float z=((device const int*)a2)[b*D+i]>=0?a1[b*D+i]:-1e4f;float v=exp(z-best)/sum;entropy-=v*log(max(v,1e-9f));if(v>first){second=first;first=v;}else second=max(second,v);}\n"
+           "        out[gid]=d==C?first:d==C+1u?first-second:d==C+2u?entropy/log(float(valid)):float(valid)/255.0f;break;\n"
+           "    }\n"
+           "    case 47u: {\n"
+           "        uint b=gid,base=b*(N+6u),valid=0u;int kind=((device const int*)a3)[b];float best=-INFINITY;bool ok=kind>=0&&kind<3;\n"
+           "        for(uint i=0;i<N;++i)if(((device const int*)a2)[b*N+i]>=0){++valid;float z=a0[b*N+i];ok=ok&&isfinite(z);best=max(best,z);}\n"
+           "        uint bucket=valid<=2u?0u:valid<=5u?1u:valid<=10u?2u:3u;float scale=ok?a4[uint(kind)*4u+bucket]:1.0f,sum=0.0f;\n"
+           "        for(uint i=0;i<N;++i)if(((device const int*)a2)[b*N+i]>=0)sum+=exp((a0[b*N+i]-best)/scale);\n"
+           "        uint winner=0u;float top=-1.0f,entropy=0.0f,expected=0.0f;\n"
+           "        for(uint i=0;i<N;++i){float v=((device const int*)a2)[b*N+i]>=0?exp((a0[b*N+i]-best)/scale)/sum:0.0f;out[base+i]=v;if(v>top){top=v;winner=i;}entropy-=v*log(max(v,1e-12f));expected+=float(i)*v;}\n"
+           "        float abest=-INFINITY;for(uint i=0;i<C;++i){float z=a1[b*C+i];ok=ok&&isfinite(z);abest=max(abest,z);}float asum=0.0f;for(uint i=0;i<C;++i)asum+=exp(a1[b*C+i]-abest);\n"
+           "        float truth=out[base+1u];out[base+N]=float(winner);out[base+N+1u]=kind==2?max(truth,1.0f-truth):clamp(1.0f-entropy/log(float(valid)),0.0f,1.0f);\n"
+           "        out[base+N+2u]=expected;out[base+N+3u]=truth;out[base+N+4u]=exp(a1[b*C]-abest)/asum;\n"
+           "        out[base+N+5u]=ok&&valid>=2u&&isfinite(sum)&&sum>0.0f&&isfinite(asum)&&asum>0.0f?0.0f:1.0f;break;\n"
+           "    }\n"
+           "    case 48u: {float x=a0[gid];out[gid]=termite_gelu_exact(x);break;}\n"
+           "    case 49u: {uint b=gid/(N+C),i=gid%(N+C);out[gid]=i<N?(((device const int*)a2)[b*N+i]>=0?a0[b*N+i]:-1e4f):a1[b*C+i-N];break;}\n"
            "    case 41u: {\n"
            "        float scale=0.0f;uint invalid=0u;for(uint i=lane;i<B;i+=32u){scale=max(scale,a0[i*3u]);if(a0[i*3u+2u]!=0.0f)invalid=1u;}\n"
            "        scale=simd_max(scale);invalid=simd_max(invalid);float sum=0.0f;\n"
@@ -14842,6 +14876,26 @@ static void termite_metal_decode_runtime_invalidate_linear_mps_matrices(
     runtime->linear_mps_result_buffers[slot] = nil;
     runtime->linear_mps_left_offsets[slot] = 0;
     runtime->linear_mps_result_offsets[slot] = 0;
+}
+
+// Strict frame-bounded callers retain weights and multiplication plans, but
+// must retire MPS views before releasing their request workspace admission.
+int termite_metal_decode_runtime_release_linear_views(termite_metal_decode_runtime *runtime, size_t count) {
+    if (runtime == NULL || count > TERMITE_METAL_LINEAR_SLOT_CAPACITY) return -1;
+    if (runtime->active_frame_cb != nil || runtime->submitted_frame_cb != nil) return -2;
+    for (size_t slot = 0; slot < count; ++slot)
+        termite_metal_decode_runtime_invalidate_linear_mps_matrices(runtime, slot);
+    return 0;
+}
+
+uint64_t termite_metal_decode_runtime_linear_view_bytes(termite_metal_decode_runtime *runtime, size_t count) {
+    if (runtime == NULL || count > TERMITE_METAL_LINEAR_SLOT_CAPACITY) return UINT64_MAX;
+    uint64_t bytes = 0;
+    for (size_t slot = 0; slot < count; ++slot) {
+        bytes += runtime->linear_mps_left_buffers[slot].length;
+        bytes += runtime->linear_mps_result_buffers[slot].length;
+    }
+    return bytes;
 }
 
 static bool termite_metal_decode_runtime_cached_mps_matrices(
@@ -33762,9 +33816,8 @@ int termite_metal_decode_runtime_apply_linear_multi_row_device(
                 return -12;
             }
         }
-        // F16 mirrors are MPS-only. Never reinterpret their storage through
-        // the float32 custom-kernel fallback.
-        if (runtime->linear_weight_dtypes[slot] == TERMITE_METAL_DENSE_LINEAR_DTYPE_F16) return -13;
+        // Small F16 projections (including scalar scoring heads) use the
+        // native F16 kernels below, preserving F32 inputs and accumulation.
         const bool frame_owned = (runtime->active_frame_cb == nil);
         id<MTLCommandBuffer> command_buffer = frame_owned
             ? termite_metal_new_command_buffer(runtime->queue, __func__)
@@ -44586,7 +44639,7 @@ int termite_metal_decode_runtime_gliner_boundary_device(
     if (!termite_metal_decode_runtime_gliner_boundary_ready(runtime)) return -17;
     if(runtime==NULL||input_handles==NULL||input_offsets==NULL||input_bytes==NULL||params==NULL||output_handle==NULL)return -1;
     if(runtime->gliner_boundary_f32_pipeline==nil)return -2;
-    if(params->kind>41u||output_elements==0||output_elements>INT32_MAX||work_items==0||work_items>INT32_MAX||simd_groups>1u)return -3;
+    if(params->kind>49u||output_elements==0||output_elements>INT32_MAX||work_items==0||work_items>INT32_MAX||simd_groups>1u)return -3;
     if(simd_groups&&(work_items%32u!=0u||runtime->gliner_boundary_f32_pipeline.threadExecutionWidth!=32u||runtime->gliner_boundary_f32_pipeline.maxTotalThreadsPerThreadgroup<32u))return -4;
     @autoreleasepool {
         id<MTLBuffer> output=(__bridge id<MTLBuffer>)output_handle;
