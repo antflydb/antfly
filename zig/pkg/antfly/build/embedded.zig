@@ -105,6 +105,7 @@ pub const AddEmbeddedResult = struct {
     install_libantfly: *std.Build.Step.InstallArtifact,
     install_capi_header: *std.Build.Step.InstallFile,
     run_capi_smoke: *std.Build.Step.Run,
+    run_capi_conformance: *std.Build.Step.Run,
     run_lite_go_tests: *std.Build.Step.Run,
     run_lite_go_example: *std.Build.Step.Run,
     run_lite_go_retrieval_template: *std.Build.Step.Run,
@@ -346,6 +347,28 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     const capi_smoke_step = b.step("capi-smoke", "Compile and run a C consumer smoke test for libantfly");
     capi_smoke_step.dependOn(&run_capi_smoke.step);
 
+    // Reference runner for the shared conformance cases every binding runs
+    // (pkg/antfly/capi-conformance/README.md). It calls libantfly only
+    // through the public header, so a case that fails here is an ABI bug
+    // rather than a binding bug.
+    const capi_conformance_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/capi/conformance_runner.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    capi_conformance_mod.link_libc = true;
+    capi_conformance_mod.addIncludePath(b.path("pkg/antfly/include"));
+    const capi_conformance = b.addExecutable(.{
+        .name = "antfly-capi-conformance",
+        .root_module = capi_conformance_mod,
+    });
+    capi_conformance.root_module.linkLibrary(libantfly);
+    const run_capi_conformance = b.addRunArtifact(capi_conformance);
+    run_capi_conformance.addDirectoryArg(b.path("pkg/antfly/capi-conformance/cases"));
+    _ = run_capi_conformance.addOutputDirectoryArg("capi-conformance-work");
+    const capi_conformance_step = b.step("capi-conformance", "Run the shared libantfly conformance cases against the C ABI");
+    capi_conformance_step.dependOn(&run_capi_conformance.step);
+
     // The Go test binary is not the `antfly` executable, so it cannot re-exec
     // itself the way the CLI does to spawn the sandboxed inference worker
     // (see inference_worker.zig's `resolveWorkerExecutable`). Point it at the
@@ -470,6 +493,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         .install_libantfly = install_libantfly,
         .install_capi_header = install_capi_header,
         .run_capi_smoke = run_capi_smoke,
+        .run_capi_conformance = run_capi_conformance,
         .run_lite_go_tests = run_lite_go_tests,
         .run_lite_go_example = run_lite_go_example,
         .run_lite_go_retrieval_template = run_lite_go_retrieval_template,

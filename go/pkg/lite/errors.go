@@ -32,7 +32,10 @@ const (
 	// Unsupported means the operation requires a platform or filesystem
 	// capability that is unavailable. Retrying unchanged will not succeed.
 	Unsupported ErrorCode = 8
-	Internal    ErrorCode = 255
+	// Stalled reports that a bounded drain such as RunUntilIdle detected a
+	// managed index making no forward progress and gave up.
+	Stalled  ErrorCode = 9
+	Internal ErrorCode = 255
 )
 
 var errorCodeNames = map[ErrorCode]string{
@@ -45,6 +48,7 @@ var errorCodeNames = map[ErrorCode]string{
 	Busy:            "ANTFLY_BUSY",
 	OutcomeUnknown:  "ANTFLY_OUTCOME_UNKNOWN",
 	Unsupported:     "ANTFLY_UNSUPPORTED",
+	Stalled:         "ANTFLY_STALLED",
 	Internal:        "ANTFLY_INTERNAL",
 }
 
@@ -58,6 +62,7 @@ var errorCodeDescriptions = map[ErrorCode]string{
 	Busy:            "the requested resource is temporarily busy or changed during streaming; stabilize it and retry",
 	OutcomeUnknown:  "the operation was published, but crash durability could not be confirmed; inspect the destination and do not retry automatically",
 	Unsupported:     "the operation requires a capability that is not supported by this platform or filesystem",
+	Stalled:         "a bounded drain made no forward progress for its configured stall window and gave up",
 	Internal:        "an internal error occurred",
 }
 

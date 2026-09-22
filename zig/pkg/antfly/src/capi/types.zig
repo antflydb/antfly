@@ -295,6 +295,7 @@ pub fn mapError(err: anyerror) ErrorCode {
         error.UnsupportedBatchRequestEncoding,
         error.ValueTooLong,
         error.InvalidQueryRequest,
+        error.InvalidSchemaUpdateRequest,
         error.UnsupportedQueryRequest,
         error.UnsupportedHierarchyGrouping,
         error.InvalidFilterQueryRequest,
