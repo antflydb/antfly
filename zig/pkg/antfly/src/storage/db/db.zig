@@ -65003,6 +65003,15 @@ fn graphEndpointResolutionsJsonAlloc(
         if (entities != .array) continue;
         for (entities.array.items) |entity| {
             if (entity != .object) continue;
+            // Same human-review gate as the mention-edge path
+            // (resolutionDecisionCreatesCanonicalEdge): a review-band entry
+            // carries a PROVISIONAL doc key, and admitting it here would make
+            // relations traversable through that identity before a curator
+            // approves it. Only canonical decisions become endpoints; the
+            // relation stays absent (drop-before-resolution) and the
+            // approval's re-resolution replay renders it.
+            const decision = jsonStringField(entity, "decision") orelse continue;
+            if (!std.mem.eql(u8, decision, "new") and !std.mem.eql(u8, decision, "match")) continue;
             const local_id = jsonStringField(entity, "local_id") orelse continue;
             const doc_ref = entity.object.get("doc_ref") orelse continue;
             if (doc_ref != .object) continue;
@@ -86608,7 +86617,7 @@ test "db does not materialize review-band resolution as canonical mention edges"
         .writes = &.{.{
             .key = "doc:a",
             .value =
-            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"}]}}
+            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"},{"id":"e1","label":"person","text":"Charles Babbage"}],"relations":[{"type":"knows","source":"e1","target":"e0"}]}}
             ,
         }},
         .sync_level = .enrichments,
@@ -86625,9 +86634,29 @@ test "db does not materialize review-band resolution as canonical mention edges"
     try std.testing.expectEqualStrings("review", ent.get("decision").?.string);
     try std.testing.expectEqualStrings("person/ada_lovelace", ent.get("doc_ref").?.object.get("key").?.string);
 
-    const out = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
-    defer graph_mod.GraphIndex.freeEdges(alloc, out);
-    try std.testing.expectEqual(@as(usize, 0), out.len);
+    // Only the cleanly resolved mention has a canonical edge; the reviewed
+    // one is withheld.
+    {
+        const out = try waitForGraphEdges(alloc, &db, "prov_graph", "doc:a", "mentions", .out, 1);
+        defer graph_mod.GraphIndex.freeEdges(alloc, out);
+        try std.testing.expectEqual(@as(usize, 1), out.len);
+        try std.testing.expectEqualStrings("person/charles_babbage", out[0].target);
+    }
+    // The relation references the reviewed entity, and a review entry
+    // carries a PROVISIONAL key: the relation must stay absent until a
+    // curator approves — from the canonical source, the producing document,
+    // and the local id alike.
+    {
+        const knows = try db.getEdges(alloc, "prov_graph", "person/charles_babbage", "knows", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, knows);
+        try std.testing.expectEqual(@as(usize, 0), knows.len);
+        const doc_sourced = try db.getEdges(alloc, "prov_graph", "doc:a", "knows", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, doc_sourced);
+        try std.testing.expectEqual(@as(usize, 0), doc_sourced.len);
+        const local_sourced = try db.getEdges(alloc, "prov_graph", "e1", "knows", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, local_sourced);
+        try std.testing.expectEqual(@as(usize, 0), local_sourced.len);
+    }
 
     _ = try db.recordReviewDecision("doc:a", "relations_v1", "resolution_v1", "e0", .match, "entities", "person/ada_lovelace");
     try db.runUntilIdle();
@@ -86642,10 +86671,21 @@ test "db does not materialize review-band resolution as canonical mention edges"
 
     // runUntilIdle is the lifecycle fence: a blocked promotion sink must not
     // prevent the independent graph consumer from publishing this edge.
-    const curated_edges = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
+    const curated_edges = try waitForGraphEdges(alloc, &db, "prov_graph", "doc:a", "mentions", .out, 2);
     defer graph_mod.GraphIndex.freeEdges(alloc, curated_edges);
-    try std.testing.expectEqual(@as(usize, 1), curated_edges.len);
-    try std.testing.expectEqualStrings("person/ada_lovelace", curated_edges[0].target);
+    try std.testing.expectEqual(@as(usize, 2), curated_edges.len);
+    var saw_ada = false;
+    for (curated_edges) |edge| {
+        if (std.mem.eql(u8, edge.target, "person/ada_lovelace")) saw_ada = true;
+    }
+    try std.testing.expect(saw_ada);
+
+    // Approval also releases the withheld relation, entity-sourced from the
+    // canonical endpoint.
+    const curated_knows = try waitForGraphEdges(alloc, &db, "prov_graph", "person/charles_babbage", "knows", .out, 1);
+    defer graph_mod.GraphIndex.freeEdges(alloc, curated_knows);
+    try std.testing.expectEqual(@as(usize, 1), curated_knows.len);
+    try std.testing.expectEqualStrings("person/ada_lovelace", curated_knows[0].target);
 }
 
 test "db mention edge weight is fused from extractor trust and mention confidence" {
