@@ -11418,6 +11418,9 @@ fn processAsset(
         }
         try appendFullTextDeleteDocumentToWindow(runtime, window, key, text_indexes);
         try materializeGraphAssetDeleteForRuntime(runtime, request, window);
+        // A null source is intentional no-output: settle graph/full_text
+        // consumer coverage as skipped instead of leaving it pending.
+        try queueCoverageOutcomeForRequest(runtime, window, request, .skipped);
         return;
     };
     var source_text_owned = true;
@@ -11433,6 +11436,7 @@ fn processAsset(
         }
         try appendFullTextDeleteDocumentToWindow(runtime, window, key, text_indexes);
         try materializeGraphAssetDeleteForRuntime(runtime, request, window);
+        try queueCoverageOutcomeForRequest(runtime, window, request, .skipped);
         return;
     }
 
@@ -11454,6 +11458,9 @@ fn processAsset(
         if (try shouldSkipAssetArtifact(runtime, key, source_text)) {
             try appendInlineFullTextDocumentToWindow(runtime, window, key, source_text, text_indexes);
             try materializeGraphAssetForRuntime(runtime, request, source_text, raw, window);
+            // The artifact exists and is current: produced coverage, so an
+            // idempotent replay converges the consumer summary.
+            try queueCoverageOutcomeForRequest(runtime, window, request, .produced);
             return;
         }
         try storePutWithRetry(runtime, key, source_text);
@@ -11461,6 +11468,7 @@ fn processAsset(
         try appendInlineFullTextDocumentToWindow(runtime, window, key, source_text, text_indexes);
         try materializeGraphAssetForRuntime(runtime, request, source_text, raw, window);
         recordArtifactBytes(runtime, .asset, source_text.len);
+        try queueCoverageOutcomeForRequest(runtime, window, request, .produced);
         return;
     }
 
@@ -11501,6 +11509,9 @@ fn processAsset(
             defer runtime.alloc.free(value);
             try appendInlineFullTextDocumentToWindow(runtime, window, key, value, text_indexes);
             try materializeGraphAssetForRuntime(runtime, request, value, raw, window);
+            // The artifact exists and matches its skip state: produced
+            // coverage, so an idempotent replay converges the summary.
+            try queueCoverageOutcomeForRequest(runtime, window, request, .produced);
             return;
         }
     }
@@ -12015,6 +12026,7 @@ fn applyAssetProducerBatchOutput(
     try appendInlineFullTextDocumentToWindow(runtime, window, item.artifact_key, produced, text_indexes);
     try materializeGraphAssetForRuntime(runtime, item.request, produced, item.raw_doc, window);
     recordArtifactBytes(runtime, .asset, produced.len);
+    try queueCoverageOutcomeForRequest(runtime, window, item.request, .produced);
 }
 
 /// Use the same completed-state gate for metadata fingerprints known before a
@@ -23067,6 +23079,9 @@ fn processChunkText(
     }
     if (chunks.len == 0) {
         try mergeOwnedDeletedKeysIntoWindow(runtime, window, stale_vector_keys);
+        // A source that chunks to nothing is intentional no-output for the
+        // artifact's consumers.
+        try queueCoverageOutcomeForRequest(runtime, window, request, .skipped);
         return;
     }
 
@@ -23120,6 +23135,7 @@ fn processChunkText(
 
     if (text_indexes.len == 0) {
         try mergeOwnedDeletedKeysIntoWindow(runtime, window, stale_vector_keys);
+        try queueCoverageOutcomeForRequest(runtime, window, request, .produced);
         return;
     }
 
@@ -23129,6 +23145,7 @@ fn processChunkText(
     }
     if (text_chunk_count == 0) {
         try mergeOwnedDeletedKeysIntoWindow(runtime, window, stale_vector_keys);
+        try queueCoverageOutcomeForRequest(runtime, window, request, .produced);
         return;
     }
 
@@ -23187,6 +23204,7 @@ fn processChunkText(
     try mergeOwnedDeletedKeysIntoWindow(runtime, window, stale_vector_keys);
     try appendOwnedDocumentsToWindow(runtime, window, &docs);
     initialized_docs = 0;
+    try queueCoverageOutcomeForRequest(runtime, window, request, .produced);
 }
 
 fn processPdfPageImageEmbedding(

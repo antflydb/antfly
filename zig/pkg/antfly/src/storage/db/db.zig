@@ -36316,7 +36316,8 @@ pub const DB = struct {
                         visible_doc_count = @max(visible_doc_count, item.doc_count);
                     }
                     item.text_merge = self.core.index_manager.textMergeStatsSnapshotForIndex(item.name);
-                    try self.populateConfiguredDerivedCoverageCounts(item.name, item);
+                    if (self.derivedCoverageAppliesToIndex(.full_text, item.name))
+                        try self.populateConfiguredDerivedCoverageCounts(item.name, item);
                 },
                 .dense_vector => {
                     if (self.core.denseIndex(item.name)) |entry| {
@@ -36351,7 +36352,8 @@ pub const DB = struct {
                         item.graph_counts_pending = graph_stats.counts_pending;
                         applyGraphAlgebraicRuntimeStats(item, &entry.index);
                     }
-                    try self.populateConfiguredDerivedCoverageCounts(item.name, item);
+                    if (self.derivedCoverageAppliesToIndex(.graph, item.name))
+                        try self.populateConfiguredDerivedCoverageCounts(item.name, item);
                     if (!item.graph_counts_pending) visible_doc_count = @max(visible_doc_count, item.doc_count);
                 },
                 .algebraic => {
@@ -38146,8 +38148,11 @@ pub const DB = struct {
                     // Artifact-fed full-text projections carry the same
                     // durable per-document generation outcomes as embeddings
                     // indexes; surface them so terminal failures are settled
-                    // coverage, not invisible pending work.
-                    try self.populateConfiguredDerivedCoverageCounts(cfg.name, &item);
+                    // coverage, not invisible pending work. Direct-document
+                    // projections have no producer outcomes and stay
+                    // coverage-silent instead of eternally pending.
+                    if (self.derivedCoverageAppliesToIndex(.full_text, cfg.name))
+                        try self.populateConfiguredDerivedCoverageCounts(cfg.name, &item);
                 },
                 .dense_vector => {
                     if (self.core.denseIndex(cfg.name)) |entry| {
@@ -38224,8 +38229,10 @@ pub const DB = struct {
                     // record per-document generation outcomes under the
                     // consuming index's coverage generation; without this the
                     // knowledge graph's terminal extraction failures were
-                    // reported nowhere on the index itself.
-                    try self.populateConfiguredDerivedCoverageCounts(cfg.name, &item);
+                    // reported nowhere on the index itself. Direct-document
+                    // graphs have no producer outcomes and stay silent.
+                    if (self.derivedCoverageAppliesToIndex(.graph, cfg.name))
+                        try self.populateConfiguredDerivedCoverageCounts(cfg.name, &item);
                 },
                 .algebraic => {
                     try self.populateAlgebraicIndexStats(alloc, cfg.name, &item, false);
@@ -39066,6 +39073,29 @@ pub const DB = struct {
         item.coverage_skipped_count = skipped orelse 0;
         item.coverage_terminal_failed_count = terminal_failed orelse 0;
         if (!item.coverage_summary_ready) item.repair_degraded = true;
+    }
+
+    /// Whether producer-outcome coverage is meaningful for a graph or
+    /// full_text index: only artifact-sourced projections have producers
+    /// that record per-document outcomes. Embeddings indexes always apply.
+    fn derivedCoverageAppliesToIndex(self: *DB, kind: types.IndexKind, index_name: []const u8) bool {
+        return switch (kind) {
+            .graph => blk: {
+                for (self.core.graphIndexes()) |entry| {
+                    if (std.mem.eql(u8, entry.config.name, index_name))
+                        break :blk entry.artifact_sources.len > 0;
+                }
+                break :blk false;
+            },
+            .full_text => blk: {
+                for (self.core.index_manager.text_indexes.items) |entry| {
+                    if (std.mem.eql(u8, entry.config.name, index_name))
+                        break :blk entry.chunk_name != null or entry.source_artifact_names.len > 0;
+                }
+                break :blk false;
+            },
+            else => true,
+        };
     }
 
     fn populateConfiguredDerivedCoverageCounts(self: *DB, index_name: []const u8, item: *types.DBIndexStats) !void {
@@ -46364,6 +46394,7 @@ fn computeAssetRequestDerived(
     deferred_asset_producer_items: ?*std.ArrayListUnmanaged(PrecomputeAssetProducerBatchItem),
     force_reprocess: bool,
     document_execution: ?*enrichment_runtime_mod.PrecommitDocumentExecution,
+    coverage_outcomes: *std.ArrayListUnmanaged(PrecomputedCoverageOutcome),
 ) !void {
     var producer_cfg = try asset_producer_mod.parseProducerConfig(alloc, request.producer_json);
     defer producer_cfg.deinit(alloc);
@@ -46492,7 +46523,7 @@ fn computeAssetRequestDerived(
                 .state_key = item_state_key,
                 .state_value = item_state_value,
             };
-            try appendPrecomputeAssetProducerBatchItem(alloc, db, items, item, artifact_writes, documents);
+            try appendPrecomputeAssetProducerBatchItem(alloc, db, items, item, artifact_writes, documents, coverage_outcomes);
             return;
         }
     }
@@ -46618,6 +46649,7 @@ fn appendPrecomputeAssetProducerBatchItem(
     item: PrecomputeAssetProducerBatchItem,
     artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
     documents: *std.ArrayListUnmanaged(derived_types.DerivedDocument),
+    coverage_outcomes: *std.ArrayListUnmanaged(PrecomputedCoverageOutcome),
 ) !void {
     const policy = enrichment_types.parseExecutionPolicyJson(alloc, item.request.execution_json) catch enrichment_types.ExecutionPolicy{};
     const max_items = @max(@as(usize, 1), policy.batch_items orelse 1);
@@ -46629,7 +46661,7 @@ fn appendPrecomputeAssetProducerBatchItem(
             items.items.len >= max_items or
             addPrecomputeAssetProducerBytes(current_bytes, item_bytes) > max_bytes)
         {
-            try flushPrecomputeAssetProducerBatch(alloc, db, items, artifact_writes, documents);
+            try flushPrecomputeAssetProducerBatch(alloc, db, items, artifact_writes, documents, coverage_outcomes);
         }
     }
     try items.append(alloc, item);
@@ -46642,6 +46674,7 @@ fn applyPrecomputeAssetProducerOutput(
     produced: []const u8,
     artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
     documents: *std.ArrayListUnmanaged(derived_types.DerivedDocument),
+    coverage_outcomes: *std.ArrayListUnmanaged(PrecomputedCoverageOutcome),
 ) !void {
     try artifact_writes.append(alloc, .{
         .key = try alloc.dupe(u8, item.artifact_key),
@@ -46652,9 +46685,9 @@ fn applyPrecomputeAssetProducerOutput(
         .value = try alloc.dupe(u8, item.state_value),
     });
 
-    _ = db;
     const text_indexes: []const []const u8 = item.request.consumer_indexes;
     try appendInlineFullTextDocument(alloc, documents, item.artifact_key, produced, text_indexes);
+    try appendPrecomputedArtifactCoverageOutcomes(db, alloc, coverage_outcomes, item.request, .produced);
 }
 
 fn flushPrecomputeAssetProducerBatchSequential(
@@ -46664,6 +46697,7 @@ fn flushPrecomputeAssetProducerBatchSequential(
     db: *DB,
     artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
     documents: *std.ArrayListUnmanaged(derived_types.DerivedDocument),
+    coverage_outcomes: *std.ArrayListUnmanaged(PrecomputedCoverageOutcome),
 ) !void {
     for (items) |item| {
         const produced = producer.produce(alloc, item.asRequest()) catch |err| {
@@ -46672,7 +46706,7 @@ fn flushPrecomputeAssetProducerBatchSequential(
             return err;
         };
         defer alloc.free(produced);
-        applyPrecomputeAssetProducerOutput(alloc, db, item, produced, artifact_writes, documents) catch |err| {
+        applyPrecomputeAssetProducerOutput(alloc, db, item, produced, artifact_writes, documents, coverage_outcomes) catch |err| {
             if (err == error.OutOfMemory) return err;
             if (isRetryableAssetProducerError(err)) return err;
             return err;
@@ -46686,6 +46720,7 @@ fn flushPrecomputeAssetProducerBatch(
     items: *std.ArrayListUnmanaged(PrecomputeAssetProducerBatchItem),
     artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
     documents: *std.ArrayListUnmanaged(derived_types.DerivedDocument),
+    coverage_outcomes: *std.ArrayListUnmanaged(PrecomputedCoverageOutcome),
 ) !void {
     if (items.items.len == 0) return;
     defer clearPrecomputeAssetProducerBatchItems(alloc, items);
@@ -46699,22 +46734,22 @@ fn flushPrecomputeAssetProducerBatch(
     const can_batch = producer.canProduceBatch(alloc, requests) catch |err| {
         if (err == error.OutOfMemory) return err;
         if (isRetryableAssetProducerError(err)) return err;
-        return try flushPrecomputeAssetProducerBatchSequential(alloc, producer, items.items, db, artifact_writes, documents);
+        return try flushPrecomputeAssetProducerBatchSequential(alloc, producer, items.items, db, artifact_writes, documents, coverage_outcomes);
     };
     if (!can_batch)
-        return try flushPrecomputeAssetProducerBatchSequential(alloc, producer, items.items, db, artifact_writes, documents);
+        return try flushPrecomputeAssetProducerBatchSequential(alloc, producer, items.items, db, artifact_writes, documents, coverage_outcomes);
 
     var produced = producer.produceBatch(alloc, requests) catch |err| {
         if (err == error.OutOfMemory) return err;
         if (isRetryableAssetProducerError(err)) return err;
-        return try flushPrecomputeAssetProducerBatchSequential(alloc, producer, items.items, db, artifact_writes, documents);
+        return try flushPrecomputeAssetProducerBatchSequential(alloc, producer, items.items, db, artifact_writes, documents, coverage_outcomes);
     };
     if (produced.len != items.items.len) {
         for (produced) |output| {
             if (output.len > 0) alloc.free(output);
         }
         alloc.free(produced);
-        return try flushPrecomputeAssetProducerBatchSequential(alloc, producer, items.items, db, artifact_writes, documents);
+        return try flushPrecomputeAssetProducerBatchSequential(alloc, producer, items.items, db, artifact_writes, documents, coverage_outcomes);
     }
 
     defer alloc.free(produced);
@@ -46725,7 +46760,7 @@ fn flushPrecomputeAssetProducerBatch(
     }
 
     for (items.items, produced, 0..) |item, output, idx| {
-        applyPrecomputeAssetProducerOutput(alloc, db, item, output, artifact_writes, documents) catch |err| {
+        applyPrecomputeAssetProducerOutput(alloc, db, item, output, artifact_writes, documents, coverage_outcomes) catch |err| {
             alloc.free(output);
             produced[idx] = "";
             if (err == error.OutOfMemory) return err;
@@ -51697,6 +51732,59 @@ fn appendPrecomputedCoverageCandidate(
     try out.append(alloc, .{ .request = cloned, .produced = produced });
 }
 
+fn sliceContainsWriteKey(writes: []const types.BatchWrite, key: []const u8) bool {
+    for (writes) |write| if (std.mem.eql(u8, write.key, key)) return true;
+    return false;
+}
+
+fn sliceContainsKey(keys: []const []const u8, key: []const u8) bool {
+    for (keys) |candidate| if (std.mem.eql(u8, candidate, key)) return true;
+    return false;
+}
+
+fn sliceContainsWriteKeyPrefix(writes: []const types.BatchWrite, prefix: []const u8) bool {
+    for (writes) |write| if (std.mem.startsWith(u8, write.key, prefix)) return true;
+    return false;
+}
+
+fn sliceContainsKeyPrefix(keys: []const []const u8, prefix: []const u8) bool {
+    for (keys) |candidate| if (std.mem.startsWith(u8, candidate, prefix)) return true;
+    return false;
+}
+
+fn sliceContainsDocKeyPrefix(docs: []const derived_types.DerivedDocument, prefix: []const u8) bool {
+    for (docs) |doc| if (std.mem.startsWith(u8, doc.key, prefix)) return true;
+    return false;
+}
+
+/// Coverage outcomes for artifact producers (assets, chunks): attributed to
+/// every index depending on the artifact — graph and full_text consumers —
+/// so the index-status coverage summary can complete beyond embeddings.
+fn appendPrecomputedArtifactCoverageOutcomes(
+    db: *DB,
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(PrecomputedCoverageOutcome),
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    outcome: DerivedCoverageOutcome,
+) !void {
+    const consumers = try db.core.index_manager.indexesDependingOnArtifact(alloc, requestArtifactName(request));
+    defer {
+        for (consumers) |name| alloc.free(name);
+        alloc.free(consumers);
+    }
+    for (consumers) |index_name| {
+        const owned_index_name = try alloc.dupe(u8, index_name);
+        errdefer alloc.free(owned_index_name);
+        const owned_doc_key = try alloc.dupe(u8, request.doc_key);
+        errdefer alloc.free(owned_doc_key);
+        try out.append(alloc, .{
+            .index_name = owned_index_name,
+            .doc_key = owned_doc_key,
+            .outcome = outcome,
+        });
+    }
+}
+
 fn appendPrecomputedEmbeddingCoverageOutcomes(
     db: *DB,
     alloc: Allocator,
@@ -52293,30 +52381,66 @@ fn prepareGeneratedEnrichments(
                 try extracted[i].logicalJsonForField(request.source_field)).?;
 
             switch (request.kind) {
-                .asset => try computeAssetRequestDerived(
-                    alloc,
-                    self,
-                    cleaned,
-                    request,
-                    &artifact_writes,
-                    &artifact_delete_keys,
-                    &documents,
-                    &dense_embeddings,
-                    &sparse_embeddings,
-                    &deferred_asset_producer_items,
-                    containsName(force_generated_artifact_names, requestArtifactName(request)),
-                    document_execution,
-                ),
-                .chunk_text => try computeChunkRequestDerived(
-                    alloc,
-                    self,
-                    cleaned,
-                    request,
-                    &artifact_writes,
-                    &artifact_delete_keys,
-                    &documents,
-                    &chunk_cache,
-                ),
+                .asset => {
+                    // Synchronous asset production settles graph/full_text
+                    // consumer coverage in the same commit. Classification is
+                    // by THIS request's artifact key (a mid-batch producer
+                    // flush may append other requests' writes): its write is
+                    // produced, its delete alone is intentional no-output,
+                    // and a deferred prompt producer touches neither here —
+                    // it settles in the batch flush below or through replay.
+                    const writes_before = artifact_writes.items.len;
+                    const deletes_before = artifact_delete_keys.items.len;
+                    try computeAssetRequestDerived(
+                        alloc,
+                        self,
+                        cleaned,
+                        request,
+                        &artifact_writes,
+                        &artifact_delete_keys,
+                        &documents,
+                        &dense_embeddings,
+                        &sparse_embeddings,
+                        &deferred_asset_producer_items,
+                        containsName(force_generated_artifact_names, requestArtifactName(request)),
+                        document_execution,
+                        &coverage_outcomes,
+                    );
+                    const asset_key = try internal_keys.artifactNamedPrefixAlloc(alloc, request.doc_key, "asset", requestArtifactName(request));
+                    defer alloc.free(asset_key);
+                    if (sliceContainsWriteKey(artifact_writes.items[writes_before..], asset_key)) {
+                        try appendPrecomputedArtifactCoverageOutcomes(self, alloc, &coverage_outcomes, request, .produced);
+                    } else if (sliceContainsKey(artifact_delete_keys.items[deletes_before..], asset_key)) {
+                        try appendPrecomputedArtifactCoverageOutcomes(self, alloc, &coverage_outcomes, request, .skipped);
+                    }
+                },
+                .chunk_text => {
+                    const writes_before = artifact_writes.items.len;
+                    const docs_before = documents.items.len;
+                    const deletes_before = artifact_delete_keys.items.len;
+                    try computeChunkRequestDerived(
+                        alloc,
+                        self,
+                        cleaned,
+                        request,
+                        &artifact_writes,
+                        &artifact_delete_keys,
+                        &documents,
+                        &chunk_cache,
+                    );
+                    // Chunk ids vary; within this request's appended slice
+                    // only its own chunk rows can carry the doc's chunk-kind
+                    // prefix, so that prefix classifies exactly.
+                    const chunk_prefix = try internal_keys.artifactTypePrefixAlloc(alloc, request.doc_key, "chunk");
+                    defer alloc.free(chunk_prefix);
+                    if (sliceContainsWriteKeyPrefix(artifact_writes.items[writes_before..], chunk_prefix) or
+                        sliceContainsDocKeyPrefix(documents.items[docs_before..], chunk_prefix))
+                    {
+                        try appendPrecomputedArtifactCoverageOutcomes(self, alloc, &coverage_outcomes, request, .produced);
+                    } else if (sliceContainsKeyPrefix(artifact_delete_keys.items[deletes_before..], chunk_prefix)) {
+                        try appendPrecomputedArtifactCoverageOutcomes(self, alloc, &coverage_outcomes, request, .skipped);
+                    }
+                },
                 .dense_embedding => {
                     const before = dense_embeddings.items.len;
                     computeDenseRequestDerived(alloc, self, cleaned, request, &artifact_writes, &dense_embeddings, &chunk_cache, generated_memo) catch |err| switch (err) {
@@ -52353,7 +52477,7 @@ fn prepareGeneratedEnrichments(
         }
     }
 
-    try flushPrecomputeAssetProducerBatch(alloc, self, &deferred_asset_producer_items, &artifact_writes, &documents);
+    try flushPrecomputeAssetProducerBatch(alloc, self, &deferred_asset_producer_items, &artifact_writes, &documents, &coverage_outcomes);
 
     // Resolve coverage only after every deferred producer has contributed its
     // manifest. This keeps terminal outcomes in the same primary commit while
