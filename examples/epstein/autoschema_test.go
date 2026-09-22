@@ -146,6 +146,11 @@ func TestCreateAutoschemaKnowledgeGraphIndexConfig(t *testing.T) {
 		if !strings.Contains(template, "{{ content }}") || len(template) < 200 {
 			t.Fatalf("enrichment template must embed instructions and {{ content }}: %q", template)
 		}
+		// The empty-page guard renders an empty source for a blank page so
+		// the runtime skips it instead of inviting fabrication.
+		if !strings.HasPrefix(template, "{{#if content}}") || !strings.HasSuffix(template, "{{/if}}") {
+			t.Fatalf("enrichment template must guard empty pages with {{#if content}}: %q", template)
+		}
 		byName[enrichment["name"].(string)] = enrichment
 	}
 

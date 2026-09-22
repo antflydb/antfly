@@ -349,8 +349,14 @@ func autoschemaExtractionEnrichments(model, inferenceAPIURL string) ([]antfly.En
 			Name: pass.name,
 			Kind: antfly.EnrichmentKindAsset,
 			// The rendered template is the generator's prompt: stage
-			// instructions followed by the document text.
-			Template:     pass.prompt + "\n\nDocument:\n{{ content }}",
+			// instructions followed by the document text. The {{#if}} guard
+			// renders an EMPTY source for an empty page, which the runtime
+			// retires as skipped coverage instead of prompting the model —
+			// instructed or not, an LLM given a blank passage eventually
+			// fabricates its favorite example triple ("John met Mary at the
+			// station"), and three blank pages then converge onto one
+			// fabricated event node.
+			Template:     "{{#if content}}" + pass.prompt + "\n\nDocument:\n{{ content }}{{/if}}",
 			ContentType:  "application/json",
 			ProducerJson: producerJSON,
 		})
