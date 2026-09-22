@@ -378,7 +378,7 @@ fn Adapter(comptime Service: type) type {
             // Preparation and apply compare the exact receipt; submit still
             // revalidates metadata authority immediately before every write.
             // Preserve the existing separate bounded execution deadline.
-            owned.request = .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() + 2 * std.time.ns_per_s };
+            owned.request.deadline_ns = @import("antfly_platform").time.monotonicNs() + 2 * std.time.ns_per_s;
             switch (action) {
                 .source_command => |command| try self.submit(owned, state, state.scope.fence.owner_group_id, .{ .online_source = command }),
                 .prepare_certificate => {

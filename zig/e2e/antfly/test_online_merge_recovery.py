@@ -586,9 +586,9 @@ def test_online_merge_recovers_after_owner_link_outage_and_crash(
     fault = owner_link_fault
 
     def interrupt(cluster, table_id, donor, receiver, table_name, documents):
-        assert wait_until(
-            fault.observed, timeout_s=90, interval_s=0.1
-        ), f"never reached {fault.window}\n{cluster.debug_logs()}"
+        assert wait_until(fault.observed, timeout_s=90, interval_s=0.1), (
+            f"never reached {fault.window}\n{cluster.debug_logs()}"
+        )
         leader = cluster.metadata_stable_leader_id(timeout_s=30)
         assert leader is not None, cluster.debug_logs()
         snapshot = cluster.metadata_snapshot(leader - 1, request_timeout_s=3)
@@ -624,9 +624,9 @@ def test_online_merge_recovers_after_owner_link_outage_and_crash(
             documents.update(tail)
         if crash == "reply_loss":
             fault.heal_with_lost_reply()
-            assert fault.reply_dropped.wait(
-                30
-            ), "release never returned a successful reply"
+            assert fault.reply_dropped.wait(30), (
+                "release never returned a successful reply"
+            )
             return online
         if crash == "raft_quorum":
             fault.raft_cut.set()
@@ -665,9 +665,9 @@ def test_online_merge_recovers_after_owner_link_outage_and_crash(
         try:
             if metadata:
                 successor = cluster.metadata_stable_leader_id(timeout_s=30)
-                assert (
-                    successor is not None and successor != leader
-                ), cluster.debug_logs()
+                assert successor is not None and successor != leader, (
+                    cluster.debug_logs()
+                )
             else:
                 assert wait_until(
                     lambda: fault.observed() - {index}, timeout_s=45, interval_s=0.1
@@ -772,9 +772,9 @@ def test_online_fk_merge_preserves_shadow_claims_and_retained_references(
         backups._seed_online_merge_setup_docs(owner, session, child, children)
 
     def interrupt(owner, table_id, donor, receiver, table, rows):
-        assert wait_until(
-            fault.observed, timeout_s=90, interval_s=0.1
-        ), owner.debug_logs()
+        assert wait_until(fault.observed, timeout_s=90, interval_s=0.1), (
+            owner.debug_logs()
+        )
         leader = owner.metadata_stable_leader_id(timeout_s=30)
         assert leader is not None, owner.debug_logs()
         state = owner.metadata_snapshot(leader - 1)

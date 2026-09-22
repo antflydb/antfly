@@ -420,9 +420,9 @@ def _assert_extension_package_routes(extension_server: _ExtensionProcess) -> Non
         return None
 
     packages = wait_until(projected_packages, timeout_s=10.0, interval_s=0.25)
-    assert (
-        packages is not None
-    ), f"memoryaf package was not projected\n{extension_server.debug_logs()}"
+    assert packages is not None, (
+        f"memoryaf package was not projected\n{extension_server.debug_logs()}"
+    )
     memoryaf_package = next(
         package for package in packages if package["name"] == "memoryaf"
     )

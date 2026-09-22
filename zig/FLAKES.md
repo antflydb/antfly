@@ -8,6 +8,48 @@ The later [Antfly E2E failures](e2e/FLAKES.md#2026-09-18-concurrent-aggregations
 add full-text hydration contention, aggregation generation races, and overlapping transaction session recovery;
 their deterministic regressions and native soak evidence are recorded there.
 
+## 2026-09-21: restore retry diagnostics vanished while running (#846)
+
+[Issue #846](https://github.com/antflydb/antfly/issues/846) records the concurrent
+restore/observer test exceeding its 120-second budget at attempt 15, with no
+published tables and no error in status. This is real retry churn, not merely
+the cooperative staging continuation (which preserves its attempt number).
+The retained CI log does not identify the retry cause or establish leadership
+instability; the test uses the standalone runtime.
+
+The job store cleared `last_error` both on begin and on ordinary progress
+checkpoints. It now retains the last retry reason until a newer reason replaces
+it or successful completion clears it. Recovery preserves the original reason,
+stale attempts remain fenced, and cancellation retains its explicit reason.
+This uses the existing durable record and public `error` field; it adds no
+extra persistence or polling. The polling timeout now includes the bounded
+server-log tail, just as terminal failures already include diagnostics.
+
+The deterministic negative control restores the old update behavior and fails
+because the resumed attempt has no retry reason. The corrected store suite
+passes 42 tests, including progress, stale-worker, recovery, and success cleanup
+coverage. Two polling tests verify bounded logs and the unchanged deadline even
+when every poll reports another attempt. Eight unchanged native macOS Debug
+observer runs on two workers pass; the rebuilt fixed server passes another
+20/20 on two workers. All 272 metadata logic tests also pass. These runs do
+**not** reproduce or prove a
+fix for the original CI stall. Keep #846 open for that investigation; no restore
+timeout, observer rate, or progress assertion was relaxed.
+
+Reproduce using an isolated local Zig cache and a fresh report directory:
+
+```sh
+cd zig
+zig build antfly-api-restore-jobs-test --cache-dir /tmp/antfly-832-local-cache
+uv run --project e2e/antfly pytest -q e2e/antfly/test_restore_wait.py
+cd ..
+SKIP_BUILD=1 ANTFLY_BIN=/absolute/path/to/antfly \
+  ANTFLY_E2E_REGRESSION_WORKERS=2 ANTFLY_E2E_REGRESSION_REPEATS=4 \
+  ANTFLY_E2E_REGRESSION_REPORT_DIR=/tmp/restore-846-fresh \
+  scripts/ci/zig-e2e-regression-loop.sh \
+  e2e/antfly/test_backup_restore.py::test_cluster_restore_modes_with_concurrent_observers
+```
+
 ## 2026-09-21: source-vector status disappeared under contention (#845)
 
 [Issue #845](https://github.com/antflydb/antfly/issues/845) observed
