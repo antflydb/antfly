@@ -110,6 +110,15 @@ pub fn chunkInputWithProvider(
     input: RemoteInput,
     antfly_provider: ?chunk_provider.Provider,
 ) ![]RemoteChunk {
+    // An empty source has nothing to chunk. Short-circuit before any
+    // provider or remote dispatch: the inference endpoint rejects an empty
+    // input as a 400 that the retry classifier treats as transient, which
+    // turns a permanently empty document field into a retry loop instead of
+    // a clean zero-chunk skip.
+    switch (input) {
+        .text => |text| if (text.len == 0) return try alloc.alloc(RemoteChunk, 0),
+        .binary => |binary| if (binary.data.len == 0) return try alloc.alloc(RemoteChunk, 0),
+    }
     const execution: execution_context.Context = if (antfly_provider) |provider| provider.execution else .{};
     try execution.check(platform_time.monotonicNs());
     const linked_callback_available = if (antfly_provider) |provider|
@@ -523,6 +532,23 @@ test "antfly chunk request frames borrowed binary input without base64" {
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "empty chunk input short-circuits without provider or remote dispatch" {
+    const alloc = std.testing.allocator;
+    // An unreachable endpoint proves nothing was dispatched: a request
+    // would fail, an empty input returns zero chunks instead.
+    const cfg = chunking_types.Config{
+        .model = "fixed",
+        .api_url = "http://127.0.0.1:1/ai/v1/chunk",
+    };
+    const text_chunks = try chunkInput(alloc, cfg, .{ .text = "" });
+    defer freeRemoteChunks(alloc, text_chunks);
+    try std.testing.expectEqual(@as(usize, 0), text_chunks.len);
+
+    const binary_chunks = try chunkInput(alloc, cfg, .{ .binary = .{ .data = "", .mime_type = "application/pdf" } });
+    defer freeRemoteChunks(alloc, binary_chunks);
+    try std.testing.expectEqual(@as(usize, 0), binary_chunks.len);
 }
 
 test "antfly chunker text round trip" {
