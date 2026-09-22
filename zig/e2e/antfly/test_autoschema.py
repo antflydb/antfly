@@ -24,11 +24,17 @@ from test_resolution import (  # noqa: F401  (fixture re-export)
     resolution_cluster,
 )
 
-# The event key template uses `slug` (not `hash`) so the expected canonical
-# key is computable here without reimplementing xxhash64; the `hash` helper
-# has its own unit coverage in lib/resolver.
+# The event key template is the production compositional shape:
+# `event/{{ hash _entity.event_identity }}`. The exact key is discovered from
+# the live cluster (traversal / table queries) instead of predicted here, so
+# the hash path, the extractor-asserted predicate, and the participant
+# composition all execute on the cluster. The entity template's `x_` prefix
+# makes the canonical key segment differ from the raw mention slug, which
+# forces the sibling re-drive to RE-KEY every event onto its canonical
+# compositional identity — and the promoter to tombstone the provisional
+# document with a merged_into redirect.
 EVENT_TEXT = "Ada Lovelace writes the first program"
-EVENT_KEY = "event/ada_lovelace_writes_the_first_program"
+EVENT_TEXT_REWORDED = "The first program is written by Ada Lovelace"
 
 AUTOSCHEMA_INDEXES = {
     "knowledge_graph": {
@@ -53,11 +59,16 @@ AUTOSCHEMA_INDEXES = {
         ],
         "resolvers": [
             {
+                # Listed FIRST so its initial pass runs before the sibling
+                # entities resolution exists: the provisional raw-slug
+                # identity is minted deterministically, then the committed
+                # entities resolution re-drives this resolver onto the
+                # canonical x_-prefixed segments.
                 "name": "events",
                 "table": "events",
                 "source_artifact": "kg_v1",
                 "resolution_artifact": "events_resolution_v1",
-                "key_template": "event/{{ slug _entity.text }}",
+                "key_template": "event/{{ hash _entity.event_identity }}",
                 "labels": ["event"],
                 "config_generation": 1,
             },
@@ -70,26 +81,32 @@ AUTOSCHEMA_INDEXES = {
                 "table": "entities",
                 "source_artifact": "kg_v1",
                 "resolution_artifact": "entities_resolution_v1",
-                "key_template": "entity/{{ slug _entity.text }}",
+                "key_template": "entity/x_{{ slug _entity.text }}",
                 "config_generation": 1,
             },
         ],
     },
 }
 
-KG_DOCUMENT = {
-    "kg": {
-        "entities": [
-            {"id": "e0", "label": "person", "text": "Ada Lovelace"},
-            {"id": "e1", "label": "org", "text": "Antfly"},
-            {"id": "v0", "label": "event", "text": EVENT_TEXT},
-        ],
-        "relations": [
-            {"type": "works_at", "source": "e0", "target": "e1"},
-            {"type": "participates_in", "source": "e0", "target": "v0"},
-        ],
+def _kg_document(event_text: str) -> dict:
+    return {
+        "kg": {
+            "entities": [
+                {"id": "e0", "label": "person", "text": "Ada Lovelace"},
+                {"id": "e1", "label": "org", "text": "Antfly"},
+                {
+                    "id": "v0",
+                    "label": "event",
+                    "text": event_text,
+                    "predicate": "write",
+                },
+            ],
+            "relations": [
+                {"type": "works_at", "source": "e0", "target": "e1"},
+                {"type": "participates_in", "source": "e0", "target": "v0"},
+            ],
+        }
     }
-}
 
 
 def _wait_for_docs(
@@ -151,101 +168,137 @@ def test_label_routed_autograph_promotes_events_and_entities(resolution_cluster)
         deadline=_new_e2e_deadline(),
     )
 
-    api.insert("documents", "doc:a", KG_DOCUMENT, deadline=_new_e2e_deadline())
+    # Two documents describe the SAME event with different wordings: the
+    # sentence-hash design would mint two nodes, the compositional identity
+    # (sorted participant segments + extractor-asserted predicate through
+    # the `hash` helper) must converge them onto one.
+    api.insert("documents", "doc:a", _kg_document(EVENT_TEXT), deadline=_new_e2e_deadline())
+    api.insert("documents", "doc:b", _kg_document(EVENT_TEXT_REWORDED), deadline=_new_e2e_deadline())
 
-    # Label routing: entity mentions promote into `entities`, the event
-    # mention promotes into `events` under its slug-minted canonical key.
+    # Label routing: entity mentions promote into `entities` under the
+    # x_-prefixed canonical keys.
     _wait_for_docs(
         api,
         "entities",
-        {"entity/ada_lovelace": "Ada Lovelace", "entity/antfly": "Antfly"},
-        deadline=_new_e2e_deadline(),
-    )
-    _wait_for_docs(
-        api,
-        "events",
-        {EVENT_KEY: EVENT_TEXT},
+        {"entity/x_ada_lovelace": "Ada Lovelace", "entity/x_antfly": "Antfly"},
         deadline=_new_e2e_deadline(),
     )
 
-    # Partition, not duplication: the catch-all skipped the event mention, and
-    # the event resolver skipped the entity mentions. (The catch-all would have
-    # minted the event under `event/...` in `entities`; the event resolver
-    # would have minted `event/ada_lovelace` from the person mention.)
+    # One combined convergence poll (the cluster settles asynchronously and
+    # the walk can transiently observe the pre-re-drive provisional key):
+    # - a SINGLE depth-2 traversal from each document walks
+    #   doc -> entity -> event THROUGH the cross-table entity node (the API
+    #   read source proves the single-group snapshot complete; no
+    #   re-seeding);
+    # - both documents' differently-worded events reach the SAME hash-minted
+    #   compositional key;
+    # - the events table holds exactly one LIVE event — the provisional
+    #   raw-slug-identity document the promoter upserted before the sibling
+    #   re-drive is now a merged_into redirect, never an orphan.
+    event_key = _wait_for_converged_event(api, deadline=_new_e2e_deadline())
+    assert event_key.startswith("event/")
+    assert "ada_lovelace" not in event_key, event_key  # hash, not slug
+
+    # Partition, not duplication: the catch-all skipped the event mention.
     absent_deadline = _new_e2e_deadline()
-    assert _lookup_absent(api, "entities", EVENT_KEY, deadline=absent_deadline)
-    assert _lookup_absent(api, "events", "event/ada_lovelace", deadline=absent_deadline)
+    assert _lookup_absent(api, "entities", event_key, deadline=absent_deadline)
 
-    # Traversal walk across the resolved topology: hop 1 from the document
-    # reaches the canonical entity as a cross-table terminal; re-seeding the
-    # traversal at that entity key (a seed always expands) walks the
-    # entity-sourced relation edges to the org and the event. This is the
-    # doc -> entity -> entity/event chain the reviewer asked to see walked,
-    # done the way the distributed executor does it: one bounded hop per
-    # frontier, re-seeded at each cross-table node.
-    _wait_for_entity_walk(api, deadline=_new_e2e_deadline())
-
-    # Entity-sourced topology: once resolution lands, the works_at and
-    # participates_in relations re-render with the resolver-minted canonical
-    # keys as their topological source. Query-seeded personalized PageRank
-    # reads the raw edge snapshot, so seeding the person must push teleport
-    # mass onto its relation targets — the HippoRAG-style proof that the
-    # graph carries entity->entity/event topology instead of doc-mediated
-    # edges. (Traversal EXPANSION from a cross-table entity node remains the
-    # GRAPH.md-deferred entity node model; PageRank does not wait for it.)
+    # Entity-sourced topology: seeding the person pushes teleport mass onto
+    # its relation targets — the HippoRAG-style proof that the graph carries
+    # entity->entity/event topology instead of doc-mediated edges.
     _wait_for_seeded_mass(
         api,
-        seed="entity/ada_lovelace",
-        expect_positive={"entity/antfly", EVENT_KEY},
+        seed="entity/x_ada_lovelace",
+        expect_positive={"entity/x_antfly", event_key},
         deadline=_new_e2e_deadline(),
     )
 
 
-def _wait_for_entity_walk(api: _Api, *, deadline: _Deadline) -> None:
-    def traverse_nodes(start_key: str) -> set[str] | None:
-        payload = {
-            "graph_queries": {
-                "walk": {
-                    "index": "knowledge_graph",
-                    "traverse": {
-                        "start": {"keys": [start_key]},
-                        "direction": "both",
-                        "max_depth": 1,
-                        "limit": 20,
-                    },
-                }
-            },
-            "limit": 1,
-        }
-        try:
-            response = api.query_table(
-                "documents", payload, timeout=deadline.request_timeout()
-            )
-        except requests.RequestException as exc:
-            if not _transient_poll_error(exc):
-                raise
-            return None
-        result = (
-            (response.get("responses") or [{}])[0]
-            .get("graph_results", {})
-            .get("walk", {})
-        )
-        return {node.get("key") for node in result.get("nodes", [])}
+def _one_query_walk(api: _Api, start_key: str, timeout: float) -> str | None:
+    """One depth-2 traversal reaching entity AND event, no re-seeding.
 
-    last: tuple[set[str] | None, set[str] | None] | None = None
+    Returns the discovered event key (table provenance verified on the
+    cross-table nodes so identity stays table-qualified through the local
+    executor's complete-snapshot expansion), or None while unsettled.
+    """
+    payload = {
+        "graph_queries": {
+            "walk": {
+                "index": "knowledge_graph",
+                "traverse": {
+                    "start": {"keys": [start_key]},
+                    "direction": "out",
+                    "max_depth": 2,
+                    "limit": 20,
+                },
+            }
+        },
+        "limit": 1,
+    }
+    try:
+        response = api.query_table("documents", payload, timeout=timeout)
+    except requests.RequestException as exc:
+        if not _transient_poll_error(exc):
+            raise
+        return None
+    result = (
+        (response.get("responses") or [{}])[0]
+        .get("graph_results", {})
+        .get("walk", {})
+    )
+    nodes = {node.get("key"): node.get("table") for node in result.get("nodes", [])}
+    event_keys = [
+        key
+        for key, table in nodes.items()
+        if key and key.startswith("event/") and table == "events"
+    ]
+    if (
+        nodes.get("entity/x_ada_lovelace") == "entities"
+        and nodes.get("entity/x_antfly") == "entities"
+        and len(event_keys) == 1
+    ):
+        return event_keys[0]
+    return None
+
+
+def _live_events(api: _Api, timeout: float) -> tuple[list[str], dict[str, str]] | None:
+    """(live keys, tombstone -> merged_into) from the events table."""
+    payload = {"query": {"match_all": {}}, "limit": 20}
+    try:
+        response = api.query_table("events", payload, timeout=timeout)
+    except requests.RequestException as exc:
+        if not _transient_poll_error(exc):
+            raise
+        return None
+    hits = (response.get("responses") or [{}])[0].get("hits", {}).get("hits", [])
+    live: list[str] = []
+    redirects: dict[str, str] = {}
+    for hit in hits:
+        source = hit.get("_source") or {}
+        if source.get("merged_into"):
+            redirects[hit.get("_id")] = source["merged_into"]
+        else:
+            live.append(hit.get("_id"))
+    return live, redirects
+
+
+def _wait_for_converged_event(api: _Api, *, deadline: _Deadline) -> str:
+    last: tuple | None = None
     while not deadline.expired():
-        from_doc = traverse_nodes("doc:a")
-        from_entity = (
-            traverse_nodes("entity/ada_lovelace")
-            if from_doc and "entity/ada_lovelace" in from_doc
-            else None
-        )
-        last = (from_doc, from_entity)
-        if from_entity and {"entity/antfly", EVENT_KEY} <= from_entity:
-            return
+        timeout = deadline.request_timeout()
+        walk_a = _one_query_walk(api, "doc:a", timeout)
+        walk_b = _one_query_walk(api, "doc:b", timeout) if walk_a else None
+        events = _live_events(api, timeout)
+        last = (walk_a, walk_b, events)
+        if walk_a and walk_a == walk_b and events is not None:
+            live, redirects = events
+            if live == [walk_a] and all(
+                target == walk_a for target in redirects.values()
+            ):
+                return walk_a
         deadline.sleep(0.5)
     raise AssertionError(
-        f"traversal walk doc -> entity -> relation targets never completed: {last}\n"
+        f"compositional event convergence never settled: {last}\n"
         f"{api.server.debug_logs()}"
     )
 
