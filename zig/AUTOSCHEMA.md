@@ -237,9 +237,14 @@ Two identity rules learned the hard way (both shipped):
   ("A. Lovelace" into `entity/ada_lovelace`) re-keys the events it
   participates in instead of leaving them pinned to the stale surface-form
   slug. The fan-back terminates because byte-stable recomputes publish no
-  new resolution record. Remaining coarseness: two genuinely different
-  events with identical participants and predicate merge (no time
-  bucketing yet).
+  new resolution record. Re-keying never orphans: the promoter keeps a
+  durable promoted-keys row per resolution artifact and diffs it on
+  replay, so the previously promoted document becomes a merged_into
+  redirect (the matcher-scorer convention) in the same atomic batch as
+  the survivor's upsert; the entity sink's merge transform SETS the
+  redirect on the live document and clears stale redirects on live
+  promotions. Remaining coarseness: two genuinely different events with
+  identical participants and predicate merge (no time bucketing yet).
 
 Post-extraction junk control: `min_confidence` on a resolver floors mention
 admission (below-floor mentions mint no key, no mention edge, and relation
@@ -426,7 +431,7 @@ Missing for HippoRAG2/AutoSchemaKG-style retrieval:
 | 7 | Lite resolver registration | DONE: native Lite handles register a graph config's inline `resolvers` array on `antfly_db_add_index_json` (add/update only, mirroring nested-enrichment registration); resolution runs locally, promotion stays cleanly blocked without a cross-table entity sink and `runUntilIdle` drains around it. AddIndex is all-or-nothing: a rejected admission or partial enrichment/resolver registration restores the pre-call catalog |
 | 8 | Convergent identity layer | DONE: label-free `entity/{{ slug _entity.text }}` keys (label rides the document), possessive-stripping slug, compositional `event/{{ hash _entity.event_identity }}` event keys (participants + predicate, computed in lib/resolver, degrades to sentence text; requires at least one participant so a bare predicate never becomes a corpus-wide hub), `min_confidence` mention-admission floor on GraphResolverConfig. Participants compose their CANONICAL keys: the resolution runtime injects sibling resolutions (same-batch overlay + committed artifacts) and a committed resolution re-drives its source for the other resolvers, so entity merges re-key the events they touch. The entity-event and event-event passes are folded into ONE `kg_events_v1` pass so every event mention carries the participants its identity needs — a participant-less event-event pass would mint sentence-keyed nodes disconnected from the participates_in topology |
 | 9 | Cross-table traversal | DONE: self-table `target_table` tags canonicalize away (`TraversalRules.owning_table` locally, `canonicalizeTable` in the local MATCH readers); the direct storage entry points (embedded Lite) and the server executors expand THROUGH cross-table nodes — the API read source proves snapshot completeness for single-group tables and threads the scope down the executor vtables; the distributed coordinator fans an entity-tagged frontier across the SOURCE table's groups (owner-scoped entity-sourced rows) in addition to the tagged table's route, for expansion, weighted paths, and incoming probes. `paths.zig` keys identity by table. See Stage 2 |
-| 10 | Terminal-failure coverage | EXISTS in the engine (durable per-document coverage markers `produced/skipped/terminal_failed`, artifact repair ledger with per-doc `generation_error`, index-status coverage JSON); this branch surfaces it to embedded consumers (capi index stats carry the coverage counters; enrichment stats carry `stalled`/`stall_reason`/`skipped_source_count`) and documents `fatal_error_count` as the durable terminal-request counter. Follow-ups: hoist the server status coverage block beyond `index_type == .embeddings`; artifact-scoped coverage for producers with no consuming index (today: the repair ledger is the answer) |
+| 10 | Coverage beyond embeddings | DONE: asset and chunk producers record produced/skipped outcomes at every terminal point in both runtimes, attributed to their graph and full_text consumers ONLY (a produced chunk says nothing about its dense/sparse consumers, whose embedding lanes settle their own outcomes); the index-status coverage block now serves artifact-sourced graph/full_text indexes (direct-document projections stay coverage-silent instead of eternally pending); capi index stats carry the counters, enrichment stats carry `stalled`/`stall_reason`/`skipped_source_count`, and `fatal_error_count` is the durable terminal-request counter. The autoschema e2e and live run observe the pipeline through this block |
 | 11 | NLI triple verification stage | DESIGNED (Stage 1 section): `verifier` asset producer over the extraction artifact through the shipped `/ai/v1/extract` classification surface. The enrichment-layer blocker is CLOSED: asset-consumes-asset is plumbed end to end (admission validates the chain, planning orders upstream-first, both runtimes read upstream bytes as the producer source, replay converges missing-upstream consumers); only the `verifier` producer kind itself remains |
 
 ## Phases
