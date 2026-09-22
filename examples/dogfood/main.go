@@ -36,7 +36,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/antflydb/antfly/go/pkg/antflylite"
+	"github.com/antflydb/antfly/go/pkg/lite"
 )
 
 const (
@@ -318,10 +318,10 @@ func runStatusCmd(args []string) error {
 // `antfly inference run` server and sets RemoteProviderConfigured so
 // Status().Inference.Mode reports "remote_provider" rather than the default
 // caller-supplied/deferred mode.
-func liteOpenOptions(inferenceURL string) antflylite.OpenOptions {
-	opts := antflylite.OpenOptions{
-		Mode:    antflylite.OpenModeWriter,
-		Profile: antflylite.ProfileNative,
+func liteOpenOptions(inferenceURL string) lite.OpenOptions {
+	opts := lite.OpenOptions{
+		Mode:    lite.OpenModeWriter,
+		Profile: lite.ProfileNative,
 	}
 	if inferenceURL == "" {
 		// libantfly links the standalone inference runtime, so a Lite handle
@@ -336,18 +336,18 @@ func liteOpenOptions(inferenceURL string) antflylite.OpenOptions {
 	return opts
 }
 
-func openOrCreateLite(path, inferenceURL string) (*antflylite.DB, error) {
+func openOrCreateLite(path, inferenceURL string) (*lite.DB, error) {
 	opts := liteOpenOptions(inferenceURL)
 	if _, err := os.Stat(path); err == nil {
-		return antflylite.OpenWithOptions(path, opts)
+		return lite.OpenWithOptions(path, opts)
 	} else if !os.IsNotExist(err) {
 		return nil, err
 	}
-	return antflylite.CreateWithOptions(path, opts)
+	return lite.CreateWithOptions(path, opts)
 }
 
-func openExistingLite(path, inferenceURL string) (*antflylite.DB, error) {
-	return antflylite.OpenWithOptions(path, liteOpenOptions(inferenceURL))
+func openExistingLite(path, inferenceURL string) (*lite.DB, error) {
+	return lite.OpenWithOptions(path, liteOpenOptions(inferenceURL))
 }
 
 // requireInferenceProvider fails fast with a clear message when the
@@ -357,7 +357,7 @@ func openExistingLite(path, inferenceURL string) (*antflylite.DB, error) {
 // comment). Without this check, ingest would silently accumulate enrichment
 // debt with no producer able to satisfy it, or fail deep inside RunUntilIdle
 // with a much less clear error.
-func requireInferenceProvider(db *antflylite.DB, inferenceURL, extractModel string) error {
+func requireInferenceProvider(db *lite.DB, inferenceURL, extractModel string) error {
 	if inferenceURL == "" {
 		caps, err := db.Capabilities()
 		if err != nil {
@@ -474,7 +474,7 @@ type existingIndex struct {
 // (full_text, chunk_vectors, knowledge) that are not already present. Schema
 // application is idempotent; index creation is name-keyed and skipped when
 // the index already exists so `ingest` can be re-run without -reset.
-func ensureSchemaAndIndexes(db *antflylite.DB, cfg indexBuildConfig) error {
+func ensureSchemaAndIndexes(db *lite.DB, cfg indexBuildConfig) error {
 	if err := db.SetSchemaJSON(schemaJSON()); err != nil {
 		return fmt.Errorf("set schema: %w", err)
 	}

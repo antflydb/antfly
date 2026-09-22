@@ -8,7 +8,7 @@
 
 //go:build cgo
 
-package antflylite
+package lite
 
 /*
 #include "antfly.h"

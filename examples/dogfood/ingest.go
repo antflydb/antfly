@@ -22,7 +22,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/antflydb/antfly/go/pkg/antflylite"
+	"github.com/antflydb/antfly/go/pkg/lite"
 	"github.com/antflydb/antfly/go/pkg/docsaf"
 )
 
@@ -133,19 +133,19 @@ const ingestBatchSize = 200
 
 // ingestSections writes docSections to db in bounded batches, returning the
 // number of documents written.
-func ingestSections(db *antflylite.DB, sections []docSection) (int, error) {
+func ingestSections(db *lite.DB, sections []docSection) (int, error) {
 	written := 0
 	for start := 0; start < len(sections); start += ingestBatchSize {
 		end := min(start+ingestBatchSize, len(sections))
 		batch := sections[start:end]
 
-		writes := make([]antflylite.WriteIntent, 0, len(batch))
+		writes := make([]lite.WriteIntent, 0, len(batch))
 		for _, section := range batch {
 			value, err := json.Marshal(section.toDocument())
 			if err != nil {
 				return written, fmt.Errorf("marshal %s: %w", section.Key, err)
 			}
-			writes = append(writes, antflylite.WriteIntent{
+			writes = append(writes, lite.WriteIntent{
 				Key:   section.Key,
 				Value: value,
 			})

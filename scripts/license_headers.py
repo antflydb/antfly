@@ -42,7 +42,7 @@ APACHE_ROOTS = (
     "zig/pkg/inference",
     "zig/lib",
     "zig/e2e/inference",
-    "go/pkg/antflylite",
+    "go/pkg/lite",
     "go/pkg/docsaf",
     "go/pkg/evalaf",
     "go/pkg/genkit",

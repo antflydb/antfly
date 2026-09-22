@@ -14,7 +14,7 @@
 
 //go:build cgo
 
-package antflylite
+package lite
 
 import (
 	"encoding/json"

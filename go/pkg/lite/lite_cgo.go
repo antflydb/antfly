@@ -14,7 +14,7 @@
 
 //go:build cgo
 
-package antflylite
+package lite
 
 /*
 #cgo CFLAGS: -I${SRCDIR}/include -I${SRCDIR}/../../../zig/pkg/antfly/include
@@ -133,10 +133,10 @@ func compiledOpenOptionsSize() uint32 {
 // compile this Go binding.
 func ValidateABI() error {
 	if got := ABIVersion(); got != SupportedABIVersion {
-		return fmt.Errorf("antflylite: unsupported C ABI version %d, want %d", got, SupportedABIVersion)
+		return fmt.Errorf("lite: unsupported C ABI version %d, want %d", got, SupportedABIVersion)
 	}
 	if got, want := OpenOptionsSize(), compiledOpenOptionsSize(); got != want {
-		return fmt.Errorf("antflylite: C ABI open options size %d, compiled header size %d", got, want)
+		return fmt.Errorf("lite: C ABI open options size %d, compiled header size %d", got, want)
 	}
 	return nil
 }

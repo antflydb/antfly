@@ -22,12 +22,12 @@ Antfly Lite embeds Antfly directly in an application process with a live
 `.aflite` database file. The first Lite binding above Zig and C is Go:
 
 ```bash
-go get github.com/antflydb/antfly/go/pkg/antflylite
+go get github.com/antflydb/antfly/go/pkg/lite
 ```
 
 The Lite binding is separate from the network SDK. Use
 `github.com/antflydb/antfly/go/pkg/sdk` for a running Antfly service and
-`github.com/antflydb/antfly/go/pkg/antflylite` for embedded local databases.
+`github.com/antflydb/antfly/go/pkg/lite` for embedded local databases.
 
 See the [Antfly Lite guide](/docs/guides/lite) for CLI and Go embedded
 examples, plus backup, restore, and promotion between Lite and a running

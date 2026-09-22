@@ -6,9 +6,9 @@
 //
 //     https://www.antfly.io/licensing/ELv2-license
 
-// Package antflylite provides Go bindings for embedded Antfly Lite databases.
+// Package lite provides Go bindings for embedded Antfly Lite databases.
 //
 // The package is backed by the stable Antfly C ABI. The Go module carries
 // the matching antfly.h header; build or install libantfly before
 // running cgo-backed tests or binaries.
-package antflylite
+package lite

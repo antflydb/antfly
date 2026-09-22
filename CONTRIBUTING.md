@@ -7,7 +7,7 @@ zig/pkg/antfly/      Antfly server, CLI, storage, Raft, and embedded runtime
 zig/pkg/inference/   Local inference runtime
 zig/e2e/             Zig runtime end-to-end suites
 go/pkg/
-  antflylite/         Go binding for embedded Antfly Lite
+  lite/              Go binding for embedded Antfly Lite
   sdk/               Go SDK
   docsaf/            Content ingestion (filesystem, web crawl, git, S3)
   evalaf/            LLM/RAG evaluation framework
@@ -102,7 +102,7 @@ The repository contains multiple independent Go modules (no `go.work`). Each mus
 
 | Module | Directory |
 |--------|-----------|
-| Antfly Lite binding | `go/pkg/antflylite/` |
+| Antfly Lite binding | `go/pkg/lite/` |
 | Go SDK | `go/pkg/sdk/` |
 | Operator | `go/pkg/operator/` |
 | Proxies (Antfly gateway, inference) | `go/pkg/proxy/` |

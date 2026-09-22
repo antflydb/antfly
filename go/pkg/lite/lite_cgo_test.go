@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build cgo && antflylite_capi
+//go:build cgo && libantfly
 
-package antflylite
+package lite
 
 import (
 	"bytes"

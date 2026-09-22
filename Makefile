@@ -8,7 +8,7 @@ SCRIPTS_PY ?= uv run --project scripts --locked python
 # Use Go 1.26 with SIMD experiment enabled for hardware SIMD acceleration
 GO := GOWORK=off GOEXPERIMENT=simd go
 GO_MODULES := \
-	./go/pkg/antflylite \
+	./go/pkg/lite \
 	./go/pkg/sdk \
 	./go/pkg/proxy \
 	./go/pkg/operator \

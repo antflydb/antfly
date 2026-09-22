@@ -359,11 +359,11 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "go",
         "test",
         "-tags",
-        "antflylite_capi",
+        "libantfly",
         "-count=1",
         "./...",
     });
-    run_lite_go_tests.setCwd(b.path("../go/pkg/antflylite"));
+    run_lite_go_tests.setCwd(b.path("../go/pkg/lite"));
     run_lite_go_tests.step.dependOn(&install_libantfly.step);
     run_lite_go_tests.step.dependOn(&install_capi_header.step);
     const lite_go_test_step = b.step("lite-go-test", "Run Go Antfly Lite binding tests against libantfly");

@@ -260,7 +260,7 @@ _ = try antfly.db.copyStableLiteSnapshotFile(
 Go is the first binding above Zig and C:
 
 ```bash
-go get github.com/antflydb/antfly/go/pkg/antflylite
+go get github.com/antflydb/antfly/go/pkg/lite
 ```
 
 ```go
@@ -269,17 +269,17 @@ package main
 import (
 	"log"
 
-	"github.com/antflydb/antfly/go/pkg/antflylite"
+	"github.com/antflydb/antfly/go/pkg/lite"
 )
 
 func main() {
-	db, err := antflylite.Create("go-app.aflite")
+	db, err := lite.Create("go-app.aflite")
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer db.Close()
 
-	err = db.Batch([]antflylite.WriteIntent{{
+	err = db.Batch([]lite.WriteIntent{{
 		Key:   "doc:go:1",
 		Value: []byte(`{"title":"embedded go lite"}`),
 	}}, 1)
@@ -295,7 +295,7 @@ func main() {
 }
 ```
 
-`Create` is the explicit first-use path; `Open` takes an existing file and never creates or upgrades one. Constants such as `antflylite.InferenceModeCallerSuppliedArtifacts` and `antflylite.InferenceModeDisabledDeferred` let you branch on status without hard-coding strings. Building from the source tree means building the C ABI first (see below, then `go test -tags antflylite_capi ./...` in `go/pkg/antflylite`). Two runnable templates live in the repository: `examples/antfly-lite-go` (create, write, lookup, status, backup) and `examples/antfly-lite-retrieval-go` (schema, full-text and dense indexes with caller-supplied embeddings, hybrid search, backup). Both are gated by `zig build lite-test` against the built `libantfly`.
+`Create` is the explicit first-use path; `Open` takes an existing file and never creates or upgrades one. Constants such as `lite.InferenceModeCallerSuppliedArtifacts` and `lite.InferenceModeDisabledDeferred` let you branch on status without hard-coding strings. Building from the source tree means building the C ABI first (see below, then `go test -tags libantfly ./...` in `go/pkg/lite`). Two runnable templates live in the repository: `examples/antfly-lite-go` (create, write, lookup, status, backup) and `examples/antfly-lite-retrieval-go` (schema, full-text and dense indexes with caller-supplied embeddings, hybrid search, backup). Both are gated by `zig build lite-test` against the built `libantfly`.
 
 ## Building from Source
 

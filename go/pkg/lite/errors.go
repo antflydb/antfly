@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package antflylite
+package lite
 
 // ErrorCode is a stable Antfly C ABI error code.
 type ErrorCode uint32

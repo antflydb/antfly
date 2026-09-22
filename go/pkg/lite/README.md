@@ -1,6 +1,6 @@
 # Antfly Lite Go Binding
 
-`go/pkg/antflylite` is the first language binding above the stable Zig APIs and
+`go/pkg/lite` is the first language binding above the stable Zig APIs and
 the `libantfly` C ABI. It wraps the Lite open/storage profile in that ABI, so
 applications embed a live `.aflite` database directly instead of talking to the
 network SDK.
@@ -12,8 +12,8 @@ C library before running cgo-backed tests:
 ```sh
 cd zig
 zig build capi
-cd ../go/pkg/antflylite
-go test -tags antflylite_capi ./...
+cd ../go/pkg/lite
+go test -tags libantfly ./...
 ```
 
 Outside the source tree, install an Antfly CLI release package or archive that
@@ -42,10 +42,12 @@ library and no extra link flags. This makes `libantfly` a much larger shared
 library than before inference was embedded by default; there is no smaller
 inference-free variant to link against instead.
 
-Normal `go test ./...` does not run the C ABI smoke test. The
-`antflylite_capi` tag is intentional so package consumers do not need a freshly
-built `libantfly` unless they are testing the local binding against the
-source-tree C library.
+Normal `go test ./...` does not run the C ABI smoke test. The `libantfly`
+build tag means "a built `libantfly` is available to link"; it is not
+Lite-specific, because the C ABI itself is storage-neutral. Without it, test
+binaries would fail at link time, so package consumers and repository-wide
+`go test ./...` runs do not need a freshly built `libantfly` unless they are
+testing the binding against the source-tree C library.
 
 The open helpers call `ValidateABI` before filling C option structures or
 creating handles. Applications can call `ValidateABI` at startup to fail fast

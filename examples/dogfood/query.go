@@ -19,7 +19,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/antflydb/antfly/go/pkg/antflylite"
+	"github.com/antflydb/antfly/go/pkg/lite"
 )
 
 // searchHitHierarchy is the ancestry envelope QueryHit carries for a chunk or
@@ -99,7 +99,7 @@ const (
 // enrichment worker never started for a remote-provider handle -- see the
 // dogfood README's "Known limitations" section), runQuery falls back to
 // full-text-only search rather than failing outright.
-func runQuery(db *antflylite.DB, text string, limit int) error {
+func runQuery(db *lite.DB, text string, limit int) error {
 	// Antfly embeds the semantic_search text itself through the index's
 	// configured embedder (the handle's in-process runtime, or the index's
 	// api_url provider), exactly like the server does. The match form scores
@@ -205,7 +205,7 @@ func runQuery(db *antflylite.DB, text string, limit int) error {
 // traverseKnowledgeGraph runs a both-direction breadth-first traversal from
 // startKey over the knowledge graph index and returns the reached node keys
 // (decoded from base64), including nodes at every depth up to maxDepth.
-func traverseKnowledgeGraph(db *antflylite.DB, startKey string, maxDepth uint32) ([]string, error) {
+func traverseKnowledgeGraph(db *lite.DB, startKey string, maxDepth uint32) ([]string, error) {
 	req := traverseEdgesRequest{
 		IndexName:        knowledgeGraphIndex,
 		StartKeyB64:      base64.StdEncoding.EncodeToString([]byte(startKey)),
@@ -245,7 +245,7 @@ type resolvedEdge struct {
 // collectGraphNeighborhood fetches the direct edges (both directions) of
 // every node in nodeKeys and returns the deduplicated entity node set
 // (non-"doc:" keys) and the deduplicated edge set.
-func collectGraphNeighborhood(db *antflylite.DB, nodeKeys map[string]bool) ([]string, []resolvedEdge, error) {
+func collectGraphNeighborhood(db *lite.DB, nodeKeys map[string]bool) ([]string, []resolvedEdge, error) {
 	entitySet := make(map[string]bool)
 	edgeSeen := make(map[string]bool)
 	var edges []resolvedEdge
@@ -293,7 +293,7 @@ func isDocumentKey(key string) bool {
 
 // runEntity prints the direct (both-direction) edges of a named entity node
 // in the knowledge graph.
-func runEntity(db *antflylite.DB, name string) error {
+func runEntity(db *lite.DB, name string) error {
 	raw, err := db.EdgesJSON(knowledgeGraphIndex, name, "", edgeDirectionBoth)
 	if err != nil {
 		return fmt.Errorf("get edges for %q: %w", name, err)
