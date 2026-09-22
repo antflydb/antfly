@@ -11,7 +11,13 @@ Antfly Lite database (`.aflite`) and builds a small knowledge graph over them:
   entities such as `component`, `subsystem`, `file`, `test`, `invariant`,
   `decision`, `person`, `model`, `backend`, `format`, `protocol`, and relation
   types `depends_on`, `owns`, `implements`, `supersedes`, `tested_by`,
-  `documented_in`.
+  `documented_in`. An entity resolver canonicalizes every mention into a
+  label-free `entity/<slug>` node (`entity/metadata_server`; the label stays
+  a mention/document attribute so differently labeled mentions of one name
+  converge), relations
+  materialize as real entity->entity edges (owned by the producing section
+  for retirement), and each section gets `mentions` edges to the canonical
+  entities it references.
 - **Hybrid search**: full-text search over the default full-text index merged
   (RRF) with semantic search over the chunk embeddings, followed by a
   depth-2, both-direction traversal of the knowledge graph starting from the
@@ -103,7 +109,9 @@ GOWORK=off go run . status
   default `full_text_index_v0` that Lite provisions on create (adding it only
   for older libantfly builds), adds the two indexes (`chunk_vectors`,
   `knowledge`), walks the corpus, writes one document per markdown section,
-  and drains chunk/embed/extract work with `RunUntilIdle`.
+  and drains chunk/embed/extract/resolution work with `RunUntilIdle`. When
+  the indexes already exist their configuration is verified against this
+  run's flags (see `verify.go`) and drift is a hard error naming `-reset`.
 - `dogfood query "<text>" [-inference-url URL]` runs the hybrid search:
   `full_text_search` (match form, so a natural-language question scores every
   term) merged by RRF with `semantic_search`, which Antfly embeds itself
@@ -149,9 +157,19 @@ admitting the index; see `index_config.go`.
    "antfly"`, `model: fastino/gliner2.5-base-v1`, `long_document: {mode:
    "window"}`) over each section body with the entity/relation schema above,
    `include_confidence`/`include_spans`, and a `pagerank` metric (retried
-   once without `metrics` if the engine rejects it). Edges use the canonical
-   extraction envelope (`$.relations[*]` with `source.entity_index` /
-   `target.entity_index`).
+   once without `metrics` if the engine rejects it). The config also declares
+   an `entities` **resolver** (`key_template: "entity/{{ slug _entity.text
+   }}"`, `min_confidence: 0.5` to drop low-score junk), which Lite registers
+   from the same
+   `antfly_db_add_index_json` call. GLiNER relations reference entities
+   positionally (`$.relations[*]` with `source.entity_index` /
+   `target.entity_index`); the materializer resolves those positions against
+   the resolver's canonical keys, so `A depends_on B` is a real
+   `component/a -> component/b` edge (document-owned in the artifact key for
+   retirement), withheld until the section's resolution artifact lands and
+   re-rendered canonically by the resolution replay. `mention_edge_type:
+   "mentions"` adds `doc:... --mentions--> entity/<slug>` provenance edges,
+   which is what bridges search hits into the entity graph.
 3. `full_text_index_v0`: the table's default full-text index, provisioned by
    every Lite creation surface (C ABI, embedded package, `antfly lite init`).
 
@@ -204,9 +222,15 @@ What remains:
   matches fp32 on 61 of 62 pinned confidence values, but one value misses
   the 5e-4 tolerance by about 18% on both backends, so it stays
   unqualified.
-- Entity node names are the extractor's surface strings (for example
-  `Raft`, `Full-cluster v42`), so `dogfood entity` needs the exact extracted
-  text; there is no entity resolution step in this example.
+- Entity nodes are canonical label-free `entity/<slug>` keys minted
+  deterministically by the resolver (`entity/raft`); `dogfood entity`
+  slugifies a bare name into that namespace. Canonical entity *documents* are minted for
+  the `entities` table by the promotion stage, which stays pending in
+  embedded Lite (no cross-table entity sink); the graph topology, mention
+  edges, and canonical keys do not depend on it.
+- Re-ingesting without `-reset` reconciles changed sections but does not
+  discover deleted files (path/heading-derived keys are upsert-only);
+  deleting a stale section's document does retire its owned graph facts.
 
 ## Files
 
@@ -218,6 +242,11 @@ What remains:
   `MarkdownProcessor`), document shaping, batched writes.
 - `query.go` -- hybrid search (with full-text fallback), graph
   traversal/edge lookup, and the `entity` command.
-- `smoke_test.go` -- a small test that adds the three indexes against a real
-  `libantfly` and checks it is idempotent. It does not exercise ingest or
+- `verify.go` -- drift verification for pre-existing indexes: re-running
+  `ingest` with a different extractor, embedding model, chunk geometry, or a
+  changed schema in `index_config.go` fails with a rebuild instruction
+  instead of silently keeping the old configuration.
+- `smoke_test.go` -- tests that add the three indexes against a real
+  `libantfly`, check idempotence, and check that changed settings are
+  rejected against an existing database. It does not exercise ingest or
   query (those need a running `antfly inference run` and pulled models).

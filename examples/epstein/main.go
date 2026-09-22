@@ -1464,6 +1464,7 @@ func loadCmd(args []string) error {
 	artifactRelationLabels := fs.String("artifact-relation-labels", DefaultRelationLabels, "Artifact extractor relation labels (comma-separated)")
 	autoschema := fs.Bool("autoschema", false, "Provision the AutoSchemaKG pipeline: entity/event extraction, resolution, and conceptualization (requires --create-table)")
 	autoschemaModel := fs.String("autoschema-model", DefaultAutoschemaModel, "Antfly generative model shared by the AutoSchemaKG extractors and conceptualizer")
+	autoschemaGlinerModel := fs.String("autoschema-gliner-model", DefaultAutoschemaGlinerModel, "GLiNER2.5 extraction model for the fast closed-schema autoschema lane (empty disables the lane)")
 
 	if err := fs.Parse(args); err != nil {
 		return fmt.Errorf("failed to parse flags: %w", err)
@@ -1523,7 +1524,7 @@ func loadCmd(args []string) error {
 			if err := provisionAutoschemaTables(ctx, client, *autoschemaModel, *inferenceURL); err != nil {
 				return fmt.Errorf("failed to provision autoschema tables: %w", err)
 			}
-			kgIndex, err := createAutoschemaKnowledgeGraphIndex(*autoschemaModel, *inferenceURL)
+			kgIndex, err := createAutoschemaKnowledgeGraphIndex(*autoschemaModel, *autoschemaGlinerModel, *inferenceURL)
 			if err != nil {
 				return fmt.Errorf("failed to create knowledge graph index config: %w", err)
 			}
@@ -1535,7 +1536,7 @@ func loadCmd(args []string) error {
 			autoschemaDocIndexes = []autoschemaRequiredIndex{{
 				name:        AutoschemaKnowledgeGraphIndex,
 				request:     *kgRequest,
-				enrichments: []string{AutoschemaEntityEntityAsset, AutoschemaEntityEventAsset, AutoschemaEventEventAsset},
+				enrichments: autoschemaRequiredEnrichments(*autoschemaGlinerModel),
 			}}
 		}
 
@@ -1619,6 +1620,7 @@ func syncCmd(args []string) error {
 	artifactRelationLabels := fs.String("artifact-relation-labels", DefaultRelationLabels, "Artifact extractor relation labels (comma-separated)")
 	autoschema := fs.Bool("autoschema", false, "Provision the AutoSchemaKG pipeline: entity/event extraction, resolution, and conceptualization (requires --create-table)")
 	autoschemaModel := fs.String("autoschema-model", DefaultAutoschemaModel, "Antfly generative model shared by the AutoSchemaKG extractors and conceptualizer")
+	autoschemaGlinerModel := fs.String("autoschema-gliner-model", DefaultAutoschemaGlinerModel, "GLiNER2.5 extraction model for the fast closed-schema autoschema lane (empty disables the lane)")
 	noHeaderFooter := fs.Bool("no-header-footer-detection", false, "Disable header/footer detection (faster)")
 	noMirroredRepair := fs.Bool("no-mirrored-text-repair", false, "Disable mirrored text repair (faster)")
 	var zipPaths StringSliceFlag
@@ -1685,7 +1687,7 @@ func syncCmd(args []string) error {
 			if err := provisionAutoschemaTables(ctx, client, *autoschemaModel, *inferenceURL); err != nil {
 				return fmt.Errorf("failed to provision autoschema tables: %w", err)
 			}
-			kgIndex, err := createAutoschemaKnowledgeGraphIndex(*autoschemaModel, *inferenceURL)
+			kgIndex, err := createAutoschemaKnowledgeGraphIndex(*autoschemaModel, *autoschemaGlinerModel, *inferenceURL)
 			if err != nil {
 				return fmt.Errorf("failed to create knowledge graph index config: %w", err)
 			}
@@ -1697,7 +1699,7 @@ func syncCmd(args []string) error {
 			autoschemaDocIndexes = []autoschemaRequiredIndex{{
 				name:        AutoschemaKnowledgeGraphIndex,
 				request:     *kgRequest,
-				enrichments: []string{AutoschemaEntityEntityAsset, AutoschemaEntityEventAsset, AutoschemaEventEventAsset},
+				enrichments: autoschemaRequiredEnrichments(*autoschemaGlinerModel),
 			}}
 		}
 

@@ -207,6 +207,10 @@ Flags:
                     Antfly generative model shared by the AutoSchemaKG
                     extractors and conceptualizer
                     (default: ggml-org/gemma-4-E4B-it-GGUF)
+  --autoschema-gliner-model
+                    GLiNER2.5 extraction model for the fast closed-schema
+                    autoschema lane; "" disables the lane
+                    (default: fastino/gliner2.5-base-v1)
 ```
 
 ### AutoSchemaKG mode
@@ -224,7 +228,22 @@ Construction through Dynamic Schema Induction from Web-Scale Corpora*
   label-routed resolvers that promote `event`-labelled mentions into an
   `events` table (`event/{{ hash _entity.text }}` keys) and every other
   mention into an `entities` table
-  (`{{ lower _entity.label }}/{{ slug _entity.text }}` keys).
+  (label-free `entity/{{ slug _entity.text }}` keys; the extractor's label
+  rides the promoted document as `entity_type`, never the key, so mentions
+  labeled differently by different passes still converge on one node).
+- A fourth, GLiNER2.5-powered extraction lane (`kg_gliner_v1`, disable with
+  `--autoschema-gliner-model ""`): a fast `extractor` asset producer with a
+  closed entity/relation schema (person, organization, location, date;
+  `employed_by`, `located_in`, `traveled_with`, `met_with`,
+  `associated_with`) feeding the same `knowledge_graph` index as an
+  `extraction_relation` source. GLiNER relations reference entities
+  positionally (`entity_index`); the lane's own catch-all resolver mints the
+  SAME label-free `entity/{{ slug _entity.text }}` canonical keys as the
+  LLM lanes, so both extractors' edges converge on shared entity nodes
+  regardless of how each extractor labeled the mention, and a
+  `min_confidence` floor drops low-score junk before it mints nodes.
+  The LLM stages keep the paper's open-vocabulary verb-phrase relations,
+  which a closed-schema extractor cannot express.
 - A recursive conceptualization autograph on the `entities` table: the
   `conceptualize_v1` enrichment abstracts each promoted entity into three or
   more concept phrases (grounded by `neighbor_context` sampling of the

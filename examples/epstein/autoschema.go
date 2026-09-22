@@ -45,7 +45,14 @@ const (
 	AutoschemaEntityEntityAsset = "kg_ee_v1"
 	AutoschemaEntityEventAsset  = "kg_ev_v1"
 	AutoschemaEventEventAsset   = "kg_vv_v1"
+	AutoschemaGlinerAsset       = "kg_gliner_v1"
 	AutoschemaConceptAsset      = "conceptualize_v1"
+
+	// DefaultAutoschemaGlinerModel is the production-qualified GLiNER2.5
+	// boundary checkpoint (zig/pkg/inference/models/gliner2/GLINER25.md). The
+	// GLiNER lane is a fast, closed-schema extraction source that runs
+	// alongside the LLM stages; --autoschema-gliner-model "" disables it.
+	DefaultAutoschemaGlinerModel = "fastino/gliner2.5-base-v1"
 
 	AutoschemaEntitiesTable = "entities"
 	AutoschemaEventsTable   = "events"
@@ -73,7 +80,8 @@ const (
 		"as a simple normalized sentence. Additionally, identify all the entities that participated in the " +
 		"events. Do not use ellipses. Call the emit_graph tool exactly once: list each event under " +
 		"\"entities\" with label \"event\" and its text set to the normalized simple sentence describing the " +
-		"event; list each participating entity with a short lowercase label and its text; for every entity " +
+		"event, plus a predicate field holding the event's main verb as a single lowercase lemma; " +
+		"list each participating entity with a short lowercase label and its text; for every entity " +
 		"that participates in an event, add a relation of type \"participates_in\" from the entity id to the " +
 		"event id, with a short evidence span from the passage. Extract only what the passage itself states: never invent entities, events, or relations that are not present, and never reuse examples from these instructions. If the passage is empty, unreadable, or contains nothing to extract, call the tool with empty \"entities\" and \"relations\" arrays. Here is the passage:"
 
@@ -82,7 +90,8 @@ const (
 		"relationships between the events using only the relation types before, after, concurrent, because, " +
 		"and as_result. Each relation should be specific, meaningful, and able to stand alone. Do not use " +
 		"ellipses. Call the emit_graph tool exactly once: list each event under \"entities\" with label " +
-		"\"event\" and its text set to the simple sentence describing the event; list each temporal or " +
+		"\"event\", its text set to the simple sentence describing the event, and a predicate field " +
+		"holding the event's main verb as a single lowercase lemma; list each temporal or " +
 		"causal relation under \"relations\" with the source and target event ids and a short evidence span " +
 		"from the passage. Extract only what the passage itself states: never invent entities, events, or relations that are not present, and never reuse examples from these instructions. If the passage is empty, unreadable, or contains nothing to extract, call the tool with empty \"entities\" and \"relations\" arrays. Here is the passage:"
 
@@ -220,6 +229,56 @@ func autoschemaGeneratorProducerJSON(model, inferenceAPIURL, toolName, toolDescr
 	return string(encoded), nil
 }
 
+// GLiNER lane vocabulary: a closed schema, unlike the LLM stages'
+// open-vocabulary verb phrases (GLiNER2.5 relation extraction requires the
+// relation types up front). The lane trades expressiveness for speed and
+// determinism; the LLM stages keep the paper's open extraction.
+var (
+	autoschemaGlinerEntityLabels = []string{
+		"person", "organization", "location", "date",
+	}
+	autoschemaGlinerRelationTypes = []string{
+		"employed_by", "located_in", "traveled_with", "met_with", "associated_with",
+	}
+)
+
+// autoschemaGlinerProducerJSON serializes the GLiNER2.5 extractor asset
+// producer for the fast entity/relation lane, mirroring
+// examples/dogfood/index_config.go's knowledgeGraphConfig producer: windowed
+// long-document execution, confidence and spans included. GLiNER emits
+// id-less entities referenced positionally by each relation's entity_index;
+// the resolver and materializer resolve those under decimal positional local
+// ids (lib/resolver parseExtractionEntities, db.zig
+// graphArtifactEntityAtIndex).
+func autoschemaGlinerProducerJSON(model, inferenceAPIURL string) (string, error) {
+	relationSchemas := make([]map[string]any, 0, len(autoschemaGlinerRelationTypes))
+	for _, t := range autoschemaGlinerRelationTypes {
+		relationSchemas = append(relationSchemas, map[string]any{"type": t})
+	}
+	producer := map[string]any{
+		"type": "extractor",
+		"config": map[string]any{
+			"provider": "antfly",
+			"model":    model,
+			"api_url":  inferenceAPIURL,
+			"schema": map[string]any{
+				"entities":  autoschemaGlinerEntityLabels,
+				"relations": relationSchemas,
+			},
+			"options": map[string]any{
+				"include_confidence": true,
+				"include_spans":      true,
+				"long_document":      map[string]any{"mode": "window"},
+			},
+		},
+	}
+	encoded, err := json.Marshal(producer)
+	if err != nil {
+		return "", fmt.Errorf("marshal %s producer config: %w", AutoschemaGlinerAsset, err)
+	}
+	return string(encoded), nil
+}
+
 // autoschemaExtractionEnrichments declares the three Stage 1 asset enrichments
 // on the documents table. Multiple asset artifacts for one graph index are
 // declared through the index-level `enrichments` field (the graph shorthand
@@ -302,14 +361,18 @@ func autoschemaExtractionEnrichments(model, inferenceAPIURL string) ([]antfly.En
 
 // createAutoschemaKnowledgeGraphIndex builds the Stage 1+2 "knowledge_graph"
 // index for the documents table: three extraction_graph sources merged in
-// declaration order plus label-routed resolvers.
+// declaration order plus label-routed resolvers, and (when glinerModel is
+// non-empty) a fourth extraction_relation source fed by a GLiNER2.5
+// extractor — a fast, closed-schema lane whose positional entity_index
+// endpoints canonicalize through its own resolver exactly like the LLM
+// stages' id-carrying payloads.
 //
 // Resolvers are scoped to one source artifact each (GraphResolverConfig's
 // source_artifact is required and singular, and sibling label disjointness is
 // enforced per artifact), so the doc's "two resolvers" become one
 // events/catch-all pair per artifact that can emit that mention class, each
 // with its own resolution artifact name.
-func createAutoschemaKnowledgeGraphIndex(model, inferenceURL string) (*antfly.IndexConfig, error) {
+func createAutoschemaKnowledgeGraphIndex(model, glinerModel, inferenceURL string) (*antfly.IndexConfig, error) {
 	if strings.TrimSpace(model) == "" {
 		return nil, fmt.Errorf("autoschema model is required")
 	}
@@ -323,31 +386,77 @@ func createAutoschemaKnowledgeGraphIndex(model, inferenceURL string) (*antfly.In
 		return nil, err
 	}
 
-	sources, err := antfly.NewGraphIndexSources(
-		antfly.GraphArtifactSourceConfig{
+	sourceConfigs := []antfly.GraphArtifactSourceConfig{
+		{
 			Artifact:        AutoschemaEntityEntityAsset,
 			Format:          antfly.GraphArtifactSourceConfigFormatExtractionGraph,
 			MentionEdgeType: "mentions",
 		},
-		antfly.GraphArtifactSourceConfig{
+		{
 			Artifact:        AutoschemaEntityEventAsset,
 			Format:          antfly.GraphArtifactSourceConfigFormatExtractionGraph,
 			MentionEdgeType: "mentions",
 		},
-		antfly.GraphArtifactSourceConfig{
+		{
 			Artifact:        AutoschemaEventEventAsset,
 			Format:          antfly.GraphArtifactSourceConfigFormatExtractionGraph,
 			MentionEdgeType: "mentions",
 		},
-	)
+	}
+	glinerEnabled := strings.TrimSpace(glinerModel) != ""
+	if glinerEnabled {
+		edgeType, err := antfly.NewGraphTemplateValue("{{ _item.type }}")
+		if err != nil {
+			return nil, fmt.Errorf("build gliner edge type template: %w", err)
+		}
+		edgeWeight, err := antfly.NewGraphTemplateValue("{{ _item.score }}")
+		if err != nil {
+			return nil, fmt.Errorf("build gliner edge weight template: %w", err)
+		}
+		sourceConfigs = append(sourceConfigs, antfly.GraphArtifactSourceConfig{
+			Artifact:        AutoschemaGlinerAsset,
+			Format:          antfly.GraphArtifactSourceConfigFormatExtractionRelation,
+			Path:            "$.relations[*]",
+			MentionEdgeType: "mentions",
+			Edge: oapi.GraphArtifactEdgeMappingConfig{
+				Type:   edgeType,
+				Weight: edgeWeight,
+			},
+		})
+		glinerProducer, err := autoschemaGlinerProducerJSON(glinerModel, inferenceAPIURL)
+		if err != nil {
+			return nil, err
+		}
+		enrichments = append(enrichments, antfly.EnrichmentConfig{
+			Name:         AutoschemaGlinerAsset,
+			Kind:         antfly.EnrichmentKindAsset,
+			Field:        "content",
+			ContentType:  "application/json",
+			ProducerJson: glinerProducer,
+		})
+	}
+	sources, err := antfly.NewGraphIndexSources(sourceConfigs...)
 	if err != nil {
 		return nil, fmt.Errorf("build knowledge graph sources: %w", err)
 	}
 
-	entityKeyTemplate := "{{ lower _entity.label }}/{{ slug _entity.text }}"
-	// Event keys hash the normalized event sentence so re-extraction converges
-	// on the same event documents across replays.
-	eventKeyTemplate := "event/{{ hash _entity.text }}"
+	// Label-free entity keys: the extractor's label is a per-chunk guess, and
+	// baking it into the key splits "Antfly the organization" and "Antfly the
+	// product" into nodes that can never be joined (SearchAF shipped exactly
+	// that and had to delete the rows). The label rides the promoted entity
+	// document as entity_type instead; homonym collapse ("washington" the
+	// person vs the place) is the accepted trade-off until the matcher-scorer
+	// phase, because a split node silently starves retrieval while a merged
+	// node is at least visible and curable.
+	entityKeyTemplate := "entity/{{ slug _entity.text }}"
+	// Compositional event identity (lib/resolver computes it from the
+	// artifact's relations): sorted participant slugs + the asserted
+	// predicate, degrading to the normalized sentence text when either is
+	// missing. Replay-stable AND convergent: two differently worded sentences
+	// about the same participants and action mint the same event document,
+	// which is what lets participates_in mass accumulate on shared events.
+	// Stability alone (hashing the sentence) is necessary but not sufficient.
+	eventKeyTemplate := "event/{{ hash _entity.event_identity }}"
 
 	cfg := antfly.GraphIndexConfig{
 		Sources: sources,
@@ -416,6 +525,33 @@ func createAutoschemaKnowledgeGraphIndex(model, inferenceURL string) (*antfly.In
 			},
 		},
 	}
+	if glinerEnabled {
+		cfg.Resolvers = append(cfg.Resolvers, oapi.GraphResolverConfig{
+			// kg_gliner_v1's schema pins a closed entity-label set; the same
+			// entityKeyTemplate makes GLiNER mentions converge on the SAME
+			// canonical entity documents as the LLM lanes ("Jeffrey Epstein"
+			// -> person/jeffrey_epstein from either extractor), fusing both
+			// lanes' edges on shared nodes.
+			Name:               "entities_gliner",
+			Table:              AutoschemaEntitiesTable,
+			SourceArtifact:     AutoschemaGlinerAsset,
+			ResolutionArtifact: "entities_gliner_resolution_v1",
+			KeyTemplate:        entityKeyTemplate,
+			CandidateSearch:    oapi.GraphResolverConfigCandidateSearchPrefix,
+			// GLiNER asserts a score per mention; drop the low-confidence
+			// junk (identifiers, mislabeled fragments) before it mints
+			// entity nodes.
+			MinConfidence:    0.5,
+			ConfigGeneration: 1,
+		})
+		cfg.EdgeTypes = append(cfg.EdgeTypes,
+			antfly.EdgeTypeConfig{Name: "employed_by"},
+			antfly.EdgeTypeConfig{Name: "located_in"},
+			antfly.EdgeTypeConfig{Name: "traveled_with"},
+			antfly.EdgeTypeConfig{Name: "met_with"},
+			antfly.EdgeTypeConfig{Name: "associated_with"},
+		)
+	}
 
 	idx, err := antfly.NewIndexConfig(AutoschemaKnowledgeGraphIndex, cfg)
 	if err != nil {
@@ -483,7 +619,7 @@ func createAutoschemaTaxonomyIndex(model, inferenceURL string) (*antfly.IndexCon
 				Table:              AutoschemaConceptsTable,
 				SourceArtifact:     AutoschemaConceptAsset,
 				ResolutionArtifact: "concepts_resolution_v1",
-				KeyTemplate:        "{{ slug _entity.text }}",
+				KeyTemplate:        "concept/{{ slug _entity.text }}",
 				Labels:             []string{"concept"},
 				ConfigGeneration:   1,
 			},
@@ -518,6 +654,17 @@ func createAutoschemaTaxonomyIndex(model, inferenceURL string) (*antfly.IndexCon
 		},
 	}
 	return idx, nil
+}
+
+// autoschemaRequiredEnrichments lists the inline enrichments the documents
+// table's knowledge_graph index must carry: the three LLM extraction stages
+// plus, when the GLiNER lane is enabled, its extractor artifact.
+func autoschemaRequiredEnrichments(glinerModel string) []string {
+	required := []string{AutoschemaEntityEntityAsset, AutoschemaEntityEventAsset, AutoschemaEventEventAsset}
+	if strings.TrimSpace(glinerModel) != "" {
+		required = append(required, AutoschemaGlinerAsset)
+	}
+	return required
 }
 
 // autoschemaRequiredIndex describes one index that must exist on an

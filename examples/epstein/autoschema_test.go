@@ -105,7 +105,9 @@ func itemPropertyEnum(t *testing.T, items map[string]any, property string) []any
 }
 
 func TestCreateAutoschemaKnowledgeGraphIndexConfig(t *testing.T) {
-	idx, err := createAutoschemaKnowledgeGraphIndex(DefaultAutoschemaModel, DefaultInferenceURL)
+	// The GLiNER lane is disabled here so this test pins the paper's
+	// three-stage LLM shape; the lane has its own test below.
+	idx, err := createAutoschemaKnowledgeGraphIndex(DefaultAutoschemaModel, "", DefaultInferenceURL)
 	if err != nil {
 		t.Fatalf("createAutoschemaKnowledgeGraphIndex failed: %v", err)
 	}
@@ -201,14 +203,14 @@ func TestCreateAutoschemaKnowledgeGraphIndexConfig(t *testing.T) {
 			if len(labels) != 1 || labels[0] != "event" {
 				t.Fatalf("events resolver must claim only the event label: %#v", resolver)
 			}
-			if resolver["key_template"] != "event/{{ hash _entity.text }}" {
+			if resolver["key_template"] != "event/{{ hash _entity.event_identity }}" {
 				t.Fatalf("events resolver key template = %v", resolver["key_template"])
 			}
 		case AutoschemaEntitiesTable:
 			if len(labels) != 0 {
 				t.Fatalf("entities resolver must be a catch-all: %#v", resolver)
 			}
-			if resolver["key_template"] != "{{ lower _entity.label }}/{{ slug _entity.text }}" {
+			if resolver["key_template"] != "entity/{{ slug _entity.text }}" {
 				t.Fatalf("entities resolver key template = %v", resolver["key_template"])
 			}
 			if resolver["candidate_search"] != "prefix" {
@@ -244,6 +246,85 @@ func TestCreateAutoschemaKnowledgeGraphIndexConfig(t *testing.T) {
 	// The request builder enforces the sources/source exclusivity contract.
 	if _, err := antfly.NewCreateIndexRequest(idx); err != nil {
 		t.Fatalf("NewCreateIndexRequest rejected knowledge graph config: %v", err)
+	}
+}
+
+func TestCreateAutoschemaKnowledgeGraphIndexWithGlinerLane(t *testing.T) {
+	idx, err := createAutoschemaKnowledgeGraphIndex(DefaultAutoschemaModel, DefaultAutoschemaGlinerModel, DefaultInferenceURL)
+	if err != nil {
+		t.Fatalf("createAutoschemaKnowledgeGraphIndex failed: %v", err)
+	}
+	got := marshalIndexConfig(t, idx)
+
+	// A fourth extraction_relation source with positional GLiNER endpoints,
+	// after the three LLM extraction_graph sources.
+	sources, ok := got["sources"].([]any)
+	if !ok || len(sources) != 4 {
+		t.Fatalf("sources = %#v, want 4 entries", got["sources"])
+	}
+	gliner, _ := sources[3].(map[string]any)
+	if gliner["artifact"] != AutoschemaGlinerAsset || gliner["format"] != "extraction_relation" ||
+		gliner["path"] != "$.relations[*]" || gliner["mention_edge_type"] != "mentions" {
+		t.Fatalf("unexpected gliner source: %#v", gliner)
+	}
+	edge, _ := gliner["edge"].(map[string]any)
+	if edge == nil || edge["type"] != "{{ _item.type }}" || edge["weight"] != "{{ _item.score }}" {
+		t.Fatalf("gliner edge mapping must map type/weight from the relation item: %#v", gliner)
+	}
+
+	// The lane's extractor enrichment reads the raw content field (no prompt
+	// template: GLiNER consumes the text directly).
+	enrichments, ok := got["enrichments"].([]any)
+	if !ok || len(enrichments) != 4 {
+		t.Fatalf("enrichments = %#v, want 4 entries", got["enrichments"])
+	}
+	glinerEnrichment, _ := enrichments[3].(map[string]any)
+	if glinerEnrichment["name"] != AutoschemaGlinerAsset || glinerEnrichment["kind"] != "asset" ||
+		glinerEnrichment["field"] != "content" || glinerEnrichment["content_type"] != "application/json" {
+		t.Fatalf("unexpected gliner enrichment: %#v", glinerEnrichment)
+	}
+	producer := decodeProducerJSON(t, glinerEnrichment)
+	if producer["type"] != "extractor" {
+		t.Fatalf("gliner producer must be an extractor: %#v", producer)
+	}
+	config, _ := producer["config"].(map[string]any)
+	if config["model"] != DefaultAutoschemaGlinerModel {
+		t.Fatalf("gliner producer model = %v", config["model"])
+	}
+	options, _ := config["options"].(map[string]any)
+	longDoc, _ := options["long_document"].(map[string]any)
+	if longDoc == nil || longDoc["mode"] != "window" {
+		t.Fatalf("gliner producer must request windowed long-document execution: %#v", config)
+	}
+
+	// A fifth resolver over the GLiNER artifact sharing the entity key
+	// template, so both lanes converge on the same canonical entities.
+	resolvers, ok := got["resolvers"].([]any)
+	if !ok || len(resolvers) != 5 {
+		t.Fatalf("resolvers = %#v, want 5 entries", got["resolvers"])
+	}
+	glinerResolver, _ := resolvers[4].(map[string]any)
+	if glinerResolver["source_artifact"] != AutoschemaGlinerAsset ||
+		glinerResolver["table"] != AutoschemaEntitiesTable ||
+		glinerResolver["resolution_artifact"] != "entities_gliner_resolution_v1" ||
+		glinerResolver["key_template"] != "entity/{{ slug _entity.text }}" {
+		t.Fatalf("unexpected gliner resolver: %#v", glinerResolver)
+	}
+	if labels, _ := glinerResolver["labels"].([]any); len(labels) != 0 {
+		t.Fatalf("gliner resolver must be a catch-all: %#v", glinerResolver)
+	}
+
+	if _, err := antfly.NewCreateIndexRequest(idx); err != nil {
+		t.Fatalf("NewCreateIndexRequest rejected gliner-enabled knowledge graph config: %v", err)
+	}
+
+	// The required-enrichment list ensureAutoschemaIndexes verifies must
+	// include the lane exactly when it is enabled.
+	if got := autoschemaRequiredEnrichments(DefaultAutoschemaGlinerModel); len(got) != 4 || got[3] != AutoschemaGlinerAsset {
+		t.Fatalf("autoschemaRequiredEnrichments(gliner) = %v", got)
+	}
+	if got := autoschemaRequiredEnrichments(""); len(got) != 3 {
+		t.Fatalf("autoschemaRequiredEnrichments(\"\") = %v", got)
 	}
 }
 
@@ -313,7 +394,7 @@ func TestCreateAutoschemaTaxonomyIndexConfig(t *testing.T) {
 	if resolver["table"] != AutoschemaConceptsTable || len(labels) != 1 || labels[0] != "concept" {
 		t.Fatalf("unexpected concepts resolver: %#v", resolver)
 	}
-	if resolver["key_template"] != "{{ slug _entity.text }}" {
+	if resolver["key_template"] != "concept/{{ slug _entity.text }}" {
 		t.Fatalf("concepts key template = %v", resolver["key_template"])
 	}
 
