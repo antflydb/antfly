@@ -7591,8 +7591,9 @@ pub const AntflyApiHandler = struct {
         if (try self.acquirePublicOperation(ctx, "lookupKey", &admission_lease)) |response| return response;
         defer self.releasePublicOperation("lookupKey", &admission_lease);
         const alloc = ctx.response.bodyAllocator();
-        const decoded_table_name = (try self.resolvePublicTableName(ctx, table_name, &authenticated_identity)) orelse return ctx.response.build();
-        defer ctx.allocator.free(decoded_table_name);
+        const binding = (try self.resolvePublicTableBinding(ctx, table_name, &authenticated_identity)) orelse return ctx.response.build();
+        defer binding.deinit(ctx.allocator);
+        const decoded_table_name = binding.physical;
         const decoded_key = (try decodePathParamOrBadRequest(ctx, key)) orelse return ctx.text("invalid path parameter");
         defer ctx.allocator.free(decoded_key);
         const source = self.api_server.table_reads orelse {
