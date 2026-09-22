@@ -16,6 +16,11 @@ All notable changes to Antfly will be documented in this file.
 
 ### [Unreleased]
 
+- **Complete hybrid-search aggregations** — internal aggregation collection now
+  exhausts vector candidates instead of only increasing the result limit,
+  preserving the original ranked page. Exhausted vector traversal with a
+  truncated top-k window remains inexact; candidate-budget failures still
+  reject incomplete counts. Exact aggregation may require a full vector scan.
 - **`antfly standby` replaces `antfly ha`** — the hot-standby command is
   renamed; `antfly ha` remains a hidden alias for one minor release. It gains
   `--data-dir` (opens the node's standby state under `<dir>/ha/` and reads the

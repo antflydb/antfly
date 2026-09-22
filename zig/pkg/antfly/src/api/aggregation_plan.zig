@@ -102,6 +102,8 @@ pub fn aggregationCollectionRequest(req: types.SearchRequest, full_limit: u32, i
     full_req.identity_read_generation = identity_read_generation;
     full_req.offset = 0;
     full_req.limit = full_limit;
+    // Exact aggregation needs exhaustive candidate coverage, not merely a larger k.
+    full_req.search_effort = 1.0;
     full_req.include_stored = true;
     full_req.count_only = false;
     full_req.order_by = &.{};

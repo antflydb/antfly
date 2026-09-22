@@ -13256,6 +13256,8 @@ fn searchDenseInternal(
             results.candidate_coverage,
             hbc_effective_k,
             bounded_full_candidate_count,
+            raw_hits.len,
+            route.exact_native_filter,
         );
         const candidate_ceiling_reached = candidate_window >= candidate_ceiling;
         if (!candidate_window_incomplete and exhaustive_broad_live_window) {
@@ -13795,9 +13797,11 @@ fn denseCandidateWindowIncomplete(
     coverage: vectorindex_mod.CandidateCoverage,
     candidate_window: u32,
     bounded_full_candidate_count: u32,
+    raw_hit_count: usize,
+    exact_native_filter: bool,
 ) bool {
     return switch (coverage) {
-        .exhausted => false,
+        .exhausted => !exact_native_filter and scoreOrderWindowTotalHitsRelation(candidate_window, bounded_full_candidate_count, raw_hit_count) == .gte,
         .more => true,
         .unknown => candidateWindowIncomplete(candidate_window, bounded_full_candidate_count),
     };
@@ -13868,9 +13872,13 @@ test "adaptive candidate window covers requested offset page and grows bounded" 
     try std.testing.expectEqual(@as(u32, 2000), growAdaptiveCandidateWindow(1025, 2000, 1025));
     try std.testing.expect(candidateWindowIncomplete(1025, 2000));
     try std.testing.expect(!candidateWindowIncomplete(2000, 2000));
-    try std.testing.expect(!denseCandidateWindowIncomplete(.exhausted, 10, 1_000_000));
-    try std.testing.expect(denseCandidateWindowIncomplete(.more, 10, 10));
-    try std.testing.expect(denseCandidateWindowIncomplete(.unknown, 10, 1_000_000));
+    try std.testing.expect(denseCandidateWindowIncomplete(.exhausted, 10, 1_000_000, 10, false));
+    try std.testing.expect(!denseCandidateWindowIncomplete(.exhausted, 10, 1_000_000, 9, false));
+    try std.testing.expect(!denseCandidateWindowIncomplete(.exhausted, 10, 10, 10, false));
+    try std.testing.expect(!denseCandidateWindowIncomplete(.exhausted, 10, 1_000_000, 10, true));
+    try std.testing.expect(denseCandidateWindowIncomplete(.more, 10, 10, 9, true));
+    try std.testing.expect(denseCandidateWindowIncomplete(.unknown, 10, 1_000_000, 9, false));
+    try std.testing.expect(!denseCandidateWindowIncomplete(.unknown, 10, 10, 10, false));
     try std.testing.expectEqual(@as(u32, 7), initialAdaptiveCandidateWindow(7, paging));
 
     // Group collection starts with an overfetch window and may grow it again.

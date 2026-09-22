@@ -27476,6 +27476,94 @@ fn implementationTests() type {
             }
         }
 
+        test "aggregation full-result rerun exhausts hybrid candidates without changing ranked page" {
+            const alloc = std.testing.allocator;
+            var path_tmp = try TestDirectory.init("antfly-api-aggregation-hybrid");
+            defer path_tmp.cleanup();
+            var db = try db_mod.DB.open(alloc, path_tmp.path(), .{});
+            defer db.close();
+            try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+            try db.addIndex(.{ .name = "dv_1", .kind = .dense_vector, .config_json = "{\"field\":\"v1\",\"dims\":2,\"metric\":\"l2_squared\"}" });
+            try db.addIndex(.{ .name = "dv_2", .kind = .dense_vector, .config_json = "{\"field\":\"v2\",\"dims\":2,\"metric\":\"l2_squared\"}" });
+            const kinds = [_][]const u8{ "pdf", "text", "image", "code" };
+            var writes = std.ArrayListUnmanaged(db_mod.types.BatchWrite).empty;
+            defer {
+                for (writes.items) |write| {
+                    alloc.free(write.key);
+                    alloc.free(write.value);
+                }
+                writes.deinit(alloc);
+            }
+            try writes.ensureTotalCapacity(alloc, 2200);
+            for (0..2200) |i| {
+                const key = try std.fmt.allocPrint(alloc, "doc:{d:0>4}", .{i});
+                errdefer alloc.free(key);
+                const value = try std.fmt.allocPrint(alloc, "{{\"body\":\"notes\",\"kind\":\"{s}\",\"v1\":[{d},1],\"v2\":[1,{d}]}}", .{ kinds[i % kinds.len], i, i });
+                writes.appendAssumeCapacity(.{ .key = key, .value = value });
+            }
+            try db.batch(.{ .writes = writes.items, .sync_level = .full_index });
+            var source = BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
+            const req: db_mod.types.SearchRequest = .{
+                .full_text = .{ .match = .{ .field = "body", .text = "notes" } },
+                .dense_queries = &.{
+                    .{ .name = "first", .index_name = "dv_1", .query = .{ .vector = &.{ 0, 0 }, .k = 30 } },
+                    .{ .name = "second", .index_name = "dv_2", .query = .{ .vector = &.{ 0, 0 }, .k = 30 } },
+                },
+                .merge_config = .{ .strategy = .rrf, .rank_constant = 60 },
+                .limit = 30,
+                .aggregations_json = "{\"kinds\":{\"type\":\"terms\",\"field\":\"kind\",\"size\":10}}",
+            };
+            var first = try db.searchWithCapturedRequest(alloc, req);
+            defer first.result.deinit();
+            try std.testing.expectEqual(@as(usize, 30), first.result.hits.len);
+            var originals = std.heap.ArenaAllocator.init(alloc);
+            defer originals.deinit();
+            var original_ids: [30][]const u8 = undefined;
+            var original_scores: [30]@TypeOf(first.result.hits[0].score) = undefined;
+            for (first.result.hits, 0..) |hit, i| {
+                original_ids[i] = try originals.allocator().dupe(u8, hit.id);
+                original_scores[i] = hit.score;
+            }
+            var meta: query_api.QueryResponseMeta = .{};
+            defer meta.deinit(alloc);
+            try applyBoundQueryAggregations(&source, alloc, first.request, &first.result, &meta, null, .read_index);
+            try std.testing.expectEqual(@as(usize, 1), meta.aggregation_results.len);
+            const aggregation = meta.aggregation_results[0];
+            try std.testing.expectEqualStrings("kinds", aggregation.name);
+            try std.testing.expectEqual(@as(usize, 4), aggregation.buckets.len);
+            for (kinds) |kind| {
+                const expected_key = try std.fmt.allocPrint(originals.allocator(), "\"{s}\"", .{kind});
+                const bucket = for (aggregation.buckets) |bucket| {
+                    if (std.mem.eql(u8, expected_key, bucket.key_json)) break bucket;
+                } else return error.TestUnexpectedResult;
+                try std.testing.expectEqual(@as(i64, 550), bucket.count);
+            }
+            try std.testing.expectEqual(@as(usize, 30), first.result.hits.len);
+            for (first.result.hits, 0..) |hit, i| {
+                try std.testing.expectEqualStrings(original_ids[i], hit.id);
+                try std.testing.expectEqual(original_scores[i], hit.score);
+            }
+
+            var dense_req: db_mod.types.SearchRequest = .{
+                .index_name = "dv_1",
+                .query = .{ .dense_knn = .{ .vector = &.{ 0, 0 }, .k = 30 } },
+                .limit = 30,
+                .search_effort = 1.0,
+            };
+            var bounded = try db.searchWithCapturedRequest(alloc, dense_req);
+            defer bounded.result.deinit();
+            try std.testing.expectEqual(@as(usize, 30), bounded.result.hits.len);
+            try std.testing.expectEqual(db_mod.types.TotalHitsRelation.gte, bounded.result.total_hits_relation);
+            try std.testing.expectError(error.QueryCandidateBudgetExceeded, requireCompleteAggregationFullResult(bounded.request, bounded.result, "test-dense-bounded"));
+            dense_req.limit = 2200;
+            var complete = try db.searchWithCapturedRequest(alloc, dense_req);
+            defer complete.result.deinit();
+            try std.testing.expectEqual(db_mod.types.TotalHitsRelation.exact, complete.result.total_hits_relation);
+            try std.testing.expectEqual(@as(u32, 2200), complete.result.total_hits);
+            try std.testing.expectEqual(@as(usize, 2200), complete.result.hits.len);
+            try requireCompleteAggregationFullResult(complete.request, complete.result, "test-dense-complete");
+        }
+
         test "local query provider returns complete aggregations and preserves the requested hit page" {
             const alloc = std.testing.allocator;
             const provider = @import("../storage/local_query_provider.zig");
