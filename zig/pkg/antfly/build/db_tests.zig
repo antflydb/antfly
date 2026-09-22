@@ -377,6 +377,17 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "storage.db.db.test.db split cutover preserves enrichment resume and fencing across reopen",
         "storage.db.db.test.db merge-style cutover fences enrichment to the merged receiver range",
         "storage.db.db.test.db merge-style cutover preserves enrichment resume and fencing across reopen",
+        "db blocked dense embedding lane does not force the independent asset lane to redo checkpointed work",
+        "cross-quantum lane pipelining publishes a fast dense quantum while a slower asset quantum is still in flight",
+        "cross-quantum dispatch clones queued requests so later caller reuse cannot corrupt an in-flight asset quantum",
+        "synchronous window checkpoints never advance the asset cursor past queued or in-flight extractor work",
+        "combined replay cursor gate requires every execution lane to cover a group",
+        "each execution lane persists and clears its own replay cursor scope",
+        "asset producer runtime accepts an unrequested boundary-model schema_version upgrade",
+        "asset producer runtime batch path accepts an unrequested boundary-model schema_version upgrade",
+        "db dense index consuming a chunk-then-embed source via plural sources config converges its target counter",
+        "runUntilIdle no-progress guard fails fast with a named stuck-index diagnostic",
+        "target advance stuck tracking records first-seen time and clears on success",
     };
     const lib_db_enrichment_tests = b.addTest(.{
         .root_module = antfly_test_mod,

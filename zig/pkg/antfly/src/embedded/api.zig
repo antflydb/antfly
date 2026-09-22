@@ -536,7 +536,8 @@ test "embedded api round-trips batch lookup scan and search over memory-backed d
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"no_inference_configured_ok\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"caller_supplied_artifacts\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"caller_supplied_embeddings\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"local_inference_runtime\":false") != null);
+    const native_local_runtime_available = support.lite_backend.capabilitiesForProfile(.native).local_inference_runtime;
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_json, if (native_local_runtime_available) "\"local_inference_runtime\":true" else "\"local_inference_runtime\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"text_search\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"hybrid_search\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"graph_search\":true") != null);
@@ -601,7 +602,8 @@ test "embedded api hosted profile drains derived indexing without native runtime
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"no_inference_configured_ok\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"caller_supplied_artifacts\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"caller_supplied_embeddings\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"local_inference_runtime\":false") != null);
+    const native_local_runtime_available = support.lite_backend.capabilitiesForProfile(.native).local_inference_runtime;
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_json, if (native_local_runtime_available) "\"local_inference_runtime\":true" else "\"local_inference_runtime\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"text_search\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"hybrid_search\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"graph_search\":true") != null);
@@ -692,6 +694,64 @@ test "embedded api hosted profile persists text index across reopen over storage
     }
 }
 
+test "embedded api createLite provisions default full text index" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/embedded-api-lite-default-index.aflite", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    {
+        var api = try Api.createLite(alloc, path, .{
+            .table_name = "docs",
+            .db = .{
+                .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+            },
+        });
+        defer api.close();
+
+        // Creating a Lite database provisions the same default full-text
+        // index the server provisions on every table create.
+        const indexes = try api.listIndexesJson(alloc);
+        defer alloc.free(indexes);
+        try std.testing.expect(std.mem.indexOf(u8, indexes, "\"full_text_index_v0\"") != null);
+
+        const batch_json = try api.batchJson(
+            alloc,
+            "{\"inserts\":{\"doc:a\":{\"title\":\"default index alpha\"}},\"sync_level\":\"full_index\"}",
+        );
+        defer alloc.free(batch_json);
+        try std.testing.expect(std.mem.indexOf(u8, batch_json, "\"inserted\":1") != null);
+
+        // A text match with no index named resolves against the default
+        // full-text index and returns hits without any manual index setup.
+        const query_json = try api.searchJson(
+            alloc,
+            "{\"full_text_search\":{\"match\":{\"field\":\"title\",\"text\":\"alpha\"}},\"limit\":1}",
+        );
+        defer alloc.free(query_json);
+        try std.testing.expect(std.mem.indexOf(u8, query_json, "\"doc:a\"") != null);
+    }
+
+    {
+        // Reopening an existing Lite database must not add anything.
+        var reopened = try Api.openLite(alloc, path, .{
+            .table_name = "docs",
+            .db = .{
+                .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+            },
+        });
+        defer reopened.close();
+
+        const indexes = try reopened.listIndexesJson(alloc);
+        defer alloc.free(indexes);
+        try std.testing.expect(std.mem.indexOf(u8, indexes, "\"full_text_index_v0\"") != null);
+        try std.testing.expect(std.mem.count(u8, indexes, "full_text_index_v0") == 1);
+    }
+}
+
 test "embedded api openLite round-trips batch lookup over aflite file" {
     const alloc = std.testing.allocator;
 
@@ -756,12 +816,15 @@ test "embedded api openLite manages index and enrichment definitions over aflite
         });
         defer api.close();
 
-        const created_index = try api.addIndexJson(
+        // Creating a Lite database already provisions the default full-text
+        // index, matching the server's behavior on table create.
+        const initial_indexes = try api.listIndexesJson(alloc);
+        defer alloc.free(initial_indexes);
+        try std.testing.expect(std.mem.indexOf(u8, initial_indexes, "\"full_text_index_v0\"") != null);
+        try std.testing.expectError(error.IndexAlreadyExists, api.addIndexJson(
             alloc,
             "{\"name\":\"full_text_index_v0\",\"kind\":\"full_text\",\"config_json\":\"{}\",\"coverage_generation\":12345}",
-        );
-        defer alloc.free(created_index);
-        try std.testing.expect(std.mem.indexOf(u8, created_index, "\"created\":true") != null);
+        ));
 
         const created_enrichment = try api.addEnrichmentJson(
             alloc,

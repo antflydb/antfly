@@ -418,13 +418,13 @@ const ArchConfig = union(ArchType) {
 const SessionTask = enum {
     generic,
     classifier,
-    recognizer,
+    extractor,
 };
 
 pub const TaskOverride = enum {
     generic,
     classifier,
-    recognizer,
+    extractor,
 };
 
 pub const GenericEncoderArchConfig = union(enum) {
@@ -437,12 +437,12 @@ fn sessionTaskForModelType(model_type: manifest_mod.ModelType, override: ?TaskOv
         return switch (value) {
             .generic => .generic,
             .classifier => .classifier,
-            .recognizer => .recognizer,
+            .extractor => .extractor,
         };
     }
     return switch (model_type) {
         .classifier, .reranker => .classifier,
-        .recognizer => .recognizer,
+        .extractor => .extractor,
         else => .generic,
     };
 }
@@ -472,7 +472,7 @@ fn sessionEnablesImmutableF32WeightBorrow(
     // Finetuning's explicit generic sessions and caller-created WeightStores
     // retain the copying contract; they must never inherit this capability
     // merely because a parameter name resembles an inference weight.
-    return backend_type == .metal and arch_type == .gliner and task == .recognizer;
+    return backend_type == .metal and arch_type == .gliner and task == .extractor;
 }
 
 /// Metal mirror/cache and graph-plan scratch amounts that ModelManager must
@@ -1752,7 +1752,7 @@ test "cuda support gate admits only supported model roles" {
         try std.testing.expectEqual(CudaCapabilityProfile.clipclap, cudaProfileForArch(.{ .clip = .{} }, .generic, &generic_manifest).?);
         try std.testing.expectEqual(CudaCapabilityProfile.bert_encoder, cudaProfileForArch(.{ .bert = .{} }, .generic, &generic_manifest).?);
         try std.testing.expectEqual(CudaCapabilityProfile.deberta_reranker, cudaProfileForArch(.{ .deberta = .{} }, .classifier, &generic_manifest).?);
-        try std.testing.expectEqual(CudaCapabilityProfile.gliner2, cudaProfileForArch(.{ .gliner = .{} }, .recognizer, &generic_manifest).?);
+        try std.testing.expectEqual(CudaCapabilityProfile.gliner2, cudaProfileForArch(.{ .gliner = .{} }, .extractor, &generic_manifest).?);
         try std.testing.expectEqual(CudaCapabilityProfile.florence2, cudaProfileForArch(.{ .florence = .{} }, .generic, &generic_manifest).?);
         try std.testing.expectEqual(CudaCapabilityProfile.gemma4, cudaProfileForArch(.{ .gpt = .{ .family = .gemma } }, .generic, &generic_manifest).?);
         try std.testing.expectEqual(CudaCapabilityProfile.qwen3_embedding, cudaProfileForArch(.{ .gpt = .{ .family = .qwen3 } }, .generic, &qwen3_embedder).?);
@@ -5621,22 +5621,22 @@ test "makeBertConfig carries num_labels from manifest" {
     try std.testing.expectEqual(@as(bert.PositionIdMode, .roberta_padding), cfg.position_id_mode);
 }
 
-test "sessionTaskForModelType maps classifier and recognizer tasks" {
+test "sessionTaskForModelType maps classifier and extractor tasks" {
     try std.testing.expectEqual(@as(SessionTask, .classifier), sessionTaskForModelType(.classifier, null));
     try std.testing.expectEqual(@as(SessionTask, .classifier), sessionTaskForModelType(.reranker, null));
-    try std.testing.expectEqual(@as(SessionTask, .recognizer), sessionTaskForModelType(.recognizer, null));
+    try std.testing.expectEqual(@as(SessionTask, .extractor), sessionTaskForModelType(.extractor, null));
     try std.testing.expectEqual(@as(SessionTask, .generic), sessionTaskForModelType(.embedder, null));
     try std.testing.expectEqual(@as(SessionTask, .generic), sessionTaskForModelType(.reranker, .generic));
 }
 
 test "legacy GLiNER immutable F32 borrow policy excludes generic training and other sessions" {
-    try std.testing.expect(sessionEnablesImmutableF32WeightBorrow(.metal, .gliner, sessionTaskForModelType(.recognizer, null)));
-    try std.testing.expect(sessionEnablesImmutableF32WeightBorrow(.metal, .gliner, sessionTaskForModelType(.recognizer, .recognizer)));
-    try std.testing.expect(!sessionEnablesImmutableF32WeightBorrow(.metal, .gliner, sessionTaskForModelType(.recognizer, .generic)));
+    try std.testing.expect(sessionEnablesImmutableF32WeightBorrow(.metal, .gliner, sessionTaskForModelType(.extractor, null)));
+    try std.testing.expect(sessionEnablesImmutableF32WeightBorrow(.metal, .gliner, sessionTaskForModelType(.extractor, .extractor)));
+    try std.testing.expect(!sessionEnablesImmutableF32WeightBorrow(.metal, .gliner, sessionTaskForModelType(.extractor, .generic)));
     inline for (std.meta.tags(BackendType)) |backend_type| {
         inline for (std.meta.tags(ArchType)) |arch_type| {
             inline for (std.meta.tags(SessionTask)) |task| {
-                const expected = backend_type == .metal and arch_type == .gliner and task == .recognizer;
+                const expected = backend_type == .metal and arch_type == .gliner and task == .extractor;
                 try std.testing.expectEqual(expected, sessionEnablesImmutableF32WeightBorrow(backend_type, arch_type, task));
             }
         }
@@ -5697,7 +5697,7 @@ test "DeBERTa fast-path admission covers direct classifiers and reranker mirrors
     );
     const gliner_manifest = manifest_mod.ModelManifest{
         .allocator = std.testing.allocator,
-        .model_type = .recognizer,
+        .model_type = .extractor,
         .inference_bundle_family = "gliner2_split_bundle/v1",
     };
     const gliner_admission = metalDebertaFastPathAdmissionAmounts(gliner_manifest);
@@ -5750,7 +5750,7 @@ test "legacy GLiNER architecture reads local encoder sidecar and preserves label
     try tmp.dir.writeFile(io, .{ .sub_path = "added_tokens.json", .data = "{\"[C]\":88,\"[E]\":89,\"[R]\":90}" });
     const model_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer allocator.free(model_dir);
-    const mf = manifest_mod.ModelManifest{ .allocator = allocator, .model_type = .recognizer, .gliner_token_e = 87 };
+    const mf = manifest_mod.ModelManifest{ .allocator = allocator, .model_type = .extractor, .gliner_token_e = 87 };
     const arch = try detectArchitecture(allocator, model_dir, mf);
     try std.testing.expect(arch == .gliner);
     const cfg = arch.gliner;
@@ -5779,7 +5779,7 @@ test "legacy GLiNER absent encoder sidecar keeps defaults while malformed presen
     try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"extractor\"}" });
     const model_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer allocator.free(model_dir);
-    const mf = manifest_mod.ModelManifest{ .allocator = allocator, .model_type = .recognizer };
+    const mf = manifest_mod.ModelManifest{ .allocator = allocator, .model_type = .extractor };
     try std.testing.expectEqual(deberta_mod.Config{}, (try detectArchitecture(allocator, model_dir, mf)).gliner);
     try tmp.dir.createDir(io, "encoder_config", .default_dir);
     try std.testing.expectEqual(deberta_mod.Config{}, (try detectArchitecture(allocator, model_dir, mf)).gliner);
@@ -5969,7 +5969,7 @@ test "detectArchitecture treats split gliner bundle encoder config as gliner" {
 
     var mf = manifest_mod.ModelManifest{
         .allocator = allocator,
-        .model_type = .recognizer,
+        .model_type = .extractor,
         .gliner_model_type = try allocator.dupe(u8, "gliner2"),
     };
     defer mf.deinit();
@@ -6593,7 +6593,7 @@ fn archRunResidentWithControl(
     control: InferenceExecutionControl,
 ) !?ResidentOutputs {
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
-    if (self.task == .classifier or self.task == .recognizer) return null;
+    if (self.task == .classifier or self.task == .extractor) return null;
     const cfg = switch (self.arch_config) {
         .bert => |cfg| cfg,
         // Returning null forces the caller through runWithControl. Never
@@ -6708,7 +6708,7 @@ test "BERT architecture regression declarations compile" {
 
 fn archRunResident(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator) !?ResidentOutputs {
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
-    if (self.task == .classifier or self.task == .recognizer) return null;
+    if (self.task == .classifier or self.task == .extractor) return null;
     switch (self.arch_config) {
         .bert, .modern_bert, .nomic_bert => {},
         else => return null,
@@ -6772,7 +6772,7 @@ fn archRunResidentTextEmbedding(
     allocator: std.mem.Allocator,
 ) !?ResidentOutputs {
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
-    if (self.task == .classifier or self.task == .recognizer or self.backend_type != .metal) return null;
+    if (self.task == .classifier or self.task == .extractor or self.backend_type != .metal) return null;
     if (request.pooling != .mean) return null;
     const cfg = switch (self.arch_config) {
         .nomic_bert => |cfg| cfg,
@@ -8049,7 +8049,7 @@ fn archRunImpl(
                 result[0] = output_tensor;
                 return result;
             }
-            if (self.task == .recognizer) {
+            if (self.task == .extractor) {
                 const logits = try runTokenClassifier(&cb, allocator, hidden, batch, seq_len, cfg.hidden_size, cfg.num_labels);
                 defer allocator.free(logits);
 
@@ -8173,7 +8173,7 @@ fn archRunImpl(
                 result[0] = output_tensor;
                 return result;
             }
-            if (self.task == .recognizer) {
+            if (self.task == .extractor) {
                 const logits = try runTokenClassifier(&cb, allocator, forward_out.hidden, batch, total_seq_len, cfg.hidden_size, cfg.num_labels);
                 defer allocator.free(logits);
 
@@ -8232,7 +8232,7 @@ fn archRunImpl(
             const hidden = try deberta_arch.forward(&cb, allocator, cfg, input_ids, attention_mask, batch, seq_len);
             defer allocator.free(hidden);
 
-            if (self.task == .recognizer) {
+            if (self.task == .extractor) {
                 const logits = try runTokenClassifier(&cb, allocator, hidden, batch, seq_len, cfg.hidden_size, cfg.num_labels);
                 defer allocator.free(logits);
 
@@ -9065,11 +9065,11 @@ fn archRunGeometry(ptr: *anyopaque, inputs: @import("../backends/session.zig").S
     const width: usize = switch (self.arch_config) {
         .bert => |cfg| blk: {
             if (self.task == .classifier) output_seq = 1;
-            break :blk if (self.task == .classifier or self.task == .recognizer) cfg.num_labels else cfg.hidden_size;
+            break :blk if (self.task == .classifier or self.task == .extractor) cfg.num_labels else cfg.hidden_size;
         },
         .deberta => |cfg| blk: {
             if (self.task == .classifier) output_seq = 1;
-            break :blk if (self.task == .classifier or self.task == .recognizer) cfg.num_labels else cfg.hidden_size;
+            break :blk if (self.task == .classifier or self.task == .extractor) cfg.num_labels else cfg.hidden_size;
         },
         .modern_bert => |cfg| blk: {
             if (cfg.laya) |laya| {
@@ -9217,7 +9217,7 @@ fn archOutputInfo(ptr: *anyopaque) []const TensorInfo {
             .{ .name = "logits", .dtype = .f32, .shape = &.{ -1, -1 } },
         };
     }
-    if (self.task == .recognizer and (self.arch_config == .bert or self.arch_config == .deberta or self.arch_config == .layoutlmv3)) {
+    if (self.task == .extractor and (self.arch_config == .bert or self.arch_config == .deberta or self.arch_config == .layoutlmv3)) {
         return &.{
             .{ .name = "logits", .dtype = .f32, .shape = &.{ -1, -1, -1 } },
         };
