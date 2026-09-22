@@ -1896,7 +1896,17 @@ pub const DBCore = struct {
         rules: traversal_mod.TraversalRules,
     ) ![]traversal_mod.TraversalResult {
         const entry = self.index_manager.graphIndex(index_name) orelse return error.IndexNotFound;
-        return try traversal_mod.traverse(alloc, &entry.index, start_key, rules);
+        // The direct storage entry point reads exactly one shard-local index,
+        // and entity-sourced cross-table edges are document-owned rows in
+        // this same index (zig/AUTOSCHEMA.md): expanding THROUGH a
+        // cross-table node here is a same-snapshot, same-index read, so an
+        // embedded (Lite) or single-shard caller walks doc -> entity ->
+        // entity topology in one traversal instead of stopping at the first
+        // resolved endpoint. Distributed/server query executors do NOT go
+        // through this entry point and keep their own routing semantics.
+        var effective = rules;
+        effective.expand_cross_table_local = true;
+        return try traversal_mod.traverse(alloc, &entry.index, start_key, effective);
     }
 
     pub fn graphFindShortestPath(

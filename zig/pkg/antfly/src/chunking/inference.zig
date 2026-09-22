@@ -256,7 +256,18 @@ pub fn chunkInputWithProvider(
     });
     defer resp.deinit();
     if (!resp.ok()) {
-        std.log.err("DEBUG chunk request failed url={s} status={d} body={s} sent={s}", .{ url, resp.status.code, resp.body orelse "<none>", body.metadata_or_json });
+        // Never log the request payload (it embeds the full source document)
+        // or the unbounded response body; a routine 429/503 must not copy
+        // document contents into production logs. A bounded response prefix
+        // is enough to identify the provider error.
+        const error_body = resp.body orelse "<none>";
+        const bounded_len = @min(error_body.len, 256);
+        std.log.warn("chunk request failed url={s} status={d} response_prefix={s}{s}", .{
+            url,
+            resp.status.code,
+            error_body[0..bounded_len],
+            if (error_body.len > bounded_len) "..." else "",
+        });
         const stale = resp.headers.get(remote_capabilities.capability_stale_header);
         if (resp.status.code == 409 and stale != null and
             std.ascii.eqlIgnoreCase(std.mem.trim(u8, stale.?, " \t"), "true"))

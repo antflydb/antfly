@@ -56,6 +56,22 @@ pub const TraversalRules = struct {
     /// Maximum number of pending traversal states. Kept configurable for
     /// request policy and deterministic low-limit testing.
     max_intermediate_states: usize = work_budget_mod.default_max_intermediate_states,
+    /// Table that owns the graph index being traversed. A `target_table` edge
+    /// tag naming this same table canonicalizes to null (the node lives in
+    /// this index's own namespace), mirroring the distributed executor's
+    /// canonicalGraphNodeTable, so a self-table tag never stops expansion or
+    /// splits node identity. Empty disables canonicalization.
+    owning_table: []const u8 = "",
+    /// Opt-in single-index expansion THROUGH cross-table nodes: instead of
+    /// treating a `target_table`-tagged node as a terminal, look its bare key
+    /// up in this same index and keep expanding. Node identity (dedup,
+    /// results) stays table-qualified. Correct where every edge reachable
+    /// from this index also LIVES in it — the entity-sourced, document-owned
+    /// autoschema topology in a single-shard or embedded (Lite) deployment —
+    /// and must stay off wherever cross-table nodes are routed to their own
+    /// table's index (the distributed executor) or cannot be served at all
+    /// (serverless segment readers).
+    expand_cross_table_local: bool = false,
 };
 
 pub const ResultAdmission = struct {
@@ -95,6 +111,15 @@ pub fn metadataTargetTable(metadata: []const u8) ?[]const u8 {
     const end = std.mem.indexOfScalarPos(u8, metadata, value_start, '"') orelse return null;
     if (end == value_start) return null;
     return metadata[value_start..end];
+}
+
+/// `metadataTargetTable` canonicalized against the index-owning table: a tag
+/// naming the owning table itself is the same namespace, not a cross-table
+/// node.
+fn canonicalMetadataTargetTable(rules: *const TraversalRules, metadata: []const u8) ?[]const u8 {
+    const table = metadataTargetTable(metadata) orelse return null;
+    if (rules.owning_table.len > 0 and std.mem.eql(u8, table, rules.owning_table)) return null;
+    return table;
 }
 
 // ============================================================================
@@ -275,10 +300,13 @@ pub fn traverseWithEdgeReader(
         // Check max depth
         if (effective_rules.max_depth > 0 and current.depth >= effective_rules.max_depth) continue;
 
-        // Cross-table nodes are expanded by the distributed owner router.
-        // Looking them up in this source-table index aliases distinct node
-        // namespaces when their keys happen to be equal.
-        if (current.ancestry.target_table != null) continue;
+        // Cross-table nodes are expanded by the distributed owner router;
+        // looking them up in this source-table index aliases distinct node
+        // namespaces when their keys happen to be equal. A caller that KNOWS
+        // this index holds those nodes' edges (single-shard entity-sourced
+        // topology; embedded Lite) opts into local expansion instead — node
+        // identity stays table-qualified either way.
+        if (current.ancestry.target_table != null and !effective_rules.expand_cross_table_local) continue;
 
         var stream = if (comptime @hasDecl(@TypeOf(edge_reader), "openEdgeStream"))
             try edge_reader.openEdgeStream(alloc, current.ancestry.key, effective_rules.edge_types, effective_rules.direction)
@@ -310,7 +338,7 @@ pub fn traverseWithEdgeReader(
                     if (!shouldTraverseEdge(&effective_rules, &edge)) continue;
                     const next_key = if (std.mem.eql(u8, current.ancestry.key, edge.source)) edge.target else edge.source;
                     const target_table = if (std.mem.eql(u8, next_key, edge.target))
-                        metadataTargetTable(edge.metadata)
+                        canonicalMetadataTargetTable(&effective_rules, edge.metadata)
                     else
                         null;
                     if (effective_rules.deduplicate and visited.contains(.{
@@ -344,7 +372,7 @@ pub fn traverseWithEdgeReader(
                     if (!shouldTraverseEdge(&effective_rules, &edge)) continue;
                 }
                 const target_table = if (std.mem.eql(u8, next_key, edge.target))
-                    metadataTargetTable(edge.metadata)
+                    canonicalMetadataTargetTable(&effective_rules, edge.metadata)
                 else
                     null;
                 if (effective_rules.deduplicate and !try putVisitedRetained(
@@ -826,6 +854,101 @@ test "local traversal does not expand a cross-table node in the source index" {
     try std.testing.expectEqual(@as(usize, 1), results.len);
     try std.testing.expectEqualStrings("shared", results[0].key);
     try std.testing.expectEqualStrings("entities", results[0].target_table.?);
+}
+
+test "local traversal expands through a cross-table node when opted in" {
+    const alloc = std.testing.allocator;
+    var sb: [256]u8 = undefined;
+    const sp = tmpPath(&sb, "external-expand-store");
+    defer cleanupTmp(sp);
+    var rb: [256]u8 = undefined;
+    const rp = tmpPath(&rb, "external-expand-graph");
+    defer cleanupTmp(rp);
+
+    var store = try docstore.DocStore.open(alloc, sp, .{});
+    defer store.close();
+    var graph = try GraphIndex.open(alloc, &store, rp, "test", .{});
+    defer graph.close();
+
+    // The autoschema shape: a mention edge into a resolved (cross-table)
+    // entity node, and an entity-sourced relation edge whose row lives in
+    // THIS index (document-owned storage).
+    try graph.addEdge(
+        "doc:a",
+        "entity/ada",
+        "mentions",
+        1.0,
+        0,
+        0,
+        "{\"target_table\":\"entities\"}",
+    );
+    try graph.addEdge(
+        "entity/ada",
+        "event/xyz",
+        "participates_in",
+        1.0,
+        0,
+        0,
+        "{\"target_table\":\"events\"}",
+    );
+
+    const results = try traverse(alloc, &graph, "doc:a", .{
+        .max_depth = 3,
+        .deduplicate = true,
+        .expand_cross_table_local = true,
+    });
+    defer freeOwnedResults(alloc, results);
+
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    try std.testing.expectEqualStrings("entity/ada", results[0].key);
+    try std.testing.expectEqualStrings("entities", results[0].target_table.?);
+    try std.testing.expectEqualStrings("event/xyz", results[1].key);
+    try std.testing.expectEqualStrings("events", results[1].target_table.?);
+}
+
+test "traversal canonicalizes a self-table target tag" {
+    const alloc = std.testing.allocator;
+    var sb: [256]u8 = undefined;
+    const sp = tmpPath(&sb, "self-table-store");
+    defer cleanupTmp(sp);
+    var rb: [256]u8 = undefined;
+    const rp = tmpPath(&rb, "self-table-graph");
+    defer cleanupTmp(rp);
+
+    var store = try docstore.DocStore.open(alloc, sp, .{});
+    defer store.close();
+    var graph = try GraphIndex.open(alloc, &store, rp, "test", .{});
+    defer graph.close();
+
+    // A resolver that promotes into the index-owning table itself tags edges
+    // with that table's own name; the node is in this index's namespace and
+    // must expand without any opt-in, and must not split identity against an
+    // untagged reference to the same key.
+    try graph.addEdge(
+        "A",
+        "shared",
+        "tagged",
+        1.0,
+        0,
+        0,
+        "{\"target_table\":\"documents\"}",
+    );
+    try graph.addEdge("A", "shared", "local", 1.0, 0, 0, "");
+    try graph.addEdge("shared", "downstream", "next", 1.0, 0, 0, "");
+
+    const results = try traverse(alloc, &graph, "A", .{
+        .max_depth = 2,
+        .deduplicate = true,
+        .owning_table = "documents",
+    });
+    defer freeOwnedResults(alloc, results);
+
+    // One identity for "shared" (no table split), and expansion continued
+    // through it to "downstream".
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    try std.testing.expectEqualStrings("shared", results[0].key);
+    try std.testing.expect(results[0].target_table == null);
+    try std.testing.expectEqualStrings("downstream", results[1].key);
 }
 
 test "traversal with path tracking" {

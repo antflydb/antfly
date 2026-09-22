@@ -3863,6 +3863,7 @@ pub const EnrichmentRuntimeStatus = struct {
     processed_requests: u64,
     error_count: u64,
     retryable_error_count: u64,
+    /// Durable count of enrichment requests parked with a non-retryable (terminal) disposition, plus fatal worker failures. A terminally failed request never returns to pending; per-document terminal state is reported by the owning index's coverage counters (terminal_failed), and per-document diagnostics by the artifact repair issue listing.
     fatal_error_count: u64,
     /// Consecutive durable worker retries for the current failed request window.
     consecutive_retry_count: u32,
@@ -7655,6 +7656,8 @@ pub const GraphResolverConfig = struct {
     fusion_trust: ?f64 = null,
     fusion_prior: ?f64 = null,
     fusion_prior_weight: ?f64 = null,
+    /// Mention admission floor: mentions whose extractor-asserted confidence is below this are never resolved — no canonical entity key, no mention edge, and relation endpoints referencing them are withheld. The cheap post-extraction junk filter for score-carrying extractors; 0 (the default) admits everything.
+    min_confidence: ?f64 = null,
     config_generation: ?u64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -7677,6 +7680,7 @@ pub const GraphResolverConfig = struct {
         .{ "fusion_trust", "fusion_trust", true },
         .{ "fusion_prior", "fusion_prior", true },
         .{ "fusion_prior_weight", "fusion_prior_weight", true },
+        .{ "min_confidence", "min_confidence", true },
         .{ "config_generation", "config_generation", true },
     };
 
@@ -7750,6 +7754,10 @@ pub const GraphResolverConfig = struct {
         }
         if (self.fusion_prior_weight) |value| {
             try jw.objectField("fusion_prior_weight");
+            try jw.write(value);
+        }
+        if (self.min_confidence) |value| {
+            try jw.objectField("min_confidence");
             try jw.write(value);
         }
         if (self.config_generation) |value| {

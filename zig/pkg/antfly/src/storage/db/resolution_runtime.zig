@@ -218,7 +218,7 @@ pub fn resolveExtraction(
         gpa,
         cfg.table,
         cfg.key_template,
-        .{ .labels = cfg.labels, .exclude_labels = sibling_excludes },
+        .{ .labels = cfg.labels, .exclude_labels = sibling_excludes, .min_confidence = cfg.min_confidence },
         cfg.type_must_match,
         cfg.scorer_json,
     );
@@ -294,7 +294,7 @@ fn processChangedExtractionWithConfig(
         gpa,
         cfg.table,
         cfg.key_template,
-        .{ .labels = cfg.labels, .exclude_labels = sibling_excludes },
+        .{ .labels = cfg.labels, .exclude_labels = sibling_excludes, .min_confidence = cfg.min_confidence },
         cfg.type_must_match,
         cfg.scorer_json,
     );

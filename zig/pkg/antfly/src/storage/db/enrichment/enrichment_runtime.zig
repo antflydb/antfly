@@ -20823,9 +20823,14 @@ fn runtimeAppendRelationItem(
         break :blk if (trimmed.len > 0) try std.fmt.parseFloat(f64, trimmed) else 1.0;
     } else runtimeJsonFloatField(item, "weight") orelse runtimeJsonFloatField(item, "confidence") orelse 1.0;
     if (!std.math.isFinite(weight)) return error.InvalidGraphEdges;
-    const metadata_json = if (mapping.metadata_template_json.len > 0)
-        try runtimeRenderGraphArtifactMetadataTemplateAlloc(alloc, mapping.metadata_template_json, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)
-    else if (target_table) |table|
+    const metadata_json = if (mapping.metadata_template_json.len > 0) blk: {
+        const rendered = try runtimeRenderGraphArtifactMetadataTemplateAlloc(alloc, mapping.metadata_template_json, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value);
+        // Mirrors db.zig: a custom metadata template must not strip the
+        // resolved endpoint's home-table tag.
+        const table = target_table orelse break :blk rendered;
+        defer alloc.free(rendered);
+        break :blk try runtimePrependTargetTableToMetadataJsonAlloc(alloc, table, rendered);
+    } else if (target_table) |table|
         try runtimePrependTargetTableToItemMetadataAlloc(alloc, table, item)
     else
         try std.json.Stringify.valueAlloc(alloc, item, .{});
@@ -21085,6 +21090,28 @@ fn runtimeCanonicalEntityTable(entity: std.json.Value) ?[]const u8 {
     return null;
 }
 
+/// Mirrors db.zig's prependTargetTableToMetadataJsonAlloc for the runtime
+/// renderer: tag an already-rendered metadata object with the resolved
+/// endpoint's home table unless the template rendered its own tag.
+fn runtimePrependTargetTableToMetadataJsonAlloc(alloc: Allocator, target_table: []const u8, metadata_json: []const u8) ![]u8 {
+    if (metadata_json.len < 2 or metadata_json[0] != '{' or
+        std.mem.indexOf(u8, metadata_json, "\"target_table\":") != null)
+        return try alloc.dupe(u8, metadata_json);
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, "{\"target_table\":");
+    const quoted = try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .string = target_table }, .{});
+    defer alloc.free(quoted);
+    try out.appendSlice(alloc, quoted);
+    if (!std.mem.eql(u8, metadata_json, "{}")) {
+        try out.append(alloc, ',');
+        try out.appendSlice(alloc, metadata_json[1..]);
+    } else {
+        try out.append(alloc, '}');
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
 fn runtimePrependTargetTableToItemMetadataAlloc(alloc: Allocator, target_table: []const u8, item: std.json.Value) ![]u8 {
     const item_json = try std.json.Stringify.valueAlloc(alloc, item, .{});
     defer alloc.free(item_json);
@@ -21141,11 +21168,26 @@ fn runtimeFindGraphArtifactEntityIn(entities: std.json.Value, entity_id: []const
 
 fn runtimeGraphArtifactEntityAtIndex(artifact_value: std.json.Value, entity_index: i64) ?std.json.Value {
     if (entity_index < 0 or artifact_value != .object) return null;
-    const entities = artifact_value.object.get("_entities") orelse artifact_value.object.get("entities") orelse return null;
-    if (entities != .array) return null;
     const index: usize = @intCast(entity_index);
-    if (index >= entities.array.items.len) return null;
-    return entities.array.items[index];
+    const raw_entity: ?std.json.Value = blk: {
+        const entities = artifact_value.object.get("entities") orelse break :blk null;
+        if (entities != .array or index >= entities.array.items.len) break :blk null;
+        break :blk entities.array.items[index];
+    };
+    if (artifact_value.object.get("_entities")) |resolved| {
+        // Mirrors db.zig's graphArtifactEntityAtIndex: the injected
+        // resolution map is keyed by mention local id, and an id-less
+        // extraction entity resolves under its decimal array position.
+        var buf: [20]u8 = undefined;
+        const positional_id = std.fmt.bufPrint(&buf, "{d}", .{index}) catch unreachable;
+        const local_id = if (raw_entity) |entity|
+            runtimeJsonStringField(entity, "id") orelse runtimeJsonStringField(entity, "local_id") orelse positional_id
+        else
+            positional_id;
+        if (runtimeFindGraphArtifactEntityIn(resolved, local_id)) |entity| return entity;
+        if (resolved == .array and index < resolved.array.items.len) return resolved.array.items[index];
+    }
+    return raw_entity;
 }
 
 fn runtimeJsonStringField(value: std.json.Value, field: []const u8) ?[]const u8 {
@@ -29732,8 +29774,9 @@ test "asset producer neighbor context samples local graph adjacency into the inp
         fn run(rt: *EnrichmentRuntime, req: enrichment_types.GeneratedEnrichmentRequest, sources: *PreparedDocumentSourceCache, win: *GeneratedReplayWindow) !void {
             var batch = PreparedAssetBatch{};
             defer batch.deinit(rt.alloc);
-            try processAsset(rt, req, &batch, sources, win);
-            try batch.flush(rt, win);
+            var scope = FailureScope{ .fingerprint = requestFailureFingerprint(req) };
+            try processAsset(rt, req, &batch, sources, win, &scope);
+            try batch.flush(rt, win, &scope);
             try std.testing.expect(batch.retry_error == null);
         }
     }.run;
@@ -29839,8 +29882,9 @@ test "asset producer neighbor context samples local graph adjacency into the inp
                     scheduled.sequence = group.sequence;
                     var batch = PreparedAssetBatch{};
                     defer batch.deinit(rt.alloc);
-                    try processAsset(rt, scheduled, &batch, sources, win);
-                    try batch.flush(rt, win);
+                    var scope = FailureScope{ .fingerprint = requestFailureFingerprint(scheduled) };
+                    try processAsset(rt, scheduled, &batch, sources, win, &scope);
+                    try batch.flush(rt, win, &scope);
                     try std.testing.expect(batch.retry_error == null);
                 }
             }

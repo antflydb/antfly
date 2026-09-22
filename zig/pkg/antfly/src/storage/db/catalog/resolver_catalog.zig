@@ -129,6 +129,13 @@ pub const ResolverConfig = struct {
     fusion_prior: f64 = 0.0,
     /// Weight of `fusion_prior` in the fusion; 0 ignores the prior.
     fusion_prior_weight: f64 = 0.0,
+    /// Mention admission floor in [0, 1]: mentions whose extractor-asserted
+    /// confidence is below this are never resolved (no canonical key, no
+    /// mention edge; relation endpoints referencing them stay unresolvable
+    /// and are dropped by the canonical-only rule). The cheap
+    /// post-extraction junk filter for score-carrying extractors (GLiNER);
+    /// 0 admits everything.
+    min_confidence: f64 = 0.0,
     /// Bumped to force a versioned re-resolution pass.
     config_generation: u64 = 0,
 
@@ -174,6 +181,7 @@ pub const ResolverConfig = struct {
             .fusion_trust = cfg.fusion_trust,
             .fusion_prior = cfg.fusion_prior,
             .fusion_prior_weight = cfg.fusion_prior_weight,
+            .min_confidence = cfg.min_confidence,
             .config_generation = cfg.config_generation,
         };
     }
@@ -225,6 +233,7 @@ pub const ResolverConfig = struct {
         if (std.mem.eql(u8, self.candidate_search, "ann")) {
             if (self.candidate_ann_index.len == 0 and self.name_embedding.len == 0) return error.InvalidResolverConfig;
         }
+        if (!(self.min_confidence >= 0.0 and self.min_confidence <= 1.0)) return error.InvalidResolverConfig;
         if (self.fusion_combine.len == 0) return;
         if (fusionStrategy(self.fusion_combine) == null) return error.InvalidResolverConfig;
         if (!(self.fusion_trust > 0.0 and self.fusion_trust <= 1.0)) return error.InvalidResolverConfig;

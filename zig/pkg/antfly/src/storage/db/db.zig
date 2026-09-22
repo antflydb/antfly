@@ -30830,8 +30830,64 @@ pub const DB = struct {
             return;
         }
         self.executor.notifySequence(sequence);
+        if (options.no_progress_timeout_ns != 0) {
+            // The threaded executor's waitForAll has no deadline, and the
+            // post-wait stall check (checkTargetAdvanceNoProgress in
+            // runMaintenanceUntilWithOptions) only runs after this returns —
+            // a derived index that can never satisfy its replay target (for
+            // example an artifact-backed dense index whose indexed count
+            // diverges from its expected count) parked the wait forever and
+            // the guard it was configured with never executed. Feed the same
+            // per-index stuck diagnostic through the wait's cancellation
+            // checkpoint so the guard interrupts the wait it is meant to
+            // bound; a transient interrupt (the stuck record cleared between
+            // firing and re-check) resumes waiting.
+            var guard = TargetAdvanceStallGuard{ .db = self, .timeout_ns = options.no_progress_timeout_ns };
+            while (true) {
+                const outcome = self.executor.waitForAllWithVisibilityWait(sequence, .{
+                    .cancellation = guard.token(),
+                });
+                outcome catch |err| switch (err) {
+                    error.EnrichmentWaitCanceled => {
+                        try self.checkTargetAdvanceNoProgress(options.no_progress_timeout_ns);
+                        continue;
+                    },
+                    else => return err,
+                };
+                return;
+            }
+        }
         try self.executor.waitForAll(sequence);
     }
+
+    /// Cancellation checkpoint that interrupts a threaded derived wait when
+    /// any index's target advance has been stuck past `timeout_ns` (the same
+    /// diagnostic `checkTargetAdvanceNoProgress` reads after the wait).
+    /// Throttled: the executor's wait loop polls its checkpoint every
+    /// millisecond, and the stuck scan takes the diagnostic mutex and
+    /// allocates a name snapshot, so re-checking every poll would be pure
+    /// overhead on healthy drains.
+    const TargetAdvanceStallGuard = struct {
+        db: *DB,
+        timeout_ns: u64,
+        last_check_ns: std.atomic.Value(u64) = .init(0),
+
+        const recheck_interval_ns: u64 = 250 * std.time.ns_per_ms;
+
+        fn token(self: *TargetAdvanceStallGuard) types.CancellationToken {
+            return .{ .ptr = self, .check_fn = check };
+        }
+
+        fn check(ptr: *const anyopaque) anyerror!void {
+            const self: *TargetAdvanceStallGuard = @ptrCast(@alignCast(@constCast(ptr)));
+            const now_ns = monotonicTimeNs();
+            if (now_ns -| self.last_check_ns.load(.monotonic) < recheck_interval_ns) return;
+            self.last_check_ns.store(now_ns, .monotonic);
+            var stuck = (try oldestTargetAdvanceStuck(self.db.async_context, self.timeout_ns, now_ns)) orelse return;
+            stuck.deinit(self.db.async_context.alloc);
+            return error.DerivedTargetAdvanceStuck;
+        }
+    };
 
     pub fn runDerivedUntil(self: *DB, sequence: u64) !void {
         try self.runDerivedUntilWithOptions(sequence, .{});
@@ -64529,9 +64585,16 @@ fn appendRelationItem(
         break :blk if (trimmed.len > 0) try std.fmt.parseFloat(f64, trimmed) else 1.0;
     } else jsonFloatField(item, "weight") orelse jsonFloatField(item, "confidence") orelse 1.0;
     graph_mod.validateEdgeWeight(weight) catch return error.InvalidGraphEdges;
-    const metadata_json = if (mapping.metadata_template_json.len > 0)
-        try renderGraphArtifactMetadataTemplateAlloc(alloc, mapping.metadata_template_json, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)
-    else if (target_table) |table|
+    const metadata_json = if (mapping.metadata_template_json.len > 0) blk: {
+        const rendered = try renderGraphArtifactMetadataTemplateAlloc(alloc, mapping.metadata_template_json, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value);
+        // A custom metadata template must not silently strip the resolved
+        // endpoint's home-table tag: without it the node looks same-table to
+        // traversal identity, admission, routing, and hydration. An explicit
+        // target_table in the template wins.
+        const table = target_table orelse break :blk rendered;
+        defer alloc.free(rendered);
+        break :blk try prependTargetTableToMetadataJsonAlloc(alloc, table, rendered);
+    } else if (target_table) |table|
         // The same cross-table endpoint tag mention edges carry: traversal
         // and node admission route the resolved target to its home table.
         try prependTargetTableToItemMetadataAlloc(alloc, table, item)
@@ -64882,6 +64945,29 @@ fn canonicalEntityTable(entity: std.json.Value) ?[]const u8 {
     return null;
 }
 
+/// Prepend the cross-table endpoint tag to an already-rendered metadata JSON
+/// object, preserving an explicit `target_table` the template rendered
+/// itself. Non-object metadata passes through untouched (the tag has nowhere
+/// coherent to live, and traversal's substring scan would misread it).
+fn prependTargetTableToMetadataJsonAlloc(alloc: Allocator, target_table: []const u8, metadata_json: []const u8) ![]u8 {
+    if (metadata_json.len < 2 or metadata_json[0] != '{' or
+        std.mem.indexOf(u8, metadata_json, "\"target_table\":") != null)
+        return try alloc.dupe(u8, metadata_json);
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, "{\"target_table\":");
+    const quoted = try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .string = target_table }, .{});
+    defer alloc.free(quoted);
+    try out.appendSlice(alloc, quoted);
+    if (!std.mem.eql(u8, metadata_json, "{}")) {
+        try out.append(alloc, ',');
+        try out.appendSlice(alloc, metadata_json[1..]);
+    } else {
+        try out.append(alloc, '}');
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
 fn prependTargetTableToItemMetadataAlloc(alloc: Allocator, target_table: []const u8, item: std.json.Value) ![]u8 {
     const item_json = try std.json.Stringify.valueAlloc(alloc, item, .{});
     defer alloc.free(item_json);
@@ -64942,11 +65028,29 @@ fn findGraphArtifactEntityIn(entities: std.json.Value, entity_id: []const u8) ?s
 
 fn graphArtifactEntityAtIndex(artifact_value: std.json.Value, entity_index: i64) ?std.json.Value {
     if (entity_index < 0 or artifact_value != .object) return null;
-    const entities = artifact_value.object.get("_entities") orelse artifact_value.object.get("entities") orelse return null;
-    if (entities != .array) return null;
     const index: usize = @intCast(entity_index);
-    if (index >= entities.array.items.len) return null;
-    return entities.array.items[index];
+    const raw_entity: ?std.json.Value = blk: {
+        const entities = artifact_value.object.get("entities") orelse break :blk null;
+        if (entities != .array or index >= entities.array.items.len) break :blk null;
+        break :blk entities.array.items[index];
+    };
+    if (artifact_value.object.get("_entities")) |resolved| {
+        // The injected resolution map is keyed by mention local id. An
+        // id-less extraction entity (GLiNER2.5's positional payloads) was
+        // resolved under its decimal array position — the same identity
+        // lib/resolver's parseExtractionEntities assigns it.
+        var buf: [20]u8 = undefined;
+        const positional_id = std.fmt.bufPrint(&buf, "{d}", .{index}) catch unreachable;
+        const local_id = if (raw_entity) |entity|
+            jsonStringField(entity, "id") orelse jsonStringField(entity, "local_id") orelse positional_id
+        else
+            positional_id;
+        if (findGraphArtifactEntityIn(resolved, local_id)) |entity| return entity;
+        if (resolved == .array and index < resolved.array.items.len) return resolved.array.items[index];
+    }
+    // The raw positional entity carries no canonical identity; the
+    // canonical-only endpoint rule downstream drops it until resolution lands.
+    return raw_entity;
 }
 
 fn jsonStringField(value: std.json.Value, field: []const u8) ?[]const u8 {
@@ -85894,6 +85998,95 @@ test "db materializes entity-sourced relation edges once resolution lands" {
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, owned_key));
 }
 
+test "db canonicalizes positional extractor endpoints once resolution lands" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    // GLiNER2.5 boundary payloads carry no per-entity ids: relations
+    // reference entities positionally through `entity_index` endpoint
+    // objects, and confidence is spelled "score". The resolver assigns each
+    // id-less mention its decimal array position as the local id, and the
+    // materializer derives the same identity for `entity_index` endpoints,
+    // so resolution injection canonicalizes them like id-carrying payloads
+    // (the examples/dogfood extractor shape).
+    try db.addIndex(.{
+        .name = "gliner_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation","mention_edge_type":"mentions"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"extraction"},"content_type":"application/json"},
+        \\  "edge_types":[{"name":"mentions"},{"name":"tested_by"}]
+        \\}
+        ,
+    });
+    try db.addResolver(.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value =
+            \\{"extraction":{"entities":[{"label":"component","text":"DataServer","score":0.69,"start":64,"end":74},{"label":"test","text":"VOPR","score":0.98,"start":45,"end":49}],"relations":[{"type":"tested_by","source":{"entity_index":0},"target":{"entity_index":1},"score":0.9}]}}
+            ,
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    // The relation edge starts from the canonical source ENTITY resolved
+    // through its positional identity, not from the producing document.
+    {
+        const out = try waitForGraphEdges(alloc, &db, "gliner_graph", "component/dataserver", "tested_by", .out, 1);
+        defer graph_mod.GraphIndex.freeEdges(alloc, out);
+        try std.testing.expectEqual(@as(usize, 1), out.len);
+        try std.testing.expectEqualStrings("test/vopr", out[0].target);
+    }
+    // Both positional mentions also produced document-owned mention edges.
+    {
+        const mentions = try db.getEdges(alloc, "gliner_graph", "doc:a", "mentions", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, mentions);
+        try std.testing.expectEqual(@as(usize, 2), mentions.len);
+    }
+    // The edge is owned by the producing document in the artifact key, and no
+    // document-sourced variant of the relation leaked.
+    const owned_key = try internal_keys.graphEdgeArtifactKeyWithSourceAlloc(alloc, "doc:a", "gliner_graph", "tested_by", "test/vopr", "component/dataserver");
+    defer alloc.free(owned_key);
+    {
+        const raw = try db.core.store.get(alloc, owned_key);
+        defer alloc.free(raw);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "\"target_table\":\"entities\"") != null);
+    }
+    {
+        const doc_sourced = try db.getEdges(alloc, "gliner_graph", "doc:a", "tested_by", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, doc_sourced);
+        try std.testing.expectEqual(@as(usize, 0), doc_sourced.len);
+    }
+
+    // Document deletion retires the entity-sourced edge with its owner.
+    try db.batch(.{ .deletes = &.{"doc:a"}, .sync_level = .enrichments });
+    try db.runUntilIdle();
+    {
+        const out = try db.getEdges(alloc, "gliner_graph", "component/dataserver", "tested_by", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, out);
+        try std.testing.expectEqual(@as(usize, 0), out.len);
+    }
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, owned_key));
+}
+
 test "db resolver removal retires resolution artifacts and mention graph state" {
     const alloc = std.testing.allocator;
 
@@ -90609,6 +90802,91 @@ test "runUntilIdle no-progress guard fails fast with a named stuck-index diagnos
     clearTargetAdvanceStuck(db.async_context, "chunk_vectors");
     try noteTargetAdvanceStuck(db.async_context, "chunk_vectors", now_ns, 12, 0);
     try db.checkTargetAdvanceNoProgress(60 * std.time.ns_per_s);
+}
+
+test "runUntilIdle no-progress guard interrupts the threaded derived wait" {
+    // Reviewer-reported P2: with background index workers the guard only ran
+    // AFTER runDerivedUntilWithOptions returned, and the threaded
+    // waitForAll has no deadline — a derived index that can never satisfy
+    // its replay target parked the wait forever and the configured timeout
+    // never fired. The stall diagnostic now rides the wait's cancellation
+    // checkpoint, so the wait itself is interrupted. This test exercises the
+    // real threaded wait path: workers enabled, a target the workers cannot
+    // reach, and a stuck record older than the timeout. Environments whose io
+    // backend starts no derived workers skip (the guard mechanics have their
+    // own unit test below); the expected-error-log declaration must come
+    // AFTER the skip decision or the boundary check flags the skip itself.
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    if (!db.executor.hasWorkers()) return error.SkipZigTest;
+    @import("../../test_error_logs.zig").expectErrorLogs(1);
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"a\"}" }},
+        .sync_level = .write,
+    });
+
+    const now_ns = monotonicTimeNs();
+    try noteTargetAdvanceStuck(db.async_context, "chunk_vectors", now_ns -| (2 * std.time.ns_per_s), 5017, 0);
+    // A target far past anything committed: without the in-wait guard this
+    // call never returns on a stuck index.
+    const unreachable_sequence = db.core.nextDerivedSequence() + 1_000_000;
+    try std.testing.expectError(error.RunUntilIdleNoProgress, db.runDerivedUntilWithOptions(unreachable_sequence, .{
+        .no_progress_timeout_ns = 1 * std.time.ns_per_s,
+    }));
+
+    const diagnostic = db.lastRunUntilIdleNoProgressDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("chunk_vectors", diagnostic.index_name);
+    clearTargetAdvanceStuck(db.async_context, "chunk_vectors");
+}
+
+test "runUntilIdle stall guard checkpoint fires on a stuck index and stays quiet otherwise" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    var guard = DB.TargetAdvanceStallGuard{ .db = &db, .timeout_ns = 1 * std.time.ns_per_s };
+    const token = guard.token();
+
+    // Healthy: the checkpoint is silent, so the wait keeps waiting.
+    try token.check();
+
+    const now_ns = monotonicTimeNs();
+    try noteTargetAdvanceStuck(db.async_context, "chunk_vectors", now_ns -| (2 * std.time.ns_per_s), 5017, 0);
+    guard.last_check_ns.store(0, .monotonic);
+    try std.testing.expectError(error.DerivedTargetAdvanceStuck, token.check());
+    // The wait layer sees the interrupt as a cancellation, which is what
+    // breaks waitForAllWithVisibilityWait out of its poll loop.
+    guard.last_check_ns.store(0, .monotonic);
+    try std.testing.expect(token.isCancelled());
+
+    // Under the recheck throttle the checkpoint stays quiet even while stuck.
+    guard.last_check_ns.store(monotonicTimeNs(), .monotonic);
+    try token.check();
+
+    // Stuck record cleared: the guard goes quiet again (a transient interrupt
+    // resumes the wait).
+    clearTargetAdvanceStuck(db.async_context, "chunk_vectors");
+    guard.last_check_ns.store(0, .monotonic);
+    try token.check();
 }
 
 test "db applies document artifact child range batch without source row write" {

@@ -12253,6 +12253,11 @@ export interface components {
             fusion_prior?: number;
             /** Format: double */
             fusion_prior_weight?: number;
+            /**
+             * Format: double
+             * @description Mention admission floor: mentions whose extractor-asserted confidence is below this are never resolved — no canonical entity key, no mention edge, and relation endpoints referencing them are withheld. The cheap post-extraction junk filter for score-carrying extractors; 0 (the default) admits everything.
+             */
+            min_confidence?: number;
             /** Format: uint64 */
             config_generation?: number;
         };
@@ -13459,7 +13464,10 @@ export interface components {
             error_count: number;
             /** Format: uint64 */
             retryable_error_count: number;
-            /** Format: uint64 */
+            /**
+             * Format: uint64
+             * @description Durable count of enrichment requests parked with a non-retryable (terminal) disposition, plus fatal worker failures. A terminally failed request never returns to pending; per-document terminal state is reported by the owning index's coverage counters (terminal_failed), and per-document diagnostics by the artifact repair issue listing.
+             */
             fatal_error_count: number;
             /**
              * Format: uint32

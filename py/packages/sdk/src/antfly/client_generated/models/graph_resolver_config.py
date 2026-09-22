@@ -40,6 +40,10 @@ class GraphResolverConfig:
         fusion_trust (float | Unset):
         fusion_prior (float | Unset):
         fusion_prior_weight (float | Unset):
+        min_confidence (float | Unset): Mention admission floor: mentions whose extractor-asserted confidence is below
+            this are never resolved — no canonical entity key, no mention edge, and relation endpoints referencing them are
+            withheld. The cheap post-extraction junk filter for score-carrying extractors; 0 (the default) admits
+            everything.
         config_generation (int | Unset):
     """
 
@@ -61,6 +65,7 @@ class GraphResolverConfig:
     fusion_trust: float | Unset = UNSET
     fusion_prior: float | Unset = UNSET
     fusion_prior_weight: float | Unset = UNSET
+    min_confidence: float | Unset = UNSET
     config_generation: int | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
@@ -108,6 +113,8 @@ class GraphResolverConfig:
 
         fusion_prior_weight = self.fusion_prior_weight
 
+        min_confidence = self.min_confidence
+
         config_generation = self.config_generation
 
         field_dict: dict[str, Any] = {}
@@ -147,6 +154,8 @@ class GraphResolverConfig:
             field_dict["fusion_prior"] = fusion_prior
         if fusion_prior_weight is not UNSET:
             field_dict["fusion_prior_weight"] = fusion_prior_weight
+        if min_confidence is not UNSET:
+            field_dict["min_confidence"] = min_confidence
         if config_generation is not UNSET:
             field_dict["config_generation"] = config_generation
 
@@ -206,6 +215,8 @@ class GraphResolverConfig:
 
         fusion_prior_weight = d.pop("fusion_prior_weight", UNSET)
 
+        min_confidence = d.pop("min_confidence", UNSET)
+
         config_generation = d.pop("config_generation", UNSET)
 
         graph_resolver_config = cls(
@@ -227,6 +238,7 @@ class GraphResolverConfig:
             fusion_trust=fusion_trust,
             fusion_prior=fusion_prior,
             fusion_prior_weight=fusion_prior_weight,
+            min_confidence=min_confidence,
             config_generation=config_generation,
         )
 

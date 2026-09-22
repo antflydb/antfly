@@ -2902,6 +2902,12 @@ pub const EnrichmentStats = struct {
     processed_requests: u64 = 0,
     error_count: u64 = 0,
     retryable_error_count: u64 = 0,
+    /// Durable count of requests parked with a terminal (non-retryable)
+    /// disposition plus fatal worker failures — despite the name, this is
+    /// NOT only worker deaths. A terminally parked request never returns to
+    /// pending; per-document terminal state lives in the derived-coverage
+    /// counters (DBIndexStats.coverage_terminal_failed_count) and the
+    /// artifact repair ledger.
     fatal_error_count: u64 = 0,
     consecutive_retry_count: u32 = 0,
     next_retry_at_ms: u64 = 0,
