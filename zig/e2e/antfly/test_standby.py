@@ -65,6 +65,17 @@ def _is_ha_transition_busy(response: requests.Response) -> bool:
     return response.status_code == 503 and response.content == HA_TRANSITION_BUSY_BODY
 
 
+def _is_ha_post_not_admitted(path: str, response: requests.Response) -> bool:
+    # These exact errors precede route dispatch or capture's backup_start.
+    # A capture can otherwise have committed even when its reply is lost: never
+    # infer replay safety from HTTP 503 alone or retry transport exceptions.
+    return _is_ha_transition_busy(response) or (
+        path == "/base-backups/capture"
+        and response.status_code == 503
+        and response.content == b"HASeedSnapshotRuntimeBusy"
+    )
+
+
 class HAStandaloneNode:
     def __init__(
         self,
@@ -132,32 +143,18 @@ class HAStandaloneNode:
 
     def capture_catalog(self) -> dict[str, Any]:
         generation = f"catalog-{time.time_ns()}"
-        deadline = time.monotonic() + HA_TRANSITION_RETRY_TIMEOUT_S
-        while True:
-            try:
-                captured = self.admin_post(
-                    "/base-backups/capture",
-                    {
-                        "slot_name": "catalog-inspection",
-                        "generation": generation,
-                        "topology_id": "e2e",
-                        "topology_generation": 1,
-                        "node_id": "standby-a",
-                        "target_pvc_name": "e2e-data",
-                        "target_pvc_uid": "e2e-data-uid",
-                    },
-                )
-                break
-            except requests.HTTPError as error:
-                response = error.response
-                if (
-                    response is None
-                    or response.status_code != 503
-                    or response.text != "HASeedSnapshotRuntimeBusy"
-                    or time.monotonic() >= deadline
-                ):
-                    raise
-                time.sleep(HA_TRANSITION_RETRY_INTERVAL_S)
+        captured = self.admin_post(
+            "/base-backups/capture",
+            {
+                "slot_name": "catalog-inspection",
+                "generation": generation,
+                "topology_id": "e2e",
+                "topology_generation": 1,
+                "node_id": "standby-a",
+                "target_pvc_name": "e2e-data",
+                "target_pvc_uid": "e2e-data-uid",
+            },
+        )
         topology = json.loads(
             (Path(captured["content_root"]) / "TOPOLOGY.json").read_text()
         )
@@ -340,14 +337,18 @@ class HAStandaloneNode:
         )
 
     def admin_post_response(
-        self, path: str, payload: dict[str, Any]
+        self,
+        path: str,
+        payload: dict[str, Any],
+        *,
+        request_timeout_s: float = 10.0,
     ) -> requests.Response:
         return self._request(
             "POST",
             f"{self.url}{HA_ADMIN_ROOT}{path}",
             json=payload,
             headers=self.admin_headers(),
-            timeout=10,
+            timeout=request_timeout_s,
         )
 
     def admin_get(self, path: str, **params: Any) -> dict[str, Any]:
@@ -366,15 +367,19 @@ class HAStandaloneNode:
     def admin_post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         deadline = time.monotonic() + HA_TRANSITION_RETRY_TIMEOUT_S
         while True:
-            response = self.admin_post_response(path, payload)
-            if not _is_ha_transition_busy(response):
+            response = self.admin_post_response(
+                path,
+                payload,
+                request_timeout_s=max(0.001, min(10.0, deadline - time.monotonic())),
+            )
+            if not _is_ha_post_not_admitted(path, response):
                 return self._check(response)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return self._check(response)
+            time.sleep(min(HA_TRANSITION_RETRY_INTERVAL_S, remaining))
             if time.monotonic() >= deadline:
                 return self._check(response)
-            # This exact response is emitted before route dispatch when the HA
-            # state mutex is owned, so no mutation has occurred and retrying is
-            # safe. Do not retry arbitrary 503 responses from route handlers.
-            time.sleep(HA_TRANSITION_RETRY_INTERVAL_S)
 
     def create_table(self, table_name: str) -> dict[str, Any]:
         response = self._request(
@@ -446,7 +451,9 @@ def test_admin_post_retries_exact_pre_dispatch_transition_busy(
     )
     attempts = 0
 
-    def next_response(_path: str, _payload: dict[str, Any]) -> requests.Response:
+    def next_response(
+        _path: str, _payload: dict[str, Any], **_kwargs: Any
+    ) -> requests.Response:
         nonlocal attempts
         attempts += 1
         return next(responses)
@@ -462,7 +469,9 @@ def test_admin_post_does_not_retry_ambiguous_service_unavailable():
     node = object.__new__(HAStandaloneNode)
     attempts = 0
 
-    def unavailable(_path: str, _payload: dict[str, Any]) -> requests.Response:
+    def unavailable(
+        _path: str, _payload: dict[str, Any], **_kwargs: Any
+    ) -> requests.Response:
         nonlocal attempts
         attempts += 1
         return _test_response(503, b"upstream unavailable")
@@ -473,6 +482,95 @@ def test_admin_post_does_not_retry_ambiguous_service_unavailable():
     with pytest.raises(requests.HTTPError, match="upstream unavailable"):
         node.admin_post("/test", {})
     assert attempts == 1
+
+
+def test_admin_capture_retries_only_pre_admission_busy_with_same_identity(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    node = object.__new__(HAStandaloneNode)
+    payload = {"slot_name": "standby-a", "generation": "same-generation"}
+    requests_seen = []
+    responses = iter(
+        [
+            _test_response(503, b"HASeedSnapshotRuntimeBusy"),
+            _test_response(503, HA_TRANSITION_BUSY_BODY),
+            _test_response(200, b'{"already_captured":false}'),
+        ]
+    )
+
+    def next_response(path, body, *, request_timeout_s):
+        assert 0 < request_timeout_s <= 10
+        requests_seen.append((path, body))
+        return next(responses)
+
+    node.admin_post_response = next_response
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+    assert node.admin_post("/base-backups/capture", payload) == {
+        "already_captured": False
+    }
+    assert requests_seen == [("/base-backups/capture", payload)] * 3
+    assert all(body is payload for _, body in requests_seen)
+
+
+@pytest.mark.parametrize(
+    ("path", "status", "body"),
+    [
+        ("/standby/bootstrap", 503, b"HASeedSnapshotRuntimeBusy"),
+        ("/base-backups/capture", 500, b"HASeedSnapshotRuntimeBusy"),
+        ("/base-backups/capture", 503, b"HASeedSnapshotRuntimeBusy\n"),
+        ("/base-backups/capture", 503, b"capture outcome unknown"),
+    ],
+)
+def test_admin_capture_never_replays_unclassified_errors(path, status, body):
+    node = object.__new__(HAStandaloneNode)
+    attempts = []
+
+    def next_response(*args, **kwargs):
+        attempts.append(args)
+        return _test_response(status, body)
+
+    node.admin_post_response = next_response
+    node.debug_logs = lambda: "test logs"
+    with pytest.raises(requests.HTTPError):
+        node.admin_post(path, {})
+    assert len(attempts) == 1
+
+
+@pytest.mark.parametrize("error", [requests.Timeout, requests.ConnectionError])
+def test_admin_capture_does_not_replay_unknown_transport_outcome(error):
+    node = object.__new__(HAStandaloneNode)
+    attempts = []
+
+    def next_response(*args, **kwargs):
+        attempts.append(args)
+        raise error("reply lost")
+
+    node.admin_post_response = next_response
+    with pytest.raises(error, match="reply lost"):
+        node.admin_post("/base-backups/capture", {})
+    assert len(attempts) == 1
+
+
+def test_admin_capture_admission_budget_includes_request_and_sleep(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    node = object.__new__(HAStandaloneNode)
+    now = [0.0]
+    timeouts = []
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(time, "sleep", lambda delay: now.__setitem__(0, now[0] + delay))
+
+    def busy(_path, _payload, *, request_timeout_s):
+        timeouts.append(request_timeout_s)
+        now[0] += request_timeout_s
+        return _test_response(503, b"HASeedSnapshotRuntimeBusy")
+
+    node.admin_post_response = busy
+    node.debug_logs = lambda: "test logs"
+    with pytest.raises(requests.HTTPError, match="HASeedSnapshotRuntimeBusy"):
+        node.admin_post("/base-backups/capture", {})
+    assert timeouts == pytest.approx([10.0, 9.9])
+    assert now[0] == pytest.approx(HA_TRANSITION_RETRY_TIMEOUT_S)
 
 
 class HACluster:

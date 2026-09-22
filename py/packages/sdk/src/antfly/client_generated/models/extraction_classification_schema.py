@@ -38,6 +38,8 @@ class ExtractionClassificationSchema:
             including 1. Omit top_k when using these options.
         mode (ExtractionClassificationSchemaMode | Unset): Version 2 classification mode. Ordinal labels are ordered
             from lowest to highest.
+            Typed-decision extractors support boolean with labels ["false", "true"] in that order.
+            Each model rejects modes it does not support.
         label_definitions (ExtractionClassificationSchemaLabelDefinitions | Unset):
         min_labels (int | Unset):
         max_labels (int | None | Unset): Version 2 maximum selected labels. Explicit null means no maximum; omission

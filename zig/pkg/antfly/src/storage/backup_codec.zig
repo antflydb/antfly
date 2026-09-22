@@ -58,6 +58,9 @@ pub const BlockType = enum(u8) {
     metadata_batch = 0x18,
     artifact_batch = 0x19,
     resolution_batch = 0x1A,
+    /// Authenticated online source-copy only; ordinary restores rebuild their
+    /// own claims and must reject this owner-bound shadow integrity stream.
+    integrity_batch = 0x1B,
     blob_header = 0x20,
     blob_chunk = 0x21,
     footer_index = 0x22,

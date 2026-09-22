@@ -78,6 +78,14 @@ pub const TableWriteSource = struct {
     boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
 
     pub const VTable = struct {
+        txn_status_group_local_with_request: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            req: distributed_txn.TxnStatusRequest,
+            context: @import("operation.zig").RequestContext,
+        ) anyerror!?db_mod.types.TxnStatus = null,
         vector_migration_group_local: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request_json: []const u8) anyerror!?[]u8 = null,
 
         /// Committed replication has distinct transaction and entry-identity
@@ -161,6 +169,7 @@ pub const TableWriteSource = struct {
             table_name: []const u8,
             contract: metadata_topology_protocol.DropCleanupContract,
         ) anyerror!?void = null,
+        backup_pin_control: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: @import("../storage/db/native_backup_seal_contract.zig").Request, control: backup_contract.BackupOperationControl) anyerror!?[]u8 = null,
         backup_table: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -787,6 +796,12 @@ pub const TableWriteSource = struct {
         return try BoundaryAbi.call("drop_table", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, contract });
     }
 
+    pub fn backupPinControl(self: TableWriteSource, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: @import("../storage/db/native_backup_seal_contract.zig").Request, control: backup_contract.BackupOperationControl) !?[]u8 {
+        try control.ensureActive();
+        const callback = self.vtable.backup_pin_control orelse return error.UnsupportedOperation;
+        return BoundaryAbi.call("backup_pin_control", self.boundary_dispatch, callback, .{ self.ptr, alloc, table_name, group_id, request, control });
+    }
+
     pub fn backupTable(
         self: TableWriteSource,
         alloc: std.mem.Allocator,
@@ -1077,6 +1092,20 @@ pub const TableWriteSource = struct {
     ) !?db_mod.types.TxnStatus {
         const fn_ptr = self.vtable.txn_status_group_local orelse return null;
         return try BoundaryAbi.call("txn_status_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, txn_id });
+    }
+
+    pub fn txnStatusGroupLocalWithRequest(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: distributed_txn.TxnStatusRequest,
+        context: @import("operation.zig").RequestContext,
+    ) !?db_mod.types.TxnStatus {
+        try context.ensureActive();
+        if (req.restore_staging_scope == null or req.restore_staging_plan_id == null) return error.InvalidTxnRequest;
+        const callback = self.vtable.txn_status_group_local_with_request orelse return error.DeadlineAwareTxnStatusUnsupported;
+        return try BoundaryAbi.call("txn_status_group_local_with_request", self.boundary_dispatch, callback, .{ self.ptr, alloc, group_id, table_name, req, context });
     }
 
     pub fn txnStatusGroupLinearizable(

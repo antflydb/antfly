@@ -2365,6 +2365,8 @@ const SecretResolutionContext = enum {
     connections,
     connection,
     external_io,
+    inference_connection,
+    inference_root,
     normal,
 };
 
@@ -2388,15 +2390,25 @@ fn resolveSecretReferencesInValue(
         .object => |*obj| {
             var it = obj.iterator();
             while (it.next()) |entry| {
+                // These subtrees are parsed from raw configuration and resolve
+                // operational credentials at use time, after native startup.
+                if (context == .config_root) {
+                    const key = entry.key_ptr.*;
+                    if (std.mem.eql(u8, key, "secrets") or std.mem.eql(u8, key, "generators") or
+                        std.mem.eql(u8, key, "embedders") or std.mem.eql(u8, key, "rerankers") or
+                        std.mem.eql(u8, key, "remote_content")) continue;
+                }
                 // External-I/O credentials are operational secrets: retain
                 // references in the immutable node config and resolve them at
                 // each backup, restore, or probe. This makes rotation effective
                 // without weakening bucket/prefix authorization. Other config
                 // secrets keep their established startup-resolution behavior.
                 const child_context: SecretResolutionContext = switch (context) {
-                    .config_root => if (std.mem.eql(u8, entry.key_ptr.*, "connections")) .connections else .normal,
+                    .config_root => if (std.mem.eql(u8, entry.key_ptr.*, "connections")) .connections else if (std.mem.eql(u8, entry.key_ptr.*, "inference")) .inference_root else .normal,
                     .connections => .connection,
-                    .connection => if (std.mem.eql(u8, entry.key_ptr.*, "external_io")) .external_io else .normal,
+                    .connection => if (std.mem.eql(u8, entry.key_ptr.*, "external_io")) .external_io else if (std.mem.eql(u8, entry.key_ptr.*, "inference") or std.mem.eql(u8, entry.key_ptr.*, "web_search")) .inference_connection else .normal,
+                    .inference_connection => if (std.mem.eql(u8, entry.key_ptr.*, "api_key")) continue else .normal,
+                    .inference_root => if (std.mem.eql(u8, entry.key_ptr.*, "api_key") or std.mem.eql(u8, entry.key_ptr.*, "s3_credentials")) continue else .normal,
                     .external_io => if (std.mem.eql(u8, entry.key_ptr.*, "credentials")) continue else .normal,
                     .normal => .normal,
                 };

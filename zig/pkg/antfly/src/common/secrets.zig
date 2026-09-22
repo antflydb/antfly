@@ -15,6 +15,7 @@
 const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
+const contract = @import("secret_contract.zig");
 const fs_paths = @import("fs_paths.zig");
 const runtime_callback_abi = @import("../runtime_callback_abi.zig");
 
@@ -24,7 +25,18 @@ const c_env = if (builtin.link_libc and builtin.os.tag != .windows) struct {
 
 /// Startup-only resolver configuration. Sources are ordered and never API-writable.
 pub const Config = struct {
-    pub const Native = struct { name: []const u8 = "native", path: []const u8 };
+    pub const Native = struct {
+        name: []const u8 = "native",
+        backend: enum { file, distributed, serverless } = .file,
+        path: []const u8 = "",
+        scope: []const u8 = "default",
+        keyring_path: ?[]const u8 = null,
+        // Dedicated per-consumer delivery credentials, independent of wrapping keys.
+        grants: []const Grant = &.{},
+        reader: ?Reader = null,
+        pub const Grant = struct { name: []const u8, credential_path: []const u8, keys: []const []const u8 };
+        pub const Reader = struct { name: []const u8, credential_path: []const u8, urls: []const []const u8 };
+    };
     pub const Source = struct { name: []const u8, type: enum { file }, path: []const u8 };
     native: ?Native = null,
     sources: []const Source = &.{},
@@ -33,7 +45,33 @@ pub const Config = struct {
     pub fn validate(self: Config) !void {
         if (self.native) |native| {
             try validateSourceName(native.name);
-            try validateSourcePath(native.path);
+            try contract.validateName(native.scope);
+            try validateSourcePath(native.scope);
+            if (native.backend == .file) {
+                try validateSourcePath(native.path);
+                if (native.keyring_path != null or native.reader != null or native.grants.len != 0) return error.InvalidConfig;
+            } else if (native.reader) |reader| {
+                if (native.backend != .distributed or native.keyring_path != null or native.grants.len != 0 or reader.urls.len == 0) return error.InvalidConfig;
+                try validateSourceName(reader.name);
+                try validateSourcePath(reader.credential_path);
+                for (reader.urls) |url| {
+                    try validateSourcePath(url);
+                    if (!(std.mem.startsWith(u8, url, "http://") or std.mem.startsWith(u8, url, "https://")) or std.mem.indexOfAny(u8, url, "?#") != null) return error.InvalidConfig;
+                }
+            } else {
+                try validateSourcePath(native.keyring_path orelse return error.InvalidConfig);
+                if (native.backend == .serverless) {
+                    try validateSourcePath(native.path);
+                    if (native.grants.len != 0) return error.InvalidConfig;
+                }
+            }
+            for (native.grants, 0..) |grant, i| {
+                try validateSourceName(grant.name);
+                try validateSourcePath(grant.credential_path);
+                if (grant.keys.len == 0) return error.InvalidConfig;
+                for (grant.keys) |key| try validateKey(key);
+                for (native.grants[0..i]) |prior| if (std.mem.eql(u8, prior.name, grant.name)) return error.InvalidConfig;
+            }
         }
         for (self.sources, 0..) |source, index| {
             try validateSourceName(source.name);
@@ -141,6 +179,7 @@ pub const ListedSecret = struct {
     status: SecretStatus,
     source: ?[]u8 = null,
     managed: bool = false,
+    revision: ?u64 = null,
     env_var: ?[]u8 = null,
     created_at: ?[]u8 = null,
     updated_at: ?[]u8 = null,
@@ -303,9 +342,14 @@ pub const BearerAuthHeaderCache = struct {
         platform_sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
 
-        if (self.header == null or self.generation != resolved.cacheGeneration()) {
+        // Generations are scoped to a source and may collide across fallback
+        // transitions (or remain zero for environment/literal values). Resolution
+        // already fetched the current value; never reuse a different credential.
+        const matches = if (self.header) |header| std.mem.eql(u8, header["Bearer ".len..], resolved.value) else false;
+        if (!matches or self.generation != resolved.cacheGeneration()) {
+            const header = try std.fmt.allocPrint(cache_alloc, "Bearer {s}", .{resolved.value});
             if (self.header) |value| cache_alloc.free(value);
-            self.header = try std.fmt.allocPrint(cache_alloc, "Bearer {s}", .{resolved.value});
+            self.header = header;
             self.generation = resolved.cacheGeneration();
         }
         return try out_alloc.dupe(u8, self.header.?);
@@ -377,6 +421,10 @@ pub const FileStore = struct {
     environment_enabled: bool = true,
     source_name: ?[]u8 = null,
     fallbacks: []FileStore = &.{},
+    native_config: ?std.json.Parsed(Config.Native) = null,
+    native_source: ?contract.Source = null,
+    native_writer: ?contract.NativeStore.Writer = null,
+    native_revision: u64 = 0,
     mutex: std.atomic.Mutex = .unlocked,
     entries: std.StringArrayHashMapUnmanaged(StoredSecret) = .{},
     observed_metadata: ?FileMetadata = null,
@@ -436,37 +484,63 @@ pub const FileStore = struct {
 
     pub fn initConfiguredWithIo(alloc: std.mem.Allocator, io: std.Io, cfg: Config) !FileStore {
         try cfg.validate();
-        if (cfg.native) |native| {
-            for (cfg.sources) |source| try rejectSourceAlias(alloc, io, native.path, source.path);
-        }
-        const count = cfg.sources.len + @as(usize, if (cfg.native != null) 1 else 0);
-        // A pathless resolver enforces environment:false even without file sources.
+        const native_file = if (cfg.native) |native| native.backend == .file else false;
+        if (native_file) for (cfg.sources) |source| try rejectSourceAlias(alloc, io, cfg.native.?.path, source.path);
+        // Encrypted native stores have a pathless root, with all files as fallbacks.
+        const encrypted = cfg.native != null and !native_file;
+        const offset: usize = if (native_file) 1 else 0;
+        const count = cfg.sources.len + offset;
         var paths = try alloc.alloc([]const u8, count);
         defer alloc.free(paths);
-        if (cfg.native) |native| paths[0] = native.path;
-        const offset: usize = if (cfg.native != null) 1 else 0;
+        if (native_file) paths[0] = cfg.native.?.path;
         for (cfg.sources, offset..) |source, i| paths[i] = source.path;
-        var store = if (count > 0)
+        var store = if (count > 0 and !encrypted)
             try initLayeredWithIo(alloc, io, paths)
         else
             FileStore{ .alloc = alloc, .io = io, .path = try alloc.dupe(u8, ""), .has_file = false };
         errdefer store.deinit();
-        store.writable = cfg.native != null;
+        if (encrypted and count > 0) {
+            var fallback_list = std.ArrayList(FileStore).empty;
+            errdefer {
+                for (fallback_list.items) |*item| item.deinit();
+                fallback_list.deinit(alloc);
+            }
+            for (paths) |path| {
+                var item = try FileStore.initWithIo(alloc, io, path);
+                errdefer item.deinit();
+                try fallback_list.append(alloc, item);
+            }
+            store.fallbacks = try fallback_list.toOwnedSlice(alloc);
+        }
+        store.writable = native_file;
         store.environment_enabled = cfg.environment;
         if (cfg.native) |native| {
             store.source_name = try alloc.dupe(u8, native.name);
+            if (encrypted) {
+                const bytes = try std.json.Stringify.valueAlloc(alloc, native, .{});
+                defer alloc.free(bytes);
+                store.native_config = try std.json.parseFromSlice(Config.Native, alloc, bytes, .{ .allocate = .alloc_always });
+            }
         } else if (cfg.sources.len > 0) {
             store.source_name = try alloc.dupe(u8, cfg.sources[0].name);
         }
         for (store.fallbacks, 0..) |*fallback, i| {
             fallback.writable = false;
             fallback.environment_enabled = cfg.environment;
-            fallback.source_name = try alloc.dupe(u8, cfg.sources[i + 1 - offset].name);
+            fallback.source_name = try alloc.dupe(u8, cfg.sources[if (encrypted) i else i + 1 - offset].name);
         }
         return store;
     }
 
+    /// Attach before listeners start. Handles borrow their runtime owner.
+    pub fn attachNative(self: *FileStore, source: contract.Source, writer: ?contract.NativeStore.Writer) void {
+        self.native_source = source;
+        self.native_writer = writer;
+        self.writable = writer != null;
+    }
+
     pub fn deinit(self: *FileStore) void {
+        if (self.native_config) |*cfg| cfg.deinit();
         for (self.fallbacks) |*fallback| fallback.deinit();
         if (self.fallbacks.len > 0) self.alloc.free(self.fallbacks);
         deinitEntries(self.alloc, &self.entries);
@@ -579,6 +653,17 @@ pub const FileStore = struct {
             for (out.items) |*item| item.deinit(alloc);
             out.deinit(alloc);
         }
+        if (self.native_config != null and self.native_source == null) return error.Unavailable;
+        if (self.native_source) |source| {
+            var listing = try source.listMetadata(alloc, self.native_config.?.value.scope, .{ .min_revision = self.native_revision });
+            defer listing.deinit(alloc);
+            self.observeNativeRevision(listing.revision);
+            for (listing.entries) |entry| {
+                var described = try self.describeNative(alloc, entry.key, entry.revision);
+                errdefer described.deinit(alloc);
+                try out.append(alloc, described);
+            }
+        }
         var it = self.entries.iterator();
         while (it.next()) |entry| {
             try out.append(alloc, try self.describeStored(alloc, entry.key_ptr.*, entry.value_ptr.*));
@@ -613,6 +698,11 @@ pub const FileStore = struct {
         try validateKey(key);
         self.lock();
         defer self.unlock();
+        if (self.native_writer) |writer| {
+            const result = try writer.put(self.native_config.?.value.scope, key, value, .any);
+            self.observeNativeRevision(result.revision);
+            return self.describeNative(alloc, key, result.revision);
+        }
         _ = try self.refreshIfChangedLocked();
 
         var next = try cloneEntries(self.alloc, self.entries);
@@ -652,6 +742,11 @@ pub const FileStore = struct {
         if (!self.writable) return error.WriteUnavailable;
         self.lock();
         defer self.unlock();
+        if (self.native_writer) |writer| {
+            const result = try writer.removeOverride(self.native_config.?.value.scope, key, .any);
+            self.observeNativeRevision(result.revision);
+            return result.changed;
+        }
         _ = try self.refreshIfChangedLocked();
 
         const index = self.entries.getIndex(key) orelse return false;
@@ -679,7 +774,8 @@ pub const FileStore = struct {
     fn getOwnedLocal(self: *FileStore, alloc: std.mem.Allocator, key: []const u8) !?[]u8 {
         self.lock();
         defer self.unlock();
-        _ = try self.refreshIfChangedLocked();
+        if (try self.resolveNativeLocked(alloc, key)) |value| return value;
+        if (self.native_source == null) _ = try self.refreshIfChangedLocked();
 
         if (self.entries.get(key)) |stored| return try alloc.dupe(u8, stored.value);
         for (self.fallbacks) |*fallback| {
@@ -698,12 +794,13 @@ pub const FileStore = struct {
     fn getOwnedWithGenerationLocal(self: *FileStore, alloc: std.mem.Allocator, key: []const u8) !ResolvedSecret {
         self.lock();
         defer self.unlock();
-        _ = try self.refreshIfChangedLocked();
+        if (try self.resolveNativeLocked(alloc, key)) |value| return .{ .value = value, .generation = self.generationLocked(), .source = .file_store };
+        if (self.native_source == null) _ = try self.refreshIfChangedLocked();
 
         if (self.entries.get(key)) |stored| {
             return .{
                 .value = try alloc.dupe(u8, stored.value),
-                .generation = self.generation_value,
+                .generation = self.generationLocked(),
                 .source = .file_store,
             };
         }
@@ -722,7 +819,7 @@ pub const FileStore = struct {
         const value = envValueOwned(alloc, env_var) orelse return error.SecretNotFound;
         return .{
             .value = value,
-            .generation = self.generation_value,
+            .generation = self.generationLocked(),
             .source = .env_var,
         };
     }
@@ -835,7 +932,39 @@ pub const FileStore = struct {
         self.markReloadHealthyLocked(true);
     }
 
+    fn observeNativeRevision(self: *FileStore, revision: u64) void {
+        if (revision != self.native_revision) {
+            self.native_revision = revision;
+            self.generation_value +%= 1;
+            self.generation_snapshot.store(self.generation_value, .release);
+        }
+    }
+
+    fn describeNative(self: *FileStore, alloc: std.mem.Allocator, key: []const u8, revision: u64) !ListedSecret {
+        const owned_key = try alloc.dupe(u8, key);
+        errdefer alloc.free(owned_key);
+        return .{ .key = owned_key, .status = .configured_file, .source = try alloc.dupe(u8, self.source_name orelse "native"), .managed = self.writable, .revision = revision };
+    }
+
+    fn resolveNativeLocked(self: *FileStore, alloc: std.mem.Allocator, key: []const u8) !?[]u8 {
+        const source = self.native_source orelse return null; // Startup bootstrap uses only files/environment.
+        const result = try source.resolve(alloc, self.native_config.?.value.scope, key, .{ .min_revision = self.native_revision });
+        self.observeNativeRevision(result.revision);
+        return if (result.value) |value| value.secret.bytes else null;
+    }
+
     fn refreshIfChangedLocked(self: *FileStore) !bool {
+        if (self.native_source) |source| {
+            const result = source.refresh(self.native_config.?.value.scope) catch |err| {
+                self.markReloadFailedLocked();
+                return err;
+            };
+            if (!result.available or result.stale or result.revision < self.native_revision) return error.Unavailable;
+            const changed = result.revision != self.native_revision;
+            self.observeNativeRevision(result.revision);
+            self.last_reload_failed = false;
+            return changed;
+        }
         if (!self.has_file) return false;
         const metadata = statFileMetadataWithIo(self.io, self.path) catch |err| switch (err) {
             error.FileNotFound => {
@@ -1845,6 +1974,24 @@ test "bearer auth header cache rebuilds on file generation change" {
     defer alloc.free(second);
     try std.testing.expectEqualStrings("Bearer second", second);
     try std.testing.expect(cache.generation > first_generation);
+}
+
+test "bearer auth header cache distinguishes credentials with equal generations" {
+    const alloc = std.testing.allocator;
+    var first = try SecretValue.initConfig(alloc, "first") orelse return error.TestUnexpectedResult;
+    defer first.deinit(alloc);
+    var second = try SecretValue.initConfig(alloc, "second") orelse return error.TestUnexpectedResult;
+    defer second.deinit(alloc);
+    var cache = BearerAuthHeaderCache{};
+    defer cache.deinit(alloc);
+    const before = try cache.getOwned(alloc, alloc, &first, null);
+    defer alloc.free(before);
+    const generation = cache.generation;
+    const after = try cache.getOwned(alloc, alloc, &second, null);
+    defer alloc.free(after);
+    try std.testing.expectEqual(generation, cache.generation);
+    try std.testing.expectEqualStrings("Bearer first", before);
+    try std.testing.expectEqualStrings("Bearer second", after);
 }
 
 test "environment secret discovery maps API key env vars" {

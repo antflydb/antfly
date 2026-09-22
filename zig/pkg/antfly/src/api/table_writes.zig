@@ -2048,6 +2048,7 @@ pub const ProvisionedTableWriteCache = struct {
     /// managed DB gets a group-specific `PromotionOwner` so only the local leader
     /// promotes resolution replay into cross-shard entity writes.
     promotion_leadership_source: ?PromotionLeadershipSourceContract = null,
+    coordinated_ttl: ?db_mod.coordinated_ttl.Port = null,
     /// Optional HA ownership gate applied when this cache opens managed writer
     /// DBs. Changing the gate retires live cached DBs so the next operation
     /// reopens with the correct primary/standby role and background runtimes.
@@ -2176,6 +2177,7 @@ pub const ProvisionedTableWriteCache = struct {
         auto_bulk_ingest_finishing: bool = false,
 
         fn detachRuntimeHooks(self: *Entry) void {
+            self.db.setCoordinatedTtl(null, 0);
             if (comptime control_only_storage_sources) return;
             self.db.setQueryVisibilityHook(null);
             self.db.setResolutionCandidateSource(null);
@@ -2359,6 +2361,7 @@ pub const ProvisionedTableWriteCache = struct {
     };
 
     fn applyRuntimeHooksToDb(self: *ProvisionedTableWriteCache, db: *db_mod.DB, group_id: u64, owner_state: ?*PromotionOwnerState) void {
+        db.setCoordinatedTtl(self.coordinated_ttl, group_id);
         db.setResolutionCandidateSource(self.resolution_candidate_source);
         db.setEntitySink(self.entity_sink);
         if (owner_state) |state| {
@@ -2533,8 +2536,14 @@ pub const ProvisionedTableWriteCache = struct {
         candidate_source: ?db_mod.CandidateSource,
         entity_sink_value: ?db_mod.EntitySink,
         leadership_source: ?PromotionLeadershipSourceContract,
+        ttl_port: ?db_mod.coordinated_ttl.Port,
     ) void {
-        if (self.runtimeHooksEqual(candidate_source, entity_sink_value, leadership_source)) return;
+        const ttl_equal = if (self.coordinated_ttl) |current|
+            if (ttl_port) |next| current.ptr == next.ptr and current.expire_fn == next.expire_fn else false
+        else
+            ttl_port == null;
+        if (ttl_equal and self.runtimeHooksEqual(candidate_source, entity_sink_value, leadership_source)) return;
+        self.coordinated_ttl = ttl_port;
         self.resolution_candidate_source = candidate_source;
         self.entity_sink = entity_sink_value;
         self.promotion_leadership_source = leadership_source;
@@ -2958,6 +2967,7 @@ pub const ProvisionedTableWriteCache = struct {
         table_name: []const u8,
         mode: ManagedDbOpenMode,
     ) !CachedDb {
+        if (comptime control_only_storage_sources) return error.StorageKernelOwnerUnavailable;
         const OpenedDb = struct {
             db: db_mod.DB,
             start_bulk_session: bool,
@@ -3397,6 +3407,7 @@ pub const ProvisionedTableWriteCache = struct {
     }
 
     fn leaseEntryLocked(self: *ProvisionedTableWriteCache, entry: *Entry) CachedDb {
+        if (comptime control_only_storage_sources) unreachable;
         lockAtomic(@constCast(&self.entry_lifecycle_mutex));
         defer @constCast(&self.entry_lifecycle_mutex).unlock();
         entry.active_leases += 1;
@@ -4724,9 +4735,24 @@ pub const ProvisionedTableWriteCache = struct {
         return !self.hasRetiredOrClosingEntryForGroupTableAssumeLifecycleLocked(group_id, table_name);
     }
 
+    fn tryDrainRetiredGroup(self: *ProvisionedTableWriteCache, group_id: u64) bool {
+        if (!self.open_mutex.tryLock()) return false;
+        defer self.unlockOpenMutex();
+        self.drainPendingClosesForGroupAssumeOpenMutexHeld(group_id);
+        lockAtomic(&self.entry_lifecycle_mutex);
+        defer self.entry_lifecycle_mutex.unlock();
+        for (self.retired_entries.items) |entry| if (entry.group_id == group_id) return false;
+        for (self.closing_entries.items) |entry| if (entry.group_id == group_id) return false;
+        return true;
+    }
+
     fn drainPendingClosesForGroup(self: *ProvisionedTableWriteCache, group_id: u64) void {
         self.lockOpenMutex();
         defer self.unlockOpenMutex();
+        self.drainPendingClosesForGroupAssumeOpenMutexHeld(group_id);
+    }
+
+    fn drainPendingClosesForGroupAssumeOpenMutexHeld(self: *ProvisionedTableWriteCache, group_id: u64) void {
         while (true) {
             var entry_to_close: ?*Entry = null;
             lockAtomic(&self.entry_lifecycle_mutex);
@@ -5053,6 +5079,7 @@ const LegacyTableWriteSource = struct {
             table_name: []const u8,
             plan: backups_api.TableBackupPlan,
         ) anyerror!?[]backups_api.ShardSnapshot = null,
+        backup_pin_control: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: @import("../storage/db/native_backup_seal.zig").Request, control: backups_api.BackupOperationControl) anyerror!?[]u8 = null,
         backup_table_to_location: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -5317,6 +5344,16 @@ const LegacyTableWriteSource = struct {
         req: db_mod.types.BatchRequest,
     ) !?void {
         return try self.vtable.batch(self.ptr, alloc, table_name, req);
+    }
+
+    pub fn topologyControl(self: TableWriteSource, alloc: std.mem.Allocator, table_name: []const u8, command: @import("../storage/db/relational_integrity_topology.zig").Command) !void {
+        _ = (try self.batch(alloc, table_name, .{ .relational_topology = command })) orelse return error.TableNotFound;
+    }
+
+    pub fn backupPinControl(self: TableWriteSource, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: @import("../storage/db/native_backup_seal.zig").Request, control: backups_api.BackupOperationControl) !?[]u8 {
+        try control.ensureActive();
+        const callback = self.vtable.backup_pin_control orelse return error.UnsupportedOperation;
+        return callback(self.ptr, alloc, table_name, group_id, request, control);
     }
 
     pub fn beginBulkIngest(self: TableWriteSource, alloc: std.mem.Allocator, table_name: []const u8) !?void {
@@ -5803,6 +5840,9 @@ const LegacyTableWriteSource = struct {
 pub const RaftBatcher = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
+
+    const BoundaryAbi = @import("../runtime_callback_abi.zig").Boundary(VTable);
 
     pub const VTable = struct {
         batch_group: *const fn (
@@ -5893,7 +5933,7 @@ pub const RaftBatcher = struct {
         table_name: []const u8,
         req: db_mod.types.BatchRequest,
     ) !void {
-        return try self.vtable.batch_group(self.ptr, alloc, group_id, table_name, req);
+        return BoundaryAbi.call("batch_group", self.boundary_dispatch, self.vtable.batch_group, .{ self.ptr, alloc, group_id, table_name, req });
     }
 
     pub fn batchGroupWithCancellation(
@@ -5906,7 +5946,7 @@ pub const RaftBatcher = struct {
     ) !void {
         const fn_ptr = self.vtable.batch_group_with_cancellation orelse
             return try self.batchGroup(alloc, group_id, table_name, req);
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, req, cancellation);
+        return BoundaryAbi.call("batch_group_with_cancellation", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, req, cancellation });
     }
 
     pub fn batchGroupRoutedWithCancellation(
@@ -5920,7 +5960,7 @@ pub const RaftBatcher = struct {
         const fn_ptr = self.vtable.batch_group_routed_with_cancellation orelse
             return error.CatalogRouteFenceUnsupported;
         try fence.validate();
-        return try fn_ptr(self.ptr, alloc, fence, table_name, req, cancellation);
+        return BoundaryAbi.call("batch_group_routed_with_cancellation", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, fence, table_name, req, cancellation });
     }
 
     pub fn batchGroupLocal(
@@ -5930,7 +5970,7 @@ pub const RaftBatcher = struct {
         table_name: []const u8,
         req: db_mod.types.BatchRequest,
     ) !void {
-        return try self.vtable.batch_group_local(self.ptr, alloc, group_id, table_name, req);
+        return BoundaryAbi.call("batch_group_local", self.boundary_dispatch, self.vtable.batch_group_local, .{ self.ptr, alloc, group_id, table_name, req });
     }
 
     pub fn batchGroupLocalWithCancellation(
@@ -5943,7 +5983,7 @@ pub const RaftBatcher = struct {
     ) !void {
         const fn_ptr = self.vtable.batch_group_local_with_cancellation orelse
             return try self.batchGroupLocal(alloc, group_id, table_name, req);
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, req, cancellation);
+        return BoundaryAbi.call("batch_group_local_with_cancellation", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, req, cancellation });
     }
 
     pub fn batchGroupLocalWithPreDecisionContext(
@@ -5956,7 +5996,7 @@ pub const RaftBatcher = struct {
     ) !void {
         const fn_ptr = self.vtable.batch_group_local_with_pre_decision_context orelse
             return try self.batchGroupLocalWithCancellation(alloc, group_id, table_name, req, context.cancellation);
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, req, context);
+        return BoundaryAbi.call("batch_group_local_with_pre_decision_context", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, req, context });
     }
 
     pub fn txnStatusGroup(
@@ -5967,7 +6007,7 @@ pub const RaftBatcher = struct {
         txn_id: db_mod.types.TxnId,
     ) !db_mod.types.TxnStatus {
         const fn_ptr = self.vtable.txn_status_group orelse return error.UnsupportedOperation;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, txn_id);
+        return BoundaryAbi.call("txn_status_group", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, txn_id });
     }
 
     pub fn txnStatusGroupUntil(
@@ -5980,7 +6020,7 @@ pub const RaftBatcher = struct {
     ) !db_mod.types.TxnStatus {
         const fn_ptr = self.vtable.txn_status_group_until orelse
             return error.DeadlineAwareTxnStatusUnsupported;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, txn_id, deadline_ns);
+        return BoundaryAbi.call("txn_status_group_until", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, txn_id, deadline_ns });
     }
 
     pub fn txnStatusGroupLocal(
@@ -5991,7 +6031,7 @@ pub const RaftBatcher = struct {
         txn_id: db_mod.types.TxnId,
     ) !db_mod.types.TxnStatus {
         const fn_ptr = self.vtable.txn_status_group_local orelse return error.UnsupportedOperation;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, txn_id);
+        return BoundaryAbi.call("txn_status_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, txn_id });
     }
 
     pub fn txnStatusGroupLocalUntil(
@@ -6004,7 +6044,7 @@ pub const RaftBatcher = struct {
     ) !db_mod.types.TxnStatus {
         const fn_ptr = self.vtable.txn_status_group_local_until orelse
             return error.DeadlineAwareTxnStatusUnsupported;
-        return try fn_ptr(self.ptr, alloc, group_id, table_name, txn_id, deadline_ns);
+        return BoundaryAbi.call("txn_status_group_local_until", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, txn_id, deadline_ns });
     }
 };
 
@@ -6046,6 +6086,9 @@ const DocumentChildRangeDispatchContext = struct {
 pub const BoundTableWriteSource = struct {
     table_name: []const u8,
     db: *db_mod.DB,
+    /// Optional physical owner identity for callers that bind one routed group.
+    /// Namespace shard IDs are document identity, not storage group identity.
+    owner_group_id: ?u64 = null,
 
     pub fn init(table_name: []const u8, db: *db_mod.DB) BoundTableWriteSource {
         return .{
@@ -6073,6 +6116,7 @@ pub const BoundTableWriteSource = struct {
                 .graph_metric_action_with_cancellation = graphMetricActionWithCancellation,
                 .graph_metric_maintenance_group_local = graphMetricMaintenanceGroupLocal,
                 .backup_table = backupTable,
+                .backup_pin_control = backupPinControl,
                 .restore_table = restoreTable,
                 .commit_transaction = commitTransaction,
                 .commit_transaction_with_cancellation = commitTransactionWithCancellation,
@@ -6370,6 +6414,12 @@ pub const BoundTableWriteSource = struct {
         db.abortBulkIngestSession();
     }
 
+    fn backupPinControl(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: @import("../storage/db/native_backup_seal.zig").Request, control: backups_api.BackupOperationControl) !?[]u8 {
+        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, self.table_name, table_name)) return null;
+        return try executeBackupPinControl(alloc, try self.activeDb(), group_id, request, control);
+    }
+
     fn backupTable(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -6384,7 +6434,7 @@ pub const BoundTableWriteSource = struct {
         try plan.ensureActive();
         const db = try self.activeDb();
         if (plan.format == .portable) {
-            return try exportPortableBackupShard(alloc, db, plan.backup_root, plan.backup_id, 0, plan.io);
+            return try exportPortableBackupShardWithSeal(alloc, db, plan.backup_root, plan.backup_id, 0, plan.io, try @import("backup_contract.zig").sealedHandleForGroup(plan.sealed_handles, 0), plan.cancellation);
         }
 
         const snapshot_io = plan.io orelse db.backend_runtime.filesystemIo() orelse
@@ -6400,7 +6450,12 @@ pub const BoundTableWriteSource = struct {
             platform_time.realtimeNs(),
         );
         defer snapshot_attempt.deinit();
-        _ = try db.snapshotNativeWithCancellation(snapshot_token, plan.cancellation);
+        _ = if (try @import("backup_contract.zig").sealedHandleForGroup(plan.sealed_handles, 0)) |handle|
+            try db.exportBackupCohort(handle.handle, snapshot_token, plan.cancellation)
+        else if (plan.relational_cohort_fence) |cohort|
+            try db.snapshotRelationalCohort(snapshot_token, cohort, plan.cancellation)
+        else
+            try db.snapshotNativeWithCancellation(snapshot_token, plan.cancellation);
 
         const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/{s}", .{ db.core.path, snapshot_token });
         defer alloc.free(snapshot_root);
@@ -6673,7 +6728,7 @@ pub const BoundTableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
-        if (tables.len == 1 and tables[0].predicates.len == 0) {
+        if (tables.len == 1 and tables[0].predicates.len == 0 and tables[0].relational_index_maintenance == null) {
             const table = tables[0];
             const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
             if (!std.mem.eql(u8, self.table_name, table.table_name)) return null;
@@ -6750,6 +6805,7 @@ pub const BoundTableWriteSource = struct {
         const table = tables[0];
         if (!std.mem.eql(u8, self.table_name, table.table_name)) return null;
 
+        if (table.relational_index_maintenance) |command| if (command.owner_group_id != (self.owner_group_id orelse return error.UnsupportedOperation)) return error.PreparedGenerationChanged;
         const db = try self.activeDb();
         try validateTransactionAgainstLocalSchema(alloc, db, txn_id, table.writes, table.deletes, table.transforms);
         const commit_version = begin_timestamp + 1;
@@ -6817,6 +6873,16 @@ pub const BoundTableWriteSource = struct {
             .deletes = table.deletes,
             .transforms = table.transforms,
             .predicates = table.predicates,
+            .integrity = table.integrity,
+            .integrity_commands = table.integrity_commands,
+            .relational_activation = table.relational_activation,
+            .relational_retirement = table.relational_retirement,
+            .relational_index_maintenance = table.relational_index_maintenance,
+            .relational_schema_version = table.relational_schema_version,
+            .relational_integrity_generation_set = table.relational_integrity_generation_set,
+            .restore_staging_scope = table.restore_staging_scope,
+            .restore_staging_plan_id = table.restore_staging_plan_id,
+            .relational_repair = table.relational_repair,
         }) catch |err| {
             // A begun local transaction must reach a terminal state on every
             // rejected write. In particular, graph transform validation is
@@ -7062,6 +7128,7 @@ pub const BoundTableWriteSource = struct {
         try ensurePreDecisionContextActive(context);
         const db = try self.activeDb();
         try validateTransactionAgainstLocalSchema(alloc, db, txn_id, req.writes, req.deletes, req.transforms);
+        if (req.relational_index_maintenance) |command| if (command.owner_group_id != (self.owner_group_id orelse return error.UnsupportedOperation)) return error.PreparedGenerationChanged;
         try ensurePreDecisionContextActive(context);
         try db.writeTransaction(txn_id, req);
     }
@@ -7922,7 +7989,7 @@ pub const ProvisionedTableWriteSource = struct {
     storage_snapshot_source: ?storage_snapshot_source.Source = null,
     storage_maintenance_source: ?storage_maintenance_source.Source = null,
     seed_create_table_writers: bool = true,
-    group_visible_root_generation: ?table_reads.GroupVisibleRootGenerationSource = null,
+    group_visible_root_generation: ?@import("local_query_contract.zig").GroupVisibleRootGenerationSource = null,
     // Hosted control-plane owners capture a catalog target and route one exact
     // immutable activation to each resident group owner. Resident and
     // standalone owners leave this null and perform the bounded local DB step.
@@ -7938,6 +8005,7 @@ pub const ProvisionedTableWriteSource = struct {
     resolution_candidate_source: ?db_mod.CandidateSource = null,
     entity_sink: ?db_mod.EntitySink = null,
     promotion_leadership_source: ?PromotionLeadershipSource = null,
+    coordinated_ttl: ?db_mod.coordinated_ttl.Port = null,
     ha_write_gate: ?db_mod.HAWriteGate = null,
     ha_async_mirror: ?db_mod.HAAsyncEffectMirror = null,
     dirty_write_tables_mutex: std.atomic.Mutex = .unlocked,
@@ -8482,6 +8550,12 @@ pub const ProvisionedTableWriteSource = struct {
         return self;
     }
 
+    pub fn withCoordinatedTtl(self: *ProvisionedTableWriteSource, port: ?db_mod.coordinated_ttl.Port) *ProvisionedTableWriteSource {
+        self.coordinated_ttl = port;
+        self.syncRuntimeHooksToCaches();
+        return self;
+    }
+
     pub fn withHAWriteGate(
         self: *ProvisionedTableWriteSource,
         gate: ?db_mod.HAWriteGate,
@@ -8597,6 +8671,7 @@ pub const ProvisionedTableWriteSource = struct {
             self.resolution_candidate_source,
             self.entity_sink,
             self.promotion_leadership_source,
+            self.coordinated_ttl,
         );
     }
 
@@ -8793,6 +8868,8 @@ pub const ProvisionedTableWriteSource = struct {
         const alloc = std.heap.page_allocator;
         if (self.raft_batcher) |batcher| {
             try batcher.batchGroup(alloc, ref.group_id, ref.table_name, .{
+                .restore_staging_scope = ref.restore_staging_scope,
+                .restore_staging_plan_id = ref.restore_staging_plan_id,
                 // Recovery acknowledges immediately after this returns. Wait
                 // for Raft apply so a leader change cannot discard a merely
                 // proposed resolution after the coordinator forgets it.
@@ -8809,16 +8886,14 @@ pub const ProvisionedTableWriteSource = struct {
             self.groupLocalWriteSource() orelse return error.StorageKernelOwnerUnavailable
         else
             self.source();
-        _ = (try local_source.txnResolveGroupLocal(
-            alloc,
-            ref.group_id,
-            ref.table_name,
-            txn_id,
-            status,
-            commit_version,
-            0,
-            .write,
-        )) orelse return error.UnknownGroup;
+        _ = (try distributed_txn.resolveGroupLocalWithRequest(local_source, alloc, ref.group_id, ref.table_name, .{
+            .txn_id = txn_id,
+            .status = status,
+            .commit_version = commit_version,
+            .sync_level = .write,
+            .restore_staging_scope = ref.restore_staging_scope,
+            .restore_staging_plan_id = ref.restore_staging_plan_id,
+        }, .none)) orelse return error.UnknownGroup;
     }
 
     fn acknowledgeRecoveryParticipant(
@@ -8831,6 +8906,8 @@ pub const ProvisionedTableWriteSource = struct {
         const owner = distributed_txn.parseParticipantRef(owner_participant) orelse return error.InvalidParticipant;
         const batcher = self.raft_batcher orelse return error.UnsupportedOperation;
         try batcher.batchGroup(std.heap.page_allocator, owner.group_id, owner.table_name, .{
+            .restore_staging_scope = owner.restore_staging_scope,
+            .restore_staging_plan_id = owner.restore_staging_plan_id,
             .sync_level = .write,
             .transaction = .{ .acknowledge = .{
                 .txn_id = txn_id,
@@ -8850,6 +8927,8 @@ pub const ProvisionedTableWriteSource = struct {
         const owner = distributed_txn.parseParticipantRef(owner_participant) orelse return error.InvalidParticipant;
         const batcher = self.raft_batcher orelse return error.UnsupportedOperation;
         try batcher.batchGroup(std.heap.page_allocator, owner.group_id, owner.table_name, .{
+            .restore_staging_scope = owner.restore_staging_scope,
+            .restore_staging_plan_id = owner.restore_staging_plan_id,
             .sync_level = .write,
             .transaction = .{ .cleanup = .{
                 .txn_id = txn_id,
@@ -9345,9 +9424,22 @@ pub const ProvisionedTableWriteSource = struct {
         group_id: u64,
         table_name: ?[]const u8,
     ) !void {
+        if (group_id == 0) return error.InvalidArgument;
         try self.beginReplicaRetirementActivity(group_id, table_name);
         var retirement_active = true;
         errdefer if (retirement_active) self.endReplicaRetirementActivity(group_id);
+
+        // Compiled owners outlive the legacy caches below. Drain their exact
+        // group before renaming its root, otherwise background WAL/index
+        // finalization can recreate files inside the just-deleted generation.
+        // Empty name means all resident names for this retired group ID; the
+        // durable ownership proof, not a reused public name, fences deletion.
+        if (self.groupLocalWriteSource()) |local_source| {
+            const drained = try local_source.retireTableGroupLocal(group_id, table_name orelse "");
+            if (comptime control_only_storage_sources) {
+                if (drained == null) return error.StorageKernelOwnerUnavailable;
+            }
+        } else if (comptime control_only_storage_sources) return error.StorageKernelOwnerUnavailable;
 
         var read_cache_exclusive = try self.beginReadCacheGroupExclusive(group_id);
         var read_cache_exclusive_active = read_cache_exclusive != null;
@@ -9368,6 +9460,16 @@ pub const ProvisionedTableWriteSource = struct {
         self.local_db_mutex.unlock();
         local_db_mutex_held = false;
         self.drainWriteCachePendingClosesForGroup(group_id);
+
+        // Resident writer leases are independent of read-cache exclusivity.
+        // Never rename a generation while a leased DB can still reference it;
+        // the durable retirement journal retries after the last holder exits.
+        if (self.write_cache) |cache| if (!cache.tryDrainRetiredGroup(group_id)) return error.ReplicaRetirementWriterBusy;
+        if (self.startup_write_cache) |cache| {
+            if (self.write_cache == null or cache != self.write_cache.?) {
+                if (!cache.tryDrainRetiredGroup(group_id)) return error.ReplicaRetirementWriterBusy;
+            }
+        }
 
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
@@ -9884,6 +9986,51 @@ pub const ProvisionedTableWriteSource = struct {
 
     pub fn requestReplicaRetirementRecovery(self: *ProvisionedTableWriteSource) void {
         self.scheduleDroppedTableRecovery();
+    }
+
+    /// A terminal authority (HA ledger or metadata lifecycle journal) must
+    /// outlive this request and reauthorize it through `ownership` on restart.
+    /// The ordinary replica-retirement journal owns cache drains and root GC;
+    /// cancellation does not introduce a second deletion path.
+    pub fn retireCanceledRestoreOwner(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_id: u64,
+        scope: [32]u8,
+        ownership: ReplicaRetirementOwnership,
+    ) !void {
+        var descriptor = (try self.readHAHiddenOwnerBootstrap(alloc, group_id, table_id)) orelse {
+            try self.requireAbsentRestoreOwnerRoot(alloc, group_id);
+            return;
+        };
+        defer descriptor.deinit();
+        if (!std.mem.eql(u8, &scope, &descriptor.value.scope.digest()) or
+            descriptor.value.scope.target_namespace.shard_id != group_id)
+            return error.RestoreStagingScopeChanged;
+        // Construction-time sources (including standalone/manual runtimes)
+        // may not yet have installed their durable ownership provider.
+        if (self.replicaRetirementOwnershipSnapshot() == null)
+            _ = self.withReplicaRetirementOwnership(ownership);
+        var prepared = try self.prepareReplicaRetirements(alloc, &.{.{
+            .group_id = group_id,
+            .table_name = descriptor.value.table_name,
+        }});
+        defer prepared.deinit();
+        try self.completePreparedReplicaRetirements(&prepared);
+    }
+
+    /// A missing bootstrap is not evidence that an existing root is ours.
+    /// Exact native scope checks may only be omitted after the root is gone.
+    pub fn requireAbsentRestoreOwnerRoot(self: *ProvisionedTableWriteSource, alloc: std.mem.Allocator, group_id: u64) !void {
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        const io = if (self.backend_runtime) |runtime| runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable else std.Options.debug_io;
+        _ = Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        return error.RestoreStagingScopeChanged;
     }
 
     /// Start the one-time recovery scan only after this source has reached a
@@ -12990,6 +13137,7 @@ pub const ProvisionedTableWriteSource = struct {
         preloaded_metadata: ?StartupCatchUpMetadata,
         managed_open_options: ManagedDbOpenOptions,
     ) !ProvisionedTableWriteCache.CachedDb {
+        if (comptime control_only_storage_sources) return error.StorageKernelOwnerUnavailable;
         _ = alloc;
         const local_persisted_metadata = if (preloaded_metadata) |metadata|
             metadata.metadata_source == .local_persisted
@@ -13179,6 +13327,7 @@ pub const ProvisionedTableWriteSource = struct {
 
             const effective_ha_mirror = haMirrorForManagedDbOpenMode(mode, self.ha_async_mirror);
             var effective_open_options = managed_open_options;
+            effective_open_options.private_restore_bootstrap = if (preloaded_metadata) |metadata| metadata.restore_reservation != null else false;
             effective_open_options.drain_resolver_backfill = false;
             effective_open_options.defer_resolver_workers = true;
             effective_open_options.source_table = table_name;
@@ -13325,6 +13474,30 @@ pub const ProvisionedTableWriteSource = struct {
                 identity_validation,
                 &opened.?,
             );
+            if (preloaded_metadata) |metadata| if (metadata.restore_reservation) |reservation| {
+                if (reservation.scope) |scope| try opened.?.installRestoreStagingReadSchema(cache.alloc, scope, reservation.read_schema_json);
+                // Install physical projections before exposing this EMPTY
+                // writer. Imported PreparedRows update them on every replica;
+                // no enrichment/resolver side effects run on hidden tables.
+                var build_projections = true;
+                if (try opened.?.restoreStagingStatus(cache.alloc)) |status_value| {
+                    var status = status_value;
+                    defer status.deinit();
+                    if (reservation.scope) |scope| try verifyRestoreReservation(&opened.?, cache.alloc, scope, reservation.terminal_admission);
+                    build_projections = status.value.phase != .canceled and status.value.phase != .published;
+                } else {
+                    if (opened.?.core.table_catalog.row_count != 0) return error.RestoreStagingTargetNotEmpty;
+                }
+                if (build_projections) _ = try metadata_table_provisioner.reconcileDbIndexesWithOptions(cache.alloc, &opened.?, reservation.indexes_json, .{ .restore_build_only = true });
+                try opened.?.updateRange(reservation.byte_range);
+                if (reservation.scope) |scope| {
+                    try verifyRestoreReservation(&opened.?, cache.alloc, scope, reservation.terminal_admission);
+                    try opened.?.installRestoreStagingBootstrap(cache.alloc, .{ .scope = scope, .table_name = table_name, .schema_json = metadata.schema_json orelse "", .read_schema_json = reservation.read_schema_json, .indexes_json = reservation.indexes_json, .byte_range = reservation.byte_range });
+                } else {
+                    try opened.?.reserveRestoreStaging(cache.alloc, reservation.plan_id, reservation.plan_digest, identity_namespace orelse return error.DocIdentityNamespaceUnavailable);
+                }
+                if (opened.?.restore_staging_required.load(.acquire)) try opened.?.attachRestoreStagingHAMirror(self.ha_async_mirror);
+            };
 
             var cached = blk: {
                 lockAtomic(&self.local_db_mutex);
@@ -13365,19 +13538,47 @@ pub const ProvisionedTableWriteSource = struct {
         group_id: u64,
         table_name: []const u8,
     ) !ProvisionedTableWriteCache.CachedDb {
+        // Private restore owners are intentionally absent from public table
+        // routing. Only an already-resident, reserved owner may bypass that
+        // lookup; DB participant admission still checks the exact scope.
+        lockAtomic(&self.local_db_mutex);
+        const resident = cache.snapshotLeaseOrAdoptSeededLocked(group_id, self.visibleRootGeneration(group_id), table_name);
+        self.local_db_mutex.unlock();
+        if (resident) |value| {
+            var cached = value;
+            if (cached.db.restoreStagingStatus(alloc)) |maybe_status| {
+                if (maybe_status) |status_value| {
+                    var status = status_value;
+                    defer status.deinit();
+                    return cached;
+                }
+            } else |err| {
+                cached.deinit(alloc);
+                return err;
+            }
+            cached.deinit(alloc);
+        }
         const start_ns = platform_time.monotonicNs();
         const deadline_ns = start_ns +| replicated_apply_writer_open_timeout_ns;
         var logged_wait = false;
         while (true) {
-            return self.getOrOpenCachedDbMode(
+            return self.getOrOpenCachedDbModeAtGeneration(
                 alloc,
                 cache,
                 path,
                 group_id,
+                self.visibleRootGeneration(group_id),
                 table_name,
                 .default_async,
                 null,
                 null,
+                null,
+                // Only this authenticated Raft/HA receiver may reconstruct
+                // missing managed projections while the public write gate is
+                // closed. Reconciliation happens on an unpublished, worker-
+                // disabled handle; the serving handle is reopened with its
+                // original HA gate before entering the cache.
+                .{ .reconcile_for_replicated_apply = true },
             ) catch |err| {
                 if (!isTransientWriterOpenConflict(err)) return err;
                 const now_ns = platform_time.monotonicNs();
@@ -13928,6 +14129,7 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         maybe_cache: ?*ProvisionedTableWriteCache,
     ) void {
+        if (comptime control_only_storage_sources) return;
         const cache = maybe_cache orelse return;
         for (cache.entries.items) |entry| {
             if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
@@ -13941,6 +14143,7 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         maybe_cache: ?*ProvisionedTableWriteCache,
     ) bool {
+        if (comptime control_only_storage_sources) return true;
         const cache = maybe_cache orelse return true;
         var published = true;
         for (cache.entries.items) |entry| {
@@ -13967,6 +14170,7 @@ pub const ProvisionedTableWriteSource = struct {
         cache: *ProvisionedTableWriteCache,
         entry: *ProvisionedTableWriteCache.Entry,
     ) !void {
+        if (comptime control_only_storage_sources) return error.StorageKernelOwnerUnavailable;
         if (!entry.auto_bulk_ingest_session_open) return;
         if (entry.auto_bulk_ingest_finishing) return error.AutoBulkIngestBusy;
         try entry.db.finishPrimaryStoreAutoBulkIngestSessionWithOptions(auto_bulk_ingest_finish_options);
@@ -14342,6 +14546,56 @@ pub const ProvisionedTableWriteSource = struct {
             metadata,
             .{},
         );
+    }
+
+    pub fn primeRestoreStagingWriter(self: *ProvisionedTableWriteSource, alloc: std.mem.Allocator, group_id: u64, table: metadata_table_manager.TableRecord, byte_range: db_mod.types.ByteRange, scope: @import("../storage/db/restore_staging.zig").Scope) !void {
+        return self.primeRestoreStagingWriterMode(alloc, group_id, table, byte_range, scope, .none);
+    }
+
+    /// Authenticated HA may replay the final receipt after a restart. Verify
+    /// its immutable terminal descriptor without reopening the reservation.
+    pub fn primeHARestoreOwner(self: *ProvisionedTableWriteSource, alloc: std.mem.Allocator, group_id: u64, table: metadata_table_manager.TableRecord, byte_range: db_mod.types.ByteRange, scope: @import("../storage/db/restore_staging.zig").Scope) !void {
+        return self.primeRestoreStagingWriterMode(alloc, group_id, table, byte_range, scope, .ha_replay);
+    }
+
+    /// Metadata has committed canceling this exact immutable plan. Recover an
+    /// unacknowledged native cancellation without reopening its reservation.
+    pub fn primeRestoreStagingWriterForCancellation(self: *ProvisionedTableWriteSource, alloc: std.mem.Allocator, group_id: u64, table: metadata_table_manager.TableRecord, byte_range: db_mod.types.ByteRange, scope: @import("../storage/db/restore_staging.zig").Scope) !void {
+        return self.primeRestoreStagingWriterMode(alloc, group_id, table, byte_range, scope, .cancel_recovery);
+    }
+
+    fn verifyRestoreReservation(db: *db_mod.DB, alloc: std.mem.Allocator, scope: @import("../storage/db/restore_staging.zig").Scope, terminal_admission: RestoreTerminalAdmission) !void {
+        if (terminal_admission != .none) {
+            if (try db.restoreStagingStatus(alloc)) |value| {
+                var status = value;
+                defer status.deinit();
+                if (!std.mem.eql(u8, &status.value.scope.digest(), &scope.digest()) or !db.core.identity_namespace.eql(scope.target_namespace)) return error.RestoreStagingScopeChanged;
+                if (status.value.phase == .canceled or (status.value.phase == .published and terminal_admission == .ha_replay)) return;
+            }
+        }
+        try db.reserveRestoreStagingScoped(alloc, scope);
+    }
+
+    fn primeRestoreStagingWriterMode(self: *ProvisionedTableWriteSource, alloc: std.mem.Allocator, group_id: u64, table: metadata_table_manager.TableRecord, byte_range: db_mod.types.ByteRange, scope: @import("../storage/db/restore_staging.zig").Scope, terminal_admission: RestoreTerminalAdmission) !void {
+        if (comptime control_only_storage_sources) return error.StorageKernelOwnerUnavailable;
+        try scope.validate();
+        if (scope.target_namespace.table_id != table.table_id) return error.RestoreStagingScopeChanged;
+        const cache = self.write_cache orelse return error.RestoreStagingInProgress;
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        const io = if (self.backend_runtime) |runtime| runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable else std.Options.debug_io;
+        try fs_paths.createDirPathPortable(io, path);
+        var cached = try self.getOrOpenCachedDbModeAtGeneration(alloc, cache, path, group_id, self.visibleRootGeneration(group_id), table.name, .restore_repair, null, null, .{
+            .indexes_json = "{}",
+            .schema_json = table.schema_json,
+            .identity_namespace = scope.target_namespace,
+            .restore_reservation = .{ .plan_id = scope.plan_id, .plan_digest = scope.plan_digest, .byte_range = byte_range, .scope = scope, .indexes_json = table.indexes_json, .read_schema_json = table.read_schema_json, .terminal_admission = terminal_admission },
+        }, .{});
+        defer cached.deinit(alloc);
+        if (!std.mem.eql(u8, cached.db.getRange().start, byte_range.start) or !std.mem.eql(u8, cached.db.getRange().end, byte_range.end)) return error.RestoreStagingScopeChanged;
+        // Existing entries must already carry the same immutable reservation.
+        try verifyRestoreReservation(cached.db, alloc, scope, terminal_admission);
+        try cached.db.installRestoreStagingBootstrap(alloc, .{ .scope = scope, .table_name = table.name, .schema_json = table.schema_json, .read_schema_json = table.read_schema_json, .indexes_json = table.indexes_json, .byte_range = byte_range });
     }
 
     /// Opens a transition destination before it is published in the catalog.
@@ -16163,6 +16417,37 @@ pub const ProvisionedTableWriteSource = struct {
     /// Exports one managed replica through DB's logical snapshot primitive.
     /// Live backend files are never copied. Ephemeral backends are rejected so
     /// callers cannot mistake process-local state for a restartable seed.
+    pub fn captureHASeedHiddenReplicaSnapshot(self: *ProvisionedTableWriteSource, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, scope: [32]u8, snapshot_token: []const u8, destination_root: []const u8) !void {
+        if (comptime control_only_storage_sources) return error.StorageKernelOwnerUnavailable;
+        var probe = self.probeManagedWriterGroupBestEffort(table_name, group_id);
+        defer probe.deinit();
+        switch (probe) {
+            .unknown => return error.HASeedSnapshotRuntimeBusy,
+            .leased => |*cached| {
+                var marker = (try cached.db.restoreStagingStatus(alloc)) orelse return error.RestoreStagingScopeChanged;
+                defer marker.deinit();
+                if (!std.mem.eql(u8, &marker.value.scope.digest(), &scope)) return error.RestoreStagingScopeChanged;
+                return captureHASeedDbSnapshot(alloc, cached.db, cached.db.core.path, snapshot_token, destination_root);
+            },
+            .absent => {},
+        }
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        const io = if (self.backend_runtime) |runtime| runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable else std.Options.debug_io;
+        _ = try Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false });
+        var locks = WriteCacheTransitionLocks.init(self, true, true);
+        defer locks.deinit();
+        if (locks.first) |cache| if (cache.hasRetiredOrClosingEntryForGroupTableAssumeLifecycleLocked(group_id, table_name)) return error.HASeedSnapshotRuntimeBusy;
+        if (locks.second) |cache| if (cache.hasRetiredOrClosingEntryForGroupTableAssumeLifecycleLocked(group_id, table_name)) return error.HASeedSnapshotRuntimeBusy;
+        locks.releaseStateLocks();
+        var db = try db_mod.DB.open(alloc, path, .{ .backend_runtime = self.backend_runtime, .start_index_workers = false, .start_optional_runtimes = false });
+        defer db.close();
+        var marker = (try db.restoreStagingStatus(alloc)) orelse return error.RestoreStagingScopeChanged;
+        defer marker.deinit();
+        if (!std.mem.eql(u8, &marker.value.scope.digest(), &scope)) return error.RestoreStagingScopeChanged;
+        try captureHASeedDbSnapshot(alloc, &db, path, snapshot_token, destination_root);
+    }
+
     pub fn captureHASeedReplicaSnapshot(
         self: *ProvisionedTableWriteSource,
         alloc: std.mem.Allocator,
@@ -17208,6 +17493,53 @@ pub const ProvisionedTableWriteSource = struct {
             .lease_group = leaseResidentDb,
             .prepare_group_for_read_retry = prepareResidentDbForReadRetry,
         };
+    }
+
+    /// Hidden restore ingress never opens a DB through public metadata. The
+    /// private provisioner must already have installed this exact owner root.
+    pub fn validateRestoreStagingScope(self: *ProvisionedTableWriteSource, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, scope: [32]u8) !void {
+        if (comptime control_only_storage_sources) return error.StorageKernelOwnerUnavailable;
+        var lease = (try self.residentDbSource().leaseGroup(alloc, table_name, group_id, self.visibleRootGeneration(group_id), .{})) orelse return error.UnknownGroup;
+        defer lease.release(alloc);
+        try lease.db.validateRestoreStagingScope(alloc, scope);
+        if (lease.db.core.identity_namespace.shard_id != group_id) return error.RestoreStagingScopeChanged;
+    }
+
+    /// Privileged owner-control lease, including a preauthorized reservation.
+    /// The caller separately verifies current metadata job authority; this
+    /// check proves the exact durable physical owner selected by that proof.
+    pub fn leaseRestoreStagingOwner(self: *ProvisionedTableWriteSource, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, scope: [32]u8, allow_terminal: bool) !table_reads.ResidentDbLease {
+        if (comptime control_only_storage_sources) return error.StorageKernelOwnerUnavailable;
+        var lease = (try self.residentDbSource().leaseGroup(alloc, table_name, group_id, self.visibleRootGeneration(group_id), .{})) orelse return error.UnknownGroup;
+        errdefer lease.release(alloc);
+        var progress = (try lease.db.restoreStagingStatus(alloc)) orelse return error.RestoreStagingScopeChanged;
+        defer progress.deinit();
+        if (!std.mem.eql(u8, &progress.value.scope.digest(), &scope) or lease.db.core.identity_namespace.shard_id != group_id or !lease.db.core.identity_namespace.eql(progress.value.scope.target_namespace)) return error.RestoreStagingScopeChanged;
+        if (!allow_terminal and (progress.value.phase == .published or progress.value.phase == .canceled)) return error.RestoreStagingScopeChanged;
+        return lease;
+    }
+
+    fn applyRestoreStagingBatch(self: *ProvisionedTableWriteSource, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, req: db_mod.types.BatchRequest, context: distributed_txn.PreDecisionContext) !void {
+        const scope = req.restore_staging_scope orelse return error.RestoreStagingScopeChanged;
+        if (comptime control_only_storage_sources) {
+            if (self.raft_batcher) |batcher| {
+                return batcher.batchGroupLocalWithPreDecisionContext(alloc, group_id, table_name, req, context);
+            }
+            const owner_source = self.groupLocalWriteSource() orelse return error.StorageKernelOwnerUnavailable;
+            _ = (try owner_source.batchGroupLocal(alloc, group_id, table_name, req)) orelse return error.StorageKernelOwnerUnavailable;
+            return;
+        }
+        var lease = (try self.residentDbSource().leaseGroup(alloc, table_name, group_id, self.visibleRootGeneration(group_id), .{})) orelse return error.UnknownGroup;
+        defer lease.release(alloc);
+        try lease.db.validateRestoreStagingScope(alloc, scope);
+        if (lease.db.core.identity_namespace.shard_id != group_id) return error.RestoreStagingScopeChanged;
+        if (self.raft_batcher) |batcher| {
+            try batcher.batchGroupLocalWithPreDecisionContext(alloc, group_id, table_name, req, context);
+        } else {
+            // This is a primary admission, not replay. Preserve native HA
+            // durable outbox and synchronous durability policy checks.
+            try lease.db.batch(req);
+        }
     }
 
     fn prepareForRead(ptr: *anyopaque, table_name: []const u8, kind: table_reads.ReadPreparation.Kind) void {
@@ -20624,6 +20956,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .commit_transaction_with_id_with_cancellation = commitTransactionWithIdAndCancellation,
                 .acknowledge_transaction_commit = acknowledgeTransactionCommit,
                 .backup_table = backupTable,
+                .backup_pin_control = backupPinControl,
                 .restore_table = restoreTable,
                 .begin_restore_lifecycle = beginRestoreLifecycle,
                 .finish_restore_lifecycle = finishRestoreLifecycle,
@@ -20639,6 +20972,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .txn_resolve_group_local = txnResolveGroupLocal,
                 .txn_resolve_group_local_with_cancellation = txnResolveGroupLocalWithCancellation,
                 .txn_status_group_local = txnStatusGroupLocal,
+                .txn_status_group_local_with_request = txnStatusGroupLocalWithRequest,
                 .txn_status_group_linearizable = txnStatusGroupLinearizable,
                 .txn_status_group_linearizable_until = txnStatusGroupLinearizableUntil,
                 .txn_status_group_authoritative_local = txnStatusGroupAuthoritativeLocal,
@@ -22004,6 +22338,16 @@ pub const ProvisionedTableWriteSource = struct {
         req: db_mod.types.BatchRequest,
         cancellation: db_mod.types.CancellationToken,
     ) !?void {
+        try @import("../storage/db/online_source_contract.zig").validateRequest(req);
+        const control_group: ?u64 = if (req.online_source) |command| command.scope().fence.owner_group_id else if (req.relational_topology) |command| command.fence.owner_group_id else null;
+        if (control_group) |group_id| {
+            try enforceHAWriteGateOptional(self.ha_write_gate);
+            if (self.raft_batcher) |batcher| {
+                try batcher.batchGroupWithCancellation(alloc, group_id, table_name, req, cancellation);
+                return {};
+            }
+            return try batchGroupLocal(self, alloc, group_id, table_name, req);
+        }
         if (self.raft_batcher == null) {
             if (self.local_write_owner) |owner| return try owner.batchWithVisibilityCancellation(alloc, table_name, req, cancellation);
         }
@@ -22117,6 +22461,31 @@ pub const ProvisionedTableWriteSource = struct {
         self.endRestoreLifecycleActivity(table_name);
     }
 
+    fn backupPinControl(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: @import("../storage/db/native_backup_seal.zig").Request, control: backups_api.BackupOperationControl) !?[]u8 {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try control.ensureActive();
+        if (comptime control_only_storage_sources) {
+            const owner_source = self.groupLocalWriteSource() orelse return error.StorageKernelOwnerUnavailable;
+            return owner_source.backupPinControl(alloc, table_name, group_id, request, control);
+        }
+        if (self.localWriteOwnerSource()) |owner| return owner.backupPinControl(alloc, table_name, group_id, request, control);
+        if (request != .seal) return try reclaimBackupPinAtGroup(alloc, self.backend_runtime, self.replica_root_dir, group_id, request, control);
+        self.beginGroupOperation(table_name, group_id);
+        defer self.endGroupOperation(table_name, group_id);
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        var exclusive = try self.beginReadCacheExclusive(table_name);
+        defer if (exclusive) |*guard| guard.deinit();
+        if (self.write_cache) |cache| {
+            var cached = try self.getOrOpenCachedDbForLocalMutation(alloc, cache, path, group_id, self.visibleRootGeneration(group_id), table_name, true);
+            defer cached.deinit(alloc);
+            return try executeBackupPinControl(alloc, cached.db, group_id, request, control);
+        }
+        var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
+        defer db.close();
+        return try executeBackupPinControl(alloc, &db, group_id, request, control);
+    }
+
     fn backupTable(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -22174,12 +22543,12 @@ pub const ProvisionedTableWriteSource = struct {
                     true,
                 );
                 defer cached.deinit(alloc);
-                return try exportPortableBackupShard(alloc, cached.db, plan.backup_root, plan.backup_id, group_id, plan.io);
+                return try exportPortableBackupShardWithSeal(alloc, cached.db, plan.backup_root, plan.backup_id, group_id, plan.io, try @import("backup_contract.zig").sealedHandleForGroup(plan.sealed_handles, group_id), plan.cancellation);
             }
 
             var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
             defer db.close();
-            return try exportPortableBackupShard(alloc, &db, plan.backup_root, plan.backup_id, group_id, plan.io);
+            return try exportPortableBackupShardWithSeal(alloc, &db, plan.backup_root, plan.backup_id, group_id, plan.io, try @import("backup_contract.zig").sealedHandleForGroup(plan.sealed_handles, group_id), plan.cancellation);
         }
 
         if (self.write_cache) |cache| {
@@ -22703,6 +23072,7 @@ pub const ProvisionedTableWriteSource = struct {
         if (tables.len != 1) return null;
 
         const table_req = tables[0];
+        if (table_req.integrity.len != 0 or table_req.integrity_commands.len != 0 or table_req.relational_activation != null or table_req.relational_retirement != null or table_req.relational_index_maintenance != null or table_req.relational_schema_version != null) return null;
         const has_mutations = table_req.writes.len != 0 or
             table_req.deletes.len != 0 or
             table_req.transforms.len != 0;
@@ -22785,7 +23155,7 @@ pub const ProvisionedTableWriteSource = struct {
         if (tables.len == 0) return .{ .committed = .{ .participant_count = 0 } };
         if (tables.len != 1) return null;
         const table_req = tables[0];
-        if (table_req.predicates.len != 0) return null;
+        if (table_req.predicates.len != 0 or table_req.integrity.len != 0 or table_req.integrity_commands.len != 0 or table_req.relational_activation != null or table_req.relational_retirement != null or table_req.relational_index_maintenance != null or table_req.relational_schema_version != null) return null;
         if (try tableCommitHasGraphProjectionTransform(table_req)) return null;
 
         var routing = (try table_catalog.tableRoutingSnapshotForWrite(
@@ -23131,9 +23501,22 @@ pub const ProvisionedTableWriteSource = struct {
         encoded: []const u8,
     ) !void {
         if (comptime control_only_storage_sources) {
-            return try self.installRaftSnapshotGroupLocalKernel(alloc, group_id, encoded);
+            return try self.installRaftSnapshotGroupLocalKernel(alloc, group_id, encoded, null, 0);
         }
         return try self.installRaftSnapshotGroupLocalLegacy(alloc, group_id, encoded);
+    }
+
+    pub fn installNativeRaftSnapshotGroupLocal(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        projection_store: *anyopaque,
+        group_id: u64,
+        expected_applied_index: u64,
+        encoded: []const u8,
+    ) !void {
+        if (expected_applied_index == 0) return error.InvalidGroupStateSnapshot;
+        if (comptime !control_only_storage_sources) return error.StorageKernelSnapshotUnavailable;
+        return self.installRaftSnapshotGroupLocalKernel(alloc, group_id, encoded, projection_store, expected_applied_index);
     }
 
     fn installRaftSnapshotGroupLocalLegacy(
@@ -23287,9 +23670,12 @@ pub const ProvisionedTableWriteSource = struct {
         alloc: std.mem.Allocator,
         group_id: u64,
         encoded: []const u8,
+        projection_store: ?*anyopaque,
+        expected_applied_index: u64,
     ) !void {
         const snapshot_source = self.storage_snapshot_source orelse return error.StorageKernelSnapshotUnavailable;
         const state = try shard_state_store.GroupStateSnapshotStream.init(encoded);
+        if ((state.native_primary != null) != (projection_store != null)) return error.NativeSnapshotRequired;
         try shard_state_store.validateGroupStateSnapshotStream(alloc, group_id, state);
 
         var discovery_snapshot = try self.catalog.adminSnapshot();
@@ -23336,6 +23722,8 @@ pub const ProvisionedTableWriteSource = struct {
         defer if (generation_reservation) |*reservation| reservation.deinit();
 
         var prepared = try snapshot_source.prepare(.{
+            .projection_store = projection_store,
+            .expected_applied_index = expected_applied_index,
             .path = path,
             .table_name = table_name,
             .group_id = group_id,
@@ -23407,15 +23795,12 @@ pub const ProvisionedTableWriteSource = struct {
 
         if (self.write_cache) |cache| {
             const target_generation = self.visibleRootGeneration(group_id);
-            var cached = try self.getOrOpenCachedDbForLocalMutationWithOptions(
+            var cached = try self.getOrOpenCachedDbModeForReplicatedApply(
                 alloc,
                 cache,
                 path,
                 group_id,
-                target_generation,
                 table_name,
-                true,
-                .{ .reconcile_for_replicated_apply = true },
             );
             defer cached.deinit(alloc);
             try cached.db.applyHAReplicationRecord(record);
@@ -23446,6 +23831,38 @@ pub const ProvisionedTableWriteSource = struct {
             self.local_db_mutex.unlock();
             self.notifyLocalChange(table_name, changeKindForHARecord(record));
         }
+    }
+
+    /// HA replay may reach an unpublished owner without any public routing
+    /// entry. Its checksummed bootstrap survives cache eviction and restart.
+    pub fn readHAHiddenOwnerBootstrap(self: *ProvisionedTableWriteSource, alloc: std.mem.Allocator, group_id: u64, table_id: u64) !?std.json.Parsed(@import("../storage/db/restore_staging.zig").OwnerBootstrap) {
+        if (comptime control_only_storage_sources) return error.StorageKernelOwnerUnavailable;
+        var resident: ?ProvisionedTableWriteCache.CachedDb = null;
+        lockAtomic(&self.local_db_mutex);
+        if (self.write_cache) |cache| {
+            for (cache.entries.items) |entry| {
+                if (entry.group_id != group_id or entry.lsm_root_generation != self.visibleRootGeneration(group_id)) continue;
+                resident = cache.leaseLiveEntryForLocalMutationLocked(group_id, entry.table_name, true);
+                break;
+            }
+        }
+        self.local_db_mutex.unlock();
+        if (resident) |*cached| {
+            defer cached.deinit(alloc);
+            if (cached.db.core.identity_namespace.table_id != table_id) return error.RestoreStagingScopeChanged;
+            return cached.db.readRestoreStagingBootstrap(alloc);
+        }
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        const io = if (self.backend_runtime) |runtime| runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable else std.Options.debug_io;
+        _ = Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        var db = try db_mod.DB.open(alloc, path, .{ .backend_runtime = self.backend_runtime, .open_mode = .query_readonly, .primary_only_readonly = true, .start_index_workers = false, .start_optional_runtimes = false });
+        defer db.close();
+        if (db.core.identity_namespace.table_id != table_id) return error.RestoreStagingScopeChanged;
+        return db.readRestoreStagingBootstrap(alloc);
     }
 
     pub fn syncReplicatedBatchGroupLocal(
@@ -23555,6 +23972,14 @@ pub const ProvisionedTableWriteSource = struct {
         self.beginGroupOperation(table_name, group_id);
         defer self.endGroupOperation(table_name, group_id);
         try ensurePreDecisionContextActive(context);
+        if (context.restore_staging_scope) |scope| {
+            try self.applyRestoreStagingBatch(alloc, table_name, group_id, .{
+                .restore_staging_scope = scope,
+                .restore_staging_plan_id = context.restore_staging_plan_id,
+                .transaction = .{ .begin = .{ .txn_id = txn_id, .begin_timestamp = begin_timestamp, .created_at_ns = nextTxnTimestamp(if (self.backend_runtime) |runtime| runtime.io() else null), .topology_epoch = topology_epoch, .retain_terminal = retain_terminal, .participants = participants } },
+            }, context);
+            return {};
+        }
         try table_catalog.validateTransactionTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
         try ensurePreDecisionContextActive(context);
         if (self.raft_batcher) |batcher| {
@@ -23657,6 +24082,27 @@ pub const ProvisionedTableWriteSource = struct {
         self.beginGroupOperation(table_name, group_id);
         defer self.endGroupOperation(table_name, group_id);
         try ensurePreDecisionContextActive(context);
+        if (req.restore_staging_scope != null) {
+            if (req.relational_index_maintenance != null) return error.InvalidBatchRequest;
+            try self.applyRestoreStagingBatch(alloc, table_name, group_id, .{
+                .writes = transactionWritesAsBatchWrites(req.writes),
+                .deletes = req.deletes,
+                .transforms = req.transforms,
+                .predicates = req.predicates,
+                .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = topology_epoch } },
+                .integrity = req.integrity,
+                .integrity_commands = req.integrity_commands,
+                .relational_activation = req.relational_activation,
+                .relational_retirement = req.relational_retirement,
+                .relational_index_maintenance = req.relational_index_maintenance,
+                .relational_schema_version = req.relational_schema_version,
+                .relational_integrity_generation_set = req.relational_integrity_generation_set,
+                .restore_staging_scope = req.restore_staging_scope,
+                .restore_staging_plan_id = req.restore_staging_plan_id,
+                .relational_repair = req.relational_repair,
+            }, context);
+            return {};
+        }
         try table_catalog.validateTransactionTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
         try ensurePreDecisionContextActive(context);
         if (self.raft_batcher) |batcher| {
@@ -23666,6 +24112,16 @@ pub const ProvisionedTableWriteSource = struct {
                 .transforms = req.transforms,
                 .predicates = req.predicates,
                 .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = topology_epoch } },
+                .integrity = req.integrity,
+                .integrity_commands = req.integrity_commands,
+                .relational_activation = req.relational_activation,
+                .relational_retirement = req.relational_retirement,
+                .relational_schema_version = req.relational_schema_version,
+                .relational_index_maintenance = req.relational_index_maintenance,
+                .relational_integrity_generation_set = req.relational_integrity_generation_set,
+                .restore_staging_scope = req.restore_staging_scope,
+                .restore_staging_plan_id = req.restore_staging_plan_id,
+                .relational_repair = req.relational_repair,
             }, context);
             return {};
         }
@@ -23837,6 +24293,22 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn txnStatusGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_mod.types.TxnId,
+    ) !?db_mod.types.TxnStatus {
+        return txnStatusGroupLocalOrdinary(ptr, alloc, group_id, table_name, txn_id);
+    }
+
+    fn txnStatusGroupLocalWithRequest(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: distributed_txn.TxnStatusRequest, context: @import("operation.zig").RequestContext) !?db_mod.types.TxnStatus {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const owner = self.groupLocalWriteSource() orelse return error.StorageKernelOwnerUnavailable;
+        return owner.txnStatusGroupLocalWithRequest(alloc, group_id, table_name, req, context);
+    }
+
+    fn txnStatusGroupLocalOrdinary(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         group_id: u64,
@@ -25191,7 +25663,7 @@ pub const HostedProvisionedTableWriteSource = struct {
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     inference_api_url: ?[]const u8 = null,
-    group_visible_root_generation: ?table_reads.GroupVisibleRootGenerationSource = null,
+    group_visible_root_generation: ?@import("local_query_contract.zig").GroupVisibleRootGenerationSource = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     internal_service_secret: ?[]const u8 = null,
@@ -25552,6 +26024,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         table_name: []const u8,
         mode: ManagedDbOpenMode,
     ) !ProvisionedTableWriteCache.CachedDb {
+        if (comptime control_only_storage_sources) return error.StorageKernelOwnerUnavailable;
         const lsm_root_generation = self.visibleRootGeneration(group_id);
         if (self.backend_runtime) |runtime| cache.write_cache.backend_runtime = runtime;
         cache.write_cache.antfly_provider = providerWithRemoteCapabilityCache(
@@ -25792,6 +26265,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .commit_transaction_with_id_with_cancellation = commitTransactionWithIdAndCancellation,
                 .acknowledge_transaction_commit = acknowledgeTransactionCommit,
                 .backup_table = backupTable,
+                .backup_pin_control = backupPinControl,
                 .backup_table_to_location = backupTableToLocation,
                 .restore_table = restoreTable,
                 .batch = batch,
@@ -25803,6 +26277,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .txn_resolve_group_local = txnResolveGroupLocal,
                 .txn_resolve_group_local_with_cancellation = txnResolveGroupLocalWithCancellation,
                 .txn_status_group_local = txnStatusGroupLocal,
+                .txn_status_group_local_with_request = txnStatusGroupLocalWithRequest,
                 .txn_acknowledge_group_local = txnAcknowledgeGroupLocal,
                 .corrupt_embedding_artifact = corruptEmbeddingArtifact,
                 .reprocess_document_artifact = reprocessDocumentArtifact,
@@ -26211,6 +26686,31 @@ pub const HostedProvisionedTableWriteSource = struct {
         req: db_mod.types.BatchRequest,
     ) !?void {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try @import("../storage/db/online_source_contract.zig").validateRequest(req);
+        const control_group: ?u64 = if (req.online_source) |command| command.scope().fence.owner_group_id else if (req.relational_topology) |command| command.fence.owner_group_id else null;
+        if (control_group) |group_id| {
+            var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader)) orelse return error.GroupLeaderUnavailable;
+            defer route.deinit(alloc);
+            switch (route) {
+                .local => return try batchGroupLocal(self, alloc, group_id, table_name, req),
+                .remote => |remote| {
+                    var client = self.httpClient(alloc);
+                    const body = try encodeRemoteBatchRequest(alloc, req);
+                    defer alloc.free(body);
+                    var response = try client.fetchGroupBatchWithForwarding(remote.base_uri, group_id, table_name, body, internal_batch_forwarding.max_remaining_ms, .{
+                        .remaining_ms = internal_batch_forwarding.max_remaining_ms,
+                        .forwards_remaining = internal_batch_forwarding.max_forwards,
+                        .campaign_allowed = true,
+                    }, null, null);
+                    response.deinit(alloc);
+                    return {};
+                },
+            }
+        }
+        // Standalone conditional batches have no supported remote wire
+        // authority. Reject before routing or touching a local first shard;
+        // public conditional writes use the distributed prepare protocol.
+        if (req.predicates.len != 0) return error.UnsupportedBatchRequestEncoding;
         var grouped = std.ArrayListUnmanaged(GroupBatch).empty;
         defer {
             for (grouped.items) |*group| group.deinit(alloc);
@@ -26445,6 +26945,41 @@ pub const HostedProvisionedTableWriteSource = struct {
         );
     }
 
+    fn backupPinControl(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: @import("../storage/db/native_backup_seal.zig").Request, control: backups_api.BackupOperationControl) !?[]u8 {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        var route: table_router.GroupRoute = if (control.owner_local_only) .local else if (control.capture_node_id) |node_id|
+            try self.exactBackupNodeRoute(alloc, group_id, node_id)
+        else
+            (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader)) orelse return error.GroupLeaderUnavailable;
+        defer route.deinit(alloc);
+        switch (route) {
+            .local => {
+                if (comptime control_only_storage_sources) {
+                    const owner_source = self.groupLocalWriteSource() orelse return error.StorageKernelOwnerUnavailable;
+                    return owner_source.backupPinControl(alloc, table_name, group_id, request, control);
+                }
+                if (request != .seal) return try reclaimBackupPinAtGroup(alloc, self.backend_runtime, self.replica_root_dir, group_id, request, control);
+                var writer = try self.leaseGroupWriter(alloc, group_id, table_name);
+                defer writer.release();
+                return try executeBackupPinControl(alloc, writer.db(), group_id, request, control);
+            },
+            .remote => |remote| {
+                var client = self.httpClient(alloc);
+                const body = try std.json.Stringify.valueAlloc(alloc, request, .{});
+                defer alloc.free(body);
+                var response = try client.fetchBackupPinControl(remote.base_uri, group_id, table_name, body, control);
+                defer response.deinit(alloc);
+                return try alloc.dupe(u8, response.body);
+            },
+        }
+    }
+
+    fn exactBackupNodeRoute(self: *HostedProvisionedTableWriteSource, alloc: std.mem.Allocator, group_id: u64, node_id: u64) !table_router.GroupRoute {
+        if (node_id == 0) return error.BackupPinSourceUnavailable;
+        const uri = (try self.router.nodeBaseUriForGroup(alloc, group_id, node_id)) orelse return error.BackupPinSourceUnavailable;
+        return .{ .remote = .{ .node_id = node_id, .base_uri = uri } };
+    }
+
     fn backupTable(
         _: *anyopaque,
         _: std.mem.Allocator,
@@ -26466,7 +27001,12 @@ pub const HostedProvisionedTableWriteSource = struct {
     ) !backups_api.ShardSnapshot {
         try control.ensureActive();
         const group_id = range.group_id;
-        switch (route) {
+        var exact_route: ?table_router.GroupRoute = if (try @import("backup_contract.zig").sealedHandleForGroup(control.sealed_handles, group_id)) |sealed|
+            try self.exactBackupNodeRoute(alloc, group_id, sealed.source_node_id)
+        else
+            null;
+        defer if (exact_route) |*owned| owned.deinit(alloc);
+        switch (exact_route orelse route) {
             .local => return error.UnsupportedOperation,
             .remote => |remote| {
                 var client = self.httpClient(alloc);
@@ -26515,6 +27055,11 @@ pub const HostedProvisionedTableWriteSource = struct {
         fence: backups_api.TableBackupFence,
         control: backups_api.BackupOperationControl,
     ) !backups_api.ShardSnapshot {
+        if (try @import("backup_contract.zig").sealedHandleForGroup(control.sealed_handles, range.group_id)) |sealed| {
+            var route = try self.exactBackupNodeRoute(alloc, range.group_id, sealed.source_node_id);
+            defer route.deinit(alloc);
+            return self.fetchHostedBackupRangeFromRoute(alloc, route, range, table_name, body, fence, control);
+        }
         const resolved_route = try table_router.resolveGroupRoute(alloc, self.catalog, self.router, range.group_id, .prefer_leader);
         var route = resolved_route orelse return error.GroupLeaderUnavailable;
         defer route.deinit(alloc);
@@ -26551,7 +27096,20 @@ pub const HostedProvisionedTableWriteSource = struct {
         const group_ids = try alloc.alloc(u64, ranges.len);
         defer alloc.free(group_ids);
         for (ranges, 0..) |range, index| group_ids[index] = range.group_id;
-        const resolved_routes = try table_router.resolveGroupRoutes(
+        const resolved_routes = if (control.sealed_handles.len != 0) sealed_routes: {
+            const exact = try alloc.alloc(table_router.GroupRoute, group_ids.len);
+            var ready: usize = 0;
+            errdefer {
+                for (exact[0..ready]) |*route| route.deinit(alloc);
+                alloc.free(exact);
+            }
+            for (group_ids, exact) |group_id, *route| {
+                const receipt = (try @import("backup_contract.zig").sealedHandleForGroup(control.sealed_handles, group_id)) orelse return error.BackupCohortChanged;
+                route.* = try self.exactBackupNodeRoute(alloc, group_id, receipt.source_node_id);
+                ready += 1;
+            }
+            break :sealed_routes @as(?[]table_router.GroupRoute, exact);
+        } else try table_router.resolveGroupRoutes(
             alloc,
             self.catalog,
             self.router,
@@ -26587,10 +27145,9 @@ pub const HostedProvisionedTableWriteSource = struct {
                 }
 
                 fn childControl(queue: *@This()) backups_api.BackupOperationControl {
-                    return .{
-                        .deadline_ns = queue.parent_control.deadline_ns,
-                        .cancellation = .{ .ptr = queue, .is_cancelled_fn = isCancelled },
-                    };
+                    var child = queue.parent_control;
+                    child.cancellation = .{ .ptr = queue, .is_cancelled_fn = isCancelled };
+                    return child;
                 }
             };
             const WorkerFiber = struct {
@@ -26805,6 +27362,8 @@ pub const HostedProvisionedTableWriteSource = struct {
     ) !?void {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         return try batchGroupLocalFencedWithPreDecisionContext(ptr, alloc, group_id, table_name, .{
+            .restore_staging_scope = context.restore_staging_scope,
+            .restore_staging_plan_id = context.restore_staging_plan_id,
             .transaction = .{ .begin = .{
                 .txn_id = txn_id,
                 .begin_timestamp = begin_timestamp,
@@ -26844,6 +27403,16 @@ pub const HostedProvisionedTableWriteSource = struct {
             .transforms = req.transforms,
             .predicates = req.predicates,
             .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = topology_epoch } },
+            .integrity = req.integrity,
+            .integrity_commands = req.integrity_commands,
+            .relational_activation = req.relational_activation,
+            .relational_retirement = req.relational_retirement,
+            .relational_index_maintenance = req.relational_index_maintenance,
+            .relational_schema_version = req.relational_schema_version,
+            .relational_integrity_generation_set = req.relational_integrity_generation_set,
+            .restore_staging_scope = req.restore_staging_scope,
+            .restore_staging_plan_id = req.restore_staging_plan_id,
+            .relational_repair = req.relational_repair,
         }, topology_epoch, context);
     }
 
@@ -26884,6 +27453,22 @@ pub const HostedProvisionedTableWriteSource = struct {
     }
 
     fn txnStatusGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_mod.types.TxnId,
+    ) !?db_mod.types.TxnStatus {
+        return txnStatusGroupLocalOrdinary(ptr, alloc, group_id, table_name, txn_id);
+    }
+
+    fn txnStatusGroupLocalWithRequest(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: distributed_txn.TxnStatusRequest, context: @import("operation.zig").RequestContext) !?db_mod.types.TxnStatus {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const owner = self.groupLocalWriteSource() orelse return error.StorageKernelOwnerUnavailable;
+        return owner.txnStatusGroupLocalWithRequest(alloc, group_id, table_name, req, context);
+    }
+
+    fn txnStatusGroupLocalOrdinary(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         group_id: u64,
@@ -27904,7 +28489,7 @@ fn sleepStatelessBatchRetry(source: anytype, attempt: u8) !void {
 
 fn statelessBatchMayRetry(tables: []const distributed_txn.TableCommitRequest) bool {
     for (tables) |table| {
-        if (table.predicates.len != 0) return false;
+        if (table.predicates.len != 0 or table.integrity.len != 0 or table.integrity_commands.len != 0 or table.relational_activation != null or table.relational_retirement != null or table.relational_index_maintenance != null) return false;
     }
     return true;
 }
@@ -29433,9 +30018,9 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(
     );
 }
 
-const ManagedDbOpenOptions = physical_local_write.ManagedDbOpenOptions;
+const ManagedDbOpenOptions = if (control_only_storage_sources) struct {} else physical_local_write.ManagedDbOpenOptions;
 
-const ManagedDbEnrichmentSet = physical_local_write.ManagedDbEnrichmentSet;
+const ManagedDbEnrichmentSet = if (control_only_storage_sources) struct {} else physical_local_write.ManagedDbEnrichmentSet;
 
 fn providerWithRemoteCapabilityCache(
     provider: ?managed_embedder.AntflyProvider,
@@ -31903,6 +32488,7 @@ pub const freeStorageKernelBackupShards = local_write_contract.freeStorageKernel
 const exportPortableBackupFile = physical_local_write.exportPortableBackupFile;
 
 const exportPortableBackupFileWithIo = physical_local_write.exportPortableBackupFileWithIo;
+const exportPortableBackupFileWithSource = physical_local_write.exportPortableBackupFileWithSource;
 
 fn readBackupFileAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
@@ -32634,52 +33220,10 @@ fn validateTransactionAgainstCatalogSchema(
 }
 
 fn encodeRemoteBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchRequest) ![]u8 {
-    var out = std.ArrayListUnmanaged(u8).empty;
-    defer out.deinit(alloc);
-
-    try out.appendSlice(alloc, "{\"inserts\":{");
-    for (req.writes, 0..) |write, i| {
-        if (i > 0) try out.append(alloc, ',');
-        try appendJsonString(alloc, &out, write.key);
-        try out.append(alloc, ':');
-        try out.appendSlice(alloc, write.value);
-    }
-    try out.append(alloc, '}');
-    if (req.deletes.len > 0) {
-        try out.appendSlice(alloc, ",\"deletes\":[");
-        for (req.deletes, 0..) |key, i| {
-            if (i > 0) try out.append(alloc, ',');
-            try appendJsonString(alloc, &out, key);
-        }
-        try out.append(alloc, ']');
-    }
-    if (req.transforms.len > 0) {
-        try out.appendSlice(alloc, ",\"transforms\":[");
-        for (req.transforms, 0..) |transform, i| {
-            if (i > 0) try out.append(alloc, ',');
-            try out.appendSlice(alloc, "{\"key\":");
-            try appendJsonString(alloc, &out, transform.key);
-            try out.appendSlice(alloc, ",\"operations\":[");
-            for (transform.operations, 0..) |op, op_index| {
-                if (op_index > 0) try out.append(alloc, ',');
-                try out.appendSlice(alloc, "{\"op\":");
-                try appendJsonString(alloc, &out, db_mod.types.transformOpText(op.op));
-                try out.appendSlice(alloc, ",\"path\":");
-                try appendJsonString(alloc, &out, op.path);
-                if (op.value_json) |value_json| {
-                    try out.appendSlice(alloc, ",\"value\":");
-                    try out.appendSlice(alloc, value_json);
-                }
-                try out.append(alloc, '}');
-            }
-            try out.append(alloc, ']');
-            if (transform.upsert) try out.appendSlice(alloc, ",\"upsert\":true");
-            try out.append(alloc, '}');
-        }
-        try out.append(alloc, ']');
-    }
-    try out.append(alloc, '}');
-    return try out.toOwnedSlice(alloc);
+    // Both routed and legacy group endpoints consume the internal batch wire
+    // contract. A separate document-only serializer silently dropped topology
+    // authority (and ordinary predicates, timestamps, and sync requirements).
+    return try batch_api.encodeBatchRequest(alloc, req);
 }
 
 /// Encodes the canonical internal batch wire contract for the compiled storage
@@ -39185,6 +39729,20 @@ fn consumerTests() type {
             const Ownership = struct {
                 state: ProvisionedTableWriteSource.ReplicaRetirementOwnership.State = .retained,
                 source: ?*ProvisionedTableWriteSource = null,
+                drained: bool = false,
+
+                fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
+                    return error.UnexpectedBatch;
+                }
+
+                fn retire(ptr: *anyopaque, group_id: u64, table_name: []const u8) !?void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqual(.retired, self.state);
+                    try std.testing.expectEqual(@as(u64, 7001), group_id);
+                    try std.testing.expectEqualStrings("docs", table_name);
+                    self.drained = true;
+                    return {};
+                }
 
                 fn classify(ptr: *anyopaque, group_id: u64) !ProvisionedTableWriteSource.ReplicaRetirementOwnership.State {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -39203,6 +39761,7 @@ fn consumerTests() type {
             var source = ProvisionedTableWriteSource.init(replica_root_dir, table_catalog.emptyCatalogSource());
             defer source.deinit();
             ownership.source = &source;
+            _ = source.withLocalWriteSource(.{ .ptr = &ownership, .vtable = &.{ .batch = Ownership.batch, .retire_table_group_local = Ownership.retire } });
             _ = source.withReplicaRetirementOwnership(.{ .ptr = &ownership, .classify = Ownership.classify });
             var prepared = try source.prepareReplicaRetirements(alloc, &.{.{ .group_id = 7001, .table_name = "docs" }});
             defer prepared.deinit();
@@ -39236,6 +39795,7 @@ fn consumerTests() type {
             // Reattaching a now-authoritative host proof must rescan synchronously;
             // an earlier generic startup scan may have run before that proof existed.
             _ = source.withReplicaRetirementOwnership(.{ .ptr = &ownership, .classify = Ownership.classify });
+            try std.testing.expect(ownership.drained);
             try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io_impl.io(), db_path, .{}));
             try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io_impl.io(), raft_path, .{}));
             try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io_impl.io(), prepared.batch_path.?, .{}));
@@ -39254,6 +39814,20 @@ fn consumerTests() type {
 
             const Ownership = struct {
                 state: ProvisionedTableWriteSource.ReplicaRetirementOwnership.State = .retiring,
+                drained: [3]bool = @splat(false),
+
+                fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
+                    return error.UnexpectedBatch;
+                }
+
+                fn retire(ptr: *anyopaque, group_id: u64, table_name: []const u8) !?void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqual(.retired, self.state);
+                    try std.testing.expect(group_id >= 7001 and group_id <= 7003);
+                    try std.testing.expectEqualStrings(if (group_id == 7003) "other" else "docs", table_name);
+                    self.drained[@intCast(group_id - 7001)] = true;
+                    return {};
+                }
 
                 fn classify(ptr: *anyopaque, _: u64) !ProvisionedTableWriteSource.ReplicaRetirementOwnership.State {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -39270,6 +39844,7 @@ fn consumerTests() type {
             var ownership = Ownership{};
             var source = ProvisionedTableWriteSource.init(replica_root_dir, table_catalog.emptyCatalogSource());
             defer source.deinit();
+            _ = source.withLocalWriteSource(.{ .ptr = &ownership, .vtable = &.{ .batch = Ownership.batch, .retire_table_group_local = Ownership.retire } });
             _ = source.withReplicaRetirementOwnership(.{ .ptr = &ownership, .classify = Ownership.classify });
             var prepared = try source.prepareReplicaRetirements(alloc, &targets);
             defer prepared.deinit();
@@ -39294,6 +39869,7 @@ fn consumerTests() type {
 
             ownership.state = .retired;
             try std.testing.expect(!try source.recoverReplicaRetirementIntents(alloc));
+            try std.testing.expect(std.mem.allEqual(bool, &ownership.drained, true));
             try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io_impl.io(), prepared.batch_path.?, .{}));
         }
 
@@ -39816,6 +40392,7 @@ fn consumerTests() type {
                 routed_requests: usize = 0,
                 legacy_requests: usize = 0,
                 saw_route_fence: bool = false,
+                expected_topology: ?@import("../storage/db/relational_integrity_topology_contract.zig").Command = null,
 
                 fn iface(self: *@This()) http_common.RequestExecutor {
                     return .{ .ptr = self, .vtable = &.{ .execute = execute } };
@@ -39842,6 +40419,16 @@ fn consumerTests() type {
                         try std.testing.expectEqual(internal_batch_forwarding.max_remaining_ms, forwarding.remaining_ms);
                         try std.testing.expectEqual(internal_batch_forwarding.max_forwards, forwarding.forwards_remaining);
                         try std.testing.expect(forwarding.campaign_allowed);
+                        if (self.expected_topology) |expected| {
+                            var parsed = try batch_api.parseInternalBatchRequest(allocator, req.body);
+                            defer parsed.deinit(allocator);
+                            const actual = parsed.req.relational_topology orelse return error.MissingTopologyAuthority;
+                            try std.testing.expectEqual(expected.action, actual.action);
+                            try std.testing.expect(expected.fence.eql(actual.fence));
+                            try std.testing.expectEqual(@as(usize, 0), parsed.req.writes.len);
+                            for (req.headers) |header| try std.testing.expect(!std.ascii.eqlIgnoreCase(header.name, metadata_api.catalog_route_fence_header));
+                            return .{ .status = 201, .body = try allocator.dupe(u8, "{}") };
+                        }
                         for (req.headers) |header| {
                             if (!std.ascii.eqlIgnoreCase(header.name, metadata_api.catalog_route_fence_header)) continue;
                             var parsed = try std.json.parseFromSlice(metadata_api.CatalogRouteFence, allocator, header.value, .{});
@@ -39886,6 +40473,55 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(usize, 1), legacy_executor.routed_requests);
             try std.testing.expectEqual(@as(usize, 1), legacy_executor.legacy_requests);
             try std.testing.expect(legacy_executor.saw_route_fence);
+            var rejected_executor: Executor = .{};
+            var rejected_source = HostedProvisionedTableWriteSource.init("unused", Catalog.iface(), Router.iface(), rejected_executor.iface());
+            try std.testing.expectError(error.UnsupportedBatchRequestEncoding, rejected_source.source().batch(alloc, "docs", .{
+                .writes = &.{.{ .key = "row", .value = "{}" }},
+                .predicates = &.{.{ .key = "row", .expected_version = 0 }},
+            }));
+            try std.testing.expectEqual(@as(usize, 0), rejected_executor.requests);
+
+            // A topology command has no user-row/catalog-route authority: the
+            // complete binary fence is the authority at the routed receiver.
+            // Exercise the actual hosted remote dispatch for backup freeze and
+            // both successful and canceled cleanup paths.
+            const topology = @import("../storage/db/relational_integrity_topology_contract.zig");
+            const fence: topology.Fence = .{
+                .transition_id = std.math.maxInt(u64),
+                .attempt = 1,
+                .admission_epoch = 2,
+                .owner_group_id = 7001,
+                .peer_group_id = 7001,
+                .role = .backup_snapshot,
+                .namespace = .{ .table_id = 7, .shard_id = 8, .range_id = 9 },
+                .catalog_digest = @splat(255),
+            };
+            for ([_]@FieldType(topology.Command, "action"){ .begin, .release, .cancel }) |action| {
+                const command: topology.Command = .{ .fence = fence, .action = action };
+                var executor: Executor = .{ .expected_topology = command };
+                var source = HostedProvisionedTableWriteSource.init("unused", Catalog.iface(), Router.iface(), executor.iface());
+                _ = (try source.source().batch(alloc, "docs", .{ .relational_topology = command })) orelse return error.TestUnexpectedResult;
+                try std.testing.expectEqual(@as(usize, 1), executor.routed_requests);
+                try std.testing.expectEqual(@as(usize, 0), executor.legacy_requests);
+            }
+
+            const ordinary = try encodeRemoteBatchRequest(alloc, .{
+                .transaction = .{ .prepare = .{ .txn_id = @splat(1), .topology_epoch = 9 } },
+                .writes = &.{.{ .key = "row", .value = "{\"id\":9007199254740993}" }},
+                .predicates = &.{.{ .key = "row", .expected_version = std.math.maxInt(u64) }},
+                .timestamp_ns = std.math.maxInt(u64),
+                .sync_level = .full_index,
+            });
+            defer alloc.free(ordinary);
+            var decoded = try batch_api.parseInternalBatchRequest(alloc, ordinary);
+            defer decoded.deinit(alloc);
+            try std.testing.expectEqual(std.math.maxInt(u64), decoded.req.timestamp_ns);
+            try std.testing.expectEqual(std.math.maxInt(u64), decoded.req.predicates[0].expected_version);
+            try std.testing.expectEqual(.full_index, decoded.req.sync_level);
+            try std.testing.expectEqualStrings("{\"id\":9007199254740993}", decoded.req.writes[0].value);
+            try std.testing.expectError(error.UnsupportedBatchRequestEncoding, encodeRemoteBatchRequest(alloc, .{
+                .predicates = &.{.{ .key = "row", .expected_version = 1 }},
+            }));
         }
 
         test "publishing a provisioned write adapter does not start pointer-capturing recovery work" {
@@ -40058,6 +40694,135 @@ pub const implementation_tests = implementationTests();
 fn implementationTests() type {
     if (!(@import("builtin").is_test and !control_only_storage_sources)) return struct {};
     const Suite = struct {
+        test "restore staging private provisioning primes hidden owner without public catalog admission" {
+            const alloc = std.testing.allocator;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/hidden-owner", .{tmp.sub_path});
+            defer alloc.free(root);
+            var cache = ProvisionedTableWriteCache.init(alloc);
+            defer cache.deinit();
+            var source = ProvisionedTableWriteSource.init(root, table_catalog.emptyCatalogSource());
+            source.write_cache = &cache;
+            const namespace: doc_identity.Namespace = .{ .table_id = 99, .shard_id = 7001, .range_id = 7001 };
+            const table: metadata_table_manager.TableRecord = .{ .table_id = 99, .name = "hidden", .schema_json = "", .indexes_json = "{\"text\":{\"type\":\"full_text\"},\"enrichments\":[{\"name\":\"disabled_provider\",\"kind\":\"embedding\",\"field\":\"text\",\"expected_dims\":384}]}" };
+            const encoded_schema = try storage_schema.serializeSchema(alloc, .{});
+            defer alloc.free(encoded_schema);
+            const scope: @import("../storage/db/restore_staging.zig").Scope = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .source_artifact_digest = @splat(3), .source_namespace = .{ .table_id = 1, .shard_id = 1, .range_id = 1 }, .target_namespace = namespace, .target_schema_digest = @import("../storage/db/restore_staging.zig").digest(encoded_schema) };
+            try source.primeRestoreStagingWriter(alloc, 7001, table, .{ .start = "a", .end = "z" }, scope);
+            try source.primeRestoreStagingWriter(alloc, 7001, table, .{ .start = "a", .end = "z" }, scope);
+            const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, root, 7001);
+            defer alloc.free(path);
+            var owner = try source.getOrOpenCachedDbModeForReplicatedApply(alloc, &cache, path, 7001, "hidden");
+            defer owner.deinit(alloc);
+            var progress = (try owner.db.restoreStagingStatus(alloc)).?;
+            defer progress.deinit();
+            try std.testing.expectEqual(.reserved, progress.value.phase);
+            try std.testing.expectEqualStrings("a", owner.db.getRange().start);
+            try std.testing.expectEqualStrings("z", owner.db.getRange().end);
+            try std.testing.expectError(error.RestoreStagingInProgress, owner.db.lookup(alloc, "b", .{}));
+            try std.testing.expectError(error.RestoreStagingInProgress, owner.db.batch(.{ .writes = &.{.{ .key = "b", .value = "{}" }} }));
+            var forged_scope = scope;
+            forged_scope.source_artifact_digest = @splat(4);
+            try std.testing.expectError(error.RestoreStagingScopeChanged, source.primeRestoreStagingWriter(alloc, 7001, table, .{ .start = "a", .end = "z" }, forged_scope));
+            const enrichments = try owner.db.listEnrichments(alloc);
+            defer db_mod.types.freeEnrichmentConfigs(alloc, enrichments);
+            try std.testing.expectEqual(@as(usize, 0), enrichments.len);
+            const source_path = try std.fs.path.join(alloc, &.{ root, "source" });
+            defer alloc.free(source_path);
+            {
+                var input_writer = try db_mod.DB.open(alloc, source_path, .{ .identity_namespace = scope.source_namespace, .start_index_workers = false, .start_optional_runtimes = false });
+                defer input_writer.close();
+                try input_writer.updateRange(.{ .start = "a", .end = "z" });
+                try input_writer.batch(.{ .writes = &.{.{ .key = "alpha", .value = "{\"text\":\"projected keyword\"}" }} });
+            }
+            var input = try db_mod.DB.open(alloc, source_path, .{ .open_mode = .query_readonly, .identity_namespace = scope.source_namespace, .start_index_workers = false, .start_optional_runtimes = false });
+            defer input.close();
+            try owner.db.beginRestoreStaging(alloc, scope);
+            for (0..4) |_| {
+                var page = try owner.db.prepareRestoreStagingPage(alloc, scope, &input, 1, .none);
+                defer page.deinit();
+                if (page.batch) |batch| try owner.db.batch(batch);
+                if (page.phase == .imported) break;
+            } else return error.TestUnexpectedResult;
+            try std.testing.expect(try owner.db.prepareRestoreStagingIndexesStep(alloc, scope.digest()));
+            _ = try owner.db.finishRestoreStaging(alloc, scope.digest(), .validated);
+            _ = try owner.db.finishRestoreStaging(alloc, scope.digest(), .published);
+            var result = try owner.db.search(alloc, .{ .index_name = "text", .full_text = .{ .match = .{ .field = "text", .text = "keyword" } }, .limit = 1 });
+            defer result.deinit();
+            try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+        }
+
+        test "restore staging private provisioning rebuilds both migration read mappings after restart" {
+            const alloc = std.testing.allocator;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/migration-owner", .{tmp.sub_path});
+            defer alloc.free(root);
+            const previous = "{\"version\":0,\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"x-antfly-types\":[\"text\"]}}}}}}";
+            const active = "{\"version\":1,\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"x-antfly-types\":[\"keyword\"]}}}}}}";
+            const table: metadata_table_manager.TableRecord = .{ .table_id = 99, .name = "migrating", .schema_json = active, .read_schema_json = previous, .indexes_json = "{\"full_text_index_v0\":{\"type\":\"full_text\"},\"full_text_index_v1\":{\"type\":\"full_text\"}}" };
+            var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, active);
+            defer parsed.deinit(alloc);
+            const schema = try @import("../schema/mod.zig").deriveRuntimeTableSchema(alloc, parsed);
+            defer storage_schema.freeSchema(alloc, schema);
+            const encoded = try storage_schema.serializeSchema(alloc, schema);
+            defer alloc.free(encoded);
+            const staging = @import("../storage/db/restore_staging.zig");
+            const scope: staging.Scope = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .source_artifact_digest = @splat(3), .source_namespace = .{ .table_id = 1, .shard_id = 1, .range_id = 1 }, .target_namespace = .{ .table_id = 99, .shard_id = 7001, .range_id = 7001 }, .target_schema_digest = staging.digest(encoded) };
+            const input_path = try std.fs.path.join(alloc, &.{ root, "input" });
+            defer alloc.free(input_path);
+            {
+                var input = try db_mod.DB.open(alloc, input_path, .{ .identity_namespace = scope.source_namespace, .start_index_workers = false, .start_optional_runtimes = false });
+                defer input.close();
+                try input.setSchemaJson(alloc, previous);
+                try input.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"name\":\"Old Mapping\"}" }} });
+                try input.setSchemaJson(alloc, active);
+            }
+            // Reopen the hidden target before importing: no accidental process-local
+            // schema history may make its old read index appear ready.
+            for (0..2) |iteration| {
+                var cache = ProvisionedTableWriteCache.init(alloc);
+                defer cache.deinit();
+                var source = ProvisionedTableWriteSource.init(root, table_catalog.emptyCatalogSource());
+                source.write_cache = &cache;
+                try source.primeRestoreStagingWriter(alloc, 7001, table, .{ .start = "", .end = "" }, scope);
+                const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, root, 7001);
+                defer alloc.free(path);
+                var target = try source.getOrOpenCachedDbModeForReplicatedApply(alloc, &cache, path, 7001, table.name);
+                defer target.deinit(alloc);
+                const historical = (try storage_schema.loadSchemaVersion(target.db.core.store, alloc, 0)) orelse return error.TestUnexpectedResult;
+                defer storage_schema.freeSchema(alloc, historical);
+                try std.testing.expectEqual(@as(u32, 0), historical.version);
+                var bootstrap = (try target.db.readRestoreStagingBootstrap(alloc)).?;
+                defer bootstrap.deinit();
+                try std.testing.expectEqualStrings(previous, bootstrap.value.read_schema_json);
+                var forged = table;
+                forged.read_schema_json = "{\"version\":0}";
+                try std.testing.expectError(error.RestoreStagingScopeChanged, source.primeRestoreStagingWriter(alloc, 7001, forged, .{ .start = "", .end = "" }, scope));
+                if (iteration == 0) continue;
+                var input = try db_mod.DB.open(alloc, input_path, .{ .open_mode = .query_readonly, .identity_namespace = scope.source_namespace, .start_index_workers = false, .start_optional_runtimes = false });
+                defer input.close();
+                try target.db.beginRestoreStaging(alloc, scope);
+                for (0..8) |_| {
+                    var page = try target.db.prepareRestoreStagingPage(alloc, scope, &input, 1, .none);
+                    defer page.deinit();
+                    if (page.batch) |batch| try target.db.batch(batch);
+                    if (page.phase == .imported) break;
+                } else return error.TestUnexpectedResult;
+                for (0..16) |_| {
+                    if (try target.db.prepareRestoreStagingIndexesStep(alloc, scope.digest())) break;
+                } else return error.TestUnexpectedResult;
+                _ = try target.db.finishRestoreStaging(alloc, scope.digest(), .validated);
+                _ = try target.db.finishRestoreStaging(alloc, scope.digest(), .published);
+                var read_result = try target.db.search(alloc, .{ .index_name = "full_text_index_v0", .full_text = .{ .match = .{ .field = "name", .text = "mapping" } }, .limit = 1 });
+                defer read_result.deinit();
+                try std.testing.expectEqual(@as(u32, 1), read_result.total_hits);
+                var active_result = try target.db.search(alloc, .{ .index_name = "full_text_index_v1", .full_text = .{ .term = .{ .field = "name", .term = "Old Mapping" } }, .limit = 1 });
+                defer active_result.deinit();
+                try std.testing.expectEqual(@as(u32, 1), active_result.total_hits);
+            }
+        }
         test "replicated merge retains its resident writer while graph ownership cleanup is pending" {
             const alloc = std.testing.allocator;
             var tmp = std.testing.tmpDir(.{});
@@ -62220,4 +62985,79 @@ comptime {
         _ = consumer_tests;
         _ = implementation_tests;
     }
+}
+
+pub fn reclaimBackupPinAtGroup(alloc: std.mem.Allocator, runtime: ?*db_mod.background_runtime.BackendRuntime, replica_root: []const u8, group_id: u64, request: @import("../storage/db/native_backup_seal.zig").Request, control: backups_api.BackupOperationControl) ![]u8 {
+    try control.ensureActive();
+    const fence = switch (request) {
+        .seal => return error.InvalidBackupFence,
+        .release => |handle| handle.fence,
+        .cancel => |value| value,
+    };
+    if (fence.owner_group_id != group_id or fence.role != .backup_snapshot) return error.InvalidBackupFence;
+    const io = (runtime orelse return error.BackendRuntimeIoUnavailable).filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
+    const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root, group_id);
+    defer alloc.free(path);
+    try @import("../storage/db/native_backup_seal.zig").reclaim(alloc, io, path, request, control.token());
+    return try alloc.dupe(u8, "{}");
+}
+
+pub fn executeBackupPinControl(alloc: std.mem.Allocator, db: *db_mod.DB, group_id: u64, request: @import("../storage/db/native_backup_seal.zig").Request, control: backups_api.BackupOperationControl) ![]u8 {
+    try control.ensureActive();
+    const fence = switch (request) {
+        .seal => |value| value.fence,
+        .release => |value| value.fence,
+        .cancel => |value| value,
+    };
+    if (fence.owner_group_id != group_id or fence.role != .backup_snapshot) return error.InvalidBackupFence;
+    switch (request) {
+        .seal => |value| {
+            const handle = try db.sealBackupCohort(value.id, value.fence, control.token());
+            return try std.json.Stringify.valueAlloc(alloc, handle, .{});
+        },
+        .release => |handle| {
+            try db.releaseBackupCohort(handle);
+            return try alloc.dupe(u8, "{}");
+        },
+        .cancel => |value| {
+            try db.cancelBackupCohort(value);
+            return try alloc.dupe(u8, "{}");
+        },
+    }
+}
+
+pub const RestoreTerminalAdmission = local_write_contract.RestoreTerminalAdmission;
+
+pub fn exportPortableBackupShardWithSeal(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    backup_root: []const u8,
+    backup_id: []const u8,
+    group_id: u64,
+    shared_io: ?std.Io,
+    sealed: ?@import("backup_contract.zig").SealedHandle,
+    cancellation: @import("operation.zig").CancellationToken,
+) ![]backups_api.ShardSnapshot {
+    const rel_path = try portableBackupShardRelPath(alloc, backup_id, group_id);
+    errdefer alloc.free(rel_path);
+
+    const dest_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ backup_root, rel_path });
+    defer alloc.free(dest_path);
+    if (sealed) |proof| {
+        var fallback: ?std.Io.Threaded = if (shared_io == null) std.Io.Threaded.init(std.heap.page_allocator, .{}) else null;
+        defer if (fallback) |*owned| owned.deinit();
+        try exportPortableBackupFileWithSource(alloc, db.core.store, dest_path, shared_io orelse fallback.?.io(), .{ .db = db, .handle = proof.handle, .cancellation = cancellation });
+    } else try exportPortableBackupFile(alloc, db.core.store, dest_path, shared_io);
+
+    const byte_range = db.getRange();
+    const shards = try alloc.alloc(backups_api.ShardSnapshot, 1);
+    shards[0] = .{
+        .group_id = group_id,
+        .start_key = try alloc.dupe(u8, byte_range.start),
+        .end_key = if (byte_range.end.len > 0) try alloc.dupe(u8, byte_range.end) else null,
+        .snapshot_path = rel_path,
+    };
+    errdefer shards[0].deinit(alloc);
+    try backups_api.populateShardArtifactIntegrity(alloc, shared_io, .portable, dest_path, &shards[0]);
+    return shards;
 }

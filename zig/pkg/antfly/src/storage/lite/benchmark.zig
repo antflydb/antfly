@@ -134,3 +134,34 @@ test "lite throughput benchmark packed cursor" {
         std.debug.print("LITE_BENCH_CURSOR n={d} scan_ns={d} batch_ns={d}\n", .{ n, scanned - start, batched - scanned });
     }
 }
+
+test "lite throughput benchmark warm point views" {
+    if (std.c.getenv("ANTFLY_LITE_BENCH") == null) return error.SkipZigTest;
+    const a = std.heap.c_allocator;
+    for ([_]usize{ 16384, 65536 }) |count| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/point.aflite", .{tmp.sub_path});
+        defer a.free(path);
+        var file = try native.NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+        defer file.close();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const batch = try arena.allocator().alloc(native.DocumentMutation, count);
+        for (batch, 0..) |*m, i| m.* = .{ .key = try std.fmt.allocPrint(arena.allocator(), "ns\x00key-{d:0>8}", .{i}), .value = "value" };
+        try file.putDocumentBatch(batch);
+        for (batch) |m| {
+            const value = (try file.getDocumentAlloc(a, m.key)).?;
+            a.free(value);
+        }
+        const before = file.test_index_comparisons.load(.monotonic);
+        const hits = file.test_index_view_hits.load(.monotonic);
+        const started = time.monotonicNs();
+        for (0..count) |i| {
+            const value = (try file.getDocumentAlloc(a, batch[(i * 4051) % count].key)).?;
+            defer a.free(value);
+            try std.testing.expectEqualStrings("value", value);
+        }
+        std.debug.print("LITE_BENCH_POINT n={d} elapsed_ns={d} comparisons={d} view_hits={d} cache_bytes={d}\n", .{ count, time.monotonicNs() - started, file.test_index_comparisons.load(.monotonic) - before, file.test_index_view_hits.load(.monotonic) - hits, file.page_cache.total_bytes });
+    }
+}

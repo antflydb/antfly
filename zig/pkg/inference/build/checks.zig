@@ -66,7 +66,8 @@ pub fn createMetalRuntimeTests(ctx: Context) CreateMetalRuntimeTestsResult {
         .filters = &.{"quant kernel metal runtime"},
     });
     const run_quant_kernel_metal_runtime_check_tests = ctx.addRunArtifact(quant_kernel_metal_runtime_check_tests);
-    run_quant_kernel_metal_runtime_check_tests.step.max_rss = 64 * 1024 * 1024;
+    // The ReleaseFast source-validation test peaks at 103 MB on macOS arm64.
+    run_quant_kernel_metal_runtime_check_tests.step.max_rss = 128 * 1024 * 1024;
     return .{
         .run_quant_kernel_metal_runtime_check_tests = run_quant_kernel_metal_runtime_check_tests,
     };

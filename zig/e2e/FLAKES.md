@@ -1204,3 +1204,37 @@ root are retained under the worktree's ignored
 `soak-debug-100.log` records all 100 final passing executions.
 The probe sources are not part of test collection. Linux CI validation remains
 outstanding.
+
+
+## 2026-09-19: VOPR runner loss and cluster-restore soak
+
+Run `35446473661`, qualification job `105906153405`, lost its runner during
+checkout. Retained GKE audit logs identify `PreemptionByScheduler` at
+`2026-09-19T13:41:16Z`: the system `konnectivity-agent` pod needed 60 MiB and
+reported insufficient memory on the available nodes. The runner exited with
+SIGTERM (143), before compiling or testing. Recovery is limited to one retry of
+this scheduled qualification job after a confirmed checkout shutdown; executed
+tests and campaigns are never retried by that policy.
+
+The separate production job completed the normal cluster-restore profile in
+about 67 minutes, then hit the shared 90-minute budget during the constrained
+profile. Give each profile its own job, reusing one production binary and
+retaining two workers, 25 repetitions, and both test cases per profile. A local
+single-profile run can set `ANTFLY_E2E_REGRESSION_PROFILE=normal` or `constrained`.
+The default shell entrypoint still runs both profiles.
+
+Every regression invocation now owns its process group, with a default
+600-second timeout (`ANTFLY_E2E_CASE_TIMEOUT_SECONDS`). Timeout/cancellation and
+normal parent exit stop remaining server descendants before returning. Reports
+and executable evidence upload separately from retained database roots so a
+root collection error cannot discard the reports.
+
+The failed restore published its table but never completed; metadata contained
+completion records for nodes 5 and 6, while proxied node 4 repeatedly logged
+`CatalogRoutingSnapshotTimeout`. Startup catch-up applied the schema-index
+25 ms admission/yield quantum even to ordinary startup and restore. A controlled
+50 ms point-catalog delay reproduced the same stuck job on main (142.54 s,
+failed). Scoping those controls to schema-index work completed the identical
+three-metadata/three-data-node test in 30.24 s. Restore retains cancellation and
+ownership fences; index repair retains its scheduling quantum. The E2E proxy
+keeps the latency injection as a regression alongside the stalled status route.

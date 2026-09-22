@@ -984,6 +984,145 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/tables/{tableName}/constraints/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        /** Read distributed UNIQUE, foreign-key, and CHECK validation coverage */
+        get: operations["getRelationalConstraintStatus"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/constraints/repair": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Repair version-conditional rows after failed or diagnosed constraint activation
+         * @description Requires table administrator permission. Each affected target range must
+         *     have failed UNIQUE/FK/CHECK activation or a validating MATCH PARTIAL
+         *     missing-parent diagnostic. Replacement values still satisfy all
+         *     constraints, and referential actions require write permission on every
+         *     affected table. Existing dependencies remain protected. Repairs do not
+         *     mark historical coverage valid. Invoke constraint retry after repairing
+         *     failed activation; validating diagnostics resume validation automatically.
+         */
+        post: operations["repairRelationalConstraints"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/constraints/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Restart failed UNIQUE/FK/CHECK validation after administrative repair
+         * @description Requires table administrator permission. Resets each failed owner using
+         *     an exact checkpoint precondition. Owners already validating or enforced
+         *     are unchanged. Retrying after partial progress is safe. Inspect the
+         *     constraint status endpoint for coverage and diagnostics.
+         *     When a retirement job is active, clears its paused diagnostic and
+         *     resumes that job instead of restarting activation. Retirement remains
+         *     fenced and retains all prior drain progress.
+         */
+        post: operations["retryRelationalConstraints"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/constraints/retire": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Retire unique and foreign-key definitions safely
+         * @description Requires table administrator permission. Starts a durable, bounded
+         *     all-owner drain. Poll constraints/status for progress. A target schema
+         *     is published automatically after the drain. With drop=true the table
+         *     remains fenced at ready_to_drop until an administrator explicitly
+         *     deletes it with the existing table deletion endpoint.
+         */
+        post: operations["retireRelationalConstraints"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/rows/query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Query projected typed relational rows */
+        post: operations["queryRelationalRows"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/rows/mutate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Atomically replace or delete version-conditional typed rows */
+        post: operations["mutateRelationalRows"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/tables/{tableName}/batch": {
         parameters: {
             query?: never;
@@ -1116,8 +1255,25 @@ export interface paths {
     };
     "/db/v1/tables/{tableName}/schema": {
         parameters: {
-            query?: never;
-            header?: never;
+            query?: {
+                /**
+                 * @description Explicitly enqueue a durable fresh-generation schema rewrite instead
+                 *     of changing the live schema. Requires administrator permission on the
+                 *     entire dependency cohort. Sources remain writable during snapshot and
+                 *     catch-up; final validation and publication are atomic across the cohort.
+                 *     Returns a restore job (202), whose existing status/cancel routes apply.
+                 *     Independent graph/vector artifacts without a retained row-derived
+                 *     source proof are rejected before admission. The default false retains
+                 *     ordinary schema-update behavior. Existing absent values remain absent
+                 *     rather than retroactively receiving defaults. Stored column type
+                 *     changes and destructive column removal are rejected.
+                 */
+                rewrite?: boolean;
+            };
+            header?: {
+                /** @description Retry identity for rewrite=true admission. Reusing a key for a different rewrite returns 409. */
+                "Idempotency-Key"?: string;
+            };
             path: {
                 /** @description Name of the table */
                 tableName: string;
@@ -1754,6 +1910,52 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/tables/{tableName}/indexes/{indexName}/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                indexName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Retry a failed index build
+         * @description Generation-fenced relational index maintenance. Requires table ADMIN permission. Retry accepts failed generations. Owners are admitted independently and durably; exact request replay resumes after partial acknowledgements. Unsupported index types return 405.
+         */
+        post: operations["retryIndex"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/indexes/{indexName}/repair": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                indexName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Repair an index generation
+         * @description Generation-fenced relational index maintenance. Requires table ADMIN permission. Repair accepts ready or failed generations and rebuilds their derived records. Owners are admitted independently and durably; exact request replay resumes after partial acknowledgements. Unsupported index types return 405.
+         */
+        post: operations["repairIndex"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/tables/{tableName}/indexes/{indexName}": {
         parameters: {
             query?: never;
@@ -2257,6 +2459,207 @@ export interface paths {
         post: operations["createNamespaceTableIndex"];
         /** Drop an index from an explicit namespace table */
         delete: operations["dropNamespaceTableIndex"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        /** Read distributed UNIQUE, foreign-key, and CHECK validation coverage */
+        get: operations["getNamespaceRelationalConstraintStatus"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/repair": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Repair version-conditional rows after failed or diagnosed constraint activation
+         * @description Requires table administrator permission. Each affected target range must
+         *     have failed UNIQUE/FK/CHECK activation or a validating MATCH PARTIAL
+         *     missing-parent diagnostic. Replacement values still satisfy all
+         *     constraints, and referential actions require write permission on every
+         *     affected table. Existing dependencies remain protected. Repairs do not
+         *     mark historical coverage valid. Invoke constraint retry after repairing
+         *     failed activation; validating diagnostics resume validation automatically.
+         */
+        post: operations["repairNamespaceRelationalConstraints"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Restart failed UNIQUE/FK/CHECK validation after administrative repair
+         * @description Requires table administrator permission. Resets each failed owner using
+         *     an exact checkpoint precondition. Owners already validating or enforced
+         *     are unchanged. Retrying after partial progress is safe. Inspect the
+         *     constraint status endpoint for coverage and diagnostics.
+         *     When a retirement job is active, clears its paused diagnostic and
+         *     resumes that job instead of restarting activation. Retirement remains
+         *     fenced and retains all prior drain progress.
+         */
+        post: operations["retryNamespaceRelationalConstraints"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/retire": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Retire unique and foreign-key definitions safely
+         * @description Requires table administrator permission. Starts a durable, bounded
+         *     all-owner drain. Poll constraints/status for progress. A target schema
+         *     is published automatically after the drain. With drop=true the table
+         *     remains fenced at ready_to_drop until an administrator explicitly
+         *     deletes it with the existing table deletion endpoint.
+         */
+        post: operations["retireNamespaceRelationalConstraints"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rows/query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Query projected typed relational rows */
+        post: operations["queryNamespaceRelationalRows"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rows/mutate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Atomically replace or delete version-conditional typed rows */
+        post: operations["mutateNamespaceRelationalRows"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                indexName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Retry a failed index build
+         * @description Generation-fenced relational index maintenance. Requires table ADMIN permission. Retry accepts failed generations. Owners are admitted independently and durably; exact request replay resumes after partial acknowledgements. Unsupported index types return 405.
+         */
+        post: operations["retryNamespaceIndex"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/repair": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                indexName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Repair an index generation
+         * @description Generation-fenced relational index maintenance. Requires table ADMIN permission. Repair accepts ready or failed generations and rebuilds their derived records. Owners are admitted independently and durably; exact request replay resumes after partial acknowledgements. Unsupported index types return 405.
+         */
+        post: operations["repairNamespaceIndex"];
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -5676,6 +6079,11 @@ export interface components {
             source?: string;
             /** @description Whether this key has an Antfly-managed override that can be deleted. */
             managed?: boolean;
+            /**
+             * Format: uint64
+             * @description Committed native entry revision, when supported by the configured backend.
+             */
+            revision?: number;
             /** @description Corresponding environment variable name (e.g., OPENAI_API_KEY) */
             env_var?: string;
             /** Format: date-time */
@@ -6812,6 +7220,94 @@ export interface components {
              */
             limit?: number;
         };
+        RelationalRowCondition: {
+            column: string;
+            op: components["schemas"]["RelationalComparisonOp"];
+            /** @description Typed scalar operand. Omission means NULL. Integer columns also accept exact decimal strings. */
+            value?: unknown;
+            collation?: string;
+        };
+        /**
+         * @description Bounded relational scan in primary-key order, or composite index order
+         *     when index is supplied. Index queries require schema_version and every
+         *     owning shard must have the selected generation ready. Partial indexes
+         *     require their WHERE predicates to be implied by the query conditions.
+         *     The bounded proof combines per-column equality, tighter ranges,
+         *     exclusions, and NULL-aware predicates using exact typed values and
+         *     matching collations. Unsupported implications fail closed. Explicit
+         *     scan bounds alone are not an implication proof. Equal tuples are
+         *     ordered by primary key. Each shard read pins its own immutable schema
+         *     and row snapshot; this is not a table-wide consistent snapshot.
+         *     Resume with the last returned _id as from for primary scans, or its
+         *     cursor as after for index scans. A resumed request opens a fresh snapshot,
+         *     not a retained cursor; concurrent mutations may move rows across the
+         *     continuation boundary. Keep index, bounds and conditions unchanged when paging.
+         *     An empty projection returns row identities and versions only.
+         */
+        RelationalRowQueryRequest: {
+            /** @description Ready composite secondary index. Requires schema_version; cannot be combined with from/to. */
+            index?: string;
+            /** @description Opaque exclusive index-order cursor from the last returned row. Binds the immutable schema version, logical index name, and comparison semantics, independent of owner-local physical generations. Each owner must still prove its current local index is ready. */
+            after?: string;
+            lower?: components["schemas"]["RelationalRowIndexBound"];
+            upper?: components["schemas"]["RelationalRowIndexBound"];
+            fields: string[];
+            conditions?: components["schemas"]["RelationalRowCondition"][];
+            /** @description Exclusive lower primary-key bound, including pagination continuation. */
+            from?: string;
+            /** @description Exclusive upper primary-key bound. */
+            to?: string;
+            /**
+             * Format: uint32
+             * @default 128
+             */
+            limit?: number;
+            /**
+             * Format: uint32
+             * @description Reject the read if an owning shard has a different active schema epoch. Zero is a valid epoch and is distinct from omission.
+             */
+            schema_version?: number;
+        };
+        /** @description Typed left-prefix bound in declared index order, including descending components. Inclusive bounds include the entire matching prefix. Integer components accept exact decimal strings; null is an indexed null. */
+        RelationalRowIndexBound: {
+            values: unknown[];
+            /** @default true */
+            inclusive?: boolean;
+        };
+        RelationalRow: {
+            /** @description Opaque index-order continuation; present only for secondary-index queries. */
+            cursor?: string;
+            _id: string;
+            row: {
+                [key: string]: unknown;
+            };
+            /** @description Exact row version for mutation preconditions, encoded as decimal text. */
+            version: string;
+            /**
+             * Format: uint32
+             * @description Active pinned schema epoch, not the historical physical row layout.
+             */
+            schema_version: number;
+        };
+        /** @description A complete row replacement, or deletion when row is omitted. No read-modify-write is implied. */
+        RelationalRowMutation: {
+            key: string;
+            /** @description Exact observed version. Zero requires that the row does not exist. */
+            expected_version: string;
+            row?: {
+                [key: string]: unknown;
+            };
+        };
+        /** @description Atomic version-conditional typed-row replacements and deletions using the durable distributed transaction coordinator. */
+        RelationalRowMutationRequest: {
+            /**
+             * Format: uint32
+             * @description Required active relational schema epoch, fenced during every participant prepare.
+             */
+            schema_version: number;
+            mutations: components["schemas"]["RelationalRowMutation"][];
+            sync_level?: components["schemas"]["SyncLevel"];
+        };
         /**
          * @description Batch insert, delete, and transform operations in a single request.
          *
@@ -7106,6 +7602,75 @@ export interface components {
              */
             phase?: "begin" | "prepare" | "resolve";
         };
+        /**
+         * @description Deterministic relational integrity failure; changing the mutation or data is required before retry.
+         * @enum {string}
+         */
+        RelationalConstraintConflictReason: "unique_constraint_violation" | "foreign_key_parent_missing" | "foreign_key_referenced";
+        /** @enum {string} */
+        RelationalConstraintActivationPhase: "unique" | "foreign_key" | "check";
+        RelationalConstraintRangeStatus: {
+            /** @description Exact owner group identifier as decimal text. */
+            group_id: string;
+            state: components["schemas"]["RelationalConstraintValidationState"];
+            phase: components["schemas"]["RelationalConstraintActivationPhase"];
+            /** @description Exact cumulative validation row count as decimal text. */
+            rows_scanned: string;
+            /** @description Opaque namespace-and-range ownership digest. */
+            owner: string;
+            failure?: string;
+        };
+        RelationalConstraintRetryRequest: {
+            schema_version: number;
+        };
+        RelationalConstraintRetryResponse: {
+            /** @enum {string} */
+            status: "accepted";
+        };
+        /**
+         * @description Supply exactly one of target_schema or drop=true. A target schema may
+         *     only remove UNIQUE/FK definitions; all other schema properties must
+         *     remain unchanged. Its version is assigned by the server. Retirement
+         *     fences primary mutations while existing reference and claim records
+         *     are drained. External foreign keys referencing removed definitions
+         *     must be retired first.
+         */
+        RelationalConstraintRetirementRequest: {
+            schema_version: number;
+            target_schema?: components["schemas"]["TableSchema"];
+            /**
+             * @description Prepare for explicit table deletion; this operation does not delete the table.
+             * @default false
+             */
+            drop?: boolean;
+        };
+        RelationalConstraintRetirementStatus: {
+            /** @description Opaque retirement job identity. */
+            id: string;
+            /** @enum {string} */
+            phase: "fencing" | "foreign_keys" | "unique" | "publishing" | "published" | "ready_to_drop";
+            drop: boolean;
+            /** Format: uint32 */
+            target_schema_version: number;
+            /**
+             * @description Durable diagnostic that pauses the job. Retry resumes the exact
+             *     checkpoint after the cause is addressed; it does not undo a partial
+             *     drain or permit primary mutations while retirement is active.
+             */
+            failure?: string;
+        };
+        RelationalConstraintStatus: {
+            /** Format: uint32 */
+            schema_version: number;
+            /**
+             * @description Distributed UNIQUE, foreign-key, and scalar CHECK coverage across every current table owner. Native local validation is not a substitute for this coordinated proof.
+             * @enum {string}
+             */
+            coverage_kind: "unique_foreign_key_and_check";
+            state: components["schemas"]["RelationalConstraintValidationState"];
+            ranges: components["schemas"]["RelationalConstraintRangeStatus"][];
+            retirement?: components["schemas"]["RelationalConstraintRetirementStatus"];
+        };
         /** @description Structured details for an aborted transaction attempt. */
         TransactionConflict: {
             /** @description Table where the conflict was detected. */
@@ -7114,6 +7679,7 @@ export interface components {
             key: string;
             /** @description Human-readable conflict description. */
             message: string;
+            reason?: components["schemas"]["RelationalConstraintConflictReason"];
             /**
              * @description Stable machine-readable conflict classification.
              * @enum {string}
@@ -7316,6 +7882,14 @@ export interface components {
              */
             connection: string;
         };
+        /**
+         * @description Native cluster backups pin a common transaction cut across a dependency-complete
+         *     table set. Restart-stable LSM seals are journaled before releasing write fences;
+         *     artifact upload uses those immutable seals without holding the write pause.
+         *     Native cohorts support at most 4096 tables and 4096 ranges and require the
+         *     filesystem-managed LSM backend. Portable backups do not support coordinated
+         *     UNIQUE/FK constraints or promise a common cross-table transaction cut.
+         */
         ClusterBackupRequest: {
             /**
              * @description Unique identifier for this backup. Used to reference the backup for restore operations.
@@ -7406,6 +7980,17 @@ export interface components {
             /** @description Opaque artifact generation retained by an ambiguous cluster attempt. */
             artifact_backup_id?: string;
         };
+        /**
+         * @description Native cohort restores use the existing asynchronous restore job to provision
+         *     hidden fresh generations, import rows, rebuild indexes and coordinated constraints,
+         *     and publish the dependency-complete target set atomically. Document, relational,
+         *     and mixed native cohorts use the same workflow (at most 128 tables/4096 ranges).
+         *     Skipping a live parent cannot substitute it for a parent generation required by
+         *     a restored child. Overwrite retains the old generation until validation and
+         *     cutover; cancellation after publication completes publication rather than rollback.
+         *     Reserved destination authorization is immutable: changing principal requires
+         *     canceling the old job and creating a new restore.
+         */
         ClusterRestoreRequest: {
             /**
              * @description Unique identifier of the backup to restore from.
@@ -11682,11 +12267,96 @@ export interface components {
             /** @description When true, derive the algebraic capability sidecar from the table schema. Internal fields and materialization definitions are not public API. */
             derive_from_schema?: boolean;
         };
+        /** @enum {string} */
+        RelationalExpressionOp: "literal" | "column" | "add" | "subtract" | "multiply" | "divide" | "negate" | "concat" | "coalesce" | "lower_ascii" | "upper_ascii" | "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "is_null" | "is_not_null" | "is_distinct" | "is_not_distinct" | "and" | "or" | "not";
+        /** @enum {string} */
+        RelationalExpressionType: "string" | "blob" | "boolean" | "datetime" | "integer" | "number";
+        /**
+         * @description Immutable typed scalar expression, limited to 128 nodes and 16 levels.
+         *     A literal requires type; omitted value means typed null. A column
+         *     requires column; other
+         *     operations require args. Unknown or irrelevant fields are rejected.
+         *     Arithmetic operands have the same integer or number type. Integer
+         *     division truncates toward zero. Overflow and division by zero reject
+         *     the write. Arithmetic and string operations propagate null. ASCII case
+         *     operations leave non-ASCII bytes unchanged. No volatile functions are
+         *     accepted. Allocated results are bounded to 1 MiB each. Allocations
+         *     and byte-comparison operand work share a 4 MiB evaluation budget per
+         *     row and expression set. An integer literal may use a decimal string
+         *     for exact int64 transport; blob uses base64 and datetime uses the
+         *     normal relational datetime representation.
+         *     Comparisons require operands of the same type and return boolean or
+         *     SQL UNKNOWN (null); is_distinct and is_not_distinct always return a
+         *     boolean. Unary is_null and is_not_null test presence/null. AND and OR
+         *     evaluate left to right with SQL three-valued short-circuit semantics;
+         *     NOT preserves UNKNOWN. CHECK accepts TRUE and UNKNOWN, rejecting FALSE.
+         */
+        RelationalScalarExpression: {
+            op: components["schemas"]["RelationalExpressionOp"];
+            type?: components["schemas"]["RelationalExpressionType"];
+            /** @description Typed literal value, including null. */
+            value?: unknown;
+            column?: string;
+            /** @description Optional binary or ASCII case-insensitive collation for binary string comparison operations only; aliases match ordered indexes. */
+            collation?: string;
+            args?: components["schemas"]["RelationalScalarExpression"][];
+        };
+        /**
+         * @description Direction of one ordered index key component. Omission selects asc.
+         * @enum {string}
+         */
+        RelationalIndexKeyDirection: "asc" | "desc";
+        /**
+         * @description Null placement for one ordered index key component. The default is
+         *     last for ascending keys and first for descending keys. Omission selects default.
+         * @enum {string}
+         */
+        RelationalIndexKeyNulls: "default" | "first" | "last";
+        /**
+         * @description Ordered component of a relational ordered-tuple index key. Supply
+         *     either a declared column or a deterministic typed scalar expression
+         *     with its result_type. Composite keys may mix both forms. Bounds use
+         *     the expression result type, not its input columns.
+         */
+        RelationalIndexKey: {
+            /** @description Declared relational column used by this key component. */
+            column?: string;
+            expression?: components["schemas"]["RelationalScalarExpression"];
+            result_type?: components["schemas"]["RelationalExpressionType"];
+            /**
+             * @description String-key collation. Omission selects binary ordering. Supported
+             *     binary aliases are C, POSIX, and binary. The aliases ci,
+             *     case_insensitive, and antfly.case_insensitive select ASCII-only
+             *     case folding, not locale-aware or Unicode case folding.
+             */
+            collation?: string;
+            direction?: components["schemas"]["RelationalIndexKeyDirection"];
+            nulls?: components["schemas"]["RelationalIndexKeyNulls"];
+        };
+        /** @enum {string} */
+        RelationalComparisonOp: "is_null" | "is_not_null" | "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "is_distinct" | "is_not_distinct";
+        /** @description A typed partial-index conjunct. Only TRUE is indexed; FALSE and SQL UNKNOWN are excluded. */
+        RelationalIndexPredicate: {
+            column: string;
+            op: components["schemas"]["RelationalComparisonOp"];
+            /** @description Typed scalar operand; integer columns also accept exact decimal strings. Omission means NULL. */
+            value?: unknown;
+            /** @description String comparison collation with the same semantics as ordered keys. */
+            collation?: string;
+        };
+        /** @description Schema-bound composite ordered index on a relational table. Keys use stable typed comparison semantics and independent direction, null placement, and string collation. Existing rows build asynchronously; indexed queries require complete owner coverage. The table schema is the single durable authority for these definitions. */
+        RelationalIndexConfig: {
+            keys: components["schemas"]["RelationalIndexKey"][];
+            /** @description Non-key columns stored for index-only projection; distinct from keys. */
+            include_columns?: string[];
+            /** @description Optional conjunction selecting index members. Queries must explicitly include all typed conjuncts. */
+            where?: components["schemas"]["RelationalIndexPredicate"][];
+        };
         /**
          * @description The type of the index.
          * @enum {string}
          */
-        IndexType: "full_text" | "embeddings" | "graph" | "algebraic";
+        IndexType: "full_text" | "embeddings" | "graph" | "algebraic" | "relational";
         /** @description Configuration for an index */
         IndexConfig: {
             /** @description Name of the index */
@@ -11719,7 +12389,7 @@ export interface components {
              *     ]
              */
             enrichments?: components["schemas"]["EnrichmentConfig"][];
-        } & (components["schemas"]["FullTextIndexConfig"] | components["schemas"]["EmbeddingsIndexConfig"] | components["schemas"]["GraphIndexConfig"] | components["schemas"]["AlgebraicIndexConfig"]);
+        } & (components["schemas"]["FullTextIndexConfig"] | components["schemas"]["EmbeddingsIndexConfig"] | components["schemas"]["GraphIndexConfig"] | components["schemas"]["AlgebraicIndexConfig"] | components["schemas"]["RelationalIndexConfig"]);
         /** @description Fields shared by every create-index variant. The index name is owned by the request path. */
         CreateIndexCommon: {
             /** @description Optional description of the index and its purpose */
@@ -11776,8 +12446,138 @@ export interface components {
              */
             type: "algebraic";
         };
+        /** @description Create a composite ordered index through the shared index resource. */
+        CreateRelationalIndexRequest: components["schemas"]["RelationalIndexConfig"] & {
+            /** @description Optional description of the index and its purpose. */
+            description?: string;
+            /**
+             * @description Index implementation version. Only zero is supported; the schema epoch is managed by the server.
+             * @default 0
+             */
+            version?: number;
+            /** @enum {string} */
+            type: "relational";
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "relational";
+        };
         /** @description Type-safe configuration for a new index. The index name is owned by the request path. */
-        CreateIndexRequest: components["schemas"]["CreateFullTextIndexRequest"] | components["schemas"]["CreateEmbeddingsIndexRequest"] | components["schemas"]["CreateGraphIndexRequest"] | components["schemas"]["CreateAlgebraicIndexRequest"];
+        CreateIndexRequest: components["schemas"]["CreateFullTextIndexRequest"] | components["schemas"]["CreateEmbeddingsIndexRequest"] | components["schemas"]["CreateGraphIndexRequest"] | components["schemas"]["CreateAlgebraicIndexRequest"] | components["schemas"]["CreateRelationalIndexRequest"];
+        /**
+         * @description Storage representation for the table. Omission selects "document".
+         *     "relational" stores schema-bound typed rows and requires exactly one
+         *     closed document schema with declared properties. It implies
+         *     enforce_types; explicitly setting enforce_types to false is invalid.
+         *     Existing JSON document write and read APIs remain available. This
+         *     setting alone does not declare primary keys or unique constraints.
+         * @enum {string}
+         */
+        TableStorageMode: "document" | "relational";
+        RelationalColumnExpression: {
+            column: string;
+            expression: components["schemas"]["RelationalScalarExpression"];
+        };
+        /**
+         * @description A typed CHECK. Supply either expression or column and op (with optional
+         *     value and collation), never both forms. Expressions must return boolean
+         *     and use the shared bounded immutable scalar expression vocabulary.
+         *     New writes are checked from schema publication;
+         *     existing rows are validated separately. SQL UNKNOWN satisfies CHECK.
+         *     Comparison values must match the column type. Integer values may also
+         *     use exact decimal strings to avoid client-side floating-point rounding.
+         */
+        RelationalCheckConstraint: {
+            name: string;
+            column?: string;
+            op?: components["schemas"]["RelationalComparisonOp"];
+            /** @description Scalar comparison operand. Omission represents NULL. Null tests require a NULL operand. */
+            value?: unknown;
+            /** @description String comparison collation; uses the same rules as ordered indexes. */
+            collation?: string;
+            expression?: components["schemas"]["RelationalScalarExpression"];
+        };
+        /**
+         * @description A named, ordered composite unique key. Validation status is maintained
+         *     by the server. TTL expiry uses the distributed integrity coordinator.
+         *     Referenced unique keys are nondeferrable.
+         */
+        RelationalUniqueConstraint: {
+            name: string;
+            columns: string[];
+            /** @description When true, NULL components compare equal for uniqueness. */
+            nulls_not_distinct?: boolean;
+        };
+        /**
+         * @description Action on referencing rows when a referenced row is changed or removed.
+         * @enum {string}
+         */
+        ForeignKeyAction: "restrict" | "set_null" | "cascade" | "no_action";
+        /**
+         * @description Enforcement timing for atomic mutations and transaction sessions. Deferred
+         *     requires deferrable=true and validates the final transaction state.
+         *     NO ACTION permits a valid final-state parent replacement; RESTRICT
+         *     still rejects referenced parent removal. Existing multi-request
+         *     transaction sessions retain deferred checks until commit; immediate
+         *     checks apply to each staged statement. SET CONSTRAINTS is not provided.
+         * @enum {string}
+         */
+        ForeignKeyTiming: "immediate" | "deferred";
+        /**
+         * @description Null matching semantics of a composite foreign key. Partial requires
+         *     at least one parent matching every non-null child component; all-null
+         *     children are exempt. Compatible parent witnesses are guarded through
+         *     commit, including concurrent deletion of alternative witnesses.
+         * @enum {string}
+         */
+        ForeignKeyMatch: "simple" | "full" | "partial";
+        /**
+         * @description Composite foreign key. Child and parent columns correspond by position
+         *     and must have the same physical comparison types. The parent columns
+         *     must identify a unique key. Existing-row validation is independent of
+         *     new-write enforcement and is never client-writable.
+         *     Enforcement and referential actions share the bounded distributed
+         *     transaction path, including TTL expiry. Partial matching uses ordered
+         *     support indexes on the parent; activation waits until these are ready.
+         *     SET NULL requires every child column to accept explicit NULL.
+         */
+        RelationalForeignKeyConstraint: {
+            name: string;
+            child_columns: string[];
+            /**
+             * @description Literal parent table name in the child table's database and namespace.
+             *     Resolved to an immutable table identity when the constraint is declared;
+             *     renaming a parent preserves the reference. Public schemas show its current name.
+             */
+            parent_table: string;
+            parent_columns: string[];
+            on_delete?: components["schemas"]["ForeignKeyAction"];
+            on_update?: components["schemas"]["ForeignKeyAction"];
+            timing?: components["schemas"]["ForeignKeyTiming"];
+            match?: components["schemas"]["ForeignKeyMatch"];
+            deferrable?: boolean;
+        };
+        /**
+         * @description Declarative table-owned ordered index. Keys are compared lexicographically
+         *     in the declared order, with independent direction, null placement, and
+         *     string collation. Creation builds existing rows asynchronously; queries
+         *     must wait for range-local coverage. Unique constraints and expression
+         *     keys are not implied by this object. Optional WHERE conjuncts select
+         *     only matching rows. INCLUDE columns
+         *     store typed values alongside keys for index-only projected reads.
+         */
+        RelationalIndexDefinition: {
+            /** @description Optional human-readable description, also exposed by the shared indexes API. */
+            description?: string;
+            name: string;
+            keys: components["schemas"]["RelationalIndexKey"][];
+            /** @description Non-key columns stored in the index; must be distinct from key columns. */
+            include_columns?: string[];
+            /** @description Conjunction of typed predicates. Indexed queries must explicitly contain every conjunct with equivalent typed comparison semantics. */
+            where?: components["schemas"]["RelationalIndexPredicate"][];
+        };
         /**
          * @description Field types accepted by detailed `x-antfly-field` and dynamic-template
          *     mappings. JSON-schema-oriented aliases are normalized to Antfly's
@@ -11960,6 +12760,52 @@ export interface components {
              * @description Backend-managed schema generation used for migrations. Omit it from create and update requests.
              */
             readonly version?: number;
+            storage_mode?: components["schemas"]["TableStorageMode"];
+            /**
+             * @description Immutable typed expressions applied only to absent columns on new
+             *     writes, never explicit null. Defaults cannot reference columns.
+             *     A column cannot have both a default and a generated expression.
+             *     Omission or [] declares none. Relational tables only.
+             */
+            column_defaults?: components["schemas"]["RelationalColumnExpression"][];
+            /**
+             * @description Stored immutable generated columns, evaluated in dependency order
+             *     on writes before validation and indexing. Cycles are rejected.
+             *     Generated columns are output-only; submitted values are replaced
+             *     by the computed value. Omission or [] declares none. Defaults
+             *     and generated declarations together are limited to 256 columns,
+             *     4096 expression nodes, and 4 MiB of literal data. Evaluation has
+             *     a shared 4 MiB allocation budget across all column expressions.
+             *     Restore verifies stored results instead of silently recomputing
+             *     them. Changing, adding, or removing generated semantics through
+             *     an existing table's schema update requires explicit rewrite=true
+             *     on the PUT or PATCH schema route. This returns a durable restore
+             *     job and replaces the complete authorized dependency cohort only
+             *     after distributed transformation and validation. Ordinary schema
+             *     updates reject these changes, even when a table appears empty.
+             *     Declaration reordering and default-only changes remain allowed.
+             *     Relational tables only.
+             */
+            generated_columns?: components["schemas"]["RelationalColumnExpression"][];
+            /**
+             * @description Named scalar CHECK constraints for a relational schema. This is
+             *     part of the complete schema: omission or [] declares no checks.
+             *     New writes enforce every check. Existing-row validation status is
+             *     maintained separately and is never accepted from the client.
+             */
+            checks?: components["schemas"]["RelationalCheckConstraint"][];
+            /** @description Complete set of composite unique declarations. Omission or [] declares none. */
+            unique_constraints?: components["schemas"]["RelationalUniqueConstraint"][];
+            /** @description Complete set of outgoing composite foreign keys. Omission or [] declares none. */
+            foreign_keys?: components["schemas"]["RelationalForeignKeyConstraint"][];
+            /**
+             * @description Desired ordered indexes for a relational table. Names must be unique.
+             *     An explicit array replaces the declarations; an empty array drops
+             *     them. Omission preserves existing declarations during schema updates.
+             *     Index definitions commit atomically with the schema; build progress
+             *     and readiness are local to each owning shard, not client-writable.
+             */
+            relational_indexes?: components["schemas"]["RelationalIndexDefinition"][];
             /** @description Default type to use from the document_types. */
             default_type?: string;
             /**
@@ -12180,8 +13026,19 @@ export interface components {
              */
             type: "algebraic";
         };
+        /** @description Effective schema-bound composite index configuration. */
+        CreatedRelationalIndex: components["schemas"]["CreatedIndexCommon"] & components["schemas"]["RelationalIndexConfig"] & {
+            /** @enum {string} */
+            type: "relational";
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "relational";
+        };
         /** @description Discriminated normalized configuration returned after an index is created. */
-        CreatedIndex: components["schemas"]["CreatedFullTextIndex"] | components["schemas"]["CreatedEmbeddingsIndex"] | components["schemas"]["CreatedGraphIndex"] | components["schemas"]["CreatedAlgebraicIndex"];
+        CreatedIndex: components["schemas"]["CreatedFullTextIndex"] | components["schemas"]["CreatedEmbeddingsIndex"] | components["schemas"]["CreatedGraphIndex"] | components["schemas"]["CreatedAlgebraicIndex"] | components["schemas"]["CreatedRelationalIndex"];
         /**
          * @description Lifecycle state for the desired index incarnation. A failed desired repair may coexist with queryable=true when a separately proven serving incarnation remains available; clients must use the explicit milestone booleans.
          * @enum {string}
@@ -13289,8 +14146,49 @@ export interface components {
                 [key: string]: unknown;
             };
         };
+        /** @enum {string} */
+        RelationalIndexBuildState: "building" | "ready" | "failed";
+        /** @enum {string} */
+        RelationalIndexBuildFailure: "incompatible_schema" | "invalid_row" | "key_too_large";
+        RelationalIndexRangeStatus: {
+            group_id: string;
+            /** @description Exact uint64 generation encoded as decimal, never a floating-point number. */
+            generation: string;
+            /** Format: uint32 */
+            slot: number;
+            /** @description Namespace and owned-range fingerprint. */
+            owner: string;
+            /** @description Executable tuple comparison fingerprint. */
+            comparison: string;
+            /** @description Exact durable progress observation for generation-fenced maintenance. */
+            progress_digest: string;
+            /** @description Replicated desired maintenance ticket, separate from replica-local progress. */
+            maintenance_epoch: string;
+            /** @description Most recently accepted maintenance command proof for exact retry acknowledgement. */
+            last_maintenance_request?: string;
+            state: components["schemas"]["RelationalIndexBuildState"];
+            rows_scanned: string;
+            failure?: components["schemas"]["RelationalIndexBuildFailure"];
+        };
+        RelationalIndexStatus: {
+            table_id: string;
+            /** Format: uint32 */
+            schema_version: number;
+            index_name: string;
+            state: components["schemas"]["RelationalIndexBuildState"];
+            ranges: components["schemas"]["RelationalIndexRangeStatus"][];
+        };
+        RelationalIndexStats: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            index_type: "relational";
+            milestones: components["schemas"]["IndexMilestones"];
+            relational_index: components["schemas"]["RelationalIndexStatus"];
+        };
         /** @description Statistics for an index */
-        IndexStats: components["schemas"]["FullTextIndexStats"] | components["schemas"]["EmbeddingsIndexStats"] | components["schemas"]["GraphIndexStats"] | components["schemas"]["AlgebraicIndexStats"];
+        IndexStats: components["schemas"]["FullTextIndexStats"] | components["schemas"]["EmbeddingsIndexStats"] | components["schemas"]["GraphIndexStats"] | components["schemas"]["AlgebraicIndexStats"] | components["schemas"]["RelationalIndexStats"];
         GraphMetricEdgeFilterStatus: {
             /** @enum {string} */
             mode: "all" | "types";
@@ -13440,6 +14338,11 @@ export interface components {
             recent_events?: components["schemas"]["GraphMetricEvent"][];
         };
         /**
+         * @description Validation state of an existing-row constraint.
+         * @enum {string}
+         */
+        RelationalConstraintValidationState: "enforced" | "unvalidated" | "validating" | "invalid";
+        /**
          * @description Available tool names for retrieval agents.
          *     - add_filter: Add search filters (field constraints)
          *     - ask_clarification: Ask user for clarification
@@ -13467,44 +14370,6 @@ export interface components {
          */
         WebSearchProvider: "exa" | "serper" | "tavily" | "brave" | "you" | "linkup" | "vertex";
         /**
-         * @description Configuration for Exa neural/semantic web search.
-         *
-         *     Exa is optimized for semantic web search, highlights, and retrieved page
-         *     contents for RAG and agent workflows.
-         *
-         *     **Setup:**
-         *     1. Sign up at https://exa.ai
-         *     2. Get API key from dashboard
-         *
-         *     **Docs:** https://docs.exa.ai
-         */
-        ExaSearchConfig: Omit<components["schemas"]["WebSearchConfig"], "provider"> & {
-            /** @description Exa API key (or set EXA_API_KEY env var) */
-            api_key?: string;
-            /**
-             * @description Search mode to request from Exa
-             * @default auto
-             * @enum {string}
-             */
-            search_type?: "auto" | "neural" | "keyword";
-            /** @description Provider-specific result count override */
-            num_results?: number;
-            /** @description ISO date/time lower bound for published date filtering */
-            start_published_date?: string;
-            /** @description ISO date/time upper bound for published date filtering */
-            end_published_date?: string;
-            /** @description Only include results from these domains */
-            include_domains?: string[];
-            /** @description Exclude results from these domains */
-            exclude_domains?: string[];
-        } & {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            provider: "exa";
-        };
-        /**
          * @description Configuration for Serper.dev Google Search API.
          *
          *     Serper provides a simpler alternative to Google Custom Search with
@@ -13517,11 +14382,12 @@ export interface components {
          *     **Docs:** https://serper.dev/docs
          */
         SerperSearchConfig: Omit<components["schemas"]["WebSearchConfig"], "provider"> & {
+            /** @enum {string} */
+            provider?: "serper";
             /** @description Serper API key (or set SERPER_API_KEY env var) */
             api_key?: string;
             /**
              * @description Type of search to perform
-             * @default search
              * @enum {string}
              */
             search_type?: "search" | "news" | "images" | "places" | "shopping";
@@ -13530,6 +14396,12 @@ export interface components {
              * @enum {string}
              */
             time_period?: "d" | "w" | "m" | "y";
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            provider: "serper";
         } & {
             /**
              * @description discriminator enum property added by openapi-typescript
@@ -13550,30 +14422,31 @@ export interface components {
          *     **Docs:** https://docs.tavily.com
          */
         TavilySearchConfig: Omit<components["schemas"]["WebSearchConfig"], "provider"> & {
+            /** @enum {string} */
+            provider?: "tavily";
             /** @description Tavily API key (or set TAVILY_API_KEY env var) */
             api_key?: string;
             /**
              * @description Search depth:
              *     - basic: Fast search with standard results
              *     - advanced: Deeper search with more comprehensive results
-             * @default basic
              * @enum {string}
              */
             search_depth?: "basic" | "advanced";
-            /**
-             * @description Include AI-generated answer summary
-             * @default true
-             */
+            /** @description Include AI-generated answer summary */
             include_answer?: boolean;
-            /**
-             * @description Include raw HTML content of pages
-             * @default false
-             */
+            /** @description Include raw HTML content of pages */
             include_raw_content?: boolean;
             /** @description Only include results from these domains */
             include_domains?: string[];
             /** @description Exclude results from these domains */
             exclude_domains?: string[];
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            provider: "tavily";
         } & {
             /**
              * @description discriminator enum property added by openapi-typescript
@@ -13593,6 +14466,8 @@ export interface components {
          *     **Docs:** https://api.search.brave.com/app/documentation
          */
         BraveSearchConfig: Omit<components["schemas"]["WebSearchConfig"], "provider"> & {
+            /** @enum {string} */
+            provider?: "brave";
             /** @description Brave Search API key (or set BRAVE_API_KEY env var) */
             api_key?: string;
             /**
@@ -13600,16 +14475,16 @@ export interface components {
              * @enum {string}
              */
             freshness?: "pd" | "pw" | "pm" | "py";
-            /**
-             * @description Include text decorations (bold, italic markers)
-             * @default false
-             */
+            /** @description Include text decorations (bold, italic markers) */
             text_decorations?: boolean;
-            /**
-             * @description Enable spellcheck suggestions
-             * @default true
-             */
+            /** @description Enable spellcheck suggestions */
             spellcheck?: boolean;
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            provider: "brave";
         } & {
             /**
              * @description discriminator enum property added by openapi-typescript
@@ -13630,6 +14505,8 @@ export interface components {
          *     **Docs:** https://api.you.com
          */
         YouSearchConfig: Omit<components["schemas"]["WebSearchConfig"], "provider"> & {
+            /** @enum {string} */
+            provider?: "you";
             /** @description You.com API key (or set YOU_API_KEY env var) */
             api_key?: string;
             /**
@@ -13637,6 +14514,12 @@ export interface components {
              * @description You.com API endpoint URL
              */
             endpoint?: string;
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            provider: "you";
         } & {
             /**
              * @description discriminator enum property added by openapi-typescript
@@ -13657,20 +14540,26 @@ export interface components {
          *     **Docs:** https://docs.linkup.so
          */
         LinkupSearchConfig: Omit<components["schemas"]["WebSearchConfig"], "provider"> & {
+            /** @enum {string} */
+            provider?: "linkup";
             /** @description Linkup API key (or set LINKUP_API_KEY env var) */
             api_key?: string;
             /**
              * @description Search depth to request from Linkup
-             * @default standard
              * @enum {string}
              */
             depth?: "standard" | "deep";
             /**
              * @description Linkup response shape to request
-             * @default searchResults
              * @enum {string}
              */
             output_type?: "searchResults" | "sourcedAnswer";
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            provider: "linkup";
         } & {
             /**
              * @description discriminator enum property added by openapi-typescript
@@ -13693,28 +14582,29 @@ export interface components {
          *     **Docs:** https://cloud.google.com/generative-ai-app-builder/docs
          */
         VertexSearchConfig: Omit<components["schemas"]["WebSearchConfig"], "provider"> & {
+            /** @enum {string} */
+            provider?: "vertex";
             /**
              * @description Google Cloud search service flavor
-             * @default agent_search
              * @enum {string}
              */
             service?: "agent_search";
             /** @description Google Cloud project ID. Falls back to GOOGLE_CLOUD_PROJECT. */
             project_id?: string;
-            /**
-             * @description Google Cloud location. Falls back to GOOGLE_CLOUD_LOCATION.
-             * @default global
-             */
+            /** @description Google Cloud location. Falls back to GOOGLE_CLOUD_LOCATION. */
             location?: string;
             /** @description Agent Search data store ID. */
             data_store?: string;
-            /**
-             * @description Agent Search serving config ID.
-             * @default default_config
-             */
+            /** @description Agent Search serving config ID. */
             serving_config?: string;
             /** @description Service account JSON path. Falls back to GOOGLE_APPLICATION_CREDENTIALS. */
             credentials_path?: string;
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            provider: "vertex";
         } & {
             /**
              * @description discriminator enum property added by openapi-typescript
@@ -13727,6 +14617,12 @@ export interface components {
          *
          *     Each provider has specific configuration requirements. Use the appropriate
          *     provider-specific config or set common options at the top level.
+         *
+         *     Omitted options inherit the named connection when one is supplied.
+         *     Inline configurations preserve omission; clients must not materialize
+         *     defaults as overrides. Without a connection, the server applies provider
+         *     defaults (Exa: 5 results, 10000 ms timeout, safe search enabled, content
+         *     and highlights disabled, and auto search).
          *
          *     **Environment Variables (fallbacks):**
          *     - EXA_API_KEY
@@ -13753,20 +14649,11 @@ export interface components {
             serving_config?: string;
             /** @description Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC. */
             credentials_path?: string;
-            /**
-             * @description Maximum number of search results to return
-             * @default 5
-             */
+            /** @description Maximum number of search results to return */
             max_results?: number;
-            /**
-             * @description Request timeout in milliseconds
-             * @default 10000
-             */
+            /** @description Request timeout in milliseconds */
             timeout_ms?: number;
-            /**
-             * @description Enable safe search filtering
-             * @default true
-             */
+            /** @description Enable safe search filtering */
             safe_search?: boolean;
             /**
              * @description Preferred language for results (e.g., 'en', 'es', 'fr')
@@ -13778,17 +14665,58 @@ export interface components {
              * @example us
              */
             region?: string;
-            /**
-             * @description Ask the provider to return extracted page content when supported
-             * @default false
-             */
+            /** @description Ask the provider to return extracted page content when supported */
             include_content?: boolean;
-            /**
-             * @description Ask the provider to return highlighted passages when supported
-             * @default false
-             */
+            /** @description Ask the provider to return highlighted passages when supported */
             include_highlights?: boolean;
         };
+        /**
+         * @description Configuration for Exa neural/semantic web search.
+         *
+         *     Exa is optimized for semantic web search, highlights, and retrieved page
+         *     contents for RAG and agent workflows.
+         *
+         *     **Setup:**
+         *     1. Sign up at https://exa.ai
+         *     2. Get API key from dashboard
+         *
+         *     **Docs:** https://docs.exa.ai
+         */
+        ExaSearchConfig: Omit<components["schemas"]["WebSearchConfig"], "provider"> & {
+            /** @enum {string} */
+            provider?: "exa";
+            /** @description Exa API key (or set EXA_API_KEY env var) */
+            api_key?: string;
+            /**
+             * @description Search mode to request from Exa
+             * @enum {string}
+             */
+            search_type?: "auto" | "neural" | "keyword";
+            /** @description Provider-specific result count override */
+            num_results?: number;
+            /** @description ISO date/time lower bound for published date filtering */
+            start_published_date?: string;
+            /** @description ISO date/time upper bound for published date filtering */
+            end_published_date?: string;
+            /** @description Only include results from these domains */
+            include_domains?: string[];
+            /** @description Exclude results from these domains */
+            exclude_domains?: string[];
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            provider: "exa";
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            provider: "exa";
+        };
+        /** @description Provider-specific inline web search configuration. */
+        WebSearchProviderConfig: components["schemas"]["ExaSearchConfig"] | components["schemas"]["SerperSearchConfig"] | components["schemas"]["TavilySearchConfig"] | components["schemas"]["BraveSearchConfig"] | components["schemas"]["YouSearchConfig"] | components["schemas"]["LinkupSearchConfig"] | components["schemas"]["VertexSearchConfig"];
         Credentials: {
             /**
              * @description S3-compatible endpoint (e.g., 's3.amazonaws.com' or 'localhost:9000' for MinIO)
@@ -13891,7 +14819,7 @@ export interface components {
              *     requests. See specs/openapi/antfly/websearch.yaml for provider-specific
              *     options.
              */
-            web_search_config?: components["schemas"]["WebSearchConfig"];
+            web_search_config?: components["schemas"]["WebSearchProviderConfig"];
             /**
              * @description Name of a configured connections.<id> resource with kind web_search.
              *     Request-level tool options may reduce scope, but cannot expand the
@@ -15520,6 +16448,26 @@ export interface components {
             context?: Record<string, never>[];
             /** @description IDs of retrieved documents (for retrieval metrics) */
             retrieved_ids?: string[];
+        };
+        IndexMaintenanceOwnerProof: {
+            group_id: string;
+            generation: string;
+            /** Format: uint32 */
+            slot: number;
+            owner: string;
+            comparison: string;
+            progress_digest: string;
+            maintenance_epoch: string;
+        };
+        /** @description Exact observations from index status. Each selected owner is admitted atomically through the replicated transaction journal; the selection is not one global transaction. Cancellation, conflicts, or a lost acknowledgement may leave some owners admitted. Resubmit the identical request to resume safely; do not replace its observations with newer progress unless starting a new maintenance attempt. */
+        IndexMaintenanceRequest: {
+            table_id: string;
+            /** Format: uint32 */
+            schema_version: number;
+            owners: components["schemas"]["IndexMaintenanceOwnerProof"][];
+        };
+        IndexMaintenanceResponse: {
+            acknowledged_groups: string[];
         };
         InferenceError: {
             /** @description Stable machine-readable error code */
@@ -17423,9 +18371,11 @@ export interface components {
             top_k?: number;
             /**
              * @description Version 2 classification mode. Ordinal labels are ordered from lowest to highest.
+             *     Typed-decision extractors support boolean with labels ["false", "true"] in that order.
+             *     Each model rejects modes it does not support.
              * @enum {string}
              */
-            mode?: "single" | "multi" | "ordinal";
+            mode?: "single" | "multi" | "ordinal" | "boolean";
             label_definitions?: {
                 [key: string]: components["schemas"]["ExtractionLabelDefinition"];
             };
@@ -17930,6 +18880,42 @@ export interface components {
             schema: components["schemas"]["ExtractionSchema"];
             options?: components["schemas"]["ExtractionOptions"];
         };
+        ExtractionLabelProbability: {
+            label: string;
+            /** Format: float */
+            probability: number;
+        };
+        /** @description Version 2 typed classification decision. Probabilities follow request label order; ordinal levels are zero-based. */
+        ExtractionDecision: {
+            name: string;
+            /** @enum {string} */
+            type: "choice" | "score" | "boolean";
+            /** @description Highest-probability label. This is distinct from the expected ordinal value. */
+            label: string;
+            probabilities: components["schemas"]["ExtractionLabelProbability"][];
+            /** Format: float */
+            confidence: number;
+            /**
+             * @description Entropy confidence is not the probability that the selected label is correct.
+             * @enum {string}
+             */
+            confidence_method: "normalized_inverse_entropy" | "max_probability";
+            /**
+             * Format: float
+             * @description Score decisions only; sum of zero-based level index times probability.
+             */
+            expected_value?: number;
+            /**
+             * Format: float
+             * @description Boolean decisions only; probability of the true label.
+             */
+            true_probability?: number;
+            /**
+             * Format: float
+             * @description Auxiliary model estimate for acting. Does not authorize or execute a tool call.
+             */
+            act_probability: number;
+        };
         ExtractionAttributeLabel: {
             label: string;
             confidence: components["schemas"]["ExtractionProbability"];
@@ -18018,6 +19004,8 @@ export interface components {
             solver_optimality_scope: "retained_candidate_graph";
         };
         ExtractionObject: {
+            /** @description Typed decision results from capable extractors, alongside compatible per-label classifications. */
+            decisions?: components["schemas"]["ExtractionDecision"][];
             id?: string;
             offset_unit?: components["schemas"]["ExtractionOffsetUnit"];
             entities?: components["schemas"]["ExtractionEntity"][];
@@ -19843,6 +20831,293 @@ export interface operations {
             504: components["responses"]["QueryGatewayTimeout"];
         };
     };
+    getRelationalConstraintStatus: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Epoch- and owner-fenced validation status for every active range. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RelationalConstraintStatus"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Schema or ownership changed during status collection. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description One or more current owners could not report authoritative coverage. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    repairRelationalConstraints: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RelationalRowMutationRequest"];
+            };
+        };
+        responses: {
+            /** @description Repair transaction committed. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BatchResponse"];
+                };
+            };
+            /** @description Commit is durable; visibility or participant recovery is pending. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BatchResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Administrator or affected-table write permission is missing. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Activation, schema, row version, or constraint changed. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Write coordination is temporarily unavailable. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    retryRelationalConstraints: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RelationalConstraintRetryRequest"];
+            };
+        };
+        responses: {
+            /** @description Failed owner checkpoints reset; background validation is pending. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RelationalConstraintRetryResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Administrator permission is missing. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Schema or activation state changed; refresh and retry. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Some owners could not be reset; repeating the request is safe. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    retireRelationalConstraints: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RelationalConstraintRetirementRequest"];
+            };
+        };
+        responses: {
+            /** @description Retirement accepted; no data or schema publication is implied yet. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RelationalConstraintRetryResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Administrator permission is missing. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Schema, retirement state, topology, or incoming foreign-key dependency changed. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Retirement coordination is temporarily unavailable. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    queryRelationalRows: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RelationalRowQueryRequest"];
+            };
+        };
+        responses: {
+            /** @description Bounded newline-delimited typed rows in primary-key order. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/x-ndjson": string;
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Requested schema epoch is stale. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Read ownership or storage is temporarily unavailable. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    mutateRelationalRows: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RelationalRowMutationRequest"];
+            };
+        };
+        responses: {
+            /** @description Atomic mutations committed. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BatchResponse"];
+                };
+            };
+            /** @description Durable commit decision; participant visibility or recovery is pending. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BatchResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description A version precondition or relational constraint conflicted. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Write coordination is temporarily unavailable. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     batchWrite: {
         parameters: {
             query?: never;
@@ -20073,8 +21348,24 @@ export interface operations {
     };
     updateSchema: {
         parameters: {
-            query?: never;
+            query?: {
+                /**
+                 * @description Explicitly enqueue a durable fresh-generation schema rewrite instead
+                 *     of changing the live schema. Requires administrator permission on the
+                 *     entire dependency cohort. Sources remain writable during snapshot and
+                 *     catch-up; final validation and publication are atomic across the cohort.
+                 *     Returns a restore job (202), whose existing status/cancel routes apply.
+                 *     Independent graph/vector artifacts without a retained row-derived
+                 *     source proof are rejected before admission. The default false retains
+                 *     ordinary schema-update behavior. Existing absent values remain absent
+                 *     rather than retroactively receiving defaults. Stored column type
+                 *     changes and destructive column removal are rejected.
+                 */
+                rewrite?: boolean;
+            };
             header?: {
+                /** @description Retry identity for rewrite=true admission. Reusing a key for a different rewrite returns 409. */
+                "Idempotency-Key"?: string;
                 /** @description Strong schema ETag returned by a previous schema mutation, for example `"schema-0"`. A mismatch returns 409 instead of overwriting a concurrent update. */
                 "If-Match"?: string;
             };
@@ -20101,7 +21392,17 @@ export interface operations {
                     "application/json": components["schemas"]["Table"];
                 };
             };
-            202: components["responses"]["CommittedMutationAccepted"];
+            /** @description Durable rewrite job accepted, or ordinary schema mutation committed with pending visibility */
+            202: {
+                headers: {
+                    /** @description Restore job status URL when rewrite=true. */
+                    Location?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RestoreJob"] | components["schemas"]["CommittedMutationOutcome"];
+                };
+            };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
@@ -20110,8 +21411,24 @@ export interface operations {
     };
     patchSchema: {
         parameters: {
-            query?: never;
+            query?: {
+                /**
+                 * @description Explicitly enqueue a durable fresh-generation schema rewrite instead
+                 *     of changing the live schema. Requires administrator permission on the
+                 *     entire dependency cohort. Sources remain writable during snapshot and
+                 *     catch-up; final validation and publication are atomic across the cohort.
+                 *     Returns a restore job (202), whose existing status/cancel routes apply.
+                 *     Independent graph/vector artifacts without a retained row-derived
+                 *     source proof are rejected before admission. The default false retains
+                 *     ordinary schema-update behavior. Existing absent values remain absent
+                 *     rather than retroactively receiving defaults. Stored column type
+                 *     changes and destructive column removal are rejected.
+                 */
+                rewrite?: boolean;
+            };
             header?: {
+                /** @description Retry identity for rewrite=true admission. Reusing a key for a different rewrite returns 409. */
+                "Idempotency-Key"?: string;
                 /** @description Strong schema ETag returned by a previous schema mutation, for example `"schema-0"`. A mismatch returns 409 instead of overwriting a concurrent update. */
                 "If-Match"?: string;
             };
@@ -20139,7 +21456,17 @@ export interface operations {
                     "application/json": components["schemas"]["Table"];
                 };
             };
-            202: components["responses"]["CommittedMutationAccepted"];
+            /** @description Durable rewrite job accepted, or ordinary schema mutation committed with pending visibility */
+            202: {
+                headers: {
+                    /** @description Restore job status URL when rewrite=true. */
+                    Location?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RestoreJob"] | components["schemas"]["CommittedMutationOutcome"];
+                };
+            };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
@@ -21029,6 +22356,72 @@ export interface operations {
             };
             404: components["responses"]["NotFound"];
             500: components["responses"]["InternalServerError"];
+        };
+    };
+    retryIndex: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                indexName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["IndexMaintenanceRequest"];
+            };
+        };
+        responses: {
+            /** @description All selected owner maintenance commands acknowledged */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IndexMaintenanceResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["IndexMutationConflict"];
+            429: components["responses"]["StorageResourceExhausted"];
+            503: components["responses"]["IndexMutationServiceUnavailable"];
+        };
+    };
+    repairIndex: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                indexName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["IndexMaintenanceRequest"];
+            };
+        };
+        responses: {
+            /** @description All selected owner maintenance commands acknowledged */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IndexMaintenanceResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["IndexMutationConflict"];
+            429: components["responses"]["StorageResourceExhausted"];
+            503: components["responses"]["IndexMutationServiceUnavailable"];
         };
     };
     getIndex: {
@@ -22216,6 +23609,375 @@ export interface operations {
                 };
                 content?: never;
             };
+        };
+    };
+    getNamespaceRelationalConstraintStatus: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Epoch- and owner-fenced validation status for every active range. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RelationalConstraintStatus"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Schema or ownership changed during status collection. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description One or more current owners could not report authoritative coverage. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    repairNamespaceRelationalConstraints: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RelationalRowMutationRequest"];
+            };
+        };
+        responses: {
+            /** @description Repair transaction committed. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BatchResponse"];
+                };
+            };
+            /** @description Commit is durable; visibility or participant recovery is pending. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BatchResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Administrator or affected-table write permission is missing. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Activation, schema, row version, or constraint changed. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Write coordination is temporarily unavailable. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    retryNamespaceRelationalConstraints: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RelationalConstraintRetryRequest"];
+            };
+        };
+        responses: {
+            /** @description Failed owner checkpoints reset; background validation is pending. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RelationalConstraintRetryResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Administrator permission is missing. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Schema or activation state changed; refresh and retry. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Some owners could not be reset; repeating the request is safe. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    retireNamespaceRelationalConstraints: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RelationalConstraintRetirementRequest"];
+            };
+        };
+        responses: {
+            /** @description Retirement accepted; no data or schema publication is implied yet. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RelationalConstraintRetryResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Administrator permission is missing. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Schema, retirement state, topology, or incoming foreign-key dependency changed. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Retirement coordination is temporarily unavailable. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    queryNamespaceRelationalRows: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RelationalRowQueryRequest"];
+            };
+        };
+        responses: {
+            /** @description Bounded newline-delimited typed rows in primary-key order. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/x-ndjson": string;
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Requested schema epoch is stale. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Read ownership or storage is temporarily unavailable. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    mutateNamespaceRelationalRows: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RelationalRowMutationRequest"];
+            };
+        };
+        responses: {
+            /** @description Atomic mutations committed. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BatchResponse"];
+                };
+            };
+            /** @description Durable commit decision; participant visibility or recovery is pending. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BatchResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description A version precondition or relational constraint conflicted. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Write coordination is temporarily unavailable. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    retryNamespaceIndex: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                indexName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["IndexMaintenanceRequest"];
+            };
+        };
+        responses: {
+            /** @description All selected owner maintenance commands acknowledged */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IndexMaintenanceResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["IndexMutationConflict"];
+            429: components["responses"]["StorageResourceExhausted"];
+            503: components["responses"]["IndexMutationServiceUnavailable"];
+        };
+    };
+    repairNamespaceIndex: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                indexName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["IndexMaintenanceRequest"];
+            };
+        };
+        responses: {
+            /** @description All selected owner maintenance commands acknowledged */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IndexMaintenanceResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["IndexMutationConflict"];
+            429: components["responses"]["StorageResourceExhausted"];
+            503: components["responses"]["IndexMutationServiceUnavailable"];
         };
     };
     renameDatabase: {

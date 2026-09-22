@@ -1864,7 +1864,10 @@ test "detect format from filename covers common audio extensions" {
 
 test "file name hint overrides ambiguous sync-word sniffing for flac" {
     const ambiguous_sync = [_]u8{ 0xff, 0xf8, 0x00, 0x00 };
-    try std.testing.expectEqual(EncodedFormat.mp3, detectFormat(ambiguous_sync[0..]).?);
+    // Those bytes are a valid ADTS sync word, and their layer bits are the
+    // reserved value no MPEG audio frame can carry, so sniffing alone lands on
+    // aac. The file name is what says this is a raw flac frame.
+    try std.testing.expectEqual(EncodedFormat.aac, detectFormat(ambiguous_sync[0..]).?);
     try std.testing.expectEqual(EncodedFormat.flac, detectFormatWithOptions(ambiguous_sync[0..], .{
         .file_name_hint = "raw-frame.flac",
     }).?);
@@ -2952,8 +2955,13 @@ test "checked-in codec corpus directory stays represented by the shared passing 
     try std.testing.expectEqual(@as(usize, checked_in_additional_codec_cases.len), fixture_names.count());
 
     for (checked_in_additional_codec_cases) |case| {
-        const removed = fixture_names.remove(case.name);
-        try std.testing.expect(removed);
+        // The set owns its keys, so take the entry rather than dropping it:
+        // `remove` alone leaves the name allocated with nothing left to free it.
+        const removed = fixture_names.fetchRemove(case.name) orelse {
+            std.debug.print("corpus fixture missing for case {s}\n", .{case.name});
+            return error.TestUnexpectedResult;
+        };
+        std.testing.allocator.free(removed.key);
     }
 
     try std.testing.expectEqual(@as(usize, 0), fixture_names.count());
@@ -2983,6 +2991,24 @@ test "checked-in codec corpus README entries stay aligned with files on disk" {
     }
 }
 
+/// The codec corpus, found from wherever the test binary was started. Zig's
+/// build runs these from the runtime root while a bare `zig test` runs them
+/// from the package, and a test that can only see the corpus from one of those
+/// is a test that silently stops running from the other.
+fn openCheckedInCodecCorpusDir(io: std.Io) !std.Io.Dir {
+    const candidates = [_][]const u8{
+        "lib/audio/testdata/codec-corpus",
+        "testdata/codec-corpus",
+        "zig/lib/audio/testdata/codec-corpus",
+        "../../lib/audio/testdata/codec-corpus",
+        "../../testdata/codec-corpus",
+    };
+    for (candidates) |candidate| {
+        return std.Io.Dir.cwd().openDir(io, candidate, .{ .iterate = true }) catch continue;
+    }
+    return error.FileNotFound;
+}
+
 fn collectCheckedInCodecCorpusFileNames(
     allocator: std.mem.Allocator,
 ) !std.StringHashMapUnmanaged(void) {
@@ -2990,7 +3016,7 @@ fn collectCheckedInCodecCorpusFileNames(
     errdefer fixture_names.deinit(allocator);
 
     const io = std.testing.io;
-    var dir = try std.Io.Dir.cwd().openDir(io, "lib/audio/testdata/codec-corpus", .{ .iterate = true });
+    var dir = try openCheckedInCodecCorpusDir(io);
     defer dir.close(io);
 
     var iter = dir.iterate();
@@ -3015,9 +3041,11 @@ fn collectCheckedInCodecCorpusReadmeNames(
         documented_names.deinit(allocator);
     }
 
-    const readme = try std.Io.Dir.cwd().readFileAlloc(
+    var corpus_dir = try openCheckedInCodecCorpusDir(std.testing.io);
+    defer corpus_dir.close(std.testing.io);
+    const readme = try corpus_dir.readFileAlloc(
         std.testing.io,
-        "lib/audio/testdata/codec-corpus/README.md",
+        "README.md",
         allocator,
         .limited(256 * 1024),
     );

@@ -1,3 +1,17 @@
+// Copyright 2026 Antfly, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package sdk
 
 import (
@@ -6,6 +20,79 @@ import (
 	"fmt"
 	"testing"
 )
+
+func TestRelationalCheckExactIntegerRoundTrip(t *testing.T) {
+	body, err := json.Marshal(TableSchema{StorageMode: TableStorageModeRelational, Checks: []RelationalCheckConstraint{
+		{Name: "positive", Column: "id", Op: RelationalComparisonOpGt, Value: "9007199254740992"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded TableSchema
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if len(decoded.Checks) != 1 || decoded.Checks[0].Value != "9007199254740992" || decoded.Checks[0].Op != RelationalComparisonOpGt {
+		t.Fatalf("CHECK contract lost: %s", body)
+	}
+}
+
+func TestRelationalIndexDeclarationsAndExplicitDropRoundTrip(t *testing.T) {
+	declarations := []RelationalIndexDefinition{{Name: "tenant_id", Keys: []RelationalIndexKey{
+		{Column: "tenant", Collation: "ci"},
+		{Column: "id", Direction: RelationalIndexKeyDirectionDesc, Nulls: RelationalIndexKeyNullsLast},
+	}}}
+	for _, indexes := range [][]RelationalIndexDefinition{declarations, {}} {
+		body, err := json.Marshal(TableSchema{StorageMode: TableStorageModeRelational, RelationalIndexes: &indexes})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Contains(body, []byte(`"relational_indexes":`)) {
+			t.Fatalf("explicit declarations omitted: %s", body)
+		}
+		var decoded TableSchema
+		if err := json.Unmarshal(body, &decoded); err != nil {
+			t.Fatal(err)
+		}
+		if decoded.RelationalIndexes == nil || len(*decoded.RelationalIndexes) != len(indexes) {
+			t.Fatalf("declarations lost: %s", body)
+		}
+		if len(indexes) != 0 && (*decoded.RelationalIndexes)[0].Keys[1].Direction != RelationalIndexKeyDirectionDesc {
+			t.Fatalf("key ordering lost: %s", body)
+		}
+	}
+}
+
+func TestTableSchemaStorageModeRoundTrip(t *testing.T) {
+	for _, mode := range []TableStorageMode{"", TableStorageModeDocument, TableStorageModeRelational} {
+		t.Run(string(mode), func(t *testing.T) {
+			body, err := json.Marshal(CreateTableRequest{Schema: TableSchema{StorageMode: mode}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var decoded CreateTableRequest
+			if err := json.Unmarshal(body, &decoded); err != nil {
+				t.Fatal(err)
+			}
+			if decoded.Schema.StorageMode != mode {
+				t.Fatalf("storage mode lost in round trip: %s", body)
+			}
+			if mode == "" && bytes.Contains(body, []byte(`"storage_mode"`)) {
+				t.Fatalf("omitted mode must preserve the document default: %s", body)
+			}
+			if mode != "" && !mode.Valid() {
+				t.Fatalf("generated enum rejects %q", mode)
+			}
+			var status TableStatus
+			if err := json.Unmarshal(body, &status); err != nil {
+				t.Fatal(err)
+			}
+			if status.Schema.StorageMode != mode {
+				t.Fatalf("storage mode lost in table status: %s", body)
+			}
+		})
+	}
+}
 
 func TestQueryRequestMarshalOmitsZeroJoin(t *testing.T) {
 	body, err := json.Marshal(QueryRequest{

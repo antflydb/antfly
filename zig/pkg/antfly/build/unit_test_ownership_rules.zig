@@ -44,6 +44,7 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
         .artifact = "test",
         .selection = "query parser accepts direct graph metric reads",
         .skip = &.{
+            "api.openapi_contract.test.client openapi module resolves shared refs through owner modules",
             "api.openapi_contract.test.metadata openapi module generates extractor surface for routed endpoints",
             "api.query.consumerTests.Suite.test.",
             "metadata.storage.raft_apply_store.test.",
@@ -56,6 +57,7 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
         .artifact = "test",
         .selection = "backup heartbeat ",
         .skip = &.{
+            "metadata.storage.raft_apply_store.test.",
             // The generating lane owns conversation and backend contracts,
             // even when this HTTP root imports them through agent tools.
             "api.agent_tools.test.agent conversation",
@@ -310,6 +312,7 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
             "api.indexes.consumerTests.Suite.test.public index config encoders omit root write-only producer documents",
             "api.indexes.consumerTests.Suite.test.public index config encoders redact coverage incarnation",
             "api.indexes.consumerTests.Suite.test.public index config encoders redact nested credentials",
+            "api.indexes.consumerTests.Suite.test.public index config encoders preserve enrichment objects on read",
             "api.indexes.consumerTests.Suite.test.readiness completion fences include every observation dimension",
             "api.indexes.consumerTests.Suite.test.readiness evaluation cannot complete while convergence work remains",
             "api.indexes.consumerTests.Suite.test.serviceable full text replacement remains queryable while rebuilding",
@@ -428,6 +431,10 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
         .artifact = "test",
         .selection = "public openapi contract module is generated and wired",
         .skip = &.{
+            "api.httpx_handler.test.httpx antfly schema update owns self partial support and rejects public index forgery",
+            "api.httpx_handler.test.httpx antfly schema update returns full table status after projection",
+            "api.httpx_handler.test.httpx relational row query mutation endpoints enforce exact versions and schema epochs",
+            "api.httpx_handler.test.httpx schema patch merges at the authority and accepts version zero ETag",
             "api.query.consumerTests.Suite.test.",
             "api.table_reads.consumerTests.Suite.test.distributed reranking widens retrieval and stays coordinator owned",
             "api.table_reads.consumerTests.Suite.test.reranker admission precedes candidate rendering",
@@ -511,6 +518,7 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
             "common.http.peer_disconnect_observer.test.",
             "common.http.std_http_executor.test.",
             "common.http.std_http_listener.test.",
+            "common.secret_contract.test.",
             "common.threaded_connect_io.test.",
             "common.threaded_io_limits.test.",
             "raft.transport.http_driver.test.",

@@ -309,6 +309,35 @@ pub const ExtractedWrite = struct {
     }
 };
 
+/// Internal cold-scan projection, never a primary-row write. Omitted required
+/// fields outside the selected constraint are not missing user input. Selected
+/// required fields, types, NULL rules and the immutable layout still apply.
+pub const PreparedRelationalProjection = struct {
+    arena: std.heap.ArenaAllocator,
+    view: relational_row_codec.OrdinalRowView,
+
+    pub fn init(alloc: Allocator, json: []const u8, schema: runtime_schema.TableSchema, layout: *const relational_row_codec.PhysicalLayout, selected_fields: []const []const u8) !PreparedRelationalProjection {
+        if (schema.version != layout.schema_version or schema.relational_columns.len != layout.column_count)
+            return error.RelationalRowSchemaMismatch;
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        errdefer arena.deinit();
+        const owned = arena.allocator();
+        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, owned, json, .{ .allocate = .alloc_always, .parse_numbers = false });
+        var required: std.ArrayList(u32) = .empty;
+        for (selected_fields) |name| {
+            const ordinal = layout.ordinalForName(schema.relational_columns, name) orelse return error.InvalidBatchRequest;
+            if (schema.relational_columns[ordinal].required) try required.append(owned, @intCast(ordinal));
+        }
+        const encoded = try buildRelationalRowValueFromParsedInternal(owned, owned, parsed, schema, layout, required.items);
+        return .{ .arena = arena, .view = try relational_row_codec.ordinalRowViewTrusted(encoded.bytes, schema, layout) };
+    }
+
+    pub fn deinit(self: *PreparedRelationalProjection) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
 /// Fully owned output of the relational write preparation boundary. One JSON
 /// parse supplies validation, special-field extraction, the semantic digest,
 /// and the physical base row.
@@ -318,6 +347,11 @@ pub const PreparedRelationalWrite = struct {
     packed_row: []u8,
     semantic_hash: document_content_hash.Digest,
     schema_version: u32,
+    /// Borrowed immutable preparation identity. The request retains its epoch;
+    /// a matching numeric version from another table/registry is not sufficient
+    /// to reinterpret trusted row bytes under that registry's layout.
+    physical_layout: *const relational_row_codec.PhysicalLayout,
+    schema_columns: []const runtime_schema.RelationalColumn,
     metadata_finalized: bool = false,
     owned_region: ?*PreparedRowRegion = null,
     packed_row_owned_individually: bool = true,
@@ -377,6 +411,7 @@ pub const PreparedRelationalWrite = struct {
             table_schema,
             physical_layout,
             null,
+            false,
         );
     }
 
@@ -391,7 +426,7 @@ pub const PreparedRelationalWrite = struct {
         table_schema: runtime_schema.TableSchema,
         physical_layout: *const relational_row_codec.PhysicalLayout,
     ) !PreparedRelationalWrite {
-        return try initWithAllocators(alloc, scratch, scratch, false, key, document_json, validator, table_schema, physical_layout, null);
+        return try initWithAllocators(alloc, scratch, scratch, false, key, document_json, validator, table_schema, physical_layout, null, false);
     }
 
     /// Split transient parse ownership from retained row ownership. Batch
@@ -410,6 +445,7 @@ pub const PreparedRelationalWrite = struct {
         table_schema: runtime_schema.TableSchema,
         physical_layout: *const relational_row_codec.PhysicalLayout,
         durable_row: ?[]const u8,
+        preserve_logical_values: bool,
     ) !PreparedRelationalWrite {
         var intent_digest: ?document_content_hash.Digest = null;
         var parsed = if (durable_row) |bytes| blk: {
@@ -429,7 +465,16 @@ pub const PreparedRelationalWrite = struct {
             else => return error.InvalidBatchRequest,
         };
         errdefer parsed.deinit();
-        if (durable_row == null) if (validator) |compiled| try compiled.validateValue(scratch, &parsed.value);
+        if (durable_row == null) if (validator) |compiled| {
+            // Defaults and stored generated values cross the same immutable
+            // schema boundary as CHECKs, extraction, indexes and logical hash.
+            // Durable intents have already crossed it and must never evaluate
+            // the current expression plan again during replay.
+            if (preserve_logical_values)
+                try compiled.validateValue(scratch, &parsed.value)
+            else
+                try compiled.prepareValue(parsed.arena.allocator(), scratch, &parsed.value);
+        };
 
         var extracted = extractWriteFromParsedPrepared(
             alloc,
@@ -478,6 +523,8 @@ pub const PreparedRelationalWrite = struct {
                 .packed_row = packed_bytes,
                 .semantic_hash = intent_digest.?,
                 .schema_version = table_schema.version,
+                .physical_layout = physical_layout,
+                .schema_columns = table_schema.relational_columns,
             };
         }
         const prepared_row = try buildPreparedRelationalRowValueForSchemaFromParsedAlloc(
@@ -488,12 +535,26 @@ pub const PreparedRelationalWrite = struct {
             physical_layout,
         );
         errdefer alloc.free(prepared_row.bytes);
+        if (validator) |compiled| if (compiled.execution.expressions) |expressions| if (expressions.bindings.len != 0) {
+            // Original API JSON predates defaults/generated evaluation. Lazy
+            // JSON consumers (including deferred text publication) must render
+            // the typed authority, never index that obsolete input snapshot.
+            const source = try alloc.create(ExtractedWrite.LazyLogicalSource);
+            errdefer alloc.destroy(source);
+            source.* = .{ .alloc = alloc, .row = try relational_row_codec.ordinalRowViewTrusted(prepared_row.bytes, table_schema, physical_layout) };
+            if (extracted.cleaned_value_owned) if (extracted.cleaned_value) |value| alloc.free(value);
+            extracted.cleaned_value = null;
+            extracted.cleaned_value_owned = false;
+            extracted.logical_source = source;
+        };
         return .{
             .parsed = parsed,
             .extracted = extracted,
             .packed_row = prepared_row.bytes,
             .semantic_hash = prepared_row.semantic_hash,
             .schema_version = table_schema.version,
+            .physical_layout = physical_layout,
+            .schema_columns = table_schema.relational_columns,
         };
     }
 
@@ -506,6 +567,9 @@ pub const PreparedRelationalWrite = struct {
     /// Trusted because this request just encoded the row. This view is valid
     /// even before timestamp/checksum finalization and borrows the row region.
     pub fn typedView(self: *const PreparedRelationalWrite, schema: runtime_schema.TableSchema, layout: *const relational_row_codec.PhysicalLayout) !relational_row_codec.OrdinalRowView {
+        if (self.schema_version != schema.version or self.physical_layout != layout or
+            self.schema_columns.ptr != schema.relational_columns.ptr or self.schema_columns.len != schema.relational_columns.len)
+            return error.RelationalRowSchemaMismatch;
         return try relational_row_codec.ordinalRowViewTrusted(self.packed_row, schema, layout);
     }
 
@@ -559,7 +623,38 @@ pub const PreparedRelationalWrite = struct {
         physical_layout: *const relational_row_codec.PhysicalLayout,
         durable_row: ?[]const u8,
     ) !PreparedRelationalWrite {
-        return try initWithAllocators(alloc, alloc, alloc, false, key, document_json, validator, table_schema, physical_layout, durable_row);
+        return try initWithAllocators(alloc, alloc, alloc, false, key, document_json, validator, table_schema, physical_layout, durable_row, false);
+    }
+
+    /// A restore is not a new mutation: preserve missing values and verify
+    /// stored generated results instead of applying current defaults or
+    /// repairing invalid generated fields. Type/CHECK validation remains live.
+    pub fn initPreserved(
+        alloc: Allocator,
+        key: []const u8,
+        document_json: []const u8,
+        validator: ?schema_api.CompiledTableValidator,
+        table_schema: runtime_schema.TableSchema,
+        physical_layout: *const relational_row_codec.PhysicalLayout,
+    ) !PreparedRelationalWrite {
+        return initWithAllocators(alloc, alloc, alloc, false, key, document_json, validator, table_schema, physical_layout, null, true);
+    }
+
+    pub fn initInSharedRegionPreserved(
+        region: *PreparedRowRegion,
+        scratch: Allocator,
+        retain_text_root: bool,
+        key: []const u8,
+        document_json: []const u8,
+        validator: ?schema_api.CompiledTableValidator,
+        table_schema: runtime_schema.TableSchema,
+        physical_layout: *const relational_row_codec.PhysicalLayout,
+    ) !PreparedRelationalWrite {
+        var prepared = try initWithAllocators(region.arena.allocator(), if (retain_text_root) region.arena.allocator() else scratch, scratch, retain_text_root, key, document_json, validator, table_schema, physical_layout, null, true);
+        region.retain();
+        prepared.owned_region = region;
+        if (retain_text_root) prepared.extracted.prepared_text_root = prepared.parsedValue();
+        return prepared;
     }
 
     pub fn initInSharedRegionFromIntent(
@@ -584,6 +679,7 @@ pub const PreparedRelationalWrite = struct {
             table_schema,
             physical_layout,
             durable_row,
+            false,
         );
         region.retain();
         prepared.owned_region = region;
@@ -644,6 +740,10 @@ pub const PreparedRelationalWrite = struct {
         self.parsed = null;
     }
 
+    /// Region-backed rows transfer the shared owner. For individually allocated
+    /// rows, lazy logical projections borrow the packed row: the caller must
+    /// retain this preparation, or takePackedRow() and retain those bytes, until
+    /// the extracted effects are consumed. The pinned schema must also survive.
     pub fn takeExtracted(self: *PreparedRelationalWrite) ExtractedWrite {
         if (self.owned_region) |region| {
             if (self.parsed) |*parsed| parsed.deinit();
@@ -3819,6 +3919,7 @@ pub fn stripTopLevelFieldsAlloc(alloc: Allocator, data: []const u8, fields: []co
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, data, .{
         .allocate = .alloc_always,
+        .parse_numbers = false,
     });
     defer parsed.deinit();
     if (parsed.value != .object) return try alloc.dupe(u8, data);
@@ -4005,6 +4106,7 @@ fn buildPreparedRelationalRowValueForSchemaFromParsedAlloc(
         root,
         table_schema,
         physical_layout,
+        physical_layout.required_ordinals,
     );
 }
 
@@ -4014,6 +4116,7 @@ fn buildRelationalRowValueFromParsedInternal(
     root: std.json.Value,
     table_schema: runtime_schema.TableSchema,
     physical_layout: *const relational_row_codec.PhysicalLayout,
+    required_ordinals: []const u32,
 ) !PreparedEncodedRow {
     if (root != .object) return error.InvalidBatchRequest;
     const columns = table_schema.relational_columns;
@@ -4113,7 +4216,7 @@ fn buildRelationalRowValueFromParsedInternal(
         // the present cells costs more than sorting the small present set. Check
         // required columns directly through the already-parsed object, then do
         // one canonical-name sort and one final physical-ordinal sort.
-        for (physical_layout.required_ordinals) |required_ordinal| {
+        for (required_ordinals) |required_ordinal| {
             const required_name = columns[required_ordinal].name;
             if (isSpecialField(required_name) or root.object.get(required_name) == null)
                 return error.InvalidBatchRequest;
@@ -4138,7 +4241,7 @@ fn buildRelationalRowValueFromParsedInternal(
             if (positions[cell.ordinal] != std.math.maxInt(u32)) return error.InvalidBatchRequest;
             positions[cell.ordinal] = @intCast(index);
         }
-        for (physical_layout.required_ordinals) |ordinal|
+        for (required_ordinals) |ordinal|
             if (positions[ordinal] == std.math.maxInt(u32)) return error.InvalidBatchRequest;
         // Gather in place, updating the inverse map after every swap. Scratch
         // is four bytes per schema column rather than another full Cell array.

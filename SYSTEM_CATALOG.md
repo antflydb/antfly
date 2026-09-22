@@ -214,15 +214,17 @@ a successful durable commit releases the old records. Readers cannot observe
 partially applied deltas. Legacy adoption retains physical names in the mutation
 arena so replacement cannot invalidate a pending binding.
 
-Local standalone stores catalog rows in an LSM directory beside the legacy file
-(`local-metadata.json.store`), using the existing engine's WAL, recovery, and
-compaction. Local commits sync the WAL before acknowledgement; they do not
-repeat that sync after a successful commit. Lite uses its existing `system/metadata` namespace. Startup prefers
-the versioned row catalog; without it, startup reads the legacy JSON file or Lite
-`catalog` value. The first successful mutation atomically imports the legacy
-state and publishes the new head. Subsequent DDL writes changed rows and the head,
-not a full catalog checkpoint. The legacy input is retained but no longer
-updated; downgrading after migration requires restoring a compatible backup.
+Native standalone uses the existing `local-state` lifecycle store as its single
+catalog authority. Physical table/range rows, logical bindings, the catalog
+revision, and the durable standby outbox commit in one WAL-backed transaction.
+Ordinary DDL writes only changed rows and affected indexes, not a full catalog
+checkpoint. Startup atomically imports the released `local-metadata.json.store`
+row journal (or older JSON checkpoint) only if native authority is absent. Once
+imported, the old journal is closed and never used as a second writer. Restart
+loads logical and physical metadata in one read transaction. Lite and borrowed
+stores retain their existing `system/metadata` row-journal contract. Legacy
+inputs are retained but no longer updated; downgrading after migration requires
+restoring a compatible backup.
 Extension mutations snapshot their own extension section; unrelated table and
 logical-resource inventories are excluded. Reopen validates row keys and rebuilds
 derived indexes once. A commit/sync failure with an uncertain outcome fences
@@ -268,6 +270,20 @@ precedence over namespace filters, then the global filter. Literal `*` and a
 wildcard scope remain distinct through storage, lookup, and removal.
 
 ## Restore jobs
+
+Relational row query/mutation, constraint lifecycle, and index maintenance APIs
+also have scoped routes and generated clients. Foreign-key parent names resolve
+relative to the child's database and namespace at schema admission. Durable
+schemas retain immutable physical identities; public schema responses render
+current logical names. Cascade and schema-rewrite authorization uses bounded,
+revision-fenced reverse catalog lookups, so renames never grant access through
+an internal storage name.
+
+Staged cluster restore reserves physical identities and the intended logical
+bindings together. It validates destination namespaces and replacement bindings
+at admission and again at publication. Logical binding changes and restored
+table/range publication commit atomically, preserving native artifact and FK
+identities without exposing a partially restored catalog.
 
 Restore jobs persist immutable destination identities. Admission intent is a
 bounded, URL-safe encoding of the structured target, allowing names with
@@ -617,7 +633,7 @@ into an owned arena under the mutex. Serialization runs after releasing that
 mutex. Selected range prefixes are visited in storage order, reusing one cursor
 and bounding unrelated skips before the next seek. Logical table result order
 is unchanged. Rollback and ambiguous-durability fencing cover index changes too. The
-owned standalone catalog retains immutable index blocks in an 8 MiB cache;
+native standalone catalog shares its lifecycle store's cache and recovery policy;
 borrowed stores, including Lite, retain their owner's cache policy.
 
 Single-table reads resolve logical identity and capture status together behind

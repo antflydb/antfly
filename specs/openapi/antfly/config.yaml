@@ -29,20 +29,63 @@ components:
     NativeSecretStoreConfig:
       type: object
       additionalProperties: false
-      required: [path]
       description: |
-        Antfly-managed override store. Currently file-backed and node-local;
-        this setting does not replicate secrets between nodes. Without native,
-        secret API writes are disabled.
+        Antfly-managed override store. File preserves the legacy JSON store.
+        Distributed stores encrypted records in metadata Raft; serverless uses
+        conditional object-store publication. Data nodes use a distributed reader.
+        Bootstrap wrapping and delivery credentials cannot reference this store.
       properties:
         name:
           type: string
           default: native
           description: Unique source name; environment is reserved.
+        backend:
+          type: string
+          enum: [file, distributed, serverless]
+          default: file
         path:
           type: string
-          minLength: 1
-          description: Literal file path, relative to the process working directory if not absolute.
+          description: Required file path for file, or dedicated s3/gs/file URI for serverless. Unused by distributed.
+        scope:
+          type: string
+          default: default
+          description: Trusted deployment or tenant scope; not supplied by API callers.
+        keyring_path:
+          type: string
+          description: Mounted bootstrap wrapping-key JSON file. Required for encrypted writers; omitted on data nodes.
+        grants:
+          type: array
+          description: Metadata-only read grants. Every consumer must have a distinct mounted credential.
+          items:
+            type: object
+            additionalProperties: false
+            required: [name, credential_path, keys]
+            properties:
+              name:
+                type: string
+              credential_path:
+                type: string
+                description: Mounted file containing a random 32-byte credential in hexadecimal.
+              keys:
+                type: array
+                items:
+                  type: string
+                description: Exact secret names this consumer may resolve. No implicit wildcard.
+        reader:
+          type: object
+          additionalProperties: false
+          required: [name, credential_path, urls]
+          description: Distributed data-node reader; mutually exclusive with keyring_path and grants.
+          properties:
+            name:
+              type: string
+            credential_path:
+              type: string
+            urls:
+              type: array
+              items:
+                type: string
+              description: Metadata admin endpoints. Requests also require internal service authentication.
     SecretSourceConfig:
       type: object
       additionalProperties: false

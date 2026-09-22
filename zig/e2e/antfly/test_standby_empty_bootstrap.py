@@ -29,10 +29,12 @@ from test_standby import (
     _promotion_fence_request,
     _wait_for_standby_applied,
     _wait_for_standby_lookup,
+    ha_cluster as standby_cluster_fixture,
 )
-from test_standby import (
-    ha_cluster as ha_cluster,  # noqa: PLC0414 - export pytest fixture
-)
+
+# Register the shared fixture in this module without shadowing an import in
+# every test's fixture parameter.
+ha_cluster = standby_cluster_fixture
 
 pytestmark = pytest.mark.ha_standby
 
@@ -273,6 +275,17 @@ def test_catalog_remote_apply_outage_recovers_without_primary_restart(
     assert response.status_code >= 400, response.text
     assert "outcome is unknown" in response.text, response.text
     assert response.headers.get("X-Antfly-Raft-Mutation-Outcome") == "unknown-v1"
+    # A different proposal blocked by the previous durable outbox has not
+    # committed. Preserve the stronger safe-retry contract for that request.
+    rejected = cluster.primary._request(
+        "POST",
+        f"{cluster.primary.url}{DB_API_ROOT}/tables/not_admitted",
+        json={"num_shards": 1},
+        timeout=30,
+    )
+    assert rejected.status_code == 503, rejected.text
+    assert rejected.headers.get("X-Antfly-Metadata-Mutation-Not-Admitted") == "true"
+    assert rejected.headers.get("X-Antfly-Raft-Mutation-Outcome") is None
     # The table is visible locally, but neither a retry nor a primary restart
     # may turn that visibility into an acknowledged AlreadyExists response.
     for restart in (False, True):
@@ -310,6 +323,7 @@ def test_catalog_remote_apply_outage_recovers_without_primary_restart(
     )
     _wait_for_standby_lookup(cluster, "pending_table", "recovered")
     cluster.primary.create_table("after_outage")
+    cluster.primary.create_table("not_admitted")
     assert cluster.primary.proc.pid == primary_pid
     cluster.primary.restart()
     assert (
@@ -318,23 +332,24 @@ def test_catalog_remote_apply_outage_recovers_without_primary_restart(
     )
 
 
-def test_catalog_replays_when_local_snapshot_lags_wal(ha_cluster: HACluster, tmp_path):
+def test_catalog_authority_survives_crash_and_obsolete_json(ha_cluster: HACluster):
     cluster = ha_cluster
     _bootstrap_empty(cluster)
-    cluster.primary.stop()
-    catalog_store = cluster.primary.catalog_path.with_suffix(
-        cluster.primary.catalog_path.suffix + ".store"
-    )
-    before = tmp_path / "before-catalog.store"
-    shutil.copytree(catalog_store, before)
-    cluster.primary.start()
+    authority = cluster.primary.catalog_path.parent / "local-state"
+    assert authority.is_dir()
     cluster.primary.create_table("replay_table")
     cluster.primary.batch_write("replay_table", {"saved": {"title": "durable data"}})
-    # Model the startup state after WAL durability but before local catalog
-    # publication. Only the disposable fixture catalog is rolled back.
+    # Catalog publication and its outbox now share a durable transaction; the
+    # former JSON/WAL split cannot occur. Crash without a graceful checkpoint
+    # and leave a stale legacy JSON catalog to prove it cannot replace the
+    # recovered authority or discard an acknowledged table.
+    assert cluster.primary.proc is not None
+    cluster.primary.proc.kill()
+    cluster.primary.proc.wait(timeout=10)
     cluster.primary.stop()
-    shutil.rmtree(catalog_store)
-    shutil.copytree(before, catalog_store)
+    cluster.primary.catalog_path.write_text(
+        json.dumps({"epoch": 1, "tables": [], "ranges": []})
+    )
     cluster.primary.start()
     assert (
         cluster.primary.lookup_key("replay_table", "saved")["title"] == "durable data"
