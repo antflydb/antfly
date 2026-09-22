@@ -146,7 +146,15 @@ pub const Mutation = struct {
     /// predicate makes it authoritative only after a successful commit.
     previous: ?*const Row = null,
 };
-pub const ConflictOwner = struct { key: ?[]const u8, identity: ?[]const u8, guard: ?*const anyopaque };
+pub const ConflictOwner = struct {
+    key: ?[]const u8,
+    identity: ?[]const u8,
+    identities: []const []const u8 = &.{},
+    guard: ?*const anyopaque,
+    /// The bound schema declares no native unique arbiters. The ordinary
+    /// schema-version and primary predicates protect this negative proof.
+    primary_only: bool = false,
+};
 pub const MutationOutcome = enum {
     committed,
     committed_pending,

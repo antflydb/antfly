@@ -1073,6 +1073,7 @@ pub const BackfillRow = struct { key: []const u8, json: []const u8, version: u64
 pub const ConflictOwner = struct {
     key: ?[]const u8,
     identity: ?[]const u8,
+    identities: []const []const u8 = &.{},
     generation_set: [32]u8,
     guards: []const planner.storage.Command,
 };
@@ -1100,8 +1101,10 @@ pub fn resolveConflictOwners(alloc: Allocator, source: reads.TableReadSource, me
         defer row.deinit(alloc);
         const addresses = try plan.conflictAddresses(alloc, selected, try row.typedView(table.view.tableSchema().*, table.view.physicalLayout()));
         const guards = try alloc.alloc(planner.storage.Command, addresses.len);
-        owner.* = .{ .key = null, .identity = null, .generation_set = generation_set, .guards = guards };
-        for (addresses, guards) |item, *guard| {
+        const identities = try alloc.alloc([]const u8, addresses.len);
+        owner.* = .{ .key = null, .identity = null, .identities = identities, .generation_set = generation_set, .guards = guards };
+        for (addresses, guards, identities) |item, *guard, *identity| {
+            identity.* = try alloc.dupe(u8, &item.address.claimKey());
             const query = try std.json.Stringify.valueAlloc(alloc, .{ .kind = "references", .address = item.address, .limit = @as(u32, 1) }, .{});
             var observation = try builder.lookup(name, &item.address.routing, .{ .relational_integrity_jobs_json = query });
             defer if (observation) |*value| value.deinit(alloc);
@@ -1118,10 +1121,10 @@ pub fn resolveConflictOwners(alloc: Allocator, source: reads.TableReadSource, me
             if (logical.claim) |claim| {
                 if (claim.state != .live) return error.ForeignKeyActionInProgress;
                 if (!std.mem.eql(u8, claim.parent_table, name) or !std.mem.eql(u8, claim.tuple, item.tuple)) return error.InvalidIntegrityRecord;
-                if (owner.key) |key| if (!std.mem.eql(u8, key, claim.parent_key)) return error.InvalidIntegrityRecord;
-                owner.key = try alloc.dupe(u8, claim.parent_key);
+                if (columns.len != 0) if (owner.key) |key| if (!std.mem.eql(u8, key, claim.parent_key)) return error.InvalidIntegrityRecord;
+                if (owner.key == null) owner.key = try alloc.dupe(u8, claim.parent_key);
             }
-            if (owner.identity == null) owner.identity = try alloc.dupe(u8, &item.address.claimKey());
+            if (owner.identity == null) owner.identity = identity.*;
         }
     }
     return owners;
@@ -1785,6 +1788,10 @@ test "distributed txn global unique coverage checks every owner and rejects stal
         try std.testing.expectEqualStrings("old", occupied[0].key.?);
         try std.testing.expectEqualDeep(addresses[0].address, occupied[0].guards[0].address);
         try std.testing.expectEqualStrings("old", occupied[0].guards[0].operation.compare_claim.?.parent_key);
+        const targetless = try resolveConflictOwners(arena.allocator(), source, &tables, &ranges, "rows", 1, &.{}, &.{.{ .key = "new", .value = "{\"id\":9007199254740993}" }}, &.{}, .{});
+        try std.testing.expectEqualStrings("old", targetless[0].key.?);
+        try std.testing.expectEqual(@as(usize, 1), targetless[0].identities.len);
+        try std.testing.expectEqualStrings(occupied[0].identity.?, targetless[0].identities[0]);
     }
     fake.stale = true;
     try std.testing.expectError(error.PreparedGenerationChanged, ensureUniqueCoverage(alloc, source, &tables, &ranges, &.{"rows"}));

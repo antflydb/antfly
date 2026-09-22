@@ -64,13 +64,17 @@ pub const Order = struct {
     nulls_first: ?bool = null,
 };
 pub const Window = struct {
+    reference: ?[]const u8 = null,
+    copy_reference: bool = false,
     partition: []const *const Scalar = &.{},
     order: []const Order = &.{},
     frame: ?Frame = null,
     pub const Bound = union(enum) { unbounded_preceding, preceding: Value, current, following: Value, unbounded_following };
-    pub const Frame = struct { mode: enum { rows, range }, start: Bound, end: Bound = .current };
+    pub const Exclusion = enum { no_others, current, group, ties };
+    pub const Frame = struct { mode: enum { rows, range, groups }, start: Bound, end: Bound = .current, exclusion: Exclusion = .no_others };
 };
 pub const Select = struct {
+    windows: []const NamedWindow = &.{},
     set_operation: ?struct { kind: SetKind, all: bool, left: *const Select, right: *const Select } = null,
     table: ?Name = null,
     source: ?*const Relation = null,
@@ -86,6 +90,7 @@ pub const Select = struct {
     limit: ?Value = null,
     offset: ?Value = null,
 };
+pub const NamedWindow = struct { name: []const u8, window: Window };
 pub const SetKind = enum { @"union", intersect, except };
 pub const Cte = struct { name: []const u8, columns: []const []const u8 = &.{}, query: *const Select };
 pub const Relation = union(enum) {

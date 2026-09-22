@@ -9,6 +9,16 @@ all connections before API and backend teardown. Transactions/sessions are rejec
 implemented. HTTP SQL support does not implicitly enable pgwire or make
 unsupported SQL shapes executable.
 
+SQL-language `PREPARE name [(types...)] AS statement`, `EXECUTE name
+[(expressions...)]`, and `DEALLOCATE [PREPARE] name|ALL` use the same bounded,
+connection-owned registry as wire Parse/Bind. Names survive transaction commit
+and are released on disconnect. Execution preserves the prepared catalog
+identity guard, rechecks current credentials, binds typed values without SQL
+interpolation, and uses pull streaming for eligible reads. EXECUTE arguments
+are bounded scalar expressions; column references, parameters, and subqueries
+are not an argument-evaluation escape hatch into table reads. These commands
+do not create durable HTTP prepared-statement resources.
+
 Enable it in the node configuration with authentication configured:
 
 ```json

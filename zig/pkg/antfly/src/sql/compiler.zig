@@ -348,6 +348,17 @@ const Parser = struct {
                 }
                 if (self.keyword(.in)) {
                     try self.expect(.lparen);
+                    if (self.keyword(.select)) {
+                        if (self.relation_depth >= self.limits.max_depth) return self.fail(error.SqlLimitExceeded, "SQL subquery nesting limit exceeded");
+                        self.relation_depth += 1;
+                        const query = try self.alloc.create(ast.Select);
+                        query.* = try self.select();
+                        self.relation_depth -= 1;
+                        try self.expect(.rparen);
+                        left = try self.scalarNode(.{ .call = .{ .name = "$in_subquery", .args = try self.alloc.dupe(*const ast.Scalar, &.{left}), .subquery = query } });
+                        if (negated) left = try self.scalarNode(.{ .unary = .{ .op = .not, .operand = left } });
+                        continue;
+                    }
                     var values: std.ArrayList(*const ast.Scalar) = .empty;
                     while (true) {
                         try values.append(self.alloc, try self.scalar(depth + 1, 0));
@@ -553,6 +564,7 @@ const Parser = struct {
     fn selectFinish(self: *Parser, first: ast.Select) Error!ast.Select {
         var result = try self.setTail(first, 1, 0);
         result.order_by = try self.selectOrder();
+        try @import("window_names.zig").resolveOrder(self.alloc, result, self.limits.max_depth);
         result.limit = if (self.keyword(.limit)) try self.rowBound() else null;
         result.offset = if (self.keyword(.offset)) try self.rowBound() else null;
         if (result.columns.len == 1 and result.group_by.len == 0 and result.having == null and result.order_by.len == 0) {
@@ -627,11 +639,24 @@ const Parser = struct {
             }
         }
         const having = if (self.keyword(.having)) try self.scalar(0, 0) else null;
-        return .{ .table = table, .source = if (simple) null else source, .columns = try columns.toOwnedSlice(self.alloc), .predicate = filter, .group_by = try group_by.toOwnedSlice(self.alloc), .having = having };
+        var windows: std.ArrayList(ast.NamedWindow) = .empty;
+        if (self.keyword(.window)) while (true) {
+            try self.node();
+            const window_name = try self.identifier();
+            try self.expectKeyword(.as);
+            if (!self.peek(.lparen)) return self.fail(error.InvalidSqlSyntax, "window definition requires parentheses");
+            try windows.append(self.alloc, .{ .name = window_name, .window = try self.window(0) });
+            if (!self.take(.comma)) break;
+        };
+        var result = ast.Select{ .table = table, .source = if (simple) null else source, .columns = try columns.toOwnedSlice(self.alloc), .predicate = filter, .group_by = try group_by.toOwnedSlice(self.alloc), .having = having, .windows = try windows.toOwnedSlice(self.alloc) };
+        try @import("window_names.zig").resolveCore(self.alloc, &result, self.limits.max_depth);
+        return result;
     }
 
     fn window(self: *Parser, depth: usize) Error!ast.Window {
+        if (!self.peek(.lparen)) return .{ .reference = try self.identifier() };
         try self.expect(.lparen);
+        const reference = if (self.peek(.identifier) and !self.tokens[self.pos].isKeyword(.partition) and !self.tokens[self.pos].isKeyword(.order) and !self.tokens[self.pos].isKeyword(.rows) and !self.tokens[self.pos].isKeyword(.range) and (self.tokens[self.pos].owned or !std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "groups"))) try self.identifier() else null;
         var partitions: std.ArrayList(*const ast.Scalar) = .empty;
         if (self.keyword(.partition)) {
             try self.expectKeyword(.by);
@@ -642,7 +667,7 @@ const Parser = struct {
         }
         const orders = try self.orderExpressions(false);
         var frame: ?ast.Window.Frame = null;
-        const mode: ?@FieldType(ast.Window.Frame, "mode") = if (self.keyword(.rows)) .rows else if (self.keyword(.range)) .range else null;
+        const mode: ?@FieldType(ast.Window.Frame, "mode") = if (self.keyword(.rows)) .rows else if (self.keyword(.range)) .range else if (self.ddlWord("groups")) .groups else null;
         if (mode) |kind| {
             const between = self.keyword(.between);
             const first = try self.windowBound();
@@ -653,9 +678,18 @@ const Parser = struct {
             if (first == .unbounded_following or last == .unbounded_preceding) return self.fail(error.InvalidSqlSyntax, "invalid window frame boundary");
             if ((first == .following and (last == .current or last == .preceding)) or (first == .current and last == .preceding)) return self.fail(error.InvalidSqlSyntax, "window frame end cannot precede its start category");
             frame = .{ .mode = kind, .start = first, .end = last };
+            if (self.ddlWord("exclude")) {
+                frame.?.exclusion = if (self.keyword(.current)) blk: {
+                    try self.expectKeyword(.row);
+                    break :blk .current;
+                } else if (self.keyword(.group)) .group else if (self.ddlWord("ties")) .ties else blk: {
+                    if (!self.ddlWord("no") or !self.ddlWord("others")) return self.fail(error.InvalidSqlSyntax, "invalid window exclusion");
+                    break :blk .no_others;
+                };
+            }
         }
         try self.expect(.rparen);
-        return .{ .partition = try partitions.toOwnedSlice(self.alloc), .order = orders, .frame = frame };
+        return .{ .reference = reference, .copy_reference = reference != null, .partition = try partitions.toOwnedSlice(self.alloc), .order = orders, .frame = frame };
     }
 
     fn windowBound(self: *Parser) Error!ast.Window.Bound {
@@ -818,18 +852,18 @@ const Parser = struct {
     fn conflict(self: *Parser) Error!?ast.Conflict {
         if (!self.keyword(.on)) return null;
         try self.expectKeyword(.conflict);
-        // Only explicit arbiters are accepted: omitting the target means ALL
-        // unique constraints, which cannot be emulated with a primary lookup.
-        if (!self.take(.lparen)) return self.fail(error.UnsupportedSqlShape, "ON CONFLICT requires an explicit conflict target");
         var columns: std.ArrayList([]const u8) = .empty;
-        while (true) {
-            try self.node();
-            try columns.append(self.alloc, try self.identifier());
-            if (!self.take(.comma)) break;
+        if (self.take(.lparen)) {
+            while (true) {
+                try self.node();
+                try columns.append(self.alloc, try self.identifier());
+                if (!self.take(.comma)) break;
+            }
+            try self.expect(.rparen);
         }
-        try self.expect(.rparen);
         try self.expectKeyword(.do);
         if (self.keyword(.nothing)) return .{ .columns = try columns.toOwnedSlice(self.alloc) };
+        if (columns.items.len == 0) return self.fail(error.UnsupportedSqlShape, "ON CONFLICT DO UPDATE requires an explicit conflict target");
         try self.expectKeyword(.update);
         try self.expectKeyword(.set);
         var assignments: std.ArrayList(ast.Assignment) = .empty;
@@ -1382,7 +1416,7 @@ test "compiler rejects unsupported clauses and additional statements atomically"
     const cases = [_][]const u8{
         "SELECT * FROM t; DELETE FROM t",
         "SELECT * FROM t JOIN u USING (x)",
-        "INSERT INTO t (x) VALUES (1) ON CONFLICT DO NOTHING",
+        "INSERT INTO t (x) VALUES (1) ON CONFLICT DO UPDATE SET x=2",
         "DELETE FROM t RETURNING *; INSERT INTO t (x) VALUES (1)",
     };
     for (cases) |source| {

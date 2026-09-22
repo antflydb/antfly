@@ -79,11 +79,21 @@ pub fn Adapter(comptime native: type) type {
             const self: *Self = @ptrCast(@alignCast(ptr));
             if (self.read_only) return error.SqlReadOnlyTransaction;
             if (!std.mem.eql(u8, table.physical_name, self.table_name)) return error.UndefinedTable;
+            if (columns.len == 0) {
+                const json = (try self.db.getSchemaJson(alloc)) orelse return error.IntegrityCatalogUnavailable;
+                const parsed = try native.public_api.tables.parseValidatedTableSchema(alloc, json);
+                if (parsed.version != table.schema_version) return error.PreparedGenerationChanged;
+                if (!try integrity.requiresCoordination(alloc, json)) {
+                    const output = try alloc.alloc(catalog.ConflictOwner, mutations.len);
+                    @memset(output, .{ .key = null, .identity = null, .guard = null, .primary_only = true });
+                    return output;
+                }
+            }
             const metadata = try self.localCatalog(alloc, table.schema_version);
             const writes = try dependencies.sql_mutation_images.writes(types.BatchWrite, alloc, mutations);
             const owners = try integrity.resolveConflictOwners(alloc, self.localSource(), &metadata.table, &metadata.range, self.table_name, table.schema_version, columns, writes, &.{}, .{});
             const output = try alloc.alloc(catalog.ConflictOwner, owners.len);
-            for (owners, output) |*owner, *out| out.* = .{ .key = owner.key, .identity = owner.identity, .guard = owner };
+            for (owners, output) |*owner, *out| out.* = .{ .key = owner.key, .identity = owner.identity, .identities = owner.identities, .guard = owner };
             return output;
         }
 

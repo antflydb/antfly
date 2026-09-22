@@ -131,6 +131,38 @@ pub fn bind(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
         result.columns = output_columns;
         return result;
     }
+    if (compiled.statement == .select and compiled.statement.select.windows.len != 0) {
+        // Validate even unused WINDOW declarations without evaluating them.
+        // Pin the same table for validation and the executable projection.
+        const relations = @import("relation_binding.zig");
+        var adapter: ?relations.ResolveAdapter = null;
+        const pinned = if (compiled.statement.select.table) |name| blk: {
+            adapter = .{ .backend = backend, .table = try backend.vtable.resolve(backend.ptr, allocator, name, .read) };
+            break :blk adapter.?.iface();
+        } else backend;
+        var validation = compiled.*;
+        const query = &validation.statement.select;
+        var projections: std.ArrayList(ast.Projection) = .empty;
+        try projections.appendSlice(allocator, query.columns);
+        if (query.count_all) {
+            const count = try allocator.create(ast.Scalar);
+            count.* = .{ .call = .{ .name = "count", .args = &.{}, .star = true } };
+            try projections.append(allocator, .{ .expression = count });
+        }
+        for (query.windows) |definition| {
+            const row_number = try allocator.create(ast.Scalar);
+            row_number.* = .{ .call = .{ .name = "row_number", .args = &.{}, .window = definition.window } };
+            try projections.append(allocator, .{ .expression = row_number });
+        }
+        query.columns = try projections.toOwnedSlice(allocator);
+        query.windows = &.{};
+        query.count_all = false;
+        query.order_by = &.{};
+        const validated = try bind(allocator, pinned, &validation, explicit_parameter_types);
+        var executable = compiled.*;
+        executable.statement.select.windows = &.{};
+        return bind(allocator, pinned, &executable, validated.parameter_types);
+    }
     if (@import("ddl_runtime.zig").accepts(compiled.statement)) {
         if (compiled.parameter_count != 0) return error.InvalidSqlParameters;
         if (backend.vtable.ddl == null) return error.UnsupportedSqlExecution;
@@ -450,7 +482,7 @@ const Context = struct {
                 .string => |key| {
                     if (key.len == 0) return error.SqlRowIdentityRequired;
                     if (!std.unicode.utf8ValidateSlice(key)) return error.SqlTypeMismatch;
-                    if ((try literal_keys.getOrPut(self.allocator, key)).found_existing and (statement.conflict == null or !@import("conflict.zig").primary(statement.conflict.?) or statement.conflict.?.assignments.len != 0)) return error.DuplicateSqlRow;
+                    if ((try literal_keys.getOrPut(self.allocator, key)).found_existing and (statement.conflict == null or !@import("conflict.zig").allowsDuplicateKeys(statement.conflict.?))) return error.DuplicateSqlRow;
                 },
                 else => return error.SqlRowIdentityRequired,
             }

@@ -77,7 +77,40 @@ pub const Adapter = struct {
     server: *http.ApiHttpServer,
 
     pub fn backend(self: *Adapter) wire.Backend {
-        return .{ .context = self, .vtable = &.{ .authenticate = authenticate, .describe = describe, .execute = execute, .open_stream = openStream, .disconnect = disconnect } };
+        return .{ .context = self, .vtable = &.{ .authenticate = authenticate, .describe = describe, .execute = execute, .evaluate_parameters = evaluateParameters, .open_stream = openStream, .disconnect = disconnect } };
+    }
+
+    fn evaluateParameters(_: *anyopaque, alloc: std.mem.Allocator, identity: wire.Identity, request: wire.Request, expressions: []const []const u8) ![]const std.json.Value {
+        const credential: *Credential = @ptrCast(@alignCast(identity.context));
+        try credential.validate();
+        return evaluateScalarParameters(alloc, request, expressions);
+    }
+
+    fn evaluateScalarParameters(alloc: std.mem.Allocator, request: wire.Request, expressions: []const []const u8) ![]const std.json.Value {
+        if (expressions.len != request.parameter_types.len) return error.InvalidSqlParameters;
+        const scalar = @import("../sql/scalar.zig");
+        const result = try alloc.alloc(std.json.Value, expressions.len);
+        for (expressions, request.parameter_types, result) |expression, kind, *value| {
+            try request.check();
+            var compiled = try compiler.compileScalar(alloc, expression, .{});
+            defer compiled.deinit();
+            if (compiled.parameter_count != 0) return error.InvalidSqlParameters;
+            const expected: ?ast.ColumnType = switch (kind) {
+                .unknown => null,
+                inline else => |tag| @field(ast.ColumnType, @tagName(tag)),
+            };
+            // Empty binding environment forbids table reads/correlated names;
+            // the scalar compiler rejects subqueries and statement commands.
+            var program = try scalar.bindExpected(alloc, compiled.expression, &.{}, &.{}, expected, .{});
+            defer program.deinit();
+            const evaluated = try program.evaluate(alloc, &.{}, &.{}, .{});
+            value.* = if (kind == .json and !evaluated.sql_null)
+                .{ .string = try std.json.Stringify.valueAlloc(alloc, evaluated.value, .{}) }
+            else
+                try native.clone(alloc, evaluated.value);
+        }
+        try request.check();
+        return result;
     }
 
     fn openStream(raw: *anyopaque, alloc: std.mem.Allocator, identity: wire.Identity, request: wire.Request) !?wire.ReadStream {
@@ -573,6 +606,26 @@ const Job = struct {
         transferred = true;
     }
 };
+
+test "SQL pgwire execute arguments use bounded scalar semantics without table access" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var canceled: std.atomic.Value(bool) = .init(false);
+    const request: wire.Request = .{ .statement = "SELECT $1, $2", .parameter_types = &.{ .integer, .string }, .limit = 1, .io = std.testing.io, .deadline = .{ .clock = .awake, .raw = .{ .nanoseconds = std.math.maxInt(i96) } }, .cancel_requested = &canceled };
+    const result = try Adapter.evaluateScalarParameters(arena.allocator(), request, &.{ "9007199254740991 + 2", "concat('a,b', upper('x'))" });
+    try std.testing.expectEqual(@as(i64, 9007199254740993), result[0].integer);
+    try std.testing.expectEqualStrings("a,bX", result[1].string);
+    try std.testing.expectError(error.InvalidSqlParameters, Adapter.evaluateScalarParameters(arena.allocator(), request, &.{ "$1", "'x'" }));
+    var json_request = request;
+    json_request.parameter_types = &.{ .json, .json };
+    const json_values = try Adapter.evaluateScalarParameters(arena.allocator(), json_request, &.{ "'null'::json", "'\"text\"'::json" });
+    try std.testing.expectEqualStrings("null", json_values[0].string);
+    try std.testing.expectEqualStrings("\"text\"", json_values[1].string);
+    const null_values = try Adapter.evaluateScalarParameters(arena.allocator(), json_request, &.{ "NULL", "NULL::json" });
+    try std.testing.expect(null_values[0] == .null and null_values[1] == .null);
+    canceled.store(true, .release);
+    try std.testing.expectError(error.QueryCanceled, Adapter.evaluateScalarParameters(arena.allocator(), request, &.{ "1", "'x'" }));
+}
 
 fn normalizeParameters(alloc: std.mem.Allocator, input: []const std.json.Value, types: []const wire.Type) ![]const std.json.Value {
     if (input.len != types.len) return error.InvalidSqlParameters;

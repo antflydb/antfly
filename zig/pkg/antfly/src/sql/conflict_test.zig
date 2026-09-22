@@ -17,11 +17,14 @@ const Fixture = struct {
     identity_failure: bool = false,
     guards: usize = 0,
     fn owners(ptr: *anyopaque, alloc: Allocator, _: catalog.Table, columns: []const []const u8, input: []const catalog.Mutation) ![]const catalog.ConflictOwner {
-        try std.testing.expectEqualStrings("n", columns[0]);
+        if (columns.len != 0) try std.testing.expectEqualStrings("n", columns[0]);
         const result = try alloc.alloc(catalog.ConflictOwner, input.len);
         for (input, result) |mutation, *owner| {
             const number = mutation.row.?.object.get("n").?.integer;
             owner.* = .{ .key = if (number == 3) "existing" else null, .identity = try std.fmt.allocPrint(alloc, "native-tuple-{d}", .{number}), .guard = ptr };
+            const identities = try alloc.alloc([]const u8, 1);
+            identities[0] = owner.identity.?;
+            owner.identities = identities;
         }
         return result;
     }
@@ -97,6 +100,23 @@ const Fixture = struct {
         return .committed;
     }
 };
+
+test "SQL targetless conflict arbitrates primary and unique keys without reserving skipped candidates" {
+    var fixture: Fixture = .{};
+    var backend = fixture.backend();
+    var vtable = backend.vtable.*;
+    vtable.resolve_conflict_owners = Fixture.owners;
+    backend.vtable = &vtable;
+    var compiled = try compiler.compile(std.testing.allocator, "INSERT INTO items (_id,n) VALUES ('existing',7),('new',7),('duplicate',7),('another',3),('another',9),('another',10) ON CONFLICT DO NOTHING RETURNING _id,n", .{});
+    defer compiled.deinit();
+    var result = try runtime.execute(std.testing.allocator, backend, &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u64, 2), result.output.rows_affected);
+    try std.testing.expectEqual(@as(usize, 2), fixture.fences);
+    try std.testing.expectEqual(@as(usize, 4), fixture.guards);
+    try std.testing.expectEqualStrings("new", result.output.rows[0][0].string);
+    try std.testing.expectEqualStrings("another", result.output.rows[1][0].string);
+}
 
 test "SQL secondary arbiter retains native owner identity and opaque atomic guards" {
     for ([_][]const u8{ "DO UPDATE SET n=items.n+excluded.n", "DO NOTHING" }) |action| {
@@ -193,6 +213,27 @@ test "SQL conflict allocations cannot partially publish a statement" {
             };
             defer result.deinit();
             try std.testing.expectEqual(@as(usize, 1), fixture.commits);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
+}
+
+test "SQL targetless conflict allocation failures cannot publish partial arbitration" {
+    const Faults = struct {
+        fn run(alloc: Allocator) !void {
+            var fixture: Fixture = .{};
+            var backend = fixture.backend();
+            var vtable = backend.vtable.*;
+            vtable.resolve_conflict_owners = Fixture.owners;
+            backend.vtable = &vtable;
+            var compiled = try compiler.compile(alloc, "INSERT INTO items (_id,n) VALUES ('existing',7),('new',7),('duplicate',7) ON CONFLICT DO NOTHING RETURNING n", .{});
+            defer compiled.deinit();
+            var result = runtime.execute(alloc, backend, &compiled, &.{}, .{}) catch |err| {
+                try std.testing.expectEqual(@as(usize, 0), fixture.commits);
+                return err;
+            };
+            defer result.deinit();
+            try std.testing.expectEqual(@as(u64, 1), result.output.rows_affected);
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});

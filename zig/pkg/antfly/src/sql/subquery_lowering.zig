@@ -136,6 +136,7 @@ const Builder = struct {
         return value;
     }
     fn subquery(self: *Builder, expression: *const ast.Scalar) anyerror!*const ast.Scalar {
+        if (std.mem.eql(u8, expression.call.name, "$in_subquery")) return self.membership(expression);
         const original = expression.call.subquery.?;
         const exists = std.mem.eql(u8, expression.call.name, "$exists");
         if (exists and (original.count_all or @import("aggregate_binding.zig").accepts(original.*))) return error.UnsupportedSqlShape;
@@ -205,6 +206,73 @@ const Builder = struct {
             return result;
         }
         return self.call("$single", &.{ result, observed });
+    }
+    /// Two grouped hash projections separate existence from NULL evidence.
+    /// A plain semi/anti join is insufficient: an unmatched NOT IN must still
+    /// become UNKNOWN when the correlated inner set contains SQL NULL.
+    fn membership(self: *Builder, expression: *const ast.Scalar) anyerror!*const ast.Scalar {
+        const original = expression.call.subquery.?;
+        if (expression.call.args.len != 1 or original.columns.len != 1 or original.count_all) return error.InvalidSqlParameters;
+        if (original.set_operation != null or original.ctes.len != 0 or original.order_by.len != 0 or original.limit != null or original.offset != null or original.group_by.len != 0 or original.having != null or @import("aggregate_binding.zig").accepts(original.*) or @import("window_binding.zig").accepts(original.*)) return error.UnsupportedSqlShape;
+        var local: Names = .empty;
+        if (original.source) |source| try aliases(self.alloc, source, &local) else if (original.table) |table| try local.put(self.alloc, table.table, {});
+        const value = original.columns[0].expression orelse try self.scalar(.{ .column = original.columns[0].field });
+        if (self.referencesOuter(value, local)) return error.UnsupportedSqlShape;
+        const operand = try self.rewrite(expression.call.args[0]);
+        var keys: std.ArrayList(Key) = .empty;
+        const residual = if (original.predicate) |predicate| try self.extract(try self.predicateScalar(predicate), local, &keys) else null;
+        const zero = try self.scalar(.{ .literal = .{ .integer = 0 } });
+        const count = try self.scalar(.{ .call = .{ .name = "count", .args = &.{}, .star = true } });
+        var total: *const ast.Scalar = undefined;
+        var nonnull: *const ast.Scalar = undefined;
+        var matched: *const ast.Scalar = undefined;
+        // Both projections are evaluated a bounded number of times, never
+        // once per outer row. Native sources share one pinned capture.
+        for (0..2) |pass| {
+            const membership_pass = pass == 1;
+            var query = original.*;
+            query.predicate = if (residual) |predicate| blk: {
+                const out = try self.alloc.create(ast.Predicate);
+                out.* = .{ .scalar = predicate };
+                break :blk out;
+            } else null;
+            const alias = try std.fmt.allocPrint(self.alloc, "$subquery_{d}", .{self.serial});
+            self.serial += 1;
+            if (self.serial > 64 or self.outer.contains(alias)) return error.SqlProgramLimitExceeded;
+            try self.outer.put(self.alloc, alias, {});
+            const columns = try self.alloc.alloc(ast.Projection, keys.items.len + 2);
+            const groups = try self.alloc.alloc(*const ast.Scalar, keys.items.len + @intFromBool(membership_pass));
+            var condition: ?*const ast.Scalar = null;
+            for (keys.items, 0..) |key, index| {
+                const name = try std.fmt.allocPrint(self.alloc, "$key_{d}", .{index});
+                columns[index] = .{ .alias = name, .expression = key.inner };
+                groups[index] = key.inner;
+                const equal = try self.scalar(.{ .binary = .{ .op = .eq, .left = key.outer, .right = try self.field(alias, name) } });
+                condition = if (condition) |prior| try self.scalar(.{ .binary = .{ .op = .@"and", .left = prior, .right = equal } }) else equal;
+            }
+            columns[keys.items.len] = .{ .alias = "$count", .expression = count };
+            if (membership_pass) {
+                columns[keys.items.len + 1] = .{ .alias = "$value", .expression = value };
+                groups[keys.items.len] = value;
+                const equal = try self.scalar(.{ .binary = .{ .op = .eq, .left = operand, .right = try self.field(alias, "$value") } });
+                condition = if (condition) |prior| try self.scalar(.{ .binary = .{ .op = .@"and", .left = prior, .right = equal } }) else equal;
+                matched = try self.field(alias, "$count");
+            } else {
+                columns[keys.items.len + 1] = .{ .alias = "$nonnull", .expression = try self.call("count", &.{value}) };
+                total = try self.call("coalesce", &.{ try self.field(alias, "$count"), zero });
+                nonnull = try self.call("coalesce", &.{ try self.field(alias, "$nonnull"), zero });
+            }
+            query.columns = columns;
+            query.group_by = groups;
+            const owned = try self.alloc.create(ast.Select);
+            owned.* = query;
+            self.source = try self.relation(.{ .join = .{ .kind = .left, .left = self.source, .right = try self.relation(.{ .derived = .{ .query = owned, .alias = alias, .hidden = true } }), .condition = condition } });
+        }
+        const branches = try self.alloc.alloc(ast.Scalar.Branch, 3);
+        branches[0] = .{ .condition = try self.scalar(.{ .binary = .{ .op = .eq, .left = total, .right = zero } }), .value = try self.scalar(.{ .literal = .{ .boolean = false } }) };
+        branches[1] = .{ .condition = try self.scalar(.{ .unary = .{ .op = .is_not_null, .operand = matched } }), .value = try self.scalar(.{ .literal = .{ .boolean = true } }) };
+        branches[2] = .{ .condition = try self.scalar(.{ .binary = .{ .op = .@"or", .left = try self.scalar(.{ .unary = .{ .op = .is_null, .operand = operand } }), .right = try self.scalar(.{ .binary = .{ .op = .gt, .left = total, .right = nonnull } }) } }), .value = try self.scalar(.{ .cast = .{ .type = .boolean, .operand = try self.scalar(.{ .literal = .null }) } }) };
+        return self.scalar(.{ .case_when = .{ .branches = branches, .otherwise = try self.scalar(.{ .literal = .{ .boolean = false } }) } });
     }
     fn rewrite(self: *Builder, input: *const ast.Scalar) anyerror!*const ast.Scalar {
         if (!has(input)) return input;

@@ -43,12 +43,20 @@ const Mock = struct {
     canceled: std.atomic.Value(bool) = .init(false),
 
     fn source(self: *Mock) backend.Backend {
-        return .{ .context = self, .vtable = &.{ .authenticate = authenticate, .describe = describe, .execute = Mock.execute, .open_stream = openStream, .disconnect = disconnect } };
+        return .{ .context = self, .vtable = &.{ .authenticate = authenticate, .describe = describe, .execute = Mock.execute, .evaluate_parameters = evaluateParameters, .open_stream = openStream, .disconnect = disconnect } };
+    }
+    fn evaluateParameters(_: *anyopaque, alloc: std.mem.Allocator, _: backend.Identity, request: backend.Request, expressions: []const []const u8) ![]const std.json.Value {
+        try request.check();
+        const result = try alloc.alloc(std.json.Value, expressions.len);
+        for (expressions, result) |expression, *value| value.* = .{ .integer = try std.fmt.parseInt(i64, expression, 10) };
+        return result;
     }
     fn openStream(raw: *anyopaque, _: std.mem.Allocator, _: backend.Identity, request: backend.Request) !?backend.ReadStream {
         const self: *Mock = @ptrCast(@alignCast(raw));
         if (self.stream_rows == 0) return null;
         try request.check();
+        if (request.parameters.len > 0) self.seen_parameter = request.parameters[0].integer;
+        self.saw_binding_guard = if (request.binding_guard) |guard| std.mem.eql(u8, guard, "immutable-catalog-binding") else false;
         return .{ .context = self, .columns = &.{.{ .name = "n", .type = .integer }}, .next = nextPage, .close = closeStream };
     }
     fn nextPage(raw: *anyopaque, alloc: std.mem.Allocator, request: backend.Request, wanted: u32) !backend.StreamPage {
@@ -370,6 +378,51 @@ test "pgwire simple query releases native result owner exactly once" {
     var output = try run(&mock, input.written(), .{});
     defer output.deinit();
     try std.testing.expectEqual(@as(usize, 1), mock.result_releases);
+}
+
+test "pgwire SQL execute streams typed parameters without eager result cap" {
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    try frame(&input.writer, 'Q', "PREPARE q(bigint) AS SELECT $1\x00");
+    try frame(&input.writer, 'Q', "EXECUTE q(17)\x00");
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .stream_rows = 7 };
+    var output = try run(&mock, input.written(), .{ .result_rows = 2 });
+    defer output.deinit();
+    try std.testing.expectEqual(@as(usize, 0), mock.executions);
+    try std.testing.expectEqual(@as(usize, 7), mock.stream_offset);
+    try std.testing.expectEqual(@as(usize, 1), mock.stream_closes);
+    try std.testing.expect(mock.saw_binding_guard);
+    try std.testing.expectEqual(@as(i64, 17), mock.seen_parameter.?);
+}
+
+test "pgwire SQL prepare execute deallocate share connection ownership with wire statements" {
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    try frame(&input.writer, 'Q', "PREPARE Mixed(bigint) AS SELECT $1\x00");
+    try frame(&input.writer, 'Q', "PREPARE mixed AS SELECT $1\x00");
+    try frame(&input.writer, 'Q', "COMMIT\x00");
+    try frame(&input.writer, 'Q', "EXECUTE MIXED(9007199254740993)\x00");
+    try frame(&input.writer, 'Q', "DEALLOCATE PREPARE mixed\x00");
+    try frame(&input.writer, 'Q', "EXECUTE mixed(1)\x00");
+    try parse(&input.writer, "wire", "SELECT $1", true);
+    try frame(&input.writer, 'Q', "EXECUTE wire(7)\x00");
+    try frame(&input.writer, 'Q', "DEALLOCATE ALL\x00");
+    try frame(&input.writer, 'Q', "EXECUTE wire(8)\x00");
+    try frame(&input.writer, 'X', "");
+    var mock = Mock{};
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    try std.testing.expectEqual(@as(usize, 2), mock.describes);
+    try std.testing.expectEqual(@as(usize, 3), mock.executions);
+    try std.testing.expect(mock.saw_statement_unchanged);
+    try std.testing.expect(mock.saw_binding_guard);
+    try std.testing.expectEqual(@as(i64, 7), mock.seen_parameter.?);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "42P05") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "26000") != null);
+    try std.testing.expectEqual(@as(usize, 1), mock.disconnects);
 }
 
 test "pgwire extended typed bind describes without execution and resumes once" {

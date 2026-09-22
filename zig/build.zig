@@ -265,9 +265,9 @@ pub fn create(b: *std.Build) ?Artifacts {
     // reserved for the full database compilation and integration test roots.
     sql_tests.step.max_rss = 1024 * 1024 * 1024;
     // The complete compiler/executor corpus includes exhaustive allocation-fault
-    // runs (about 88 MiB process RSS in ReleaseSafe). This scheduling estimate
+    // runs (about 137 MiB process RSS in ReleaseSafe). This scheduling estimate
     // is independent of the executor's per-statement memory admission tests.
-    run_sql_tests.step.max_rss = 128 * 1024 * 1024;
+    run_sql_tests.step.max_rss = 192 * 1024 * 1024;
     b.step("sql-test", "Run SQL compilation, catalog binding, and native execution contract tests").dependOn(&run_sql_tests.step);
     const pgwire_tests = b.addTest(.{
         .root_module = b.createModule(.{

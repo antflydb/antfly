@@ -129,14 +129,20 @@ pub const Plan = struct {
     /// Bind the SQL conflict shape against durable native unique generations,
     /// once per statement. Column order does not change arbiter inference;
     /// encoding always follows the constraint's canonical native tuple order.
+    /// An empty target selects every supported immediate unique constraint for
+    /// DO NOTHING; the SQL boundary independently arbitrates physical row IDs.
     pub fn bindConflictTarget(self: *const Plan, alloc: Allocator, columns: []const []const u8) ![]const usize {
-        if (columns.len == 0 or columns.len > 32) return error.InvalidIntegrityDefinition;
+        if (columns.len > 32) return error.InvalidIntegrityDefinition;
         for (columns, 0..) |column, i| for (columns[0..i]) |previous| {
             if (std.mem.eql(u8, column, previous)) return error.InvalidIntegrityDefinition;
         };
         var selected: std.ArrayList(usize) = .empty;
         errdefer selected.deinit(alloc);
         for (self.uniques, 0..) |unique, index| {
+            if (columns.len == 0) {
+                try selected.append(alloc, index);
+                continue;
+            }
             if (unique.definition.columns.len != columns.len) continue;
             const matches = for (columns) |column| {
                 const present = for (unique.definition.columns) |candidate| {
@@ -146,7 +152,7 @@ pub const Plan = struct {
             } else true;
             if (matches) try selected.append(alloc, index);
         }
-        if (selected.items.len == 0) return error.ConflictArbiterNotFound;
+        if (selected.items.len == 0 and columns.len != 0) return error.ConflictArbiterNotFound;
         return selected.toOwnedSlice(alloc);
     }
 
@@ -312,12 +318,32 @@ test "distributed txn typed integrity expansion matches composite parent claim w
     defer parent.deinit();
     var child = try Plan.init(alloc, "children", view, &.{}, &.{.{ .generation = @splat(2), .parent_generation = @splat(1), .definition = fk, .parent = view, .parent_unique = unique }});
     defer child.deinit();
+    const primary_only = try child.bindConflictTarget(alloc, &.{});
+    defer alloc.free(primary_only);
+    try std.testing.expectEqual(@as(usize, 0), primary_only.len);
     const encoded = try codec.serializeOrdinal(alloc, 1, view.tableSchema().relational_columns, &.{
         .{ .ordinal = 0, .path = "tenant", .value_type = .bytes_val, .value = .{ .bytes_val = "Acme" } },
         .{ .ordinal = 1, .path = "id", .value_type = .i64_val, .value = .{ .i64_val = 9_007_199_254_740_993 } },
     }, @splat(0));
     defer alloc.free(encoded);
     const row = try codec.ordinalRowView(encoded, view.tableSchema().*, view.physicalLayout());
+    {
+        var all = try Plan.init(alloc, "parents", view, &.{
+            .{ .generation = @splat(1), .definition = unique },
+            .{ .generation = @splat(3), .definition = .{ .name = "tenant_key", .columns = &.{"tenant"} } },
+        }, &.{});
+        defer all.deinit();
+        const selected = try all.bindConflictTarget(alloc, &.{});
+        defer alloc.free(selected);
+        try std.testing.expectEqualSlices(usize, &.{ 0, 1 }, selected);
+        const addresses = try all.conflictAddresses(alloc, selected, row);
+        defer {
+            for (addresses) |address| alloc.free(address.tuple);
+            alloc.free(addresses);
+        }
+        try std.testing.expectEqual(@as(usize, 2), addresses.len);
+        try std.testing.expect(!std.meta.eql(addresses[0].address, addresses[1].address));
+    }
     const target = try parent.bindConflictTarget(alloc, &.{ "id", "tenant" });
     defer alloc.free(target);
     const arbiters = try parent.conflictAddresses(alloc, target, row);

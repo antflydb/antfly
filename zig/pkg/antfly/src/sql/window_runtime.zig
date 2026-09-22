@@ -123,17 +123,83 @@ fn rangeBoundary(context: anytype, bound: ast.Window.Bound, cells: []const []Dat
 }
 
 const Frame = struct { start: usize, end: usize };
-fn frame(context: anytype, spec: binding.Spec, sort: binding.Sort, cells: []const []Datum, indices: []const usize, position: usize, peer_start: usize, peer_end: usize) !Frame {
+fn frame(context: anytype, spec: binding.Spec, sort: binding.Sort, cells: []const []Datum, indices: []const usize, position: usize, peer_start: usize, peer_end: usize, groups: []const usize, group_index: usize) !Frame {
     const definition = spec.frame orelse ast.Window.Frame{ .mode = .range, .start = .unbounded_preceding, .end = .current };
     const start = if (definition.mode == .rows)
         try rowBoundary(context, definition.start, position, indices.len, false)
+    else if (definition.mode == .groups)
+        groups[try rowBoundary(context, definition.start, group_index, groups.len - 1, false)]
     else
         try rangeBoundary(context, definition.start, cells, indices, sort, position, peer_start, peer_end, false);
     const end = if (definition.mode == .rows)
         try rowBoundary(context, definition.end, position, indices.len, true)
+    else if (definition.mode == .groups)
+        groups[try rowBoundary(context, definition.end, group_index, groups.len - 1, true)]
     else
         try rangeBoundary(context, definition.end, cells, indices, sort, position, peer_start, peer_end, true);
     return .{ .start = start, .end = @max(start, end) };
+}
+
+/// Exclusions split a contiguous frame into at most three ordered intervals.
+/// Aggregates combine indexed nodes, and value functions select by interval
+/// length: neither operation walks the excluded peers or rescans frame rows.
+const FrameSet = struct {
+    parts: [3]Frame = undefined,
+    len: usize = 0,
+    fn append(self: *FrameSet, bounds: Frame, start: usize, end: usize) void {
+        const clipped = Frame{ .start = @max(bounds.start, start), .end = @min(bounds.end, end) };
+        if (clipped.start >= clipped.end) return;
+        self.parts[self.len] = clipped;
+        self.len += 1;
+    }
+    fn init(bounds: Frame, exclusion: ast.Window.Exclusion, position: usize, peer_start: usize, peer_end: usize) FrameSet {
+        var result: FrameSet = .{};
+        switch (exclusion) {
+            .no_others => result.append(bounds, bounds.start, bounds.end),
+            .current => {
+                result.append(bounds, 0, position);
+                result.append(bounds, position + 1, bounds.end);
+            },
+            .group, .ties => {
+                result.append(bounds, 0, peer_start);
+                if (exclusion == .ties) result.append(bounds, position, position + 1);
+                result.append(bounds, peer_end, bounds.end);
+            },
+        }
+        return result;
+    }
+    fn nth(self: FrameSet, offset: usize) ?usize {
+        var remaining = offset;
+        for (self.parts[0..self.len]) |part| {
+            const count = part.end - part.start;
+            if (remaining < count) return part.start + remaining;
+            remaining -= count;
+        }
+        return null;
+    }
+};
+
+test "SQL excluded frame intervals match every peer and row boundary" {
+    const count = 8;
+    for (0..count) |position| for (0..position + 1) |peer_start| for (position + 1..count + 1) |peer_end| {
+        for (0..count + 1) |start| for (start..count + 1) |end| inline for (std.meta.tags(ast.Window.Exclusion)) |exclusion| {
+            const selected = FrameSet.init(.{ .start = start, .end = end }, exclusion, position, peer_start, peer_end);
+            var ordinal: usize = 0;
+            for (start..end) |row| {
+                const excluded = switch (exclusion) {
+                    .no_others => false,
+                    .current => row == position,
+                    .group => row >= peer_start and row < peer_end,
+                    .ties => row != position and row >= peer_start and row < peer_end,
+                };
+                if (!excluded) {
+                    try std.testing.expectEqual(@as(?usize, row), selected.nth(ordinal));
+                    ordinal += 1;
+                }
+            }
+            try std.testing.expectEqual(null, selected.nth(ordinal));
+        };
+    };
 }
 
 const Node = struct {
@@ -227,6 +293,14 @@ const Tree = struct {
         return result;
     }
     fn query(self: Tree, bounds: Frame) !Datum {
+        return self.querySet(FrameSet.init(bounds, .no_others, 0, 0, 0));
+    }
+    fn querySet(self: Tree, bounds: FrameSet) !Datum {
+        var result: Node = .{};
+        for (bounds.parts[0..bounds.len]) |part| result = try self.combine(result, try self.queryNode(part));
+        return self.finish(result);
+    }
+    fn queryNode(self: Tree, bounds: Frame) !Node {
         var left = self.base + bounds.start;
         var right = self.base + bounds.end;
         var result: Node = .{};
@@ -242,6 +316,9 @@ const Tree = struct {
             left /= 2;
             right /= 2;
         }
+        return result;
+    }
+    fn finish(self: Tree, result: Node) !Datum {
         if (self.spec.kind == .count) return Datum.json(.{ .integer = @intCast(result.count) });
         if (result.count == 0) return .{};
         return switch (self.spec.kind) {
@@ -351,7 +428,7 @@ test "SQL window wide moving frames retain bounded indexed aggregate state" {
     std.debug.print("SQL window frames: rows={d} frame_width=8193 peak_bytes={d} elapsed_ns={d}\n", .{ count, budget.peak, std.Io.Clock.awake.now(std.testing.io).nanoseconds - started });
 }
 
-fn evaluate(context: anytype, cells: [][]Datum, indices: []const usize, sort: binding.Sort, spec: binding.Spec, column: usize, peers_start: []const usize, peers_end: []const usize) !void {
+fn evaluate(context: anytype, cells: [][]Datum, indices: []const usize, sort: binding.Sort, spec: binding.Spec, column: usize, peers_start: []const usize, peers_end: []const usize, groups: []const usize) !void {
     const aggregate = switch (spec.kind) {
         .count, .sum, .avg, .min, .max, .bool_and, .bool_or => true,
         else => false,
@@ -364,7 +441,8 @@ fn evaluate(context: anytype, cells: [][]Datum, indices: []const usize, sort: bi
     for (indices, 0..) |row, position| {
         try context.checkpoint();
         if (peers_start[position] == position) dense += 1;
-        const bounds = try frame(context, spec, sort, cells, indices, position, peers_start[position], peers_end[position]);
+        const bounds = try frame(context, spec, sort, cells, indices, position, peers_start[position], peers_end[position], groups, @intCast(dense - 1));
+        const selected = FrameSet.init(bounds, if (spec.frame) |definition| definition.exclusion else .no_others, position, peers_start[position], peers_end[position]);
         const result: Datum = switch (spec.kind) {
             .row_number => Datum.json(.{ .integer = @intCast(position + 1) }),
             .rank => Datum.json(.{ .integer = @intCast(peers_start[position] + 1) }),
@@ -388,15 +466,17 @@ fn evaluate(context: anytype, cells: [][]Datum, indices: []const usize, sort: bi
                 break :blk cells[indices[@intCast(target)]][spec.arguments[0]];
             },
             .first_value, .last_value, .nth_value => blk: {
-                const index: usize = if (spec.kind == .last_value) bounds.end -| 1 else if (spec.kind == .first_value) bounds.start else nth: {
+                const index: usize = if (spec.kind == .last_value) last: {
+                    if (selected.len == 0) break :blk Datum{};
+                    break :last selected.parts[selected.len - 1].end - 1;
+                } else if (spec.kind == .first_value) selected.nth(0) orelse break :blk Datum{} else nth: {
                     const n = (try integer(cells[row][spec.arguments[1]])) orelse break :blk Datum{};
                     if (n <= 0) return error.InvalidSqlParameters;
-                    break :nth bounds.start +| @as(usize, @intCast(n - 1));
+                    break :nth selected.nth(@intCast(n - 1)) orelse break :blk Datum{};
                 };
-                if (bounds.start == bounds.end or index >= bounds.end) break :blk Datum{};
                 break :blk cells[indices[index]][spec.arguments[0]];
             },
-            else => try tree.?.query(bounds),
+            else => try tree.?.querySet(selected),
         };
         cells[row][column] = if (result.sql_null) result else .{
             .value = try describe.coerce(result.value, spec.type),
@@ -407,6 +487,10 @@ fn evaluate(context: anytype, cells: [][]Datum, indices: []const usize, sort: bi
 
 pub fn execute(context: anytype, statement: ast.Select) anyerror!@import("runtime.zig").Output {
     const bound = context.binding.window orelse return error.InvalidSqlBackendResponse;
+    for (bound.specs) |spec| if (spec.frame) |definition| for ([_]ast.Window.Bound{ definition.start, definition.end }) |boundary| switch (boundary) {
+        .preceding, .following => |value| _ = try offsetValue(context, value),
+        else => {},
+    };
     const limit = try context.count(statement.limit, context.limits.result_rows);
     const offset = try context.count(statement.offset, 0);
     if (limit > context.limits.result_rows or offset > context.limits.scan_rows) return error.SqlProgramLimitExceeded;
@@ -437,6 +521,10 @@ pub fn execute(context: anytype, statement: ast.Select) anyerror!@import("runtim
         if (sorter.failure) |err| return err;
         const peer_starts = try sorted.allocator().alloc(usize, cells.len);
         const peer_ends = try sorted.allocator().alloc(usize, cells.len);
+        const needs_groups = for (bound.specs) |spec| {
+            if (spec.sort == sort_index and spec.frame != null and spec.frame.?.mode == .groups) break true;
+        } else false;
+        const group_starts = try sorted.allocator().alloc(usize, if (needs_groups) cells.len + 1 else 0);
         var start: usize = 0;
         while (start < indices.len) {
             var end = start + 1;
@@ -445,7 +533,10 @@ pub fn execute(context: anytype, statement: ast.Select) anyerror!@import("runtim
             }
             const partition = indices[start..end];
             var peer: usize = 0;
+            var group_count: usize = 0;
             while (peer < partition.len) {
+                if (needs_groups) group_starts[group_count] = peer;
+                group_count += 1;
                 var peer_end = peer + 1;
                 while (peer_end < partition.len and try equal(cells, partition[peer], partition[peer_end], sort.order)) : (peer_end += 1) {
                     if (peer_end % 256 == 0) try context.checkpoint();
@@ -454,7 +545,8 @@ pub fn execute(context: anytype, statement: ast.Select) anyerror!@import("runtim
                 @memset(peer_ends[peer..peer_end], peer_end);
                 peer = peer_end;
             }
-            for (bound.specs, 0..) |spec, index| if (spec.sort == sort_index) try evaluate(context, cells, partition, sort, spec, bound.input.columns.len + index, peer_starts[0..partition.len], peer_ends[0..partition.len]);
+            if (needs_groups) group_starts[group_count] = partition.len;
+            for (bound.specs, 0..) |spec, index| if (spec.sort == sort_index) try evaluate(context, cells, partition, sort, spec, bound.input.columns.len + index, peer_starts[0..partition.len], peer_ends[0..partition.len], group_starts[0..if (needs_groups) group_count + 1 else 0]);
             start = end;
         }
     }

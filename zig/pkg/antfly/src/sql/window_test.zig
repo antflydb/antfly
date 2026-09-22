@@ -27,6 +27,90 @@ const Backend = struct {
     }
 };
 
+test "SQL GROUPS frames and exclusions share peer domains without row rescans" {
+    var backend: Backend = .{};
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT x, sum(x) OVER (ORDER BY x GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW), sum(x) OVER (ORDER BY x GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW EXCLUDE TIES), count(*) OVER (ORDER BY x GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW EXCLUDE GROUP), first_value(x) OVER (ORDER BY x ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE CURRENT ROW), nth_value(x,2) OVER (ORDER BY x ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE GROUP) FROM (SELECT 1 AS x UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 3) t ORDER BY x", .{});
+    defer compiled.deinit();
+    var result = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{});
+    defer result.deinit();
+    const expected = [_][6]i64{ .{ 1, 2, 1, 0, 1, 3 }, .{ 1, 2, 1, 0, 1, 3 }, .{ 2, 4, 4, 2, 1, 1 }, .{ 3, 8, 5, 1, 1, 1 }, .{ 3, 8, 5, 1, 1, 1 } };
+    try std.testing.expectEqual(expected.len, result.output.rows.len);
+    for (result.output.rows, expected) |row, want| for (row, want) |value, number| try std.testing.expectEqual(number, try std.fmt.parseInt(i64, value.string, 10));
+}
+
+test "SQL named windows inherit once and preserve query-local scope" {
+    var backend: Backend = .{};
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT x, sum(x) OVER running, rank() OVER base FROM (SELECT 2 AS x UNION ALL SELECT 1 UNION ALL SELECT 1) t WINDOW base AS (ORDER BY x), running AS (base GROUPS UNBOUNDED PRECEDING) ORDER BY row_number() OVER base", .{});
+    defer compiled.deinit();
+    var result = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{});
+    defer result.deinit();
+    const expected = [_][3]i64{ .{ 1, 2, 1 }, .{ 1, 2, 1 }, .{ 2, 4, 3 } };
+    for (result.output.rows, expected) |row, want| for (row, want) |value, number| try std.testing.expectEqual(number, try std.fmt.parseInt(i64, value.string, 10));
+    // Direct reference admits a frame, copying a framed window does not.
+    const rejected = [_][]const u8{
+        "SELECT sum(1) OVER missing",
+        "SELECT sum(1) OVER (w) WINDOW w AS (ROWS CURRENT ROW)",
+        "SELECT sum(1) OVER (w PARTITION BY 1) WINDOW w AS ()",
+        "SELECT sum(1) OVER (w ORDER BY 2) WINDOW w AS (ORDER BY 1)",
+        "SELECT 1 WINDOW w AS (), w AS ()",
+        "SELECT 1 WINDOW w AS (later), later AS ()",
+        "SELECT 1 WINDOW w AS (PARTITION BY sum(1) OVER w)",
+        "SELECT sum(1) OVER w FROM (SELECT 1 WINDOW w AS ()) t",
+    };
+    for (rejected) |text| try std.testing.expectError(error.InvalidSqlSyntax, compiler.compile(std.testing.allocator, text, .{}));
+}
+
+test "SQL named windows and exclusions release allocation failures" {
+    const Case = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var backend: Backend = .{};
+            var compiled = try compiler.compile(alloc, "SELECT sum(x) OVER (w GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING EXCLUDE TIES), nth_value(x,2) OVER (w ROWS UNBOUNDED PRECEDING EXCLUDE CURRENT ROW) FROM (SELECT 1 AS x UNION ALL SELECT 2 UNION ALL SELECT 2) t WINDOW w AS (ORDER BY x)", .{});
+            defer compiled.deinit();
+            var result = try runtime.execute(alloc, backend.backend(), &compiled, &.{}, .{});
+            defer result.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "SQL unused named windows validate without evaluating discarded expressions" {
+    var backend: Backend = .{};
+    var valid = try compiler.compile(std.testing.allocator, "SELECT 1 WINDOW unused AS (ORDER BY 1/0)", .{});
+    defer valid.deinit();
+    var result = try runtime.execute(std.testing.allocator, backend.backend(), &valid, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqualStrings("1", result.output.rows[0][0].string);
+    var invalid = try compiler.compile(std.testing.allocator, "SELECT 1 FROM (SELECT 1 AS x) t WINDOW unused AS (ORDER BY missing)", .{});
+    defer invalid.deinit();
+    try std.testing.expectError(error.UndefinedColumn, runtime.execute(std.testing.allocator, backend.backend(), &invalid, &.{}, .{}));
+    var quoted = try compiler.compile(std.testing.allocator, "SELECT sum(1) OVER (\"groups\") WINDOW \"groups\" AS ()", .{});
+    defer quoted.deinit();
+    var quoted_result = try runtime.execute(std.testing.allocator, backend.backend(), &quoted, &.{}, .{});
+    defer quoted_result.deinit();
+    try std.testing.expectEqualStrings("1", quoted_result.output.rows[0][0].string);
+    var missing_order = try compiler.compile(std.testing.allocator, "SELECT 1 WINDOW unused AS (RANGE 1 PRECEDING)", .{});
+    defer missing_order.deinit();
+    try std.testing.expectError(error.UnsupportedSqlShape, runtime.execute(std.testing.allocator, backend.backend(), &missing_order, &.{}, .{}));
+    var wrong_type = try compiler.compile(std.testing.allocator, "SELECT 1 WINDOW unused AS (ORDER BY 'a' RANGE 1 PRECEDING)", .{});
+    defer wrong_type.deinit();
+    try std.testing.expectError(error.SqlTypeMismatch, runtime.execute(std.testing.allocator, backend.backend(), &wrong_type, &.{}, .{}));
+}
+
+test "SQL exclusions preserve empty frames and ignore peers outside frame" {
+    var backend: Backend = .{};
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT x, count(*) OVER (ORDER BY x ROWS BETWEEN CURRENT ROW AND CURRENT ROW EXCLUDE CURRENT ROW), first_value(x) OVER (ORDER BY x GROUPS CURRENT ROW EXCLUDE GROUP), sum(x) OVER (ORDER BY x ROWS BETWEEN 1 FOLLOWING AND 1 FOLLOWING EXCLUDE TIES) FROM (SELECT 1 AS x UNION ALL SELECT 1 UNION ALL SELECT 2) t ORDER BY x", .{});
+    defer compiled.deinit();
+    var result = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{});
+    defer result.deinit();
+    for (result.output.rows, result.output.sql_nulls.?) |row, flags| {
+        try std.testing.expectEqualStrings("0", row[1].string);
+        try std.testing.expect(flags[2]);
+    }
+    try std.testing.expect(result.output.sql_nulls.?[0][3]);
+    try std.testing.expectEqualStrings("2", result.output.rows[1][3].string);
+    try std.testing.expect(result.output.sql_nulls.?[2][3]);
+}
+
 test "SQL window ranking partitions and shared sort preserve final ordering" {
     var backend: Backend = .{};
     var compiled = try compiler.compile(std.testing.allocator, "SELECT x, row_number() OVER (PARTITION BY x%2 ORDER BY x DESC) AS rn, rank() OVER (ORDER BY x) AS r, dense_rank() OVER (ORDER BY x) AS d FROM (SELECT 3 AS x UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 1) t ORDER BY x,rn", .{});

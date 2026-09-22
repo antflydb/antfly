@@ -3666,6 +3666,47 @@ test "transaction activated range guards fence pending writers without serializi
     try std.testing.expectEqual(@as(u64, 0), try manager.readGuardCount());
 }
 
+test "transaction activated range reader and writer reservations recover across LSM restart" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const writer: TxnId = @splat(94);
+    const reader: TxnId = @splat(95);
+    const key = range_protection.counterKey(range_protection.bucket("alpha"));
+    const predicate: VersionPredicate = .{ .key = &key, .expected_version = 0, .comparison = .exact_value, .expected_value = null };
+    for (0..3) |phase| {
+        var backend = try lsm_backend.Backend.open(alloc, path, .{});
+        defer backend.close();
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        var manager = try TxnManager.init(alloc, &store);
+        defer manager.deinit();
+        switch (phase) {
+            0 => {
+                try store.put(range_protection.activation_key, range_protection.activation_value);
+                try manager.initTransaction(writer, 1);
+                try manager.initTransaction(reader, 1);
+                try manager.writeIntents(writer, &.{.{ .key = "alpha", .value = "pending" }}, &.{});
+            },
+            1 => {
+                try std.testing.expectError(error.IntentConflict, manager.writeIntents(reader, &.{}, &.{predicate}));
+                try manager.resolveIntents(writer, .aborted, 2);
+                try manager.writeIntents(reader, &.{}, &.{predicate});
+            },
+            2 => {
+                try std.testing.expectError(error.IntentConflict, manager.checkOrdinaryWriteConflict("another phantom"));
+                try std.testing.expect(try manager.hasTopologySensitiveTransactions());
+                try manager.resolveIntents(reader, .aborted, 3);
+                try manager.checkOrdinaryWriteConflict("another phantom");
+                try std.testing.expectEqual(@as(u64, 0), try manager.readGuardCount());
+            },
+            else => unreachable,
+        }
+    }
+}
+
 test "transaction range generations are atomic snapshot bound and coalesced per bucket" {
     const alloc = std.testing.allocator;
     var backend = mem_backend.Backend.init(alloc, .{});

@@ -75,17 +75,56 @@ self-referencing foreign-key actions. It rejects out-of-handle dependencies.
 Equality-correlated EXISTS/NOT EXISTS and scalar subqueries lower to grouped
 hash joins under the same coordinated capture as their outer query. Scalar
 cardinality, NULL equality and hidden-column projection are checked explicitly.
+Single-column IN/NOT IN subqueries now use bounded grouped membership and NULL
+evidence under that same capture. Empty sets, duplicate values, nullable operands
+and correlated NULL groups retain three-valued SQL semantics. Computed side-local
+join operands bind as hash keys rather than quadratic residual comparisons.
 Broader correlation forms remain unsupported; there is no per-row remote-query
 fallback.
 
+Named WINDOW definitions resolve in query-local scopes before publication of the
+immutable AST. Inheritance restrictions and unused definitions are validated
+without evaluating discarded expressions. GROUPS frames use indexed peer-group
+boundaries; EXCLUDE CURRENT ROW/GROUP/TIES/NO OTHERS produces at most three
+intervals, shared by indexed aggregates and constant-interval value selection.
+
+Targetless ON CONFLICT DO NOTHING now coordinates primary identity and every
+supported immediate unique arbiter. Only admitted candidates reserve in-batch
+claims, so skipped rows cannot suppress later valid rows. Native schema and
+generation fences still cover the complete atomic mutation.
+
+Pgwire SQL PREPARE/EXECUTE/DEALLOCATE shares the existing bounded wire-protocol
+prepared registry and binding-identity fences. Statements survive transaction
+commit and release on deallocation/disconnect. EXECUTE evaluates typed scalar
+arguments in an empty binding environment, never interpolating SQL or opening
+table readers; JSON null remains distinct from SQL NULL. Eligible executions
+use the existing backpressured pull stream. HTTP has no durable connection-owned
+prepared resource, and SQL-language DECLARE/FETCH cursor ownership is still open.
+
 Remaining major items include broader isolation deployment and fault validation,
-unique-arbiter inference and correlated subquery shapes,
-SQL-language prepared/cursor session ownership, and the complete parity,
+advanced unique-arbiter inference and correlated subquery shapes,
+durable HTTP prepared sessions and SQL-language cursor ownership, and the complete parity,
 fault-injection and workload benchmark gates. Passing focused component tests is
-not completion of S2. Partial/expression/deferrable unique arbiters and targetless
-conflict inference are not yet supported.
+not completion of S2. Partial/expression/deferrable unique arbiters require native
+integrity-plan support, not just SQL inference; they remain unsupported.
 
 ### Latest local validation
+
+- Follow-up ReleaseSafe SQL suite: 168 tests. Membership benchmark (opt-in
+  `ANTFLY_SQL_MEMBERSHIP_BENCHMARK=1`): 10,000 outer and 10,000 inner rows,
+  three scans, one coordinated capture, 8.43 MB query peak, about 1.59 seconds.
+  The routine fixture is smaller and still crosses multiple native pages.
+- Pgwire follow-up: 28 tests; native adapter: seven tests, including typed
+  expression arguments, JSON-null provenance, cancellation and credential checks.
+- Final SQL-filtered API integration: 31 tests, no leaks; `make generate` and
+  `make fmt` passed after integration.
+- Follow-up native storage: 92 tests; distributed transactions: 96; Lite SQL: 9.
+  New fault tests cover reservation survival across two restarts, atomic counter
+  exhaustion, and rejection of equal counters after restore/topology/identity
+  changes. These are focused fault tests, not a complete distributed chaos gate.
+- Native LSM bookkeeping workload (Debug, 100 batches of 32 common-prefix rows):
+  tracking inactive 452 ms versus active 485 ms, about 7.3% overhead in one run.
+  This is preliminary, not a statistically rigorous production throughput claim.
 
 - Expanded SQL runtime/compiler/binder: 156 tests in ReleaseSafe; pgwire:
   25 tests; native SQL pgwire adapter and mounted route: seven tests. Final

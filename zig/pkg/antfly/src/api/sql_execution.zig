@@ -190,7 +190,7 @@ pub const Adapter = struct {
         const owners = try integrity.resolveConflictOwners(alloc, self.server.table_reads orelse return error.UnsupportedSqlExecution, snapshot.tables, snapshot.ranges, table.physical_name, table.schema_version, columns, writes, previous, self.context);
         try self.verify(alloc, table);
         const result = try alloc.alloc(catalog.ConflictOwner, owners.len);
-        for (owners, result) |*owner, *out| out.* = .{ .key = owner.key, .identity = owner.identity, .guard = owner };
+        for (owners, result) |*owner, *out| out.* = .{ .key = owner.key, .identity = owner.identity, .identities = owner.identities, .guard = owner };
         return result;
     }
 

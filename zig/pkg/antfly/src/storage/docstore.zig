@@ -3171,6 +3171,74 @@ test "docstore retained row effects bound admission and abort oversized atomic w
     }
 }
 
+test "docstore range tracking native LSM common prefix batch benchmark" {
+    const range_protection = @import("range_protection.zig");
+    const alloc = std.testing.allocator;
+    var keys: [32][]u8 = undefined;
+    var writes: [32]KVPair = undefined;
+    var initialized: usize = 0;
+    defer for (keys[0..initialized]) |key| alloc.free(key);
+    for (&keys, &writes, 0..) |*key, *write, i| {
+        var raw: [32]u8 = undefined;
+        key.* = try internal_keys.documentKeyAlloc(alloc, try std.fmt.bufPrint(&raw, "doc:{d}", .{i}));
+        initialized += 1;
+        write.* = .{ .key = key.*, .value = "{\"value\":123,\"category\":\"bounded shared-prefix benchmark\"}" };
+    }
+    inline for (.{ false, true }) |active| {
+        var backend = lsm_backend.Backend.init(alloc, .{ .flush_threshold = 4096 });
+        defer backend.close();
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        if (active) try store.put(range_protection.activation_key, range_protection.activation_value);
+        const started = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+        for (0..100) |_| try store.putBatch(&writes, &.{});
+        const elapsed = std.Io.Clock.awake.now(std.testing.io).nanoseconds - started;
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqual(@as(?u64, if (active) 100 else null), try range_protection.generation(&read, range_protection.bucket("doc:0")));
+        std.debug.print("native LSM range tracking active={any} batches=100 rows_per_batch=32 elapsed_ns={d}\n", .{ active, elapsed });
+    }
+}
+
+test "docstore range tracking survives native LSM reopen and rejects generation overflow atomically" {
+    const range_protection = @import("range_protection.zig");
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const key = try internal_keys.documentKeyAlloc(alloc, "doc:one");
+    defer alloc.free(key);
+    const id = range_protection.bucket("doc:one");
+    {
+        var backend = try lsm_backend.Backend.open(alloc, path, .{ .flush_threshold_bytes = 4096 });
+        defer backend.close();
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        try store.put(range_protection.activation_key, range_protection.activation_value);
+        try store.put(key, "before restart");
+    }
+    {
+        var backend = try lsm_backend.Backend.open(alloc, path, .{ .flush_threshold_bytes = 4096 });
+        defer backend.close();
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        try store.put(key, "after restart");
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqual(@as(?u64, 2), try range_protection.generation(&read, id));
+        const counter_key = range_protection.counterKey(id);
+        var exhausted: [8]u8 = undefined;
+        std.mem.writeInt(u64, &exhausted, std.math.maxInt(u64), .little);
+        try store.put(&counter_key, &exhausted);
+        try std.testing.expectError(error.RangeTrackingGenerationExhausted, store.put(key, "must never publish"));
+        var current = try store.beginReadTxn();
+        defer current.abort();
+        try std.testing.expectEqualStrings("after restart", try current.get(key));
+        try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), try range_protection.generation(&current, id));
+    }
+}
+
 test "docstore retained row effects resume across LSM reopen and keep aborted GC history" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

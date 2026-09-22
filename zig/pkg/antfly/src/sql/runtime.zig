@@ -481,7 +481,7 @@ pub const Context = struct {
             const key = key_datum.value;
             if (key_datum.sql_null or key != .string or key.string.len == 0) return error.SqlRowIdentityRequired;
             if (!std.unicode.utf8ValidateSlice(key.string)) return error.SqlTypeMismatch;
-            if ((try keys.getOrPut(self.arena, key.string)).found_existing and (statement.conflict == null or !@import("conflict.zig").primary(statement.conflict.?) or statement.conflict.?.assignments.len != 0)) return error.DuplicateSqlRow;
+            if ((try keys.getOrPut(self.arena, key.string)).found_existing and (statement.conflict == null or !@import("conflict.zig").allowsDuplicateKeys(statement.conflict.?))) return error.DuplicateSqlRow;
             var object: std.json.ObjectMap = .empty;
             var json_null_fields: std.ArrayList([]const u8) = .empty;
             for (columns, row, 0..) |column, item, i| {
@@ -546,7 +546,7 @@ pub const Context = struct {
             }
             const identity = key orelse try (self.backend.vtable.generate_row_id orelse return error.SqlRowIdentityRequired)(self.backend.ptr, self.arena);
             if (identity.len == 0 or !std.unicode.utf8ValidateSlice(identity)) return error.InvalidSqlBackendResponse;
-            if ((try keys.getOrPut(self.arena, identity)).found_existing and (statement.conflict == null or !@import("conflict.zig").primary(statement.conflict.?) or statement.conflict.?.assignments.len != 0)) return error.DuplicateSqlRow;
+            if ((try keys.getOrPut(self.arena, identity)).found_existing and (statement.conflict == null or !@import("conflict.zig").allowsDuplicateKeys(statement.conflict.?))) return error.DuplicateSqlRow;
             mutation.* = .{ .key = identity, .expected_version = 0, .row = .{ .object = object }, .json_null_fields = json_null_fields.items };
         }
         try self.checkpoint();

@@ -15,13 +15,23 @@ statement before any mutation.
 - Inner/outer joins with source aliases, derived tables and nonrecursive CTEs;
   grouping, aggregate FILTER/DISTINCT, HAVING, and bounded aggregate ordering.
 - Window ranking, offset/value functions and aggregates with PARTITION BY,
-  ORDER BY, peer-aware RANGE and explicit ROWS frames. Equal sort domains share
+  ORDER BY, peer-aware RANGE, ROWS and GROUPS frames and frame exclusions.
+  Query-local WINDOW definitions support checked inheritance and sort sharing.
+  Equal sort domains share
   sorting; moving aggregates use bounded indexed state. Window evaluation runs
   after grouping/HAVING and before final ordering/limits under the same budget.
 - Equality-correlated EXISTS/NOT EXISTS and scalar subqueries, including direct
   scalar aggregates, lower to grouped hash joins rather than per-row reads.
   All physical tables participate in the same authorized statement capture.
   Scalar subqueries preserve zero-row NULL and SQLSTATE 21000 for multiple rows.
+- Scalar IN/NOT IN subqueries use grouped hash membership and per-correlation
+  total/non-null evidence, preserving empty-set and SQL NULL semantics without
+  duplicating outer rows. Two bounded inner projections share the statement
+  capture; execution never opens one native query per outer row.
+  Side-local computed equality expressions are compiled hash keys too, so
+  expressions such as `o.x + 1 IN (SELECT i.y + 1 ...)` do not degrade to a
+  quadratic residual join. Set `ANTFLY_SQL_MEMBERSHIP_BENCHMARK=1` when running
+  `zig build sql-test` for the 10,000-row fixture (routine coverage uses 512).
 - UNION/INTERSECT/EXCEPT with ALL/distinct multiplicities, INTERSECT precedence,
   parenthesized operands and final ordering/limits. Typed equality keeps JSON
   null distinct from SQL NULL; set operands share the statement memory budget.
@@ -40,7 +50,10 @@ statement before any mutation.
   native tuple codec and generation-bound claim authority, including composite
   keys and native NULL-distinct behavior. Exact claim/absence guards travel with
   the atomic mutation and survive session staging, savepoints, and recovery.
-  Omitted targets and providers without native arbiter coordination fail closed.
+  Targetless `ON CONFLICT DO NOTHING` checks all supported native immediate
+  unique constraints plus `_id`; skipped candidates do not reserve identities
+  against later VALUES rows. Targetless UPDATE, unsupported native constraint
+  forms, and providers without native arbiter coordination fail closed.
 - `DELETE FROM ... [WHERE ...]`.
 - Relational and document INSERT/UPDATE/DELETE `RETURNING` projections, expressions and
   wildcard. Native schema-bound normalization supplies defaults/generated
@@ -66,15 +79,18 @@ explicit `_id`. Integer literals are signed 64-bit values parsed exactly.
 
 ## Deliberate exclusions
 
-Named windows, GROUPS/EXCLUDE frames and DISTINCT window aggregates remain
-unsupported. Subquery IN/ANY/ALL, non-equality correlation, nested subquery
+DISTINCT window aggregates remain unsupported. Subquery ANY/ALL, multi-column
+membership, non-equality correlation, nested subquery
 expressions inside an inner subquery, per-key ORDER/LIMIT, set/group/HAVING/window
 subquery forms, complex aggregate expressions, lazy CASE/COALESCE subquery
 branches, and mutation-expression subqueries
 remain unsupported. EXISTS currently admits literal/field projections; richer
 expressions need a validation-only binding domain to avoid evaluating discarded
-values. Partial/expression/deferrable conflict arbiters, targetless inference and
-SQL-language prepared statements/cursors remain separate capability gates.
+values. Partial/expression/deferrable conflict arbiters and
+SQL-language cursors remain a separate capability gate. Pgwire SQL
+PREPARE/EXECUTE/DEALLOCATE uses connection-owned prepared state shared with
+Parse/Bind, typed scalar argument evaluation, binding identity checks and pull
+execution. This does not expose durable prepared state through stateless HTTP.
 These implemented forms do not constitute the complete S2 parity gate.
 Unsupported tails and additional statements are rejected, never
 ignored. The existing generated grammar remains a syntax oracle, not a

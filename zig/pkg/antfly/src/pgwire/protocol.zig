@@ -13,7 +13,8 @@
 // limitations.
 
 //! PostgreSQL v3 framing and simple/extended-query state machine. Storage and
-//! SQL parsing belong behind backend.zig; this module never rewrites SQL.
+//! query/expression binding belong behind backend.zig. Connection commands own
+//! prepared lifetimes here; this module never interpolates or rewrites SQL.
 const std = @import("std");
 pub const backend = @import("backend.zig");
 const values = @import("values.zig");
@@ -314,6 +315,11 @@ pub const Session = struct {
                 } else {
                     var arena = std.heap.ArenaAllocator.init(self.alloc);
                     defer arena.deinit();
+                    if (try self.sessionCommand(arena.allocator(), statement)) {
+                        if (self.status == .idle) self.clearPortals();
+                        try self.ready();
+                        return;
+                    }
                     if (try self.simpleStream(statement)) {
                         if (self.status == .idle) self.clearPortals();
                         try self.ready();
@@ -505,6 +511,65 @@ pub const Session = struct {
         }
     }
 
+    fn sessionCommand(self: *Session, alloc: std.mem.Allocator, text: []const u8) !bool {
+        const parsed_command = (try @import("session_commands.zig").parse(alloc, text, self.limits.parameters)) orelse return false;
+        if (self.status == .failed) return error.InFailedSqlTransaction;
+        switch (parsed_command) {
+            .prepare => |prepare| {
+                if (self.prepared.contains(prepare.name)) return error.DuplicatePreparedStatement;
+                if (self.prepared.count() >= self.limits.prepared_statements) return error.ProgramLimitExceeded;
+                var arena = std.heap.ArenaAllocator.init(self.alloc);
+                errdefer arena.deinit();
+                const a = arena.allocator();
+                const description = try self.describe(a, prepare.statement, prepare.types);
+                if (prepare.types.len > description.parameter_types.len) return error.InvalidParameter;
+                const oids = try a.alloc(u32, description.parameter_types.len);
+                for (oids, description.parameter_types) |*oid, kind| oid.* = values.oid(kind);
+                const sql = try a.dupe(u8, prepare.statement);
+                const name = try self.alloc.dupe(u8, prepare.name);
+                errdefer self.alloc.free(name);
+                try self.prepared.put(self.alloc, name, .{ .arena = arena, .statement = sql, .parameter_oids = oids, .description = description });
+                // Map ownership has transferred before writing an acknowledgement.
+                // A failed socket is handled by connection cleanup, never replay.
+            },
+            .deallocate => |name| {
+                if (name) |named| {
+                    if (!self.prepared.contains(named)) return error.InvalidStatementName;
+                    self.removePrepared(named);
+                } else {
+                    var iterator = self.prepared.iterator();
+                    while (iterator.next()) |entry| {
+                        self.alloc.free(entry.key_ptr.*);
+                        entry.value_ptr.arena.deinit();
+                    }
+                    self.prepared.clearRetainingCapacity();
+                }
+            },
+            .execute => |execute_command| {
+                const prepared = self.prepared.get(execute_command.name) orelse return error.InvalidStatementName;
+                if (execute_command.expressions.len != prepared.description.parameter_types.len) return error.InvalidParameter;
+                const evaluator = self.source.vtable.evaluate_parameters orelse return error.UnsupportedSqlExecution;
+                self.cancel_requested.store(false, .release);
+                self.executing.store(true, .release);
+                defer self.executing.store(false, .release);
+                const req = self.request(prepared.statement, &.{}, prepared.description.parameter_types);
+                try req.check();
+                const parameters = try evaluator(self.source.context, alloc, self.identity orelse return error.AuthenticationFailed, req, execute_command.expressions);
+                if (parameters.len != prepared.description.parameter_types.len) return error.InvalidParameter;
+                if (try self.simpleStreamParameters(prepared.statement, parameters, prepared.description.parameter_types, prepared.description.binding_guard)) return true;
+                var result = try self.execute(alloc, prepared.statement, parameters, prepared.description.parameter_types, prepared.description.binding_guard);
+                defer result.deinit();
+                if (result.columns.len > 0) try self.rowDescription(result.columns, &.{});
+                if (result.sql_nulls) |flags| if (flags.len != result.rows.len) return error.InvalidResult;
+                for (result.rows, 0..) |row, index| try self.dataRow(result.columns, &.{}, row, if (result.sql_nulls) |flags| flags[index] else null);
+                try self.complete(result);
+                return true;
+            },
+        }
+        try self.complete(.{ .command_tag = if (parsed_command == .prepare) "PREPARE" else "DEALLOCATE", .transaction_status = self.status });
+        return true;
+    }
+
     fn removePrepared(self: *Session, name: []const u8) void {
         if (self.prepared.fetchRemove(name)) |entry| {
             self.alloc.free(entry.key);
@@ -572,19 +637,24 @@ pub const Session = struct {
     }
 
     fn simpleStream(self: *Session, statement: []const u8) !bool {
+        return self.simpleStreamParameters(statement, &.{}, &.{}, null);
+    }
+
+    fn simpleStreamParameters(self: *Session, statement: []const u8, parameters: []const std.json.Value, types: []const backend.Type, binding_guard: ?[]const u8) !bool {
         const open = self.source.vtable.open_stream orelse return false;
         self.cancel_requested.store(false, .release);
         self.executing.store(true, .release);
         defer self.executing.store(false, .release);
-        const req = self.request(statement, &.{}, &.{});
+        var req = self.request(statement, parameters, types);
+        req.binding_guard = binding_guard;
         const stream = (try open(self.source.context, self.alloc, self.identity orelse return error.AuthenticationFailed, req)) orelse return false;
         var portal = Portal{
             .arena = std.heap.ArenaAllocator.init(self.alloc),
             .statement = statement,
-            .parameters = &.{},
-            .types = &.{},
+            .parameters = parameters,
+            .types = types,
             .formats = &.{},
-            .description = .{ .columns = stream.columns },
+            .description = .{ .columns = stream.columns, .parameter_types = types, .binding_guard = binding_guard },
             .stream = stream,
             .stream_opened = true,
         };
@@ -761,6 +831,7 @@ fn sqlstate(err: anyerror) []const u8 {
         error.OutOfMemory, error.ProgramLimitExceeded => "54000",
         error.SyntaxError => "42601",
         error.InvalidSqlSyntax => "42601",
+        error.InFailedSqlTransaction => "25P02",
         error.InvalidSqlParameters, error.InvalidSqlParameter, error.InvalidSqlNumber, error.SqlTypeMismatch, error.InvalidSqlLimit => "22023",
         error.SqlNotNullViolation => "23502",
         error.SqlProgramLimitExceeded, error.SqlResultTooLarge, error.SqlLimitExceeded => "54000",

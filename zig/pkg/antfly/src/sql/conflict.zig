@@ -51,6 +51,10 @@ pub fn primary(clause: ast.Conflict) bool {
     return clause.columns.len == 1 and std.mem.eql(u8, clause.columns[0], "_id");
 }
 
+pub fn allowsDuplicateKeys(clause: ast.Conflict) bool {
+    return clause.assignments.len == 0 and (primary(clause) or clause.columns.len == 0);
+}
+
 /// A retained point snapshot plus an atomic version predicate is optimistic
 /// concurrency control, not a read-then-overwrite. A racing insert/update is a
 /// definite serialization conflict, never an automatically replayed mutation.
@@ -62,6 +66,16 @@ pub fn resolve(context: anytype, table: catalog.Table, clause: ast.Conflict, bin
     if (normalized.len != proposed.len) return error.InvalidSqlBackendResponse;
     const owners = if (!primary(clause)) try (context.backend.vtable.resolve_conflict_owners orelse return error.UnsupportedSqlExecution)(context.backend.ptr, context.arena, table, clause.columns, normalized) else null;
     if (owners) |items| if (items.len != normalized.len) return error.InvalidSqlBackendResponse;
+    if (clause.columns.len == 0) {
+        for (proposed, normalized) |original, value| {
+            if (!std.mem.eql(u8, original.key, value.key) or value.row == null or value.expected_version != 0) return error.InvalidSqlBackendResponse;
+        }
+        return resolveAny(context, table, binding, normalized, owners.?);
+    }
+    return resolvePrepared(context, table, clause, binding, proposed, normalized, owners);
+}
+
+fn resolvePrepared(context: anytype, table: catalog.Table, clause: ast.Conflict, binding: Bound, proposed: []const catalog.Mutation, normalized: []const catalog.Mutation, owners: ?[]const catalog.ConflictOwner) ![]const catalog.Mutation {
     const buffer = try context.arena.alloc(catalog.Mutation, normalized.len);
     var seen: std.StringHashMapUnmanaged(void) = .empty;
     var owner_by_key: std.StringHashMapUnmanaged(catalog.ConflictOwner) = .empty;
@@ -188,4 +202,39 @@ pub fn resolve(context: anytype, table: catalog.Table, clause: ast.Conflict, bin
         mutation.json_null_fields = nulls.items;
     }
     return result;
+}
+
+/// Targetless DO NOTHING arbitrates every native unique generation and the
+/// physical row key. Only accepted rows reserve statement-local identities;
+/// rejected candidates must not shadow later candidates in the VALUES list.
+fn resolveAny(context: anytype, table: catalog.Table, binding: Bound, proposed: []const catalog.Mutation, owners: []const catalog.ConflictOwner) ![]const catalog.Mutation {
+    var accepted_keys: std.StringHashMapUnmanaged(void) = .empty;
+    var accepted_claims: std.StringHashMapUnmanaged(void) = .empty;
+    var result: std.ArrayList(catalog.Mutation) = .empty;
+    for (proposed, owners) |candidate, owner| {
+        try context.checkpoint();
+        if (owner.primary_only) {
+            if (owner.guard != null or owner.key != null or owner.identity != null or owner.identities.len != 0) return error.InvalidSqlBackendResponse;
+        } else if (owner.guard == null or (owner.key != null and owner.identity == null)) return error.InvalidSqlBackendResponse;
+        if (accepted_keys.contains(candidate.key)) continue;
+        const duplicate = for (owner.identities) |identity| {
+            if (accepted_claims.contains(identity)) break true;
+        } else false;
+        if (duplicate) continue;
+        var point = candidate;
+        // A native unique owner alone is sufficient to skip the candidate.
+        // Retain its point fence as well as all native claim comparisons.
+        if (owner.key) |key| point.key = key;
+        const resolved = try resolvePrepared(context, table, .{ .columns = &.{"_id"} }, binding, &.{point}, &.{point}, null);
+        if (resolved.len != 1) return error.InvalidSqlBackendResponse;
+        var mutation = resolved[0];
+        if (owner.key != null and !mutation.predicate_only) return error.SqlWriteConflict;
+        mutation.conflict_guard = owner.guard;
+        try result.append(context.arena, mutation);
+        if (!mutation.predicate_only) {
+            try accepted_keys.put(context.arena, candidate.key, {});
+            for (owner.identities) |identity| try accepted_claims.put(context.arena, identity, {});
+        }
+    }
+    return result.items;
 }

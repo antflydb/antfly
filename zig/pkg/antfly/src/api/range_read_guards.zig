@@ -125,6 +125,25 @@ test "distributed txn SQL range observations retain first snapshot and reject ow
                 value.deinit();
                 return error.TestExpectedError;
             } else |err| if (err != error.CatalogGenerationChanged) return err;
+            // Equal counter values never make a restored catalog or a split
+            // owner interchangeable with the snapshot's original authority.
+            for (0..3) |transition| {
+                changed = first;
+                switch (transition) {
+                    0 => changed.fence.metadata_incarnation = @splat('2'),
+                    1 => changed.fence.topology_epoch += 1,
+                    2 => {
+                        changed.fence.route.range_id += 1;
+                        changed.fence.route.identity_namespace.range_id = changed.fence.route.range_id;
+                    },
+                    else => unreachable,
+                }
+                if (merge(alloc, initial.value, &.{changed})) |unexpected| {
+                    var value = unexpected;
+                    value.deinit();
+                    return error.TestExpectedError;
+                } else |err| if (err != error.CatalogGenerationChanged) return err;
+            }
             const bytes = try std.json.Stringify.valueAlloc(alloc, again.value, .{});
             defer alloc.free(bytes);
             var decoded = try std.json.parseFromSlice([]const OwnerRangeProof, alloc, bytes, .{});

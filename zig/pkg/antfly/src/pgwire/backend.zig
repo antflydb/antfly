@@ -112,6 +112,9 @@ pub const Backend = struct {
         authenticate: *const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8) anyerror!Identity,
         describe: *const fn (*anyopaque, std.mem.Allocator, Identity, Request) anyerror!Description,
         execute: *const fn (*anyopaque, std.mem.Allocator, Identity, Request) anyerror!Result,
+        /// Evaluate SQL EXECUTE arguments as scalar expressions without any
+        /// catalog/table access. Values are owned by the supplied allocator.
+        evaluate_parameters: ?*const fn (*anyopaque, std.mem.Allocator, Identity, Request, []const []const u8) anyerror![]const std.json.Value = null,
         /// Optional owned read-only pull execution. Null declines a blocking
         /// shape before execution. Each page is independently owned; release it
         /// before the next pull or closing the stream. Never use for mutations.

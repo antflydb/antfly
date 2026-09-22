@@ -458,6 +458,13 @@ const Builder = struct {
             }
         }
         result.order_by = orders;
+        const windows = try self.alloc.alloc(ast.NamedWindow, statement.windows.len);
+        for (statement.windows, windows) |definition, *out| {
+            const wrapped = try self.scalarNode(.{ .call = .{ .name = "row_number", .args = &.{}, .window = definition.window } });
+            const rewritten = try self.expression(source.columns, wrapped, &.{});
+            out.* = .{ .name = definition.name, .window = rewritten.call.window.? };
+        }
+        result.windows = windows;
         if (result.predicate) |predicate_| {
             const wrapper = try self.alloc.create(ast.Predicate);
             wrapper.* = .{ .scalar = if (self.shape_only) try self.shapePredicate(source.columns, predicate_) else try @import("bound_scalars.zig").predicateScalar(self.alloc, try self.virtualTable(source.columns), predicate_) };
@@ -629,15 +636,41 @@ const Builder = struct {
             try self.joinKeys(binary.right, left, right, left_keys, right_keys);
             return;
         }
-        if (binary.op != .eq or binary.left.* != .column or binary.right.* != .column) return;
+        if (binary.op != .eq) return;
         var left_node = binary.left;
         var right_node = binary.right;
-        if (!hasInternal(left.columns, left_node.column)) std.mem.swap(*const ast.Scalar, &left_node, &right_node);
-        if (!hasInternal(left.columns, left_node.column) or !hasInternal(right.columns, right_node.column)) return;
+        if (!sideLocal(left.columns, left_node) or !sideLocal(right.columns, right_node)) std.mem.swap(*const ast.Scalar, &left_node, &right_node);
+        if (!sideLocal(left.columns, left_node) or !sideLocal(right.columns, right_node)) return;
         try left_keys.append(self.alloc, try scalar.bind(self.alloc, left_node, try self.scalarColumns(left.columns), self.parameters, .{}));
         try right_keys.append(self.alloc, try scalar.bind(self.alloc, right_node, try self.scalarColumns(right.columns), self.parameters, .{}));
     }
 };
+/// Expressions whose inputs belong to one side are valid hash keys too.
+/// Restricting extraction to bare columns makes computed IN/join operands
+/// unexpectedly quadratic despite a perfectly usable equality key.
+fn sideLocal(columns: []const Column, input: *const ast.Scalar) bool {
+    return switch (input.*) {
+        .literal => true,
+        .column => |name| hasInternal(columns, name),
+        .unary => |part| sideLocal(columns, part.operand),
+        .cast => |part| sideLocal(columns, part.operand),
+        .binary => |part| sideLocal(columns, part.left) and sideLocal(columns, part.right),
+        .call => |part| blk: {
+            if (part.subquery != null or part.window != null or part.star or part.distinct or part.filter != null) break :blk false;
+            for (part.args) |arg| if (!sideLocal(columns, arg)) break :blk false;
+            break :blk true;
+        },
+        .case_when => |part| blk: {
+            for (part.branches) |branch| if (!sideLocal(columns, branch.condition) or !sideLocal(columns, branch.value)) break :blk false;
+            break :blk if (part.otherwise) |other| sideLocal(columns, other) else true;
+        },
+        .in_list => |part| blk: {
+            if (!sideLocal(columns, part.operand)) break :blk false;
+            for (part.values) |value| if (!sideLocal(columns, value)) break :blk false;
+            break :blk true;
+        },
+    };
+}
 fn hasInternal(columns: []const Column, name: []const u8) bool {
     for (columns) |column| if (std.mem.eql(u8, column.internal, name)) return true;
     return false;
