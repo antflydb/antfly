@@ -30,6 +30,8 @@ import (
 	"fmt"
 	"runtime"
 	"strings"
+	"sync"
+	"time"
 	"unsafe"
 )
 
@@ -65,6 +67,10 @@ const (
 
 // OpenOptions configures OpenWithOptions and CreateWithOptions.
 //
+// BusyTimeout, like sqlite3_busy_timeout, keeps retrying a writer open while
+// another process or handle holds the database's writer lock. Zero fails
+// immediately with Busy. The C ABI takes whole milliseconds.
+//
 // HostBudgetMB, BackendBudgetMB, CombinedBudgetMB, KVBudgetMB,
 // ScratchBudgetMB, and ProcessMemoryBudgetMB are explicit resource-budget
 // overrides for the local embedded inference runtime (0 means the embedded
@@ -90,6 +96,7 @@ type OpenOptions struct {
 	KVBudgetMB                uint32
 	ScratchBudgetMB           uint32
 	ProcessMemoryBudgetMB     uint32
+	BusyTimeout               time.Duration
 }
 
 // TTLCleanupOptions configures the optional Lite TTL cleanup runtime.
@@ -111,8 +118,28 @@ type WriteIntent struct {
 }
 
 // DB is an embedded Antfly Lite database handle.
+//
+// A DB is safe for concurrent use by multiple goroutines, like *sql.DB.
+// libantfly runs in serialized threading mode (see ThreadingMode): reads run
+// in parallel, writes on one handle queue behind each other instead of
+// failing with Busy, and schema or index changes wait for in-flight calls.
+// Close waits for in-flight calls to finish; calls made after Close return
+// InvalidArgument.
 type DB struct {
+	// mu is held shared for the duration of every C call and exclusively by
+	// Close, so the handle is never freed under an in-flight call.
+	mu     sync.RWMutex
 	handle unsafe.Pointer
+}
+
+// ThreadingSerialized is the only threading mode libantfly provides: any
+// goroutine may call any method on a DB concurrently.
+const ThreadingSerialized uint32 = C.ANTFLY_THREADING_SERIALIZED
+
+// ThreadingMode reports the loaded libantfly threading contract, like
+// sqlite3_threadsafe().
+func ThreadingMode() uint32 {
+	return uint32(C.antfly_threading_mode())
 }
 
 // ABIVersion returns the loaded Antfly C ABI version.
@@ -256,6 +283,9 @@ func openWithOptions(path string, opts OpenOptions, create bool) (*DB, error) {
 	cOpts.inference_kv_budget_mb = C.uint32_t(opts.KVBudgetMB)
 	cOpts.inference_scratch_budget_mb = C.uint32_t(opts.ScratchBudgetMB)
 	cOpts.inference_process_memory_budget_mb = C.uint32_t(opts.ProcessMemoryBudgetMB)
+	if opts.BusyTimeout > 0 {
+		cOpts.busy_timeout_ms = C.uint64_t((opts.BusyTimeout + time.Millisecond - 1) / time.Millisecond)
+	}
 	if opts.GeneratedEnrichmentReplay {
 		cOpts.flags |= C.ANTFLY_LITE_OPEN_FLAG_GENERATED_ENRICHMENT_REPLAY
 	}
@@ -295,24 +325,38 @@ func (db *DB) closeFinalizer() {
 	_ = db.Close()
 }
 
-// Close releases the embedded database handle. It is safe to call more than
-// once.
+// Close releases the embedded database handle, waiting for in-flight calls
+// on other goroutines to finish first. It is safe to call more than once and
+// concurrently.
 func (db *DB) Close() error {
-	if db == nil || db.handle == nil {
+	if db == nil {
 		return nil
 	}
+	db.mu.Lock()
 	handle := db.handle
 	db.handle = nil
+	db.mu.Unlock()
+	if handle == nil {
+		return nil
+	}
 	runtime.SetFinalizer(db, nil)
 	C.antfly_db_close(handle)
 	return nil
 }
 
-func (db *DB) requireHandle() (unsafe.Pointer, error) {
-	if db == nil || db.handle == nil {
-		return nil, InvalidArgument
+// acquire returns the live handle and holds it open until release is called.
+// Callers must not call another acquiring method before releasing: a pending
+// Close would block the nested acquire and deadlock.
+func (db *DB) acquire() (handle unsafe.Pointer, release func(), err error) {
+	if db == nil {
+		return nil, nil, InvalidArgument
 	}
-	return db.handle, nil
+	db.mu.RLock()
+	if db.handle == nil {
+		db.mu.RUnlock()
+		return nil, nil, InvalidArgument
+	}
+	return db.handle, db.mu.RUnlock, nil
 }
 
 // StatusJSON returns a JSON status document for the Lite database.
@@ -456,10 +500,11 @@ func (db *DB) CopyStableSnapshotJSON(destPath string, replace bool) ([]byte, err
 	if !strings.HasSuffix(destPath, ".aflite") {
 		return nil, InvalidArgument
 	}
-	handle, err := db.requireHandle()
+	handle, release, err := db.acquire()
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 	defer runtime.KeepAlive(db)
 	cDest := C.CString(destPath)
 	defer C.free(unsafe.Pointer(cDest))
@@ -491,10 +536,11 @@ func CopyStableSnapshotFileJSON(srcPath, destPath string, replace bool) ([]byte,
 
 // Batch applies write intents at timestampNS.
 func (db *DB) Batch(writes []WriteIntent, timestampNS uint64) error {
-	handle, err := db.requireHandle()
+	handle, release, err := db.acquire()
 	if err != nil {
 		return err
 	}
+	defer release()
 	defer runtime.KeepAlive(db)
 	cWrites, cleanup, err := makeCWriteIntents(writes)
 	if err != nil {
@@ -550,10 +596,11 @@ func (db *DB) SetSchemaJSON(schema []byte) error {
 
 // RunUntilIdle drains pending enrichment and index work.
 func (db *DB) RunUntilIdle() error {
-	handle, err := db.requireHandle()
+	handle, release, err := db.acquire()
 	if err != nil {
 		return err
 	}
+	defer release()
 	defer runtime.KeepAlive(db)
 	return check(C.antfly_lite_run_until_idle(handle))
 }
@@ -589,10 +636,11 @@ func (db *DB) AddIndexJSON(config []byte) error {
 
 // DeleteIndex deletes an index by name and reports whether it existed.
 func (db *DB) DeleteIndex(name string) (bool, error) {
-	handle, err := db.requireHandle()
+	handle, release, err := db.acquire()
 	if err != nil {
 		return false, err
 	}
+	defer release()
 	defer runtime.KeepAlive(db)
 	input, cleanup := makeCStringSlice([]byte(name))
 	defer cleanup()
@@ -621,10 +669,11 @@ func (db *DB) AddEnrichmentJSON(config []byte) error {
 // DeleteEnrichment deletes an enrichment by kind and name and reports whether
 // it existed.
 func (db *DB) DeleteEnrichment(kind, name string) (bool, error) {
-	handle, err := db.requireHandle()
+	handle, release, err := db.acquire()
 	if err != nil {
 		return false, err
 	}
+	defer release()
 	defer runtime.KeepAlive(db)
 	cKind, cleanupKind := makeCStringSlice([]byte(kind))
 	defer cleanupKind()
@@ -777,10 +826,11 @@ func (db *DB) MatchPatternJSON(request []byte) ([]byte, error) {
 }
 
 func (db *DB) readBuffer(fn func(unsafe.Pointer, *C.antfly_buffer) C.antfly_error_code) ([]byte, error) {
-	handle, err := db.requireHandle()
+	handle, release, err := db.acquire()
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 	defer runtime.KeepAlive(db)
 	var out C.antfly_buffer
 	if err := check(fn(handle, &out)); err != nil {
@@ -790,10 +840,11 @@ func (db *DB) readBuffer(fn func(unsafe.Pointer, *C.antfly_buffer) C.antfly_erro
 }
 
 func (db *DB) withInput(input []byte, fn func(unsafe.Pointer, C.antfly_slice) C.antfly_error_code) error {
-	handle, err := db.requireHandle()
+	handle, release, err := db.acquire()
 	if err != nil {
 		return err
 	}
+	defer release()
 	defer runtime.KeepAlive(db)
 	cInput, cleanup := makeCStringSlice(input)
 	defer cleanup()
@@ -801,10 +852,11 @@ func (db *DB) withInput(input []byte, fn func(unsafe.Pointer, C.antfly_slice) C.
 }
 
 func (db *DB) withInputOutput(input []byte, fn func(unsafe.Pointer, C.antfly_slice, *C.antfly_buffer) C.antfly_error_code) ([]byte, error) {
-	handle, err := db.requireHandle()
+	handle, release, err := db.acquire()
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 	defer runtime.KeepAlive(db)
 	cInput, cleanup := makeCStringSlice(input)
 	defer cleanup()
@@ -821,10 +873,11 @@ func (db *DB) withStringInputOutput(input string, fn func(unsafe.Pointer, C.antf
 }
 
 func (db *DB) graphLookup(indexName, key, edgeType string, direction uint8, fn func(unsafe.Pointer, C.antfly_slice, C.antfly_slice, C.antfly_slice, C.uint8_t, *C.antfly_buffer) C.antfly_error_code) ([]byte, error) {
-	handle, err := db.requireHandle()
+	handle, release, err := db.acquire()
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 	defer runtime.KeepAlive(db)
 	cIndex, cleanupIndex := makeCStringSlice([]byte(indexName))
 	defer cleanupIndex()

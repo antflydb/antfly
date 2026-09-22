@@ -35,10 +35,11 @@ const (
 
 // BeginTransaction starts a local transaction with an explicit transaction ID.
 func (db *DB) BeginTransaction(txnID TxnID, timestampNS uint64, participants []string) error {
-	handle, err := db.requireHandle()
+	handle, release, err := db.acquire()
 	if err != nil {
 		return err
 	}
+	defer release()
 	defer runtime.KeepAlive(db)
 	cParticipants, cleanup, err := makeCParticipantSlices(participants)
 	if err != nil {
@@ -57,10 +58,11 @@ func (db *DB) BeginTransaction(txnID TxnID, timestampNS uint64, participants []s
 
 // WriteTransaction appends write intents to an open local transaction.
 func (db *DB) WriteTransaction(txnID TxnID, writes []WriteIntent) error {
-	handle, err := db.requireHandle()
+	handle, release, err := db.acquire()
 	if err != nil {
 		return err
 	}
+	defer release()
 	defer runtime.KeepAlive(db)
 	cWrites, cleanup, err := makeCWriteIntents(writes)
 	if err != nil {
@@ -80,10 +82,11 @@ func (db *DB) WriteTransaction(txnID TxnID, writes []WriteIntent) error {
 
 // ResolveTransaction resolves transaction intents as committed or aborted.
 func (db *DB) ResolveTransaction(txnID TxnID, status TxnStatus, commitVersion uint64) error {
-	handle, err := db.requireHandle()
+	handle, release, err := db.acquire()
 	if err != nil {
 		return err
 	}
+	defer release()
 	defer runtime.KeepAlive(db)
 	return check(C.antfly_db_resolve_intents(
 		handle,
@@ -95,10 +98,11 @@ func (db *DB) ResolveTransaction(txnID TxnID, status TxnStatus, commitVersion ui
 
 // TransactionStatus returns the current transaction lifecycle state.
 func (db *DB) TransactionStatus(txnID TxnID) (TxnStatus, error) {
-	handle, err := db.requireHandle()
+	handle, release, err := db.acquire()
 	if err != nil {
 		return 0, err
 	}
+	defer release()
 	defer runtime.KeepAlive(db)
 	var status C.uint8_t
 	if err := check(C.antfly_db_get_transaction_status(handle, cTxnIDPtr(txnID), &status)); err != nil {
@@ -109,10 +113,11 @@ func (db *DB) TransactionStatus(txnID TxnID) (TxnStatus, error) {
 
 // CommitVersion returns the commit version recorded for a committed transaction.
 func (db *DB) CommitVersion(txnID TxnID) (uint64, error) {
-	handle, err := db.requireHandle()
+	handle, release, err := db.acquire()
 	if err != nil {
 		return 0, err
 	}
+	defer release()
 	defer runtime.KeepAlive(db)
 	var version C.uint64_t
 	if err := check(C.antfly_db_get_commit_version(handle, cTxnIDPtr(txnID), &version)); err != nil {

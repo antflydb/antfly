@@ -22,8 +22,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/antflydb/antfly/go/pkg/lite"
 	"github.com/antflydb/antfly/go/pkg/docsaf"
+	"github.com/antflydb/antfly/go/pkg/lite"
 )
 
 // corpusIncludes selects Antfly's own design docs and work log, relative to

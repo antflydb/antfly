@@ -74,6 +74,7 @@ type InferenceStatus struct {
 // Capabilities describes the Lite feature contract advertised by a handle.
 type Capabilities struct {
 	FreestandingBuild                  bool     `json:"freestanding_build"`
+	Threading                          string   `json:"threading"`
 	HostedProfile                      bool     `json:"hosted_profile"`
 	ManualMaintenance                  bool     `json:"manual_maintenance"`
 	BackgroundEnrichmentRuntime        bool     `json:"background_enrichment_runtime"`

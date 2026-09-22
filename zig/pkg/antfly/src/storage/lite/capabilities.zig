@@ -71,6 +71,10 @@ const hosted_freestanding_available_inference_modes = [_][]const u8{
 
 pub const Capabilities = struct {
     freestanding_build: bool = builtin.os.tag == .freestanding,
+    // C ABI threading contract, like sqlite3_threadsafe(): "serialized"
+    // means any thread may call any function on a handle concurrently. See
+    // zig/CAPI.md "Thread Safety".
+    threading: []const u8 = "serialized",
     hosted_profile: bool = false,
     manual_maintenance: bool = false,
     background_enrichment_runtime: bool = true,

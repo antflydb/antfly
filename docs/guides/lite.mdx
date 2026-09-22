@@ -297,6 +297,8 @@ func main() {
 
 `Create` is the explicit first-use path; `Open` takes an existing file and never creates or upgrades one. Constants such as `lite.InferenceModeCallerSuppliedArtifacts` and `lite.InferenceModeDisabledDeferred` let you branch on status without hard-coding strings. Building from the source tree means building the C ABI first (see below, then `go test -tags libantfly ./...` in `go/pkg/lite`). Two runnable templates live in the repository: `examples/antfly-lite-go` (create, write, lookup, status, backup) and `examples/antfly-lite-retrieval-go` (schema, full-text and dense indexes with caller-supplied embeddings, hybrid search, backup). Both are gated by `zig build lite-test` against the built `libantfly`.
 
+A `*lite.DB` is safe to share across goroutines, like `*sql.DB`. Searches and lookups run in parallel with each other and with writes; concurrent `Batch` calls on one handle queue rather than fail. Only one writer handle can have a file open at a time, including across processes. Set `OpenOptions.BusyTimeout` to wait for the other writer to close instead of failing immediately with `lite.Busy`.
+
 ## Building from Source
 
 From the `zig` directory, `zig build lite` installs the Lite-only CLI as `zig-out/bin/antfly` together with the `libantfly` library and its C header. It reuses the standalone runtime archives, including the API and inference runtimes that `lite serve` needs, and runs no tests. For the full Antfly CLI with the Lite commands and the C library, use the existing targets:

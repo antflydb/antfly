@@ -107,6 +107,21 @@ a `LocalRuntimeConfigured` handle that needs Metal/CUDA/ONNX/PJRT models. See
 `zig/LITE.md`'s "Local Embedded Inference" section for the full resolution
 order and rationale.
 
+### Concurrency
+
+A `*DB` is safe for concurrent use by multiple goroutines, like `*sql.DB`;
+share one handle rather than opening one per goroutine. `libantfly` runs in
+serialized threading mode (`ThreadingMode() == ThreadingSerialized`): reads
+such as `SearchJSON`, `LookupJSON`, and `ScanJSON` run in parallel with each
+other and with writes, `Batch` and transaction calls on one handle queue
+instead of failing with `Busy`, and schema or index changes wait for in-flight
+calls. `Close` waits for in-flight calls; calls after it return
+`InvalidArgument`. See `zig/CAPI.md` "Thread Safety" for the full contract.
+
+Only one writer handle may be open per file at a time, across processes. Set
+`OpenOptions.BusyTimeout` to wait for another writer to close instead of
+failing immediately with `Busy`, like `sqlite3_busy_timeout`.
+
 Use `BeginTransaction`, `WriteTransaction`, `ResolveTransaction`,
 `TransactionStatus`, and `CommitVersion` when an embedded application needs the
 local transaction/OCC path exposed by the Antfly C ABI.

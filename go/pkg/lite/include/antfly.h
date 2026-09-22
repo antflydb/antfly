@@ -134,7 +134,10 @@ typedef struct antfly_open_options {
     uint64_t ttl_cleanup_lease_ttl_ms;
     uint64_t ttl_cleanup_interval_ms;
     uint64_t ttl_cleanup_grace_period_ns;
-    uint64_t reserved[8];
+    /* Milliseconds to keep retrying while another writer holds the writer
+     * lock (ANTFLY_BUSY), like sqlite3_busy_timeout. 0 fails immediately. */
+    uint64_t busy_timeout_ms;
+    uint64_t reserved[7];
 } antfly_open_options;
 
 typedef struct antfly_lite_open_options {
@@ -162,7 +165,10 @@ typedef struct antfly_lite_open_options {
     uint32_t inference_combined_budget_mb;
     uint32_t inference_kv_budget_mb;
     uint32_t inference_scratch_budget_mb;
-    uint64_t reserved[8];
+    /* Milliseconds to keep retrying while another writer holds the writer
+     * lock (ANTFLY_BUSY), like sqlite3_busy_timeout. 0 fails immediately. */
+    uint64_t busy_timeout_ms;
+    uint64_t reserved[7];
 } antfly_lite_open_options;
 
 /*
@@ -283,6 +289,15 @@ const char *antfly_error_code_name(antfly_error_code code);
 const char *antfly_error_code_description(antfly_error_code code);
 antfly_error_code antfly_open_options_init(antfly_open_options *options);
 antfly_error_code antfly_lite_open_options_init(antfly_lite_open_options *options);
+
+/*
+ * Threading contract, like sqlite3_threadsafe(). ANTFLY_THREADING_SERIALIZED
+ * means any thread may call any function on any handle concurrently: reads
+ * run in parallel, writes on one handle queue behind each other, and schema
+ * or admin changes wait for in-flight calls. See zig/CAPI.md "Thread Safety".
+ */
+#define ANTFLY_THREADING_SERIALIZED 1u
+uint32_t antfly_threading_mode(void);
 
 /*
  * Storage-neutral embedded opens. ANTFLY_STORAGE_KIND_DIRECTORY opens a normal

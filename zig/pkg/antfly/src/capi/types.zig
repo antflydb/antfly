@@ -40,6 +40,8 @@ pub const Buffer = extern struct {
     len: usize = 0,
 };
 
+pub const threading_serialized: u32 = 1;
+
 pub const lite_open_mode_writer: u32 = 0;
 pub const lite_open_mode_readonly: u32 = 1;
 pub const lite_open_mode_status_only: u32 = 2;
@@ -84,7 +86,12 @@ pub const OpenOptions = extern struct {
     ttl_cleanup_lease_ttl_ms: u64 = 0,
     ttl_cleanup_interval_ms: u64 = 0,
     ttl_cleanup_grace_period_ns: u64 = 0,
-    reserved: [8]u64 = .{0} ** 8,
+    // Milliseconds to keep retrying an open while another writer holds the
+    // database's writer lock (ANTFLY_BUSY), like sqlite3_busy_timeout. 0
+    // fails immediately. Carved from the first reserved word, so the struct
+    // size is unchanged and older callers, which zero it, keep failing fast.
+    busy_timeout_ms: u64 = 0,
+    reserved: [7]u64 = .{0} ** 7,
 };
 
 pub const LiteOpenOptions = extern struct {
@@ -115,7 +122,12 @@ pub const LiteOpenOptions = extern struct {
     inference_combined_budget_mb: u32 = 0,
     inference_kv_budget_mb: u32 = 0,
     inference_scratch_budget_mb: u32 = 0,
-    reserved: [8]u64 = .{0} ** 8,
+    // Milliseconds to keep retrying an open while another writer holds the
+    // database's writer lock (ANTFLY_BUSY), like sqlite3_busy_timeout. 0
+    // fails immediately. Carved from the first reserved word, so the struct
+    // size is unchanged and older callers, which zero it, keep failing fast.
+    busy_timeout_ms: u64 = 0,
+    reserved: [7]u64 = .{0} ** 7,
 };
 
 pub const DenseSearchHit = extern struct {

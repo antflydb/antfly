@@ -637,7 +637,10 @@ Antfly Lite should match the familiar embedded database model:
 - Cross-process locking for the database path.
 - Read-only opens for tooling and inspection.
 - Clear `ANTFLY_BUSY` errors when another process or in-process write handle
-  owns the writer lock.
+  owns the writer lock, or an optional `busy_timeout_ms` wait for it.
+- Serialized threading within a process: one handle may be shared by any
+  number of threads, with reads running in parallel and alongside writes. See
+  `CAPI.md` "Thread Safety" for the per-call access classes.
 
 The CLI should expose this plainly:
 
