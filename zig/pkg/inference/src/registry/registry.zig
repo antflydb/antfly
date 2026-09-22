@@ -22,7 +22,12 @@ const projector_format = @import("../architectures/projector_format.zig");
 const gguf_format = @import("../gguf/format.zig");
 const gguf_writer = @import("../gguf/writer.zig");
 const manifest_mod = @import("../models/manifest.zig");
+const gliner_boundary = @import("../models/gliner_boundary.zig");
+const gliner_qualification = @import("../models/gliner_boundary_qualification.zig");
+const boundary_bundle = @import("../models/gliner_boundary_bundle.zig");
+const safetensors_mod = @import("../models/safetensors.zig");
 const managed_receipt = @import("managed_receipt.zig");
+const c_file = @import("../util/c_file.zig");
 pub const download = @import("download.zig");
 pub const qwen3vl_catalog = @import("qwen3vl_catalog.zig");
 pub const qwen3_embedding_catalog = @import("qwen3_embedding_catalog.zig");
@@ -33,11 +38,14 @@ pub const ModelKind = enum {
     chunker,
     reranker,
     generator,
-    recognizer,
     classifier,
     rewriter,
     reader,
     transcriber,
+    /// GLiNER-style entity/relation/classification extraction models. Also
+    /// the discovery hint for the legacy `extractors/` subdirectory layout
+    /// (`inferModelKindFromPath`/`discoverLegacy`), so both the manifest-
+    /// declared and path-inferred routes to this kind now agree on one name.
     extractor,
 };
 
@@ -971,7 +979,7 @@ fn modelKindFromManifestType(model_type: manifest_mod.ModelType) ModelKind {
         .chunker => .chunker,
         .reranker => .reranker,
         .generator => .generator,
-        .recognizer => .recognizer,
+        .extractor => .extractor,
         .classifier => .classifier,
         .rewriter => .rewriter,
         .reader => .reader,
@@ -1014,7 +1022,7 @@ fn modelTypeName(model_type: manifest_mod.ModelType) []const u8 {
         .chunker => "chunker",
         .reranker => "reranker",
         .generator => "generator",
-        .recognizer => "recognizer",
+        .extractor => "extractor",
         .classifier => "classifier",
         .rewriter => "rewriter",
         .reader => "reader",
@@ -1035,12 +1043,59 @@ fn appendUniqueOwnedString(
     try items.append(allocator, try allocator.dupe(u8, trimmed));
 }
 
+/// True only if the actual bytes just staged to `dest_dir`/the manifest's
+/// resolved paths match a reviewed row in
+/// models/gliner_boundary_qualification.zig's production table exactly:
+/// backbone, precision, and every one of the five weight/sidecar digests.
+/// This is a deliberate, one-time file read done at pull time -- it must
+/// never be called from a per-request listing path. Any missing file,
+/// unrecognized architecture, or parse failure fails closed to `false`
+/// rather than erroring the whole pull; a genuinely broken download is
+/// caught by the normal artifact validation elsewhere.
+///
+/// A directory produced by `antfly-inference-gliner25-convert` carries its
+/// own `gliner_boundary_bundle` receipt (`antfly_inference_bundle.json`),
+/// which is the only source of truth for which precision its `model.gguf`
+/// actually stores -- the manifest's `gguf_path` alone does not say. A plain
+/// HuggingFace pull never writes that receipt and is always the published
+/// fp32 `model.safetensors` checkpoint, so its identity is derived from that
+/// file directly, unchanged from before this function recognized converted
+/// bundles.
+fn boundaryIdentityIsQualified(allocator: std.mem.Allocator, manifest: *const manifest_mod.ModelManifest) bool {
+    if (manifest.gliner_architecture != .boundary) return false;
+    const config = manifest.gliner_boundary_config orelse return false;
+    const sidecars = manifest.boundarySidecarDigests() catch return false;
+    if (manifest.gliner_boundary_bundle) |receipt| {
+        const weight_path = manifest.gguf_path orelse return false;
+        var region = c_file.MmapRegion.init(allocator, weight_path) catch return false;
+        defer region.deinit();
+        const identity = boundary_bundle.Identity{
+            .backbone = config.backbone,
+            .precision = receipt.value.precision,
+            .weight = boundary_bundle.Digest.of(region.data),
+            .sidecars = sidecars,
+        };
+        return gliner_qualification.hasQualifiedIdentity(identity);
+    }
+    const weight_path = manifest.safetensors_path orelse return false;
+    var reader = safetensors_mod.MMapReader.openFileAbsolute(allocator, weight_path) catch return false;
+    defer reader.deinit();
+    const identity = boundary_bundle.Identity{
+        .backbone = config.backbone,
+        .precision = .fp32,
+        .weight = boundary_bundle.Digest.of(reader.file_bytes),
+        .sidecars = sidecars,
+    };
+    return gliner_qualification.hasQualifiedIdentity(identity);
+}
+
 fn appendManifestTasks(
     allocator: std.mem.Allocator,
     manifest: *const manifest_mod.ModelManifest,
     tasks: *std.ArrayListUnmanaged([]const u8),
+    qualified_boundary: bool,
 ) !void {
-    if (!manifest.hasSupportedGlinerRuntime()) return;
+    if (!manifest.hasSupportedGlinerRuntime() and !qualified_boundary) return;
     for (manifest.tasks) |task| try appendUniqueOwnedString(allocator, tasks, task);
 
     switch (manifest.model_type) {
@@ -1048,22 +1103,23 @@ fn appendManifestTasks(
         .chunker => try appendUniqueOwnedString(allocator, tasks, "chunk"),
         .reranker => try appendUniqueOwnedString(allocator, tasks, "rerank"),
         .generator => try appendUniqueOwnedString(allocator, tasks, "generate"),
-        .recognizer => try appendUniqueOwnedString(allocator, tasks, "extract"),
+        .extractor => try appendUniqueOwnedString(allocator, tasks, "extract"),
         .classifier => try appendUniqueOwnedString(allocator, tasks, "classify"),
         .rewriter => try appendUniqueOwnedString(allocator, tasks, "rewrite"),
         .reader => try appendUniqueOwnedString(allocator, tasks, "read"),
         .transcriber => try appendUniqueOwnedString(allocator, tasks, "transcribe"),
     }
 
-    try appendSupplementalTasks(allocator, manifest, tasks);
+    try appendSupplementalTasks(allocator, manifest, tasks, qualified_boundary);
 }
 
 fn appendSupplementalTasks(
     allocator: std.mem.Allocator,
     manifest: *const manifest_mod.ModelManifest,
     tasks: *std.ArrayListUnmanaged([]const u8),
+    qualified_boundary: bool,
 ) !void {
-    if (!manifest.hasSupportedGlinerRuntime()) return;
+    if (!manifest.hasSupportedGlinerRuntime() and !qualified_boundary) return;
     if (manifest.hasCapability("extraction")) {
         try appendUniqueOwnedString(allocator, tasks, "extract");
     }
@@ -1078,7 +1134,7 @@ test "gliner boundary registry withholds tasks until runtime support exists" {
     var declared_capabilities = [_][]const u8{ "classification", "relations", "extraction" };
     var manifest = manifest_mod.ModelManifest{
         .allocator = allocator,
-        .model_type = .recognizer,
+        .model_type = .extractor,
         .gliner_architecture = .boundary,
         .tasks = &declared_tasks,
         .capabilities = &declared_capabilities,
@@ -1093,11 +1149,72 @@ test "gliner boundary registry withholds tasks until runtime support exists" {
         for (capabilities.items) |capability| allocator.free(capability);
         capabilities.deinit(allocator);
     }
-    try appendManifestTasks(allocator, &manifest, &tasks);
-    try appendSupplementalTasks(allocator, &manifest, &tasks);
-    try appendInferredCapabilities(allocator, &manifest, &declared_tasks, &capabilities);
+    // An unreviewed digest/variant: architecture is recognized as boundary,
+    // but nothing established that THIS artifact matches a production row,
+    // so synthesis must still withhold tasks and capabilities.
+    try appendManifestTasks(allocator, &manifest, &tasks, false);
+    try appendSupplementalTasks(allocator, &manifest, &tasks, false);
+    try appendInferredCapabilities(allocator, &manifest, &declared_tasks, &capabilities, false);
     try std.testing.expectEqual(@as(usize, 0), tasks.items.len);
     try std.testing.expectEqual(@as(usize, 0), capabilities.items.len);
+}
+
+test "gliner boundary registry serves tasks and derived capabilities once the artifact is qualified" {
+    const allocator = std.testing.allocator;
+    var declared_tasks = [_][]const u8{};
+    var declared_capabilities = [_][]const u8{};
+    var config = gliner_boundary.HeadConfig{};
+    var manifest = manifest_mod.ModelManifest{
+        .allocator = allocator,
+        .model_type = .extractor,
+        .gliner_architecture = .boundary,
+        .tasks = &declared_tasks,
+        .capabilities = &declared_capabilities,
+        .gliner_boundary_config = .{
+            .version = gliner_boundary.config_version,
+            .architecture_version = gliner_boundary.architecture_version,
+            .max_len = 4096,
+            .backbone = .base,
+            .head = config,
+            .encoder = undefined,
+        },
+    };
+    var tasks = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (tasks.items) |task| allocator.free(task);
+        tasks.deinit(allocator);
+    }
+    var capabilities = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (capabilities.items) |capability| allocator.free(capability);
+        capabilities.deinit(allocator);
+    }
+    // Caller has independently matched this artifact's exact consumed bytes
+    // against a production row (see boundaryIdentityIsQualified below); only
+    // then may synthesis advertise it.
+    try appendManifestTasks(allocator, &manifest, &tasks, true);
+    try appendInferredCapabilities(allocator, &manifest, tasks.items, &capabilities, true);
+    try std.testing.expect(taskListContains(tasks.items, "extract"));
+    try std.testing.expect(taskListContains(capabilities.items, "extraction"));
+    try std.testing.expect(taskListContains(capabilities.items, "classification"));
+    try std.testing.expect(taskListContains(capabilities.items, "relations"));
+    try std.testing.expect(taskListContains(capabilities.items, "records"));
+
+    // A head config that genuinely disables relations/records must not
+    // advertise capabilities the artifact itself does not implement.
+    for (tasks.items) |task| allocator.free(task);
+    tasks.clearRetainingCapacity();
+    for (capabilities.items) |cap| allocator.free(cap);
+    capabilities.clearRetainingCapacity();
+    config.enable_relations = false;
+    config.enable_records = false;
+    manifest.gliner_boundary_config.?.head = config;
+    try appendManifestTasks(allocator, &manifest, &tasks, true);
+    try appendInferredCapabilities(allocator, &manifest, tasks.items, &capabilities, true);
+    try std.testing.expect(taskListContains(tasks.items, "extract"));
+    try std.testing.expect(taskListContains(capabilities.items, "extraction"));
+    try std.testing.expect(!taskListContains(capabilities.items, "relations"));
+    try std.testing.expect(!taskListContains(capabilities.items, "records"));
 }
 
 fn taskListContains(tasks: []const []const u8, needle: []const u8) bool {
@@ -1125,12 +1242,25 @@ fn appendInferredCapabilities(
     manifest: *const manifest_mod.ModelManifest,
     tasks: []const []const u8,
     capabilities: *std.ArrayListUnmanaged([]const u8),
+    qualified_boundary: bool,
 ) !void {
-    if (!manifest.hasSupportedGlinerRuntime()) return;
+    if (!manifest.hasSupportedGlinerRuntime() and !qualified_boundary) return;
     for (manifest.capabilities) |cap| try appendUniqueOwnedString(allocator, capabilities, cap);
 
     if (taskListContains(tasks, "embed") and manifest.sparse_3d_output_layout != null) {
         try appendUniqueOwnedString(allocator, capabilities, "sparse");
+    }
+
+    // Entity extraction and classification are structural to every boundary
+    // checkpoint; relations and records are declared per artifact in its own
+    // reviewed config.json and only advertised when that config enables them.
+    if (qualified_boundary) {
+        try appendUniqueOwnedString(allocator, capabilities, "extraction");
+        try appendUniqueOwnedString(allocator, capabilities, "classification");
+        if (manifest.gliner_boundary_config) |config| {
+            if (config.head.enable_relations) try appendUniqueOwnedString(allocator, capabilities, "relations");
+            if (config.head.enable_records) try appendUniqueOwnedString(allocator, capabilities, "records");
+        }
     }
 }
 
@@ -1236,7 +1366,7 @@ fn appendInferredInputs(
             if (has_visual) try appendUniqueOwnedString(allocator, inputs, "image");
             if (has_audio) try appendUniqueOwnedString(allocator, inputs, "audio");
         },
-        .chunker, .reranker, .generator, .recognizer, .classifier, .rewriter => {
+        .chunker, .reranker, .generator, .extractor, .classifier, .rewriter => {
             try appendUniqueOwnedString(allocator, inputs, "text");
             if (effective_type == .generator and has_visual) {
                 try appendUniqueOwnedString(allocator, inputs, "image");
@@ -1294,7 +1424,7 @@ fn appendJsonStringArray(
 
 fn manifestTypeFromTasks(tasks: []const []const u8, fallback: manifest_mod.ModelType) manifest_mod.ModelType {
     for (tasks) |task| {
-        if (std.mem.eql(u8, task, "extract") or std.mem.eql(u8, task, "extractors")) return .recognizer;
+        if (std.mem.eql(u8, task, "extract") or std.mem.eql(u8, task, "extractors")) return .extractor;
     }
     if (tasksIncludeVad(tasks)) return .classifier;
     for (tasks) |task| {
@@ -1324,7 +1454,14 @@ fn manifestTypeFromTasks(tasks: []const []const u8, fallback: manifest_mod.Model
     return fallback;
 }
 
-fn synthesizePulledModelManifestJson(
+/// Synthesize `model_manifest.json` contents for an already-published,
+/// fully-materialized model directory (as opposed to
+/// `synthesizePulledModelManifestJsonFromPlan`, which reads a `pull`
+/// transaction's staging plan). Exported so a local conversion tool (for
+/// example `gliner25-convert`, which never goes through `pull`'s network/
+/// staging path) can synthesize the same reviewed-identity-gated manifest
+/// for a directory it just finished writing to disk.
+pub fn synthesizePulledModelManifestJson(
     allocator: std.mem.Allocator,
     dest_dir: []const u8,
     tasks_csv: ?[]const u8,
@@ -1369,7 +1506,13 @@ fn synthesizePulledModelManifestJsonInternal(
     };
     defer manifest.deinit();
 
-    if (!manifest.hasSupportedGlinerRuntime() and (tasks_csv != null or capabilities_csv != null))
+    // A one-time, pull-scoped check: hash the actual downloaded weight file
+    // and compare it against the reviewed production table. This must never
+    // run on the per-request listing path (loadListingFromDir), only here,
+    // where the artifact was just staged to disk.
+    const qualified_boundary = boundaryIdentityIsQualified(allocator, &manifest);
+
+    if (!manifest.hasSupportedGlinerRuntime() and !qualified_boundary and (tasks_csv != null or capabilities_csv != null))
         return error.UnsupportedGlinerBoundaryRuntime;
 
     var tasks = std.ArrayListUnmanaged([]const u8).empty;
@@ -1379,9 +1522,9 @@ fn synthesizePulledModelManifestJsonInternal(
     }
     if (tasks_csv) |csv| {
         try appendCsvTasks(allocator, &tasks, csv);
-        try appendSupplementalTasks(allocator, &manifest, &tasks);
+        try appendSupplementalTasks(allocator, &manifest, &tasks, qualified_boundary);
     } else {
-        try appendManifestTasks(allocator, &manifest, &tasks);
+        try appendManifestTasks(allocator, &manifest, &tasks, qualified_boundary);
     }
 
     const manifest_type = manifestTypeFromTasks(tasks.items, manifest.model_type);
@@ -1401,7 +1544,7 @@ fn synthesizePulledModelManifestJsonInternal(
         for (capabilities.items) |cap| allocator.free(cap);
         capabilities.deinit(allocator);
     }
-    try appendInferredCapabilities(allocator, &manifest, tasks.items, &capabilities);
+    try appendInferredCapabilities(allocator, &manifest, tasks.items, &capabilities, qualified_boundary);
     if (capabilities_csv) |csv| try appendCsvCapabilities(allocator, &capabilities, csv);
 
     const sparse_3d_output_layout = inferredSparse3DOutputLayout(&manifest);

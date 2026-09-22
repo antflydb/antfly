@@ -3687,7 +3687,7 @@ fn shouldUseQ4Q5KQ8KActivationShape(rows: usize, out_dim: usize, row_blocks: usi
     if (!(row_blocks == 2 or row_blocks == 3 or row_blocks == 6 or row_blocks == 8 or row_blocks == 12)) return false;
 
     // Keep q4/q5 activation quantization on the CLIP/CLAP-style buckets that
-    // were measured. GLiNER recognizer rows can be numerically sensitive near
+    // were measured. GLiNER extractor rows can be numerically sensitive near
     // extraction thresholds and should fall through to dense-dequant SGEMM.
     if (rows == 1 or rows == 2 or rows == 4 or rows == 9) return true;
     if (rows == 50 or rows == 64 or rows == 77 or rows == 197 or rows == 257 or rows == 308 or rows == 514) return true;
@@ -45109,7 +45109,7 @@ test "native quant linear buckets use packed dispatch without dense dequant" {
     }
 }
 
-test "q4 q5 unmeasured recognizer shapes use cached dense dequant sgemm" {
+test "q4 q5 unmeasured extractor shapes use cached dense dequant sgemm" {
     const allocator = std.testing.allocator;
     const rows: usize = 37;
     const in_dim: usize = 768;

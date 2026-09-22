@@ -83,7 +83,7 @@ fn parity(comptime variant: []const u8, comptime environment: [:0]const u8, comp
         var result = try pipeline.runScored(a, &config, &prepared, &.{&schema}, scorer.scores, scorer.scorer(), .{ .offset_unit = .unicode_codepoints });
         defer result.deinit();
         try std.testing.expectEqual(@as(usize, 1), result.samples.len);
-        try pipeline.expectSample(case.expected, result.samples[0]);
+        try pipeline.expectSample(case.expected, result.samples[0], pipeline.fp32_confidence_tolerance);
         // The only encoder-owner readback is the scalar classification output.
         try std.testing.expectEqual(@as(usize, @intFromBool(prepared.classification_width > 0)), encoded.stats().result_download_calls);
         const stats = try scorer.stats();

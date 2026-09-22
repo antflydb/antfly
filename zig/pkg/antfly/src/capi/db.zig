@@ -79,6 +79,7 @@ const scraping = antfly.scraping;
 const inference_provider = antfly.inference_provider;
 const managed_embedder = antfly.managed_embedder;
 const raft_catalog = antfly.raft_catalog;
+const indexes_api = antfly.public_api.indexes;
 const Allocator = std.mem.Allocator;
 
 const lite_abi_version: u32 = 1;
@@ -681,6 +682,24 @@ const Handle = struct {
     storage_owner_context: ?*StorageOwnerContext = null,
     storage_owner_transaction_recovery: ?*StorageOwnerTransactionRecovery = null,
     storage_owner_runtime_hooks: ?*StorageOwnerRuntimeHooks = null,
+    // Present only for a Lite handle opened with the local-runtime-configured
+    // flag on a build that both advertises and actually links the local
+    // inference runtime (see capi_build_options.inference_enabled and
+    // pkg/antfly/build/runtime.zig's addCapiInferenceVariantUnits). Default
+    // libantfly and Lite handles opened without the flag leave these null,
+    // which keeps today's behavior unchanged.
+    lite_inference_lifetime: ?inference_provider.EmbeddedInferenceProviderLifetime = null,
+    lite_inference_io: ?*std.Io.Threaded = null,
+    // Mirrors `LiteResolvedOpenOptions.generated_enrichment_replay` from this
+    // handle's open call. `refreshLiteManagedEmbeddingRuntime` must not lose
+    // this caller intent across its own reconfigure passes -- see its doc
+    // comment.
+    lite_generated_enrichment_replay: bool = false,
+
+    fn liteAntflyProvider(self: *Handle) ?managed_embedder.AntflyProvider {
+        const lifetime = if (self.lite_inference_lifetime) |*value| value else return null;
+        return inference_provider.inferenceBoundaryProvider(lifetime);
+    }
 
     fn prepareSearchRequest(self: *Handle, req: db_mod.types.SearchRequest) !void {
         const hook = self.readable_lease_hook orelse return;
@@ -744,6 +763,600 @@ const StorageSnapshot = struct {
     }
 };
 
+/// Starts the embedded inference provider owned by a Lite handle. Callers
+/// must only invoke this when `capi_build_options.inference_enabled` is true
+/// (only true for the isolated `-Dcapi-inference=true` storage_kernel unit
+/// and for unit tests): that is the only context where the real inference
+/// runtime archive is linked in this binary instead of the
+/// capi/link_anchor(_inference).zig trap.
+fn startLiteEmbeddedInference(
+    handle: *Handle,
+    alloc: Allocator,
+    path: []const u8,
+    budget_options: inference_provider.EmbeddedInferenceNodeOptions,
+) !void {
+    const io_impl = try alloc.create(std.Io.Threaded);
+    errdefer alloc.destroy(io_impl);
+    io_impl.* = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    errdefer io_impl.deinit();
+    const data_dir = std.fs.path.dirname(path) orelse ".";
+    const created = try inference_provider.createEmbeddedInferenceNode(data_dir, io_impl.io(), budget_options);
+    handle.lite_inference_io = io_impl;
+    handle.lite_inference_lifetime = .{ .handle = created.handle, .resource_owner = created.resource_owner };
+    // Report the policy the node actually resolved (host-detected by
+    // default, or the caller's explicit override) rather than leaving
+    // `lite_inference_status` at the pre-open placeholder values.
+    if (handle.lite_inference_status) |*status| {
+        status.process_memory_limit_bytes = @intCast(created.process_memory_limit_bytes);
+        status.process_memory_limit_source = @tagName(created.process_memory_limit_source);
+        status.host_budget_mb = created.host_budget_mb;
+        status.backend_budget_mb = created.backend_budget_mb;
+        status.combined_budget_mb = created.combined_budget_mb;
+        status.kv_budget_mb = created.kv_budget_mb;
+        status.scratch_budget_mb = created.scratch_budget_mb;
+    }
+}
+
+fn stopLiteEmbeddedInference(handle: *Handle) void {
+    if (handle.lite_inference_lifetime) |*lifetime| {
+        lifetime.quiesce();
+        inference_provider.destroyEmbeddedInferenceNode(lifetime.handle, lifetime.resource_owner);
+        handle.lite_inference_lifetime = null;
+    }
+    if (handle.lite_inference_io) |io_impl| {
+        io_impl.deinit();
+        handle.alloc.destroy(io_impl);
+        handle.lite_inference_io = null;
+    }
+}
+
+/// `managed_embedder.zig`'s index scanner only recognizes an entry as a
+/// managed embeddings producer when it carries the public
+/// `"type":"embeddings"` marker, matching the shape a server table stores
+/// (see the `EmbeddingsIndexConfig` OpenAPI schema). Lite's own raw
+/// `config_json` for a dense_vector/sparse_vector index uses lower-level,
+/// pre-existing field names instead ("dims"/"metric" rather than
+/// "dimension"/"distance_metric", and no "type" at all -- confirmed against
+/// examples/dogfood's index_config.go), so without this the entry is
+/// silently skipped by `parseManagedEmbeddingEntry` rather than erroring.
+/// Bridges the gap by injecting the marker (and a "dimension" alias of
+/// "dims" so a known vector width skips the capability-discovery probe)
+/// without touching any field the caller supplied. Falls back to passing
+/// `config_json` through unchanged for any other index kind, or if it fails
+/// to parse as a JSON object.
+fn liteManagedEmbeddingIndexConfigJson(
+    alloc: Allocator,
+    kind: db_mod.types.IndexKind,
+    config_json: []const u8,
+) ![]u8 {
+    if (kind != .dense_vector and kind != .sparse_vector) return try alloc.dupe(u8, config_json);
+
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    var parsed = std.json.parseFromSlice(std.json.Value, arena, config_json, .{}) catch
+        return try alloc.dupe(u8, config_json);
+    if (parsed.value != .object) return try alloc.dupe(u8, config_json);
+
+    if (parsed.value.object.get("type") == null) {
+        try parsed.value.object.put(arena, "type", .{ .string = "embeddings" });
+    }
+    if (kind == .sparse_vector and parsed.value.object.get("sparse") == null) {
+        try parsed.value.object.put(arena, "sparse", .{ .bool = true });
+    }
+    if (parsed.value.object.get("dimension") == null) {
+        if (parsed.value.object.get("dims")) |dims_value| {
+            try parsed.value.object.put(arena, "dimension", dims_value);
+        }
+    }
+    return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(parsed.value, .{})});
+}
+
+/// Server table provisioning accepts the artifact-stream chunk pattern
+/// (`go/pkg/docsaf`'s `chunk` enrichment producing a `doc_chunks_v1` artifact,
+/// consumed by an embeddings index via `"sources":[{"artifact":...}]`) by
+/// nesting an `"enrichments"` array inside whichever index config
+/// authoritatively owns each producer, then harvesting every nested
+/// declaration across the whole table (`api/indexes.zig`'s
+/// `collectArtifactEnrichmentsFromTableIndexesJsonWithOptions`, dependency
+/// sorted via `sortArtifactEnrichmentsByDependency`) and registering each one
+/// with `db.upsertEnrichment` *before* admitting the physical indexes
+/// (`metadata_table_provisioner.reconcileDbIndexesWithOptions` calls
+/// `ensureEnrichments` ahead of `ensureIndexes`). A native Lite handle only
+/// ever admits one index at a time through `antfly_db_add_index_json`, so
+/// there is no single merged table definition to harvest from; this instead
+/// harvests the `"enrichments"` nested in *this* index's own raw config
+/// before it is translated/admitted, mirroring the same per-index shape
+/// docsaf and the dogfood example already send. Two caveats callers must
+/// respect that the server's atomic table-create request does not have: (1)
+/// a producer index (e.g. the `chunk` enrichment's owning `full_text` index)
+/// must be added before any index whose `sources`/`embedding_name` names an
+/// artifact that producer's enrichment declares, since enrichment admission
+/// validates upstream references immediately; (2) re-adding the same index
+/// name replays its enrichment declarations too, which is harmless because
+/// `db.upsertEnrichment` is idempotent for an unchanged config. Scoped to the
+/// native profile: a hosted Lite handle's owning process reconciles its own
+/// enrichments the same way the server does.
+fn registerLiteIndexEnrichments(handle: *Handle, config_json: []const u8) !void {
+    var arena_impl = std.heap.ArenaAllocator.init(handle.alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    var parsed = std.json.parseFromSlice(std.json.Value, arena, config_json, .{}) catch return;
+    if (parsed.value != .object or parsed.value.object.get("enrichments") == null) return;
+
+    const alloc = handle.alloc;
+    var collected: std.ArrayListUnmanaged(db_mod.types.EnrichmentConfig) = .empty;
+    defer {
+        for (collected.items) |*cfg| cfg.deinit(alloc);
+        collected.deinit(alloc);
+    }
+    try indexes_api.collectArtifactEnrichmentsFromValueWithOptions(
+        alloc,
+        parsed.value,
+        .{ .antfly_provider = handle.liteAntflyProvider() },
+        &collected,
+    );
+    if (collected.items.len == 0) return;
+    indexes_api.sortArtifactEnrichmentsByDependency(collected.items);
+    for (collected.items) |cfg| _ = try handle.db.upsertEnrichment(cfg);
+}
+
+test "capi lite AddIndexJSON registers the server's nested artifact-sourced enrichment shape" {
+    // Reproduces the docsaf/dogfood chunk-artifact pattern -- a `chunk`
+    // enrichment producing `document_chunks_v1`, then an embeddings index
+    // consuming it via `"sources":[{"artifact":"document_chunk_dense_v1"}]`
+    // with the producing `embedding` enrichment nested in the index's own
+    // config -- driven entirely through `antfly_db_add_index_json`, the way
+    // `go/pkg/docsaf/cmd/docsaf/main.go`'s `createHierarchyIndexes` and
+    // `antfly.NewArtifactEmbeddingIndexConfig` build it. Before
+    // `registerLiteIndexEnrichments` this silently dropped both nested
+    // enrichment declarations (they are not valid `db.addIndex` fields), so
+    // the physical dense_vector index referenced a `document_chunk_dense_v1`
+    // artifact with no enrichment ever registered to produce it.
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
+    const alloc = std.testing.allocator;
+    const path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-nested-enrichments");
+    defer alloc.free(path);
+    cleanupTestFile(path);
+    defer cleanupTestFile(path);
+
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(path, &handle));
+    defer antfly_db_close(handle);
+
+    // Producer index: a full_text index over the chunk artifact (docsaf's
+    // `document_text`), with the `chunk` enrichment nested in its config.
+    const chunk_index_json =
+        \\{"name":"document_text_chunks","kind":"full_text","config_json":"{\"chunk_name\":\"document_chunks_v1\",\"enrichments\":[{\"name\":\"document_chunks_v1\",\"kind\":\"chunk\",\"field\":\"body\",\"chunk_size\":64}]}"}
+    ;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(handle, .{
+        .ptr = chunk_index_json,
+        .len = chunk_index_json.len,
+    }));
+
+    var enrichments_after_chunk: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_list_enrichments_json(handle, &enrichments_after_chunk));
+    defer antfly_db_buffer_free(enrichments_after_chunk.ptr, enrichments_after_chunk.len);
+    try std.testing.expect(std.mem.indexOf(u8, enrichments_after_chunk.ptr.?[0..enrichments_after_chunk.len], "\"document_chunks_v1\"") != null);
+
+    // Consumer index: the exact two-stage `sources` form docsaf's
+    // `NewArtifactEmbeddingIndexConfig` builds, with the `embedding`
+    // enrichment nested in this index's own config and its
+    // `source_artifact_name` pointing at the chunk artifact above.
+    const vector_index_json =
+        \\{"name":"document_vectors","kind":"dense_vector","config_json":"{\"type\":\"embeddings\",\"sources\":[{\"artifact\":\"document_chunk_dense_v1\"}],\"dimension\":3,\"embedder\":{\"provider\":\"antfly\",\"model\":\"test-embed\",\"api_url\":\"http://127.0.0.1:1\"},\"distance_metric\":\"cosine\",\"enrichments\":[{\"name\":\"document_chunk_dense_v1\",\"kind\":\"embedding\",\"field\":\"text\",\"source_artifact_name\":\"document_chunks_v1\",\"expected_dims\":3}]}"}
+    ;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(handle, .{
+        .ptr = vector_index_json,
+        .len = vector_index_json.len,
+    }));
+
+    var enrichments_after_vectors: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_list_enrichments_json(handle, &enrichments_after_vectors));
+    defer antfly_db_buffer_free(enrichments_after_vectors.ptr, enrichments_after_vectors.len);
+    try std.testing.expect(std.mem.indexOf(u8, enrichments_after_vectors.ptr.?[0..enrichments_after_vectors.len], "\"document_chunk_dense_v1\"") != null);
+
+    var indexes: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_list_indexes_json(handle, &indexes));
+    defer antfly_db_buffer_free(indexes.ptr, indexes.len);
+    const indexes_json = indexes.ptr.?[0..indexes.len];
+    try std.testing.expect(std.mem.indexOf(u8, indexes_json, "\"document_vectors\"") != null);
+    // The physical config carries the translated artifact source reference
+    // (config_json is itself JSON-encoded as a string, so its embedded quotes
+    // are backslash-escaped here rather than literal).
+    try std.testing.expect(std.mem.indexOf(u8, indexes_json, "\\\"sources\\\":[{\\\"artifact\\\":\\\"document_chunk_dense_v1\\\"") != null);
+}
+
+test "capi lite AddIndexJSON surfaces an unresolvable source_artifact_name as invalid_argument, not internal" {
+    // Regression test for the ANTFLY_INTERNAL reported against every
+    // `sources`-based dense_vector config: the enrichment catalog's own
+    // upstream-reference validation (an `embedding` enrichment naming a
+    // `source_artifact_name` with no matching `chunk` enrichment) is a
+    // caller config mistake, not a server fault, and must map to
+    // ANTFLY_INVALID_ARGUMENT (see `capi/types.zig`'s `mapError`).
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
+    const alloc = std.testing.allocator;
+    const path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-unresolved-artifact-source");
+    defer alloc.free(path);
+    cleanupTestFile(path);
+    defer cleanupTestFile(path);
+
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(path, &handle));
+    defer antfly_db_close(handle);
+
+    const vector_index_json =
+        \\{"name":"document_vectors","kind":"dense_vector","config_json":"{\"type\":\"embeddings\",\"sources\":[{\"artifact\":\"document_chunk_dense_v1\"}],\"dimension\":3,\"embedder\":{\"provider\":\"antfly\",\"model\":\"test-embed\",\"api_url\":\"http://127.0.0.1:1\"},\"enrichments\":[{\"name\":\"document_chunk_dense_v1\",\"kind\":\"embedding\",\"field\":\"text\",\"source_artifact_name\":\"missing_chunks_v1\",\"expected_dims\":3}]}"}
+    ;
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_add_index_json(handle, .{
+        .ptr = vector_index_json,
+        .len = vector_index_json.len,
+    }));
+}
+
+/// Server table provisioning never calls `db.addIndex` with a caller's raw
+/// dense/sparse config: `metadata_table_provisioner.extractIndexConfigJsonForKind`
+/// first runs it through `managed_embedder.translateEmbeddingsIndexConfigJson`,
+/// which is what attaches the internal `"generator"` section that
+/// `index_manager`'s `hasGeneratedEnrichmentTargets`/`appendGeneratedEnrichments`
+/// need to ever schedule a document's field for embedding. A native Lite
+/// handle calling `db.addIndex` directly skipped that step entirely, so even
+/// after `refreshLiteManagedEmbeddingRuntime` wires up a working embedder,
+/// the physical index never asks it for anything: `parseDenseConfig` only
+/// looks at `field`/`dims`/`metric`/`embedding_name`/`external`, and nothing
+/// else marks the index as awaiting generated content. Runs the same
+/// translation here so what gets stored via `db.addIndex` matches what the
+/// server would have stored. Falls back to the untranslated config on any
+/// translation error (for example a managed, non-external index with
+/// neither `embedder` nor `chunker` configured) so a Lite caller that never
+/// relied on this feature keeps today's permissive, pass-through behavior;
+/// `refreshLiteManagedEmbeddingRuntime` is likewise a no-op for such an
+/// index.
+/// True for a plain embedder-only embeddings config -- no `field`/`template`
+/// of its own, and none of the other shapes that mean something different
+/// (an artifact-backed consumer, an external/caller-supplied index, or one
+/// still carrying its own chunker) -- where defaulting `field` to
+/// `"embedding"` is unambiguous. Keeps `litePhysicalIndexConfigJson` from
+/// defaulting a config whose author meant something other than "index the
+/// stored `embedding` field".
+fn needsDefaultEmbeddingField(object: std.json.ObjectMap) bool {
+    if (object.get("field") != null) return false;
+    if (object.get("template") != null) return false;
+    if (object.get("sources") != null) return false;
+    if (object.get("embedding_name") != null) return false;
+    if (object.get("source_artifact_name") != null) return false;
+    if (object.get("chunker") != null) return false;
+    if (object.get("external")) |external| {
+        if (external == .bool and external.bool) return false;
+    }
+    return true;
+}
+
+fn litePhysicalIndexConfigJson(
+    alloc: Allocator,
+    kind: db_mod.types.IndexKind,
+    name: []const u8,
+    config_json: []const u8,
+    provider: ?managed_embedder.AntflyProvider,
+) ![]u8 {
+    if (kind != .dense_vector and kind != .sparse_vector) return try alloc.dupe(u8, config_json);
+    const bridged = try liteManagedEmbeddingIndexConfigJson(alloc, kind, config_json);
+    defer alloc.free(bridged);
+
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    var parsed = std.json.parseFromSlice(std.json.Value, arena, bridged, .{}) catch
+        return try alloc.dupe(u8, config_json);
+    // The translator requires `field` (or `template`/an artifact source) on
+    // a non-external embeddings config and otherwise bails out before ever
+    // resolving dimensions -- before this, a caller relying on the same
+    // "embedding" default `field` this function's own post-failure fallback
+    // below injects would always take that fallback, which has no way to
+    // learn the real vector width and stores an index `db.addIndex` then
+    // rejects for a missing `dims`. Inject the default proactively so
+    // translation actually runs and probes the configured embedder (local or
+    // remote) for its output width instead of falling back before trying.
+    if (parsed.value == .object and needsDefaultEmbeddingField(parsed.value.object)) {
+        parsed.value.object.put(arena, "field", .{ .string = "embedding" }) catch
+            return try alloc.dupe(u8, config_json);
+    }
+    // `provider` must be threaded through here too: an embedder with no
+    // `api_url` translates to a durable `"antfly:embedded"` semantic
+    // producer identity, and the translator rejects that identity outright
+    // when no embedded provider is attached to validate it against.
+    return managed_embedder.translateEmbeddingsIndexConfigJsonWithOptions(alloc, name, parsed.value, .{ .antfly_provider = provider }) catch {
+        // A translation failure (for example dimension auto-detection
+        // requiring a live round trip this call cannot make) must not turn
+        // into a hard AddIndex error. Fall back to the bridged config, but
+        // `index_manager.parseDenseConfig` hard-requires `field` on every
+        // dense/sparse entry -- callers who omit it entirely (relying on
+        // translation to supply the artifact-storage default) would
+        // otherwise fail `db.addIndex` outright instead of landing in the
+        // same "no managed producer configured" no-op state as any other
+        // untranslatable config.
+        if (parsed.value == .object and parsed.value.object.get("field") == null) {
+            parsed.value.object.put(arena, "field", .{ .string = "embedding" }) catch
+                return try alloc.dupe(u8, config_json);
+            return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(parsed.value, .{})});
+        }
+        return try alloc.dupe(u8, config_json);
+    };
+}
+
+/// Rebuilds the DB's managed embedding/chunking/extraction runtime from the
+/// currently declared indexes and enrichments. Provider "antfly" producers
+/// with no `api_url` route through the Lite handle's embedded inference
+/// provider when one exists (see `startLiteEmbeddedInference`); producers
+/// that carry their own `api_url` call that remote Antfly inference service
+/// directly and work fine with a null local provider. Scoped to the native
+/// profile: hosted Lite handles are reconciled by their owning process and
+/// non-Lite (storage-owner) handles are reconciled through
+/// `configureStorageKernelOwnerDb` instead. Includes every declared index
+/// kind (not just dense/sparse vector) plus standalone enrichments so a
+/// graph index's asset-producer extractor and any chunk enrichments are
+/// discovered the same way `indexesJsonNeedsAssetProducer` /
+/// `indexesJsonHasGeneratedEnrichment` discover them for the server. A
+/// database with neither a local provider nor any producer `api_url`
+/// resolves an empty producer set, which is a safe no-op: pending work stays
+/// visible and neither open nor AddIndex/AddEnrichment errors.
+/// Builds the merged `{"<index_name>":<bridged_config_json>, ...}` blob both
+/// `refreshLiteManagedEmbeddingRuntime` (write-time enrichment wiring) and
+/// `LiteSemanticResolver` (query-time `semantic_search` embedding) feed to
+/// `managed_embedder.zig`. Every index kind is included, not just
+/// dense_vector/sparse_vector: `indexesJsonNeedsAssetProducer`/
+/// `indexesJsonHasGeneratedEnrichment` recursively scan the whole merged
+/// object for a nested `"kind":"asset","producer_json":...}` object (see
+/// examples/dogfood's knowledgeGraphIndexJSON, which declares the graph
+/// index's extractor exactly that way, under an "artifact" key inside the
+/// graph index's own config), so a graph/full_text/algebraic index must not
+/// be filtered out here even though `managed_embedder.zig`'s embedder
+/// scanner only ever recognizes a dense_vector/sparse_vector entry.
+/// `liteManagedEmbeddingIndexConfigJson` passes every other kind through
+/// unchanged.
+///
+/// Also appends every *standalone* catalog enrichment from `db.listEnrichments`
+/// -- one registered directly through `antfly_db_add_enrichment_json` with no
+/// index nesting the same declaration in its own config (see
+/// `registerLiteIndexEnrichments`). Without this, a `kind:"asset"` extractor
+/// or a `kind:"chunk"` enrichment added standalone is accepted into the
+/// catalog (`db.addEnrichment` validates and stores it) but never gets an
+/// asset producer or chunk provider wired up: `indexesJsonNeedsAssetProducer`/
+/// `indexesJsonHasGeneratedEnrichment` only ever saw the index catalog, so a
+/// document's pending generated-enrichment work for that name stays "accepted"
+/// forever with nothing servicing it (a stall, surfaced as
+/// `error.RunUntilIdleNoProgress` from `antfly_db_run_until_idle`). Each
+/// standalone entry is appended under a `"$enrichment:<kind>:<name>"` key --
+/// reserved so it cannot collide with a real index name -- as an object shaped
+/// `{"kind":<kind>,"producer_json":<...>}` (only when non-empty), which is
+/// exactly the shape the two scanners above already recognize wherever it
+/// appears in the merged tree. `managed_embedder.zig`'s own scanners
+/// (`parseManagedEmbeddingEntry`, `addArtifactBackedManagedEmbeddingEntries`)
+/// only ever look at top-level entries carrying `"type":"embeddings"`, and
+/// this shape carries no `"type"` or `"enrichments"` key, so it is inert to
+/// them and to `LiteSemanticResolver`'s query-time resolution. Caller owns the
+/// returned slice.
+fn liteMergedIndexesJsonAlloc(handle: *Handle) ![]u8 {
+    const alloc = handle.alloc;
+    const configs = try handle.db.listIndexes(alloc);
+    defer db_mod.types.freeIndexConfigs(alloc, configs);
+    const enrichments = try handle.db.listEnrichments(alloc);
+    defer db_mod.types.freeEnrichmentConfigs(alloc, enrichments);
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(alloc);
+    try buf.append(alloc, '{');
+    var wrote_any = false;
+    for (configs) |cfg| {
+        if (wrote_any) try buf.append(alloc, ',');
+        wrote_any = true;
+        const escaped_name = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(cfg.name, .{})});
+        defer alloc.free(escaped_name);
+        try buf.appendSlice(alloc, escaped_name);
+        try buf.append(alloc, ':');
+        const entry_config_json = try liteManagedEmbeddingIndexConfigJson(alloc, cfg.kind, cfg.config_json);
+        defer alloc.free(entry_config_json);
+        try buf.appendSlice(alloc, entry_config_json);
+    }
+    for (enrichments) |cfg| {
+        if (wrote_any) try buf.append(alloc, ',');
+        wrote_any = true;
+        const merged_key = try std.fmt.allocPrint(alloc, "$enrichment:{s}:{s}", .{ @tagName(cfg.kind), cfg.name });
+        defer alloc.free(merged_key);
+        const escaped_key = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(merged_key, .{})});
+        defer alloc.free(escaped_key);
+        try buf.appendSlice(alloc, escaped_key);
+        try buf.append(alloc, ':');
+        const entry_json = try liteEnrichmentCatalogEntryJsonAlloc(alloc, cfg);
+        defer alloc.free(entry_json);
+        try buf.appendSlice(alloc, entry_json);
+    }
+    try buf.append(alloc, '}');
+    return try buf.toOwnedSlice(alloc);
+}
+
+/// Builds the `{"kind":<kind>,"producer_json":<...>}`-shaped object
+/// `liteMergedIndexesJsonAlloc` nests under each standalone catalog
+/// enrichment's reserved `"$enrichment:<kind>:<name>"` key. `producer_json`
+/// is included only for an `asset` enrichment that carries one (the field
+/// `objectIsModelBackedAssetEnrichment` inspects); `kind:"chunk"` needs no
+/// further fields since `jsonValueHasGeneratedEnrichment` treats any
+/// `"kind":"chunk"` object as a generated-enrichment marker regardless of
+/// its other fields. A standalone `embedding` enrichment (always paired with
+/// an owning dense/sparse index's own `"type":"embeddings"` config, already
+/// merged in above) carries neither marker and is included only for listing
+/// symmetry; it is inert to every scanner.
+fn liteEnrichmentCatalogEntryJsonAlloc(alloc: Allocator, cfg: db_mod.types.EnrichmentConfig) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(alloc);
+    const kind_json = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(@tagName(cfg.kind), .{})});
+    defer alloc.free(kind_json);
+    try buf.appendSlice(alloc, "{\"kind\":");
+    try buf.appendSlice(alloc, kind_json);
+    if (cfg.producer_json.len > 0) {
+        const producer_json_json = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(cfg.producer_json, .{})});
+        defer alloc.free(producer_json_json);
+        try buf.appendSlice(alloc, ",\"producer_json\":");
+        try buf.appendSlice(alloc, producer_json_json);
+    }
+    try buf.append(alloc, '}');
+    return try buf.toOwnedSlice(alloc);
+}
+
+test "capi lite merged indexes JSON discovers a standalone asset extractor and chunk enrichment with no owning index" {
+    // Regression test for db.zig:1091 (pre-fix): `liteMergedIndexesJsonAlloc`
+    // only read `handle.db.listIndexes`, so a `kind:"asset"` extractor or a
+    // `kind:"chunk"` enrichment registered directly through
+    // `antfly_db_add_enrichment_json` -- with no index nesting the same
+    // declaration in its own config (see `registerLiteIndexEnrichments`) --
+    // was accepted into the catalog but invisible to
+    // `local_write.indexesJsonNeedsAssetProducer`/`indexesJsonHasGeneratedEnrichment`.
+    // `refreshLiteManagedEmbeddingRuntime` always resolved an empty producer
+    // set for it, so `ManagedDbEnrichmentSet.enabled()` stayed false and the
+    // enrichment runtime never serviced that name's pending work at all.
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
+    const alloc = std.testing.allocator;
+    const path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-standalone-enrichment-discovery");
+    defer alloc.free(path);
+    cleanupTestFile(path);
+    defer cleanupTestFile(path);
+
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(path, &handle));
+    defer antfly_db_close(handle);
+
+    // Standalone `chunk` enrichment: no index anywhere nests this declaration.
+    const chunk_enrichment_json =
+        \\{"name":"standalone_chunks_v1","kind":"chunk","field":"body","chunk_size":64,"chunk_overlap":8}
+    ;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_enrichment_json(handle, .{
+        .ptr = chunk_enrichment_json,
+        .len = chunk_enrichment_json.len,
+    }));
+
+    // Standalone `asset` enrichment with a model-backed (non-"copy") extractor
+    // producer: also nested nowhere.
+    const asset_enrichment_json =
+        \\{"name":"standalone_extract_v1","kind":"asset","field":"body","producer_json":"{\"type\":\"extractor\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-extract\"}}"}
+    ;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_enrichment_json(handle, .{
+        .ptr = asset_enrichment_json,
+        .len = asset_enrichment_json.len,
+    }));
+
+    const owned_handle = asHandle(handle).?;
+    const merged_json = try liteMergedIndexesJsonAlloc(owned_handle);
+    defer std.heap.c_allocator.free(merged_json);
+
+    try std.testing.expect(std.mem.indexOf(u8, merged_json, "$enrichment:chunk:standalone_chunks_v1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, merged_json, "$enrichment:asset:standalone_extract_v1") != null);
+
+    // Before the fix these both returned false: neither scanner ever saw a
+    // "kind":"asset"/"chunk" object anywhere in the merged JSON.
+    try std.testing.expect(try local_write.indexesJsonHasGeneratedEnrichment(alloc, merged_json));
+    try std.testing.expect(try local_write.indexesJsonNeedsAssetProducer(alloc, merged_json));
+}
+
+test "capi lite run until idle drains a standalone chunk enrichment with no owning index" {
+    // End-to-end reproduction of the same gap: before the fix, a standalone
+    // `kind:"chunk"` catalog enrichment left `generated=false` in
+    // `local_write.createManagedDbEnrichments`'s scan of the merged JSON, so
+    // `ManagedDbEnrichmentSet.enabled()` (dense/sparse/asset_runtime all null,
+    // `generated` false) stayed false and `refreshLiteManagedEmbeddingRuntime`
+    // never created an enrichment runtime at all. A document's pending chunk
+    // work for that name was accepted (the catalog entry validates and
+    // stores) but nothing ever serviced it, so `antfly_db_run_until_idle`
+    // would return `.stalled` (`error.RunUntilIdleNoProgress`) instead of
+    // draining. A fixed-size, non-semantic chunker (`chunk_size`/
+    // `chunk_overlap`, no `chunker_json`) needs no embedder or extractor
+    // provider at all (`chunker_mod.chunkText` in enrichment_runtime.zig), so
+    // this reproduces and proves the fix end to end without any local model.
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
+    const alloc = std.testing.allocator;
+    const path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-standalone-chunk-drain");
+    defer alloc.free(path);
+    cleanupTestFile(path);
+    defer cleanupTestFile(path);
+
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(path, &handle));
+    defer antfly_db_close(handle);
+
+    const enrichment_json =
+        \\{"name":"standalone_chunks_v1","kind":"chunk","field":"body","chunk_size":16,"chunk_overlap":4}
+    ;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_enrichment_json(handle, .{
+        .ptr = enrichment_json,
+        .len = enrichment_json.len,
+    }));
+
+    const batch_json = "{\"inserts\":{\"doc:capi-standalone-chunk\":{\"body\":\"antfly lite chunks this document body text into overlapping windows for later retrieval\"}},\"sync_level\":\"write\"}";
+    var batch_out: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch_json(handle, .{
+        .ptr = batch_json.ptr,
+        .len = batch_json.len,
+    }, &batch_out));
+    defer antfly_db_buffer_free(batch_out.ptr, batch_out.len);
+
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_run_until_idle(handle));
+
+    const owned_handle = asHandle(handle).?;
+    const drained = owned_handle.db.pendingWorkStats();
+    try std.testing.expectEqual(@as(u64, 0), drained.enrichment.error_count);
+    try std.testing.expectEqual(@as(u64, 0), drained.enrichment.fatal_error_count);
+    try std.testing.expect(!drained.enrichment.stalled);
+    try std.testing.expectEqual(drained.enrichment.target_sequence, drained.enrichment.applied_sequence);
+    try std.testing.expect(drained.enrichment.target_sequence > 0);
+}
+
+fn refreshLiteManagedEmbeddingRuntime(handle: *Handle) !void {
+    if (handle.lite_profile != .native) return;
+    // A read-only/status-only handle has nothing to reconcile toward, and
+    // `db.reconfigureEnrichmentRuntime` unconditionally fails with
+    // `error.ReadOnly` on one -- before it even looks at whether there is
+    // anything to configure. Every open of an already-written native Lite
+    // database (query_readonly, status_only) would otherwise fail outright.
+    if (!liteOpenModeCanWrite(handle.open_mode)) return;
+    const provider = handle.liteAntflyProvider();
+    const alloc = handle.alloc;
+    const merged_json = try liteMergedIndexesJsonAlloc(handle);
+    defer alloc.free(merged_json);
+
+    // Not `local_write.reconfigureManagedDbEnrichmentRuntime` directly: that
+    // helper derives `enable_without_producers` purely from
+    // `indexesJsonHasGeneratedEnrichment`'s scan of the *index* catalog's own
+    // config shape (an inline `"kind":"chunk"`/`"asset"` object, or an
+    // `"embeddings"` config). A full-text index that references a chunk
+    // enrichment by name -- `{"chunk_name":"..."}`, the shape
+    // `antfly_db_add_index_json` stores -- carries no such literal marker, so
+    // the scan misses it even though a caller that opened this handle with
+    // `generated_enrichment_replay` explicitly asked to resume exactly that
+    // pending work. This function runs unconditionally after every open,
+    // addIndex, and addEnrichment, so without preserving that intent here it
+    // silently tears down and never rebuilds the runtime
+    // `replayGeneratedEnrichmentsFromStoredDocs` depends on the very first
+    // time this handle reconciles anything.
+    var enrichments = try local_write.createManagedDbEnrichments(
+        alloc,
+        merged_json,
+        handle.db.backend_runtime,
+        provider,
+        null,
+        null,
+        "",
+        null,
+        null,
+    );
+    defer enrichments.deinit(alloc);
+    var cfg = enrichments.takeConfig();
+    cfg.enable_without_producers = cfg.enable_without_producers or handle.lite_generated_enrichment_replay;
+    try handle.db.reconfigureEnrichmentRuntime(cfg);
+}
+
 fn closeHandle(handle: *Handle) void {
     const storage_owner_context = handle.storage_owner_context;
     const storage_owner_transaction_recovery = handle.storage_owner_transaction_recovery;
@@ -753,6 +1366,7 @@ fn closeHandle(handle: *Handle) void {
         handle.db.syncIndexes(true) catch {};
     }
     handle.db.close();
+    stopLiteEmbeddedInference(handle);
     if (storage_owner_transaction_recovery) |recovery| {
         recovery.deinit();
         handle.alloc.destroy(recovery);
@@ -859,6 +1473,7 @@ const ReadableLeaseHook = struct {
             .busy => return error.WouldBlock,
             .outcome_unknown => return error.DurabilityOutcomeUnknown,
             .unsupported => return error.UnsupportedOperation,
+            .stalled => return error.Stalled,
             .internal => return error.Internal,
         }
     }
@@ -7353,6 +7968,12 @@ fn resolveLiteOpenOptions(options_ptr: ?*const capi.LiteOpenOptions) !LiteResolv
         .inference = .{
             .remote_provider_configured = (flags & capi.lite_open_flag_remote_provider_configured) != 0,
             .local_runtime_configured = (flags & capi.lite_open_flag_local_runtime_configured) != 0,
+            .host_budget_mb = readOptionField(capi.LiteOpenOptions, options, abi_size, "inference_host_budget_mb") orelse 0,
+            .backend_budget_mb = readOptionField(capi.LiteOpenOptions, options, abi_size, "inference_backend_budget_mb") orelse 0,
+            .combined_budget_mb = readOptionField(capi.LiteOpenOptions, options, abi_size, "inference_combined_budget_mb") orelse 0,
+            .kv_budget_mb = readOptionField(capi.LiteOpenOptions, options, abi_size, "inference_kv_budget_mb") orelse 0,
+            .scratch_budget_mb = readOptionField(capi.LiteOpenOptions, options, abi_size, "inference_scratch_budget_mb") orelse 0,
+            .process_memory_budget_mb = readOptionField(capi.LiteOpenOptions, options, abi_size, "inference_process_memory_budget_mb") orelse 0,
         },
         .generated_enrichment_replay = (flags & capi.lite_open_flag_generated_enrichment_replay) != 0,
     };
@@ -7532,8 +8153,22 @@ fn openLiteHandleAllocWithRuntime(
     }
     try backend.configureDbOpenOptions(&opts);
 
+    // One identity policy for every Lite surface (C ABI, embedded package,
+    // CLI): pin a new file to the embedded root identity and adopt whatever
+    // identity an existing file already carries, so a database created
+    // through one surface opens through any other.
+    const identity = antfly.lite.connection.identityOpenOptions(create);
+    opts.identity_namespace = identity.identity_namespace;
+    opts.prefer_existing_identity_namespace = identity.prefer_existing_identity_namespace;
     var db = try db_mod.DB.open(alloc, path, opts);
     errdefer db.close();
+
+    if (create) {
+        // Antfly Lite databases provision the same default full-text index
+        // the server provisions on every table create, through the routine
+        // shared with the CLI and the embedded package.
+        try antfly.lite.connection.provisionDefaultFullTextIndex(&db);
+    }
 
     const handle = alloc.create(Handle) catch return error.OutOfMemory;
     errdefer alloc.destroy(handle);
@@ -7544,6 +8179,40 @@ fn openLiteHandleAllocWithRuntime(
         .owned_lite_backend = backend,
         .lite_profile = resolved.profile,
         .lite_inference_status = lite_backend.inferenceStatusForProfileWithOptions(resolved.profile, resolved.inference),
+        .lite_generated_enrichment_replay = resolved.generated_enrichment_replay,
+    };
+    // Only the native profile runs background enrichment automatically;
+    // only builds that both advertise (lite-local-inference-runtime) and
+    // actually link (capi_build_options.inference_enabled) the local
+    // inference runtime may construct one. Every other combination -- flag
+    // unset, default build, hosted profile -- leaves the handle exactly as
+    // it was before this feature existed.
+    if (resolved.profile == .native and
+        resolved.inference.local_runtime_configured and
+        capi_build_options.inference_enabled and
+        lite_backend.capabilitiesForProfile(.native).local_inference_runtime)
+    {
+        // `backend.deinit()`, `db.close()`, and `alloc.destroy(handle)` are
+        // already registered as `errdefer`s above (in that unwind order);
+        // adding any of that cleanup here too would run it twice on this
+        // error path. Only unwind the state this function itself owns.
+        try startLiteEmbeddedInference(handle, alloc, path, .{
+            .host_budget_mb = resolved.inference.host_budget_mb,
+            .backend_budget_mb = resolved.inference.backend_budget_mb,
+            .combined_budget_mb = resolved.inference.combined_budget_mb,
+            .kv_budget_mb = resolved.inference.kv_budget_mb,
+            .scratch_budget_mb = resolved.inference.scratch_budget_mb,
+            .process_memory_budget_mb = resolved.inference.process_memory_budget_mb,
+        });
+    }
+    // Restores the managed enrichment runtime for indexes/enrichments that
+    // were already declared in a prior session (`create` only ever adds the
+    // default full-text index, so this is a no-op there). Must run after
+    // `startLiteEmbeddedInference` so an embedded local provider is already
+    // attached to the handle when this reads it.
+    refreshLiteManagedEmbeddingRuntime(handle) catch |err| {
+        stopLiteEmbeddedInference(handle);
+        return err;
     };
     handle.db.startQuarantineRetryWorkerIfNeeded();
     return handle;
@@ -7930,7 +8599,10 @@ pub export fn antfly_lite_run_until_idle_json(handle_ptr: ?*anyopaque, out_buf: 
     const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
     if (handle.owned_lite_backend == null) return .invalid_argument;
-    handle.db.runUntilIdle() catch |err| return capi.mapError(err);
+    handle.db.runUntilIdle() catch |err| {
+        writeRunUntilIdleNoProgressDiagnosticIfAny(&handle.db, out, err);
+        return capi.mapError(err);
+    };
     out.* = stringifyJson(handle.db.pendingWorkStats()) catch return .internal;
     return .ok;
 }
@@ -8869,11 +9541,15 @@ fn searchTextOwned(
     limit: u32,
     offset: u32,
 ) !DenseOwnedResult {
-    if (index_name.len == 0) return error.InvalidArgument;
+    // An empty index name aliases the default full-text index, matching the
+    // server's public-query resolution (see api/tables.zig). A name that
+    // does not resolve to an existing index still fails inside
+    // executeLocalSearch below.
+    const resolved_index_name = if (index_name.len == 0) tables_api.default_full_text_index_name else index_name;
     const identity_read_generation = try currentIdentityReadGenerationForHandle(handle, null);
 
     const req: db_mod.types.SearchRequest = .{
-        .index_name = index_name,
+        .index_name = resolved_index_name,
         .query = query,
         .limit = limit,
         .offset = offset,
@@ -9141,9 +9817,28 @@ pub export fn antfly_db_run_until_idle_json(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
-    handle.db.runUntilIdle() catch |err| return capi.mapError(err);
+    handle.db.runUntilIdle() catch |err| {
+        writeRunUntilIdleNoProgressDiagnosticIfAny(&handle.db, out_buf, err);
+        return capi.mapError(err);
+    };
     out_buf.* = stringifyJson(handle.db.pendingWorkStats()) catch return .internal;
     return .ok;
+}
+
+/// On `error.RunUntilIdleNoProgress` (mapped to `capi.ErrorCode.stalled`),
+/// best-effort populate `out_buf` with the exact stuck index name and its
+/// indexed/expected counters (see `DB.NoProgressDiagnostic`) instead of
+/// leaving callers with only the non-descriptive status code. Any other
+/// error leaves `out_buf` untouched, matching every other failure path here.
+fn writeRunUntilIdleNoProgressDiagnosticIfAny(db: anytype, out_buf: *capi.Buffer, err: anyerror) void {
+    if (err != error.RunUntilIdleNoProgress) return;
+    const diagnostic = db.lastRunUntilIdleNoProgressDiagnostic() orelse return;
+    out_buf.* = stringifyJson(.{
+        .index_name = diagnostic.index_name,
+        .indexed = diagnostic.indexed,
+        .expected = diagnostic.expected,
+        .stuck_ms = diagnostic.stuck_ns / std.time.ns_per_ms,
+    }) catch return;
 }
 
 pub export fn antfly_db_pending_work_stats_json(
@@ -9764,34 +10459,96 @@ fn storageOwnerQueryFailure(
     return out_failure.status;
 }
 
+/// Resolves a public query's `semantic_search` text into a dense query
+/// vector for a native Lite handle, the same way the server does for a
+/// managed table: embed the text through the index's own configured
+/// embedder, using the retrieval-query task/instruction (Qwen3's built-in
+/// query instruction, for example) rather than the document-indexing task.
+/// Mirrors `http_server.zig`'s `SemanticStatusResolver`, but against Lite's
+/// index list instead of a table's admin snapshot, and constructs a
+/// throwaway `ManagedEmbedder` per call instead of reusing one cached on the
+/// enrichment runtime: Lite queries are not expected at a rate where that
+/// matters, and every other Lite embedder call site (`refreshLite...`,
+/// `litePhysicalIndexConfigJson`) already does the same thing.
+const LiteSemanticResolver = struct {
+    handle: *Handle,
+
+    fn resolveDenseQuery(
+        ptr: *anyopaque,
+        alloc: Allocator,
+        table_name: []const u8,
+        index_name: []const u8,
+        semantic_search: []const u8,
+        embedding_template: ?[]const u8,
+        limit: u32,
+    ) anyerror!db_mod.types.DenseKnnQuery {
+        _ = table_name;
+        if (embedding_template != null) return error.UnsupportedQueryRequest;
+        const self: *LiteSemanticResolver = @ptrCast(@alignCast(ptr));
+        const handle = self.handle;
+        const merged_json = try liteMergedIndexesJsonAlloc(handle);
+        defer handle.alloc.free(merged_json);
+        var managed = try managed_embedder.ManagedEmbedder.initFromIndexesJsonWithOptions(
+            handle.alloc,
+            merged_json,
+            .{ .antfly_provider = handle.liteAntflyProvider() },
+        );
+        defer managed.deinit();
+        const vector = try managed.embedQuery(alloc, index_name, semantic_search);
+        return .{ .vector = vector, .k = limit };
+    }
+
+    fn resolver(self: *LiteSemanticResolver) query_api.SemanticResolver {
+        return .{
+            .ptr = self,
+            .vtable = &.{ .resolve_dense_query = resolveDenseQuery },
+        };
+    }
+};
+
 fn searchPublicQueryJson(
     handle: *Handle,
     table_name: []const u8,
     request_json: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
+    // `linked_storage` says this compiled library links the full storage
+    // internals -- true unconditionally for the default `libantfly` since
+    // it is shared with the `antfly` executable -- not that `handle` is a
+    // genuine storage-owner/distributed-table handle. A Lite handle
+    // (`owned_lite_backend != null`) has no metadata/table catalog for
+    // `local_query_client`'s internal semantic-search resolution to look an
+    // index's embedder up in, so it always takes the simpler path below,
+    // which resolves `semantic_search` itself via `LiteSemanticResolver`.
     if (comptime capi_build_options.linked_storage) {
-        handle.prepareSearchRequest(.{}) catch |err| return capi.mapError(err);
-        var failure: kernel_owner_abi.FailureIdentity = .{};
-        const response = local_query_client.executeJsonAlloc(
-            std.heap.c_allocator,
-            @ptrCast(&handle.db),
-            table_name,
-            request_json.bytes(),
-            .public,
-            .{},
-            null,
-            null,
-            null,
-            &failure,
-        ) catch |err| return capi.mapError(err);
-        out_buf.* = .{ .ptr = response.json.ptr, .len = response.json.len };
-        return .ok;
+        if (handle.owned_lite_backend == null) {
+            handle.prepareSearchRequest(.{}) catch |err| return capi.mapError(err);
+            var failure: kernel_owner_abi.FailureIdentity = .{};
+            const response = local_query_client.executeJsonAlloc(
+                std.heap.c_allocator,
+                @ptrCast(&handle.db),
+                table_name,
+                request_json.bytes(),
+                .public,
+                .{},
+                null,
+                null,
+                null,
+                &failure,
+            ) catch |err| return capi.mapError(err);
+            out_buf.* = .{ .ptr = response.json.ptr, .len = response.json.len };
+            return .ok;
+        }
     }
 
+    var lite_semantic_resolver = LiteSemanticResolver{ .handle = handle };
+    const semantic_resolver: ?query_api.SemanticResolver = if (handle.lite_profile == .native)
+        lite_semantic_resolver.resolver()
+    else
+        null;
     var owned = query_api.parsePublicQueryRequest(
         handle.alloc,
-        null,
+        semantic_resolver,
         table_name,
         request_json.bytes(),
     ) catch |err| return capi.mapError(err);
@@ -12032,11 +12789,29 @@ pub export fn antfly_db_add_index_json(
         .algebraic
     else
         return .invalid_argument;
+    // A native Lite handle also accepts the server's nested "enrichments"
+    // shape on this index's own config (see `registerLiteIndexEnrichments`),
+    // registering every declared producer before the index below is admitted
+    // so an artifact-sourced `sources`/`embedding_name` reference already
+    // resolves.
+    if (handle.lite_profile == .native) {
+        registerLiteIndexEnrichments(handle, parsed.value.config_json) catch |err| return capi.mapError(err);
+    }
+    // Only a native Lite handle calls `db.addIndex` directly with a raw
+    // public-shaped dense/sparse config; the server always translates first
+    // (see `litePhysicalIndexConfigJson`). Every other handle keeps calling
+    // `db.addIndex` with exactly the config it was given, unchanged.
+    const stored_config_json = if (handle.lite_profile == .native)
+        litePhysicalIndexConfigJson(handle.alloc, kind, parsed.value.name, parsed.value.config_json, handle.liteAntflyProvider()) catch |err| return capi.mapError(err)
+    else
+        parsed.value.config_json;
+    defer if (handle.lite_profile == .native) handle.alloc.free(@constCast(stored_config_json));
     handle.db.addIndex(.{
         .name = parsed.value.name,
         .kind = kind,
-        .config_json = parsed.value.config_json,
+        .config_json = stored_config_json,
     }) catch |err| return capi.mapError(err);
+    refreshLiteManagedEmbeddingRuntime(handle) catch |err| return capi.mapError(err);
     return .ok;
 }
 
@@ -12062,6 +12837,7 @@ pub export fn antfly_db_add_enrichment_json(
     }) catch return .invalid_argument;
     defer parsed.deinit();
     handle.db.addEnrichment(parsed.value) catch |err| return capi.mapError(err);
+    refreshLiteManagedEmbeddingRuntime(handle) catch |err| return capi.mapError(err);
     return .ok;
 }
 
@@ -12111,6 +12887,14 @@ pub export fn antfly_db_get_edges_json(
 }
 
 test "capi get edges json does not double free a non-empty edge slice" {
+    // Regression test for graphFreeEdges double-freeing the edges slice
+    // GraphIndex.freeEdges already frees (antfly_db_get_edges_json's only
+    // caller). std.testing.allocator (a GeneralPurposeAllocator) detects a
+    // double free immediately, so this test would have failed loudly before
+    // the fix -- the bug otherwise only corrupted the libc heap used by
+    // production builds, manifesting later as an unrelated SIGABRT with no
+    // panic message. An empty-result query (before any edges exist) freed a
+    // zero-length slice, which many allocators no-op, so it never caught this.
     // Exercise the edge cleanup helper with the testing allocator as well as
     // the public C ABI, which uses the C allocator for its handle and results.
     var test_tmp = try TestDirectory.init("capi");
@@ -12151,6 +12935,8 @@ test "capi get edges json does not double free a non-empty edge slice" {
     defer antfly_db_buffer_free(batch_out.ptr, batch_out.len);
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_run_until_idle(handle_ptr));
 
+    // Now getEdges returns one real edge. Freeing that non-empty slice twice
+    // is a real heap corruption that std.testing.allocator catches.
     {
         const edges = try asHandle(handle_ptr).?.db.getEdges(alloc, "gr_edges_v1", "doc:edge-source", "", .both);
         defer graphFreeEdges(alloc, edges);
@@ -13167,6 +13953,13 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_stats_json(concurrent_status_handle, &concurrent_status));
     defer antfly_db_buffer_free(concurrent_status.ptr, concurrent_status.len);
     try std.testing.expect(std.mem.indexOf(u8, concurrent_status.ptr.?[0..concurrent_status.len], "\"doc_count\":") != null);
+    // Every fresh Lite database now carries the default full-text index,
+    // whose maintenance for the writes above runs in the background. Bring
+    // that work to idle before the vacuum and the physical-tail probes that
+    // follow: the online vacuum waits its turn for the writer slot, but the
+    // junk bytes appended below are only a stable tail if no later
+    // checkpoint extends the file past them.
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_run_until_idle(src_handle));
     var online_vacuum: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_vacuum_json(src_handle, &online_vacuum));
     defer antfly_db_buffer_free(online_vacuum.ptr, online_vacuum.len);
@@ -13234,6 +14027,8 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     var snapshot_file_report: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_copy_stable_snapshot_file_json(src_path, snapshot_file_path, false, &snapshot_file_report));
     defer antfly_db_buffer_free(snapshot_file_report.ptr, snapshot_file_report.len);
+    if (std.mem.indexOf(u8, snapshot_file_report.ptr.?[0..snapshot_file_report.len], "\"tail_bytes\":4") == null)
+        std.debug.print("stable snapshot file report: {s}\n", .{snapshot_file_report.ptr.?[0..snapshot_file_report.len]});
     try std.testing.expect(std.mem.indexOf(u8, snapshot_file_report.ptr.?[0..snapshot_file_report.len], "\"tail_bytes\":4") != null);
     var snapshot_file_existing_report: capi.Buffer = .{ .ptr = scratch[0..].ptr, .len = scratch.len };
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_copy_stable_snapshot_file_json(src_path, snapshot_file_path, false, &snapshot_file_existing_report));
@@ -13509,10 +14304,17 @@ test "capi lite exposes hosted and status-only profiles" {
     try std.testing.expect(std.mem.indexOf(u8, hosted_caps_json, "\"ttl_cleanup_runtime\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, hosted_caps_json, "\"transaction_recovery_runtime\":false") != null);
 
+    // Creating a Lite database already provisions the default full-text
+    // index, matching the server's behavior on table create.
+    var initial_indexes: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_list_indexes_json(hosted_handle, &initial_indexes));
+    defer antfly_db_buffer_free(initial_indexes.ptr, initial_indexes.len);
+    try std.testing.expect(std.mem.indexOf(u8, initial_indexes.ptr.?[0..initial_indexes.len], "\"full_text_index_v0\"") != null);
+
     const index_json =
         \\{"name":"full_text_index_v0","kind":"full_text","config_json":"{}"}
     ;
-    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(hosted_handle, .{
+    try std.testing.expectEqual(capi.ErrorCode.internal, antfly_db_add_index_json(hosted_handle, .{
         .ptr = index_json,
         .len = index_json.len,
     }));
@@ -14424,6 +15226,242 @@ test "capi dense search profile breakdown" {
     var final_result = try handle.db.search(alloc, req);
     defer final_result.deinit();
     try std.testing.expectEqual(@as(u32, 10), final_result.total_hits);
+}
+
+// This always runs (on every build, including the default) and only asserts
+// on the build-capability signal, never on whether construction succeeded:
+// `local_inference_runtime` and `inference_mode: "local_embedded"` must
+// report true/present only when the loaded build both advertises and links
+// the local inference runtime.
+test "capi lite local-runtime-configured flag reports local_embedded only when the build links inference" {
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
+    const alloc = std.testing.allocator;
+    const path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-inference-variant-caps");
+    defer alloc.free(path);
+    cleanupTestFile(path);
+    defer cleanupTestFile(path);
+
+    var options = capi.LiteOpenOptions{
+        .abi_size = @sizeOf(capi.LiteOpenOptions),
+        .flags = capi.lite_open_flag_local_runtime_configured,
+    };
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create_with_options(path, &options, &handle));
+    defer antfly_db_close(handle);
+
+    var status: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_status_json(handle, &status));
+    defer antfly_db_buffer_free(status.ptr, status.len);
+    const status_json = status.ptr.?[0..status.len];
+
+    // capi_build_options.inference_enabled is only true for the isolated
+    // `-Dcapi-inference=true` storage_kernel unit and for unit tests
+    // themselves; it is never true for the default build.
+    if (capi_build_options.inference_enabled and lite_backend.capabilitiesForProfile(.native).local_inference_runtime) {
+        try std.testing.expect(std.mem.indexOf(u8, status_json, "\"inference_mode\":\"local_embedded\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, status_json, "\"local_inference_runtime\":true") != null);
+        const owned_handle = asHandle(handle).?;
+        try std.testing.expect(owned_handle.lite_inference_lifetime != null);
+    } else {
+        try std.testing.expect(std.mem.indexOf(u8, status_json, "\"inference_mode\":\"caller_supplied_or_disabled\"") != null);
+        const owned_handle = asHandle(handle).?;
+        try std.testing.expect(owned_handle.lite_inference_lifetime == null);
+    }
+}
+
+// Confirms `EmbeddedInferenceNodeOptions` plumbing end to end: an explicit
+// process-memory budget override passed through `antfly_lite_open_options`
+// is what the embedded node actually resolves and reports back in
+// `antfly_lite_status_json`'s "inference" object, rather than the previous
+// hardcoded zero-bytes/"automatic" policy that gave every Lite handle no way
+// to distinguish "host-detected" from "unset" (see
+// `inference_provider.createEmbeddedInferenceNode` and
+// `LiteResolvedOpenOptions.inference`). Runs on every build (including the
+// default, where the local runtime never actually starts) and only asserts
+// the reported budgets on the build-capability signal, matching the sibling
+// local-runtime test above.
+test "capi lite explicit resource budget overrides are reported in status" {
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
+    const alloc = std.testing.allocator;
+    const path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-inference-budget-status");
+    defer alloc.free(path);
+    cleanupTestFile(path);
+    defer cleanupTestFile(path);
+
+    var options = capi.LiteOpenOptions{
+        .abi_size = @sizeOf(capi.LiteOpenOptions),
+        .flags = capi.lite_open_flag_local_runtime_configured,
+        .inference_host_budget_mb = 256,
+        .inference_backend_budget_mb = 128,
+        .inference_process_memory_budget_mb = 512,
+        .inference_combined_budget_mb = 384,
+        .inference_kv_budget_mb = 64,
+        .inference_scratch_budget_mb = 32,
+    };
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create_with_options(path, &options, &handle));
+    defer antfly_db_close(handle);
+
+    var status: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_status_json(handle, &status));
+    defer antfly_db_buffer_free(status.ptr, status.len);
+    const status_json = status.ptr.?[0..status.len];
+
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"host_budget_mb\":256") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"backend_budget_mb\":128") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"process_memory_budget_mb\":512") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"combined_budget_mb\":384") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"kv_budget_mb\":64") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"scratch_budget_mb\":32") != null);
+
+    if (capi_build_options.inference_enabled and lite_backend.capabilitiesForProfile(.native).local_inference_runtime) {
+        // The node actually started against the explicit override: the
+        // resolved envelope is exactly the requested 512 MiB (clamped by
+        // `resolveEffectiveDetailed` only when the detected host is
+        // smaller, which a 512 MiB request never exceeds on any test
+        // runner), and its provenance is "explicit", not "automatic".
+        try std.testing.expect(std.mem.indexOf(u8, status_json, "\"process_memory_limit_bytes\":536870912") != null);
+        try std.testing.expect(std.mem.indexOf(u8, status_json, "\"process_memory_limit_source\":\"explicit\"") != null);
+        const owned_handle = asHandle(handle).?;
+        try std.testing.expect(owned_handle.lite_inference_lifetime != null);
+    } else {
+        // No local runtime started, so the resolution never ran; status
+        // still echoes the caller's requested override values (asserted
+        // above) but the resolved fields stay at their zero-value/automatic
+        // defaults.
+        try std.testing.expect(std.mem.indexOf(u8, status_json, "\"process_memory_limit_bytes\":0") != null);
+        try std.testing.expect(std.mem.indexOf(u8, status_json, "\"process_memory_limit_source\":\"automatic\"") != null);
+    }
+}
+
+// A Lite handle opened with the local-runtime flag but no explicit budget
+// overrides must not fall back to the previous zero-bytes/automatic
+// generation-budget policy: that policy could not admit even one
+// boundary-architecture extraction window (fastino/gliner2.5-base-v1's
+// admission estimate exceeds it regardless of request size -- see
+// GLINER25.md's "Memory budget" section and this task's
+// gliner25-longdoc-handoff.md), so every such call failed with
+// error.MemoryBudgetExceeded through the embedded/in-process worker path
+// even though `antfly inference run` succeeded (only because an operator
+// supplied `--host-budget-mb`/`--backend-budget-mb`/`--combined-budget-mb`/
+// `--kv-budget-mb`/`--scratch-budget-mb` by hand). Confirms the embedded
+// node instead defaults each lane to
+// `inference_provider.default_{host,backend,combined,kv,scratch}_budget_mb`
+// (clamped to the host-detected envelope), and logs the resolved values for
+// the machine running this test.
+test "capi lite defaults embedded generation budgets when no override is given" {
+    if (!capi_build_options.inference_enabled) return error.SkipZigTest;
+    if (!lite_backend.capabilitiesForProfile(.native).local_inference_runtime) return error.SkipZigTest;
+
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
+    const alloc = std.testing.allocator;
+    const path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-inference-budget-defaults");
+    defer alloc.free(path);
+    cleanupTestFile(path);
+    defer cleanupTestFile(path);
+
+    var options = capi.LiteOpenOptions{
+        .abi_size = @sizeOf(capi.LiteOpenOptions),
+        .flags = capi.lite_open_flag_local_runtime_configured,
+    };
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create_with_options(path, &options, &handle));
+    defer antfly_db_close(handle);
+
+    var status: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_status_json(handle, &status));
+    defer antfly_db_buffer_free(status.ptr, status.len);
+    const status_json = status.ptr.?[0..status.len];
+    std.debug.print("capi lite default embedded generation budgets on this machine: {s}\n", .{status_json});
+
+    // None of these lanes may resolve to 0 (the previous automatic/unbounded
+    // policy that admitted no boundary-model window). host/backend/scratch
+    // default to 16384 MiB, combined to 32768, kv to 4096, each clamped to
+    // the host-detected envelope; a real dev/CI machine has well over 4 GiB,
+    // so all five stay at their un-clamped defaults on any realistic runner.
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"host_budget_mb\":0") == null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"backend_budget_mb\":0") == null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"combined_budget_mb\":0") == null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"kv_budget_mb\":0") == null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"scratch_budget_mb\":0") == null);
+}
+
+fn liteLocalEmbeddingModelAvailable(alloc: Allocator) bool {
+    const home_c = std.c.getenv("HOME") orelse return false;
+    const home = std.mem.span(home_c);
+    const owner_dir = std.fs.path.join(alloc, &.{ home, ".antfly", "inference", "models", "Qwen" }) catch return false;
+    defer alloc.free(owner_dir);
+    var dir = std.Io.Dir.cwd().openDir(std.testing.io, owner_dir, .{ .iterate = true }) catch return false;
+    defer dir.close(std.testing.io);
+    var it = dir.iterateAssumeFirstIteration();
+    while (it.next(std.testing.io) catch return false) |entry| {
+        if (std.mem.startsWith(u8, entry.name, "Qwen3-Embedding-0.6B-GGUF")) return true;
+    }
+    return false;
+}
+
+// Conditional on the `-Dcapi-inference=true` variant (skips on the default
+// build, where capi_build_options.inference_enabled is false) and on the
+// small local embedding model being present under
+// ~/.antfly/inference/models, so this never requires a network call and
+// never fails a machine that has not pulled the model.
+test "capi lite drains an antfly embedder with no api_url through the embedded inference provider" {
+    if (!capi_build_options.inference_enabled) return error.SkipZigTest;
+    if (!lite_backend.capabilitiesForProfile(.native).local_inference_runtime) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    if (!liteLocalEmbeddingModelAvailable(alloc)) return error.SkipZigTest;
+
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
+    const path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-local-embedding-drain");
+    defer alloc.free(path);
+    cleanupTestFile(path);
+    defer cleanupTestFile(path);
+
+    var options = capi.LiteOpenOptions{
+        .abi_size = @sizeOf(capi.LiteOpenOptions),
+        .flags = capi.lite_open_flag_local_runtime_configured,
+    };
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create_with_options(path, &options, &handle));
+    defer antfly_db_close(handle);
+    const owned_handle = asHandle(handle).?;
+    try std.testing.expect(owned_handle.lite_inference_lifetime != null);
+
+    const index_json =
+        \\{"name":"body_embedding","kind":"dense_vector","config_json":"{\"type\":\"embeddings\",\"embedder\":{\"provider\":\"antfly\",\"model\":\"Qwen/Qwen3-Embedding-0.6B-GGUF\"}}"}
+    ;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(handle, .{
+        .ptr = index_json.ptr,
+        .len = index_json.len,
+    }));
+
+    const enrichment_json =
+        \\{"name":"body_embedder","kind":"embedding","field":"body","vector_space":"body_embedding","producer_json":"{\"type\":\"embedder\",\"config\":{\"provider\":\"antfly\",\"model\":\"Qwen/Qwen3-Embedding-0.6B-GGUF\"}}"}
+    ;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_enrichment_json(handle, .{
+        .ptr = enrichment_json.ptr,
+        .len = enrichment_json.len,
+    }));
+
+    const batch_json = "{\"inserts\":{\"doc:capi-local-embedding\":{\"body\":\"antfly lite embeds documents locally\"}},\"sync_level\":\"write\"}";
+    var batch_out: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch_json(handle, .{
+        .ptr = batch_json.ptr,
+        .len = batch_json.len,
+    }, &batch_out));
+    defer antfly_db_buffer_free(batch_out.ptr, batch_out.len);
+
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_run_until_idle(handle));
+
+    const drained = owned_handle.db.pendingWorkStats();
+    try std.testing.expectEqual(@as(u64, 0), drained.enrichment.error_count);
+    try std.testing.expectEqual(@as(u64, 0), drained.enrichment.fatal_error_count);
+    try std.testing.expect(!drained.enrichment.stalled);
+    try std.testing.expectEqual(drained.enrichment.target_sequence, drained.enrichment.applied_sequence);
 }
 
 pub fn storageOwnerRestoreControlJson(owner_ptr: ?*anyopaque, request: *const kernel_owner_abi.RestoreOwnerControlRequest, out_result: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {

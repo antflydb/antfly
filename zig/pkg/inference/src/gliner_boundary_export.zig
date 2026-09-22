@@ -10,6 +10,7 @@ const policy = @import("models/gliner_boundary_artifact.zig");
 const access_mod = @import("models/tensor_access.zig");
 const c_file = @import("util/c_file.zig");
 const gguf = @import("gguf/root.zig");
+const registry = @import("registry/registry.zig");
 const Control = @import("execution_control.zig").InferenceExecutionControl;
 const Allocator = std.mem.Allocator;
 
@@ -288,6 +289,27 @@ pub fn exportBundle(allocator: Allocator, io: std.Io, source_dir: []const u8, ou
         try marker.writeStreamingAll(io, receipt_json);
         try marker.sync(io);
     }
+    // Write model_manifest.json before publishing so it is part of the same
+    // atomic directory the caller ever observes -- never a mutation of an
+    // already-published, otherwise-immutable bundle. This makes the produced
+    // directory immediately discoverable by name (`owner/name` layout) with
+    // real tasks/capabilities IF AND ONLY IF this exact converted identity
+    // (backbone, precision, and all five digests) already matches a reviewed
+    // row in models/gliner_boundary_qualification.zig's production table --
+    // the identical reviewed-identity gate a HuggingFace `pull` goes through
+    // (registry.zig's `boundaryIdentityIsQualified`, which recognizes this
+    // receipt's recorded precision instead of assuming fp32/safetensors).
+    // An unreviewed precision/digest still gets a manifest, just one with an
+    // empty tasks list, exactly like an unreviewed HuggingFace pull's.
+    const manifest_json = try registry.synthesizePulledModelManifestJson(allocator, staging, null, null);
+    defer allocator.free(manifest_json);
+    const manifest_path = try std.fs.path.join(a, &.{ staging, "model_manifest.json" });
+    {
+        var manifest_file = try cwd.createFile(io, manifest_path, .{ .exclusive = true });
+        defer manifest_file.close(io);
+        try manifest_file.writeStreamingAll(io, manifest_json);
+        try manifest_file.sync(io);
+    }
     try syncDirectory(io, try std.fs.path.join(a, &.{ staging, "encoder_config" }));
     try syncDirectory(io, staging);
     try check(options.control);
@@ -405,4 +427,46 @@ test "gliner boundary conversion pinned small FP32 roundtrip and same size subst
     try weight.writePositionalAll(std.testing.io, &byte, stat.size - 1);
     try weight.sync(std.testing.io);
     try std.testing.expectError(error.GlinerBoundaryArtifactMismatch, @import("architectures/session_factory.zig").createNativeSession(a, target));
+}
+
+// Regression proof for the registry.zig wiring above: exportBundle writes
+// model_manifest.json into the SAME atomic publish (never a follow-up
+// mutation of an already-published bundle), through the identical
+// reviewed-identity gate (`registry.synthesizePulledModelManifestJson` ->
+// `boundaryIdentityIsQualified`) a HuggingFace `pull` goes through. A
+// converted identity that already matches a reviewed row in
+// models/gliner_boundary_qualification.zig's production table (fp16_encoder,
+// as of this qualification) gets real tasks/capabilities; one that does not
+// (q8_0, still unreviewed) gets an empty tasks list, exactly like an
+// unreviewed HuggingFace pull's -- the conversion tool itself grants no
+// execution permission either way; only the production table does.
+test "gliner boundary conversion synthesizes a manifest gated on reviewed qualification, never a mutation after publish" {
+    const a = std.testing.allocator;
+    const source = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_BASE_MODEL_DIR") orelse return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const parent = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(parent);
+
+    const qualified_target = try std.fs.path.join(a, &.{ parent, "fp16" });
+    defer a.free(qualified_target);
+    var qualified_result = try exportBundle(a, std.testing.io, source, qualified_target, .{ .precision = .fp16_encoder });
+    defer qualified_result.deinit();
+    const qualified_manifest_path = try std.fs.path.join(a, &.{ qualified_target, "model_manifest.json" });
+    defer a.free(qualified_manifest_path);
+    const qualified_manifest_bytes = try c_file.readFileMax(a, qualified_manifest_path, 64 * 1024);
+    defer a.free(qualified_manifest_bytes);
+    try std.testing.expect(std.mem.indexOf(u8, qualified_manifest_bytes, "\"tasks\":[\"extract\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, qualified_manifest_bytes, "\"capabilities\":") != null);
+
+    const unqualified_target = try std.fs.path.join(a, &.{ parent, "q8_0" });
+    defer a.free(unqualified_target);
+    var unqualified_result = try exportBundle(a, std.testing.io, source, unqualified_target, .{ .precision = .q8_0 });
+    defer unqualified_result.deinit();
+    const unqualified_manifest_path = try std.fs.path.join(a, &.{ unqualified_target, "model_manifest.json" });
+    defer a.free(unqualified_manifest_path);
+    const unqualified_manifest_bytes = try c_file.readFileMax(a, unqualified_manifest_path, 64 * 1024);
+    defer a.free(unqualified_manifest_bytes);
+    try std.testing.expect(std.mem.indexOf(u8, unqualified_manifest_bytes, "\"tasks\":[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unqualified_manifest_bytes, "\"capabilities\":") == null);
 }
