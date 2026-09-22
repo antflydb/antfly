@@ -267,6 +267,9 @@ pub const TextDocument = struct {
     doc_ordinal: ?u32 = null,
     recursive_typed_fields: bool = false,
     infer_type_dynamic_paths: []const []const u8 = &.{},
+    /// Subtrees the document schema declares with `x-antfly-index: false`.
+    /// Typed doc values are never inferred at or below these paths.
+    unindexed_paths: []const []const u8 = &.{},
     typed_fields: ?[]const TypedFieldValue = null,
     typed_source: ?std.json.Value = null,
 };
@@ -280,6 +283,7 @@ pub const TextField = struct {
 pub const BuildTextOptions = struct {
     recursive_typed_fields: bool = false,
     infer_type_dynamic_paths: []const []const u8 = &.{},
+    unindexed_paths: []const []const u8 = &.{},
     index_sort: []const segment_mod.SegmentIndexSortField = &.{},
     profile: ?*BuildTextProfile = null,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
@@ -767,6 +771,9 @@ pub fn writeSegmentFromTextWithAnalysisOptions(
         doc_options.recursive_typed_fields = doc_options.recursive_typed_fields or text_doc.recursive_typed_fields;
         if (text_doc.infer_type_dynamic_paths.len > 0) {
             doc_options.infer_type_dynamic_paths = text_doc.infer_type_dynamic_paths;
+        }
+        if (text_doc.unindexed_paths.len > 0) {
+            doc_options.unindexed_paths = text_doc.unindexed_paths;
         }
         const typed_collect_start_ns = if (profile_timings) platform_time.monotonicNs() else 0;
         if (text_doc.typed_fields) |projected_typed_fields| {
@@ -1358,12 +1365,13 @@ pub fn collectTypedFieldProjection(
     if (options.recursive_typed_fields) {
         try collectTypedFieldProjectionRecursive(alloc, value, "", text_analysis, &fields);
     } else if (options.infer_type_dynamic_paths.len > 0) {
-        try collectTypedFieldProjectionRecursiveScoped(alloc, value, "", text_analysis, options.infer_type_dynamic_paths, &fields);
+        try collectTypedFieldProjectionRecursiveScoped(alloc, value, "", text_analysis, options.infer_type_dynamic_paths, options.unindexed_paths, &fields);
     } else {
         var it = value.object.iterator();
         while (it.next()) |entry| {
             const field_name = entry.key_ptr.*;
             if (field_name.len > 0 and field_name[0] == '_') continue;
+            if (pathFallsUnderAnyScopedPath(options.unindexed_paths, field_name)) continue;
 
             const detected = detectTypedValue(field_name, entry.value_ptr.*, text_analysis) orelse continue;
             try appendTypedFieldProjectionValue(alloc, &fields, field_name, detected);
@@ -1402,7 +1410,7 @@ fn collectTypedFieldValuesFromValue(
         return;
     }
     if (options.infer_type_dynamic_paths.len > 0) {
-        try collectTypedFieldValuesRecursiveScoped(alloc, value, "", doc_id, typed_fields, text_analysis, options.infer_type_dynamic_paths, options.profile);
+        try collectTypedFieldValuesRecursiveScoped(alloc, value, "", doc_id, typed_fields, text_analysis, options.infer_type_dynamic_paths, options.unindexed_paths, options.profile);
         return;
     }
 
@@ -1410,6 +1418,7 @@ fn collectTypedFieldValuesFromValue(
     while (it.next()) |entry| {
         const field_name = entry.key_ptr.*;
         if (field_name.len > 0 and field_name[0] == '_') continue;
+        if (pathFallsUnderAnyScopedPath(options.unindexed_paths, field_name)) continue;
 
         const detected = detectTypedValue(field_name, entry.value_ptr.*, text_analysis) orelse continue;
         try appendTypedFieldValue(alloc, typed_fields, field_name, doc_id, detected, options.profile);
@@ -1458,8 +1467,10 @@ fn collectTypedFieldProjectionRecursiveScoped(
     path: []const u8,
     text_analysis: TextAnalysisConfig,
     scoped_paths: []const []const u8,
+    unindexed_paths: []const []const u8,
     fields: *std.ArrayListUnmanaged(TypedFieldValue),
 ) !void {
+    if (path.len > 0 and pathFallsUnderAnyScopedPath(unindexed_paths, path)) return;
     if (path.len > 0 and pathFallsUnderAnyScopedPath(scoped_paths, path)) {
         if (detectTypedValue(path, value, text_analysis)) |detected| {
             try appendTypedFieldProjectionValue(alloc, fields, path, detected);
@@ -1477,12 +1488,12 @@ fn collectTypedFieldProjectionRecursiveScoped(
                 else
                     try std.fmt.allocPrint(alloc, "{s}.{s}", .{ path, entry.key_ptr.* });
                 defer alloc.free(child_path);
-                try collectTypedFieldProjectionRecursiveScoped(alloc, entry.value_ptr.*, child_path, text_analysis, scoped_paths, fields);
+                try collectTypedFieldProjectionRecursiveScoped(alloc, entry.value_ptr.*, child_path, text_analysis, scoped_paths, unindexed_paths, fields);
             }
         },
         .array => |array| {
             for (array.items) |item| {
-                try collectTypedFieldProjectionRecursiveScoped(alloc, item, path, text_analysis, scoped_paths, fields);
+                try collectTypedFieldProjectionRecursiveScoped(alloc, item, path, text_analysis, scoped_paths, unindexed_paths, fields);
             }
         },
         else => {},
@@ -1574,8 +1585,10 @@ fn collectTypedFieldValuesRecursiveScoped(
     typed_fields: *std.StringHashMapUnmanaged(TypedFieldCollector),
     text_analysis: TextAnalysisConfig,
     scoped_paths: []const []const u8,
+    unindexed_paths: []const []const u8,
     profile: ?*BuildTextProfile,
 ) !void {
+    if (path.len > 0 and pathFallsUnderAnyScopedPath(unindexed_paths, path)) return;
     if (path.len > 0 and pathFallsUnderAnyScopedPath(scoped_paths, path)) {
         if (detectTypedValue(path, value, text_analysis)) |detected| {
             try appendTypedFieldValue(alloc, typed_fields, path, doc_id, detected, profile);
@@ -1593,12 +1606,12 @@ fn collectTypedFieldValuesRecursiveScoped(
                 else
                     try std.fmt.allocPrint(alloc, "{s}.{s}", .{ path, entry.key_ptr.* });
                 defer alloc.free(child_path);
-                try collectTypedFieldValuesRecursiveScoped(alloc, entry.value_ptr.*, child_path, doc_id, typed_fields, text_analysis, scoped_paths, profile);
+                try collectTypedFieldValuesRecursiveScoped(alloc, entry.value_ptr.*, child_path, doc_id, typed_fields, text_analysis, scoped_paths, unindexed_paths, profile);
             }
         },
         .array => |array| {
             for (array.items) |item| {
-                try collectTypedFieldValuesRecursiveScoped(alloc, item, path, doc_id, typed_fields, text_analysis, scoped_paths, profile);
+                try collectTypedFieldValuesRecursiveScoped(alloc, item, path, doc_id, typed_fields, text_analysis, scoped_paths, unindexed_paths, profile);
             }
         },
         else => {},

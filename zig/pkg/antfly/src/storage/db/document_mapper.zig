@@ -953,6 +953,7 @@ pub const TextProjectionBatchBuilder = struct {
             .text_fields = extracted.fields,
             .recursive_typed_fields = extracted.recursive_typed_fields,
             .infer_type_dynamic_paths = extracted.infer_type_dynamic_paths,
+            .unindexed_paths = extracted.unindexed_paths,
             // A selected-field index must not inherit typed doc values from the
             // whole source document. Besides violating the projection contract,
             // doing so would let filters and sorts observe fields the index was
@@ -1017,6 +1018,7 @@ const ExtractedTextFields = struct {
     fields: []const introducer_mod.TextField,
     recursive_typed_fields: bool = false,
     infer_type_dynamic_paths: []const []const u8 = &.{},
+    unindexed_paths: []const []const u8 = &.{},
     typed_fields: ?[]const introducer_mod.TypedFieldValue = null,
 };
 
@@ -2531,8 +2533,16 @@ fn extractTextFieldsFromValue(
 
     if (schema) |runtime| {
         if (!runtimeHasSchemaDrivenText(runtime)) {
+            // A schema that declares no text mapping still indexes every
+            // string like a schema-less table, but a declaration that
+            // disables indexing is honoured even here.
+            const unindexed_paths = if (resolveFullTextDocument(runtime, root.object)) |resolved|
+                resolved.unindexed_paths
+            else
+                &.{};
             return .{
-                .fields = try extractStringFieldsNoSchema(alloc, root.object),
+                .fields = try extractStringFieldsNoSchema(alloc, root.object, unindexed_paths),
+                .unindexed_paths = unindexed_paths,
             };
         }
 
@@ -2554,6 +2564,7 @@ fn extractTextFieldsFromValue(
         return .{
             .fields = if (fields.items.len > 0) try alloc.dupe(introducer_mod.TextField, fields.items) else &.{},
             .infer_type_dynamic_paths = if (document_schema) |resolved| resolved.infer_type_dynamic_paths else &.{},
+            .unindexed_paths = if (document_schema) |resolved| resolved.unindexed_paths else &.{},
             .typed_fields = if (typed_fields.items.len > 0) try alloc.dupe(introducer_mod.TypedFieldValue, typed_fields.items) else null,
         };
     }
@@ -2874,6 +2885,16 @@ fn collectDynamicSchemaTextFields(
     text_analysis: introducer_mod.TextAnalysisConfig,
     observed_field_analyzers: ?*std.ArrayListUnmanaged(ObservedFieldAnalyzer),
 ) !void {
+    // `x-antfly-index: false` disables every dynamic projection for the whole
+    // subtree, regardless of how the enclosing object opts into dynamic
+    // indexing. Explicit fields never reach here, so this only guards the
+    // dynamic fallbacks below.
+    if (path.len > 0) {
+        if (document_schema) |resolved| {
+            if (runtime_schema.pathFallsUnderAnyPrefix(resolved.unindexed_paths, path)) return;
+        }
+    }
+
     var dynamic_typed_terminal = false;
     if (path.len > 0 and !containsStringSlice(explicit_paths, path)) {
         if (document_schema) |resolved| {
@@ -2927,7 +2948,12 @@ fn collectDynamicSchemaTextFields(
         .string => |text| {
             if (path.len == 0) return;
             if (containsStringSlice(explicit_paths, path)) return;
+            // A declared property is indexed only as its declaration says.
+            // One that emits no text field (`blob`, `embedding`, numeric
+            // shorthand, ...) is not an undeclared string for the dynamic
+            // rules, templates, or open paths to pick up.
             if (document_schema) |resolved| {
+                if (runtime_schema.containsPath(resolved.declared_paths, path)) return;
                 if (resolveDynamicRule(resolved, path)) |rule| {
                     try appendDynamicRuleTextField(alloc, fields, path, text, rule, text_analysis);
                     return;
@@ -3195,10 +3221,14 @@ fn appendDynamicSchemaLessStringTextFields(
     }
 }
 
-fn extractStringFieldsNoSchema(alloc: Allocator, object: std.json.ObjectMap) ![]introducer_mod.TextField {
+fn extractStringFieldsNoSchema(
+    alloc: Allocator,
+    object: std.json.ObjectMap,
+    unindexed_paths: []const []const u8,
+) ![]introducer_mod.TextField {
     var fields = std.ArrayListUnmanaged(introducer_mod.TextField).empty;
     defer fields.deinit(alloc);
-    try collectStringFieldsNoSchema(alloc, &fields, .{ .object = object }, "");
+    try collectStringFieldsNoSchema(alloc, &fields, .{ .object = object }, "", unindexed_paths);
     return try alloc.dupe(introducer_mod.TextField, fields.items);
 }
 
@@ -3454,7 +3484,9 @@ fn collectStringFieldsNoSchema(
     fields: *std.ArrayListUnmanaged(introducer_mod.TextField),
     value: std.json.Value,
     path: []const u8,
+    unindexed_paths: []const []const u8,
 ) !void {
+    if (path.len > 0 and runtime_schema.pathFallsUnderAnyPrefix(unindexed_paths, path)) return;
     switch (value) {
         .object => |object| {
             var it = object.iterator();
@@ -3465,12 +3497,12 @@ fn collectStringFieldsNoSchema(
                 else
                     try std.fmt.allocPrint(alloc, "{s}.{s}", .{ path, entry.key_ptr.* });
                 defer alloc.free(child_path);
-                try collectStringFieldsNoSchema(alloc, fields, entry.value_ptr.*, child_path);
+                try collectStringFieldsNoSchema(alloc, fields, entry.value_ptr.*, child_path, unindexed_paths);
             }
         },
         .array => |array| {
             for (array.items) |item| {
-                try collectStringFieldsNoSchema(alloc, fields, item, path);
+                try collectStringFieldsNoSchema(alloc, fields, item, path, unindexed_paths);
             }
         },
         .string => |text| {
@@ -5790,6 +5822,131 @@ test "document mapper emits additionalProperties true fallback text fields" {
 
     try std.testing.expect((try reader.invertedIndex("meta.foo.title")) != null);
     try std.testing.expect((try reader.invertedIndex("skip.title")) == null);
+}
+
+test "document mapper honours explicit declarations under additionalProperties true" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":0,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true,"properties":{
+        \\  "body":{"type":"string","x-antfly-types":["text"]},
+        \\  "stored_only":{"type":"string","x-antfly-index":false},
+        \\  "attachment":{"type":"string","x-antfly-types":["blob"]},
+        \\  "notes":{"type":"array","items":{"type":"string","x-antfly-index":false}},
+        \\  "meta":{"type":"object","properties":{
+        \\    "label":{"type":"string"},
+        \\    "secret":{"type":"object","x-antfly-index":false,"properties":{"token":{"type":"string"}}}
+        \\  }}
+        \\}}}}}
+    ;
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    const text_analysis = introducer_mod.TextAnalysisConfig{};
+    const segment = (try buildTextSegmentFromDocuments(alloc, &.{
+        .{ .key = "doc:1", .value =
+        \\{"_type":"doc","body":"zebrafish","stored_only":"xylophone","attachment":"aGVsbG8=","notes":["quince"],
+        \\ "undeclared":"quokka","meta":{"label":"lemur","secret":{"token":"walrus","extra":"yak"},"loose":"ibex"}}
+        },
+    }, text_analysis, schema)).?;
+    defer alloc.free(segment);
+
+    var reader = try @import("../../segment.zig").SegmentReader.init(alloc, segment);
+    defer reader.deinit();
+
+    // Declared text fields and undeclared fields are indexed as before.
+    try std.testing.expect((try reader.invertedIndex("body")) != null);
+    try std.testing.expect((try reader.invertedIndex("undeclared")) != null);
+    try std.testing.expect((try reader.invertedIndex("meta.label")) != null);
+    try std.testing.expect((try reader.invertedIndex("meta.loose")) != null);
+
+    // Explicit declarations win over the open dynamic mapper.
+    try std.testing.expect((try reader.invertedIndex("stored_only")) == null);
+    try std.testing.expect((try reader.invertedIndex("stored_only.keyword")) == null);
+    try std.testing.expect((try reader.invertedIndex("attachment")) == null);
+    try std.testing.expect((try reader.invertedIndex("notes")) == null);
+    try std.testing.expect((try reader.invertedIndex("meta.secret.token")) == null);
+    try std.testing.expect((try reader.invertedIndex("meta.secret.extra")) == null);
+}
+
+test "document mapper skips unindexed subtrees for infer_types and dynamic rules" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":0,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object",
+        \\  "additionalProperties":true,"x-antfly-dynamic-indexing":{"mode":"infer_types"},
+        \\  "properties":{
+        \\    "count":{"type":"integer"},
+        \\    "hidden_count":{"type":"integer","x-antfly-index":false},
+        \\    "stored_only":{"type":"string","x-antfly-index":false},
+        \\    "tags":{"type":"object","additionalProperties":{"type":"string","x-antfly-types":["text","search_as_you_type"]},
+        \\      "properties":{"private":{"type":"string","x-antfly-index":false}}}
+        \\}}}}}
+    ;
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    const text_analysis = introducer_mod.TextAnalysisConfig{};
+    var result = try buildTextSegmentFromDocumentsWithMetadata(alloc, &.{
+        .{ .key = "doc:1", .value =
+        \\{"count":7,"hidden_count":11,"stored_only":"2024-01-02T03:04:05Z","free":"ocelot",
+        \\ "tags":{"public":"gamma ray","private":"delta ray"}}
+        },
+    }, text_analysis, schema);
+    defer result.deinit(alloc);
+    const segment = result.segment.?;
+
+    var reader = try @import("../../segment.zig").SegmentReader.init(alloc, segment);
+    defer reader.deinit();
+
+    // Declared shorthand integers and undeclared fields keep their inferred
+    // projections; unindexed fields get neither text nor typed doc values.
+    try std.testing.expect((try reader.getSection("count", .typed_doc_values)) != null);
+    try std.testing.expect((try reader.invertedIndex("free")) != null);
+    try std.testing.expect((try reader.getSection("hidden_count", .typed_doc_values)) == null);
+    try std.testing.expect((try reader.invertedIndex("stored_only")) == null);
+    try std.testing.expect((try reader.getSection("stored_only", .typed_doc_values)) == null);
+
+    // The additionalProperties rule applies to undeclared members only.
+    try std.testing.expect((try reader.invertedIndex("tags.public")) != null);
+    try std.testing.expect((try reader.invertedIndex("tags.public._2gram")) != null);
+    try std.testing.expect((try reader.invertedIndex("tags.private")) == null);
+    try std.testing.expect((try reader.invertedIndex("tags.private._2gram")) == null);
+}
+
+test "document mapper honours x-antfly-index false without any schema-driven text" {
+    const alloc = std.testing.allocator;
+    // No declaration produces a text mapping, so the table indexes strings
+    // like a schema-less one; the unindexed declarations still hold.
+    const schema_json =
+        \\{"version":0,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{
+        \\  "count":{"type":"integer"},
+        \\  "hidden_count":{"type":"integer","x-antfly-index":false},
+        \\  "content":{"type":"string","x-antfly-index":false}
+        \\}}}}}
+    ;
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, schema);
+    try std.testing.expect(!runtimeHasSchemaDrivenText(schema));
+
+    const text_analysis = introducer_mod.TextAnalysisConfig{};
+    var result = try buildTextSegmentFromDocumentsWithMetadata(alloc, &.{
+        .{ .key = "doc:1", .value = "{\"count\":7,\"hidden_count\":11,\"content\":\"xylophone\",\"title\":\"zebrafish\"}" },
+    }, text_analysis, schema);
+    defer result.deinit(alloc);
+    const segment = result.segment.?;
+
+    var reader = try @import("../../segment.zig").SegmentReader.init(alloc, segment);
+    defer reader.deinit();
+
+    try std.testing.expect((try reader.invertedIndex("title")) != null);
+    try std.testing.expect((try reader.getSection("count", .typed_doc_values)) != null);
+    try std.testing.expect((try reader.invertedIndex("content")) == null);
+    try std.testing.expect((try reader.getSection("hidden_count", .typed_doc_values)) == null);
 }
 
 test "document mapper emits schema-present infer_types text fields" {

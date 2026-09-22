@@ -144,11 +144,24 @@ tags:
 
       **Dynamic Indexing** (`additionalProperties`):
 
-      - `"additionalProperties": false` - Only index fields defined in `properties` (recommended for performance)
+      - `"additionalProperties": false` - Reject documents that carry fields not defined in `properties`
+      (standard JSON Schema validation); only declared fields exist, so only declared fields are indexed
 
-      - `"additionalProperties": true` - Index all fields dynamically (flexible but slower)
+      - `"additionalProperties": true` - Store undeclared fields and index them dynamically (flexible
+      but slower)
 
-      - If not specified, dynamic indexing is disabled
+      - If not specified, undeclared fields are stored but not indexed
+
+
+      Dynamic indexing only ever applies to undeclared fields. A property
+
+      listed in `properties` is indexed exactly as its declaration says: one
+
+      declared with `x-antfly-index: false`, or with a non-text type such as
+
+      `blob` or `embedding`, stays out of the text index even when the
+
+      enclosing object sets `"additionalProperties": true`.
 
 
       **Nested Objects**:
@@ -262,6 +275,18 @@ tags:
       {"type": "string", "x-antfly-index": false}
 
       ```
+
+      The value is still stored and returned with the document, but nothing at
+
+      or below that path is indexed: no text postings, no typed doc values, and
+
+      no dynamic indexing even when the enclosing object sets
+
+      `"additionalProperties": true`. On an object or an array's `items` it
+
+      applies to the whole subtree. This is the way to keep a large field that
+
+      exists only as the source of an embeddings index out of the text index.
 
 
       ### `x-antfly-include-in-all`
