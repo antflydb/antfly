@@ -25,6 +25,7 @@ const request_admission = @import("../common/request_admission.zig");
 const common_cancellation = @import("../common/cancellation.zig");
 const provider_limits = @import("../common/provider_limits.zig");
 const credential_identity = @import("../common/credential_source_identity.zig");
+const platform_time = @import("antfly_platform").time;
 const google_auth = @import("antfly_google").auth;
 
 pub const Config = lib.Config;
@@ -140,18 +141,15 @@ pub fn normalizeOperationalError(err: anyerror) anyerror {
         error.HostUnreachable,
         error.TemporaryNameServerFailure,
         error.NameServerFailure,
+        error.ResourceTemporarilyUnavailable,
+        error.ConcurrencyUnavailable,
         => error.RerankTransientFailure,
         else => err,
     };
 }
 
 pub fn statusError(status: u16) anyerror {
-    return switch (status) {
-        408, 504 => error.Timeout,
-        429 => error.RerankRateLimited,
-        500...503, 505...599 => error.RerankTransientFailure,
-        else => error.RerankRequestFailed,
-    };
+    return @import("../inference/types.zig").rerankStatusError(status);
 }
 
 test "reranking runtime failures use stable query dependency classes" {
@@ -162,6 +160,8 @@ test "reranking runtime failures use stable query dependency classes" {
     try std.testing.expectEqual(error.RerankRequestFailed, statusError(401));
     try std.testing.expectEqual(error.RerankUpstreamFailure, normalizeOperationalError(error.InvalidRerankerResponse));
     try std.testing.expectEqual(error.RerankTransientFailure, normalizeOperationalError(error.ConnectionRefused));
+    try std.testing.expectEqual(error.RerankTransientFailure, normalizeOperationalError(error.ResourceTemporarilyUnavailable));
+    try std.testing.expectEqual(error.RerankTransientFailure, normalizeOperationalError(error.ConcurrencyUnavailable));
     try std.testing.expectEqual(error.Timeout, normalizeOperationalError(error.ConnectionTimedOut));
     try std.testing.expectEqual(error.Cancelled, normalizeOperationalError(error.Canceled));
     try std.testing.expectEqual(error.Cancelled, normalizeOperationalError(error.Cancelled));
@@ -552,6 +552,129 @@ test "reranking runtime delegates to antfly provider" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.9), scores.?[0], 0.0001);
 }
 
+test "reranking runtime preserves antfly HTTP failure classes" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const Case = struct { status: u16, body: []const u8 = "{}", expected: anyerror };
+    const cases = [_]Case{
+        .{ .status = 503, .body = "{\"error\":\"MODEL_RESOURCE_BUSY\",\"reason\":\"inference_capacity\",\"retryable\":true,\"retry_after_ms\":1000}", .expected = error.RerankTransientFailure },
+        .{ .status = 429, .expected = error.RerankRateLimited },
+        .{ .status = 500, .expected = error.RerankTransientFailure },
+        .{ .status = 502, .expected = error.RerankTransientFailure },
+        .{ .status = 408, .expected = error.Timeout },
+        .{ .status = 504, .expected = error.Timeout },
+        .{ .status = 401, .expected = error.RerankUpstreamFailure },
+        .{ .status = 422, .body = "{\"error\":\"MODEL_RESOURCE_LIMIT\",\"retryable\":false}", .expected = error.RerankUpstreamFailure },
+    };
+    for (cases) |tc| {
+        var server = try httpx.TestServer.start(alloc, io, &.{
+            .{ .method = .POST, .path = "/rerank", .respond = .{ .status = tc.status, .body = tc.body } },
+        });
+        defer server.deinit();
+        var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
+        defer client.deinit();
+        var run_err: ?anyerror = null;
+        var group = std.Io.Group.init;
+        defer group.cancel(io);
+        const Fiber = struct {
+            fn run(a: std.mem.Allocator, http: *httpx.Client, url: []const u8, err_out: *?anyerror) std.Io.Cancelable!void {
+                // Use the endpoint's default model to exercise execution without discovery.
+                const scores = rerankDocumentsWithOptions(a, http, .{
+                    .provider = .antfly,
+                    .url = url,
+                    .field = "body",
+                }, .{}, "query", &.{"document"}) catch |err| {
+                    err_out.* = normalizeOperationalError(err);
+                    return;
+                };
+                a.free(scores);
+            }
+        };
+        try group.concurrent(io, Fiber.run, .{ alloc, &client, server.baseUrl(), &run_err });
+        try server.handleOne();
+        try group.await(io);
+        try std.testing.expectEqual(@as(?anyerror, tc.expected), run_err);
+    }
+}
+
+test "reranking runtime cancels active antfly HTTP work and releases admission" {
+    if (@import("builtin").os.tag == .windows or @import("builtin").os.tag == .freestanding) return;
+    const State = struct {
+        var started = std.atomic.Value(bool).init(false);
+        var canceled = std.atomic.Value(bool).init(false);
+        var release = std.atomic.Value(bool).init(false);
+        fn handler(ctx: *httpx.Context) anyerror!httpx.Response {
+            if (started.swap(true, .acq_rel)) return ctx.json(.{ .scores = [_]f32{0.5} });
+            while (!release.load(.acquire)) {
+                if (ctx.isCancellationRequested()) {
+                    canceled.store(true, .release);
+                    return error.Canceled;
+                }
+                try ctx.io.sleep(.fromMilliseconds(1), .awake);
+            }
+            return ctx.json(.{ .scores = [_]f32{0.5} });
+        }
+    };
+    State.started.store(false, .release);
+    State.canceled.store(false, .release);
+    State.release.store(false, .release);
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var server = httpx.Server.initWithConfig(alloc, io, .{ .host = "127.0.0.1", .port = 0 });
+    defer server.deinit();
+    try server.post("/rerank", State.handler);
+    try server.bind();
+    var listener = try std.testing.io.concurrent(struct {
+        fn run(s: *httpx.Server) void {
+            s.listen() catch {};
+        }
+    }.run, .{&server});
+    defer {
+        State.release.store(true, .release);
+        server.stop();
+        listener.await(std.testing.io);
+    }
+    while (!server.listen_started.load(.acquire)) try io.sleep(.fromMilliseconds(1), .awake);
+    const url = try std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}", .{server.boundAddress().?.getPort()});
+    defer alloc.free(url);
+    var runtime = Runtime.init(alloc, io);
+    defer runtime.deinit();
+    runtime.admission = .init(1);
+    var cancellation = std.atomic.Value(bool).init(false);
+    const cfg = Config{ .provider = .antfly, .url = url, .field = "body" };
+    var request = try io.concurrent(struct {
+        fn run(a: std.mem.Allocator, r: *Runtime, config: Config, signal: *std.atomic.Value(bool)) anyerror!void {
+            const scores = try r.rerank(a, config, .{ .execution_context = .{
+                .io = r.io,
+                .deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s,
+                .cancellation = common_cancellation.CancellationToken.fromAtomic(signal),
+            } }, "query", &.{"document"});
+            a.free(scores);
+        }
+    }.run, .{ alloc, &runtime, cfg, &cancellation });
+    defer request.cancel(io) catch {};
+    for (0..5000) |_| {
+        if (State.started.load(.acquire)) break;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(State.started.load(.acquire));
+    cancellation.store(true, .release);
+    try std.testing.expectError(error.Cancelled, request.await(io));
+    for (0..2000) |_| {
+        if (State.canceled.load(.acquire)) break;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(State.canceled.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), runtime.admission.stats().in_flight);
+    const scores = try runtime.rerank(alloc, cfg, .{}, "next query", &.{"document"});
+    defer alloc.free(scores);
+    try std.testing.expectEqual(@as(f32, 0.5), scores[0]);
+}
+
 test "reranking runtime routes antfly provider to local antfly" {
     const alloc = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
@@ -561,6 +684,7 @@ test "reranking runtime routes antfly provider to local antfly" {
 
     const State = struct {
         called: bool = false,
+        failure: ?anyerror = null,
 
         fn dense(_: *anyopaque, a: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![][]f32 {
             return try a.alloc([]f32, 0);
@@ -573,6 +697,7 @@ test "reranking runtime routes antfly provider to local antfly" {
         fn rerank(ptr: *anyopaque, a: std.mem.Allocator, model: []const u8, query: []const u8, documents: []const []const u8) anyerror![]f32 {
             const state: *@This() = @ptrCast(@alignCast(ptr));
             state.called = true;
+            if (state.failure) |err| return err;
             try std.testing.expectEqualStrings("", model);
             try std.testing.expectEqualStrings("query", query);
             try std.testing.expectEqual(@as(usize, 2), documents.len);
@@ -600,6 +725,18 @@ test "reranking runtime routes antfly provider to local antfly" {
     defer alloc.free(scores);
     try std.testing.expect(state.called);
     try std.testing.expectApproxEqAbs(@as(f32, 0.8), scores[1], 0.0001);
+
+    for ([_]anyerror{ error.ResourceTemporarilyUnavailable, error.ConcurrencyUnavailable }) |err| {
+        state.failure = err;
+        try std.testing.expectError(err, rerankDocumentsWithAntflyProvider(
+            alloc,
+            &client,
+            cfg,
+            local,
+            "query",
+            &.{ "doc1", "doc2" },
+        ));
+    }
 }
 
 test "reranking runtime authentication owns wire credentials and stable quota sources" {

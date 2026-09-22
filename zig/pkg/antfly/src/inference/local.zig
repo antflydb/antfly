@@ -489,7 +489,7 @@ pub const Provider = struct {
                 null,
         });
         defer resp.deinit();
-        if (!resp.ok()) return error.RerankRequestFailed;
+        if (!resp.ok()) return inference.rerankStatusError(resp.status.code);
         const body = resp.body orelse return error.EmptyResponse;
         var parsed = try std.json.parseFromSlice(Response, alloc, body, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();

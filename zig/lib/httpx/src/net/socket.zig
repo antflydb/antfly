@@ -136,10 +136,19 @@ fn readAtLeastOne(reader: *Io.Reader, buf: []u8) Io.Reader.Error!usize {
     }
 }
 
+/// True only for handles owned by Zig's host-network Threaded backend. This
+/// identity check keeps raw socket options away from deterministic/custom Io
+/// implementations whose handles are virtual rather than OS descriptors.
+fn isThreadedNetworkIo(io: Io) bool {
+    if (comptime builtin.os.tag == .wasi or builtin.os.tag == .freestanding) return false;
+    return io.vtable.netListenIp == Io.Threaded.global_single_threaded.io().vtable.netListenIp;
+}
+
 /// TCP socket abstraction backed by std.Io.net.
 pub const Socket = struct {
     handle: net.Socket.Handle,
     io: Io,
+    send_timeout_ms: ?u64 = null,
     request_deadline_ms: ?i64 = null,
     request_cancel_cb: ?*const fn (context: ?*anyopaque) bool = null,
     request_cancel_ctx: ?*anyopaque = null,
@@ -223,11 +232,37 @@ pub const Socket = struct {
         self.io.vtable.netShutdown(self.io.userdata, self.handle, .both) catch {};
     }
 
+    /// Wake an abandoned HTTP/1 request without first sending an orderly FIN.
+    /// Its owner still closes the descriptor after the request task unwinds;
+    /// zero linger makes that close a reset the peer can observe as cancellation.
+    pub fn abortRequest(self: *Self) void {
+        // Cleanup must still wake the owner when its parent task is cancelled.
+        const protection = self.io.swapCancelProtection(.blocked);
+        defer _ = self.io.swapCancelProtection(protection);
+        if (isThreadedNetworkIo(self.io)) {
+            const Linger = if (is_windows) std.os.windows.ws2_32.linger else posix.linger;
+            const linger = Linger{ .onoff = 1, .linger = 0 };
+            setSocketOption(self.handle, posix.SOL.SOCKET, posix.SO.LINGER, std.mem.asBytes(&linger)) catch {
+                self.shutdown();
+                return;
+            };
+            self.io.vtable.netShutdown(self.io.userdata, self.handle, .recv) catch {};
+        } else {
+            // Custom Io handles are not necessarily native descriptors.
+            self.shutdown();
+        }
+    }
+
     /// Sends data, returning the number of bytes written.
     pub fn send(self: *Self, data: []const u8) !usize {
+        // Keep one write deadline across cancellation polling retries.
+        const send_deadline_ms = if (self.send_timeout_ms) |timeout_ms|
+            common.milliTimestamp(self.io) +| @as(i64, @intCast(@min(timeout_ms, std.math.maxInt(i64))))
+        else
+            null;
         while (true) {
             try self.checkRequestCancellation();
-            try self.applyRequestDeadline(.send);
+            try self.applySendDeadline(send_deadline_ms);
             const sent = (if (is_windows)
                 self.io.vtable.netWrite(self.io.userdata, self.handle, "", &.{data}, 1)
             else
@@ -236,7 +271,9 @@ pub const Socket = struct {
                 try self.checkRequestCancellation();
                 if (err == error.Timeout or err == error.WouldBlock) {
                     try self.checkRequestDeadline();
-                    if (self.request_cancel_cb != null or self.request_deadline_ms != null) continue;
+                    try self.applySendDeadline(send_deadline_ms);
+                    if (self.request_cancel_cb != null) continue;
+                    return error.Timeout;
                 }
                 return error.SendFailed;
             };
@@ -360,6 +397,24 @@ pub const Socket = struct {
         }
     }
 
+    fn applySendDeadline(self: *Self, send_deadline_ms: ?i64) !void {
+        const deadline_ms = if (send_deadline_ms) |send_deadline|
+            if (self.request_deadline_ms) |request_deadline| @min(send_deadline, request_deadline) else send_deadline
+        else
+            self.request_deadline_ms;
+        const remaining_ms: ?u64 = if (deadline_ms) |deadline| blk: {
+            const now_ms = common.milliTimestamp(self.io);
+            if (now_ms >= deadline) return error.Timeout;
+            break :blk @intCast(deadline - now_ms);
+        } else null;
+        const timeout_ms = if (self.request_cancel_cb != null)
+            @min(remaining_ms orelse 20, 20)
+        else
+            remaining_ms orelse 0;
+        // Polling must not overwrite the configured timeout for later writes.
+        self.setTimeout(posix.SO.SNDTIMEO, timeout_ms) catch return error.SendFailed;
+    }
+
     fn checkRequestDeadline(self: *Self) !void {
         const deadline_ms = self.request_deadline_ms orelse return;
         if (common.milliTimestamp(self.io) >= deadline_ms) return error.Timeout;
@@ -384,6 +439,7 @@ pub const Socket = struct {
     /// Sets the send timeout in milliseconds.
     pub fn setSendTimeout(self: *Self, ms: u64) !void {
         try self.setTimeout(posix.SO.SNDTIMEO, ms);
+        self.send_timeout_ms = if (ms == 0) null else ms;
     }
 
     fn setTimeout(self: *Self, opt: u32, ms: u64) !void {
@@ -1435,6 +1491,58 @@ test "Socket recv timeout returns error.Timeout" {
     try std.testing.expectError(error.Timeout, accepted.socket.recv(&recv_buf));
 }
 
+test "Socket abort interrupts a backpressured native send" {
+    if (is_windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var listener = try TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, io);
+    defer listener.deinit();
+    var sender = try Socket.connect(listener.getLocalAddress(), io);
+    defer sender.close();
+    var accepted = try listener.accept();
+    defer accepted.socket.close();
+    const send_buffer: u32 = 4096;
+    try Socket.setSocketOption(sender.handle, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&send_buffer));
+    try sender.setSendTimeout(5);
+    var payload: [64 * 1024]u8 = @splat(0xa5);
+    for (0..1024) |_| {
+        _ = sender.send(&payload) catch |err| {
+            try std.testing.expectEqual(error.Timeout, err);
+            break;
+        };
+    } else return error.TestUnexpectedResult;
+    try sender.setSendTimeout(0);
+    var cancelled = std.atomic.Value(bool).init(false);
+    var done = std.atomic.Value(bool).init(false);
+    sender.setRequestCancellation(struct {
+        fn check(raw: ?*anyopaque) bool {
+            const signal: *std.atomic.Value(bool) = @ptrCast(@alignCast(raw.?));
+            return signal.load(.acquire);
+        }
+    }.check, &cancelled);
+    var writer = try io.concurrent(struct {
+        fn run(socket: *Socket, data: []const u8, completed: *std.atomic.Value(bool)) anyerror!void {
+            defer completed.store(true, .release);
+            while (true) try socket.sendAll(data);
+        }
+    }.run, .{ &sender, &payload, &done });
+    defer {
+        sender.shutdown();
+        writer.cancel(io) catch {};
+    }
+    try io.sleep(.fromMilliseconds(100), .awake);
+    cancelled.store(true, .release);
+    sender.abortRequest();
+    for (0..250) |_| {
+        if (done.load(.acquire)) break;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    const prompt = done.load(.acquire);
+    // Bound failure cleanup even if cancellation cannot wake a native send.
+    sender.shutdown();
+    try std.testing.expectError(error.Canceled, writer.await(io));
+    try std.testing.expect(prompt);
+}
+
 test "Socket send timeout reports backpressure without panicking" {
     if (is_windows) return;
 
@@ -1450,12 +1558,18 @@ test "Socket send timeout reports backpressure without panicking" {
     const send_buffer: u32 = 4096;
     try Socket.setSocketOption(sender.handle, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&send_buffer));
     try sender.setSendTimeout(5);
+    // Cancellation polling must retain the configured native write deadline.
+    sender.setRequestCancellation(struct {
+        fn check(_: ?*anyopaque) bool {
+            return false;
+        }
+    }.check, null);
 
     var payload: [64 * 1024]u8 = @splat(0xa5);
     var attempts: usize = 0;
     while (attempts < 1024) : (attempts += 1) {
         _ = sender.send(&payload) catch |err| {
-            try std.testing.expectEqual(error.SendFailed, err);
+            try std.testing.expectEqual(error.Timeout, err);
             return;
         };
     }
