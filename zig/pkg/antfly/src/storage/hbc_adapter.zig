@@ -27078,7 +27078,7 @@ fn testNativeExternalUpdateReopen(comptime dims: usize) !void {
         try std.testing.expect(work.insert_find_leaf_calls <= 24 * 256);
         if (dims == 1536) {
             try std.testing.expect(work.centroid_delta_removals > 0);
-            try std.testing.expect(work.centroid_recompute_members_total < 160_000);
+            try std.testing.expect(work.centroid_recompute_members_total < 110_000);
         }
         if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_WORK_PROFILE"))
             std.debug.print("\nWORK external-update dims={d} routes={d} centroid_recomputes={d} centroid_members={d}\n", .{ dims, work.insert_find_leaf_calls, work.centroid_recompute_calls, work.centroid_recompute_members_total });
@@ -32930,6 +32930,76 @@ test "coalesced centroid deltas survive a later member moving to another leaf" {
         for (leaf.members) |member| sum += vectors[member - 1][0];
         const expected = sum / @as(f32, @floatFromInt(leaf.members.len));
         try std.testing.expectApproxEqAbs(expected, leaf.centroid[0], 0.0001);
+    }
+}
+
+test "interleaved external relocations reuse versioned source sums" {
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
+    var path: TestPath = .{};
+    var idx = try HBCIndex.open(alloc, path.init(), .{
+        .dims = 2,
+        .metric = .l2_squared,
+        .leaf_size = 32,
+        .branching_factor = 4,
+        .use_quantization = false,
+        .lazy_posting_maintenance = false,
+        .stable_posting_origin_max_mutations = 0,
+    });
+    defer path.cleanup();
+    defer idx.close();
+    const Source = struct {
+        vectors: [128][2]f32,
+        fn load(raw: *anyopaque, a: Allocator, id: u64, _: []const u8) ![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return a.dupe(f32, &self.vectors[id - 1]);
+        }
+    };
+    var source: Source = undefined;
+    const centers = [_][2]f32{ .{ -2, 0 }, .{ 0, -2 }, .{ 2, 0 }, .{ 0, 2 } };
+    var items: [128]BatchInsertItem = undefined;
+    for (&source.vectors, &items, 0..) |*vector, *item, i| {
+        vector.* = centers[i / 32];
+        vector[1] += @as(f32, @floatFromInt(i % 32)) / 1000;
+        item.* = .{ .vector_id = i + 1, .vector = vector, .metadata = "doc" };
+    }
+    try idx.bulkBuildWithMetadata(&items);
+    idx.setExternalVectorLoader(&source, Source.load);
+    idx.setBypassExternalVectorCache(true);
+    for (0..2) |revision| {
+        var updates: [8]BatchInsertItem = undefined;
+        for (&updates, 0..) |*item, i| {
+            const id = (i % 2) * 32 + revision * 4 + i / 2;
+            source.vectors[id] = .{ 2, 0 };
+            item.* = .{ .vector_id = id + 1, .vector = &source.vectors[id], .metadata = "doc" };
+        }
+        const before = idx.getWriteProfile().centroid_delta_removals;
+        try idx.batchInsertWithMetadataOptions(&updates, .{ .skip_vector_store = true, .defer_quantized_rebuild = true });
+        // Most removals must reuse sums even when their sources alternate.
+        // A destination split may invalidate a source through redistribution.
+        // A single-entry cache instead rebuilds on every source switch.
+        try std.testing.expect(idx.getWriteProfile().centroid_delta_removals - before >= 4);
+        var txn = try idx.beginReadTxn();
+        defer txn.abort();
+        for ([_]u64{ 32, 64 }) |survivor| {
+            var leaf = try idx.loadNode(&txn, try idx.getVecLeaf(&txn, survivor));
+            defer leaf.deinit(alloc);
+            const matrix = try alloc.alloc(f32, leaf.members.len * 2);
+            defer alloc.free(matrix);
+            var mean: [2]f32 = @splat(0);
+            for (leaf.members, 0..) |id, row| {
+                const vector = matrix[row * 2 ..][0..2];
+                _ = idx.transformVector(&source.vectors[id - 1], vector);
+                for (&mean, vector) |*sum, value| sum.* += value;
+            }
+            for (&mean, leaf.centroid) |*want, got| {
+                want.* /= @floatFromInt(leaf.members.len);
+                try std.testing.expectApproxEqAbs(want.*, got, 0.00001);
+            }
+            const radius = vectorindex_posting.coveringRadiusForMatrix(.l2_squared, leaf.centroid, matrix, leaf.members.len);
+            try std.testing.expect(leaf.covering_radius + 0.00001 >= radius);
+        }
     }
 }
 

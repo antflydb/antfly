@@ -1188,6 +1188,7 @@ const DataDescriptorFactory = struct {
 
 const RaftTableApplyStateMachine = struct {
     const RetryApplyCheckpoint = struct {
+        native_snapshot_installed: u64 = 0,
         completed_index: u64 = 0,
         completed_term: u64 = 0,
         writer_unavailable_attempts: u64 = 0,
@@ -1204,6 +1205,7 @@ const RaftTableApplyStateMachine = struct {
     const TestFaults = if (@import("builtin").is_test) struct {
         writer_unavailable_once_at_index: ?u64 = null,
         resource_budget_exceeded_once_at_index: ?u64 = null,
+        semantic_rejection_once: ?struct { index: u64, reason: anyerror } = null,
         storage_admission_once: ?struct { index: u64, err: anyerror } = null,
         applied_index_publication_failure_once: bool = false,
         document_apply_attempts: usize = 0,
@@ -1216,15 +1218,94 @@ const RaftTableApplyStateMachine = struct {
     };
 
     const ExpectedApplyFailure = enum {
+        RetainedEffectsFull,
+        RetainedEffectsConsumerLimit,
+        RetainedEffectsNamespaceMismatch,
+        RetainedEffectsFenceMismatch,
+        RetainedEffectsCursorMismatch,
+        InvalidRetainedEffectsAdmission,
+        InvalidOnlineSourceCommand,
+        OnlineSourceScopeChanged,
+        InvalidSourceSnapshot,
+        SourceSnapshotCutMismatch,
+        InvalidMergePage,
+        MergePageSequenceGap,
+        MergePageRequired,
+        MergePageIncomplete,
+        RestoreStagingScopeChanged,
+        RestoreStagingInProgress,
+        RestoreStagingCanceled,
+        RestoreStagingProgressChanged,
+        InvalidRestoreStagingCommand,
+        RestoreStagingTargetNotEmpty,
+        InvalidConstraintActivationCommand,
+        InvalidConstraintRetirementCommand,
+        ForeignKeyActionMismatch,
+        ForeignKeyActionNotValidated,
+        ForeignKeyActionFailed,
+        ConstraintNotFound,
+        SchemaInUse,
+        KeyOutOfRange,
+        InvalidIntegrityCommand,
+        InvalidIntegrityOperation,
+        InvalidIntegrityContinuation,
+        IntegrityClaimGuardRequired,
+        IntegrityActionJobRequired,
+        InvalidRelationalRowsRequest,
+        UnsupportedTransformOperation,
+        IntegrityCatalogIncarnationMismatch,
+        ForeignKeyParentMissing,
+        ForeignKeyCoordinationRequired,
+        ForeignKeyReferenced,
+        UniqueConstraintViolation,
+        ForeignKeyActionInProgress,
+        PreparedGenerationChanged,
+        PreparedReadSetChanged,
+        IntegrityCatalogChanged,
+        ConstraintActivationChanged,
+        ConstraintActivationInProgress,
+        ConstraintActivationFailed,
+        ConstraintActivationOwnerChanged,
+        ConstraintRetirementInProgress,
+        ConstraintRetirementChanged,
+        ConstraintRetirementRequired,
         intent_conflict,
         version_conflict,
         decision_conflict,
         txn_not_found,
         transaction_too_large,
         invalid_batch_request,
+        integrity_topology_busy,
+        integrity_topology_changed,
+        integrity_topology_completed,
+        integrity_handoff_incomplete,
+        integrity_handoff_sequence_changed,
+        integrity_handoff_destination_reset_required,
+        RelationalExpressionOverflow,
+        RelationalExpressionDivisionByZero,
+        RelationalExpressionBudgetExceeded,
+        InvalidRelationalExpressionInput,
+        InvalidRelationalGeneratedValue,
+        GeneratedColumnRewriteRequired,
 
         fn fromError(err: anyerror) ?ExpectedApplyFailure {
+            inline for (@typeInfo(@import("../storage/db/online_source_contract.zig").Rejection).error_set.?) |field| {
+                if (err == @field(@import("../storage/db/online_source_contract.zig").Rejection, field.name)) return @field(ExpectedApplyFailure, field.name);
+            }
+            inline for (@typeInfo(@import("../schema/relational_expression_errors.zig").Error).error_set.?) |field| {
+                if (err == @field(@import("../schema/relational_expression_errors.zig").Error, field.name)) return @field(ExpectedApplyFailure, field.name);
+            }
+            // Share the stable typed contract with the participant HTTP path.
+            // A semantic rejection must advance this committed log entry so
+            // subsequent aborts, repairs and topology retries can make progress.
+            inline for (@typeInfo(@import("../api/relational_integrity_errors.zig").Error).error_set.?) |field| {
+                if (err == @field(@import("../api/relational_integrity_errors.zig").Error, field.name)) return @field(ExpectedApplyFailure, field.name);
+            }
             return switch (err) {
+                error.InvalidMergePage => .InvalidMergePage,
+                error.MergePageSequenceGap => .MergePageSequenceGap,
+                error.MergePageRequired => .MergePageRequired,
+                error.MergePageIncomplete => .MergePageIncomplete,
                 error.IntentConflict => .intent_conflict,
                 error.VersionConflict => .version_conflict,
                 error.DecisionConflict => .decision_conflict,
@@ -1234,19 +1315,64 @@ const RaftTableApplyStateMachine = struct {
                 // of the replicated command. Retrying it cannot repair input.
                 // Storage corruption and resource pressure remain retryable.
                 error.InvalidBatchRequest => .invalid_batch_request,
+                error.IntegrityTopologyBusy, error.TransactionTopologyBusy => .integrity_topology_busy,
+                error.IntegrityTopologyChanged, error.IntegrityTopologyFenceMissing => .integrity_topology_changed,
+                error.IntegrityTopologyCompleted => .integrity_topology_completed,
+                error.IntegrityHandoffMissing, error.IntegrityHandoffIncomplete, error.SplitBootstrapIncomplete, error.MergeTransitionNotReady => .integrity_handoff_incomplete,
+                error.IntegrityHandoffSequenceChanged => .integrity_handoff_sequence_changed,
+                error.IntegrityHandoffDestinationResetRequired => .integrity_handoff_destination_reset_required,
+                error.InvalidIntegrityTopologyFence,
+                error.IntegrityTopologyCutoverRequired,
+                error.IntegrityHandoffCollision,
+                error.IntegrityHandoffTooLarge,
+                error.IntegrityRecordTooLarge,
+                error.InvalidIntegrityKey,
+                error.InvalidRange,
+                error.IdentityNamespaceMismatch,
+                => .invalid_batch_request,
                 else => null,
             };
         }
 
         fn toError(self: ExpectedApplyFailure) anyerror {
+            inline for (@typeInfo(@import("../storage/db/online_source_contract.zig").Rejection).error_set.?) |field| {
+                if (self == @field(ExpectedApplyFailure, field.name)) return @field(@import("../storage/db/online_source_contract.zig").Rejection, field.name);
+            }
+            inline for (@typeInfo(@import("../schema/relational_expression_errors.zig").Error).error_set.?) |field| {
+                if (self == @field(ExpectedApplyFailure, field.name)) return @field(@import("../schema/relational_expression_errors.zig").Error, field.name);
+            }
+            inline for (@typeInfo(@import("../api/relational_integrity_errors.zig").Error).error_set.?) |field| {
+                if (self == @field(ExpectedApplyFailure, field.name)) return @field(@import("../api/relational_integrity_errors.zig").Error, field.name);
+            }
             return switch (self) {
+                .InvalidMergePage => error.InvalidMergePage,
+                .MergePageSequenceGap => error.MergePageSequenceGap,
+                .MergePageRequired => error.MergePageRequired,
+                .MergePageIncomplete => error.MergePageIncomplete,
                 .intent_conflict => error.IntentConflict,
                 .version_conflict => error.VersionConflict,
                 .decision_conflict => error.DecisionConflict,
                 .txn_not_found => error.TxnNotFound,
                 .transaction_too_large => error.TransactionTooLarge,
                 .invalid_batch_request => error.InvalidBatchRequest,
+                .integrity_topology_busy => error.IntegrityTopologyBusy,
+                .integrity_topology_changed => error.IntegrityTopologyChanged,
+                .integrity_topology_completed => error.IntegrityTopologyCompleted,
+                .integrity_handoff_incomplete => error.IntegrityHandoffIncomplete,
+                .integrity_handoff_sequence_changed => error.IntegrityHandoffSequenceChanged,
+                .integrity_handoff_destination_reset_required => error.IntegrityHandoffDestinationResetRequired,
+                else => unreachable, // Stable semantic cases handled above.
             };
+        }
+
+        fn forRequest(err: anyerror, req: antfly.db.types.BatchRequest) ?ExpectedApplyFailure {
+            // A committed transaction decision cannot be converted into a
+            // rejected row mutation merely because source retention is full.
+            // Its journal capacity must have been reserved before that decision.
+            if (err == error.RetainedEffectsFull) if (req.transaction) |control| {
+                if (control == .resolve and control.resolve.status == .committed) return null;
+            };
+            return fromError(err);
         }
     };
 
@@ -1278,6 +1404,9 @@ const RaftTableApplyStateMachine = struct {
     /// direct writes, Raft apply, HA replay, and snapshot publication so those
     /// paths cannot open competing physical DB owners.
     kernel_owner_source: ?*antfly.public_api.ProvisionedKernelOwnerSource = null,
+    /// Borrowed from the managed host, which applies the raw projection first.
+    /// Its exact-index arbitration receipt also survives a delegate retry.
+    topology_apply_store: ?*DataRaftApplyStore = null,
     applied_mutex: std.atomic.Mutex = .unlocked,
     applied_indexes: std.AutoHashMapUnmanaged(u64, u64) = .empty,
     retry_apply_checkpoints: std.AutoHashMapUnmanaged(u64, RetryApplyCheckpoint) = .empty,
@@ -1346,6 +1475,48 @@ const RaftTableApplyStateMachine = struct {
         _ = self.write_source.withLocalWriteSource(owner_source.writeSource());
         _ = self.write_source.withStorageSnapshotSource(owner_source.snapshotSource());
         _ = self.write_source.withStorageMaintenanceSource(owner_source.maintenanceSource());
+    }
+
+    fn nativeSnapshotDelegate(self: *RaftTableApplyStateMachine) @import("../raft/native_snapshot_delegate.zig").Delegate {
+        return .{ .ptr = self, .capture = captureNativeSnapshot, .install = installNativeSnapshot };
+    }
+
+    fn captureNativeSnapshot(ptr: *anyopaque, group_id: u64, applied_index: u64) !*anyopaque {
+        const self: *RaftTableApplyStateMachine = @ptrCast(@alignCast(ptr));
+        // The host prepares snapshots only at the shared completed boundary,
+        // not merely the raw projection's independently persisted watermark.
+        lockAtomic(&self.applied_mutex);
+        const completed = self.applied_indexes.get(group_id);
+        self.applied_mutex.unlock();
+        // After restart the host's durable applied sink is authoritative until
+        // this process publishes its first Ready. An absent in-memory receipt
+        // must not prevent a caught-up idle replica from creating a snapshot.
+        // The caller pins the raw projection at this same durable index; native
+        // capture separately rejects primary state ahead of that boundary.
+        if (completed) |index| if (index != applied_index) return error.AppliedSnapshotIndexMismatch;
+        // Inline physical-source runtimes do not own a compiled storage ABI.
+        // Keep their unavailable capability path independent of that archive.
+        if (comptime !linked_storage) return error.StorageKernelOwnerUnavailable;
+        const owner = self.kernel_owner_source orelse return error.StorageKernelOwnerUnavailable;
+        return owner.captureNativeRaftSnapshot(group_id, applied_index);
+    }
+
+    fn installNativeSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator, projection_store: *anyopaque, group_id: u64, applied_index: u64, encoded: []const u8) !void {
+        const self: *RaftTableApplyStateMachine = @ptrCast(@alignCast(ptr));
+        // Reserve the completion receipt before either store can publish. A
+        // version tag alone must never let a custom/absent raw installer cause
+        // the native delegate to acknowledge state it has not installed.
+        {
+            lockAtomic(&self.applied_mutex);
+            defer self.applied_mutex.unlock();
+            const entry = try self.retry_apply_checkpoints.getOrPut(self.alloc, group_id);
+            if (!entry.found_existing) entry.value_ptr.* = .{};
+            if (entry.value_ptr.completed_index >= applied_index) return;
+        }
+        try self.write_source.installNativeRaftSnapshotGroupLocal(alloc, projection_store, group_id, applied_index, encoded);
+        lockAtomic(&self.applied_mutex);
+        self.retry_apply_checkpoints.getPtr(group_id).?.native_snapshot_installed = applied_index;
+        self.applied_mutex.unlock();
     }
 
     fn attachProvisionedStorage(
@@ -1426,7 +1597,7 @@ const RaftTableApplyStateMachine = struct {
         const waiter = self.read_barrier_waiters.get(request_id) orelse return .missing;
         if (waiter.retired) return .retired;
         const read_index = waiter.read_index orelse return .pending;
-        const applied_index = self.applied_indexes.get(waiter.group_id) orelse 0;
+        const applied_index = @max(self.applied_indexes.get(waiter.group_id) orelse 0, self.read_barriers.appliedIndex(waiter.group_id));
         return if (applied_index >= read_index) .ready else .pending;
     }
 
@@ -1609,6 +1780,12 @@ const RaftTableApplyStateMachine = struct {
     ) !void {
         if (@import("builtin").is_test) {
             self.test_faults.document_apply_attempts += 1;
+            if (self.test_faults.semantic_rejection_once) |rejection| {
+                if (rejection.index == entry_index) {
+                    self.test_faults.semantic_rejection_once = null;
+                    return rejection.reason;
+                }
+            }
             if (self.test_faults.writer_unavailable_once_at_index == entry_index) {
                 self.test_faults.writer_unavailable_once_at_index = null;
                 return error.RaftApplyWriterUnavailable;
@@ -1808,7 +1985,14 @@ const RaftTableApplyStateMachine = struct {
         var last_index: u64 = snapshot_index;
         var completed_index = try self.prepareRetryApplyCheckpoint(group_id, snapshot, committed_entries);
         if (snapshot) |value| if (value.metadata.index > completed_index) {
-            try self.write_source.installRaftSnapshotGroupLocal(self.alloc, group_id, value.data);
+            // The native-aware raw builder already prepared both stores from
+            // one checkpoint and published through the generation-CAS path.
+            if (@import("../raft/native_snapshot_delegate.zig").isNative(value.data)) {
+                lockAtomic(&self.applied_mutex);
+                const installed = self.retry_apply_checkpoints.get(group_id).?.native_snapshot_installed;
+                self.applied_mutex.unlock();
+                if (installed != value.metadata.index) return error.NativeSnapshotRequired;
+            } else try self.write_source.installRaftSnapshotGroupLocal(self.alloc, group_id, value.data);
             completed_index = value.metadata.index;
             self.advanceRetryApplyCheckpoint(group_id, value.metadata.index, value.metadata.term, false);
         };
@@ -1818,6 +2002,27 @@ const RaftTableApplyStateMachine = struct {
             if (entry.entry_type == .normal and data_raft_batch.looksLikeEnvelope(entry.data)) {
                 var decoded = try data_raft_batch.decode(self.alloc, entry.data);
                 defer decoded.deinit(self.alloc);
+                if (decoded.protocol_barrier_version == null and batchRequiresTopologyArbitration(decoded.batch.req)) {
+                    if (self.topology_apply_store) |store| if (try store.topologyRejection(self.alloc, group_id, entry.index)) |rejection| {
+                        // The ordered raw fold rejected this whole command.
+                        // Advance the native marker without its effects before
+                        // publishing the same typed outcome to the proposer.
+                        if (batchRequiresDocumentDbApply(decoded.batch.req)) {
+                            self.applyDocumentBatchForEntry(group_id, entry.index, entry.term, decoded.table_name, .{}, if (decoded.storage_owner_descriptor) |*value| value.view() else null) catch |err| switch (err) {
+                                error.RaftApplyWriterUnavailable, error.RetainedEffectsFull, error.OnlineSourcePinPending, error.ResourceBudgetExceeded, error.RestoreProjectionCatchUpPending => return error.RaftApplyWriterUnavailable,
+                                else => return err,
+                            };
+                        }
+                        const reason: anyerror = switch (rejection) {
+                            .busy => error.IntegrityTopologyBusy,
+                            .scope_changed => error.OnlineSourceScopeChanged,
+                        };
+                        self.recordApplyFailure(group_id, entry.index, entry.term, ExpectedApplyFailure.fromError(reason).?);
+                        completed_index = entry.index;
+                        self.advanceRetryApplyCheckpoint(group_id, entry.index, entry.term, true);
+                        continue;
+                    };
+                }
                 // The durable apply store consumes protocol barriers. They carry
                 // no document mutation, and their null batch payload is
                 // intentionally poison to binaries that predate the barrier.
@@ -1835,7 +2040,7 @@ const RaftTableApplyStateMachine = struct {
                         decoded.batch.req,
                         if (decoded.storage_owner_descriptor) |*value| value.view() else null,
                     ) catch |err| {
-                        if (ExpectedApplyFailure.fromError(err)) |failure| {
+                        if (ExpectedApplyFailure.forRequest(err, decoded.batch.req)) |failure| {
                             // Transaction conflicts are deterministic command
                             // results, not state-machine failures. Every replica
                             // rejects the prepare at this log index and continues.
@@ -1847,9 +2052,12 @@ const RaftTableApplyStateMachine = struct {
                                 @errorName(err),
                             });
                         } else if (err == error.RaftApplyWriterUnavailable or
+                            err == error.RetainedEffectsFull or
+                            err == error.OnlineSourcePinPending or
                             err == error.StorageBusy or
                             err == error.StorageReadTemporarilyUnavailable or
-                            err == error.ResourceBudgetExceeded)
+                            err == error.ResourceBudgetExceeded or
+                            err == error.RestoreProjectionCatchUpPending)
                         {
                             // Owner publication/lease and resource admission
                             // can fail before or during an
@@ -1911,6 +2119,12 @@ fn batchRequiresDocumentDbApply(req: antfly.db.types.BatchRequest) bool {
         }
     }
     return true;
+}
+
+fn batchRequiresTopologyArbitration(req: antfly.db.types.BatchRequest) bool {
+    return req.online_source != null or req.relational_topology != null or req.split_transition != null or
+        req.split_checkpoint != null or req.merge_source_transition != null or req.merge_checkpoint != null or
+        req.merge_replication != null or req.merge_page != null;
 }
 
 fn batchMutatesDocuments(req: antfly.db.types.BatchRequest) bool {
@@ -3345,6 +3559,7 @@ const StoreStatusHeartbeatCache = struct {
     status_generation: u64 = 0,
     artifact_sources_protocol_version: u16 = 0,
     dense_native_storage_protocol_version: u16 = 0,
+    relational_topology_protocol_version: u16 = 0,
     live: bool = true,
     health_class: []const u8 = "healthy",
     owns_health_class: bool = false,
@@ -3812,6 +4027,10 @@ pub const DataServerConfig = struct {
 };
 
 pub const DataServerHAConfig = struct {
+    /// Explicit node-local metadata directory for restore owner authority.
+    /// Standalone seed activation supplies its installed metadata directory;
+    /// otherwise private state stays beneath the configured replica root.
+    restore_owner_metadata_root: ?[]const u8 = null,
     admin_context: ?antfly.hot_standby.admin_exec.Context = null,
     standby_owner: ?*?antfly.hot_standby.standby.Standby = null,
     admin_bearer_token: ?[]const u8 = null,
@@ -4766,6 +4985,30 @@ const ReplicatedTransitionLease = struct {
         if (comptime linked_storage) return try self.owner.mergeArtifactsPage(alloc, range, after_key);
         return try self.owner.db.mergeArtifactsPage(alloc, range, after_key);
     }
+
+    fn relationalTopologyStatus(self: *ReplicatedTransitionLease) !struct { fence: ?DataServer.IntegrityTopology.Fence, drained: bool } {
+        const status = if (comptime linked_storage) try self.owner.relationalTopologyStatus() else try self.owner.db.relationalTopologyStatus();
+        return .{ .fence = status.fence, .drained = status.drained };
+    }
+
+    fn readRelationalTopologyJson(self: *ReplicatedTransitionLease, alloc: std.mem.Allocator, mode: []const u8) ![]u8 {
+        if (comptime linked_storage) return self.owner.readRelationalTopologyJson(alloc, mode);
+        const request = try std.json.Stringify.valueAlloc(alloc, .{ .mode = mode }, .{});
+        defer alloc.free(request);
+        var result = (try self.owner.db.lookup(alloc, "", .{ .relational_topology_json = request })) orelse return error.NotFound;
+        defer result.deinit(alloc);
+        return alloc.dupe(u8, result.json);
+    }
+
+    fn relationalHandoffManifest(self: *ReplicatedTransitionLease, alloc: std.mem.Allocator, source: DataServer.IntegrityTopology.Fence, destination: DataServer.IntegrityTopology.Fence, lower: []const u8, upper: []const u8, sequence: u64) !DataServer.IntegrityHandoff.Manifest {
+        if (comptime linked_storage) return self.owner.relationalHandoffManifest(alloc, source, destination, lower, upper, sequence);
+        return self.owner.db.relationalHandoffManifest(alloc, source, destination, lower, upper, sequence);
+    }
+
+    fn relationalHandoffPage(self: *ReplicatedTransitionLease, alloc: std.mem.Allocator, manifest: DataServer.IntegrityHandoff.Manifest, progress: DataServer.IntegrityHandoff.Progress) !DataServer.IntegrityHandoff.Page {
+        if (comptime linked_storage) return self.owner.relationalHandoffPage(alloc, manifest, progress);
+        return self.owner.db.relationalHandoffPage(alloc, manifest, progress);
+    }
 };
 
 const TransitionDbLeaseContext = struct {
@@ -4881,6 +5124,8 @@ pub const DataServer = struct {
     };
 
     alloc: std.mem.Allocator,
+    restore_terminal_ledger: ?@import("../storage/hot_standby/restore_terminal_ledger.zig").Ledger = null,
+    restore_terminal_mutex: std.Io.Mutex = .init,
     remote_metadata: ?*RemoteMetadataSource = null,
     metadata_service: ?*antfly.metadata_service.MetadataService = null,
     metadata_http_service: ?*antfly.metadata_service.MetadataHttpService = null,
@@ -4969,10 +5214,17 @@ pub const DataServer = struct {
     provision_ticks: usize = 0,
     last_provision_fingerprint: ?u64 = null,
     last_provision_metadata_epoch: ?u64 = null,
+    private_provisioning_active: bool = false,
     last_provision_head_check_at_ms: u64 = 0,
     background_jobs_mutex: std.atomic.Mutex = .unlocked,
     background_jobs_owner_id: u64 = 0,
     background_jobs_shutdown: std.atomic.Value(bool) = .init(false),
+    // Preparation may own up to 16 MiB per transaction. Bound concurrency as
+    // well as queued observation bytes, independent of local shard count.
+    relational_ttl_queue: antfly.db.coordinated_ttl.Queue = .{ .max_jobs = 4 },
+    relational_ttl_completed: std.atomic.Value(u64) = .init(0),
+    relational_ttl_expired: std.atomic.Value(u64) = .init(0),
+    relational_ttl_failed: std.atomic.Value(u64) = .init(0),
     provisioned_root_refresh_mutex: std.atomic.Mutex = .unlocked,
     provisioned_root_refresh_active: std.atomic.Value(bool) = .init(false),
     provisioned_root_refresh_dirty: std.atomic.Value(bool) = .init(true),
@@ -5149,9 +5401,6 @@ pub const DataServer = struct {
     h1_disconnect_probe: ?httpx.H1DisconnectProbe = null,
     data_request_lifecycle_hook: ?DataRequestLifecycleHook = null,
     ha_cfg: DataServerHAConfig = .{},
-    /// Standalone owns its durable catalog; apply before routing later WAL records.
-    ha_catalog_apply_ctx: ?*anyopaque = null,
-    ha_catalog_apply_fn: ?*const fn (*anyopaque, antfly.hot_standby.replication_record.RecordView) anyerror!void = null,
     ha_state_mutex: std.atomic.Mutex = .unlocked,
     /// Global primary mutation/capture ordering point. All DB/catalog writers
     /// share this instance through their HA mirror configuration.
@@ -5175,6 +5424,7 @@ pub const DataServer = struct {
     ha_standby_replication_last_attempt_ns: std.atomic.Value(u64) = .init(0),
     ha_standby_replication_last_success_ns: std.atomic.Value(u64) = .init(0),
     ha_standby_replication_next_attempt_ns: std.atomic.Value(u64) = .init(0),
+    ha_terminal_gc_next_attempt_ns: std.atomic.Value(u64) = .init(0),
     /// Owned independently of the active config: promotion clears that
     /// config while a replication round can still be reading these strings.
     /// The initial caller-owned pair is never stored here or freed by us.
@@ -5197,6 +5447,7 @@ pub const DataServer = struct {
     listener_cfg: antfly.raft.transport.std_http_listener.StdHttpListenerConfig,
     listener: ?*DataPublicHttpRuntime = null,
     query_io_impl: ?std.Io.Threaded = null,
+    distributed_read_http_executor: ?*antfly.common.http.IoHttpExecutor = null,
     lsm_maintenance_mutex: std.atomic.Mutex = .unlocked,
     lsm_maintenance_future: ?std.Io.Future(void) = null,
     dense_publication_future: ?std.Io.Future(void) = null,
@@ -5613,11 +5864,15 @@ pub const DataServer = struct {
             self.write_source.catalog,
             self.read_source.read_safety_barrier,
         );
+        owner_source.online_source_authority = if (self.api_server_cfg.deployment_mode == .standalone and self.data_raft == null) .native else .raft;
         _ = owner_source.withRuntimeStatusCache(&self.provisioned_storage.runtime_status_cache);
         _ = owner_source.withNativeMigrationPolicy(self.provisioned_storage.denseNativeMigrationPolicySource());
         _ = owner_source.withGroupVisibleRootGeneration(self.provisioned_storage.groupVisibleRootGenerationSource());
         _ = owner_source.withTransactionRecoverySource(self.write_source.transactionRecoverySource());
+        _ = owner_source.withRestoreDescriptorRecovery(.{ .ptr = self, .recover_fn = recoverRestoreDescriptor });
         _ = owner_source.withRemoteContent(self.api_server_cfg.remote_content);
+        _ = owner_source.withCoordinatedTtl(.{ .ptr = self, .expire_fn = expireRelationalRows });
+        _ = owner_source.withSecretStore(self.api_server_cfg.secret_store);
         if (comptime linked_storage) {
             if (self.storageKernelContextHandle()) |handle|
                 _ = owner_source.withStorageContextHandle(handle);
@@ -5690,23 +5945,19 @@ pub const DataServer = struct {
         }
         var owned_restore_job_store_path: ?[]u8 = null;
         defer if (owned_restore_job_store_path) |path| self.alloc.free(path);
-        // Filesystem-backed runtimes keep API job state beside their shard
-        // catalog by default. Lite overrides this after construction with an
-        // engine namespace so its artifact remains genuinely single-file.
+        // Only filesystem builds can use the legacy LMDB registry. Standalone
+        // lifecycle jobs already belong to the durable metadata owner.
         if (comptime build_options.lmdb_enabled) {
             if (api_server_cfg.restore_job_store_path == null and
+                api_server_cfg.restore_job_store == null and
                 api_server_cfg.session_store_path == null and
                 api_server_cfg.session_store == null and
+                self.status_source.standalone_hot_standby == null and
                 api_server_cfg.deployment_mode != .serverless)
             {
                 owned_restore_job_store_path = try std.fmt.allocPrint(self.alloc, "{s}/api-restore-jobs", .{self.write_source.replica_root_dir});
                 api_server_cfg.restore_job_store_path = owned_restore_job_store_path;
             }
-        } else {
-            // Linked production roles intentionally compile LMDB out. Until
-            // this registry moves behind the resident LSM storage-owner ABI,
-            // retain the server's in-memory restore-job registry instead of
-            // trying to open an unavailable legacy backend at startup.
         }
         api_server_cfg.shard_ops = self.localShardOperationAdapter();
         api_server_cfg.shard_db_adapter = self.localShardDbAdapter();
@@ -5724,6 +5975,7 @@ pub const DataServer = struct {
         else
             null;
         api_server_cfg.backend_runtime = self.backend_runtime;
+        api_server_cfg.restore_owner = .{ .ptr = self, .execute_fn = restoreOwnerControl };
         api_server_cfg.resource_manager = &self.provisioned_storage.resource_manager;
         self.configureHAPublicGateState();
         self.attachHaExecutors(&api_server_cfg);
@@ -5762,7 +6014,7 @@ pub const DataServer = struct {
             _ = self.read_source.withGraphReadBarrier(self.dataGraphReadBarrier());
             _ = self.read_source.withDistributedRouting(
                 self.dataReadGroupRouter(),
-                raft.host.http_host.request_executor,
+                try self.distributedReadExecutor(),
                 api_server_cfg.internal_service_secret,
                 api_server_cfg.internal_service_issuer,
             );
@@ -5776,12 +6028,22 @@ pub const DataServer = struct {
         if (comptime linked_storage) {
             const owner_source = try self.ensureKernelOwnerSource();
             _ = owner_source.withReadSafetyBarrier(self.read_source.read_safety_barrier);
+            // The owner is lazily constructed here on normal startup. Bind
+            // the private port only after construction and read-barrier
+            // selection, before the HTTP server copies its configuration.
+            if (self.data_raft != null or api_server_cfg.deployment_mode == .standalone)
+                api_server_cfg.online_merge_io = .{ .ptr = self, .execute_fn = onlineMergeIo };
         }
         _ = self.read_source.withHAReadGate(self.haReadGate());
         const ha_write_gate = self.haWriteGate();
         const ha_primary_mirror = self.haPrimaryMirror();
+        if (self.status_source.standalone_hot_standby) |metadata_ha| {
+            try metadata_ha.bindMirror(ha_write_gate, ha_primary_mirror);
+            if (ha_primary_mirror != null) try prepareStandaloneMetadataStartup(metadata_ha);
+        }
         _ = try self.write_source.withHAWriteGate(ha_write_gate);
         _ = try self.write_source.withHAMirror(ha_primary_mirror);
+        _ = self.write_source.withReplicaRetirementOwnership(self.replicaRetirementOwnership());
         if (comptime linked_storage) {
             _ = self.kernel_owner_source.?.withHAControls(ha_write_gate, ha_primary_mirror);
         }
@@ -5865,19 +6127,194 @@ pub const DataServer = struct {
         // from diverging and gives both paths the configured durable L2.
         self.http_server.?.bindIncomingGraphRoutes(self.read_source.source());
         antfly.public_api.kernel_bridge.setAntflyProvider(&self.http_server.?, self.read_source.antfly_provider);
+        const ttl_port: antfly.db.coordinated_ttl.Port = .{ .ptr = self, .expire_fn = expireRelationalRows };
+        _ = self.write_source.withCoordinatedTtl(ttl_port);
+        if (self.data_raft_apply) |apply_sm| _ = apply_sm.write_source.withCoordinatedTtl(ttl_port);
+    }
+
+    fn expireRelationalRows(ptr: *anyopaque, request: antfly.db.coordinated_ttl.Request) !u32 {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        if (self.background_jobs_shutdown.load(.acquire)) return error.Canceled;
+        const runtime = self.backend_runtime orelse return error.CoordinatedTtlBackpressure;
+        // Manual lanes execute on the native worker's stack and therefore
+        // cannot provide the callback/cache-close separation required here.
+        if (runtime.durable_jobs.executesInline()) return error.CoordinatedTtlBackpressure;
+        const io = runtime.io() orelse return error.CoordinatedTtlBackpressure;
+        if (self.haWriteGate()) |gate| try gate.check();
+        if (self.group_leadership_source) |leadership| {
+            if (!leadership.isLocalLeader(request.group_id)) return error.NotLeader;
+        }
+        const observation = self.relational_ttl_queue.reserve(io, self.alloc, request) catch |err| switch (err) {
+            error.OutOfMemory => return error.CoordinatedTtlBackpressure,
+            else => return err,
+        };
+        errdefer self.relational_ttl_queue.release(io, observation);
+        const job = self.alloc.create(RelationalTtlJob) catch return error.CoordinatedTtlBackpressure;
+        errdefer self.alloc.destroy(job);
+        job.* = .{ .server = self, .observation = observation, .io = io };
+        const owner = try self.dataServerBackgroundOwnerId(runtime);
+        runtime.durable_jobs.submit(.{
+            .owner_id = owner,
+            .class = .maintenance,
+            .ptr = job,
+            .run = runRelationalTtlJob,
+            .deinit = deinitRelationalTtlJob,
+        }) catch return error.CoordinatedTtlBackpressure;
+        // Queue admission is not a successful deletion. Native code must not
+        // report expired rows until the FK-aware transaction actually commits.
+        return 0;
+    }
+
+    const RelationalTtlJob = struct {
+        server: *DataServer,
+        observation: ?*antfly.db.coordinated_ttl.Queue.Job,
+        io: std.Io,
+        next_candidate: usize = 0,
+    };
+
+    fn runRelationalTtlJob(ptr: *anyopaque) !void {
+        const job: *RelationalTtlJob = @ptrCast(@alignCast(ptr));
+        const self = job.server;
+        const observation = job.observation orelse return;
+        while (true) {
+            if (self.background_jobs_shutdown.load(.acquire)) return;
+            if (self.haWriteGate()) |gate| gate.check() catch return;
+            if (self.group_leadership_source) |leadership| {
+                if (!leadership.isLocalLeader(observation.request.group_id)) return;
+            }
+            // This job owns its observations and no native DB/cache lease. Cache
+            // eviction can close the original TTL worker without self-joining.
+            const result = @import("../api/relational_ttl.zig").expireStep(
+                self.alloc,
+                self.write_source.catalog,
+                self.read_source.source(),
+                self.write_source.source(),
+                observation.request,
+                .fromAtomic(&self.background_jobs_shutdown),
+                .{ .next_candidate = job.next_candidate },
+            ) catch |err| {
+                _ = self.relational_ttl_failed.fetchAdd(1, .monotonic);
+                switch (err) {
+                    // A setup allocation/deadline failure did not attempt any
+                    // root. Keep the accepted cursor instead of reconstructing
+                    // this page from its beginning on the next native sweep.
+                    error.OutOfMemory, error.ConcurrencyUnavailable, error.DeadlineExceeded, error.Timeout => {
+                        if (self.background_jobs_shutdown.load(.acquire)) return;
+                        job.io.sleep(.fromMilliseconds(10), .awake) catch return;
+                        continue;
+                    },
+                    else => return,
+                }
+            };
+            _ = self.relational_ttl_expired.fetchAdd(result.expired, .monotonic);
+            _ = self.relational_ttl_failed.fetchAdd(result.failed, .monotonic);
+            if (result.next_candidate == observation.request.candidates.len) {
+                _ = self.relational_ttl_completed.fetchAdd(1, .monotonic);
+                return;
+            }
+            if (self.background_jobs_shutdown.load(.acquire)) return;
+            const runtime = self.backend_runtime orelse return;
+            if (!runtime.durable_jobs.isAccepting() or runtime.durable_jobs.executesInline()) return;
+            const owner = self.dataServerBackgroundOwnerId(runtime) catch return;
+            job.next_candidate = result.next_candidate;
+            if (submitRelationalTtlSuccessor(job, runtime, owner)) return;
+            // Allocation/concurrency pressure must not reset the accepted page.
+            // Retain this worker's bounded slot and resume its next slice after an
+            // Io yield; shutdown still releases the volatile page promptly.
+            job.io.sleep(.fromMilliseconds(10), .awake) catch return;
+        }
+    }
+
+    fn submitRelationalTtlSuccessor(job: *RelationalTtlJob, runtime: *backend_runtime_mod.BackendRuntime, owner: u64) bool {
+        const self = job.server;
+        const observation = job.observation orelse return true;
+        const successor = self.alloc.create(RelationalTtlJob) catch return false;
+        successor.* = .{ .server = self, .observation = observation, .io = job.io, .next_candidate = job.next_candidate };
+        // Tail resubmission yields the finite worker lane. Transfer this same
+        // owned page/admission slot; a second group page cannot overtake it.
+        job.observation = null;
+        runtime.durable_jobs.submit(.{
+            .owner_id = owner,
+            .class = .maintenance,
+            .ptr = successor,
+            .run = runRelationalTtlJob,
+            .deinit = deinitRelationalTtlJob,
+        }) catch {
+            job.observation = observation;
+            self.alloc.destroy(successor);
+            return false;
+        };
+        return true;
+    }
+
+    fn deinitRelationalTtlJob(ptr: *anyopaque) void {
+        const job: *RelationalTtlJob = @ptrCast(@alignCast(ptr));
+        const self = job.server;
+        if (job.observation) |observation| self.relational_ttl_queue.release(job.io, observation);
+        self.alloc.destroy(job);
     }
 
     pub fn applyHAReplicationRecord(self: *DataServer, record: antfly.hot_standby.replication_record.RecordView) !void {
-        if (record.kind == .metadata_mutation and record.table_id == 0 and record.shard_id == 0) {
-            const apply = self.ha_catalog_apply_fn orelse return error.HACatalogReplicationUnavailable;
-            try apply(self.ha_catalog_apply_ctx orelse return error.HACatalogReplicationUnavailable, record);
-            return;
-        }
         if (isWholeInstanceHAControlRecord(record)) return;
+        if (record.kind == .metadata_mutation and record.table_id == 0 and record.shard_id == 0) {
+            const metadata_ha = self.status_source.standalone_hot_standby orelse return error.HAMetadataAuthorityUnavailable;
+            return metadata_ha.applyRecord(record);
+        }
 
         var snapshot = try self.write_source.catalog.adminSnapshot();
         defer self.write_source.catalog.freeAdminSnapshot(&snapshot);
-        const route = try resolveHAReplicationRecordRoute(&snapshot, record);
+        const route = resolveHAReplicationRecordRoute(&snapshot, record) catch |err| switch (err) {
+            error.HAReplicationRecordUnknownTable, error.HAReplicationRecordUnknownShard => {
+                const terminals = try self.haRestoreTerminalLedger();
+                var terminal_snapshot = try terminals.snapshot();
+                defer terminal_snapshot.deinit();
+                // A reclaimed owner must not be rediscovered by an old frame,
+                // even after its per-owner terminal proof has been deleted.
+                try terminal_snapshot.requireReplay(record);
+                if (try terminal_snapshot.get(record.shard_id)) |terminal| {
+                    if (terminal.table_id != record.table_id or terminal.cluster_id != record.cluster_id) return error.RestoreStagingScopeChanged;
+                    const scope = try canceledRestoreScope(self.alloc, record) orelse return error.RestoreStagingCanceled;
+                    if (!std.mem.eql(u8, &scope, &terminal.scope)) return error.RestoreStagingScopeChanged;
+                    try self.retireHATerminalRegistry(record.shard_id, scope);
+                    return;
+                }
+                // The authenticated HA stream carries the first owner proof.
+                // Later records use its durable descriptor, never depend on
+                // this standby being an authoritative Raft placement owner.
+                if (record.kind == .batch_mutation) {
+                    var decoded = try antfly.hot_standby.effects.decodeBatchMutationRequest(self.alloc, record);
+                    defer decoded.deinit();
+                    if (decoded.value.restore_staging_bootstrap) |descriptor| {
+                        const control = decoded.value.request.restore_staging orelse return error.InvalidRestoreStagingCommand;
+                        switch (control) {
+                            .begin => |scope| if (!std.mem.eql(u8, &scope.digest(), &descriptor.scope.digest())) return error.RestoreStagingScopeChanged,
+                            else => return error.InvalidRestoreStagingCommand,
+                        }
+                        return self.applyHAHiddenOwnerRecord(record, descriptor);
+                    }
+                }
+                if (try self.readHAHiddenOwnerBootstrap(record.shard_id, record.table_id)) |value| {
+                    var descriptor = value;
+                    defer descriptor.deinit();
+                    return self.applyHAHiddenOwnerRecord(record, descriptor.value);
+                }
+                var private = (try self.captureHAPrivateProvisioning(self.alloc, &snapshot)) orelse return err;
+                defer private.deinit();
+                var arena = std.heap.ArenaAllocator.init(self.alloc);
+                defer arena.deinit();
+                const owners = try @import("private_provisioning.zig").validate(arena.allocator(), snapshot.tables, snapshot.ranges, private.value);
+                const owner = for (owners) |candidate| {
+                    if (candidate.scope.target_namespace.table_id == record.table_id and candidate.scope.target_namespace.shard_id == record.shard_id) break candidate;
+                } else return err;
+                const source = self.liveRuntimeWriteSource();
+                try self.primePrivateRestoreOwner(source, owner);
+                if (comptime linked_storage) {
+                    try (try self.ensureKernelOwnerSource()).applyHAHiddenOwnerRecord(self.alloc, owner.range.group_id, owner.table.name, owner.scope.digest(), record);
+                } else try source.applyHAReplicationRecordGroupLocal(self.alloc, owner.range.group_id, owner.table.name, record);
+                return;
+            },
+            else => return err,
+        };
         if (comptime linked_storage) {
             const owner_source = try self.ensureKernelOwnerSource();
             try owner_source.applyHAReplicationRecordGroupLocal(
@@ -5961,6 +6398,157 @@ pub const DataServer = struct {
     pub fn applyHAReplicationRecordCallback(ctx: *anyopaque, record: antfly.hot_standby.replication_record.RecordView) anyerror!void {
         const self: *DataServer = @ptrCast(@alignCast(ctx));
         try self.applyHAReplicationRecord(record);
+    }
+
+    fn applyHAHiddenOwnerRecord(self: *DataServer, record: antfly.hot_standby.replication_record.RecordView, descriptor: @import("../storage/db/restore_staging_contract.zig").OwnerBootstrap) !void {
+        try descriptor.validate();
+        if (descriptor.scope.target_namespace.table_id != record.table_id or descriptor.scope.target_namespace.shard_id != record.shard_id) return error.RestoreStagingScopeChanged;
+        const source = self.liveRuntimeWriteSource();
+        if (comptime linked_storage) {
+            try self.primeHAHiddenOwner(descriptor);
+        } else try source.primeHARestoreOwner(self.alloc, record.shard_id, .{
+            .table_id = record.table_id,
+            .name = descriptor.table_name,
+            .schema_json = descriptor.schema_json,
+            .read_schema_json = descriptor.read_schema_json,
+            .indexes_json = descriptor.indexes_json,
+        }, descriptor.byte_range, descriptor.scope);
+        const registry_root = try self.haRestoreOwnerMetadataRoot(self.alloc);
+        defer self.alloc.free(registry_root);
+        const registry_io = if (source.backend_runtime) |runtime| runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable else std.Options.debug_io;
+        // Persist discovery before acknowledging this record. Otherwise a
+        // post-seed hidden owner disappears from an offline subsequent seed.
+        try @import("../storage/hot_standby/restore_owner_registry.zig").record(self.alloc, registry_io, registry_root, descriptor);
+        if (comptime linked_storage) {
+            try (try self.ensureKernelOwnerSource()).applyHAHiddenOwnerRecord(self.alloc, record.shard_id, descriptor.table_name, descriptor.scope.digest(), record);
+        } else try source.applyHAReplicationRecordGroupLocal(self.alloc, record.shard_id, descriptor.table_name, record);
+        if (try canceledRestoreScope(self.alloc, record)) |scope| {
+            if (!std.mem.eql(u8, &scope, &descriptor.scope.digest())) return error.RestoreStagingScopeChanged;
+            const terminals = try self.haRestoreTerminalLedger();
+            try terminals.record(@import("../storage/hot_standby/restore_terminal_ledger.zig").Terminal.fromRecord(record, scope));
+            try self.retireHATerminalRegistry(record.shard_id, scope);
+        }
+    }
+
+    fn retireHATerminalRegistry(self: *DataServer, group_id: u64, scope: [32]u8) !void {
+        const source = self.liveRuntimeWriteSource();
+        const ledger = try self.haRestoreTerminalLedger();
+        var snapshot = try ledger.snapshot();
+        defer snapshot.deinit();
+        const terminal = (try snapshot.get(group_id)) orelse return error.RestoreStagingScopeChanged;
+        if (!std.mem.eql(u8, &terminal.scope, &scope)) return error.RestoreStagingScopeChanged;
+        // Persist the existing retirement sidecar before dropping discovery
+        // metadata or acknowledging HA replay. Recovery rechecks the terminal
+        // ledger and exact native scope, then drains all resident generations.
+        if (comptime linked_storage) {
+            if (try self.readHAHiddenOwnerBootstrap(group_id, terminal.table_id)) |value| {
+                var descriptor = value;
+                defer descriptor.deinit();
+                if (!std.mem.eql(u8, &scope, &descriptor.value.scope.digest()) or descriptor.value.scope.target_namespace.shard_id != group_id) return error.RestoreStagingScopeChanged;
+                _ = source.withReplicaRetirementOwnership(self.replicaRetirementOwnership());
+                var prepared = try source.prepareReplicaRetirements(self.alloc, &.{.{ .group_id = group_id, .table_name = descriptor.value.table_name }});
+                defer prepared.deinit();
+                try source.completePreparedReplicaRetirements(&prepared);
+            } else try source.requireAbsentRestoreOwnerRoot(self.alloc, group_id);
+        } else try source.retireCanceledRestoreOwner(self.alloc, group_id, terminal.table_id, scope, self.replicaRetirementOwnership());
+        const io = if (source.backend_runtime) |runtime| runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable else std.Options.debug_io;
+        const root = try self.haRestoreOwnerMetadataRoot(self.alloc);
+        defer self.alloc.free(root);
+        try @import("../storage/hot_standby/restore_owner_registry.zig").retireTerminal(self.alloc, io, root, group_id, scope);
+    }
+
+    fn canceledRestoreScope(alloc: std.mem.Allocator, record: antfly.hot_standby.replication_record.RecordView) !?[32]u8 {
+        if (record.kind != .batch_mutation) return null;
+        var decoded = try antfly.hot_standby.effects.decodeBatchMutationRequest(alloc, record);
+        defer decoded.deinit();
+        const req = decoded.value.request;
+        const control = req.restore_staging orelse return null;
+        if (control != .finish or control.finish.phase != .canceled) return null;
+        if (req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or req.integrity_commands.len != 0 or req.integrity.len != 0 or req.relational_activation != null or req.relational_retirement != null or req.relational_index_maintenance != null or req.relational_topology != null or req.transaction != null or req.graph_writes.len != 0 or req.graph_deletes.len != 0 or req.predicates.len != 0 or req.merge_artifacts.len != 0 or req.split_checkpoint != null or req.split_replication != null or req.split_transition != null or req.merge_source_transition != null or req.merge_checkpoint != null or req.merge_replication != null) return error.InvalidBatchRequest;
+        return control.finish.scope;
+    }
+
+    fn readHAHiddenOwnerBootstrap(self: *DataServer, group_id: u64, table_id: u64) !?std.json.Parsed(@import("../storage/db/restore_staging_contract.zig").OwnerBootstrap) {
+        if (comptime linked_storage) return (try self.ensureKernelOwnerSource()).readHAHiddenOwnerBootstrap(self.alloc, group_id, table_id);
+        return self.liveRuntimeWriteSource().readHAHiddenOwnerBootstrap(self.alloc, group_id, table_id);
+    }
+
+    fn primeHAHiddenOwner(self: *DataServer, bootstrap: @import("../storage/db/restore_staging_contract.zig").OwnerBootstrap) !void {
+        const compiled = try self.ensureKernelOwnerSource();
+        const encoded = try std.json.Stringify.valueAlloc(self.alloc, bootstrap, .{});
+        defer self.alloc.free(encoded);
+        const namespace = bootstrap.scope.target_namespace;
+        try compiled.primeRestoreOwner(namespace.shard_id, bootstrap.table_name, .{
+            .lsm_root_generation = self.provisioned_storage.groupVisibleRootGenerationSource().visibleRootGenerationForGroup(namespace.shard_id),
+            .identity = .{ .table_id = namespace.table_id, .shard_id = namespace.shard_id, .range_id = namespace.range_id },
+            .schema_json = bootstrap.schema_json,
+            .indexes_json = bootstrap.indexes_json,
+            .restore_bootstrap_json = encoded,
+            .restore_ha_replay = true,
+        });
+    }
+
+    fn haRestoreTerminalLedger(self: *DataServer) !*@import("../storage/hot_standby/restore_terminal_ledger.zig").Ledger {
+        const source = self.liveRuntimeWriteSource();
+        const io = if (source.backend_runtime) |runtime| runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable else std.Options.debug_io;
+        self.restore_terminal_mutex.lockUncancelable(io);
+        defer self.restore_terminal_mutex.unlock(io);
+        if (self.restore_terminal_ledger == null) {
+            const root = try self.haRestoreOwnerMetadataRoot(self.alloc);
+            defer self.alloc.free(root);
+            var opened = try @import("../storage/hot_standby/restore_terminal_ledger.zig").Ledger.open(self.alloc, io, root);
+            errdefer opened.deinit();
+            if (self.ha_cfg.seed_activation_root) |activation_root| {
+                if (try @import("../storage/hot_standby/replay_floor.zig").load(self.alloc, io, activation_root)) |floor| try opened.advanceFloor(floor);
+            }
+            self.restore_terminal_ledger = opened;
+        }
+        return &self.restore_terminal_ledger.?;
+    }
+
+    fn terminalOwnerReclaimed(ptr: *anyopaque, terminal: @import("../storage/hot_standby/restore_terminal_ledger.zig").Terminal) !bool {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        try self.retireHATerminalRegistry(terminal.group_id, terminal.scope);
+        self.liveRuntimeWriteSource().requireAbsentRestoreOwnerRoot(self.alloc, terminal.group_id) catch |err| switch (err) {
+            error.RestoreStagingScopeChanged => return false,
+            else => return err,
+        };
+        return true;
+    }
+
+    /// Called under HA role ownership after Standby persisted contiguous apply
+    /// progress. Four exact owner probes bound each maintenance slice; retained
+    /// writer leases remain protected by the existing retirement journal.
+    fn reclaimHATerminals(self: *DataServer, identity: antfly.hot_standby.standby.Identity, applied_lsn: u64) !void {
+        if (applied_lsn == 0) return;
+        const floor: @import("../storage/hot_standby/replay_floor.zig").Floor = .{ .cluster_id = identity.cluster_id, .timeline_id = identity.timeline_id, .epoch = identity.epoch, .lsn = applied_lsn };
+        const source = self.liveRuntimeWriteSource();
+        const io = if (source.backend_runtime) |runtime| runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable else std.Options.debug_io;
+        const ledger = try self.haRestoreTerminalLedger();
+        var current = try ledger.snapshot();
+        defer current.deinit();
+        if (!try current.hasTerminals()) return;
+        const previous = try current.floor();
+        // The external anchor survives replacing a live generation. Publish it
+        // first, so a crash can never expose deleted proofs to an older seed.
+        if (previous == null or !try previous.?.covers(floor)) {
+            if (self.ha_cfg.seed_activation_root) |root| try @import("../storage/hot_standby/replay_floor.zig").advance(self.alloc, io, root, floor);
+            try ledger.advanceFloor(floor);
+        }
+        _ = try ledger.gcStep(4, self, terminalOwnerReclaimed);
+    }
+
+    fn maintainHATerminalReclamation(self: *DataServer, now_ns: u64) void {
+        if (now_ns < self.ha_terminal_gc_next_attempt_ns.load(.monotonic)) return;
+        self.ha_terminal_gc_next_attempt_ns.store(now_ns +| std.time.ns_per_s, .monotonic);
+        if (!self.ha_state_mutex.tryLock()) return;
+        defer self.ha_state_mutex.unlock();
+        if (self.ha_cfg.admin_context == null) return;
+        // Continue cleanup after promotion or an upstream outage. This never
+        // advances the floor from primary WAL length; it only consumes a floor
+        // already established by durable replay/seed activation authority.
+        const ledger = self.haRestoreTerminalLedger() catch return;
+        _ = ledger.gcStep(4, self, terminalOwnerReclaimed) catch return;
     }
 
     const HAStandbyFetchSnapshot = struct {
@@ -6106,6 +6694,11 @@ pub const DataServer = struct {
         };
         const status_identity = applied.identity;
         self.ha_public_gate_state.publishStandbyProgress(applied.progress);
+        self.reclaimHATerminals(status_identity, applied.progress.applied_lsn) catch |err| {
+            // Replication progress is already durable; failed reclamation
+            // retains proofs and retries on the next bounded polling slice.
+            std.log.warn("hot-standby terminal reclamation deferred err={}", .{err});
+        };
         self.ha_state_mutex.unlock();
 
         try client.updateStandbyStatusSnapshot(
@@ -6269,8 +6862,15 @@ pub const DataServer = struct {
 
     fn openPromotedPrimaryFromStandbyIfReady(self: *DataServer, cfg: HAStandbyReplicationConfig) !bool {
         if (self.ha_cfg.admin_context == null) return false;
+        if (self.ha_promoted_primary) |*primary| {
+            // A failed metadata outbox recovery keeps promotion fenced. Retry
+            // the binding before admitting any owner job or public mutation.
+            try self.rewireHAPromotionMirrors();
+            self.ha_public_gate_state.publishPrimary(primary, haContextPrimaryIsFenced(self.ha_cfg.admin_context.?));
+            self.ha_cfg.standby_replication = null;
+            return true;
+        }
         if (self.ha_cfg.admin_context.?.standby == null) return false;
-        if (self.ha_promoted_primary != null) return true;
 
         const standby = self.ha_cfg.admin_context.?.standby.?;
         const handoff = standby.promotedPrimaryHandoff() catch |err| switch (err) {
@@ -6347,11 +6947,12 @@ pub const DataServer = struct {
         if (self.http_server) |*server| {
             server.setHAInternalExecutor(self.api_server_cfg.ha_internal_executor);
         }
-        self.rewireHAPromotionMirrors();
+        try self.rewireHAPromotionMirrors();
         self.ha_public_gate_state.publishPrimary(
             promoted_primary_handle,
             haContextPrimaryIsFenced(self.ha_cfg.admin_context.?),
         );
+        self.ha_cfg.standby_replication = null;
         return true;
     }
 
@@ -6364,8 +6965,9 @@ pub const DataServer = struct {
         return error.HAStandbyOwnershipRequired;
     }
 
-    fn rewireHAPromotionMirrors(self: *DataServer) void {
+    fn rewireHAPromotionMirrors(self: *DataServer) !void {
         const ha_primary_mirror = self.haPrimaryMirror();
+        if (self.status_source.standalone_hot_standby) |metadata_ha| try metadata_ha.bindMirror(self.haWriteGate(), ha_primary_mirror);
         _ = self.write_source.withPreparedHAMirror(ha_primary_mirror);
         if (comptime linked_storage) {
             _ = self.kernel_owner_source.?.withHAControls(self.haWriteGate(), ha_primary_mirror);
@@ -6563,29 +7165,58 @@ pub const DataServer = struct {
             for (records) |*record| record.deinit(alloc);
             alloc.free(records);
         }
+        if (records.len == 0 and !self.api_server_cfg.deployment_mode.isStandalone())
+            return error.HASeedSnapshotEmptyCatalog;
 
+        // Catalog revisions exclude unrelated metadata traffic. Fence the
+        // export and private-owner projection with the metadata head instead
+        // of comparing these two different revision domains.
+        const export_head = if (self.remote_metadata) |remote| try remote.fetchHead() else null;
         const exported = try self.write_source.catalog.exportCatalog(alloc);
         defer alloc.free(exported);
         var parsed_export = try std.json.parseFromSlice(@import("../system_catalog/projection.zig").Export, alloc, exported, .{ .allocate = .alloc_always });
         defer parsed_export.deinit();
         const metadata_snapshot = parsed_export.value;
-        if (records.len == 0 and !self.api_server_cfg.deployment_mode.isStandalone())
-            return error.HASeedSnapshotEmptyCatalog;
-        const group_ids = try alloc.alloc(
-            u64,
-            if (records.len > 0) records.len else metadata_snapshot.ranges.len,
-        );
-        defer alloc.free(group_ids);
-        if (records.len > 0) {
-            for (records, 0..) |record, index| group_ids[index] = record.group_id;
-        } else {
-            for (metadata_snapshot.ranges, 0..) |range, index| group_ids[index] = range.group_id;
+        var private = if (export_head) |head|
+            try self.captureHAPrivateProvisioning(alloc, &.{ .status = .{ .metadata_epoch = head.metadata_epoch }, .tables = metadata_snapshot.tables, .ranges = metadata_snapshot.ranges })
+        else
+            try self.captureHAPrivateProvisioning(alloc, &metadata_snapshot);
+        defer if (private) |*value| value.deinit();
+        var projection_arena = std.heap.ArenaAllocator.init(alloc);
+        defer projection_arena.deinit();
+        const projection_alloc = projection_arena.allocator();
+        const placed_tables = if (private) |value| try std.mem.concat(projection_alloc, antfly.metadata.TableRecord, &.{ metadata_snapshot.tables, value.value.tables }) else metadata_snapshot.tables;
+        const placed_ranges = if (private) |value| try std.mem.concat(projection_alloc, antfly.metadata.RangeRecord, &.{ metadata_snapshot.ranges, value.value.ranges }) else metadata_snapshot.ranges;
+        const registry_root = try self.haRestoreOwnerMetadataRoot(projection_alloc);
+        var terminal_snapshot = try (try self.haRestoreTerminalLedger()).snapshot();
+        defer terminal_snapshot.deinit();
+        var native_inventory = try @import("../storage/hot_standby/restore_owner_registry.zig").loadWithTerminalSnapshot(alloc, io, registry_root, metadata_snapshot.tables, &terminal_snapshot);
+        defer native_inventory.deinit();
+        const native_projection = try @import("../storage/hot_standby/restore_owner_registry.zig").project(projection_alloc, native_inventory.owners, metadata_snapshot.tables, placed_tables, placed_ranges);
+        const capture_tables = try std.mem.concat(projection_alloc, antfly.metadata.TableRecord, &.{ placed_tables, native_projection.tables });
+        const capture_ranges = try std.mem.concat(projection_alloc, antfly.metadata.RangeRecord, &.{ placed_ranges, native_projection.ranges });
+        const hidden_owners = if (private) |value| try @import("private_provisioning.zig").validate(projection_alloc, metadata_snapshot.tables, metadata_snapshot.ranges, value.value) else &.{};
+        var group_list: std.ArrayList(u64) = .empty;
+        defer group_list.deinit(alloc);
+        var group_set: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        defer group_set.deinit(alloc);
+        for (records) |record| {
+            const entry = try group_set.getOrPut(alloc, record.group_id);
+            if (entry.found_existing) return error.HASeedSnapshotDuplicateReplica;
+            try group_list.append(alloc, record.group_id);
         }
+        if (records.len == 0) {
+            for (capture_ranges) |range| try group_list.append(alloc, range.group_id);
+        } else for (native_projection.ranges) |range| {
+            const entry = try group_set.getOrPut(alloc, range.group_id);
+            if (!entry.found_existing) try group_list.append(alloc, range.group_id);
+        }
+        const group_ids = group_list.items;
         std.mem.sort(u64, group_ids, {}, std.sort.asc(u64));
 
         if (metadata_snapshot.epoch == 0 or
             (metadata_snapshot.tables.len == 0) != (metadata_snapshot.ranges.len == 0) or
-            group_ids.len != metadata_snapshot.ranges.len)
+            group_ids.len != capture_ranges.len)
             return error.HASeedSnapshotIncompleteTopology;
         std.mem.sort(antfly.metadata.TableRecord, metadata_snapshot.tables, {}, struct {
             fn lessThan(_: void, left: antfly.metadata.TableRecord, right: antfly.metadata.TableRecord) bool {
@@ -6629,9 +7260,9 @@ pub const DataServer = struct {
         for (group_ids, 0..) |group_id, index| {
             if (index > 0 and group_ids[index - 1] == group_id)
                 return error.HASeedSnapshotDuplicateReplica;
-            const range = findHASeedRange(metadata_snapshot.ranges, group_id) orelse
+            const range = findHASeedRange(capture_ranges, group_id) orelse
                 return error.HASeedSnapshotReplicaMissingFromTopology;
-            const table = findHASeedTable(metadata_snapshot.tables, range.table_id) orelse
+            const table = findHASeedTable(capture_tables, range.table_id) orelse
                 return error.HASeedSnapshotTableMissingFromTopology;
             const snapshot_path = try std.fmt.allocPrint(alloc, "replicas/group-{d}", .{group_id});
             errdefer alloc.free(snapshot_path);
@@ -6639,13 +7270,19 @@ pub const DataServer = struct {
             defer alloc.free(destination_root);
             const snapshot_token = try std.fmt.allocPrint(alloc, "{s}-g{d}", .{ request.generation, group_id });
             defer alloc.free(snapshot_token);
-            try self.write_source.captureHASeedReplicaSnapshot(
-                alloc,
-                table.name,
-                group_id,
-                snapshot_token,
-                destination_root,
-            );
+            if (@import("private_provisioning.zig").find(hidden_owners, group_id)) |owner| {
+                if (comptime linked_storage) {
+                    try self.primePrivateRestoreOwner(self.liveRuntimeWriteSource(), owner);
+                    try (try self.ensureKernelOwnerSource()).captureHASeedHiddenReplicaSnapshot(alloc, table.name, group_id, owner.scope.digest(), snapshot_token, destination_root);
+                } else try self.liveRuntimeWriteSource().captureHASeedHiddenReplicaSnapshot(alloc, table.name, group_id, owner.scope.digest(), snapshot_token, destination_root);
+            } else if (findHANativeRestoreOwner(native_projection.owners, group_id)) |owner| {
+                if (comptime linked_storage) {
+                    try self.primeHAHiddenOwner(owner);
+                    try (try self.ensureKernelOwnerSource()).captureHASeedHiddenReplicaSnapshot(alloc, table.name, group_id, owner.scope.digest(), snapshot_token, destination_root);
+                } else try self.liveRuntimeWriteSource().captureHASeedHiddenReplicaSnapshot(alloc, table.name, group_id, owner.scope.digest(), snapshot_token, destination_root);
+            } else if (comptime linked_storage) {
+                try (try self.ensureKernelOwnerSource()).captureHASeedReplicaSnapshot(table.name, group_id, snapshot_token, destination_root);
+            } else try self.write_source.captureHASeedReplicaSnapshot(alloc, table.name, group_id, snapshot_token, destination_root);
             const store_path = try std.fs.path.join(alloc, &.{ destination_root, "store.bin" });
             defer alloc.free(store_path);
             const digest = try haSeedSnapshotFileSha256HexAlloc(alloc, io, store_path);
@@ -6665,8 +7302,8 @@ pub const DataServer = struct {
                 .logical_sha256 = digest,
                 .snapshot_manifest_sha256 = snapshot_manifest_digest,
                 .identity_table_id = table.table_id,
-                .identity_shard_id = range.doc_identity_shard_id,
-                .identity_range_id = range.doc_identity_range_id,
+                .identity_shard_id = antfly.metadata.table_manager.rangeDocIdentityShardId(range),
+                .identity_range_id = antfly.metadata.table_manager.rangeDocIdentityRangeId(range),
             });
         }
 
@@ -6704,6 +7341,18 @@ pub const DataServer = struct {
             };
         }
 
+        const compact_native = try @import("../storage/hot_standby/restore_owner_registry.zig").compact(projection_alloc, native_projection.owners);
+        const metadata_artifact: ?HASeedSnapshotAuthArtifact = if (self.status_source.standalone_hot_standby) |metadata_ha| blk: {
+            const path = try std.fs.path.join(projection_alloc, &.{ building_root, antfly.hot_standby.seed_materialization.standalone_metadata_name });
+            const checkpoint = try metadata_ha.captureCheckpoint(io, path);
+            break :blk .{
+                .path = antfly.hot_standby.seed_materialization.standalone_metadata_name,
+                .size_bytes = checkpoint.size_bytes,
+                .sha256 = try projection_alloc.dupe(u8, &std.fmt.bytesToHex(checkpoint.sha256, .lower)),
+            };
+        } else null;
+        const terminal_path = try std.fs.path.join(projection_alloc, &.{ building_root, @import("../storage/hot_standby/restore_terminal_ledger.zig").artifact_name });
+        const terminal_artifact = try terminal_snapshot.exportFile(io, terminal_path);
         const topology_json = try std.json.Stringify.valueAlloc(alloc, HASeedSnapshotTopology{
             .generation = request.generation,
             .catalog = .{
@@ -6717,9 +7366,14 @@ pub const DataServer = struct {
                 .extension_dependencies = metadata_snapshot.extension_dependencies,
             },
             .replicas = topology_replicas.items,
+            .standalone_metadata = metadata_artifact,
+            .native_restore_tables = compact_native.tables,
+            .native_restore_owners = compact_native.owners,
+            .restore_terminals = .{ .path = @import("../storage/hot_standby/restore_terminal_ledger.zig").artifact_name, .size_bytes = terminal_artifact.size_bytes, .sha256 = try projection_alloc.dupe(u8, &std.fmt.bytesToHex(terminal_artifact.sha256, .lower)) },
             .extension_artifacts = topology_extension_artifacts.items,
             .auth_enabled = request.auth_artifact_json != null,
             .auth_artifact = topology_auth_artifact,
+            .private_provisioning = if (private) |value| value.value else null,
         }, .{});
         defer alloc.free(topology_json);
         if (topology_json.len > ha_seed_snapshot_max_topology_bytes) return error.HASeedSnapshotTopologyTooLarge;
@@ -6747,6 +7401,17 @@ pub const DataServer = struct {
         return .{ .root = published_root };
     }
 
+    fn prepareStandaloneMetadataStartup(metadata_ha: @import("../api/standalone_hot_standby.zig").Port) !void {
+        // Recover missing log appends from the durable metadata outbox before
+        // serving, but do not require a remote acknowledgement to start the
+        // listener the standby needs for catch-up. The pending outbox remains
+        // authoritative and subsequent writes/checkpoints still drain it.
+        metadata_ha.prepareCheckpoint() catch |err| switch (err) {
+            error.HASyncCommitWouldBlock => {},
+            else => return err,
+        };
+    }
+
     /// Converge process-local replay/enrichment work before seed capture takes
     /// the exclusive HA mutation boundary. Background enrichment completion is
     /// itself a durable primary mutation and must never be waited on while that
@@ -6754,6 +7419,7 @@ pub const DataServer = struct {
     /// The bounded verification inside DB.snapshotHASeed closes the remaining
     /// race and converts it into a retryable busy result.
     fn prepareDefaultHASeedSnapshotMaintenance(self: *DataServer) !void {
+        if (self.status_source.standalone_hot_standby) |metadata_ha| try metadata_ha.prepareCheckpoint();
         var metadata_snapshot = try self.write_source.catalog.adminSnapshot();
         defer self.write_source.catalog.freeAdminSnapshot(&metadata_snapshot);
         if ((metadata_snapshot.tables.len == 0) != (metadata_snapshot.ranges.len == 0))
@@ -6764,6 +7430,22 @@ pub const DataServer = struct {
         else
             platform_time.monotonicNs();
         const deadline_ns = now_ns +| ha_seed_snapshot_preflight_timeout_ns;
+        const registry_root = try self.haRestoreOwnerMetadataRoot(self.alloc);
+        defer self.alloc.free(registry_root);
+        const registry_io = if (self.write_source.backend_runtime) |runtime| runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable else std.Options.debug_io;
+        var terminal_snapshot = try (try self.haRestoreTerminalLedger()).snapshot();
+        defer terminal_snapshot.deinit();
+        var native_inventory = try @import("../storage/hot_standby/restore_owner_registry.zig").loadWithTerminalSnapshot(self.alloc, registry_io, registry_root, metadata_snapshot.tables, &terminal_snapshot);
+        defer native_inventory.deinit();
+        for (native_inventory.owners) |owner| try self.liveRuntimeWriteSource().prepareHASeedReplicaSnapshot(owner.table_name, owner.scope.target_namespace.shard_id, deadline_ns);
+        var private = try self.captureHAPrivateProvisioning(self.alloc, &metadata_snapshot);
+        defer if (private) |*value| value.deinit();
+        if (private) |value| {
+            for (value.value.ranges) |range| {
+                const table = findHASeedTable(value.value.tables, range.table_id) orelse return error.HASeedSnapshotTableMissingFromTopology;
+                try self.liveRuntimeWriteSource().prepareHASeedReplicaSnapshot(table.name, range.group_id, deadline_ns);
+            }
+        }
         for (metadata_snapshot.ranges) |range| {
             const table = findHASeedTable(metadata_snapshot.tables, range.table_id) orelse
                 return error.HASeedSnapshotTableMissingFromTopology;
@@ -6773,6 +7455,68 @@ pub const DataServer = struct {
                 deadline_ns,
             );
         }
+    }
+
+    fn haRestoreOwnerMetadataRoot(self: *DataServer, alloc: std.mem.Allocator) ![]u8 {
+        return @import("../storage/hot_standby/restore_owner_contract.zig").metadataRootAlloc(alloc, self.write_source.replica_root_dir, self.ha_cfg.restore_owner_metadata_root);
+    }
+
+    fn findHANativeRestoreOwner(owners: []const @import("../storage/db/restore_staging_contract.zig").OwnerBootstrap, group_id: u64) ?@import("../storage/db/restore_staging_contract.zig").OwnerBootstrap {
+        for (owners) |owner| if (owner.scope.target_namespace.shard_id == group_id) return owner;
+        return null;
+    }
+
+    /// Capture only private authority; never merge it into the shared/public
+    /// catalog. HA seeds retain this proof beside (not inside) local metadata.
+    fn captureHAPrivateProvisioning(self: *DataServer, alloc: std.mem.Allocator, public: anytype) !?std.json.Parsed(@import("../metadata/restore_staging.zig").ProvisioningProjection) {
+        const Projection = @import("../metadata/restore_staging.zig").ProvisioningProjection;
+        const epoch = if (@hasField(@TypeOf(public.*), "epoch")) public.epoch else public.status.metadata_epoch;
+        if (self.status_source.standalone_hot_standby) |metadata_ha| {
+            var private = (try metadata_ha.capturePrivate(alloc, epoch)) orelse return null;
+            errdefer private.deinit();
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            _ = try @import("private_provisioning.zig").validate(arena.allocator(), public.tables, public.ranges, private.value);
+            return private;
+        }
+        if (self.remote_metadata) |remote| {
+            const registration = self.store_registration orelse return error.HASeedSnapshotIncompleteTopology;
+            const current_head = try remote.fetchHead();
+            if (current_head.metadata_epoch != epoch) return error.MetadataSnapshotHeadMismatch;
+            var private = remote.fetchProvisioningSnapshotForHead(current_head, registration.node_id) catch |err| switch (err) {
+                error.UnsupportedOperation => return null,
+                else => return err,
+            };
+            defer private.deinit();
+            if (private.value.catalog.ranges.len == 0) return null;
+            var proof_arena = std.heap.ArenaAllocator.init(alloc);
+            defer proof_arena.deinit();
+            _ = try @import("private_provisioning.zig").validate(proof_arena.allocator(), public.tables, public.ranges, private.value.catalog);
+            const encoded = try std.json.Stringify.valueAlloc(alloc, private.value.catalog, .{});
+            defer alloc.free(encoded);
+            return try std.json.parseFromSlice(Projection, alloc, encoded, .{ .allocate = .alloc_always });
+        }
+        // Offline HA materialization has already authenticated this sidecar
+        // against TOPOLOGY.json. Native owner markers remain the write fence.
+        const metadata_root = try self.haRestoreOwnerMetadataRoot(alloc);
+        defer alloc.free(metadata_root);
+        const path = try std.fs.path.join(alloc, &.{ metadata_root, antfly.hot_standby.seed_materialization.private_provisioning_name });
+        defer alloc.free(path);
+        const io = if (self.write_source.backend_runtime) |runtime| runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable else std.Options.debug_io;
+        const encoded = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(antfly.hot_standby.seed_materialization.max_topology_bytes)) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        defer alloc.free(encoded);
+        var parsed = try std.json.parseFromSlice(Projection, alloc, encoded, .{ .allocate = .alloc_always });
+        defer parsed.deinit();
+        var proof_arena = std.heap.ArenaAllocator.init(alloc);
+        defer proof_arena.deinit();
+        const remaining = try @import("private_provisioning.zig").unpublishedProjection(proof_arena.allocator(), public.tables, parsed.value);
+        if (remaining.ranges.len == 0) return null;
+        _ = try @import("private_provisioning.zig").validate(proof_arena.allocator(), public.tables, public.ranges, remaining);
+        const remaining_json = try std.json.Stringify.valueAlloc(proof_arena.allocator(), remaining, .{});
+        return try std.json.parseFromSlice(Projection, alloc, remaining_json, .{ .allocate = .alloc_always });
     }
 
     fn findHASeedRange(ranges: []const antfly.metadata.RangeRecord, group_id: u64) ?antfly.metadata.RangeRecord {
@@ -7021,6 +7765,8 @@ pub const DataServer = struct {
             }
             if (entry.kind != .file) return error.HASeedSnapshotUnexpectedArtifact;
             if (std.mem.eql(u8, entry.path, ha_seed_snapshot_topology_name)) continue;
+            if (topology.standalone_metadata) |artifact| if (std.mem.eql(u8, entry.path, artifact.path)) continue;
+            if (topology.restore_terminals) |artifact| if (std.mem.eql(u8, entry.path, artifact.path)) continue;
             for (topology.extension_artifacts) |artifact| {
                 if (std.mem.eql(u8, entry.path, artifact.path)) break;
             } else {
@@ -7527,6 +8273,7 @@ pub const DataServer = struct {
         // Durable cleanup epochs survive transient allocation/queue failures;
         // the control loop is their allocation-free watchdog.
         self.write_source.maintainDroppedTableRecovery();
+        self.maintainHATerminalReclamation(now_ns);
         if (self.haStandbyReplicationRetryDue(now_ns)) {
             if (self.runHAStandbyReplicationRound()) |_| {
                 self.clearHAStandbyReplicationRetry();
@@ -7828,13 +8575,22 @@ pub const DataServer = struct {
         self.store_report_collection = null;
         self.store_report_publisher.deinit(self.alloc);
         self.store_status_heartbeat_cache.clear(self.alloc);
+        if (self.restore_terminal_ledger) |*ledger| ledger.deinit();
         self.provisioned_storage.deinit();
         self.write_source.deinit();
+        // Owner jobs drained before caches; native callbacks have now stopped
+        // too, so no admission can race this final assertion/reclamation.
+        self.relational_ttl_queue.deinit();
         if (self.owned_incoming_graph_route_store) |*store| store.deinit();
         if (self.owned_incoming_graph_route_backend) |*backend| backend.close();
         if (self.remote_metadata) |remote_metadata| {
             remote_metadata.deinit();
             self.alloc.destroy(remote_metadata);
+        }
+        if (self.distributed_read_http_executor) |executor| {
+            executor.deinit();
+            self.alloc.destroy(executor);
+            self.distributed_read_http_executor = null;
         }
         if (self.owned_backend_runtime) |*runtime| runtime.deinit();
         if (self.query_io_impl) |*io_impl| io_impl.deinit();
@@ -8451,6 +9207,7 @@ pub const DataServer = struct {
         return .{
             .ptr = self,
             .vtable = &.{
+                .topology_read = localReadTransitionTopology,
                 .observe_split = localObserveSplit,
                 .observe_merge = localObserveMerge,
                 .prepare_split_source = localPrepareSplitSource,
@@ -8617,6 +9374,21 @@ pub const DataServer = struct {
         };
     }
 
+    /// Called with data_raft_mutex held. The provider's completion marker is
+    /// advanced only after the native delegate and projection finish. Neither
+    /// live core applied nor persisted snapshot index proves installation.
+    fn seedCompletedDataReadIndexLocked(self: *DataServer, group_id: u64) !void {
+        const raft = self.data_raft orelse return;
+        const apply_sm = self.data_raft_apply orelse return;
+        const completed = if (raft.host.owned_wal_replica_provider) |provider|
+            if (provider.stateForGroup(group_id)) |state| state.completedAppliedIndex() else 0
+        else if (raft.host.owned_file_replica_provider) |provider|
+            if (provider.stateForGroup(group_id)) |state| state.completedAppliedIndex() else 0
+        else
+            0;
+        try apply_sm.read_barriers.noteApplied(group_id, completed);
+    }
+
     fn waitDataReadSafeWithCancellation(
         self: *DataServer,
         group_id: u64,
@@ -8650,6 +9422,7 @@ pub const DataServer = struct {
             defer self.data_raft_mutex.unlock();
             if (cancellation.isCancelled()) return error.Cancelled;
             if (self.dataRaftMonotonicNs() >= deadline_ns) return error.ReadIndexTimeout;
+            try self.seedCompletedDataReadIndexLocked(group_id);
             try raft.requestReadIndex(group_id, registration.request_ctx);
         }
 
@@ -8855,6 +9628,291 @@ pub const DataServer = struct {
         return try alloc.dupe(u8, store.api_url);
     }
 
+    fn onlineMergeIo(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request: @import("../storage/db/online_merge_io_contract.zig").Request, context: antfly.public_api.operation.RequestContext) ![]u8 {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        if (comptime !linked_storage) return error.StorageKernelOwnerUnavailable;
+        const source = self.kernel_owner_source orelse return error.StorageKernelOwnerUnavailable;
+        if (self.data_raft == null) {
+            if (self.api_server_cfg.deployment_mode != .standalone) return error.UnsupportedRestoreSource;
+            const NativeOwner = struct {
+                fn execute(owner_ptr: *anyopaque, allocator: std.mem.Allocator, group: u64, table: []const u8, input: @import("../storage/db/online_merge_io_contract.zig").Request, control: antfly.public_api.operation.RequestContext) ![]u8 {
+                    const owner: *antfly.public_api.ProvisionedKernelOwnerSource = @ptrCast(@alignCast(owner_ptr));
+                    return owner.onlineMergeIo(allocator, group, table, input, control);
+                }
+            };
+            const port: @import("../api/online_merge_io.zig").Port = .{ .ptr = source, .execute_fn = NativeOwner.execute };
+            return port.executeStandaloneRewrite(alloc, group_id, table_name, request, context, self.haWriteGate());
+        }
+        if (request.scope.authority != .raft) return error.OnlineSourceScopeChanged;
+        if (request.operation == .revoke or (request.operation == .status and request.operation.status == .donor)) {
+            try context.ensureActive();
+            try request.validate();
+            if (request.ownerGroup() != group_id) return error.OnlineSourceScopeChanged;
+            // Status is a leader ReadIndex observation in the native owner.
+            // Revoke preparation adds raw ordinary-transition state from the
+            // same replica; the returned command still arbitrates at apply.
+            const observation = try source.onlineMergeIo(alloc, group_id, table_name, .{ .scope = request.scope, .operation = .{ .status = .donor } }, context);
+            defer alloc.free(observation);
+            const contract = @import("../storage/db/online_merge_io_contract.zig");
+            const raw = self.localTransitionApplyStore() orelse return error.GroupLeaderUnavailable;
+            const ordinary = try raw.currentMergeSourceState(alloc, group_id);
+            try context.ensureActive();
+            if (request.operation == .revoke) {
+                const prepared: contract.Prepared = .{ .scope = request.scope, .request = onlineMergeRevokeBatch(request.scope, ordinary) };
+                return std.json.Stringify.valueAlloc(alloc, prepared, .{});
+            }
+            var parsed = try std.json.parseFromSlice(contract.SourceStatus, alloc, observation, .{});
+            defer parsed.deinit();
+            if (ordinary) |merge| if (merge.phase == .accepting) {
+                parsed.value.ordinary_conflict = true;
+                parsed.value.ordinary_scope_conflict = merge.transition_id == request.scope.fence.transition_id and merge.receiver_group_id == request.scope.fence.peer_group_id;
+            };
+            if (try raw.currentSplitState(alloc, group_id)) |split| {
+                freeDataRaftSplitState(alloc, split);
+                parsed.value.ordinary_conflict = true;
+            }
+            var receiver_state = try raw.currentMergeReceiverState(alloc, group_id);
+            defer if (receiver_state) |*value| value.deinit(alloc);
+            if (receiver_state) |value| if (value.phase != .none and value.phase != .finalized and value.phase != .rolled_back) {
+                // This donor may itself have been selected as another merge's
+                // receiver. Cancel our attempt, never that unrelated scope.
+                parsed.value.ordinary_conflict = true;
+            };
+            return std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+        }
+        if (request.operation != .admission) return source.onlineMergeIo(alloc, group_id, table_name, request, context);
+        try context.ensureActive();
+        try request.validate();
+        if (request.ownerGroup() != group_id) return error.OnlineSourceScopeChanged;
+        // Capture leader authority and every applying member, including joint
+        // voters and learners. Never hold the host mutex across network I/O.
+        const authority = blk: {
+            lockAtomic(&self.data_raft_mutex);
+            defer self.data_raft_mutex.unlock();
+            const raft = self.data_raft orelse return error.GroupLeaderUnavailable;
+            if (!raft.host.http_host.host.isLocalLeader(group_id)) return error.GroupLeaderUnavailable;
+            const status = raft.host.http_host.host.raftStatus(group_id) orelse return error.UnknownGroup;
+            break :blk .{ .term = status.hard.current_term, .plan = try self.dataRaftProtocolProbePlanLocked(alloc, raft, group_id, status.conf_state, raft.host.http_host.host.cfg.local_node_id) };
+        };
+        var plan = authority.plan;
+        defer plan.deinit(alloc);
+        if (!plan.routes_complete) return error.GroupLeaderUnavailable;
+        var cancellation = antfly.raft.transport.http_common.RequestCancellation.fromToken(context.cancellation);
+        const budget_ns = if (context.deadline_ns) |deadline| blk: {
+            const now_ns = if (context.deadline_io) |borrow| clock: {
+                var receiver = try borrow.receive();
+                break :clock @as(u64, @intCast(@max(0, std.Io.Clock.now(.awake, receiver.io()).nanoseconds)));
+            } else platform_time.monotonicNs();
+            break :blk @min(deadline -| now_ns, 5 * std.time.ns_per_s);
+        } else 5 * std.time.ns_per_s;
+        const deadline_ns = self.dataRaftMonotonicNs() +| budget_ns;
+        var protocol_supported = true;
+        for (plan.peers) |peer| {
+            try context.ensureActive();
+            const version = self.probeDataRaftBatchProtocolVersion(alloc, peer.node_id, peer.raft_url, deadline_ns, &cancellation);
+            // Unknown/unreachable is retryable, not evidence that an ordinary
+            // merge should be selected. A positively observed older peer is.
+            if (!try onlineMergePeerEligible(version)) protocol_supported = false;
+        }
+        // The owner read performs ReadIndex before observing durable counters.
+        const json = try source.onlineMergeIo(alloc, group_id, table_name, request, context);
+        defer alloc.free(json);
+        const contract = @import("../storage/db/online_merge_io_contract.zig");
+        var parsed = try std.json.parseFromSlice(contract.AdmissionFacts, alloc, json, .{});
+        defer parsed.deinit();
+        const raw = self.localTransitionApplyStore() orelse return error.GroupLeaderUnavailable;
+        if (try raw.currentSplitState(alloc, group_id)) |split| {
+            freeDataRaftSplitState(alloc, split);
+            return error.TransitionOperationBusy;
+        }
+        if (try raw.currentMergeSourceState(alloc, group_id)) |merge| {
+            if (merge.transition_id == request.scope.fence.transition_id) {
+                // Resume a previously started ordinary merge after a lost
+                // metadata acknowledgement, even if still in prepare.
+                parsed.value.eligible = false;
+            } else if (merge.phase != .rolled_back and merge.phase != .finalized) return error.TransitionOperationBusy;
+        }
+        try context.ensureActive();
+        {
+            lockAtomic(&self.data_raft_mutex);
+            defer self.data_raft_mutex.unlock();
+            const raft = self.data_raft orelse return error.GroupLeaderUnavailable;
+            if (!raft.host.http_host.host.isLocalLeader(group_id)) return error.GroupLeaderUnavailable;
+            const status = raft.host.http_host.host.raftStatus(group_id) orelse return error.UnknownGroup;
+            try validateOnlineMergeAdmissionAuthority(authority.term, status.hard.current_term, plan.conf_state_fingerprint, dataRaftConfStateFingerprint(status.conf_state));
+        }
+        parsed.value.eligible = parsed.value.eligible and protocol_supported;
+        parsed.value.donor_term = authority.term;
+        return std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+    }
+
+    fn restoreOwnerControl(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, input: antfly.public_api.restore_owner.Request, context: antfly.public_api.operation.RequestContext) !antfly.public_api.restore_owner.Response {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        try context.ensureActive();
+        try input.validate(group_id);
+        const local_term: ?u64 = blk: {
+            lockAtomic(&self.data_raft_mutex);
+            defer self.data_raft_mutex.unlock();
+            const raft = self.data_raft orelse break :blk null;
+            if (!raft.host.http_host.host.isLocalLeader(group_id)) return error.GroupLeaderUnavailable;
+            const status = raft.host.http_host.host.raftStatus(group_id) orelse return error.UnknownGroup;
+            break :blk status.hard.current_term;
+        };
+        if (local_term != null) try self.waitDataReadSafeWithCancellation(group_id, "restore-owner", 30_000, context.cancellation);
+        try context.ensureActive();
+        if (input.action == .publish) {
+            // Native serving admission follows the authoritative all-table
+            // metadata decision. A request body cannot publish a hidden root.
+            var snapshot = (try self.status_source.linearizableSnapshot(context)) orelse return error.MetadataSnapshotUnavailable;
+            defer self.status_source.freeAdminSnapshot(&snapshot);
+            const table = for (snapshot.tables) |candidate| {
+                if (candidate.table_id == input.scope.target_namespace.table_id and std.mem.eql(u8, candidate.name, table_name)) break candidate;
+            } else return error.RestoreStagingInProgress;
+            _ = table;
+            for (snapshot.ranges) |range| {
+                if (range.group_id == group_id and range.table_id == input.scope.target_namespace.table_id and
+                    antfly.metadata.table_manager.rangeDocIdentityShardId(range) == input.scope.target_namespace.shard_id and
+                    antfly.metadata.table_manager.rangeDocIdentityRangeId(range) == input.scope.target_namespace.range_id) break;
+            } else return error.RestoreStagingScopeChanged;
+        }
+        if (comptime linked_storage) return self.restoreOwnerControlCompiled(alloc, table_name, group_id, input, context, local_term);
+        var lease = try self.liveRuntimeWriteSource().leaseRestoreStagingOwner(alloc, table_name, group_id, input.scope.digest(), true);
+        defer lease.release(alloc);
+        const Proposal = struct {
+            server: *DataServer,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            group_id: u64,
+            term: ?u64,
+            target: *antfly.db.DB,
+            scope: [32]u8,
+            fn propose(ctx: *anyopaque, request: antfly.db.types.BatchRequest, operation_context: antfly.public_api.operation.RequestContext) !void {
+                const proposal: *@This() = @ptrCast(@alignCast(ctx));
+                var batch = request;
+                batch.restore_staging_scope = proposal.scope;
+                try operation_context.ensureActive();
+                if (proposal.term) |term| {
+                    try proposal.server.proposeRaftBatchGroup(proposal.alloc, proposal.group_id, proposal.table_name, batch, .{
+                        .discovery = .cached,
+                        .required_local_term = term,
+                        .visibility_cancellation = operation_context.cancellation,
+                    });
+                } else {
+                    // Standalone shares the same scoped native transaction and
+                    // HA outbox. It has no Raft log and must not pretend to be
+                    // a replica apply (which would bypass primary HA admission).
+                    try proposal.target.batchWithVisibilityCancellation(batch, operation_context.cancellation);
+                }
+                try operation_context.ensureActive();
+            }
+        };
+        var proposal: Proposal = .{ .server = self, .alloc = alloc, .table_name = table_name, .group_id = group_id, .term = local_term, .target = lease.db, .scope = input.scope.digest() };
+        const runtime = try self.ensureBackendRuntime();
+        const io = runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
+        const cache_path = try std.fmt.allocPrint(alloc, "{s}.restore-source-{s}", .{ lease.db.core.path, std.fmt.bytesToHex(input.scope.digest(), .lower) });
+        defer alloc.free(cache_path);
+        return @import("../storage/restore_owner.zig").executeResident(alloc, lease.db, .{
+            .io = io,
+            .runtime = runtime,
+            .cache_path = cache_path,
+            .location_options = .{ .secret_store = self.api_server_cfg.secret_store, .node_config = self.api_server_cfg.node_config, .network_io = runtime.apiIo(), .filesystem_io = io },
+            .proposer = .{ .ptr = &proposal, .propose = Proposal.propose },
+        }, input, context);
+    }
+
+    fn recoverRestoreDescriptor(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, scope: [32]u8, plan_id: [16]u8, use: antfly.public_api.ProvisionedKernelOwnerSource.RestoreDescriptorUse, context: antfly.public_api.operation.RequestContext) !antfly.public_api.ProvisionedKernelOwnerSource.OwnedRestoreDescriptor {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        try context.ensureActive();
+        const bytes = (try self.status_source.getRestoreStaging(alloc, plan_id, context)) orelse return error.RestoreStagingScopeChanged;
+        defer alloc.free(bytes);
+        var job = try std.json.parseFromSlice(@import("../metadata/restore_staging.zig").Job, alloc, bytes, .{});
+        defer job.deinit();
+        if (!std.mem.eql(u8, &job.value.plan.id, &plan_id)) return error.RestoreStagingScopeChanged;
+        switch (job.value.state) {
+            .preparing_sources => return error.RestoreStagingInProgress,
+            .importing, .validating => {},
+            .cutover, .published => if (use != .resolve) return error.RestoreStagingScopeChanged,
+            .canceling, .canceled => if (use != .resolve) return error.RestoreStagingCanceled,
+        }
+        var descriptor = try self.restoreDescriptorFromJob(alloc, job.value, group_id, table_name, scope);
+        errdefer descriptor.deinit(alloc);
+        descriptor.descriptor.restore_cancel_recovery = job.value.state == .canceling or job.value.state == .canceled;
+        // Confirm current authority after decoding the immutable plan. A
+        // cancellation/publication racing this read cannot reopen admission.
+        const current = (try self.status_source.getRestoreStagingProgress(alloc, plan_id, context)) orelse return error.RestoreStagingScopeChanged;
+        if (current.state != job.value.state or current.revision != job.value.revision) return error.RestoreStagingProgressChanged;
+        try context.ensureActive();
+        return descriptor;
+    }
+
+    fn restoreDescriptorFromJob(self: *DataServer, alloc: std.mem.Allocator, job: @import("../metadata/restore_staging.zig").Job, group_id: u64, table_name: []const u8, digest: [32]u8) !antfly.public_api.ProvisionedKernelOwnerSource.OwnedRestoreDescriptor {
+        const stages = @import("../metadata/restore_staging.zig");
+        if (!std.mem.eql(u8, &job.plan_digest, &(try job.plan.digest(alloc)))) return error.RestoreStagingScopeChanged;
+        for (job.plan.targets) |target| {
+            if (!std.mem.eql(u8, target.table.name, table_name)) continue;
+            for (target.ranges) |range| {
+                if (range.group_id != group_id) continue;
+                const scope = try stages.ownerScope(alloc, job.plan, job.plan_digest, target, range);
+                if (!std.mem.eql(u8, &scope.digest(), &digest)) return error.RestoreStagingScopeChanged;
+                const schema_json = try alloc.dupe(u8, target.table.schema_json);
+                errdefer alloc.free(schema_json);
+                const indexes_json = try alloc.dupe(u8, target.table.indexes_json);
+                errdefer alloc.free(indexes_json);
+                const bootstrap: @import("../storage/db/restore_staging_contract.zig").OwnerBootstrap = .{ .scope = scope, .table_name = table_name, .schema_json = target.table.schema_json, .read_schema_json = target.table.read_schema_json, .indexes_json = target.table.indexes_json, .byte_range = .{ .start = range.start_key, .end = range.end_key orelse "" } };
+                const encoded = try std.json.Stringify.valueAlloc(alloc, bootstrap, .{});
+                return .{ .descriptor = .{ .lsm_root_generation = self.provisioned_storage.groupVisibleRootGenerationSource().visibleRootGenerationForGroup(group_id), .identity = .{ .table_id = scope.target_namespace.table_id, .shard_id = scope.target_namespace.shard_id, .range_id = scope.target_namespace.range_id }, .schema_json = schema_json, .indexes_json = indexes_json, .table_storage = target.table.storage, .restore_bootstrap_json = encoded } };
+            }
+        }
+        return error.RestoreStagingScopeChanged;
+    }
+
+    fn restoreOwnerControlCompiled(self: *DataServer, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, input: antfly.public_api.restore_owner.Request, context: antfly.public_api.operation.RequestContext, local_term: ?u64) !antfly.public_api.restore_owner.Response {
+        const metadata_staging = @import("../metadata/restore_staging.zig");
+        const owner = try self.ensureKernelOwnerSource();
+        // Only a compact authority read is needed on the steady-state path.
+        // The immutable owner descriptor is already authenticated by its exact
+        // scope; its cache entry is not itself a lease across the Raft proposal.
+        const progress = (try self.status_source.getRestoreStagingProgress(alloc, input.scope.plan_id, context)) orelse return error.RestoreStagingScopeChanged;
+        switch (input.action) {
+            .status => {},
+            .publish => if (progress.state != .published) return error.RestoreStagingInProgress,
+            .cancel => if (progress.state != .canceling and progress.state != .canceled) return error.RestoreStagingScopeChanged,
+            .begin, .import_page, .validate => switch (progress.state) {
+                .importing, .validating, .cutover => {},
+                .canceling, .canceled => return error.RestoreStagingCanceled,
+                .published, .preparing_sources => return error.RestoreStagingScopeChanged,
+            },
+        }
+        var cached = try owner.cachedRestoreDescriptor(alloc, group_id, table_name, input.scope.digest());
+        defer if (cached) |*value| value.deinit(alloc);
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        var descriptor = if (cached) |*value| value.view() else blk: {
+            const encoded = (try self.status_source.getRestoreStaging(scratch, input.scope.plan_id, context)) orelse return error.RestoreStagingScopeChanged;
+            const job = try std.json.parseFromSliceLeaky(metadata_staging.Job, scratch, encoded, .{ .allocate = .alloc_always });
+            if (!std.mem.eql(u8, &job.plan.id, &input.scope.plan_id) or !std.mem.eql(u8, &job.plan_digest, &input.scope.plan_digest)) return error.RestoreStagingScopeChanged;
+            const recovered = try self.restoreDescriptorFromJob(scratch, job, group_id, table_name, input.scope.digest());
+            break :blk recovered.descriptor;
+        };
+        descriptor.restore_cancel_recovery = progress.state == .canceling or progress.state == .canceled;
+        const Proposal = struct {
+            server: *DataServer,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            group_id: u64,
+            term: u64,
+            scope: [32]u8,
+            fn propose(ptr: *anyopaque, batch: antfly.db.types.BatchRequest, request: antfly.public_api.operation.RequestContext) !void {
+                const proposal: *@This() = @ptrCast(@alignCast(ptr));
+                if (!std.mem.eql(u8, &(batch.restore_staging_scope orelse return error.RestoreStagingScopeChanged), &proposal.scope)) return error.RestoreStagingScopeChanged;
+                try proposal.server.proposeRaftBatchGroup(proposal.alloc, proposal.group_id, proposal.table_name, batch, .{ .discovery = .cached, .required_local_term = proposal.term, .visibility_cancellation = request.cancellation });
+            }
+        };
+        var proposal: Proposal = .{ .server = self, .alloc = alloc, .table_name = table_name, .group_id = group_id, .term = local_term orelse 0, .scope = input.scope.digest() };
+        return owner.restoreOwnerControl(alloc, group_id, table_name, descriptor, input, if (local_term != null) .{ .ptr = &proposal, .propose = Proposal.propose } else null, .{ .secret_store = self.api_server_cfg.secret_store, .node_config = self.api_server_cfg.node_config }, context);
+    }
+
     fn routedRaftBatchWriter(self: *DataServer) antfly.public_api.internal_group_operations.RoutedRaftBatchWriter {
         return .{
             .ptr = self,
@@ -9007,12 +10065,9 @@ pub const DataServer = struct {
         context: antfly.public_api.distributed_txn.PreDecisionContext,
     ) !void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
-        const deadline_ns = context.deadline_ns orelse
+        if (context.deadline_ns == null)
             return try localRaftBatchGroupLocalWithCancellation(ptr, alloc, group_id, table_name, req, context.cancellation);
-        const leader_wait_ns = preDecisionLeaderWaitNsAt(
-            platform_time.monotonicNs(),
-            deadline_ns,
-        ) orelse return error.PreDecisionDeadlineExceeded;
+        const leader_wait_ns = preDecisionLeaderWaitNs(context) orelse return error.PreDecisionDeadlineExceeded;
         var cancellation = antfly.raft.transport.http_common.RequestCancellation.fromToken(context.cancellation);
         try self.proposeRaftBatchGroupWithLeaderWait(
             alloc,
@@ -9074,6 +10129,10 @@ pub const DataServer = struct {
             self.data_raft_mutex.unlock();
             return error.LeaderUnavailable;
         }
+        self.seedCompletedDataReadIndexLocked(group_id) catch |err| {
+            self.data_raft_mutex.unlock();
+            return err;
+        };
         raft.requestReadIndex(group_id, request_ctx) catch |err| {
             self.data_raft_mutex.unlock();
             return switch (err) {
@@ -9245,7 +10304,7 @@ pub const DataServer = struct {
         if (remaining == 0) return error.DeadlineExceeded;
         const write_route_fence: ?antfly.metadata_api.CatalogRouteFence = switch (authority) {
             .catalog => |fence| fence,
-            .transaction, .split_replication, .merge_replication => null,
+            .transaction, .split_replication, .merge_replication, .relational_topology => null,
         };
         var cancellation = antfly.raft.transport.http_common.RequestCancellation.fromToken(cancellation_token);
         const leader_wait_ns = dataRaftForwardedLeaderWaitNs(forwarding);
@@ -9292,6 +10351,9 @@ pub const DataServer = struct {
         realtime_ns: u64,
     ) antfly.db.types.BatchRequest {
         var proposal_req = req;
+        // Source-bound merge pages carry certified per-row timestamps. Adding
+        // a wall-clock batch override invalidates their replay contract.
+        if (proposal_req.merge_page != null or proposal_req.online_source != null) return proposal_req;
         // DB.batch treats zero as "read realtime now". Materialize that value
         // once before any forwarding or Raft encoding so every replica applies
         // identical document versions and TTL deadlines. Preserve zero as the
@@ -9314,6 +10376,23 @@ pub const DataServer = struct {
     }
 
     fn requiredRaftBatchProtocolVersion(req: antfly.db.types.BatchRequest) u16 {
+        if (req.restore_staging != null or req.online_source != null or
+            (if (req.merge_page) |page| page.source.retention != null else false) or
+            (if (req.merge_checkpoint) |checkpoint| if (checkpoint.page_source) |source| source.retention != null else false else false))
+            return data_raft_batch.source_scope_protocol_version;
+        if (req.restore_staging != null or
+            (if (req.merge_page) |page| page.source.integrity != null else false) or
+            (if (req.merge_checkpoint) |checkpoint| if (checkpoint.page_source) |source| source.integrity != null else false else false))
+            return data_raft_batch.relational_transfer_protocol_version;
+        if (req.online_source != null) return data_raft_batch.source_pin_protocol_version;
+        if (if (req.merge_page) |page| page.next_snapshot_position != null else false)
+            return data_raft_batch.source_pin_protocol_version;
+        if (if (req.merge_page) |page| page.chunk != null else false) return data_raft_batch.merge_chunk_protocol_version;
+        if ((if (req.merge_page) |page| page.source.retention != null else false) or
+            (if (req.merge_checkpoint) |checkpoint| if (checkpoint.page_source) |source| source.retention != null else false else false))
+            return data_raft_batch.online_source_protocol_version;
+        if (req.merge_page != null or (if (req.merge_checkpoint) |checkpoint| checkpoint.page_source != null else false))
+            return data_raft_batch.merge_page_protocol_version;
         if (req.merge_replication != null or req.merge_checkpoint != null)
             return data_raft_batch.merge_copy_attempt_protocol_version;
         if (req.merge_artifacts.len > 0) return data_raft_batch.merge_artifacts_protocol_version;
@@ -9519,6 +10598,67 @@ pub const DataServer = struct {
             error.RequestForwardCapacityUnavailable => error.LeaderUnavailable,
             else => err,
         };
+    }
+
+    fn distributedReadExecutor(self: *DataServer) !antfly.common.http.RequestExecutor {
+        if (self.distributed_read_http_executor == null) {
+            const runtime = self.backend_runtime orelse return error.BackendRuntimeUnavailable;
+            var lane = runtime.acquireRequestForwardLane() catch |err| switch (err) {
+                error.RequestForwardCapacityUnavailable => return error.StorageReadTemporarilyUnavailable,
+                else => return err,
+            };
+            defer lane.release();
+            const executor = try self.alloc.create(antfly.common.http.IoHttpExecutor);
+            // Query/API workers synchronously await these requests. The HTTP
+            // client needs nested request/connect/socket watchdog tasks, so it
+            // must not compete with callers on the API lane. Reuse the bounded
+            // forwarding lane and one keep-alive client; reserve the complete
+            // task graph for each request below, before any bytes are sent.
+            executor.* = antfly.common.http.IoHttpExecutor.init(self.alloc, lane.io(), .{ .keep_alive = true });
+            self.distributed_read_http_executor = executor;
+        }
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .execute = executeDistributedRead,
+                .execute_stream = executeDistributedReadStream,
+            },
+            .realtime_ns_fn = distributedReadRealtimeNs,
+            .clock_io = self.distributed_read_http_executor.?.executor().clock_io,
+        };
+    }
+
+    fn acquireDistributedReadLane(self: *DataServer, request: antfly.common.http.HttpRequest) !backend_runtime_mod.BackendRuntime.RequestForwardLaneLease {
+        if (request.delivery_tracker) |tracker| tracker.markNotSent();
+        if (request.cancellation) |cancellation| if (cancellation.isCancelled()) return error.Cancelled;
+        if (request.timeout_ms == 0) return error.Timeout;
+        const runtime = self.backend_runtime orelse return error.BackendRuntimeUnavailable;
+        return runtime.acquireRequestForwardLane() catch |err| switch (err) {
+            // Preserve local admission provenance until the caller can drain
+            // sibling reads and reduce its own fanout. This request sent no
+            // bytes; remote availability failures use a different error.
+            error.RequestForwardCapacityUnavailable => error.ConcurrencyUnavailable,
+            else => err,
+        };
+    }
+
+    fn executeDistributedRead(ptr: *anyopaque, alloc: std.mem.Allocator, request: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        var lane = try self.acquireDistributedReadLane(request);
+        defer lane.release();
+        return self.distributed_read_http_executor.?.executor().execute(alloc, request);
+    }
+
+    fn executeDistributedReadStream(ptr: *anyopaque, alloc: std.mem.Allocator, request: antfly.common.http.HttpRequest, writer: antfly.common.http.StreamWriter) !bool {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        var lane = try self.acquireDistributedReadLane(request);
+        defer lane.release();
+        return (try self.distributed_read_http_executor.?.executor().executeStream(alloc, request, writer)).?;
+    }
+
+    fn distributedReadRealtimeNs(ptr: *anyopaque) i128 {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return self.distributed_read_http_executor.?.executor().realtimeNs().?;
     }
 
     fn dataRaftMonotonicNs(self: *DataServer) u64 {
@@ -9755,6 +10895,8 @@ pub const DataServer = struct {
             const preflighted_local_leader = raft.host.http_host.host.isLocalLeader(group_id);
             var storage_owner_descriptor: ?antfly.public_api.ProvisionedKernelOwnerSource.LoadedDescriptor = null;
             defer if (storage_owner_descriptor) |*descriptor| descriptor.deinit(alloc);
+            var restore_owner_descriptor: ?antfly.public_api.ProvisionedKernelOwnerSource.OwnedRestoreDescriptor = null;
+            defer if (restore_owner_descriptor) |*descriptor| descriptor.deinit(alloc);
             var protocol_preflight: DataRaftBatchProtocolPreflight = .{};
             var protocol_activation_entry: ?*DataRaftProtocolActivationEntry = null;
             var protocol_activation_lock_owned = false;
@@ -9845,7 +10987,12 @@ pub const DataServer = struct {
                 try ensureDataRaftBatchRouteActive(route);
                 if (self.dataRaftMonotonicNs() >= deadline_ns) return error.LeaderUnavailable;
                 const admission_source = if (self.data_raft_apply) |apply_sm| &apply_sm.write_source else &self.write_source;
-                if (route.write_route_fence) |fence| {
+                if (req.restore_staging_scope) |scope| {
+                    if (comptime linked_storage) {
+                        const owner_source = try self.ensureKernelOwnerSource();
+                        restore_owner_descriptor = (try owner_source.cachedRestoreDescriptor(alloc, group_id, table_name, scope)) orelse return error.RestoreStagingScopeChanged;
+                    } else try admission_source.validateRestoreStagingScope(alloc, table_name, group_id, scope);
+                } else if (route.write_route_fence) |fence| {
                     // Preserve the remaining duration in the catalog's own
                     // clock domain; both sides may borrow simulated I/O.
                     const admission_now_ns = self.dataRaftMonotonicNs();
@@ -9860,10 +11007,12 @@ pub const DataServer = struct {
                         route.visibility_cancellation,
                     );
                 }
-                try admission_source.preflightDenseRepairWriteAdmission(group_id, table_name);
+                if (req.restore_staging_scope == null) try admission_source.preflightDenseRepairWriteAdmission(group_id, table_name);
                 if (comptime linked_storage) {
-                    const owner_source = try self.ensureKernelOwnerSource();
-                    storage_owner_descriptor = try owner_source.loadDescriptor(alloc, group_id, table_name);
+                    if (restore_owner_descriptor == null) {
+                        const owner_source = try self.ensureKernelOwnerSource();
+                        storage_owner_descriptor = try owner_source.loadDescriptor(alloc, group_id, table_name);
+                    }
                 }
             }
 
@@ -9963,7 +11112,7 @@ pub const DataServer = struct {
                                 alloc,
                                 table_name,
                                 proposal_req,
-                                storage_owner_descriptor.?.view(),
+                                if (restore_owner_descriptor) |*descriptor| descriptor.view() else storage_owner_descriptor.?.view(),
                             )
                         else
                             try data_raft_batch.encode(alloc, table_name, proposal_req);
@@ -10551,6 +11700,15 @@ pub const DataServer = struct {
         // routing and remote consensus while retaining the established 500 ms
         // cap for ordinary five-second writes.
         return @min(data_raft_local_campaign_max_grace_ns, leader_wait_ns / 4);
+    }
+
+    fn preDecisionLeaderWaitNs(context: antfly.public_api.distributed_txn.PreDecisionContext) ?u64 {
+        // HTTP admission and compiled callers may use an executor's awake
+        // clock. Only transfer the remaining duration into the Raft clock;
+        // comparing its absolute deadline with platform monotonic time can
+        // incorrectly reject every remote request before proposal.
+        const now_ns = (antfly.public_api.table_catalog.RoutingBudget{ .io = context.deadline_io }).nowNs();
+        return preDecisionLeaderWaitNsAt(now_ns, context.deadline_ns orelse return null);
     }
 
     fn preDecisionLeaderWaitNsAt(now_ns: u64, deadline_ns: u64) ?u64 {
@@ -12156,6 +13314,122 @@ pub const DataServer = struct {
         };
     }
 
+    fn localReadTransitionTopology(ptr: *anyopaque, _: u64, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request: @import("../raft/shard_ops.zig").TopologyReadRequest, cancellation: antfly.db.types.CancellationToken) ![]u8 {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        try cancellation.check();
+        if (request.transition_id == 0 or request.attempt_epoch == 0) return error.InvalidArgument;
+        // Destination groups are deliberately absent from public routing until
+        // publication. Resolve their immutable namespace from the admitted
+        // transition, never by relaxing ordinary table-read authorization.
+        var snapshot = (try self.status_source.linearizableSnapshot(.{ .cancellation = cancellation })) orelse return error.CatalogRoutingUnavailable;
+        defer self.status_source.freeAdminSnapshot(&snapshot);
+        const resolved = try resolveTransitionTopologyRead(snapshot, group_id, table_name, request);
+        // A quorum/apply barrier precedes the managed-owner lease: holding a
+        // writer/transition activity while waiting for apply could deadlock.
+        if (self.data_raft != null) {
+            try self.waitDataReadSafeWithCancellation(group_id, "transition-topology", 5_000, cancellation);
+        }
+        try cancellation.check();
+        var owner = try self.leaseReplicatedTransitionOwner(group_id, resolved.contract, resolved.role, .exact);
+        defer owner.release();
+        return owner.readRelationalTopologyJson(alloc, @tagName(request.mode));
+    }
+
+    fn resolveTransitionTopologyRead(snapshot: antfly.metadata_api.AdminSnapshot, group_id: u64, table_name: []const u8, request: @import("../raft/shard_ops.zig").TopologyReadRequest) !struct { contract: antfly.metadata.TransitionTableContract, role: TransitionIdentityRole } {
+        for (snapshot.split_transitions) |record| {
+            if (record.transition_id != request.transition_id) continue;
+            if (record.attempt_epoch != request.attempt_epoch or !std.mem.eql(u8, table_name, record.table_contract.table_name)) return error.TopologyChanged;
+            try record.table_contract.validateForSplit();
+            const role: TransitionIdentityRole = if (group_id == record.source_group_id) .source else if (group_id == record.destination_group_id) .target else return error.TopologyChanged;
+            return .{ .contract = record.table_contract, .role = role };
+        }
+        for (snapshot.merge_transitions) |record| {
+            if (record.transition_id != request.transition_id) continue;
+            if (request.attempt_epoch != 1 or !std.mem.eql(u8, table_name, record.table_contract.table_name)) return error.TopologyChanged;
+            try record.table_contract.validateForMerge(record.allow_doc_identity_reassignment);
+            const role: TransitionIdentityRole = if (group_id == record.donor_group_id) .source else if (group_id == record.receiver_group_id) .target else return error.TopologyChanged;
+            return .{ .contract = record.table_contract, .role = role };
+        }
+        return error.TopologyChanged;
+    }
+
+    fn readRelationalTopologyValue(self: *DataServer, comptime T: type, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, transition_id: u64, attempt_epoch: u64, mode: []const u8) !std.json.Parsed(T) {
+        const scoped: @import("../raft/shard_ops.zig").TopologyReadRequest = .{ .transition_id = transition_id, .attempt_epoch = attempt_epoch, .mode = std.meta.stringToEnum(@FieldType(@import("../raft/shard_ops.zig").TopologyReadRequest, "mode"), mode) orelse return error.InvalidArgument };
+        const request = try std.json.Stringify.valueAlloc(alloc, scoped, .{});
+        defer alloc.free(request);
+        if (self.read_source.distributed_router) |router| {
+            var route = (try antfly.public_api.table_router.resolveGroupRoute(alloc, self.read_source.catalog, router, group_id, .prefer_leader)) orelse return error.GroupLeaderUnavailable;
+            defer route.deinit(alloc);
+            switch (route) {
+                .local => {},
+                .remote => |remote| {
+                    // Lifecycle RPCs must use the same owned transport and
+                    // clock as the Raft process selecting this group route.
+                    // A separately configured public-read executor may use a
+                    // different Io backend (notably during replay/simulation).
+                    var lane = try self.acquireDataRaftForwardLane();
+                    defer lane.release();
+                    var executor = antfly.common.http.IoHttpExecutor.init(alloc, lane.io(), .{});
+                    defer executor.deinit();
+                    var client = antfly.public_api.ApiHttpClient.init(alloc, executor.executor());
+                    _ = client.withInternalServiceAuth(self.api_server_cfg.internal_service_secret, self.api_server_cfg.internal_service_issuer);
+                    if (scoped.mode == .merge_copy_receipt) {
+                        // This private read ships with the complete v10 native
+                        // bundle. A positively identified older peer retains
+                        // ordinary copying; auth/transport ambiguity propagates.
+                        if (!try onlineMergePeerEligible(try client.fetchDataRaftBatchProtocolVersion(remote.base_uri, 10000, null)))
+                            return error.GuardedMergeCopyReceiptUnsupported;
+                    }
+                    var response = try client.fetchGroupLookupWithMode(remote.base_uri, group_id, table_name, "", null, "read_index", 10000, null, false, false, "", "", "", request, null, null, false);
+                    defer response.deinit(alloc);
+                    return std.json.parseFromSlice(T, alloc, response.body, .{ .allocate = .alloc_always });
+                },
+            }
+        }
+        const response = try self.localShardOperationAdapter().topologyRead(alloc, group_id, table_name, scoped, .none);
+        defer alloc.free(response);
+        return std.json.parseFromSlice(T, alloc, response, .{ .allocate = .alloc_always });
+    }
+
+    fn transitionHasCoordinatedConstraints(alloc: std.mem.Allocator, contract: antfly.metadata.TransitionTableContract) !bool {
+        const Shape = struct { unique_constraints: []const std.json.Value = &.{}, foreign_keys: []const std.json.Value = &.{} };
+        if (contract.schema_json.len == 0) return false;
+        var parsed = try std.json.parseFromSlice(Shape, alloc, contract.schema_json, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        const coordinated = parsed.value.unique_constraints.len != 0 or parsed.value.foreign_keys.len != 0;
+        if (coordinated and (contract.integrity_protocol != .distributed_quiescent_v1 or contract.read_schema_json.len != 0)) return error.CoordinatedConstraintTopologyUnsupported;
+        return coordinated;
+    }
+
+    const IntegrityTopology = @import("../storage/db/relational_integrity_topology_contract.zig");
+    const IntegrityHandoff = @import("../storage/db/relational_integrity_handoff_contract.zig");
+    const IntegrityTopologyStatus = struct { fence: ?IntegrityTopology.Fence, drained: bool };
+
+    fn ensureRelationalSplitFence(self: *DataServer, group_id: u64, peer_id: u64, transition_id: u64, attempt: u64, role: IntegrityTopology.Role, contract: antfly.metadata.TransitionTableContract) !IntegrityTopology.Fence {
+        var status = self.readRelationalTopologyValue(IntegrityTopologyStatus, self.alloc, group_id, contract.table_name, transition_id, attempt, "status") catch |err| {
+            std.log.warn("integrity topology status read failed group={} transition={} role={s} err={s}", .{ group_id, transition_id, @tagName(role), @errorName(err) });
+            return err;
+        };
+        defer status.deinit();
+        if (status.value.fence) |fence| {
+            if (fence.role != role or fence.owner_group_id != group_id or fence.peer_group_id != peer_id or fence.transition_id != transition_id or fence.attempt != attempt) return error.IntegrityTopologyBusy;
+            if (!status.value.drained) return error.TransactionTopologyBusy;
+            return fence;
+        }
+        var identity = try self.readRelationalTopologyValue(IntegrityTopology.Identity, self.alloc, group_id, contract.table_name, transition_id, attempt, "identity");
+        defer identity.deinit();
+        const fence: IntegrityTopology.Fence = .{ .admission_epoch = identity.value.next_epoch, .transition_id = transition_id, .attempt = attempt, .owner_group_id = group_id, .peer_group_id = peer_id, .role = role, .namespace = identity.value.namespace, .catalog_digest = identity.value.catalog_digest };
+        self.proposeRaftBatchGroup(self.alloc, group_id, contract.table_name, .{ .relational_topology = .{ .action = .begin, .fence = fence } }, .{ .discovery = .catalog }) catch |err| {
+            std.log.warn("integrity topology fence proposal failed group={} transition={} role={s} err={s}", .{ group_id, transition_id, @tagName(role), @errorName(err) });
+            return err;
+        };
+        var observed = try self.readRelationalTopologyValue(IntegrityTopologyStatus, self.alloc, group_id, contract.table_name, transition_id, attempt, "status");
+        defer observed.deinit();
+        if (observed.value.fence == null or !observed.value.fence.?.eql(fence)) return error.IntegrityTopologyChanged;
+        if (!observed.value.drained) return error.TransactionTopologyBusy;
+        return fence;
+    }
+
     fn replicateSplitBootstrapBudgeted(
         self: *DataServer,
         work_alloc: std.mem.Allocator,
@@ -12201,9 +13475,45 @@ pub const DataServer = struct {
             table_contract,
         );
 
+        var integrity_arena = std.heap.ArenaAllocator.init(work_alloc);
+        defer integrity_arena.deinit();
+        var integrity_manifest: ?IntegrityHandoff.Manifest = null;
+        if (try transitionHasCoordinatedConstraints(work_alloc, table_contract)) {
+            const source_fence = try self.ensureRelationalSplitFence(source_group_id, destination_group_id, transition_id, attempt_epoch, .split_source, table_contract);
+            const destination_fence = try self.ensureRelationalSplitFence(destination_group_id, source_group_id, transition_id, attempt_epoch, .split_destination, table_contract);
+            {
+                var source_db = try self.leaseReplicatedTransitionOwner(source_group_id, table_contract, .source, .exact);
+                defer source_db.release();
+                integrity_manifest = try source_db.relationalHandoffManifest(integrity_arena.allocator(), source_fence, destination_fence, handoff.byte_range.start, handoff.byte_range.end, handoff.base_delta_sequence);
+            }
+            try self.proposeRaftBatchGroup(work_alloc, destination_group_id, table_contract.table_name, .{ .relational_topology = .{ .action = .transfer, .fence = destination_fence, .transfer = .{ .begin = integrity_manifest.? } } }, .{ .discovery = .cached });
+        }
+
         // Reserve the exact destination generation before streaming data. The
         // begin checkpoint is idempotent, and makes a later completion marker
         // impossible to apply without the corresponding bootstrap identity.
+        if (integrity_manifest) |manifest| {
+            const deadline = platform_time.monotonicNs() +| 250 * std.time.ns_per_ms;
+            for (0..32) |slice| {
+                if (slice != 0 and platform_time.monotonicNs() >= deadline) return error.TransitionOperationBusy;
+                try self.requireReplicatedTransitionActionActive(source_group_id);
+                var progress = try self.readRelationalTopologyValue(IntegrityHandoff.Progress, work_alloc, destination_group_id, table_contract.table_name, transition_id, attempt_epoch, "handoff_progress");
+                defer progress.deinit();
+                if (progress.value.ready) break;
+                if (progress.value.exhausted) {
+                    try self.proposeRaftBatchGroup(work_alloc, destination_group_id, table_contract.table_name, .{ .relational_topology = .{ .action = .transfer, .fence = manifest.destination, .transfer = .{ .finish = .{ .sequence = progress.value.sequence, .digest = progress.value.digest } } } }, .{ .discovery = .cached });
+                    continue;
+                }
+                var page_arena = std.heap.ArenaAllocator.init(work_alloc);
+                defer page_arena.deinit();
+                const page = blk: {
+                    var source_db = try self.leaseReplicatedTransitionOwner(source_group_id, table_contract, .source, .exact);
+                    defer source_db.release();
+                    break :blk try source_db.relationalHandoffPage(page_arena.allocator(), manifest, progress.value);
+                };
+                try self.proposeRaftBatchGroup(work_alloc, destination_group_id, table_contract.table_name, .{ .relational_topology = .{ .action = .transfer, .fence = manifest.destination, .transfer = .{ .page = page } } }, .{ .discovery = .cached });
+            } else return error.TransitionOperationBusy;
+        }
         try self.requireReplicatedTransitionActionActive(source_group_id);
         try self.replicateSplitDestinationCheckpoint(
             destination_group_id,
@@ -12293,7 +13603,17 @@ pub const DataServer = struct {
             if (observation.state) |state| state.split_key else if (observation.terminal) |terminal| terminal.split_key else split_key
         else
             split_key;
-        if (try planReplicatedSplitTransition(observation.state, observation.terminal, transition_id, attempt_epoch, destination_group_id, kind, effective_split_key) == .idempotent) return;
+        if (try planReplicatedSplitTransition(observation.state, observation.terminal, transition_id, attempt_epoch, destination_group_id, kind, effective_split_key) == .idempotent) {
+            if (kind == .finalize and try transitionHasCoordinatedConstraints(self.alloc, table_contract))
+                try self.releaseRelationalSplitDestination(destination_group_id, source_group_id, transition_id, attempt_epoch, table_contract);
+            if (kind == .rollback and try transitionHasCoordinatedConstraints(self.alloc, table_contract))
+                try self.abortRelationalSplit(source_group_id, destination_group_id, transition_id, attempt_epoch, table_contract);
+            return;
+        }
+
+        if (kind == .prepare and try transitionHasCoordinatedConstraints(self.alloc, table_contract)) {
+            _ = try self.ensureRelationalSplitFence(source_group_id, destination_group_id, transition_id, attempt_epoch, .split_source, table_contract);
+        }
 
         try self.proposeRaftBatchGroup(self.alloc, source_group_id, table_contract.table_name, .{
             .sync_level = .write,
@@ -12305,6 +13625,46 @@ pub const DataServer = struct {
                 .split_key = effective_split_key,
             },
         }, .{ .discovery = .cached });
+        if (kind == .finalize and try transitionHasCoordinatedConstraints(self.alloc, table_contract))
+            try self.releaseRelationalSplitDestination(destination_group_id, source_group_id, transition_id, attempt_epoch, table_contract);
+        if (kind == .rollback and try transitionHasCoordinatedConstraints(self.alloc, table_contract))
+            try self.abortRelationalSplit(source_group_id, destination_group_id, transition_id, attempt_epoch, table_contract);
+    }
+
+    fn abortRelationalSplit(self: *DataServer, source_id: u64, destination_id: u64, transition_id: u64, attempt: u64, contract: antfly.metadata.TransitionTableContract) !void {
+        for ([_]u64{ source_id, destination_id }, [_]u64{ destination_id, source_id }, [_]IntegrityTopology.Role{ .split_source, .split_destination }) |owner, peer, role| {
+            var identity = try self.readRelationalTopologyValue(IntegrityTopology.Identity, self.alloc, owner, contract.table_name, transition_id, attempt, "identity");
+            defer identity.deinit();
+            const fence: IntegrityTopology.Fence = .{ .admission_epoch = identity.value.next_epoch, .transition_id = transition_id, .attempt = attempt, .owner_group_id = owner, .peer_group_id = peer, .role = role, .namespace = identity.value.namespace, .catalog_digest = identity.value.catalog_digest };
+            try self.proposeRaftBatchGroup(self.alloc, owner, contract.table_name, .{ .relational_topology = .{ .action = .abort_transition, .fence = fence } }, .{ .discovery = .catalog });
+        }
+    }
+
+    fn releaseRelationalSplitDestination(self: *DataServer, group_id: u64, source_id: u64, transition_id: u64, attempt: u64, contract: antfly.metadata.TransitionTableContract) !void {
+        var status = try self.readRelationalTopologyValue(IntegrityTopologyStatus, self.alloc, group_id, contract.table_name, transition_id, attempt, "status");
+        defer status.deinit();
+        if (status.value.fence) |fence| {
+            if (fence.role != .split_destination or fence.owner_group_id != group_id or fence.peer_group_id != source_id or fence.transition_id != transition_id or fence.attempt != attempt) return error.IntegrityTopologyChanged;
+            try self.proposeRaftBatchGroup(self.alloc, group_id, contract.table_name, .{ .relational_topology = .{ .action = .release, .fence = fence } }, .{ .discovery = .cached });
+        }
+        try self.pruneRelationalSplitSource(source_id, group_id, transition_id, attempt, contract);
+    }
+
+    fn pruneRelationalSplitSource(self: *DataServer, source_id: u64, destination_id: u64, transition_id: u64, attempt: u64, contract: antfly.metadata.TransitionTableContract) !void {
+        var receipt = try self.readRelationalTopologyValue(?IntegrityTopology.Fence, self.alloc, source_id, contract.table_name, transition_id, attempt, "completed");
+        defer receipt.deinit();
+        const fence = receipt.value orelse return error.IntegrityTopologyFenceMissing;
+        if (fence.role != .split_source or fence.transition_id != transition_id or fence.attempt != attempt or fence.peer_group_id != destination_id) return error.IntegrityTopologyChanged;
+        const deadline = platform_time.monotonicNs() +| 250 * std.time.ns_per_ms;
+        for (0..32) |slice| {
+            if (slice != 0 and platform_time.monotonicNs() >= deadline) return error.TransitionOperationBusy;
+            try self.requireReplicatedTransitionActionActive(source_id);
+            var progress = try self.readRelationalTopologyValue(?IntegrityHandoff.PruneProgress, self.alloc, source_id, contract.table_name, transition_id, attempt, "prune_progress");
+            defer progress.deinit();
+            if (progress.value) |value| if (value.complete and value.fence.eql(fence)) return;
+            try self.proposeRaftBatchGroup(self.alloc, source_id, contract.table_name, .{ .relational_topology = .{ .action = .prune, .fence = fence } }, .{ .discovery = .cached });
+        }
+        return error.TransitionOperationBusy;
     }
 
     fn replicateSplitCatchUp(
@@ -12361,6 +13721,14 @@ pub const DataServer = struct {
         const source_seq = try source_store.currentSplitDeltaSequence(self.alloc, source_group_id);
         const source_ack = try self.splitProgressForSource(transition_id, attempt_epoch, source_group_id, destination_group_id);
         const after_seq = if (source_ack) |ack| ack else 0;
+        if (try transitionHasCoordinatedConstraints(work_alloc, table_contract)) {
+            _ = try self.ensureRelationalSplitFence(source_group_id, destination_group_id, transition_id, attempt_epoch, .split_source, table_contract);
+            if (source_ack == null or after_seq != source_seq) return error.IntegrityHandoffSequenceChanged;
+            var progress = try self.readRelationalTopologyValue(IntegrityHandoff.Progress, work_alloc, destination_group_id, table_contract.table_name, transition_id, attempt_epoch, "handoff_progress");
+            defer progress.deinit();
+            if (!progress.value.ready) return error.IntegrityHandoffIncomplete;
+            return;
+        }
         var destination_discovery: DataRaftMutationDiscovery = .catalog;
         var cursor = after_seq;
         while (cursor < source_seq) {
@@ -13533,7 +14901,10 @@ pub const DataServer = struct {
         table_contract: antfly.metadata.TransitionTableContract,
         donor_lease: *ReplicatedTransitionLease,
     ) !antfly.db.types.MergeCopyAttempt {
-        const attempt = try self.nextMergeCopyAttempt(donor_group_id);
+        if (try transitionHasCoordinatedConstraints(self.alloc, table_contract)) {
+            _ = try mergeSourceFenceUnderLease(donor_lease, donor_group_id, receiver_group_id, transition_id);
+            _ = try self.ensureRelationalSplitFence(receiver_group_id, donor_group_id, transition_id, 1, .merge_destination, table_contract);
+        }
         const source_store = self.localTransitionApplyStore() orelse
             return error.MissingMergeSourceStore;
         const watermark = try self.reconcileMergeSourceUnderLease(
@@ -13547,6 +14918,37 @@ pub const DataServer = struct {
         defer if (receiver_state) |*state| state.deinit(self.alloc);
         if (receiver_state == null or receiver_state.?.transition_id != transition_id)
             return error.MergeReceiverProjectionNotReady;
+        // A lost outer RPC reply does not invalidate a completed native copy.
+        // The receiver receipt must come from its authenticated read-index
+        // route, never this donor replica's possibly lagging raw projection.
+        // The local projection is only a negative-work hint. It can delay an
+        // optimization, but can never authorize skipping any copy effects.
+        if (receiver_state.?.bootstrap_complete and receiver_state.?.bootstrap_applied_index == watermark.last_entry_index) reuse: {
+            if (try transitionHasCoordinatedConstraints(self.alloc, table_contract)) break :reuse;
+            const Receipt = @import("../storage/db/merge_contract.zig").CopyReceipt;
+            // Background vector/graph/enrichment artifacts need a separate
+            // durable generation proof. A Raft row watermark cannot certify
+            // those effects. Ask the borrowed native source without reentering
+            // its transition lease; unsupported shapes keep ordinary copying.
+            const source_json = try donor_lease.readRelationalTopologyJson(self.alloc, "merge_copy_receipt");
+            defer self.alloc.free(source_json);
+            var source_receipt = try std.json.parseFromSlice(Receipt, self.alloc, source_json, .{});
+            defer source_receipt.deinit();
+            if (!source_receipt.value.row_derived_document or !source_receipt.value.namespace.eql(identityNamespaceFromTransitionContract(table_contract, .source)) or
+                !std.mem.eql(u8, source_receipt.value.range.start, donor_range.start) or !std.mem.eql(u8, source_receipt.value.range.end, donor_range.end)) break :reuse;
+            const donor_term = try self.currentMergeCopyTerm(donor_group_id);
+            var receipt = self.readRelationalTopologyValue(@import("../storage/db/merge_contract.zig").CopyReceipt, self.alloc, receiver_group_id, table_contract.table_name, transition_id, 1, "merge_copy_receipt") catch |err| {
+                if (err == error.GuardedMergeCopyReceiptUnsupported) break :reuse;
+                return err;
+            };
+            defer receipt.deinit();
+            if (guardedMergeCopyReceiptMatches(receipt.value, transition_id, donor_group_id, receiver_group_id, donor_range, watermark.last_entry_index, donor_term, receiver_state.?.copy_attempt, allow_doc_identity_reassignment, table_contract)) {
+                const prior_attempt = receipt.value.state.?.copy_attempt;
+                if (try self.currentMergeCopyTerm(donor_group_id) != donor_term) return error.GroupLeaderUnavailable;
+                return prior_attempt;
+            }
+        }
+        const attempt = try self.nextMergeCopyAttempt(donor_group_id);
         const base_range = receiver_state.?.receiver_base_range;
         const merged_range = receiver_state.?.merged_range orelse
             return error.MergeReceiverProjectionNotReady;
@@ -13557,6 +14959,7 @@ pub const DataServer = struct {
             table_contract,
             attempt,
         );
+        try self.replicateMergeIntegrityHandoff(donor_lease, transition_id, donor_group_id, receiver_group_id, table_contract, donor_range, watermark.last_entry_index, attempt);
         try self.replicateMergeReceiverCheckpoint(mergeReceiverCheckpoint(
             transition_id,
             donor_group_id,
@@ -13627,6 +15030,105 @@ pub const DataServer = struct {
         return attempt;
     }
 
+    fn guardedMergeCopyReceiptMatches(
+        receipt: @import("../storage/db/merge_contract.zig").CopyReceipt,
+        transition_id: u64,
+        donor: u64,
+        receiver: u64,
+        donor_range: antfly.db.types.ByteRange,
+        source_cut: u64,
+        donor_term: u64,
+        expected_attempt: antfly.db.types.MergeCopyAttempt,
+        allow_reassignment: bool,
+        contract: antfly.metadata.TransitionTableContract,
+    ) bool {
+        const state = receipt.state orelse return false;
+        const namespace = identityNamespaceFromTransitionContract(contract, .target);
+        if (!receipt.row_derived_document or !receipt.namespace.eql(namespace) or state.transition_id != transition_id or
+            state.donor_group_id != donor or state.receiver_group_id != receiver or
+            state.phase != .accepting or !state.bootstrap_complete or source_cut == 0 or
+            state.bootstrap_applied_index != source_cut or donor_term == 0 or
+            state.copy_attempt.donor_term != donor_term or state.copy_attempt.sequence == 0 or state.copy_attempt.order(expected_attempt) != .eq or
+            state.allow_doc_identity_reassignment != allow_reassignment or antfly.db.merge_state.isRetired(state, transition_id)) return false;
+        if (allow_reassignment) {
+            if (!(state.receiver_identity_reassignment_namespace orelse return false).eql(namespace)) return false;
+        } else if (state.receiver_identity_reassignment_namespace != null) return false;
+        const merged = state.merged_range orelse return false;
+        const expected = mergeTransitionRange(donor_range, state.receiver_base_range) catch return false;
+        return std.mem.eql(u8, merged.start, expected.start) and std.mem.eql(u8, merged.end, expected.end) and
+            std.mem.eql(u8, receipt.range.start, merged.start) and std.mem.eql(u8, receipt.range.end, merged.end);
+    }
+
+    fn currentMergeCopyTerm(self: *DataServer, donor_group_id: u64) !u64 {
+        lockAtomic(&self.data_raft_mutex);
+        defer self.data_raft_mutex.unlock();
+        const raft = self.data_raft orelse return error.UnsupportedOperation;
+        if (!raft.host.http_host.host.isLocalLeader(donor_group_id)) return error.GroupLeaderUnavailable;
+        const status = raft.host.http_host.host.raftStatus(donor_group_id) orelse return error.GroupLeaderUnavailable;
+        return status.hard.current_term;
+    }
+
+    fn replicateMergeIntegrityHandoff(
+        self: *DataServer,
+        donor_db: *ReplicatedTransitionLease,
+        transition_id: u64,
+        donor_group_id: u64,
+        receiver_group_id: u64,
+        contract: antfly.metadata.TransitionTableContract,
+        donor_range: antfly.db.types.ByteRange,
+        watermark: u64,
+        attempt: antfly.db.types.MergeCopyAttempt,
+    ) !void {
+        if (!try transitionHasCoordinatedConstraints(self.alloc, contract)) return;
+        const source_fence = try mergeSourceFenceUnderLease(donor_db, donor_group_id, receiver_group_id, transition_id);
+        const destination_fence = try self.ensureRelationalSplitFence(receiver_group_id, donor_group_id, transition_id, 1, .merge_destination, contract);
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const owned = arena.allocator();
+        var previous = try self.readRelationalTopologyValue(?IntegrityHandoff.Manifest, owned, receiver_group_id, contract.table_name, transition_id, 1, "handoff_manifest");
+        defer previous.deinit();
+        const manifest = if (previous.value) |value| blk: {
+            if (!value.source.eql(source_fence) or !value.destination.eql(destination_fence) or value.primary_sequence > watermark or
+                !std.mem.eql(u8, value.lower, donor_range.start) or !std.mem.eql(u8, value.upper, donor_range.end)) return error.IntegrityTopologyChanged;
+            break :blk value;
+        } else blk: {
+            var value = try donor_db.relationalHandoffManifest(owned, source_fence, destination_fence, donor_range.start, donor_range.end, watermark);
+            value.merge_copy_attempt = attempt;
+            try self.proposeRaftBatchGroup(self.alloc, receiver_group_id, contract.table_name, .{ .relational_topology = .{ .action = .transfer, .fence = destination_fence, .transfer = .{ .begin = value } } }, .{ .discovery = .cached });
+            break :blk value;
+        };
+        const deadline = platform_time.monotonicNs() +| 250 * std.time.ns_per_ms;
+        for (0..32) |slice| {
+            if (slice != 0 and platform_time.monotonicNs() >= deadline) return error.TransitionOperationBusy;
+            try self.requireReplicatedTransitionActionActive(donor_group_id);
+            var progress = try self.readRelationalTopologyValue(IntegrityHandoff.Progress, self.alloc, receiver_group_id, contract.table_name, transition_id, 1, "handoff_progress");
+            defer progress.deinit();
+            if (progress.value.ready) return;
+            if (progress.value.exhausted) {
+                try self.proposeRaftBatchGroup(self.alloc, receiver_group_id, contract.table_name, .{ .relational_topology = .{ .action = .transfer, .fence = destination_fence, .transfer = .{ .finish = .{ .sequence = progress.value.sequence, .digest = progress.value.digest } } } }, .{ .discovery = .cached });
+            } else {
+                var page_arena = std.heap.ArenaAllocator.init(self.alloc);
+                defer page_arena.deinit();
+                const page = try donor_db.relationalHandoffPage(page_arena.allocator(), manifest, progress.value);
+                try self.proposeRaftBatchGroup(self.alloc, receiver_group_id, contract.table_name, .{ .relational_topology = .{ .action = .transfer, .fence = destination_fence, .transfer = .{ .page = page } } }, .{ .discovery = .cached });
+            }
+        }
+        return error.TransitionOperationBusy;
+    }
+
+    fn mergeSourceFenceUnderLease(db: *ReplicatedTransitionLease, owner: u64, peer: u64, transition: u64) !IntegrityTopology.Fence {
+        // The transition lease exclusively owns this group's admission. A
+        // routed read would try to acquire that same lease again and deadlock.
+        // Acceptance already durably installed the fence; validate its exact
+        // identity directly on the borrowed native owner instead.
+        const status = try db.relationalTopologyStatus();
+        const fence = status.fence orelse return error.IntegrityTopologyFenceMissing;
+        if (fence.role != .merge_source or fence.owner_group_id != owner or
+            fence.peer_group_id != peer or fence.transition_id != transition or fence.attempt != 1) return error.IntegrityTopologyChanged;
+        if (!status.drained) return error.TransactionTopologyBusy;
+        return fence;
+    }
+
     fn nextMergeCopyAttempt(self: *DataServer, donor_group_id: u64) !antfly.db.types.MergeCopyAttempt {
         lockAtomic(&self.data_raft_mutex);
         defer self.data_raft_mutex.unlock();
@@ -13636,6 +15138,44 @@ pub const DataServer = struct {
         self.merge_copy_sequence = std.math.add(u64, self.merge_copy_sequence, 1) catch
             return error.MergeCopySequenceExhausted;
         return .{ .donor_term = status.hard.current_term, .sequence = self.merge_copy_sequence };
+    }
+
+    fn releaseRelationalMergeReceiver(self: *DataServer, donor: u64, receiver: u64, transition: u64, contract: antfly.metadata.TransitionTableContract) !void {
+        if (!try transitionHasCoordinatedConstraints(self.alloc, contract)) return;
+        var status = try self.readRelationalTopologyValue(IntegrityTopologyStatus, self.alloc, receiver, contract.table_name, transition, 1, "status");
+        defer status.deinit();
+        if (status.value.fence) |fence| {
+            if (fence.role != .merge_destination or fence.transition_id != transition or fence.owner_group_id != receiver or fence.peer_group_id != donor) return error.IntegrityTopologyChanged;
+            try self.proposeRaftBatchGroup(self.alloc, receiver, contract.table_name, .{ .relational_topology = .{ .action = .release, .fence = fence } }, .{ .discovery = .cached });
+        }
+    }
+
+    fn abortRelationalMerge(self: *DataServer, donor: u64, receiver: u64, transition: u64, contract: antfly.metadata.TransitionTableContract) !void {
+        if (!try transitionHasCoordinatedConstraints(self.alloc, contract)) return;
+        // Receiver cleanup comes first: a failure must never resume parent
+        // admission on the donor while its imported references remain live.
+        for ([_]u64{ receiver, donor }, [_]u64{ donor, receiver }, [_]IntegrityTopology.Role{ .merge_destination, .merge_source }) |owner, peer, role| {
+            var status = try self.readRelationalTopologyValue(IntegrityTopologyStatus, self.alloc, owner, contract.table_name, transition, 1, "status");
+            defer status.deinit();
+            if (status.value.fence) |fence| {
+                if (fence.role != role or fence.transition_id != transition or fence.owner_group_id != owner or fence.peer_group_id != peer) return error.IntegrityTopologyChanged;
+                if (role == .merge_destination) {
+                    var manifest = try self.readRelationalTopologyValue(?IntegrityHandoff.Manifest, self.alloc, owner, contract.table_name, transition, 1, "handoff_manifest");
+                    defer manifest.deinit();
+                    if (manifest.value != null) {
+                        const deadline = platform_time.monotonicNs() +| 250 * std.time.ns_per_ms;
+                        for (0..32) |slice| {
+                            if (slice != 0 and platform_time.monotonicNs() >= deadline) return error.TransitionOperationBusy;
+                            var progress = try self.readRelationalTopologyValue(?IntegrityHandoff.PruneProgress, self.alloc, owner, contract.table_name, transition, 1, "prune_progress");
+                            defer progress.deinit();
+                            if (progress.value) |value| if (value.complete and value.fence.eql(fence)) break;
+                            try self.proposeRaftBatchGroup(self.alloc, owner, contract.table_name, .{ .relational_topology = .{ .action = .prune, .fence = fence } }, .{ .discovery = .cached });
+                        } else return error.TransitionOperationBusy;
+                    }
+                }
+                try self.proposeRaftBatchGroup(self.alloc, owner, contract.table_name, .{ .relational_topology = .{ .action = .abort_transition, .fence = fence } }, .{ .discovery = .cached });
+            }
+        }
     }
 
     fn replicateMergeRollbackDeletes(
@@ -13659,7 +15199,7 @@ pub const DataServer = struct {
             copy_attempt,
         );
         while (true) {
-            var page = try store.groupStatePageInRange(
+            var page = try store.groupStateKeysPageInRange(
                 self.alloc,
                 receiver_group_id,
                 donor_range,
@@ -13841,6 +15381,10 @@ pub const DataServer = struct {
                     &receiver_lease,
                 );
             }
+            if (try transitionHasCoordinatedConstraints(self.alloc, op.table_contract)) {
+                _ = try self.ensureRelationalSplitFence(op.donor_group_id, op.receiver_group_id, op.transition_id, 1, .merge_source, op.table_contract);
+                _ = try self.ensureRelationalSplitFence(op.receiver_group_id, op.donor_group_id, op.transition_id, 1, .merge_destination, op.table_contract);
+            }
             try self.replicateMergeSourceTransition(
                 op.transition_id,
                 op.donor_group_id,
@@ -13930,7 +15474,10 @@ pub const DataServer = struct {
                 op.receiver_group_id,
                 op.allow_doc_identity_reassignment,
                 op.table_contract,
-            )) return;
+            )) {
+                try self.releaseRelationalMergeReceiver(op.donor_group_id, op.receiver_group_id, op.transition_id, op.table_contract);
+                return;
+            }
             var donor_lease = try self.leaseReplicatedTransitionOwner(
                 op.donor_group_id,
                 op.table_contract,
@@ -14002,14 +15549,25 @@ pub const DataServer = struct {
                 op.receiver_group_id,
                 op.allow_doc_identity_reassignment,
                 op.table_contract,
-            )) return;
+            )) {
+                try self.releaseRelationalMergeReceiver(op.donor_group_id, op.receiver_group_id, op.transition_id, op.table_contract);
+                return;
+            }
+            // Proposal preflight acquires the ordinary catalog descriptor.
+            // The transition descriptor intentionally omits initial-range
+            // hints, so holding its native owner while proposing to that same
+            // donor waits for our own lease to drain. Keep transition activity
+            // through cutover, but release the copied owner's lease first.
+            var transition_activity: ?antfly.public_api.ProvisionedTableWriteSource.GroupTransitionActivity = null;
+            defer if (transition_activity) |*activity| activity.deinit();
             var donor_lease = try self.leaseReplicatedTransitionOwner(
                 op.donor_group_id,
                 op.table_contract,
                 .source,
                 .exact,
             );
-            defer donor_lease.release();
+            var owner_released = false;
+            defer if (!owner_released) donor_lease.release();
             const attempt = try self.replicateMergeCopyUnderLease(
                 op.transition_id,
                 op.donor_group_id,
@@ -14018,6 +15576,12 @@ pub const DataServer = struct {
                 op.table_contract,
                 &donor_lease,
             );
+            if (comptime linked_storage) {
+                transition_activity = donor_lease.activity;
+                donor_lease.activity = null;
+                donor_lease.release();
+                owner_released = true;
+            }
             try self.replicateMergeSourceTransition(
                 op.transition_id,
                 op.donor_group_id,
@@ -14052,6 +15616,7 @@ pub const DataServer = struct {
                 ),
                 op.table_contract,
             );
+            try self.releaseRelationalMergeReceiver(op.donor_group_id, op.receiver_group_id, op.transition_id, op.table_contract);
         } else if (self.local_transition_runtime) |runtime| {
             try runtime.shardOperationAdapter().execute(.{ .finalize_merge = op });
         } else {
@@ -14132,30 +15697,48 @@ pub const DataServer = struct {
             const donor_range = try store.currentRange(self.alloc, op.donor_group_id);
             defer range_state_mod.freeRange(self.alloc, donor_range);
             var receiver_state = (try store.currentMergeReceiverState(self.alloc, op.receiver_group_id)) orelse
-                return error.MergeReceiverProjectionNotReady;
+                {
+                    if (!try transitionHasCoordinatedConstraints(self.alloc, op.table_contract)) return error.MergeReceiverProjectionNotReady;
+                    // The source freeze may commit before receiver acceptance.
+                    // Native exact fence/manifest checks reject cancellation
+                    // if any imported ownership still needs pruning.
+                    try self.abortRelationalMerge(op.donor_group_id, op.receiver_group_id, op.transition_id, op.table_contract);
+                    self.invalidateLocalGroupStatusCache();
+                    return;
+                };
             defer receiver_state.deinit(self.alloc);
             const merged_range = receiver_state.merged_range orelse
                 return error.MergeReceiverProjectionNotReady;
-            try self.replicateMergeReceiverCheckpoint(mergeReceiverCheckpoint(
-                op.transition_id,
-                op.donor_group_id,
-                op.receiver_group_id,
-                receiver_state.receiver_base_range,
-                merged_range,
-                .begin_copy,
-                0,
-                op.allow_doc_identity_reassignment,
-                op.table_contract,
-                attempt,
-            ), op.table_contract);
-            try self.replicateMergeRollbackDeletes(
-                op.transition_id,
-                op.donor_group_id,
-                op.receiver_group_id,
-                donor_range,
-                op.table_contract,
-                attempt,
-            );
+            var copy_attempt = attempt;
+            var imported = true;
+            if (try transitionHasCoordinatedConstraints(self.alloc, op.table_contract)) {
+                var manifest = try self.readRelationalTopologyValue(?IntegrityHandoff.Manifest, self.alloc, op.receiver_group_id, op.table_contract.table_name, op.transition_id, 1, "handoff_manifest");
+                defer manifest.deinit();
+                imported = manifest.value != null;
+                if (!imported) copy_attempt = receiver_state.copy_attempt;
+            }
+            if (imported) {
+                try self.replicateMergeReceiverCheckpoint(mergeReceiverCheckpoint(
+                    op.transition_id,
+                    op.donor_group_id,
+                    op.receiver_group_id,
+                    receiver_state.receiver_base_range,
+                    merged_range,
+                    .begin_copy,
+                    0,
+                    op.allow_doc_identity_reassignment,
+                    op.table_contract,
+                    copy_attempt,
+                ), op.table_contract);
+                try self.replicateMergeRollbackDeletes(
+                    op.transition_id,
+                    op.donor_group_id,
+                    op.receiver_group_id,
+                    donor_range,
+                    op.table_contract,
+                    copy_attempt,
+                );
+            }
             try self.replicateMergeReceiverCheckpoint(
                 mergeReceiverCheckpoint(
                     op.transition_id,
@@ -14167,10 +15750,11 @@ pub const DataServer = struct {
                     0,
                     op.allow_doc_identity_reassignment,
                     op.table_contract,
-                    attempt,
+                    copy_attempt,
                 ),
                 op.table_contract,
             );
+            try self.abortRelationalMerge(op.donor_group_id, op.receiver_group_id, op.transition_id, op.table_contract);
         } else if (self.local_transition_runtime) |runtime| {
             try runtime.shardOperationAdapter().execute(.{ .rollback_merge = op });
         } else {
@@ -14265,6 +15849,7 @@ pub const DataServer = struct {
             .reporter_incarnation = try self.reporterIncarnation(),
             .artifact_sources_protocol_version = antfly.metadata.table_manager.artifact_sources_protocol_version,
             .native_generation_restore_version = antfly.metadata.table_manager.native_generation_restore_protocol_version,
+            .relational_topology_protocol_version = if (self.data_raft != null) antfly.metadata.table_manager.relational_topology_protocol_version else 0,
             .dense_native_storage_protocol_version = dense_native_capability,
             .api_url = api_url,
             .raft_url = raft_url,
@@ -15115,6 +16700,7 @@ pub const DataServer = struct {
             .reporter_incarnation = reporter_incarnation,
             .artifact_sources_protocol_version = antfly.metadata.table_manager.artifact_sources_protocol_version,
             .dense_native_storage_protocol_version = dense_native_capability,
+            .relational_topology_protocol_version = if (self.data_raft != null) antfly.metadata.table_manager.relational_topology_protocol_version else 0,
             .live = true,
             .health_class = "healthy",
             .capacity_bytes = capacity.capacity_bytes,
@@ -15132,6 +16718,7 @@ pub const DataServer = struct {
             .status_generation = status_generation,
             .artifact_sources_protocol_version = candidate_report.artifact_sources_protocol_version,
             .dense_native_storage_protocol_version = candidate_report.dense_native_storage_protocol_version,
+            .relational_topology_protocol_version = candidate_report.relational_topology_protocol_version,
             .live = candidate_report.live,
             .health_class = candidate_report.health_class,
             .capacity_bytes = candidate_report.capacity_bytes,
@@ -15222,6 +16809,8 @@ pub const DataServer = struct {
                 .reporter_incarnation = cache.reporter_incarnation,
                 .status_generation = cache.status_generation,
                 .artifact_sources_protocol_version = cache.artifact_sources_protocol_version,
+                .dense_native_storage_protocol_version = cache.dense_native_storage_protocol_version,
+                .relational_topology_protocol_version = cache.relational_topology_protocol_version,
                 .live = cache.live,
                 .health_class = cache.health_class,
                 .capacity_bytes = cache.capacity_bytes,
@@ -16227,6 +17816,7 @@ pub const DataServer = struct {
             .status_generation = cache.status_generation,
             .artifact_sources_protocol_version = cache.artifact_sources_protocol_version,
             .dense_native_storage_protocol_version = cache.dense_native_storage_protocol_version,
+            .relational_topology_protocol_version = cache.relational_topology_protocol_version,
             .live = cache.live,
             .health_class = health_class,
             .capacity_bytes = cache.capacity_bytes,
@@ -16272,6 +17862,7 @@ pub const DataServer = struct {
             .status_generation = report.status_generation,
             .artifact_sources_protocol_version = report.artifact_sources_protocol_version,
             .dense_native_storage_protocol_version = report.dense_native_storage_protocol_version,
+            .relational_topology_protocol_version = report.relational_topology_protocol_version,
             .live = report.live,
             .health_class = health_class,
             .owns_health_class = true,
@@ -16336,6 +17927,43 @@ pub const DataServer = struct {
         return try reports.toOwnedSlice(alloc);
     }
 
+    fn primePrivateRestoreOwner(self: *DataServer, source: *antfly.public_api.ProvisionedTableWriteSource, owner: @import("private_provisioning.zig").Owner) !void {
+        const range: antfly.db.types.ByteRange = .{ .start = owner.range.start_key, .end = owner.range.end_key orelse "" };
+        if (comptime linked_storage) {
+            const compiled = try self.ensureKernelOwnerSource();
+            const bootstrap: @import("../storage/db/restore_staging_contract.zig").OwnerBootstrap = .{
+                .scope = owner.scope,
+                .table_name = owner.table.name,
+                .schema_json = owner.table.schema_json,
+                .read_schema_json = owner.table.read_schema_json,
+                .indexes_json = owner.table.indexes_json,
+                .byte_range = range,
+            };
+            const encoded = try std.json.Stringify.valueAlloc(self.alloc, bootstrap, .{});
+            defer self.alloc.free(encoded);
+            return compiled.primeRestoreOwner(owner.range.group_id, owner.table.name, .{
+                .lsm_root_generation = self.provisioned_storage.groupVisibleRootGenerationSource().visibleRootGenerationForGroup(owner.range.group_id),
+                .identity = .{ .table_id = owner.scope.target_namespace.table_id, .shard_id = owner.scope.target_namespace.shard_id, .range_id = owner.scope.target_namespace.range_id },
+                .schema_json = owner.table.schema_json,
+                .indexes_json = owner.table.indexes_json,
+                .table_storage = owner.table.storage,
+                .restore_bootstrap_json = encoded,
+                .restore_cancel_recovery = owner.cancel_recovery,
+            });
+        }
+        // Only authenticated metadata progress can authorize reopening an
+        // unacknowledged canceled owner. This never admits published roots or
+        // relaxes the native immutable scope/identity checks.
+        if (owner.cancel_recovery)
+            try source.primeRestoreStagingWriterForCancellation(self.alloc, owner.range.group_id, owner.table, range, owner.scope)
+        else
+            try source.primeRestoreStagingWriter(self.alloc, owner.range.group_id, owner.table, range, owner.scope);
+    }
+
+    pub fn primeRestoreOwnerDescriptor(self: *DataServer, group_id: u64, table_name: []const u8, descriptor: @import("../storage/kernel_owner_descriptor.zig").Descriptor) !void {
+        return (try self.ensureKernelOwnerSource()).primeRestoreOwner(group_id, table_name, descriptor);
+    }
+
     fn liveRuntimeWriteSource(self: *DataServer) *antfly.public_api.ProvisionedTableWriteSource {
         if (self.data_raft_apply) |apply_sm| return &apply_sm.write_source;
         return &self.write_source;
@@ -16347,15 +17975,34 @@ pub const DataServer = struct {
     ) !antfly.public_api.ProvisionedTableWriteSource.ReplicaRetirementOwnership.State {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         lockAtomic(&self.data_raft_mutex);
-        defer self.data_raft_mutex.unlock();
-        const raft = self.data_raft orelse return error.ReplicaRetirementOwnershipUnavailable;
-        const catalog_contains = raft.host.http_host.host.replicaCatalogContains(group_id) orelse
-            return error.ReplicaRetirementCatalogUnavailable;
-        if (catalog_contains) return .retained;
-        return if (raft.host.http_host.host.hasReplica(group_id)) .retiring else .retired;
+        const raft_state: ?antfly.public_api.ProvisionedTableWriteSource.ReplicaRetirementOwnership.State = blk: {
+            defer self.data_raft_mutex.unlock();
+            const raft = self.data_raft orelse break :blk null;
+            const catalog_contains = raft.host.http_host.host.replicaCatalogContains(group_id) orelse
+                return error.ReplicaRetirementCatalogUnavailable;
+            if (catalog_contains) return .retained;
+            if (raft.host.http_host.host.hasReplica(group_id)) return .retiring;
+            break :blk .retired;
+        };
+        // HA-only restored owners have no Raft placement. Public-catalog
+        // absence cannot authorize their deletion; the durable exact-scope
+        // cancellation ledger can, and remains available after root removal.
+        const ledger = try self.haRestoreTerminalLedger();
+        var snapshot = try ledger.snapshot();
+        defer snapshot.deinit();
+        if (try snapshot.get(group_id)) |terminal| {
+            const source = self.liveRuntimeWriteSource();
+            if (try self.readHAHiddenOwnerBootstrap(group_id, terminal.table_id)) |value| {
+                var descriptor = value;
+                defer descriptor.deinit();
+                if (!std.mem.eql(u8, &terminal.scope, &descriptor.value.scope.digest())) return error.RestoreStagingScopeChanged;
+            } else try source.requireAbsentRestoreOwnerRoot(self.alloc, group_id);
+            return .retired;
+        }
+        return raft_state orelse error.ReplicaRetirementOwnershipUnavailable;
     }
 
-    fn replicaRetirementOwnership(self: *DataServer) antfly.public_api.ProvisionedTableWriteSource.ReplicaRetirementOwnership {
+    pub fn replicaRetirementOwnership(self: *DataServer) antfly.public_api.ProvisionedTableWriteSource.ReplicaRetirementOwnership {
         return .{
             .ptr = self,
             .classify = classifyLocalDataRaftReplicaRetirement,
@@ -17421,10 +19068,14 @@ pub const DataServer = struct {
                     .target_index_name = schema_index_name,
                     .advance_index_repairs = schema_index_name != null,
                     .index_repair_options = .{
-                        .admission_deadline_ns = schema_yield.catalogDeadline(),
+                        // Restore/startup advances bounded durable phases; it is
+                        // not a schema-index build quantum. Applying the 25 ms
+                        // slice to its remote descriptor fetch can starve every
+                        // attempt when catalog latency exceeds that slice.
+                        .admission_deadline_ns = if (schema_index_name != null) schema_yield.catalogDeadline() else null,
                         .target_index_name = schema_index_name,
                         .cancel_check = .{ .ptr = &schema_fence, .is_requested = SchemaRepairFence.cancelled },
-                        .yield_check = .{ .ptr = &schema_yield, .is_requested = IndexRepairYieldFence.requested },
+                        .yield_check = if (schema_index_name != null) .{ .ptr = &schema_yield, .is_requested = IndexRepairYieldFence.requested } else null,
                         .activation_check = .{ .ptr = &schema_fence, .is_current_owner = SchemaRepairFence.current },
                         .owner_epoch = schema_fence.ownership_generation,
                         .capacity_domain_id = registration.store_id,
@@ -18211,7 +19862,7 @@ pub const DataServer = struct {
             self.last_provision_head_check_at_ms = now_ms;
 
             const head = try remote_metadata.fetchHead();
-            if (self.last_provision_metadata_epoch == head.metadata_epoch and self.last_provision_fingerprint != null) return;
+            if (!self.private_provisioning_active and self.last_provision_metadata_epoch == head.metadata_epoch and self.last_provision_fingerprint != null) return;
             self.provisioned_root_refresh_dirty.store(true, .release);
         }
 
@@ -19286,21 +20937,35 @@ pub const DataServer = struct {
         self.last_provision_head_check_at_ms = self.backgroundMonotonicMs();
 
         const head = try remote_metadata.fetchHead();
-        if (self.last_provision_metadata_epoch == head.metadata_epoch and self.last_provision_fingerprint != null) return;
+        if (!self.private_provisioning_active and self.last_provision_metadata_epoch == head.metadata_epoch and self.last_provision_fingerprint != null) return;
 
         var snapshot = try remote_metadata.fetchSnapshotForHead(head);
         defer freeAdminSnapshotOwned(self.alloc, &snapshot);
 
+        var private_snapshot: ?std.json.Parsed(@import("../metadata/restore_staging.zig").ProvisioningSnapshot) = remote_metadata.fetchProvisioningSnapshotForHead(head, registration.node_id) catch |err| switch (err) {
+            error.UnsupportedOperation => null,
+            else => return err,
+        };
+        defer if (private_snapshot) |*value| value.deinit();
+        var proof_arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer proof_arena.deinit();
+        const hidden = if (private_snapshot) |value| try @import("private_provisioning.zig").validate(proof_arena.allocator(), snapshot.tables, snapshot.ranges, value.value.catalog) else &.{};
+        self.private_provisioning_active = hidden.len != 0;
+        const provisioning_tables = if (private_snapshot) |value| try std.mem.concat(proof_arena.allocator(), antfly.metadata.table_manager.TableRecord, &.{ snapshot.tables, value.value.catalog.tables }) else snapshot.tables;
+        const desired_ranges = if (private_snapshot) |value| try std.mem.concat(proof_arena.allocator(), antfly.metadata.table_manager.RangeRecord, &.{ snapshot.ranges, value.value.catalog.ranges }) else snapshot.ranges;
+
         const provisioning_ranges = try collectProvisioningRanges(
             self.alloc,
-            snapshot.ranges,
+            desired_ranges,
             snapshot.split_transitions,
         );
         defer self.alloc.free(provisioning_ranges);
 
         var local_group_ids = try collectLocalGroupIds(self.alloc, snapshot.placement_intents, registration.node_id);
         if (local_group_ids.len == 0 and hasSingleRoleStore(snapshot.stores, registration.role, registration.store_id)) {
-            const fallback_group_ids = try collectAllRangeGroupIds(self.alloc, provisioning_ranges);
+            // Implicit single-node fallback only applies to published ranges.
+            // Hidden owner admission requires an explicit placement intent.
+            const fallback_group_ids = try collectAllRangeGroupIds(self.alloc, snapshot.ranges);
             self.alloc.free(local_group_ids);
             local_group_ids = fallback_group_ids;
         }
@@ -19375,11 +21040,11 @@ pub const DataServer = struct {
                 break :blk_fingerprint antfly.metadata.table_provisioner.provisioningFingerprint(
                     head.metadata_group_id,
                     local_group_ids,
-                    snapshot.tables,
+                    provisioning_tables,
                     provisioning_ranges,
                 );
             };
-            if (self.last_provision_fingerprint == next_fingerprint) {
+            if (!self.private_provisioning_active and self.last_provision_fingerprint == next_fingerprint) {
                 self.last_provision_metadata_epoch = head.metadata_epoch;
                 return;
             }
@@ -19388,7 +21053,20 @@ pub const DataServer = struct {
             for (local_group_ids) |group_id| {
                 if (group_id == head.metadata_group_id) continue;
                 const range = findRangeByGroupId(provisioning_ranges, group_id) orelse continue;
-                const table = findTableById(snapshot.tables, range.table_id) orelse continue;
+                const table = findTableById(provisioning_tables, range.table_id) orelse continue;
+
+                if (@import("private_provisioning.zig").find(hidden, group_id)) |owner| {
+                    // Explicit node placement plus exact immutable plan proof
+                    // authorizes EMPTY root creation, never a source restore.
+                    const assigned = for (snapshot.placement_intents) |intent| {
+                        if (intent.record.group_id == group_id and intent.record.local_node_id == registration.node_id) break true;
+                    } else false;
+                    if (!assigned) return error.InvalidRestoreStaging;
+                    var activity = refresh_write_source.tryBeginGroupRefreshActivity(table.name, group_id) orelse return error.RestoreStagingInProgress;
+                    defer activity.deinit();
+                    try self.primePrivateRestoreOwner(refresh_write_source, owner);
+                    continue;
+                }
 
                 {
                     var activity = refresh_write_source.tryBeginGroupRefreshActivity(table.name, group_id) orelse {
@@ -19404,7 +21082,7 @@ pub const DataServer = struct {
                         self.alloc,
                         head.metadata_group_id,
                         group_ids_one[0..],
-                        snapshot.tables,
+                        provisioning_tables,
                         provisioning_ranges,
                         backend_runtime,
                     );
@@ -19419,7 +21097,7 @@ pub const DataServer = struct {
             break :blk next_fingerprint;
         };
 
-        self.pruneStaleVisibleWriteCaches();
+        if (!self.private_provisioning_active) self.pruneStaleVisibleWriteCaches();
         if (indexes_pending != 0) {
             // Same-name replacement is a bounded multi-pass transition. Keep
             // the desired-state refresh armed while the durable cleanup owner
@@ -19702,6 +21380,7 @@ pub const DataServer = struct {
                 );
                 defer alloc.free(security_json);
                 try storage_kernel_context.?.configureRemoteContentSecurity(security_json);
+                try storage_kernel_context.?.configureSecrets(cfg.api_server_cfg.secret_store);
             }
         }
 
@@ -19724,6 +21403,7 @@ pub const DataServer = struct {
             cfg.api_server_cfg.internal_service_secret,
             cfg.api_server_cfg.internal_service_issuer,
         );
+        remote_metadata.local_node_id = if (cfg.store_registration) |registration| registration.node_id else 0;
         errdefer remote_metadata.deinit();
 
         var data_raft_store: ?*raft_engine.core.MemoryStorage = null;
@@ -19812,12 +21492,14 @@ pub const DataServer = struct {
                             },
                         },
                         .data_apply_storage_context = if (storage_kernel_context) |context| context.handle else null,
+                        .native_snapshot_delegate = data_raft_apply.?.nativeSnapshotDelegate(),
                     }, .{}, .{
                         .transition_runtime = null,
                     });
                     break :blk raft;
                 };
                 data_raft = initialized_data_raft;
+                data_raft_apply.?.topology_apply_store = initialized_data_raft.host.owned_data_store;
             }
         }
 
@@ -19879,6 +21561,23 @@ fn lockAtomic(mutex: *std.atomic.Mutex) void {
     // waiter — on CPU-constrained hosts (CI runners) that starves the very
     // threads that would release the lock.
     platform_sync.lockYielding(mutex);
+}
+
+fn onlineMergePeerEligible(version: u16) !bool {
+    if (version == 0) return error.GroupLeaderUnavailable;
+    return version >= data_raft_batch.source_pin_protocol_version;
+}
+
+fn onlineMergeRevokeBatch(scope: @import("../storage/db/online_source_contract.zig").Scope, ordinary: ?@import("../storage/data_raft_projection_wire.zig").AppliedMergeSourceState) antfly.db.types.BatchRequest {
+    if (ordinary) |merge| if (merge.phase == .accepting and merge.transition_id == scope.fence.transition_id and merge.receiver_group_id == scope.fence.peer_group_id) {
+        return .{ .merge_source_transition = .{ .kind = .rollback, .transition_id = merge.transition_id, .receiver_group_id = merge.receiver_group_id } };
+    };
+    return .{ .relational_topology = .{ .fence = scope.fence, .action = .abort_transition } };
+}
+
+fn validateOnlineMergeAdmissionAuthority(observed_term: u64, current_term: u64, observed_members: u64, current_members: u64) !void {
+    if (observed_term == 0 or current_term != observed_term or current_members != observed_members)
+        return error.GroupLeaderUnavailable;
 }
 
 fn catalogRoutingProbeDeadline(now_ns: u64, deadline_ns: u64, probe_interval_ns: u64) u64 {
@@ -20364,6 +22063,9 @@ const RemoteMetadataSource = struct {
     /// This makes cache TTLs and retry suppression part of VOPR replay truth.
     io: std.Io,
     base_uris: [][]u8,
+    /// Private restore authority is scoped to the actual registered data node.
+    /// It is never inferred from an untrusted restore request body.
+    local_node_id: u64 = 0,
     // Mutations discover the current leader by trying every configured
     // endpoint. Keep that authority affinity separate from ordinary reads:
     // a successful read from a reachable-but-lagging follower must not steer
@@ -20447,7 +22149,12 @@ const RemoteMetadataSource = struct {
             alloc.free(http_executors);
         }
         for (http_executors) |*executor| {
-            executor.initSharedInPlace(alloc, .{ .keep_alive = true }, io_impl);
+            executor.initSharedInPlace(alloc, .{
+                .keep_alive = true,
+                // An immutable private restore plan may fill its canonical
+                // limit; the outer JSON string can escape every source byte.
+                .max_response_bytes = @import("../metadata/restore_staging.zig").max_encoded_bytes * 2 + 4096,
+            }, io_impl);
             executors_initialized += 1;
         }
         return try initBase(alloc, base_uris, http_executors, &.{}, io_impl.io());
@@ -20555,6 +22262,16 @@ const RemoteMetadataSource = struct {
 
     fn awakeNs(self: *const RemoteMetadataSource) u64 {
         return @intCast(@max(0, std.Io.Clock.now(.awake, self.io).nanoseconds));
+    }
+
+    fn requestDeadlineOnClock(request: antfly.public_api.operation.RequestContext, local_now_ns: u64, maximum_ns: u64) !u64 {
+        try request.ensureActive();
+        const deadline = request.deadline_ns orelse return local_now_ns +| maximum_ns;
+        const source_now = (antfly.public_api.table_catalog.RoutingBudget{ .io = request.deadline_io }).nowNs();
+        if (source_now >= deadline) return error.DeadlineExceeded;
+        // Sample the destination before the source clock so conversion never
+        // grants additional time spent on the boundary itself.
+        return local_now_ns +| @min(maximum_ns, deadline - source_now);
     }
 
     fn lockBefore(self: *RemoteMetadataSource, mutex: *std.atomic.Mutex, deadline_ns: ?u64) bool {
@@ -21137,6 +22854,9 @@ const RemoteMetadataSource = struct {
                 .acquire_join_planning = remoteAcquireJoinPlanning,
                 .cached_admin_snapshot = remoteCachedAdminSnapshot,
                 .linearizable_snapshot = remoteLinearizableSnapshot,
+                .get_restore_staging = remoteGetRestoreStaging,
+                .get_restore_staging_progress = remoteGetRestoreStagingProgress,
+                .get_restore_staging_receipt = remoteGetRestoreStagingReceipt,
                 .free_admin_snapshot = remoteFreeAdminSnapshot,
                 .routing_snapshot = remoteRoutingSnapshot,
                 .linearizable_routing_snapshot = remoteLinearizableRoutingSnapshot,
@@ -21164,6 +22884,72 @@ const RemoteMetadataSource = struct {
                 .restore_extensions = remoteRestoreExtensions,
             },
         };
+    }
+
+    fn fetchRestoreStagingAuthority(
+        self: *RemoteMetadataSource,
+        alloc: std.mem.Allocator,
+        authority_request: @import("../metadata/restore_staging.zig").AuthorityRequest,
+        request: antfly.public_api.operation.RequestContext,
+    ) !std.json.Parsed(@import("../metadata/restore_staging.zig").AuthorityResponse) {
+        try request.ensureActive();
+        if (self.local_node_id == 0 or authority_request.node_id != self.local_node_id)
+            return error.StoreRegistrationRequired;
+        const local_deadline = try requestDeadlineOnClock(request, self.awakeNs(), remote_metadata_linearizable_snapshot_timeout_ns);
+        var cancellation: antfly.raft.transport.http_common.RequestCancellation = .{
+            .borrowed_context = request.cancellation.ptr,
+            .borrowed_is_cancelled = request.cancellation.is_cancelled_fn,
+        };
+        const budget: antfly.metadata_http_client.RequestBudget = .{
+            .deadline_ns = local_deadline,
+            .cancellation = &cancellation,
+            .io = self.io,
+        };
+        var last_error: anyerror = error.MissingMetadataApi;
+        for (0..self.base_uris.len) |attempt| {
+            try request.ensureActive();
+            try ensureBudgetActive(budget);
+            const index = self.metadataApiIndexForAttempt(attempt);
+            var client = self.metadataClient(alloc);
+            var response = client.fetchRestoreStagingAuthority(self.base_uris[index], authority_request, budget) catch |err| {
+                switch (err) {
+                    error.OutOfMemory, error.Canceled, error.Cancelled, error.DeadlineExceeded => return err,
+                    else => {
+                        last_error = err;
+                        continue;
+                    },
+                }
+            };
+            errdefer response.deinit();
+            if (response.value.node_id != self.local_node_id or !std.mem.eql(u8, &response.value.plan_id, &authority_request.plan_id))
+                return error.RestoreStagingScopeChanged;
+            try self.acceptMetadataIdentity(response.value.metadata_group_id, response.value.metadata_incarnation);
+            try request.ensureActive();
+            self.noteMetadataAuthoritySuccess(index);
+            return response;
+        }
+        return last_error;
+    }
+
+    fn remoteGetRestoreStaging(ptr: *anyopaque, alloc: std.mem.Allocator, id: [16]u8, request: antfly.public_api.operation.RequestContext) !?[]u8 {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        var response = try self.fetchRestoreStagingAuthority(alloc, .{ .node_id = self.local_node_id, .plan_id = id, .include_plan = true }, request);
+        defer response.deinit();
+        return if (response.value.job_json) |json| try alloc.dupe(u8, json) else null;
+    }
+
+    fn remoteGetRestoreStagingProgress(ptr: *anyopaque, alloc: std.mem.Allocator, id: [16]u8, request: antfly.public_api.operation.RequestContext) !?@import("../metadata/restore_staging.zig").Progress {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        var response = try self.fetchRestoreStagingAuthority(alloc, .{ .node_id = self.local_node_id, .plan_id = id }, request);
+        defer response.deinit();
+        return response.value.progress;
+    }
+
+    fn remoteGetRestoreStagingReceipt(ptr: *anyopaque, alloc: std.mem.Allocator, id: [16]u8, state: @import("../metadata/restore_staging.zig").State, owner_group: u64, request: antfly.public_api.operation.RequestContext) !?[]u8 {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        var response = try self.fetchRestoreStagingAuthority(alloc, .{ .node_id = self.local_node_id, .plan_id = id, .receipt = .{ .state = state, .owner_group = owner_group } }, request);
+        defer response.deinit();
+        return if (response.value.receipt) |*digest| try alloc.dupe(u8, digest) else null;
     }
 
     fn withMetadataApiClient(
@@ -21251,7 +23037,7 @@ const RemoteMetadataSource = struct {
             if (now_ns >= deadline_ns)
                 return replay_proof_error;
             const index = (start_index + attempt) % self.base_uris.len;
-            // A slow or unavailable status endpoint cannot consume the whole
+            // A slow or unavailable topology endpoint cannot consume the whole
             // mutation budget. Give every remaining endpoint a turn and
             // reserve one share for delivery to the discovered authority.
             const discovery_budget = antfly.metadata_http_client.RequestBudget{
@@ -21262,7 +23048,7 @@ const RemoteMetadataSource = struct {
             defer arena.deinit();
             const scratch = arena.allocator();
             var metadata_client = self.metadataClient(scratch);
-            const status = metadata_client.fetchStatusWithBudget(self.base_uris[index], discovery_budget) catch |err| {
+            const status = metadata_client.fetchMutationTopologyWithBudget(self.base_uris[index], discovery_budget) catch |err| {
                 if (self.awakeNs() >= deadline_ns)
                     return replay_proof_error;
                 last_pre_admission_err = if (err == error.Timeout) error.NotLeader else err;
@@ -21344,7 +23130,7 @@ const RemoteMetadataSource = struct {
         fn observe(
             self: *MetadataMutationEndpointDiscovery,
             index: usize,
-            status: antfly.metadata_api.MetadataStatus,
+            status: anytype,
         ) ?usize {
             if (metadataMutationEndpointReportsLocalLeader(status)) return index;
             std.debug.assert(self.fallback_count < self.fallback_indices.len);
@@ -21358,7 +23144,7 @@ const RemoteMetadataSource = struct {
         }
     };
 
-    fn metadataMutationEndpointReportsLocalLeader(status: antfly.metadata_api.MetadataStatus) bool {
+    fn metadataMutationEndpointReportsLocalLeader(status: anytype) bool {
         const leader_id = status.metadata_raft_leader_id orelse return false;
         return leader_id == status.metadata_raft_local_node_id and
             std.mem.eql(u8, status.metadata_raft_role, "leader");
@@ -21572,6 +23358,24 @@ const RemoteMetadataSource = struct {
         expected_head: antfly.metadata_api.MetadataHead,
     ) !antfly.metadata_api.AdminSnapshot {
         return try self.fetchSnapshotRemoteWithBudget(expected_head, null);
+    }
+
+    fn fetchProvisioningSnapshotForHead(self: *RemoteMetadataSource, expected: antfly.metadata_api.MetadataHead, node_id: u64) !std.json.Parsed(@import("../metadata/restore_staging.zig").ProvisioningSnapshot) {
+        var last_err: anyerror = error.MissingMetadataApi;
+        for (0..self.base_uris.len) |attempt| {
+            const index = self.metadataReadApiIndexForAttempt(attempt);
+            var client = self.metadataClient(self.alloc);
+            var parsed = client.fetchProvisioningSnapshot(self.base_uris[index], node_id, .{ .deadline_ns = self.awakeNs() +| remote_metadata_snapshot_timeout_ns, .io = self.io }) catch |err| {
+                if (err == error.UnsupportedOperation) return err;
+                last_err = err;
+                continue;
+            };
+            errdefer parsed.deinit();
+            const incarnation = expected.metadata_incarnation orelse return error.MetadataIncarnationUnavailable;
+            if (parsed.value.metadata_group_id != expected.metadata_group_id or parsed.value.metadata_epoch != expected.metadata_epoch or !std.mem.eql(u8, &parsed.value.metadata_incarnation, &incarnation)) return error.MetadataSnapshotHeadMismatch;
+            return parsed;
+        }
+        return last_err;
     }
 
     fn fetchSnapshotRemoteWithBudget(
@@ -23972,6 +25776,7 @@ fn storeRegistrationVisible(
             store.reporter_incarnation != record.reporter_incarnation) continue;
         if (store.native_generation_restore_version != record.native_generation_restore_version) continue;
         if (store.dense_native_storage_protocol_version != record.dense_native_storage_protocol_version) continue;
+        if (store.relational_topology_protocol_version != record.relational_topology_protocol_version) continue;
         return true;
     }
     return false;
@@ -25508,8 +27313,8 @@ pub fn runFromIterator(
     var secret_store_initialized = false;
     defer if (secret_store_initialized) secret_store.deinit();
 
-    if (cli.secret_store_paths.items.len > 0) {
-        secret_store = try initLayeredSecretStore(alloc, setup_io.io(), cli.secret_store_paths.items);
+    if (try antfly.common.secrets.initFromConfigPathWithIo(alloc, setup_io.io(), cli.config_path, cli.secret_store_paths.items)) |configured_store| {
+        secret_store = configured_store;
         secret_store_initialized = true;
     }
 
@@ -25652,6 +27457,7 @@ pub fn runFromIterator(
         const security_json = try antfly.common.config.remoteContentSecurityJsonAlloc(alloc, remote_content);
         defer alloc.free(security_json);
         try process_storage_kernel_context.?.configureRemoteContentSecurity(security_json);
+        try process_storage_kernel_context.?.configureSecrets(if (secret_store_initialized) &secret_store else null);
     }
 
     var auth_backend: ?LegacyAuthBackend = null;
@@ -25709,6 +27515,13 @@ pub fn runFromIterator(
     );
     defer if (trusted_principal_issuer) |value| alloc.free(value);
 
+    var native_reader: @import("../common/secret_delivery.zig").Remote = undefined;
+    if (secret_store_initialized) {
+        if (secret_store.native_config) |native| {
+            if (native.value.backend != .distributed or native.value.reader == null) return error.InvalidConfig;
+        }
+    }
+
     var data_server = try DataServer.initFromMetadataApiUrls(alloc, .{
         .bind_host = cli.bind_host orelse "127.0.0.1",
         .bind_port = cli.bind_port orelse 0,
@@ -25760,6 +27573,20 @@ pub fn runFromIterator(
         },
     }, metadata_api_urls.urls);
     defer data_server.deinitWithDeadline(supervisor.deadline());
+    if (secret_store_initialized) {
+        if (secret_store.native_config) |native| {
+            const remote = data_server.remote_metadata orelse return error.InvalidConfig;
+            native_reader = .{
+                .alloc = alloc,
+                .io = setup_io.io(),
+                .scope = native.value.scope,
+                .config = native.value.reader.?,
+                .executor = remote.httpExecutor(),
+                .internal_service = if (internal_service_secret) |secret| .{ .secret = secret, .issuer = internal_service_issuer.? } else null,
+            };
+            secret_store.attachNative(native_reader.source(), null);
+        }
+    }
     const managed_memory = data_server.provisioned_storage.resource_manager.snapshot().memory;
     std.log.info(
         "process memory policy operator_source={s} effective_source={s} configured_limit_bytes={d} effective_limit_bytes={d} managed_hard_limit_bytes={d}",
@@ -26701,12 +28528,83 @@ const MultiOwnerReplayStep = struct {
     clock_only: bool,
 };
 
+fn seedTransitionIntegrityRows(alloc: std.mem.Allocator, donor: *antfly.db.DB, receiver: *antfly.db.DB, receiver_json: []const u8) !void {
+    const integrity = @import("../storage/db/relational_integrity.zig");
+    const catalogs = @import("../storage/db/relational_integrity_catalog.zig");
+    const tuples = @import("../storage/db/relational_index_keys.zig");
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    var catalog = try catalogs.decode(owned, try donor.core.store.get(owned, catalogs.key));
+    defer catalog.deinit();
+    const generation = catalog.find(.unique, "uqside").?.generation;
+    const foreign_generation = catalog.find(.foreign_key, "parent").?.generation;
+    var view = donor.core.acquireSchemaView().?;
+    defer view.release();
+    var tuple_plan = try tuples.TuplePlan.init(owned, view.tableSchema().*, view.physicalLayout(), &.{.{ .column = "side" }});
+    defer tuple_plan.deinit();
+    var commands: [2]std.ArrayList(integrity.Command) = .{ .empty, .empty };
+    for ([_][]const u8{ "donor", "receiver" }, [_][]const u8{ "doc:b", "doc:z" }) |side, key| {
+        var tuple: std.ArrayList(u8) = .empty;
+        _ = try tuple_plan.appendValues(owned, &tuple, &.{.{ .string = side }});
+        const address = try integrity.Address.init(generation, tuple.items);
+        const owner: usize = if (donor.getRange().contains(&address.routing)) 0 else 1;
+        try commands[owner].append(owned, .{ .address = address, .operation = .{ .establish = .{ .tuple = tuple.items, .parent_table = "docs", .parent_key = key, .schema_version = 1 } } });
+        if (std.mem.eql(u8, side, "donor")) try commands[owner].append(owned, .{ .address = address, .operation = .{ .attach = .{ .child_table = "docs", .child_key = "doc:z", .constraint_name = "parent", .constraint_generation = foreign_generation } } });
+    }
+    const ids = [_]antfly.db.types.TxnId{ @splat(193), @splat(194) };
+    for ([_]*antfly.db.DB{ donor, receiver }, 0..) |db, index| {
+        const txn = try db.beginTransactionWithId(ids[index], 100);
+        try db.writeTransaction(txn, .{ .relational_schema_version = 1, .relational_integrity_generation_set = @import("../storage/db/relational_integrity_activation.zig").generationSet(catalog), .writes = &.{.{ .key = if (index == 0) "doc:b" else "doc:z", .value = if (index == 0) "{\"side\":\"donor\"}" else receiver_json }}, .integrity_commands = commands[index].items });
+    }
+    // All owners are prepared before any participant publishes the fixture.
+    for ([_]*antfly.db.DB{ donor, receiver }, 0..) |db, index| try db.commitTransaction(ids[index], 200);
+}
+
+fn verifyTransitionIntegrityOwnership(alloc: std.mem.Allocator, db: *antfly.db.DB) !void {
+    const integrity = @import("../storage/db/relational_integrity.zig");
+    const catalogs = @import("../storage/db/relational_integrity_catalog.zig");
+    const tuples = @import("../storage/db/relational_index_keys.zig");
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    var catalog = try catalogs.decode(owned, try db.core.store.get(owned, catalogs.key));
+    defer catalog.deinit();
+    var view = db.core.acquireSchemaView().?;
+    defer view.release();
+    var plan = try tuples.TuplePlan.init(owned, view.tableSchema().*, view.physicalLayout(), &.{.{ .column = "side" }});
+    defer plan.deinit();
+    var read = try db.core.store.beginProbeTxn();
+    defer read.abort();
+    for ([_][]const u8{ "donor", "receiver" }) |side| {
+        var tuple: std.ArrayList(u8) = .empty;
+        _ = try plan.appendValues(owned, &tuple, &.{.{ .string = side }});
+        const address = try integrity.Address.init(catalog.find(.unique, "uqside").?.generation, tuple.items);
+        if (db.getRange().contains(&address.routing)) {
+            _ = try read.get(&address.claimKey());
+        } else try std.testing.expectError(error.NotFound, read.get(&address.claimKey()));
+        if (std.mem.eql(u8, side, "donor")) {
+            const reference: integrity.Reference = .{ .child_table = "docs", .child_key = "doc:z", .constraint_name = "parent", .constraint_generation = catalog.find(.foreign_key, "parent").?.generation };
+            const key = try reference.key(address);
+            if (db.getRange().contains(&address.routing)) {
+                try integrity.validateTransferredCompanions(&read, &key, try read.get(&key));
+            } else try std.testing.expectError(error.NotFound, read.get(&key));
+        }
+    }
+}
+
 fn runThreeDataServerReplicatedTransitionVoprHistory(
+    comptime coordinated: bool,
     trace_alloc: std.mem.Allocator,
     replay_trace: ?[]const MultiOwnerReplayStep,
     recorded_trace: *std.ArrayListUnmanaged(MultiOwnerReplayStep),
 ) !void {
     const vopr = @import("vopr");
+    const first_key = if (coordinated) "" else "doc:a";
+    const receiver_json = if (coordinated) "{\"side\":\"receiver\",\"parent\":\"donor\"}" else "{\"side\":\"receiver\"}";
+    const coordinated_schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"uqside","columns":["side"]}],"foreign_keys":[{"name":"parent","child_columns":["parent"],"parent_table":"docs","parent_columns":["side"],"on_delete":"restrict"}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"side":{"type":"string"},"parent":{"type":"string"}},"additionalProperties":false}}}}
+    ;
     const internal_service_secret = "data-runtime-vopr-internal-service-secret";
     const internal_service_issuer = "data-runtime-vopr";
     const public_port_base: u16 = 24_100;
@@ -27004,6 +28902,8 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
     const merge_contract: antfly.metadata.TransitionTableContract = .{
         .table_id = 17,
         .table_name = "docs",
+        .schema_json = if (coordinated) coordinated_schema else "",
+        .integrity_protocol = if (coordinated) .distributed_quiescent_v1 else .none,
         .indexes_json = "{}",
         .source_identity = .{ .shard_id = 171, .range_id = 1711 },
         .target_identity = .{ .shard_id = 172, .range_id = 1721 },
@@ -27011,6 +28911,8 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
     const split_contract: antfly.metadata.TransitionTableContract = .{
         .table_id = 17,
         .table_name = "docs",
+        .schema_json = if (coordinated) coordinated_schema else "",
+        .integrity_protocol = if (coordinated) .distributed_quiescent_v1 else .none,
         .indexes_json = "{}",
         .source_identity = .{ .shard_id = 172, .range_id = 1721 },
         .target_identity = .{ .shard_id = 172, .range_id = 1721 },
@@ -27018,6 +28920,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
     const tables = [_]antfly.metadata.table_manager.TableRecord{.{
         .table_id = merge_contract.table_id,
         .name = merge_contract.table_name,
+        .schema_json = merge_contract.schema_json,
         .placement_role = "data",
     }};
     var ranges = [3]antfly.metadata.table_manager.RangeRecord{
@@ -27025,7 +28928,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
             .group_id = 171,
             .range_id = merge_contract.source_identity.range_id,
             .table_id = merge_contract.table_id,
-            .start_key = "doc:a",
+            .start_key = first_key,
             .end_key = "doc:m",
             .doc_identity_shard_id = merge_contract.source_identity.shard_id,
             .doc_identity_range_id = merge_contract.source_identity.range_id,
@@ -27045,6 +28948,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
     for (&stores, 0..) |*store, i| store.* = .{
         .store_id = i + 1,
         .node_id = i + 1,
+        .relational_topology_protocol_version = if (coordinated) antfly.metadata.table_manager.relational_topology_protocol_version else 0,
         .role = "data",
         .live = true,
         .health_class = "healthy",
@@ -27139,13 +29043,13 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
             .start_optional_runtimes = false,
             .start_optional_runtime_workers = false,
         });
+        defer donor.close();
+        try donor.updateRange(.{ .start = first_key, .end = "doc:m" });
         try antfly.public_api.table_writes.applyLocalTableSchemaJson(alloc, &donor, merge_contract.schema_json);
-        try donor.updateRange(.{ .start = "doc:a", .end = "doc:m" });
-        try donor.batch(.{ .writes = &.{.{
+        if (!coordinated) try donor.batch(.{ .writes = &.{.{
             .key = "doc:b",
             .value = "{\"side\":\"donor\"}",
         }} });
-        donor.close();
 
         const receiver_path = try antfly.metadata.groupDbPathFromReplicaRoot(alloc, root, 172);
         defer alloc.free(receiver_path);
@@ -27160,13 +29064,15 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
             .start_optional_runtimes = false,
             .start_optional_runtime_workers = false,
         });
-        try antfly.public_api.table_writes.applyLocalTableSchemaJson(alloc, &receiver, merge_contract.schema_json);
+        defer receiver.close();
         try receiver.updateRange(.{ .start = "doc:m", .end = "" });
-        try receiver.batch(.{ .writes = &.{.{
+        try antfly.public_api.table_writes.applyLocalTableSchemaJson(alloc, &receiver, merge_contract.schema_json);
+        if (coordinated) {
+            try seedTransitionIntegrityRows(alloc, &donor, &receiver, receiver_json);
+        } else try receiver.batch(.{ .writes = &.{.{
             .key = "doc:z",
-            .value = "{\"side\":\"receiver\"}",
+            .value = receiver_json,
         }} });
-        receiver.close();
     }
     for (&servers) |*server| try server.syncDataRaftFromSnapshot(&snapshot, .linearizable);
     if (vopr_io.firstCapabilityViolation()) |violation| {
@@ -27327,9 +29233,12 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
 
         fn drive(self: *@This(), index: usize) void {
             defer self.driver_done[index] = true;
+            // Ten virtual milliseconds still drives Raft faster than its
+            // production 100 ms cadence, without polling each node 1,200 times
+            // while public operations wait on their own retry deadlines.
             while (!self.stop_driver) {
                 if (!self.nodeIsRunning(index) or self.driver_paused[index]) {
-                    self.io.sleep(.fromMilliseconds(1), .awake) catch |err| {
+                    self.io.sleep(.fromMilliseconds(10), .awake) catch |err| {
                         self.driver_failure = err;
                         self.stop_driver = true;
                         return;
@@ -27345,7 +29254,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
                 };
                 self.driver_active[index] = false;
                 self.driver_rounds[index] += 1;
-                self.io.sleep(.fromMilliseconds(1), .awake) catch |err| {
+                self.io.sleep(.fromMilliseconds(10), .awake) catch |err| {
                     self.driver_failure = err;
                     self.stop_driver = true;
                     return;
@@ -27478,7 +29387,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
             // must be captured in the source delta log and replayed to the new
             // owner before cutover.
             self.stage = 52;
-            try self.writeSplitDelta();
+            try self.writeSplitDelta(coordinated);
             try self.transferAndWait(self.split_record.source_group_id, 2);
             try self.transferAndWait(self.split_record.destination_group_id, 2);
             ops = self.servers[1].localShardOperationAdapter();
@@ -27502,14 +29411,18 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
             } });
             try self.waitForSplitFinalizedEverywhere();
             try self.publishFinalizedSplitTopology();
+            if (coordinated) try self.writeSplitDelta(false);
 
             // Restart a physical owner after cutover, lead both resulting
             // groups from its durable images, then prove the terminal command
             // remains exactly idempotent through the routed adapter.
             self.stage = 6;
             try self.restartNode(1);
+            self.stage = 55;
             try self.waitForSplitFinalizedEverywhere();
+            self.stage = 56;
             try self.transferAndWait(self.split_record.source_group_id, 2);
+            self.stage = 57;
             try self.transferAndWait(self.split_record.destination_group_id, 2);
             self.stage = 59;
             var restarted_ops = self.servers[1].localShardOperationAdapter();
@@ -27777,16 +29690,19 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
             ops: *antfly.raft.ShardOperationAdapter,
             action: antfly.metadata.TransitionAction,
         ) !void {
-            for (0..20) |_| {
+            for (0..20) |retry| {
                 ops.execute(action) catch |err| switch (err) {
                     error.GroupLeaderUnavailable,
                     error.LeaderUnavailable,
+                    error.TransitionOperationBusy,
+                    error.TransactionTopologyBusy,
                     error.RaftBatchWriteOutcomeUnknown,
                     error.ConnectionRefused,
                     error.ConnectionResetByPeer,
                     error.EndOfStream,
                     error.Timeout,
                     => {
+                        if (retry == 0 or retry == 19) std.log.warn("three-node transition retry action={s} retry={} err={s}", .{ @tagName(action), retry, @errorName(err) });
                         try self.io.sleep(.fromMilliseconds(10), .awake);
                         continue;
                     },
@@ -27808,10 +29724,13 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
         }
 
         fn waitForLeader(self: *@This(), group_id: u64, expected: u64) !void {
-            for (0..20_000) |_| {
+            // Match the progress driver's cadence. Polling every virtual
+            // millisecond burns scheduler choices while waiting for an
+            // ordinary production election, without advancing Raft sooner.
+            for (0..2_000) |_| {
                 if (self.leader(group_id) == expected) return;
                 if (self.driver_failure) |err| return err;
-                try self.io.sleep(.fromMilliseconds(1), .awake);
+                try self.io.sleep(.fromMilliseconds(10), .awake);
             }
             for (self.servers, 0..) |*server, i| {
                 if (!self.nodeIsRunning(i)) continue;
@@ -27826,7 +29745,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
         }
 
         fn transferAndWait(self: *@This(), group_id: u64, target: u64) !void {
-            for (0..20_000) |_| {
+            for (0..2_000) |_| {
                 if (self.leader(group_id)) |current| {
                     if (current == target) return;
                     const raft = self.servers[current - 1].data_raft orelse
@@ -27835,7 +29754,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
                     return try self.waitForLeader(group_id, target);
                 }
                 if (self.driver_failure) |err| return err;
-                try self.io.sleep(.fromMilliseconds(1), .awake);
+                try self.io.sleep(.fromMilliseconds(10), .awake);
             }
             return error.VoprDataServerLeaderTimeout;
         }
@@ -27885,7 +29804,8 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
                 const receiver_doc = (try receiver.db.get(self.alloc, "doc:z")) orelse
                     return error.MissingReceiverDocument;
                 defer self.alloc.free(receiver_doc);
-                try std.testing.expectEqualStrings("{\"side\":\"receiver\"}", receiver_doc);
+                try std.testing.expectEqualStrings(receiver_json, receiver_doc);
+                if (coordinated) try verifyTransitionIntegrityOwnership(self.alloc, receiver.db);
             }
         }
 
@@ -27895,7 +29815,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
                 .group_id = self.split_record.source_group_id,
                 .range_id = self.split_record.table_contract.source_identity.range_id,
                 .table_id = self.split_record.table_contract.table_id,
-                .start_key = "doc:a",
+                .start_key = first_key,
                 .end_key = null,
                 .doc_identity_shard_id = self.split_record.table_contract.source_identity.shard_id,
                 .doc_identity_range_id = self.split_record.table_contract.source_identity.range_id,
@@ -27916,7 +29836,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
                 .group_id = self.split_record.source_group_id,
                 .range_id = self.split_record.table_contract.source_identity.range_id,
                 .table_id = self.split_record.table_contract.table_id,
-                .start_key = "doc:a",
+                .start_key = first_key,
                 .end_key = self.split_record.split_key,
                 .doc_identity_shard_id = self.split_record.table_contract.source_identity.shard_id,
                 .doc_identity_range_id = self.split_record.table_contract.source_identity.range_id,
@@ -27943,7 +29863,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
             }
         }
 
-        fn writeSplitDelta(self: *@This()) !void {
+        fn writeSplitDelta(self: *@This(), expect_fenced: bool) !void {
             // The fixture owns the modeled metadata projection directly. Keep
             // its data-node caches current after a long split-bootstrap wait
             // so the short Raft proposal budget is spent on the write itself.
@@ -27958,6 +29878,15 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
                 var response = try client.fetchBatchResponse(self.api_uris[0], self.split_record.table_contract.table_name,
                     \\{"inserts":{"doc:y":{"side":"split-delta"}},"sync_level":"write"}
                 );
+                if (expect_fenced) {
+                    defer response.deinit(self.alloc);
+                    try std.testing.expect(response.status == 409 or response.status == 503);
+                    const owner = try self.servers[0].leaseTransitionDbForTableGroup(self.split_record.source_group_id, self.split_record.table_contract, .source, .exact);
+                    defer owner.release();
+                    try std.testing.expect((try owner.db.relationalTopologyStatus()).fence != null);
+                    try std.testing.expect((try owner.db.get(self.alloc, "doc:y")) == null);
+                    return;
+                }
                 if (response.status == 201 or response.status == 202) {
                     defer response.deinit(self.alloc);
                     try std.testing.expect(std.mem.indexOf(u8, response.body, "\"inserted\":1") != null);
@@ -28045,7 +29974,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
                     defer range_state_mod.freeRange(self.alloc, source_range);
                     const destination_range = try store.currentRange(self.alloc, self.split_record.destination_group_id);
                     defer range_state_mod.freeRange(self.alloc, destination_range);
-                    if (!std.mem.eql(u8, source_range.start, "doc:a") or
+                    if (!std.mem.eql(u8, source_range.start, first_key) or
                         !std.mem.eql(u8, source_range.end, self.split_record.split_key.?) or
                         !std.mem.eql(u8, destination_range.start, self.split_record.split_key.?) or
                         destination_range.end.len != 0)
@@ -28108,11 +30037,15 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
                 const base_doc = (try destination.db.get(self.alloc, "doc:z")) orelse
                     return error.MissingSplitBootstrapDocument;
                 defer self.alloc.free(base_doc);
-                try std.testing.expectEqualStrings("{\"side\":\"receiver\"}", base_doc);
+                try std.testing.expectEqualStrings(receiver_json, base_doc);
                 const delta_doc = (try destination.db.get(self.alloc, "doc:y")) orelse
                     return error.MissingSplitDeltaDocument;
                 defer self.alloc.free(delta_doc);
                 try std.testing.expectEqualStrings("{\"side\":\"split-delta\"}", delta_doc);
+                if (coordinated) {
+                    try verifyTransitionIntegrityOwnership(self.alloc, source.db);
+                    try verifyTransitionIntegrityOwnership(self.alloc, destination.db);
+                }
             }
         }
 
@@ -28348,7 +30281,12 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
         };
         try vopr_io.scheduler().executeReady(selected.id, &events, alloc);
         transitions += 1;
-        if (transitions > 400_000) {
+        // The integrity history includes quiescence and owner projections,
+        // then restarts the current leader. Budget the complete recovery:
+        // bounded 10 ms leader polling takes about 8,700 choices, versus
+        // 3,500 for the document-only history. Keep the latter's bound intact.
+        const transition_budget: usize = if (coordinated) 10_000 else 8_000;
+        if (transitions > transition_budget) {
             std.log.err(
                 "multi-owner DataServer VOPR transition budget stage={} donor_leader={?} receiver_leader={?} now_ns={} rounds={any}",
                 .{
@@ -28425,6 +30363,11 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
         return err;
     }
     if (replay_failure) |err| return err;
+    // Work contracts cover record and replay without a wall-clock timeout.
+    // The 1 ms polling regression exceeded 1,200 rounds per node; the 10 ms
+    // cadence needs about 190 for documents and 345 with UNIQUE/FK ownership,
+    // while retaining the complete transition history in both cases.
+    for (shared.driver_rounds) |rounds| try std.testing.expect(rounds <= 400);
     const observation = shared.observation orelse return error.MissingMergeObservation;
     try std.testing.expectEqual(.finalized, observation.donor.phase);
     try std.testing.expectEqual(.finalized, observation.receiver.phase);
@@ -29062,6 +31005,7 @@ fn consumerTests() type {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     self.probes += 1;
                     try std.testing.expectEqual(.GET, request.method);
+                    try std.testing.expect(std.mem.endsWith(u8, request.uri, "/metadata/v1/runtime-topology"));
                     const first = std.mem.startsWith(u8, request.uri, "http://stalled.test/");
                     if (self.mode == .slow_all or (first and self.mode != .affinity_changed)) {
                         self.clock.monotonic_ns += @as(u64, request.timeout_ms.?) * std.time.ns_per_ms;
@@ -29189,6 +31133,7 @@ fn consumerTests() type {
             defer server.deinit();
 
             const control_io = server.dataRaftIo().?;
+            const read_executor = try server.distributedReadExecutor();
             var release: std.Io.Event = .unset;
             const Worker = struct {
                 fn run(io: std.Io, event: *std.Io.Event) void {
@@ -29249,6 +31194,51 @@ fn consumerTests() type {
             try serving.await(std.testing.io);
             try std.testing.expectEqual(@as(usize, 1), peer.route_hits[0]);
 
+            // Strong reads (including FK preflight) await peer lookups from
+            // API workers. Fill that lane completely and prove the peer HTTP
+            // task graph uses the separately admitted forwarding lane.
+            const api_io = backend_runtime.ptr().apiIo().?;
+            var api_release: std.Io.Event = .unset;
+            var api_tasks: [@import("../common/threaded_io_limits.zig").backend_runtime_api]std.Io.Future(void) = undefined;
+            var api_started: usize = 0;
+            defer {
+                api_release.set(api_io);
+                for (api_tasks[0..api_started]) |*task| task.await(api_io);
+            }
+            for (&api_tasks) |*task| {
+                task.* = try api_io.concurrent(Worker.run, .{ api_io, &api_release });
+                api_started += 1;
+            }
+            try std.testing.expectError(error.ConcurrencyUnavailable, api_io.concurrent(Worker.run, .{ api_io, &api_release }));
+            var read_peer = try httpx.TestServer.start(alloc, std.testing.io, &.{.{
+                .method = .GET,
+                .path = "/lookup",
+                .respond = .{ .status = 200, .body = "{\"id\":7}" },
+                .max_uses = 1,
+            }});
+            defer read_peer.deinit();
+            var read_serving = try std.testing.io.concurrent(httpx.TestServer.handleOne, .{&read_peer});
+            defer read_serving.cancel(std.testing.io) catch {};
+            const read_uri = try std.fmt.allocPrint(alloc, "{s}/lookup", .{read_peer.baseUrl()});
+            defer alloc.free(read_uri);
+            var unisolated = antfly.common.http.IoHttpExecutor.init(alloc, api_io, .{});
+            defer unisolated.deinit();
+            try std.testing.expectError(error.ConcurrencyUnavailable, unisolated.executor().execute(alloc, .{
+                .method = .GET,
+                .uri = read_uri,
+                .timeout_ms = 5000,
+            }));
+            try std.testing.expectEqual(@as(usize, 0), read_peer.route_hits[0]);
+            var read_response = try read_executor.execute(alloc, .{
+                .method = .GET,
+                .uri = read_uri,
+                .timeout_ms = 5000,
+            });
+            defer read_response.deinit(alloc);
+            try std.testing.expectEqualStrings("{\"id\":7}", read_response.body);
+            try read_serving.await(std.testing.io);
+            try std.testing.expectEqual(@as(usize, 1), read_peer.route_hits[0]);
+
             raft_release.set(raft_io);
             for (raft_tasks[0..raft_started]) |*task| task.await(raft_io);
             raft_started = 0;
@@ -29266,6 +31256,24 @@ fn consumerTests() type {
             for (&forward_tasks) |*task| {
                 task.* = try forward_io.concurrent(Worker.run, .{ forward_io, &forward_release });
                 forward_started += 1;
+            }
+            var rejected_delivery: antfly.common.http.http_common.RequestDeliveryTracker = .{};
+            try std.testing.expectError(error.ConcurrencyUnavailable, read_executor.execute(alloc, .{
+                .method = .GET,
+                .uri = read_uri,
+                .timeout_ms = 5000,
+                .delivery_tracker = &rejected_delivery,
+            }));
+            try std.testing.expectEqual(antfly.common.http.http_common.RequestDeliveryTracker.State.not_sent, rejected_delivery.load());
+            try std.testing.expectEqual(@as(usize, 1), read_peer.route_hits[0]);
+            {
+                // First-use initialization must expose the same availability
+                // condition as an already initialized client's admission.
+                const retained_client = server.distributed_read_http_executor;
+                server.distributed_read_http_executor = null;
+                defer server.distributed_read_http_executor = retained_client;
+                try std.testing.expectError(error.StorageReadTemporarilyUnavailable, server.distributedReadExecutor());
+                try std.testing.expect(server.distributed_read_http_executor == null);
             }
             var consensus_peer = try httpx.TestServer.start(alloc, std.testing.io, &.{.{
                 .method = .POST,
@@ -29339,6 +31347,10 @@ fn consumerTests() type {
                 .backend_runtime = backend_runtime.ptr(),
             };
             defer server.deinit();
+
+            const read_executor = try server.distributedReadExecutor();
+            try std.testing.expectEqual(@as(u64, @intCast(std.Io.Clock.awake.now(io).nanoseconds)), read_executor.monotonicNs());
+            try std.testing.expectEqual(@as(i128, std.Io.Clock.real.now(io).nanoseconds), read_executor.realtimeNs().?);
 
             try server.requestProvisionedCacheWarmup();
             try std.testing.expect(server.provisioned_warmup_active.load(.acquire));
@@ -30840,6 +32852,35 @@ fn consumerTests() type {
             server.data_raft_mutex.unlock();
         }
 
+        test "data raft native snapshot requires an install completion receipt" {
+            const alloc = std.testing.allocator;
+            var apply_sm = try RaftTableApplyStateMachine.init(
+                alloc,
+                "/tmp/unused-antfly-native-snapshot-receipt",
+                antfly.public_api.table_catalog.emptyCatalogSource(),
+                null,
+            );
+            defer apply_sm.deinit();
+            const snapshot: raft_engine.core.types.Snapshot = .{
+                .metadata = .{ .index = 7, .term = 1, .conf_state = .{} },
+                .data = @constCast("AFDS\x04"),
+            };
+            // A native version tag is only a routing hint, not evidence that
+            // the trusted compiled installer validated or published anything.
+            try std.testing.expectError(error.NativeSnapshotRequired, RaftTableApplyStateMachine.applyReady(&apply_sm, 7001, snapshot, &.{}, &.{}));
+            try std.testing.expectEqual(@as(u64, 0), apply_sm.appliedIndex(7001));
+            apply_sm.retry_apply_checkpoints.getPtr(7001).?.native_snapshot_installed = 6;
+            try std.testing.expectError(error.NativeSnapshotRequired, RaftTableApplyStateMachine.applyReady(&apply_sm, 7001, snapshot, &.{}, &.{}));
+            try std.testing.expectEqual(@as(u64, 0), apply_sm.appliedIndex(7001));
+
+            // Cold restart has no volatile completed-index entry. It reaches
+            // owner admission, while a known mismatched boundary is rejected
+            // before touching storage.
+            try std.testing.expectError(error.StorageKernelOwnerUnavailable, RaftTableApplyStateMachine.captureNativeSnapshot(&apply_sm, 7002, 7));
+            try apply_sm.applied_indexes.put(alloc, 7002, 6);
+            try std.testing.expectError(error.AppliedSnapshotIndexMismatch, RaftTableApplyStateMachine.captureNativeSnapshot(&apply_sm, 7002, 7));
+        }
+
         test "data raft read safety barrier completes only after matching ReadState apply" {
             const alloc = std.testing.allocator;
             var apply_sm = try RaftTableApplyStateMachine.init(
@@ -30915,7 +32956,11 @@ fn consumerTests() type {
             const new_txn = try restarted.registerReadBarrier(7);
             try std.testing.expectEqual(old_read.token, new_read.token);
             try std.testing.expectEqual(old_txn, new_txn);
-            try restarted.publishAppliedReady(7, 0, &.{}, 10);
+            // Recovery exposes the host's durable applied cursor without a
+            // new command applying. Only read readiness may inherit it.
+            try restarted.read_barriers.noteApplied(7, 10);
+            try std.testing.expectEqual(@as(u64, 0), restarted.appliedIndex(7));
+            try std.testing.expectEqual(@as(usize, 0), restarted.apply_outcomes.count());
             restarted.read_barriers.observeReadStates(7, &.{.{ .index = 10, .request_ctx = @constCast(old_read.request_ctx) }});
             restarted.publishReadStates(7, &.{.{ .index = 10, .request_ctx = old_txn_context }});
             try std.testing.expect(!restarted.read_barriers.takeCompleted(new_read.token));
@@ -30926,6 +32971,75 @@ fn consumerTests() type {
             restarted.publishReadStates(7, &.{.{ .index = 10, .request_ctx = new_txn_context }});
             try std.testing.expect(restarted.read_barriers.takeCompleted(new_read.token));
             try std.testing.expectEqual(RaftTableApplyStateMachine.ReadBarrierState.ready, restarted.readBarrierState(new_txn));
+            try std.testing.expectEqual(@as(u64, 0), restarted.appliedIndex(7));
+            // A later quorum index still requires actual application; a
+            // recovered cursor is not permission to advance to commit_index.
+            const later_txn = try restarted.registerReadBarrier(7);
+            var later_buffer: [96]u8 = undefined;
+            const later_context = try std.fmt.bufPrint(&later_buffer, "{s}{x:0>32}:{d}", .{ RaftTableApplyStateMachine.read_barrier_context_prefix, restarted.read_barriers.incarnation, later_txn });
+            restarted.publishReadStates(7, &.{.{ .index = 11, .request_ctx = later_context }});
+            try std.testing.expectEqual(RaftTableApplyStateMachine.ReadBarrierState.pending, restarted.readBarrierState(later_txn));
+            try restarted.publishAppliedReady(7, 0, &.{}, 11);
+            try std.testing.expectEqual(RaftTableApplyStateMachine.ReadBarrierState.ready, restarted.readBarrierState(later_txn));
+        }
+
+        test "data raft read safety barrier excludes persisted but uninstalled snapshots" {
+            const alloc = std.testing.allocator;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/pending-read-snapshot", .{tmp.sub_path});
+            defer alloc.free(root);
+            var layout = try antfly.raft.storage.ReplicaPathLayout.initForReplica(alloc, root, 7, 1);
+            defer layout.deinit(alloc);
+            var state = try antfly.raft.storage.PersistentReplicaState.init(alloc, layout);
+            var state_open = true;
+            defer if (state_open) state.deinit();
+            try state.groupStorage().persistReady(7, .{
+                .hard_state = .{ .current_term = 1, .voted_for = 1, .commit_index = 5 },
+                .snapshot = .{ .metadata = .{ .index = 5, .term = 1, .conf_state = .{ .voters = @constCast(&[_]u64{1}) } }, .data = @constCast("installed") },
+            });
+            try state.setAppliedIndex(5); // Completed native delegate boundary.
+
+            var apply_sm = try RaftTableApplyStateMachine.init(alloc, root, antfly.public_api.table_catalog.emptyCatalogSource(), null);
+            defer apply_sm.deinit();
+            try apply_sm.read_barriers.noteApplied(7, state.completedAppliedIndex());
+            var buffer: [96]u8 = undefined;
+            const read = try apply_sm.read_barriers.register(7, &buffer);
+            const txn = try apply_sm.registerReadBarrier(7);
+            defer apply_sm.finishReadBarrier(txn);
+            var txn_buffer: [96]u8 = undefined;
+            const txn_context = try std.fmt.bufPrint(&txn_buffer, "{s}{x:0>32}:{d}", .{ RaftTableApplyStateMachine.read_barrier_context_prefix, apply_sm.read_barriers.incarnation, txn });
+            // Already observed quorum responses must not become readable just
+            // because the next snapshot reaches the log persistence boundary.
+            try apply_sm.stateMachine().applyReady(7, null, &.{}, &.{
+                .{ .index = 10, .request_ctx = @constCast(read.request_ctx) },
+                .{ .index = 10, .request_ctx = txn_context },
+            });
+            try state.groupStorage().persistReady(7, .{
+                .hard_state = .{ .current_term = 2, .voted_for = 1, .commit_index = 10 },
+                .snapshot = .{ .metadata = .{ .index = 10, .term = 2, .conf_state = .{ .voters = @constCast(&[_]u64{1}) } }, .data = @constCast("not-installed") },
+            });
+            try std.testing.expectEqual(@as(u64, 10), state.appliedIndex());
+            try std.testing.expectEqual(@as(u64, 5), state.completedAppliedIndex());
+            for (0..2) |attempt| {
+                if (attempt == 1) {
+                    state.deinit();
+                    state_open = false;
+                    state = try antfly.raft.storage.PersistentReplicaState.init(alloc, layout);
+                    state_open = true;
+                }
+                try apply_sm.read_barriers.noteApplied(7, state.completedAppliedIndex());
+                try std.testing.expect(!apply_sm.read_barriers.takeCompleted(read.token));
+                try std.testing.expectEqual(RaftTableApplyStateMachine.ReadBarrierState.pending, apply_sm.readBarrierState(txn));
+                try std.testing.expectEqual(@as(u64, 0), apply_sm.appliedIndex(7));
+            }
+            // Only completed state-machine application advances readiness,
+            // even though Raft persistence already advertised applied=10.
+            try state.setAppliedIndex(10);
+            try apply_sm.read_barriers.noteApplied(7, state.completedAppliedIndex());
+            try std.testing.expect(apply_sm.read_barriers.takeCompleted(read.token));
+            try std.testing.expectEqual(RaftTableApplyStateMachine.ReadBarrierState.ready, apply_sm.readBarrierState(txn));
+            try std.testing.expectEqual(@as(u64, 0), apply_sm.appliedIndex(7));
         }
 
         test "data raft bootstrap campaign retries leaderless voter elections" {
@@ -31293,6 +33407,11 @@ fn consumerTests() type {
         }
 
         test "data raft apply records transaction conflicts without stopping replica progress" {
+            // Invalid lifecycle commands are deterministic Raft outcomes, not
+            // apply-loop retries that can strand every following decision.
+            inline for (.{ error.IntegrityRecordTooLarge, error.InvalidIntegrityKey, error.InvalidRange, error.IdentityNamespaceMismatch }) |failure| {
+                try std.testing.expectEqual(RaftTableApplyStateMachine.ExpectedApplyFailure.invalid_batch_request, RaftTableApplyStateMachine.ExpectedApplyFailure.fromError(failure).?);
+            }
             const alloc = std.testing.allocator;
             const group_id: u64 = 77;
 
@@ -31576,7 +33695,72 @@ fn consumerTests() type {
             try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 14).?);
             try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 15).?);
             try std.testing.expectEqual(@as(?RaftTableApplyStateMachine.ExpectedApplyFailure, null), RaftTableApplyStateMachine.ExpectedApplyFailure.fromError(error.ResourceBudgetExceeded));
+            try std.testing.expectEqual(@as(?RaftTableApplyStateMachine.ExpectedApplyFailure, null), RaftTableApplyStateMachine.ExpectedApplyFailure.fromError(error.OnlineSourcePinPending));
             try std.testing.expectEqual(@as(?RaftTableApplyStateMachine.ExpectedApplyFailure, null), RaftTableApplyStateMachine.ExpectedApplyFailure.fromError(error.InvalidData));
+            inline for (@typeInfo(@import("../schema/relational_expression_errors.zig").Error).error_set.?) |field| {
+                const reason = @field(@import("../schema/relational_expression_errors.zig").Error, field.name);
+                try std.testing.expectEqual(reason, RaftTableApplyStateMachine.ExpectedApplyFailure.fromError(reason).?.toError());
+            }
+            inline for (@typeInfo(@import("../storage/db/online_source_contract.zig").Rejection).error_set.?) |field| {
+                const reason = @field(@import("../storage/db/online_source_contract.zig").Rejection, field.name);
+                try std.testing.expectEqual(reason, RaftTableApplyStateMachine.ExpectedApplyFailure.fromError(reason).?.toError());
+            }
+            inline for (.{ error.OutOfMemory, error.RetainedEffectsCorrupt, error.RetainedEffectsTransactionFailed, error.OnlineSourceCorrupt, error.SourceSnapshotCorrupt }) |reason|
+                try std.testing.expectEqual(@as(?RaftTableApplyStateMachine.ExpectedApplyFailure, null), RaftTableApplyStateMachine.ExpectedApplyFailure.fromError(reason));
+
+            const OwnerIdentity = @import("../storage/db/relational_integrity_topology_contract.zig").Identity;
+            const owner_identity: OwnerIdentity = if (comptime linked_storage) owner: {
+                var reply = (try linked_owner.owner.readSource().lookupGroupLocal(alloc, group_id, "docs", "", .{ .relational_topology_json = "{\"mode\":\"identity\"}" }, .stale)) orelse return error.TestExpectedEqual;
+                defer reply.deinit(alloc);
+                var decoded = try std.json.parseFromSlice(OwnerIdentity, alloc, reply.json, .{});
+                defer decoded.deinit();
+                break :owner decoded.value;
+            } else owner: {
+                var lease = try apply_sm.write_source.leaseGroupWriter(alloc, group_id, "docs");
+                defer lease.release();
+                const value = try lease.db().relationalTopologyIdentity();
+                break :owner .{ .namespace = value.namespace, .catalog_digest = value.catalog_digest, .next_epoch = value.next_epoch };
+            };
+            const source_scope: @import("../storage/db/online_source_contract.zig").Scope = .{
+                .fence = .{ .admission_epoch = owner_identity.next_epoch, .transition_id = 901, .attempt = 1, .peer_group_id = 78, .owner_group_id = group_id, .role = .merge_source, .namespace = owner_identity.namespace, .catalog_digest = owner_identity.catalog_digest },
+                .receiver_namespace = .{ .table_id = 7, .shard_id = 78, .range_id = 78 },
+                .consumer_epoch = 1,
+                .copy_attempt = .{ .donor_term = 1, .sequence = 1 },
+            };
+            // Durable retention pressure rejects this one proposal instead of
+            // wedging the committed log ahead of the receiver's ACK/reclaim.
+            // The quota fault is injected at the native apply boundary, while
+            // admission, retained writes, ACK and reclaim run their real paths.
+            const source_commands = [_]antfly.db.types.BatchRequest{
+                .{ .online_source = .{ .admit = .{ .scope = source_scope } } },
+                .{ .timestamp_ns = 301, .writes = &.{.{ .key = "doc:tail", .value = "{\"title\":\"retained\"}" }} },
+                .{ .timestamp_ns = 302, .writes = &.{.{ .key = "doc:pressure", .value = "{\"title\":\"reject\"}" }} },
+                .{ .online_source = .{ .acknowledge = .{ .scope = source_scope, .previous = 0, .next = 1 } } },
+                .{ .online_source = .{ .reclaim = .{ .scope = source_scope, .frame_limit = 1, .byte_limit = 1 } } },
+                .{ .timestamp_ns = 303, .writes = &.{.{ .key = "doc:tail", .value = "{\"title\":\"continued\"}" }} },
+            };
+            apply_sm.test_faults.semantic_rejection_once = .{ .index = 18, .reason = error.RetainedEffectsFull };
+            for (source_commands, 0..) |request, offset| {
+                const index: u64 = 16 + @as(u64, @intCast(offset));
+                const encoded = try data_raft_batch.encodeWithStorageOwnerDescriptor(alloc, "docs", request, if (descriptor) |*value| value.view() else null);
+                defer alloc.free(encoded);
+                const entry = [_]raft_engine.core.Entry{.{ .term = 2, .index = index, .entry_type = .normal, .data = encoded }};
+                try apply_sm.registerApplyOutcomeWaiter(group_id, index, 2);
+                try RaftTableApplyStateMachine.applyReady(&apply_sm, group_id, null, &entry, &.{});
+                const outcome = apply_sm.takeApplyOutcome(group_id, index).?;
+                if (index == 18) try std.testing.expectEqual(error.RetainedEffectsFull, outcome.failed.toError()) else try std.testing.expectEqual(.succeeded, outcome);
+            }
+            try std.testing.expectEqual(@as(u64, 21), apply_sm.appliedIndex(group_id));
+            const committed_resolution: antfly.db.types.BatchRequest = .{ .transaction = .{ .resolve = .{ .txn_id = txn_a, .status = .committed, .commit_version = 400 } } };
+            try std.testing.expectEqual(@as(?RaftTableApplyStateMachine.ExpectedApplyFailure, null), RaftTableApplyStateMachine.ExpectedApplyFailure.forRequest(error.RetainedEffectsFull, committed_resolution));
+            const committed_payload = try data_raft_batch.encodeWithStorageOwnerDescriptor(alloc, "docs", committed_resolution, if (descriptor) |*value| value.view() else null);
+            defer alloc.free(committed_payload);
+            const committed_entry = [_]raft_engine.core.Entry{.{ .term = 2, .index = 22, .entry_type = .normal, .data = committed_payload }};
+            apply_sm.test_faults.semantic_rejection_once = .{ .index = 22, .reason = error.RetainedEffectsFull };
+            try apply_sm.registerApplyOutcomeWaiter(group_id, 22, 2);
+            try std.testing.expectError(error.RaftApplyWriterUnavailable, RaftTableApplyStateMachine.applyReady(&apply_sm, group_id, null, &committed_entry, &.{}));
+            try std.testing.expectEqual(@as(u64, 21), apply_sm.appliedIndex(group_id));
+            try std.testing.expectEqual(.pending, apply_sm.takeApplyOutcome(group_id, 22).?);
         }
 
         test "data runtime structural raft progress prefers durable restart state over process-local outcomes" {
@@ -34640,9 +36824,19 @@ fn consumerTests() type {
                 .metrics = .{},
             });
 
+            const topology = antfly.metadata_api.stabilizeMetadataRuntimeTopology(.{
+                .metadata_group_id = 1,
+                .metadata_raft_local_node_id = 2,
+                .metadata_raft_leader_id = 2,
+                .metadata_raft_role = source_role,
+            });
             try std.testing.expect(status.metadata_raft_role.ptr != source_role.ptr);
+            try std.testing.expect(topology.metadata_raft_role.ptr != source_role.ptr);
             @memset(source_role, 'x');
             try std.testing.expectEqualStrings("leader", status.metadata_raft_role);
+            try std.testing.expectEqualStrings("leader", topology.metadata_raft_role);
+            try std.testing.expectEqual(@as(u64, 2), topology.metadata_raft_local_node_id);
+            try std.testing.expectEqual(@as(?u64, 2), topology.metadata_raft_leader_id);
             const future = antfly.metadata_api.stabilizeMetadataStatus(.{
                 .metadata_group_id = 1,
                 .metadata_raft_role = "future_role",
@@ -34650,6 +36844,11 @@ fn consumerTests() type {
             });
             try std.testing.expectEqualStrings("unknown", future.metadata_raft_role);
             try std.testing.expect(future.metadata_raft_role.ptr != "future_role".ptr);
+            const future_topology = antfly.metadata_api.stabilizeMetadataRuntimeTopology(.{
+                .metadata_group_id = 1,
+                .metadata_raft_role = "future_role",
+            });
+            try std.testing.expectEqualStrings("unknown", future_topology.metadata_raft_role);
         }
 
         test "data runtime health metrics include replay debt and provisioned warmup counters" {
@@ -35011,25 +37210,68 @@ fn consumerTests() type {
             try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_phase{phase=\"opening_db\"} 1") != null);
         }
 
-        test "storage.hot_standby data runtime rejects concurrent seed capture before waiting on mutation barrier" {
-            var server: DataServer = undefined;
-            server.ha_seed_capture_active = .init(true);
-            try std.testing.expectError(
-                error.HASeedCaptureAlreadyInProgress,
-                DataServer.captureHASeedCallback(
-                    &server,
-                    std.testing.allocator,
-                    "standby-a",
-                    "seed-standby-a-1",
-                    .{
-                        .topology_id = "topology-a",
-                        .topology_generation = 1,
-                        .node_id = "standby-a",
-                        .target_pvc_name = "standby-a-data",
-                        .target_pvc_uid = "pvc-uid-1",
-                    },
-                ),
-            );
+        test "data raft raw topology rejection advances delegate with exact typed outcome" {
+            const alloc = std.testing.allocator;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/online-arbitration", .{tmp.sub_path});
+            defer alloc.free(root);
+            var raw = try DataRaftApplyStore.init(alloc, .{ .root_dir = root, .native_source_delegate = true });
+            defer raw.deinit();
+            const scope: @import("../storage/db/online_source_contract.zig").Scope = .{
+                .fence = .{ .transition_id = 9, .attempt = 1, .admission_epoch = 1, .owner_group_id = 77, .peer_group_id = 78, .role = .merge_source, .namespace = .{ .table_id = 7, .shard_id = 77, .range_id = 1 }, .catalog_digest = @splat(3) },
+                .receiver_namespace = .{ .table_id = 7, .shard_id = 78, .range_id = 2 },
+                .consumer_epoch = 1,
+                .copy_attempt = .{ .donor_term = 1, .sequence = 1 },
+            };
+            const barrier = try data_raft_batch.encodeProtocolBarrier(alloc, "docs", data_raft_batch.source_pin_protocol_version);
+            defer alloc.free(barrier);
+            const admit = try data_raft_batch.encode(alloc, "docs", .{ .online_source = .{ .admit = .{ .scope = scope } } });
+            defer alloc.free(admit);
+            const ordinary = try data_raft_batch.encode(alloc, "docs", .{ .merge_source_transition = .{ .kind = .prepare, .transition_id = 10, .receiver_group_id = 78 } });
+            defer alloc.free(ordinary);
+            const entries = [_]raft_engine.core.Entry{
+                .{ .term = 1, .index = 1, .entry_type = .normal, .data = barrier },
+                .{ .term = 1, .index = 2, .entry_type = .normal, .data = admit },
+                .{ .term = 1, .index = 3, .entry_type = .normal, .data = ordinary },
+                .{ .term = 1, .index = 4, .entry_type = .normal, .data = barrier },
+            };
+            // Collision recovery may roll back only this merge's old ordinary
+            // donor prepare; unrelated transitions retain their authority.
+            const same: @import("../storage/data_raft_projection_wire.zig").AppliedMergeSourceState = .{ .transition_id = 9, .receiver_group_id = 78, .phase = .accepting, .applied_index = 2 };
+            try std.testing.expectEqual(.rollback, onlineMergeRevokeBatch(scope, same).merge_source_transition.?.kind);
+            var unrelated = same;
+            unrelated.transition_id = 10;
+            try std.testing.expectEqual(.abort_transition, onlineMergeRevokeBatch(scope, unrelated).relational_topology.?.action);
+            unrelated = same;
+            unrelated.receiver_group_id = 79;
+            try std.testing.expectEqual(.abort_transition, onlineMergeRevokeBatch(scope, unrelated).relational_topology.?.action);
+            const encoded = try antfly.raft.state_machine.encodeCommittedEntries(alloc, &entries);
+            defer alloc.free(encoded);
+            try raw.applyBatch(77, 4, encoded);
+            try std.testing.expectEqual(.busy, (try raw.topologyRejection(alloc, 77, 3)).?);
+            // Simulate both a normal delegate pass and restart after raw apply.
+            // Neither may turn the durable rejected command into a success.
+            for (0..2) |_| {
+                var delegate = try RaftTableApplyStateMachine.init(alloc, root, antfly.public_api.table_catalog.emptyCatalogSource(), null);
+                defer delegate.deinit();
+                delegate.topology_apply_store = &raw;
+                try delegate.registerApplyOutcomeWaiter(77, 3, 1);
+                try RaftTableApplyStateMachine.applyReady(&delegate, 77, null, entries[2..], &.{});
+                try std.testing.expectEqual(@as(?u64, 4), delegate.appliedIndex(77));
+                try std.testing.expectEqual(error.IntegrityTopologyBusy, delegate.apply_outcomes.get(.{ .group_id = 77, .index = 3 }).?.outcome.failed.toError());
+                try std.testing.expectEqual(@as(usize, 0), delegate.test_faults.document_apply_attempts);
+            }
+        }
+
+        test "online merge admission distinguishes unsupported peers and fences leader authority" {
+            try std.testing.expectError(error.GroupLeaderUnavailable, onlineMergePeerEligible(0));
+            try std.testing.expect(!try onlineMergePeerEligible(data_raft_batch.source_pin_protocol_version - 1));
+            try std.testing.expect(try onlineMergePeerEligible(data_raft_batch.source_pin_protocol_version));
+            try validateOnlineMergeAdmissionAuthority(9, 9, 17, 17);
+            try std.testing.expectError(error.GroupLeaderUnavailable, validateOnlineMergeAdmissionAuthority(0, 0, 17, 17));
+            try std.testing.expectError(error.GroupLeaderUnavailable, validateOnlineMergeAdmissionAuthority(9, 10, 17, 17));
+            try std.testing.expectError(error.GroupLeaderUnavailable, validateOnlineMergeAdmissionAuthority(9, 9, 17, 18));
         }
 
         test "raft proposal materializes a default batch timestamp exactly once" {
@@ -35058,6 +37300,58 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(u64, 0), legacy.timestamp_ns);
             const negotiated = DataServer.raftBatchRequestForProtocol(explicit, true, 456);
             try std.testing.expectEqual(@as(u64, 123), negotiated.timestamp_ns);
+
+            const pages = @import("../storage/db/merge_page_contract.zig");
+            var page_request: antfly.db.types.BatchRequest = .{
+                .writes = &.{.{ .key = "row", .value = "{ \"x\": 1 }" }},
+                .merge_replication = .{
+                    .transition_id = 1,
+                    .donor_group_id = 2,
+                    .receiver_group_id = 3,
+                    .identity_namespace = .{ .table_id = 4, .shard_id = 3, .range_id = 5 },
+                    .copy_attempt = .{ .donor_term = 1, .sequence = 1 },
+                },
+                .merge_page = .{
+                    .source = .{ .namespace = .{ .table_id = 4, .shard_id = 2, .range_id = 6 }, .pin_digest = @splat(1), .applied_index = 9 },
+                    .sequence = 2,
+                    .phase = .rows,
+                    .next = "row",
+                    .exhausted = true,
+                    .timestamps = &.{123},
+                    .digest = @splat(0),
+                },
+            };
+            page_request.merge_page.?.digest = pages.commandDigest(page_request);
+            try std.testing.expectEqual(data_raft_batch.merge_page_protocol_version, DataServer.requiredRaftBatchProtocolVersion(page_request));
+            const page_proposal = DataServer.raftBatchRequestForProtocol(page_request, true, 999);
+            try std.testing.expectEqual(@as(u64, 0), page_proposal.timestamp_ns);
+            const page_bytes = try data_raft_batch.encode(alloc, "docs", page_proposal);
+            defer alloc.free(page_bytes);
+            var page_decoded = try data_raft_batch.decode(alloc, page_bytes);
+            defer page_decoded.deinit(alloc);
+            try std.testing.expectEqualDeep(page_request.merge_page.?, page_decoded.batch.req.merge_page.?);
+            try std.testing.expectEqualStrings(page_request.writes[0].value, page_decoded.batch.req.writes[0].value);
+            page_request.merge_page.?.source.retention = .{ .epoch = 1, .after_sequence = 5 };
+            try std.testing.expectEqual(data_raft_batch.source_scope_protocol_version, DataServer.requiredRaftBatchProtocolVersion(page_request));
+            page_request.merge_page.?.digest = pages.commandDigest(page_request);
+            const chunks = try pages.RowChunks(antfly.db.types.BatchRequest).init(page_request);
+            const chunk = try chunks.requestAt(0);
+            try std.testing.expectEqual(data_raft_batch.source_scope_protocol_version, DataServer.requiredRaftBatchProtocolVersion(chunk));
+            page_request.merge_page.?.next_snapshot_position = .{ .object = 1, .offset = 8, .remaining = 0 };
+            try std.testing.expectEqual(data_raft_batch.source_pin_protocol_version, DataServer.requiredRaftBatchProtocolVersion(page_request));
+            const source_request: antfly.db.types.BatchRequest = .{ .online_source = .{ .admit = .{ .scope = .{
+                .fence = .{ .transition_id = 1, .attempt = 1, .owner_group_id = 2, .peer_group_id = 3, .role = .merge_source, .namespace = .{ .table_id = 4, .shard_id = 2, .range_id = 6 }, .catalog_digest = @splat(1) },
+                .receiver_namespace = .{ .table_id = 4, .shard_id = 3, .range_id = 5 },
+                .consumer_epoch = 1,
+                .copy_attempt = .{ .donor_term = 1, .sequence = 1 },
+            } } } };
+            try std.testing.expectEqual(data_raft_batch.source_pin_protocol_version, DataServer.requiredRaftBatchProtocolVersion(source_request));
+            try std.testing.expectEqual(@as(u64, 0), DataServer.materializeRaftBatchTimestamp(source_request, 999).timestamp_ns);
+            page_request.merge_page.?.source.integrity = .{ .catalog_digest = @splat(2), .generation_set = @splat(3) };
+            try std.testing.expectEqual(@as(u16, 12), DataServer.requiredRaftBatchProtocolVersion(page_request));
+            try std.testing.expectEqual(@as(u16, 12), DataServer.requiredRaftBatchProtocolVersion(.{
+                .restore_staging = .{ .finish = .{ .scope = @splat(4), .phase = .validated } },
+            }));
         }
 
         test "raft batch protocol preflight fingerprint fences every applying replica set" {
@@ -38760,11 +41054,74 @@ fn consumerTests() type {
                 try std.testing.expect(executor.io_impl == api_io_impl);
                 try std.testing.expectEqual(.shared, executor.io_owner);
                 try std.testing.expect(executor.cfg.keep_alive);
+                const full_plan_bytes = @import("../metadata/restore_staging.zig").max_encoded_bytes * 2 + 4096;
+                const full_plan_request: antfly.common.http.HttpRequest = .{ .method = .POST, .uri = "http://metadata.invalid", .max_response_bytes = full_plan_bytes };
+                try std.testing.expectEqual(full_plan_bytes, full_plan_request.responseLimit(executor.cfg.max_response_bytes));
+                const progress_request: antfly.common.http.HttpRequest = .{ .method = .POST, .uri = "http://metadata.invalid", .max_response_bytes = 4096 };
+                try std.testing.expectEqual(@as(usize, 4096), progress_request.responseLimit(executor.cfg.max_response_bytes));
             }
             for (source.http_executors) |*expected| {
                 try std.testing.expect(source.httpExecutor().ptr == @as(*anyopaque, @ptrCast(expected)));
             }
             try std.testing.expect(source.httpExecutor().ptr == @as(*anyopaque, @ptrCast(&source.http_executors[0])));
+        }
+
+        test "remote metadata source restore staging authority binds every owner read" {
+            const alloc = std.testing.allocator;
+            const staging = @import("../metadata/restore_staging.zig");
+            const Stub = struct {
+                calls: usize = 0,
+                wrong_node: bool = false,
+                incarnation: antfly.metadata_api.MetadataClusterIncarnation = .{'1'} ** 32,
+                fn execute(ptr: *anyopaque, allocator: std.mem.Allocator, request: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.calls += 1;
+                    try std.testing.expectEqual(.POST, request.method);
+                    try std.testing.expect(std.mem.endsWith(u8, request.uri, "/internal/v1/catalog/restore-staging-authority"));
+                    var parsed = try std.json.parseFromSlice(staging.AuthorityRequest, allocator, request.body, .{});
+                    defer parsed.deinit();
+                    try std.testing.expectEqual(@as(u64, 7), parsed.value.node_id);
+                    try std.testing.expectEqualSlices(u8, &@as([16]u8, @splat(9)), &parsed.value.plan_id);
+                    const response: staging.AuthorityResponse = .{
+                        .node_id = if (self.wrong_node) 8 else 7,
+                        .plan_id = parsed.value.plan_id,
+                        .metadata_group_id = 17,
+                        .metadata_incarnation = self.incarnation,
+                        .metadata_epoch = 21,
+                        .progress = .{ .state = .validating, .revision = 4, .completed_owners = 2 },
+                        .job_json = if (parsed.value.include_plan) "{\"immutable\":true}" else null,
+                        .receipt = if (parsed.value.receipt != null) @splat(255) else null,
+                    };
+                    return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(allocator, response, .{}) };
+                }
+            };
+            var stub: Stub = .{};
+            var source = try RemoteMetadataSource.initWithRequestExecutors(alloc, &.{"http://metadata.invalid"}, &.{.{ .ptr = &stub, .vtable = &.{ .execute = Stub.execute } }}, std.testing.io);
+            defer source.deinit();
+            source.local_node_id = 7;
+            const api = source.statusSource();
+            const id: [16]u8 = @splat(9);
+            const progress = (try api.getRestoreStagingProgress(alloc, id, .{})).?;
+            try std.testing.expectEqual(staging.State.validating, progress.state);
+            const job = (try api.getRestoreStaging(alloc, id, .{})).?;
+            defer alloc.free(job);
+            try std.testing.expectEqualStrings("{\"immutable\":true}", job);
+            const receipt = (try api.getRestoreStagingReceipt(alloc, id, .validating, 701, .{})).?;
+            defer alloc.free(receipt);
+            try std.testing.expectEqualSlices(u8, &@as([32]u8, @splat(255)), receipt);
+            try std.testing.expectEqual(@as(usize, 3), stub.calls);
+            source.local_node_id = 0;
+            try std.testing.expectError(error.StoreRegistrationRequired, api.getRestoreStagingProgress(alloc, id, .{}));
+            try std.testing.expectEqual(@as(usize, 3), stub.calls);
+            source.local_node_id = 7;
+            stub.wrong_node = true;
+            try std.testing.expectError(error.InvalidRestoreStaging, api.getRestoreStagingProgress(alloc, id, .{}));
+            stub.wrong_node = false;
+            stub.incarnation = .{'2'} ** 32;
+            try std.testing.expectError(error.MetadataIncarnationMismatch, api.getRestoreStagingProgress(alloc, id, .{}));
+            const before = stub.calls;
+            try std.testing.expectError(error.DeadlineExceeded, api.getRestoreStagingProgress(alloc, id, .{ .deadline_ns = 0 }));
+            try std.testing.expectEqual(before, stub.calls);
         }
 
         test "remote metadata source accepts transport-neutral request executors" {
@@ -38887,6 +41244,28 @@ fn consumerTests() type {
                 @as(?u64, null),
                 DataServer.preDecisionLeaderWaitNsAt(deadline_ns, deadline_ns),
             );
+
+            // Model an HTTP executor whose clock starts at zero, unrelated to
+            // the platform's boot epoch. Admission consumes that clock's
+            // budget, then hands Raft only a bounded duration.
+            var clock = try @import("vopr").vopr_io.VoprIo.init(.{});
+            defer clock.deinit();
+            const context: antfly.public_api.distributed_txn.PreDecisionContext = .{
+                .deadline_ns = 2 * std.time.ns_per_s,
+                .deadline_io = @import("../runtime_io_abi.zig").Borrow.init(&clock.io()),
+            };
+            try std.testing.expectEqual(@as(?u64, 2 * std.time.ns_per_s - response_reserve_ns), DataServer.preDecisionLeaderWaitNs(context));
+            clock.monotonic_ns = 1_200 * std.time.ns_per_ms;
+            try std.testing.expectEqual(@as(?u64, 800 * std.time.ns_per_ms - response_reserve_ns), DataServer.preDecisionLeaderWaitNs(context));
+            const request: antfly.public_api.operation.RequestContext = .{ .deadline_ns = context.deadline_ns, .deadline_io = context.deadline_io };
+            const remote_origin = 900_000 * std.time.ns_per_s;
+            try std.testing.expectEqual(remote_origin + 800 * std.time.ns_per_ms, try RemoteMetadataSource.requestDeadlineOnClock(request, remote_origin, 5 * std.time.ns_per_s));
+            try std.testing.expectEqual(remote_origin + 100 * std.time.ns_per_ms, try RemoteMetadataSource.requestDeadlineOnClock(request, remote_origin, 100 * std.time.ns_per_ms));
+            clock.monotonic_ns = context.deadline_ns.? - response_reserve_ns;
+            try std.testing.expectEqual(@as(?u64, null), DataServer.preDecisionLeaderWaitNs(context));
+            clock.monotonic_ns = context.deadline_ns.?;
+            try std.testing.expectEqual(@as(?u64, null), DataServer.preDecisionLeaderWaitNs(context));
+            try std.testing.expectError(error.DeadlineExceeded, RemoteMetadataSource.requestDeadlineOnClock(request, remote_origin, 5 * std.time.ns_per_s));
         }
 
         test "data raft batch forwarding bounds routing campaigns deadlines and deterministic fallback" {
@@ -39360,6 +41739,1205 @@ pub const implementation_tests = implementationTests();
 fn implementationTests() type {
     if (!(@import("builtin").is_test and !control_only_storage_sources)) return struct {};
     const Suite = struct {
+        test "data runtime status refresh skips opening the active startup group when no cached snapshot exists yet" {
+            const alloc = std.testing.allocator;
+
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+
+            const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-refresh-skip-active-startup-open", .{tmp.sub_path});
+            defer alloc.free(replica_root_dir);
+            const docs_db_path = try std.fmt.allocPrint(alloc, "{s}/group-77/table-db", .{replica_root_dir});
+            defer alloc.free(docs_db_path);
+            const logs_db_path = try std.fmt.allocPrint(alloc, "{s}/group-88/table-db", .{replica_root_dir});
+            defer alloc.free(logs_db_path);
+
+            var docs_db = try antfly.db.DB.open(alloc, docs_db_path, .{});
+            defer docs_db.close();
+            try docs_db.batch(.{
+                .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+                .sync_level = .write,
+            });
+
+            var logs_db = try antfly.db.DB.open(alloc, logs_db_path, .{});
+            defer logs_db.close();
+            try logs_db.batch(.{
+                .writes = &.{
+                    .{ .key = "log:a", .value = "{\"title\":\"beta\"}" },
+                    .{ .key = "log:b", .value = "{\"title\":\"gamma\"}" },
+                },
+                .sync_level = .write,
+            });
+
+            const FakeStatus = struct {
+                fn iface() antfly.public_api.http_server.StatusSource {
+                    return .{
+                        .ptr = undefined,
+                        .vtable = &.{
+                            .status = status,
+                            .admin_snapshot = adminSnapshot,
+                            .free_admin_snapshot = freeAdminSnapshot,
+                            .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                            .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                            .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
+                        },
+                    };
+                }
+
+                fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
+                    return .{ .metadata_group_id = 1, .metrics = .{} };
+                }
+
+                fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+                    return .{
+                        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                        .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{ .{
+                            .table_id = 7,
+                            .name = "docs",
+                            .placement_role = "data",
+                        }, .{
+                            .table_id = 8,
+                            .name = "logs",
+                            .placement_role = "data",
+                        } })[0..]),
+                        .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{ .{
+                            .group_id = 77,
+                            .table_id = 7,
+                            .start_key = "",
+                            .end_key = null,
+                        }, .{
+                            .group_id = 88,
+                            .table_id = 8,
+                            .start_key = "",
+                            .end_key = null,
+                        } })[0..]),
+                        .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{.{
+                            .store_id = 19,
+                            .node_id = 9,
+                            .role = "data",
+                            .live = true,
+                            .health_class = "healthy",
+                        }})[0..]),
+                        .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{.{
+                            .record = .{ .group_id = 77, .replica_id = 1, .local_node_id = 9 },
+                            .store_id = 19,
+                            .peer_node_ids = &.{9},
+                        }})[0..]),
+                        .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
+                        .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
+                    };
+                }
+
+                fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+            };
+
+            const FakeCatalog = struct {
+                fn iface() antfly.public_api.table_catalog.CatalogSource {
+                    return .{
+                        .ptr = undefined,
+                        .vtable = &.{
+                            .admin_snapshot = adminSnapshot,
+                            .free_admin_snapshot = freeAdminSnapshot,
+                            .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                            .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                            .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
+                        },
+                    };
+                }
+
+                fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+                    return try FakeStatus.adminSnapshot(undefined);
+                }
+
+                fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+            };
+
+            var server: DataServer = .{
+                .alloc = alloc,
+                .store_registration = .{
+                    .node_id = 9,
+                    .store_id = 19,
+                    .role = "data",
+                    .failure_domain = "test",
+                },
+                .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+                .read_source = antfly.public_api.ProvisionedTableReadSource.init(
+                    replica_root_dir,
+                    FakeCatalog.iface(),
+                    antfly.raft.read_gate.alreadyReadSafeBarrier(),
+                ),
+                .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
+                    replica_root_dir,
+                    FakeCatalog.iface(),
+                ),
+                .status_source = FakeStatus.iface(),
+                .api_server_cfg = undefined,
+                .query_async_limit = .limited(8),
+                .listener_cfg = undefined,
+            };
+            defer server.deinit();
+            try server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
+
+            server.provisioned_startup_catch_up_active.store(true, .release);
+            try server.setProvisionedStartupCatchUpTarget(77, "docs");
+            defer server.clearProvisionedStartupCatchUpTarget();
+
+            try server.requestRuntimeStatusRefresh();
+            server.drainDataServerBackgroundJobs();
+
+            try std.testing.expectEqual(@as(u64, 0), server.runtime_status_refresh_failed.load(.monotonic));
+            try std.testing.expect((try server.provisioned_storage.runtime_status_cache.snapshot(alloc, "docs")) == null);
+            try std.testing.expect((try server.provisioned_storage.runtime_status_cache.snapshot(alloc, "logs")) == null);
+        }
+
+        test "storage.hot_standby data runtime rejects concurrent seed capture before waiting on mutation barrier" {
+            var server: DataServer = undefined;
+            server.ha_seed_capture_active = .init(true);
+            try std.testing.expectError(
+                error.HASeedCaptureAlreadyInProgress,
+                DataServer.captureHASeedCallback(
+                    &server,
+                    std.testing.allocator,
+                    "standby-a",
+                    "seed-standby-a-1",
+                    .{
+                        .topology_id = "topology-a",
+                        .topology_generation = 1,
+                        .node_id = "standby-a",
+                        .target_pvc_name = "standby-a-data",
+                        .target_pvc_uid = "pvc-uid-1",
+                    },
+                ),
+            );
+        }
+
+        test "storage.hot_standby data runtime default seed snapshot derives standalone groups including private owners" {
+            const alloc = std.testing.allocator;
+
+            const FakeMetadata = struct {
+                var include_public = true;
+                var epoch: u64 = 7;
+                fn catalogSource() antfly.public_api.table_catalog.CatalogSource {
+                    return .{
+                        .ptr = undefined,
+                        .vtable = &.{
+                            .export_catalog = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).exportCatalog,
+                            .admin_snapshot = adminSnapshot,
+                            .free_admin_snapshot = freeAdminSnapshot,
+                            .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                            .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                            .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
+                        },
+                    };
+                }
+
+                fn statusSource() antfly.public_api.http_server.StatusSource {
+                    return .{
+                        .ptr = undefined,
+                        .vtable = &.{
+                            .status = status,
+                            .admin_snapshot = adminSnapshot,
+                            .free_admin_snapshot = freeAdminSnapshot,
+                            .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                            .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                            .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
+                        },
+                    };
+                }
+
+                fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
+                    return .{ .metadata_group_id = 1, .metadata_epoch = epoch, .metrics = .{} };
+                }
+
+                fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+                    return .{
+                        .status = .{ .metadata_group_id = 1, .metadata_epoch = epoch, .metrics = .{} },
+                        .tables = if (!include_public) &.{} else @constCast((&[_]antfly.metadata.table_manager.TableRecord{.{
+                            .table_id = 7,
+                            .name = "docs",
+                            .placement_role = "data",
+                        }})[0..]),
+                        .ranges = if (!include_public) &.{} else @constCast((&[_]antfly.metadata.table_manager.RangeRecord{.{
+                            .group_id = 77,
+                            .range_id = 77,
+                            .table_id = 7,
+                            .start_key = "",
+                            .end_key = null,
+                            // Legacy metadata omitted these fields. The store still
+                            // uses the canonical group/range fallback namespace.
+                            .doc_identity_shard_id = 0,
+                            .doc_identity_range_id = 0,
+                        }})[0..]),
+                        .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{})[0..]),
+                        .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{})[0..]),
+                        .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
+                        .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
+                    };
+                }
+
+                fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+            };
+
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+
+            const fixture_root = try std.fmt.allocPrint(
+                alloc,
+                ".zig-cache/tmp/{s}/data-runtime-ha-standalone-seed",
+                .{tmp.sub_path},
+            );
+            defer alloc.free(fixture_root);
+            const replica_root = try std.fs.path.join(alloc, &.{ fixture_root, "replicas" });
+            defer alloc.free(replica_root);
+            const replica_catalog_path = try std.fs.path.join(alloc, &.{ fixture_root, "catalog.txt" });
+            defer alloc.free(replica_catalog_path);
+            const capture_root = try std.fs.path.join(alloc, &.{ fixture_root, "seed-captures" });
+            defer alloc.free(capture_root);
+            const replica_db_path = try antfly.metadata.groupDbPathFromReplicaRoot(alloc, replica_root, 77);
+            defer alloc.free(replica_db_path);
+
+            {
+                var replica_catalog = try antfly.raft.FileReplicaCatalog.init(alloc, replica_catalog_path);
+                replica_catalog.deinit();
+            }
+            {
+                var db = try antfly.db.DB.open(alloc, replica_db_path, .{
+                    .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+                    .identity_namespace = .{ .table_id = 7, .shard_id = 77, .range_id = 77 },
+                    .start_index_workers = false,
+                });
+                defer db.close();
+                try db.batch(.{
+                    .writes = &.{.{ .key = "doc:seed", .value = "{\"title\":\"standalone seed\"}" }},
+                    .sync_level = .full_index,
+                });
+            }
+
+            var standalone = DataServer.initFromLocalMetadataSources(alloc, .{
+                .replica_root_dir = replica_root,
+                .replica_catalog_path = replica_catalog_path,
+                .api_server_cfg = .{ .deployment_mode = .standalone },
+            }, FakeMetadata.catalogSource(), FakeMetadata.statusSource());
+            defer standalone.deinit();
+
+            var prepared = try standalone.prepareDefaultHASeedSnapshot(alloc, .{
+                .capture_root = capture_root,
+                .generation = "standalone-empty-catalog",
+            });
+            defer prepared.deinit(alloc);
+
+            var io_impl = std.Io.Threaded.init(alloc, .{});
+            defer io_impl.deinit();
+            const topology_path = try std.fs.path.join(alloc, &.{ prepared.root, ha_seed_snapshot_topology_name });
+            defer alloc.free(topology_path);
+            const topology_json = try std.Io.Dir.cwd().readFileAlloc(
+                io_impl.io(),
+                topology_path,
+                alloc,
+                .limited(1024 * 1024),
+            );
+            defer alloc.free(topology_json);
+            var topology = try std.json.parseFromSlice(
+                HASeedSnapshotTopology,
+                alloc,
+                topology_json,
+                .{ .ignore_unknown_fields = false },
+            );
+            defer topology.deinit();
+            try std.testing.expectEqual(@as(usize, 1), topology.value.replicas.len);
+            try std.testing.expectEqual(@as(u64, 77), topology.value.replicas[0].group_id);
+            try std.testing.expectEqualStrings("docs", topology.value.replicas[0].table_name);
+            try std.testing.expectEqual(@as(u64, 77), topology.value.catalog.ranges[0].doc_identity_shard_id);
+            try std.testing.expectEqual(@as(u64, 77), topology.value.catalog.ranges[0].doc_identity_range_id);
+            try std.testing.expectEqual(@as(u64, 7), topology.value.replicas[0].identity_table_id);
+            try std.testing.expectEqual(@as(u64, 77), topology.value.replicas[0].identity_shard_id);
+            try std.testing.expectEqual(@as(u64, 77), topology.value.replicas[0].identity_range_id);
+
+            // A seed includes private in-flight owners without exposing them in its
+            // ordinary catalog. Reopening the materialized replica retains the exact
+            // reservation and therefore cannot serve or accept arbitrary writes.
+            {
+                var arena = std.heap.ArenaAllocator.init(alloc);
+                defer arena.deinit();
+                const scratch = arena.allocator();
+                const staging = @import("../metadata/restore_staging.zig");
+                const target: staging.Target = .{
+                    .source_table_id = 7,
+                    .table = .{ .table_id = 8, .name = "hidden", .schema_json = "{}" },
+                    .ranges = &.{.{ .table_id = 8, .group_id = 88, .range_id = 88, .start_key = "", .doc_identity_shard_id = 88, .doc_identity_range_id = 88 }},
+                    .source_artifacts = &.{.{ .target_group_id = 88, .source_namespace = .{ .table_id = 7, .shard_id = 77, .range_id = 77 }, .format = .native, .snapshot_path = "source", .artifact_size_bytes = 1, .artifact_sha256 = @splat(3) }},
+                };
+                const plan: staging.Plan = .{ .id = @splat(1), .cohort_digest = @splat(2), .targets = &.{target} };
+                const plan_digest = try plan.digest(scratch);
+                const scope = try staging.ownerScope(scratch, plan, plan_digest, target, target.ranges[0]);
+                // Exercise the production capability with a real indexed metadata
+                // store, not just the legacy public-catalog/private-sidecar fixture.
+                const metadata_root = try std.fs.path.join(scratch, &.{ fixture_root, "source-metadata" });
+                var source_metadata = try antfly.metadata.RaftApplyStore.init(alloc, .{ .root_dir = metadata_root });
+                defer source_metadata.deinit();
+                const metadata_group = @import("../common/group_ids.zig").main_metadata_group_id;
+                var catalog_snapshot = try FakeMetadata.adminSnapshot(undefined);
+                defer FakeMetadata.freeAdminSnapshot(undefined, &catalog_snapshot);
+                try source_metadata.replaceStandaloneCatalog(metadata_group, 0, catalog_snapshot.tables, catalog_snapshot.ranges, "{}");
+                const reserve = try std.json.Stringify.valueAlloc(scratch, staging.Command{ .id = plan.id, .action = .reserve, .plan = plan }, .{});
+                try source_metadata.applyStandaloneCommand(metadata_group, .{ .apply_restore_staging = reserve });
+                const user_job_key = "\x00\x00__api_restore_jobs__:000000000000002a";
+                const user_job_json = try std.json.Stringify.valueAlloc(scratch, antfly.public_api.restore_jobs.JobState{
+                    .format_version = 4,
+                    .job_id = 42,
+                    .enqueue_sequence = 1,
+                    .dispatch_sequence = 1,
+                    .scope = .table,
+                    .table_name = "hidden",
+                    .backup_id = "backup-source",
+                    .location = "file:///fixture-backups",
+                    .connection = "",
+                    .idempotency_namespace = "seed-test",
+                    .idempotency_key = "job-42",
+                    .request_fingerprint = "fixture-request",
+                    .created_at_ms = 1,
+                    .updated_at_ms = 1,
+                    .expires_at_ms = std.math.maxInt(u64),
+                }, .{});
+                try source_metadata.applyStandaloneCommand(metadata_group, .{ .create_restore_job = .{ .key = user_job_key, .value = user_job_json } });
+                while (try source_metadata.standaloneRevision() < 7)
+                    try source_metadata.applyStandaloneCommand(metadata_group, .{ .initialize_metadata_incarnation = "0123456789abcdef0123456789abcdef".* });
+                const MetadataPort = struct {
+                    const port_mod = @import("../api/standalone_hot_standby.zig");
+                    fn store(ptr: *anyopaque) *antfly.metadata.RaftApplyStore {
+                        return @ptrCast(@alignCast(ptr));
+                    }
+                    fn bind(ptr: *anyopaque, gate: ?antfly.db.HAWriteGate, mirror: ?antfly.db.HAAsyncEffectMirror) !void {
+                        try store(ptr).bindHA(gate, mirror);
+                    }
+                    fn prepare(ptr: *anyopaque) !void {
+                        try store(ptr).flushHAOutbox();
+                    }
+                    fn apply(ptr: *anyopaque, record: antfly.hot_standby.replication_record.RecordView) !void {
+                        try store(ptr).applyHARecord(record);
+                    }
+                    fn capture(ptr: *anyopaque, io: std.Io, path: []const u8) !port_mod.Checkpoint {
+                        const result = try store(ptr).exportHACheckpoint(io, path);
+                        return .{ .size_bytes = result.size_bytes, .sha256 = result.sha256 };
+                    }
+                    fn private(ptr: *anyopaque, allocator: std.mem.Allocator, epoch: u64) !?std.json.Parsed(staging.ProvisioningProjection) {
+                        const metadata = store(ptr);
+                        if (try metadata.standaloneRevision() != epoch) return error.MetadataSnapshotHeadMismatch;
+                        var projection = try metadata.captureProvisioningCatalog(allocator, @import("../common/group_ids.zig").main_metadata_group_id);
+                        defer projection.deinit(allocator);
+                        var hidden_tables: std.ArrayList(antfly.metadata.TableRecord) = .empty;
+                        defer hidden_tables.deinit(allocator);
+                        var hidden_ranges: std.ArrayList(antfly.metadata.RangeRecord) = .empty;
+                        defer hidden_ranges.deinit(allocator);
+                        for (projection.tables) |table| if (table.table_id != 7) try hidden_tables.append(allocator, table);
+                        for (projection.ranges) |range| if (range.table_id != 7) try hidden_ranges.append(allocator, range);
+                        const bytes = try std.json.Stringify.valueAlloc(allocator, staging.ProvisioningProjection{ .tables = hidden_tables.items, .ranges = hidden_ranges.items, .jobs_json = projection.jobs_json }, .{});
+                        defer allocator.free(bytes);
+                        return try std.json.parseFromSlice(staging.ProvisioningProjection, allocator, bytes, .{ .allocate = .alloc_always });
+                    }
+                    fn loadJobs(ptr: *anyopaque, allocator: std.mem.Allocator) ![]antfly.public_api.restore_jobs.ReplicatedPersistence.OwnedRow {
+                        const metadata = store(ptr);
+                        const rows = try metadata.listRestoreJobRows(allocator, @import("../common/group_ids.zig").main_metadata_group_id);
+                        errdefer metadata.freeRestoreJobRows(allocator, rows);
+                        const result = try allocator.alloc(antfly.public_api.restore_jobs.ReplicatedPersistence.OwnedRow, rows.len);
+                        for (rows, result) |row, *output| output.* = .{ .key = row.key, .value = row.value };
+                        allocator.free(rows);
+                        return result;
+                    }
+                    fn getJob(ptr: *anyopaque, allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
+                        return store(ptr).getRestoreJobValue(allocator, @import("../common/group_ids.zig").main_metadata_group_id, key);
+                    }
+                    fn putJob(_: *anyopaque, _: []const u8, _: []const u8, _: u64) !void {
+                        return error.TestUnexpectedResult;
+                    }
+                    fn deleteJob(_: *anyopaque, _: []const u8, _: u64) !void {
+                        return error.TestUnexpectedResult;
+                    }
+                    fn deleteJobs(_: *anyopaque, _: []const []const u8, _: u64) !void {
+                        return error.TestUnexpectedResult;
+                    }
+                };
+                standalone.status_source.standalone_hot_standby = .{ .ptr = &source_metadata, .vtable = &.{ .bind_mirror = MetadataPort.bind, .prepare_checkpoint = MetadataPort.prepare, .apply_record = MetadataPort.apply, .capture_checkpoint = MetadataPort.capture, .capture_private = MetadataPort.private } };
+                defer standalone.status_source.standalone_hot_standby = null;
+                try standalone.initApiServer();
+                try std.testing.expect(standalone.http_server.?.restore_job_store.opened == null);
+                try std.testing.expect(standalone.http_server.?.restore_job_store.runtime == null);
+                try standalone.http_server.?.restore_job_store.attachReplicated(antfly.public_api.restore_jobs.ReplicatedPersistence.fromLocal(&source_metadata, .{ .load = MetadataPort.loadJobs, .get = MetadataPort.getJob, .put = MetadataPort.putJob, .delete = MetadataPort.deleteJob, .delete_many = MetadataPort.deleteJobs }));
+                const job_json = try std.json.Stringify.valueAlloc(scratch, staging.Job{ .plan = plan, .plan_digest = plan_digest }, .{});
+                const private_metadata_root = try standalone.haRestoreOwnerMetadataRoot(scratch);
+                const private_path = try std.fs.path.join(scratch, &.{ private_metadata_root, antfly.hot_standby.seed_materialization.private_provisioning_name });
+                try fs_paths.createDirPathPortable(io_impl.io(), std.fs.path.dirname(private_path).?);
+                var private_tables = [_]antfly.metadata.TableRecord{target.table};
+                const private_json = try std.json.Stringify.valueAlloc(scratch, staging.ProvisioningProjection{ .tables = &private_tables, .ranges = @constCast(target.ranges), .jobs_json = &.{job_json} }, .{});
+                {
+                    const file = try std.Io.Dir.cwd().createFile(io_impl.io(), private_path, .{});
+                    defer file.close(io_impl.io());
+                    try file.writeStreamingAll(io_impl.io(), private_json);
+                    try file.sync(io_impl.io());
+                }
+                const hidden_path = try antfly.metadata.groupDbPathFromReplicaRoot(scratch, replica_root, 88);
+                {
+                    var hidden_db = try antfly.db.DB.open(alloc, hidden_path, .{ .identity_namespace = scope.target_namespace, .start_index_workers = false, .start_optional_runtimes = false });
+                    defer hidden_db.close();
+                    try hidden_db.reserveRestoreStagingScoped(alloc, scope);
+                }
+                var hidden_seed = try standalone.prepareDefaultHASeedSnapshot(alloc, .{ .capture_root = capture_root, .generation = "private-owner-seed" });
+                defer hidden_seed.deinit(alloc);
+                const raw_absolute = try std.Io.Dir.cwd().realPathFileAlloc(io_impl.io(), hidden_seed.root, scratch);
+                const fixture_absolute = try std.Io.Dir.cwd().realPathFileAlloc(io_impl.io(), fixture_root, scratch);
+                const capture_absolute = try std.fs.path.join(scratch, &.{ fixture_absolute, "seed-captures" });
+                try DataServer.validateHASeedPreparedSnapshot(alloc, capture_absolute, "private-owner-seed", raw_absolute);
+                const metadata_topology_path = try std.fs.path.join(scratch, &.{ raw_absolute, ha_seed_snapshot_topology_name });
+                const metadata_topology_json = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), metadata_topology_path, scratch, .limited(antfly.hot_standby.seed_materialization.max_topology_bytes));
+                var metadata_topology = try std.json.parseFromSlice(HASeedSnapshotTopology, alloc, metadata_topology_json, .{});
+                defer metadata_topology.deinit();
+                try std.testing.expect(metadata_topology.value.standalone_metadata != null);
+                var corrupt_metadata_topology = metadata_topology.value;
+                corrupt_metadata_topology.standalone_metadata.?.sha256 = "0" ** 64;
+                try std.testing.expectError(error.SeedLogicalDigestMismatch, antfly.hot_standby.seed_materialization.validateTopology(alloc, io_impl.io(), raw_absolute, "private-owner-seed", corrupt_metadata_topology));
+                const parent_absolute = try tmp.dir.realPathFileAlloc(io_impl.io(), ".", scratch);
+                const live = try std.fs.path.join(scratch, &.{ parent_absolute, "materialized-private-owner" });
+                var materialized = try antfly.hot_standby.seed_materialization.materialize(alloc, .{
+                    .io = io_impl.io(),
+                    .raw_generation_root = raw_absolute,
+                    .live_installing_root = live,
+                    .generation = "private-owner-seed",
+                    .target_local_node_id = 1,
+                    .seed_receipt_sha256 = "a" ** 64,
+                    .capture_receipt_sha256 = "b" ** 64,
+                    .raw_manifest_sha256 = "c" ** 64,
+                    .raw_aggregate_sha256 = "d" ** 64,
+                });
+                defer materialized.deinit(alloc);
+                const catalog_path = try std.fs.path.join(scratch, &.{ live, "metadata/local-metadata.json" });
+                const catalog_json = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), catalog_path, scratch, .limited(1024 * 1024));
+                var public_catalog = try std.json.parseFromSlice(antfly.hot_standby.seed_materialization.LogicalCatalog, alloc, catalog_json, .{});
+                defer public_catalog.deinit();
+                try std.testing.expectEqual(@as(usize, 1), public_catalog.value.tables.len);
+                try std.testing.expectEqual(@as(u64, 7), public_catalog.value.tables[0].table_id);
+                const imported_metadata_path = try std.fs.path.join(scratch, &.{ live, "metadata/local-state" });
+                {
+                    var imported_metadata = try antfly.metadata.RaftApplyStore.init(alloc, .{ .root_dir = imported_metadata_path });
+                    defer imported_metadata.deinit();
+                    try std.testing.expectEqual(@as(u64, 7), try imported_metadata.standaloneRevision());
+                    var active_plan = (try imported_metadata.loadRestoreStaging(alloc, metadata_group, plan.id)).?;
+                    defer active_plan.deinit();
+                    try std.testing.expectEqual(.importing, active_plan.value.state);
+                    try std.testing.expectEqualSlices(u8, &plan_digest, &active_plan.value.plan_digest);
+                    const restored_job = (try imported_metadata.getRestoreJobValue(alloc, metadata_group, user_job_key)).?;
+                    defer alloc.free(restored_job);
+                    try std.testing.expectEqualStrings(user_job_json, restored_job);
+                }
+                // The artifact itself is authentic, but its full metadata revision
+                // disagrees with the separately declared topology: do not publish it.
+                var mismatched_metadata_topology = metadata_topology.value;
+                mismatched_metadata_topology.catalog.epoch += 1;
+                const mismatched_json = try std.json.Stringify.valueAlloc(scratch, mismatched_metadata_topology, .{});
+                try std.Io.Dir.cwd().writeFile(io_impl.io(), .{ .sub_path = metadata_topology_path, .data = mismatched_json });
+                const mismatch_live = try std.fs.path.join(scratch, &.{ parent_absolute, "metadata-mismatch" });
+                try std.testing.expectError(error.SeedMetadataTopologyMismatch, antfly.hot_standby.seed_materialization.materialize(alloc, .{ .io = io_impl.io(), .raw_generation_root = raw_absolute, .live_installing_root = mismatch_live, .generation = "private-owner-seed", .target_local_node_id = 1, .seed_receipt_sha256 = "a" ** 64, .capture_receipt_sha256 = "b" ** 64, .raw_manifest_sha256 = "c" ** 64, .raw_aggregate_sha256 = "d" ** 64 }));
+                try std.Io.Dir.cwd().writeFile(io_impl.io(), .{ .sub_path = metadata_topology_path, .data = metadata_topology_json });
+                const reopened_path = try std.fs.path.join(scratch, &.{ live, "data/replicas/group-88/table-db" });
+                var reopened = try antfly.db.DB.open(alloc, reopened_path, .{ .identity_namespace = scope.target_namespace, .start_index_workers = false, .start_optional_runtimes = false });
+                defer reopened.close();
+                var restored_marker = (try reopened.restoreStagingStatus(alloc)).?;
+                defer restored_marker.deinit();
+                try std.testing.expectEqual(.reserved, restored_marker.value.phase);
+                try std.testing.expectEqualSlices(u8, &scope.digest(), &restored_marker.value.scope.digest());
+                try std.testing.expectError(error.RestoreStagingInProgress, reopened.batch(.{ .writes = &.{.{ .key = "forbidden", .value = "{}" }} }));
+
+                // A post-seed owner is bootstrapped by the authenticated HA record,
+                // not by public metadata or standby Raft placement membership.
+                const post_seed_root = try std.fs.path.join(scratch, &.{ parent_absolute, "post-seed/data/replicas" });
+                const post_seed_catalog = try std.fs.path.join(scratch, &.{ parent_absolute, "post-seed/data/catalog.txt" });
+                var standby = DataServer.initFromLocalMetadataSources(alloc, .{ .replica_root_dir = post_seed_root, .replica_catalog_path = post_seed_catalog, .api_server_cfg = .{ .deployment_mode = .standalone } }, FakeMetadata.catalogSource(), FakeMetadata.statusSource());
+                defer standby.deinit();
+                standby.write_source.write_cache = &standby.provisioned_storage.write_cache;
+                const descriptor: @import("../storage/db/restore_staging.zig").OwnerBootstrap = .{ .scope = scope, .table_name = "hidden", .schema_json = "{}", .indexes_json = "{}", .byte_range = .{ .start = "", .end = "" } };
+                const begin_payload = try antfly.hot_standby.effects.encodeBatchMutationWithRestoreBootstrapAlloc(scratch, .{ .restore_staging = .{ .begin = scope } }, descriptor);
+                const begin_record: antfly.hot_standby.replication_record.RecordView = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .table_id = 8, .shard_id = 88, .timeline_id = 1, .epoch = 1, .lsn = 1, .previous_lsn = 0, .payload = begin_payload };
+                try standby.applyHAReplicationRecord(begin_record);
+                try standby.write_source.clearWriteCache();
+                try standby.applyHAReplicationRecord(begin_record);
+                const cancel_payload = try antfly.hot_standby.effects.encodeBatchMutationRequestAlloc(scratch, .{ .restore_staging = .{ .finish = .{ .scope = scope.digest(), .phase = .canceled } } });
+                var cancel_record = begin_record;
+                cancel_record.lsn = 2;
+                cancel_record.previous_lsn = 1;
+                cancel_record.payload = cancel_payload;
+                // A terminal HA receipt may release discovery immediately, but an
+                // outstanding native lease must keep its exact generation alive.
+                var canceled_lease = standby.write_source.leaseManagedWriterGroupForTransition(88).?;
+                const canceled_root = try antfly.metadata.groupDbPathFromReplicaRoot(scratch, post_seed_root, 88);
+                var wrong_scope = scope.digest();
+                wrong_scope[0] ^= 1;
+                try std.testing.expectError(error.RestoreStagingScopeChanged, standby.write_source.retireCanceledRestoreOwner(alloc, 88, 8, wrong_scope, standby.replicaRetirementOwnership()));
+                try standby.applyHAReplicationRecord(cancel_record);
+                _ = try std.Io.Dir.cwd().statFile(io_impl.io(), canceled_root, .{});
+                canceled_lease.deinit(alloc);
+                // Crash/restart after terminal acknowledgement and before cleanup:
+                // the sidecar plus terminal ledger, not the deleted discovery record,
+                // authorizes recovery of this exact native generation.
+                standby.deinit();
+                standby = DataServer.initFromLocalMetadataSources(alloc, .{ .replica_root_dir = post_seed_root, .replica_catalog_path = post_seed_catalog, .api_server_cfg = .{ .deployment_mode = .standalone } }, FakeMetadata.catalogSource(), FakeMetadata.statusSource());
+                standby.write_source.write_cache = &standby.provisioned_storage.write_cache;
+                _ = standby.write_source.withReplicaRetirementOwnership(standby.replicaRetirementOwnership());
+                try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io_impl.io(), canceled_root, .{}));
+                try standby.write_source.clearWriteCache();
+                try standby.applyHAReplicationRecord(cancel_record);
+                const canceled_registry_root = try standby.haRestoreOwnerMetadataRoot(scratch);
+                var canceled_registry = try @import("../storage/hot_standby/restore_owner_registry.zig").load(alloc, io_impl.io(), canceled_registry_root);
+                defer canceled_registry.deinit();
+                try std.testing.expectEqual(@as(usize, 0), canceled_registry.owners.len);
+                try std.testing.expect((try standby.write_source.readHAHiddenOwnerBootstrap(alloc, 88, 8)) == null);
+                var active_descriptor = descriptor;
+                active_descriptor.table_name = "active-hidden";
+                active_descriptor.scope.target_namespace = .{ .table_id = 9, .shard_id = 99, .range_id = 99 };
+                var active_begin = begin_record;
+                active_begin.table_id = 9;
+                active_begin.shard_id = 99;
+                active_begin.lsn = 3;
+                active_begin.previous_lsn = 2;
+                active_begin.payload = try antfly.hot_standby.effects.encodeBatchMutationWithRestoreBootstrapAlloc(scratch, .{ .restore_staging = .{ .begin = active_descriptor.scope } }, active_descriptor);
+                try standby.applyHAReplicationRecord(active_begin);
+
+                // The replay-created group is absent from both public placement and
+                // the local Raft catalog. A later OFFLINE seed must still retain it.
+                const post_seed_public_path = try std.fs.path.join(scratch, &.{ post_seed_root, "group-77/table-db" });
+                {
+                    var public_db = try antfly.db.DB.open(alloc, post_seed_public_path, .{ .identity_namespace = .{ .table_id = 7, .shard_id = 77, .range_id = 77 }, .start_index_workers = false, .start_optional_runtimes = false });
+                    defer public_db.close();
+                    try public_db.batch(.{ .writes = &.{.{ .key = "public-row", .value = "{}" }} });
+                }
+                const post_seed_capture = try std.fs.path.join(scratch, &.{ parent_absolute, "post-seed-capture" });
+                var reseed = try standby.prepareDefaultHASeedSnapshot(alloc, .{ .capture_root = post_seed_capture, .generation = "post-seed-owner-reseed" });
+                defer reseed.deinit(alloc);
+                try DataServer.validateHASeedPreparedSnapshot(alloc, post_seed_capture, "post-seed-owner-reseed", reseed.root);
+                const reseed_topology_path = try std.fs.path.join(scratch, &.{ reseed.root, antfly.hot_standby.seed_materialization.topology_name });
+                const reseed_topology_bytes = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), reseed_topology_path, scratch, .limited(antfly.hot_standby.seed_materialization.max_topology_bytes));
+                var reseed_topology = try std.json.parseFromSlice(antfly.hot_standby.seed_materialization.Topology, alloc, reseed_topology_bytes, .{});
+                defer reseed_topology.deinit();
+                try std.testing.expectEqual(@as(usize, 1), reseed_topology.value.catalog.tables.len);
+                try std.testing.expectEqual(@as(usize, 1), reseed_topology.value.native_restore_owners.len);
+                try std.testing.expectEqual(@as(usize, 2), reseed_topology.value.replicas.len);
+                try std.testing.expectEqualSlices(u8, &active_descriptor.scope.digest(), &reseed_topology.value.native_restore_owners[0].scope.digest());
+                try std.testing.expect(reseed_topology.value.restore_terminals != null);
+                const reseed_absolute = try std.Io.Dir.cwd().realPathFileAlloc(io_impl.io(), reseed.root, scratch);
+                var corrupt_topology = reseed_topology.value;
+                corrupt_topology.restore_terminals.?.sha256 = "0" ** 64;
+                try std.testing.expectError(error.SeedLogicalDigestMismatch, antfly.hot_standby.seed_materialization.validateTopology(alloc, io_impl.io(), reseed_absolute, "post-seed-owner-reseed", corrupt_topology));
+                const reseed_live = try std.fs.path.join(scratch, &.{ parent_absolute, "materialized-reseed-owner" });
+                var reseeded = try antfly.hot_standby.seed_materialization.materialize(alloc, .{
+                    .io = io_impl.io(),
+                    .raw_generation_root = reseed_absolute,
+                    .live_installing_root = reseed_live,
+                    .generation = "post-seed-owner-reseed",
+                    .target_local_node_id = 1,
+                    .seed_receipt_sha256 = "a" ** 64,
+                    .capture_receipt_sha256 = "b" ** 64,
+                    .raw_manifest_sha256 = "c" ** 64,
+                    .raw_aggregate_sha256 = "d" ** 64,
+                });
+                defer reseeded.deinit(alloc);
+                const registry_root = try std.fs.path.join(scratch, &.{ reseed_live, "metadata" });
+                var registry = try @import("../storage/hot_standby/restore_owner_registry.zig").load(alloc, io_impl.io(), registry_root);
+                defer registry.deinit();
+                try std.testing.expectEqual(@as(usize, 1), registry.owners.len);
+                const registry_codec = @import("../storage/hot_standby/restore_owner_registry.zig");
+                var another_owner = registry.owners[0];
+                another_owner.scope.target_namespace.shard_id = 100;
+                another_owner.scope.target_namespace.range_id = 100;
+                const compact_owners = try registry_codec.compact(scratch, &.{ registry.owners[0], another_owner });
+                try std.testing.expectEqual(@as(usize, 1), compact_owners.tables.len);
+                try std.testing.expectEqual(@as(usize, 2), compact_owners.owners.len);
+                const expanded_owners = try registry_codec.expand(scratch, compact_owners.tables, compact_owners.owners);
+                try std.testing.expectEqualSlices(u8, &another_owner.scope.digest(), &expanded_owners[1].scope.digest());
+                try std.testing.expect(expanded_owners[0].schema_json.ptr == expanded_owners[1].schema_json.ptr);
+                try std.testing.expectError(error.RestoreStagingScopeChanged, registry_codec.expand(scratch, &.{}, compact_owners.owners));
+                try std.testing.expectError(error.InvalidRestoreStagingRecord, registry_codec.expand(scratch, compact_owners.tables, &.{}));
+                const reseeded_catalog_path = try std.fs.path.join(scratch, &.{ reseed_live, "data/catalog.txt" });
+                {
+                    var raft_catalog = try antfly.raft.FileReplicaCatalog.init(alloc, reseeded_catalog_path);
+                    defer raft_catalog.deinit();
+                    const membership = try raft_catalog.catalog().listReplicas(alloc);
+                    defer {
+                        for (membership) |*member| member.deinit(alloc);
+                        alloc.free(membership);
+                    }
+                    try std.testing.expectEqual(@as(usize, 1), membership.len);
+                    try std.testing.expectEqual(@as(u64, 77), membership[0].group_id);
+                }
+                {
+                    const next_replica_root = try std.fs.path.join(scratch, &.{ reseed_live, "data/replicas" });
+                    var next_standby = DataServer.initFromLocalMetadataSources(alloc, .{ .replica_root_dir = next_replica_root, .replica_catalog_path = reseeded_catalog_path, .api_server_cfg = .{ .deployment_mode = .standalone }, .ha = .{ .restore_owner_metadata_root = registry_root } }, FakeMetadata.catalogSource(), FakeMetadata.statusSource());
+                    defer next_standby.deinit();
+                    const next_capture = try std.fs.path.join(scratch, &.{ parent_absolute, "next-offline-capture" });
+                    var next_seed = try next_standby.prepareDefaultHASeedSnapshot(alloc, .{ .capture_root = next_capture, .generation = "second-offline-reseed" });
+                    defer next_seed.deinit(alloc);
+                    // Terminal replay needs neither source schema nor a retained DB.
+                    try next_standby.applyHAReplicationRecord(cancel_record);
+                    try std.testing.expectError(error.RestoreStagingCanceled, next_standby.applyHAReplicationRecord(begin_record));
+                    var wrong_cancel = cancel_record;
+                    wrong_cancel.payload = try antfly.hot_standby.effects.encodeBatchMutationRequestAlloc(scratch, .{ .restore_staging = .{ .finish = .{ .scope = active_descriptor.scope.digest(), .phase = .canceled } } });
+                    try std.testing.expectError(error.RestoreStagingScopeChanged, next_standby.applyHAReplicationRecord(wrong_cancel));
+                    wrong_cancel.payload = try antfly.hot_standby.effects.encodeBatchMutationRequestAlloc(scratch, .{ .writes = &.{.{ .key = "resurrect", .value = "{}" }}, .restore_staging = .{ .finish = .{ .scope = scope.digest(), .phase = .canceled } } });
+                    try std.testing.expectError(error.InvalidBatchRequest, next_standby.applyHAReplicationRecord(wrong_cancel));
+                    var terminal_view = try (try next_standby.haRestoreTerminalLedger()).snapshot();
+                    defer terminal_view.deinit();
+                    const canceled = (try terminal_view.get(88)).?;
+                    try std.testing.expectEqualSlices(u8, &scope.digest(), &canceled.scope);
+                    try std.testing.expectEqual(@as(u64, 2), canceled.lsn);
+                    var corrupt_terminal = try canceled.encode();
+                    corrupt_terminal[80] ^= 1;
+                    try std.testing.expectError(error.InvalidRestoreTerminal, @import("../storage/hot_standby/restore_terminal_ledger.zig").Terminal.decode(&corrupt_terminal));
+                }
+                const reseeded_path = try std.fs.path.join(scratch, &.{ reseed_live, "data/replicas/group-88/table-db" });
+                try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io_impl.io(), reseeded_path, .{}));
+                // Once the contiguous applied prefix is durable and the canceled root
+                // is physically retired, replace its indexed proof with one floor.
+                const floor_anchor = try std.fs.path.join(scratch, &.{ parent_absolute, "terminal-floor-anchor" });
+                standby.ha_cfg.seed_activation_root = floor_anchor;
+                try standby.reclaimHATerminals(.{ .cluster_id = active_begin.cluster_id, .table_id = 0, .shard_id = 0, .timeline_id = active_begin.timeline_id, .epoch = active_begin.epoch }, active_begin.lsn);
+                {
+                    var compacted = try (try standby.haRestoreTerminalLedger()).snapshot();
+                    defer compacted.deinit();
+                    try std.testing.expect(try compacted.get(88) == null);
+                    try std.testing.expectEqual(active_begin.lsn, (try compacted.floor()).?.lsn);
+                }
+                try std.testing.expectError(error.HAReplayBelowReclamationFloor, standby.applyHAReplicationRecord(begin_record));
+                try std.testing.expectError(error.HAReplayBelowReclamationFloor, standby.applyHAReplicationRecord(cancel_record));
+                const floor_seed_root = try std.fs.path.join(scratch, &.{ parent_absolute, "floor-seed-capture" });
+                var floor_seed = try standby.prepareDefaultHASeedSnapshot(alloc, .{ .capture_root = floor_seed_root, .generation = "terminal-floor-seed" });
+                defer floor_seed.deinit(alloc);
+                const floor_live = try std.fs.path.join(scratch, &.{ parent_absolute, "terminal-floor-live" });
+                var floor_materialized = try antfly.hot_standby.seed_materialization.materialize(alloc, .{ .io = io_impl.io(), .raw_generation_root = floor_seed.root, .live_installing_root = floor_live, .generation = "terminal-floor-seed", .target_local_node_id = 1, .seed_receipt_sha256 = "a" ** 64, .capture_receipt_sha256 = "b" ** 64, .raw_manifest_sha256 = "c" ** 64, .raw_aggregate_sha256 = "d" ** 64 });
+                defer floor_materialized.deinit(alloc);
+                const floor_metadata = try std.fs.path.join(scratch, &.{ floor_live, "metadata" });
+                var imported_floor_ledger = try @import("../storage/hot_standby/restore_terminal_ledger.zig").Ledger.open(alloc, io_impl.io(), floor_metadata);
+                defer imported_floor_ledger.deinit();
+                var imported_floor = try imported_floor_ledger.snapshot();
+                defer imported_floor.deinit();
+                try std.testing.expect(try imported_floor.get(88) == null);
+                try std.testing.expectError(error.HAReplayBelowReclamationFloor, imported_floor.requireReplay(begin_record));
+
+                const published_tables: []const antfly.metadata.TableRecord = &.{.{ .table_id = 9, .name = "active-hidden", .schema_json = "{}" }};
+                const split_ranges: []const antfly.metadata.RangeRecord = &.{.{ .table_id = 9, .group_id = 100, .range_id = 100, .start_key = "" }};
+                const retired_projection = try @import("../storage/hot_standby/restore_owner_registry.zig").project(scratch, registry.owners, published_tables, published_tables, split_ranges);
+                try std.testing.expectEqual(@as(usize, 0), retired_projection.owners.len);
+                var reclaimed = try @import("../storage/hot_standby/restore_owner_registry.zig").loadWithPublicTables(alloc, io_impl.io(), registry_root, published_tables);
+                defer reclaimed.deinit();
+                try std.testing.expectEqual(@as(usize, 0), reclaimed.owners.len);
+                var after_reclaim = try @import("../storage/hot_standby/restore_owner_registry.zig").load(alloc, io_impl.io(), registry_root);
+                defer after_reclaim.deinit();
+                try std.testing.expectEqual(@as(usize, 0), after_reclaim.owners.len);
+
+                // A fresh standalone instance can contain only a private restore, or
+                // no tables at all. Its full metadata checkpoint is still meaningful.
+                try source_metadata.replaceStandaloneCatalog(metadata_group, try source_metadata.standaloneRevision(), &.{}, &.{}, "{}");
+                const empty_metadata_root = try std.fs.path.join(scratch, &.{ fixture_root, "empty-metadata" });
+                var empty_metadata = try antfly.metadata.RaftApplyStore.init(alloc, .{ .root_dir = empty_metadata_root });
+                defer empty_metadata.deinit();
+                try empty_metadata.replaceStandaloneCatalog(metadata_group, 0, &.{}, &.{}, "{}");
+                FakeMetadata.include_public = false;
+                defer FakeMetadata.include_public = true;
+                defer FakeMetadata.epoch = 7;
+                const old_port = standalone.status_source.standalone_hot_standby;
+                defer standalone.status_source.standalone_hot_standby = old_port;
+                for ([_]bool{ true, false }) |has_private| {
+                    const checkpoint_store = if (has_private) &source_metadata else &empty_metadata;
+                    FakeMetadata.epoch = try checkpoint_store.standaloneRevision();
+                    standalone.status_source.standalone_hot_standby.?.ptr = checkpoint_store;
+                    try standalone.prepareDefaultHASeedSnapshotMaintenance();
+                    const generation = if (has_private) "private-only-metadata-seed" else "empty-metadata-seed";
+                    var empty_seed = try standalone.prepareDefaultHASeedSnapshot(alloc, .{ .capture_root = capture_absolute, .generation = generation });
+                    defer empty_seed.deinit(alloc);
+                    try DataServer.validateHASeedPreparedSnapshot(alloc, capture_absolute, generation, empty_seed.root);
+                    const empty_topology_path = try std.fs.path.join(scratch, &.{ empty_seed.root, ha_seed_snapshot_topology_name });
+                    const empty_topology_bytes = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), empty_topology_path, scratch, .limited(antfly.hot_standby.seed_materialization.max_topology_bytes));
+                    var parsed_topology = try std.json.parseFromSlice(HASeedSnapshotTopology, alloc, empty_topology_bytes, .{});
+                    defer parsed_topology.deinit();
+                    try std.testing.expectEqual(@as(usize, 0), parsed_topology.value.catalog.tables.len);
+                    try std.testing.expectEqual(@as(usize, if (has_private) 1 else 0), parsed_topology.value.replicas.len);
+                    var legacy_empty = parsed_topology.value;
+                    legacy_empty.standalone_metadata = null;
+                    try std.testing.expectError(error.InvalidSeedTopology, antfly.hot_standby.seed_materialization.validateTopology(alloc, io_impl.io(), empty_seed.root, generation, legacy_empty));
+                    const empty_live = try std.fs.path.join(scratch, &.{ parent_absolute, generation });
+                    var empty_materialized = try antfly.hot_standby.seed_materialization.materialize(alloc, .{ .io = io_impl.io(), .raw_generation_root = empty_seed.root, .live_installing_root = empty_live, .generation = generation, .target_local_node_id = 1, .seed_receipt_sha256 = "a" ** 64, .capture_receipt_sha256 = "b" ** 64, .raw_manifest_sha256 = "c" ** 64, .raw_aggregate_sha256 = "d" ** 64 });
+                    defer empty_materialized.deinit(alloc);
+                    const empty_imported_path = try std.fs.path.join(scratch, &.{ empty_live, "metadata/local-state" });
+                    var empty_imported = try antfly.metadata.RaftApplyStore.init(alloc, .{ .root_dir = empty_imported_path });
+                    defer empty_imported.deinit();
+                    try std.testing.expectEqual(FakeMetadata.epoch, try empty_imported.standaloneRevision());
+                    var empty_projection = try empty_imported.captureProvisioningCatalog(alloc, metadata_group);
+                    defer empty_projection.deinit(alloc);
+                    try std.testing.expectEqual(@as(usize, if (has_private) 1 else 0), empty_projection.jobs_json.len);
+                }
+            }
+
+            var distributed = DataServer.initFromLocalMetadataSources(alloc, .{
+                .replica_root_dir = replica_root,
+                .replica_catalog_path = replica_catalog_path,
+                .api_server_cfg = .{ .deployment_mode = .distributed },
+            }, FakeMetadata.catalogSource(), FakeMetadata.statusSource());
+            defer distributed.deinit();
+            try std.testing.expectError(error.HASeedSnapshotEmptyCatalog, distributed.prepareDefaultHASeedSnapshot(alloc, .{
+                .capture_root = capture_root,
+                .generation = "distributed-empty-catalog",
+            }));
+        }
+
+        test "data runtime guarded completed copy receipt requires exact current authority" {
+            const Receipt = @import("../storage/db/merge_contract.zig").CopyReceipt;
+            const namespace: antfly.db.DocIdentityNamespace = .{ .table_id = 7, .shard_id = 74, .range_id = 741 };
+            const contract: antfly.metadata.TransitionTableContract = .{
+                .table_id = 7,
+                .table_name = "docs",
+                .indexes_json = "{}",
+                .source_identity = .{ .shard_id = 73, .range_id = 731 },
+                .target_identity = .{ .shard_id = 74, .range_id = 741 },
+            };
+            const receipt: Receipt = .{ .namespace = namespace, .row_derived_document = true, .range = .{ .start = "a", .end = "z" }, .state = .{
+                .transition_id = 9002,
+                .donor_group_id = 73,
+                .receiver_group_id = 74,
+                .phase = .accepting,
+                .receiver_base_range = .{ .start = "m", .end = "z" },
+                .merged_range = .{ .start = "a", .end = "z" },
+                .bootstrap_complete = true,
+                .bootstrap_applied_index = 19,
+                .copy_attempt = .{ .donor_term = 3, .sequence = 2 },
+                .allow_doc_identity_reassignment = true,
+                .receiver_identity_reassignment_namespace = namespace,
+            } };
+            const Check = struct {
+                fn matches(value: Receipt, expected_contract: antfly.metadata.TransitionTableContract) bool {
+                    return DataServer.guardedMergeCopyReceiptMatches(value, 9002, 73, 74, .{ .start = "a", .end = "m" }, 19, 3, .{ .donor_term = 3, .sequence = 2 }, true, expected_contract);
+                }
+            };
+            try std.testing.expect(Check.matches(receipt, contract));
+            var wrong = receipt;
+            wrong.row_derived_document = false;
+            try std.testing.expect(!Check.matches(wrong, contract));
+            wrong = receipt;
+            wrong.state = null;
+            try std.testing.expect(!Check.matches(wrong, contract));
+            inline for (.{ "transition_id", "donor_group_id", "receiver_group_id", "bootstrap_applied_index" }) |field| {
+                for ([_]u64{ 0, 999 }) |value| {
+                    wrong = receipt;
+                    @field(wrong.state.?, field) = value;
+                    try std.testing.expect(!Check.matches(wrong, contract));
+                }
+            }
+            for ([_]u64{ 0, 1, 3 }) |sequence| {
+                wrong = receipt;
+                wrong.state.?.copy_attempt.sequence = sequence;
+                try std.testing.expect(!Check.matches(wrong, contract));
+            }
+            for ([_]u64{ 0, 2, 4 }) |term| {
+                wrong = receipt;
+                wrong.state.?.copy_attempt.donor_term = term;
+                try std.testing.expect(!Check.matches(wrong, contract));
+            }
+            inline for (.{ .finalized, .rolling_back, .rolled_back }) |phase| {
+                wrong = receipt;
+                wrong.state.?.phase = phase;
+                try std.testing.expect(!Check.matches(wrong, contract));
+            }
+            wrong = receipt;
+            wrong.state.?.bootstrap_complete = false;
+            try std.testing.expect(!Check.matches(wrong, contract));
+            wrong = receipt;
+            wrong.namespace.range_id += 1;
+            try std.testing.expect(!Check.matches(wrong, contract));
+            wrong = receipt;
+            wrong.state.?.receiver_identity_reassignment_namespace = null;
+            try std.testing.expect(!Check.matches(wrong, contract));
+            wrong = receipt;
+            wrong.state.?.receiver_base_range.start = "n";
+            try std.testing.expect(!Check.matches(wrong, contract));
+            wrong = receipt;
+            wrong.state.?.merged_range.?.end = "y";
+            try std.testing.expect(!Check.matches(wrong, contract));
+            wrong = receipt;
+            wrong.range = receipt.state.?.receiver_base_range;
+            try std.testing.expect(!Check.matches(wrong, contract));
+            wrong = receipt;
+            wrong.state.?.retired_transition_ids = &.{9002};
+            try std.testing.expect(!Check.matches(wrong, contract));
+        }
+
+        test "transition topology reads reject stale attempts and unrelated owners" {
+            const contract: antfly.metadata.TransitionTableContract = .{
+                .table_id = 7,
+                .table_name = "docs",
+                .indexes_json = "{}",
+                .source_identity = .{ .shard_id = 71, .range_id = 711 },
+                .target_identity = .{ .shard_id = 71, .range_id = 711 },
+            };
+            var splits = [_]antfly.metadata.SplitTransitionRecord{.{
+                .transition_id = 9001,
+                .attempt_epoch = 4,
+                .source_group_id = 71,
+                .destination_group_id = 72,
+                .table_contract = contract,
+            }};
+            var merges = [_]antfly.metadata.MergeTransitionRecord{.{
+                .transition_id = 9002,
+                .donor_group_id = 73,
+                .receiver_group_id = 74,
+                .table_contract = contract,
+            }};
+            const snapshot: antfly.metadata_api.AdminSnapshot = .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = &.{},
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &splits,
+                .merge_transitions = &merges,
+            };
+            const Request = @import("../raft/shard_ops.zig").TopologyReadRequest;
+            const split: Request = .{ .transition_id = 9001, .attempt_epoch = 4, .mode = .status };
+            const source = try DataServer.resolveTransitionTopologyRead(snapshot, 71, "docs", split);
+            const target = try DataServer.resolveTransitionTopologyRead(snapshot, 72, "docs", split);
+            try std.testing.expectEqual(TransitionIdentityRole.source, source.role);
+            try std.testing.expectEqual(TransitionIdentityRole.target, target.role);
+            try std.testing.expect(target.contract.eql(contract));
+            try std.testing.expectError(error.TopologyChanged, DataServer.resolveTransitionTopologyRead(snapshot, 73, "docs", split));
+            try std.testing.expectError(error.TopologyChanged, DataServer.resolveTransitionTopologyRead(snapshot, 72, "another-table", split));
+            var stale = split;
+            stale.attempt_epoch -= 1;
+            try std.testing.expectError(error.TopologyChanged, DataServer.resolveTransitionTopologyRead(snapshot, 72, "docs", stale));
+            stale = split;
+            stale.transition_id = 9999;
+            try std.testing.expectError(error.TopologyChanged, DataServer.resolveTransitionTopologyRead(snapshot, 72, "docs", stale));
+            const merge: Request = .{ .transition_id = 9002, .attempt_epoch = 1, .mode = .merge_copy_receipt };
+            try std.testing.expectEqual(TransitionIdentityRole.source, (try DataServer.resolveTransitionTopologyRead(snapshot, 73, "docs", merge)).role);
+            try std.testing.expectEqual(TransitionIdentityRole.target, (try DataServer.resolveTransitionTopologyRead(snapshot, 74, "docs", merge)).role);
+            stale = merge;
+            stale.attempt_epoch = 2;
+            try std.testing.expectError(error.TopologyChanged, DataServer.resolveTransitionTopologyRead(snapshot, 74, "docs", stale));
+            try std.testing.expectError(error.TopologyChanged, DataServer.resolveTransitionTopologyRead(snapshot, 71, "docs", merge));
+            try std.testing.expectError(error.TopologyChanged, DataServer.resolveTransitionTopologyRead(snapshot, 74, "another-table", merge));
+        }
+
+        test "three production DataServers preserve UNIQUE FK ownership across quiesced merge split restart on VoprIo" {
+            var trace: std.ArrayListUnmanaged(MultiOwnerReplayStep) = .empty;
+            defer trace.deinit(std.testing.allocator);
+            try runThreeDataServerReplicatedTransitionVoprHistory(true, std.testing.allocator, null, &trace);
+        }
+
+        test "data runtime coordinated ttl admission never reenters cache and drains with its owner" {
+            const alloc = std.testing.allocator;
+            var runtime = try backend_runtime_mod.BackendRuntime.init(alloc, .{ .backend = .manual, .borrowed_io = .{ .general = std.testing.io } });
+            defer runtime.deinit();
+            const original_lane = runtime.durable_jobs;
+            defer runtime.durable_jobs = original_lane;
+            const Lane = struct {
+                pending: ?backend_runtime_mod.Job = null,
+                drained: usize = 0,
+                fn submit(ptr: *anyopaque, job: backend_runtime_mod.Job) !void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    if (self.pending != null) return error.ConcurrencyUnavailable;
+                    self.pending = job;
+                }
+                fn drain(ptr: *anyopaque, _: u64) void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    const job = self.pending orelse return;
+                    self.pending = null;
+                    job.run(job.ptr) catch @panic("canceled TTL job must drain");
+                    job.deinit(job.ptr);
+                    self.drained += 1;
+                }
+                fn poll(_: *anyopaque, _: usize) !usize {
+                    return 0;
+                }
+            };
+            var lane: Lane = .{};
+            var cache = antfly.public_api.ProvisionedTableWriteCache.init(alloc);
+            defer cache.deinit();
+            var server: DataServer = .{
+                .alloc = alloc,
+                .backend_runtime = &runtime,
+                .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+                .read_source = antfly.public_api.ProvisionedTableReadSource.init("/tmp/unused-ttl-admission", antfly.public_api.table_catalog.emptyCatalogSource(), antfly.raft.read_gate.alreadyReadSafeBarrier()),
+                .write_source = antfly.public_api.ProvisionedTableWriteSource.init("/tmp/unused-ttl-admission", antfly.public_api.table_catalog.emptyCatalogSource()),
+                .status_source = undefined,
+                .api_server_cfg = undefined,
+                .query_async_limit = .nothing,
+                .listener_cfg = undefined,
+            };
+            defer server.deinit();
+            server.write_source.write_cache = &cache;
+            var key = [_]u8{ 'r', 0, 'x' };
+            const request: antfly.db.coordinated_ttl.Request = .{
+                .table_id = 17,
+                .group_id = 171,
+                .schema_version = 1,
+                .ttl_duration_ns = 1,
+                .ttl_field = "expires",
+                .observed_at_unix_ns = 100,
+                .grace_period_ns = 0,
+                .candidates = &.{
+                    .{ .key = &key, .row_version = 1, .ttl_timestamp_ns = 1, .expected_content_digest = @splat(3) },
+                    .{ .key = "tail", .row_version = 1, .ttl_timestamp_ns = 1, .expected_content_digest = @splat(4) },
+                },
+            };
+            try std.testing.expectError(error.CoordinatedTtlBackpressure, DataServer.expireRelationalRows(&server, request));
+            try std.testing.expectEqual(@as(usize, 0), server.relational_ttl_queue.jobs);
+            runtime.durable_jobs = .{ .ptr = &lane, .vtable = &.{ .submit = Lane.submit, .drain_owner = Lane.drain, .close_owner = Lane.drain, .poll = Lane.poll } };
+            {
+                lockAtomic(&cache.open_mutex);
+                defer cache.open_mutex.unlock();
+                try std.testing.expectEqual(@as(u32, 0), try DataServer.expireRelationalRows(&server, request));
+                try std.testing.expectError(error.CoordinatedTtlBackpressure, DataServer.expireRelationalRows(&server, request));
+            }
+            try std.testing.expectEqual(@as(usize, 1), server.relational_ttl_queue.jobs);
+            key[0] = 'z';
+            const queued: *DataServer.RelationalTtlJob = @ptrCast(@alignCast(lane.pending.?.ptr));
+            try std.testing.expectEqualStrings("r\x00x", queued.observation.?.request.candidates[0].key);
+            queued.next_candidate = 1;
+            const observation = queued.observation.?;
+            // Saturation leaves both the owned page and its accepted progress intact.
+            try std.testing.expect(!DataServer.submitRelationalTtlSuccessor(queued, &runtime, server.background_jobs_owner_id));
+            try std.testing.expectEqual(observation, queued.observation.?);
+            try std.testing.expectEqual(@as(usize, 1), queued.next_candidate);
+            const previous = lane.pending.?;
+            lane.pending = null;
+            try std.testing.expect(DataServer.submitRelationalTtlSuccessor(queued, &runtime, server.background_jobs_owner_id));
+            try std.testing.expect(queued.observation == null);
+            const successor: *DataServer.RelationalTtlJob = @ptrCast(@alignCast(lane.pending.?.ptr));
+            try std.testing.expectEqual(observation, successor.observation.?);
+            try std.testing.expectEqual(@as(usize, 1), successor.next_candidate);
+            previous.deinit(previous.ptr);
+            try std.testing.expectEqual(@as(usize, 1), server.relational_ttl_queue.jobs);
+            try cache.closeAllDbsLocked();
+            server.stopDataServerBackgroundJobs();
+            try std.testing.expectEqual(@as(usize, 1), lane.drained);
+            try std.testing.expectEqual(@as(usize, 0), server.relational_ttl_queue.jobs);
+            try std.testing.expectEqual(@as(u64, 0), server.relational_ttl_expired.load(.acquire));
+            try std.testing.expectError(error.Canceled, DataServer.expireRelationalRows(&server, request));
+        }
+
+        test "storage.hot_standby standalone metadata dispatch precedes routing and promotion binds under transition lock" {
+            const metadata_port = @import("../api/standalone_hot_standby.zig");
+            const Probe = struct {
+                applied: usize = 0,
+                bound: usize = 0,
+                prepared: usize = 0,
+                preparation_error: ?anyerror = null,
+                transition: ?*std.atomic.Mutex = null,
+
+                fn admin(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+                    return error.UnexpectedCatalogLookup;
+                }
+                fn freeAdmin(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+                fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
+                    return error.UnexpectedCatalogLookup;
+                }
+                fn bind(ptr: *anyopaque, gate: ?antfly.db.HAWriteGate, mirror: ?antfly.db.HAAsyncEffectMirror) !void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expect(gate != null);
+                    try std.testing.expect(mirror != null);
+                    try std.testing.expect(mirror.?.transition_mutex == self.transition.?);
+                    // The real promotion callback owns this mutex already. Binding
+                    // is configuration only; appending/draining here would deadlock.
+                    if (self.transition.?.tryLock()) {
+                        self.transition.?.unlock();
+                        return error.TestUnexpectedResult;
+                    }
+                    self.bound += 1;
+                }
+                fn apply(ptr: *anyopaque, record: antfly.hot_standby.replication_record.RecordView) !void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqual(.metadata_mutation, record.kind);
+                    try std.testing.expectEqual(@as(u64, 0), record.table_id);
+                    try std.testing.expectEqualStrings("metadata-effects", record.payload);
+                    self.applied += 1;
+                }
+                fn capture(_: *anyopaque, _: std.Io, _: []const u8) !metadata_port.Checkpoint {
+                    return error.TestUnexpectedResult;
+                }
+                fn prepare(ptr: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.prepared += 1;
+                    if (self.preparation_error) |err| return err;
+                }
+                fn private(_: *anyopaque, _: std.mem.Allocator, _: u64) !?std.json.Parsed(@import("../metadata/restore_staging.zig").ProvisioningProjection) {
+                    return error.TestUnexpectedResult;
+                }
+            };
+            var probe: Probe = .{};
+            const port: metadata_port.Port = .{ .ptr = &probe, .vtable = &.{ .bind_mirror = Probe.bind, .prepare_checkpoint = Probe.prepare, .apply_record = Probe.apply, .capture_checkpoint = Probe.capture, .capture_private = Probe.private } };
+            var server = DataServer.initFromLocalMetadataSources(std.testing.allocator, .{ .replica_root_dir = "unused-metadata-port", .replica_catalog_path = "unused-metadata-port-catalog" }, .{ .ptr = &probe, .vtable = &.{ .admin_snapshot = Probe.admin, .free_admin_snapshot = Probe.freeAdmin } }, .{ .ptr = &probe, .vtable = &.{ .status = Probe.status }, .standalone_hot_standby = port });
+            defer server.deinit();
+            const record: antfly.hot_standby.replication_record.RecordView = .{ .kind = .metadata_mutation, .payload_codec = .json, .cluster_id = 1, .table_id = 0, .shard_id = 0, .timeline_id = 1, .epoch = 1, .lsn = 1, .previous_lsn = 0, .payload = "metadata-effects" };
+            try server.applyHAReplicationRecord(record);
+            try std.testing.expectEqual(@as(usize, 1), probe.applied);
+            var binary_record = record;
+            binary_record.payload_codec = .binary;
+            try server.applyHAReplicationRecord(binary_record);
+            try std.testing.expectEqual(@as(usize, 2), probe.applied);
+            server.status_source.standalone_hot_standby = null;
+            try std.testing.expectError(error.HAMetadataAuthorityUnavailable, server.applyHAReplicationRecord(record));
+            server.status_source.standalone_hot_standby = port;
+            probe.preparation_error = error.HASyncCommitWouldBlock;
+            try DataServer.prepareStandaloneMetadataStartup(port);
+            try std.testing.expectEqual(@as(usize, 1), probe.prepared);
+            // Seed preparation cannot borrow startup's availability exception.
+            try std.testing.expectError(error.HASyncCommitWouldBlock, server.prepareDefaultHASeedSnapshotMaintenance());
+            probe.preparation_error = error.InvalidMetadataHAEffectChunk;
+            try std.testing.expectError(error.InvalidMetadataHAEffectChunk, DataServer.prepareStandaloneMetadataStartup(port));
+            probe.preparation_error = null;
+            try DataServer.prepareStandaloneMetadataStartup(port);
+            try std.testing.expectEqual(@as(usize, 4), probe.prepared);
+            var primary: antfly.hot_standby.primary.Primary = undefined;
+            server.ha_cfg.admin_context = .{ .primary = &primary };
+            defer server.ha_cfg.admin_context = null;
+            probe.transition = &server.ha_state_mutex;
+            lockAtomic(&server.ha_state_mutex);
+            defer server.ha_state_mutex.unlock();
+            try server.rewireHAPromotionMirrors();
+            try std.testing.expectEqual(@as(usize, 1), probe.bound);
+            try std.testing.expect(server.write_source.ha_async_mirror.?.primary == &primary);
+        }
+
+        test "data runtime private cancel proof recovers a restarted native terminal owner" {
+            const alloc = std.testing.allocator;
+            const staging = @import("../metadata/restore_staging.zig");
+            const native = @import("../storage/db/restore_staging.zig");
+            const private = @import("private_provisioning.zig");
+            const metadata_group = @import("../common/group_ids.zig").main_metadata_group_id;
+            const Probe = struct {
+                fn admin(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+                    return error.UnexpectedPublicCatalogLookup;
+                }
+                fn freeAdmin(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+                fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
+                    return error.UnexpectedPublicCatalogLookup;
+                }
+                fn server(allocator: std.mem.Allocator, root: []const u8) DataServer {
+                    return DataServer.initFromLocalMetadataSources(allocator, .{ .replica_root_dir = root }, .{ .ptr = undefined, .vtable = &.{ .admin_snapshot = admin, .free_admin_snapshot = freeAdmin } }, .{ .ptr = undefined, .vtable = &.{ .status = status } });
+                }
+            };
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const scratch = arena.allocator();
+            const root = try std.fmt.allocPrint(scratch, ".zig-cache/tmp/{s}/private-cancel", .{tmp.sub_path});
+            const metadata_root = try std.fs.path.join(scratch, &.{ root, "metadata" });
+            const replica_root = try std.fs.path.join(scratch, &.{ root, "replicas" });
+            var metadata = try antfly.metadata.RaftApplyStore.init(alloc, .{ .root_dir = metadata_root });
+            defer metadata.deinit();
+            const target: staging.Target = .{
+                .source_table_id = 1,
+                .table = .{ .table_id = 11, .name = "hidden-cancel", .schema_json = "{}" },
+                .ranges = &.{.{ .table_id = 11, .group_id = 701, .range_id = 701, .doc_identity_shard_id = 701, .doc_identity_range_id = 701, .start_key = "" }},
+                .source_artifacts = &.{.{ .target_group_id = 701, .source_namespace = .{ .table_id = 1, .shard_id = 1, .range_id = 1 }, .format = .native, .snapshot_path = "source", .artifact_size_bytes = 1, .artifact_sha256 = @splat(3) }},
+            };
+            const plan: staging.Plan = .{ .id = @splat(7), .cohort_digest = @splat(9), .targets = &.{target} };
+            const reserve = try std.json.Stringify.valueAlloc(scratch, staging.Command{ .id = plan.id, .action = .reserve, .plan = plan }, .{});
+            try metadata.applyStandaloneCommand(metadata_group, .{ .apply_restore_staging = reserve });
+            var before = try metadata.captureProvisioningCatalog(alloc, metadata_group);
+            defer before.deinit(alloc);
+            const initial = (try private.validate(scratch, &.{}, &.{}, before))[0];
+            try std.testing.expect(!initial.cancel_recovery);
+            {
+                var server = Probe.server(alloc, replica_root);
+                defer server.deinit();
+                server.write_source.write_cache = &server.provisioned_storage.write_cache;
+                try server.primePrivateRestoreOwner(&server.write_source, initial);
+                var writer = server.write_source.leaseManagedWriterGroupForTransition(701).?;
+                defer writer.deinit(alloc);
+                _ = try writer.db.finishRestoreStaging(alloc, initial.scope.digest(), .canceled);
+            }
+            // Native cancellation committed, but no owner receipt was acknowledged.
+            // Recover from independently durable metadata progress after process loss.
+            const cancel = try std.json.Stringify.valueAlloc(scratch, staging.Command{ .id = plan.id, .expected_revision = 1, .action = .begin_cancel }, .{});
+            try metadata.applyStandaloneCommand(metadata_group, .{ .apply_restore_staging = cancel });
+            var after = try metadata.captureProvisioningCatalog(alloc, metadata_group);
+            defer after.deinit(alloc);
+            const recovery = (try private.validate(scratch, &.{}, &.{}, after))[0];
+            try std.testing.expect(recovery.cancel_recovery);
+            try std.testing.expectEqualSlices(u8, &initial.scope.digest(), &recovery.scope.digest());
+            {
+                var restarted = Probe.server(alloc, replica_root);
+                defer restarted.deinit();
+                restarted.write_source.write_cache = &restarted.provisioned_storage.write_cache;
+                try std.testing.expectError(error.RestoreStagingScopeChanged, restarted.primePrivateRestoreOwner(&restarted.write_source, initial));
+                var wrong_scope = recovery;
+                wrong_scope.scope.source_artifact_digest[0] ^= 1;
+                try std.testing.expectError(error.RestoreStagingScopeChanged, restarted.primePrivateRestoreOwner(&restarted.write_source, wrong_scope));
+                try restarted.primePrivateRestoreOwner(&restarted.write_source, recovery);
+                var writer = restarted.write_source.leaseManagedWriterGroupForTransition(701).?;
+                defer writer.deinit(alloc);
+                var terminal = (try writer.db.restoreStagingStatus(alloc)).?;
+                defer terminal.deinit();
+                try std.testing.expectEqual(.canceled, terminal.value.phase);
+                try std.testing.expectError(error.RestoreStagingCanceled, writer.db.batch(.{ .writes = &.{.{ .key = "forbidden", .value = "{}" }} }));
+                _ = try writer.db.finishRestoreStaging(alloc, recovery.scope.digest(), .canceled);
+                const canceled_snapshot = try std.fs.path.join(scratch, &.{ root, "canceled-owner-seed" });
+                try restarted.write_source.captureHASeedHiddenReplicaSnapshot(alloc, recovery.table.name, 701, recovery.scope.digest(), "canceled-owner", canceled_snapshot);
+            }
+            // A cancellation capability is not HA's broader terminal replay mode.
+            // Seed a durable published marker and verify the cold-open path rejects it.
+            const db_path = try antfly.metadata.groupDbPathFromReplicaRoot(scratch, replica_root, 701);
+            {
+                var db = try antfly.db.DB.open(alloc, db_path, .{ .identity_namespace = recovery.scope.target_namespace, .start_index_workers = false, .start_optional_runtimes = false });
+                defer db.close();
+                const encoded = try (native.Progress{ .scope = recovery.scope, .phase = .published }).encode(scratch);
+                var txn = try db.core.store.beginWriteTxn();
+                var txn_open = true;
+                defer if (txn_open) txn.abort();
+                try txn.put(native.key, encoded);
+                try txn.commit();
+                txn_open = false;
+            }
+            var published = Probe.server(alloc, replica_root);
+            defer published.deinit();
+            published.write_source.write_cache = &published.provisioned_storage.write_cache;
+            try std.testing.expectError(error.RestoreStagingScopeChanged, published.primePrivateRestoreOwner(&published.write_source, recovery));
+        }
+
+        test "data runtime terminal floor anchor failure never publishes a partial ledger" {
+            const alloc = std.testing.allocator;
+            const io = std.testing.io;
+            const floor_mod = @import("../storage/hot_standby/replay_floor.zig");
+            const Probe = struct {
+                fn admin(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+                    return error.UnexpectedCatalogLookup;
+                }
+                fn freeAdmin(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+                fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
+                    return error.UnexpectedCatalogLookup;
+                }
+            };
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const scratch = arena.allocator();
+            const root = try tmp.dir.realPathFileAlloc(io, ".", scratch);
+            const replicas = try std.fs.path.join(scratch, &.{ root, "data/replicas" });
+            const anchor_root = try std.fs.path.join(scratch, &.{ root, "activation" });
+            const anchor_path = try std.fs.path.join(scratch, &.{ anchor_root, floor_mod.anchor_name });
+            try std.Io.Dir.cwd().createDirPath(io, anchor_root);
+            try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = anchor_path, .data = "corrupt" });
+            var server = DataServer.initFromLocalMetadataSources(alloc, .{ .replica_root_dir = replicas }, .{ .ptr = undefined, .vtable = &.{ .admin_snapshot = Probe.admin, .free_admin_snapshot = Probe.freeAdmin } }, .{ .ptr = undefined, .vtable = &.{ .status = Probe.status } });
+            defer server.deinit();
+            server.ha_cfg.seed_activation_root = anchor_root;
+            for (0..2) |_| {
+                try std.testing.expectError(error.InvalidHAReplayFloor, server.haRestoreTerminalLedger());
+                try std.testing.expect(server.restore_terminal_ledger == null);
+            }
+            const floor: floor_mod.Floor = .{ .cluster_id = 7, .timeline_id = 1, .epoch = 1, .lsn = 42 };
+            const bytes = try floor.encode();
+            try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = anchor_path, .data = &bytes });
+            var snapshot = try (try server.haRestoreTerminalLedger()).snapshot();
+            defer snapshot.deinit();
+            try std.testing.expectEqual(floor, (try snapshot.floor()).?);
+        }
+
         test "DataServer LSM maintenance yields with idle work and failed attempts beyond host uptime" {
             const vopr = @import("vopr");
             const alloc = std.testing.allocator;
@@ -45566,7 +49144,6 @@ fn implementationTests() type {
                 .generation = "distributed-empty-catalog",
             }));
         }
-
         test "data server wires configured HA executors into API server" {
             const alloc = std.testing.allocator;
             const FakeStatus = struct {
@@ -46216,6 +49793,8 @@ fn implementationTests() type {
                 "seed-standby-structural-busy-5",
                 capture_binding,
             ));
+            try std.testing.expect(primary.slot("standby-structural-busy") == null);
+            try std.testing.expect(!server.ha_seed_capture_active.load(.acquire));
             active_group_operation.deinit();
 
             server.lsm_maintenance_active.store(true, .release);
@@ -46227,6 +49806,8 @@ fn implementationTests() type {
                 "seed-standby-busy-6",
                 capture_binding,
             ));
+            try std.testing.expect(primary.slot("standby-busy") == null);
+            try std.testing.expect(!server.ha_seed_capture_active.load(.acquire));
             server.lsm_maintenance_active.store(false, .release);
 
             server.ha_cfg.seed_snapshot_provider = seed_snapshot_provider.iface();
@@ -46865,9 +50446,9 @@ fn implementationTests() type {
         test "three production DataServers compose replicated merge and split across public writes failover and restart on VoprIo" {
             var trace: std.ArrayListUnmanaged(MultiOwnerReplayStep) = .empty;
             defer trace.deinit(std.testing.allocator);
-            try runThreeDataServerReplicatedTransitionVoprHistory(std.testing.allocator, null, &trace);
+            try runThreeDataServerReplicatedTransitionVoprHistory(false, std.testing.allocator, null, &trace);
             try std.testing.expect(trace.items.len > 0);
-            try runThreeDataServerReplicatedTransitionVoprHistory(std.testing.allocator, trace.items, &trace);
+            try runThreeDataServerReplicatedTransitionVoprHistory(false, std.testing.allocator, trace.items, &trace);
         }
 
         test "data server mirrors managed primary writes into HA replication log" {

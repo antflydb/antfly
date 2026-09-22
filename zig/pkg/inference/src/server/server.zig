@@ -43,6 +43,7 @@ const model_manager_mod = @import("model_manager.zig");
 const embedding_trace = @import("../embedding_trace.zig");
 const model_caps = @import("../models/capabilities.zig");
 const manifest_mod = @import("../models/manifest.zig");
+const gliner_boundary_model = @import("../models/gliner_boundary.zig");
 const safetensors_mod = @import("../models/safetensors.zig");
 const gpt_model_mod = @import("../models/gpt.zig");
 const model_compatibility = @import("../models/compatibility.zig");
@@ -74,6 +75,7 @@ const streaming_transcription = @import("../pipelines/streaming_transcription.zi
 const dictation_mod = @import("../pipelines/dictation.zig");
 const vad_mod = @import("../pipelines/vad.zig");
 const silero_vad_mod = @import("../pipelines/silero_vad.zig");
+const speaker_embedding_mod = @import("../pipelines/speaker_embedding.zig");
 const transcription_sessions = @import("transcription_sessions.zig");
 const readers_mod = @import("../readers/reader.zig");
 const qwen3vl_reader_mod = @import("../readers/qwen3vl.zig");
@@ -495,6 +497,101 @@ fn generationStreamWriteIsPeerDisconnect(err: anyerror) bool {
         => true,
         else => false,
     };
+}
+
+test "transcription response survives an allocation failure at any step" {
+    // Every owned string here has two plausible owners: the builder that is
+    // part-way through a batch, and the response teardown once the batch is
+    // attached. Running the conversion under every failing allocation is
+    // what proves only one of them ever frees it.
+    const Case = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var words = [_]long_transcription.Word{
+                .{ .word = @constCast("hello"), .start_ms = 0, .end_ms = 400 },
+                .{ .word = @constCast("there"), .start_ms = 400, .end_ms = 900 },
+            };
+            var second_words = [_]long_transcription.Word{
+                .{ .word = @constCast("fine"), .start_ms = 1000, .end_ms = 1500 },
+            };
+            var segments = [_]long_transcription.Segment{
+                .{
+                    .text = @constCast("hello there"),
+                    .start_ms = 0,
+                    .end_ms = 900,
+                    .words = &words,
+                    .speaker_index = 0,
+                },
+                .{
+                    .text = @constCast("fine"),
+                    .start_ms = 1000,
+                    .end_ms = 1500,
+                    .words = &second_words,
+                    .speaker_index = 1,
+                },
+            };
+            const result = long_transcription.Result{
+                .allocator = allocator,
+                .segments = &segments,
+                .text = @constCast("hello there fine"),
+                .language = @constCast("en"),
+                .duration_ms = 1500,
+                .windows = 1,
+            };
+
+            var response = try Node.transcriptionResponseAlloc(allocator, &result);
+            transcribing_api.deinitResponse(allocator, &response);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "transcription response carries every speaker it labelled" {
+    const alloc = std.testing.allocator;
+    var words = [_]long_transcription.Word{
+        .{ .word = @constCast("hello"), .start_ms = 0, .end_ms = 400 },
+    };
+    var segments = [_]long_transcription.Segment{
+        .{ .text = @constCast("hello"), .start_ms = 0, .end_ms = 400, .words = &words, .speaker_index = 1 },
+        .{ .text = @constCast("there"), .start_ms = 400, .end_ms = 900, .words = &.{}, .speaker_index = 0 },
+    };
+    const result = long_transcription.Result{
+        .allocator = alloc,
+        .segments = &segments,
+        .text = @constCast("hello there"),
+        .language = null,
+        .duration_ms = 900,
+        .windows = 1,
+    };
+
+    var response = try Node.transcriptionResponseAlloc(alloc, &result);
+    defer transcribing_api.deinitResponse(alloc, &response);
+
+    const api_segments = response.segments orelse return error.MissingSegments;
+    try std.testing.expectEqual(@as(usize, 2), api_segments.len);
+    try std.testing.expectEqualStrings("SPEAKER_01", api_segments[0].speaker.?);
+    try std.testing.expectEqualStrings("SPEAKER_00", api_segments[1].speaker.?);
+    // The roster covers every index used, not only the ones seen first.
+    const speakers = response.speakers orelse return error.MissingSpeakers;
+    try std.testing.expectEqual(@as(usize, 2), speakers.len);
+    try std.testing.expectEqualStrings("SPEAKER_00", speakers[0].label.?);
+    try std.testing.expectEqualStrings("SPEAKER_01", speakers[1].label.?);
+
+    // An undiarized transcript reports no speakers at all.
+    var plain = [_]long_transcription.Segment{
+        .{ .text = @constCast("hello"), .start_ms = 0, .end_ms = 400, .words = &.{} },
+    };
+    const plain_result = long_transcription.Result{
+        .allocator = alloc,
+        .segments = &plain,
+        .text = @constCast("hello"),
+        .language = null,
+        .duration_ms = 400,
+        .windows = 1,
+    };
+    var plain_response = try Node.transcriptionResponseAlloc(alloc, &plain_result);
+    defer transcribing_api.deinitResponse(alloc, &plain_response);
+    try std.testing.expectEqual(@as(?[]const transcribing_api.Speaker, null), plain_response.speakers);
+    try std.testing.expectEqual(@as(?[]const u8, null), (plain_response.segments orelse return error.MissingSegments)[0].speaker);
 }
 
 test "generation pipeline session lookup is field safe" {
@@ -3225,10 +3322,10 @@ fn validateRequestModelIdentifier(raw: []const u8) !void {
 
     const value = if (std.mem.startsWith(u8, raw, "hf:")) raw[3..] else raw;
     if (value.len == 0) return error.InvalidModelIdentifier;
-    const colon = std.mem.indexOfScalar(u8, value, ':');
-    const identifier = if (colon) |index| value[0..index] else value;
-    if (colon) |index| {
-        const variant = value[index + 1 ..];
+    const separator = std.mem.indexOfAny(u8, value, ":@");
+    const identifier = if (separator) |index| value[0..index] else value;
+    if (separator) |index| {
+        const variant = if (value[index] == ':') value[index + 1 ..] else value[index..];
         if (!registry_mod.modelVariantIsSafe(variant)) return error.InvalidModelIdentifier;
     }
 
@@ -3555,6 +3652,10 @@ pub const Node = struct {
     /// for the node's lifetime; session configs point into this cache.
     silero_weights: std.StringHashMapUnmanaged(*silero_vad_mod.Weights) = .empty,
     silero_weights_lock: std.atomic.Mutex = .unlocked,
+    /// Speaker-embedding models for diarization by resolved ONNX path,
+    /// loaded on first use and kept for the node's lifetime.
+    speaker_embedders: std.StringHashMapUnmanaged(*speaker_embedding_mod.Embedder) = .empty,
+    speaker_embedders_lock: std.atomic.Mutex = .unlocked,
     /// Lazily allocates only while compatible native executor work is queued.
     /// Ownership is here, rather than the storage BackendRuntime, because Node
     /// owns resolved model generations and concrete fused executor callbacks.
@@ -3803,6 +3904,13 @@ pub const Node = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.silero_weights.deinit(self.allocator);
+        var speaker_it = self.speaker_embedders.iterator();
+        while (speaker_it.next()) |entry| {
+            entry.value_ptr.*.deinit();
+            self.allocator.destroy(entry.value_ptr.*);
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.speaker_embedders.deinit(self.allocator);
         // The refresher borrows Node, its allocator, and the models directory.
         // Cancel and join it before releasing any of those dependencies.
         if (self.readiness_refresh_io) |io| self.readiness_refresh_group.cancel(io);
@@ -8400,12 +8508,210 @@ pub const Node = struct {
         pipeline.execution_control = control;
 
         pipeline.batch_dispatch = self.tensorBatchDispatch(.transcribe);
-        var result = try pipeline.transcribePcm(decoded.samples, decoded.sample_rate);
+        // The same windowed path the HTTP handler takes: clips longer than
+        // one Whisper window are cut at pauses and decoded window by window,
+        // so an in-process enrichment gets the whole recording, not its first
+        // 30 seconds.
+        var result = try long_transcription.transcribeLong(allocator, &pipeline, decoded.samples, decoded.sample_rate, .{});
         defer result.deinit();
-        return .{
+        if (request.diarization orelse false) {
+            try control.update(.executing, 0, 0);
+            try self.assignTranscriptSpeakers(allocator, &result, decoded.samples, decoded.sample_rate, control);
+        }
+        return try transcriptionResponseAlloc(allocator, &result);
+    }
+
+    /// Where the default speaker-embedding model lives once pulled: the
+    /// registry's variant leaf for the explicit `.onnx` file name, or that
+    /// file directly under the repository directory. Caller frees.
+    fn resolveSpeakerModelPath(self: *Node) ![]const u8 {
+        const ref = try registry_mod.ModelRef.parse(speaker_embedding_mod.default_model_ref);
+        const variant_dir = try registry_mod.modelInstallDirAlloc(self.allocator, self.config.models_dir, ref);
+        defer self.allocator.free(variant_dir);
+        const candidates = [_][]const u8{ variant_dir, self.config.models_dir };
+        for (candidates, 0..) |dir, i| {
+            const path = if (i == 0)
+                try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir, speaker_embedding_mod.default_model_file })
+            else
+                try std.fmt.allocPrint(self.allocator, "{s}/{s}/{s}/{s}", .{ dir, ref.owner, ref.name, speaker_embedding_mod.default_model_file });
+            if (dirExists(path)) return path;
+            self.allocator.free(path);
+        }
+        return error.SpeakerModelUnavailable;
+    }
+
+    /// The loaded default speaker model, shared across requests. The graph
+    /// import takes seconds, so it runs outside the map lock; a concurrent
+    /// first request may import twice and the later copy is dropped.
+    fn speakerEmbedder(self: *Node) !*speaker_embedding_mod.Embedder {
+        const model_path = try self.resolveSpeakerModelPath();
+        defer self.allocator.free(model_path);
+        {
+            spinLock(&self.speaker_embedders_lock);
+            defer self.speaker_embedders_lock.unlock();
+            if (self.speaker_embedders.get(model_path)) |embedder| return embedder;
+        }
+        var loaded = try speaker_embedding_mod.Embedder.load(self.allocator, model_path);
+        errdefer loaded.deinit();
+        const owned = try self.allocator.create(speaker_embedding_mod.Embedder);
+        errdefer self.allocator.destroy(owned);
+        owned.* = loaded;
+        const key = try self.allocator.dupe(u8, model_path);
+        errdefer self.allocator.free(key);
+        spinLock(&self.speaker_embedders_lock);
+        defer self.speaker_embedders_lock.unlock();
+        if (self.speaker_embedders.get(model_path)) |existing| {
+            self.allocator.free(key);
+            owned.deinit();
+            self.allocator.destroy(owned);
+            return existing;
+        }
+        try self.speaker_embedders.put(self.allocator, key, owned);
+        return owned;
+    }
+
+    /// Local diarization: replaces the phrases of `result` with
+    /// speaker-attributed ones (`Segment.speaker_index`), splitting a phrase
+    /// where the voice changes. `result` must own its segments through
+    /// `allocator`.
+    fn assignTranscriptSpeakers(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        result: *long_transcription.Result,
+        samples: []const f32,
+        sample_rate: u32,
+        control: ?InferenceExecutionControl,
+    ) !void {
+        if (result.segments.len == 0) return;
+        const embedder = try self.speakerEmbedder();
+        const pcm = try audio_mod.copyOrResample(allocator, samples, sample_rate, speaker_embedding_mod.sample_rate);
+        defer allocator.free(pcm);
+        const labelled = try speaker_embedding_mod.diarizeSegmentsAlloc(allocator, embedder, pcm, result.segments, .{}, control);
+        long_transcription.freeSegments(result.allocator, result.segments);
+        result.segments = labelled;
+    }
+
+    /// Distinct speaker labels of a transcript in order of first appearance;
+    /// empty when diarization did not run. Caller frees.
+    fn transcriptSpeakerLabelsAlloc(allocator: std.mem.Allocator, result: *const long_transcription.Result) ![]const []const u8 {
+        var count: usize = 0;
+        for (result.segments) |segment| {
+            if (segment.speaker_index) |index| count = @max(count, @as(usize, index) + 1);
+        }
+        const labels = try allocator.alloc([]const u8, count);
+        for (labels, 0..) |*label, i| label.* = speaker_embedding_mod.speakerLabelStatic(@intCast(i));
+        return labels;
+    }
+
+    /// The transcript as the shared STT response, with timestamped segments
+    /// and word spans so callers can link text back to a moment.
+    ///
+    /// Each piece is built complete before it is attached to `response`, so
+    /// exactly one cleanup owns it at any moment: the builder's own until it
+    /// returns, `deinitResponse` after. Sharing those two would double-free
+    /// on an allocation failure part-way through.
+    fn transcriptionResponseAlloc(allocator: std.mem.Allocator, result: *const long_transcription.Result) !transcribing_api.Response {
+        var response = transcribing_api.Response{
             .text = try allocator.dupe(u8, result.text),
-            .language = if (result.language) |language| try allocator.dupe(u8, language) else null,
+            .duration_ms = std.math.cast(i64, result.duration_ms) orelse std.math.maxInt(i64),
         };
+        errdefer transcribing_api.deinitResponse(allocator, &response);
+        if (result.language) |language| response.language = try allocator.dupe(u8, language);
+        response.segments = try transcriptionSegmentsAlloc(allocator, result.segments);
+        response.speakers = try transcriptionSpeakersAlloc(allocator, result.segments);
+        return response;
+    }
+
+    /// The transcript's phrases as API segments. Caller owns the result.
+    fn transcriptionSegmentsAlloc(
+        allocator: std.mem.Allocator,
+        segments: []const long_transcription.Segment,
+    ) ![]transcribing_api.Segment {
+        const out = try allocator.alloc(transcribing_api.Segment, segments.len);
+        var filled: usize = 0;
+        errdefer {
+            for (out[0..filled]) |segment| {
+                var owned = segment;
+                transcribing_api.deinitSegment(allocator, &owned);
+            }
+            allocator.free(out);
+        }
+        for (segments, out) |segment, *slot| {
+            const words = try transcriptionWordsAlloc(allocator, segment.words);
+            errdefer {
+                for (words) |word| if (word.word) |value| allocator.free(value);
+                allocator.free(words);
+            }
+            const text = try allocator.dupe(u8, segment.text);
+            errdefer allocator.free(text);
+            const speaker: ?[]const u8 = if (segment.speaker_index) |index|
+                try allocator.dupe(u8, speaker_embedding_mod.speakerLabelStatic(index))
+            else
+                null;
+            // Nothing below may fail: the slot takes ownership of all three.
+            slot.* = .{
+                .text = text,
+                .start_ms = std.math.cast(i64, segment.start_ms) orelse std.math.maxInt(i64),
+                .end_ms = std.math.cast(i64, segment.end_ms) orelse std.math.maxInt(i64),
+                .words = words,
+                .speaker = speaker,
+            };
+            filled += 1;
+        }
+        return out;
+    }
+
+    fn transcriptionWordsAlloc(
+        allocator: std.mem.Allocator,
+        words: []const long_transcription.Word,
+    ) ![]transcribing_api.WordTimestamp {
+        const out = try allocator.alloc(transcribing_api.WordTimestamp, words.len);
+        var filled: usize = 0;
+        errdefer {
+            for (out[0..filled]) |word| if (word.word) |value| allocator.free(value);
+            allocator.free(out);
+        }
+        for (words, out) |word, *slot| {
+            slot.* = .{
+                .word = try allocator.dupe(u8, word.word),
+                .start_ms = std.math.cast(i64, word.start_ms) orelse std.math.maxInt(i64),
+                .end_ms = std.math.cast(i64, word.end_ms) orelse std.math.maxInt(i64),
+            };
+            filled += 1;
+        }
+        return out;
+    }
+
+    /// The speakers a diarized transcript names, in order of first
+    /// appearance; null when diarization did not run. Caller owns the result.
+    fn transcriptionSpeakersAlloc(
+        allocator: std.mem.Allocator,
+        segments: []const long_transcription.Segment,
+    ) !?[]transcribing_api.Speaker {
+        var count: usize = 0;
+        for (segments) |segment| {
+            if (segment.speaker_index) |index| count = @max(count, @as(usize, index) + 1);
+        }
+        if (count == 0) return null;
+
+        const out = try allocator.alloc(transcribing_api.Speaker, count);
+        var filled: usize = 0;
+        errdefer {
+            for (out[0..filled]) |speaker| {
+                if (speaker.id) |id| allocator.free(id);
+                if (speaker.label) |label| allocator.free(label);
+            }
+            allocator.free(out);
+        }
+        for (out, 0..) |*slot, i| {
+            const label = speaker_embedding_mod.speakerLabelStatic(@intCast(i));
+            const id = try allocator.dupe(u8, label);
+            errdefer allocator.free(id);
+            const owned_label = try allocator.dupe(u8, label);
+            slot.* = .{ .id = id, .label = owned_label };
+            filled += 1;
+        }
+        return out;
     }
 
     pub fn extractDirect(
@@ -8531,6 +8837,52 @@ pub const Node = struct {
         return .{ .allocator = allocator, .json = try allocator.dupe(u8, json) };
     }
 
+    fn tryExtractLayaV2(self: *Node, scratch: std.mem.Allocator, request_json: []const u8, control: ?InferenceExecutionControl, response_limit: ?usize, failure: *extraction_v2.FailureContext) !?[]u8 {
+        try extraction_v2.scanJsonEnvelope(request_json, .{});
+        const parsed = try std.json.parseFromSlice(std.json.Value, scratch, request_json, .{ .duplicate_field_behavior = .@"error" });
+        defer parsed.deinit();
+        if (parsed.value != .object) return null;
+        const name = parsed.value.object.get("model") orelse return null;
+        if (name != .string or name.string.len == 0) return null;
+        var owned_io: ?std.Io.Threaded = null;
+        defer if (owned_io) |*io_impl| io_impl.deinit();
+        const io = self.inferenceIo(scratch, null, &owned_io);
+        const path = self.resolveRequestModelPath(scratch, io, name.string, "extractors") catch |err| switch (err) {
+            error.ModelNotFound => return null,
+            else => return err,
+        };
+        defer scratch.free(path);
+        // A listing load reads architecture sidecars before capabilities. That
+        // would run GLiNER model preflight too early, before its schema checks
+        // and model-stage failure context. Laya imports declare this capability.
+        const is_laya = manifest_mod.hasDeclaredCapability(scratch, path, "typed_decisions") catch |err| {
+            failure.* = .{ .stage = "model" };
+            return err;
+        };
+        if (!is_laya) return null;
+        const laya = @import("../extractors/laya.zig");
+        var arena = std.heap.ArenaAllocator.init(scratch);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        const request = try laya.parse(allocator, parsed.value);
+        const contract = try resolvedInferenceExecutorContractFromDir(self, allocator, path, "extract");
+        try validateLayaExecutorInvocation(allocator, contract, request);
+        const effective = control orelse InferenceExecutionControl{};
+        try effective.check();
+        var handle = try self.model_manager.acquireFromDirWithControl(path, effective);
+        defer handle.release();
+        const loaded = handle.get();
+        const config = session_factory.getLayaConfig(loaded.session) orelse return error.UnsupportedExtractionModel;
+        if (loaded.session.backend() != .native and loaded.session.backend() != .metal) return error.UnsupportedExtractionBackend;
+        const mutex = loaded.targetInferenceExecutionMutex();
+        if (mutex) |lock| try effective.lock(lock);
+        defer if (mutex) |lock| lock.unlock();
+        const result = try @import("../pipelines/laya.zig").executeWithScratch(allocator, scratch, loaded.session, loaded.getTokenizer(), config, request.tasks, effective, contract.batch.max_input_tokens_per_item);
+        const bytes = try laya.response(allocator, request, result, @min(64 * 1024 * 1024, response_limit orelse 64 * 1024 * 1024));
+        try effective.check();
+        return try scratch.dupe(u8, bytes);
+    }
+
     fn extractV2InMemory(
         self: *Node,
         scratch: std.mem.Allocator,
@@ -8543,6 +8895,8 @@ pub const Node = struct {
         working_bytes: usize,
         allocation_failure: *ExtractionAllocationFailure,
     ) ![]u8 {
+        // Each architecture retains its own schema validation and qualification.
+        if (try self.tryExtractLayaV2(scratch, request_json, control, response_limit, failure)) |json| return json;
         const regex = @import("../pipelines/extraction_regex.zig");
         var validators = regex.Context.init(scratch, .{
             .compile_options = .{ .control = control },
@@ -8678,10 +9032,26 @@ pub const Node = struct {
         self: *Node,
         allocator: std.mem.Allocator,
         model_name: []const u8,
-        request: extracting_api.Request,
+        supplied_request: extracting_api.Request,
         admission_owner: ExtractionAdmissionOwner,
         supplied_control: ?InferenceExecutionControl,
     ) !extracting_api.Response {
+        // A boundary-architecture model (e.g. a qualified GLiNER2.5
+        // checkpoint) is only ever executed through the schema_version:2
+        // path below (extractV2WithAdmission -> extractV2InMemory ->
+        // boundary_executor); the legacy dispatch beneath this check cannot
+        // run it. This is the one entry point shared by both the HTTP
+        // "structures" operation and extractDirect/extractDirectWithControl
+        // (the entry the in-process worker's provider operation calls), so
+        // upgrading here -- exactly once, before any manifest is resolved
+        // for real -- covers both without either caller needing to know
+        // this internal detail. Any resolution failure (bad model name,
+        // non-boundary model) leaves the request unmodified.
+        var request = supplied_request;
+        if (request.schema_version == null) upgrade: {
+            const io = self.session_manager.io orelse break :upgrade;
+            if (self.resolvesToBoundaryArchitecture(io, model_name)) request.schema_version = 2;
+        }
         const schema_version = request.schema_version orelse 1;
         if (schema_version == 2) {
             var failure = extraction_v2.FailureContext{};
@@ -12061,6 +12431,17 @@ pub const Node = struct {
             return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = internalErrorMessage("BACKEND_ERROR", err) });
         };
         config.prefill_chunk_size = prefill_admission.max_chunk_rows;
+        const isolated_generation = canIsolateGeneration(backend_kind, effective_compiled_partition_backend != null, draft_model_for_generation != null, config.prompt_cache_enabled, want_stream);
+        // Whole-request native owners cannot hold the model gate while waiting
+        // for a turn belonging to an isolated peer that needs that same gate.
+        if (backend_kind == .native and !isolated_generation) {
+            if (native_generate_lease) |lease| {
+                model.native_generate_coordinator.?.release(lease);
+                native_generate_lease = null;
+            }
+        }
+        // Choose the owner before borrowing a plan: releasing the coordinator
+        // lease also frees its plan. Whole-request execution owns its plan below.
         var standalone_prefill_plan: ?runtime.scheduler.native_generate.PrefillChunkPlan = null;
         defer if (standalone_prefill_plan) |*plan| plan.deinit(ctx.allocator);
         const prefill_plan_applicable = !generation.messagesHaveImages(messages.items) and
@@ -12189,15 +12570,6 @@ pub const Node = struct {
             else if (first_locked_model == model) draft_model else model
         else
             null;
-        const isolated_generation = canIsolateGeneration(backend_kind, effective_compiled_partition_backend != null, draft_model_for_generation != null, config.prompt_cache_enabled, want_stream);
-        // Whole-request native owners cannot hold the model gate while waiting
-        // for a turn belonging to an isolated peer that needs that same gate.
-        if (backend_kind == .native and !isolated_generation) {
-            if (native_generate_lease) |lease| {
-                model.native_generate_coordinator.?.release(lease);
-                native_generate_lease = null;
-            }
-        }
         if (!isolated_generation) {
             execution_control.lock(first_locked_model.nativeGenerationMutex()) catch |err|
                 return inferenceFailureResponse(ctx, err);
@@ -16793,12 +17165,30 @@ pub const Node = struct {
                 return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) }),
         };
         defer result.deinit();
+        if (body.diarization orelse false) {
+            self.assignTranscriptSpeakers(ctx.allocator, &result, pcm, audio_mod.WHISPER_SAMPLE_RATE, execution_control) catch |err| switch (err) {
+                error.SpeakerModelUnavailable => return ctx.status(422).json(.{
+                    .@"error" = "SPEAKER_MODEL_UNAVAILABLE",
+                    .message = "diarization needs the local speaker model: antfly inference pull " ++ speaker_embedding_mod.default_model_ref,
+                }),
+                error.OutOfMemory => return err,
+                error.Timeout, error.Cancelled, error.Canceled => return inferenceFailureResponse(ctx, err),
+                else => return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = internalErrorMessage("INFERENCE_FAILED", err) }),
+            };
+        }
 
+        var api_segments = try dictationTranscriptSegments(ctx.allocator, &result);
+        defer api_segments.deinit(ctx.allocator);
+        const speaker_labels = try transcriptSpeakerLabelsAlloc(ctx.allocator, &result);
+        defer ctx.allocator.free(speaker_labels);
         const data = [_]api.TranscribeObject{.{
             .object = "transcription",
             .index = 0,
             .text = result.text,
             .language = result.language,
+            .duration_ms = std.math.cast(i64, result.duration_ms) orelse std.math.maxInt(i64),
+            .segments = api_segments.segments,
+            .speakers = if (speaker_labels.len > 0) speaker_labels else null,
         }};
         return ctx.json(api.TranscribeResponse{
             .object = "list",
@@ -17089,6 +17479,7 @@ pub const Node = struct {
                 .start_ms = @intCast(segment.start_ms),
                 .end_ms = @intCast(segment.end_ms),
                 .words = span,
+                .speaker = if (segment.speaker_index) |index| speaker_embedding_mod.speakerLabelStatic(index) else null,
             };
         }
         return .{ .segments = segments, .words = words };
@@ -18235,6 +18626,68 @@ pub const Node = struct {
         return !ctx.isCancellationRequested();
     }
 
+    /// True if `model_name` resolves to a boundary-architecture manifest
+    /// (e.g. a qualified GLiNER2.5 checkpoint). Used only to decide whether a
+    /// request that omits an explicit schema version must be upgraded onto
+    /// the schema_version:2 path before any operation-specific dispatch;
+    /// this grants no execution permission by itself -- Gate/require() still
+    /// independently enforce the exact identity, backend, feature set, and
+    /// geometry once a session loads. Fails closed to `false` (leave the
+    /// request alone) on any resolution error, so it can never itself turn a
+    /// valid request into a rejection.
+    fn resolvesToBoundaryArchitecture(self: *Node, io: std.Io, model_name: []const u8) bool {
+        if (model_name.len == 0) return false;
+        var arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const model_path = self.resolveRequestModelPath(scratch, io, model_name, "extractors") catch return false;
+        var manifest = manifest_mod.loadListingFromDir(scratch, model_path) catch return false;
+        defer manifest.deinit();
+        return manifest.gliner_architecture == .boundary;
+    }
+
+    /// If `request_json` names a boundary-architecture model and does not
+    /// already declare a schema version, returns a new allocation (owned by
+    /// `result_allocator`) with `"schema_version":2` stamped on, so
+    /// extractJSON routes it to the only path that can execute it
+    /// (extractV2InMemory -> boundary_executor) instead of the pre-boundary
+    /// legacy dispatcher. Returns null on any failure (bad JSON, unresolved
+    /// model, non-boundary model, already-versioned request) so the caller
+    /// falls through to its existing, unmodified behavior; this must never
+    /// itself decide extraction is unsupported.
+    ///
+    /// This is the HTTP-side counterpart of the same upgrade applied to the
+    /// typed request in extractWithAdmission below (used by
+    /// extractDirect/extractDirectWithControl, the entry the in-process
+    /// worker's provider operation calls). Both exist because HTTP's legacy
+    /// (schema_version-less) dispatch for the "entities_relations" and
+    /// "classifications" operations does not otherwise pass through
+    /// extractWithAdmission; upgrading the raw JSON here, before that
+    /// operation switch, is what keeps this file's one other legacy
+    /// entities/relations implementation (extractEntitiesAndRelations) out
+    /// of the boundary architecture's path entirely.
+    fn boundaryUpgradeRequestJsonIfNeeded(
+        self: *Node,
+        result_allocator: std.mem.Allocator,
+        io: std.Io,
+        request_json: []const u8,
+        max_request_bytes: usize,
+    ) !?[]u8 {
+        if (request_json.len == 0 or request_json.len > max_request_bytes) return null;
+        var arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        var parsed = std.json.parseFromSlice(std.json.Value, scratch, request_json, .{}) catch return null;
+        defer parsed.deinit();
+        if (parsed.value != .object) return null;
+        if (parsed.value.object.contains("schema_version")) return null;
+        const model_value = parsed.value.object.get("model") orelse return null;
+        if (model_value != .string or model_value.string.len == 0) return null;
+        if (!self.resolvesToBoundaryArchitecture(io, model_value.string)) return null;
+        parsed.value.object.put(scratch, "schema_version", .{ .integer = 2 }) catch return null;
+        return std.json.Stringify.valueAlloc(result_allocator, parsed.value, .{}) catch null;
+    }
+
     pub fn extractJSON(self: *Node, ctx: *httpx.Context) !httpx.Response {
         const execution_control = httpInferenceExecutionControl(self, ctx);
         execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
@@ -18253,7 +18706,21 @@ pub const Node = struct {
             break :blk attachment_envelope.?.metadata;
         } else (try ctx.body()) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
-        const version = extractionSchemaVersion(self, request_json, ctx.max_request_body_size) catch |err| {
+        // A boundary-architecture model (e.g. a qualified GLiNER2.5 checkpoint)
+        // is only ever executed through the schema_version:2 path
+        // (extractV2InMemory -> boundary_executor); the pre-boundary legacy
+        // dispatcher below cannot run it. The documented plain request shape
+        // omits schema_version, so stamp it on for exactly this model family
+        // rather than requiring every caller to know this internal detail.
+        // Any failure here (bad JSON, unknown model, non-boundary model)
+        // falls through to the unchanged existing behavior below.
+        const boundary_upgraded = if (!uses_attachment_envelope)
+            boundaryUpgradeRequestJsonIfNeeded(self, ctx.allocator, ctx.io, request_json, ctx.max_request_body_size) catch null
+        else
+            null;
+        defer if (boundary_upgraded) |bytes| ctx.allocator.free(bytes);
+        const effective_request_json = boundary_upgraded orelse request_json;
+        const version = extractionSchemaVersion(self, effective_request_json, ctx.max_request_body_size) catch |err| {
             self.metrics.extraction_v2.envelopeFailure(err);
             self.metrics.incError();
             return extractionV2FailureResponse(ctx, err, .{});
@@ -18269,7 +18736,7 @@ pub const Node = struct {
                 return extractionV2FailureResponse(ctx, error.UnsupportedExtractionInput, .{});
             };
             var failure = extraction_v2.FailureContext{};
-            var response = self.extractV2WithAdmission(ctx.allocator, .{ .json = request_json }, .http_route, execution_control, &failure, null) catch |err|
+            var response = self.extractV2WithAdmission(ctx.allocator, .{ .json = effective_request_json }, .http_route, execution_control, &failure, null) catch |err|
                 return extractionV2FailureResponse(ctx, err, failure);
             defer response.deinit();
             try ctx.setHeader("content-type", "application/json");
@@ -19224,7 +19691,7 @@ fn canonicalExtractionOperation(schema: extraction_api.ExtractionSchema) !Canoni
 /// with an extraction-capable head and standard BIO token recognizers. Reject
 /// other model families before constructing a pipeline or running inference.
 fn validateTextEntityExtractionManifest(manifest: *const manifest_mod.ModelManifest) !void {
-    if (manifest.model_type != .recognizer) return error.InvalidModelForExtraction;
+    if (manifest.model_type != .extractor) return error.InvalidModelForExtraction;
     if (!model_caps.modelAcceptsInput(manifest, "text")) return error.UnsupportedInput;
     if (manifest.gliner_model_type.len > 0 and !model_caps.modelSupportsCapability(
         @tagName(manifest.model_type),
@@ -19430,8 +19897,16 @@ fn directExtractionMediaShape(
     attachments: []const extracting_api.Attachment,
 ) !RequestMediaAdmissionShape {
     var shape: RequestMediaAdmissionShape = .{};
-    for (inputs) |input| try addDirectExtractionContentMediaShape(allocator, &shape, input.content_json);
-    for (attachments) |attachment| shape.addBorrowed(attachment.bytes.len, true);
+    var text_count: usize = 0;
+    for (inputs, 0..) |input, index| {
+        const images_before = shape.image_count;
+        try addDirectExtractionContentMediaShape(allocator, &shape, input.content_json);
+        for (attachments) |attachment| if (attachment.input_index == index) {
+            shape.addBorrowed(attachment.bytes.len, true);
+        };
+        if (shape.image_count == images_before) text_count += 1;
+    }
+    try validateExtractionInputKinds(text_count, shape.image_count);
     return shape;
 }
 
@@ -19899,6 +20374,7 @@ test {
     _ = @import("gliner_boundary_concurrency_test.zig");
     _ = @import("gliner_boundary_metal_socket_test.zig");
     _ = @import("gliner_boundary_queued_cancellation_test.zig");
+    _ = @import("embed_direct_vs_http_bench_test.zig");
 }
 
 test "gliner boundary v2 allocation attribution distinguishes recovery and model backing OOM" {
@@ -21138,15 +21614,22 @@ fn taskMatchesModelListing(
 ) bool {
     // A listing, including an already loaded model rendered through this
     // string-only path, has no exact prepared request qualification. Explicit
-    // tasks/capabilities cannot turn boundary metadata into a serving grant.
-    if (std.mem.eql(u8, gliner_model_type, "gliner2.5")) return false;
+    // tasks/capabilities cannot turn boundary metadata into a serving grant
+    // by themselves. While the family has no reviewed production row at
+    // all, withhold every gliner2.5 listing outright. Once reviewed rows
+    // exist, pull-time synthesis (registry.zig's boundaryIdentityIsQualified)
+    // is the only place permitted to populate a specific artifact's tasks/
+    // capabilities, so an unreviewed digest or variant still falls through
+    // to an empty tasks/capabilities set below and is excluded the same way
+    // every other unsupported model is.
+    if (std.mem.eql(u8, gliner_model_type, "gliner2.5") and !gliner_boundary_model.runtime_available) return false;
     // Classification is a public extraction capability. Keep `classifier` as
     // an internal pipeline kind without publishing a parallel API/catalog task.
     if (std.mem.eql(u8, task, "classifiers")) return false;
     if (std.mem.eql(u8, task, "extractors") and
         model_caps.modelSupportsCapability(model_kind, gliner_model_type, capabilities, "classification"))
     {
-        return !std.mem.eql(u8, model_kind, "classifier") or zero_shot_classification;
+        return !std.mem.eql(u8, model_kind, "classifier") or zero_shot_classification or model_caps.hasCapability(capabilities, "typed_decisions");
     }
     if (tasks.len > 0) {
         const singular_task: ?[]const u8 = if (std.mem.eql(u8, task, "embedders"))
@@ -21175,7 +21658,25 @@ fn taskMatchesModelListing(
         }
         return false;
     }
-    if (task.len > 0 and std.mem.eql(u8, task[0 .. task.len - 1], model_kind)) return true;
+    // Every other kind's plural task-category name doubles as an always-on
+    // listing convenience once nothing above already returned -- including a
+    // plain "extractor" kind with no gliner_model_type at all (e.g. the
+    // legacy `extractors/` directory discovery hint) or a legacy "gliner2"
+    // (span) extractor, neither of which has a reviewed-row gate. A
+    // gliner2.5 BOUNDARY-family extractor must NOT take this shortcut: it is
+    // withheld from listing until pull-time synthesis (registry.zig's
+    // boundaryIdentityIsQualified) has actually granted it real tasks/
+    // capabilities for its exact reviewed bytes (see GLINER25.md's
+    // "Two-tier gate"). Before the `recognizer` -> `extractor` rename, the
+    // enum literal was spelled "recognizer" specifically so it could never
+    // coincide with the "extractors" task name and take this fallback by
+    // accident for ANY gliner kind; now that the name matches, only the
+    // boundary family (identified by gliner_model_type, not model_kind) is
+    // excluded, explicitly, so the pre-rename gate survives exactly as
+    // narrowly as before.
+    const is_unreviewed_gate_kind = std.mem.eql(u8, model_kind, "extractor") and
+        std.mem.eql(u8, gliner_model_type, gliner_boundary_model.model_type);
+    if (task.len > 0 and !is_unreviewed_gate_kind and std.mem.eql(u8, task[0 .. task.len - 1], model_kind)) return true;
     return std.mem.eql(u8, task, "extractors") and
         model_caps.modelSupportsCapability(model_kind, gliner_model_type, capabilities, "extraction");
 }
@@ -21865,9 +22366,29 @@ test "microbatch registration qualifies concrete GLiNER bundles and Qwen embeddi
         .gliner_head_gguf_path = "head.gguf",
     };
     try std.testing.expectEqual(.native_gliner_extraction, resolvedExecutorKind("extract", &gliner));
-    try std.testing.expectEqual(.native, resolvedExecutorBatchImplementation("extract", resolvedExecutorKind("extract", &gliner)).mode);
+    // The concrete GLiNER boundary executor is recognized as its own kind
+    // (never falls back to the generic compatibility loop), but its reviewed
+    // qualification covers exactly one item per request today, so it must
+    // not advertise native batching beyond that -- see
+    // resolvedExecutorBatchImplementation's doc comment.
+    const gliner_batch = resolvedExecutorBatchImplementation("extract", resolvedExecutorKind("extract", &gliner));
+    try std.testing.expectEqual(.none, gliner_batch.mode);
+    try std.testing.expectEqual(@as(usize, 1), gliner_batch.max_items);
+    try std.testing.expectEqual(@as(usize, 1), gliner_batch.preferred_items);
     const onnx = manifest_mod.ModelManifest{ .allocator = std.testing.allocator, .gliner_model_type = "gliner2" };
     try std.testing.expectEqual(.compatibility, resolvedExecutorKind("extract", &onnx));
+    // A boundary-architecture checkpoint (gliner2.5 from safetensors) has no
+    // separate head file, so it is not a split bundle, yet it runs on the
+    // concrete boundary executor whose qualification is one item per request.
+    const boundary = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .gliner_model_type = "gliner2.5",
+        .gliner_architecture = .boundary,
+    };
+    try std.testing.expectEqual(.native_gliner_extraction, resolvedExecutorKind("extract", &boundary));
+    const boundary_batch = resolvedExecutorBatchImplementation("extract", resolvedExecutorKind("extract", &boundary));
+    try std.testing.expectEqual(.none, boundary_batch.mode);
+    try std.testing.expectEqual(@as(usize, 1), boundary_batch.max_items);
     const qwen = manifest_mod.ModelManifest{ .allocator = std.testing.allocator, .embedding_style = .qwen3_embedding };
     try std.testing.expectEqual(.native_dense_embedding, resolvedExecutorKind("embed", &qwen));
     try std.testing.expectEqual(.compatibility, resolvedExecutorKind("generate", &qwen));
@@ -21889,7 +22410,17 @@ pub fn resolvedExecutorKind(
     }
     if (std.mem.eql(u8, resolved_task, "read") and manifest.native_arch_hint == .florence)
         return .native_florence_reader;
-    if (std.mem.eql(u8, resolved_task, "extract") and manifest.isSplitGlinerBundle())
+    // Both concrete GLiNER executors are their own kind: the split
+    // encoder+head GGUF bundle (gliner2) and the boundary architecture
+    // (gliner2.5, served from safetensors or its converted bundle through
+    // extractV2InMemory -> boundary_executor). Classifying the boundary
+    // architecture as `.compatibility` advertised the generic serial batch
+    // contract (max_items=128), which let the antfly asset-producer batcher
+    // group several documents into one request that the boundary executor's
+    // one-item LengthContract then rejected with
+    // GlinerBoundaryRequestItemsLimitExceeded for the whole group.
+    if (std.mem.eql(u8, resolved_task, "extract") and
+        (manifest.isSplitGlinerBundle() or manifest.gliner_architecture == .boundary))
         return .native_gliner_extraction;
     return .compatibility;
 }
@@ -21898,6 +22429,25 @@ pub fn resolvedExecutorBatchImplementation(
     resolved_task: []const u8,
     executor_kind: ResolvedExecutorKind,
 ) ResolvedExecutorBatchImplementation {
+    // GLiNER boundary extraction's reviewed production qualification (see
+    // models/gliner_boundary_qualification.zig's LengthContract.request_items,
+    // and GLINER25.md's long-document section) covers exactly one item per
+    // request, for both the single-window and windowed long-document rows:
+    // no correctness evidence exists yet for a batched multi-item request
+    // through either merge path. Advertising more here let a caller (the
+    // antfly asset-producer batcher) opportunistically group multiple
+    // documents into one call, which then failed closed for the whole group
+    // regardless of any individual document's size -- this is exactly the
+    // "long documents fail closed with UnsupportedGlinerBoundaryRuntime for
+    // no apparent geometric reason" incident traced in GLINER25.md. This
+    // stays fixed at one item until batched multi-item execution is reviewed
+    // and reflected in that table.
+    if (executor_kind == .native_gliner_extraction) return .{
+        .mode = .none,
+        .preferred_items = 1,
+        .max_items = 1,
+        .per_item_failures = false,
+    };
     const task_max_items = resolvedTaskMaxItems(resolved_task);
     const native_reader = executor_kind == .native_florence_reader and
         effectiveNativeReadBatchSize() > 1;
@@ -21907,7 +22457,7 @@ pub fn resolvedExecutorBatchImplementation(
         task_max_items;
     const preferred_items = @min(@as(usize, 8), max_items);
     const native = executor_kind == .native_dense_embedding or
-        executor_kind == .native_sparse_embedding or executor_kind == .native_gliner_extraction or native_reader;
+        executor_kind == .native_sparse_embedding or native_reader;
     return .{
         .mode = if (max_items == 1) .none else if (native) .native else .serial_compatibility,
         .preferred_items = preferred_items,
@@ -22182,6 +22732,7 @@ fn canonicalAudioMime(format: audio_mod.EncodedFormat) []const u8 {
         .aiff => "audio/aiff",
         .caf => "audio/caf",
         .au => "audio/basic",
+        .webm => "audio/webm",
     };
 }
 
@@ -22311,8 +22862,9 @@ fn generateExecutorContractError(err: anyerror) GenerateExecutorContractFailure 
         err == error.UnsupportedInferenceModality or
         err == error.InvalidInferenceMedia;
     const invalid_contract = err == error.InvalidInferenceCapabilities;
+    const not_qualified = err == error.UnsupportedGlinerBoundaryRuntime;
     return .{
-        .status = if (invalid_contract) 500 else if (invalid_input) 400 else 413,
+        .status = if (invalid_contract) 500 else if (invalid_input or not_qualified) 400 else 413,
         .batch = .{
             .code = if (invalid_contract)
                 "INVALID_MODEL_CAPABILITIES"
@@ -22322,6 +22874,8 @@ fn generateExecutorContractError(err: anyerror) GenerateExecutorContractFailure 
                 "UNSUPPORTED_MODALITY"
             else if (err == error.InvalidInferenceMedia)
                 "INVALID_IMAGE"
+            else if (not_qualified)
+                "MODEL_NOT_QUALIFIED"
             else if (err == error.InferenceDecodedPixelsExceeded)
                 "DECODED_PIXELS_EXCEEDED"
             else if (err == error.InferenceEncodedBytesExceeded)
@@ -22346,6 +22900,8 @@ fn generateExecutorContractError(err: anyerror) GenerateExecutorContractFailure 
                 "the resolved model capability contract is invalid"
             else if (invalid_input)
                 "the request media is not accepted by the resolved model"
+            else if (not_qualified)
+                "model is not qualified for serving on this runtime"
             else
                 "the request exceeds a resolved model capability limit",
             .retryable = false,
@@ -22425,6 +22981,76 @@ fn validateTextExecutorInvocation(
         .schema_bytes = schema_bytes,
         .has_text = items.len > 0 or additional_text_bytes_per_item > 0,
     });
+}
+
+fn validateLayaExecutorInvocation(
+    allocator: std.mem.Allocator,
+    contract: ResolvedInferenceExecutorContract,
+    request: @import("../extractors/laya.zig").Request,
+) !void {
+    const texts = try allocator.alloc([]const u8, request.tasks.len);
+    defer allocator.free(texts);
+    var max_candidates: usize = 0;
+    var schema_text_bytes: usize = 0;
+    for (request.tasks, texts) |task, *text| {
+        text.* = task.text;
+        max_candidates = @max(max_candidates, task.question.labels.len);
+        var question_bytes = task.question.instruction.len;
+        for (task.question.labels, task.question.descriptions) |label, description| question_bytes += label.len + description.len;
+        schema_text_bytes = @max(schema_text_bytes, question_bytes);
+    }
+    // The executor advertises input items, not expanded questions. Parsing
+    // independently enforces 64 questions per input and 512 per request.
+    try validateTextExecutorInvocation(contract, request.items.len, texts, schema_text_bytes, 0, max_candidates, request.schema_bytes);
+}
+
+test "laya extraction validates input and question limits independently" {
+    const laya = @import("../extractors/laya.zig");
+    const contract = ResolvedInferenceExecutorContract{
+        .task = "extract",
+        .batch = .{
+            .mode = .serial_compatibility,
+            .preferred_items = 1,
+            .max_items = 128,
+            .max_encoded_media_bytes = 0,
+            .max_decoded_pixels = null,
+            .max_media_parts_per_item = 0,
+            .per_item_failures = false,
+        },
+        .accepts_text = true,
+        .accepts_image = false,
+        .accepts_audio = false,
+        .accepts_document = false,
+    };
+    const cases = [_]struct { inputs: usize, questions: usize, expected_error: ?anyerror = null }{
+        .{ .inputs = 64, .questions = 3 },
+        .{ .inputs = 128, .questions = 4 },
+        .{ .inputs = 8, .questions = 64 },
+        .{ .inputs = 129, .questions = 1, .expected_error = error.ExtractionRequestLimitExceeded },
+        .{ .inputs = 103, .questions = 5, .expected_error = error.ExtractionRequestLimitExceeded },
+        .{ .inputs = 1, .questions = 65, .expected_error = error.InvalidLayaQuestion },
+    };
+    for (cases) |case| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const inputs = try a.alloc(struct { content: []const u8 = "hello" }, case.inputs);
+        @memset(inputs, .{});
+        const questions = try a.alloc(struct { name: []const u8, instruction: []const u8 = "choose", labels: []const []const u8 = &.{ "yes", "no" } }, case.questions);
+        for (questions, 0..) |*question, i| question.* = .{ .name = try std.fmt.allocPrint(a, "q{d}", .{i}) };
+        const body = try std.json.Stringify.valueAlloc(a, .{ .model = "laya", .schema_version = 2, .inputs = inputs, .schema = .{ .classifications = questions } }, .{});
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+        if (case.expected_error) |expected| {
+            try std.testing.expectError(expected, laya.parse(a, parsed.value));
+            continue;
+        }
+        const request = try laya.parse(a, parsed.value);
+        try std.testing.expectEqual(case.inputs * case.questions, request.tasks.len);
+        try validateLayaExecutorInvocation(a, contract, request);
+        var lower_limit = contract;
+        lower_limit.batch.max_items = case.inputs - 1;
+        try std.testing.expectError(error.InferenceBatchTooLarge, validateLayaExecutorInvocation(a, lower_limit, request));
+    }
 }
 
 fn minOptionalLimit(current: ?usize, requested: usize) ?usize {
@@ -22707,6 +23333,29 @@ test "task-neutral executor contract enforces every resolved resource dimension"
     try std.testing.expectError(error.InferenceCandidateLimitExceeded, validateInferenceExecutorInvocation(contract, .{ .candidates_per_request = 3 }));
     try std.testing.expectError(error.InferenceSchemaBytesExceeded, validateInferenceExecutorInvocation(contract, .{ .schema_bytes = 17 }));
     try std.testing.expectError(error.UnsupportedInferenceModality, validateInferenceExecutorInvocation(contract, .{ .has_audio = true }));
+}
+
+test "generate executor contract error maps unqualified GLiNER boundary runtime to a dedicated response" {
+    const failure = generateExecutorContractError(error.UnsupportedGlinerBoundaryRuntime);
+    try std.testing.expectEqual(@as(u16, 400), failure.status);
+    try std.testing.expectEqualStrings("MODEL_NOT_QUALIFIED", failure.batch.code);
+    try std.testing.expectEqualStrings("model is not qualified for serving on this runtime", failure.batch.message);
+    try std.testing.expectEqual(false, failure.batch.retryable);
+
+    // A genuinely unresolved capability limit still falls back to the
+    // generic resource-limit response rather than being misclassified.
+    const limit_failure = generateExecutorContractError(error.InferenceOutputTokensExceeded);
+    try std.testing.expectEqualStrings("OUTPUT_TOKEN_LIMIT_EXCEEDED", limit_failure.batch.code);
+    try std.testing.expectEqual(@as(u16, 413), limit_failure.status);
+
+    var request = try httpx.Request.init(std.testing.allocator, .POST, "/ai/v1/extract");
+    defer request.deinit();
+    var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try inferenceExecutorContractFailureResponse(&ctx, error.UnsupportedGlinerBoundaryRuntime);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 400), response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "MODEL_NOT_QUALIFIED") != null);
 }
 
 test "executor modality resolution uses the shared manifest authority" {
@@ -26386,7 +27035,7 @@ test "canonical extraction operation routes every documented schema family" {
 test "entity extraction model preflight rejects incompatible families and modalities" {
     var manifest = manifest_mod.ModelManifest{
         .allocator = std.testing.allocator,
-        .model_type = .recognizer,
+        .model_type = .extractor,
     };
     try validateTextEntityExtractionManifest(&manifest);
 
@@ -26397,7 +27046,7 @@ test "entity extraction model preflight rejects incompatible families and modali
     );
 
     var image_inputs = [_][]const u8{"image"};
-    manifest.model_type = .recognizer;
+    manifest.model_type = .extractor;
     manifest.inputs = &image_inputs;
     try std.testing.expectError(
         error.UnsupportedInput,
@@ -27383,13 +28032,13 @@ test "prompt cache stays disabled while CUDA continuous batching releases the mo
 
 test "taskMatchesModelListing exposes extraction-capable models only as extractors" {
     try std.testing.expect(taskMatchesModelListing("extractors", "extractor", "", &.{}, &.{}, false));
-    try std.testing.expect(taskMatchesModelListing("extractors", "recognizer", "", &.{}, &.{"extraction"}, false));
+    try std.testing.expect(taskMatchesModelListing("extractors", "extractor", "", &.{}, &.{"extraction"}, false));
     try std.testing.expect(taskMatchesModelListing("extractors", "reader", "", &.{}, &.{"extraction"}, false));
-    try std.testing.expect(taskMatchesModelListing("extractors", "recognizer", "gliner2", &.{}, &.{"labels"}, true));
+    try std.testing.expect(taskMatchesModelListing("extractors", "extractor", "gliner2", &.{}, &.{"labels"}, true));
     try std.testing.expect(taskMatchesModelListing("extractors", "classifier", "", &.{"classify"}, &.{}, true));
     try std.testing.expect(!taskMatchesModelListing("extractors", "classifier", "", &.{"classify"}, &.{}, false));
     try std.testing.expect(!taskMatchesModelListing("classifiers", "classifier", "", &.{"classify"}, &.{}, true));
-    try std.testing.expect(!taskMatchesModelListing("classifiers", "recognizer", "gliner2", &.{}, &.{"classification"}, true));
+    try std.testing.expect(!taskMatchesModelListing("classifiers", "extractor", "gliner2", &.{}, &.{"classification"}, true));
 }
 
 test "classification extraction applies top-k to single-label and threshold to multi-label taxonomies" {
@@ -27570,7 +28219,7 @@ test "HTTP model resolution is canonical and contained while trusted resolution 
     const explicit_variant_config = try std.fs.path.join(alloc, &.{ explicit_variant_root, "config.json" });
     defer alloc.free(explicit_variant_config);
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = explicit_variant_config, .data = "{}" });
-    const bge_ref = try registry_mod.ModelRef.parse(registry_mod.bge_m3_pinned_ref);
+    const bge_ref = try registry_mod.ModelRef.parse("BAAI/bge-m3");
     const bge_variant_root = try registry_mod.modelInstallDirAlloc(alloc, models_root, bge_ref);
     defer alloc.free(bge_variant_root);
     try std.Io.Dir.cwd().createDirPath(std.testing.io, bge_variant_root);
@@ -28237,6 +28886,7 @@ fn dirContainsModel(path: []const u8) bool {
         while (iter.next(std.Options.debug_io) catch null) |entry| {
             const name = entry.name;
             if (name.len > 5 and std.mem.endsWith(u8, name, ".gguf")) return true;
+            if (name.len > 5 and std.mem.endsWith(u8, name, ".onnx")) return true;
         }
         return false;
     }
@@ -28251,6 +28901,7 @@ fn dirContainsModel(path: []const u8) bool {
         const name_z: [*:0]const u8 = @ptrCast(&entry.*.d_name);
         const name = std.mem.span(name_z);
         if (name.len > 5 and std.mem.endsWith(u8, name, ".gguf")) return true;
+        if (name.len > 5 and std.mem.endsWith(u8, name, ".onnx")) return true;
     }
 
     return false;
@@ -32932,6 +33583,24 @@ test "admission rejection metrics retain unclamped requested units" {
     ) != null);
 }
 
+test "structured extract rejects mixed inputs before resolving a missing model" {
+    const allocator = std.testing.allocator;
+    var node = try Node.init(allocator, .{});
+    defer node.deinit();
+    var request = try httpx.Request.init(allocator, .POST, "/ai/v1/extract");
+    defer request.deinit();
+    request.body =
+        \\{"model":"missing-model","inputs":[{"content":"hello"},{"content":[{"type":"image_url","image_url":{"url":"https://invalid.example/image.png"}}]}],"schema":{"structures":{"answer":{"fields":{"value":"string"}}}}}
+    ;
+    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try node.extract(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 400), response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "INVALID_REQUEST") != null);
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+}
+
 test "structured extract maps weighted admission exhaustion to retryable capacity" {
     const allocator = std.testing.allocator;
     var node = try Node.init(allocator, .{ .max_concurrent_requests = 1 });
@@ -33047,12 +33716,130 @@ fn graphModeEnabled() bool {
     return platform.env.getenvBool("TERMITE_GRAPH_MODE");
 }
 
-test "boundary qualification model listings reject raw explicit tasks and capabilities" {
+test "boundary qualification model listings withhold every unqualified gliner2.5 artifact" {
+    // The family runtime is reviewed and published
+    // (models/gliner_boundary_qualification.zig has a production row), so
+    // this no longer takes the blanket family-closed shortcut. An artifact
+    // whose pull-time synthesis withheld its tasks/capabilities (because
+    // registry.zig's boundaryIdentityIsQualified found no matching
+    // production row for its actual bytes) still has nothing to list here,
+    // exactly like any other model kind with an empty tasks/capabilities set.
+    try std.testing.expect(gliner_boundary_model.runtime_available);
+    // Every real gliner2.5 manifest reports model_type "extractor" (was
+    // "recognizer"; parseBoundaryConfigFromCatalog). Include "extractors"
+    // itself here on purpose: model_kind now equals the singular of its own
+    // task category name, which for every OTHER kind would trigger the
+    // generic kind-name pluralization fallback (task[0..len-1] == model_kind)
+    // regardless of tasks/capabilities -- taskMatchesModelListing explicitly
+    // excludes "extractor" from that fallback (see its comment) so an
+    // unqualified/empty-capabilities gliner2.5 artifact still cannot slip
+    // into a listing this way. This loop is exactly the regression guard for
+    // that exclusion.
     for ([_][]const u8{ "extractors", "generators", "readers" }) |task| {
-        for ([_][]const u8{ "recognizer", "extractor", "generator" }) |kind| {
-            try std.testing.expect(!taskMatchesModelListing(task, kind, "gliner2.5", &.{ "extract", "generate", "read" }, &.{ "extraction", "classification", "relations" }, true));
+        try std.testing.expect(!taskMatchesModelListing(task, "extractor", "gliner2.5", &.{}, &.{}, false));
+    }
+
+    // A reviewed, qualified artifact carries real tasks/capabilities written
+    // by registry.zig and is listed the same way as any other extractor:
+    // present under "extractors" and its declared capabilities, absent from
+    // categories it never claimed.
+    try std.testing.expect(taskMatchesModelListing("extractors", "extractor", "gliner2.5", &.{"extract"}, &.{ "extraction", "classification", "relations", "records" }, false));
+    try std.testing.expect(!taskMatchesModelListing("generators", "extractor", "gliner2.5", &.{"extract"}, &.{ "extraction", "classification", "relations", "records" }, false));
+    try std.testing.expect(!taskMatchesModelListing("readers", "extractor", "gliner2.5", &.{"extract"}, &.{ "extraction", "classification", "relations", "records" }, false));
+
+    try std.testing.expect(taskMatchesModelListing("extractors", "extractor", "gliner2", &.{"extract"}, &.{"labels"}, true));
+}
+
+test "laya extraction v2 serves typed decisions over HTTP and embedded calls" {
+    const root = platform.env.getenv("ANTFLY_LAYA_QUALIFICATION") orelse platform.env.getenv("ANTFLY_LAYA_REFERENCE") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var node = try Node.init(a, .{ .models_dir = root, .allow_unknown_models = true, .max_concurrent_requests = 1, .process_termination_available = true });
+    defer node.deinit();
+    try node.attachIo(std.testing.io);
+    const backend: backends_mod.BackendType = if (platform.env.getenv("ANTFLY_LAYA_METAL") != null) .metal else .native;
+    node.session_manager.required_backend = backend;
+    node.model_manager.session_manager.required_backend = backend;
+    const body =
+        \\{"model":"model","schema_version":2,"inputs":[{"content":"please find the document"}],"schema":{"classifications":[{"name":"tool","mode":"single","instruction":"which tool is needed?","labels":["search","fetch","none"]},{"name":"urgency","mode":"ordinal","instruction":"urgency?","labels":["low","medium","high"]},{"name":"needed","mode":"boolean","instruction":"is search needed?","labels":["false","true"]}]}}
+    ;
+    var direct = try node.extractV2DirectJsonWithControl(a, body, null);
+    defer direct.deinit();
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, direct.json, .{});
+    defer parsed.deinit();
+    const item = parsed.value.object.get("data").?.array.items[0].object;
+    try std.testing.expect(!item.contains("id"));
+    const decisions = item.get("decisions").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), decisions.len);
+    try std.testing.expectEqualStrings("normalized_inverse_entropy", decisions[0].object.get("confidence_method").?.string);
+    try std.testing.expect(decisions[1].object.contains("expected_value"));
+    try std.testing.expect(decisions[2].object.contains("true_probability"));
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/extract");
+    defer request.deinit();
+    request.body = body;
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try node.extractJSON(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    try std.testing.expectEqualStrings(direct.json, response.body.?);
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    // 64 public inputs expand into 192 questions, exceeding the executor's
+    // 128-input ceiling only if questions are incorrectly counted as inputs.
+    const repeated_inputs = [_]struct { content: []const u8 }{.{ .content = "please find the document" }} ** 64;
+    const original_request = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+    defer original_request.deinit();
+    const expanded_body = try std.json.Stringify.valueAlloc(a, .{ .model = "model", .schema_version = 2, .inputs = repeated_inputs, .schema = original_request.value.object.get("schema").? }, .{});
+    defer a.free(expanded_body);
+    var expanded_result = try node.extractV2DirectJsonWithControl(a, expanded_body, null);
+    defer expanded_result.deinit();
+    const expanded_parsed = try std.json.parseFromSlice(std.json.Value, a, expanded_result.json, .{});
+    defer expanded_parsed.deinit();
+    const expanded_items = expanded_parsed.value.object.get("data").?.array.items;
+    try std.testing.expectEqual(@as(usize, 64), expanded_items.len);
+    for (expanded_items) |expanded_item| {
+        const expanded_decisions = expanded_item.object.get("decisions").?.array.items;
+        try std.testing.expectEqual(decisions.len, expanded_decisions.len);
+        for (decisions, expanded_decisions) |expected, actual| {
+            try std.testing.expectEqualStrings(expected.object.get("name").?.string, actual.object.get("name").?.string);
+            try std.testing.expectEqualStrings(expected.object.get("label").?.string, actual.object.get("label").?.string);
         }
     }
-    try std.testing.expect(!taskMatchesModelListing("extractors", "extractor", "gliner2.5", &.{}, &.{}, false));
-    try std.testing.expect(taskMatchesModelListing("extractors", "recognizer", "gliner2", &.{"extract"}, &.{"labels"}, true));
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    const invalid = try std.mem.replaceOwned(u8, a, body, "\"mode\":\"boolean\"", "\"mode\":\"multi\"");
+    defer a.free(invalid);
+    try std.testing.expectError(error.UnsupportedExtractionFeature, node.extractV2DirectJsonWithControl(a, invalid, null));
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    const shared_schema = "{\"classifications\":[{\"name\":\"tool\",\"instruction\":\"which tool is needed?\",\"labels\":[\"search\",\"fetch\",\"none\"]}]}";
+    const input_rows = [_][]const u8{
+        "{\"id\":\"first\",\"content\":\"please find the document\"}",
+        "{\"id\":\"second\",\"content\":\"urgent\",\"schema\":{\"classifications\":[{\"name\":\"needed\",\"mode\":\"boolean\",\"instruction\":\"is search needed?\",\"labels\":[\"false\",\"true\"]}]}}",
+        "{\"id\":\"third\",\"content\":\"hello world\"}",
+    };
+    const batch_body = try std.fmt.allocPrint(a, "{{\"model\":\"model\",\"schema_version\":2,\"schema\":{s},\"inputs\":[{s},{s},{s}]}}", .{ shared_schema, input_rows[0], input_rows[1], input_rows[2] });
+    defer a.free(batch_body);
+    var batch_result = try node.extractV2DirectJsonWithControl(a, batch_body, null);
+    defer batch_result.deinit();
+    const BatchResponse = struct { data: []const struct { id: []const u8, decisions: []const struct { name: []const u8, label: []const u8, probabilities: []const struct { probability: f32 } } } };
+    const batch_parsed = try std.json.parseFromSlice(BatchResponse, a, batch_result.json, .{ .ignore_unknown_fields = true });
+    defer batch_parsed.deinit();
+    try std.testing.expectEqual(input_rows.len, batch_parsed.value.data.len);
+    for (input_rows, batch_parsed.value.data) |input, actual| {
+        const single_body = try std.fmt.allocPrint(a, "{{\"model\":\"model\",\"schema_version\":2,\"schema\":{s},\"inputs\":[{s}]}}", .{ shared_schema, input });
+        defer a.free(single_body);
+        var single = try node.extractV2DirectJsonWithControl(a, single_body, null);
+        defer single.deinit();
+        const single_parsed = try std.json.parseFromSlice(BatchResponse, a, single.json, .{ .ignore_unknown_fields = true });
+        defer single_parsed.deinit();
+        const expected = single_parsed.value.data[0];
+        try std.testing.expectEqualStrings(expected.id, actual.id);
+        try std.testing.expectEqual(expected.decisions.len, actual.decisions.len);
+        for (expected.decisions, actual.decisions) |want, got| {
+            try std.testing.expectEqualStrings(want.name, got.name);
+            try std.testing.expectEqualStrings(want.label, got.label);
+            for (want.probabilities, got.probabilities) |p, q| try std.testing.expectApproxEqAbs(p.probability, q.probability, 5e-4);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    try std.testing.expect(taskMatchesModelListing("extractors", "classifier", "", &.{"extract"}, &.{"typed_decisions"}, false));
+    try std.testing.expect(!taskMatchesModelListing("classifiers", "classifier", "", &.{"extract"}, &.{"typed_decisions"}, false));
 }

@@ -133,6 +133,9 @@ pub fn addAssetToolChecks(b: *std.Build, steps: *std.AutoHashMap(*std.Build.Step
     while (iterator.next()) |entry| {
         const artifact = entry.*.cast(std.Build.Step.Compile) orelse continue;
         if (!artifact.root_module.import_table.contains("inference_finetune_assets")) continue;
+        // Grouped entrypoint checks combine multiple source owners. They are
+        // inspected by check(), but are not individual offline I/O commands.
+        if (std.mem.startsWith(u8, artifact.name, "finetune-command-check-")) continue;
         var seen = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
         checkAssetModule(b, artifact.root_module, &seen);
         assets.put(artifact.name, artifact) catch @panic("OOM");
@@ -238,6 +241,9 @@ fn checkAssetModule(b: *std.Build, module: *std.Build.Module, seen: *std.AutoHas
 /// Keep the actual inference qualification test's imports and runner.
 pub fn addPjrtQualificationProbe(b: *std.Build, artifact: *std.Build.Step.Compile) bool {
     if (!artifact.kind.isTest() or artifact.test_runner == null) return false;
+    // The hardware gate shares this module. Select the ordinary test artifact
+    // deterministically before replacing the shared source, regardless of map order.
+    if (!std.mem.eql(u8, artifact.name, "test")) return false;
     const source = artifact.root_module.root_source_file orelse return false;
     switch (source) {
         .src_path => |path| if (!std.mem.eql(u8, path.sub_path, "src/inference.zig") and

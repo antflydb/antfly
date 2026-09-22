@@ -33,11 +33,11 @@ pub fn create(ctx: Context) Suite {
         .path = ctx.path("src/test_runner_filter.zig"),
         .mode = .simple,
     };
-    // Full CPU inference tests including GLiNER2.5 measured 7.2 GiB to
-    // compile. Reserve headroom so the bounded build scheduler can account
-    // for this artifact without rejecting a successful compilation.
+    // Full CPU inference tests including GLiNER2.5 measured 7.2 GiB; the
+    // macOS build with Metal measured 11.2 GiB. Reserve target-specific
+    // headroom rather than rejecting successful accelerator compilations.
     const tests = b.addTest(.{
-        .max_rss = 9 * 1024 * 1024 * 1024,
+        .max_rss = @as(usize, if (ctx.target.result.os.tag == .macos) 14 else 9) * 1024 * 1024 * 1024,
         .root_module = b.createModule(.{
             .root_source_file = ctx.path("src/inference.zig"),
             .target = ctx.target,
@@ -51,6 +51,7 @@ pub fn create(ctx: Context) Suite {
     tests.root_module.addImport("build_options", ctx.graph.qualification_build_options_mod);
     tests.root_module.addImport("antfly-json", ctx.graph.json_mod);
     tests.root_module.addImport("httpx", ctx.graph.httpx_mod);
+    tests.root_module.addImport("protobuf", ctx.graph.protobuf_mod);
     tests.root_module.addImport("inference_api", ctx.graph.inference_api_mod);
     tests.root_module.addImport("antfly_generating_openapi", ctx.graph.generating_openapi_mod);
     tests.root_module.addImport("antfly_extraction_openapi", ctx.graph.extraction_openapi_mod);

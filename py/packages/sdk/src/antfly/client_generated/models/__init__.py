@@ -77,6 +77,7 @@ from .bool_field_query import BoolFieldQuery
 from .boolean_query import BooleanQuery
 from .brave_search_config import BraveSearchConfig
 from .brave_search_config_freshness import BraveSearchConfigFreshness
+from .brave_search_config_provider import BraveSearchConfigProvider
 from .calendar_interval import CalendarInterval
 from .capability import Capability
 from .cardinality_mode import CardinalityMode
@@ -144,6 +145,8 @@ from .create_full_text_index_request_type import CreateFullTextIndexRequestType
 from .create_graph_index_request import CreateGraphIndexRequest
 from .create_graph_index_request_type import CreateGraphIndexRequestType
 from .create_index_common import CreateIndexCommon
+from .create_relational_index_request import CreateRelationalIndexRequest
+from .create_relational_index_request_type import CreateRelationalIndexRequestType
 from .create_table_request import CreateTableRequest
 from .create_table_request_indexes import CreateTableRequestIndexes
 from .create_table_storage_migration_body import CreateTableStorageMigrationBody
@@ -172,6 +175,8 @@ from .created_graph_index_config_metrics import CreatedGraphIndexConfigMetrics
 from .created_graph_index_type import CreatedGraphIndexType
 from .created_index_common import CreatedIndexCommon
 from .created_provider_config import CreatedProviderConfig
+from .created_relational_index import CreatedRelationalIndex
+from .created_relational_index_type import CreatedRelationalIndexType
 from .credentials import Credentials
 from .data_shape_decl import DataShapeDecl
 from .data_shape_kind import DataShapeKind
@@ -261,6 +266,7 @@ from .evaluator_name import EvaluatorName
 from .evaluator_score import EvaluatorScore
 from .evaluator_score_metadata import EvaluatorScoreMetadata
 from .exa_search_config import ExaSearchConfig
+from .exa_search_config_provider import ExaSearchConfigProvider
 from .exa_search_config_search_type import ExaSearchConfigSearchType
 from .exact_sort_error import ExactSortError
 from .exact_sort_error_error import ExactSortErrorError
@@ -314,6 +320,9 @@ from .extraction_constraint_not import ExtractionConstraintNot
 from .extraction_constraint_not_type import ExtractionConstraintNotType
 from .extraction_constraint_or import ExtractionConstraintOr
 from .extraction_constraint_or_type import ExtractionConstraintOrType
+from .extraction_decision import ExtractionDecision
+from .extraction_decision_confidence_method import ExtractionDecisionConfidenceMethod
+from .extraction_decision_type import ExtractionDecisionType
 from .extraction_decoder_options import ExtractionDecoderOptions
 from .extraction_decoder_options_algorithm import ExtractionDecoderOptionsAlgorithm
 from .extraction_entity import ExtractionEntity
@@ -352,6 +361,7 @@ from .extraction_joint_schema import ExtractionJointSchema
 from .extraction_joint_schema_entities import ExtractionJointSchemaEntities
 from .extraction_joint_schema_relations import ExtractionJointSchemaRelations
 from .extraction_label_definition import ExtractionLabelDefinition
+from .extraction_label_probability import ExtractionLabelProbability
 from .extraction_long_document_metadata import ExtractionLongDocumentMetadata
 from .extraction_long_document_metadata_classification_aggregation import (
     ExtractionLongDocumentMetadataClassificationAggregation,
@@ -420,6 +430,9 @@ from .filter_spec import FilterSpec
 from .filter_spec_operator import FilterSpecOperator
 from .followup_step_config import FollowupStepConfig
 from .foreign_column import ForeignColumn
+from .foreign_key_action import ForeignKeyAction
+from .foreign_key_match import ForeignKeyMatch
+from .foreign_key_timing import ForeignKeyTiming
 from .foreign_source import ForeignSource
 from .foreign_source_type import ForeignSourceType
 from .full_text_artifact_index_source import FullTextArtifactIndexSource
@@ -654,6 +667,9 @@ from .image_url_content_part_type import ImageURLContentPartType
 from .incomplete_details import IncompleteDetails
 from .incomplete_details_reason import IncompleteDetailsReason
 from .index_execution_config import IndexExecutionConfig
+from .index_maintenance_owner_proof import IndexMaintenanceOwnerProof
+from .index_maintenance_request import IndexMaintenanceRequest
+from .index_maintenance_response import IndexMaintenanceResponse
 from .index_milestone_status import IndexMilestoneStatus
 from .index_milestones import IndexMilestones
 from .index_mutation_conflict_error import IndexMutationConflictError
@@ -883,6 +899,7 @@ from .linear_merge_result import LinearMergeResult
 from .linkup_search_config import LinkupSearchConfig
 from .linkup_search_config_depth import LinkupSearchConfigDepth
 from .linkup_search_config_output_type import LinkupSearchConfigOutputType
+from .linkup_search_config_provider import LinkupSearchConfigProvider
 from .list_document_artifact_manifests_detail import ListDocumentArtifactManifestsDetail
 from .list_restore_jobs_phase import ListRestoreJobsPhase
 from .list_restore_jobs_scope import ListRestoreJobsScope
@@ -1008,6 +1025,46 @@ from .rate_limit_config import RateLimitConfig
 from .reauthorize_table_destinations_response_200 import ReauthorizeTableDestinationsResponse200
 from .reauthorize_table_destinations_response_200_status import ReauthorizeTableDestinationsResponse200Status
 from .regexp_query import RegexpQuery
+from .relational_check_constraint import RelationalCheckConstraint
+from .relational_column_expression import RelationalColumnExpression
+from .relational_comparison_op import RelationalComparisonOp
+from .relational_constraint_activation_phase import RelationalConstraintActivationPhase
+from .relational_constraint_conflict_reason import RelationalConstraintConflictReason
+from .relational_constraint_range_status import RelationalConstraintRangeStatus
+from .relational_constraint_retirement_request import RelationalConstraintRetirementRequest
+from .relational_constraint_retirement_status import RelationalConstraintRetirementStatus
+from .relational_constraint_retirement_status_phase import RelationalConstraintRetirementStatusPhase
+from .relational_constraint_retry_request import RelationalConstraintRetryRequest
+from .relational_constraint_retry_response import RelationalConstraintRetryResponse
+from .relational_constraint_retry_response_status import RelationalConstraintRetryResponseStatus
+from .relational_constraint_status import RelationalConstraintStatus
+from .relational_constraint_status_coverage_kind import RelationalConstraintStatusCoverageKind
+from .relational_constraint_validation_state import RelationalConstraintValidationState
+from .relational_expression_op import RelationalExpressionOp
+from .relational_expression_type import RelationalExpressionType
+from .relational_foreign_key_constraint import RelationalForeignKeyConstraint
+from .relational_index_build_failure import RelationalIndexBuildFailure
+from .relational_index_build_state import RelationalIndexBuildState
+from .relational_index_config import RelationalIndexConfig
+from .relational_index_definition import RelationalIndexDefinition
+from .relational_index_key import RelationalIndexKey
+from .relational_index_key_direction import RelationalIndexKeyDirection
+from .relational_index_key_nulls import RelationalIndexKeyNulls
+from .relational_index_predicate import RelationalIndexPredicate
+from .relational_index_range_status import RelationalIndexRangeStatus
+from .relational_index_stats import RelationalIndexStats
+from .relational_index_stats_index_type import RelationalIndexStatsIndexType
+from .relational_index_status import RelationalIndexStatus
+from .relational_row import RelationalRow
+from .relational_row_condition import RelationalRowCondition
+from .relational_row_index_bound import RelationalRowIndexBound
+from .relational_row_mutation import RelationalRowMutation
+from .relational_row_mutation_request import RelationalRowMutationRequest
+from .relational_row_mutation_row import RelationalRowMutationRow
+from .relational_row_query_request import RelationalRowQueryRequest
+from .relational_row_row import RelationalRowRow
+from .relational_scalar_expression import RelationalScalarExpression
+from .relational_unique_constraint import RelationalUniqueConstraint
 from .rename_catalog_resource_request import RenameCatalogResourceRequest
 from .repair_issue_list_request import RepairIssueListRequest
 from .repair_run_request import RepairRunRequest
@@ -1064,6 +1121,7 @@ from .secret_store_status import SecretStoreStatus
 from .secret_write_request import SecretWriteRequest
 from .semantic_query_mode import SemanticQueryMode
 from .serper_search_config import SerperSearchConfig
+from .serper_search_config_provider import SerperSearchConfigProvider
 from .serper_search_config_search_type import SerperSearchConfigSearchType
 from .serper_search_config_time_period import SerperSearchConfigTimePeriod
 from .set_row_filter_body import SetRowFilterBody
@@ -1098,6 +1156,7 @@ from .storage_runtime_status import StorageRuntimeStatus
 from .storage_runtime_status_engine import StorageRuntimeStatusEngine
 from .storage_status import StorageStatus
 from .stream_transcription_audio_format import StreamTranscriptionAudioFormat
+from .stt_provider import STTProvider
 from .success_message import SuccessMessage
 from .sync_level import SyncLevel
 from .table import Table
@@ -1130,12 +1189,14 @@ from .table_shards import TableShards
 from .table_statistics import TableStatistics
 from .table_statistics_field_stats import TableStatisticsFieldStats
 from .table_status import TableStatus
+from .table_storage_mode import TableStorageMode
 from .table_storage_settings import TableStorageSettings
 from .table_storage_settings_dense_embeddings import TableStorageSettingsDenseEmbeddings
 from .table_storage_unreadable_error import TableStorageUnreadableError
 from .table_storage_unreadable_error_code import TableStorageUnreadableErrorCode
 from .tablespace_catalog_record import TablespaceCatalogRecord
 from .tavily_search_config import TavilySearchConfig
+from .tavily_search_config_provider import TavilySearchConfigProvider
 from .tavily_search_config_search_depth import TavilySearchConfigSearchDepth
 from .template_field_mapping import TemplateFieldMapping
 from .template_field_mapping_missing_null_policy import TemplateFieldMappingMissingNullPolicy
@@ -1179,6 +1240,7 @@ from .transaction_stage_read_snapshot import TransactionStageReadSnapshot
 from .transaction_stage_write_request import TransactionStageWriteRequest
 from .transaction_stage_write_request_document import TransactionStageWriteRequestDocument
 from .transaction_status_response import TransactionStatusResponse
+from .transcriber_enrichment_config import TranscriberEnrichmentConfig
 from .transform import Transform
 from .transform_op import TransformOp
 from .transform_op_type import TransformOpType
@@ -1213,12 +1275,14 @@ from .vertex_generator_config_provider import VertexGeneratorConfigProvider
 from .vertex_reranker_config import VertexRerankerConfig
 from .vertex_reranker_config_provider import VertexRerankerConfigProvider
 from .vertex_search_config import VertexSearchConfig
+from .vertex_search_config_provider import VertexSearchConfigProvider
 from .vertex_search_config_service import VertexSearchConfigService
 from .web_search_config import WebSearchConfig
 from .web_search_connection import WebSearchConnection
 from .web_search_provider import WebSearchProvider
 from .wildcard_query import WildcardQuery
 from .you_search_config import YouSearchConfig
+from .you_search_config_provider import YouSearchConfigProvider
 
 __all__ = (
     "AdvanceTableStorageMigrationBody",
@@ -1298,6 +1362,7 @@ __all__ = (
     "BoolFieldQuery",
     "BraveSearchConfig",
     "BraveSearchConfigFreshness",
+    "BraveSearchConfigProvider",
     "CalendarInterval",
     "Capability",
     "CardinalityMode",
@@ -1377,6 +1442,8 @@ __all__ = (
     "CreatedGraphIndexType",
     "CreatedIndexCommon",
     "CreatedProviderConfig",
+    "CreatedRelationalIndex",
+    "CreatedRelationalIndexType",
     "CreateEmbeddingsIndexRequest",
     "CreateEmbeddingsIndexRequestType",
     "CreateFullTextIndexRequest",
@@ -1384,6 +1451,8 @@ __all__ = (
     "CreateGraphIndexRequest",
     "CreateGraphIndexRequestType",
     "CreateIndexCommon",
+    "CreateRelationalIndexRequest",
+    "CreateRelationalIndexRequestType",
     "CreateTableRequest",
     "CreateTableRequestIndexes",
     "CreateTablespaceRequest",
@@ -1483,6 +1552,7 @@ __all__ = (
     "ExactSortErrorError",
     "ExactSortErrorStatus",
     "ExaSearchConfig",
+    "ExaSearchConfigProvider",
     "ExaSearchConfigSearchType",
     "ExecuteGraphMetricActionAction",
     "ExecuteNamespaceTableGraphMetricActionAction",
@@ -1533,6 +1603,9 @@ __all__ = (
     "ExtractionConstraintNotType",
     "ExtractionConstraintOr",
     "ExtractionConstraintOrType",
+    "ExtractionDecision",
+    "ExtractionDecisionConfidenceMethod",
+    "ExtractionDecisionType",
     "ExtractionDecoderOptions",
     "ExtractionDecoderOptionsAlgorithm",
     "ExtractionEntity",
@@ -1571,6 +1644,7 @@ __all__ = (
     "ExtractionJointSchemaEntities",
     "ExtractionJointSchemaRelations",
     "ExtractionLabelDefinition",
+    "ExtractionLabelProbability",
     "ExtractionLongDocumentMetadata",
     "ExtractionLongDocumentMetadataClassificationAggregation",
     "ExtractionLongDocumentMetadataDuplicateScore",
@@ -1633,6 +1707,9 @@ __all__ = (
     "FilterSpecOperator",
     "FollowupStepConfig",
     "ForeignColumn",
+    "ForeignKeyAction",
+    "ForeignKeyMatch",
+    "ForeignKeyTiming",
     "ForeignSource",
     "ForeignSourceType",
     "FullTextArtifactIndexSource",
@@ -1867,6 +1944,9 @@ __all__ = (
     "IncompleteDetails",
     "IncompleteDetailsReason",
     "IndexExecutionConfig",
+    "IndexMaintenanceOwnerProof",
+    "IndexMaintenanceRequest",
+    "IndexMaintenanceResponse",
     "IndexMilestones",
     "IndexMilestoneStatus",
     "IndexMutationConflictError",
@@ -2094,6 +2174,7 @@ __all__ = (
     "LinkupSearchConfig",
     "LinkupSearchConfigDepth",
     "LinkupSearchConfigOutputType",
+    "LinkupSearchConfigProvider",
     "ListDocumentArtifactManifestsDetail",
     "ListRestoreJobsPhase",
     "ListRestoreJobsScope",
@@ -2217,6 +2298,46 @@ __all__ = (
     "ReauthorizeTableDestinationsResponse200",
     "ReauthorizeTableDestinationsResponse200Status",
     "RegexpQuery",
+    "RelationalCheckConstraint",
+    "RelationalColumnExpression",
+    "RelationalComparisonOp",
+    "RelationalConstraintActivationPhase",
+    "RelationalConstraintConflictReason",
+    "RelationalConstraintRangeStatus",
+    "RelationalConstraintRetirementRequest",
+    "RelationalConstraintRetirementStatus",
+    "RelationalConstraintRetirementStatusPhase",
+    "RelationalConstraintRetryRequest",
+    "RelationalConstraintRetryResponse",
+    "RelationalConstraintRetryResponseStatus",
+    "RelationalConstraintStatus",
+    "RelationalConstraintStatusCoverageKind",
+    "RelationalConstraintValidationState",
+    "RelationalExpressionOp",
+    "RelationalExpressionType",
+    "RelationalForeignKeyConstraint",
+    "RelationalIndexBuildFailure",
+    "RelationalIndexBuildState",
+    "RelationalIndexConfig",
+    "RelationalIndexDefinition",
+    "RelationalIndexKey",
+    "RelationalIndexKeyDirection",
+    "RelationalIndexKeyNulls",
+    "RelationalIndexPredicate",
+    "RelationalIndexRangeStatus",
+    "RelationalIndexStats",
+    "RelationalIndexStatsIndexType",
+    "RelationalIndexStatus",
+    "RelationalRow",
+    "RelationalRowCondition",
+    "RelationalRowIndexBound",
+    "RelationalRowMutation",
+    "RelationalRowMutationRequest",
+    "RelationalRowMutationRow",
+    "RelationalRowQueryRequest",
+    "RelationalRowRow",
+    "RelationalScalarExpression",
+    "RelationalUniqueConstraint",
     "RenameCatalogResourceRequest",
     "RepairIssueListRequest",
     "RepairRunRequest",
@@ -2273,6 +2394,7 @@ __all__ = (
     "SecretWriteRequest",
     "SemanticQueryMode",
     "SerperSearchConfig",
+    "SerperSearchConfigProvider",
     "SerperSearchConfigSearchType",
     "SerperSearchConfigTimePeriod",
     "SetRowFilterBody",
@@ -2307,6 +2429,7 @@ __all__ = (
     "StorageRuntimeStatusEngine",
     "StorageStatus",
     "StreamTranscriptionAudioFormat",
+    "STTProvider",
     "SuccessMessage",
     "SyncLevel",
     "Table",
@@ -2340,11 +2463,13 @@ __all__ = (
     "TableStatistics",
     "TableStatisticsFieldStats",
     "TableStatus",
+    "TableStorageMode",
     "TableStorageSettings",
     "TableStorageSettingsDenseEmbeddings",
     "TableStorageUnreadableError",
     "TableStorageUnreadableErrorCode",
     "TavilySearchConfig",
+    "TavilySearchConfigProvider",
     "TavilySearchConfigSearchDepth",
     "TemplateFieldMapping",
     "TemplateFieldMappingMissingNullPolicy",
@@ -2388,6 +2513,7 @@ __all__ = (
     "TransactionStageWriteRequest",
     "TransactionStageWriteRequestDocument",
     "TransactionStatusResponse",
+    "TranscriberEnrichmentConfig",
     "Transform",
     "TransformOp",
     "TransformOpType",
@@ -2422,10 +2548,12 @@ __all__ = (
     "VertexRerankerConfig",
     "VertexRerankerConfigProvider",
     "VertexSearchConfig",
+    "VertexSearchConfigProvider",
     "VertexSearchConfigService",
     "WebSearchConfig",
     "WebSearchConnection",
     "WebSearchProvider",
     "WildcardQuery",
     "YouSearchConfig",
+    "YouSearchConfigProvider",
 )

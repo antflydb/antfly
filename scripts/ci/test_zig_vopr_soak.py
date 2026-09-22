@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -42,6 +43,10 @@ class SoakTests(unittest.TestCase):
                 (root / "production-e2e-soak").mkdir()
                 (root / "scripts/ci").mkdir(parents=True)
                 (root / "tools").mkdir()
+                for helper in ("run_e2e_case.py", "zig_vopr_soak.py"):
+                    shutil.copyfile(
+                        Path(__file__).with_name(helper), root / "scripts/ci" / helper
+                    )
                 (root / "tools/run_bounded_zig_build.py").write_text(
                     "import os, sys\n"
                     "args = sys.argv[1:]\n"
@@ -165,6 +170,97 @@ class SoakTests(unittest.TestCase):
             pid = int((root / "log").read_text())
             with self.assertRaises(ProcessLookupError):
                 os.kill(pid, 0)
+
+    def test_timeout_allows_nested_supervisor_to_finish_after_parent_exits(self):
+        import signal
+        import time
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            heartbeat = root / "heartbeat"
+            pid_file = root / "server.pid"
+            finished = root / "supervisor-finished"
+            child = root / "server.py"
+            child.write_text(
+                "import os, signal, time\nfrom pathlib import Path\n"
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                f"Path({str(pid_file)!r}).write_text(str(os.getpid()))\n"
+                f"p = Path({str(heartbeat)!r})\n"
+                "while True:\n p.write_text(str(time.monotonic())); time.sleep(.01)\n"
+            )
+            supervisor = root / "supervisor.py"
+            supervisor.write_text(
+                "import sys\nfrom pathlib import Path\n"
+                f"sys.path.insert(0, {str(Path(soak.__file__).parent)!r})\n"
+                "from zig_vopr_soak import run_process\n"
+                f"result = run_process([sys.executable, {str(child)!r}], "
+                "stdout=None, timeout=60, grace=.3, clean_descendants=True)\n"
+                f"Path({str(finished)!r}).write_text(str(result.returncode))\n"
+            )
+            # Like the profile wrapper, this parent exits immediately on TERM.
+            # Its supervisor owns a server in a separate process group.
+            parent = root / "parent.py"
+            parent.write_text(
+                "import subprocess, sys, time\n"
+                f"subprocess.Popen([sys.executable, {str(supervisor)!r}])\n"
+                "time.sleep(60)\n"
+            )
+            try:
+                result = soak.run_process(
+                    [sys.executable, str(parent)],
+                    stdout=subprocess.DEVNULL,
+                    timeout=2,
+                    grace=2,
+                    clean_descendants=True,
+                )
+                self.assertEqual(result.returncode, 124)
+                self.assertTrue(heartbeat.exists(), "server must have started")
+                self.assertTrue(
+                    finished.exists(), "inner supervisor must finish cleanup"
+                )
+                self.assertEqual(finished.read_text(), "130")
+                stopped = heartbeat.read_text()
+                time.sleep(0.1)
+                self.assertEqual(heartbeat.read_text(), stopped)
+            finally:
+                if pid_file.exists():
+                    try:
+                        os.kill(int(pid_file.read_text()), signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+    def test_completed_parent_cannot_leave_writing_server_descendants(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            heartbeat = root / "heartbeat"
+            child = root / "server.py"
+            child.write_text(
+                "import signal, time\nfrom pathlib import Path\n"
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                f"p = Path({str(heartbeat)!r})\n"
+                "while True:\n p.write_text(str(time.monotonic())); time.sleep(.01)\n"
+            )
+            parent = root / "parent.py"
+            parent.write_text(
+                "import subprocess, sys, time\nfrom pathlib import Path\n"
+                f"subprocess.Popen([sys.executable, {str(child)!r}])\n"
+                f"while not Path({str(heartbeat)!r}).exists(): time.sleep(.01)\n"
+            )
+            with (root / "log").open("w") as log:
+                result = soak.run_process(
+                    [sys.executable, str(parent)],
+                    stdout=log,
+                    timeout=5,
+                    grace=0.1,
+                    clean_descendants=True,
+                )
+            self.assertEqual(result.returncode, 0)
+            import time
+
+            time.sleep(0.1)
+            stopped = heartbeat.read_text()
+            time.sleep(0.1)
+            self.assertEqual(heartbeat.read_text(), stopped)
 
     def test_interrupted_campaign_keeps_partial_evidence_and_durable_status(self):
         with tempfile.TemporaryDirectory() as root:

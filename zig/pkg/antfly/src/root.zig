@@ -79,6 +79,7 @@ pub const sparse = @import("sparse/sparse.zig");
 // Inference clients (Antfly, OpenAI/Ollama)
 pub const inference = @import("inference/mod.zig");
 pub const table_schema = @import("schema/mod.zig");
+pub const capi_dependencies = @import("capi_dependencies.zig");
 pub const image = @import("antfly_image");
 pub const font = @import("antfly_font");
 pub const pdf = @import("antfly_pdf");
@@ -119,6 +120,7 @@ pub const restore_admission_vopr = @import("vopr/restore_admission.zig");
 pub const generation_lifecycle_vopr = @import("vopr/generation_lifecycle.zig");
 pub const backfill_marker_discovery_vopr = @import("vopr/backfill_marker_discovery.zig");
 pub const config_extension_lifecycle_vopr = @import("vopr/config_extension_lifecycle.zig");
+pub const secrets_vopr = @import("vopr/secrets.zig");
 pub const vopr_determinism_audit = @import("vopr/determinism_audit.zig");
 pub const external_lake_vopr = @import("vopr/external_lake.zig");
 pub const media_runtime_vopr = @import("vopr/media_runtime.zig");
@@ -407,6 +409,7 @@ test {
     _ = generation_lifecycle_vopr;
     _ = backfill_marker_discovery_vopr;
     _ = config_extension_lifecycle_vopr;
+    _ = secrets_vopr;
     _ = vopr_determinism_audit;
     _ = external_lake_vopr;
     _ = media_runtime_vopr;

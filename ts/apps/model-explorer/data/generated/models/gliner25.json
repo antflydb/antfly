@@ -3,7 +3,7 @@
  "id": "gliner25",
  "family": "gliner",
  "displayName": "GLiNER2.5 Base",
- "tagline": "GLiNER2's successor. Instead of scoring every possible span, it proposes span boundaries and lets each field in the schema score one shared pool of candidates — classifying, relating and building records in the same pass. It runs and trains in the runtime today, but is not yet cleared for serving.",
+ "tagline": "GLiNER2's successor. Instead of scoring every possible span, it proposes span boundaries and lets each field in the schema score one shared pool of candidates — classifying, relating and building records in the same pass. The base variant now serves in the runtime, gated by a published qualification table.",
  "stats": {
   "layers": 12,
   "hidden": 768,
@@ -17,7 +17,7 @@
   "variants": "small 74M · base 194M · multi 287M",
   "quant": "FP32 heads; encoder FP16/Q8_0/Q4_K",
   "tokenizer": "SentencePiece Unigram + strict normalizer",
-  "scope": "Architecture is recognized and runnable, but serving is withheld: no published runtime qualification profiles. Diagrams are schematic, not qualification evidence."
+  "scope": "Serving is qualified for the base-v1 bundles (f32 and fp16-encoder) on native and Metal, within pinned single-window and long-document length contracts; other variants and quantized-encoder bundles are not in the table. Diagrams are schematic, not qualification evidence."
  },
  "stages": [
   {
@@ -1542,7 +1542,7 @@
   }
  },
  "sources": {
-  "gitCommit": "497d957522ae809ebd322960cac8c7943851d841",
-  "generatedAt": "2026-09-18T23:10:04.315Z"
+  "gitCommit": "bcee94f230bc6058a4baf63a89fdb169a93823d0",
+  "generatedAt": "2026-09-22T16:40:40.798Z"
  }
 }

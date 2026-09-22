@@ -42,6 +42,15 @@ members need a runtime that understands catalog records: older receivers fail
 closed and cannot acknowledge them. Existing table-scoped streams keep their
 previous catalog restrictions.
 
+Seed capture can return HTTP 503 with the exact body
+`HASeedSnapshotRuntimeBusy` while background maintenance owns snapshot
+resources, including on an empty instance. This is a pre-admission rejection:
+the capture has not created its retention slot or started the base backup.
+Callers may retry the same generation, slot, and lifecycle binding within a
+bounded deadline. This does not make arbitrary 503 responses or lost replies
+safe to replay; reconcile uncertain capture outcomes using their lifecycle
+receipts instead.
+
 This adds table creation, including the initial table schema/index definition.
 It does not enable deletion or alteration of existing tables, native auth
 changes, backups or other surfaces still rejected by the mutation inventory.

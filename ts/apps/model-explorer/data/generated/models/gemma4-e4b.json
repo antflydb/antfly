@@ -918,7 +918,7 @@
      "source": {
       "path": "zig/pkg/inference/src/backends/metal_kernels.m",
       "anchor": "kernel void termite_sample_gumbel_partials(",
-      "line": 8789
+      "line": 8800
      },
      "kernelRouteIds": [],
      "kernels": [
@@ -1153,7 +1153,7 @@
   ]
  },
  "sources": {
-  "gitCommit": "497d957522ae809ebd322960cac8c7943851d841",
-  "generatedAt": "2026-09-18T23:10:04.315Z"
+  "gitCommit": "bcee94f230bc6058a4baf63a89fdb169a93823d0",
+  "generatedAt": "2026-09-22T16:40:40.798Z"
  }
 }

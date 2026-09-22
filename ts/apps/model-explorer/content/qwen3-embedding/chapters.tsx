@@ -156,7 +156,12 @@ export function Qwen3EmbeddingChapters({ spec }: ChaptersProps) {
             <strong>Simdgroup flash attention</strong>: <code>sg_q16</code> tiles with online
             softmax, never materializing the <code>[T, T]</code> score matrix.{" "}
             <strong>F16-KV direct load</strong>: the attention kernel reads K/V in f16 natively,
-            halving K/V storage bytes relative to f32 when that route is selected.
+            halving K/V storage bytes relative to f32 when that route is selected. The arithmetic
+            inside those tiles is ordinary attention —{" "}
+            <Link className="text-primary underline" href="/models/gemma4-e4b#ch-4">
+              walked through with small numbers
+            </Link>{" "}
+            on the Gemma4 page.
           </p>
           <p>
             <CodeLink link={L("kernel-q8-mm-sg")} /> ·{" "}

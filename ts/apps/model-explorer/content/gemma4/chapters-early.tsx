@@ -12,6 +12,7 @@ import { L } from "@/lib/links";
 import type { ChaptersProps } from "../registry";
 import {
   AttentionBlockFigure,
+  AttentionMicroFigure,
   EmbedLookupFigure,
   GqaGroupingFigure,
   KvExtrasFigure,
@@ -137,6 +138,28 @@ export function Gemma4EarlyChapters({ spec }: ChaptersProps) {
           </p>
         }
       >
+        <Scene id="mechanism" graphic={<AttentionMicroFigure />}>
+          <p>
+            <strong>The recipe everything here edits.</strong> Encoding the word <em>it</em> in “the
+            shard refused the write because it was full” means deciding which earlier words matter —
+            mostly <em>shard</em>. Attention makes that decision with arithmetic, and it is worth
+            seeing once with small numbers before Gemma4 starts rearranging it.
+          </p>
+          <p>
+            Every position carries three small vectors. The <strong>query</strong> is what a
+            position is looking for; the <strong>key</strong> is what it can be found by; the{" "}
+            <strong>value</strong> is what it contributes once chosen. A score is the dot product of
+            one position's query with another's key. Scores are divided by a fixed scale tied to
+            head width — √64 = 8 for the classic 64-wide head — and a softmax turns them into
+            weights that sum to one. The new representation of <em>it</em> is the weighted sum of
+            the value vectors: mostly <em>shard</em>, a little <em>full</em>, almost none of{" "}
+            <em>write</em>.
+          </p>
+          <p>
+            Gemma4's heads are wider, and the scenes below move the norms, shrink the key count, and
+            shutter which positions may be read at all. The recipe itself never changes.
+          </p>
+        </Scene>
         <Scene id="block" graphic={<AttentionBlockFigure isE4b={isE4b} />}>
           <p>
             After the QKV projection, each query and key head is RMS-normalized <em>per head</em> —
@@ -154,17 +177,23 @@ export function Gemma4EarlyChapters({ spec }: ChaptersProps) {
           <p>
             <strong>Grouped-query attention.</strong> {spec.displayName} runs 8 query heads against{" "}
             {isE4b ? "2 KV heads" : "a single KV head"} — {isE4b ? "4 queries" : "all 8 queries"}{" "}
-            share each K/V bank. Relative to eight distinct KV heads of the same width, that reduces
-            KV elements by {isE4b ? "4×" : "8×"}. Its effect on total latency depends on context
-            length, weight traffic, and the selected attention kernel.
+            share each K/V bank. The eight heads still ask eight different questions about{" "}
+            <em>it</em>; they just look the answers up in{" "}
+            {isE4b ? "two shared banks" : "one shared bank"} instead of eight private ones. Relative
+            to eight distinct KV heads of the same width, that reduces KV elements by{" "}
+            {isE4b ? "4×" : "8×"}. Its effect on total latency depends on context length, weight
+            traffic, and the selected attention kernel.
           </p>
         </Scene>
         <Scene id="mask" graphic={<RangeMaskFigure pattern={isE4b ? 6 : 5} />}>
           <p>
             <strong>The two masks.</strong> A sliding layer may only read a fixed trailing window of
             the sequence; every {isE4b ? "sixth" : "fifth"} layer can read the full causal history.
-            The layer types also differ in head dimension and RoPE settings. Attention dispatch
-            depends on those shapes, context length, and route policy.
+            In a document long enough that <em>shard</em> fell outside the window, no single sliding
+            layer could see <em>it</em> and its referent at once — the periodic global layers are
+            what keep direct long-range reads alive. The layer types also differ in head dimension
+            and RoPE settings. Attention dispatch depends on those shapes, context length, and route
+            policy.
           </p>
           <p>
             <CodeLink link={L("config-layer-uses-sliding")} />

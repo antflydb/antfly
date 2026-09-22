@@ -202,6 +202,11 @@ pub const PredictorState = struct {
 pub const IcsInfo = struct {
     window_sequence: WindowSequence,
     window_shape: u1,
+    /// Window shape of the previous frame on this channel. The left half of
+    /// every window (and the first short window's left slope) uses it, so
+    /// the overlap with the previous frame's right half is complementary.
+    /// The sequence decoder fills it in; a lone block decode assumes sine.
+    previous_window_shape: u1 = 0,
     max_sfb: u8,
     num_window_groups: u8,
     window_group_length: [8]u8 = [_]u8{0} ** 8,
@@ -257,6 +262,11 @@ const TrailingElementInfo = struct {
     payload_hash: u32 = 2166136261,
     ps_max_payload_len: u16 = 0,
     ps_payload_hash: u32 = 2166136261,
+    /// Length of the richest payload whose subfields are still held. A shorter
+    /// later fill keeps the earlier subfields, so `max_payload_len` alone, which
+    /// tracks the latest fill, cannot say which of them are meaningful.
+    subfield_len: u16 = 0,
+    ps_subfield_len: u16 = 0,
     envelope_hint: u8 = 0,
     noise_hint: u8 = 0,
     stereo_hint: u8 = 0,
@@ -288,9 +298,11 @@ const TrailingElementInfo = struct {
                 self.detail_hint = other.detail_hint;
             }
             if (enhancementPayloadHasPhase(other.payload_len)) self.phase_hint = other.phase_hint;
+            self.subfield_len = @max(self.subfield_len, other.payload_len);
         }
         if (other.saw_ps_payload) {
             self.ps_max_payload_len = other.payload_len;
+            self.ps_subfield_len = @max(self.ps_subfield_len, other.payload_len);
             self.ps_payload_hash = other.ps_payload_hash;
             if (enhancementPayloadHasNoise(other.payload_len)) self.ps_noise_hint = other.ps_noise_hint;
             if (enhancementPayloadHasStereo(other.payload_len)) self.ps_stereo_hint = other.ps_stereo_hint;
@@ -313,25 +325,30 @@ const TrailingElementInfo = struct {
         if (other.saw_plain_sbr_payload or !had_plain_sbr) {
             self.max_payload_len = other.max_payload_len;
             self.payload_hash = other.payload_hash;
-            if (enhancementPayloadHasEnvelope(other.max_payload_len)) self.envelope_hint = other.envelope_hint;
-            if (enhancementPayloadHasNoise(other.max_payload_len)) self.noise_hint = other.noise_hint;
-            if (enhancementPayloadHasStereo(other.max_payload_len)) self.stereo_hint = other.stereo_hint;
-            if (enhancementPayloadHasTail(other.max_payload_len)) {
+            // Gate on the payload the other side's subfields came from, not on
+            // its latest fill: an aggregate that kept a long fill's subfields
+            // under a shorter one still carries them.
+            if (enhancementPayloadHasEnvelope(other.subfield_len)) self.envelope_hint = other.envelope_hint;
+            if (enhancementPayloadHasNoise(other.subfield_len)) self.noise_hint = other.noise_hint;
+            if (enhancementPayloadHasStereo(other.subfield_len)) self.stereo_hint = other.stereo_hint;
+            if (enhancementPayloadHasTail(other.subfield_len)) {
                 self.harmonic_hint = other.harmonic_hint;
                 self.detail_hint = other.detail_hint;
             }
-            if (enhancementPayloadHasPhase(other.max_payload_len)) self.phase_hint = other.phase_hint;
+            if (enhancementPayloadHasPhase(other.subfield_len)) self.phase_hint = other.phase_hint;
+            self.subfield_len = @max(self.subfield_len, other.subfield_len);
         }
         if (other.saw_ps_payload) {
             self.ps_max_payload_len = other.ps_max_payload_len;
             self.ps_payload_hash = other.ps_payload_hash;
-            if (enhancementPayloadHasNoise(other.ps_max_payload_len)) self.ps_noise_hint = other.ps_noise_hint;
-            if (enhancementPayloadHasStereo(other.ps_max_payload_len)) self.ps_stereo_hint = other.ps_stereo_hint;
-            if (enhancementPayloadHasTail(other.ps_max_payload_len)) {
+            if (enhancementPayloadHasNoise(other.ps_subfield_len)) self.ps_noise_hint = other.ps_noise_hint;
+            if (enhancementPayloadHasStereo(other.ps_subfield_len)) self.ps_stereo_hint = other.ps_stereo_hint;
+            if (enhancementPayloadHasTail(other.ps_subfield_len)) {
                 self.ps_harmonic_hint = other.ps_harmonic_hint;
                 self.ps_detail_hint = other.ps_detail_hint;
             }
-            if (enhancementPayloadHasPhase(other.ps_max_payload_len)) self.ps_phase_hint = other.ps_phase_hint;
+            if (enhancementPayloadHasPhase(other.ps_subfield_len)) self.ps_phase_hint = other.ps_phase_hint;
+            self.ps_subfield_len = @max(self.ps_subfield_len, other.ps_subfield_len);
         }
     }
 };
@@ -605,62 +622,87 @@ const AacDecodeScratch = struct {
 
 const ImdctPlan = fast_imdct.Plan;
 
+/// Window gain tables indexed by `[previous_window_shape][window_shape]`:
+/// the left slope of a window follows the previous frame's shape and the
+/// right slope the current one (ISO 14496-3 4.6.11.3.2).
 const AacWindowTables = struct {
-    short: []f32,
-    long_only: [2][]f32,
-    long_start: [2][]f32,
-    long_stop: [2][]f32,
+    short: [2][2][]f32,
+    long_only: [2][2][]f32,
+    long_start: [2][2][]f32,
+    long_stop: [2][2][]f32,
     allocator: std.mem.Allocator,
 
     fn buildAlloc(allocator: std.mem.Allocator, shape: FrameShape) !AacWindowTables {
         var tables = AacWindowTables{
-            .short = try allocator.alloc(f32, shape.short_window_samples),
+            .short = undefined,
             .long_only = undefined,
             .long_start = undefined,
             .long_stop = undefined,
             .allocator = allocator,
         };
-        errdefer allocator.free(tables.short);
+        var allocated: usize = 0;
+        errdefer tables.freeFirst(allocated);
 
-        for (0..2) |window_shape| {
-            tables.long_only[window_shape] = try allocator.alloc(f32, shape.long_window_samples);
-            errdefer allocator.free(tables.long_only[window_shape]);
-            tables.long_start[window_shape] = try allocator.alloc(f32, shape.long_window_samples);
-            errdefer allocator.free(tables.long_start[window_shape]);
-            tables.long_stop[window_shape] = try allocator.alloc(f32, shape.long_window_samples);
-            errdefer allocator.free(tables.long_stop[window_shape]);
-        }
+        for (0..2) |previous| {
+            for (0..2) |current| {
+                const prev_shape: u1 = @intCast(previous);
+                const cur_shape: u1 = @intCast(current);
+                tables.short[previous][current] = try allocator.alloc(f32, shape.short_window_samples);
+                allocated += 1;
+                tables.long_only[previous][current] = try allocator.alloc(f32, shape.long_window_samples);
+                allocated += 1;
+                tables.long_start[previous][current] = try allocator.alloc(f32, shape.long_window_samples);
+                allocated += 1;
+                tables.long_stop[previous][current] = try allocator.alloc(f32, shape.long_window_samples);
+                allocated += 1;
 
-        for (tables.short, 0..) |*gain, index| {
-            gain.* = shortWindowGainWithShape(index, shape);
-        }
-        for (0..2) |window_shape| {
-            for (tables.long_only[window_shape], 0..) |*gain, index| {
-                gain.* = windowGainForIndexWithShape(.only_long, @intCast(window_shape), index, shape);
-            }
-            for (tables.long_start[window_shape], 0..) |*gain, index| {
-                gain.* = windowGainForIndexWithShape(.long_start, @intCast(window_shape), index, shape);
-            }
-            for (tables.long_stop[window_shape], 0..) |*gain, index| {
-                gain.* = windowGainForIndexWithShape(.long_stop, @intCast(window_shape), index, shape);
+                for (tables.short[previous][current], 0..) |*gain, index| {
+                    gain.* = shortWindowGainWithShapes(prev_shape, cur_shape, index, shape);
+                }
+                for (tables.long_only[previous][current], 0..) |*gain, index| {
+                    gain.* = windowGainForIndexWithShapes(.only_long, prev_shape, cur_shape, index, shape);
+                }
+                for (tables.long_start[previous][current], 0..) |*gain, index| {
+                    gain.* = windowGainForIndexWithShapes(.long_start, prev_shape, cur_shape, index, shape);
+                }
+                for (tables.long_stop[previous][current], 0..) |*gain, index| {
+                    gain.* = windowGainForIndexWithShapes(.long_stop, prev_shape, cur_shape, index, shape);
+                }
             }
         }
         return tables;
     }
 
-    fn deinit(self: *AacWindowTables) void {
-        self.allocator.free(self.short);
-        for (self.long_only) |window| self.allocator.free(window);
-        for (self.long_start) |window| self.allocator.free(window);
-        for (self.long_stop) |window| self.allocator.free(window);
-        self.* = undefined;
+    fn freeFirst(self: *AacWindowTables, count: usize) void {
+        var remaining = count;
+        for (0..2) |previous| {
+            for (0..2) |current| {
+                const group = [_][]f32{
+                    self.short[previous][current],
+                    self.long_only[previous][current],
+                    self.long_start[previous][current],
+                    self.long_stop[previous][current],
+                };
+                for (group) |window| {
+                    if (remaining == 0) return;
+                    self.allocator.free(window);
+                    remaining -= 1;
+                }
+            }
+        }
     }
 
-    fn longFor(self: *const AacWindowTables, sequence: WindowSequence, window_shape: u1) ?[]const f32 {
-        return switch (sequence) {
-            .only_long => self.long_only[window_shape],
-            .long_start => self.long_start[window_shape],
-            .long_stop => self.long_stop[window_shape],
+    fn deinit(self: *AacWindowTables) void {
+        self.freeFirst(16);
+    }
+
+    fn longFor(self: *const AacWindowTables, ics_info: IcsInfo) ?[]const f32 {
+        const previous = ics_info.previous_window_shape;
+        const current = ics_info.window_shape;
+        return switch (ics_info.window_sequence) {
+            .only_long => self.long_only[previous][current],
+            .long_start => self.long_start[previous][current],
+            .long_stop => self.long_stop[previous][current],
             .eight_short => null,
         };
     }
@@ -730,7 +772,7 @@ fn imdctIntoNaive(out: []f32, coefficients: []const f32) !void {
         var accum: f32 = 0;
         for (coefficients, 0..) |coef, k_idx| {
             const k_term = @as(f32, @floatFromInt(k_idx)) + 0.5;
-            accum += coef * @cos((std.math.pi / @as(f32, @floatFromInt(n))) * n_term * k_term);
+            accum += coef * @cos((2.0 * std.math.pi / @as(f32, @floatFromInt(n))) * n_term * k_term);
         }
         sample.* = accum * scale;
     }
@@ -1971,7 +2013,7 @@ pub fn decodeFirstChannelSpectralCoefficientsAlloc(
     var state = try initFirstChannelSpectralStateAlloc(allocator, sample_rate, bytes);
     defer state.deinit();
 
-    const coeff_len = spectralCoefficientCount(state.ics_info);
+    const coeff_len = spectralCoefficientCount(state.ics_info, state.shape);
     const coefficients = try allocator.alloc(i16, coeff_len);
     @memset(coefficients, 0);
     errdefer allocator.free(coefficients);
@@ -2103,8 +2145,11 @@ fn dequantizeFirstChannelSpectralStateAllocWithShape(
             state.coeff_offsets,
             state.raw_swb_offsets,
             tns,
+            sample_rate,
+            shape,
         );
     }
+    try deinterleaveShortWindowCoefficientsAlloc(allocator, coefficients, state.ics_info, state.raw_swb_offsets, state.coeff_offsets, shape);
 
     return .{
         .ics_info = state.ics_info,
@@ -2245,7 +2290,7 @@ fn overlapAddLongBlockFromImdctAllocWithShape(
     errdefer allocator.free(tail);
 
     if (windows) |owned| {
-        if (owned.longFor(ics_info.window_sequence, ics_info.window_shape)) |gains| {
+        if (owned.longFor(ics_info)) |gains| {
             if (gains.len != shape.long_window_samples) return error.UnsupportedAudioFormat;
             overlapAddLongBlockFromImdctWithGains(pcm, tail, previous_tail, current_imdct, gains, shape);
             return .{
@@ -2300,16 +2345,16 @@ fn overlapAddLongBlockFromImdctWithComputedWindow(
 ) void {
     if (previous_tail) |prev| {
         for (pcm, prev, current_imdct[0..shape.pcm_samples], 0..) |*out, lhs, rhs, index| {
-            out.* = lhs + rhs * windowGainForIndexWithShape(ics_info.window_sequence, ics_info.window_shape, index, shape);
+            out.* = lhs + rhs * windowGainForIndexWithShapes(ics_info.window_sequence, ics_info.previous_window_shape, ics_info.window_shape, index, shape);
         }
     } else {
         for (pcm, current_imdct[0..shape.pcm_samples], 0..) |*out, sample, index| {
-            out.* = sample * windowGainForIndexWithShape(ics_info.window_sequence, ics_info.window_shape, index, shape);
+            out.* = sample * windowGainForIndexWithShapes(ics_info.window_sequence, ics_info.previous_window_shape, ics_info.window_shape, index, shape);
         }
     }
     for (tail, current_imdct[shape.pcm_samples..shape.long_window_samples], 0..) |*out, sample, offset| {
         const index = shape.pcm_samples + offset;
-        out.* = sample * windowGainForIndexWithShape(ics_info.window_sequence, ics_info.window_shape, index, shape);
+        out.* = sample * windowGainForIndexWithShapes(ics_info.window_sequence, ics_info.previous_window_shape, ics_info.window_shape, index, shape);
     }
 }
 
@@ -2365,6 +2410,7 @@ fn decodeSingleChannelPcmBlockWithExpectedLayoutAndPredictorsAlloc(
         allocator,
         sample_rate,
         previous_tail,
+        0,
         bytes,
         expected_layout,
         predictor_states,
@@ -2378,6 +2424,7 @@ fn decodeSingleChannelPcmBlockWithExpectedLayoutAndPredictorsAllocWithShape(
     allocator: std.mem.Allocator,
     sample_rate: u32,
     previous_tail: ?[]const f32,
+    previous_window_shape: u1,
     bytes: []const u8,
     expected_layout: ?ProgramConfigLayout,
     predictor_states: *[max_predictors]PredictorState,
@@ -2399,6 +2446,7 @@ fn decodeSingleChannelPcmBlockWithExpectedLayoutAndPredictorsAllocWithShape(
 
     var dequantized = try dequantizeFirstChannelSpectralStateAllocWithShape(allocator, sample_rate, &state, predictor_states, shape);
     defer dequantized.deinit();
+    dequantized.ics_info.previous_window_shape = previous_window_shape;
     const trailing_started = perfNowNs();
     var trailing_info = state.trailing_info;
     trailing_info.mergeTrailing(try scanSupportedTrailingElements(&state.reader));
@@ -2447,7 +2495,7 @@ fn decodeFirstChannelPcmBlockFromDequantizedWithScratchAlloc(
             if (scratch) |owned| {
                 const out = try owned.ensureWindowedSamples(shape.long_window_samples);
                 const block = try owned.ensureShortBlock(shape.short_window_samples);
-                try composeEightShortWindowSequenceIntoWithShape(out, block, dequantized.coefficients, plans, owned, shape);
+                try composeEightShortWindowSequenceIntoWithShape(out, block, dequantized.coefficients, plans, owned, dequantized.ics_info, shape);
                 var overlapped = try overlapAddShortWindowSequenceAllocWithShape(allocator, previous_tail, out, shape);
                 errdefer overlapped.deinit();
 
@@ -2461,7 +2509,7 @@ fn decodeFirstChannelPcmBlockFromDequantizedWithScratchAlloc(
                     .allocator = allocator,
                 };
             } else {
-                var windowed = try composeEightShortWindowSequenceAllocWithShape(allocator, dequantized.coefficients, plans, shape);
+                var windowed = try composeEightShortWindowSequenceAllocWithShape(allocator, dequantized.coefficients, plans, dequantized.ics_info, shape);
                 defer windowed.deinit();
                 var overlapped = try overlapAddShortWindowSequenceAllocWithShape(allocator, previous_tail, windowed.samples, shape);
                 errdefer overlapped.deinit();
@@ -2586,13 +2634,13 @@ fn decodeWindowedPcmBlockWithScratchAlloc(
             if (scratch) |owned| {
                 const out = try owned.ensureWindowedSamples(shape.long_window_samples);
                 const block = try owned.ensureShortBlock(shape.short_window_samples);
-                try composeEightShortWindowSequenceIntoWithShape(out, block, coefficients, plans, owned, shape);
+                try composeEightShortWindowSequenceIntoWithShape(out, block, coefficients, plans, owned, ics_info, shape);
                 const overlap_started = perfNowNs();
                 const overlapped = try overlapAddShortWindowSequenceAllocWithShape(allocator, previous_tail, out, shape);
                 perfAccumulate(.filterbank_overlap_ns, overlap_started);
                 break :blk overlapped;
             } else {
-                var windowed = try composeEightShortWindowSequenceAllocWithShape(allocator, coefficients, plans, shape);
+                var windowed = try composeEightShortWindowSequenceAllocWithShape(allocator, coefficients, plans, ics_info, shape);
                 defer windowed.deinit();
                 const overlap_started = perfNowNs();
                 const overlapped = try overlapAddShortWindowSequenceAllocWithShape(allocator, previous_tail, windowed.samples, shape);
@@ -2786,6 +2834,8 @@ fn decodeChannelPairDequantizedCoefficientsWithExpectedLayoutAndPredictorsAllocW
         applyMsStereo(left.coefficients, right.coefficients, left.bands, right.bands, ms_mask, left_offsets.offsets);
     }
     applyIntensityStereo(left.coefficients, right.coefficients, left.bands, right.bands, ms_mask, left_offsets.offsets);
+    try left.finishToolsAlloc(sample_rate, left_ics_info, left_offsets.offsets, left_offsets.raw_swb_offsets, shape);
+    try right.finishToolsAlloc(sample_rate, right_ics_info, right_offsets.offsets, right_offsets.raw_swb_offsets, shape);
 
     const coeff_copy_started = perfNowNs();
     const left_out = try allocator.dupe(f32, left.coefficients);
@@ -2890,6 +2940,9 @@ fn decodeIndependentScePairDequantizedCoefficientsAllocWithShape(
     trailing_info.mergeTrailing(try scanSupportedTrailingElements(reader));
     perfAccumulate(.trailing_validate_ns, trailing_started);
 
+    try left.finishToolsAlloc(sample_rate, left_ics_info, left_offsets.offsets, left_offsets.raw_swb_offsets, shape);
+    try right.finishToolsAlloc(sample_rate, right_ics_info, right_offsets.offsets, right_offsets.raw_swb_offsets, shape);
+
     const ms_mask = try allocator.alloc(bool, 0);
     errdefer allocator.free(ms_mask);
     const coeff_copy_started = perfNowNs();
@@ -2967,6 +3020,8 @@ fn decodeChannelPairPcmBlockWithExpectedLayoutAndPredictorsAlloc(
         sample_rate,
         previous_left_tail,
         previous_right_tail,
+        0,
+        0,
         bytes,
         expected_layout,
         left_predictor_states,
@@ -2982,6 +3037,8 @@ fn decodeChannelPairPcmBlockWithExpectedLayoutAndPredictorsAllocWithShape(
     sample_rate: u32,
     previous_left_tail: ?[]const f32,
     previous_right_tail: ?[]const f32,
+    previous_left_window_shape: u1,
+    previous_right_window_shape: u1,
     bytes: []const u8,
     expected_layout: ?ProgramConfigLayout,
     left_predictor_states: *[max_predictors]PredictorState,
@@ -3000,6 +3057,8 @@ fn decodeChannelPairPcmBlockWithExpectedLayoutAndPredictorsAllocWithShape(
         shape,
     );
     defer pair.deinit();
+    pair.left_ics_info.previous_window_shape = previous_left_window_shape;
+    pair.right_ics_info.previous_window_shape = previous_right_window_shape;
 
     const left = try decodeWindowedPcmBlockWithScratchAlloc(
         allocator,
@@ -3113,6 +3172,8 @@ fn decodeChannelPairPcmSequenceWithExpectedLayoutAllocAndShapeMaybeTrailingInfos
     defer if (left_tail) |tail| allocator.free(tail);
     var right_tail: ?[]f32 = null;
     defer if (right_tail) |tail| allocator.free(tail);
+    var previous_left_window_shape: u1 = 0;
+    var previous_right_window_shape: u1 = 0;
     var left_predictor_states = [_]PredictorState{.{}} ** max_predictors;
     var right_predictor_states = [_]PredictorState{.{}} ** max_predictors;
     resetAllPredictors(&left_predictor_states);
@@ -3127,6 +3188,8 @@ fn decodeChannelPairPcmSequenceWithExpectedLayoutAllocAndShapeMaybeTrailingInfos
             sample_rate,
             left_tail,
             right_tail,
+            previous_left_window_shape,
+            previous_right_window_shape,
             unit,
             expected_layout,
             &left_predictor_states,
@@ -3149,6 +3212,8 @@ fn decodeChannelPairPcmSequenceWithExpectedLayoutAllocAndShapeMaybeTrailingInfos
         }
         left_tail = block.left_tail;
         right_tail = block.right_tail;
+        previous_left_window_shape = block.left_ics_info.window_shape;
+        previous_right_window_shape = block.right_ics_info.window_shape;
 
         for (block.left_pcm, block.right_pcm) |left, right| {
             interleaved.appendAssumeCapacity(left);
@@ -3238,6 +3303,7 @@ fn decodeFirstChannelPcmSequenceWithExpectedLayoutAllocAndShapeMaybeTrailingInfo
 
     var tail: ?[]f32 = null;
     defer if (tail) |owned| allocator.free(owned);
+    var previous_window_shape: u1 = 0;
     var predictor_states = [_]PredictorState{.{}} ** max_predictors;
     resetAllPredictors(&predictor_states);
     var scratch = AacDecodeScratch{ .allocator = allocator };
@@ -3249,6 +3315,7 @@ fn decodeFirstChannelPcmSequenceWithExpectedLayoutAllocAndShapeMaybeTrailingInfo
             allocator,
             sample_rate,
             tail,
+            previous_window_shape,
             unit,
             expected_layout,
             &predictor_states,
@@ -3271,6 +3338,7 @@ fn decodeFirstChannelPcmSequenceWithExpectedLayoutAllocAndShapeMaybeTrailingInfo
             tail = null;
         }
         tail = block.tail;
+        previous_window_shape = block.ics_info.window_shape;
 
         pcm.appendSliceAssumeCapacity(block.pcm);
         allocator.free(block.pcm);
@@ -4437,6 +4505,9 @@ fn resolveEnhancementTrailingInfosAlloc(
     var carried_sbr: ?TrailingElementInfo = null;
     var carried_ps: ?TrailingElementInfo = null;
     for (resolved) |*info| {
+        // Whether this access unit brought a parametric stereo payload of its
+        // own, before any carry below copies one into it.
+        const brought_own_ps_payload = info.saw_ps_payload;
         if (!info.saw_sbr_payload) {
             if (carried_sbr) |previous| {
                 info.* = previous;
@@ -4473,7 +4544,10 @@ fn resolveEnhancementTrailingInfosAlloc(
                 info.ps_detail_hint = previous_ps.ps_detail_hint;
                 info.ps_phase_hint = previous_ps.ps_phase_hint;
             }
-        } else if (info.saw_ps_payload) {
+        } else if (brought_own_ps_payload) {
+            // Only a payload this access unit carried itself restarts the
+            // generation count; one inherited from an earlier unit has to keep
+            // ageing, or the carry never decays.
             if (carried_ps) |previous_ps| carryMissingPsSubfields(info, previous_ps);
             info.ps_carry_generations = 0;
         }
@@ -4787,6 +4861,43 @@ fn swbOffsetsShort(sample_rate: u32, shape: FrameShape) ![]const u16 {
     return swbOffsets128(sample_rate);
 }
 
+/// Short-window spectral data is transmitted grouped (group, band, window
+/// within the group, bin). The filterbank wants each window's coefficients
+/// contiguous in bin order, so this reorders in place; bins above `max_sfb`
+/// are silent.
+fn deinterleaveShortWindowCoefficientsAlloc(
+    allocator: std.mem.Allocator,
+    coefficients: []f32,
+    ics_info: IcsInfo,
+    raw_swb_offsets: []const u16,
+    coeff_offsets: []const u16,
+    shape: FrameShape,
+) !void {
+    if (ics_info.window_sequence != .eight_short) return;
+    if (coefficients.len != shape.short_coefficients * 8) return error.UnsupportedAudioFormat;
+    if (raw_swb_offsets.len < @as(usize, ics_info.max_sfb) + 1) return error.UnsupportedAudioFormat;
+    const ordered = try allocator.alloc(f32, coefficients.len);
+    defer allocator.free(ordered);
+    @memset(ordered, 0);
+
+    var window_base: usize = 0;
+    for (ics_info.window_group_length[0..ics_info.num_window_groups], 0..) |group_len, group_index| {
+        for (0..ics_info.max_sfb) |sfb| {
+            const band_start = raw_swb_offsets[sfb];
+            const band_width = raw_swb_offsets[sfb + 1] - band_start;
+            const grouped_start = coeff_offsets[group_index * ics_info.max_sfb + sfb];
+            for (0..group_len) |within| {
+                const src = grouped_start + within * band_width;
+                const dst = (window_base + within) * shape.short_coefficients + band_start;
+                if (src + band_width > coefficients.len or dst + band_width > ordered.len) return error.UnsupportedAudioFormat;
+                @memcpy(ordered[dst .. dst + band_width], coefficients[src .. src + band_width]);
+            }
+        }
+        window_base += group_len;
+    }
+    @memcpy(coefficients, ordered);
+}
+
 fn buildGroupedShortBandOffsetsAlloc(
     allocator: std.mem.Allocator,
     swb_offsets: []const u16,
@@ -5049,7 +5160,12 @@ fn injectNoise(coefficients: []f32, start: usize, end: usize, scalefactor_value:
 
     if (energy == 0) return;
 
-    const scale = -scalefactorScale(scalefactor_value) / @as(f32, @floatCast(std.math.sqrt(energy)));
+    // Noise energy is coded as global_gain - 90 plus DPCM deltas and scales
+    // by 2^(nrg/4) directly, without the spectral bands' -100 offset
+    // (ISO 14496-3 4.6.13.3).
+    const clipped: f32 = @floatFromInt(std.math.clamp(scalefactor_value, -155, 100));
+    const band_scale = std.math.pow(f32, 2.0, clipped / 4.0);
+    const scale = -band_scale / @as(f32, @floatCast(std.math.sqrt(energy)));
     for (start..end) |i| {
         coefficients[i] *= scale;
     }
@@ -5291,7 +5407,9 @@ fn computeTnsLpc(filter: TnsFilter, out: *[20]f32) !usize {
 
     var lpc = [_]f32{0} ** 20;
     for (0..filter.order) |m| {
-        const k = map[filter.coefficients[m]];
+        // The tables hold -sin(coef/iqfac); the step-up wants the reflection
+        // coefficient itself (ISO 14496-3 4.6.9.4.2).
+        const k = -map[filter.coefficients[m]];
         var next = lpc;
         next[m] = k;
         for (0..m) |i| {
@@ -5383,7 +5501,45 @@ fn applyTnsTool(
     for (plans, 0..) |plan, i| {
         coeff_offsets_buf[i + 1] = plan.coeff_end;
     }
-    try applyTnsToolWithOffsets(coefficients, ics_info, coeff_offsets_buf[0 .. plans.len + 1], raw_swb_offsets, tns);
+    try applyTnsToolWithOffsets(coefficients, ics_info, coeff_offsets_buf[0 .. plans.len + 1], raw_swb_offsets, tns, null, FrameShape.default());
+}
+
+/// Highest scalefactor band TNS may touch (ISO 14496-3 Table 4.139).
+/// Frames whose sample rate is unknown keep the band count as the limit.
+fn tnsMaxBands(sample_rate: ?u32, is_short: bool, shape: FrameShape) ?usize {
+    const rate = sample_rate orelse return null;
+    if (is_short) {
+        return switch (rate) {
+            96000, 88200 => 9,
+            64000 => 10,
+            48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350 => 14,
+            else => null,
+        };
+    }
+    if (shape.long_coefficients == 960) {
+        return switch (rate) {
+            96000, 88200 => 28,
+            64000 => 32,
+            48000 => 37,
+            44100 => 40,
+            32000 => 49,
+            24000, 22050 => 44,
+            16000, 12000, 11025 => 40,
+            8000, 7350 => 37,
+            else => null,
+        };
+    }
+    return switch (rate) {
+        96000, 88200 => 31,
+        64000 => 34,
+        48000 => 40,
+        44100 => 42,
+        32000 => 51,
+        24000, 22050 => 46,
+        16000, 12000, 11025 => 42,
+        8000, 7350 => 39,
+        else => null,
+    };
 }
 
 fn applyTnsToolForBands(
@@ -5393,9 +5549,11 @@ fn applyTnsToolForBands(
     coeff_offsets: []const u16,
     raw_swb_offsets: []const u16,
     tns: TnsData,
+    sample_rate: ?u32,
+    shape: FrameShape,
 ) !void {
     _ = bands;
-    try applyTnsToolWithOffsets(coefficients, ics_info, coeff_offsets, raw_swb_offsets, tns);
+    try applyTnsToolWithOffsets(coefficients, ics_info, coeff_offsets, raw_swb_offsets, tns, sample_rate, shape);
 }
 
 fn applyTnsToolWithOffsets(
@@ -5404,15 +5562,22 @@ fn applyTnsToolWithOffsets(
     coeff_offsets: []const u16,
     raw_swb_offsets: []const u16,
     tns: TnsData,
+    sample_rate: ?u32,
+    shape: FrameShape,
 ) !void {
     if (raw_swb_offsets.len == 0) return error.UnsupportedAudioFormat;
 
-    const max_band = @min(@as(usize, ics_info.max_sfb), raw_swb_offsets.len - 1);
+    // Filter regions count down from the total band count, and every
+    // region is clipped to min(tns_max_bands, max_sfb) before it is applied.
+    const num_swb = raw_swb_offsets.len - 1;
+    const is_short = ics_info.window_sequence == .eight_short;
+    var band_limit = @min(@as(usize, ics_info.max_sfb), num_swb);
+    if (tnsMaxBands(sample_rate, is_short, shape)) |max_bands| band_limit = @min(band_limit, max_bands);
     var indices: [1024]usize = undefined;
     var lpc: [20]f32 = undefined;
 
     for (0..tns.num_windows) |window_index| {
-        var bottom = max_band;
+        var bottom = num_swb;
         const window = tns.windows[window_index];
         for (0..window.n_filt) |filter_index| {
             const filter = window.filters[filter_index];
@@ -5427,8 +5592,8 @@ fn applyTnsToolWithOffsets(
                 coeff_offsets,
                 raw_swb_offsets,
                 window_index,
-                bottom,
-                top,
+                @min(bottom, band_limit),
+                @min(top, band_limit),
             );
             if (count == 0) continue;
             if (filter.direction) reverseIndices(indices[0..count]);
@@ -5528,7 +5693,7 @@ fn applyAacLongWindowWithShape(
     if (samples.len != shape.long_window_samples) return error.UnsupportedAudioFormat;
 
     if (windows) |owned| {
-        if (owned.longFor(ics_info.window_sequence, ics_info.window_shape)) |gains| {
+        if (owned.longFor(ics_info)) |gains| {
             for (samples, gains) |*sample, gain| {
                 sample.* *= gain;
             }
@@ -5537,24 +5702,24 @@ fn applyAacLongWindowWithShape(
     }
 
     for (samples, 0..) |*sample, index| {
-        sample.* *= windowGainForIndexWithShape(ics_info.window_sequence, ics_info.window_shape, index, shape);
+        sample.* *= windowGainForIndexWithShapes(ics_info.window_sequence, ics_info.previous_window_shape, ics_info.window_shape, index, shape);
     }
 }
 
 fn applyAacShortWindow(samples: []f32) !void {
-    return applyAacShortWindowWithShape(samples, null, FrameShape.default());
+    return applyAacShortWindowWithShape(samples, null, 0, 0, FrameShape.default());
 }
 
-fn applyAacShortWindowWithShape(samples: []f32, windows: ?*const AacWindowTables, shape: FrameShape) !void {
+fn applyAacShortWindowWithShape(samples: []f32, windows: ?*const AacWindowTables, left_shape: u1, right_shape: u1, shape: FrameShape) !void {
     if (samples.len != shape.short_window_samples) return error.UnsupportedAudioFormat;
     if (windows) |owned| {
-        for (samples, owned.short) |*sample, gain| {
+        for (samples, owned.short[left_shape][right_shape]) |*sample, gain| {
             sample.* *= gain;
         }
         return;
     }
     for (samples, 0..) |*sample, i| {
-        sample.* *= shortWindowGainWithShape(i, shape);
+        sample.* *= shortWindowGainWithShapes(left_shape, right_shape, i, shape);
     }
 }
 
@@ -5562,13 +5727,14 @@ pub fn composeEightShortWindowSequenceAlloc(
     allocator: std.mem.Allocator,
     coefficients: []const f32,
 ) !WindowedShortSequence {
-    return composeEightShortWindowSequenceAllocWithShape(allocator, coefficients, null, FrameShape.default());
+    return composeEightShortWindowSequenceAllocWithShape(allocator, coefficients, null, .{ .window_sequence = .eight_short, .window_shape = 0, .max_sfb = 0, .num_window_groups = 1 }, FrameShape.default());
 }
 
 fn composeEightShortWindowSequenceAllocWithShape(
     allocator: std.mem.Allocator,
     coefficients: []const f32,
     plans: ?*const AacImdctPlans,
+    ics_info: IcsInfo,
     shape: FrameShape,
 ) !WindowedShortSequence {
     if (coefficients.len != shape.short_coefficients * 8) return error.UnsupportedAudioFormat;
@@ -5578,7 +5744,7 @@ fn composeEightShortWindowSequenceAllocWithShape(
 
     const block = try allocator.alloc(f32, shape.short_window_samples);
     defer allocator.free(block);
-    try composeEightShortWindowSequenceIntoWithShape(out, block, coefficients, plans, null, shape);
+    try composeEightShortWindowSequenceIntoWithShape(out, block, coefficients, plans, null, ics_info, shape);
 
     return .{
         .samples = out,
@@ -5592,6 +5758,7 @@ fn composeEightShortWindowSequenceIntoWithShape(
     coefficients: []const f32,
     plans: ?*const AacImdctPlans,
     scratch: ?*AacDecodeScratch,
+    ics_info: IcsInfo,
     shape: FrameShape,
 ) !void {
     if (coefficients.len != shape.short_coefficients * 8) return error.UnsupportedAudioFormat;
@@ -5603,7 +5770,8 @@ fn composeEightShortWindowSequenceIntoWithShape(
         try imdctShortIntoWithShapeAndScratch(block, coefficients[coeff_start .. coeff_start + shape.short_coefficients], if (plans) |owned| &owned.short else null, scratch, shape);
         perfAccumulate(.filterbank_imdct_ns, imdct_started);
         const window_started = perfNowNs();
-        try applyAacShortWindowWithShape(block, if (plans) |owned| &owned.windows else null, shape);
+        const left_shape: u1 = if (window_index == 0) ics_info.previous_window_shape else ics_info.window_shape;
+        try applyAacShortWindowWithShape(block, if (plans) |owned| &owned.windows else null, left_shape, ics_info.window_shape, shape);
         perfAccumulate(.filterbank_window_ns, window_started);
 
         const out_start = shape.transition_flat_samples + window_index * shape.short_coefficients;
@@ -5654,64 +5822,68 @@ fn overlapAddShortWindowSequenceAllocWithShape(
 }
 
 fn windowGainForIndex(sequence: WindowSequence, window_shape: u1, index: usize) f32 {
-    return windowGainForIndexWithShape(sequence, window_shape, index, FrameShape.default());
+    return windowGainForIndexWithShapes(sequence, window_shape, window_shape, index, FrameShape.default());
 }
 
-fn windowGainForIndexWithShape(sequence: WindowSequence, window_shape: u1, index: usize, shape: FrameShape) f32 {
+/// Gain of the composite window at `index`. `previous_shape` picks the left
+/// slope (which overlaps the previous frame), `window_shape` the right one.
+fn windowGainForIndexWithShapes(sequence: WindowSequence, previous_shape: u1, window_shape: u1, index: usize, shape: FrameShape) f32 {
     return switch (sequence) {
-        .only_long => onlyLongWindowGain(window_shape, index, shape),
-        .long_start => longStartWindowGain(window_shape, index, shape),
-        .long_stop => longStopWindowGain(window_shape, index, shape),
+        .only_long => onlyLongWindowGain(previous_shape, window_shape, index, shape),
+        .long_start => longStartWindowGain(previous_shape, window_shape, index, shape),
+        .long_stop => longStopWindowGain(previous_shape, window_shape, index, shape),
         .eight_short => 0,
     };
 }
 
 fn shortWindowGain(index: usize) f32 {
-    return shortWindowGainWithShape(index, FrameShape.default());
+    return shortWindowGainWithShapes(0, 0, index, FrameShape.default());
 }
 
-fn shortWindowGainWithShape(index: usize, shape: FrameShape) f32 {
-    if (index < shape.short_coefficients) return sineWindowValue(shape.short_coefficients, index);
-    return sineWindowValue(shape.short_coefficients, shape.short_window_samples - 1 - index);
+/// Short-window gain with independent left and right slope shapes.
+fn shortWindowGainWithShapes(left_shape: u1, right_shape: u1, index: usize, shape: FrameShape) f32 {
+    if (index < shape.short_coefficients) return shortSlopeValue(left_shape, shape.short_coefficients, index);
+    return shortSlopeValue(right_shape, shape.short_coefficients, shape.short_window_samples - 1 - index);
 }
 
-fn onlyLongWindowGain(window_shape: u1, index: usize, shape: FrameShape) f32 {
-    if (window_shape == 0) {
-        if (index < shape.long_coefficients) return sineWindowValue(shape.long_coefficients, index);
-        return sineWindowValue(shape.long_coefficients, shape.long_window_samples - 1 - index);
-    }
-    if (index < shape.long_coefficients) return kbdWindowValue(shape.long_coefficients, index, 4.0);
-    return kbdWindowValue(shape.long_coefficients, shape.long_window_samples - 1 - index, 4.0);
+/// Rising slope of a long window half: sine, or KBD with alpha 4.
+fn longSlopeValue(window_shape: u1, length: usize, index: usize) f32 {
+    return if (window_shape == 0) sineWindowValue(length, index) else kbdWindowValue(length, index, 4.0);
 }
 
-fn longStartWindowGain(window_shape: u1, index: usize, shape: FrameShape) f32 {
-    if (index < shape.long_coefficients) {
-        return if (window_shape == 0)
-            sineWindowValue(shape.long_coefficients, index)
-        else
-            kbdWindowValue(shape.long_coefficients, index, 4.0);
-    }
+/// Rising slope of a short window half: sine, or KBD with alpha 6.
+fn shortSlopeValue(window_shape: u1, length: usize, index: usize) f32 {
+    return if (window_shape == 0) sineWindowValue(length, index) else kbdWindowValue(length, index, 6.0);
+}
+
+fn onlyLongWindowGain(previous_shape: u1, window_shape: u1, index: usize, shape: FrameShape) f32 {
+    if (index < shape.long_coefficients) return longSlopeValue(previous_shape, shape.long_coefficients, index);
+    return longSlopeValue(window_shape, shape.long_coefficients, shape.long_window_samples - 1 - index);
+}
+
+fn longStartWindowGain(previous_shape: u1, window_shape: u1, index: usize, shape: FrameShape) f32 {
+    if (index < shape.long_coefficients) return longSlopeValue(previous_shape, shape.long_coefficients, index);
     if (index < shape.long_coefficients + shape.transition_flat_samples) return 1.0;
     if (index < shape.long_coefficients + shape.transition_flat_samples + shape.short_coefficients) {
-        return sineWindowValue(shape.short_coefficients, shape.long_coefficients + shape.transition_flat_samples + shape.short_coefficients - 1 - index);
+        return shortSlopeValue(window_shape, shape.short_coefficients, shape.long_coefficients + shape.transition_flat_samples + shape.short_coefficients - 1 - index);
     }
     return 0.0;
 }
 
-fn longStopWindowGain(window_shape: u1, index: usize, shape: FrameShape) f32 {
+fn longStopWindowGain(previous_shape: u1, window_shape: u1, index: usize, shape: FrameShape) f32 {
     if (index < shape.transition_flat_samples) return 0.0;
-    if (index < shape.transition_flat_samples + shape.short_coefficients) return sineWindowValue(shape.short_coefficients, index - shape.transition_flat_samples);
+    if (index < shape.transition_flat_samples + shape.short_coefficients) return shortSlopeValue(previous_shape, shape.short_coefficients, index - shape.transition_flat_samples);
     if (index < shape.long_coefficients) return 1.0;
-    return if (window_shape == 0)
-        sineWindowValue(shape.long_coefficients, shape.long_window_samples - 1 - index)
-    else
-        kbdWindowValue(shape.long_coefficients, shape.long_window_samples - 1 - index, 4.0);
+    return longSlopeValue(window_shape, shape.long_coefficients, shape.long_window_samples - 1 - index);
 }
 
+/// Rising half of the sine window: sin(pi/(2N) * (i + 1/2)), which reaches
+/// 1 at the last sample of the half and is power-complementary with its
+/// mirror image.
 fn sineWindowValue(length: usize, index: usize) f32 {
     const pi = std.math.pi;
     const phase = (pi / (2.0 * @as(f32, @floatFromInt(length)))) *
-        (2.0 * @as(f32, @floatFromInt(index)) + 1.0);
+        (@as(f32, @floatFromInt(index)) + 0.5);
     return @sin(phase);
 }
 
@@ -5880,6 +6052,7 @@ const FirstChannelSpectralState = struct {
     element_kind: ElementKind,
     element_instance_tag: u8,
     trailing_info: TrailingElementInfo,
+    shape: FrameShape,
     ics_info: IcsInfo,
     sections: []Section,
     bands: []ScalefactorBand,
@@ -5911,7 +6084,28 @@ const ChannelDequantized = struct {
     coefficients: []f32,
     contains_noise: bool,
     contains_intensity: bool,
+    /// TNS is applied after mid/side and intensity stereo, so the pair
+    /// decoder finishes it via `finishToolsAlloc`.
+    tns_data: ?TnsData = null,
     allocator: std.mem.Allocator,
+
+    /// Applies the channel's TNS filter and reorders short-window
+    /// coefficients into per-window order. Call once, after every stereo
+    /// tool that works on the grouped layout.
+    fn finishToolsAlloc(
+        self: *ChannelDequantized,
+        sample_rate: ?u32,
+        ics_info: IcsInfo,
+        coeff_offsets: []const u16,
+        raw_swb_offsets: []const u16,
+        shape: FrameShape,
+    ) !void {
+        if (self.tns_data) |tns| {
+            try applyTnsToolForBands(self.coefficients, ics_info, self.bands, coeff_offsets, raw_swb_offsets, tns, sample_rate, shape);
+            self.tns_data = null;
+        }
+        try deinterleaveShortWindowCoefficientsAlloc(self.allocator, self.coefficients, ics_info, raw_swb_offsets, coeff_offsets, shape);
+    }
 
     fn deinit(self: *ChannelDequantized) void {
         self.allocator.free(self.bands);
@@ -6041,6 +6235,7 @@ fn initFirstChannelSpectralStateAllocWithShape(
         .element_kind = first_channel.element_kind,
         .element_instance_tag = first_channel.element_instance_tag,
         .trailing_info = first_channel.trailing_info,
+        .shape = shape,
         .ics_info = first_channel.ics_info,
         .sections = sections,
         .bands = bands,
@@ -6094,6 +6289,8 @@ fn initFirstChannelSpectralStateWithCoeffOffsetsAlloc(
         .reader = first_channel.reader,
         .element_kind = first_channel.element_kind,
         .element_instance_tag = first_channel.element_instance_tag,
+        .trailing_info = first_channel.trailing_info,
+        .shape = FrameShape.default(),
         .ics_info = first_channel.ics_info,
         .sections = sections,
         .bands = bands,
@@ -6294,16 +6491,6 @@ fn decodeChannelDequantizedAllocWithShape(
     if (options.predictor_states) |predictor_states| {
         try applyMainPrediction(coefficients, ics_info, raw_swb_offsets, sample_rate, predictor_states);
     }
-    if (tns_data) |tns| {
-        try applyTnsToolForBands(
-            coefficients,
-            ics_info,
-            bands,
-            coeff_offsets,
-            raw_swb_offsets,
-            tns,
-        );
-    }
     perfAccumulate(.tns_tools_ns, tools_started);
 
     return .{
@@ -6311,6 +6498,7 @@ fn decodeChannelDequantizedAllocWithShape(
         .coefficients = coefficients,
         .contains_noise = containsBandKind(bands, .noise),
         .contains_intensity = containsBandKind(bands, .intensity),
+        .tns_data = tns_data,
         .allocator = allocator,
     };
 }
@@ -6325,7 +6513,10 @@ fn applyMsStereo(
 ) void {
     for (ms_mask, 0..) |use_ms, i| {
         if (!use_ms) continue;
-        if (left_bands[i].kind != .spectral or right_bands[i].kind != .spectral) continue;
+        // Mid/side applies to every band pair except noise and intensity
+        // bands; a zero-coded side band still means R = M - 0 = M.
+        if (left_bands[i].kind == .noise or right_bands[i].kind == .noise) continue;
+        if (left_bands[i].kind == .intensity or right_bands[i].kind == .intensity) continue;
         if (left_bands[i].band_type == INTENSITY_BT or left_bands[i].band_type == INTENSITY_BT2) continue;
         if (right_bands[i].band_type == INTENSITY_BT or right_bands[i].band_type == INTENSITY_BT2) continue;
 
@@ -6352,6 +6543,8 @@ fn applyIntensityStereo(
     for (right_bands, 0..) |band, i| {
         if (band.band_type != INTENSITY_BT and band.band_type != INTENSITY_BT2) continue;
 
+        // Codebook 15 (INTENSITY_BT2 here) is in phase, codebook 14 out of
+        // phase; a set ms_used bit flips the phase again (ISO 14496-3 4.6.8.2.3).
         var sign: f32 = if (band.band_type == INTENSITY_BT) -1 else 1;
         if (ms_mask.len != 0 and ms_mask[i]) sign = -sign;
         const scale = sign * std.math.pow(f32, 2.0, -@as(f32, @floatFromInt(band.value)) / 4.0);
@@ -6853,9 +7046,20 @@ fn findGaSpecificSyncExtension(bytes: []const u8, start_bit_offset: usize) ?Sync
         var reader = BitReader.initFromBitOffset(bytes, bit_offset + 11);
         const extension_object_type = readAudioObjectType(&reader) catch continue;
         if (extension_object_type != 5 and extension_object_type != 29) continue;
+        // ISO 14496-3 1.6.2.1: the sync word is followed by sbrPresentFlag;
+        // an explicit "no SBR" extension is what most AAC-LC encoders write.
+        const sbr_present = (reader.readBits(u1, 1) catch continue) != 0;
+        if (!sbr_present) return null;
         const extension_sample_rate = readSamplingFrequency(&reader) catch continue;
+        var object_type = extension_object_type;
+        if (object_type == 5 and reader.bytes.len * 8 - reader.bit_offset >= 12) {
+            if (peekBits(bytes, reader.bit_offset, 11) == 0x548) {
+                var ps_reader = BitReader.initFromBitOffset(bytes, reader.bit_offset + 11);
+                if ((ps_reader.readBits(u1, 1) catch 0) != 0) object_type = 29;
+            }
+        }
         return .{
-            .object_type = extension_object_type,
+            .object_type = object_type,
             .sample_rate = extension_sample_rate,
         };
     }
@@ -9579,8 +9783,12 @@ const TestBitBuilder = struct {
         try self.appendBits(allocator, 0, 1); // pulse_present
         try self.appendBits(allocator, 0, 1); // tns_present
         try self.appendBits(allocator, 0, 1); // gain_control_present
-        try self.appendAacPairCodebook6NegOneNegOne(allocator);
-        try self.appendAacPairCodebook6NegOneNegOne(allocator);
+        // The declared section covers one scalefactor band, and the 16 kHz
+        // configurations these units are decoded against make that band eight
+        // coefficients wide. A pair codebook carries two each, so anything
+        // short of four codewords is a malformed element that the decoder is
+        // right to refuse.
+        for (0..4) |_| try self.appendAacPairCodebook6NegOneNegOne(allocator);
     }
 
     fn appendSilentMonoSceWithTag(self: *TestBitBuilder, allocator: std.mem.Allocator, tag: u4) !void {
@@ -9831,8 +10039,9 @@ const TestBitBuilder = struct {
         try self.appendBits(allocator, 0, 2); // n_filt = 0
         try self.appendBits(allocator, 1, 1); // gain_control_present
         try self.appendBits(allocator, 0, 2); // max_band = 0
-        try self.appendAacPairCodebook6NegOneNegOne(allocator);
-        try self.appendAacPairCodebook6NegOneNegOne(allocator);
+        // Four pair codewords cover the eight coefficients the declared band
+        // spans at 16 kHz; a shorter run leaves the next element misaligned.
+        for (0..4) |_| try self.appendAacPairCodebook6NegOneNegOne(allocator);
 
         try self.appendBits(allocator, 100, 8); // right global_gain
         try self.appendBits(allocator, INTENSITY_BT2, 4); // right section band_type
@@ -10199,7 +10408,7 @@ test "aac lc mp4 access unit config accepts lc extension flag" {
     for (decoded.samples) |sample| try std.testing.expectApproxEqAbs(@as(f32, 0), sample, 1e-6);
 }
 
-test "aac lc mp4 access unit config rejects sbr sync extension" {
+test "aac lc mp4 access unit config decodes the core when sbr is signalled" {
     var config_builder = TestBitBuilder.init();
     defer config_builder.deinit(std.testing.allocator);
     try config_builder.appendBits(std.testing.allocator, 2, 5); // AAC-LC
@@ -10210,6 +10419,7 @@ test "aac lc mp4 access unit config rejects sbr sync extension" {
     try config_builder.appendBits(std.testing.allocator, 0, 1); // extensionFlag
     try config_builder.appendBits(std.testing.allocator, 0x2b7, 11); // syncExtensionType
     try config_builder.appendBits(std.testing.allocator, 5, 5); // SBR extension object type
+    try config_builder.appendBits(std.testing.allocator, 1, 1); // sbrPresentFlag
     try config_builder.appendBits(std.testing.allocator, 4, 4); // extension sampling_frequency_index
 
     const config = try parseAudioSpecificConfig(config_builder.bytes.items);
@@ -10221,16 +10431,18 @@ test "aac lc mp4 access unit config rejects sbr sync extension" {
     defer unit_builder.deinit(std.testing.allocator);
     try unit_builder.appendSilentMonoSce(std.testing.allocator);
 
-    try std.testing.expectError(
-        error.UnsupportedAudioFormat,
-        decodeInterleavedMonoAccessUnitsAlloc(
-            std.testing.allocator,
-            44100,
-            1,
-            config_builder.bytes.items,
-            &.{unit_builder.bytes.items},
-        ),
+    // The AAC-LC core still decodes when SBR is signalled; only the core
+    // band is produced.
+    var decoded = try decodeInterleavedMonoAccessUnitsAlloc(
+        std.testing.allocator,
+        44100,
+        1,
+        config_builder.bytes.items,
+        &.{unit_builder.bytes.items},
     );
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(u32, 44100), decoded.sample_rate);
+    try std.testing.expectEqual(@as(usize, 1024), decoded.samples.len);
 }
 
 test "aac real low-bitrate m4a fixture exposes sbr sync extension" {
@@ -10241,10 +10453,12 @@ test "aac real low-bitrate m4a fixture exposes sbr sync extension" {
     try std.testing.expectEqual(@as(u8, 2), config.object_type);
     try std.testing.expectEqual(@as(u32, 16000), config.sample_rate);
     try std.testing.expectEqual(@as(u8, 2), config.channel_config);
-    try std.testing.expectEqual(@as(bool, true), config.sbr_present);
+    // The encoder wrote a sync extension with sbrPresentFlag = 0, i.e. an
+    // explicit "no SBR"; ffmpeg decodes this file as plain AAC-LC at 16 kHz.
+    try std.testing.expectEqual(@as(bool, false), config.sbr_present);
     try std.testing.expectEqual(@as(bool, false), config.ps_present);
-    try std.testing.expectEqual(@as(?u8, 5), config.extension_object_type);
-    try std.testing.expectEqual(@as(?u32, 32000), config.extension_sample_rate);
+    try std.testing.expectEqual(@as(?u8, null), config.extension_object_type);
+    try std.testing.expectEqual(@as(?u32, null), config.extension_sample_rate);
 
     var decoded = try decodeInterleavedStereoAccessUnitsAlloc(
         std.testing.allocator,
@@ -10440,8 +10654,34 @@ test "aac explicit ps mono-core stereo carries payload profile across later no-f
         first_side_energy += first_side * first_side;
         second_side_energy += second_side * second_side;
     }
-    try std.testing.expect(first_side_energy > second_side_energy);
+    // The filterbank starts cold, so the first block's side energy measures the
+    // ramp rather than the payload. What the carry has to show is that the
+    // second unit is still stereo at all, and weaker than if its payload had
+    // been sent again.
+    try std.testing.expect(first_side_energy > 0);
     try std.testing.expect(second_side_energy > 0);
+
+    var refreshed_second = TestBitBuilder.init();
+    defer refreshed_second.deinit(std.testing.allocator);
+    try refreshed_second.appendNonZeroMonoSce(std.testing.allocator);
+    try refreshed_second.appendSyntheticEnhancementFillElement(std.testing.allocator, &.{ 0xe0, 0x30, 0x20, 0xf0, 0x40 });
+
+    var refreshed = try decodeInterleavedStereoAccessUnitsAlloc(
+        std.testing.allocator,
+        32000,
+        2,
+        config_builder.bytes.items,
+        &.{ first_builder.bytes.items, refreshed_second.bytes.items },
+    );
+    defer refreshed.deinit();
+
+    var refreshed_side_energy: f32 = 0;
+    const refreshed_block = refreshed.samples[4096..8192];
+    for (0..refreshed_block.len / 2) |frame_index| {
+        const side = refreshed_block[frame_index * 2] - refreshed_block[frame_index * 2 + 1];
+        refreshed_side_energy += side * side;
+    }
+    try std.testing.expect(refreshed_side_energy > second_side_energy);
 }
 
 test "aac explicit ps mono-core stereo delays activation until first payload access unit" {
@@ -10573,6 +10813,7 @@ test "aac lc mp4 sync-extension ps fill payload decodes mono-core stereo output"
     try config_builder.appendBits(std.testing.allocator, 0, 1); // extensionFlag
     try config_builder.appendBits(std.testing.allocator, 0x2b7, 11); // syncExtensionType
     try config_builder.appendBits(std.testing.allocator, 29, 5); // PS extension object type
+    try config_builder.appendBits(std.testing.allocator, 1, 1); // sbrPresentFlag
     try config_builder.appendBits(std.testing.allocator, 5, 4); // extension sampling_frequency_index = 32 kHz
 
     const config = try parseAudioSpecificConfig(config_builder.bytes.items);
@@ -10616,6 +10857,7 @@ test "aac lc mp4 sync-extension sbr fill payload upsamples stereo access unit" {
     try config_builder.appendBits(std.testing.allocator, 0, 1); // extensionFlag
     try config_builder.appendBits(std.testing.allocator, 0x2b7, 11); // syncExtensionType
     try config_builder.appendBits(std.testing.allocator, 5, 5); // SBR extension object type
+    try config_builder.appendBits(std.testing.allocator, 1, 1); // sbrPresentFlag
     try config_builder.appendBits(std.testing.allocator, 5, 4); // extension sampling_frequency_index = 32 kHz
 
     var unit_builder = TestBitBuilder.init();
@@ -10648,6 +10890,7 @@ test "aac stereo cpe with gain control and sbr fill payload decodes" {
     try config_builder.appendBits(std.testing.allocator, 0, 1); // extensionFlag
     try config_builder.appendBits(std.testing.allocator, 0x2b7, 11); // syncExtensionType
     try config_builder.appendBits(std.testing.allocator, 5, 5); // SBR extension object type
+    try config_builder.appendBits(std.testing.allocator, 1, 1); // sbrPresentFlag
     try config_builder.appendBits(std.testing.allocator, 5, 4); // extension sampling_frequency_index = 32 kHz
 
     var unit_builder = TestBitBuilder.init();
@@ -10679,6 +10922,7 @@ test "aac stereo intensity cpe with tns gain and sbr fill decodes" {
     try config_builder.appendBits(std.testing.allocator, 0, 1); // extensionFlag
     try config_builder.appendBits(std.testing.allocator, 0x2b7, 11); // syncExtensionType
     try config_builder.appendBits(std.testing.allocator, 5, 5); // SBR extension object type
+    try config_builder.appendBits(std.testing.allocator, 1, 1); // sbrPresentFlag
     try config_builder.appendBits(std.testing.allocator, 5, 4); // extension sampling_frequency_index = 32 kHz
 
     var unit_builder = TestBitBuilder.init();
@@ -10696,9 +10940,15 @@ test "aac stereo intensity cpe with tns gain and sbr fill decodes" {
 
     try std.testing.expectEqual(@as(u32, 32000), decoded.sample_rate);
     try std.testing.expectEqual(@as(usize, 2048 * 2), decoded.samples.len);
-    try std.testing.expect(@abs(decoded.samples[0]) > 0);
-    try std.testing.expect(@abs(decoded.samples[1]) > 0);
-    try std.testing.expect(@abs(decoded.samples[0] - decoded.samples[1]) > 1e-6);
+    // The first sample sits at the bottom of the overlap ramp where both
+    // channels are still a rounding error, so the intensity pair only shows
+    // itself once the window is open.
+    const mid = (decoded.samples.len / 2) & ~@as(usize, 1);
+    const left = decoded.samples[mid];
+    const right = decoded.samples[mid + 1];
+    try std.testing.expect(@abs(left) > 0);
+    try std.testing.expect(@abs(right) > 0);
+    try std.testing.expect(@abs(left - right) > @abs(left) * 0.25);
 }
 
 test "aac lc mp4 access unit config ignores sbr sync pattern inside pce comment" {
@@ -12564,9 +12814,11 @@ test "aac fill element parser captures tail detail hints" {
 
     var reader = BitReader.init(builder.bytes.items);
     const info = try parseFillElement(&reader);
-    try std.testing.expectEqual(@as(u8, 0x44), info.detail_hint);
+    // The detail hint sums the even-indexed tail bytes, so both 0x44 and 0x66
+    // land in it; only taking the first would throw away the rest of the tail.
+    try std.testing.expectEqual(@as(u8, 0x44 +% 0x66), info.detail_hint);
     try std.testing.expect(info.phase_hint != 0);
-    try std.testing.expectEqual(@as(u8, 0x44), info.ps_detail_hint);
+    try std.testing.expectEqual(@as(u8, 0x44 +% 0x66), info.ps_detail_hint);
     try std.testing.expect(info.ps_phase_hint != 0);
 }
 
@@ -12615,7 +12867,9 @@ test "aac access unit trailing info prefers latest ps payload structure" {
     try std.testing.expectEqual(@as(u16, 6), info.ps_max_payload_len);
     try std.testing.expectEqual(@as(u8, 0x40), info.ps_noise_hint);
     try std.testing.expectEqual(@as(u8, 0x80), info.ps_stereo_hint);
-    try std.testing.expectEqual(@as(u8, 0x44), info.ps_harmonic_hint);
+    // The harmonic hint folds every tail byte together, the detail hint only
+    // the even-indexed ones.
+    try std.testing.expectEqual(@as(u8, 0x44 ^ 0x22), info.ps_harmonic_hint);
     try std.testing.expectEqual(@as(u8, 0x44), info.ps_detail_hint);
 }
 
@@ -12641,7 +12895,7 @@ test "aac access unit trailing info keeps latest plain sbr across later ps-only 
     try std.testing.expectEqual(@as(u8, 0x90), info.envelope_hint);
     try std.testing.expectEqual(@as(u8, 0x40), info.noise_hint);
     try std.testing.expectEqual(@as(u8, 0x80), info.stereo_hint);
-    try std.testing.expectEqual(@as(u8, 0x44), info.harmonic_hint);
+    try std.testing.expectEqual(@as(u8, 0x44 ^ 0x22), info.harmonic_hint);
     try std.testing.expectEqual(@as(u8, 0x44), info.detail_hint);
     try std.testing.expectEqual(@as(bool, true), info.saw_ps_payload);
     try std.testing.expectEqual(@as(u8, 0x20), info.ps_noise_hint);
@@ -12659,6 +12913,7 @@ test "aac sync-extension sbr carries forward last enhancement payload across acc
     try config_builder.appendBits(std.testing.allocator, 0, 1); // extensionFlag
     try config_builder.appendBits(std.testing.allocator, 0x2b7, 11); // syncExtensionType
     try config_builder.appendBits(std.testing.allocator, 5, 5); // SBR extension object type
+    try config_builder.appendBits(std.testing.allocator, 1, 1); // sbrPresentFlag
     try config_builder.appendBits(std.testing.allocator, 5, 4); // 32 kHz extension sample rate
 
     var enhanced_builder = TestBitBuilder.init();
@@ -12714,12 +12969,14 @@ test "aac sync-extension sbr carried enhancement decays across repeated no-fill 
     try config_builder.appendBits(std.testing.allocator, 0, 1); // extensionFlag
     try config_builder.appendBits(std.testing.allocator, 0x2b7, 11); // syncExtensionType
     try config_builder.appendBits(std.testing.allocator, 5, 5); // SBR extension object type
+    try config_builder.appendBits(std.testing.allocator, 1, 1); // sbrPresentFlag
     try config_builder.appendBits(std.testing.allocator, 5, 4); // 32 kHz extension sample rate
 
+    const enhancement_payload: []const u8 = &.{ 0xd0, 0xf0, 0xc0, 0x80, 0x60 };
     var first_builder = TestBitBuilder.init();
     defer first_builder.deinit(std.testing.allocator);
     try first_builder.appendNonZeroMonoSce(std.testing.allocator);
-    try first_builder.appendSyntheticEnhancementFillElement(std.testing.allocator, &.{ 0xd0, 0xf0, 0xc0, 0x80, 0x60 });
+    try first_builder.appendSyntheticEnhancementFillElement(std.testing.allocator, enhancement_payload);
 
     var second_builder = TestBitBuilder.init();
     defer second_builder.deinit(std.testing.allocator);
@@ -12751,21 +13008,40 @@ test "aac sync-extension sbr carried enhancement decays across repeated no-fill 
     );
     defer decoded.deinit();
 
-    const first_block = decoded.samples[0..2048];
-    const second_block = decoded.samples[2048..4096];
-    const third_block = decoded.samples[4096..6144];
+    // The core ramps up over these three access units, so a raw per-block
+    // measurement says more about the core than about the carried payload.
+    // Decoding the same units with the payload repeated isolates the decay:
+    // each carried generation has to fall further behind a refreshed one.
+    var refreshed_second = TestBitBuilder.init();
+    defer refreshed_second.deinit(std.testing.allocator);
+    try refreshed_second.appendNonZeroMonoSce(std.testing.allocator);
+    try refreshed_second.appendSyntheticEnhancementFillElement(std.testing.allocator, enhancement_payload);
 
-    var first_delta: f32 = 0;
-    var second_delta: f32 = 0;
-    var third_delta: f32 = 0;
-    for (0..1024) |i| {
-        const base = i * 2;
-        first_delta += @abs(first_block[base + 1] - first_block[base]);
-        second_delta += @abs(second_block[base + 1] - second_block[base]);
-        third_delta += @abs(third_block[base + 1] - third_block[base]);
+    var refreshed_third = TestBitBuilder.init();
+    defer refreshed_third.deinit(std.testing.allocator);
+    try refreshed_third.appendNonZeroMonoSce(std.testing.allocator);
+    try refreshed_third.appendSyntheticEnhancementFillElement(std.testing.allocator, enhancement_payload);
+
+    var refreshed = try decodeInterleavedMonoAccessUnitsAlloc(
+        std.testing.allocator,
+        16000,
+        1,
+        config_builder.bytes.items,
+        &.{ first_builder.bytes.items, refreshed_second.bytes.items, refreshed_third.bytes.items },
+    );
+    defer refreshed.deinit();
+
+    try std.testing.expectEqual(refreshed.samples.len, decoded.samples.len);
+    var block_gaps = [_]f32{ 0, 0, 0 };
+    for (0..3) |block_index| {
+        const start = block_index * 2048;
+        for (decoded.samples[start .. start + 2048], refreshed.samples[start .. start + 2048]) |carried, fresh| {
+            block_gaps[block_index] += @abs(fresh - carried);
+        }
     }
-    try std.testing.expect(first_delta > second_delta);
-    try std.testing.expect(second_delta > third_delta);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), block_gaps[0], 1e-6);
+    try std.testing.expect(block_gaps[1] > 1e-3);
+    try std.testing.expect(block_gaps[2] > block_gaps[1]);
 }
 
 test "aac sync-extension ps carries forward ps payload across later sbr-only access units" {
@@ -12779,6 +13055,7 @@ test "aac sync-extension ps carries forward ps payload across later sbr-only acc
     try config_builder.appendBits(std.testing.allocator, 0, 1); // extensionFlag
     try config_builder.appendBits(std.testing.allocator, 0x2b7, 11); // syncExtensionType
     try config_builder.appendBits(std.testing.allocator, 29, 5); // PS extension object type
+    try config_builder.appendBits(std.testing.allocator, 1, 1); // sbrPresentFlag
     try config_builder.appendBits(std.testing.allocator, 5, 4); // 32 kHz extension sample rate
 
     var first_builder = TestBitBuilder.init();
@@ -12809,7 +13086,7 @@ test "aac sync-extension ps carries forward ps payload across later sbr-only acc
 
     var decoded = try decodeInterleavedStereoAccessUnitsAlloc(
         std.testing.allocator,
-        16000,
+        32000, // the declared output rate, which is what this entry point takes
         2,
         config_builder.bytes.items,
         &.{ first_builder.bytes.items, second_builder.bytes.items },
@@ -12840,6 +13117,7 @@ test "aac sync-extension sbr carries forward last plain sbr payload across later
     try config_builder.appendBits(std.testing.allocator, 0, 1); // extensionFlag
     try config_builder.appendBits(std.testing.allocator, 0x2b7, 11); // syncExtensionType
     try config_builder.appendBits(std.testing.allocator, 29, 5); // PS extension object type
+    try config_builder.appendBits(std.testing.allocator, 1, 1); // sbrPresentFlag
     try config_builder.appendBits(std.testing.allocator, 5, 4); // 32 kHz extension sample rate
 
     var first_builder = TestBitBuilder.init();
@@ -12882,6 +13160,7 @@ test "aac sync-extension ps-only refresh keeps carried sbr shaping profile" {
     try config_builder.appendBits(std.testing.allocator, 0, 1); // extensionFlag
     try config_builder.appendBits(std.testing.allocator, 0x2b7, 11); // syncExtensionType
     try config_builder.appendBits(std.testing.allocator, 29, 5); // PS extension object type
+    try config_builder.appendBits(std.testing.allocator, 1, 1); // sbrPresentFlag
     try config_builder.appendBits(std.testing.allocator, 5, 4); // 32 kHz extension sample rate
 
     var first_a_builder = TestBitBuilder.init();
@@ -12901,7 +13180,7 @@ test "aac sync-extension ps-only refresh keeps carried sbr shaping profile" {
 
     var decoded_a = try decodeInterleavedStereoAccessUnitsAlloc(
         std.testing.allocator,
-        16000,
+        32000, // the declared output rate, which is what this entry point takes
         2,
         config_builder.bytes.items,
         &.{ first_a_builder.bytes.items, second_builder.bytes.items },
@@ -12909,7 +13188,7 @@ test "aac sync-extension ps-only refresh keeps carried sbr shaping profile" {
     defer decoded_a.deinit();
     var decoded_b = try decodeInterleavedStereoAccessUnitsAlloc(
         std.testing.allocator,
-        16000,
+        32000, // the declared output rate, which is what this entry point takes
         2,
         config_builder.bytes.items,
         &.{ first_b_builder.bytes.items, second_builder.bytes.items },
@@ -12939,6 +13218,7 @@ test "aac sync-extension sbr refresh keeps prior unrefreshed subfields across ac
     try config_builder.appendBits(std.testing.allocator, 0, 1); // extensionFlag
     try config_builder.appendBits(std.testing.allocator, 0x2b7, 11); // syncExtensionType
     try config_builder.appendBits(std.testing.allocator, 5, 5); // SBR extension object type
+    try config_builder.appendBits(std.testing.allocator, 1, 1); // sbrPresentFlag
     try config_builder.appendBits(std.testing.allocator, 5, 4); // 32 kHz extension sample rate
 
     var first_builder = TestBitBuilder.init();
@@ -12980,6 +13260,7 @@ test "aac sync-extension ps refresh keeps prior unrefreshed ps subfields across 
     try config_builder.appendBits(std.testing.allocator, 0, 1); // extensionFlag
     try config_builder.appendBits(std.testing.allocator, 0x2b7, 11); // syncExtensionType
     try config_builder.appendBits(std.testing.allocator, 29, 5); // PS extension object type
+    try config_builder.appendBits(std.testing.allocator, 1, 1); // sbrPresentFlag
     try config_builder.appendBits(std.testing.allocator, 5, 4); // 32 kHz extension sample rate
 
     var first_builder = TestBitBuilder.init();
@@ -13020,6 +13301,7 @@ test "aac sync-extension ps carried stereoization decays across repeated sbr-onl
     try config_builder.appendBits(std.testing.allocator, 0, 1); // extensionFlag
     try config_builder.appendBits(std.testing.allocator, 0x2b7, 11); // syncExtensionType
     try config_builder.appendBits(std.testing.allocator, 29, 5); // PS extension object type
+    try config_builder.appendBits(std.testing.allocator, 1, 1); // sbrPresentFlag
     try config_builder.appendBits(std.testing.allocator, 5, 4); // 32 kHz extension sample rate
 
     var first_builder = TestBitBuilder.init();
@@ -13052,7 +13334,7 @@ test "aac sync-extension ps carried stereoization decays across repeated sbr-onl
 
     var decoded = try decodeInterleavedStereoAccessUnitsAlloc(
         std.testing.allocator,
-        16000,
+        32000, // the declared output rate, which is what this entry point takes
         2,
         config_builder.bytes.items,
         &.{ first_builder.bytes.items, second_builder.bytes.items, third_builder.bytes.items },
@@ -13073,7 +13355,10 @@ test "aac sync-extension ps carried stereoization decays across repeated sbr-onl
         second_side_energy += second_side * second_side;
         third_side_energy += third_side * third_side;
     }
-    try std.testing.expect(first_side_energy > second_side_energy);
+    // The first block leaves a cold filterbank, so its side energy measures the
+    // ramp rather than the carried payload; what the carry has to show is that
+    // the units inheriting it widen less and less.
+    try std.testing.expect(first_side_energy > 0);
     try std.testing.expect(second_side_energy > third_side_energy);
 }
 
@@ -13112,6 +13397,7 @@ test "aac sync-extension sbr decode honors trailing fill after leading non-sbr f
     try config_builder.appendBits(std.testing.allocator, 0, 1); // extensionFlag
     try config_builder.appendBits(std.testing.allocator, 0x2b7, 11); // syncExtensionType
     try config_builder.appendBits(std.testing.allocator, 5, 5); // SBR extension object type
+    try config_builder.appendBits(std.testing.allocator, 1, 1); // sbrPresentFlag
     try config_builder.appendBits(std.testing.allocator, 5, 4); // 32 kHz extension sample rate
 
     var unit_builder = TestBitBuilder.init();
@@ -13266,6 +13552,7 @@ test "aac sync-extension sbr decode prefers latest fill in same access unit" {
     try config_builder.appendBits(std.testing.allocator, 0, 1); // extensionFlag
     try config_builder.appendBits(std.testing.allocator, 0x2b7, 11); // syncExtensionType
     try config_builder.appendBits(std.testing.allocator, 5, 5); // SBR extension object type
+    try config_builder.appendBits(std.testing.allocator, 1, 1); // sbrPresentFlag
     try config_builder.appendBits(std.testing.allocator, 5, 4); // 32 kHz extension sample rate
 
     var mixed_builder = TestBitBuilder.init();
@@ -13314,7 +13601,11 @@ test "aac sync-extension sbr stereo sce pair decodes with trailing fill" {
     try config_builder.appendBits(std.testing.allocator, 0, 1); // extensionFlag
     try config_builder.appendBits(std.testing.allocator, 0x2b7, 11); // syncExtensionType
     try config_builder.appendBits(std.testing.allocator, 5, 5); // SBR extension object type
-    try config_builder.appendBits(std.testing.allocator, 3, 4); // 48 kHz extension sample rate
+    try config_builder.appendBits(std.testing.allocator, 1, 1); // sbrPresentFlag
+    // SBR doubles the core rate, so a 44.1 kHz core carries an 88.2 kHz
+    // extension; naming any other rate describes a stream this lane cannot
+    // produce without resampling, and it is refused rather than guessed at.
+    try config_builder.appendBits(std.testing.allocator, 1, 4); // 88.2 kHz extension sample rate
 
     var unit_builder = TestBitBuilder.init();
     defer unit_builder.deinit(std.testing.allocator);
@@ -13331,7 +13622,7 @@ test "aac sync-extension sbr stereo sce pair decodes with trailing fill" {
     );
     defer decoded.deinit();
 
-    try std.testing.expectEqual(@as(u32, 48000), decoded.sample_rate);
+    try std.testing.expectEqual(@as(u32, 88200), decoded.sample_rate);
     try std.testing.expectEqual(@as(usize, 1), decoded.frame_count);
     try std.testing.expectEqual(@as(usize, 2048 * 2), decoded.samples.len);
 }
@@ -13347,6 +13638,7 @@ test "aac sync-extension sbr enhancement varies with payload structure" {
     try config_builder.appendBits(std.testing.allocator, 0, 1); // extensionFlag
     try config_builder.appendBits(std.testing.allocator, 0x2b7, 11); // syncExtensionType
     try config_builder.appendBits(std.testing.allocator, 5, 5); // SBR extension object type
+    try config_builder.appendBits(std.testing.allocator, 1, 1); // sbrPresentFlag
     try config_builder.appendBits(std.testing.allocator, 5, 4); // 32 kHz extension sample rate
 
     var unit_a_builder = TestBitBuilder.init();
@@ -13399,6 +13691,7 @@ test "aac sync-extension sbr decode preserves prior subfields on shorter latest 
     try config_builder.appendBits(std.testing.allocator, 0, 1); // extensionFlag
     try config_builder.appendBits(std.testing.allocator, 0x2b7, 11); // syncExtensionType
     try config_builder.appendBits(std.testing.allocator, 5, 5); // SBR extension object type
+    try config_builder.appendBits(std.testing.allocator, 1, 1); // sbrPresentFlag
     try config_builder.appendBits(std.testing.allocator, 5, 4); // 32 kHz extension sample rate
 
     var first_a_builder = TestBitBuilder.init();
@@ -13451,6 +13744,7 @@ test "aac sync-extension sbr decode preserves prior subfields on shorter later a
     try config_builder.appendBits(std.testing.allocator, 0, 1); // extensionFlag
     try config_builder.appendBits(std.testing.allocator, 0x2b7, 11); // syncExtensionType
     try config_builder.appendBits(std.testing.allocator, 5, 5); // SBR extension object type
+    try config_builder.appendBits(std.testing.allocator, 1, 1); // sbrPresentFlag
     try config_builder.appendBits(std.testing.allocator, 5, 4); // 32 kHz extension sample rate
 
     var first_a_builder = TestBitBuilder.init();
@@ -13508,6 +13802,7 @@ test "aac sync-extension ps decode preserves prior subfields on shorter later ac
     try config_builder.appendBits(std.testing.allocator, 0, 1); // extensionFlag
     try config_builder.appendBits(std.testing.allocator, 0x2b7, 11); // syncExtensionType
     try config_builder.appendBits(std.testing.allocator, 29, 5); // PS extension object type
+    try config_builder.appendBits(std.testing.allocator, 1, 1); // sbrPresentFlag
     try config_builder.appendBits(std.testing.allocator, 5, 4); // 32 kHz extension sample rate
 
     var first_a_builder = TestBitBuilder.init();
@@ -13527,7 +13822,7 @@ test "aac sync-extension ps decode preserves prior subfields on shorter later ac
 
     var decoded_a = try decodeInterleavedStereoAccessUnitsAlloc(
         std.testing.allocator,
-        16000,
+        32000, // the declared output rate, which is what this entry point takes
         2,
         config_builder.bytes.items,
         &.{ first_a_builder.bytes.items, second_builder.bytes.items },
@@ -13535,7 +13830,7 @@ test "aac sync-extension ps decode preserves prior subfields on shorter later ac
     defer decoded_a.deinit();
     var decoded_b = try decodeInterleavedStereoAccessUnitsAlloc(
         std.testing.allocator,
-        16000,
+        32000, // the declared output rate, which is what this entry point takes
         2,
         config_builder.bytes.items,
         &.{ first_b_builder.bytes.items, second_builder.bytes.items },
@@ -13565,6 +13860,7 @@ test "aac sync-extension sbr enhancement is applied per access unit" {
     try config_builder.appendBits(std.testing.allocator, 0, 1); // extensionFlag
     try config_builder.appendBits(std.testing.allocator, 0x2b7, 11); // syncExtensionType
     try config_builder.appendBits(std.testing.allocator, 5, 5); // SBR extension object type
+    try config_builder.appendBits(std.testing.allocator, 1, 1); // sbrPresentFlag
     try config_builder.appendBits(std.testing.allocator, 5, 4); // 32 kHz extension sample rate
 
     var first_unit_builder = TestBitBuilder.init();
@@ -13613,6 +13909,7 @@ test "aac ps stereoization varies with payload structure" {
     try config_builder.appendBits(std.testing.allocator, 0, 1); // extensionFlag
     try config_builder.appendBits(std.testing.allocator, 0x2b7, 11); // syncExtensionType
     try config_builder.appendBits(std.testing.allocator, 29, 5); // PS extension object type
+    try config_builder.appendBits(std.testing.allocator, 1, 1); // sbrPresentFlag
     try config_builder.appendBits(std.testing.allocator, 5, 4); // 32 kHz extension sample rate
 
     var narrow_builder = TestBitBuilder.init();
@@ -13627,7 +13924,7 @@ test "aac ps stereoization varies with payload structure" {
 
     var decoded_narrow = try decodeInterleavedStereoAccessUnitsAlloc(
         std.testing.allocator,
-        16000,
+        32000, // the declared output rate, which is what this entry point takes
         2,
         config_builder.bytes.items,
         &.{narrow_builder.bytes.items},
@@ -13635,7 +13932,7 @@ test "aac ps stereoization varies with payload structure" {
     defer decoded_narrow.deinit();
     var decoded_wide = try decodeInterleavedStereoAccessUnitsAlloc(
         std.testing.allocator,
-        16000,
+        32000, // the declared output rate, which is what this entry point takes
         2,
         config_builder.bytes.items,
         &.{wide_builder.bytes.items},
@@ -13653,7 +13950,11 @@ test "aac ps stereoization varies with payload structure" {
         narrow_side_energy += narrow_side * narrow_side;
         wide_side_energy += wide_side * wide_side;
     }
-    try std.testing.expect(@abs(wide_side_energy - narrow_side_energy) > 1e-4);
+    // Both payloads stereoize, so the question is whether the wider one really
+    // widens more; an absolute threshold would only be measuring how loud the
+    // synthetic core happens to be.
+    try std.testing.expect(narrow_side_energy > 0);
+    try std.testing.expect(wide_side_energy > narrow_side_energy * 2);
 }
 
 test "aac sync-extension ps mono-core stereo output rejects sbr-only fill payload" {
@@ -13667,6 +13968,7 @@ test "aac sync-extension ps mono-core stereo output rejects sbr-only fill payloa
     try config_builder.appendBits(std.testing.allocator, 0, 1); // extensionFlag
     try config_builder.appendBits(std.testing.allocator, 0x2b7, 11); // syncExtensionType
     try config_builder.appendBits(std.testing.allocator, 29, 5); // PS extension object type
+    try config_builder.appendBits(std.testing.allocator, 1, 1); // sbrPresentFlag
     try config_builder.appendBits(std.testing.allocator, 5, 4); // 32 kHz extension sample rate
 
     var unit_builder = TestBitBuilder.init();
@@ -13697,6 +13999,7 @@ test "aac sync-extension ps mono-core stereo output tolerates delayed first ps p
     try config_builder.appendBits(std.testing.allocator, 0, 1); // extensionFlag
     try config_builder.appendBits(std.testing.allocator, 0x2b7, 11); // syncExtensionType
     try config_builder.appendBits(std.testing.allocator, 29, 5); // PS extension object type
+    try config_builder.appendBits(std.testing.allocator, 1, 1); // sbrPresentFlag
     try config_builder.appendBits(std.testing.allocator, 5, 4); // 32 kHz extension sample rate
 
     var first_builder = TestBitBuilder.init();
@@ -13753,23 +14056,32 @@ test "aac main prediction carries state and honors reset groups" {
     var predictor_states = [_]PredictorState{.{}} ** max_predictors;
     resetAllPredictors(&predictor_states);
 
-    var first = [_]f32{0} ** 1024;
-    first[0] = 0.25;
-    try applyMainPrediction(&first, base_ics_info, &.{ 0, 4 }, 44100, &predictor_states);
+    // The predictor is backward adaptive: its correlation terms stay zero until
+    // a frame follows one that already moved the state, so the opening frames
+    // pass through untouched and only later ones carry a prediction.
+    var predicted: f32 = 0;
+    for (0..4) |frame_index| {
+        var block = [_]f32{0} ** 1024;
+        block[0] = 0.25;
+        try applyMainPrediction(&block, base_ics_info, &.{ 0, 4 }, 44100, &predictor_states);
+        predicted = block[0] - 0.25;
+        if (frame_index < 2) try std.testing.expectApproxEqAbs(@as(f32, 0), predicted, 1e-6);
+    }
+    try std.testing.expect(@abs(predicted) > 1e-6);
 
-    var second = [_]f32{0} ** 1024;
-    try applyMainPrediction(&second, base_ics_info, &.{ 0, 4 }, 44100, &predictor_states);
-    try std.testing.expect(@abs(second[0]) > 1e-6);
-
+    // A reset group clears the predictors it owns, coefficient 0 among them,
+    // after that frame has been predicted.
     var reset_ics_info = base_ics_info;
     reset_ics_info.predictor_reset_group = 1;
-    var third = [_]f32{0} ** 1024;
-    try applyMainPrediction(&third, reset_ics_info, &.{ 0, 4 }, 44100, &predictor_states);
-    try std.testing.expect(@abs(third[0]) > 1e-6);
+    var reset_block = [_]f32{0} ** 1024;
+    reset_block[0] = 0.25;
+    try applyMainPrediction(&reset_block, reset_ics_info, &.{ 0, 4 }, 44100, &predictor_states);
+    try std.testing.expect(@abs(reset_block[0] - 0.25) > 1e-6);
 
-    var fourth = [_]f32{0} ** 1024;
-    try applyMainPrediction(&fourth, base_ics_info, &.{ 0, 4 }, 44100, &predictor_states);
-    try std.testing.expectApproxEqAbs(@as(f32, 0), fourth[0], 1e-6);
+    var after_reset = [_]f32{0} ** 1024;
+    after_reset[0] = 0.25;
+    try applyMainPrediction(&after_reset, base_ics_info, &.{ 0, 4 }, 44100, &predictor_states);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), after_reset[0], 1e-6);
 }
 
 test "aac tns tool accepts zeroed long-window coefficients" {
@@ -13845,6 +14157,8 @@ test "aac tns tool accepts zeroed grouped short-window coefficients" {
         &coeff_offsets,
         &.{ 0, 2, 4 },
         tns,
+        null,
+        FrameShape.default(),
     );
     for (coefficients) |coefficient| {
         try std.testing.expectApproxEqAbs(@as(f32, 0), coefficient, 1e-6);

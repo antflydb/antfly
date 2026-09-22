@@ -102,9 +102,13 @@ export function Gliner2Chapters({ spec }: ChaptersProps) {
         <Scene id="c2c" graphic={<DisentangledScoresFigure highlight="c2c" />}>
           <p>
             <strong>C2C</strong> is ordinary attention: content query dot content key,{" "}
-            <code>Q_c · K_cᵀ</code>. Without any positional terms, attention cannot distinguish
-            reordered content by its position alone: permuting the input permutes the outputs rather
-            than teaching the model word order.
+            <code>Q_c · K_cᵀ</code> — the score/softmax/weighted-sum recipe{" "}
+            <Link className="text-primary underline" href="/models/gemma4-e4b#ch-4">
+              walked through with small numbers
+            </Link>{" "}
+            on the Gemma4 page. Without any positional terms, attention cannot distinguish reordered
+            content by its position alone: permuting the input permutes the outputs rather than
+            teaching the model word order.
           </p>
         </Scene>
         <Scene id="c2p" graphic={<DisentangledScoresFigure highlight="all" />}>

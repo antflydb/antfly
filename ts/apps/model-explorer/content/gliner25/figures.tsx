@@ -1599,13 +1599,13 @@ export function QualificationGateFigure() {
       <div className="text-center font-mono text-xs">
         serve = recognized <span className="text-muted-foreground">AND</span> available{" "}
         <span className="text-muted-foreground">AND</span> qualified →{" "}
-        <span className="font-semibold" style={{ color: "var(--kfam-text-kv)" }}>
-          withheld
+        <span className="font-semibold" style={{ color: "var(--kfam-text-attention)" }}>
+          served, for the eight named rows
         </span>
       </div>
       <p className="text-center font-mono text-[11px] text-muted-foreground">
-        all three are code facts, not policy prose · adding a qualification row is a reviewed
-        release decision
+        all three are code facts, not policy prose · every row is a reviewed release decision ·
+        anything unlisted still reports unsupported
       </p>
     </div>
   );

@@ -91,11 +91,22 @@ jobs:
         id: toolchain
         uses: ./.github/actions/load-toolchain-policy
       - name: Install build tools
-        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils
-      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils file
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
         with:
-          version: ${{ steps.toolchain.outputs.zig_version }}
-          use-cache: false
+          nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/${{ steps.toolchain.outputs.zig_nixpkgs_revision }}.tar.gz
+      - name: Install glibc-linked Zig
+        env:
+          ZIG_VERSION: ${{ steps.toolchain.outputs.zig_version }}
+          ZIG_NIX_ATTRIBUTE: ${{ steps.toolchain.outputs.zig_nix_attribute }}
+        run: |
+          zig_path="$(nix-build '<nixpkgs>' -A "$ZIG_NIX_ATTRIBUTE" --no-out-link)"
+          test "$("$zig_path/bin/zig" version)" = "$ZIG_VERSION"
+          compiler_description="$(file "$zig_path/bin/zig")"
+          echo "$compiler_description"
+          grep -q 'dynamically linked' <<<"$compiler_description"
+          echo "$zig_path/bin" >> "$GITHUB_PATH"
       - name: Test soak orchestration
         run: |
           python3 -m unittest discover -s scripts/ci -p test_zig_vopr_soak.py
@@ -103,7 +114,7 @@ jobs:
       - name: Test production transport, runtime scheduling, and determinism boundaries
         working-directory: zig
         run: |
-          python3 tools/run_bounded_zig_build.py --max-rss-cap 23622320128 -- build antfly-raft-transport-test standby-vopr-test vopr-runtime-test restore-admission-vopr-test vopr-determinism-audit \
+          python3 tools/run_bounded_zig_build.py --max-rss-cap 23622320128 -- build antfly-raft-transport-test standby-vopr-test vopr-runtime-test restore-admission-vopr-test vopr-determinism-audit secrets-test \
             -Doptimize=ReleaseSafe --summary all \
             --cache-dir "$VOPR_LOCAL_CACHE_DIR" --global-cache-dir "$VOPR_GLOBAL_CACHE_DIR"
 
@@ -126,11 +137,22 @@ jobs:
         id: toolchain
         uses: ./.github/actions/load-toolchain-policy
       - name: Install build tools
-        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils
-      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils file
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
         with:
-          version: ${{ steps.toolchain.outputs.zig_version }}
-          use-cache: false
+          nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/${{ steps.toolchain.outputs.zig_nixpkgs_revision }}.tar.gz
+      - name: Install glibc-linked Zig
+        env:
+          ZIG_VERSION: ${{ steps.toolchain.outputs.zig_version }}
+          ZIG_NIX_ATTRIBUTE: ${{ steps.toolchain.outputs.zig_nix_attribute }}
+        run: |
+          zig_path="$(nix-build '<nixpkgs>' -A "$ZIG_NIX_ATTRIBUTE" --no-out-link)"
+          test "$("$zig_path/bin/zig" version)" = "$ZIG_VERSION"
+          compiler_description="$(file "$zig_path/bin/zig")"
+          echo "$compiler_description"
+          grep -q 'dynamically linked' <<<"$compiler_description"
+          echo "$zig_path/bin" >> "$GITHUB_PATH"
       - name: Restore the pinned runner for this revision
         id: runner_cache
         uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
@@ -194,7 +216,7 @@ jobs:
       fail-fast: false
       max-parallel: 2
       matrix:
-        scenario: [standby, raft, distributed-data, standby-scaling]
+        scenario: [standby, raft, distributed-data, standby-scaling, secrets]
         shard: [0, 1]
         include:
           - scenario: standby
@@ -205,6 +227,8 @@ jobs:
             histories: 12
           - scenario: standby-scaling
             histories: 2
+          - scenario: secrets
+            histories: 1000
           - shard: 0
             policy: bounded-fair
           - shard: 1
@@ -283,13 +307,76 @@ jobs:
 
   # Native production stress complements the replayable scheduling campaigns.
   # Build once, repeat against those bytes, and keep every case's result.
-  production-e2e:
+  production-build:
     if: inputs.diagnostic_run == '' && inputs.qualification_only != true
     runs-on: arc-antfly-heavy
-    timeout-minutes: 330
+    timeout-minutes: 120
     env:
       ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/vopr-soak/${{ github.run_id }}-${{ github.run_attempt }}-restore
       ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.head_sha || github.sha }}
+          persist-credentials: false
+          submodules: true
+      - name: Prepare evidence directories
+        run: |
+          mkdir -p "$RUNNER_TEMP/production-e2e-soak/tmp" "$RUNNER_TEMP/production-e2e-soak/reports"
+          echo "TMPDIR=$RUNNER_TEMP/production-e2e-soak/tmp" >> "$GITHUB_ENV"
+          echo "ANTFLY_E2E_REGRESSION_REPORT_DIR=$RUNNER_TEMP/production-e2e-soak/reports" >> "$GITHUB_ENV"
+      - name: Load pinned toolchain policy
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+      - name: Install build tools and native debugger
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils file gdb
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+        with:
+          nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/${{ steps.toolchain.outputs.zig_nixpkgs_revision }}.tar.gz
+      - name: Install glibc-linked Zig
+        env:
+          ZIG_VERSION: ${{ steps.toolchain.outputs.zig_version }}
+          ZIG_NIX_ATTRIBUTE: ${{ steps.toolchain.outputs.zig_nix_attribute }}
+        run: |
+          zig_path="$(nix-build '<nixpkgs>' -A "$ZIG_NIX_ATTRIBUTE" --no-out-link)"
+          test "$("$zig_path/bin/zig" version)" = "$ZIG_VERSION"
+          compiler_description="$(file "$zig_path/bin/zig")"
+          echo "$compiler_description"
+          grep -q 'dynamically linked' <<<"$compiler_description"
+          echo "$zig_path/bin" >> "$GITHUB_PATH"
+      - name: Build production executable and qualify owner publication
+        id: production-build
+        working-directory: zig
+        run: |
+          python3 tools/run_bounded_zig_build.py --max-rss-cap 23622320128 -- build antfly antfly-storage-owner-source-test -Doptimize=ReleaseSafe --summary all \
+            2>&1 | tee "$RUNNER_TEMP/production-e2e-soak/build.log"
+          sha256sum zig-out/bin/antfly > "$RUNNER_TEMP/production-e2e-soak/binary.sha256"
+          tar -C zig-out/bin -czf "$RUNNER_TEMP/production-e2e-soak/antfly.tar.gz" antfly
+      - name: Soak compiled-owner restore with concurrent maintenance and status
+        working-directory: zig
+        run: |
+          for iteration in $(seq 1 20); do
+            python3 tools/run_bounded_zig_build.py --max-rss-cap 23622320128 -- build antfly-storage-owner-source-test -Doptimize=ReleaseSafe --summary all \
+              > "$RUNNER_TEMP/production-e2e-soak/owner-$iteration.log" 2>&1
+          done
+      - name: Retain production binary and build evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: production-soak-binary
+          path: |
+            ${{ runner.temp }}/production-e2e-soak/antfly.tar.gz
+            ${{ runner.temp }}/production-e2e-soak/binary.sha256
+            ${{ runner.temp }}/production-e2e-soak/*.log
+          if-no-files-found: error
+          retention-days: 30
+
+  production-e2e:
+    needs: production-build
+    runs-on: arc-antfly-heavy
+    timeout-minutes: 180
+    env:
       SKIP_BUILD: '1'
       ANTFLY_E2E_ENV_LOADED: '1'
       ANTFLY_BIN: ${{ github.workspace }}/zig/zig-out/bin/antfly
@@ -307,31 +394,20 @@ jobs:
           mkdir -p "$RUNNER_TEMP/production-e2e-soak/tmp" "$RUNNER_TEMP/production-e2e-soak/reports"
           echo "TMPDIR=$RUNNER_TEMP/production-e2e-soak/tmp" >> "$GITHUB_ENV"
           echo "ANTFLY_E2E_REGRESSION_REPORT_DIR=$RUNNER_TEMP/production-e2e-soak/reports" >> "$GITHUB_ENV"
-      - name: Load pinned toolchain policy
-        id: toolchain
-        uses: ./.github/actions/load-toolchain-policy
-      - name: Install build tools and native debugger
-        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb
-      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
-        with:
-          version: ${{ steps.toolchain.outputs.zig_version }}
-          use-cache: false
+      - name: Install native debugger
+        run: sudo apt-get update && sudo apt-get install -y gdb
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
-      - name: Build production executable and qualify owner publication
-        id: production-build
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: production-soak-binary
+          path: ${{ runner.temp }}/production-e2e-soak
+      - name: Restore and verify the production executable
+        id: restore-binary
         working-directory: zig
         run: |
-          python3 tools/run_bounded_zig_build.py --max-rss-cap 23622320128 -- build antfly antfly-storage-owner-source-test -Doptimize=ReleaseSafe --summary all \
-            2>&1 | tee "$RUNNER_TEMP/production-e2e-soak/build.log"
-          sha256sum zig-out/bin/antfly > "$RUNNER_TEMP/production-e2e-soak/binary.sha256"
-          tar -C zig-out/bin -czf "$RUNNER_TEMP/production-e2e-soak/antfly.tar.gz" antfly
-      - name: Soak compiled-owner restore with concurrent maintenance and status
-        working-directory: zig
-        run: |
-          for iteration in $(seq 1 20); do
-            python3 tools/run_bounded_zig_build.py --max-rss-cap 23622320128 -- build antfly-storage-owner-source-test -Doptimize=ReleaseSafe --summary all \
-              > "$RUNNER_TEMP/production-e2e-soak/owner-$iteration.log" 2>&1
-          done
+          mkdir -p zig-out/bin
+          tar -C zig-out/bin -xzf "$RUNNER_TEMP/production-e2e-soak/antfly.tar.gz"
+          sha256sum -c "$RUNNER_TEMP/production-e2e-soak/binary.sha256"
       - name: Soak public overwrite restore with concurrent readers and status
         run: |
           scripts/ci/zig-e2e-regression-loop.sh \
@@ -340,25 +416,16 @@ jobs:
             2>&1 | tee "$RUNNER_TEMP/production-e2e-soak/e2e.log"
       - name: Soak cross-shard Autograph resolution, promotion, and hydration
         timeout-minutes: 45
-        if: ${{ !cancelled() && steps.production-build.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.restore-binary.outcome == 'success' }}
         env:
           ANTFLY_E2E_REGRESSION_WORKERS: '2'
           ANTFLY_E2E_REGRESSION_REPORT_DIR: ${{ runner.temp }}/production-e2e-soak/autograph
         run: |
           scripts/ci/zig-e2e-autograph-soak.sh \
             2>&1 | tee "$RUNNER_TEMP/production-e2e-soak/autograph.log"
-      - name: Soak three by three cluster backup delete and restore
-        timeout-minutes: 90
-        if: ${{ !cancelled() && steps.production-build.outcome == 'success' }}
-        env:
-          ANTFLY_E2E_REGRESSION_WORKERS: '2'
-          ANTFLY_E2E_REGRESSION_REPORT_DIR: ${{ runner.temp }}/production-e2e-soak/cluster-restore
-        run: |
-          scripts/ci/zig-e2e-cluster-restore-soak.sh \
-            2>&1 | tee "$RUNNER_TEMP/production-e2e-soak/cluster-restore.log"
       - name: Soak large catalog control and diagnostic isolation
         timeout-minutes: 45
-        if: ${{ !cancelled() && steps.production-build.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.restore-binary.outcome == 'success' }}
         env:
           ANTFLY_E2E_REGRESSION_WORKERS: '2'
           ANTFLY_E2E_REGRESSION_REPORT_DIR: ${{ runner.temp }}/production-e2e-soak/catalog
@@ -367,7 +434,7 @@ jobs:
             2>&1 | tee "$RUNNER_TEMP/production-e2e-soak/catalog.log"
       - name: Soak concurrent aggregations and transaction session recovery
         timeout-minutes: 45
-        if: ${{ !cancelled() && steps.production-build.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.restore-binary.outcome == 'success' }}
         env:
           ANTFLY_E2E_REGRESSION_WORKERS: '2'
           ANTFLY_E2E_REGRESSION_REPORT_DIR: ${{ runner.temp }}/production-e2e-soak/query-transaction
@@ -375,7 +442,7 @@ jobs:
           scripts/ci/zig-e2e-query-transaction-soak.sh \
             2>&1 | tee "$RUNNER_TEMP/production-e2e-soak/query-transaction.log"
       - name: Verify complete production soak evidence
-        if: ${{ !cancelled() && steps.production-build.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.restore-binary.outcome == 'success' }}
         working-directory: zig
         run: |
           sha256sum -c "$RUNNER_TEMP/production-e2e-soak/binary.sha256"
@@ -419,25 +486,118 @@ jobs:
                   "test_multinode_autograph_recovers_after_data_restart": 50,
               }, profile
               assert all(not any(case.find(tag) is not None for tag in ("failure", "error", "skipped")) for case in cases), profile
-          for profile in ("normal", "constrained"):
-              reports = list((Path(os.environ["RUNNER_TEMP"]) / "production-e2e-soak/cluster-restore" / profile).glob("*.xml"))
-              assert len(reports) == 100, ("cluster-restore", profile, len(reports))
-              cases = [case for report in reports for case in ET.parse(report).getroot().findall(".//testcase")]
-              assert Counter(case.attrib["name"] for case in cases) == {
-                  "test_three_by_three_cluster_backup_restore_through_metadata_public_api": 50,
-                  "test_backup_restore_discovers_leader_past_stalled_status": 50,
-              }, profile
-              assert all(not any(case.find(tag) is not None for tag in ("failure", "error", "skipped")) for case in cases), profile
           PY
-      - name: Retain production executable, reports, and failed server roots
+      - name: Retain production executable and reports
         if: always()
         timeout-minutes: 20
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: production-e2e-soak
-          path: ${{ runner.temp }}/production-e2e-soak
+          path: |
+            ${{ runner.temp }}/production-e2e-soak
+            !${{ runner.temp }}/production-e2e-soak/tmp/**
           retention-days: 30
           if-no-files-found: error
+      - name: Retain stopped server roots separately
+        if: always()
+        timeout-minutes: 10
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: production-e2e-soak-roots
+          path: ${{ runner.temp }}/production-e2e-soak/tmp
+          retention-days: 30
+          if-no-files-found: warn
+
+  cluster-restore:
+    needs: production-build
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        profile: [normal, constrained]
+    runs-on: arc-antfly-heavy
+    timeout-minutes: 100
+    env:
+      SKIP_BUILD: '1'
+      ANTFLY_E2E_ENV_LOADED: '1'
+      ANTFLY_BIN: ${{ github.workspace }}/zig/zig-out/bin/antfly
+      ANTFLY_E2E_REGRESSION_WORKERS: '2'
+      ANTFLY_E2E_REGRESSION_REPEATS: '25'
+      ANTFLY_E2E_PRESERVE_FAILURE_LIMIT: '4'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.head_sha || github.sha }}
+          persist-credentials: false
+          submodules: true
+      - name: Prepare evidence directories
+        run: |
+          mkdir -p "$RUNNER_TEMP/production-e2e-soak/tmp" "$RUNNER_TEMP/production-e2e-soak/reports"
+          echo "TMPDIR=$RUNNER_TEMP/production-e2e-soak/tmp" >> "$GITHUB_ENV"
+          echo "ANTFLY_E2E_REGRESSION_REPORT_DIR=$RUNNER_TEMP/production-e2e-soak/reports" >> "$GITHUB_ENV"
+      - name: Install native debugger
+        run: sudo apt-get update && sudo apt-get install -y gdb
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: production-soak-binary
+          path: ${{ runner.temp }}/production-e2e-soak
+      - name: Restore and verify the production executable
+        id: restore-binary
+        working-directory: zig
+        run: |
+          mkdir -p zig-out/bin
+          tar -C zig-out/bin -xzf "$RUNNER_TEMP/production-e2e-soak/antfly.tar.gz"
+          sha256sum -c "$RUNNER_TEMP/production-e2e-soak/binary.sha256"
+      - name: Soak three by three cluster backup delete and restore
+        timeout-minutes: 90
+        env:
+          ANTFLY_E2E_REGRESSION_PROFILE: ${{ matrix.profile }}
+          ANTFLY_E2E_REGRESSION_REPORT_DIR: ${{ runner.temp }}/production-e2e-soak/cluster-restore
+        run: |
+          python3 scripts/ci/run_e2e_case.py --timeout 4800 --grace 30 scripts/ci/zig-e2e-cluster-restore-soak.sh \
+            2>&1 | tee "$RUNNER_TEMP/production-e2e-soak/cluster-restore.log"
+        # Reserve ten minutes for process shutdown and artifact collection.
+        # The inner per-case supervisors keep their separate ten-minute budget.
+      - name: Verify complete cluster restore evidence
+        env:
+          SOAK_PROFILE: ${{ matrix.profile }}
+        run: |
+          python3 - <<'PYVERIFY'
+          import os
+          from collections import Counter
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          root = Path(os.environ["RUNNER_TEMP"]) / "production-e2e-soak/cluster-restore" / os.environ["SOAK_PROFILE"]
+          reports = list(root.glob("*.xml"))
+          assert len(reports) == 100, len(reports)
+          cases = [case for report in reports for case in ET.parse(report).getroot().findall(".//testcase")]
+          assert Counter(case.attrib["name"] for case in cases) == {
+              "test_three_by_three_cluster_backup_restore_through_metadata_public_api": 50,
+              "test_backup_restore_discovers_leader_past_stalled_status": 50,
+          }
+          assert all(not any(case.find(tag) is not None for tag in ("failure", "error", "skipped")) for case in cases)
+          PYVERIFY
+      - name: Retain cluster restore reports
+        if: always()
+        timeout-minutes: 10
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cluster-restore-${{ matrix.profile }}
+          path: |
+            ${{ runner.temp }}/production-e2e-soak
+            !${{ runner.temp }}/production-e2e-soak/tmp/**
+          retention-days: 30
+          if-no-files-found: error
+      - name: Retain stopped server roots separately
+        if: always()
+        timeout-minutes: 10
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cluster-restore-${{ matrix.profile }}-roots
+          path: ${{ runner.temp }}/production-e2e-soak/tmp
+          retention-days: 30
+          if-no-files-found: warn
 
   corpus:
     needs: [build, qualify, campaign]
@@ -448,7 +608,7 @@ jobs:
       fail-fast: false
       max-parallel: 2
       matrix:
-        scenario: [standby, raft, distributed-data, standby-scaling]
+        scenario: [standby, raft, distributed-data, standby-scaling, secrets]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

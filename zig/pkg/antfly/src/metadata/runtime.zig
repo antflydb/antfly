@@ -132,6 +132,7 @@ fn metadataWalReplicaStateConfig() antfly.raft.storage.WalReplicaStateConfig {
 
 const CliConfig = struct {
     config_path: ?[]const u8 = null,
+    online_merge_enabled: bool = true,
     experimental: bool = false,
     raft_host: ?[]const u8 = null,
     raft_port: ?u16 = null,
@@ -469,6 +470,10 @@ pub const MetadataClusterPeer = struct {
 };
 
 pub const ServerConfig = struct {
+    /// Prefer online copying where the authenticated native protocol bundle
+    /// and each new candidate are eligible. False disables new admission while
+    /// still recovering already-admitted online transitions.
+    online_merge_enabled: bool = true,
     local_node_id: u64 = 1,
     metadata_group_id: u64 = group_ids.main_metadata_group_id,
     metadata_cluster_peers: []const MetadataClusterPeer = &.{},
@@ -487,6 +492,42 @@ pub const ServerConfig = struct {
     api_server_cfg: antfly.public_api.http_server.ApiHttpServerConfig = .{},
     storage_context: ?*anyopaque = null,
 };
+
+test "metadata server online merge default preserves unsupported startup and explicit disable" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/online-install", .{tmp.sub_path});
+    defer alloc.free(root);
+    const catalog = try std.fmt.allocPrint(alloc, "{s}/catalog", .{root});
+    defer alloc.free(catalog);
+    const snapshots = try std.fmt.allocPrint(alloc, "{s}/snapshots", .{root});
+    defer alloc.free(snapshots);
+    var cfg: ServerConfig = .{ .replica_root_dir = root, .replica_catalog_path = catalog, .snapshot_root_dir = snapshots };
+    try std.testing.expect(cfg.online_merge_enabled);
+    // Missing authentication disables only the online driver, not deployment
+    // startup. The ordinary merge path remains available.
+    {
+        var server = try Server.init(alloc, cfg);
+        defer server.deinit();
+        try std.testing.expect(server.server.svc.online_merge_runtime == null);
+    }
+    cfg.online_merge_enabled = false;
+    cfg.api_server_cfg.internal_service_secret = "online-config-test-secret";
+    {
+        var server = try Server.init(alloc, cfg);
+        defer server.deinit();
+        try std.testing.expectEqual(linked_storage, server.server.svc.online_merge_runtime != null);
+        if (server.server.svc.online_merge_runtime) |runtime| try std.testing.expect(runtime.driver.admit == null);
+    }
+    cfg.online_merge_enabled = true;
+    {
+        var server = try Server.init(alloc, cfg);
+        defer server.deinit();
+        try std.testing.expectEqual(linked_storage, server.server.svc.online_merge_runtime != null);
+        if (server.server.svc.online_merge_runtime) |runtime| try std.testing.expect(runtime.driver.admit != null);
+    }
+}
 
 const MetadataRaftStorageDiagnostics = struct {
     groups: usize = 0,
@@ -605,6 +646,7 @@ pub const Server = struct {
             .reallocation_protocol_peers = result.reallocation_protocol_peers,
         };
         result.server = try antfly.metadata_server.MetadataServer.init(alloc, .{
+            .online_merge_enabled = cfg.online_merge_enabled,
             .http = .{
                 .http = .{
                     .host = .{
@@ -974,8 +1016,8 @@ pub fn runFromIterator(
     var secret_store_initialized = false;
     defer if (secret_store_initialized) secret_store.deinit();
 
-    if (cli.secret_store_paths.items.len > 0) {
-        secret_store = try initLayeredSecretStore(alloc, setup_io.io(), cli.secret_store_paths.items);
+    if (try antfly.common.secrets.initFromConfigPathWithIo(alloc, setup_io.io(), cli.config_path, cli.secret_store_paths.items)) |configured_store| {
+        secret_store = configured_store;
         secret_store_initialized = true;
     }
 
@@ -1115,6 +1157,7 @@ pub fn runFromIterator(
         const security_json = try antfly.common.config.remoteContentSecurityJsonAlloc(alloc, remote_content);
         defer alloc.free(security_json);
         try storage_kernel_context.?.configureRemoteContentSecurity(security_json);
+        try storage_kernel_context.?.configureSecrets(if (secret_store_initialized) &secret_store else null);
     }
 
     var auth_backend: ?LegacyAuthBackend = null;
@@ -1176,7 +1219,19 @@ pub fn runFromIterator(
     const listener = resolveRaftListener(cli, if (loaded_config) |*cfg| cfg else null);
     const admin_listener = resolveAdminListener(cli, if (loaded_config) |*cfg| cfg else null, local_node_id, listener.bind_host);
 
+    var native_keys: @import("../common/secret_keyring.zig").Keyring = undefined;
+    var native_secrets: ?@import("secret_store.zig").Store = null;
+    defer if (native_secrets) |*store| store.deinit();
+    if (secret_store_initialized) {
+        if (secret_store.native_config) |native| {
+            if (native.value.backend != .distributed or native.value.reader != null) return error.InvalidConfig;
+            native_keys = .{ .alloc = alloc, .io = setup_io.io(), .path = native.value.keyring_path.? };
+            try native_keys.validate();
+        }
+    }
+
     var server = try Server.init(alloc, .{
+        .online_merge_enabled = cli.online_merge_enabled,
         .local_node_id = local_node_id,
         .metadata_group_id = metadata_group_id,
         .metadata_cluster_peers = cluster_peers,
@@ -1218,6 +1273,13 @@ pub fn runFromIterator(
         .storage_context = storageKernelContextHandle(storage_kernel_context),
     });
     defer server.deinitWithDeadline(supervisor.deadline());
+    if (secret_store_initialized) {
+        if (secret_store.native_config) |native| {
+            native_secrets = try @import("secret_store.zig").Store.init(alloc, setup_io.io(), native.value.scope, native_keys.provider(), .{ .service = server.server.svc });
+            const handle = native_secrets.?.nativeStore();
+            secret_store.attachNative(handle.source, handle.writer);
+        }
+    }
     try server.start();
     try server.bootstrapCluster(metadata_group_id, local_node_id, cluster_peers);
     const synced_extension_packages = try server.server.svc.syncExtensionPackageStore(setup_io.io(), resolved.extension_package_store_dir);
@@ -1372,6 +1434,14 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
         }
         if (std.mem.eql(u8, arg, "--control-tick-ms")) {
             cfg.control_tick_ms = try std.fmt.parseInt(u64, args.next() orelse return error.InvalidArguments, 10);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--online-merge-enabled")) {
+            cfg.online_merge_enabled = parseBoolFlag(args.next() orelse return error.InvalidArguments) orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--online-merge-enabled=")) {
+            cfg.online_merge_enabled = parseBoolFlag(arg["--online-merge-enabled=".len..]) orelse return error.InvalidArguments;
             continue;
         }
         if (std.mem.eql(u8, arg, "--data-dir")) {
@@ -1815,6 +1885,8 @@ fn printUsage(argv0: []const u8) void {
         \\  --experimental                 Enable experimental A2A protocol surfaces
         \\  --raft-tick-ms <ms>            Consensus progress interval, 1-1000 (default: 100)
         \\  --control-tick-ms <ms>         Control scheduling interval, 1-60000 (default: 100)
+        \\  --online-merge-enabled <bool>  Prefer online copying for eligible new merges (default: true; requires authenticated native storage)
+        \\                                 False stops new admission, but completes in-flight online merges
         \\  --data-dir <path>              Local storage root for metadata data
         \\  --replica-root-dir <path>      Replica root directory
         \\  --replica-catalog-path <path>  Replica catalog file path
@@ -1910,6 +1982,23 @@ test "metadata runtime cli accepts secret and extension package store paths" {
     defer cfg.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("/run/antfly/secrets/secrets.json", cfg.secret_store_paths.items[0]);
     try std.testing.expectEqualStrings("/opt/antfly/extensions", cfg.extension_package_store_dir.?);
+}
+
+test "metadata runtime cli online merge defaults on and accepts explicit disable" {
+    try std.testing.expect((CliConfig{}).online_merge_enabled);
+    var argv = [_][*:0]const u8{ "--online-merge-enabled", "true" };
+    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var cfg = try parseCli(std.testing.allocator, &iter);
+    defer cfg.deinit(std.testing.allocator);
+    try std.testing.expect(cfg.online_merge_enabled);
+    var off = [_][*:0]const u8{"--online-merge-enabled=false"};
+    var off_iter = std.process.Args.Iterator.init(.{ .vector = off[0..] });
+    var off_cfg = try parseCli(std.testing.allocator, &off_iter);
+    defer off_cfg.deinit(std.testing.allocator);
+    try std.testing.expect(!off_cfg.online_merge_enabled);
+    var invalid = [_][*:0]const u8{"--online-merge-enabled=maybe"};
+    var invalid_iter = std.process.Args.Iterator.init(.{ .vector = invalid[0..] });
+    try std.testing.expectError(error.InvalidArguments, parseCli(std.testing.allocator, &invalid_iter));
 }
 
 test "metadata runtime cli accepts layered secret store paths" {

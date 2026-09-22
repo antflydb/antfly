@@ -8761,11 +8761,14 @@ pub fn testFileBackedApiKeyRotation() !void {
         }
     };
 
-    const store_path = try std.fmt.allocPrint(alloc, ".zig-cache/test-managed-embedder-secret-rotation-{d}.json", .{monotonicNowNs()});
-    defer alloc.free(store_path);
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
-    defer std.Io.Dir.cwd().deleteFile(io_impl.io(), store_path) catch {};
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try tmp.dir.realPathFileAlloc(io_impl.io(), ".", alloc);
+    defer alloc.free(directory);
+    const store_path = try std.fs.path.join(alloc, &.{ directory, "secrets.json" });
+    defer alloc.free(store_path);
 
     try std.Io.Dir.cwd().writeFile(io_impl.io(), .{
         .sub_path = store_path,

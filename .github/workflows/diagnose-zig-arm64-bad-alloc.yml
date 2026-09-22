@@ -146,8 +146,13 @@ jobs:
           stat -c 'binary_size_bytes=%s' "$binary" | tee "$RUNNER_TEMP/darwin-arm64.binary-size"
           stat -c 'capi_size_bytes=%s' "$library" | tee "$RUNNER_TEMP/darwin-arm64.capi-size"
           library_size=$(stat -c '%s' "$library")
-          if [ "$library_size" -ge 20971520 ]; then
-            echo "libantfly.dylib exceeded the 20MiB retained-code budget: $library_size bytes" >&2
+          # Raised from 20MiB on 2026-09-17: libantfly now embeds the
+          # standalone inference runtime by default (see COMPILATION.md's
+          # "C API composition" section), which is a deliberate product
+          # decision, not a regression. 60MiB leaves headroom over the
+          # measured ~48MiB stripped ReleaseFast size.
+          if [ "$library_size" -ge 62914560 ]; then
+            echo "libantfly.dylib exceeded the 60MiB retained-code budget: $library_size bytes" >&2
             exit 1
           fi
 

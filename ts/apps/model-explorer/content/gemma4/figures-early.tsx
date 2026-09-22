@@ -865,3 +865,209 @@ export function MoeForkJoinFigure() {
     </Figure>
   );
 }
+
+/** Stable roles for the attention walkthrough: query, key, value. */
+function QkvChip({ x, y, kind }: { x: number; y: number; kind: "q" | "k" | "v" }) {
+  const color =
+    kind === "q" ? "var(--kfam-attention)" : kind === "k" ? "var(--kfam-kv)" : "var(--kfam-matvec)";
+  return (
+    <g>
+      <rect
+        x={x}
+        y={y}
+        width={18}
+        height={13}
+        rx={3}
+        fill={`color-mix(in oklch, ${color} 18%, transparent)`}
+        stroke={color}
+        strokeWidth={1}
+      />
+      <text
+        x={x + 9}
+        y={y + 7.5}
+        textAnchor="middle"
+        dominantBaseline="central"
+        fontSize={8}
+        className="fill-foreground font-mono"
+      >
+        {kind}
+      </text>
+    </g>
+  );
+}
+
+const MICRO_COLS = [
+  { id: "shard", word: "shard", x: 150, score: "24", scaled: "3.0", weight: "0.67", barW: 56 },
+  { id: "write", word: "write", x: 262, score: "8", scaled: "1.0", weight: "0.09", barW: 8 },
+  { id: "full", word: "full", x: 374, score: "16", scaled: "2.0", weight: "0.24", barW: 20 },
+];
+
+export function AttentionMicroFigure() {
+  return (
+    <Figure
+      viewBox="0 0 480 260"
+      title="attention, once, with small numbers"
+      caption="Schematic numbers, not model activations. One query — the position of “it” — scores three earlier positions, with 64-wide heads making the divisor √64 = 8. The softmax weights then mix the value vectors into the new “it”."
+    >
+      {/* query card */}
+      <rect
+        x={8}
+        y={34}
+        width={88}
+        height={46}
+        rx={5}
+        fill="color-mix(in oklch, var(--kfam-attention) 10%, transparent)"
+        stroke="var(--kfam-attention)"
+        strokeWidth={1.2}
+      />
+      <text
+        x={52}
+        y={50}
+        textAnchor="middle"
+        fontSize={10}
+        fontWeight={600}
+        className="fill-foreground"
+      >
+        “it”
+      </text>
+      <QkvChip x={43} y={58} kind="q" />
+      <text x={52} y={92} textAnchor="middle" fontSize={7} className="fill-muted-foreground">
+        the query position
+      </text>
+
+      {/* context cards */}
+      {MICRO_COLS.map((c) => (
+        <g key={c.id}>
+          <rect
+            x={c.x}
+            y={34}
+            width={96}
+            height={46}
+            rx={5}
+            fill="var(--muted)"
+            fillOpacity={0.4}
+            stroke="var(--muted-foreground)"
+            strokeWidth={0.8}
+          />
+          <text
+            x={c.x + 48}
+            y={50}
+            textAnchor="middle"
+            fontSize={10}
+            fontWeight={600}
+            className="fill-foreground"
+          >
+            “{c.word}”
+          </text>
+          <QkvChip x={c.x + 26} y={58} kind="k" />
+          <QkvChip x={c.x + 52} y={58} kind="v" />
+          <FlowArrow x1={92} y1={78} x2={c.x + 40} y2={102} dashed />
+        </g>
+      ))}
+
+      {/* score row */}
+      <text x={8} y={116} fontSize={7.5} className="fill-muted-foreground font-mono">
+        score = q · k
+      </text>
+      {MICRO_COLS.map((c) => (
+        <text
+          key={c.id}
+          x={c.x + 48}
+          y={116}
+          textAnchor="middle"
+          fontSize={10}
+          className="fill-foreground font-mono"
+        >
+          {c.score}
+        </text>
+      ))}
+
+      {/* scale row */}
+      <text x={8} y={140} fontSize={7.5} className="fill-muted-foreground font-mono">
+        ÷ √64 = 8
+      </text>
+      {MICRO_COLS.map((c) => (
+        <text
+          key={c.id}
+          x={c.x + 48}
+          y={140}
+          textAnchor="middle"
+          fontSize={10}
+          className="fill-foreground font-mono"
+        >
+          {c.scaled}
+        </text>
+      ))}
+
+      {/* softmax row */}
+      <text x={8} y={166} fontSize={7.5} className="fill-muted-foreground font-mono">
+        softmax →
+      </text>
+      <text x={8} y={178} fontSize={7} className="fill-muted-foreground font-mono">
+        Σ = 1.00
+      </text>
+      {MICRO_COLS.map((c) => (
+        <g key={c.id}>
+          <rect
+            x={c.x + 6}
+            y={158}
+            width={c.barW}
+            height={12}
+            rx={2}
+            fill="var(--kfam-attention)"
+            fillOpacity={0.85}
+          />
+          <text
+            x={c.x + 6 + c.barW + 5}
+            y={167.5}
+            dominantBaseline="central"
+            fontSize={8.5}
+            className="fill-foreground font-mono"
+          >
+            {c.weight}
+          </text>
+        </g>
+      ))}
+
+      {/* weighted sum */}
+      <FlowArrow x1={240} y1={182} x2={240} y2={196} />
+      <text x={240} y={210} textAnchor="middle" fontSize={9} className="fill-foreground font-mono">
+        new “it” = 0.67·<tspan fill="var(--kfam-matvec)">v(shard)</tspan> + 0.09·
+        <tspan fill="var(--kfam-matvec)">v(write)</tspan> + 0.24·
+        <tspan fill="var(--kfam-matvec)">v(full)</tspan>
+      </text>
+
+      {/* legend */}
+      <QkvChip x={16} y={228} kind="q" />
+      <text
+        x={38}
+        y={235}
+        dominantBaseline="central"
+        fontSize={7.5}
+        className="fill-muted-foreground"
+      >
+        what a position looks for
+      </text>
+      <QkvChip x={175} y={228} kind="k" />
+      <text
+        x={197}
+        y={235}
+        dominantBaseline="central"
+        fontSize={7.5}
+        className="fill-muted-foreground"
+      >
+        what it is found by
+      </text>
+      <QkvChip x={320} y={228} kind="v" />
+      <text
+        x={342}
+        y={235}
+        dominantBaseline="central"
+        fontSize={7.5}
+        className="fill-muted-foreground"
+      >
+        what it contributes
+      </text>
+    </Figure>
+  );
+}

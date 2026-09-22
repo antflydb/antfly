@@ -154,3 +154,32 @@ test "secret store archive boundary transports injected cancellation without mut
     try std.testing.expectEqualStrings("original", recovered.value);
     try std.testing.expect(!store.?.reloadFailed());
 }
+
+const secret_contract = @import("common/secret_contract.zig");
+const secret_record = @import("common/secret_record.zig");
+extern fn secret_foundation_abi_handles(*secret_contract.Source, *secret_contract.NativeStore.Writer, *secret_record.KeyProvider) callconv(.c) void;
+
+test "secret store archive boundary transports common contracts and key-provider errors" {
+    const alloc = std.testing.allocator;
+    var source: secret_contract.Source = undefined;
+    var writer: secret_contract.NativeStore.Writer = undefined;
+    var keys: secret_record.KeyProvider = undefined;
+    secret_foundation_abi_handles(&source, &writer, &keys);
+    var found = try source.resolve(alloc, "scope", "token", .{ .min_revision = 9 });
+    defer found.deinit(alloc);
+    try std.testing.expectEqualStrings("archive-secret", found.value.?.secret.bytes);
+    try std.testing.expectEqual(@as(u64, 8), found.value.?.revision);
+    try std.testing.expectError(error.Unavailable, source.resolve(alloc, "unavailable", "token", .{}));
+    try std.testing.expectError(error.Unavailable, source.resolve(alloc, "scope", "token", .{ .min_revision = 10 }));
+    var listing = try source.listMetadata(alloc, "scope", .{});
+    defer listing.deinit(alloc);
+    try std.testing.expectEqualStrings("token", listing.entries[0].key);
+    const health = try source.refresh("scope");
+    try std.testing.expect(health.stale and !health.available);
+    try std.testing.expectError(error.Conflict, writer.put("scope", "token", "new", .absent));
+    try std.testing.expectEqual(@as(u64, 10), (try writer.put("scope", "token", "new", .{ .exact = 8 })).revision);
+    try std.testing.expectError(error.Conflict, writer.removeOverride("scope", "token", .{ .exact = 7 }));
+    try std.testing.expect((try writer.removeOverride("scope", "token", .{ .exact = 8 })).changed);
+    const identity = secret_contract.Identity{ .scope = "scope", .key = "token", .revision = 10 };
+    try std.testing.expectError(error.Unavailable, secret_record.seal(alloc, std.Options.debug_io, keys, identity, "new"));
+}

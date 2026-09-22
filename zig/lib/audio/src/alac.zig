@@ -96,8 +96,10 @@ pub fn decodeInterleavedPacketizedAlloc(
     const cookie = try parseMagicCookie(decoder_config);
     if (cookie.bit_depth == 0 or cookie.bit_depth > 24) return error.UnsupportedAudioFormat;
     if (cookie.channels == 0 or cookie.channels > 2) return error.UnsupportedAudioFormat;
-    if (channels != cookie.channels) return error.UnsupportedAudioFormat;
-    if (sample_rate != cookie.sample_rate) return error.UnsupportedAudioFormat;
+    // The magic cookie is authoritative: Apple's muxer writes a stereo
+    // sample entry for mono ALAC tracks.
+    _ = channels;
+    _ = sample_rate;
     const scale = alacScaleForBitDepth(cookie.bit_depth);
 
     var samples = std.ArrayList(f32).empty;
@@ -115,8 +117,8 @@ pub fn decodeInterleavedPacketizedAlloc(
 
     return .{
         .samples = try samples.toOwnedSlice(allocator),
-        .sample_rate = sample_rate,
-        .channels = @intCast(channels),
+        .sample_rate = cookie.sample_rate,
+        .channels = @intCast(cookie.channels),
         .allocator = allocator,
     };
 }
@@ -219,11 +221,12 @@ fn decodeFrameAlloc(
     errdefer allocator.free(interleaved);
 
     if (header.is_uncompressed) {
-        try decodeUncompressedFrame(&br, cookie, header.wasted_bits, output_samples, interleaved);
+        // Escape frames carry full-width samples; the shifted-bits field
+        // does not apply to them.
+        try decodeUncompressedFrame(&br, cookie, 0, output_samples, interleaved);
     } else {
         try decodeCompressedFrame(allocator, &br, cookie, header, output_samples, interleaved);
     }
-    try restoreWastedBits(&br, interleaved, cookie.bit_depth, header.wasted_bits);
 
     const end_marker = try br.readBits(u8, 3);
     if (end_marker != 7 and header.wasted_bits == 0) return error.UnsupportedAudioFormat;
@@ -283,18 +286,13 @@ fn decodeUncompressedFrame(
     }
 }
 
+/// The shifted-out low bits of every sample sit between the predictor
+/// parameters and the entropy-coded residuals, interleaved by channel;
+/// `br` is positioned at their start. They are reattached after stereo
+/// decorrelation.
 fn restoreWastedBits(br: *BitReader, interleaved: []i32, bit_depth: u8, wasted_bits: u8) !void {
     if (wasted_bits == 0) return;
     if ((wasted_bits & 7) != 0 or wasted_bits >= bit_depth) return error.UnsupportedAudioFormat;
-
-    const bits_needed = try std.math.mul(usize, interleaved.len, wasted_bits);
-    const bits_remaining = br.bytes.len * 8 - br.bit_pos;
-    if (bits_remaining < bits_needed) {
-        for (interleaved) |*sample| {
-            sample.* = signExtend(sample.* << @intCast(wasted_bits), bit_depth);
-        }
-        return;
-    }
 
     for (interleaved) |*sample| {
         const low = try br.readBits(u32, wasted_bits);
@@ -318,6 +316,15 @@ fn decodeCompressedFrame(
     for (0..cookie.channels) |chan| {
         channel_predictors[chan] = try parseChannelPredictor(br);
         if (channel_predictors[chan].prediction_type != 0) return error.UnsupportedAudioFormat;
+    }
+
+    // Shifted low bits precede the residuals; remember where they start and
+    // step over them so the entropy decoder reads the right bits.
+    var shifted_bits_reader = BitReader{ .bytes = br.bytes, .bit_pos = br.bit_pos };
+    if (header.wasted_bits != 0) {
+        const skip = try std.math.mul(usize, try std.math.mul(usize, output_samples, cookie.channels), header.wasted_bits);
+        if (br.bit_pos + skip > br.bytes.len * 8) return error.UnsupportedAudioFormat;
+        br.bit_pos += skip;
     }
 
     var predicterror: [2][]i32 = .{ undefined, undefined };
@@ -360,16 +367,16 @@ fn decodeCompressedFrame(
         for (0..output_samples) |i| {
             interleaved[i] = output[0][i];
         }
-        return;
+    } else {
+        reconstructStereo(
+            output[0],
+            output[1],
+            interleaved,
+            header.interlacing_shift,
+            header.interlacing_leftweight,
+        ) catch return error.UnsupportedAudioFormat;
     }
-
-    reconstructStereo(
-        output[0],
-        output[1],
-        interleaved,
-        header.interlacing_shift,
-        header.interlacing_leftweight,
-    ) catch return error.UnsupportedAudioFormat;
+    try restoreWastedBits(&shifted_bits_reader, interleaved, cookie.bit_depth, header.wasted_bits);
 }
 
 fn parseChannelPredictor(br: *BitReader) !ChannelPredictor {

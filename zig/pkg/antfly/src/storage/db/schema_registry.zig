@@ -133,6 +133,18 @@ pub const SchemaView = struct {
         return self.epoch.validator;
     }
 
+    pub fn hasCoordinatedConstraints(self: SchemaView) bool {
+        const compiled = self.validator() orelse return false;
+        return (if (compiled.schema.unique_constraints) |items| items.value.len != 0 else false) or
+            (if (compiled.schema.foreign_keys) |items| items.value.len != 0 else false);
+    }
+
+    /// Expiry under coordinated constraints becomes visible only when its
+    /// FK-aware transaction commits, including when RESTRICT prevents deletion.
+    pub fn visibilityTtlDurationNs(self: SchemaView) u64 {
+        return if (self.hasCoordinatedConstraints()) 0 else self.tableSchema().ttl_duration_ns;
+    }
+
     pub fn physicalLayout(self: SchemaView) *const row_codec.PhysicalLayout {
         return &self.epoch.physical_layout;
     }

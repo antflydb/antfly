@@ -91,6 +91,7 @@ pub fn build(b: *std.Build) void {
 }
 
 pub const Artifacts = struct {
+    inference_steps: @import("pkg/inference/build/integration.zig").Steps,
     runtime: antfly_runtime_build.AddRuntimeResult,
     inference: inference_runtime_build.Graph,
     wasm: *std.Build.Step.Compile,
@@ -171,7 +172,19 @@ pub fn create(b: *std.Build) ?Artifacts {
         .optimize = optimize,
         .version = antfly_version,
     });
-    const lite_local_inference_runtime = b.option(bool, "lite-local-inference-runtime", "Advertise an embedded local inference runtime in Antfly Lite status") orelse false;
+    // Antfly Lite always links and advertises the embedded local inference
+    // runtime, matching the `antfly` executable (see COMPILATION.md's "C API
+    // composition" section and LITE.md's "Local Embedded Inference" section).
+    // This remains a build option so a caller can still opt out of
+    // advertising the capability; freestanding/wasm builds always disable it
+    // regardless of this flag (see storage/lite/capabilities.zig).
+    // Antfly Lite always links and advertises the embedded local inference
+    // runtime, matching the `antfly` executable (see COMPILATION.md's "C API
+    // composition" section and LITE.md's "Local Embedded Inference" section).
+    // This remains a build option so a caller can still opt out of
+    // advertising the capability; freestanding/wasm builds always disable it
+    // regardless of this flag (see storage/lite/capabilities.zig).
+    const lite_local_inference_runtime = b.option(bool, "lite-local-inference-runtime", "Advertise an embedded local inference runtime in Antfly Lite status") orelse true;
     const platform_tests = platform_build.addTests(b, .{
         .root = b.path("lib/platform"),
         .target = target,
@@ -283,6 +296,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const generating_api_openapi_mod = openapi_modules.generating_api;
     const extraction_openapi_mod = openapi_modules.extraction;
     const openai_api_mod = openapi_modules.openai_api;
+    const exa_api_mod = openapi_modules.exa_api;
 
     // Handlebars template engine
     const handlebars_dep = b.dependency("handlebars", .{ .target = target, .optimize = optimize });
@@ -696,6 +710,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .indexes_openapi = indexes_openapi_mod,
         .sort_openapi = sort_openapi_mod,
         .generating_api_openapi = generating_api_openapi_mod,
+        .websearch_openapi = openapi_modules.websearch,
         .eval_openapi = eval_openapi_mod,
         .query_openapi = query_openapi_mod,
         .admin_openapi = admin_openapi_mod,
@@ -750,6 +765,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .font = font_mod,
         .pdf = pdf_mod,
         .openai_api = openai_api_mod,
+        .exa_api = exa_api_mod,
         .handlebars = handlebars_mod,
         .inference_server = inference_server_mod,
         .prometheus = prometheus_mod,
@@ -1375,6 +1391,8 @@ pub fn create(b: *std.Build) ?Artifacts {
     }
 
     const storage_owner_runs = @import("pkg/antfly/build/storage_owner_tests.zig").add(b, target, optimize, production_antfly_imports, vopr_mod, runtime_library_artifacts);
+    b.step("antfly-storage-owner-test", "Run real compiled storage owner ABI regressions").dependOn(&storage_owner_runs.runs[0].step);
+    b.step("antfly-storage-owner-source-test", "Run compiled owner source and callback regressions").dependOn(&storage_owner_runs.runs[1].step);
     for (storage_owner_runs.runs) |run| {
         owner_tests.storage_test_step.dependOn(&run.step);
         owner_tests.integration_test_step.dependOn(&run.step);
@@ -1594,5 +1612,5 @@ pub fn create(b: *std.Build) ?Artifacts {
         &b.top_level_steps.get("inference-test").?.step,
         &b.top_level_steps.get("inference-finetune-test").?.step,
     });
-    return .{ .runtime = runtime, .inference = inference_graph, .wasm = wasm.artifact };
+    return .{ .runtime = runtime, .inference = inference_graph, .wasm = wasm.artifact, .inference_steps = inference_steps };
 }

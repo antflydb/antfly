@@ -397,28 +397,34 @@ export function Gliner25Chapters({ spec }: ChaptersProps) {
         </Scene>
       </ScrollyChapter>
 
-      {/* ── Ch 9 · Recognized, not yet served ───────────────────────── */}
+      {/* ── Ch 9 · Served, but only what the table names ────────────── */}
       <ScrollyChapter
         id="ch-9"
         number={9}
-        title="Recognized, not yet served"
-        intro="The runtime can parse, run, train and benchmark GLiNER2.5 — and still refuses to advertise it."
+        title="Served, but only what the table names"
+        intro="Serving stayed switched off until a qualification table could name exactly what had been measured. That table is now published — and it is deliberately narrow."
       >
         <Scene id="gate" graphic={<QualificationGateFigure />}>
           <p>
-            Three code facts gate serving. <code>detectArchitecture</code> recognizes a boundary
-            bundle from <code>architecture: "boundary"</code> (and fails closed on ambiguity). The
-            architecture module declares <code>runtime_available = false</code>. And the
-            qualification table — which must pin an exact model identity, backend, feature set and
-            length limit per row — is deliberately empty, with no environment override. The manifest
-            ANDs all three, so listing, capability and compatibility APIs report the model as
-            unsupported until a reviewed release decision adds a row. Nothing on this page is an
-            availability or performance claim.
+            Three code facts gate serving, and all three are now true — for the rows the table
+            names. <code>detectArchitecture</code> recognizes a boundary bundle from{" "}
+            <code>architecture: "boundary"</code> (and fails closed on ambiguity). The architecture
+            module declares <code>runtime_available = true</code>. And the qualification table —
+            which pins an exact model identity, backend, feature set and length contract per row —
+            publishes eight rows: the base-v1 bundle and its fp16-encoder sibling, each on native
+            and Metal, each in a single-window and a long-document profile.
+          </p>
+          <p>
+            The gate still works exactly as before, just with the third input flipped. Anything the
+            table does not name — the small and multi variants, quantized-encoder bundles, requests
+            outside the pinned length contracts — still reports as unsupported. The long-document
+            profile itself is an envelope of what was measured (up to 29 windows), not the
+            architecture's ceiling. Nothing on this page is a performance claim.
           </p>
           <p>
             <CodeLink link={L("gliner25-detect-arch")} /> ·{" "}
-            <CodeLink link={L("gliner25-runtime-withheld")} /> ·{" "}
-            <CodeLink link={L("gliner25-qualification-empty")} /> ·{" "}
+            <CodeLink link={L("gliner25-runtime-available")} /> ·{" "}
+            <CodeLink link={L("gliner25-qualification-table")} /> ·{" "}
             <CodeLink link={L("gliner25-manifest-gate")} /> ·{" "}
             <CodeLink link={L("gliner25-executor-preflight")} />
           </p>
@@ -430,7 +436,9 @@ export function Gliner25Chapters({ spec }: ChaptersProps) {
             <strong>base</strong> (~194M, hidden 768, deberta-v3-base — the numbers on this page),
             and <strong>multi</strong> (~287M, mdeberta-v3-base, 250k multilingual vocab).
             Everything else on this page — pool of {spec.stats.poolSize}, top-32 pool proposals, ten
-            marker types — is the same across all three.
+            marker types — is the same across all three. Only <strong>base</strong> is in the
+            qualification table today; small and multi run and train in the runtime but are not
+            cleared for serving.
           </p>
           <p className="text-xs">
             The shared runtime spine in full:{" "}

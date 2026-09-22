@@ -259,6 +259,9 @@ pub fn reconcileDbIndexes(
 }
 
 pub const ReconcileDbIndexOptions = struct {
+    /// Hidden restore owners admit physical projections while empty. External
+    /// enrichment/resolution producers remain disabled until publication.
+    restore_build_only: bool = false,
     drain_resolver_backfill: bool = true,
     embedding_options: managed_embedder.InitOptions = .{},
     source_table: []const u8 = "",
@@ -275,6 +278,13 @@ pub fn reconcileDbIndexesWithOptions(
     indexes_json: []const u8,
     options: ReconcileDbIndexOptions,
 ) !ProvisionSummary {
+    if (options.restore_build_only) {
+        if (!dbIndexReconciliationCanMutate(db)) return error.ReadOnly;
+        const removed = try removeMissingIndexes(alloc, db, indexes_json);
+        const indexes = try ensureIndexes(alloc, db, indexes_json);
+        try db.syncIndexes(true);
+        return .{ .indexes_added = indexes.added, .indexes_removed = removed + indexes.removed, .indexes_pending = indexes.pending };
+    }
     var desired_enrichments = std.ArrayListUnmanaged(db_mod.types.EnrichmentConfig).empty;
     defer {
         for (desired_enrichments.items) |*cfg| cfg.deinit(alloc);
@@ -1753,15 +1763,16 @@ fn findTable(tables: []const table_manager.TableRecord, table_id: u64) ?table_ma
 }
 
 fn testProvisionedFullTextBackfill(inject_activation_deferral: bool) !void {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/backfill", .{tmp.sub_path});
-    defer std.testing.allocator.free(path);
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
-    defer io_impl.deinit();
+    var path_tmp = try @import("../common/test_directory.zig").TestDirectory.initFast("backfill");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path();
+    const platform = @import("antfly_platform");
+    var clock = platform.clock.ManualClock{ .now_realtime_ns = 10 * std.time.ns_per_s };
 
     var db = try db_mod.DB.open(std.testing.allocator, path, .{
         .start_index_workers = false,
+        .index_repair_clock = clock.clock(),
+        .start_optional_runtimes = false,
         .ttl_cleanup = .{ .enabled = false },
     });
     defer db.close();
@@ -1822,8 +1833,8 @@ fn testProvisionedFullTextBackfill(inject_activation_deferral: bool) !void {
     // This is a functional durability test, not the production 250 ms reader
     // pause SLA. Match the storage repair tests' activation headroom, but still
     // honor any persisted retry instead of spending a fixed number of spins.
-    const platform = @import("antfly_platform");
-    const deadline_ns = platform.time.monotonicNs() + 90 * std.time.ns_per_s;
+    // Bound state-machine work independently of scheduler speed.
+    const max_steps = 32;
     var repaired = false;
     var observed_retry = false;
     defer if (!repaired) {
@@ -1839,7 +1850,7 @@ fn testProvisionedFullTextBackfill(inject_activation_deferral: bool) !void {
             }
         }
     };
-    while (platform.time.monotonicNs() < deadline_ns) {
+    for (0..max_steps) |_| {
         const step = try db.advanceIndexRepairIntent(std.testing.allocator, repair_id, .{
             .max_activation_pause_ms = 5_000,
         });
@@ -1848,7 +1859,7 @@ fn testProvisionedFullTextBackfill(inject_activation_deferral: bool) !void {
             break;
         }
         try std.testing.expect(!step.terminal);
-        const now_ms = platform.clock.Clock.real().nowRealtimeMs();
+        const now_ms = clock.clock().nowRealtimeMs();
         const retry_delay_ms = step.next_retry_at_ms -| now_ms;
         if (retry_delay_ms != 0) {
             observed_retry = true;
@@ -1863,6 +1874,13 @@ fn testProvisionedFullTextBackfill(inject_activation_deferral: bool) !void {
                 try std.testing.expect(pending.intent.candidate_relative_path != null);
                 try std.testing.expect(pending.intent.last_error != null);
                 try std.testing.expectEqualStrings("repair_attempt_incomplete", pending.intent.last_error.?);
+                // Status and the scheduler must classify backoff against the
+                // same clock that wrote the durable retry deadline.
+                const stats = try db.stats(std.testing.allocator);
+                defer db_mod.types.freeDBStats(std.testing.allocator, stats);
+                const index_stats = findDbIndexStats(stats.indexes, "full_text_index_v1") orelse return error.TestExpectedEqual;
+                try std.testing.expectEqualStrings("backoff", index_stats.index_repair_wait_reason);
+                try std.testing.expectEqual(step.next_retry_at_ms, index_stats.index_repair_next_retry_at_ms);
                 // Advancing before the retry time must neither attempt work
                 // nor lose the persisted retry schedule.
                 const early = try db.advanceIndexRepairIntent(std.testing.allocator, repair_id, .{});
@@ -1871,15 +1889,15 @@ fn testProvisionedFullTextBackfill(inject_activation_deferral: bool) !void {
                 try std.testing.expectEqual(step.next_retry_at_ms, early.next_retry_at_ms);
             }
         }
-        // Recheck realtime periodically because the durable retry timestamp is
-        // realtime, while the test's overall bound must remain monotonic.
-        while (true) {
-            const remaining_ms = (deadline_ns -| platform.time.monotonicNs()) / std.time.ns_per_ms;
-            if (remaining_ms == 0) break;
-            const retry_ms = step.next_retry_at_ms -| platform.clock.Clock.real().nowRealtimeMs();
-            const wait_ms = @min(remaining_ms, if (retry_ms != 0) @min(retry_ms, 1_000) else @as(u64, 10));
-            try io_impl.io().sleep(std.Io.Duration.fromMilliseconds(@intCast(wait_ms)), .awake);
-            if (platform.clock.Clock.real().nowRealtimeMs() >= step.next_retry_at_ms) break;
+        if (retry_delay_ms != 0) {
+            // The durable deadline is exclusive: one millisecond early still
+            // defers, while the next turn at the deadline may attempt work.
+            clock.setRealtimeNs((step.next_retry_at_ms - 1) * std.time.ns_per_ms);
+            const early = try db.advanceIndexRepairIntent(std.testing.allocator, repair_id, .{});
+            try std.testing.expect(early.deferred);
+            try std.testing.expect(!early.attempted);
+            try std.testing.expectEqual(step.next_retry_at_ms, early.next_retry_at_ms);
+            clock.advanceMs(1);
         }
     }
     try std.testing.expect(repaired);

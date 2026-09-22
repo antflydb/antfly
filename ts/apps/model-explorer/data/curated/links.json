@@ -339,13 +339,13 @@
     "path": "zig/pkg/inference/src/models/gliner_boundary.zig",
     "anchor": "pub fn detectArchitecture("
   },
-  "gliner25-runtime-withheld": {
+  "gliner25-runtime-available": {
     "path": "zig/pkg/inference/src/models/gliner_boundary.zig",
-    "anchor": "pub const runtime_available = false;"
+    "anchor": "pub const runtime_available = true;"
   },
-  "gliner25-qualification-empty": {
+  "gliner25-qualification-table": {
     "path": "zig/pkg/inference/src/models/gliner_boundary_qualification.zig",
-    "anchor": "const production_entries: []const Entry = &.{};"
+    "anchor": "const production_entries: []const Entry = &.{"
   },
   "gliner25-qualification-require": {
     "path": "zig/pkg/inference/src/models/gliner_boundary_qualification.zig",
@@ -353,7 +353,7 @@
   },
   "gliner25-manifest-gate": {
     "path": "zig/pkg/inference/src/models/manifest.zig",
-    "anchor": "return boundary and gliner_boundary.runtime_available and gliner_qualification.hasPublishedProfiles();"
+    "anchor": "if (!boundary or !gliner_boundary.runtime_available or !gliner_qualification.hasPublishedProfiles()) return false;"
   },
   "gliner25-markers": {
     "path": "zig/pkg/inference/src/pipelines/gliner_boundary_processor.zig",

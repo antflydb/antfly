@@ -12,16 +12,62 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Test root for lib/audio. Every codec module is referenced here so that a
+//! `--test-filter` can reach its tests: Zig only collects tests from files
+//! that analyzed code references, and a filtered run analyzes none of the
+//! mod.zig tests that would otherwise pull the codec modules in.
+
 const audio = @import("src/mod.zig");
+const aac = @import("src/aac.zig");
+const aiff = @import("src/aiff.zig");
+const alac = @import("src/alac.zig");
 const au = @import("src/au.zig");
 const caf = @import("src/caf.zig");
+const conformance = @import("src/conformance.zig");
+const flac = @import("src/flac.zig");
+const imdct = @import("src/imdct.zig");
+const mp3 = @import("src/mp3.zig");
+// The codec files behind the MP3 facade are only analyzed when something
+// references them, and a filtered run analyzes nothing that does, so their
+// tests were unreachable from this root until they were named here.
+const mp3_backend = @import("src/mp3/mp3.zig");
+const mp3_bitstream = @import("src/mp3/bitstream.zig");
+const mp3_huffman = @import("src/mp3/huffman.zig");
+const mp3_imdct = @import("src/mp3/imdct.zig");
+const mp3_requantize = @import("src/mp3/requantize.zig");
+const mp3_synthesis = @import("src/mp3/synthesis.zig");
 const mp4 = @import("src/mp4.zig");
+const ogg = @import("src/ogg.zig");
+const opus = @import("src/opus.zig");
+const opus_celt = @import("src/opus_celt.zig");
+const opus_silk = @import("src/opus_silk.zig");
+const vorbis = @import("src/vorbis.zig");
 const wav = @import("src/wav.zig");
+const webm = @import("src/webm.zig");
 
 test {
     _ = audio;
+    _ = aac;
+    _ = aiff;
+    _ = alac;
     _ = au;
     _ = caf;
+    _ = conformance;
+    _ = flac;
+    _ = imdct;
+    _ = mp3;
+    _ = mp3_backend;
+    _ = mp3_bitstream;
+    _ = mp3_huffman;
+    _ = mp3_imdct;
+    _ = mp3_requantize;
+    _ = mp3_synthesis;
     _ = mp4;
+    _ = ogg;
+    _ = opus;
+    _ = opus_celt;
+    _ = opus_silk;
+    _ = vorbis;
     _ = wav;
+    _ = webm;
 }

@@ -1524,6 +1524,11 @@ pub const ComputeBackend = struct {
         return op(self.ptr);
     }
 
+    pub fn tryCumulativeSum(self: *const ComputeBackend, tensor: CT, axis: u8, exclusive: bool, reverse: bool) !?CT {
+        const op = self.vtable.cumulativeSum orelse return null;
+        return op(self.ptr, tensor, axis, exclusive, reverse);
+    }
+
     pub fn tryConvertDType(self: *const ComputeBackend, tensor: CT, target: GraphDType) !?CT {
         const op = self.vtable.convertDType orelse return null;
         return op(self.ptr, tensor, target);
@@ -1628,6 +1633,7 @@ pub const ComputeBackend = struct {
         decoderRuntimePushPlannedComputeBarrierSuppression: ?*const fn (ctx: *anyopaque) anyerror!bool = null,
         decoderRuntimePopPlannedComputeBarrierSuppression: ?*const fn (ctx: *anyopaque) anyerror!void = null,
 
+        cumulativeSum: ?*const fn (ctx: *anyopaque, tensor: CT, axis: u8, exclusive: bool, reverse: bool) anyerror!?CT = null,
         convertDType: ?*const fn (ctx: *anyopaque, tensor: CT, target: GraphDType) anyerror!?CT = null,
         glinerBoundaryDevice: ?*const fn (ctx: *anyopaque, request: *const gliner_boundary_device.Request) anyerror!CT = null,
         glinerBoundaryScope: ?*const fn (ctx: *anyopaque, request: *const gliner_boundary_device.ScopeRequest) anyerror!gliner_boundary_device.ScopeStats = null,
@@ -2351,6 +2357,10 @@ pub const ComputeBackend = struct {
         /// Create a tensor from raw i32 data with an explicit logical shape.
         /// Backends may leave this null when they do not support integer tensors.
         fromInt32Shape: ?*const fn (ctx: *anyopaque, data: []const i32, shape: []const i32) anyerror!?CT = null,
+
+        /// Optional exact graph-constant import. Copies bytes and shape; return
+        /// null to retain the backend's legacy numeric-constant path.
+        fromConstantBytes: ?*const fn (ctx: *anyopaque, data: []const u8, dtype: GraphDType, shape: []const i64) anyerror!?CT = null,
 
         /// Copy tensor data to a caller-owned f32 slice.
         toFloat32: *const fn (ctx: *anyopaque, tensor: CT, allocator: std.mem.Allocator) anyerror![]f32,
@@ -4266,6 +4276,11 @@ pub const ComputeBackend = struct {
         if (self.vtable.fromInt32Shape) |op| {
             return op(self.ptr, data, shape);
         }
+        return null;
+    }
+
+    pub fn fromConstantBytes(self: *const ComputeBackend, data: []const u8, dtype: GraphDType, shape: []const i64) !?CT {
+        if (self.vtable.fromConstantBytes) |op| return op(self.ptr, data, dtype, shape);
         return null;
     }
 

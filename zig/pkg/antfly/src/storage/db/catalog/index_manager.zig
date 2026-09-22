@@ -20,6 +20,7 @@ const platform_clock = platform.clock;
 const Allocator = std.mem.Allocator;
 const fs_paths = @import("../../../common/fs_paths.zig");
 const CancellationToken = @import("../../../common/cancellation.zig").CancellationToken;
+const full_text_index_defaults = @import("../../../common/full_text_index_defaults.zig");
 const native_artifact_sink = @import("../../native_artifact_sink.zig");
 const native_backup = @import("../native_backup.zig");
 const process_memory = @import("antfly_platform").process_memory;
@@ -8063,6 +8064,26 @@ pub const IndexManager = struct {
         artifacts: std.ArrayListUnmanaged(Artifact) = .empty,
         native_files: ?native_backup.PinnedGeneratedArtifacts = null,
 
+        pub fn walPrefixBytes(self: *const NativeBackupCheckpoints) !u64 {
+            return if (self.native_files) |*files| try files.walPrefixBytes() else 0;
+        }
+
+        pub fn seal(self: *NativeBackupCheckpoints, io: std.Io, root: []const u8, cancellation: CancellationToken, wal_budget: u64) !u64 {
+            if (try self.walPrefixBytes() > wal_budget) return error.BackupSealWalBudgetExceeded;
+            var total: u64 = 0;
+            for (self.artifacts.items) |*artifact| {
+                const destination = try std.fmt.allocPrint(self.alloc, "{s}/indexes/{s}/{s}", .{ root, artifact.index_name, artifact.backend_root });
+                defer self.alloc.free(destination);
+                const bytes = switch (artifact.checkpoint) {
+                    .lsm => |*checkpoint| try checkpoint.seal(io, destination, cancellation),
+                    .text_segments => |*checkpoint| try checkpoint.seal(self.alloc, io, destination, cancellation),
+                };
+                total = std.math.add(u64, total, bytes) catch return error.FileTooBig;
+            }
+            if (self.native_files) |*files| total = std.math.add(u64, total, try files.seal(root, cancellation, wal_budget)) catch return error.FileTooBig;
+            return total;
+        }
+
         const Artifact = struct {
             index_name: []u8,
             backend_root: []const u8,
@@ -13906,18 +13927,29 @@ pub const IndexManager = struct {
         }
 
         if (self.text_indexes.items.len == 1) return &self.text_indexes.items[0].persistent;
+        // Every table (and, since Antfly Lite creation provisions it too,
+        // every Lite database) carries the default full-text index
+        // alongside any additional named indexes. When the caller does not
+        // disambiguate and there is more than one candidate, prefer the
+        // default rather than failing closed the way an HTTP request path
+        // that never resolved a primary index would.
+        if (self.textIndexEntryByName(full_text_index_defaults.default_full_text_index_name)) |entry| return &entry.persistent;
         return null;
     }
 
     pub fn textIndexEntry(self: *IndexManager, name: ?[]const u8) ?*TextIndex {
         if (name) |index_name| {
-            for (self.text_indexes.items) |*entry| {
-                if (std.mem.eql(u8, entry.config.name, index_name)) return entry;
-            }
-            return null;
+            return self.textIndexEntryByName(index_name);
         }
 
         if (self.text_indexes.items.len == 1) return &self.text_indexes.items[0];
+        return self.textIndexEntryByName(full_text_index_defaults.default_full_text_index_name);
+    }
+
+    fn textIndexEntryByName(self: *IndexManager, index_name: []const u8) ?*TextIndex {
+        for (self.text_indexes.items) |*entry| {
+            if (std.mem.eql(u8, entry.config.name, index_name)) return entry;
+        }
         return null;
     }
 
@@ -20857,6 +20889,7 @@ pub const IndexManager = struct {
         defer runtime_store.deinit();
         var txn = try runtime_store.store.beginWrite();
         errdefer txn.abort();
+        try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, enrichment_catalog_key, data);
         try txn.put(enrichment_catalog_key, data);
         try txn.commit();
         // Enrichment definitions are part of the immutable foreground write
@@ -20935,6 +20968,7 @@ pub const IndexManager = struct {
         defer runtime_store.deinit();
         var txn = try runtime_store.store.beginWrite();
         errdefer txn.abort();
+        try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, resolver_catalog_key, data);
         try txn.put(resolver_catalog_key, data);
         if (mode == .mark_reresolve_dirty) {
             try txn.put(resolver_catalog.reresolve_resume_key, "");

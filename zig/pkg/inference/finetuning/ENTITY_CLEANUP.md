@@ -277,14 +277,14 @@ model directory to enable the learned cleanup stage at inference time.
 
 The best product shape for this repo is:
 
-- ship a `GLiNER2 + cleanup head` bundle as one recognizer product
+- ship a `GLiNER2 + cleanup head` bundle as one extractor product
 - keep the cleanup head architecturally separate from the core GLiNER2 detector
 - train the cleanup head on GLiNER2-native span or boundary features, not the
   current hashed text/context features
 
 This keeps the user-facing experience simple:
 
-- one recognizer model
+- one extractor model
 - one inference API
 - built-in cleanup behavior
 
@@ -419,7 +419,7 @@ Expected behavior:
 Implemented workflow:
 - prepare train/eval GLiNER2 cleanup caches
 - train/eval the cleanup head
-- materialize the recognizer bundle
+- materialize the extractor bundle
 - emit a single JSON summary
 
 Command:

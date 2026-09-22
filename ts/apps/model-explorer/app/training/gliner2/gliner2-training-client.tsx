@@ -217,7 +217,7 @@ function MaskedBceFigure() {
     <Figure
       viewBox="0 0 440 210"
       title="the mask is a per-position loss weight"
-      caption="Schematic weights, not real data: m = 0 positions are skipped entirely (a validity gate — no Inf·0 NaN can leak in); m > 0 positions carry a real weight, and the mean divides by the summed weighted mass only."
+      caption="Schematic weights, not real data. An m = 0 position is skipped entirely — a validity gate, so no Inf·0 NaN can leak in. An m > 0 position carries a real weight, and the mean divides by the summed weighted mass only."
     >
       {BCE_GRID.map((c) => (
         <g key={c.id}>
