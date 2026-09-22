@@ -38,6 +38,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lib_data_runtime_default_filters = [_][]const u8{
         "workload admission cache metrics emit unique sample identities",
         "data ownership fallback requires a single store across all roles",
+        "data relational maintenance yields to raft persistence and follows elections",
         "data runtime background worker capacity is reserved and closes with its owner",
         "data runtime status refresh retries bounded executor pressure without losing wakes",
         "failed full index enrichment does not make resident reads unavailable",
@@ -213,6 +214,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "system catalog read peer routing honors expired and canceled admission budgets",
         "system catalog read peer routing retains healthy relocation views across publication and invalidation",
         "system catalog remote reads survive elections without skipping peers or extending budgets",
+        "system catalog remote reads spend one caller budget across bounded RPC attempts",
         "system catalog report failover preserves repair signals and stable peer order",
         "metadata capability client distinguishes advertised routing from N-1 absence",
         "data server wires configured HA executors into API server",

@@ -23110,8 +23110,10 @@ type RestoreJob struct {
 	CreatedAtMs         int64 `json:"created_at_ms"`
 
 	// DurabilityPendingTableCount Number of tables whose generation publication is visible but whose parent-directory durability could not be confirmed.
-	DurabilityPendingTableCount int64  `json:"durability_pending_table_count"`
-	Error                       string `json:"error,omitempty,omitzero"`
+	DurabilityPendingTableCount int64 `json:"durability_pending_table_count"`
+
+	// Error Most recent retry or terminal failure reason. Retained while queued or running, including across progress checkpoints and recovery; omitted after successful completion.
+	Error string `json:"error,omitempty,omitzero"`
 
 	// ExpiresAtMs Unix epoch milliseconds after which this terminal job record and its idempotency key may be removed. Omitted while the job is nonterminal.
 	ExpiresAtMs int64 `json:"expires_at_ms,omitempty,omitzero"`

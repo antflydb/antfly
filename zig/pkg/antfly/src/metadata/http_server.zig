@@ -3070,6 +3070,7 @@ pub const MetadataHttpServer = struct {
             error.NodeNotFound, error.UnknownStore => ctx.status(404).text("node not found"),
             error.StoreReportBaseMismatch => ctx.status(409).text("store report generation changed; send a full report"),
             error.ResourceTemporarilyUnavailable => ctx.status(503).text("report admission capacity exhausted"),
+            error.RuntimeStatusProtocolUnavailable => ctx.status(503).text("runtime status protocol is not ready"),
             error.ActiveNodeFinalizeRejected => ctx.status(409).text("node is not ready to finalize"),
             error.RelationalTopologyProtocolUpgradeRequired => ctx.status(409).text("upgrade every table-serving data runtime to relational topology protocol v1 before registration or constrained split/merge"),
             error.TableTopologyProtocolUpgradeRequired => ctx.status(426).text("upgrade metadata voters and learners to topology protocol v7 before registering a relational topology-capable data runtime"),

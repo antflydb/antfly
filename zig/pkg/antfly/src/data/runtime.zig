@@ -10265,6 +10265,27 @@ pub const DataServer = struct {
         };
     }
 
+    fn relationalMaintenanceLeadershipSource(self: *DataServer) ?antfly.public_api.table_writes.PromotionLeadershipSource {
+        if (self.group_leadership_source == null) return null;
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .is_local_leader = struct {
+                    fn isLocalLeader(ptr: *anyopaque, group_id: u64) bool {
+                        const server: *DataServer = @ptrCast(@alignCast(ptr));
+                        // Maintenance yields to Raft instead of waiting behind slow
+                        // persistence. Protect the mutable host/group lookup using
+                        // the same lock as membership changes and foreground reads.
+                        const lock_host = server.data_raft != null;
+                        if (lock_host and !server.data_raft_mutex.tryLock()) return false;
+                        defer if (lock_host) server.data_raft_mutex.unlock();
+                        return server.group_leadership_source.?.isLocalLeader(group_id);
+                    }
+                }.isLocalLeader,
+            },
+        };
+    }
+
     fn promotionLeadershipSource(self: *DataServer) ?antfly.public_api.table_writes.PromotionLeadershipSource {
         if (self.group_leadership_source == null) return null;
         return .{
@@ -25140,17 +25161,11 @@ const RemoteMetadataSource = struct {
     }
 
     fn readSystemCatalog(self: *RemoteMetadataSource, alloc: std.mem.Allocator, request: antfly.public_api.operation.RequestContext, input: @import("../system_catalog/domain.zig").Call) ![]u8 {
-        try request.ensureActive();
-        const started = self.awakeNs();
-        var budget_ns: u64 = @as(u64, antfly.public_api.raft_mutation_forwarding.max_remaining_ms) * std.time.ns_per_ms;
-        if (request.deadline_ns) |deadline| {
-            const now: u64 = if (request.deadline_io) |borrow| blk: {
-                var receiver = try borrow.receive();
-                break :blk @intCast(@max(0, std.Io.Clock.awake.now(receiver.io()).nanoseconds));
-            } else @import("antfly_platform").time.monotonicNs();
-            budget_ns = @min(budget_ns, deadline -| now);
-        }
-        const deadline = started +| budget_ns;
+        // The forwarding envelope bounds one RPC, not the complete read.
+        // Share the caller's existing snapshot allowance across attempts so
+        // a slow/failed peer cannot consume a fresh budget or prematurely
+        // terminate write validation while its caller still has time left.
+        const deadline = try requestDeadlineOnClock(request, self.awakeNs(), remote_metadata_snapshot_timeout_ns);
         // Pin the endpoint order for each pass. Concurrent successful calls
         // may change affinity, but must not cause this read to skip a peer.
         while (true) {
@@ -25163,7 +25178,11 @@ const RemoteMetadataSource = struct {
                 const index = (first + attempt) % self.base_uris.len;
                 var client = self.metadataClient(alloc);
                 var cancellation = antfly.raft.transport.http_common.RequestCancellation.fromToken(request.cancellation);
-                const read = client.readSystemCatalog(self.base_uris[index], input, @intCast(@max(1, remaining_ns / std.time.ns_per_ms)), &cancellation) catch |err| {
+                const attempt_ms: u32 = @intCast(@min(
+                    antfly.public_api.raft_mutation_forwarding.max_remaining_ms,
+                    @max(1, remaining_ns / std.time.ns_per_ms),
+                ));
+                const read = client.readSystemCatalog(self.base_uris[index], input, attempt_ms, &cancellation) catch |err| {
                     switch (err) {
                         error.InvalidCatalogName, error.CatalogNotFound, error.CatalogGenerationChanged, error.CatalogCommandTooLarge, error.OutOfMemory, error.Cancelled, error.Canceled => return err,
                         else => {
@@ -25177,6 +25196,9 @@ const RemoteMetadataSource = struct {
                         },
                     }
                 };
+                errdefer read.deinit(alloc);
+                try request.ensureActive();
+                if (self.awakeNs() >= deadline) return error.DeadlineExceeded;
                 self.acceptMetadataIdentity(read.metadata_group_id, read.metadata_incarnation) catch |err| {
                     read.deinit(alloc);
                     terminal_error = err;
@@ -43730,6 +43752,40 @@ pub const implementation_tests = implementationTests();
 fn implementationTests() type {
     if (!(@import("builtin").is_test and !control_only_storage_sources)) return struct {};
     const Suite = struct {
+        test "data relational maintenance yields to raft persistence and follows elections" {
+            const Fake = struct {
+                leader: bool = true,
+                calls: usize = 0,
+                fn owns(ptr: *anyopaque, _: u64) bool {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.calls += 1;
+                    return self.leader;
+                }
+            };
+            var fake: Fake = .{};
+            // This callback only borrows the leadership port and host mutex. The host
+            // sentinel establishes distributed mode and is never dereferenced.
+            var host: antfly.raft.ManagedHttpHostService = undefined;
+            var server: DataServer = undefined;
+            server.data_raft = &host;
+            server.data_raft_mutex = .unlocked;
+            server.group_leadership_source = .{ .ptr = &fake, .vtable = &.{ .is_local_leader = Fake.owns } };
+            const source = server.relationalMaintenanceLeadershipSource().?;
+            try std.testing.expect(server.data_raft_mutex.tryLock());
+            try std.testing.expect(!source.isLocalLeader(7));
+            try std.testing.expectEqual(@as(usize, 0), fake.calls);
+            server.data_raft_mutex.unlock();
+            try std.testing.expect(source.isLocalLeader(7));
+            fake.leader = false;
+            try std.testing.expect(!source.isLocalLeader(7));
+            fake.leader = true;
+            try std.testing.expect(source.isLocalLeader(7));
+            try std.testing.expectEqual(@as(usize, 3), fake.calls);
+            server.group_leadership_source = null;
+            server.data_raft = null;
+            try std.testing.expectEqual(null, server.relationalMaintenanceLeadershipSource());
+        }
+
         test "data runtime status refresh skips opening the active startup group when no cached snapshot exists yet" {
             const alloc = std.testing.allocator;
 

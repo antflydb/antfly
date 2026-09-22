@@ -6721,7 +6721,9 @@ components:
             failure_details_truncated:
               type: boolean
               description: True when additional failed tables or part of a long table name or error were omitted.
-        error: { type: string }
+        error:
+          type: string
+          description: Most recent retry or terminal failure reason. Retained while queued or running, including across progress checkpoints and recovery; omitted after successful completion.
         created_at_ms: { type: integer, format: int64 }
         updated_at_ms: { type: integer, format: int64 }
         expires_at_ms:

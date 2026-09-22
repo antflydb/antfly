@@ -2003,18 +2003,7 @@ fn deleteGroupPathIfPresent(
     try std.Io.Dir.cwd().deleteTree(io_impl.io(), path);
 }
 
-const PromotionLeadershipSourceContract = struct {
-    ptr: *anyopaque,
-    vtable: *const VTable,
-
-    pub const VTable = struct {
-        is_local_leader: *const fn (ptr: *anyopaque, group_id: u64) bool,
-    };
-
-    pub fn isLocalLeader(self: PromotionLeadershipSourceContract, group_id: u64) bool {
-        return self.vtable.is_local_leader(self.ptr, group_id);
-    }
-};
+const PromotionLeadershipSourceContract = @import("group_work_ownership.zig").Source;
 
 pub const PromotionLeadershipSource = PromotionLeadershipSourceContract;
 
@@ -14076,7 +14065,7 @@ pub const ProvisionedTableWriteSource = struct {
         // Enrichment activity hooks can run inside the DB apply boundary.
         // Source counters have their own nonblocking lock; sampling unrelated
         // LSM counters here would reenter the DB lock and stall publication.
-        if (db.sourceVectorStats()) |stats| status.source_vectors = stats;
+        status.source_vectors = db.sourceVectorStats() catch status.source_vectors;
         _ = snapshot_cache.publishGroup(publication_token, table_name, status) catch |err| {
             std.log.warn("managed runtime status overlay publish failed table={s} group_id={} err={s}", .{
                 table_name,
@@ -16977,7 +16966,7 @@ pub const ProvisionedTableWriteSource = struct {
                         }
                         if (lifecycle_observed) self.markManagedWriterRuntimeStatus(&status);
                         status.lsm_storage_stats = lsmStorageStatsFromDb(owned.db);
-                        if (owned.db.sourceVectorStats()) |stats| status.source_vectors = stats;
+                        status.source_vectors = owned.db.sourceVectorStats() catch status.source_vectors;
                         if (status.created_at_millis == 0) {
                             status.created_at_millis = (owned.db.getGroupCreatedAtMillis(alloc, group_id) catch null) orelse 0;
                         }
@@ -16987,9 +16976,9 @@ pub const ProvisionedTableWriteSource = struct {
                 var status = runtime_status.LocalTableRuntimeStatus{
                     .group_id = group_id,
                     .created_at_millis = (owned.db.getGroupCreatedAtMillis(alloc, group_id) catch null) orelse 0,
+                    .source_vectors = owned.db.sourceVectorStats() catch return error.WriterLocked,
                     .stats = try owned.db.runtimeStatusStatsConsistent(alloc),
                     .lsm_storage_stats = lsmStorageStatsFromDb(owned.db),
-                    .source_vectors = owned.db.sourceVectorStats(),
                 };
                 self.markManagedWriterRuntimeStatus(&status);
                 break :blk status;
@@ -17015,7 +17004,7 @@ pub const ProvisionedTableWriteSource = struct {
                     self.markManagedWriterRuntimeStatus(status);
                 }
                 status.lsm_storage_stats = lsmStorageStatsFromDb(owned.db);
-                if (owned.db.sourceVectorStats()) |stats| status.source_vectors = stats;
+                status.source_vectors = owned.db.sourceVectorStats() catch status.source_vectors;
                 if (status.created_at_millis == 0) {
                     status.created_at_millis = (owned.db.getGroupCreatedAtMillis(std.heap.page_allocator, group_id) catch null) orelse 0;
                 }
@@ -30782,7 +30771,7 @@ fn captureStructuralRuntimeStatusObservation(
         .group_id = group_id,
         .disk_bytes = disk_bytes,
         .created_at_millis = created_at_millis,
-        .source_vectors = db.sourceVectorStats(),
+        .source_vectors = db.sourceVectorStats() catch return error.WriterLocked,
         .stats = try db.runtimeStatusStatsConsistent(alloc),
     };
     errdefer status.deinit(alloc);
@@ -31153,7 +31142,7 @@ fn publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
             applyStartupCatchUpAsyncOverlay(&status, async_stats, startup);
             if (!retain_authoritative_metadata) markStartupRuntimeStatus(&status, startup);
             status.metadata.lsm_root_generation = lsm_root_generation;
-            if (db.sourceVectorStats()) |stats| status.source_vectors = stats;
+            status.source_vectors = db.sourceVectorStats() catch status.source_vectors;
             result = try publishRuntimeStatusGroupAfterObservationMode(snapshot_cache, publication_token, table_name, target_index_name, target_transition_token, status, mode);
         } else {
             var status = runtime_status.LocalTableRuntimeStatus{
@@ -31168,7 +31157,7 @@ fn publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
             applyStartupCatchUpAsyncOverlay(&status, async_stats, startup);
             markStartupRuntimeStatus(&status, startup);
             status.metadata.lsm_root_generation = lsm_root_generation;
-            if (db.sourceVectorStats()) |stats| status.source_vectors = stats;
+            status.source_vectors = db.sourceVectorStats() catch return error.WriterLocked;
             result = try publishRuntimeStatusGroupAfterObservationMode(snapshot_cache, publication_token, table_name, target_index_name, target_transition_token, status, mode);
         }
         return result;
@@ -31267,7 +31256,7 @@ fn publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
         };
         status_initialized = true;
     }
-    if (db.sourceVectorStats()) |stats| status.source_vectors = stats;
+    status.source_vectors = db.sourceVectorStats() catch return error.WriterLocked;
     var startup = startupCatchUpStatsForPhase(phase, db);
     if (!startup.wal_retention_known and cached_startup.wal_retention_known) {
         startup.wal_retention_known = true;

@@ -1,5 +1,275 @@
 # Zig E2E flakes
 
+## 2026-09-21: #842 donor readiness and concurrent restore observations
+
+[Issue #842](https://github.com/antflydb/antfly/issues/842) failed the
+`snapshot-owner` foreign-key merge recovery case because it treated stable
+metadata leadership as proof that the donor group's asynchronous leader report
+had arrived. The shared cluster helper now polls that specific group under one
+absolute deadline, follows metadata leader changes, checks process liveness,
+and retains the last observation on timeout. Both recovery hooks use it.
+Deterministic tests cover absent/delayed reports, leader changes, deadline
+exhaustion, and process failure. The affected production test passed 4/4 with
+two workers and two repetitions using `zig-e2e-regression-loop.sh`. No fault
+window, merge deadline, or data-integrity assertion changed.
+
+[Full run 35641562828](https://github.com/antflydb/antfly/actions/runs/35641562828)
+also reported a 404 from a concurrent restore observer. A point lookup can
+resolve a physical table just before restore replaces the logical binding and
+retires that table. On absence, validate the original catalog identity before
+returning 404. A changed or temporarily unavailable binding returns a retryable
+503; the request never silently follows a replacement table. Deterministic
+HTTP coverage checks both missing-table and missing-document paths, unchanged,
+replaced, and deleted bindings, and catalog unavailability.
+
+The unchanged observer reproduced a separate 409 topology-change response in
+one of six runs. Its retry classifier already defines that response as
+retryable; the observer now invokes that classifier for both 409 and 503.
+404s remain failures. The rebuilt Linux server passes all five extension cases
+and this restore observer (6/6), without a diagnostic shim. Final native
+separate-cache server qualification passes the same six tests plus the
+controlled standby ACK-withholding case (7/7).
+
+Linux extension crashes and the full-unit failures from
+this run are recorded in [the runtime flake history](../FLAKES.md#2026-09-21-full-lane-cache-vopr-storage-and-extension-failures).
+
+The standby-startup ACK-pending 503 from the later PR lane did not reproduce in
+four unchanged runs (two workers, two repetitions). One successful round does
+not promise that every subsequent ACK arrives within the two-second response
+budget. The streaming/restart test now sends each write once and reconciles only
+the explicit locally-committed, ACK-pending response through both standby apply
+and the primary's recorded ACK within one 20-second observation budget. Document,
+restart, and remote-durability assertions still run. Other 503s fail; no mutation
+is retried. Deterministic tests require both observations for success and failure
+paths. A real authenticated proxy withholds all write ACKs until the original
+write returns the exact post-commit 503, then releases them. The reconciliation
+case fails with the old write handling and passed 4/4 with the correction on
+two workers and two repetitions, preserving all restart,
+content, and remote-durability assertions. Production acknowledgement policy and
+explicit outage-rejection tests remain unchanged; these changes do not claim to
+establish the CI latency cause.
+
+## 2026-09-21: online merge recovery exceeded phase deadlines in PR #832 CI
+
+[Run 35633482490's recovery-1 job](https://github.com/antflydb/antfly/actions/runs/35633482490/job/106465550834)
+failed two `test_online_merge_recovers_after_owner_link_outage_and_crash` cases:
+`release-reply_loss` did not reach its injected release window within 90 seconds,
+and `snapshot-raft_quorum` did not finish source release after the injected outage.
+The latter's final observation remained in online `freeze`. Nine other recovery
+cases passed. The ordinary Antfly E2E lane passed 727 tests (five skipped),
+including the catalog cases for #828 and #831. Recovery-0, inference, and VOPR
+qualification also passed in the same run.
+
+Retained metadata/data logs show slow persistence, repeated group-leader and
+transport timeouts, and delayed merge phase progress. The first case eventually
+logs the release phase during teardown. Native stacks include threads in
+`fsync`, but lack enough symbols to identify a complete wait chain. These are
+different signatures from the catalog reporter-readiness and five-second
+read-budget failures documented below; the logs do not establish their root
+cause or prove they are unrelated to the candidate. No recovery deadline or
+assertion has been relaxed, and the trace-test registration correction does not
+fix these failures.
+
+Evidence is retained under `.benchmark-results/issue-828/` in the PR worktree:
+`ci-832-recovery.log` and `ci-832-recovery-artifacts/`, including both failed
+clusters' metadata/data logs and native stacks.
+
+An unchanged native macOS ARM64 run passed 8/8 targeted cases (two workers,
+two repetitions); the exact CI Linux binary passed both cases under local x86
+emulation. Injecting an 800 ms delay into every eighth `fsync`/`fdatasync`,
+starting 30 seconds after each server starts, reproduced both timeout assertions.
+However, the second reproduction stalled in `snapshot`, not CI's `freeze`.
+This is evidence of persistence sensitivity, not proof of the original wait chain.
+
+The controller performed a receiver ReadIndex twice per effect and reacquired
+the same metadata context before preparing it. It also required receiver
+leadership during donor-only phases, and conflated an installed source fence
+with drained transactions, reproposing durable `begin` while waiting for drain.
+It now borrows one authenticated observation for each step, resolves/reads the
+receiver only when needed, and waits on an already-installed fence. Metadata
+authority is still revalidated immediately before every write; preparation and
+apply retain exact scope/receipt checks. No RPC or E2E deadline was raised.
+
+The 13 focused controller tests cover ownership through ambiguous replies,
+lost effects/CAS replies, cancellation, drain waiting, and donor-only routing
+without a receiver leader. All six owner-link/crash scenarios passed on two
+native workers (12/12). Five proxy diagnostics/CLI tests pass. The same sustained
+800 ms injection still times out after these changes: fewer reads do not make
+arbitrary persistence stalls fit the existing budgets. Both failed runs remain
+retained and must not be presented as passing pressure qualification or as a
+reproduction of CI's exact freeze stall. Bounded proxy diagnostics now retain
+receipt sequence, fence identity, drain status, and observation time.
+
+Reproduction uses `scripts/ci/zig-e2e-regression-loop.sh` with explicit selectors,
+`SKIP_BUILD=1`, `ANTFLY_BIN`, `ANTFLY_E2E_REGRESSION_WORKERS=2`, and a fresh
+`ANTFLY_E2E_REGRESSION_REPORT_DIR`. Local evidence is `merge-before*`,
+`merge-linux-before*`, `merge-linux-pressure3*`, `merge-linux-pressure-fixed2*`,
+and `merge-native-soak*` under the directory above. The Linux experiment used
+four emulated CPUs and an 8 GiB container, not native ARC hardware.
+
+## 2026-09-21: dependency-cohort seeding lost leadership after readiness (#841)
+
+[Issue #841](https://github.com/antflydb/antfly/issues/841) links
+[run 35647014305](https://github.com/antflydb/antfly/actions/runs/35647014305/job/106507526474):
+the child-table seed in `test_schema_rewrite_recovers_dependency_cohort`
+exhausted its 30-second write budget. The fixture already waits for all three
+replicas, known leaders, and enforced constraints before seeding. The retained
+logs show subsequent leader unavailability and activation `ConcurrencyUnavailable`;
+they do not establish that a first election never completed.
+
+Every data-node supervisor was scheduling activation and retirement against
+the entire cluster catalog. Duplicate attempts are fenced by durable progress
+CAS, but still consume remote reads, transaction slots, and persistence work.
+Maintenance now samples current local group leadership before doing that work.
+It yields if the Raft host mutex is busy, so maintenance does not queue behind
+slow persistence merely to discover that it is a follower. Elections transfer
+work on the next pass; native progress remains authoritative, and no completion
+cache can hide a new schema generation. Standalone ownership is unchanged.
+
+Deterministic regressions exercise follower suppression, leader transfer,
+standalone behavior, and contention with the Raft host. The maintenance suite
+also exposed a duplicated `expectErrorLogs(1)` declaration around one injected
+session-store failure; remove the duplicate, preserving strict error accounting.
+Before the ownership change, both #841 scenarios passed on two native workers
+(4/4). Consequently, the original seed failure has not been reproduced locally;
+the scheduling defect is independently established, not a proven explanation
+for every `LeaderUnavailable` in that CI run. Seed budgets and mutation retry
+rules are unchanged. Evidence: `ci-841-recovery.log`, `merge-native-soak*`, and
+`activation-*` beside the merge evidence above.
+
+## 2026-09-21: catalog reporter startup preceded protocol readiness
+
+[Issue #828](https://github.com/antflydb/antfly/issues/828) records
+[run 35549453714's catalog failure](https://github.com/antflydb/antfly/actions/runs/35549453714/job/106186967472).
+`test_large_inventory_uses_bounded_control_and_diagnostic_transfers` failed at
+synthetic reporter registration with HTTP 500 / `RuntimeStatusProtocolUnavailable`.
+The retained diagnostics show leader node 2 with protocol ready/activated version
+0 and one failed probe, while followers report ready version 17. HTTP readiness
+and ordinary data-node registration therefore did not establish the leader's
+ability to persist the synthetic reporter's required dense-native status profile.
+The probe also checks incarnation compatibility; a peer advertising version 17
+alone does not prove readiness. The evidence does not establish an activation
+state-machine defect.
+
+[Issue #831](https://github.com/antflydb/antfly/issues/831) also reports this
+signature in [PR #793's catalog job](https://github.com/antflydb/antfly/actions/runs/35564629013/job/106229248643),
+where `test_report_baseline_fragments_large_group_and_batches_neighbors` fails
+registration on all three metadata endpoints with the same protocol error and
+deferred activation probe. The shared fixture barrier covers both tests.
+
+The other main-run occurrence linked from #831 has a different signature.
+[Job 106215258019](https://github.com/antflydb/antfly/actions/runs/35557807565/job/106215258019)
+fails `test_skewed_schema_migrations_keep_foreground_traffic_available` on a
+foreground batch write with HTTP 503 / `DeadlineExceeded` after 5,003 ms, after
+setup succeeds. Metadata logs include a WAL commit lasting 6,457 ms; the trace
+does not identify the write's exact wait or establish the timeout's root cause.
+Do not classify this failure as protocol readiness merely because the startup
+log also contains `MetadataIncarnationUnavailable`. This full-E2E job retained
+only its executable artifact. It now preserves failed cluster roots and uploads
+server logs, diagnostic snapshots, and native stacks, like the base-E2E job.
+Original job logs are `issue-831-pr793.log` and `issue-831-main.log` beside the
+#828 evidence below.
+
+The read-budget audit found a distinct defect that can explain an early
+five-second failure: write validation establishes the existing 12-second metadata
+snapshot allowance, but `readSystemCatalog` truncated the entire operation to
+the five-second forwarding-envelope limit for one RPC. A deterministic VoprIo
+regression lets the first peer consume its five-second allowance, then makes the
+next peer recover 1.4 seconds later. On unchanged main's read implementation,
+it fails with `DeadlineExceeded` before trying the recovered peer, despite time
+remaining in the caller's budget (`issue-831-budget-negative.log`).
+
+Catalog reads now keep one absolute deadline from the caller, capped by the
+existing snapshot allowance, and cap each individual RPC at the unchanged
+five-second wire limit. Retry backoff consumes that same deadline. Shorter
+deadlines and cancellation remain authoritative, including after a response
+arrives. Mutations do not gain retries. The regression also covers complete
+budget exhaustion and rejects late or canceled successful responses. This
+establishes and fixes premature read-budget exhaustion; the retained CI log
+alone cannot prove that this was its exact internal failure path.
+All seven focused catalog read/cache/failover regressions pass without leaks.
+The final Debug server, including the budget correction, passes all 19 catalog
+and readiness cases with the normal four-worker runner. Its SHA-256 is
+`e77cf5b0c7139a6f7a53a817a4c052c8081a51a4e8d4302585b0495f8aa3fedd`;
+see `issue-831-budget-fixed.log` and `catalog-with-budget-module.log`.
+The targeted #831 soak then passes 40/40 fresh-server cases: two workers, five
+repetitions each of reporter baseline fragmentation and foreground migration
+traffic, under both normal and 256-FD profiles. There are no errors or skips;
+write deadlines and every availability/count assertion are unchanged. Reports
+and logs are in `issue-831-soak/` and `issue-831-soak.log`. This is native macOS
+ARM64 qualification; it does not substitute for native Linux ARC CI.
+
+Inspection of `origin/main` at `a032858819bd89ffcb31e5dcf7e76699babfdc3b`
+confirmed the missing fixture barrier and the HTTP 500 classification. An
+unchanged macOS ARM64 Debug binary passed one isolated case and twelve cases
+across four independent workers; the original HTTP 500 did not recur naturally.
+A deterministic fixture regression supplies an unready leader followed by a
+ready one: the original fixture yields immediately and fails the assertion;
+the corrected fixture waits before exposing the cluster.
+
+Catalog setup now observes a leader with a metadata incarnation and the named
+V17 ready profile, with a bounded deadline and retained setup-failure diagnostics.
+It does not require activation to have already committed: the subsequent
+registration can commit it. Unknown future version numbers do not satisfy the
+profile by numeric ordering. Status-read connection failures and HTTP 503 can be
+polled; HTTP 500 propagates. Reporter writes, inventory assertions, transfer
+admission assertions, and their deadlines are unchanged. Production node
+mutation responses classify unavailable protocol as HTTP 503, without claiming
+whole-request non-admission: node registration may have committed before store
+admission fails.
+
+The catalog fixture was also missing its process-resource declaration. The normal
+four-worker runner classified these six-node clusters as lightweight and bypassed
+the two-process-slot limit. The fixture now declares `antfly_process` using the
+existing scheduler API. Eleven readiness regressions, 62 scheduler tests, and the
+focused Zig HTTP-classification regression pass. The final complete catalog and
+readiness modules pass all 19 tests with four pytest workers and two process slots.
+
+Retain the unsuccessful stress runs too. An earlier four-worker catalog soak
+passed 39/40 cases (20/20 normal, 19/20 at `nofile=256`); its failure was a later
+diagnostic snapshot admission returning `snapshot transfer capacity exhausted`,
+after reporter registration succeeded. While that soak and TLA/build work ran,
+the broader catalog module passed 16/18 cases: a data-node `ReadFailed` after
+deliberate leader termination and a full-text count of 2001 instead of 2002 were
+the failures. The unchanged binary subsequently passed those two cases, which
+does not establish that these failures are unrelated or pre-existing. The final
+module pass after resource classification does not prove their runtime causes.
+A subsequent two-worker soak passed 20/20 fresh-server cases: five per worker
+under each of the normal and 256-FD profiles, with no failures or skips. Its
+reports are in `final-soak/` and `catalog-final-soak.log` beside the failed runs.
+
+During qualification, main advanced to `227f2dc39c` (#784), which independently
+added the same catalog process-resource declaration. Rebase preserves that
+upstream change; trace ownership and the readiness barrier were still unfixed.
+All 77 readiness/scheduler regressions pass on that base.
+The rebuilt Debug server also passes all 19 catalog/readiness cases through the
+normal four-worker runner, two isolated large-inventory repetitions, and eight
+two-worker inventory cases across normal and 256-FD profiles. Its SHA-256 is
+`baad0214e7c0e07f4f3d1de88e8f9f8e59d216b744ee24adebf6756c21e6487b`;
+results are `catalog-rebased-*.log`, `rebased-serial/`, and `rebased-soak/`.
+These checks precede the separate catalog-read deadline correction for #831.
+
+Evidence is in `.benchmark-results/issue-828/` in `.worktrees/issue-828-flakes`:
+`catalog-readiness-negative.log`, `catalog-fixed-soak.log`, `fixed-soak/`,
+`catalog-fixed-module.log`, `catalog-baseline-extra.log`, and
+`catalog-fixed-final-module.log`, with JUnit reports and preserved failure roots.
+The fixed native Debug server SHA-256 is
+`5b1b38811386f099ffc7aae7815ed1a15a6a2671997e5e9f088b9e121ac8a331`;
+the unchanged server is
+`9e22dada7c087f6bda5726c6846494098498d2a2ba5e2d122e010b933476d6a5`.
+Native Linux ARC qualification remains a CI gate.
+
+Reproduce with `scripts/ci/zig-e2e-catalog-soak.sh`, `SKIP_BUILD=1`, an absolute
+`ANTFLY_BIN`, and a fresh absolute `ANTFLY_E2E_REGRESSION_REPORT_DIR`. It runs both
+normal and 256-FD profiles; worker and repeat counts use
+`ANTFLY_E2E_REGRESSION_WORKERS` and `ANTFLY_E2E_REGRESSION_REPEATS`. Use the normal
+`scripts/ci/zig-antfly-e2e-pytest.sh` runner for module-level parallel scheduling.
+The catalog soak also accepts explicit pytest selectors; its no-argument default
+is unchanged. For #831, pass
+`e2e/antfly/test_catalog_resilience.py::test_report_baseline_fragments_large_group_and_batches_neighbors`
+and
+`e2e/antfly/test_catalog_resilience.py::test_skewed_schema_migrations_keep_foreground_traffic_available`.
+
 ## 2026-09-18: concurrent aggregations stalled hydration and raced primary generations
 
 [Run 35304355356, Antfly E2E](https://github.com/antflydb/antfly/actions/runs/35304355356/job/105482406606)

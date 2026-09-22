@@ -8099,6 +8099,7 @@ export interface components {
                 /** @description True when additional failed tables or part of a long table name or error were omitted. */
                 failure_details_truncated?: boolean;
             };
+            /** @description Most recent retry or terminal failure reason. Retained while queued or running, including across progress checkpoints and recovery; omitted after successful completion. */
             error?: string;
             /** Format: int64 */
             created_at_ms: number;
