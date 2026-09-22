@@ -999,7 +999,7 @@ fn inferTensorDesc(graph: *const Graph, descs: []const ?contracts.TensorDesc, no
         .slice => inferViewDesc(graph, descs, node_id, n.inputs[0], inputStrides(descs, n.inputs[0]) orelse contracts.TensorStrides.none()),
         .broadcast_in_dim => inferViewDesc(graph, descs, node_id, n.inputs[0], contracts.TensorStrides.none()),
         .concat_prim => inferConcatDesc(graph, descs, node_id),
-        .shape_of, .range => contracts.TensorDesc.init(n.output_shape, .host_dense),
+        .shape_of, .size_of, .range => contracts.TensorDesc.init(n.output_shape, .host_dense),
         else => inferComputeDesc(graph, descs, node_id),
     };
 }

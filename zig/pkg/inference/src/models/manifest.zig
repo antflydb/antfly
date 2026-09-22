@@ -281,6 +281,7 @@ pub const ModelManifest = struct {
     config_path: ?[]const u8 = null,
     model_manifest_path: ?[]const u8 = null,
     tokenizer_json_path: ?[]const u8 = null,
+    vocab_txt_path: ?[]const u8 = null,
     tokenizer_config_path: ?[]const u8 = null,
     special_tokens_map_path: ?[]const u8 = null,
     preprocessor_config_path: ?[]const u8 = null,
@@ -311,6 +312,7 @@ pub const ModelManifest = struct {
     bert_layer_norm_eps: f32 = 1e-12,
     bert_model_type: bert.ModelType = .bert,
     bert_pad_token_id: i64 = 0,
+    bert_position_embedding_offset: u32 = 0,
     config_model_arch: []const u8 = "",
 
     // Pipeline config
@@ -375,6 +377,7 @@ pub const ModelManifest = struct {
         const config = bert.Config{
             .max_position_embeddings = self.max_position_embeddings,
             .pad_token_id = self.bert_pad_token_id,
+            .position_embedding_offset = self.bert_position_embedding_offset,
             .position_id_mode = position_id_mode,
         };
         return config.maxSequenceLength();
@@ -392,6 +395,7 @@ pub const ModelManifest = struct {
         if (self.config_path) |p| self.allocator.free(p);
         if (self.model_manifest_path) |p| self.allocator.free(p);
         if (self.tokenizer_json_path) |p| self.allocator.free(p);
+        if (self.vocab_txt_path) |p| self.allocator.free(p);
         if (self.tokenizer_config_path) |p| self.allocator.free(p);
         if (self.special_tokens_map_path) |p| self.allocator.free(p);
         if (self.preprocessor_config_path) |p| self.allocator.free(p);
@@ -842,7 +846,33 @@ const ArtifactCatalog = struct {
     }
 
     fn find(self: *const ArtifactCatalog, relative_path: []const u8) ?*const managed_receipt.ValidatedArtifact {
-        if (self.receipt) |*receipt| return receipt.find(relative_path);
+        if (self.receipt) |*receipt| {
+            if (receipt.parsed.value.source) |source| {
+                if (source.selected_format != null and std.mem.eql(u8, source.selected_format.?, "onnx") and
+                    std.mem.indexOfScalar(u8, relative_path, '/') == null and
+                    !std.mem.eql(u8, relative_path, "model_manifest.json") and
+                    !std.mem.endsWith(u8, relative_path, ".onnx"))
+                {
+                    // Export-local tokenizer/configuration takes precedence;
+                    // resolve only files authenticated by the managed receipt.
+                    for (receipt.artifacts) |artifact| {
+                        if (!std.mem.endsWith(u8, artifact.path, ".onnx")) continue;
+                        const directory = std.fs.path.dirname(artifact.path) orelse continue;
+                        var path_buf: [4096]u8 = undefined;
+                        const local = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ directory, relative_path }) catch continue;
+                        if (receipt.find(local)) |found| return found;
+                        // Select the export's tokenizer before falling back to
+                        // a different format at the repository root. This also
+                        // keeps metadata parsing and admission on that choice.
+                        if (std.mem.eql(u8, relative_path, "tokenizer.json")) {
+                            const vocab = std.fmt.bufPrint(&path_buf, "{s}/vocab.txt", .{directory}) catch continue;
+                            if (receipt.find(vocab) != null) return null;
+                        }
+                    }
+                }
+            }
+            return receipt.find(relative_path);
+        }
         return null;
     }
 
@@ -1187,6 +1217,7 @@ fn loadFromCatalog(allocator: std.mem.Allocator, catalog: *const ArtifactCatalog
     if (manifest.config_path == null) manifest.config_path = try findFileInSubdirs(allocator, catalog, &.{"config.json"}, &.{""});
     if (manifest.model_manifest_path == null) manifest.model_manifest_path = try findFileInSubdirs(allocator, catalog, &.{"model_manifest.json"}, &.{""});
     if (manifest.tokenizer_json_path == null) manifest.tokenizer_json_path = try findFileInSubdirs(allocator, catalog, &.{"tokenizer.json"}, &.{""});
+    if (manifest.vocab_txt_path == null) manifest.vocab_txt_path = try findFileInSubdirs(allocator, catalog, &.{"vocab.txt"}, &.{""});
     if (manifest.tokenizer_config_path == null) manifest.tokenizer_config_path = try findFileInSubdirs(allocator, catalog, &.{"tokenizer_config.json"}, &.{""});
     if (manifest.special_tokens_map_path == null) manifest.special_tokens_map_path = try findFileInSubdirs(allocator, catalog, &.{"special_tokens_map.json"}, &.{""});
     if (manifest.preprocessor_config_path == null) manifest.preprocessor_config_path = try findFileInSubdirs(allocator, catalog, &.{"preprocessor_config.json"}, &.{""});
@@ -1327,6 +1358,7 @@ pub fn loadListingFromDir(allocator: std.mem.Allocator, model_dir_path: []const 
     if (manifest.config_path == null) manifest.config_path = try findFileInSubdirs(allocator, &catalog, &.{"config.json"}, &.{""});
     if (manifest.model_manifest_path == null) manifest.model_manifest_path = try findFileInSubdirs(allocator, &catalog, &.{"model_manifest.json"}, &.{""});
     if (manifest.tokenizer_json_path == null) manifest.tokenizer_json_path = try findFileInSubdirs(allocator, &catalog, &.{"tokenizer.json"}, &.{""});
+    if (manifest.vocab_txt_path == null) manifest.vocab_txt_path = try findFileInSubdirs(allocator, &catalog, &.{"vocab.txt"}, &.{""});
     if (manifest.tokenizer_config_path == null) manifest.tokenizer_config_path = try findFileInSubdirs(allocator, &catalog, &.{"tokenizer_config.json"}, &.{""});
     if (manifest.preprocessor_config_path == null) manifest.preprocessor_config_path = try findFileInSubdirs(allocator, &catalog, &.{"preprocessor_config.json"}, &.{""});
     if (manifest.processor_config_path == null) manifest.processor_config_path = try findFileInSubdirs(allocator, &catalog, &.{"processor_config.json"}, &.{""});
@@ -1747,6 +1779,7 @@ fn applyGgufTokenizerMetadata(
             manifest.bert_layer_norm_eps = config.layer_norm_eps;
             manifest.bert_model_type = config.model_type;
             manifest.bert_pad_token_id = config.pad_token_id;
+            manifest.bert_position_embedding_offset = config.position_embedding_offset;
         }
         if (!manifest.model_manifest_declarations.pooling) {
             if (view.getU64("bert.pooling_type")) |pooling_type| {
@@ -7048,4 +7081,36 @@ test "boundary qualification listings cannot substitute for consumed identity an
     try std.testing.expect(manifest.hasSupportedGlinerRuntime());
     try std.testing.expect(manifest.hasTask("extract"));
     try std.testing.expect(!manifest.mayLoadQualifiedGlinerBoundaryRuntime());
+}
+
+test "managed ONNX export uses its own configuration and tokenizer" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "onnx");
+    const paths = [_][]const u8{ "config.json", "tokenizer.json", "onnx/model.onnx", "onnx/config.json", "onnx/tokenizer.json", "onnx/tokenizer_config.json" };
+    const bodies = [_][]const u8{ "{\"hidden_size\":4}", "{}", "onnx", "{\"model_type\":\"xlm-roberta\",\"hidden_size\":8}", "{}", "{}" };
+    var artifacts: [paths.len]managed_receipt.ArtifactReceipt = undefined;
+    for (paths, bodies, 0..) |path, body, i| {
+        try tmp.dir.writeFile(io, .{ .sub_path = path, .data = body });
+        artifacts[i] = .{ .path = path, .size = body.len };
+    }
+    const receipt = try std.json.Stringify.valueAlloc(allocator, managed_receipt.DownloadReceipt{
+        .version = 2,
+        .source = .{ .owner = "BAAI", .name = "bge-m3", .variant = "onnx", .selected_format = "onnx" },
+        .artifacts = &artifacts,
+    }, .{});
+    defer allocator.free(receipt);
+    try tmp.dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = receipt });
+    const model_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(model_dir);
+    var manifest = try loadFromDir(allocator, model_dir);
+    defer manifest.deinit();
+    try std.testing.expectEqual(@as(u32, 8), manifest.hidden_size);
+    try std.testing.expect(std.mem.endsWith(u8, manifest.config_path.?, "onnx/config.json"));
+    try std.testing.expect(std.mem.endsWith(u8, manifest.tokenizer_json_path.?, "onnx/tokenizer.json"));
+    var listing = try loadListingFromDir(allocator, model_dir);
+    defer listing.deinit();
+    try std.testing.expect(std.mem.endsWith(u8, listing.config_path.?, "onnx/config.json"));
 }

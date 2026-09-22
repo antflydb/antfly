@@ -3322,10 +3322,10 @@ fn validateRequestModelIdentifier(raw: []const u8) !void {
 
     const value = if (std.mem.startsWith(u8, raw, "hf:")) raw[3..] else raw;
     if (value.len == 0) return error.InvalidModelIdentifier;
-    const colon = std.mem.indexOfScalar(u8, value, ':');
-    const identifier = if (colon) |index| value[0..index] else value;
-    if (colon) |index| {
-        const variant = value[index + 1 ..];
+    const separator = std.mem.indexOfAny(u8, value, ":@");
+    const identifier = if (separator) |index| value[0..index] else value;
+    if (separator) |index| {
+        const variant = if (value[index] == ':') value[index + 1 ..] else value[index..];
         if (!registry_mod.modelVariantIsSafe(variant)) return error.InvalidModelIdentifier;
     }
 
@@ -28219,7 +28219,7 @@ test "HTTP model resolution is canonical and contained while trusted resolution 
     const explicit_variant_config = try std.fs.path.join(alloc, &.{ explicit_variant_root, "config.json" });
     defer alloc.free(explicit_variant_config);
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = explicit_variant_config, .data = "{}" });
-    const bge_ref = try registry_mod.ModelRef.parse(registry_mod.bge_m3_pinned_ref);
+    const bge_ref = try registry_mod.ModelRef.parse("BAAI/bge-m3");
     const bge_variant_root = try registry_mod.modelInstallDirAlloc(alloc, models_root, bge_ref);
     defer alloc.free(bge_variant_root);
     try std.Io.Dir.cwd().createDirPath(std.testing.io, bge_variant_root);

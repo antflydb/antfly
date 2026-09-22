@@ -59,6 +59,10 @@ const Options = struct {
     validate_specialized_attention: bool = false,
     tune_generated_kernels: bool = false,
     print_embedding: bool = false,
+    managed_only: bool = false,
+    pull_ref: ?[]const u8 = null,
+    text_offset: usize = 0,
+    texts_path: ?[]const u8 = null,
     show_help: bool = false,
     kernel_jit: kernel_jit.Config = .{},
     kernel_jit_mode_explicit: bool = false,
@@ -142,7 +146,9 @@ const ManagedTiming = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
-    const allocator = std.heap.page_allocator;
+    // Match the server's process allocator. Page-per-allocation tokenizer
+    // tries otherwise turn a 250K vocabulary into tens of GiB of mappings.
+    const allocator = std.heap.c_allocator;
     const opts = try parseArgs(init);
     if (opts.show_help) {
         printUsage();
@@ -151,6 +157,12 @@ pub fn main(init: std.process.Init) !void {
     if (opts.model_dir.len == 0 or opts.batch == 0 or opts.seq_len == 0 or opts.measure_iters == 0) {
         printUsage();
         return error.InvalidArguments;
+    }
+    if (opts.pull_ref) |ref| {
+        var registry = benchmark_runtime.registry.ModelRegistry.init(allocator, opts.model_dir);
+        defer registry.deinit();
+        try registry.pull(init.io, ref, .{}, null, null, .auto);
+        return;
     }
     try ensureBackendAvailable(opts.backend);
     if (opts.tune_generated_kernels and
@@ -197,6 +209,19 @@ pub fn main(init: std.process.Init) !void {
     const managed_texts = try allocator.alloc([]const u8, opts.batch);
     defer allocator.free(managed_texts);
     @memset(managed_texts, managed_text);
+    var custom_texts: ?std.json.Parsed([]const []const u8) = null;
+    defer if (custom_texts) |*parsed| parsed.deinit();
+    if (opts.texts_path) |path| {
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(init.io, path, allocator, .limited(4 * 1024 * 1024));
+        defer allocator.free(bytes);
+        custom_texts = try std.json.parseFromSlice([]const []const u8, allocator, bytes, .{ .allocate = .alloc_always });
+        if (custom_texts.?.value.len == 0) return error.EmptyTextCorpus;
+    }
+    if (opts.managed_only) {
+        const texts = [_][]const u8{ "What is BGE-M3?", "A multilingual embedding model supports retrieval across languages and document lengths.", "你好，世界！", "Bonjour, comment fonctionne la recherche sémantique ?" };
+        const corpus = if (custom_texts) |parsed| parsed.value else &texts;
+        for (managed_texts, 0..) |*text, i| text.* = corpus[(i + opts.text_offset) % corpus.len];
+    }
     const cold_embeddings = node.embedDenseTextsFromPathWithExecutionControl(
         allocator,
         cold_control,
@@ -230,13 +255,50 @@ pub fn main(init: std.process.Init) !void {
     const warm_json = try std.json.Stringify.valueAlloc(allocator, warm_embeddings, .{});
     const warm_done_ns = nowNs();
     allocator.free(warm_json);
-    freeEmbeddings(allocator, warm_embeddings);
+    defer freeEmbeddings(allocator, warm_embeddings);
     const warm_managed = managedTiming(warm_capture, warm_started_ns, warm_forward_done_ns, warm_done_ns);
     try validateManagedTiming(warm_managed);
 
     var model_handle = try node.model_manager.acquireFromDirWithControl(opts.model_dir, cold_control);
     defer model_handle.release();
     const model = model_handle.get();
+    if (opts.managed_only) {
+        if (model.session.backend() != preferred_backends[0]) return error.UnexpectedBackend;
+        const tokens = try allocator.alloc([]i32, managed_texts.len);
+        defer allocator.free(tokens);
+        for (managed_texts, 0..) |text, i| {
+            var encoded = try model.getTokenizer().encodeForModel(allocator, text, model.manifest.maxTextSequenceLength());
+            defer encoded.deinit();
+            var length = encoded.ids.len;
+            while (length > 0 and encoded.attention_mask[length - 1] == 0) length -= 1;
+            tokens[i] = try allocator.dupe(i32, encoded.ids[0..length]);
+        }
+        defer for (tokens) |row| allocator.free(row);
+        const graph_before = backends.imported_onnx_session.executionStats(model.session);
+        const warm_times = try allocator.alloc(f64, opts.measure_iters);
+        defer allocator.free(warm_times);
+        for (warm_times) |*time| {
+            const start = nowNs();
+            const embeddings = try node.embedDenseTextsFromPathWithExecutionControl(allocator, warm_control, opts.model_dir, managed_texts);
+            time.* = nsToMs(nowNs() - start);
+            freeEmbeddings(allocator, embeddings);
+        }
+        const record = try std.json.Stringify.valueAlloc(allocator, .{
+            .kind = "bge_m3_managed_qualification",
+            .backend = @tagName(model.session.backend()),
+            .batch = opts.batch,
+            .texts = managed_texts,
+            .token_ids = tokens,
+            .embeddings = warm_embeddings,
+            .cold_ms = nsToMs(cold_managed.total_ns),
+            .warm_ms = warm_times,
+            .graph_before = graph_before,
+            .graph_after = backends.imported_onnx_session.executionStats(model.session),
+        }, .{});
+        defer allocator.free(record);
+        std.debug.print("{s}\n", .{record});
+        return;
+    }
     const managed_token_ids = try model.getTokenizer().encode(allocator, managed_text);
     defer allocator.free(managed_token_ids);
     const managed_sequence_length = managed_token_ids.len;
@@ -606,6 +668,14 @@ fn parseArgs(init: std.process.Init) !Options {
             opts.validate_specialized_attention = true;
         } else if (std.mem.eql(u8, arg, "--tune-generated-kernels")) {
             opts.tune_generated_kernels = true;
+        } else if (std.mem.eql(u8, arg, "--texts-json")) {
+            opts.texts_path = args.next() orelse return error.MissingTextCorpus;
+        } else if (std.mem.eql(u8, arg, "--text-offset")) {
+            opts.text_offset = try std.fmt.parseInt(usize, args.next() orelse return error.MissingTextOffset, 10);
+        } else if (std.mem.eql(u8, arg, "--pull-ref")) {
+            opts.pull_ref = args.next() orelse return error.MissingModelRef;
+        } else if (std.mem.eql(u8, arg, "--managed-only")) {
+            opts.managed_only = true;
         } else if (std.mem.eql(u8, arg, "--print-embedding") or std.mem.eql(u8, arg, "--print-embeddings")) {
             opts.print_embedding = true;
         } else if (std.mem.eql(u8, arg, "--kernel-jit-mode")) {
@@ -701,7 +771,7 @@ fn nsToMs(ns: u64) f64 {
 
 fn printUsage() void {
     std.debug.print(
-        "usage: zig build bench-bge-m3-e2e -Doptimize=ReleaseFast -- --model-dir <bge-m3.gguf|dir> [--model-sha SHA256] [--fixture src/bench/testdata/bge_m3_tokens.json] [--backend metal|cuda|native] [--batch N] [--seq-len 16|128|200|256] [--warmup-iters N] [--measure-iters N] [--validate-specialized-attention] [--tune-generated-kernels] [--print-embeddings] [--kernel-jit-mode off|shadow|on|required] [--kernel-jit-cache-dir PATH]\n",
+        "usage: zig build bench-bge-m3-e2e -Doptimize=ReleaseFast -- --model-dir <bge-m3.gguf|dir> [--model-sha SHA256] [--fixture src/bench/testdata/bge_m3_tokens.json] [--backend metal|cuda|native] [--batch N] [--seq-len 16|128|200|256] [--warmup-iters N] [--measure-iters N] [--validate-specialized-attention] [--tune-generated-kernels] [--print-embeddings] [--managed-only] [--texts-json PATH] [--text-offset N] [--kernel-jit-mode off|shadow|on|required] [--kernel-jit-cache-dir PATH]\n",
         .{},
     );
 }

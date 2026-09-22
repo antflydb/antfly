@@ -94,7 +94,12 @@ test "resident training Metal exact integer clone reshape and adjacent indices a
     try expectInts(&cb, reshaped, &integers);
     try std.testing.expectError(error.UnsupportedTensorType, cb.toFloat32(indices, std.testing.allocator));
     try std.testing.expectError(error.UnsupportedTensorType, cb.trainingOverwriteF32(indices, &.{ 0, 0, 0, 0 }, &.{ 2, 2 }));
-    try std.testing.expectError(error.UnsupportedResidentTrainingPrimitive, cb.tryConvertDType(indices, .i64));
+    const wide = (try cb.tryConvertDType(indices, .i64)).?;
+    defer cb.free(wide);
+    const exact = (try cb.exportTensorData(wide, std.testing.allocator)).?;
+    defer std.testing.allocator.free(exact.payload.bytes);
+    try std.testing.expectEqual(.i64, exact.dtype);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]i64{ 16777217, -16777217, 2147483647, -2147483648 }), exact.payload.bytes);
 
     // A single64MiB device output, populated from two values without a host
     // table. Distinct adjacent IDs prove the MSL kernel itself reads i32.

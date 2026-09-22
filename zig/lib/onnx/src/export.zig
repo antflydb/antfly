@@ -2151,6 +2151,7 @@ fn mapOp(alloc: Allocator, graph: *const Graph, n: *const Node) !OpMapping {
         .concat_prim => |a| try intAttrOp(alloc, "Concat", "axis", a.axis),
         .range => simpleOp("Range"),
         .shape_of => |a| try shapeOfOp(alloc, a),
+        .size_of => simpleOp("Size"),
         .gather => |a| try intAttrOp(alloc, if (a.elements) "GatherElements" else "Gather", "axis", a.axis),
         .scatter_add => simpleOp("ScatterElements"),
 
