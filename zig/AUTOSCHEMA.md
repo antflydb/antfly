@@ -64,7 +64,7 @@ AutoSchemaKG's results that matter for Antfly:
 ```text
 document write
   -> chunker (existing)
-  -> generator enrichments kg_ee_v1 / kg_ev_v1 / kg_vv_v1   [config]
+  -> generator enrichments kg_ee_v1 / kg_events_v1          [config]
        forced tool call -> extraction_graph artifacts
   -> resolver/promoter (existing runtime)                   [config]
        entities table:  person/ada_lovelace
@@ -87,7 +87,7 @@ personalized PageRank (engine gap 2) -> `graph_metric_rerank` blend (shipped)
 
 ## Stage 1: LLM Triple Extraction
 
-Three `generator` asset enrichments, one per extraction pass, following the
+Two `generator` asset enrichments, one per extraction pass, following the
 forced-tool-call pattern proven in `examples/epstein/main.go`
 (`tool_output: "arguments"`, pinned `tool_choice`, `additionalProperties:
 false`, enum-constrained relation types). Each emits one `extraction_graph`
@@ -130,16 +130,23 @@ artifact; the graph index merges them via its ordered `sources` array (up to
 }
 ```
 
-The other two passes differ only in prompt and schema constraints:
+The second pass differs in prompt and schema constraints:
 
-- **kg_ev_v1 (entity-event)**: events are emitted as entity items with
-  `label: "event"` and `text` set to the normalized simple sentence
-  ("Sam plays with his dog"); relations are `participates_in` from entity to
-  event. The paper's prompt: identify events and the entities participating
-  in them.
-- **kg_vv_v1 (event-event)**: relation `type` is enum-constrained to
-  `["before", "after", "concurrent", "because", "as_result"]` — the tool
-  schema is the guardrail, same trick as epstein's relation labels.
+- **kg_events_v1 (events)**: events are emitted as entity items with
+  `label: "event"`, `text` set to the normalized simple sentence ("Sam plays
+  with his dog"), and a `predicate` field holding the main verb lemma; the
+  participating entities ride the same artifact with `participates_in`
+  relations, and the temporal/causal event-event relations are
+  enum-constrained to
+  `["participates_in", "before", "after", "concurrent", "because",
+  "as_result"]` — the tool schema is the guardrail, same trick as epstein's
+  relation labels. The paper runs entity-event and event-event as separate
+  passes; they are folded into ONE here because compositional event identity
+  needs every event mention to carry its participants. A participant-less
+  event-event pass would key its events by sentence text, structurally
+  disconnected from the participant-keyed nodes where mention and
+  `participates_in` mass accumulates — its temporal/causal edges would
+  connect nodes the seeded PageRank never reaches.
 
 Extraction prompts should be ported from the reference implementation's
 prompt set (MIT-licensed) and evaluated per corpus before freezing.
@@ -159,14 +166,21 @@ extraction_graph shape that the graph index consumes instead. Relation
 `confidence` already becomes edge weight at materialization, so
 annotate-mode additionally enables query-time `min_weight` filtering for
 free. The threshold lives in `producer_json.config` so it participates in
-artifact identity and re-derives on change. Blockers, all in the enrichment
-layer: asset-consumes-asset is currently accepted at admission but silently
-dropped in planning (the `.asset` arm of `validateEnrichmentConfig` never
-reads `source_artifact_name`, and the asset planning loop never copies it),
-and asset requests have no dependency ordering, so the verifier must either
-defer-and-retry off `changed_artifact_keys` or planning must become
-topological. Typed-decision models (issue #810) are a later drop-in for the
-same slot.
+artifact identity and re-derives on change. The enrichment-layer blocker is
+now CLOSED: asset-consumes-asset is plumbed end to end. An asset enrichment
+with `source_artifact_name` naming another asset reads the upstream's
+produced bytes as its source (field/template must be omitted;
+media-locator producers — document_extraction, reader, transcriber — are
+rejected at admission; existence, self-reference and cycles are validated
+in both the API config walk and the catalog validator). Planning emits
+asset requests upstream-first, the synchronous batch path overlays pending
+same-batch producer writes and deletes, and the async runtime treats a
+missing upstream as the normal null-source retire path — the per-document
+replay record written when the upstream artifact lands re-plans the
+consumer, so chains converge without bespoke retry state. Skip-state is
+free: the consumer's source text IS the upstream bytes. What remains for
+the verifier is only the `verifier` producer kind itself. Typed-decision
+models (issue #810) are a later drop-in for the same slot.
 
 ## Stage 2: Entities And Events Via Resolution
 
@@ -181,9 +195,8 @@ resolver/promoter runtime (`storage/db/resolution_runtime.zig`,
   "sources": [
     { "artifact_name": "kg_ee_v1", "format": "extraction_graph",
       "mention_edge_type": "mentions" },
-    { "artifact_name": "kg_ev_v1", "format": "extraction_graph",
-      "mention_edge_type": "mentions" },
-    { "artifact_name": "kg_vv_v1", "format": "extraction_graph" }
+    { "artifact_name": "kg_events_v1", "format": "extraction_graph",
+      "mention_edge_type": "mentions" }
   ],
   "resolvers": [
     { "table": "entities",
@@ -216,9 +229,17 @@ Two identity rules learned the hard way (both shipped):
   mentions plus the extractor-asserted `predicate` (main-verb lemma, an
   optional mention field the extraction tool schemas now request),
   degrading to the raw sentence text when either is missing — never weaker
-  than the sentence hash it replaces. Remaining coarseness: two genuinely
-  different events with identical participants and predicate merge (no
-  time bucketing yet).
+  than the sentence hash it replaces. Participants compose their CANONICAL
+  key's final segment, not their raw text: the resolution runtime feeds
+  each resolver the sibling resolutions over the same artifact (pending
+  same-batch writes overlaid), and a committed resolution artifact
+  re-drives its source for the other resolvers, so a matcher-scorer merge
+  ("A. Lovelace" into `entity/ada_lovelace`) re-keys the events it
+  participates in instead of leaving them pinned to the stale surface-form
+  slug. The fan-back terminates because byte-stable recomputes publish no
+  new resolution record. Remaining coarseness: two genuinely different
+  events with identical participants and predicate merge (no time
+  bucketing yet).
 
 Post-extraction junk control: `min_confidence` on a resolver floors mention
 admission (below-floor mentions mint no key, no mention edge, and relation
@@ -229,8 +250,8 @@ One shape note from implementation: `source_artifact` is required and
 singular per resolver, so the events/catch-all pair above is declared per
 artifact in practice — a labeled `event` resolver plus a catch-all where an
 artifact carries both classes, each with its own `resolution_artifact` (see
-`examples/epstein/autoschema.go` for the working four-resolver layout over
-three artifacts). Everything downstream — durable edge artifacts, generation
+`examples/epstein/autoschema.go` for the working three-resolver layout over
+two artifacts). Everything downstream — durable edge artifacts, generation
 binding, visibility inheritance, replay, split/merge — is the existing
 autograph machinery, unchanged.
 
@@ -262,22 +283,29 @@ kernel reads the raw edge snapshot). Traversal:
   same-snapshot single-index read, and an embedded walk crosses
   doc -> entity -> entity/event in one traversal. Node identity stays
   table-qualified for dedup and results.
-- The server query executors keep the terminal behavior: the local executor
-  still stops at tagged nodes (single-group opt-in is a follow-up — the
-  drain plumbing from `requiresDistributedGraphCoordinator` down to
-  `TraversalRules` — and a caller can already re-seed a second traversal at
-  the returned entity key, which always expands; the autoschema e2e walks
-  the chain exactly that way). The DEEP open question for the multi-shard
-  entity node model (GRAPH.md): the distributed router routes an
-  entity-tagged frontier to the entity TABLE's identically named graph
-  index, while the entity's relation edges live in the DOCUMENTS table's
-  index scattered by producing document — owner-scoped storage and
-  table-scoped routing disagree about where an entity node's edges live,
-  and reverse-direction completeness needs a span fanout, not an owner
-  route. Also unresolved in the local path engines: `paths.zig` keys its
-  visited set by bare key (namespace aliasing the traversal engine already
-  fixed via table-qualified identity) and local MATCH readers return empty
-  streams for tagged nodes.
+- The server query executors now expand too. A single-group graph query
+  admitted for local execution carries a complete-snapshot scope from the
+  API read source (`graphScopedSearchRequest` sets
+  `SearchRequest.graph_owning_table` + `graph_index_complete_snapshot`;
+  the scope rides the graph executor vtables down to `TraversalRules`,
+  `PathFindOptions`, and `MatchOptions`), so traversal, paths, and MATCH
+  walk doc -> entity -> event in one local execution — the same
+  single-index justification as the embedded entry points, now proven by
+  the group count instead of assumed. The local MATCH edge readers serve a
+  tagged node's adjacency by bare key under that scope and canonicalize
+  self-table tags (`LocalGraphIndexEdgeReader.canonicalizeTable`,
+  mirroring the distributed reader).
+- The multi-shard routing disagreement is CLOSED by source-table fanout:
+  the distributed coordinator still routes an entity-tagged frontier node
+  to the tagged table's identically named index (its own locally-owned
+  adjacency) but ALSO fans the node out across the SOURCE table's groups,
+  where the entity-sourced edges live as owner-scoped document rows
+  (`batchFrontierByGroup`; the weighted shortest-path search mirrors it
+  with per-node expand routes). Incoming probes consult the source table's
+  groups the same way, because reverse rows are colocated with the
+  source-owned edge rows. A tagged table without the index no longer
+  silently terminates the node. The hop merge deduplicates by canonical
+  {table, key} identity, so overlapping routes collapse.
 
 Fuzzy resolution ("A. Lovelace" vs "Ada Lovelace") upgrades later by swapping
 the deterministic resolver for the matcher-scorer configuration with
@@ -396,14 +424,14 @@ Missing for HippoRAG2/AutoSchemaKG-style retrieval:
 | 5 | Resolver routing-by-label | DONE: `labels` on `GraphResolverConfig`; labeled siblings disjoint (admission), catch-alls skip sibling-claimed labels at runtime, `{{ hash }}` key-template helper for event keys |
 | 6 | Positional (id-less) extractor payloads | DONE: GLiNER2.5 boundary payloads carry no per-entity ids and reference entities via each relation's `entity_index`; `lib/resolver` assigns id-less mentions their decimal array position as the local id, and the graph materializer resolves `entity_index` endpoints through the injected `_entities` resolution map under the same identity (`graphArtifactEntityAtIndex` + runtime mirror). `examples/dogfood` (Lite) and the `kg_gliner_v1` lane in `examples/epstein` build on this |
 | 7 | Lite resolver registration | DONE: native Lite handles register a graph config's inline `resolvers` array on `antfly_db_add_index_json` (add/update only, mirroring nested-enrichment registration); resolution runs locally, promotion stays cleanly blocked without a cross-table entity sink and `runUntilIdle` drains around it. AddIndex is all-or-nothing: a rejected admission or partial enrichment/resolver registration restores the pre-call catalog |
-| 8 | Convergent identity layer | DONE: label-free `entity/{{ slug _entity.text }}` keys (label rides the document), possessive-stripping slug, compositional `event/{{ hash _entity.event_identity }}` event keys (participants + predicate, computed in lib/resolver, degrades to sentence text), `min_confidence` mention-admission floor on GraphResolverConfig |
-| 9 | Cross-table traversal, local | DONE (scoped): self-table `target_table` tags canonicalize away (`TraversalRules.owning_table`); the direct storage traversal (embedded Lite) expands THROUGH cross-table nodes in the same index (`expand_cross_table_local`, identity stays table-qualified); custom metadata templates no longer drop the `target_table` tag. Server-executor opt-in, `paths.zig` identity-keyed visited sets, and the multi-shard entity-node routing model (owner-scoped storage vs table-scoped routing) remain follow-ups — see Stage 2 |
+| 8 | Convergent identity layer | DONE: label-free `entity/{{ slug _entity.text }}` keys (label rides the document), possessive-stripping slug, compositional `event/{{ hash _entity.event_identity }}` event keys (participants + predicate, computed in lib/resolver, degrades to sentence text; requires at least one participant so a bare predicate never becomes a corpus-wide hub), `min_confidence` mention-admission floor on GraphResolverConfig. Participants compose their CANONICAL keys: the resolution runtime injects sibling resolutions (same-batch overlay + committed artifacts) and a committed resolution re-drives its source for the other resolvers, so entity merges re-key the events they touch. The entity-event and event-event passes are folded into ONE `kg_events_v1` pass so every event mention carries the participants its identity needs — a participant-less event-event pass would mint sentence-keyed nodes disconnected from the participates_in topology |
+| 9 | Cross-table traversal | DONE: self-table `target_table` tags canonicalize away (`TraversalRules.owning_table` locally, `canonicalizeTable` in the local MATCH readers); the direct storage entry points (embedded Lite) and the server executors expand THROUGH cross-table nodes — the API read source proves snapshot completeness for single-group tables and threads the scope down the executor vtables; the distributed coordinator fans an entity-tagged frontier across the SOURCE table's groups (owner-scoped entity-sourced rows) in addition to the tagged table's route, for expansion, weighted paths, and incoming probes. `paths.zig` keys identity by table. See Stage 2 |
 | 10 | Terminal-failure coverage | EXISTS in the engine (durable per-document coverage markers `produced/skipped/terminal_failed`, artifact repair ledger with per-doc `generation_error`, index-status coverage JSON); this branch surfaces it to embedded consumers (capi index stats carry the coverage counters; enrichment stats carry `stalled`/`stall_reason`/`skipped_source_count`) and documents `fatal_error_count` as the durable terminal-request counter. Follow-ups: hoist the server status coverage block beyond `index_type == .embeddings`; artifact-scoped coverage for producers with no consuming index (today: the repair ledger is the answer) |
-| 11 | NLI triple verification stage | DESIGNED (Stage 1 section): `verifier` asset producer over the extraction artifact through the shipped `/ai/v1/extract` classification surface; blocked on asset-consumes-asset enrichment plumbing (admission reads it, planning drops it) and producer dependency ordering |
+| 11 | NLI triple verification stage | DESIGNED (Stage 1 section): `verifier` asset producer over the extraction artifact through the shipped `/ai/v1/extract` classification surface. The enrichment-layer blocker is CLOSED: asset-consumes-asset is plumbed end to end (admission validates the chain, planning orders upstream-first, both runtimes read upstream bytes as the producer source, replay converges missing-upstream consumers); only the `verifier` producer kind itself remains |
 
 ## Phases
 
-1. **Prototype (config only).** Extend `examples/epstein` with the three
+1. **Prototype (config only).** Extend `examples/epstein` with the
    extraction tool schemas and an `events` resolver; port and evaluate the
    reference prompts against local 8B-class models. Exit criterion: triple
    precision/recall on a labeled sample comparable to the paper's 88%+ F1.

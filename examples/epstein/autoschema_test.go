@@ -106,7 +106,7 @@ func itemPropertyEnum(t *testing.T, items map[string]any, property string) []any
 
 func TestCreateAutoschemaKnowledgeGraphIndexConfig(t *testing.T) {
 	// The GLiNER lane is disabled here so this test pins the paper's
-	// three-stage LLM shape; the lane has its own test below.
+	// two-stage LLM shape; the lane has its own test below.
 	idx, err := createAutoschemaKnowledgeGraphIndex(DefaultAutoschemaModel, "", DefaultInferenceURL)
 	if err != nil {
 		t.Fatalf("createAutoschemaKnowledgeGraphIndex failed: %v", err)
@@ -123,12 +123,12 @@ func TestCreateAutoschemaKnowledgeGraphIndexConfig(t *testing.T) {
 		t.Fatalf("multi-artifact index must declare producers via enrichments, not the artifact shorthand: %#v", got)
 	}
 
-	// Stage 1: three generator asset enrichments, one per extraction pass.
+	// Stage 1: two generator asset enrichments, one per extraction pass.
 	enrichments, ok := got["enrichments"].([]any)
-	if !ok || len(enrichments) != 3 {
-		t.Fatalf("enrichments = %#v, want 3 entries", got["enrichments"])
+	if !ok || len(enrichments) != 2 {
+		t.Fatalf("enrichments = %#v, want 2 entries", got["enrichments"])
 	}
-	wantAssets := []string{AutoschemaEntityEntityAsset, AutoschemaEntityEventAsset, AutoschemaEventEventAsset}
+	wantAssets := []string{AutoschemaEntityEntityAsset, AutoschemaEventsAsset}
 	byName := map[string]map[string]any{}
 	for i, raw := range enrichments {
 		enrichment, _ := raw.(map[string]any)
@@ -158,24 +158,33 @@ func TestCreateAutoschemaKnowledgeGraphIndexConfig(t *testing.T) {
 		t.Fatalf("kg_ee_v1 relation types must be open-vocabulary, got enum %#v", enum)
 	}
 
-	evParams := producerToolParameters(t, decodeProducerJSON(t, byName[AutoschemaEntityEventAsset]), autoschemaExtractionToolName)
-	if enum := itemPropertyEnum(t, schemaItems(t, evParams, "relations"), "type"); len(enum) != 1 || enum[0] != "participates_in" {
-		t.Fatalf("kg_ev_v1 relation types = %#v, want [participates_in]", enum)
+	eventsParams := producerToolParameters(t, decodeProducerJSON(t, byName[AutoschemaEventsAsset]), autoschemaExtractionToolName)
+	if enum := itemPropertyEnum(t, schemaItems(t, eventsParams, "entities"), "label"); len(enum) != 0 {
+		t.Fatalf("kg_events_v1 entity labels must stay open for participants, got enum %#v", enum)
+	}
+	wantEventRelations := []any{"participates_in", "before", "after", "concurrent", "because", "as_result"}
+	if enum := itemPropertyEnum(t, schemaItems(t, eventsParams, "relations"), "type"); len(enum) != len(wantEventRelations) {
+		t.Fatalf("kg_events_v1 relation types = %#v, want %#v", enum, wantEventRelations)
+	}
+	// The prompts ask for a predicate lemma; the tool schema must ADMIT the
+	// field or structured-output enforcement silently drops it and every
+	// event identity degrades to the sentence text (two wordings of the same
+	// event then mint two nodes).
+	for _, pass := range []struct {
+		name   string
+		params map[string]any
+	}{{AutoschemaEntityEntityAsset, eeParams}, {AutoschemaEventsAsset, eventsParams}} {
+		items := schemaItems(t, pass.params, "entities")
+		properties, _ := items["properties"].(map[string]any)
+		if _, ok := properties["predicate"]; !ok {
+			t.Fatalf("%s entity item schema must admit the predicate field: %#v", pass.name, properties)
+		}
 	}
 
-	vvParams := producerToolParameters(t, decodeProducerJSON(t, byName[AutoschemaEventEventAsset]), autoschemaExtractionToolName)
-	if enum := itemPropertyEnum(t, schemaItems(t, vvParams, "entities"), "label"); len(enum) != 1 || enum[0] != "event" {
-		t.Fatalf("kg_vv_v1 entity labels = %#v, want [event]", enum)
-	}
-	wantEventRelations := []any{"before", "after", "concurrent", "because", "as_result"}
-	if enum := itemPropertyEnum(t, schemaItems(t, vvParams, "relations"), "type"); len(enum) != len(wantEventRelations) {
-		t.Fatalf("kg_vv_v1 relation types = %#v, want %#v", enum, wantEventRelations)
-	}
-
-	// Stage 2: three ordered extraction_graph sources.
+	// Stage 2: two ordered extraction_graph sources.
 	sources, ok := got["sources"].([]any)
-	if !ok || len(sources) != 3 {
-		t.Fatalf("sources = %#v, want 3 entries", got["sources"])
+	if !ok || len(sources) != 2 {
+		t.Fatalf("sources = %#v, want 2 entries", got["sources"])
 	}
 	for i, raw := range sources {
 		source, _ := raw.(map[string]any)
@@ -184,10 +193,11 @@ func TestCreateAutoschemaKnowledgeGraphIndexConfig(t *testing.T) {
 		}
 	}
 
-	// Label-routed resolvers, one events/catch-all pair per mention class.
+	// Label-routed resolvers: the ee catch-all plus the events/catch-all
+	// pair on the merged events artifact.
 	resolvers, ok := got["resolvers"].([]any)
-	if !ok || len(resolvers) != 4 {
-		t.Fatalf("resolvers = %#v, want 4 entries", got["resolvers"])
+	if !ok || len(resolvers) != 3 {
+		t.Fatalf("resolvers = %#v, want 3 entries", got["resolvers"])
 	}
 	seenResolution := map[string]bool{}
 	for _, raw := range resolvers {
@@ -256,13 +266,13 @@ func TestCreateAutoschemaKnowledgeGraphIndexWithGlinerLane(t *testing.T) {
 	}
 	got := marshalIndexConfig(t, idx)
 
-	// A fourth extraction_relation source with positional GLiNER endpoints,
-	// after the three LLM extraction_graph sources.
+	// A third extraction_relation source with positional GLiNER endpoints,
+	// after the two LLM extraction_graph sources.
 	sources, ok := got["sources"].([]any)
-	if !ok || len(sources) != 4 {
-		t.Fatalf("sources = %#v, want 4 entries", got["sources"])
+	if !ok || len(sources) != 3 {
+		t.Fatalf("sources = %#v, want 3 entries", got["sources"])
 	}
-	gliner, _ := sources[3].(map[string]any)
+	gliner, _ := sources[2].(map[string]any)
 	if gliner["artifact"] != AutoschemaGlinerAsset || gliner["format"] != "extraction_relation" ||
 		gliner["path"] != "$.relations[*]" || gliner["mention_edge_type"] != "mentions" {
 		t.Fatalf("unexpected gliner source: %#v", gliner)
@@ -275,10 +285,10 @@ func TestCreateAutoschemaKnowledgeGraphIndexWithGlinerLane(t *testing.T) {
 	// The lane's extractor enrichment reads the raw content field (no prompt
 	// template: GLiNER consumes the text directly).
 	enrichments, ok := got["enrichments"].([]any)
-	if !ok || len(enrichments) != 4 {
-		t.Fatalf("enrichments = %#v, want 4 entries", got["enrichments"])
+	if !ok || len(enrichments) != 3 {
+		t.Fatalf("enrichments = %#v, want 3 entries", got["enrichments"])
 	}
-	glinerEnrichment, _ := enrichments[3].(map[string]any)
+	glinerEnrichment, _ := enrichments[2].(map[string]any)
 	if glinerEnrichment["name"] != AutoschemaGlinerAsset || glinerEnrichment["kind"] != "asset" ||
 		glinerEnrichment["field"] != "content" || glinerEnrichment["content_type"] != "application/json" {
 		t.Fatalf("unexpected gliner enrichment: %#v", glinerEnrichment)
@@ -297,13 +307,13 @@ func TestCreateAutoschemaKnowledgeGraphIndexWithGlinerLane(t *testing.T) {
 		t.Fatalf("gliner producer must request windowed long-document execution: %#v", config)
 	}
 
-	// A fifth resolver over the GLiNER artifact sharing the entity key
+	// A fourth resolver over the GLiNER artifact sharing the entity key
 	// template, so both lanes converge on the same canonical entities.
 	resolvers, ok := got["resolvers"].([]any)
-	if !ok || len(resolvers) != 5 {
-		t.Fatalf("resolvers = %#v, want 5 entries", got["resolvers"])
+	if !ok || len(resolvers) != 4 {
+		t.Fatalf("resolvers = %#v, want 4 entries", got["resolvers"])
 	}
-	glinerResolver, _ := resolvers[4].(map[string]any)
+	glinerResolver, _ := resolvers[3].(map[string]any)
 	if glinerResolver["source_artifact"] != AutoschemaGlinerAsset ||
 		glinerResolver["table"] != AutoschemaEntitiesTable ||
 		glinerResolver["resolution_artifact"] != "entities_gliner_resolution_v1" ||
@@ -320,10 +330,10 @@ func TestCreateAutoschemaKnowledgeGraphIndexWithGlinerLane(t *testing.T) {
 
 	// The required-enrichment list ensureAutoschemaIndexes verifies must
 	// include the lane exactly when it is enabled.
-	if got := autoschemaRequiredEnrichments(DefaultAutoschemaGlinerModel); len(got) != 4 || got[3] != AutoschemaGlinerAsset {
+	if got := autoschemaRequiredEnrichments(DefaultAutoschemaGlinerModel); len(got) != 3 || got[2] != AutoschemaGlinerAsset {
 		t.Fatalf("autoschemaRequiredEnrichments(gliner) = %v", got)
 	}
-	if got := autoschemaRequiredEnrichments(""); len(got) != 3 {
+	if got := autoschemaRequiredEnrichments(""); len(got) != 2 {
 		t.Fatalf("autoschemaRequiredEnrichments(\"\") = %v", got)
 	}
 }

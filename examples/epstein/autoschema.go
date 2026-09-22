@@ -4,12 +4,13 @@ package main
 //
 // --autoschema provisions the paper's pipeline as pure Antfly configuration:
 //
-//   Stage 1: three generator asset enrichments on the documents table
-//            (kg_ee_v1 entity-entity, kg_ev_v1 entity-event, kg_vv_v1
-//            event-event), each a forced tool call emitting the
-//            extraction_graph shape {entities:[{id,label,text}],
+//   Stage 1: two generator asset enrichments on the documents table
+//            (kg_ee_v1 entity-entity; kg_events_v1 events with their
+//            participants and temporal/causal relations), each a forced
+//            tool call emitting the extraction_graph shape
+//            {entities:[{id,label,text,predicate?}],
 //            relations:[{type,source,target,evidence}]}.
-//   Stage 2: one "knowledge_graph" graph index merging the three artifact
+//   Stage 2: one "knowledge_graph" graph index merging the artifact
 //            streams, with label-routed resolvers promoting mentions into
 //            the entities and events tables.
 //   Stage 3: a recursive autograph on the entities table: the
@@ -35,7 +36,7 @@ import (
 )
 
 const (
-	// DefaultAutoschemaModel is shared by the three extraction passes and the
+	// DefaultAutoschemaModel is shared by the extraction passes and the
 	// conceptualizer. AutoSchemaKG's extraction works with 8B-class models.
 	DefaultAutoschemaModel = DefaultGeneratorModel
 
@@ -43,10 +44,17 @@ const (
 	AutoschemaTaxonomyIndex       = "taxonomy"
 
 	AutoschemaEntityEntityAsset = "kg_ee_v1"
-	AutoschemaEntityEventAsset  = "kg_ev_v1"
-	AutoschemaEventEventAsset   = "kg_vv_v1"
-	AutoschemaGlinerAsset       = "kg_gliner_v1"
-	AutoschemaConceptAsset      = "conceptualize_v1"
+	// AutoschemaEventsAsset is the single event pass: events with their
+	// participating entities (participates_in) AND the temporal/causal
+	// relations between them. One pass instead of the paper's separate
+	// entity-event and event-event passes, because compositional event
+	// identity needs every event mention to carry its participants — a
+	// participant-less event-event pass would key its events by sentence
+	// text, structurally disconnected from the participant-bearing nodes
+	// where mention and participates_in mass accumulates.
+	AutoschemaEventsAsset  = "kg_events_v1"
+	AutoschemaGlinerAsset  = "kg_gliner_v1"
+	AutoschemaConceptAsset = "conceptualize_v1"
 
 	// DefaultAutoschemaGlinerModel is the production-qualified GLiNER2.5
 	// boundary checkpoint (zig/pkg/inference/models/gliner2/GLINER25.md). The
@@ -75,25 +83,20 @@ const (
 		"under \"relations\" with a short verb phrase as its type, the source and target entity ids, and a " +
 		"short evidence span from the passage. Extract only what the passage itself states: never invent entities, events, or relations that are not present, and never reuse examples from these instructions. If the passage is empty, unreadable, or contains nothing to extract, call the tool with empty \"entities\" and \"relations\" arrays. Here is the passage:"
 
-	autoschemaEntityEventPrompt = "Please analyze and summarize the participation relations between the " +
-		"events and entities in the following passage. Each event is a single independent sentence written " +
-		"as a simple normalized sentence. Additionally, identify all the entities that participated in the " +
-		"events. Do not use ellipses. Call the emit_graph tool exactly once: list each event under " +
-		"\"entities\" with label \"event\" and its text set to the normalized simple sentence describing the " +
-		"event, plus a predicate field holding the event's main verb as a single lowercase lemma; " +
-		"list each participating entity with a short lowercase label and its text; for every entity " +
-		"that participates in an event, add a relation of type \"participates_in\" from the entity id to the " +
-		"event id, with a short evidence span from the passage. Extract only what the passage itself states: never invent entities, events, or relations that are not present, and never reuse examples from these instructions. If the passage is empty, unreadable, or contains nothing to extract, call the tool with empty \"entities\" and \"relations\" arrays. Here is the passage:"
-
-	autoschemaEventEventPrompt = "Please analyze and summarize the relationships between the events in the " +
-		"following passage. Each event is a single independent sentence. Identify temporal and causal " +
-		"relationships between the events using only the relation types before, after, concurrent, because, " +
-		"and as_result. Each relation should be specific, meaningful, and able to stand alone. Do not use " +
-		"ellipses. Call the emit_graph tool exactly once: list each event under \"entities\" with label " +
-		"\"event\", its text set to the simple sentence describing the event, and a predicate field " +
-		"holding the event's main verb as a single lowercase lemma; list each temporal or " +
-		"causal relation under \"relations\" with the source and target event ids and a short evidence span " +
-		"from the passage. Extract only what the passage itself states: never invent entities, events, or relations that are not present, and never reuse examples from these instructions. If the passage is empty, unreadable, or contains nothing to extract, call the tool with empty \"entities\" and \"relations\" arrays. Here is the passage:"
+	autoschemaEventsPrompt = "Please analyze and summarize the events in the following passage, the " +
+		"entities participating in them, and the relationships between the events. Each event is a single " +
+		"independent sentence written as a simple normalized sentence. Do not use ellipses. Call the " +
+		"emit_graph tool exactly once: list each event under \"entities\" with label \"event\", its text set " +
+		"to the normalized simple sentence describing the event, plus a predicate field holding the event's " +
+		"main verb as a single lowercase lemma; list each participating entity with a short lowercase label " +
+		"and its text; for every entity that participates in an event, add a relation of type " +
+		"\"participates_in\" from the entity id to the event id; identify temporal and causal relationships " +
+		"between the events using only the relation types before, after, concurrent, because, and as_result, " +
+		"each specific, meaningful, and able to stand alone, from source event id to target event id. Give " +
+		"every relation a short evidence span from the passage. Extract only what the passage itself states: " +
+		"never invent entities, events, or relations that are not present, and never reuse examples from " +
+		"these instructions. If the passage is empty, unreadable, or contains nothing to extract, call the " +
+		"tool with empty \"entities\" and \"relations\" arrays. Here is the passage:"
 
 	autoschemaConceptPrompt = "You are given an entity from a knowledge graph (its canonical name and type, " +
 		"followed by a JSON block of its sampled graph neighbors when available). Produce three or more " +
@@ -108,7 +111,7 @@ const (
 // autoschemaExtractionToolParameters builds the JSON Schema for the pinned
 // extraction tool call. All three passes emit the same extraction_graph shape;
 // the label and relation-type sub-schemas are the per-pass guardrails
-// (open string for kg_ee_v1, pinned enums for kg_ev_v1/kg_vv_v1).
+// (open string for kg_ee_v1, pinned relation enum for kg_events_v1).
 func autoschemaExtractionToolParameters(labelSchema, relationTypeSchema map[string]any) map[string]any {
 	return map[string]any{
 		"type":                 "object",
@@ -125,6 +128,10 @@ func autoschemaExtractionToolParameters(labelSchema, relationTypeSchema map[stri
 						"id":    map[string]any{"type": "string", "description": "Unique local identifier such as e0, e1, v0."},
 						"label": labelSchema,
 						"text":  map[string]any{"type": "string", "description": "Surface text of the entity or the normalized event sentence."},
+						"predicate": map[string]any{
+							"type":        "string",
+							"description": "For event items only: the event's main verb as a single lowercase lemma (e.g. meet, hire, travel). Omit for non-event items.",
+						},
 					},
 				},
 			},
@@ -307,29 +314,21 @@ func autoschemaExtractionEnrichments(model, inferenceAPIURL string) ([]antfly.En
 			},
 		},
 		{
-			name:        AutoschemaEntityEventAsset,
-			prompt:      autoschemaEntityEventPrompt,
-			description: "Emit the events in the passage and the entities participating in them.",
+			name:   AutoschemaEventsAsset,
+			prompt: autoschemaEventsPrompt,
+			description: "Emit the events in the passage, the entities participating in them, and the " +
+				"temporal or causal relations between the events.",
 			labelSchema: map[string]any{
 				"type":        "string",
 				"description": "Short lowercase entity type, or exactly \"event\" for event items.",
 			},
+			// participates_in carries entity->event participation; the rest
+			// are the paper's temporal/causal event->event relations. One
+			// pass emits both so every event mention carries the
+			// participants its compositional identity is built from.
 			relationTypeSchema: map[string]any{
 				"type": "string",
-				"enum": []string{"participates_in"},
-			},
-		},
-		{
-			name:        AutoschemaEventEventAsset,
-			prompt:      autoschemaEventEventPrompt,
-			description: "Emit the events in the passage and the temporal or causal relations between them.",
-			labelSchema: map[string]any{
-				"type": "string",
-				"enum": []string{"event"},
-			},
-			relationTypeSchema: map[string]any{
-				"type": "string",
-				"enum": []string{"before", "after", "concurrent", "because", "as_result"},
+				"enum": []string{"participates_in", "before", "after", "concurrent", "because", "as_result"},
 			},
 		},
 	}
@@ -360,7 +359,7 @@ func autoschemaExtractionEnrichments(model, inferenceAPIURL string) ([]antfly.En
 }
 
 // createAutoschemaKnowledgeGraphIndex builds the Stage 1+2 "knowledge_graph"
-// index for the documents table: three extraction_graph sources merged in
+// index for the documents table: two extraction_graph sources merged in
 // declaration order plus label-routed resolvers, and (when glinerModel is
 // non-empty) a fourth extraction_relation source fed by a GLiNER2.5
 // extractor — a fast, closed-schema lane whose positional entity_index
@@ -393,12 +392,7 @@ func createAutoschemaKnowledgeGraphIndex(model, glinerModel, inferenceURL string
 			MentionEdgeType: "mentions",
 		},
 		{
-			Artifact:        AutoschemaEntityEventAsset,
-			Format:          antfly.GraphArtifactSourceConfigFormatExtractionGraph,
-			MentionEdgeType: "mentions",
-		},
-		{
-			Artifact:        AutoschemaEventEventAsset,
+			Artifact:        AutoschemaEventsAsset,
 			Format:          antfly.GraphArtifactSourceConfigFormatExtractionGraph,
 			MentionEdgeType: "mentions",
 		},
@@ -493,34 +487,26 @@ func createAutoschemaKnowledgeGraphIndex(model, glinerModel, inferenceURL string
 				ConfigGeneration:   1,
 			},
 			{
-				// kg_ev_v1 mixes entities and events; the labeled resolver
-				// claims "event" mentions and the catch-all below skips them.
-				Name:               "events_ev",
+				// kg_events_v1 mixes entities and events; the labeled
+				// resolver claims "event" mentions and the catch-all below
+				// skips them. Event keys compose from the participants'
+				// canonical entity keys once the sibling entities resolution
+				// lands, so both resolvers ride the same artifact.
+				Name:               "events",
 				Table:              AutoschemaEventsTable,
-				SourceArtifact:     AutoschemaEntityEventAsset,
-				ResolutionArtifact: "events_ev_resolution_v1",
+				SourceArtifact:     AutoschemaEventsAsset,
+				ResolutionArtifact: "events_resolution_v1",
 				KeyTemplate:        eventKeyTemplate,
 				Labels:             []string{"event"},
 				ConfigGeneration:   1,
 			},
 			{
-				Name:               "entities_ev",
+				Name:               "entities_events",
 				Table:              AutoschemaEntitiesTable,
-				SourceArtifact:     AutoschemaEntityEventAsset,
-				ResolutionArtifact: "entities_ev_resolution_v1",
+				SourceArtifact:     AutoschemaEventsAsset,
+				ResolutionArtifact: "entities_events_resolution_v1",
 				KeyTemplate:        entityKeyTemplate,
 				CandidateSearch:    oapi.GraphResolverConfigCandidateSearchPrefix,
-				ConfigGeneration:   1,
-			},
-			{
-				// kg_vv_v1 endpoints are all events (tool schema pins the
-				// label), so a single labeled resolver suffices.
-				Name:               "events_vv",
-				Table:              AutoschemaEventsTable,
-				SourceArtifact:     AutoschemaEventEventAsset,
-				ResolutionArtifact: "events_vv_resolution_v1",
-				KeyTemplate:        eventKeyTemplate,
-				Labels:             []string{"event"},
 				ConfigGeneration:   1,
 			},
 		},
@@ -657,10 +643,10 @@ func createAutoschemaTaxonomyIndex(model, inferenceURL string) (*antfly.IndexCon
 }
 
 // autoschemaRequiredEnrichments lists the inline enrichments the documents
-// table's knowledge_graph index must carry: the three LLM extraction stages
+// table's knowledge_graph index must carry: the two LLM extraction stages
 // plus, when the GLiNER lane is enabled, its extractor artifact.
 func autoschemaRequiredEnrichments(glinerModel string) []string {
-	required := []string{AutoschemaEntityEntityAsset, AutoschemaEntityEventAsset, AutoschemaEventEventAsset}
+	required := []string{AutoschemaEntityEntityAsset, AutoschemaEventsAsset}
 	if strings.TrimSpace(glinerModel) != "" {
 		required = append(required, AutoschemaGlinerAsset)
 	}

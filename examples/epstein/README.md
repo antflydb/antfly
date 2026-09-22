@@ -200,7 +200,7 @@ Flags:
   --artifact-labels Entity labels for the artifact extractor
   --artifact-relation-labels
                     Relation labels for the artifact extractor
-  --autoschema      Provision the AutoSchemaKG pipeline: three LLM extraction
+  --autoschema      Provision the AutoSchemaKG pipeline: LLM extraction
                     passes, entities/events resolution, and a concept taxonomy
                     (requires --create-table; see "AutoSchemaKG mode" below)
   --autoschema-model
@@ -220,18 +220,21 @@ in `zig/AUTOSCHEMA.md`, following *AutoSchemaKG: Autonomous Knowledge Graph
 Construction through Dynamic Schema Induction from Web-Scale Corpora*
 (arXiv:2505.23628). It coexists with `--enable-artifact-graph` and creates:
 
-- Three generator asset enrichments on the documents table, one per
-  extraction pass (`kg_ee_v1` entity-entity, `kg_ev_v1` entity-event,
-  `kg_vv_v1` event-event), each a forced tool call emitting the
-  `extraction_graph` artifact shape.
-- A `knowledge_graph` graph index merging the three artifact streams, with
+- Two generator asset enrichments on the documents table, one per
+  extraction pass (`kg_ee_v1` entity-entity; `kg_events_v1` events with
+  their participating entities and the temporal/causal relations between
+  them), each a forced tool call emitting the `extraction_graph` artifact
+  shape.
+- A `knowledge_graph` graph index merging the artifact streams, with
   label-routed resolvers that promote `event`-labelled mentions into an
-  `events` table (`event/{{ hash _entity.text }}` keys) and every other
-  mention into an `entities` table
+  `events` table (compositional `event/{{ hash _entity.event_identity }}`
+  keys: sorted participant slugs + predicate lemma, composed from the
+  participants' canonical entity keys once their resolution lands) and
+  every other mention into an `entities` table
   (label-free `entity/{{ slug _entity.text }}` keys; the extractor's label
   rides the promoted document as `entity_type`, never the key, so mentions
   labeled differently by different passes still converge on one node).
-- A fourth, GLiNER2.5-powered extraction lane (`kg_gliner_v1`, disable with
+- A third, GLiNER2.5-powered extraction lane (`kg_gliner_v1`, disable with
   `--autoschema-gliner-model ""`): a fast `extractor` asset producer with a
   closed entity/relation schema (person, organization, location, date;
   `employed_by`, `located_in`, `traveled_with`, `met_with`,
