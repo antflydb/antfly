@@ -557,6 +557,10 @@ pub const SchemaBeforeIndexLoad = struct {
     public_schema_json: ?[]const u8 = null,
 };
 
+/// Default for `OpenOptions.run_until_idle_no_progress_timeout_ms` /
+/// `DB.run_until_idle_no_progress_timeout_ns`. See `checkTargetAdvanceNoProgress`.
+const default_run_until_idle_no_progress_timeout_ns: u64 = 60 * std.time.ns_per_s;
+
 pub const OpenOptions = struct {
     pub const PhysicalRootMode = enum {
         /// The DB path names a directory-backed physical root. DB owns its
@@ -716,6 +720,14 @@ pub const OpenOptions = struct {
     /// client-write guard. A standby gate also suppresses mutating background
     /// runtimes at open, even if the generic runtime defaults are enabled.
     ha_write_gate: ?HAWriteGate = null,
+    /// Bounded stall guard for the foreground `runUntilIdle` drain (Lite's
+    /// synchronous ingest drain, in particular): if a managed derived index
+    /// cannot advance its replay target for this long, `runUntilIdle` fails
+    /// with `error.RunUntilIdleNoProgress` naming the stuck index and its
+    /// indexed/expected counters instead of spinning indefinitely. 0 disables
+    /// the guard. Never applied to background/steady-state replay or to any
+    /// other drain entry point -- see `ReplayDrainOptions.no_progress_timeout_ns`.
+    run_until_idle_no_progress_timeout_ms: u64 = default_run_until_idle_no_progress_timeout_ns / std.time.ns_per_ms,
 };
 
 pub const DenseNativeMigrationPolicySource = db_config.DenseNativeMigrationPolicySource;
@@ -1665,6 +1677,18 @@ const AsyncContext = struct {
     /// debt from the durable counter on the next replay attempt.
     target_advance_debt_mutex: std.atomic.Mutex = .unlocked,
     target_advance_maintenance_pending: std.StringHashMapUnmanaged(TargetAdvanceMaintenanceDebt) = .empty,
+    /// First-observed monotonic time an exact index could not advance its
+    /// derived replay target, plus the last observed indexed/expected
+    /// counters at that moment. Populated unconditionally (cheap map upsert)
+    /// whenever `canAdvanceDerivedToTargetAsync` defers to artifact
+    /// maintenance; cleared the moment that index advances normally. This is
+    /// pure bookkeeping with no behavioral effect by itself -- background/
+    /// steady-state replay never reads it, so a legitimately slow (but still
+    /// progressing) embedding backlog is unaffected. `runUntilIdle`'s opt-in
+    /// no-progress guard (`ReplayDrainOptions.no_progress_timeout_ns`) is the
+    /// only reader: it fails fast with a named, bounded diagnostic instead of
+    /// looping on the same deferred check indefinitely.
+    target_advance_stuck: std.StringHashMapUnmanaged(TargetAdvanceStuckRecord) = .empty,
     text_merge_runtime: ?*text_merge_runtime_mod.TextMergeRuntime = null,
     text_merge_restart_state: std.atomic.Value(u8) = .init(0),
     sparse_compaction_runtime: ?*sparse_compaction_runtime_mod.SparseCompactionRuntime = null,
@@ -1703,7 +1727,16 @@ const AsyncContext = struct {
         var target_pending_it = self.target_advance_maintenance_pending.keyIterator();
         while (target_pending_it.next()) |key| alloc.free(@constCast(key.*));
         self.target_advance_maintenance_pending.deinit(alloc);
+        var target_stuck_it = self.target_advance_stuck.keyIterator();
+        while (target_stuck_it.next()) |key| alloc.free(@constCast(key.*));
+        self.target_advance_stuck.deinit(alloc);
     }
+};
+
+const TargetAdvanceStuckRecord = struct {
+    first_stuck_ns: u64,
+    indexed: u64,
+    expected: u64,
 };
 
 const TargetAdvanceMaintenanceDebt = struct {
@@ -5325,6 +5358,17 @@ pub const DB = struct {
     artifact_metadata_retry_after_ns: u64 = 0,
     artifact_repair_metadata_due_ns: u64 = 0,
     artifact_repair_metadata_pending: bool = true,
+    /// Bounded no-progress guard for `runUntilIdle` (see `OpenOptions.
+    /// run_until_idle_no_progress_timeout_ms` and `ReplayDrainOptions.
+    /// no_progress_timeout_ns`); 0 disables it. Copied into `ReplayDrainOptions`
+    /// only by `runUntilIdle`, so a busy but progressing background replay is
+    /// never subject to it.
+    run_until_idle_no_progress_timeout_ns: u64 = default_run_until_idle_no_progress_timeout_ns,
+    /// Most recent `error.RunUntilIdleNoProgress` diagnostic, retained past the
+    /// error return for callers (tests, capi JSON status) that want the exact
+    /// stuck index and its indexed/expected counters without re-parsing a log
+    /// line. Overwritten on each new occurrence; freed at `deinitWrapperState`.
+    last_run_until_idle_no_progress: ?NoProgressDiagnostic = null,
     shadow: ?*ShadowState,
     bulk_ingest_coalescer: @This().BulkIngestCoalescer = .{},
     flushing_bulk_ingest_coalescer: bool = false,
@@ -6246,6 +6290,7 @@ pub const DB = struct {
                 .executor = executor,
                 .start_index_workers = start_index_workers,
                 .optional_runtime_workers_enabled = false,
+                .run_until_idle_no_progress_timeout_ns = @as(u64, opts.run_until_idle_no_progress_timeout_ms) *| std.time.ns_per_ms,
                 .graph_metric_idle_maintenance = opts.graph_metric_idle_maintenance,
                 .graph_metric_idle_planned_options = opts.graph_metric_idle_planned_options,
                 .graph_metric_idle_auto_options = opts.graph_metric_idle_auto_options,
@@ -7122,6 +7167,45 @@ pub const DB = struct {
 
     pub fn isClosed(self: *const DB) bool {
         return self.closed;
+    }
+
+    /// Named diagnostic for `error.RunUntilIdleNoProgress` (see
+    /// `checkTargetAdvanceNoProgress`): exactly which managed index could not
+    /// advance its derived replay target, and its last observed indexed vs.
+    /// durable-expected counters when the bounded stall fired.
+    pub const NoProgressDiagnostic = struct {
+        index_name: []u8,
+        indexed: u64,
+        expected: u64,
+        stuck_ns: u64,
+
+        fn deinit(self: *@This(), alloc: Allocator) void {
+            alloc.free(self.index_name);
+            self.* = undefined;
+        }
+    };
+
+    fn setLastRunUntilIdleNoProgressDiagnostic(
+        self: *DB,
+        index_name: []const u8,
+        indexed: u64,
+        expected: u64,
+        stuck_ns: u64,
+    ) !void {
+        const owned_name = try self.alloc.dupe(u8, index_name);
+        if (self.last_run_until_idle_no_progress) |*previous| previous.deinit(self.alloc);
+        self.last_run_until_idle_no_progress = .{
+            .index_name = owned_name,
+            .indexed = indexed,
+            .expected = expected,
+            .stuck_ns = stuck_ns,
+        };
+    }
+
+    /// Read-only view of the most recent no-progress diagnostic, if any.
+    /// Valid until the next `runUntilIdle` call or `DB.close`.
+    pub fn lastRunUntilIdleNoProgressDiagnostic(self: *const DB) ?NoProgressDiagnostic {
+        return self.last_run_until_idle_no_progress;
     }
 
     fn resumeGeneratedReplayFromJournalIfNeeded(self: *DB) !void {
@@ -8095,6 +8179,8 @@ pub const DB = struct {
     }
 
     fn deinitWrapperState(self: *DB, executor_ready: bool) void {
+        if (self.last_run_until_idle_no_progress) |*diagnostic| diagnostic.deinit(self.alloc);
+        self.last_run_until_idle_no_progress = null;
         // Stop background workers before tearing down stores, runtimes, and
         // index state they may inspect.
         self.async_context.background_closing.store(true, .release);
@@ -30711,6 +30797,20 @@ pub const DB = struct {
         /// (`sync_wait_timeout_ms`, 5 minutes). Only `runUntilIdle` sets
         /// this; see `runEnrichmentUntilForDrainUnbounded`.
         unbounded_enrichment_wait: bool = false,
+        /// Opt-in stall guard, in nanoseconds; 0/null disables it. Only
+        /// `runUntilIdle` sets this (from `run_until_idle_no_progress_timeout_ms`
+        /// at open, see `OpenOptions`). Every pass through
+        /// `runMaintenanceUntilWithOptions`'s catch-up loop checks
+        /// `AsyncContext.target_advance_stuck` (populated by
+        /// `canAdvanceDerivedToTargetAsync`) and fails with
+        /// `error.RunUntilIdleNoProgress` once any exact index has been unable
+        /// to advance its replay target for at least this long, instead of
+        /// looping on the same deferred artifact-maintenance check forever.
+        /// Left disabled for every other caller (request-visibility waits,
+        /// plain `runMaintenanceUntil`, background replay): a busy but
+        /// legitimately-progressing embedding backlog must not fail those
+        /// paths just because one index is temporarily behind.
+        no_progress_timeout_ns: u64 = 0,
     };
 
     fn runDerivedUntilWithOptions(self: *DB, sequence: u64, options: ReplayDrainOptions) !void {
@@ -30889,6 +30989,7 @@ pub const DB = struct {
             // the complete revision and can advance from durable evidence.
             try self.runEnrichmentUntilForDrain(stable_target, options);
             try self.runDerivedUntilWithOptions(stable_target, options);
+            if (options.no_progress_timeout_ns != 0) try self.checkTargetAdvanceNoProgress(options.no_progress_timeout_ns);
 
             const next_target = self.core.nextDerivedSequence();
             if (next_target <= stable_target) {
@@ -30898,6 +30999,33 @@ pub const DB = struct {
             }
             stable_target = next_target;
         }
+    }
+
+    /// Opt-in stall guard for `runUntilIdle` (see `ReplayDrainOptions.no_progress_timeout_ns`).
+    /// A global "did the replay sequence move" check would not catch this
+    /// class of bug: an index that can never satisfy its own replay target
+    /// can still coexist with an unrelated sequence counter that keeps
+    /// climbing (retries, other lanes' progress), which is exactly the
+    /// livelock this guards against. Scoped per-index instead, using the
+    /// same diagnostic `canAdvanceDerivedToTargetAsync` already computes.
+    fn checkTargetAdvanceNoProgress(self: *DB, timeout_ns: u64) !void {
+        const now_ns = monotonicTimeNs();
+        var stuck = (try oldestTargetAdvanceStuck(self.async_context, timeout_ns, now_ns)) orelse return;
+        // `oldestTargetAdvanceStuck` dupes with `AsyncContext.alloc`
+        // (`self.runtime_alloc`), a distinct allocator instance from
+        // `self.alloc` -- free with the same one it was allocated with.
+        defer stuck.deinit(self.async_context.alloc);
+        std.log.err(
+            "runUntilIdle no-progress timeout index={s} indexed={d} expected_docs={d} stuck_ms={d}",
+            .{ stuck.index_name, stuck.record.indexed, stuck.record.expected, (now_ns -| stuck.record.first_stuck_ns) / std.time.ns_per_ms },
+        );
+        try self.setLastRunUntilIdleNoProgressDiagnostic(
+            stuck.index_name,
+            stuck.record.indexed,
+            stuck.record.expected,
+            now_ns -| stuck.record.first_stuck_ns,
+        );
+        return error.RunUntilIdleNoProgress;
     }
 
     pub fn runMaintenanceUntil(self: *DB, sequence: u64, sync_targets: ManagedSyncTargets) !void {
@@ -32118,10 +32246,66 @@ pub const DB = struct {
     }
 
     pub fn runUntilIdle(self: *DB) !void {
-        try self.runUntilIdleWithReplayDrainOptions(.{
+        const started_ns = platform_time.monotonicNs();
+        const before = self.enrichmentThroughputSnapshot();
+        defer self.logRunUntilIdleSummary(started_ns, before);
+        self.runUntilIdleWithReplayDrainOptions(.{
             .wait_for_enrichment_retries = true,
             .unbounded_enrichment_wait = true,
-        });
+            .no_progress_timeout_ns = self.run_until_idle_no_progress_timeout_ns,
+        }) catch |err| {
+            // Embedded callers only see the mapped C ABI code (most of these
+            // collapse to ANTFLY_INTERNAL), so name the error here where the
+            // process log is the only diagnostic left.
+            std.log.warn("runUntilIdle failed after {d} ms: {s}", .{
+                (platform_time.monotonicNs() -| started_ns) / std.time.ns_per_ms,
+                @errorName(err),
+            });
+            return err;
+        };
+    }
+
+    const EnrichmentThroughputSnapshot = struct {
+        embed_batches: u64 = 0,
+        embed_items: u64 = 0,
+        embed_ns: u64 = 0,
+        extract_batches: u64 = 0,
+        extract_items: u64 = 0,
+        extract_ns: u64 = 0,
+    };
+
+    fn enrichmentThroughputSnapshot(self: *DB) EnrichmentThroughputSnapshot {
+        const runtime = self.enrichment_runtime orelse return .{};
+        return .{
+            .embed_batches = runtime.embed_batches_completed,
+            .embed_items = runtime.embed_items_completed,
+            .embed_ns = runtime.total_embed_ns,
+            .extract_batches = runtime.extract_batches_completed,
+            .extract_items = runtime.extract_items_completed,
+            .extract_ns = runtime.total_extract_ns,
+        };
+    }
+
+    /// One-line throughput summary so a caller (Lite's `dogfood`-style ingest
+    /// drain, in particular) can see embed/extract batch counts and wall time
+    /// without instrumenting its own driver loop. Deltas isolate this call's
+    /// own contribution on a long-lived, repeatedly-drained runtime.
+    fn logRunUntilIdleSummary(self: *DB, started_ns: u64, before: EnrichmentThroughputSnapshot) void {
+        const after = self.enrichmentThroughputSnapshot();
+        const wall_ns = platform_time.monotonicNs() -| started_ns;
+        if (after.embed_batches == before.embed_batches and after.extract_batches == before.extract_batches) return;
+        std.log.info(
+            "runUntilIdle summary wall_ms={d} embed_batches={d} embed_items={d} embed_ns={d} extract_batches={d} extract_items={d} extract_ns={d}",
+            .{
+                wall_ns / std.time.ns_per_ms,
+                after.embed_batches -| before.embed_batches,
+                after.embed_items -| before.embed_items,
+                after.embed_ns -| before.embed_ns,
+                after.extract_batches -| before.extract_batches,
+                after.extract_items -| before.extract_items,
+                after.extract_ns -| before.extract_ns,
+            },
+        );
     }
 
     /// Resident managed writers already have an asynchronous enrichment owner.
@@ -36346,7 +36530,23 @@ pub const DB = struct {
     }
 
     fn portableImportTargetEmptyLocked(self: *DB, alloc: Allocator) !bool {
-        if (self.core.schema != null or self.core.indexCount() != 0) return false;
+        if (self.core.schema != null) return false;
+        // Every Lite database is now provisioned with the default full-text
+        // index at creation, matching the server's table-create behavior, so
+        // a target carrying only that pristine index is still eligible for a
+        // full physical import. Anything beyond that single default index
+        // means the target has been configured and must not be silently
+        // overwritten.
+        switch (self.core.indexCount()) {
+            0 => {},
+            1 => {
+                const configs = try self.core.listIndexes(alloc);
+                defer types.freeIndexConfigs(alloc, configs);
+                if (configs.len != 1 or configs[0].kind != .full_text or
+                    !std.mem.eql(u8, configs[0].name, "full_text_index_v0")) return false;
+            },
+            else => return false,
+        }
 
         // Primary rows can be empty while durable identity tombstones and
         // forward/reverse mappings remain. Publishing over that state would
@@ -56010,6 +56210,64 @@ fn clearTargetAdvanceMaintenanceDebt(ctx: *AsyncContext, index_name: []const u8)
     ctx.alloc.free(@constCast(entry.key));
 }
 
+/// Called every time `canAdvanceDerivedToTargetAsync` cannot advance an
+/// artifact-backed dense index's replay target, and read back from
+/// `checkTargetAdvanceNoProgress` on a foreground `runUntilIdle` drain. Both
+/// sites may run on different threads from a background derived-executor
+/// worker's callback invocation (hosted/multi-worker profiles), so this map
+/// shares `target_advance_debt_mutex` with `target_advance_maintenance_pending`
+/// rather than relying on the caller's transient apply-exclusive hold.
+fn noteTargetAdvanceStuck(ctx: *AsyncContext, index_name: []const u8, now_ns: u64, indexed: u64, expected: u64) !void {
+    lockAtomic(&ctx.target_advance_debt_mutex);
+    defer ctx.target_advance_debt_mutex.unlock();
+    const gop = try ctx.target_advance_stuck.getOrPut(ctx.alloc, index_name);
+    if (!gop.found_existing) {
+        gop.key_ptr.* = try ctx.alloc.dupe(u8, index_name);
+        gop.value_ptr.* = .{ .first_stuck_ns = now_ns, .indexed = indexed, .expected = expected };
+        return;
+    }
+    gop.value_ptr.indexed = indexed;
+    gop.value_ptr.expected = expected;
+}
+
+fn clearTargetAdvanceStuck(ctx: *AsyncContext, index_name: []const u8) void {
+    lockAtomic(&ctx.target_advance_debt_mutex);
+    defer ctx.target_advance_debt_mutex.unlock();
+    const entry = ctx.target_advance_stuck.fetchRemove(index_name) orelse return;
+    ctx.alloc.free(@constCast(entry.key));
+}
+
+/// Snapshot of `target_advance_stuck` older than `timeout_ns`, or null if
+/// none. Copies out under the shared mutex so the caller can log/stash the
+/// diagnostic and return without holding it.
+const TargetAdvanceStuckSnapshot = struct {
+    /// Owned copy, duped while `target_advance_debt_mutex` is held; the map's
+    /// own key may be freed by a concurrent `clearTargetAdvanceStuck` the
+    /// instant this function returns, so the caller cannot safely borrow it.
+    index_name: []u8,
+    record: TargetAdvanceStuckRecord,
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(self.index_name);
+        self.* = undefined;
+    }
+};
+
+fn oldestTargetAdvanceStuck(ctx: *AsyncContext, timeout_ns: u64, now_ns: u64) !?TargetAdvanceStuckSnapshot {
+    lockAtomic(&ctx.target_advance_debt_mutex);
+    defer ctx.target_advance_debt_mutex.unlock();
+    var it = ctx.target_advance_stuck.iterator();
+    while (it.next()) |stuck_entry| {
+        const stuck_ns = now_ns -| stuck_entry.value_ptr.first_stuck_ns;
+        if (stuck_ns < timeout_ns) continue;
+        return .{
+            .index_name = try ctx.alloc.dupe(u8, stuck_entry.key_ptr.*),
+            .record = stuck_entry.value_ptr.*,
+        };
+    }
+    return null;
+}
+
 test "async context dense catch-up session tracking suppresses local bulk sessions" {
     var apply_mutex: apply_rw_lock_mod.ApplyRwLock = .{};
     var resource_manager = resource_manager_mod.ResourceManager.init(.{});
@@ -56397,6 +56655,39 @@ test "target advance maintenance handoff is exact-incarnation scoped" {
     try std.testing.expect(targetAdvanceMaintenanceDebtPending(&ctx, "idx", .{ .config_hash = 12, .generation = 1 }));
     clearTargetAdvanceMaintenanceDebt(&ctx, "idx");
     try std.testing.expect(!targetAdvanceMaintenanceDebtPending(&ctx, "idx", .{ .config_hash = 12, .generation = 1 }));
+}
+
+test "target advance stuck tracking records first-seen time and clears on success" {
+    var apply_mutex: apply_rw_lock_mod.ApplyRwLock = .{};
+    var ctx = AsyncContext{
+        .alloc = std.testing.allocator,
+        .store = undefined,
+        .index_manager = undefined,
+        .apply_mutex = &apply_mutex,
+    };
+    defer ctx.deinit(std.testing.allocator);
+
+    const first_ns: u64 = 10 * std.time.ns_per_s;
+    try noteTargetAdvanceStuck(&ctx, "idx", first_ns, 3, 9);
+    // A later call for the same index updates counters but must not reset
+    // the original first-stuck timestamp -- that timestamp is the duration
+    // basis for `checkTargetAdvanceNoProgress`.
+    try noteTargetAdvanceStuck(&ctx, "idx", first_ns + std.time.ns_per_s, 5, 9);
+
+    var not_yet = try oldestTargetAdvanceStuck(&ctx, 2 * std.time.ns_per_s, first_ns + std.time.ns_per_s);
+    try std.testing.expect(not_yet == null);
+
+    var stuck = (try oldestTargetAdvanceStuck(&ctx, 1 * std.time.ns_per_s, first_ns + std.time.ns_per_s)) orelse
+        return error.TestUnexpectedResult;
+    defer stuck.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("idx", stuck.index_name);
+    try std.testing.expectEqual(first_ns, stuck.record.first_stuck_ns);
+    try std.testing.expectEqual(@as(u64, 5), stuck.record.indexed);
+    try std.testing.expectEqual(@as(u64, 9), stuck.record.expected);
+
+    clearTargetAdvanceStuck(&ctx, "idx");
+    not_yet = try oldestTargetAdvanceStuck(&ctx, 0, first_ns + std.time.ns_per_s);
+    try std.testing.expect(not_yet == null);
 }
 
 fn readEnvUsize(name: [:0]const u8, default_value: usize) usize {
@@ -67549,7 +67840,10 @@ fn canAdvanceDerivedToTargetAsync(ctx_ptr: *anyopaque, index_ref: index_manager_
         ctx.applied_sequence_checkpoint_path,
         index_ref,
     );
-    if (persisted_applied >= target_sequence) return true;
+    if (persisted_applied >= target_sequence) {
+        if (index_ref.kind == .dense_vector) clearTargetAdvanceStuck(ctx, index_ref.name);
+        return true;
+    }
 
     if (try replayRangeHasManagedIndexApplicableRecord(ctx, index_ref, from_sequence, target_sequence)) return false;
     if (!ctx.index_manager.indexLoadComplete(index_ref.name)) return false;
@@ -67570,7 +67864,10 @@ fn canAdvanceDerivedToTargetAsync(ctx_ptr: *anyopaque, index_ref: index_manager_
         return false;
     };
     const active_count = entry.index.stats().active_count;
-    if (denseCoverageMatchesTarget(active_count, expected_doc_count)) return true;
+    if (denseCoverageMatchesTarget(active_count, expected_doc_count)) {
+        clearTargetAdvanceStuck(ctx, index_ref.name);
+        return true;
+    }
 
     // The derived executor has no stable DB pointer: DB.open returns its
     // wrapper by value, while this AsyncContext is independently allocated and
@@ -67583,6 +67880,12 @@ fn canAdvanceDerivedToTargetAsync(ctx_ptr: *anyopaque, index_ref: index_manager_
     });
 
     const now_ns = monotonicTimeNs();
+    // Cheap upsert every call (unlike the cooldown-gated log below): this is
+    // the only durable record of how long this index has been stuck, which
+    // `runUntilIdle`'s opt-in no-progress guard needs to fail fast instead of
+    // spinning on this exact deferred check indefinitely (see
+    // `checkTargetAdvanceNoProgress`).
+    try noteTargetAdvanceStuck(ctx, index_ref.name, now_ns, active_count, expected_doc_count);
     if (shouldLogTargetAdvanceDebt(ctx, index_ref.name, now_ns)) {
         try noteTargetAdvanceDebtLogged(ctx, index_ref.name, now_ns);
         std.log.warn(
@@ -70096,6 +70399,38 @@ const GateAssetProducer = struct {
 
     fn allowAll(self: *@This()) void {
         self.blocked.store(false, .release);
+    }
+};
+
+/// An asset producer whose `produce` call parks on `allowed` until the test
+/// explicitly releases it, tracking whether a call has started and whether
+/// it has returned. Used to prove cross-quantum lane pipelining: dispatching
+/// a later quantum (of either lane) must not depend on this call returning.
+const SlowGatedAssetProducer = struct {
+    allowed: std.atomic.Value(bool) = .init(false),
+    calls: std.atomic.Value(usize) = .init(0),
+    started: std.atomic.Value(bool) = .init(false),
+    finished: std.atomic.Value(bool) = .init(false),
+
+    fn produce(ptr: *anyopaque, alloc: Allocator, request: asset_producer_mod.Request) ![]u8 {
+        const self: *SlowGatedAssetProducer = @ptrCast(@alignCast(ptr));
+        self.started.store(true, .release);
+        _ = self.calls.fetchAdd(1, .monotonic);
+        while (!self.allowed.load(.acquire)) sleepNs(2 * std.time.ns_per_ms);
+        const out = try std.fmt.allocPrint(alloc, "asset:{s}", .{request.source_text});
+        self.finished.store(true, .release);
+        return out;
+    }
+
+    fn interface(self: *@This()) asset_producer_mod.Producer {
+        return .{ .ptr = self, .vtable = &.{
+            .produce = produce,
+            .invocation_memory_for_requests = GateAssetProducer.invocationMemory,
+        } };
+    }
+
+    fn allow(self: *@This()) void {
+        self.allowed.store(true, .release);
     }
 };
 
@@ -89643,6 +89978,141 @@ test "db document extraction skips stable unit local rewrites without text consu
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"fingerprint_match\":true") != null);
 }
 
+// Regression test for the dogfood in-process ingest livelock: a dense_vector
+// index that consumes a two-stage chunk-then-embed pipeline through the
+// plural `sources` config form (`embedding_names`, not the singular
+// `embedding_name` every other chunk-dense test above uses) never advanced
+// its durable dense-artifact target counter past 0, because
+// `denseArtifactTargetsForArtifact` (enrichment/enrichment_runtime.zig) only
+// matched `entry.embedding_name` and `entry.config.name`. `runUntilIdle`
+// (db.zig's `canAdvanceDerivedToTargetAsync`) then deferred forever to
+// artifact-maintenance debt that nothing drains, because expected_docs was
+// permanently stuck at 0 while indexed kept climbing. See ENRICHMENTS.md's
+// "Two-Stream Execution Model" and DENSE_INDEXING_LIFECYCLE.md.
+test "db dense index consuming a chunk-then-embed source via plural sources config converges its target counter" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var counting = CountingDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = counting.interface(),
+        },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+    try db.addEnrichment(.{
+        .name = "document_chunks_v1",
+        .kind = .chunk,
+        .field = "text",
+        .source_artifact_name = "document_units_v1",
+        .chunk_size = 256,
+    });
+    try db.addEnrichment(.{
+        .name = "document_chunk_dense_v1",
+        .kind = .embedding,
+        .field = "text",
+        .source_artifact_name = "document_chunks_v1",
+        .expected_dims = 3,
+    });
+    // Dogfood's `chunk_vectors` declares its consumed embedding artifact via
+    // the plural `sources` array (one entry), not `embedding_name`. Both
+    // forms populate the same durable dense-artifact-counter machinery, but
+    // only `embedding_names` (plural) hit the missing-match bug.
+    try db.addIndex(.{
+        .name = "dv_document_chunks",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"sources\":[{\"artifact\":\"document_chunk_dense_v1\"}]}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YSBnYW1tYQ==\"}",
+        }},
+        .sync_level = .full_index,
+    });
+    try db.runUntilIdle();
+
+    try std.testing.expect(counting.calls > 0);
+
+    const active_count = db.core.index_manager.denseIndex("dv_document_chunks").?.index.stats().active_count;
+    try std.testing.expect(active_count > 0);
+    // Before the fix this counter was permanently stuck at 0 (the guarded
+    // embedding-artifact write path never found a matching counter target),
+    // so `canAdvanceDerivedToTargetAsync` could never observe
+    // `denseCoverageMatchesTarget` and would defer to artifact maintenance
+    // forever.
+    try std.testing.expectEqual(
+        @as(?u64, active_count),
+        try DB.loadDenseArtifactTargetCounter(alloc, db.core.store, "dv_document_chunks"),
+    );
+
+    // The counter equality above proves the durable target watermark
+    // converges; also prove the index is actually searchable end to end.
+    var search_result = try db.search(alloc, .{
+        .index_name = "dv_document_chunks",
+        .query = .{ .dense_knn = .{ .vector = &.{ 0, 0, 0 }, .k = 5 } },
+        .limit = 5,
+        .search_effort = 1.0,
+    });
+    defer search_result.deinit();
+    try std.testing.expect(search_result.total_hits > 0);
+}
+
+// `checkTargetAdvanceNoProgress` is `runUntilIdle`'s opt-in stall guard (task
+// requirement: fail fast with a named, bounded diagnostic instead of
+// spinning on `canAdvanceDerivedToTargetAsync`'s deferred artifact-maintenance
+// check indefinitely). Exercised directly against a real (otherwise idle) DB
+// rather than by reproducing a genuinely broken pipeline, so the pass/fail
+// signal is deterministic and does not depend on timing.
+test "runUntilIdle no-progress guard fails fast with a named stuck-index diagnostic" {
+    @import("../../test_error_logs.zig").expectErrorLogs(1);
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try std.testing.expect(db.lastRunUntilIdleNoProgressDiagnostic() == null);
+
+    const now_ns = monotonicTimeNs();
+    // Simulate `canAdvanceDerivedToTargetAsync` having observed
+    // "chunk_vectors" stuck (indexed=5017, expected_docs=0, matching the
+    // dogfood reproduction) for longer than the configured timeout.
+    try noteTargetAdvanceStuck(db.async_context, "chunk_vectors", now_ns -| (2 * std.time.ns_per_s), 5017, 0);
+    try std.testing.expectError(error.RunUntilIdleNoProgress, db.checkTargetAdvanceNoProgress(1 * std.time.ns_per_s));
+
+    const diagnostic = db.lastRunUntilIdleNoProgressDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("chunk_vectors", diagnostic.index_name);
+    try std.testing.expectEqual(@as(u64, 5017), diagnostic.indexed);
+    try std.testing.expectEqual(@as(u64, 0), diagnostic.expected);
+
+    // A shorter observed duration than the configured timeout must not fire.
+    clearTargetAdvanceStuck(db.async_context, "chunk_vectors");
+    try noteTargetAdvanceStuck(db.async_context, "chunk_vectors", now_ns, 12, 0);
+    try db.checkTargetAdvanceNoProgress(60 * std.time.ns_per_s);
+}
+
 test "db applies document artifact child range batch without source row write" {
     const alloc = std.testing.allocator;
 
@@ -94540,6 +95010,481 @@ test "db retryable asset producer batches do not block independent dense publica
     gated_asset.allowAll();
     try db.runUntilIdle();
     try std.testing.expect(gated_asset.successful_requests.load(.acquire) != 0);
+}
+
+test "db blocked dense embedding lane does not force the independent asset lane to redo checkpointed work" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var gated_dense = GateDenseEmbedder{};
+    gated_dense.allowed_successes.store(0, .release);
+    var gated_asset = GateAssetProducer{};
+    gated_asset.allowAll();
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .asset_producer = gated_asset.interface(),
+            .dense_embedder = gated_dense.interface(),
+            .inline_retry_max_attempts = 1,
+        },
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "summary_v1",
+        .kind = .asset,
+        .field = "body",
+        .content_type = "text/plain",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}",
+    });
+    try db.addIndex(.{
+        .name = "title_dense",
+        .kind = .dense_vector,
+        .config_json =
+        \\{"field":"embedding","dims":3,"publication_policy":"progressive","generator":{"kind":"dense_embedding","source_field":"title","embedding_name":"title_dense"}}
+        ,
+    });
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"title\":\"independent title\",\"body\":\"available summary source\"}",
+        }},
+        .sync_level = .write,
+    });
+
+    // The dense lane is blocked from the first attempt onward. The
+    // asset-producer lane is an independent execution lane with its own
+    // window and replay cursor (scope "generated.assets"), so it must
+    // publish and checkpoint without waiting on the still-failing dense
+    // lane (scope "generated.dense"). See "Two-Stream Execution Model" in
+    // ENRICHMENTS.md.
+    // The asset lane's first publish is a real provider round trip plus a
+    // durable checkpoint on a background worker; on a loaded host that can
+    // take longer than the default one-second poll budget, so use the slow
+    // budget here (the assertion is unchanged).
+    var asset_published = false;
+    var attempts: usize = 0;
+    while (attempts < slow_test_wait_attempts) : (attempts += 1) {
+        if (gated_dense.blocked_requests.load(.acquire) != 0 and
+            gated_asset.successful_requests.load(.acquire) != 0)
+        {
+            asset_published = true;
+            break;
+        }
+        sleepPollInterval();
+    }
+    try std.testing.expect(asset_published);
+    const first_asset_successes = gated_asset.successful_requests.load(.acquire);
+
+    // The asset lane's own replay cursor is durable even though the dense
+    // lane, which never completed a batch, has none: this is only true of
+    // the per-stream design. Under the historical single shared cursor, no
+    // cursor would exist under either scope until *both* lanes published.
+    // The producer's success is observed before the lane has flushed its
+    // window and saved the cursor, so wait for the checkpoint itself.
+    var assets_cursor_seen = false;
+    attempts = 0;
+    while (attempts < slow_test_wait_attempts) : (attempts += 1) {
+        if (try enrichment_state.loadReplayCursor(alloc, db.enrichment_runtime.?.store, "generated.assets")) |cursor| {
+            var owned = cursor;
+            owned.deinit(alloc);
+            assets_cursor_seen = true;
+            break;
+        }
+        sleepPollInterval();
+    }
+    try std.testing.expect(assets_cursor_seen);
+
+    gated_dense.allowAll();
+    try db.runUntilIdle();
+
+    var result = try db.search(alloc, .{
+        .index_name = "title_dense",
+        .dense = .{ .vector = &.{ 1.0, 0.0, 0.0 }, .k = 1 },
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+
+    // The already-checkpointed asset lane is not redone once the sibling
+    // dense lane finally publishes.
+    try std.testing.expectEqual(first_asset_successes, gated_asset.successful_requests.load(.acquire));
+}
+
+test "cross-quantum lane pipelining publishes a fast dense quantum while a slower asset quantum is still in flight" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    const c = struct {
+        extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+        extern fn unsetenv(name: [*:0]const u8) c_int;
+    };
+    const window_env = "ANTFLY_ENRICHMENT_PREPARATION_WINDOW_ITEMS";
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(window_env, "1", 1));
+    defer _ = c.unsetenv(window_env);
+
+    var slow_asset = SlowGatedAssetProducer{};
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .asset_producer = slow_asset.interface(),
+            .dense_embedder = deterministic.interface(),
+            .inline_retry_max_attempts = 1,
+        },
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    // Safety net, evaluated (LIFO) before the `db.close()` defer above: if
+    // any assertion below fails before the explicit `slow_asset.allow()`
+    // call, this still releases the parked producer so `db.close()`'s
+    // shutdown drain cannot hang the whole test binary waiting on a gate
+    // nothing will ever open. Calling `allow()` twice is harmless (it is a
+    // one-way latch).
+    defer slow_asset.allow();
+
+    try db.addEnrichment(.{
+        .name = "summary_v1",
+        .kind = .asset,
+        .field = "body",
+        .content_type = "text/plain",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}",
+    });
+    try db.addIndex(.{
+        .name = "title_dense",
+        .kind = .dense_vector,
+        .config_json =
+        \\{"field":"embedding","dims":3,"publication_policy":"progressive","generator":{"kind":"dense_embedding","source_field":"title","embedding_name":"title_dense"}}
+        ,
+    });
+
+    // doc:a has only "body" (queues asset-lane work -- quantum 1); doc:b has
+    // only "title" (queues dense-lane work -- quantum 2, scanned strictly
+    // after quantum 1). The preparation window is forced to 1 item, so these
+    // become two separate preparation quanta instead of one shared quantum
+    // (within-quantum concurrency already worked before this change; the
+    // bug this test targets is specifically about a *later* quantum's
+    // dispatch waiting on an *earlier* quantum's still-running lane).
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"alpha summary source\"}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"independent title\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    // Poll until the asset lane's producer call has started but not yet
+    // returned. The historical bug dispatched quantum 1's asset lane
+    // synchronously-to-the-caller: the scan (and therefore quantum 2's
+    // dispatch) could not proceed until this call returned.
+    var attempts: usize = 0;
+    var caught_overlap = false;
+    while (attempts < default_test_wait_attempts) : (attempts += 1) {
+        if (slow_asset.started.load(.acquire) and !slow_asset.finished.load(.acquire)) {
+            caught_overlap = true;
+            break;
+        }
+        sleepPollInterval();
+    }
+    try std.testing.expect(caught_overlap);
+    try std.testing.expect(!slow_asset.finished.load(.acquire));
+
+    // The dense lane's quantum -- scanned strictly after the still-in-flight
+    // asset quantum -- must already have been dispatched, run, published,
+    // and checkpointed its own replay cursor scope, independent of the
+    // sibling asset lane's own quantum still being in flight; see
+    // "Two-Stream Execution Model" in ENRICHMENTS.md.
+    var dense_cursor_seen = false;
+    attempts = 0;
+    while (attempts < default_test_wait_attempts) : (attempts += 1) {
+        if (try enrichment_state.loadReplayCursor(alloc, db.enrichment_runtime.?.store, "generated.dense")) |cursor| {
+            var owned = cursor;
+            owned.deinit(alloc);
+            dense_cursor_seen = true;
+            break;
+        }
+        if (slow_asset.finished.load(.acquire)) break;
+        sleepPollInterval();
+    }
+    try std.testing.expect(dense_cursor_seen);
+    // The overlap was real, not a lucky race after the asset call already
+    // returned: it was still parked when the dense cursor appeared.
+    try std.testing.expect(!slow_asset.finished.load(.acquire));
+
+    slow_asset.allow();
+    try db.runUntilIdle();
+
+    // Both lanes' work is durable and correct once the whole pass has
+    // drained -- the dense cursor observed above while asset was still
+    // parked was real published progress, not a stale/partial artifact.
+    var result = try db.search(alloc, .{
+        .index_name = "title_dense",
+        .dense = .{ .vector = &.{ 1.0, 0.0, 0.0 }, .k = 1 },
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+
+    const artifact_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "summary_v1");
+    defer alloc.free(artifact_key);
+    const artifact_value = try db.core.store.get(alloc, artifact_key);
+    defer alloc.free(artifact_value);
+    try std.testing.expectEqualStrings("asset:alpha summary source", artifact_value);
+    try std.testing.expectEqual(@as(usize, 1), slow_asset.calls.load(.acquire));
+}
+
+test "synchronous window checkpoints never advance the asset cursor past queued or in-flight extractor work" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    const c = struct {
+        extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+        extern fn unsetenv(name: [*:0]const u8) c_int;
+    };
+    // A preparation quantum wide enough to hold every document's extractor
+    // request (so the asset lane is dispatched only once, at the end of the
+    // scan, with the earlier documents' requests queued behind the scan the
+    // whole time) and a one-item synchronous replay window (so each
+    // document's copy asset takes the scanner's mid-scan flush-and-checkpoint
+    // path while those extractor requests are still queued).
+    const preparation_env = "ANTFLY_ENRICHMENT_PREPARATION_WINDOW_ITEMS";
+    const window_env = "ANTFLY_ENRICHMENT_WINDOW_ITEMS";
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(preparation_env, "8", 1));
+    defer _ = c.unsetenv(preparation_env);
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(window_env, "1", 1));
+    defer _ = c.unsetenv(window_env);
+
+    var slow_asset = SlowGatedAssetProducer{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .asset_producer = slow_asset.interface(),
+            .inline_retry_max_attempts = 1,
+        },
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    defer slow_asset.allow();
+
+    try db.addEnrichment(.{
+        .name = "summary_v1",
+        .kind = .asset,
+        .field = "body",
+        .content_type = "text/plain",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}",
+    });
+    // A copy asset is synchronous scanner work planned after the extractor:
+    // it publishes through the shared window, never through an execution
+    // lane, so it is what fills the window at the end of each group.
+    try db.addEnrichment(.{
+        .name = "title_copy_v1",
+        .kind = .asset,
+        .field = "title",
+        .content_type = "text/plain",
+        .producer_json = "{\"type\":\"copy\"}",
+    });
+
+    // Every document queues an extractor request (deferred to the lane) and
+    // a copy request (published synchronously by the scanner).
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"first title\",\"body\":\"alpha summary source\"}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"second title\",\"body\":\"beta summary source\"}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"third title\",\"body\":\"gamma summary source\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    // The scan reaches the end and dispatches the asset lane, which parks in
+    // the producer on its first call.
+    var attempts: usize = 0;
+    var parked = false;
+    while (attempts < slow_test_wait_attempts) : (attempts += 1) {
+        if (slow_asset.started.load(.acquire) and !slow_asset.finished.load(.acquire)) {
+            parked = true;
+            break;
+        }
+        sleepPollInterval();
+    }
+    try std.testing.expect(parked);
+
+    // The copy work was published and checkpointed mid-scan: the dense
+    // stream had nothing outstanding, so its cursor advanced...
+    for ([_][]const u8{ "doc:a", "doc:b", "doc:c" }) |doc_key| {
+        const copy_key = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "asset", "title_copy_v1");
+        defer alloc.free(copy_key);
+        const copied = try db.core.store.get(alloc, copy_key);
+        alloc.free(copied);
+    }
+    const dense_cursor = try enrichment_state.loadReplayCursor(alloc, db.enrichment_runtime.?.store, "generated.dense");
+    try std.testing.expect(dense_cursor != null);
+    var owned_dense_cursor = dense_cursor.?;
+    owned_dense_cursor.deinit(alloc);
+    try std.testing.expect(!slow_asset.finished.load(.acquire));
+    // ...but the asset stream's cursor must not exist yet: at each of those
+    // checkpoints the documents' asset requests were still queued for the
+    // lane, and now the lane's quantum is in flight. A cursor at doc:c would
+    // tell a restart that all three extractions are durable, and the
+    // historical mid-scan checkpoint wrote exactly that for both streams.
+    if (try enrichment_state.loadReplayCursor(alloc, db.enrichment_runtime.?.store, "generated.assets")) |cursor| {
+        var owned = cursor;
+        defer owned.deinit(alloc);
+        std.debug.print("unexpected asset cursor while extraction is outstanding: sequence={d} doc_key={s}\n", .{ owned.sequence, owned.doc_key });
+        return error.TestUnexpectedResult;
+    }
+
+    slow_asset.allow();
+    try db.runUntilIdle();
+
+    // The completed pass advanced the applied sequence and retired both
+    // stream cursors; every extraction is durable.
+    try std.testing.expect((try enrichment_state.loadReplayCursor(alloc, db.enrichment_runtime.?.store, "generated.assets")) == null);
+    try std.testing.expect((try enrichment_state.loadReplayCursor(alloc, db.enrichment_runtime.?.store, "generated.dense")) == null);
+    for ([_][]const u8{ "doc:a", "doc:b", "doc:c" }) |doc_key| {
+        const artifact_key = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "asset", "summary_v1");
+        defer alloc.free(artifact_key);
+        const artifact_value = try db.core.store.get(alloc, artifact_key);
+        defer alloc.free(artifact_value);
+        try std.testing.expect(std.mem.startsWith(u8, artifact_value, "asset:"));
+    }
+}
+
+test "cross-quantum dispatch clones queued requests so later caller reuse cannot corrupt an in-flight asset quantum" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    const c = struct {
+        extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+        extern fn unsetenv(name: [*:0]const u8) c_int;
+    };
+    const window_env = "ANTFLY_ENRICHMENT_PREPARATION_WINDOW_ITEMS";
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(window_env, "1", 1));
+    defer _ = c.unsetenv(window_env);
+
+    var slow_asset = SlowGatedAssetProducer{};
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    // Manual/hosted maintenance mode (Lite's synchronous `catchUpUntilGuarded`
+    // drive, e.g. `runUntilIdle` called from the app thread), not the
+    // background worker -- this test exercises that path specifically.
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_optional_runtime_workers = false,
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .asset_producer = slow_asset.interface(),
+            .dense_embedder = deterministic.interface(),
+            .inline_retry_max_attempts = 1,
+        },
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    // Safety net, evaluated (LIFO) before the `db.close()` defer above: if
+    // any assertion below fails before the unblocker thread (or its
+    // explicit `allow()`) runs, this still releases the parked producer so
+    // `db.close()`'s shutdown drain cannot hang the whole test binary
+    // waiting on a gate nothing will ever open. Calling `allow()` twice is
+    // harmless (it is a one-way latch).
+    defer slow_asset.allow();
+
+    try db.addEnrichment(.{
+        .name = "summary_v1",
+        .kind = .asset,
+        .field = "body",
+        .content_type = "text/plain",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}",
+    });
+    try db.addIndex(.{
+        .name = "title_dense",
+        .kind = .dense_vector,
+        .config_json =
+        \\{"field":"embedding","dims":3,"publication_policy":"progressive","generator":{"kind":"dense_embedding","source_field":"title","embedding_name":"title_dense"}}
+        ,
+    });
+
+    // doc:a queues the (parked) asset quantum first. The 24 dense-only
+    // documents that follow each become their own preparation quantum
+    // (window = 1 item): every one of those quanta clones its own request,
+    // dispatches, publishes, and repeatedly reallocates/frees
+    // request_plan_cache and the deferred-request lists while doc:a's asset
+    // quantum is still parked inside its producer call. If the asset lane's
+    // request were still borrowing its doc_key/source_field strings from
+    // request_plan_cache -- the confirmed root cause of the reverted first
+    // pipelining attempt -- this churn would read freed/reused memory by
+    // the time the producer call actually reads them, corrupting or
+    // crashing instead of producing "doc:a"'s own artifact. Running under
+    // `std.testing.allocator` also catches any use-after-free directly.
+    const dense_doc_count = 24;
+    var writes: [1 + dense_doc_count]types.BatchWrite = undefined;
+    writes[0] = .{ .key = "doc:a", .value = "{\"body\":\"alpha summary source\"}" };
+    var dense_keys: [dense_doc_count][]u8 = undefined;
+    var dense_values: [dense_doc_count][]u8 = undefined;
+    for (0..dense_doc_count) |i| {
+        dense_keys[i] = try std.fmt.allocPrint(alloc, "doc:b{d}", .{i});
+        dense_values[i] = try std.fmt.allocPrint(alloc, "{{\"title\":\"independent title {d}\"}}", .{i});
+        writes[1 + i] = .{ .key = dense_keys[i], .value = dense_values[i] };
+    }
+    defer for (0..dense_doc_count) |i| {
+        alloc.free(dense_keys[i]);
+        alloc.free(dense_values[i]);
+    };
+
+    try db.batch(.{ .writes = &writes, .sync_level = .write });
+
+    const sequence = db.core.nextEnrichmentSequence();
+
+    const Unblocker = struct {
+        fn run(producer: *SlowGatedAssetProducer) void {
+            // Give the manual drive time to dispatch doc:a's asset quantum
+            // and churn through every dense-only quantum before releasing
+            // the parked producer call.
+            sleepNs(80 * std.time.ns_per_ms);
+            producer.allow();
+        }
+    };
+    const unblock_thread = try std.Thread.spawn(.{}, Unblocker.run, .{&slow_asset});
+    defer unblock_thread.join();
+
+    try db.runEnrichmentUntil(sequence);
+
+    try std.testing.expectEqual(@as(usize, 1), slow_asset.calls.load(.acquire));
+    try std.testing.expect(slow_asset.finished.load(.acquire));
+
+    const artifact_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "summary_v1");
+    defer alloc.free(artifact_key);
+    const artifact_value = try db.core.store.get(alloc, artifact_key);
+    defer alloc.free(artifact_value);
+    try std.testing.expectEqualStrings("asset:alpha summary source", artifact_value);
+
+    // Durable coverage accounting (not approximate vector-search recall) is
+    // the exact signal that every one of the 24 independently dispatched
+    // dense quanta produced and published its own embedding correctly
+    // despite the concurrent request_plan_cache/chunk_cache churn.
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    for (stats.indexes) |index_stats| {
+        if (!std.mem.eql(u8, index_stats.name, "title_dense")) continue;
+        try std.testing.expectEqual(@as(u64, dense_doc_count), index_stats.coverage_produced_count);
+        try std.testing.expectEqual(@as(u64, 0), index_stats.coverage_terminal_failed_count);
+    }
 }
 
 test "db managed dense enrichment retries temporary model capacity without terminal coverage" {

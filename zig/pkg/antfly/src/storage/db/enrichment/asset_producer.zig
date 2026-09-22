@@ -315,7 +315,13 @@ pub const Producer = struct {
             );
             const bounded_alloc = bounded.allocator();
             const output = self.invokeProduce(bounded_alloc, request) catch |err| {
-                if (bounded.limit_exceeded) return error.InferenceInvocationMemoryExceeded;
+                if (bounded.limit_exceeded) {
+                    std.log.warn(
+                        "asset producer invocation exceeded its memory plan: limit_bytes={d} peak_live_bytes={d} source_bytes={d} producer={s}",
+                        .{ bounded.max_live_bytes, bounded.peak_live_bytes, request.source_text.len, @tagName(request.producer_type) },
+                    );
+                    return error.InferenceInvocationMemoryExceeded;
+                }
                 return err;
             };
             if (output.len > resolved.max_result_bytes_per_item or output.len > resolved.max_result_bytes) {
@@ -642,7 +648,25 @@ fn requestsRequireInvocationContract(requests: []const Request) bool {
     return false;
 }
 
+/// Planning a request (resolveInvocationMemoryForRequests) parses the
+/// producer configuration into a generic JSON value tree and routes it. Those
+/// allocations -- object maps, arena chunks, duplicated strings -- have a fixed
+/// cost that does not shrink with the source text, so a budget derived only
+/// from the request's own bytes starves the smallest requests: a 150-byte
+/// markdown section with the ordinary GLiNER extractor config (schema with a
+/// dozen entity and relation types, long-document options) resolved to a
+/// budget of about 10 KB and failed with InferenceInvocationMemoryExceeded,
+/// which is a terminal disposition, while every larger section passed. This
+/// floor is a planning-only budget (the invocation itself is bounded by the
+/// resolved plan), so it is set generously above what configuration parsing
+/// can need.
+const invocation_resolution_floor_bytes: usize = 1 << 20;
+
 fn invocationResolutionLimit(requests: []const Request) !usize {
+    return @max(invocation_resolution_floor_bytes, try invocationResolutionScaledLimit(requests));
+}
+
+fn invocationResolutionScaledLimit(requests: []const Request) !usize {
     var source_bytes: usize = 0;
     for (requests) |request| {
         source_bytes = std.math.add(usize, source_bytes, request.config_json.len) catch
@@ -661,6 +685,30 @@ fn invocationResolutionLimit(requests: []const Request) !usize {
         return error.InferenceEncodedBytesExceeded;
     return std.math.add(usize, parsed, control) catch
         error.InferenceEncodedBytesExceeded;
+}
+
+test "invocation resolution budget never falls below the fixed planning floor" {
+    // Regression for the dogfood ingest: tiny sections with an ordinary
+    // extractor config were rejected during planning, before any provider
+    // ran, because the scaled budget was smaller than config parsing itself.
+    const tiny = Request{
+        .producer_type = .extractor,
+        .config_json = "{\"provider\":\"antfly\",\"model\":\"gliner-boundary\",\"schema\":{\"entities\":[\"person\"]}}",
+        .source_text = "This document tracks reader and OCR parity.",
+        .content_type = "application/json",
+    };
+    const scaled = try invocationResolutionScaledLimit(&.{tiny});
+    try std.testing.expect(scaled < invocation_resolution_floor_bytes);
+    try std.testing.expectEqual(invocation_resolution_floor_bytes, try invocationResolutionLimit(&.{tiny}));
+
+    // A large request still scales past the floor.
+    const large_source = try std.testing.allocator.alloc(u8, 2 << 20);
+    defer std.testing.allocator.free(large_source);
+    @memset(large_source, 'a');
+    var large = tiny;
+    large.source_text = large_source;
+    try std.testing.expect(try invocationResolutionLimit(&.{large}) > invocation_resolution_floor_bytes);
+    try std.testing.expectEqual(try invocationResolutionScaledLimit(&.{large}), try invocationResolutionLimit(&.{large}));
 }
 
 fn invocationAllocatorLimit(
@@ -946,7 +994,9 @@ test "asset producer bounds invocation contract resolution allocations" {
         }
 
         fn memory(_: *anyopaque, alloc: Allocator, _: []const Request) !inference_work.InvocationMemoryPlan {
-            _ = try alloc.alloc(u8, 8192);
+            // Resolution is bounded by the fixed planning floor for a tiny
+            // request, so an allocation just past it must be refused.
+            _ = try alloc.alloc(u8, invocation_resolution_floor_bytes + 1);
             return .{
                 .attachment_transport = .borrowed_binary,
                 .fixed_bytes = 1,

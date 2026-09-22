@@ -731,3 +731,347 @@ test "boundary qualification canonical feature matrix covers every task and opti
         try std.testing.expect(covered.contains(@enumFromInt(field.value)));
     }
 }
+
+// Evidence-gathering, not a synthetic contract check: this measures the exact
+// geometry the pinned base checkpoint's own tokenizer produces for the
+// shortest and longest known qualification requests, using the real
+// preparation path. The production row in ../models/gliner_boundary_qualification.zig
+// is reviewed against these printed numbers; a future narrowing of that row
+// below an observed value here is a release regression, not just a test edit.
+test "gliner boundary qualification measures pinned base checkpoint production geometry" {
+    const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_BASE_MODEL_DIR") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const c_file = @import("../util/c_file.zig");
+    const path = try std.fs.path.join(a, &.{ directory, "tokenizer.json" });
+    defer a.free(path);
+    const tokenizer_bytes = try c_file.readFile(a, path);
+    defer a.free(tokenizer_bytes);
+    const tok = try @import("inference_hf_tokenizer").HfTokenizer.loadFromBytes(a, tokenizer_bytes);
+    defer tok.tokenizer().deinitTokenizer();
+
+    const Case = struct { name: []const u8, text: []const u8, body: []const u8 };
+    const cases = [_]Case{
+        .{
+            .name = "shortest canonical fixture (enum_field/constrained_classification length)",
+            .text = "Delete the temporary file.",
+            .body =
+            \\{"schema_version":2,"model":"boundary","schema":{"entities":["object"]},"inputs":[{"content":"Delete the temporary file."}]}
+            ,
+        },
+        .{
+            .name = "repro request (entities + relations + confidence + spans)",
+            .text = "The metadata server coordinates Raft groups. VOPR exercises the DataServer under fault injection.",
+            .body =
+            \\{"schema_version":2,"model":"boundary","schema":{"entities":["component","subsystem","test"],"relations":[{"type":"depends_on"},{"type":"tested_by"}]},"options":{"include_confidence":true,"include_spans":true},"inputs":[{"content":"The metadata server coordinates Raft groups. VOPR exercises the DataServer under fault injection."}]}
+            ,
+        },
+        .{
+            .name = "examples/dogfood real production schema (11 entities, 6 relations) on the repro text",
+            .text = "The metadata server coordinates Raft groups. VOPR exercises the DataServer under fault injection.",
+            .body =
+            \\{"schema_version":2,"model":"boundary","schema":{"entities":["component","subsystem","file","test","invariant","decision","person","model","backend","format","protocol"],"relations":[{"type":"depends_on"},{"type":"owns"},{"type":"implements"},{"type":"supersedes"},{"type":"tested_by"},{"type":"documented_in"}]},"options":{"include_confidence":true,"include_spans":true},"inputs":[{"content":"The metadata server coordinates Raft groups. VOPR exercises the DataServer under fault injection."}]}
+            ,
+        },
+        .{
+            // examples/dogfood's smallest real section: zig/SCHEMA.md's
+            // "Related Docs" list, which docsaf reduces to the link targets
+            // with no whitespace between them -- one 20-byte "word". The
+            // ingest embeds and full-text indexes it, so extraction must
+            // admit it too rather than fail the whole drain.
+            .name = "examples/dogfood real production schema on the smallest real corpus section (SCHEMA.md Related Docs, 20 bytes/1 word)",
+            .text = "TODO.mdSERVERLESS.md",
+            .body =
+            \\{"schema_version":2,"model":"boundary","schema":{"entities":["component","subsystem","file","test","invariant","decision","person","model","backend","format","protocol"],"relations":[{"type":"depends_on"},{"type":"owns"},{"type":"implements"},{"type":"supersedes"},{"type":"tested_by"},{"type":"documented_in"}]},"options":{"include_confidence":true,"include_spans":true,"long_document":{"mode":"window"}},"inputs":[{"content":"TODO.mdSERVERLESS.md"}]}
+            ,
+        },
+        .{
+            .name = "examples/dogfood real production schema on a one-character document",
+            .text = "a",
+            .body =
+            \\{"schema_version":2,"model":"boundary","schema":{"entities":["component","subsystem","file","test","invariant","decision","person","model","backend","format","protocol"],"relations":[{"type":"depends_on"},{"type":"owns"},{"type":"implements"},{"type":"supersedes"},{"type":"tested_by"},{"type":"documented_in"}]},"options":{"include_confidence":true,"include_spans":true,"long_document":{"mode":"window"}},"inputs":[{"content":"a"}]}
+            ,
+        },
+        .{
+            .name = "examples/dogfood real production schema on a realistic corpus paragraph (ENRICHMENTS.md, 734 bytes/107 words)",
+            .text = "Both lanes are handed the same document group's classified work and, when both have real work for the quantum, are scheduled with `Io.concurrent` so their provider round trips overlap; the calling task runs the dense lane inline while awaiting the concurrently spawned asset lane. If the `Io` backend does not support concurrency (for example a deterministic single-flow VOPR/simulation harness), both lanes still run, just sequentially, with identical outcomes -- concurrency is a scheduling optimization, not a correctness requirement. In-flight work is bounded to exactly one preparation quantum per stream.",
+            .body =
+            \\{"schema_version":2,"model":"boundary","schema":{"entities":["component","subsystem","file","test","invariant","decision","person","model","backend","format","protocol"],"relations":[{"type":"depends_on"},{"type":"owns"},{"type":"implements"},{"type":"supersedes"},{"type":"tested_by"},{"type":"documented_in"}]},"options":{"include_confidence":true,"include_spans":true},"inputs":[{"content":"Both lanes are handed the same document group's classified work and, when both have real work for the quantum, are scheduled with `Io.concurrent` so their provider round trips overlap; the calling task runs the dense lane inline while awaiting the concurrently spawned asset lane. If the `Io` backend does not support concurrency (for example a deterministic single-flow VOPR/simulation harness), both lanes still run, just sequentially, with identical outcomes -- concurrency is a scheduling optimization, not a correctness requirement. In-flight work is bounded to exactly one preparation quantum per stream."}]}
+            ,
+        },
+    };
+    var min = policy.LengthContract{
+        .request_items = policy.Range.exact(1),
+        .document_bytes = .{ .min = std.math.maxInt(u64), .max = std.math.maxInt(u64) },
+        .document_words = .{ .min = std.math.maxInt(u64), .max = std.math.maxInt(u64) },
+        .window_count = policy.Range.exact(1),
+        .window_words = .{ .min = std.math.maxInt(u64), .max = std.math.maxInt(u64) },
+        .padded_sequence_tokens = .{ .min = std.math.maxInt(u64), .max = std.math.maxInt(u64) },
+    };
+    var max = policy.LengthContract{
+        .request_items = policy.Range.exact(1),
+        .document_bytes = .{ .min = 0, .max = 0 },
+        .document_words = .{ .min = 0, .max = 0 },
+        .window_count = policy.Range.exact(1),
+        .window_words = .{ .min = 0, .max = 0 },
+        .padded_sequence_tokens = .{ .min = 0, .max = 0 },
+    };
+    for (cases) |case| {
+        var request = try wire.parseJson(a, case.body, .{});
+        defer request.deinit();
+        const words = try sourceWords(a, case.text, .{});
+        var prepared = try processor.prepare(a, tok.tokenizer(), &.{.{ .text = case.text, .schema = &request.items[0].compiled }}, .{});
+        defer prepared.deinit();
+        const observed = try lengths(1, case.text.len, words, 1, &prepared);
+        std.debug.print(
+            "gliner boundary base geometry [{s}]: document_bytes={} document_words={} window_words={} padded_sequence_tokens={}\n",
+            .{ case.name, observed.document_bytes.min, observed.document_words.min, observed.window_words.min, observed.padded_sequence_tokens.min },
+        );
+        min.document_bytes.min = @min(min.document_bytes.min, observed.document_bytes.min);
+        min.document_words.min = @min(min.document_words.min, observed.document_words.min);
+        min.window_words.min = @min(min.window_words.min, observed.window_words.min);
+        min.padded_sequence_tokens.min = @min(min.padded_sequence_tokens.min, observed.padded_sequence_tokens.min);
+        max.document_bytes.max = @max(max.document_bytes.max, observed.document_bytes.max);
+        max.document_words.max = @max(max.document_words.max, observed.document_words.max);
+        max.window_words.max = @max(max.window_words.max, observed.window_words.max);
+        max.padded_sequence_tokens.max = @max(max.padded_sequence_tokens.max, observed.padded_sequence_tokens.max);
+    }
+
+    // The ten canonical single-window task fixtures for the pinned base
+    // checkpoint (entities, relations, classification, records, JointIE,
+    // Unicode) are exercised end to end and cross-checked against the Python
+    // reference by the native and Metal parity tests above. Sweep their exact
+    // documents through the same real tokenizer to bound the schema-inflated
+    // encoded sequence length actually produced for this feature set.
+    const fixtures = @import("../architectures/gliner/boundary_parity_test.zig");
+    const fixture_bytes = try fixtures.fixtureBytes(a, "pipeline_cases_base.json");
+    defer a.free(fixture_bytes);
+    const parsed = try std.json.parseFromSlice(pipeline.ReferenceFixture, a, fixture_bytes, .{});
+    defer parsed.deinit();
+    const Input = struct { content: []const u8 };
+    const Envelope = struct { schema_version: u32 = 2, model: []const u8 = "boundary", schema: std.json.Value, inputs: []const Input };
+    for (parsed.value.cases) |case| {
+        const body = try std.json.Stringify.valueAlloc(a, Envelope{ .schema = case.schema, .inputs = &.{.{ .content = case.text }} }, .{});
+        defer a.free(body);
+        var request = try wire.parseJson(a, body, .{});
+        defer request.deinit();
+        const words = try sourceWords(a, case.text, .{});
+        var prepared = try processor.prepare(a, tok.tokenizer(), &.{.{ .text = case.text, .schema = &request.items[0].compiled }}, .{});
+        defer prepared.deinit();
+        const observed = try lengths(1, case.text.len, words, 1, &prepared);
+        std.debug.print(
+            "gliner boundary base geometry [fixture {s}]: document_bytes={} document_words={} window_words={} padded_sequence_tokens={}\n",
+            .{ case.id, observed.document_bytes.min, observed.document_words.min, observed.window_words.min, observed.padded_sequence_tokens.min },
+        );
+        min.document_bytes.min = @min(min.document_bytes.min, observed.document_bytes.min);
+        min.document_words.min = @min(min.document_words.min, observed.document_words.min);
+        min.window_words.min = @min(min.window_words.min, observed.window_words.min);
+        min.padded_sequence_tokens.min = @min(min.padded_sequence_tokens.min, observed.padded_sequence_tokens.min);
+        max.document_bytes.max = @max(max.document_bytes.max, observed.document_bytes.max);
+        max.document_words.max = @max(max.document_words.max, observed.document_words.max);
+        max.window_words.max = @max(max.window_words.max, observed.window_words.max);
+        max.padded_sequence_tokens.max = @max(max.padded_sequence_tokens.max, observed.padded_sequence_tokens.max);
+    }
+    std.debug.print(
+        "gliner boundary base geometry SUMMARY: document_bytes=[{},{}] document_words=[{},{}] window_words=[{},{}] padded_sequence_tokens=[{},{}]\n",
+        .{
+            min.document_bytes.min,         max.document_bytes.max,
+            min.document_words.min,         max.document_words.max,
+            min.window_words.min,           max.window_words.max,
+            min.padded_sequence_tokens.min, max.padded_sequence_tokens.max,
+        },
+    );
+}
+
+/// Slices out the section beginning at the first occurrence of `heading`
+/// (a full Markdown heading line, e.g. "### Some Title") and running up to
+/// (but excluding) the next line that starts a new Markdown heading, or to
+/// the end of the file. Mirrors the section boundaries examples/dogfood's
+/// docsaf.MarkdownProcessor produces (a new section at every heading line),
+/// so the measured document is the same shape a real ingest would extract.
+fn extractHeadingSection(full: []const u8, heading: []const u8) ![]const u8 {
+    const start = std.mem.indexOf(u8, full, heading) orelse return error.MissingFixtureSection;
+    var end = full.len;
+    var cursor = start + heading.len;
+    while (cursor + 1 < full.len) : (cursor += 1) {
+        if (full[cursor] == '\n' and full[cursor + 1] == '#') {
+            end = cursor;
+            break;
+        }
+    }
+    return full[start..end];
+}
+
+const LongDocumentCase = struct { name: []const u8, path: ?[]const u8 = null, heading: []const u8 = "", text: ?[]const u8 = null };
+
+// Paths are relative to the inference-test binary's working directory
+// (zig/pkg/inference, per zig/TESTING.md's build steps). examples/dogfood
+// requests long_document.mode=window unconditionally for every section (see
+// index_config.go's knowledgeGraphIndexJSON), so the qualified row must also
+// cover the small end of the real corpus, not just the sections that
+// actually require more than one window.
+const long_document_geometry_cases = [_]LongDocumentCase{
+    // The two smallest documents the row must admit: examples/dogfood's
+    // smallest real section (zig/SCHEMA.md's "Related Docs" list, which
+    // docsaf reduces to the two link targets with no whitespace between
+    // them) and a one-character document. Both are embedded and full-text
+    // indexed by the ingest, so extraction must admit them too.
+    .{ .name = "SCHEMA.md \"Related Docs\" (smallest real corpus section, 20 bytes), windowed", .text = "TODO.mdSERVERLESS.md" },
+    .{ .name = "one-character document, windowed", .text = "a" },
+    .{ .name = "shortest canonical fixture, windowed", .text = "Delete the temporary file." },
+    .{ .name = "ENRICHMENTS.md realistic short paragraph, windowed (734 bytes/107 words)", .text = "Both lanes are handed the same document group's classified work and, when both have real work for the quantum, are scheduled with `Io.concurrent` so their provider round trips overlap; the calling task runs the dense lane inline while awaiting the concurrently spawned asset lane. If the `Io` backend does not support concurrency (for example a deterministic single-flow VOPR/simulation harness), both lanes still run, just sequentially, with identical outcomes -- concurrency is a scheduling optimization, not a correctness requirement. In-flight work is bounded to exactly one preparation quantum per stream." },
+    .{ .name = "LSM.md \"Read And Scan Work\" (~p95 real section size, 6.8KB)", .path = "../antfly/src/storage/lsm/LSM.md", .heading = "### Read And Scan Work" },
+    .{ .name = "VOPR.md \"Completion-Claim Audit\" (37KB real section)", .path = "../../VOPR.md", .heading = "### Completion-Claim Audit" },
+    .{ .name = "PDF.md \"Review findings and required fixes\" (max real section across zig/*.md and work-log/**/*.md, 99KB)", .path = "../../PDF.md", .heading = "## Review findings and required fixes" },
+    // Synthetic documents built by concatenating zig/PDF.md's two largest
+    // real sections (verbatim, per a docsaf-accurate Go-side sweep of the
+    // whole ingest corpus that also confirmed no single real section
+    // currently exceeds ~94KB), fixtured under testdata/gliner25/. A
+    // production incident (see GLINER25.md's long-document section) traced 9
+    // dogfood extraction failures to batched multi-item requests, not
+    // document size -- but qualifying past the corpus's current real
+    // single-section maximum, with real measured margin instead of
+    // extrapolation, is still the right defensive posture for corpus growth.
+    .{ .name = "synthetic 130KB (PDF.md sections concatenated)", .path = "testdata/gliner25/long_document_probe/combo130.txt" },
+    .{ .name = "synthetic 182KB/28275-word (PDF.md sections concatenated)", .path = "testdata/gliner25/long_document_probe/combo182.txt" },
+};
+
+/// Measures exact window geometry for one (window_words, overlap_words) pair
+/// across `long_document_geometry_cases`, printing a per-case line and a
+/// SUMMARY line, and returns the overall observed LengthContract. Pure
+/// tokenizer/planner measurement: no model weights are loaded.
+fn measureLongDocumentGeometry(
+    a: std.mem.Allocator,
+    tok: anytype,
+    config: *const model.Config,
+    parsed_schema: std.json.Value,
+    window_words: u64,
+    overlap_words: u64,
+    label: []const u8,
+) !policy.LengthContract {
+    const c_file = @import("../util/c_file.zig");
+    var overall = policy.LengthContract{
+        .request_items = policy.Range.exact(1),
+        .document_bytes = .{ .min = std.math.maxInt(u64), .max = 0 },
+        .document_words = .{ .min = std.math.maxInt(u64), .max = 0 },
+        .window_count = .{ .min = std.math.maxInt(u64), .max = 0 },
+        .window_words = .{ .min = std.math.maxInt(u64), .max = 0 },
+        .padded_sequence_tokens = .{ .min = std.math.maxInt(u64), .max = 0 },
+    };
+    for (long_document_geometry_cases) |case| {
+        var owned_full: ?[]const u8 = null;
+        defer if (owned_full) |full| a.free(full);
+        const section_text = if (case.text) |literal| literal else blk: {
+            const path = case.path.?;
+            const full = c_file.readFile(a, path) catch |err| {
+                std.debug.print("gliner boundary long-document geometry: skipping unavailable fixture {s} ({s}): {s}\n", .{ case.name, path, @errorName(err) });
+                continue;
+            };
+            owned_full = full;
+            break :blk if (case.heading.len == 0) full else try extractHeadingSection(full, case.heading);
+        };
+        const body = try std.json.Stringify.valueAlloc(a, .{
+            .schema_version = @as(u32, 2),
+            .model = "boundary",
+            .schema = parsed_schema,
+            .options = .{ .include_confidence = true, .include_spans = true, .long_document = .{ .mode = "window", .window_words = window_words, .overlap_words = overlap_words } },
+            .inputs = &.{.{ .content = section_text }},
+        }, .{});
+        defer a.free(body);
+        var request = try wire.parseJson(a, body, .{});
+        defer request.deinit();
+        const item = &request.items[0];
+
+        const planning = try longPlanning(config, item, .{}, null);
+        var doc = try document.plan(a, item.text, item.compiled.fingerprint, planning);
+        defer doc.deinit();
+        // Whole-document word counting is unrelated to the per-window body
+        // cap (processor.Options.max_text_words defaults to 4096): raise it
+        // here so counting the full document does not itself hit that limit.
+        const words = try sourceWords(a, item.text, .{ .max_text_words = 1 << 20, .max_text_bytes = 4 * 1024 * 1024 });
+
+        var min_window_words: u64 = std.math.maxInt(u64);
+        var max_window_words: u64 = 0;
+        var min_padded: u64 = std.math.maxInt(u64);
+        var max_padded: u64 = 0;
+        for (doc.windows) |window| {
+            const window_text = try doc.windowText(window.index);
+            const window_options = windowProcessor(item, .{}, planning, 16384, null);
+            var prepared = try processor.prepare(a, tok.tokenizer(), &.{.{ .text = window_text, .schema = &item.compiled }}, window_options);
+            defer prepared.deinit();
+            const observed = try lengths(1, item.text.len, words, doc.windows.len, &prepared);
+            min_window_words = @min(min_window_words, observed.window_words.min);
+            max_window_words = @max(max_window_words, observed.window_words.max);
+            min_padded = @min(min_padded, observed.padded_sequence_tokens.min);
+            max_padded = @max(max_padded, observed.padded_sequence_tokens.max);
+        }
+        std.debug.print(
+            "gliner boundary base LONG-DOCUMENT geometry [{s}, window_words={}] [{s}]: document_bytes={} document_words={} window_count={} window_words=[{},{}] padded_sequence_tokens=[{},{}]\n",
+            .{ label, window_words, case.name, item.text.len, words, doc.windows.len, min_window_words, max_window_words, min_padded, max_padded },
+        );
+        overall.document_bytes.min = @min(overall.document_bytes.min, item.text.len);
+        overall.document_bytes.max = @max(overall.document_bytes.max, item.text.len);
+        overall.document_words.min = @min(overall.document_words.min, words);
+        overall.document_words.max = @max(overall.document_words.max, words);
+        overall.window_count.min = @min(overall.window_count.min, doc.windows.len);
+        overall.window_count.max = @max(overall.window_count.max, doc.windows.len);
+        overall.window_words.min = @min(overall.window_words.min, min_window_words);
+        overall.window_words.max = @max(overall.window_words.max, max_window_words);
+        overall.padded_sequence_tokens.min = @min(overall.padded_sequence_tokens.min, min_padded);
+        overall.padded_sequence_tokens.max = @max(overall.padded_sequence_tokens.max, max_padded);
+    }
+    std.debug.print(
+        "gliner boundary base LONG-DOCUMENT geometry SUMMARY [{s}, window_words={}]: document_bytes=[{},{}] document_words=[{},{}] window_count=[{},{}] window_words=[{},{}] padded_sequence_tokens=[{},{}]\n",
+        .{
+            label,                              window_words,
+            overall.document_bytes.min,         overall.document_bytes.max,
+            overall.document_words.min,         overall.document_words.max,
+            overall.window_count.min,           overall.window_count.max,
+            overall.window_words.min,           overall.window_words.max,
+            overall.padded_sequence_tokens.min, overall.padded_sequence_tokens.max,
+        },
+    );
+    return overall;
+}
+
+// Evidence for long-document windowing qualification: real repository
+// sections at representative sizes (see GLINER25.md's long-document
+// qualification section for the corpus-wide percentile/max survey that
+// picked these), against the real examples/dogfood production schema (11
+// entities, 6 relations). Sweeps the wire's window_words options actually
+// under consideration for the default (see GLINER25.md's throughput section
+// for why 1024 was chosen over the original 4096 default: attention cost is
+// quadratic in window length, and a live-server throughput sweep on Metal
+// showed 1024-word windows completing real sections several times faster
+// than 4096-word windows, at the cost of more windows per long document).
+test "gliner boundary qualification measures pinned base checkpoint long-document production geometry" {
+    const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_BASE_MODEL_DIR") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const c_file = @import("../util/c_file.zig");
+    const tokenizer_path = try std.fs.path.join(a, &.{ directory, "tokenizer.json" });
+    defer a.free(tokenizer_path);
+    const tokenizer_bytes = try c_file.readFile(a, tokenizer_path);
+    defer a.free(tokenizer_bytes);
+    const tok = try @import("inference_hf_tokenizer").HfTokenizer.loadFromBytes(a, tokenizer_bytes);
+    defer tok.tokenizer().deinitTokenizer();
+
+    const config_path = try std.fs.path.join(a, &.{ directory, "config.json" });
+    defer a.free(config_path);
+    const config_bytes = try c_file.readFile(a, config_path);
+    defer a.free(config_bytes);
+    const encoder_path = try std.fs.path.join(a, &.{ directory, "encoder_config", "config.json" });
+    defer a.free(encoder_path);
+    const encoder_bytes = try c_file.readFile(a, encoder_path);
+    defer a.free(encoder_bytes);
+    const config = try model.parseConfig(a, config_bytes, encoder_bytes);
+
+    const schema_source =
+        \\{"entities":["component","subsystem","file","test","invariant","decision","person","model","backend","format","protocol"],"relations":[{"type":"depends_on"},{"type":"owns"},{"type":"implements"},{"type":"supersedes"},{"type":"tested_by"},{"type":"documented_in"}]}
+    ;
+    var parsed_schema = try std.json.parseFromSlice(std.json.Value, a, schema_source, .{});
+    defer parsed_schema.deinit();
+
+    // Proportional overlap: window_words/32, matching the original 4096/128
+    // ratio (~3.125%).
+    _ = try measureLongDocumentGeometry(a, tok, &config, parsed_schema.value, 1024, 32, "candidate default");
+    _ = try measureLongDocumentGeometry(a, tok, &config, parsed_schema.value, 4096, 128, "prior default, for comparison");
+}

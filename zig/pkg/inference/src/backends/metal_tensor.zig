@@ -38,6 +38,20 @@ pub const StorageMode = enum(c_int) {
 pub const DType = enum(u8) {
     f32 = 0,
     i32 = 1,
+    i64 = 2,
+    i8 = 3,
+    i16 = 4,
+    u8 = 5,
+    bool_ = 6,
+
+    pub fn byteSize(self: DType) usize {
+        return switch (self) {
+            .f32, .i32 => 4,
+            .i64 => 8,
+            .i16 => 2,
+            .i8, .u8, .bool_ => 1,
+        };
+    }
 };
 
 const DeviceBufferRef = struct {
@@ -602,7 +616,7 @@ pub const MetalTensor = struct {
         mode: StorageMode,
         dims: []const i32,
     ) !MetalTensor {
-        return deviceAllocateChecked(allocator, runtime, byte_len, mode, dims, false);
+        return deviceAllocateChecked(allocator, runtime, byte_len, mode, dims, false, .f32);
     }
 
     /// Strict allocation variant: admit and allocate the ownership record
@@ -616,7 +630,17 @@ pub const MetalTensor = struct {
         mode: StorageMode,
         dims: []const i32,
     ) !MetalTensor {
-        return deviceAllocateChecked(allocator, runtime, byte_len, mode, dims, true);
+        return deviceAllocateChecked(allocator, runtime, byte_len, mode, dims, true, .f32);
+    }
+
+    /// Allocate physical storage without converting or narrowing the dtype.
+    pub fn deviceAllocateTyped(allocator: std.mem.Allocator, runtime: *anyopaque, dtype: DType, mode: StorageMode, dims: []const i32) !MetalTensor {
+        var count: usize = 1;
+        for (dims) |extent| {
+            if (extent < 0) return error.InvalidTensorShape;
+            count = try std.math.mul(usize, count, @intCast(extent));
+        }
+        return deviceAllocateChecked(allocator, runtime, try std.math.mul(usize, count, dtype.byteSize()), mode, dims, false, dtype);
     }
 
     fn deviceAllocateChecked(
@@ -626,14 +650,15 @@ pub const MetalTensor = struct {
         mode: StorageMode,
         dims: []const i32,
         fresh: bool,
+        dtype: DType,
     ) !MetalTensor {
-        if (dims.len > max_dims or byte_len == 0) return error.InvalidTensorShape;
+        if (dims.len > max_dims) return error.InvalidTensorShape;
         var elements: usize = 1;
         for (dims) |axis_dim| {
-            if (axis_dim <= 0) return error.InvalidTensorShape;
+            if (axis_dim < 0) return error.InvalidTensorShape;
             elements = std.math.mul(usize, elements, @intCast(axis_dim)) catch return error.InvalidTensorShape;
         }
-        if ((std.math.mul(usize, elements, 4) catch return error.InvalidTensorShape) != byte_len)
+        if ((std.math.mul(usize, elements, dtype.byteSize()) catch return error.InvalidTensorShape) != byte_len)
             return error.InvalidTensorShape;
         const ref = try allocator.create(DeviceBufferRef);
         if (comptime !@import("build_options").enable_metal) {
@@ -641,9 +666,9 @@ pub const MetalTensor = struct {
             return error.MetalUnavailable;
         }
         const handle = (if (fresh)
-            termite_metal_buffer_alloc_fresh(runtime, byte_len, @intFromEnum(mode))
+            termite_metal_buffer_alloc_fresh(runtime, @max(byte_len, 1), @intFromEnum(mode))
         else
-            termite_metal_buffer_alloc(runtime, byte_len, @intFromEnum(mode))) orelse {
+            termite_metal_buffer_alloc(runtime, @max(byte_len, 1), @intFromEnum(mode))) orelse {
             allocator.destroy(ref);
             return error.MetalBufferAllocFailed;
         };
@@ -656,7 +681,7 @@ pub const MetalTensor = struct {
             .release_on_drop = true,
             .allocator = allocator,
         };
-        var result = deviceView(ref, 0, byte_len, dims, .f32);
+        var result = deviceView(ref, 0, byte_len, dims, dtype);
         noteDeviceOwnedCreate(handle, byte_len, dims);
         errdefer result.deinit();
         try result.retainForActiveFrame();
@@ -794,10 +819,9 @@ pub const MetalTensor = struct {
         return self.shape_len;
     }
 
-    /// Element count (f32 slots). For device-only tensors this reports the
-    /// device byte length in f32 units even before a host mirror exists.
+    /// Logical element count, using the physical dtype width for device storage.
     pub fn elemCount(self: *const MetalTensor) usize {
-        if (self.device) |d| return d.byte_len / @sizeOf(f32);
+        if (self.device) |d| return d.byte_len / self.dtype.byteSize();
         return self.len;
     }
 

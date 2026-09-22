@@ -56,6 +56,18 @@ const default_provider_response_envelope_bytes: usize = 1 << 20;
 // A JSON string may encode one logical byte as a six-byte \u00XX escape. Use
 // the task-neutral worst case until a provider publishes a tighter wire codec.
 const provider_json_result_wire_multiplier: usize = 6;
+// GLiNER boundary extraction's reviewed long-document contract (see
+// zig/pkg/inference/models/gliner2/GLINER25.md's LengthContract) qualifies
+// documents up to 182 KB / 28,275 words / 29 windows for the embedded
+// extraction path. A small, fixed fraction of the embedded node's own
+// host/scratch budget (tens of GiB by default; see
+// standalone/inference_provider.zig's createEmbeddedInferenceNode) --
+// comfortably covering that qualified bound -- so
+// invocationMemoryForRequests's allocator ceiling for local extraction never
+// falls below what a single qualified-length document needs, regardless of
+// what the generic caller-side response-envelope arithmetic happens to
+// produce for a given result-size configuration.
+const extraction_qualified_document_allocator_floor_bytes: usize = 256 << 20;
 
 pub const ResultLimits = struct {
     reader_bytes_per_item: usize = 256 << 10,
@@ -195,6 +207,111 @@ test "asset producer runtime local invocation ownership fails closed without exe
         inference_work.InvocationAllocatorOwner.executor,
         try localInvocationAllocatorOwner(provider),
     );
+}
+
+// Regression test for the "a single 182 KB document is rejected on a fixed
+// constant" defect: the generic nonmedia-bytes/response-envelope arithmetic
+// in invocationMemoryForRequests has no notion of GLiNER boundary
+// extraction's qualified long-document bound (GLINER25.md's LengthContract,
+// 182 KB / 28,275 words / 29 windows). For the local/embedded extraction
+// path the allocator ceiling must be floored at
+// extraction_qualified_document_allocator_floor_bytes so a document at that
+// qualified bound is comfortably admitted.
+test "asset producer runtime floors the local extractor allocator ceiling at the qualified document bound" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    var client = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
+    defer client.deinit();
+
+    const Local = struct {
+        fn extract(_: *anyopaque, _: Allocator, _: []const u8, _: extracting.Request) !extracting.Response {
+            return error.TestUnexpectedResult;
+        }
+        fn embedDense(_: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8) ![][]f32 {
+            return error.TestUnexpectedResult;
+        }
+        fn embedSparse(_: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8) ![]@import("storage/db/enrichment/embedder.zig").SparseEmbedding {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var context: u8 = 0;
+    const provider = managed_embedder.AntflyProvider{
+        .ptr = &context,
+        .owns_invocation_admission = true,
+        .embed_dense_texts = Local.embedDense,
+        .embed_sparse_texts = Local.embedSparse,
+        .extract = Local.extract,
+    };
+    var runtime = Runtime.initWithOptions(alloc, &client, .{ .antfly_provider = provider });
+    defer runtime.deinit();
+
+    // A document at the qualified long-document bound (182 KB), plus a
+    // modest schema, as the sole item in the invocation.
+    const document = try alloc.alloc(u8, 182 * 1024);
+    defer alloc.free(document);
+    @memset(document, 'a');
+    const request = asset_producer.Request{
+        .producer_type = .extractor,
+        .config_json = "{\"provider\":\"antfly\",\"model\":\"gliner-boundary\",\"schema\":{\"entities\":[\"person\"]}}",
+        .source_text = document,
+        .content_type = "application/json",
+    };
+
+    const plan = try runtime.producer().invocationMemoryForRequests(alloc, &.{request});
+    try std.testing.expectEqual(inference_work.InvocationAllocatorOwner.executor, plan.allocator_owner);
+    try std.testing.expect(plan.allocator_limit_bytes >= extraction_qualified_document_allocator_floor_bytes);
+    // The floor must never shrink the ceiling below what the generic
+    // arithmetic would have produced for a larger, well-provisioned response
+    // budget, and the invariant fixed_bytes >= allocator_limit_bytes >=
+    // max_result_bytes must still hold after flooring.
+    try plan.validate();
+}
+
+// Regression for the dogfood ingest's six terminal failures: planning a tiny
+// section (150-560 bytes) with the ordinary GLiNER extractor config parses
+// that config into a JSON value tree whose allocations exceed a budget scaled
+// only from the request's own bytes. Resolution must reach the provider (which
+// here fails with a sentinel) rather than failing closed with
+// InferenceInvocationMemoryExceeded before the invocation.
+test "asset producer runtime resolves a plan for a tiny local extractor request" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    var client = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
+    defer client.deinit();
+
+    const Local = struct {
+        fn extract(_: *anyopaque, _: Allocator, _: []const u8, _: extracting.Request) !extracting.Response {
+            return error.TestUnexpectedResult;
+        }
+        fn embedDense(_: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8) ![][]f32 {
+            return error.TestUnexpectedResult;
+        }
+        fn embedSparse(_: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8) ![]@import("storage/db/enrichment/embedder.zig").SparseEmbedding {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var context: u8 = 0;
+    const provider = managed_embedder.AntflyProvider{
+        .ptr = &context,
+        .owns_invocation_admission = true,
+        .embed_dense_texts = Local.embedDense,
+        .embed_sparse_texts = Local.embedSparse,
+        .extract = Local.extract,
+    };
+    var runtime = Runtime.initWithOptions(alloc, &client, .{ .antfly_provider = provider });
+    defer runtime.deinit();
+
+    const request = asset_producer.Request{
+        .producer_type = .extractor,
+        .config_json =
+        \\{"model":"fastino/gliner2.5-base-v1","options":{"include_confidence":true,"include_spans":true,"long_document":{"mode":"window"}},"provider":"antfly","schema":{"entities":["component","subsystem","file","test","invariant","decision","person","model","backend","format","protocol"],"relations":[{"type":"depends_on"},{"type":"owns"},{"type":"implements"},{"type":"supersedes"},{"type":"tested_by"},{"type":"documented_in"}]}}
+        ,
+        .source_text = "This document tracks reader and OCR parity between the Zig server in this repo and the reference.",
+        .content_type = "application/json",
+    };
+    try std.testing.expectError(error.TestUnexpectedResult, runtime.producer().produce(alloc, request));
 }
 
 /// Two in-flight local transcriptions keep the model busy while the other
@@ -633,7 +750,7 @@ pub const Runtime = struct {
             response_limit,
             invocation_response_resident_multiplier - 1,
         ) catch return error.InferenceEncodedBytesExceeded;
-        const allocator_limit = std.math.add(usize, fixed, parser_and_copy_limit) catch
+        var allocator_limit = std.math.add(usize, fixed, parser_and_copy_limit) catch
             return error.InferenceEncodedBytesExceeded;
         const response_peak = std.math.mul(
             usize,
@@ -641,6 +758,28 @@ pub const Runtime = struct {
             invocation_response_resident_multiplier,
         ) catch return error.InferenceEncodedBytesExceeded;
         fixed = std.math.add(usize, fixed, response_peak) catch return error.InferenceEncodedBytesExceeded;
+
+        // The arithmetic above sizes a caller-side JSON adapter's parsing and
+        // response-copy overhead; it has no notion of a document-extraction
+        // model's own qualified length contract (GLINER25.md's long-document
+        // LengthContract admits documents up to
+        // extraction_qualified_document_bound_bytes, windowed into dozens of
+        // sub-requests inside the executor). For the LOCAL/embedded
+        // extraction path -- allocator_owner == .executor, meaning the
+        // executor is admitted against the embedded node's own host/scratch
+        // budget (see standalone/inference_provider.zig's
+        // createEmbeddedInferenceNode, tens of GiB by default) rather than
+        // being purely a JSON transport -- floor the allocator ceiling well
+        // above what the generic response-envelope formula happens to
+        // produce, so a single document at or under the qualified bound is
+        // admitted instead of rejected by a constant sized for a small
+        // adapter. This is a small, fixed fraction of the embedded node's own
+        // budget, not a per-document scaling that could itself be exhausted
+        // by one oversized document.
+        if (requests[0].producer_type == .extractor and allocator_owner == .executor) {
+            allocator_limit = @max(allocator_limit, extraction_qualified_document_allocator_floor_bytes);
+            fixed = @max(fixed, allocator_limit);
+        }
         return .{
             .attachment_transport = transport,
             .fixed_bytes = fixed,
@@ -1695,7 +1834,18 @@ pub const Runtime = struct {
 
         const extract_request = extracting.Request{
             .inputs = inputs,
-            .schema_version = cfg.schema_version,
+            // `extracting.Request.schema_version` is `?u32`; leaving this an
+            // implicit-default `cfg.schema_version` (always a concrete `u32`,
+            // never itself null) would silently wrap it into `Some(1)`,
+            // erasing exactly the explicit-vs-defaulted distinction
+            // `schema_version_explicit` exists to preserve. `extract()`'s
+            // HTTP transport (`HttpExtractorState.extract` in
+            // lib/extracting/src/mod.zig) reads this same field back via
+            // `req.schema_version orelse ...` to decide whether to enforce
+            // the response's schema_version -- an always-concrete `Some(1)`
+            // here would make that check fire unconditionally regardless of
+            // whether the caller ever asked for v1, defeating the fix there.
+            .schema_version = if (cfg.schema_version_explicit) cfg.schema_version else null,
             .schema_json = cfg.schema_json,
             .options_json = cfg.options_json,
             .attachments = attachments,
@@ -1737,7 +1887,12 @@ pub const Runtime = struct {
         return try extractionResultsJsonAllocExpected(alloc, response.json, .{
             .model = cfg.model,
             .item_count = input_ids.len,
-            .schema_version = cfg.schema_version,
+            // See the single-item extract() call site's comment: only pin
+            // the response to a specific schema_version when the caller's
+            // config asked for one explicitly, so a boundary model's
+            // provider-side auto-upgrade to v2 is not rejected as a mismatch
+            // when nothing pinned the request to v1.
+            .schema_version = if (cfg.schema_version_explicit) cfg.schema_version else null,
             .max_response_bytes = extract_request.max_response_bytes,
         }, input_ids, output_ids);
     }
@@ -2947,7 +3102,18 @@ pub const Runtime = struct {
         };
         const extract_request = extracting.Request{
             .inputs = &.{input},
-            .schema_version = cfg.schema_version,
+            // `extracting.Request.schema_version` is `?u32`; leaving this an
+            // implicit-default `cfg.schema_version` (always a concrete `u32`,
+            // never itself null) would silently wrap it into `Some(1)`,
+            // erasing exactly the explicit-vs-defaulted distinction
+            // `schema_version_explicit` exists to preserve. `extract()`'s
+            // HTTP transport (`HttpExtractorState.extract` in
+            // lib/extracting/src/mod.zig) reads this same field back via
+            // `req.schema_version orelse ...` to decide whether to enforce
+            // the response's schema_version -- an always-concrete `Some(1)`
+            // here would make that check fire unconditionally regardless of
+            // whether the caller ever asked for v1, defeating the fix there.
+            .schema_version = if (cfg.schema_version_explicit) cfg.schema_version else null,
             .schema_json = cfg.schema_json,
             .options_json = cfg.options_json,
             .attachments = attachments,
@@ -2990,7 +3156,25 @@ pub const Runtime = struct {
         return try extractionResultJsonAlloc(alloc, response.json, .{
             .model = cfg.model,
             .item_count = 1,
-            .schema_version = cfg.schema_version,
+            // Only pin the response to a specific schema_version when the
+            // producer config asked for one explicitly. A boundary-
+            // architecture model (fastino/gliner2.5-base-v1) auto-upgrades a
+            // plain, schema-version-less wire request to v2 on the provider
+            // side (see zig/pkg/inference's extractWithAdmission); a caller
+            // that left schema_version unset -- as
+            // examples/dogfood/index_config.go's knowledgeGraphIndexJSON and
+            // GRAPH.md's shorthand extractor config both do -- has no basis
+            // to reject that upgraded response as a schema_version mismatch.
+            // parseExtractionResponse still derives the actual `v2` parsing
+            // flag from the response body itself, independent of this
+            // expectation, so relations/entities validate correctly either
+            // way; this only controls whether an unrequested upgrade is
+            // treated as an error. Previously every extraction call against
+            // such a model failed downstream with InvalidExtractorResponse
+            // (logged as "enrichment request failed ... InvalidExtractorResponse"),
+            // silently producing zero relations/edges for graph indexes fed
+            // by the extractor asset producer.
+            .schema_version = if (cfg.schema_version_explicit) cfg.schema_version else null,
             .max_response_bytes = extract_request.max_response_bytes,
         }, input.id, !(isJsonContentType(request.content_type) or request.content_type.len == 0));
     }
@@ -3792,8 +3976,19 @@ fn validateExtractorBatchCompatibility(
     attachment_transport: inference_work.AttachmentTransport,
     requests: []const asset_producer.Request,
 ) !void {
-    if (capabilities.task != .extract or capabilities.result_cardinality != .one_per_item or
-        capabilities.batch.mode == .none) return error.InvalidInferenceCapabilities;
+    if (capabilities.task != .extract or capabilities.result_cardinality != .one_per_item)
+        return error.InvalidInferenceCapabilities;
+    // An executor that advertises no batching (the GLiNER boundary contract:
+    // mode = .none, max_items = 1 -- see resolvedExecutorBatchImplementation
+    // in zig/pkg/inference/src/server/server.zig) is not a malformed
+    // capability, it is simply not batchable. `canExtractBatch` already
+    // treats this as "return false, use sequential production" without
+    // erroring; this gate must classify it the same way its caller
+    // (`produceBatch`'s `error.BatchIncompatible => {}` fallback) expects, so
+    // a direct `produceBatch`/`produceBatchReported` call against a
+    // one-item-at-a-time executor degrades to sequential instead of
+    // surfacing a hard failure.
+    if (capabilities.batch.mode == .none) return error.BatchIncompatible;
     var uses_media: ?bool = null;
     var media_prompt: ?[]u8 = null;
     defer if (media_prompt) |prompt| alloc.free(prompt);
@@ -4851,7 +5046,24 @@ fn extractionResultsJsonAllocExpected(
         const index = expected_by_id.get(id_value.string) orelse return error.InvalidExtractorResponse;
         if (seen[index]) return error.InvalidExtractorResponse;
         if (output_ids[index].len > 0) {
-            try item.object.put(alloc, "id", .{ .string = output_ids[index] });
+            // `item.object` is a `std.json.Value.Object` (ArrayHashMapUnmanaged)
+            // built by `parseExtractionResponse`'s `std.json.parseFromSlice`
+            // using `raw.arena.allocator()` (see std/json/static.zig's
+            // `Parsed(T)`: parsed values are always leaked into the arena,
+            // never the base allocator passed to `parseFromSlice`). Growing
+            // the map with a *different* allocator -- `alloc` here, which for
+            // a real caller is `std.heap.c_allocator` and in tests is
+            // `std.testing.allocator` -- frees the old backing storage
+            // through an allocator that never allocated it the moment `put`
+            // needs to grow capacity: a canary-detected "Invalid free" panic
+            // under the testing allocator, and silent heap corruption under
+            // `c_allocator` in production, which manifested as extraction
+            // batch responses failing validation
+            // (`error.InvalidExtractorResponse`) as soon as a multi-document
+            // batch's response items grew a JSON object past its initial
+            // parsed capacity -- exactly what a real GLiNER2.5 boundary
+            // response's richer per-relation fields do.
+            try item.object.put(raw.arena.allocator(), "id", .{ .string = output_ids[index] });
         } else {
             _ = item.object.orderedRemove("id");
         }
@@ -5060,6 +5272,117 @@ test "asset producer runtime single extractor response preserves legacy optional
     try std.testing.expectError(error.InvalidExtractorResponse, extractionResultJsonAlloc(a, named, expected, "wire-2", false));
     try std.testing.expectError(error.InvalidExtractorResponse, extractionResultJsonAlloc(a, payload, expected, "wire-1", false));
     try std.testing.expectError(error.InvalidExtractorResponse, extractionResultJsonAlloc(a, payload, .{ .model = "m", .item_count = 1, .schema_version = 2 }, null, false));
+}
+
+// A boundary-architecture model (fastino/gliner2.5-base-v1; see GLINER25.md
+// and zig/pkg/inference's extractWithAdmission) auto-upgrades a plain,
+// schema-version-less wire request to a schema_version=2 response. A
+// producer config that never asked for a specific schema_version -- as
+// examples/dogfood/index_config.go's knowledgeGraphIndexJSON and GRAPH.md's
+// shorthand extractor config both do -- has no basis to reject that upgrade
+// as a mismatch: before Config.schema_version_explicit existed, `extract()`
+// (asset_producer_runtime.zig) pinned `expected.schema_version` to
+// `cfg.schema_version`'s implicit-default value of 1 regardless of whether
+// the caller actually requested it, so every such response failed
+// parseResponse's strict equality check with InvalidExtractorResponse --
+// logged only as a warning by the enrichment runtime, so the extraction call
+// itself was reported as having "succeeded" while silently producing zero
+// relations/entities and therefore zero graph edges for any index whose
+// extractor asset producer omits schema_version. This test exercises the
+// same derivation `extract()` and its batch counterpart now use directly
+// against `extracting.parseConfigFromSlice`, so a regression in either call
+// site's `if (cfg.schema_version_explicit) cfg.schema_version else null`
+// expression would be caught here even though it lives past this file's own
+// unit-test boundary.
+test "asset producer runtime accepts an unrequested boundary-model schema_version upgrade" {
+    const a = std.testing.allocator;
+    const response = "{\"object\":\"extraction\",\"model\":\"fastino/gliner2.5-base-v1\",\"schema_version\":2,\"data\":[{\"entities\":[{\"label\":\"component\",\"text\":\"VOPR\",\"start\":0,\"end\":4}],\"relations\":[{\"type\":\"depends_on\",\"source\":{\"entity_index\":0},\"target\":{\"text\":\"antfly-core\",\"start\":10,\"end\":21}}]}]}";
+
+    // Config JSON with no "schema_version" field, matching dogfood's real
+    // producer config shape exactly (examples/dogfood/index_config.go's
+    // knowledgeGraphIndexJSON never sets one).
+    var implicit_cfg = try extracting.parseConfigFromSlice(
+        a,
+        "{\"provider\":\"antfly\",\"model\":\"fastino/gliner2.5-base-v1\",\"schema\":{\"entities\":[\"component\"],\"relations\":[{\"type\":\"depends_on\"}]}}",
+    );
+    defer implicit_cfg.deinit(a);
+    try std.testing.expect(!implicit_cfg.schema_version_explicit);
+    try std.testing.expectEqual(@as(u32, 1), implicit_cfg.schema_version);
+
+    const accepted = try extractionResultJsonAlloc(a, response, .{
+        .model = implicit_cfg.model,
+        .item_count = 1,
+        .schema_version = if (implicit_cfg.schema_version_explicit) implicit_cfg.schema_version else null,
+    }, null, false);
+    defer a.free(accepted);
+    try std.testing.expect(std.mem.indexOf(u8, accepted, "\"depends_on\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, accepted, "\"antfly-core\"") != null);
+
+    // An explicit v1 request must still reject an upgraded v2 response: the
+    // caller pinned a version this time, so serving a different one is a
+    // real mismatch, not a sanctioned upgrade.
+    var explicit_cfg = try extracting.parseConfigFromSlice(
+        a,
+        "{\"provider\":\"antfly\",\"model\":\"fastino/gliner2.5-base-v1\",\"schema_version\":1,\"schema\":{\"entities\":[\"component\"],\"relations\":[{\"type\":\"depends_on\"}]}}",
+    );
+    defer explicit_cfg.deinit(a);
+    try std.testing.expect(explicit_cfg.schema_version_explicit);
+    try std.testing.expectError(error.InvalidExtractorResponse, extractionResultJsonAlloc(a, response, .{
+        .model = explicit_cfg.model,
+        .item_count = 1,
+        .schema_version = if (explicit_cfg.schema_version_explicit) explicit_cfg.schema_version else null,
+    }, null, false));
+}
+
+// Batch-path counterpart of the previous test: Lite's graph-fed extractor
+// asset producer runs multiple documents through
+// `extractionResultsJsonAllocExpected` (the "extract_batches=1
+// extract_items=2" runUntilIdle summary line), not the single-item
+// `extractionResultJsonAlloc` path, whenever more than one document changes
+// in the same replay pass -- exactly what
+// TestLiteNativeGraphEdgesFromExtractionArtifactBoundaryV2
+// (go/pkg/antflylite/lite_cgo_test.go) exercises with its two documents.
+test "asset producer runtime batch path accepts an unrequested boundary-model schema_version upgrade" {
+    const a = std.testing.allocator;
+    const item_shape =
+        "\"entities\":[{\"label\":\"component\",\"text\":\"VOPR\",\"start\":0,\"end\":4,\"score\":0.95}," ++
+        "{\"label\":\"component\",\"text\":\"antfly-core\",\"start\":10,\"end\":21,\"score\":0.9}]," ++
+        "\"relations\":[{\"type\":\"depends_on\"," ++
+        "\"source\":{\"entity_index\":0,\"label\":\"component\",\"text\":\"VOPR\",\"start\":0,\"end\":4,\"score\":0.95}," ++
+        "\"target\":{\"entity_index\":1,\"label\":\"component\",\"text\":\"antfly-core\",\"start\":10,\"end\":21,\"score\":0.9}," ++
+        "\"score\":0.88,\"derived\":false}]," ++
+        "\"long_document\":{\"version\":1,\"window_count\":2,\"window_policy\":\"source_words_midpoint_ownership\"," ++
+        "\"classification_aggregation\":\"owned_word_weighted_mean_raw_logits\"," ++
+        "\"duplicate_score\":\"maximum_calibrated_score\",\"natural_record_identity\":\"exact_source_anchor\"," ++
+        "\"other_record_identity\":\"occurrence\",\"solver_optimality_scope\":\"retained_candidate_graph\"}";
+    const response = "{\"object\":\"extraction\",\"model\":\"fastino/gliner2.5-base-v1\",\"schema_version\":2,\"data\":[" ++
+        "{\"id\":\"antfly-batch-item-0\"," ++ item_shape ++ "}," ++
+        "{\"id\":\"antfly-batch-item-1\"," ++ item_shape ++ "}" ++
+        "]}";
+
+    var implicit_cfg = try extracting.parseConfigFromSlice(
+        a,
+        "{\"provider\":\"antfly\",\"model\":\"fastino/gliner2.5-base-v1\",\"schema\":{\"entities\":[\"component\"],\"relations\":[{\"type\":\"depends_on\"}]}}",
+    );
+    defer implicit_cfg.deinit(a);
+    try std.testing.expect(!implicit_cfg.schema_version_explicit);
+
+    const wire_ids = [_][]const u8{ "antfly-batch-item-0", "antfly-batch-item-1" };
+    const output_ids = [_][]const u8{ "doc:vopr-design", "doc:vopr-tests" };
+    const results = try extractionResultsJsonAllocExpected(a, response, .{
+        .model = implicit_cfg.model,
+        .item_count = wire_ids.len,
+        .schema_version = if (implicit_cfg.schema_version_explicit) implicit_cfg.schema_version else null,
+    }, &wire_ids, &output_ids);
+    defer {
+        for (results) |item| a.free(item);
+        a.free(results);
+    }
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    for (results) |item| {
+        try std.testing.expect(std.mem.indexOf(u8, item, "\"depends_on\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, item, "\"antfly-core\"") != null);
+    }
 }
 
 fn antflyGenerateBatchUrlAlloc(alloc: Allocator, base_url: []const u8) ![]u8 {
@@ -7269,6 +7592,112 @@ test "asset producer runtime batches compatible antfly extractor requests" {
     try std.testing.expect(std.mem.indexOf(u8, results[0], "\"Ada\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, results[1], "\"Grace\"") != null);
     try std.testing.expectEqual(@as(usize, 1), local.extract_calls);
+}
+
+// Regression test for the "9 of 1,231" GLiNER boundary incident: an executor
+// that advertises `mode = .none, max_items = 1` (the boundary extraction
+// contract; see zig/pkg/inference/src/server/server.zig's
+// resolvedExecutorBatchImplementation and GLINER25.md's LengthContract) must
+// never see more than one document per extract() invocation, no matter how
+// many compatible requests the caller offers at once. `canExtractBatch`
+// (consulted by `batchMode`/`canProduceBatch`) must refuse batching outright,
+// and `tryExtractBatchReported`'s own `validateExtractorBatchCompatibility`
+// gate must independently refuse it too -- both read the same freshly
+// resolved capabilities, so there is no path that can silently widen the
+// group after admission.
+test "asset producer runtime never batches an extractor that advertises max_items=1" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    const Local = struct {
+        extract_calls: usize = 0,
+        max_inputs_seen: usize = 0,
+
+        fn provider(self: *@This()) managed_embedder.AntflyProvider {
+            return .{
+                .ptr = self,
+                .owns_invocation_admission = true,
+                .embed_dense_texts = embedDense,
+                .embed_sparse_texts = embedSparse,
+                .extract = extract,
+                .model_capabilities = modelCapabilities,
+            };
+        }
+
+        fn embedDense(_: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8) ![][]f32 {
+            return error.TestUnexpectedResult;
+        }
+
+        fn embedSparse(_: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8) ![]@import("storage/db/enrichment/embedder.zig").SparseEmbedding {
+            return error.TestUnexpectedResult;
+        }
+
+        // Mirrors the fixed native_gliner_extraction advertisement: batching
+        // is disabled outright (mode = .none), which BatchCapabilities.validate
+        // requires to carry preferred_items = max_items = 1.
+        fn modelCapabilities(_: *anyopaque, _: Allocator, _: []const u8, task: inference_work.Task) !inference_work.InferenceCapabilities {
+            try std.testing.expectEqual(inference_work.Task.extract, task);
+            return .{
+                .task = .extract,
+                .input_modalities = .{ .text = true },
+                .accepted_mime_types = .{ .text_plain = true },
+                .input_granularity = .item,
+                .batch = .{ .mode = .none, .preferred_items = 1, .max_items = 1 },
+                .output = .extraction,
+                .prompt_policy = .structured_schema,
+            };
+        }
+
+        fn extract(ptr: *anyopaque, a: Allocator, model: []const u8, request: extracting.Request) !extracting.Response {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.extract_calls += 1;
+            self.max_inputs_seen = @max(self.max_inputs_seen, request.inputs.len);
+            try std.testing.expectEqualStrings("gliner-boundary", model);
+            // The one invariant this regression test exists to lock in: every
+            // wire request the provider path issues carries exactly one
+            // document, matching the executor's advertised max_items. Falling
+            // back to sequential production (BatchIncompatible, not a batch
+            // chunk) leaves each Input.id null, so the response envelope
+            // matches the single-item shape (no "id" field) rather than the
+            // native-batch shape.
+            try std.testing.expectEqual(@as(usize, 1), request.inputs.len);
+            try std.testing.expect(request.inputs[0].id == null);
+            return .{
+                .allocator = a,
+                .json = try a.dupe(u8, "{\"object\":\"extraction\",\"model\":\"gliner-boundary\",\"data\":[{\"entities\":[],\"relations\":[]}]}"),
+            };
+        }
+    };
+
+    var local = Local{};
+    var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
+    defer client.deinit();
+    var runtime = Runtime.initWithOptions(alloc, &client, .{ .antfly_provider = local.provider() });
+    defer runtime.deinit();
+    const producer = runtime.producer();
+
+    const config_json = "{\"provider\":\"antfly\",\"model\":\"gliner-boundary\",\"schema\":{\"entities\":[\"person\"]}}";
+    const requests = [_]asset_producer.Request{
+        .{ .producer_type = .extractor, .config_json = config_json, .source_text = "Ada works at Antfly.", .content_type = "application/json" },
+        .{ .producer_type = .extractor, .config_json = config_json, .source_text = "Grace works at Antfly.", .content_type = "application/json" },
+        .{ .producer_type = .extractor, .config_json = config_json, .source_text = "Alan works at Antfly.", .content_type = "application/json" },
+    };
+
+    // The admission check must independently agree that this producer cannot
+    // batch: canProduceBatch/batchMode consult the same capabilities.
+    try std.testing.expect(!try producer.canProduceBatch(alloc, &requests));
+
+    const results = try producer.produceBatch(alloc, &requests);
+    defer {
+        for (results) |result| alloc.free(result);
+        alloc.free(results);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), results.len);
+    try std.testing.expectEqual(@as(usize, 3), local.extract_calls);
+    try std.testing.expectEqual(@as(usize, 1), local.max_inputs_seen);
 }
 
 test "laya enrichment preserves typed decisions and rejects invalid probabilities" {

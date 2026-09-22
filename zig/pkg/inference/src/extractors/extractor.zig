@@ -91,7 +91,7 @@ pub const Context = struct {
 };
 
 /// Node-scoped cache for fallback OCR readers. Reader preference can
-/// depend on the recognizer name, so selections are keyed by recognizer rather
+/// depend on the extractor name, so selections are keyed by extractor rather
 /// than sharing one process-wide default. Model discovery and compatibility
 /// inspection are filesystem work, so same-key concurrent requests share a
 /// selection instead of reparsing every installed model. Striped selection
@@ -335,7 +335,7 @@ pub const ReaderResolver = struct {
         self.expireFailuresLocked(now);
 
         // Candidate health is a property of the reader artifact, not of the
-        // recognizer that happened to select it. Invalidate every positive
+        // extractor that happened to select it. Invalidate every positive
         // selection of the failed path so other extractors do not repeat an
         // expensive model load before observing the global quarantine.
         var entries_it = self.entries.iterator();
@@ -360,11 +360,11 @@ pub const ReaderResolver = struct {
 };
 
 pub const Extractor = union(enum) {
-    recognizer: RecognizerExtractor,
+    extractor: GlinerExtractor,
     reader: ReaderExtractor,
 
-    pub fn initRecognizer(allocator: std.mem.Allocator, model_path: []const u8, model_name: []const u8) !Extractor {
-        return .{ .recognizer = .{
+    pub fn initExtractor(allocator: std.mem.Allocator, model_path: []const u8, model_name: []const u8) !Extractor {
+        return .{ .extractor = .{
             .model_path = try allocator.dupe(u8, model_path),
             .model_name = try allocator.dupe(u8, model_name),
         } };
@@ -378,7 +378,7 @@ pub const Extractor = union(enum) {
 
     pub fn deinit(self: *Extractor, allocator: std.mem.Allocator) void {
         switch (self.*) {
-            .recognizer => |*recognizer| recognizer.deinit(allocator),
+            .extractor => |*extractor| extractor.deinit(allocator),
             .reader => |*reader| reader.deinit(allocator),
         }
     }
@@ -388,7 +388,7 @@ pub const Extractor = union(enum) {
     /// discovery before any task-specific inference begins.
     pub fn modelPath(self: *const Extractor) []const u8 {
         return switch (self.*) {
-            .recognizer => |recognizer| recognizer.model_path,
+            .extractor => |extractor| extractor.model_path,
             .reader => |reader| reader.model_path,
         };
     }
@@ -401,7 +401,7 @@ pub const Extractor = union(enum) {
         texts: []const []const u8,
     ) ![]extraction_mod.ExtractionResult {
         return switch (self.*) {
-            .recognizer => |*recognizer| recognizer.extractText(ctx, schemas, config, texts),
+            .extractor => |*extractor| extractor.extractText(ctx, schemas, config, texts),
             .reader => error.UnsupportedInput,
         };
     }
@@ -415,7 +415,7 @@ pub const Extractor = union(enum) {
         read_options: readers_mod.ReadOptions,
     ) ![]extraction_mod.ExtractionResult {
         return switch (self.*) {
-            .recognizer => |*recognizer| recognizer.extractImages(ctx, schemas, config, image_datas, read_options),
+            .extractor => |*extractor| extractor.extractImages(ctx, schemas, config, image_datas, read_options),
             .reader => |*reader| reader.extractImages(ctx, schemas, config, image_datas, read_options),
         };
     }
@@ -424,25 +424,25 @@ pub const Extractor = union(enum) {
 pub fn resolve(ctx: Context, model_name: []const u8, wants_images: bool) !Extractor {
     if (wants_images) {
         if (try tryResolveReader(ctx, model_name)) |extractor| return extractor;
-        if (try tryResolveRecognizer(ctx, model_name)) |extractor| return extractor;
+        if (try tryResolveGlinerExtractor(ctx, model_name)) |extractor| return extractor;
     } else {
-        if (try tryResolveRecognizer(ctx, model_name)) |extractor| return extractor;
+        if (try tryResolveGlinerExtractor(ctx, model_name)) |extractor| return extractor;
         if (try tryResolveReader(ctx, model_name)) |extractor| return extractor;
     }
     return error.ModelNotFound;
 }
 
-const RecognizerExtractor = struct {
+const GlinerExtractor = struct {
     model_path: []const u8,
     model_name: []const u8,
 
-    fn deinit(self: *RecognizerExtractor, allocator: std.mem.Allocator) void {
+    fn deinit(self: *GlinerExtractor, allocator: std.mem.Allocator) void {
         allocator.free(self.model_path);
         allocator.free(self.model_name);
     }
 
     fn extractText(
-        self: *RecognizerExtractor,
+        self: *GlinerExtractor,
         ctx: Context,
         schemas: []const extraction_mod.ExtractionSchema,
         config: extraction_mod.ExtractionConfig,
@@ -465,7 +465,7 @@ const RecognizerExtractor = struct {
     }
 
     fn extractImages(
-        self: *RecognizerExtractor,
+        self: *GlinerExtractor,
         ctx: Context,
         schemas: []const extraction_mod.ExtractionSchema,
         config: extraction_mod.ExtractionConfig,
@@ -523,7 +523,7 @@ const ReaderExtractor = struct {
     }
 };
 
-fn tryResolveRecognizer(ctx: Context, model_name: []const u8) !?Extractor {
+fn tryResolveGlinerExtractor(ctx: Context, model_name: []const u8) !?Extractor {
     const path = resolveNamedModelPath(ctx, model_name, "extractors") catch |err| switch (err) {
         error.ModelNotFound => return null,
         else => return err,
@@ -532,10 +532,10 @@ fn tryResolveRecognizer(ctx: Context, model_name: []const u8) !?Extractor {
 
     var manifest = try manifest_mod.loadListingFromDir(ctx.allocator, path);
     defer manifest.deinit();
-    if (!model_caps.modelSupportsCapability("recognizer", manifest.gliner_model_type, manifest.capabilities, "extraction")) return null;
+    if (!model_caps.modelSupportsCapability("extractor", manifest.gliner_model_type, manifest.capabilities, "extraction")) return null;
     if (!model_caps.modelAcceptsInput(&manifest, "text")) return null;
 
-    return try Extractor.initRecognizer(ctx.allocator, path, model_name);
+    return try Extractor.initExtractor(ctx.allocator, path, model_name);
 }
 
 fn tryResolveReader(ctx: Context, model_name: []const u8) !?Extractor {
@@ -884,7 +884,7 @@ test "resolve prefers reader for image extraction when both exist" {
     defer tmp.cleanup();
 
     try writeTestManifest(tmp.dir, "readers/acme/doc-extract", "{\"type\":\"reader\",\"capabilities\":[\"extraction\"],\"inputs\":[\"image\"]}");
-    try writeTestManifest(tmp.dir, "extractors/acme/doc-extract", "{\"type\":\"recognizer\",\"capabilities\":[\"extraction\"],\"inputs\":[\"text\"]}");
+    try writeTestManifest(tmp.dir, "extractors/acme/doc-extract", "{\"type\":\"extractor\",\"capabilities\":[\"extraction\"],\"inputs\":[\"text\"]}");
 
     const models_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
     defer allocator.free(models_dir);
@@ -901,7 +901,7 @@ test "resolve prefers reader for image extraction when both exist" {
     try std.testing.expect(extractor == .reader);
 }
 
-test "resolve rejects extraction recognizer without text input before inference" {
+test "resolve rejects extraction extractor without text input before inference" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -909,7 +909,7 @@ test "resolve rejects extraction recognizer without text input before inference"
     try writeTestManifest(
         tmp.dir,
         "extractors/acme/audio-only-extract",
-        "{\"type\":\"recognizer\",\"capabilities\":[\"extraction\"],\"inputs\":[\"audio\"]}",
+        "{\"type\":\"extractor\",\"capabilities\":[\"extraction\"],\"inputs\":[\"audio\"]}",
     );
 
     const models_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
@@ -977,7 +977,7 @@ test "image extraction does not reinterpret the extractor root as a reader" {
     try writeTestManifest(
         tmp.dir,
         "fastino/gliner2-base-v1",
-        "{\"type\":\"recognizer\",\"capabilities\":[\"extraction\"],\"inputs\":[\"text\"]}",
+        "{\"type\":\"extractor\",\"capabilities\":[\"extraction\"],\"inputs\":[\"text\"]}",
     );
 
     const models_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
@@ -1098,13 +1098,13 @@ test "image extraction caches unavailable reader discovery for a bounded ttl" {
     try std.testing.expectEqual(@as(usize, 2), discovery.calls);
 }
 
-test "image extraction fallback cache is isolated by recognizer" {
+test "image extraction fallback cache is isolated by extractor" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try writeTestManifest(tmp.dir, "acme/extractor-a", "{\"type\":\"recognizer\",\"inputs\":[\"text\"]}");
-    try writeTestManifest(tmp.dir, "acme/extractor-b", "{\"type\":\"recognizer\",\"inputs\":[\"text\"]}");
+    try writeTestManifest(tmp.dir, "acme/extractor-a", "{\"type\":\"extractor\",\"inputs\":[\"text\"]}");
+    try writeTestManifest(tmp.dir, "acme/extractor-b", "{\"type\":\"extractor\",\"inputs\":[\"text\"]}");
     try writeTestFlorenceReader(tmp.dir, "readers/acme/extractor-a");
     try writeTestFlorenceReader(tmp.dir, "readers/acme/extractor-b");
 
@@ -1279,7 +1279,7 @@ test "reader selection does not recache a candidate quarantined during discovery
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.calls += 1;
             if (self.calls == 1) {
-                // Emulate another recognizer finding the same candidate to be
+                // Emulate another extractor finding the same candidate to be
                 // structurally broken while this discovery is in flight.
                 try self.resolver.markCandidateFailure(io, preferred);
                 return allocator.dupe(u8, preferred);
@@ -1399,7 +1399,7 @@ test "reader selection bounds global structural failure history" {
     try std.testing.expectEqual(@as(usize, 0), resolver.entries.count());
 }
 
-test "structural reader failure invalidates every recognizer selection" {
+test "structural reader failure invalidates every extractor selection" {
     const allocator = std.testing.allocator;
     var resolver = ReaderResolver.init(allocator);
     defer resolver.deinit();
@@ -1665,13 +1665,13 @@ test "canonical model names coalesce prefixes and variants" {
     try std.testing.expectEqualStrings("acme/model", canonicalModelName("hf:acme/model:gguf:Q4_K"));
 }
 
-test "resolve prefers recognizer for text extraction when both exist" {
+test "resolve prefers extractor for text extraction when both exist" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try writeTestManifest(tmp.dir, "readers/acme/doc-extract", "{\"type\":\"reader\",\"capabilities\":[\"extraction\"],\"inputs\":[\"image\"]}");
-    try writeTestManifest(tmp.dir, "extractors/acme/doc-extract", "{\"type\":\"recognizer\",\"capabilities\":[\"extraction\"],\"inputs\":[\"text\"]}");
+    try writeTestManifest(tmp.dir, "extractors/acme/doc-extract", "{\"type\":\"extractor\",\"capabilities\":[\"extraction\"],\"inputs\":[\"text\"]}");
 
     const models_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
     defer allocator.free(models_dir);
@@ -1685,7 +1685,7 @@ test "resolve prefers recognizer for text extraction when both exist" {
     }, "acme/doc-extract", false);
     defer extractor.deinit(allocator);
 
-    try std.testing.expect(extractor == .recognizer);
+    try std.testing.expect(extractor == .extractor);
 }
 
 test "reader extractor does not accept text input" {

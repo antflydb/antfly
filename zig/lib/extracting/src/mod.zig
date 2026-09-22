@@ -59,6 +59,16 @@ pub const Config = struct {
     framed_attachments: bool = false,
     /// Canonical extraction schema protocol; omitted configurations retain v1.
     schema_version: u32 = 1,
+    /// True only when the configuration JSON carried an explicit
+    /// `schema_version` field. A boundary-architecture model (see
+    /// GLINER25.md) auto-upgrades a plain, schema-version-less wire request
+    /// to v2 on the provider side; a caller that never asked for a specific
+    /// version has no basis to reject that upgraded response as a mismatch.
+    /// Response-side validators should key strict schema_version equality
+    /// off this flag, not off `schema_version` alone, since the latter
+    /// cannot distinguish "the caller pinned v1" from "the caller never
+    /// said" -- both read 1.
+    schema_version_explicit: bool = false,
     schema_json: []const u8 = "",
     options_json: []const u8 = "",
 
@@ -244,10 +254,12 @@ pub fn parseConfigFromSlice(alloc: Allocator, raw: []const u8) !Config {
 
     const provider_raw = stringField(parsed.value, "provider") orelse return error.InvalidExtractionConfig;
     const provider = try parseProvider(provider_raw);
-    const schema_version: u32 = if (parsed.value.object.get("schema_version")) |version| blk: {
+    const schema_version_field = parsed.value.object.get("schema_version");
+    const schema_version: u32 = if (schema_version_field) |version| blk: {
         if (version != .integer or (version.integer != 1 and version.integer != 2)) return error.UnsupportedExtractionSchemaVersion;
         break :blk @intCast(version.integer);
     } else 1;
+    const schema_version_explicit = schema_version_field != null;
     const model = if (stringField(parsed.value, "model")) |value| try alloc.dupe(u8, value) else "";
     errdefer if (model.len > 0) alloc.free(model);
 
@@ -283,6 +295,7 @@ pub fn parseConfigFromSlice(alloc: Allocator, raw: []const u8) !Config {
         .capability_revision = null,
         .framed_attachments = false,
         .schema_version = schema_version,
+        .schema_version_explicit = schema_version_explicit,
         .schema_json = schema_json,
         .options_json = options_json,
     };
@@ -291,7 +304,12 @@ pub fn parseConfigFromSlice(alloc: Allocator, raw: []const u8) !Config {
 }
 
 pub fn cloneConfig(alloc: Allocator, cfg: Config) !Config {
-    var owned = Config{ .provider = cfg.provider, .schema_version = cfg.schema_version, .framed_attachments = cfg.framed_attachments };
+    var owned = Config{
+        .provider = cfg.provider,
+        .schema_version = cfg.schema_version,
+        .schema_version_explicit = cfg.schema_version_explicit,
+        .framed_attachments = cfg.framed_attachments,
+    };
     errdefer owned.deinit(alloc);
     if (cfg.model.len > 0) owned.model = try alloc.dupe(u8, cfg.model);
     if (cfg.url.len > 0) owned.url = try alloc.dupe(u8, cfg.url);
@@ -481,7 +499,7 @@ const HttpExtractorState = struct {
             framed_body = try httpx.attachment_envelope.encodeSegmentsAlloc(alloc, metadata, attachments);
         }
 
-        const base = self.cfg.resolvedUrl() orelse switch (self.cfg.provider) {
+        const base_raw = self.cfg.resolvedUrl() orelse switch (self.cfg.provider) {
             .antfly => "http://127.0.0.1:8080",
             else => return error.InvalidExtractionConfig,
         };
@@ -489,6 +507,16 @@ const HttpExtractorState = struct {
             .pioneer => "/inference",
             else => "/extract",
         };
+        // A configured antfly extractor `url`/`api_url` is commonly a bare
+        // `scheme://host:port` (the same value a caller reuses for the
+        // embedder and chunker on the same inference service), which must
+        // resolve under the joined public API's `/ai/v1` prefix rather than
+        // the process root. Other providers' URLs are used exactly as given.
+        const base = if (self.cfg.provider == .antfly)
+            try normalizedAntflyExtractionBaseAlloc(alloc, base_raw)
+        else
+            try alloc.dupe(u8, base_raw);
+        defer alloc.free(base);
         const url = try std.fmt.allocPrint(alloc, "{s}{s}", .{ base, path });
         defer alloc.free(url);
 
@@ -523,10 +551,28 @@ const HttpExtractorState = struct {
         else
             error.ExtractionRequestFailed;
         const payload = resp.body orelse return error.EmptyExtractionResponse;
+        // Only pin the response to a specific schema_version when the
+        // caller actually asked for one -- either this request explicitly
+        // (`req.schema_version`) or the provider config explicitly
+        // (`cfg.schema_version_explicit`). A boundary-architecture model
+        // (fastino/gliner2.5-base-v1) auto-upgrades a plain,
+        // schema-version-less wire request to v2 on the provider side (see
+        // zig/pkg/inference's extractWithAdmission); a caller that left
+        // schema_version unset everywhere -- as
+        // examples/dogfood/index_config.go's knowledgeGraphIndexJSON and
+        // GRAPH.md's shorthand extractor config both do -- has no basis to
+        // reject that upgrade as a mismatch. Before this, `req.schema_version
+        // orelse self.cfg.schema_version` always produced a concrete value
+        // (`Config.schema_version` defaults to 1, never null), so every such
+        // response failed this exact check with InvalidExtractionResponse --
+        // surfacing to Lite's enrichment runtime as "InvalidExtractorResponse"
+        // and silently producing zero relations/entities per call.
+        const expected_schema_version = req.schema_version orelse
+            (if (self.cfg.schema_version_explicit) self.cfg.schema_version else null);
         const canonical = try canonicalResponseJsonAlloc(alloc, payload, .{
             .model = self.cfg.model,
             .item_count = req.inputs.len,
-            .schema_version = req.schema_version orelse self.cfg.schema_version,
+            .schema_version = expected_schema_version,
             .max_response_bytes = req.max_response_bytes,
         }, req.inputs);
         return .{ .allocator = alloc, .json = canonical };
@@ -766,6 +812,22 @@ fn appendJsonString(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: [
     const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
     defer alloc.free(encoded);
     try out.appendSlice(alloc, encoded);
+}
+
+/// A bare `scheme://host:port` antfly extractor base gets `/ai/v1` appended
+/// so it lands on the joined public API instead of the process root; a base
+/// that already carries a path (including one already ending in `/ai/v1`) is
+/// left exactly as configured. Mirrors
+/// `managed_embedder.zig`'s `normalizeAntflyInferenceBaseUrl` for the
+/// embedder/chunker paths.
+fn normalizedAntflyExtractionBaseAlloc(alloc: Allocator, raw: []const u8) ![]u8 {
+    const trimmed = std.mem.trimEnd(u8, raw, "/");
+    if (std.mem.endsWith(u8, trimmed, "/ai/v1")) return try alloc.dupe(u8, trimmed);
+    const scheme_pos = std.mem.indexOf(u8, trimmed, "://");
+    const host_start = if (scheme_pos) |pos| pos + 3 else 0;
+    const path_pos = std.mem.indexOfPos(u8, trimmed, host_start, "/");
+    if (path_pos == null) return try std.fmt.allocPrint(alloc, "{s}/ai/v1", .{trimmed});
+    return try alloc.dupe(u8, trimmed);
 }
 
 fn parseProvider(raw: []const u8) !Provider {

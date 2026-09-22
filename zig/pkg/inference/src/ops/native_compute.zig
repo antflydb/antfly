@@ -974,6 +974,10 @@ fn getData(ct: CT) []f32 {
             buf.shared_data_refcount = null;
         };
     }
+    materializeIntegerNumericView(buf) catch |err| {
+        std.log.warn("failed to materialize integer numeric view: {s}", .{@errorName(err)});
+        return &.{};
+    };
     return buf.data;
 }
 
@@ -982,7 +986,23 @@ fn getData(ct: CT) []f32 {
 fn getDataChecked(ct: CT) ![]f32 {
     const buf = toBuf(ct);
     if (buf.view_strides != null) try materializeViewData(buf);
+    try materializeIntegerNumericView(buf);
     return buf.data;
+}
+
+// Legacy arithmetic consumes numeric f32 views. Keep the original integer
+// payload for exact operators and export, and materialize its numeric view
+// only on demand. Source-backed buffers cannot be donated to in-place ops.
+fn materializeIntegerNumericView(buf: *Buf) !void {
+    if (buf.data.len != 0) return;
+    const source = buf.source_tensor orelse return;
+    switch (source.dtype) {
+        .i8, .i16, .i32, .i64, .u8, .bool_ => {},
+        else => return,
+    }
+    const data = try convertTensorToOwnedF32(buf.allocator, source);
+    buf.data = data;
+    buf.owned = true;
 }
 
 test "native tensor view readback preserves materialization OOM and nullable clone fallback" {
@@ -3687,7 +3707,7 @@ fn shouldUseQ4Q5KQ8KActivationShape(rows: usize, out_dim: usize, row_blocks: usi
     if (!(row_blocks == 2 or row_blocks == 3 or row_blocks == 6 or row_blocks == 8 or row_blocks == 12)) return false;
 
     // Keep q4/q5 activation quantization on the CLIP/CLAP-style buckets that
-    // were measured. GLiNER recognizer rows can be numerically sensitive near
+    // were measured. GLiNER extractor rows can be numerically sensitive near
     // extraction thresholds and should fall through to dense-dequant SGEMM.
     if (rows == 1 or rows == 2 or rows == 4 or rows == 9) return true;
     if (rows == 50 or rows == 64 or rows == 77 or rows == 197 or rows == 257 or rows == 308 or rows == 514) return true;
@@ -4016,6 +4036,13 @@ fn matmulRhsSourceTensorChunked(
         return error.UnsupportedTensorType;
     }
 
+    // Imported ONNX initializers already have row-major [K,N] f32 storage.
+    // Pass that directly to BLAS instead of copying and transposing every
+    // model weight on every request. Reduced/unaligned storage stays bounded.
+    if (borrowTensorF32IfAligned(rhs_tensor)) |rhs| {
+        return self.dispatchSgemm(m, n, k, 1.0, lhs, rhs, 1.0, output);
+    }
+
     const target_weight_bytes: usize = 8 * 1024 * 1024;
     const k_block = @max(@as(usize, 1), @min(k, target_weight_bytes / (@max(@as(usize, 1), n) * @sizeOf(f32))));
     const lhs_block = try self.allocator.alloc(f32, m * k_block);
@@ -4205,16 +4232,20 @@ pub const NativeCompute = struct {
     }
 
     pub fn importHostTensor(self: *NativeCompute, tensor: *const tensor_mod.Tensor) !CT {
-        if (tensor.dtype == .i32 or tensor.dtype == .i64) return copyIntegerTensorWithShape(self, tensor, tensor.shape);
+        switch (tensor.dtype) {
+            .i8, .i16, .i32, .i64, .u8, .bool_ => return copyIntegerTensorWithShape(self, tensor, tensor.shape),
+            else => {},
+        }
         const converted = try convertTensorToOwnedF32(self.allocator, tensor);
         errdefer self.allocator.free(converted);
         return self.importDenseTensor(tensor.name, tensor.dtype, tensor.shape, converted);
     }
 
     pub fn importOwnedStaticTensor(self: *NativeCompute, tensor: tensor_mod.Tensor) !CT {
-        const can_keep_typed =
-            tensor.dtype == .i32 or tensor.dtype == .i64 or (tensor.shape.len == 2 and
-                (tensor.dtype == .f32 or tensor.dtype == .f16 or tensor.dtype == .bf16));
+        const can_keep_typed = switch (tensor.dtype) {
+            .i8, .i16, .i32, .i64, .u8, .bool_ => true,
+            else => tensor.shape.len == 2 and (tensor.dtype == .f32 or tensor.dtype == .f16 or tensor.dtype == .bf16),
+        };
         if (can_keep_typed) {
             return self.makeBufWithOwnedSourceTensor(tensor);
         }
@@ -4697,6 +4728,9 @@ pub const vtable_impl = ComputeBackend.VTable{
     .fromFloat32 = &fromFloat32Op,
     .fromFloat32Shape = &fromFloat32ShapeOp,
     .fromInt32Shape = &fromInt32ShapeOp,
+    .fromConstantBytes = &fromConstantBytesOp,
+    .convertDType = &convertDTypeOp,
+    .cumulativeSum = &cumulativeSumOp,
     .cloneTensorShape = &cloneTensorShapeOp,
     .toFloat32 = &toFloat32Op,
     .exportTensorData = &exportTensorDataOp,
@@ -6573,6 +6607,7 @@ fn unaryConsumeOp(_: *anyopaque, op: ops.UnaryConsumeOp, input: CT) anyerror!?CT
 
 fn addOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    if (integerSource(a) != null and integerSource(b) != null) return integerBinaryOp(self, a, b, .add);
     if (try applyShapeAwareBinaryOp(self, a, b, .add)) |result| {
         return result;
     }
@@ -6608,6 +6643,7 @@ fn addOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
 }
 
 fn addConsumeLeftOp(_: *anyopaque, a: CT, b: CT) anyerror!?CT {
+    if (integerSource(a) != null or integerSource(b) != null) return null;
     if (try applyShapeAwareBinaryConsumeLeft(a, b, .add)) |result| return result;
     const a_buf = ownedDenseBufWithMaxSharedRefs(a, 2) orelse return null;
     const a_data = a_buf.data;
@@ -6634,6 +6670,7 @@ fn addConsumeLeftOp(_: *anyopaque, a: CT, b: CT) anyerror!?CT {
 }
 
 fn addConsumeRightOp(_: *anyopaque, a: CT, b: CT) anyerror!?CT {
+    if (integerSource(a) != null or integerSource(b) != null) return null;
     if (try applyShapeAwareBinaryConsumeLeft(b, a, .add)) |result| return result;
     const b_buf = ownedDenseBufWithMaxSharedRefs(b, 2) orelse return null;
     const a_data = getData(a);
@@ -6660,6 +6697,7 @@ fn addConsumeRightOp(_: *anyopaque, a: CT, b: CT) anyerror!?CT {
 }
 
 fn multiplyConsumeLeftOp(_: *anyopaque, a: CT, b: CT) anyerror!?CT {
+    if (integerSource(a) != null or integerSource(b) != null) return null;
     if (try applyShapeAwareBinaryConsumeLeft(a, b, .mul)) |result| return result;
     const a_buf = ownedDenseBufWithMaxSharedRefs(a, 2) orelse return null;
     const a_data = a_buf.data;
@@ -6686,6 +6724,7 @@ fn multiplyConsumeLeftOp(_: *anyopaque, a: CT, b: CT) anyerror!?CT {
 }
 
 fn multiplyConsumeRightOp(_: *anyopaque, a: CT, b: CT) anyerror!?CT {
+    if (integerSource(a) != null or integerSource(b) != null) return null;
     if (try applyShapeAwareBinaryConsumeLeft(b, a, .mul)) |result| return result;
     const b_buf = ownedDenseBufWithMaxSharedRefs(b, 2) orelse return null;
     const a_data = getData(a);
@@ -6712,6 +6751,7 @@ fn multiplyConsumeRightOp(_: *anyopaque, a: CT, b: CT) anyerror!?CT {
 }
 
 fn subtractConsumeLeftOp(_: *anyopaque, a: CT, b: CT) anyerror!?CT {
+    if (integerSource(a) != null or integerSource(b) != null) return null;
     if (try applyShapeAwareBinaryConsumeLeft(a, b, .sub)) |result| return result;
     const a_buf = ownedDenseBufWithMaxSharedRefs(a, 2) orelse return null;
     const a_data = a_buf.data;
@@ -6764,6 +6804,9 @@ fn divideConsumeLeftOp(_: *anyopaque, a: CT, b: CT) anyerror!?CT {
 }
 
 fn lessThanConsumeLeftOp(_: *anyopaque, a: CT, b: CT) anyerror!?CT {
+    // An f32 lhs may be donated with an integer rhs. Decline before any
+    // numeric-view materialization so the exact comparison handles both.
+    if (integerSource(a) != null or integerSource(b) != null) return null;
     if (try applyShapeAwareBinaryConsumeLeft(a, b, .lt)) |result| return result;
     const a_buf = ownedDenseBufWithMaxSharedRefs(a, 2) orelse return null;
     const a_data = a_buf.data;
@@ -6805,6 +6848,7 @@ fn canConsumeWhereSelectBranch(
 
 fn whereSelectConsumeTrueOp(ctx: *anyopaque, cond: CT, on_true: CT, on_false: CT) anyerror!?CT {
     _ = ctx;
+    if (integerSource(cond) != null or integerSource(on_true) != null or integerSource(on_false) != null) return null;
     var c_shape_symbolic_buf: [8]i64 = undefined;
     var t_shape_symbolic_buf: [8]i64 = undefined;
     var f_shape_symbolic_buf: [8]i64 = undefined;
@@ -6894,6 +6938,7 @@ fn whereSelectConsumeTrueOp(ctx: *anyopaque, cond: CT, on_true: CT, on_false: CT
 
 fn whereSelectConsumeFalseOp(ctx: *anyopaque, cond: CT, on_true: CT, on_false: CT) anyerror!?CT {
     _ = ctx;
+    if (integerSource(cond) != null or integerSource(on_true) != null or integerSource(on_false) != null) return null;
     var c_shape_symbolic_buf: [8]i64 = undefined;
     var t_shape_symbolic_buf: [8]i64 = undefined;
     var f_shape_symbolic_buf: [8]i64 = undefined;
@@ -36139,6 +36184,7 @@ pub fn t5RelativePositionBucket(relative_position: i64, num_buckets_: usize, max
 
 fn multiplyOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    if (integerSource(a) != null and integerSource(b) != null) return integerBinaryOp(self, a, b, .multiply);
     if (try applyShapeAwareBinaryOp(self, a, b, .mul)) |result| {
         return result;
     }
@@ -37501,6 +37547,7 @@ fn primBinaryBroadcast(allocator: std.mem.Allocator, a_data: []const f32, b_data
 
 fn subtractOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    if (integerSource(a) != null and integerSource(b) != null) return integerBinaryOp(self, a, b, .subtract);
     if (try applyShapeAwareBinaryOp(self, a, b, .sub)) |result| {
         return result;
     }
@@ -37618,6 +37665,7 @@ fn primErfOp(ctx: *anyopaque, a: CT) anyerror!CT {
 
 fn lessThanOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    if (integerSource(a) != null or integerSource(b) != null) return exactLessThan(self, a, b);
     if (try applyShapeAwareBinaryOp(self, a, b, .lt)) |result| {
         return result;
     }
@@ -37635,6 +37683,7 @@ fn lessThanOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
 
 fn whereSelectOp(ctx: *anyopaque, cond: CT, on_true: CT, on_false: CT) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    if (integerSource(cond) != null or integerSource(on_true) != null or integerSource(on_false) != null) return exactWhereSelect(self, cond, on_true, on_false);
     var c_shape_symbolic_buf: [8]i64 = undefined;
     var t_shape_symbolic_buf: [8]i64 = undefined;
     var f_shape_symbolic_buf: [8]i64 = undefined;
@@ -38256,6 +38305,21 @@ fn primTransposeOp(ctx: *anyopaque, input: CT, perm: []const u8, input_shape: []
 
 fn primBroadcastInDimOp(ctx: *anyopaque, input: CT, target_shape: []const i64, broadcast_axes: []const u8, input_shape: []const i64) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    if (integerSource(input)) |source| {
+        const plan = try @import("binary_broadcast.zig").SelectionPlan.broadcast(storedOrDeclaredShape(input, input_shape), target_shape, broadcast_axes);
+        if (plan.counts[0] != try integerTensorCount(source)) return error.ShapeMismatch;
+        if (plan.identity()) return copyIntegerTensorWithShape(self, source, plan.shape[0..plan.rank]);
+        const width = source.dtype.byteSize();
+        const bytes = try self.allocator.alloc(u8, try std.math.mul(usize, plan.count, width));
+        var transferred = false;
+        defer if (!transferred) self.allocator.free(bytes);
+        for (0..plan.count) |i| {
+            const offset = plan.offsets(i)[0] * width;
+            @memcpy(bytes[i * width ..][0..width], source.data[offset..][0..width]);
+        }
+        transferred = true;
+        return takeOwnedIntegerBytes(self, bytes, source.dtype, plan.shape[0..plan.rank]);
+    }
     const input_buf = toBuf(input);
     const out_rank = target_shape.len;
     const effective_input_shape = storedOrDeclaredShape(input, input_shape);
@@ -39082,13 +39146,220 @@ fn primDotGeneralOp(ctx: *anyopaque, lhs: CT, rhs: CT, lhs_shape: []const i64, r
     return error.UnsupportedPrimitiveOp;
 }
 
+/// Scan each independent axis lane in place. Integer addition wraps just as
+/// the Metal integer scan does, without rounding through floating point.
+fn scanAxis(comptime T: type, values: []align(1) T, outer: usize, width: usize, inner: usize, exclusive: bool, reverse: bool) void {
+    for (0..outer) |batch| for (0..inner) |channel| {
+        var sum: T = 0;
+        for (0..width) |step| {
+            const index = (batch * width + (if (reverse) width - 1 - step else step)) * inner + channel;
+            const value = values[index];
+            if (exclusive) values[index] = sum;
+            sum = if (@typeInfo(T) == .int) sum +% value else sum + value;
+            if (!exclusive) values[index] = sum;
+        }
+    };
+}
+
+/// Compare without promoting the integer to floating point, even at i64's
+/// limits. A finite in-range f32's truncated integer part fits exactly in i64.
+fn integerFloatLess(integer: i64, floating: f32, reverse: bool) bool {
+    if (std.math.isNan(floating)) return false;
+    if (floating >= 9223372036854775808.0) return !reverse;
+    if (floating < -9223372036854775808.0) return reverse;
+    const integral: i64 = @intFromFloat(floating);
+    const integral_float: f32 = @floatFromInt(integral);
+    return if (reverse)
+        integral < integer or (integral == integer and floating < integral_float)
+    else
+        integer < integral or (integer == integral and floating > integral_float);
+}
+
+fn exactLessThan(self: *NativeCompute, a: CT, b: CT) !CT {
+    const lhs = if (integerSource(a) != null) try IndexReader.init(a) else null;
+    const rhs = if (integerSource(b) != null) try IndexReader.init(b) else null;
+    const lf = if (lhs == null) try denseTensorView(self, a) else null;
+    defer if (lf) |view| if (view.owned) |owned| self.allocator.free(owned);
+    const rf = if (rhs == null) try denseTensorView(self, b) else null;
+    defer if (rf) |view| if (view.owned) |owned| self.allocator.free(owned);
+    const ln = if (lhs) |reader| reader.len else lf.?.data.len;
+    const rn = if (rhs) |reader| reader.len else rf.?.data.len;
+    const lflat = [_]i64{@intCast(ln)};
+    const rflat = [_]i64{@intCast(rn)};
+    const plan = try @import("binary_broadcast.zig").Plan.init(tensorStoredShape(a) orelse &lflat, tensorStoredShape(b) orelse &rflat);
+    if (plan.lhs_count != ln or plan.rhs_count != rn) return error.ShapeMismatch;
+    const data = try self.allocator.alloc(f32, plan.count);
+    const result = try self.makeOwnedBuf(data);
+    errdefer freeTensor(self, result);
+    // Select the operand kinds once. Flat/scalar maps avoid divisions and
+    // coalesced axes keep general broadcasting bounded without input copies.
+    if (lhs) |left| {
+        if (rhs) |right| {
+            for (data, 0..) |*value, i| {
+                const offsets = plan.offsets(i);
+                value.* = @floatFromInt(@intFromBool(try left.at(offsets.lhs) < try right.at(offsets.rhs)));
+            }
+        } else {
+            for (data, 0..) |*value, i| {
+                const offsets = plan.offsets(i);
+                value.* = @floatFromInt(@intFromBool(integerFloatLess(try left.at(offsets.lhs), rf.?.data[offsets.rhs], false)));
+            }
+        }
+    } else {
+        for (data, 0..) |*value, i| {
+            const offsets = plan.offsets(i);
+            value.* = @floatFromInt(@intFromBool(integerFloatLess(try rhs.?.at(offsets.rhs), lf.?.data[offsets.lhs], true)));
+        }
+    }
+    return self.withLogicalShape(result, plan.shape[0..plan.rank]);
+}
+
+fn integerBinaryOp(self: *NativeCompute, a: CT, b: CT, comptime kind: enum { add, subtract, multiply }) !CT {
+    const lhs = integerSource(a) orelse return error.UnsupportedTensorType;
+    const rhs = integerSource(b) orelse return error.UnsupportedTensorType;
+    if (lhs.dtype != rhs.dtype or lhs.dtype == .bool_) return error.UnsupportedTensorType;
+    const left = try IndexReader.init(a);
+    const right = try IndexReader.init(b);
+    const plan = try @import("binary_broadcast.zig").Plan.init(tensorStoredShape(a) orelse lhs.shape, tensorStoredShape(b) orelse rhs.shape);
+    if (plan.lhs_count != left.len or plan.rhs_count != right.len) return error.ShapeMismatch;
+    const count = plan.count;
+    const shape = plan.shape[0..plan.rank];
+    const bytes = try self.allocator.alloc(u8, try std.math.mul(usize, count, lhs.dtype.byteSize()));
+    defer self.allocator.free(bytes);
+    for (0..count) |i| {
+        const offsets = plan.offsets(i);
+        const x: u64 = @bitCast(try left.at(offsets.lhs));
+        const y: u64 = @bitCast(try right.at(offsets.rhs));
+        const result = switch (kind) {
+            .add => x +% y,
+            .subtract => x -% y,
+            .multiply => x *% y,
+        };
+        switch (lhs.dtype) {
+            .i8, .u8 => bytes[i] = @truncate(result),
+            .i16 => std.mem.writeInt(u16, bytes[i * 2 ..][0..2], @truncate(result), .little),
+            .i32 => std.mem.writeInt(u32, bytes[i * 4 ..][0..4], @truncate(result), .little),
+            .i64 => std.mem.writeInt(u64, bytes[i * 8 ..][0..8], result, .little),
+            else => unreachable,
+        }
+    }
+    const dtype: ops.GraphDType = switch (lhs.dtype) {
+        inline else => |tag| @field(ops.GraphDType, @tagName(tag)),
+    };
+    return (try fromConstantBytesOp(self, bytes, dtype, shape)).?;
+}
+
+fn cumulativeSumOp(ctx: *anyopaque, input: CT, axis: u8, exclusive: bool, reverse: bool) anyerror!?CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    var flat_shape: [1]i64 = undefined;
+    const shape = tensorStoredShape(input) orelse blk: {
+        flat_shape[0] = @intCast((try getDataChecked(input)).len);
+        break :blk &flat_shape;
+    };
+    if (shape.len > 8 or axis >= shape.len) return error.InvalidTensorShape;
+    const count = typedShapeNumel(shape) orelse return error.InvalidTensorShape;
+    const outer = typedShapeNumel(shape[0..axis]) orelse return error.InvalidTensorShape;
+    const inner = typedShapeNumel(shape[axis + 1 ..]) orelse return error.InvalidTensorShape;
+    const width: usize = @intCast(shape[axis]);
+    if (integerSource(input)) |source| {
+        if (source.dtype == .bool_) return error.UnsupportedTensorType;
+        if (try integerTensorCount(source) != count) return error.ShapeMismatch;
+        const output = try copyIntegerTensorWithShape(self, source, shape);
+        const data = toBuf(output).owned_source_tensor.?.data;
+        switch (source.dtype) {
+            .i8 => scanAxis(i8, std.mem.bytesAsSlice(i8, data), outer, width, inner, exclusive, reverse),
+            .i16 => scanAxis(i16, std.mem.bytesAsSlice(i16, data), outer, width, inner, exclusive, reverse),
+            .u8 => scanAxis(u8, data, outer, width, inner, exclusive, reverse),
+            .i32 => scanAxis(i32, std.mem.bytesAsSlice(i32, data), outer, width, inner, exclusive, reverse),
+            .i64 => scanAxis(i64, std.mem.bytesAsSlice(i64, data), outer, width, inner, exclusive, reverse),
+            else => unreachable,
+        }
+        return output;
+    }
+    // Other physical integer types must not fall through the float scan.
+    switch (try tensorDTypeOp(ctx, input)) {
+        .i8, .i16, .i32, .i64, .u8, .bool_ => return error.UnsupportedTensorType,
+        else => {},
+    }
+    const source = try getDataChecked(input);
+    if (source.len != count) return error.ShapeMismatch;
+    const data = try self.allocator.dupe(f32, source);
+    const output = try self.makeOwnedBuf(data);
+    errdefer self.computeBackend().free(output);
+    scanAxis(f32, data, outer, width, inner, exclusive, reverse);
+    return self.withLogicalShape(output, shape);
+}
+
+fn exactWhereSelect(self: *NativeCompute, cond: CT, yes: CT, no: CT) !CT {
+    const dtype: tensor_mod.DType = if (integerSource(yes)) |source| source.dtype else .f32;
+    const false_dtype: tensor_mod.DType = if (integerSource(no)) |source| source.dtype else .f32;
+    if (dtype != false_dtype) return error.UnsupportedTensorType;
+    var views: [3]?WeightF32View = @splat(null);
+    defer for (&views) |*view| {
+        if (view.*) |v| if (v.owned) |owned| self.allocator.free(owned);
+    };
+    var shapes: [3][]const i64 = undefined;
+    var flat: [3][1]i64 = undefined;
+    var bytes: [3][]const u8 = undefined;
+    var counts: [3]usize = undefined;
+    for ([_]CT{ cond, yes, no }, 0..) |input, i| {
+        if (integerSource(input)) |source| {
+            counts[i] = try integerTensorCount(source);
+            bytes[i] = source.data;
+        } else {
+            views[i] = try denseTensorView(self, input);
+            counts[i] = views[i].?.data.len;
+            bytes[i] = std.mem.sliceAsBytes(views[i].?.data);
+        }
+        flat[i][0] = @intCast(counts[i]);
+        shapes[i] = tensorStoredShape(input) orelse &flat[i];
+    }
+    const plan = try @import("binary_broadcast.zig").SelectionPlan.where(shapes[0], shapes[1], shapes[2]);
+    if (!std.mem.eql(usize, &counts, &plan.counts)) return error.ShapeMismatch;
+    const condition = if (integerSource(cond) != null) try IndexReader.init(cond) else null;
+    const width = if (integerSource(yes)) |source| source.dtype.byteSize() else @sizeOf(f32);
+    const output = try self.allocator.alloc(u8, try std.math.mul(usize, plan.count, width));
+    var transferred = false;
+    defer if (!transferred) self.allocator.free(output);
+    for (0..plan.count) |i| {
+        const offsets = plan.offsets(i);
+        const take_true = if (condition) |reader| try reader.at(offsets[0]) != 0 else views[0].?.data[offsets[0]] != 0;
+        const branch: usize = if (take_true) 1 else 2;
+        @memcpy(output[i * width ..][0..width], bytes[branch][offsets[branch] * width ..][0..width]);
+    }
+    if (dtype == .f32) {
+        const data = try self.allocator.alloc(f32, plan.count);
+        @memcpy(std.mem.sliceAsBytes(data), output);
+        const result = try self.makeOwnedBuf(data);
+        errdefer freeTensor(self, result);
+        return self.withLogicalShape(result, plan.shape[0..plan.rank]);
+    }
+    transferred = true;
+    return takeOwnedIntegerBytes(self, output, dtype, plan.shape[0..plan.rank]);
+}
+
+/// Takes ownership on success and failure, avoiding a second output copy.
+fn takeOwnedIntegerBytes(self: *NativeCompute, data: []u8, dtype: tensor_mod.DType, shape: []const i64) !CT {
+    const owned_shape = self.allocator.dupe(i64, shape) catch |err| {
+        self.allocator.free(data);
+        return err;
+    };
+    return self.makeBufWithOwnedSourceTensor(.{ .data = data, .dtype = dtype, .shape = owned_shape, .name = "", .allocator = self.allocator, .owns_data = true, .owns_shape = true });
+}
+
 fn integerSource(input: CT) ?*const tensor_mod.Tensor {
     const source = toBuf(input).source_tensor orelse return null;
-    return if (source.dtype == .i32 or source.dtype == .i64) source else null;
+    return switch (source.dtype) {
+        .i8, .i16, .i32, .i64, .u8, .bool_ => source,
+        else => null,
+    };
 }
 
 fn integerTensorCount(tensor: *const tensor_mod.Tensor) !usize {
-    if (tensor.dtype != .i32 and tensor.dtype != .i64) return error.UnsupportedTensorType;
+    switch (tensor.dtype) {
+        .i8, .i16, .i32, .i64, .u8, .bool_ => {},
+        else => return error.UnsupportedTensorType,
+    }
     const expected = tensorExpectedDenseByteLen(tensor) orelse return error.InvalidTensorShape;
     if (tensor.data.len != expected) return error.InvalidTensorShape;
     return expected / tensor.dtype.byteSize();
@@ -39120,6 +39391,9 @@ const IndexReader = struct {
     fn at(self: IndexReader, index: usize) !i64 {
         if (index >= self.len) return error.IndexOutOfBounds;
         if (self.source) |source| return switch (source.dtype) {
+            .i8 => std.mem.bytesAsSlice(i8, source.data)[index],
+            .i16 => std.mem.bytesAsSlice(i16, source.data)[index],
+            .u8, .bool_ => source.data[index],
             .i32 => std.mem.bytesAsSlice(i32, source.data)[index],
             .i64 => std.mem.bytesAsSlice(i64, source.data)[index],
             else => unreachable,
@@ -39777,6 +40051,20 @@ fn primGatherOp(ctx: *anyopaque, input: CT, indices: CT, axis: u8, input_shape: 
 
 fn primSliceOp(ctx: *anyopaque, input: CT, starts: []const i64, limits: []const i64, strides: []const i64, input_shape: []const i64) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    if (integerSource(input)) |source| {
+        const plan = try @import("slice_plan.zig").Plan.init(storedOrDeclaredShape(input, input_shape), starts, limits, strides, input_shape);
+        if (plan.input_count != try integerTensorCount(source)) return error.ShapeMismatch;
+        const width = source.dtype.byteSize();
+        const bytes = try self.allocator.alloc(u8, try std.math.mul(usize, plan.count, width));
+        if (plan.count > 0) {
+            if (plan.contiguous()) {
+                @memcpy(bytes, source.data[@as(usize, @intCast(plan.base)) * width ..][0..bytes.len]);
+            } else for (0..plan.count) |i| {
+                @memcpy(bytes[i * width ..][0..width], source.data[plan.offset(i) * width ..][0..width]);
+            }
+        }
+        return takeOwnedIntegerBytes(self, bytes, source.dtype, plan.shape[0..plan.rank]);
+    }
     const in_data = getData(input);
     const rank = input_shape.len;
     if (rank > 8 or starts.len < rank or limits.len < rank or strides.len < rank) return error.UnsupportedShape;
@@ -40213,6 +40501,69 @@ fn fromFloat32ShapeOp(ctx: *anyopaque, data: []const f32, shape: []const i32) an
     const buf = try self.makeBuf(owned, true);
     toBuf(buf).logical_shape = logical_shape;
     return buf;
+}
+
+fn convertDTypeOp(ctx: *anyopaque, input: CT, target: ops.GraphDType) anyerror!?CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const source = integerSource(input);
+    const target_integer = switch (target) {
+        .i8, .i16, .i32, .i64, .u8, .bool_ => true,
+        else => false,
+    };
+    if (!target_integer) {
+        if (source == null) return null;
+        const data = try convertTensorToOwnedF32(self.allocator, source.?);
+        const output = try self.makeOwnedBuf(data);
+        errdefer self.computeBackend().free(output);
+        return self.withLogicalShape(output, source.?.shape);
+    }
+    const floats = if (source == null) try getDataChecked(input) else &.{};
+    const count = if (source) |tensor| try integerTensorCount(tensor) else floats.len;
+    const fallback = [_]i64{@intCast(count)};
+    const shape = tensorStoredShape(input) orelse &fallback;
+    const bytes = try self.allocator.alloc(u8, try std.math.mul(usize, count, target.byteSize()));
+    defer self.allocator.free(bytes);
+    const reader = if (source != null) try IndexReader.init(input) else null;
+    for (0..count) |i| {
+        var value: i64 = undefined;
+        if (reader) |exact| {
+            value = try exact.at(i);
+        } else {
+            const f: f64 = floats[i];
+            if (target == .bool_) {
+                bytes[i] = @intFromBool(f != 0);
+                continue;
+            }
+            if (!std.math.isFinite(f) or f < -9223372036854775808.0 or f >= 9223372036854775808.0) return error.InvalidIntegerCast;
+            value = @intFromFloat(f);
+        }
+        switch (target) {
+            .i8, .u8 => bytes[i] = @truncate(@as(u64, @bitCast(value))),
+            .i16 => std.mem.writeInt(u16, bytes[i * 2 ..][0..2], @truncate(@as(u64, @bitCast(value))), .little),
+            .i32 => std.mem.writeInt(u32, bytes[i * 4 ..][0..4], @truncate(@as(u64, @bitCast(value))), .little),
+            .i64 => std.mem.writeInt(i64, bytes[i * 8 ..][0..8], value, .little),
+            .bool_ => bytes[i] = @intFromBool(value != 0),
+            else => unreachable,
+        }
+    }
+    return fromConstantBytesOp(ctx, bytes, target, shape);
+}
+
+fn fromConstantBytesOp(ctx: *anyopaque, data: []const u8, dtype: ops.GraphDType, shape: []const i64) anyerror!?CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const storage_dtype: tensor_mod.DType = switch (dtype) {
+        inline .i8, .i16, .i32, .i64, .u8, .bool_ => |tag| @field(tensor_mod.DType, @tagName(tag)),
+        else => return null,
+    };
+    if (shape.len > 8) return error.InvalidTensorShape;
+    const count = typedShapeNumel(shape) orelse return error.InvalidTensorShape;
+    if (data.len != try std.math.mul(usize, count, storage_dtype.byteSize())) return error.InvalidTensorShape;
+    const raw = try self.allocator.dupe(u8, data);
+    var transferred = false;
+    errdefer if (!transferred) self.allocator.free(raw);
+    const owned_shape = try self.allocator.dupe(i64, shape);
+    transferred = true;
+    return self.makeBufWithOwnedSourceTensor(.{ .data = raw, .dtype = storage_dtype, .shape = owned_shape, .name = "", .allocator = self.allocator, .owns_data = true, .owns_shape = true });
 }
 
 fn fromInt32ShapeOp(ctx: *anyopaque, data: []const i32, shape: []const i32) anyerror!?CT {
@@ -45339,7 +45690,7 @@ test "native quant linear buckets use packed dispatch without dense dequant" {
     }
 }
 
-test "q4 q5 unmeasured recognizer shapes use cached dense dequant sgemm" {
+test "q4 q5 unmeasured extractor shapes use cached dense dequant sgemm" {
     const allocator = std.testing.allocator;
     const rows: usize = 37;
     const in_dim: usize = 768;
@@ -50702,4 +51053,89 @@ test "gather source-backed 2d table with unshaped vector indices" {
         1, 2,
         7, 8,
     }, getData(out_ct));
+}
+
+test "native CumSum preserves batched strided i32 and i64 scans" {
+    const a = std.testing.allocator;
+    var ws = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(a, &ws, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    inline for (.{ i32, i64 }) |T| {
+        const large: T = if (T == i32) 16777217 else 9007199254740993;
+        const values = [_]T{ large, 1, 1, -large, std.math.maxInt(T), -1, 1, std.math.minInt(T), 2, 3, 4, 5 };
+        const host = if (T == i32)
+            try tensor_mod.Tensor.initInt32(a, "", &.{ 2, 3, 2 }, &values)
+        else
+            try tensor_mod.Tensor.initInt64(a, "", &.{ 2, 3, 2 }, &values);
+        const input = try compute.importOwnedStaticTensor(host);
+        defer cb.free(input);
+        for ([_]bool{ false, true }) |reverse| for ([_]bool{ false, true }) |exclusive| {
+            const output = (try cb.tryCumulativeSum(input, 1, exclusive, reverse)).?;
+            defer cb.free(output);
+            const exported = (try cb.exportTensorData(output, a)).?;
+            defer a.free(exported.payload.bytes);
+            try std.testing.expectEqual(if (T == i32) .i32 else .i64, exported.dtype);
+            const actual = std.mem.bytesAsSlice(T, exported.payload.bytes);
+            for (0..2) |batch| for (0..2) |channel| for (0..3) |position| {
+                var expected: T = 0;
+                for (0..3) |source| {
+                    const included = if (reverse) source > position or (!exclusive and source == position) else source < position or (!exclusive and source == position);
+                    if (included) expected +%= values[(batch * 3 + source) * 2 + channel];
+                }
+                try std.testing.expectEqual(expected, actual[(batch * 3 + position) * 2 + channel]);
+            };
+        };
+        // Inputs remain reusable across scans and invalid requests.
+        const original = (try cb.exportTensorData(input, a)).?;
+        defer a.free(original.payload.bytes);
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&values), original.payload.bytes);
+        try std.testing.expectError(error.InvalidTensorShape, cb.tryCumulativeSum(input, 3, false, false));
+    }
+    const empty = (try cb.fromInt32Shape(&.{}, &.{ 2, 0, 3 })).?;
+    defer cb.free(empty);
+    const empty_output = (try cb.tryCumulativeSum(empty, 1, true, true)).?;
+    defer cb.free(empty_output);
+    const shape = try cb.tensorShape(empty_output, a);
+    defer a.free(shape);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 0, 3 }, shape);
+}
+
+test "native CumSum accepts the flat float tensor constructor" {
+    const a = std.testing.allocator;
+    var ws = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(a, &ws, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const input = try cb.fromFloat32(&.{ 1, 2, 3 });
+    defer cb.free(input);
+    const output = (try cb.tryCumulativeSum(input, 0, false, false)).?;
+    defer cb.free(output);
+    const values = try cb.toFloat32(output, a);
+    defer a.free(values);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 3, 6 }, values);
+}
+
+test "native integer numeric views retain exact bytes and propagate allocation failure" {
+    const a = std.testing.allocator;
+    var failing = std.testing.FailingAllocator.init(a, .{});
+    var ws = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(failing.allocator(), &ws, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const input = (try cb.fromConstantBytes(std.mem.sliceAsBytes(&[_]i64{ 9007199254740993, 1 }), .i64, &.{2})).?;
+    defer cb.free(input);
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, getDataChecked(input));
+    try std.testing.expectEqual(@as(usize, 0), toBuf(input).data.len);
+    failing.fail_index = std.math.maxInt(usize);
+    const numeric = try getDataChecked(input);
+    const before = failing.alloc_index;
+    try std.testing.expectEqual(numeric.ptr, (try getDataChecked(input)).ptr);
+    try std.testing.expectEqual(before, failing.alloc_index);
+    const output = (try cb.tryCumulativeSum(input, 0, false, false)).?;
+    defer cb.free(output);
+    const exact = (try cb.exportTensorData(output, a)).?;
+    defer a.free(exact.payload.bytes);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]i64{ 9007199254740993, 9007199254740994 }), exact.payload.bytes);
 }
