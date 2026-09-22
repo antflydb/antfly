@@ -14,7 +14,7 @@ const record = @import("completion_control_record.zig");
 const entry = @import("completion_entry.zig");
 const internal_keys = @import("../internal_keys.zig");
 
-pub const max_owners = 4;
+pub const max_owners = capacity.control_outputs;
 const max_namespace_bytes = "docs".len;
 
 fn add(a: u64, b: u64) !u64 {
@@ -239,11 +239,7 @@ pub fn certifyCohort(base: Base, inputs: []const OwnerInput, limits: Limits) !Ce
         .max_output_file_bytes = try size(limits.format.file_bytes),
     };
     const workspace = try maintenance.workspaceRequirement(result.total_cost, @max(result.format.frontier_bytes, result.current_frontier_bytes), result.format.outputs, writer_limits);
-    // The current builder has 68 physical cursor slots. This extra allocation
-    // bound is required by the future extended builder; it does not create its
-    // paths/pins or make a 72-input invocation supported by today's builder.
-    const extra_cursors = limits.max_inputs -| (maintenance.Limits{}).max_inputs;
-    result.maintenance_workspace_bytes = try std.math.add(usize, workspace.total, try std.math.mul(usize, 3 * extra_cursors, try footprint(0, 8)));
+    result.maintenance_workspace_bytes = workspace.total;
     const completion = @import("completion_runtime.zig");
     const operation = try completion.operationWorkspaceRequirement(mutable, writer_limits);
     // Existing operation certificate includes document/foreground reset paths;

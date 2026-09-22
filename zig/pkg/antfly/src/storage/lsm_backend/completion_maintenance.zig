@@ -21,8 +21,8 @@ comptime {
 }
 
 pub const Limits = struct {
-    max_inputs: usize = 68,
-    max_outputs: usize = 64,
+    max_inputs: usize = capacity.max_input_runs,
+    max_outputs: usize = capacity.maintenance_outputs,
     max_metadata_bytes: usize = 1024 * 1024,
     max_output_metadata_bytes: usize = 1024 * 1024,
     max_block_bytes: usize = 1024 * 1024,
@@ -171,14 +171,14 @@ pub fn workspaceRequirement(cost: capacity.Cost, frontier: u64, output_count: u6
     const record = std.math.cast(usize, @max(cost.max_record_bytes, 1)) orelse return error.UnsupportedCompletionProfile;
     const key = std.math.cast(usize, cost.max_key_bytes) orelse return error.UnsupportedCompletionProfile;
     const outputs = std.math.cast(usize, output_count) orelse return error.UnsupportedCompletionProfile;
-    if (outputs > limits.max_outputs or record > limits.max_record_bytes or key > record) return error.UnsupportedCompletionProfile;
+    if (limits.max_inputs > capacity.max_input_runs or outputs > limits.max_outputs or record > limits.max_record_bytes or key > record) return error.UnsupportedCompletionProfile;
     const encoder = try table.boundedEncoderWorkspace(.{ .metadata_bytes = @min(limits.max_metadata_bytes, limits.max_output_metadata_bytes), .record_bytes = record, .key_bytes = key });
     var writer = try std.math.add(usize, encoder.persistent_bytes, try repository.streamingWriterWorkspaceBytes(512));
     writer = try std.math.add(usize, writer, try std.math.mul(usize, key, 2));
     const footprint = domains.RecyclingScratch.allocationFootprint;
     var total = std.math.cast(usize, frontier) orelse return error.UnsupportedCompletionProfile;
     // Each cursor owns one compact index and two fixed block allocations.
-    total = try std.math.add(usize, total, try std.math.mul(usize, 3 * 68, try footprint(0, 8)));
+    total = try std.math.add(usize, total, try std.math.mul(usize, 3 * limits.max_inputs, try footprint(0, 8)));
     total = try std.math.add(usize, total, try footprint(limits.max_metadata_bytes, 1));
     total = try std.math.add(usize, total, try footprint(writer, 1));
     total = try std.math.add(usize, total, try footprint(encoder.compression_bytes, 1));
@@ -313,11 +313,11 @@ pub fn buildStateDrain(allocator: Allocator, io: io_mod.Storage, root: []const u
 }
 
 fn buildInternal(allocator: Allocator, io: io_mod.Storage, root: []const u8, paths: []const []const u8, mutable: *const state.State, output_base: u64, limits: Limits, certified: bool) !std.ArrayListUnmanaged(repository.Run) {
-    if (!domains.isPrepaid(allocator) or root.len > 512 or paths.len > 68 or paths.len > limits.max_inputs or limits.max_outputs > 64)
+    if (!domains.isPrepaid(allocator) or root.len > 512 or paths.len > capacity.max_input_runs or paths.len > limits.max_inputs or limits.max_outputs > capacity.maintenance_outputs)
         return error.UnsupportedCompletionProfile;
     const metadata = try allocator.alloc(u8, limits.max_metadata_bytes);
     defer allocator.free(metadata);
-    var cursors: [68]Cursor = undefined;
+    var cursors: [capacity.max_input_runs]Cursor = undefined;
     var cursor_count: usize = 0;
     defer for (cursors[0..cursor_count]) |*cursor| cursor.deinit();
     var frontier: usize = 0;

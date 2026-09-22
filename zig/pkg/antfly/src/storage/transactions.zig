@@ -61,12 +61,12 @@ pub fn makeIntentLockKeyAlloc(alloc: Allocator, user_key: []const u8) ![]u8 {
 // resolution use point probes instead of cloning the whole mutable memtable.
 // Resolution deletes this sidecar atomically with the intents; terminal
 // history uses TxnRecord.intents_resolved instead.
-const intent_keys_prefix = "\x00\x00__txn_intent_keys__:";
+const intent_keys_prefix = @import("completion_control_budget.zig").intent_keys_prefix;
 const intent_members_prefix = "\x00\x00__txn_intent_members__:";
-const intent_admission_prefix = "\x00\x00__txn_intent_admission__:";
+const intent_admission_prefix = @import("completion_control_budget.zig").intent_admission_prefix;
 const IntentAdmission = struct { count: u64 = 0, bytes: u64 = 0 };
-const completion_prefix = "\x00\x00__txn_completion_v1__:";
-const completion_summary_key = "\x00\x00__metadata__:txn_completion_v1";
+const completion_prefix = @import("completion_control_budget.zig").completion_prefix;
+const completion_summary_key = @import("completion_control_budget.zig").completion_summary_key;
 pub const CompletionLimits = struct {
     max_transaction_bytes: u64 = 0,
     max_count: u64 = 0,
@@ -129,94 +129,14 @@ const CompletionChange = struct {
 // Durable epoch leases. A prepare vote and its schema identity are one atomic
 // mutation; resolution retires both. Historical immutable schemas remain
 // usable after a new active epoch is published and after participant restart.
-const schema_leases_prefix = "\x00\x00__txn_schema_leases__:";
-const records_prefix = "\x00\x00__txn_records__:";
-const participants_prefix = "\x00\x00__txn_participants__:";
-const resolved_participants_prefix = "\x00\x00__txn_resolved_participants__:";
+const schema_leases_prefix = @import("completion_control_budget.zig").schema_leases_prefix;
+const records_prefix = @import("completion_control_budget.zig").records_prefix;
+const participants_prefix = @import("completion_control_budget.zig").participants_prefix;
+const resolved_participants_prefix = @import("completion_control_budget.zig").resolved_participants_prefix;
 const ha_batch_outbox_prefix = "\x00\x00__txn_ha_batch_outbox__:";
 const ha_replay_outbox_prefix = "\x00\x00__txn_ha_replay_outbox__:";
 
-/// Physical metadata traffic for one begin, one decision, and every unique
-/// participant acknowledgement. Intent application and native ownership rows
-/// are additional costs. This is a sizing input, not a native resource lease.
-/// Duplicate commands assigned fresh consensus indices need separate admission;
-/// they cannot spend the finite budget for unique lifecycle transitions.
-pub const CompletionControlBudget = struct {
-    participant_list_bytes: u64,
-    acknowledgement_list_bytes: u64,
-    mutations: u64,
-    operations: u64,
-    payload_bytes: u64,
-    max_mutation_payload_bytes: u64,
-    max_key_bytes: u64,
-    max_record_payload_bytes: u64,
-    wal_bytes: u64,
-
-    fn add(a: u64, b: u64) !u64 {
-        return std.math.add(u64, a, b) catch error.TransactionTooLarge;
-    }
-
-    fn mul(a: u64, b: u64) !u64 {
-        return std.math.mul(u64, a, b) catch error.TransactionTooLarge;
-    }
-
-    pub fn measure(participants: []const []const u8) !CompletionControlBudget {
-        if (participants.len > std.math.maxInt(u32)) return error.TransactionTooLarge;
-        var list_bytes: u64 = @sizeOf(u32);
-        for (participants) |participant| {
-            if (participant.len > std.math.maxInt(u32)) return error.TransactionTooLarge;
-            list_bytes = try add(list_bytes, try add(@sizeOf(u32), participant.len));
-        }
-        return fromEncodedList(participants.len, list_bytes);
-    }
-
-    fn fromEncodedList(count: u64, list_bytes: u64) !CompletionControlBudget {
-        if (count > std.math.maxInt(u32) or list_bytes > std.math.maxInt(u32)) return error.TransactionTooLarge;
-        const record = records_prefix.len + @sizeOf(TxnId) + txn_record_v6_size;
-        const participants_key = participants_prefix.len + @sizeOf(TxnId);
-        const resolved_key = resolved_participants_prefix.len + @sizeOf(TxnId);
-        const credit_key = completion_prefix.len + @sizeOf(TxnId);
-        const summary = completion_summary_key.len + 16;
-        // Begin always has five rows, including the resolved-set tombstone.
-        // An empty participant set deletes its sidecar instead of storing a list.
-        const begin = try add(record + participants_key + resolved_key + credit_key + 16 + summary, if (count == 0) 0 else list_bytes);
-        // Metadata-only resolve writes the record and retires three intent/schema
-        // sidecars. Charging ledger retirement here AND each ACK is conservative
-        // across follower, coordinator, and empty-participant lifecycles.
-        const decision = record + intent_admission_prefix.len + @sizeOf(TxnId) +
-            intent_keys_prefix.len + @sizeOf(TxnId) + schema_leases_prefix.len + @sizeOf(TxnId) + credit_key + summary;
-        const ack_fixed = resolved_key + credit_key + summary;
-        // ACK order is unconstrained. Every prefix is at most the complete
-        // encoded list, so N*L bounds all N rewrites in linear sizing time.
-        // A fixed multiplier of participant-name bytes does not bound this.
-        const acknowledgement_lists = try mul(count, list_bytes);
-        const acknowledgements = try add(try mul(count, ack_fixed), acknowledgement_lists);
-        const payload = try add(try add(begin, decision), acknowledgements);
-        const mutations = try add(2, count);
-        const operations = try add(5 + 6, try mul(count, 3));
-        // Native WAL v1: 16-byte record header, four-byte row count, and
-        // 16-byte row headers. Include the longest supported namespace, docs.
-        const wal_bytes = try add(payload, try add(try mul(mutations, 20), try mul(operations, 16 + "docs".len)));
-        var max_key_bytes: u64 = 0;
-        inline for (.{ records_prefix, participants_prefix, resolved_participants_prefix, completion_prefix, intent_admission_prefix, intent_keys_prefix, schema_leases_prefix }) |prefix|
-            max_key_bytes = @max(max_key_bytes, prefix.len + @sizeOf(TxnId));
-        max_key_bytes = @max(max_key_bytes, completion_summary_key.len);
-        // Keep the largest key distinct from cumulative/list payload sizes:
-        // SST bound metadata stores keys, not the participant-list values.
-        const max_record_payload_bytes = @max(max_key_bytes, @max(record, @max(summary, @max(credit_key + 16, try add(@max(participants_key, resolved_key), list_bytes)))));
-        return .{
-            .participant_list_bytes = list_bytes,
-            .acknowledgement_list_bytes = acknowledgement_lists,
-            .mutations = mutations,
-            .operations = operations,
-            .payload_bytes = payload,
-            .max_mutation_payload_bytes = @max(begin, @max(decision, if (count == 0) 0 else try add(ack_fixed, list_bytes))),
-            .max_key_bytes = max_key_bytes,
-            .max_record_payload_bytes = max_record_payload_bytes,
-            .wal_bytes = wal_bytes,
-        };
-    }
-};
+pub const CompletionControlBudget = @import("completion_control_budget.zig").Budget;
 
 // ============================================================================
 // Types
@@ -498,7 +418,7 @@ const txn_record_v2_size = 49;
 const txn_record_v3_size = 50;
 const txn_record_v4_size = 51;
 const txn_record_v5_size = 52;
-const txn_record_v6_size = 53;
+const txn_record_v6_size = @import("completion_control_budget.zig").txn_record_v6_size;
 
 /// Only begin metadata may omit derived replay publication. Never grant this
 /// exemption to document mutations, decisions, acknowledgements or intents.
@@ -3298,6 +3218,104 @@ fn rebindCompiledTemplateForTest(template: *completion_compiler.Template, timest
             .value => op.value,
         });
         std.mem.writeInt(u64, target[binding.offset..][0..8], value, if (binding.byte_order == .little) .little else .big);
+    };
+}
+
+test "workload admission completion compiler derives native control ownership from actual fresh BEGIN" {
+    const alloc = std.testing.allocator;
+    const begin = @import("lsm_backend/completion_control_begin.zig");
+    const record = @import("lsm_backend/completion_control_record.zig");
+    const guard = @import("lsm_backend/completion_control_guard.zig");
+    const entry = @import("lsm_backend/completion_entry.zig");
+    var backend = lsm_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    var manager = try TxnManager.init(alloc, &store);
+    defer manager.deinit();
+    manager.completion_limits = .{ .max_count = 16, .max_bytes = 1024 * 1024 };
+    try manager.reconcileCompletionAdmission();
+    const authority: @import("completion_candidate.zig").Authority = .{
+        .group_id = 9,
+        .incarnation = @splat(3),
+        .policy_digest = @splat(4),
+        .schema_catalog_digest = @splat(5),
+        .previous_term = 2,
+        .previous_index = 17,
+    };
+    var case: u8 = 0;
+    for ([_]bool{ false, true }) |coordinator| for ([_]bool{ false, true }) |retain_terminal| for ([_][]const []const u8{ &.{}, &.{ "coordinator", "left\x00\xff", "right" } }) |participants| {
+        case += 1;
+        const id: TxnId = @splat(case);
+        const input: TxnManager.BeginInput = .{
+            .txn_id = id,
+            .timestamp = 100,
+            .created_at = 90,
+            .participants = participants,
+            .coordinator = coordinator,
+            .retain_terminal = retain_terminal,
+        };
+        {
+            var snapshot = try manager.store.beginRead();
+            defer snapshot.abort();
+            const wire = try manager.compileBeginMutation(alloc, &snapshot, input, authority, @splat(case), "native-control-begin", &.{});
+            defer alloc.free(wire);
+            var decoded = try entry.decode(alloc, wire);
+            defer decoded.deinit();
+            const declaration = try begin.inspect(decoded.entry.prepare_operations);
+            try std.testing.expectEqualDeep(id, declaration.txn_id);
+            try std.testing.expectEqualDeep(try CompletionControlBudget.measure(participants), declaration.budget);
+            try std.testing.expectEqualDeep(try record.Participants.measure(participants), declaration.participants);
+            try std.testing.expectEqual(coordinator, declaration.coordinator);
+            try std.testing.expectEqual(retain_terminal, declaration.retain_terminal);
+            try std.testing.expectError(error.TxnNotFound, manager.loadTransactionRecord(id));
+            const owned_record: record.Record = .{
+                .authority = .{ .group_id = authority.group_id, .incarnation = authority.incarnation, .policy_digest = authority.policy_digest, .schema_catalog_digest = authority.schema_catalog_digest, .generation = 7 },
+                .txn_id = declaration.txn_id,
+                .begin = .{ .term = 2, .index = 18, .digest = entry.protocol.payloadDigest(wire) },
+                .participants = declaration.participants,
+                .slot_index = case % record.max_owners,
+                .output_run_id = 100 + @as(u64, case),
+            };
+            const retained = try (guard.Guard{ .record = owned_record, .envelope = wire }).encode(alloc);
+            defer alloc.free(retained);
+            const restored = try guard.Guard.decode(retained);
+            try std.testing.expectEqualDeep(owned_record, restored.record);
+            var restored_entry = try entry.decode(alloc, restored.envelope);
+            defer restored_entry.deinit();
+            try std.testing.expectEqualDeep(declaration, try begin.inspect(restored_entry.entry.prepare_operations));
+
+            var operations: [5]completion_compiler.slot.Operation = undefined;
+            @memcpy(&operations, decoded.entry.prepare_operations);
+            for (operations, 0..) |op, i| {
+                if (std.mem.startsWith(u8, op.key, records_prefix)) {
+                    var value = op.value[0..txn_record_v6_size].*;
+                    value[49] = 1; // Already prepared is not fresh BEGIN debt.
+                    operations[i].value = &value;
+                    try std.testing.expectError(error.InvalidCompletionSlot, begin.inspect(&operations));
+                    operations[i] = op;
+                } else if (std.mem.startsWith(u8, op.key, completion_prefix)) {
+                    var value = op.value[0..16].*;
+                    std.mem.writeInt(u64, value[0..8], declaration.budget.wal_bytes - 1, .little);
+                    operations[i].value = &value;
+                    try std.testing.expectError(error.CompletionPlanCapacityExceeded, begin.inspect(&operations));
+                    operations[i] = op;
+                }
+                operations[i].key = "unrelated-document-key";
+                try std.testing.expectError(error.InvalidCompletionSlot, begin.inspect(&operations));
+                operations[i] = op;
+            }
+            operations[1] = operations[0];
+            try std.testing.expectError(error.InvalidCompletionSlot, begin.inspect(&operations));
+        }
+        try manager.initTransactionWithParticipantsCreatedAtRoleAndRetention(id, 100, 90, participants, coordinator, retain_terminal);
+        var snapshot = try manager.store.beginRead();
+        defer snapshot.abort();
+        const duplicate = try manager.compileBeginMutation(alloc, &snapshot, input, authority, @splat(case), "native-control-begin", &.{});
+        defer alloc.free(duplicate);
+        var decoded_duplicate = try entry.decode(alloc, duplicate);
+        defer decoded_duplicate.deinit();
+        try std.testing.expectError(error.UnsupportedCompletionProfile, begin.inspect(decoded_duplicate.entry.prepare_operations));
     };
 }
 

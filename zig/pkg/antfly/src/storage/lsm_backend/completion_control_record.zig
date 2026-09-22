@@ -16,6 +16,7 @@ pub const encoded_bytes = 256;
 pub const receipt_bytes = 48;
 pub const owner_key_bytes = owner_prefix.len + 16;
 pub const receipt_key_bytes = receipt_prefix.len + 16;
+pub const max_owners = 4;
 const magic = "AFCTLOW1";
 const version: u16 = 1;
 
@@ -83,6 +84,17 @@ pub const Participants = struct {
         return .{ .digest = hash.finalResult(), .count = count, .encoded_list_bytes = total };
     }
 
+    pub fn fromEncodedList(bytes: []const u8) !Participants {
+        // Validate complete framing before hashing; count and length alone do
+        // not distinguish truncated names or a noncanonical trailing suffix.
+        var iterator = try @import("../completion_control_budget.zig").ParticipantIterator.init(bytes);
+        while (try iterator.next()) |_| {}
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("antfly-completion-control-participants-v1\x00");
+        hash.update(bytes);
+        return .{ .digest = hash.finalResult(), .count = iterator.count, .encoded_list_bytes = @intCast(bytes.len) };
+    }
+
     fn validate(self: Participants) !void {
         const minimum = std.math.add(u64, 4, @as(u64, self.count) * 4) catch unreachable;
         if (self.encoded_list_bytes < minimum or (self.count == 0 and self.encoded_list_bytes != 4) or
@@ -95,9 +107,13 @@ pub const Record = struct {
     txn_id: [16]u8,
     begin: Receipt,
     participants: Participants,
+    /// Native-local output ownership survives document cohort maintenance.
+    slot_index: u16,
+    output_run_id: u64,
 
     fn validate(self: Record) !void {
-        if (self.authority.group_id == 0 or self.authority.generation == 0)
+        if (self.authority.group_id == 0 or self.authority.generation == 0 or
+            self.slot_index >= max_owners or self.output_run_id == 0)
             return error.InvalidCompletionSlot;
         try self.begin.validate();
         try self.participants.validate();
@@ -121,6 +137,7 @@ pub const Record = struct {
         var bytes: [encoded_bytes]u8 = @splat(0);
         @memcpy(bytes[0..8], magic);
         std.mem.writeInt(u16, bytes[8..10], version, .little);
+        std.mem.writeInt(u16, bytes[10..12], self.slot_index, .little);
         std.mem.writeInt(u64, bytes[16..24], self.authority.group_id, .little);
         @memcpy(bytes[24..40], &self.authority.incarnation);
         @memcpy(bytes[40..72], &self.authority.policy_digest);
@@ -131,6 +148,7 @@ pub const Record = struct {
         @memcpy(bytes[176..208], &self.participants.digest);
         std.mem.writeInt(u32, bytes[208..212], self.participants.count, .little);
         std.mem.writeInt(u32, bytes[212..216], self.participants.encoded_list_bytes, .little);
+        std.mem.writeInt(u64, bytes[216..224], self.output_run_id, .little);
         @memcpy(bytes[224..256], &checksum(&bytes));
         return bytes;
     }
@@ -140,7 +158,7 @@ pub const Record = struct {
             return error.InvalidCompletionSlot;
         if (std.mem.readInt(u16, bytes[8..10], .little) != version)
             return error.UnsupportedCompletionSlotVersion;
-        if (!std.mem.allEqual(u8, bytes[10..16], 0) or !std.mem.allEqual(u8, bytes[216..224], 0))
+        if (!std.mem.allEqual(u8, bytes[12..16], 0))
             return error.InvalidCompletionSlot;
         if (!std.mem.eql(u8, bytes[224..256], &checksum(bytes)))
             return error.CompletionSlotChecksumMismatch;
@@ -159,6 +177,8 @@ pub const Record = struct {
                 .count = std.mem.readInt(u32, bytes[208..212], .little),
                 .encoded_list_bytes = std.mem.readInt(u32, bytes[212..216], .little),
             },
+            .slot_index = std.mem.readInt(u16, bytes[10..12], .little),
+            .output_run_id = std.mem.readInt(u64, bytes[216..224], .little),
         };
         try self.validate();
         return self;
@@ -192,6 +212,8 @@ fn fixture() !Record {
         .txn_id = @splat(19),
         .begin = .{ .term = 23, .index = 29, .digest = @splat(31) },
         .participants = try Participants.measure(&.{ "coordinator", "binary\x00\xffpeer" }),
+        .slot_index = 2,
+        .output_run_id = 101,
     };
 }
 
@@ -233,7 +255,7 @@ test "workload admission completion compiler control record rejects corruption n
         if (Record.decode(&bytes)) |_| return error.TestExpectedError else |_| {}
     }
     try std.testing.expectError(error.InvalidCompletionSlot, Record.decode(original[0 .. original.len - 1]));
-    for ([_]usize{ 10, 216 }) |offset| {
+    for ([_]usize{ 12, 15 }) |offset| {
         var bytes = original;
         bytes[offset] = 1;
         @memcpy(bytes[224..256], &checksum(&bytes));
@@ -248,6 +270,12 @@ test "workload admission completion compiler control record rejects corruption n
     try std.testing.expectError(error.InvalidCompletionSlot, invalid.encode());
     invalid = expected;
     invalid.authority.generation = 0;
+    try std.testing.expectError(error.InvalidCompletionSlot, invalid.encode());
+    invalid = expected;
+    invalid.slot_index = max_owners;
+    try std.testing.expectError(error.InvalidCompletionSlot, invalid.encode());
+    invalid = expected;
+    invalid.output_run_id = 0;
     try std.testing.expectError(error.InvalidCompletionSlot, invalid.encode());
     var zero_receipt: [receipt_bytes]u8 = @splat(0);
     try std.testing.expectError(error.InvalidCompletionSlot, Receipt.decode(&zero_receipt));

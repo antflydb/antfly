@@ -6,6 +6,10 @@
 //! outcomes. Overwrites never refund capacity before a new durable baseline.
 const std = @import("std");
 
+pub const maintenance_outputs = 64;
+pub const document_outputs = 4;
+pub const control_outputs = 4;
+pub const max_input_runs = maintenance_outputs + document_outputs + control_outputs;
 pub const block_bytes = 32 * 1024;
 pub const fixed_file_bytes = 256;
 pub const record_metadata_bytes = 256;
