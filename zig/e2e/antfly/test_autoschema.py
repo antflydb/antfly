@@ -70,7 +70,7 @@ AUTOSCHEMA_INDEXES = {
                 "table": "entities",
                 "source_artifact": "kg_v1",
                 "resolution_artifact": "entities_resolution_v1",
-                "key_template": "{{ lower _entity.label }}/{{ slug _entity.text }}",
+                "key_template": "entity/{{ slug _entity.text }}",
                 "config_generation": 1,
             },
         ],
@@ -158,7 +158,7 @@ def test_label_routed_autograph_promotes_events_and_entities(resolution_cluster)
     _wait_for_docs(
         api,
         "entities",
-        {"person/ada_lovelace": "Ada Lovelace", "org/antfly": "Antfly"},
+        {"entity/ada_lovelace": "Ada Lovelace", "entity/antfly": "Antfly"},
         deadline=_new_e2e_deadline(),
     )
     _wait_for_docs(
@@ -176,6 +176,15 @@ def test_label_routed_autograph_promotes_events_and_entities(resolution_cluster)
     assert _lookup_absent(api, "entities", EVENT_KEY, deadline=absent_deadline)
     assert _lookup_absent(api, "events", "event/ada_lovelace", deadline=absent_deadline)
 
+    # Traversal walk across the resolved topology: hop 1 from the document
+    # reaches the canonical entity as a cross-table terminal; re-seeding the
+    # traversal at that entity key (a seed always expands) walks the
+    # entity-sourced relation edges to the org and the event. This is the
+    # doc -> entity -> entity/event chain the reviewer asked to see walked,
+    # done the way the distributed executor does it: one bounded hop per
+    # frontier, re-seeded at each cross-table node.
+    _wait_for_entity_walk(api, deadline=_new_e2e_deadline())
+
     # Entity-sourced topology: once resolution lands, the works_at and
     # participates_in relations re-render with the resolver-minted canonical
     # keys as their topological source. Query-seeded personalized PageRank
@@ -186,9 +195,58 @@ def test_label_routed_autograph_promotes_events_and_entities(resolution_cluster)
     # GRAPH.md-deferred entity node model; PageRank does not wait for it.)
     _wait_for_seeded_mass(
         api,
-        seed="person/ada_lovelace",
-        expect_positive={"org/antfly", EVENT_KEY},
+        seed="entity/ada_lovelace",
+        expect_positive={"entity/antfly", EVENT_KEY},
         deadline=_new_e2e_deadline(),
+    )
+
+
+def _wait_for_entity_walk(api: _Api, *, deadline: _Deadline) -> None:
+    def traverse_nodes(start_key: str) -> set[str] | None:
+        payload = {
+            "graph_queries": {
+                "walk": {
+                    "index": "knowledge_graph",
+                    "traverse": {
+                        "start": {"keys": [start_key]},
+                        "direction": "both",
+                        "max_depth": 1,
+                        "limit": 20,
+                    },
+                }
+            },
+            "limit": 1,
+        }
+        try:
+            response = api.query_table(
+                "documents", payload, timeout=deadline.request_timeout()
+            )
+        except requests.RequestException as exc:
+            if not _transient_poll_error(exc):
+                raise
+            return None
+        result = (
+            (response.get("responses") or [{}])[0]
+            .get("graph_results", {})
+            .get("walk", {})
+        )
+        return {node.get("key") for node in result.get("nodes", [])}
+
+    last: tuple[set[str] | None, set[str] | None] | None = None
+    while not deadline.expired():
+        from_doc = traverse_nodes("doc:a")
+        from_entity = (
+            traverse_nodes("entity/ada_lovelace")
+            if from_doc and "entity/ada_lovelace" in from_doc
+            else None
+        )
+        last = (from_doc, from_entity)
+        if from_entity and {"entity/antfly", EVENT_KEY} <= from_entity:
+            return
+        deadline.sleep(0.5)
+    raise AssertionError(
+        f"traversal walk doc -> entity -> relation targets never completed: {last}\n"
+        f"{api.server.debug_logs()}"
     )
 
 

@@ -144,12 +144,29 @@ The other two passes differ only in prompt and schema constraints:
 Extraction prompts should be ported from the reference implementation's
 prompt set (MIT-licensed) and evaluated per corpus before freezing.
 
-Optional verification: the paper filters extracted triples for faithfulness.
-"Is this triple entailed by its evidence span?" is textbook NLI
-(premise = evidence, hypothesis = verbalized triple) and runs on the existing
-NLI classification pipeline (`pkg/inference/src/pipelines/classification.zig`)
-— no generative call needed. Typed-decision models (issue #810) are a later
-drop-in for the same slot.
+Verification (designed, not yet implemented): the paper filters extracted
+triples for faithfulness. "Is this triple entailed by its evidence span?" is
+textbook NLI (premise = evidence, hypothesis = verbalized triple). The
+concrete native design: a new `verifier` asset producer that consumes the
+extraction artifact (`source_artifact_name` on an asset enrichment), scores
+each relation's (evidence, verbalized triple) pair through the SHIPPED
+classification surface — `/ai/v1/extract` with
+`schema.classifications[].hypothesis_template` + `options.threshold`; the
+NLI cross-encoder in `pkg/inference/src/pipelines/classification.zig` is
+only reachable through that endpoint or the standalone bridge, never
+directly — and writes a filtered/annotated artifact in the same
+extraction_graph shape that the graph index consumes instead. Relation
+`confidence` already becomes edge weight at materialization, so
+annotate-mode additionally enables query-time `min_weight` filtering for
+free. The threshold lives in `producer_json.config` so it participates in
+artifact identity and re-derives on change. Blockers, all in the enrichment
+layer: asset-consumes-asset is currently accepted at admission but silently
+dropped in planning (the `.asset` arm of `validateEnrichmentConfig` never
+reads `source_artifact_name`, and the asset planning loop never copies it),
+and asset requests have no dependency ordering, so the verifier must either
+defer-and-retry off `changed_artifact_keys` or planning must become
+topological. Typed-decision models (issue #810) are a later drop-in for the
+same slot.
 
 ## Stage 2: Entities And Events Via Resolution
 
@@ -169,15 +186,44 @@ resolver/promoter runtime (`storage/db/resolution_runtime.zig`,
     { "artifact_name": "kg_vv_v1", "format": "extraction_graph" }
   ],
   "resolvers": [
-    { "labels": ["person", "org", "place", "work"],
-      "table": "entities",
-      "key_template": "{{lower _entity.label}}/{{slug _entity.text}}" },
+    { "table": "entities",
+      "key_template": "entity/{{slug _entity.text}}" },
     { "labels": ["event"],
       "table": "events",
-      "key_template": "event/{{hash _entity.text}}" }
+      "key_template": "event/{{hash _entity.event_identity}}" }
   ]
 }
 ```
+
+Two identity rules learned the hard way (both shipped):
+
+- **Entity keys are label-free.** The extractor's label is a per-chunk
+  guess; baking it into the key splits "Antfly the organization" and
+  "Antfly the product" into nodes that can never be joined, and a graph
+  whose nodes never converge gives seeded PageRank nothing to concentrate
+  on. The label rides the promoted entity document (`entity_type`) and the
+  mention, not the key. The accepted trade-off is homonym collapse
+  ("washington" the person vs the place), which the matcher-scorer phase
+  exists to relitigate — a merged node is visible and curable, a split node
+  silently starves retrieval. The `slug` helper also strips English
+  possessives so "Epstein's island" and "Epstein island" converge.
+- **Event keys compose participants + predicate, because replay-stable is
+  necessary but NOT sufficient.** Hashing the normalized sentence is stable
+  across replays yet mints a distinct event per wording, so
+  `participates_in` mass never accumulates on a shared node across
+  documents. `_entity.event_identity` (computed by lib/resolver from the
+  artifact's relations) is the sorted slugs of the related non-event
+  mentions plus the extractor-asserted `predicate` (main-verb lemma, an
+  optional mention field the extraction tool schemas now request),
+  degrading to the raw sentence text when either is missing — never weaker
+  than the sentence hash it replaces. Remaining coarseness: two genuinely
+  different events with identical participants and predicate merge (no
+  time bucketing yet).
+
+Post-extraction junk control: `min_confidence` on a resolver floors mention
+admission (below-floor mentions mint no key, no mention edge, and relation
+endpoints referencing them are withheld). Score-carrying extractors (GLiNER)
+should set it; LLM lanes default their mentions to confidence 1.0.
 
 One shape note from implementation: `source_artifact` is required and
 singular per resolver, so the events/catch-all pair above is declared per
@@ -200,11 +246,38 @@ resolution such relations are deliberately absent rather than rendered with
 local mention ids; endpoints matching no extraction entity keep the
 external-node string passthrough, and legacy inline endpoint objects keep the
 document source. Resolved endpoints carry their home table in edge metadata
-(`target_table`), the same cross-table tag mention edges use. Seeded
+(`target_table`), the same cross-table tag mention edges use — including
+when the source declares a custom metadata template (the tag is prepended
+to the rendered object unless the template sets its own). Seeded
 personalized PageRank consumes the entity-sourced topology directly (the
-kernel reads the raw edge snapshot); traversal EXPANSION from a cross-table
-entity node remains the GRAPH.md-deferred entity node model, because bare
-store keys would alias distinct table namespaces.
+kernel reads the raw edge snapshot). Traversal:
+
+- A `target_table` tag naming the index-owning table itself canonicalizes
+  to null (`TraversalRules.owning_table`), matching the distributed
+  executor's `canonicalGraphNodeTable`, so a self-table tag never stops
+  expansion or splits node identity.
+- The direct storage entry point (embedded Lite, `traverseEdges`) opts into
+  `expand_cross_table_local`: entity-sourced edges are document-owned rows
+  in the SAME index, so expanding THROUGH a cross-table node there is a
+  same-snapshot single-index read, and an embedded walk crosses
+  doc -> entity -> entity/event in one traversal. Node identity stays
+  table-qualified for dedup and results.
+- The server query executors keep the terminal behavior: the local executor
+  still stops at tagged nodes (single-group opt-in is a follow-up — the
+  drain plumbing from `requiresDistributedGraphCoordinator` down to
+  `TraversalRules` — and a caller can already re-seed a second traversal at
+  the returned entity key, which always expands; the autoschema e2e walks
+  the chain exactly that way). The DEEP open question for the multi-shard
+  entity node model (GRAPH.md): the distributed router routes an
+  entity-tagged frontier to the entity TABLE's identically named graph
+  index, while the entity's relation edges live in the DOCUMENTS table's
+  index scattered by producing document — owner-scoped storage and
+  table-scoped routing disagree about where an entity node's edges live,
+  and reverse-direction completeness needs a span fanout, not an owner
+  route. Also unresolved in the local path engines: `paths.zig` keys its
+  visited set by bare key (namespace aliasing the traversal engine already
+  fixed via table-qualified identity) and local MATCH readers return empty
+  streams for tagged nodes.
 
 Fuzzy resolution ("A. Lovelace" vs "Ada Lovelace") upgrades later by swapping
 the deterministic resolver for the matcher-scorer configuration with
@@ -321,6 +394,12 @@ Missing for HippoRAG2/AutoSchemaKG-style retrieval:
 | 3 | Retrieval-agent seeding/rerank orchestration + wire-layer plumbing | DONE: `seed_nodes`+`damping` on `graph_metric`/`graph_metric_rerank` wire shapes; personalized top-k and rerank readers; serverless and cross-shard personalized requests fail closed (422); the retrieval agent auto-seeds a fresh rerank from literal graph-search start keys and degrades to unseeded when none resolve |
 | 4 | Promoter upserts trigger enrichments on entity/event tables | verified by construction (promotion writes through routed `TableWriteSource`); e2e cascade coverage pending |
 | 5 | Resolver routing-by-label | DONE: `labels` on `GraphResolverConfig`; labeled siblings disjoint (admission), catch-alls skip sibling-claimed labels at runtime, `{{ hash }}` key-template helper for event keys |
+| 6 | Positional (id-less) extractor payloads | DONE: GLiNER2.5 boundary payloads carry no per-entity ids and reference entities via each relation's `entity_index`; `lib/resolver` assigns id-less mentions their decimal array position as the local id, and the graph materializer resolves `entity_index` endpoints through the injected `_entities` resolution map under the same identity (`graphArtifactEntityAtIndex` + runtime mirror). `examples/dogfood` (Lite) and the `kg_gliner_v1` lane in `examples/epstein` build on this |
+| 7 | Lite resolver registration | DONE: native Lite handles register a graph config's inline `resolvers` array on `antfly_db_add_index_json` (add/update only, mirroring nested-enrichment registration); resolution runs locally, promotion stays cleanly blocked without a cross-table entity sink and `runUntilIdle` drains around it. AddIndex is all-or-nothing: a rejected admission or partial enrichment/resolver registration restores the pre-call catalog |
+| 8 | Convergent identity layer | DONE: label-free `entity/{{ slug _entity.text }}` keys (label rides the document), possessive-stripping slug, compositional `event/{{ hash _entity.event_identity }}` event keys (participants + predicate, computed in lib/resolver, degrades to sentence text), `min_confidence` mention-admission floor on GraphResolverConfig |
+| 9 | Cross-table traversal, local | DONE (scoped): self-table `target_table` tags canonicalize away (`TraversalRules.owning_table`); the direct storage traversal (embedded Lite) expands THROUGH cross-table nodes in the same index (`expand_cross_table_local`, identity stays table-qualified); custom metadata templates no longer drop the `target_table` tag. Server-executor opt-in, `paths.zig` identity-keyed visited sets, and the multi-shard entity-node routing model (owner-scoped storage vs table-scoped routing) remain follow-ups — see Stage 2 |
+| 10 | Terminal-failure coverage | EXISTS in the engine (durable per-document coverage markers `produced/skipped/terminal_failed`, artifact repair ledger with per-doc `generation_error`, index-status coverage JSON); this branch surfaces it to embedded consumers (capi index stats carry the coverage counters; enrichment stats carry `stalled`/`stall_reason`/`skipped_source_count`) and documents `fatal_error_count` as the durable terminal-request counter. Follow-ups: hoist the server status coverage block beyond `index_type == .embeddings`; artifact-scoped coverage for producers with no consuming index (today: the repair ledger is the answer) |
+| 11 | NLI triple verification stage | DESIGNED (Stage 1 section): `verifier` asset producer over the extraction artifact through the shipped `/ai/v1/extract` classification surface; blocked on asset-consumes-asset enrichment plumbing (admission reads it, planning drops it) and producer dependency ordering |
 
 ## Phases
 
