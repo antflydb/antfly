@@ -4808,6 +4808,8 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lake_scaffold_tests.step);
 
     const lib_data_runtime_default_filters = [_][]const u8{
+        "background shutdown waits for admitted submission and rejects worker rescheduling",
+        "data server shutdown rejects late background worker submissions",
         "data ownership fallback requires a single store across all roles",
         "failed full index enrichment does not make resident reads unavailable",
         "enrichment runtime status reports worker lifecycle diagnostics",
@@ -5665,6 +5667,7 @@ pub fn build(b: *std.Build) void {
         "auto bulk max-window request waits for idle finish",
         "auto bulk group writes release leases so idle finish can publish",
         "auto bulk background finish skips entries with active foreground leases",
+        "maintenance lease batch releases all pins on every allocation failure",
         "provisioned table write source seeds doc identity namespace from table range",
         "provisioned table write source cached runtime status does not fetch catalog coverage",
         "managed startup catch-up uses provided indexes json without catalog fetch",

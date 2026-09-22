@@ -3489,6 +3489,47 @@ test "data server repair owner cancels and drains through backend runtime" {
     try std.testing.expect(!server.provisioned_index_repair_active.load(.acquire));
 }
 
+test "data server shutdown rejects late background worker submissions" {
+    const alloc = std.testing.allocator;
+    var runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    defer runtime.deinit();
+    const catalog = antfly.public_api.table_catalog.CatalogSource{ .ptr = undefined, .vtable = undefined };
+    var server: DataServer = .{
+        .alloc = alloc,
+        .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+        .read_source = antfly.public_api.ProvisionedTableReadSource.init(".", catalog, antfly.raft.read_gate.noopReadableLeaseRequester()),
+        .write_source = antfly.public_api.ProvisionedTableWriteSource.init(".", catalog),
+        .status_source = undefined,
+        .api_server_cfg = undefined,
+        .query_async_limit = .limited(1),
+        .backend_runtime = runtime.ptr(),
+        .listener_cfg = undefined,
+    };
+    defer server.deinit();
+    server.quiesceBackgroundWork();
+    // Model completion callbacks from workers joined after status refresh.
+    // None may inspect the catalog, execute inline test work, or spawn again.
+    try server.requestRuntimeStatusRefresh();
+    try server.requestAutoBulkFinishBackground();
+    try server.requestProvisionedCacheWarmup();
+    try server.requestProvisionedStartupCatchUpNow();
+    try server.requestProvisionedRootRefresh();
+    try server.requestLsmMaintenanceBackground();
+    try server.requestProvisionedIndexRepair();
+    const Spawner = struct {
+        fn unexpected(_: *DataServer) !std.Thread {
+            return error.UnexpectedWorkerSpawn;
+        }
+    };
+    try server.requestProvisionedRootRefreshWithSpawner(Spawner.unexpected);
+    try server.requestProvisionedStartupCatchUpWithSpawner(Spawner.unexpected);
+    try server.requestLocalGroupStatusRefreshWithSources(0, 0, ".", &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, null, null, null);
+    try std.testing.expectEqual(@as(u64, 0), server.runtime_status_refresh_started.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), server.auto_bulk_finish_started.load(.acquire));
+    try std.testing.expect(server.runtime_status_refresh_thread == null);
+    try std.testing.expect(server.auto_bulk_finish_future == null);
+}
+
 test "data server rejects replicated transition admission after owner shutdown" {
     const alloc = std.testing.allocator;
     var runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
@@ -5426,6 +5467,7 @@ pub const DataServer = struct {
     provisioned_startup_catch_up_thread: ?std.Thread = null,
     provisioned_startup_catch_up_active: std.atomic.Value(bool) = .init(false),
     background_work_quiesced: bool = false,
+    background_submissions: @import("background_submission_gate.zig").BackgroundSubmissionGate = .{},
     external_provider_users_quiesced: bool = false,
     provisioned_startup_catch_up_target_mutex: std.atomic.Mutex = .unlocked,
     provisioned_startup_catch_up_target_group_id: u64 = 0,
@@ -7716,6 +7758,11 @@ pub const DataServer = struct {
     ) void {
         if (self.background_work_quiesced) return;
         self.background_work_quiesced = true;
+        // Warmup and bulk-finish workers can schedule status refresh as they
+        // exit. Close admission and finish publishing already-admitted worker
+        // handles before joining any owner, or a later worker can recreate an
+        // owner that shutdown has already joined and retain a DB at teardown.
+        self.background_submissions.close();
         self.unregisterMetadataLocalProviders();
         if (self.data_raft) |raft| raft.stop();
         self.stopLsmMaintenanceBackground();
@@ -7906,6 +7953,8 @@ pub const DataServer = struct {
     }
 
     fn requestLsmMaintenanceBackground(self: *DataServer) !void {
+        if (!self.background_submissions.begin()) return;
+        defer self.background_submissions.end();
         if (!self.haOwnerJobCanRun(.compaction_publish)) return;
         const now_ns = platform_time.monotonicNs();
         if (now_ns < self.lsm_maintenance_next_eligible_ns.load(.monotonic)) return;
@@ -14370,6 +14419,8 @@ pub const DataServer = struct {
     }
 
     pub fn requestProvisionedCacheWarmup(self: *DataServer) !void {
+        if (!self.background_submissions.begin()) return;
+        defer self.background_submissions.end();
         if (@import("builtin").is_test) {
             _ = self.runProvisionedCacheWarmup();
             return;
@@ -15483,6 +15534,8 @@ pub const DataServer = struct {
     const ProvisionedStartupCatchUpThreadSpawner = *const fn (*DataServer) anyerror!std.Thread;
 
     fn requestAutoBulkFinishBackground(self: *DataServer) !void {
+        if (!self.background_submissions.begin()) return;
+        defer self.background_submissions.end();
         if (@import("builtin").is_test) {
             self.runAutoBulkFinish();
             return;
@@ -15504,6 +15557,8 @@ pub const DataServer = struct {
     }
 
     fn requestRuntimeStatusRefresh(self: *DataServer) !void {
+        if (!self.background_submissions.begin()) return;
+        defer self.background_submissions.end();
         if (@import("builtin").is_test) {
             _ = self.runRuntimeStatusRefresh();
             return;
@@ -15520,6 +15575,8 @@ pub const DataServer = struct {
     }
 
     fn requestProvisionedRootRefresh(self: *DataServer) !void {
+        if (!self.background_submissions.begin()) return;
+        defer self.background_submissions.end();
         const registration = self.store_registration orelse return;
         _ = registration;
         try self.requestProvisionedRootRefreshWithSpawner(spawnProvisionedRootRefreshThreadMain);
@@ -15529,6 +15586,8 @@ pub const DataServer = struct {
         self: *DataServer,
         spawner: ProvisionedRootRefreshThreadSpawner,
     ) !void {
+        if (!self.background_submissions.begin()) return;
+        defer self.background_submissions.end();
         const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
 
         self.reapProvisionedRootRefreshThread();
@@ -15544,6 +15603,8 @@ pub const DataServer = struct {
     }
 
     fn requestProvisionedStartupCatchUp(self: *DataServer) !void {
+        if (!self.background_submissions.begin()) return;
+        defer self.background_submissions.end();
         const registration = self.store_registration orelse return;
         _ = registration;
         if (@import("builtin").is_test) {
@@ -15555,6 +15616,8 @@ pub const DataServer = struct {
     }
 
     pub fn requestProvisionedStartupCatchUpNow(self: *DataServer) !void {
+        if (!self.background_submissions.begin()) return;
+        defer self.background_submissions.end();
         self.clearProvisionedStartupCatchUpBackoffs();
         self.markProvisionedStartupCatchUpFullScanDirty();
         try self.requestProvisionedStartupCatchUp();
@@ -15572,6 +15635,8 @@ pub const DataServer = struct {
         self: *DataServer,
         spawner: ProvisionedStartupCatchUpThreadSpawner,
     ) !void {
+        if (!self.background_submissions.begin()) return;
+        defer self.background_submissions.end();
         const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
 
         self.reapProvisionedStartupCatchUpThread();
@@ -15603,6 +15668,8 @@ pub const DataServer = struct {
     }
 
     fn requestProvisionedIndexRepair(self: *DataServer) !void {
+        if (!self.background_submissions.begin()) return;
+        defer self.background_submissions.end();
         const runtime = try self.ensureBackendRuntime();
         if (self.provisioned_index_repair_active.load(.acquire)) return;
         lockAtomic(&self.provisioned_index_repair_mutex);
@@ -16295,6 +16362,8 @@ pub const DataServer = struct {
         group_leadership_source: ?GroupLeadershipSource,
         group_membership_source: ?GroupMembershipSource,
     ) !void {
+        if (!self.background_submissions.begin()) return;
+        defer self.background_submissions.end();
         if (self.provisioned_startup_catch_up_active.load(.acquire)) return;
 
         if (@import("builtin").is_test) {
