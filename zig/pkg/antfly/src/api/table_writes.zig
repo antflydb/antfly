@@ -3677,6 +3677,13 @@ pub const ProvisionedTableWriteCache = struct {
         };
     }
 
+    /// Reserve storage before taking the next lifetime pin. Callers release
+    /// the accumulated batch on both successful and failed collection.
+    fn appendMaintenanceLease(self: *ProvisionedTableWriteCache, leases: *std.ArrayListUnmanaged(CachedDb), entry: *Entry) !void {
+        try leases.ensureUnusedCapacity(self.alloc, 1);
+        leases.appendAssumeCapacity(self.leaseEntryLocked(entry));
+    }
+
     fn leaseLiveEntryForLocalMutationLocked(
         self: *ProvisionedTableWriteCache,
         group_id: u64,
@@ -15071,6 +15078,10 @@ pub const ProvisionedTableWriteSource = struct {
         if (!self.local_db_mutex.tryLock()) return 0;
         var leases = std.ArrayListUnmanaged(ProvisionedTableWriteCache.CachedDb).empty;
         var lease_alloc: std.mem.Allocator = std.heap.page_allocator;
+        defer {
+            for (leases.items) |*lease| lease.deinit(lease_alloc);
+            leases.deinit(lease_alloc);
+        }
         {
             defer self.local_db_mutex.unlock();
             const cache = self.write_cache orelse return 0;
@@ -15078,12 +15089,8 @@ pub const ProvisionedTableWriteSource = struct {
             for (cache.entries.items) |entry| {
                 if (entry.bulk_ingest_session_open) continue;
                 if (entry.db.hasActiveDenseBulkWork()) continue;
-                try leases.append(lease_alloc, cache.leaseEntryLocked(entry));
+                try cache.appendMaintenanceLease(&leases, entry);
             }
-        }
-        defer {
-            for (leases.items) |*lease| lease.deinit(lease_alloc);
-            leases.deinit(lease_alloc);
         }
         var total_steps: usize = 0;
         for (leases.items) |lease| {
@@ -35651,6 +35658,33 @@ test "auto bulk max-window request waits for idle finish" {
     try std.testing.expect(try write_cache.finishExpiredAutoBulkIngestLocked(idle_finish_ns));
     try std.testing.expect(!write_cache.entries.items[0].*.auto_bulk_ingest_session_open);
     try std.testing.expectEqual(@as(usize, 0), write_cache.active_bulk_ingest_sessions.items.len);
+}
+
+test "maintenance lease batch releases all pins on every allocation failure" {
+    const Fixture = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var cache = ProvisionedTableWriteCache.init(alloc);
+            defer cache.deinit();
+            // Exercise lifetime acquisition only; no real DB is opened.
+            var entries: [32]ProvisionedTableWriteCache.Entry = undefined;
+            for (&entries) |*entry| entry.* = .{
+                .group_id = 0,
+                .lsm_root_generation = 0,
+                .table_name = undefined,
+                .managed_config_fingerprint = undefined,
+                .db = undefined,
+            };
+            defer for (entries) |entry| std.debug.assert(entry.active_leases == 0);
+            var leases = std.ArrayListUnmanaged(ProvisionedTableWriteCache.CachedDb).empty;
+            defer {
+                for (leases.items) |*lease| lease.deinit(alloc);
+                leases.deinit(alloc);
+            }
+            for (&entries) |*entry| try cache.appendMaintenanceLease(&leases, entry);
+            for (entries) |entry| try std.testing.expectEqual(@as(usize, 1), entry.active_leases);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }
 
 test "auto bulk background finish skips entries with active foreground leases" {
