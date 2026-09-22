@@ -81,6 +81,7 @@ const train_eval_reranker_lora_surrogate_cached = @import("../train/train_eval_r
 const train_eval_reranker_lora_top_layer_cached_surrogate = @import("../train/train_eval_reranker_lora_top_layer_cached_surrogate.zig");
 const train_gliner2_autodiff = @import("../train/train_gliner2_autodiff.zig");
 const train_gliner25 = @import("../train/train_gliner25.zig");
+const train_laya = @import("../train/train_laya.zig");
 
 test {
     _ = train_gliner25;
@@ -100,6 +101,7 @@ const Command = struct {
 };
 
 const commands = [_]Command{
+    .{ .domain = "train", .action = "run", .subject = "laya", .adapter_argv0 = "train-laya", .main_fn = train_laya.main },
     .{ .domain = "train", .action = "run", .subject = "gliner25", .adapter_argv0 = "train-gliner25", .main_fn = train_gliner25.main },
     .{ .domain = "dataset", .action = "generate", .subject = "gemma4-pilot", .adapter_argv0 = "generate-gemma4-pilot-dataset", .main_fn = generate_gemma4_pilot_dataset.main },
     .{ .domain = "dataset", .action = "generate", .subject = "gemma4-multimodal-pilot", .adapter_argv0 = "generate-gemma4-multimodal-pilot-dataset", .main_fn = generate_gemma4_multimodal_pilot_dataset.main },
@@ -387,6 +389,7 @@ fn usage() void {
         \\  antfly inference finetune workflow <workflow> ...
         \\
         \\examples:
+        \\  antfly inference finetune train laya /tmp/laya-job.json
         \\  antfly inference finetune run /tmp/recipe.json
         \\  antfly inference finetune dataset generate gemma4-pilot /tmp/pilot.jsonl --count 1000 --split train
         \\  antfly inference finetune dataset prepare gemma4-lora /models/gemma4 /tmp/pilot.jsonl train /tmp/prepared.json
