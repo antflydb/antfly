@@ -29,7 +29,9 @@ class EnrichmentConfig:
             field (str | Unset): Source field to read from the source document or source artifact payload.
             template (str | Unset): Optional template for generated text input.
             source_artifact_name (str | Unset): Existing artifact stream this enrichment consumes. Chunk enrichments may
-                consume asset artifacts; embedding enrichments may consume chunk artifacts.
+                consume asset artifacts; embedding enrichments may consume chunk artifacts; asset enrichments may consume other
+                asset artifacts (the upstream asset's produced bytes become this producer's source, so field and template must
+                be omitted and the producer must consume text: copy, generator, or extractor).
             expected_dims (int | Unset): Expected embedding dimension for embedding enrichments.
             vector_space (str | Unset): Optional stable model/token-space identifier for embedding artifacts. When omitted
                 on every source, Antfly requires the effective producers to be semantically equivalent. To combine intentionally
