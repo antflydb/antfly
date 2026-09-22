@@ -136,7 +136,7 @@ def _wait_for_docs(
             deadline.sleep(0.25)
     assert not pending, (
         f"documents never promoted into {table}: {sorted(pending)} "
-        f"last_error={last_error}\n{api.server.debug_logs()}"
+        f"last_error={last_error}\n{api._server.debug_logs()}"
     )
 
 
@@ -299,7 +299,7 @@ def _wait_for_converged_event(api: _Api, *, deadline: _Deadline) -> str:
         deadline.sleep(0.5)
     raise AssertionError(
         f"compositional event convergence never settled: {last}\n"
-        f"{api.server.debug_logs()}"
+        f"{api._server.debug_logs()}"
     )
 
 
