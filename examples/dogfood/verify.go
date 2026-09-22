@@ -17,7 +17,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"strings"
 
 	"github.com/antflydb/antfly/go/pkg/antflylite"
 )
@@ -67,6 +66,19 @@ func verifyKnowledgeGraphConfig(storedConfigJSON string, cfg indexBuildConfig) e
 				"Re-run ingest with -reset (or a fresh -db path) to rebuild it",
 			knowledgeGraphIndex, path)
 	}
+	// The reverse direction catches REMOVED settings: graph configs pass
+	// through Lite's AddIndex untranslated, so a stored field this run no
+	// longer sets (a remote api_url after switching to in-process inference,
+	// a metrics section after -metrics=false) is a behavioral change, not
+	// harmless surplus. The metrics-fallback exception above only covers the
+	// desired-but-unsupported direction.
+	if path, mismatch := subsetMismatch(stored, desiredValue, "$"); mismatch {
+		return fmt.Errorf(
+			"index %q carries a stored setting this run no longer sets (first drift at %s); "+
+				"the previous build used different ingestion flags. "+
+				"Re-run ingest with -reset (or a fresh -db path) to rebuild it",
+			knowledgeGraphIndex, path)
+	}
 	return nil
 }
 
@@ -111,36 +123,99 @@ func verifyChunkPipelineEnrichments(db *antflylite.DB, storedChunkVectorsConfig 
 			name, what, got, want)
 	}
 
-	if chunk, ok := byName[chunkArtifact]; ok {
-		if want := cfg.TargetTokens * bytesPerToken; chunk.ChunkSize != want {
-			return drift(chunkArtifact, "chunk_size", want, chunk.ChunkSize)
-		}
-		if want := cfg.OverlapTokens * bytesPerToken; chunk.ChunkOverlap != want {
-			return drift(chunkArtifact, "chunk_overlap", want, chunk.ChunkOverlap)
-		}
+	// The pipeline's enrichments must EXIST: a missing entry means the
+	// database predates this pipeline (or was built by a different one), and
+	// silently accepting it would leave the stage unconfigured forever.
+	missing := func(name string) error {
+		return fmt.Errorf(
+			"enrichment %q is missing from the catalog; the database was built without this pipeline stage. "+
+				"Re-run ingest with -reset (or a fresh -db path) to rebuild",
+			name)
 	}
-	if dense, ok := byName[denseArtifact]; ok {
-		if dense.SourceArtifactName != chunkArtifact {
-			return drift(denseArtifact, "source_artifact_name", chunkArtifact, dense.SourceArtifactName)
-		}
-		if dense.ExpectedDims != qwen3EmbeddingDims {
-			return drift(denseArtifact, "expected_dims", qwen3EmbeddingDims, dense.ExpectedDims)
-		}
+	chunk, ok := byName[chunkArtifact]
+	if !ok {
+		return missing(chunkArtifact)
 	}
-	if extractor, ok := byName[relationsArtifact]; ok {
-		if !strings.Contains(extractor.ProducerJSON, cfg.ExtractModel) {
-			return drift(relationsArtifact, "extraction model", cfg.ExtractModel, "a different producer configuration")
-		}
+	if want := cfg.TargetTokens * bytesPerToken; chunk.ChunkSize != want {
+		return drift(chunkArtifact, "chunk_size", want, chunk.ChunkSize)
 	}
-	// Dense index configs are translated on AddIndex, so the embedder is only
-	// checked for the configured model name surviving in the stored config.
-	if storedChunkVectorsConfig != "" && !strings.Contains(storedChunkVectorsConfig, cfg.EmbedModel) {
+	if want := cfg.OverlapTokens * bytesPerToken; chunk.ChunkOverlap != want {
+		return drift(chunkArtifact, "chunk_overlap", want, chunk.ChunkOverlap)
+	}
+	dense, ok := byName[denseArtifact]
+	if !ok {
+		return missing(denseArtifact)
+	}
+	if dense.SourceArtifactName != chunkArtifact {
+		return drift(denseArtifact, "source_artifact_name", chunkArtifact, dense.SourceArtifactName)
+	}
+	if dense.ExpectedDims != qwen3EmbeddingDims {
+		return drift(denseArtifact, "expected_dims", qwen3EmbeddingDims, dense.ExpectedDims)
+	}
+	extractor, ok := byName[relationsArtifact]
+	if !ok {
+		return missing(relationsArtifact)
+	}
+	// Compare the parsed producer model exactly: a substring check would
+	// accept a stored "org/model-v2" for a requested "org/model".
+	if got := producerModel(extractor.ProducerJSON); got != cfg.ExtractModel {
+		return drift(relationsArtifact, "extraction model", cfg.ExtractModel, got)
+	}
+	// Dense index configs are translated on AddIndex, so the embedder is
+	// checked by collecting the stored config's parsed "model" fields and
+	// requiring an EXACT match among them.
+	if storedChunkVectorsConfig != "" && !jsonHasExactModel(storedChunkVectorsConfig, cfg.EmbedModel) {
 		return fmt.Errorf(
 			"index %q was built with a different embedding model than -embed-model %s; "+
 				"re-run ingest with -reset (or a fresh -db path) to rebuild",
 			chunkVectorsIndex, cfg.EmbedModel)
 	}
 	return nil
+}
+
+// producerModel extracts the exact `config.model` string of a producer_json
+// payload; empty when absent or malformed.
+func producerModel(producerJSON string) string {
+	var producer struct {
+		Config struct {
+			Model string `json:"model"`
+		} `json:"config"`
+	}
+	if err := json.Unmarshal([]byte(producerJSON), &producer); err != nil {
+		return ""
+	}
+	return producer.Config.Model
+}
+
+// jsonHasExactModel reports whether any "model" field anywhere in the JSON
+// document equals `model` exactly.
+func jsonHasExactModel(configJSON, model string) bool {
+	var value any
+	if err := json.Unmarshal([]byte(configJSON), &value); err != nil {
+		return false
+	}
+	return anyModelFieldEquals(value, model)
+}
+
+func anyModelFieldEquals(value any, model string) bool {
+	switch typed := value.(type) {
+	case map[string]any:
+		if got, ok := typed["model"].(string); ok && got == model {
+			return true
+		}
+		for _, nested := range typed {
+			if anyModelFieldEquals(nested, model) {
+				return true
+			}
+		}
+	case []any:
+		for _, nested := range typed {
+			if anyModelFieldEquals(nested, model) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // jsonRoundTrip normalizes a Go config map into generic JSON values (numbers

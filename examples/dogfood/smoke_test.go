@@ -70,7 +70,88 @@ func TestIndexConfigsAreAccepted(t *testing.T) {
 		t.Fatalf("ensure schema and indexes accepted changed chunk geometry against an existing database")
 	}
 
+	// REMOVING a behavior-affecting setting is drift too, not harmless
+	// surplus in the stored config: a database built with metrics must not
+	// verify against -metrics=false.
+	noMetrics := cfg
+	noMetrics.Metrics = false
+	if err := ensureSchemaAndIndexes(db, noMetrics); err == nil {
+		t.Fatalf("ensure schema and indexes accepted -metrics=false against a database built with metrics")
+	}
+
 	os.Remove(dbPath)
+}
+
+func TestRemoteToLocalInferenceIsDrift(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "remote.aflite")
+	db, err := openOrCreateLite(dbPath, "")
+	if err != nil {
+		t.Fatalf("create Lite db: %v", err)
+	}
+	defer db.Close()
+
+	remoteCfg := indexBuildConfig{
+		InferenceURL:  "http://127.0.0.1:8090",
+		EmbedModel:    defaultEmbedModel,
+		ExtractModel:  defaultExtractModel,
+		TargetTokens:  defaultTargetTokens,
+		OverlapTokens: defaultOverlapTokens,
+		Metrics:       true,
+	}
+	if err := ensureSchemaAndIndexes(db, remoteCfg); err != nil {
+		t.Fatalf("ensure schema and indexes (remote inference): %v", err)
+	}
+	// Producers built for a remote inference server carry api_url; a re-run
+	// in the default in-process mode omits it. The stored remote URL is a
+	// live behavioral difference and must be reported as drift instead of
+	// passing as an extra stored field.
+	localCfg := remoteCfg
+	localCfg.InferenceURL = ""
+	if err := ensureSchemaAndIndexes(db, localCfg); err == nil {
+		t.Fatalf("ensure schema and indexes accepted in-process inference against a database built for a remote inference server")
+	}
+	os.Remove(dbPath)
+}
+
+func TestMissingPipelineEnrichmentsAreDrift(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "empty.aflite")
+	db, err := openOrCreateLite(dbPath, "")
+	if err != nil {
+		t.Fatalf("create Lite db: %v", err)
+	}
+	defer db.Close()
+
+	cfg := indexBuildConfig{
+		InferenceURL:  defaultInferenceURL,
+		EmbedModel:    defaultEmbedModel,
+		ExtractModel:  defaultExtractModel,
+		TargetTokens:  defaultTargetTokens,
+		OverlapTokens: defaultOverlapTokens,
+	}
+	// A database without the pipeline's enrichments (predating it, or built
+	// by another tool) must fail verification, not silently skip the
+	// unconfigured stages.
+	if err := verifyChunkPipelineEnrichments(db, "", cfg); err == nil {
+		t.Fatalf("verifyChunkPipelineEnrichments accepted a database with no pipeline enrichments")
+	}
+	os.Remove(dbPath)
+}
+
+func TestModelComparisonsAreExact(t *testing.T) {
+	// A substring check would accept the stored "-v2" variant for the
+	// requested base model; the parsed comparison must not.
+	if got := producerModel(`{"type":"extractor","config":{"model":"org/model-v2"}}`); got == "org/model" {
+		t.Fatalf("producerModel conflated org/model-v2 with org/model")
+	}
+	if got := producerModel(`{"type":"extractor","config":{"model":"org/model"}}`); got != "org/model" {
+		t.Fatalf("producerModel = %q, want org/model", got)
+	}
+	if jsonHasExactModel(`{"embedder":{"model":"org/model-v2"}}`, "org/model") {
+		t.Fatalf("jsonHasExactModel accepted a prefix match")
+	}
+	if !jsonHasExactModel(`{"nested":{"embedder":{"model":"org/model"}}}`, "org/model") {
+		t.Fatalf("jsonHasExactModel missed an exact nested match")
+	}
 }
 
 func TestSubsetMismatch(t *testing.T) {
