@@ -4091,6 +4091,7 @@ fn buildBertMetadataEntries(
     try appendMetadataU32Entry(allocator, &entries, "bert.attention.head_count", config.num_attention_heads);
     try appendMetadataU32Entry(allocator, &entries, "bert.feed_forward_length", config.intermediate_size);
     try appendMetadataU32Entry(allocator, &entries, "bert.context_length", config.max_position_embeddings);
+    try appendMetadataU32Entry(allocator, &entries, "bert.position_embedding_offset", config.position_embedding_offset);
     try appendMetadataU32Entry(allocator, &entries, "bert.token_type_count", config.type_vocab_size);
     try appendMetadataU32Entry(allocator, &entries, "bert.label_count", config.num_labels);
     try entries.append(allocator, .{
@@ -7276,7 +7277,7 @@ test "gliner2 export can quantize gguf head sidecar tensors" {
     try compat.cwd().writeFile(compat.io(), .{
         .sub_path = config_path,
         .data =
-        \\{"model_type":"recognizer","hidden_size":4,"num_hidden_layers":1,"num_attention_heads":2,"intermediate_size":8,"vocab_size":16,"max_position_embeddings":16,"position_buckets":16}
+        \\{"model_type":"extractor","hidden_size":4,"num_hidden_layers":1,"num_attention_heads":2,"intermediate_size":8,"vocab_size":16,"max_position_embeddings":16,"position_buckets":16}
         ,
     });
 

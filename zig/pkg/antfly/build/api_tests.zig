@@ -229,6 +229,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "distributed join preserves native public filters when adding join predicates",
         "scan request errors map to stable client responses",
         "httpx antfly reads preserve availability and terminal failures",
+        "httpx lookup revalidates missing catalog bindings across restore",
         "httpx antfly scan honors optional body and documented bad requests",
         "httpx multi batch route uses the batch commit hook and public response contract",
         "httpx stable transaction commit durably hands off recovery before acknowledgement",
@@ -637,6 +638,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "api http server retries stable terminal commits without replaying writes",
             "api session maintenance recovers crash window after durable 2pc commit",
             "api session maintenance skips live commit execution and acknowledgement",
+            "session maintenance activation follows current range leadership without follower RPCs",
             "transaction commit execution yields through caller io and preserves ownership on cancellation",
             "transaction session registry adopts durable session ownership",
             "transaction session registry only adopts durable sessions after lease expiry",
@@ -1541,6 +1543,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-api-transactions-test", "Run transaction coordinator and participant contracts").dependOn(&addFilteredTestRunArtifact(b, api_transaction_contract_tests).step);
     const run_api_public_table_http_docid_tests = addFilteredTestRunArtifact(b, api_public_table_http_docid_tests);
+    b.step("antfly-api-public-table-http-test", "Run public table HTTP response contracts").dependOn(&run_api_public_table_http_docid_tests.step);
     const api_relational_row_contract_tests = b.addTest(.{
         .root_module = api_public_table_http_docid_test_mod,
         .filters = &.{ "relational mutation", "relational row query", "relational declarations" },

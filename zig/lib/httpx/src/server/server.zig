@@ -6106,6 +6106,83 @@ test "H1 context preserves buffered pipeline input across client SHUT_WR" {
     try std.testing.expect(mem.indexOf(u8, response[0..response_len], "\r\n\r\nB") != null);
 }
 
+test "H1 client cancellation reaches active server work" {
+    try testH1ClientCancellation(false);
+    try testH1ClientCancellation(true);
+}
+
+fn testH1ClientCancellation(cancel_parent_task: bool) !void {
+    if (builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
+    const Client = @import("../client/client.zig").Client;
+    const State = struct {
+        var started = std.atomic.Value(bool).init(false);
+        var canceled = std.atomic.Value(bool).init(false);
+        var release = std.atomic.Value(bool).init(false);
+
+        fn handler(ctx: *Context) anyerror!Response {
+            started.store(true, .release);
+            while (!release.load(.acquire)) {
+                if (ctx.isCancellationRequested()) {
+                    canceled.store(true, .release);
+                    return error.Canceled;
+                }
+                try ctx.io.sleep(Io.Duration.fromMilliseconds(1), .awake);
+            }
+            return ctx.text("complete");
+        }
+    };
+    State.started.store(false, .release);
+    State.canceled.store(false, .release);
+    State.release.store(false, .release);
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var server = Server.initWithConfig(alloc, io, .{ .host = "127.0.0.1", .port = 0 });
+    defer server.deinit();
+    try server.post("/rerank", State.handler);
+    try server.bind();
+    var listener = try std.testing.io.concurrent(struct {
+        fn run(s: *Server) void {
+            s.listen() catch {};
+        }
+    }.run, .{&server});
+    defer {
+        State.release.store(true, .release);
+        server.stop();
+        listener.await(std.testing.io);
+    }
+    while (!server.listen_started.load(.acquire)) try io.sleep(.fromMilliseconds(1), .awake);
+    const url = try std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}/rerank", .{server.boundAddress().?.getPort()});
+    defer alloc.free(url);
+    var client = Client.initWithConfig(alloc, io, .{ .timeouts = .uniform(5000) });
+    defer client.deinit();
+    var cancellation = std.atomic.Value(bool).init(false);
+    var request = try io.concurrent(struct {
+        fn run(c: *Client, endpoint: []const u8, signal: *std.atomic.Value(bool)) anyerror!void {
+            var response = try c.post(endpoint, .{ .json = "{}", .cancellation = .fromAtomic(signal) });
+            defer response.deinit();
+        }
+    }.run, .{ &client, url, &cancellation });
+    defer request.cancel(io) catch {};
+    for (0..5000) |_| {
+        if (State.started.load(.acquire)) break;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(State.started.load(.acquire));
+    if (cancel_parent_task) {
+        try std.testing.expectError(error.Canceled, request.cancel(io));
+    } else {
+        cancellation.store(true, .release);
+        try std.testing.expectError(error.Cancelled, request.await(io));
+    }
+    for (0..2000) |_| {
+        if (State.canceled.load(.acquire)) break;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(State.canceled.load(.acquire));
+}
+
 test "H1 orderly half close does not cancel an active response" {
     if (builtin.os.tag == .windows) return;
 

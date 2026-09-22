@@ -12,7 +12,7 @@
 # Elastic License 2.0 for the specific language governing permissions and
 # limitations.
 
-"""Exa retrieval through the public API, with deterministic HTTP providers."""
+"""Web-search retrieval through the public API, with deterministic HTTP providers."""
 
 from __future__ import annotations
 
@@ -33,11 +33,19 @@ pytestmark = pytest.mark.e2e_resource("antfly_process")
 
 
 @pytest.fixture
-def web_runtime(tmp_path):
+def web_runtime(tmp_path, request):
+    search_provider = getattr(request, "param", "exa")
+    live = search_provider == "tavily-live"
+    if live:
+        search_provider = "tavily"
+        if not os.environ.get("TAVILY_API_KEY"):
+            pytest.skip("Set TAVILY_API_KEY to run the live Tavily smoke test")
     binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
     if not Path(binary).is_file():
         pytest.skip("Build Antfly or set ANTFLY_BIN")
     state = {
+        "provider": search_provider,
+        "live": live,
         "searches": [],
         "generations": [],
         "status": 200,
@@ -82,6 +90,17 @@ def web_runtime(tmp_path):
                             },
                         ]
                     }
+                if (
+                    search_provider == "tavily"
+                    and status == 200
+                    and not state["malformed"]
+                ):
+                    for item in body["results"]:
+                        item["content"] = item.pop("text", "")
+                        item["raw_content"] = None
+                        item["published_date"] = None
+                        item.pop("highlights", None)
+                    body["answer"] = "UNSOURCED-PROVIDER-ANSWER"
             elif self.path == "/v1/chat/completions":
                 state["generations"].append(payload)
                 previous = [m for m in payload["messages"] if m["role"] == "tool"]
@@ -89,6 +108,8 @@ def web_runtime(tmp_path):
                     answer = (
                         "EXA-HTTP-CANARY-731 [source](https://example.com/evidence)"
                     )
+                    if live:
+                        answer = "Live Tavily search completed."
                     if state["answer_summary"]:
                         summary = json.loads(previous[-1]["content"])["results"][0]
                         count = (
@@ -115,7 +136,11 @@ def web_runtime(tmp_path):
                                     "arguments": json.dumps(
                                         {"query_index": 0}
                                         if state["database_first"] and not previous
-                                        else {"query": "Antfly evidence"}
+                                        else {
+                                            "query": "Tavily search API documentation"
+                                            if live
+                                            else "Antfly evidence"
+                                        }
                                     ),
                                 },
                             }
@@ -160,19 +185,25 @@ def web_runtime(tmp_path):
         "connections": {
             "exa-test": {
                 "kind": "web_search",
-                "provider": "exa",
+                "provider": search_provider,
                 "capabilities": ["web.search", "agents.use"],
                 "web_search": {
                     "endpoint": provider_url + "/search",
                     "api_key": "${secret:exa.test}",
                     "include_content": True,
-                    "include_highlights": True,
+                    "include_highlights": search_provider == "exa",
                     "include_domains": ["example.com"],
                     "max_results": 2,
                 },
             }
         }
     }
+    if live:
+        config["connections"]["exa-test"]["web_search"].update(
+            endpoint="https://api.tavily.com/search",
+            api_key="${secret:tavily.api_key}",
+            include_domains=["tavily.com"],
+        )
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps(config))
     ports = LoopbackPortReservations()
@@ -309,6 +340,7 @@ def test_exa_web_only_returns_sources_and_tool_history(web_runtime, stream):
     "status,malformed",
     [(401, False), (429, False), (500, False), (302, False), (200, True)],
 )
+@pytest.mark.parametrize("web_runtime", ["exa", "tavily"], indirect=True)
 def test_exa_failure_never_becomes_grounded_answer(web_runtime, status, malformed):
     url, payload, state = web_runtime
     state.update(status=status, malformed=malformed)
@@ -324,6 +356,8 @@ def test_exa_failure_never_becomes_grounded_answer(web_runtime, status, malforme
     assert "test-exa-secret" not in response.text
     assert "test-exa-secret" not in json.dumps(state["generations"])
     assert len(state["searches"]) == 1
+    feedback = json.loads(state["generations"][1]["messages"][-1]["content"])
+    assert feedback["provider"] == state["provider"]
 
 
 def test_exa_connection_cannot_be_redirected_by_request(web_runtime):
@@ -578,3 +612,102 @@ def test_pruned_documents_preserve_summary_evidence(web_runtime, stream, aggrega
     assert response.json()["status"] == "incomplete"
     assert response.json().get("generation") is None
     assert len(state["generations"]) == 1
+
+
+@pytest.mark.parametrize("web_runtime", ["tavily"], indirect=True)
+@pytest.mark.parametrize("stream", [False, True])
+def test_tavily_sources_and_wire_contract(web_runtime, stream):
+    url, payload, state = web_runtime
+    payload["stream"] = stream
+    payload["tools"]["web_search_config"] = {
+        "provider": "tavily",
+        "max_results": 1,
+        "search_depth": "advanced",
+        "include_answer": True,
+        "include_raw_content": True,
+    }
+    response = requests.post(url + "/agents/retrieval", json=payload, timeout=30)
+    assert response.status_code == 200, response.text
+    assert "EXA-HTTP-CANARY-731" in response.text
+    assert "UNSOURCED-PROVIDER-ANSWER" not in response.text
+    if stream:
+        assert "event: hit" in response.text and "event: done" in response.text
+    else:
+        result = response.json()
+        assert result["status"] == "completed"
+        assert len(result["hits"]) == 1
+        assert result["hits"][0]["_source"]["provider"] == "tavily"
+        assert result["hits"][0]["_source"]["text"] == "EXA-HTTP-CANARY-731"
+        step = next(s for s in result["steps"] if s["name"] == "web_search")
+        assert step["details"]["provider"] == "tavily"
+    assert len(state["searches"]) == 1
+    headers, wire = state["searches"][0]
+    headers = {k.lower(): v for k, v in headers.items()}
+    assert headers["authorization"] == "Bearer test-exa-secret"
+    assert "x-api-key" not in headers
+    assert wire["search_depth"] == "advanced" and wire["max_results"] == 1
+    assert wire["include_answer"] is True and wire["include_raw_content"] is True
+    assert wire["safe_search"] is True and wire["include_domains"] == ["example.com"]
+    assert "api_key" not in wire and "numResults" not in wire
+    assert "test-exa-secret" not in response.text
+    assert "test-exa-secret" not in json.dumps(state["generations"])
+    assert "UNSOURCED-PROVIDER-ANSWER" not in json.dumps(state["generations"])
+    history = state["generations"][1]["messages"]
+    assert json.loads(history[-1]["content"])["provider"] == "tavily"
+
+
+@pytest.mark.parametrize("web_runtime", ["tavily"], indirect=True)
+@pytest.mark.parametrize(
+    "override,status",
+    [
+        ({"provider": "exa"}, 400),
+        ({"provider": "tavily", "endpoint": "http://127.0.0.1:1/search"}, 403),
+        ({"provider": "tavily", "api_key": "replacement"}, 403),
+        ({"provider": "tavily", "safe_search": False}, 403),
+        ({"provider": "tavily", "include_domains": []}, 403),
+    ],
+)
+def test_tavily_connection_policy(web_runtime, override, status):
+    url, payload, state = web_runtime
+    payload["tools"]["web_search_config"] = override
+    response = requests.post(url + "/agents/retrieval", json=payload, timeout=30)
+    assert response.status_code == status, response.text
+    assert state["searches"] == [] and state["generations"] == []
+
+
+@pytest.mark.parametrize("web_runtime", ["tavily-live"], indirect=True)
+@pytest.mark.parametrize("stream", [False, True])
+def test_tavily_live_search(web_runtime, stream):
+    """Opt-in real Tavily search through HTTP retrieval; generator is deterministic."""
+    url, payload, state = web_runtime
+    payload["query"] = "Find Tavily search API documentation."
+    payload["stream"] = stream
+    payload["tools"]["web_search_config"] = {
+        "provider": "tavily",
+        "search_depth": "basic",
+        "max_results": 2,
+        "include_raw_content": True,
+        "timeout_ms": 30000,
+    }
+    response = requests.post(url + "/agents/retrieval", json=payload, timeout=60)
+    assert response.status_code == 200
+    if stream:
+        hits = []
+        for frame in response.text.strip().split("\n\n"):
+            fields = dict(
+                line.split(": ", 1) for line in frame.splitlines() if ": " in line
+            )
+            if fields.get("event") == "hit":
+                hits.append(json.loads(fields["data"]))
+        assert "event: done" in response.text
+    else:
+        result = response.json()
+        assert result["status"] == "completed"
+        hits = result["hits"]
+    assert 1 <= len(hits) <= 2
+    for hit in hits:
+        assert hit["_source"]["provider"] == "tavily"
+        assert hit["_source"]["url"].startswith("https://")
+        assert hit["_source"]["text"]
+    assert os.environ["TAVILY_API_KEY"] not in response.text
+    assert os.environ["TAVILY_API_KEY"] not in json.dumps(state["generations"])

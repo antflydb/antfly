@@ -142,8 +142,10 @@ endif
 	@set -e; \
 	segdir=$$(mktemp -d); \
 	trap 'rm -rf "$$segdir"' EXIT; \
+	producer=0; \
 	for f in $(TRACE_FILES); do \
-	  python3 ../scripts/tla-segment-raft-trace.py "$$f" "$$segdir"; \
+	  producer=$$((producer + 1)); \
+	  python3 ../scripts/tla-segment-raft-trace.py "$$f" "$$segdir/producer-$$producer"; \
 	done; \
 	segments=$$(find "$$segdir" -name '*.ndjson' -size +0c | sort); \
 	if [ -n "$$segments" ]; then \

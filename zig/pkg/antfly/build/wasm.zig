@@ -137,6 +137,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         api.indexes,
         api.sort,
         api.metadata,
+        api.schema,
         reranking_mod,
         wasm_objectstore_mod,
         httpx_mod,

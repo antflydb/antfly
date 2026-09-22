@@ -29,6 +29,7 @@ from catalog_baseline import (
     plan_baseline,
     post_baseline,
 )
+from catalog_readiness import wait_for_catalog_protocol
 from conftest import DEFAULT_ANTFLY_BIN, internal_service_headers
 from e2e_scheduler import e2e_resource
 from test_scaling import MultiNodeScalingCluster, _insert_docs
@@ -45,14 +46,18 @@ def catalog_cluster(request):
     cluster = MultiNodeScalingCluster(
         str(binary), initial_data_node_count=3, tick_ms=None
     )
+    setup_complete = False
     try:
+        wait_for_catalog_protocol(cluster)
+        setup_complete = True
         yield cluster
     finally:
         report = getattr(request.node, "rep_call", None)
-        if report and report.failed:
+        failed = not setup_complete or bool(report and report.failed)
+        if failed:
             for path in cluster.log_paths:
                 print(f"[{path.name}]\n{path.read_text(errors='replace')[-8192:]}")
-        cluster.stop(test_failed=bool(report and report.failed))
+        cluster.stop(test_failed=failed)
 
 
 def post_report(cluster, path, body):

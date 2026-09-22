@@ -1265,7 +1265,7 @@ test "metadata transition driver online service never invokes ordinary merge fal
             }
             return .{ .scope = state.scope, .source_progress = .{ .namespace = state.scope.namespace(), .consumer_epoch = state.scope.consumer_epoch, .pin = state.scope.pin(), .start = 11, .acknowledged = 11, .admitted_applied_index = 19, .snapshot_phase = .pinned } };
         }
-        fn execute(ptr: *anyopaque, _: @import("../metadata/online_merge.zig").State, action: @import("../metadata/online_merge.zig").Action) !void {
+        fn execute(ptr: *anyopaque, _: @import("../metadata/online_merge.zig").State, action: @import("../metadata/online_merge.zig").Action, _: *const @import("../metadata/online_merge.zig").Observation) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (action != .prepare_certificate) return error.UnexpectedOnlineStep;
             self.publication_calls += 1;
