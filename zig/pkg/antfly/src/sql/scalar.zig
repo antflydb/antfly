@@ -26,7 +26,7 @@ pub const Type = struct { kind: ?ast.ColumnType = null, nullable: bool = true };
 pub const Column = struct { name: []const u8, type: ast.ColumnType, nullable: bool = true };
 pub const BindLimits = struct { nodes: usize = 8192, depth: usize = 64, parameters: usize = 1024 };
 pub const EvalLimits = struct { steps: usize = 65_536, depth: usize = 64, output_bytes: usize = 1024 * 1024 };
-pub const Function = enum { abs, lower, upper, length, octet_length, concat, coalesce, nullif, greatest, least, ceil, floor, round, sqrt, power, mod, substring, trim, ltrim, rtrim, replace, starts_with, date_part, date_trunc, to_timestamp };
+pub const Function = enum { abs, lower, upper, length, octet_length, concat, coalesce, nullif, greatest, least, ceil, floor, round, sqrt, power, mod, substring, trim, ltrim, rtrim, replace, starts_with, date_part, date_trunc, to_timestamp, @"$single" };
 
 pub const Instruction = struct {
     type: Type,
@@ -155,7 +155,7 @@ fn functionId(name: []const u8) !Function {
 fn arity(function: Function, count: usize) !void {
     const valid = switch (function) {
         .abs, .lower, .upper, .length, .octet_length, .ceil, .floor, .round, .sqrt, .to_timestamp => count == 1,
-        .nullif, .power, .mod, .starts_with, .date_part, .date_trunc => count == 2,
+        .nullif, .power, .mod, .starts_with, .date_part, .date_trunc, .@"$single" => count == 2,
         .substring => count == 2 or count == 3,
         .replace => count == 3,
         .trim, .ltrim, .rtrim => count == 1 or count == 2,
@@ -224,11 +224,12 @@ const Binder = struct {
                 break :blk .{ .kind = if (binary.op == .concat) .string else .boolean, .nullable = if (binary.op == .is_distinct or binary.op == .is_not_distinct) false else merged.nullable };
             },
             .call => |call| blk: {
-                if (call.star or call.distinct or call.filter != null) return error.UnsupportedSqlShape;
+                if (call.subquery != null or call.window != null or call.star or call.distinct or call.filter != null) return error.UnsupportedSqlShape;
                 const function = try functionId(call.name);
                 try arity(function, call.args.len);
                 var merged: Type = .{};
                 switch (function) {
+                    .@"$single" => merged = try self.infer(call.args[0], depth + 1),
                     .coalesce, .nullif, .greatest, .least, .abs, .ceil, .floor, .round, .sqrt, .power, .mod => for (call.args) |arg| {
                         merged = try common(merged, try self.infer(arg, depth + 1));
                     },
@@ -244,7 +245,7 @@ const Binder = struct {
                     .starts_with => .boolean,
                     .sqrt, .power, .date_part => .number,
                     .date_trunc, .to_timestamp => .datetime,
-                    .coalesce, .nullif, .greatest, .least, .abs, .ceil, .floor, .round, .mod => merged.kind,
+                    .coalesce, .nullif, .greatest, .least, .abs, .ceil, .floor, .round, .mod, .@"$single" => merged.kind,
                     else => .string,
                 }, .nullable = function != .concat };
             },
@@ -318,6 +319,7 @@ const Binder = struct {
                 const args = try self.alloc.alloc(u32, call.args.len);
                 for (call.args, args, 0..) |arg, *out, i| {
                     const desired: ?ast.ColumnType = switch (function) {
+                        .@"$single" => if (i == 0) kind.kind else .integer,
                         .lower, .upper, .length, .octet_length, .trim, .ltrim, .rtrim, .replace, .starts_with => .string,
                         .substring => if (i == 0) .string else .integer,
                         .date_part, .date_trunc => if (i == 0) .string else .datetime,
@@ -444,6 +446,11 @@ const Evaluator = struct {
             },
             .call => |call| blk: {
                 switch (call.function) {
+                    .@"$single" => {
+                        const count = try self.runDatum(call.args[1], depth + 1);
+                        if (!count.sql_null and (count.value != .integer or count.value.integer > 1)) return error.SqlCardinalityViolation;
+                        break :blk try self.runDatum(call.args[0], depth + 1);
+                    },
                     .coalesce => {
                         for (call.args) |arg| {
                             const datum = try self.runDatum(arg, depth + 1);
@@ -655,6 +662,11 @@ const Evaluator = struct {
     }
 
     fn invokeFunction(self: *Evaluator, function: Function, args: []const u32, depth: usize) anyerror!Json {
+        if (function == .@"$single") {
+            const count = try self.run(args[1], depth + 1);
+            if (count != .null and (count != .integer or count.integer > 1)) return error.SqlCardinalityViolation;
+            return self.run(args[0], depth + 1);
+        }
         if (function == .coalesce) {
             for (args) |arg| {
                 const value = try self.run(arg, depth);

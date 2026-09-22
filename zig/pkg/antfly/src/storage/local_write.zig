@@ -355,6 +355,7 @@ pub fn applyReplicatedTransactionMutationInternal(
     raft_entry: ?db_mod.RaftAppliedEntryIdentity,
 ) !void {
     const mutation = req.transaction orelse return error.InvalidBatchRequest;
+    try @import("range_protection.zig").validateRequest(req);
     if (req.relational_index_maintenance) |command| if (command.owner_group_id != group_id) return error.PreparedGenerationChanged;
     switch (mutation) {
         .begin => |begin| {
@@ -407,9 +408,11 @@ pub fn applyReplicatedTransactionMutationInternal(
                 .predicates = req.predicates,
                 .integrity = req.integrity,
                 .integrity_commands = req.integrity_commands,
+                .range_guards = req.range_guards,
                 .relational_activation = req.relational_activation,
                 .relational_retirement = req.relational_retirement,
                 .relational_index_maintenance = req.relational_index_maintenance,
+                .schema_version = req.schema_version,
                 .relational_schema_version = req.relational_schema_version,
                 .relational_integrity_generation_set = req.relational_integrity_generation_set,
                 .restore_staging_scope = req.restore_staging_scope,

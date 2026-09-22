@@ -23,6 +23,7 @@ pub fn open(alloc: std.mem.Allocator, native: catalog.Cursor, staged: *const tra
     var rows: std.ArrayList(catalog.Row) = .empty;
     for (staged.tables) |entry| {
         if (!std.mem.eql(u8, staged.physicalName(entry.table_name), table.physical_name)) continue;
+        if (entry.schema_version != null and entry.schema_version != table.schema_version) return error.CatalogGenerationChanged;
         if (entry.relational_schema_version != null and entry.relational_schema_version != table.schema_version) return error.CatalogGenerationChanged;
         for (entry.batch.deletes) |key| try cursor.shadowed.put(arena, key, {});
         for (entry.batch.writes) |write| {
@@ -36,17 +37,17 @@ pub fn open(alloc: std.mem.Allocator, native: catalog.Cursor, staged: *const tra
             const nulls = try arena.alloc(bool, table.columns.len);
             for (table.columns, nulls) |column, *sql_null| {
                 const raw = value.object.get(column.path) orelse .null;
-                const json_null = for (write.json_null_fields) |field| {
+                const json_null = if (table.storage_mode == .document) column.type == .json and value.object.contains(column.path) else for (write.json_null_fields) |field| {
                     if (std.mem.eql(u8, field, column.path)) break true;
                 } else false;
                 sql_null.* = raw == .null and !json_null;
                 const typed = if (raw == .null) raw else try @import("../sql/describe.zig").coerce(raw, column.type);
                 try object.put(arena, column.path, typed);
             }
-            const version = for (entry.predicates.items) |predicate| {
-                if (std.mem.eql(u8, predicate.key, write.key)) break predicate.expected_version;
+            const observed = for (entry.predicates.items) |predicate| {
+                if (std.mem.eql(u8, predicate.key, write.key)) break predicate;
             } else return error.InvalidSqlBackendResponse;
-            const row = catalog.Row{ .id = write.key, .version = version, .value = .{ .object = object }, .sql_nulls = nulls };
+            const row = catalog.Row{ .id = write.key, .version = observed.expected_version, .value = .{ .object = object }, .sql_nulls = nulls, .expected_content_digest = observed.expected_content_digest, .document = if (request.include_document) value else null };
             if (try matches(row, request.conditions)) {
                 var projected: std.json.ObjectMap = .empty;
                 const projected_nulls = try arena.alloc(bool, request.fields.len);
@@ -55,7 +56,7 @@ pub fn open(alloc: std.mem.Allocator, native: catalog.Cursor, staged: *const tra
                     try projected.put(arena, field, cell.value);
                     sql_null.* = cell.sql_null;
                 }
-                try rows.append(arena, .{ .id = row.id, .version = row.version, .value = .{ .object = projected }, .sql_nulls = projected_nulls });
+                try rows.append(arena, .{ .id = row.id, .version = row.version, .value = .{ .object = projected }, .sql_nulls = projected_nulls, .expected_content_digest = row.expected_content_digest, .document = row.document });
             }
         }
     }
@@ -134,7 +135,7 @@ const Cursor = struct {
             if (native == null and staged == null) break;
             const take_staged = staged != null and (native == null or std.mem.lessThan(u8, staged.?.id, native.?.id));
             const row = if (take_staged) staged.? else native.?;
-            try rows.append(alloc, .{ .id = try alloc.dupe(u8, row.id), .version = row.version, .value = try @import("../storage/typed_json.zig").clone(alloc, row.value), .sql_nulls = if (row.sql_nulls) |flags| try alloc.dupe(bool, flags) else null });
+            try rows.append(alloc, .{ .id = try alloc.dupe(u8, row.id), .version = row.version, .value = try @import("../storage/typed_json.zig").clone(alloc, row.value), .sql_nulls = if (row.sql_nulls) |flags| try alloc.dupe(bool, flags) else null, .expected_content_digest = row.expected_content_digest, .document = if (row.document) |document| try @import("../storage/typed_json.zig").clone(alloc, document) else null });
             if (take_staged) self.staged_index += 1 else self.page_index += 1;
         }
         const more = self.staged_index < self.staged.len or (try self.peek()) != null;
@@ -192,6 +193,36 @@ test "SQL session overlay merges pages and suppresses replaced and deleted rows"
     try std.testing.expectEqual(@as(usize, 1), visible.rows.len);
     try std.testing.expectEqualStrings("b", visible.rows[0].id);
     try std.testing.expect(visible.after == null);
+}
+
+test "SQL document session overlay retains full postimage and original conflict digest" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const Empty = struct {
+        fn next(_: *anyopaque, _: std.mem.Allocator, _: u32) !catalog.Page {
+            return .{ .rows = &.{} };
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var state: u8 = 0;
+    var staged = try transactions.parseCommitRequest(alloc, "{\"read_set\":[{\"table\":\"t\",\"key\":\"a\",\"version\":\"7\"}],\"tables\":{\"t\":{\"inserts\":{\"a\":{\"j\":null,\"extra\":9007199254740993}}}}}");
+    defer staged.deinit(alloc);
+    staged.tables[0].schema_version = 2;
+    staged.tables[0].predicates.items[0].expected_content_digest = @splat(42);
+    const table = catalog.Table{ .id = 1, .physical_name = "t", .schema_version = 2, .storage_mode = .document, .columns = &.{ .{ .name = "j", .path = "j", .type = .json }, .{ .name = "missing", .path = "missing", .type = .json } } };
+    const cursor = try open(alloc, .{ .ptr = &state, .next = Empty.next, .close = Empty.close }, &staged, table, .{ .fields = &.{ "j", "missing" }, .include_document = true, .limit = 1 }, null);
+    defer cursor.close(cursor.ptr);
+    const page = try cursor.next(cursor.ptr, arena.allocator(), 1);
+    try std.testing.expectEqual(@as(usize, 1), page.rows.len);
+    try std.testing.expect(!(try page.rows[0].cell("j")).sql_null);
+    try std.testing.expect((try page.rows[0].cell("missing")).sql_null);
+    try std.testing.expectEqual(@as(u64, 7), page.rows[0].version);
+    try std.testing.expectEqual([_]u8{42} ** 32, page.rows[0].expected_content_digest.?);
+    try std.testing.expectEqualStrings("9007199254740993", page.rows[0].document.?.object.get("extra").?.number_string);
+    var wrong_epoch = table;
+    wrong_epoch.schema_version = 3;
+    try std.testing.expectError(error.CatalogGenerationChanged, open(alloc, .{ .ptr = &state, .next = Empty.next, .close = Empty.close }, &staged, wrong_epoch, .{ .fields = &.{}, .limit = 1 }, null));
 }
 
 test "SQL session overlay preserves JSON null independently of SQL NULL" {

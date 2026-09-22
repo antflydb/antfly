@@ -237,6 +237,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "httpx antfly routes require auth and enforce admin middleware",
         "httpx relational row query mutation endpoints enforce exact versions and schema epochs",
         "httpx SQL",
+        "httpx retained read",
         "api.sql_execution",
         "api.sql_pgwire",
         "api.sql_session",
@@ -1078,6 +1079,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = api_table_reads_docid_test_mod,
         .filters = &.{
             "retained read owner",
+            "retained read RPC",
+            "retained read client",
             "relational row query response budget",
             "relational row query executes typed projection",
             "relational row query retained owner holds admission and releases failed opens",

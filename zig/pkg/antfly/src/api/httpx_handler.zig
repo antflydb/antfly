@@ -1163,6 +1163,7 @@ pub const AntflyApiHandler = struct {
         try server.post(table_prefix ++ routes.restore_owner_suffix, httpx.Handler.bind(self, internalGroupRestoreOwner));
         try server.post(table_prefix ++ routes.online_merge_io_suffix, httpx.Handler.bind(self, internalGroupOnlineMergeIo));
         try server.postResponseStreaming(table_prefix ++ routes.documents_suffix, httpx.Handler.bind(self, internalGroupScan));
+        try server.post(table_prefix ++ "/retained-read", httpx.Handler.bind(self, internalRetainedRead));
         try server.post(table_prefix ++ routes.query_suffix, httpx.Handler.bind(self, internalGroupQuery));
         try server.post(table_prefix ++ routes.query_preflight_suffix, httpx.Handler.bind(self, internalGroupQueryPreflight));
         try server.post(table_prefix ++ routes.vector_worker_suffix, httpx.Handler.bind(self, internalGroupVectorWorker));
@@ -2988,6 +2989,48 @@ pub const AntflyApiHandler = struct {
             internalGroupErrorResponse(ctx, err);
         defer result.deinit(ctx.allocator);
         return internalQueryResponse(ctx, &result);
+    }
+
+    fn internalRetainedRead(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const rpc = @import("retained_read_rpc.zig");
+        // Unlike legacy stateless internal reads, retained handles NEVER accept
+        // unsigned migration traffic. Bind each operation to the authenticated
+        // service credential, not a principal supplied by the request body.
+        const credential = ctx.header(internal_service_auth.header_name) orelse return unauthorizedResponse(ctx);
+        var identity = self.api_server.authenticateInternalServiceRequest(credential) catch return unauthorizedResponse(ctx);
+        defer identity.deinit(self.api_server.alloc);
+        if (!identity.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "missing retained read request");
+        if (body.len > rpc.max_request_bytes) return textResponse(ctx, 413, "retained read request too large");
+        var request_budget: SQLMemoryBudget = .{ .backing = ctx.allocator, .limit = 16 << 20 };
+        var parsed = std.json.parseFromSlice(rpc.Request, request_budget.allocator(), body, .{ .parse_numbers = false }) catch return textResponse(ctx, 400, "invalid retained read request");
+        defer parsed.deinit();
+        const request = operationContext(ctx, null);
+        try request.ensureActive();
+        var source = self.api_server.table_reads orelse return textResponse(ctx, 503, "retained read source unavailable");
+        source.bindCatalogRouteFenceJson(ctx.allocator, request.catalog_route_fence_json, params.group_id, request.deadline_ns, request.cancellation) catch return textResponse(ctx, 400, "invalid catalog route fence");
+        const route = source.route_fence orelse return textResponse(ctx, 400, "catalog route fence required");
+        var principal: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(identity.credential_principal, &principal, .{});
+        const runtime = self.api_server.retainedReadRuntime() catch return textResponse(ctx, 503, "retained read owner unavailable");
+        const encoded = rpc.execute(ctx.allocator, .{ .registry = &runtime.registry, .source = source }, .{
+            .principal = principal,
+            .authorization_revision = 1,
+            .table_id = route.table_id,
+            .group_id = route.route.group_id,
+            .topology_revision = route.topology_epoch,
+            .schema_version = parsed.value.schema_version,
+        }, params.table_name, parsed.value) catch |err| return textResponse(ctx, switch (err) {
+            error.InvalidRetainedReadLease, error.InvalidRetainedReadToken, error.InvalidRetainedReadQuery, error.InvalidRetainedReadPageLimit => 400,
+            error.RetainedReadAdmissionExceeded, error.RetainedReadBusy => 429,
+            error.RetainedReadNotFound, error.RetainedReadExpired, error.RetainedReadScopeChanged, error.RetainedReadSequenceMismatch, error.SqlRangeTrackingRequired => 409,
+            else => 503,
+        }, @errorName(err));
+        defer ctx.allocator.free(encoded);
+        try ctx.setHeader("content-type", "application/json");
+        return ctx.response.body(try ctx.allocator.dupe(u8, encoded)).build();
     }
 
     fn internalGroupScan(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -11564,6 +11607,37 @@ test "httpx antfly schema update owns self partial support and rejects public in
     defer dropped.deinit();
     try std.testing.expectEqual(@as(u16, 400), dropped.status.code);
     try std.testing.expect(std.mem.indexOf(u8, dropped.body.?, "server-owned") != null);
+}
+
+test "httpx retained read refuses unsigned migration requests and requires catalog authority" {
+    const alloc = std.testing.allocator;
+    var source = AuthStatusSource{};
+    const secret = "retained-read-test-secret-long-enough";
+    var api_server = ApiHttpServer.init(alloc, .{ .internal_service_secret = secret, .internal_service_issuer = "httpx-test", .internal_service_accept_legacy_unauthenticated = true }, source.iface(), null, null);
+    defer api_server.deinit();
+    var server: HttpxE2eServer = undefined;
+    try server.init(alloc, &api_server);
+    defer server.deinit();
+    var client_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer client_io.deinit();
+    var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base = try server.baseUrl(alloc);
+    defer alloc.free(base);
+    const url = try std.fmt.allocPrint(alloc, "{s}/internal/v1/groups/7/tables/docs/retained-read", .{base});
+    defer alloc.free(url);
+    const body = "{\"operation\":\"capture\",\"schema_version\":1}";
+    var unsigned = try requestWithRetry(&client, client_io.io(), .POST, url, body, &.{.{ "content-type", "application/json" }}, 20);
+    defer unsigned.deinit();
+    try std.testing.expectEqual(@as(u16, 401), unsigned.status.code);
+    const token = try internal_service_auth.tokenAlloc(alloc, .{ .secret = secret, .issuer = "httpx-test", .subject = "node:test" }, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+    defer alloc.free(token);
+    const headers = [_][2][]const u8{ .{ "content-type", "application/json" }, .{ internal_service_auth.header_name, token } };
+    var authenticated = try requestWithRetry(&client, client_io.io(), .POST, url, body, &headers, 20);
+    defer authenticated.deinit();
+    try std.testing.expectEqual(@as(u16, 503), authenticated.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, authenticated.body.?, "source unavailable") != null);
+    try std.testing.expect(api_server.retained_read_runtime == null);
 }
 
 test "httpx restore owner accepts bounded rewrite source chunks above legacy control limit" {

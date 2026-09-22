@@ -61,11 +61,13 @@ pub const OrderKey = struct {
     nulls_first: ?bool = null,
 };
 pub const BoundStatement = struct {
+    conflict: ?@import("conflict.zig").Bound = null,
     insert_source: ?*const BoundStatement = null,
     returning: ?*const BoundStatement = null,
     returning_projections: ?[]const ast.Projection = null,
     relation: ?*const @import("relation_binding.zig").Bound = null,
     aggregate: ?*const @import("aggregate_binding.zig").Bound = null,
+    window: ?*const @import("window_binding.zig").Bound = null,
     scalars: bound_scalars.Bound = .{},
     order_keys: []const OrderKey = &.{},
     primary_order: bool = false,
@@ -107,6 +109,12 @@ pub fn describe(allocator: std.mem.Allocator, backend: catalog.Backend, compiled
 /// execution reuses binding.table instead of resolving another schema epoch.
 pub fn bind(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *const compiler.Compiled, explicit_parameter_types: []const ?ast.ColumnType) anyerror!BoundStatement {
     if (explicit_parameter_types.len > compiled.parameter_count) return error.InvalidSqlParameters;
+    if (compiled.statement == .select) try @import("window_binding.zig").validatePlacement(compiled.statement.select);
+    if (compiled.statement == .select and @import("subquery_lowering.zig").accepts(compiled.statement.select)) {
+        var lowered = compiled.*;
+        lowered.statement = .{ .select = try @import("subquery_lowering.zig").lower(allocator, compiled.statement.select) };
+        return bind(allocator, backend, &lowered, explicit_parameter_types);
+    }
     if (compiled.statement == .select and @import("relation_binding.zig").accepts(compiled.statement.select)) {
         const relations = @import("relation_binding.zig");
         const parameters = try allocator.alloc(?ast.ColumnType, compiled.parameter_count);
@@ -135,6 +143,13 @@ pub fn bind(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
         // create/drop an object merely to discover its protocol metadata.
         return .{ .table = null, .action = .admin, .columns = &.{}, .parameter_types = &.{}, .json_literals = .empty };
     }
+    if (compiled.statement == .select and @import("window_binding.zig").accepts(compiled.statement.select)) {
+        const window = try allocator.create(@import("window_binding.zig").Bound);
+        window.* = try @import("window_binding.zig").bind(allocator, backend, compiled, explicit_parameter_types);
+        const columns = try allocator.alloc(Column, window.outputs.len);
+        for (columns, window.names, window.outputs) |*column, name, program| column.* = .{ .name = name, .type = program.output_type.kind orelse .string, .untyped_null = program.output_type.kind == null };
+        return .{ .table = window.input.table, .action = .read, .columns = columns, .parameter_types = window.input.parameter_types, .json_literals = .empty, .window = window };
+    }
     if (compiled.statement == .select and @import("aggregate_binding.zig").accepts(compiled.statement.select)) {
         try backend.vtable.checkpoint(backend.ptr);
         const table = if (compiled.statement.select.table) |name| try backend.vtable.resolve(backend.ptr, allocator, name, .read) else null;
@@ -161,7 +176,7 @@ pub fn bind(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
     }
     const target: struct { name: ast.Name, action: catalog.Action } = switch (compiled.statement) {
         .select => |statement| .{ .name = statement.table.?, .action = .read },
-        .insert => |statement| .{ .name = statement.table, .action = if (statement.returning != null) .read_write else .write },
+        .insert => |statement| .{ .name = statement.table, .action = if (statement.returning != null or statement.conflict != null) .read_write else .write },
         .update => |statement| .{ .name = statement.table, .action = .read_write },
         .delete => |statement| .{ .name = statement.table, .action = .read_write },
         else => return error.UnsupportedSqlExecution,
@@ -187,6 +202,7 @@ pub fn bind(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
     defer allocator.free(contexts);
     @memset(contexts, null);
     var context: Context = .{ .allocator = allocator, .backend = backend, .table = table, .parameters = parameters, .contexts = contexts };
+    const conflict_binding = if (compiled.statement == .insert and compiled.statement.insert.conflict != null) try @import("conflict.zig").bind(allocator, backend, table, target.name, compiled.statement.insert.conflict.?, parameters) else null;
     context.scalars = try bound_scalars.bind(allocator, table, compiled.statement, parameters);
     const columns: []const Column = switch (compiled.statement) {
         .select => |statement| try context.select(statement),
@@ -205,6 +221,7 @@ pub fn bind(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
         else => unreachable,
     };
     var result: BoundStatement = .{ .table = table, .action = target.action, .columns = columns, .parameter_types = parameters, .json_literals = context.json_literals, .scalars = context.scalars, .order_keys = context.order_keys, .primary_order = context.primary_order };
+    result.conflict = conflict_binding;
     if (compiled.statement == .insert) if (compiled.statement.insert.source) |source| {
         const insertion = compiled.statement.insert;
         // Assignment context supplies the type of otherwise-untyped positional
@@ -416,7 +433,7 @@ const Context = struct {
             if (column.generated) return error.SqlGeneratedColumnWrite;
             if (std.mem.eql(u8, name, "_id")) identity_column = i;
         }
-        const key_column = identity_column orelse return error.SqlRowIdentityRequired;
+        if (identity_column == null and self.backend.vtable.generate_row_id == null) return error.SqlRowIdentityRequired;
         var literal_keys: std.StringHashMapUnmanaged(void) = .empty;
         defer literal_keys.deinit(self.allocator);
         for (statement.rows, 0..) |row, row_index| {
@@ -426,13 +443,14 @@ const Context = struct {
                 if (self.scalars.insert_rows.len != 0 and self.scalars.insert_rows[row_index][cell_index] != null) continue;
                 try self.value(node, column, true);
             }
+            const key_column = identity_column orelse continue;
             if (self.scalars.insert_rows.len != 0 and self.scalars.insert_rows[row_index][key_column] != null) continue;
             switch (row[key_column]) {
                 .parameter => {},
                 .string => |key| {
                     if (key.len == 0) return error.SqlRowIdentityRequired;
                     if (!std.unicode.utf8ValidateSlice(key)) return error.SqlTypeMismatch;
-                    if ((try literal_keys.getOrPut(self.allocator, key)).found_existing) return error.DuplicateSqlRow;
+                    if ((try literal_keys.getOrPut(self.allocator, key)).found_existing and (statement.conflict == null or !@import("conflict.zig").primary(statement.conflict.?) or statement.conflict.?.assignments.len != 0)) return error.DuplicateSqlRow;
                 },
                 else => return error.SqlRowIdentityRequired,
             }

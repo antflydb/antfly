@@ -112,8 +112,20 @@ pub const Backend = struct {
         authenticate: *const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8) anyerror!Identity,
         describe: *const fn (*anyopaque, std.mem.Allocator, Identity, Request) anyerror!Description,
         execute: *const fn (*anyopaque, std.mem.Allocator, Identity, Request) anyerror!Result,
+        /// Optional owned read-only pull execution. Null declines a blocking
+        /// shape before execution. Each page is independently owned; release it
+        /// before the next pull or closing the stream. Never use for mutations.
+        open_stream: ?*const fn (*anyopaque, std.mem.Allocator, Identity, Request) anyerror!?ReadStream = null,
         // Disconnect/termination must abandon any transaction session owned by
         // the connection. This callback must not commit it or perform retries.
         disconnect: *const fn (*anyopaque, Identity, ?[]const u8) void,
     };
 };
+
+pub const ReadStream = struct {
+    context: *anyopaque,
+    columns: []const Column,
+    next: *const fn (*anyopaque, std.mem.Allocator, Request, u32) anyerror!StreamPage,
+    close: *const fn (*anyopaque) void,
+};
+pub const StreamPage = struct { result: Result, exhausted: bool };

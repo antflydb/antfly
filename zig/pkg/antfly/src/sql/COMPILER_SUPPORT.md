@@ -14,6 +14,14 @@ statement before any mutation.
   ASC/DESC and NULLS FIRST/LAST; LIMIT/OFFSET accept nonnegative integers/parameters.
 - Inner/outer joins with source aliases, derived tables and nonrecursive CTEs;
   grouping, aggregate FILTER/DISTINCT, HAVING, and bounded aggregate ordering.
+- Window ranking, offset/value functions and aggregates with PARTITION BY,
+  ORDER BY, peer-aware RANGE and explicit ROWS frames. Equal sort domains share
+  sorting; moving aggregates use bounded indexed state. Window evaluation runs
+  after grouping/HAVING and before final ordering/limits under the same budget.
+- Equality-correlated EXISTS/NOT EXISTS and scalar subqueries, including direct
+  scalar aggregates, lower to grouped hash joins rather than per-row reads.
+  All physical tables participate in the same authorized statement capture.
+  Scalar subqueries preserve zero-row NULL and SQLSTATE 21000 for multiple rows.
 - UNION/INTERSECT/EXCEPT with ALL/distinct multiplicities, INTERSECT precedence,
   parenthesized operands and final ordering/limits. Typed equality keeps JSON
   null distinct from SQL NULL; set operands share the statement memory budget.
@@ -23,11 +31,24 @@ statement before any mutation.
   checks and bounded whole-statement preparation. Source cursors close before
   commit, including self-inserts; source failure cannot publish a partial batch.
 - `UPDATE ... SET column = expression [, ...] [WHERE ...]`.
+- `INSERT ... ON CONFLICT (_id) DO NOTHING` and `DO UPDATE SET ... [WHERE ...]`.
+  Assignments bind old-row and `excluded` values once, with native defaults and
+  generated values. Skipped rows remain atomic read-set fences, never deletes;
+  affected counts and RETURNING omit them. Concurrent arbiter changes fail as
+  definite serialization conflicts, without implicit replay. Coordinated
+  backends also resolve explicit complete unique-column targets through the
+  native tuple codec and generation-bound claim authority, including composite
+  keys and native NULL-distinct behavior. Exact claim/absence guards travel with
+  the atomic mutation and survive session staging, savepoints, and recovery.
+  Omitted targets and providers without native arbiter coordination fail closed.
 - `DELETE FROM ... [WHERE ...]`.
-- Relational INSERT/UPDATE/DELETE `RETURNING` projections, expressions and
+- Relational and document INSERT/UPDATE/DELETE `RETURNING` projections, expressions and
   wildcard. Native schema-bound normalization supplies defaults/generated
   values; DELETE uses version-fenced preimages. All output preparation occurs
   before commit, and a backend without normalization fails before writing.
+  Document UPDATE retains undeclared fields from the pinned primary preimage;
+  native digest and schema-epoch predicates protect every mutation. Explicit
+  SQL NULL removes a document member while JSON null remains a present value.
 - Native table/database/schema/tablespace CREATE/DROP/rename/tablespace DDL,
   schema-version-conditional column/default changes and multicolumn covering
   indexes. Unique declarations await native constraint activation; a durable
@@ -37,13 +58,23 @@ statement before any mutation.
 
 Names can be `table`, `namespace.table`, or `database.namespace.table`. Unquoted
 identifiers fold ASCII case; quoted identifiers preserve their exact names.
-`_id` is reserved for the backend's explicit row identity, not a schema primary
-key declaration. Integer literals are signed 64-bit values parsed exactly.
+`_id` is reserved for the backend's opaque row identity, not a schema primary
+key declaration. INSERT without `_id` uses the shared native secure identity
+provider once during preparation; the native expected-absent fence prevents
+collisions from overwriting a row. Providers without that capability require an
+explicit `_id`. Integer literals are signed 64-bit values parsed exactly.
 
 ## Deliberate exclusions
 
-Window expressions, correlated subqueries, conflict clauses and
-SQL-language prepared statements/cursors are not implemented by this compiler.
+Named windows, GROUPS/EXCLUDE frames and DISTINCT window aggregates remain
+unsupported. Subquery IN/ANY/ALL, non-equality correlation, nested subquery
+expressions inside an inner subquery, per-key ORDER/LIMIT, set/group/HAVING/window
+subquery forms, complex aggregate expressions, lazy CASE/COALESCE subquery
+branches, and mutation-expression subqueries
+remain unsupported. EXISTS currently admits literal/field projections; richer
+expressions need a validation-only binding domain to avoid evaluating discarded
+values. Partial/expression/deferrable conflict arbiters, targetless inference and
+SQL-language prepared statements/cursors remain separate capability gates.
 These implemented forms do not constitute the complete S2 parity gate.
 Unsupported tails and additional statements are rejected, never
 ignored. The existing generated grammar remains a syntax oracle, not a
@@ -53,8 +84,9 @@ Whole-shape parameter inference runs before emitting inner programs. Symbolic
 column lineage carries constraints through nested derived queries, CTEs, joins,
 set operands and INSERT assignment context. This catalog-only pass never reads
 rows, reuses resolved read identities, and is skipped when parameter types are
-already known. Query operands also materialize bounded intermediate results;
-fully streaming composition remains part of the unfinished cursor architecture.
+already known. Nonblocking nested queries and CTEs stream through owned pull
+cursors; blocking sorts, aggregates, windows and set operands retain bounded
+intermediate results.
 
 The execution layer separately controls support for parsed ordering, predicate
 forms, DDL, and transactions. Those capabilities must not be advertised merely
@@ -109,9 +141,15 @@ OFFSET+LIMIT rows (plus one overflow witness without an explicit LIMIT), owns
 only competitive rows, and preserves stable tie ordering. Primary-key ascending
 order and simple COUNT retain their native fast paths.
 
-SQL sessions currently admit READ COMMITTED explicitly. Stronger isolation is
-not advertised until coordinated owner snapshots and durable range/phantom
-validation are wired. The native row-preparation port shares schema defaults,
+SQL sessions admit READ COMMITTED. Repeatable-read and serializable require
+explicitly capable read/write providers: coordinated owner snapshots, replicated
+tracking activation, durable range observations and owner-fenced atomic prepare.
+Changed observations cause serialization failure, never silent snapshot renewal.
+Savepoint rollback retains observations already exposed to the client. Unsupported
+providers reject stronger BEGIN; TTL-enabled tables reject guarded reads until
+clock-driven visibility has a transaction-time contract. Conservative first-byte
+buckets may conflict for distinct keys sharing a prefix.
+The native row-preparation port shares schema defaults,
 stored-generated expressions and validation with commit; it does not publish
 any data while staging a session statement.
 

@@ -38,6 +38,19 @@ pub const BatchResult = struct {
     failure: ?BatchFailure = null,
 };
 
+test "SQL document epoch fence survives internal batch codec and rejects public injection" {
+    const alloc = std.testing.allocator;
+    for ([_]u32{ 0, 7, std.math.maxInt(u32) }) |version| {
+        const body = try encodeBatchRequest(alloc, .{ .schema_version = version, .deletes = &.{"row"} });
+        defer alloc.free(body);
+        var parsed = try parseInternalBatchRequest(alloc, body);
+        defer parsed.deinit(alloc);
+        try std.testing.expectEqual(@as(?u32, version), parsed.req.schema_version);
+        try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, body));
+    }
+    try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(alloc, "{\"_schema_version\":4294967296}"));
+}
+
 test "index maintenance internal batch codec owns binary proof and rejects public bypass" {
     const alloc = std.testing.allocator;
     const command = @import("../storage/db/relational_index_maintenance_contract.zig").Command{
@@ -304,6 +317,7 @@ pub const OwnedBatchRequest = struct {
     predicates: []db_mod.types.TransactionVersionPredicate = &.{},
     integrity: []const db_mod.types.TransactionIntegrityOperation = &.{},
     integrity_commands: ?std.json.Parsed([]const @import("../storage/db/relational_integrity_contract.zig").Command) = null,
+    range_guards: ?std.json.Parsed([]const @import("../storage/range_protection.zig").Proof) = null,
     relational_activation: ?std.json.Parsed(@import("../storage/db/relational_integrity_activation_contract.zig").Command) = null,
     relational_retirement: ?std.json.Parsed(@import("../storage/db/relational_integrity_retirement_contract.zig").Command) = null,
     relational_index_maintenance: ?std.json.Parsed(@import("../storage/db/relational_index_maintenance_contract.zig").Command) = null,
@@ -326,6 +340,7 @@ pub const OwnedBatchRequest = struct {
     pub fn deinit(self: *OwnedBatchRequest, alloc: std.mem.Allocator) void {
         @import("relational_integrity_wire.zig").free(alloc, self.integrity);
         if (self.integrity_commands) |*commands| commands.deinit();
+        if (self.range_guards) |*guards| guards.deinit();
         if (self.relational_activation) |*activation| activation.deinit();
         if (self.relational_retirement) |*retirement| retirement.deinit();
         if (self.relational_index_maintenance) |*retirement| retirement.deinit();
@@ -437,6 +452,7 @@ fn parseBatchRequestWithOptions(
 
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, options) catch |err| switch (err) {
         error.ValueTooLong => return error.ValueTooLong,
+        error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidBatchRequest,
     };
     defer parsed.deinit();
@@ -498,6 +514,12 @@ fn parseBatchRequestWithOptions(
         break :commands @as(?std.json.Parsed([]const @import("../storage/db/relational_integrity_contract.zig").Command), try @import("relational_integrity_wire.zig").parseCommands(alloc, value));
     } else null;
     errdefer if (integrity_commands) |*commands| commands.deinit();
+    var range_guards = if (root.get("_range_guards")) |value| guards: {
+        if (!allow_internal) return error.InvalidBatchRequest;
+        break :guards @as(?std.json.Parsed([]const @import("../storage/range_protection.zig").Proof), try std.json.parseFromValue([]const @import("../storage/range_protection.zig").Proof, alloc, value, .{ .allocate = .alloc_always }));
+    } else null;
+    errdefer if (range_guards) |*guards| guards.deinit();
+    if (range_guards) |guards| if (guards.value.len > 257) return error.InvalidBatchRequest;
     var relational_activation = if (root.get("_relational_activation")) |value| activation: {
         if (!allow_internal) return error.InvalidBatchRequest;
         break :activation @as(?std.json.Parsed(@import("../storage/db/relational_integrity_activation_contract.zig").Command), try std.json.parseFromValue(@import("../storage/db/relational_integrity_activation_contract.zig").Command, alloc, value, .{ .allocate = .alloc_always }));
@@ -536,6 +558,10 @@ fn parseBatchRequestWithOptions(
         break :control @as(?std.json.Parsed(@import("../storage/db/online_source_contract.zig").Command), try std.json.parseFromValue(@import("../storage/db/online_source_contract.zig").Command, alloc, value, .{ .allocate = .alloc_always }));
     } else null;
     errdefer if (online_source) |*control| control.deinit();
+    const schema_version: ?u32 = if (root.get("_schema_version")) |value| blk: {
+        if (!allow_internal) return error.InvalidBatchRequest;
+        break :blk std.math.cast(u32, try parseInternalU64(value)) orelse return error.InvalidBatchRequest;
+    } else null;
     const relational_schema_version: ?u32 = if (root.get("_relational_schema_version")) |value| blk: {
         if (!allow_internal) return error.InvalidBatchRequest;
         break :blk std.math.cast(u32, try parseInternalU64(value)) orelse return error.InvalidBatchRequest;
@@ -545,6 +571,10 @@ fn parseBatchRequestWithOptions(
         break :blk try @import("relational_integrity_wire.zig").parseGenerationSet(value);
     } else null;
     const relational_repair = if (root.get("_relational_repair")) |value| blk: {
+        if (!allow_internal or value != .bool) return error.InvalidBatchRequest;
+        break :blk value.bool;
+    } else false;
+    const activate_range_tracking = if (root.get("_activate_range_tracking")) |value| blk: {
         if (!allow_internal or value != .bool) return error.InvalidBatchRequest;
         break :blk value.bool;
     } else false;
@@ -991,7 +1021,9 @@ fn parseBatchRequestWithOptions(
                 .participants = transaction_participants,
             } };
         }
-        if (std.mem.eql(u8, phase_value.string, "prepare")) break :transaction .{ .prepare = .{
+        const guarded_prepare = std.mem.eql(u8, phase_value.string, "prepare_ranges_v1");
+        if (guarded_prepare != (range_guards != null and range_guards.?.value.len != 0)) return error.InvalidBatchRequest;
+        if (std.mem.eql(u8, phase_value.string, "prepare") or guarded_prepare) break :transaction .{ .prepare = .{
             .txn_id = txn_id,
             .topology_epoch = try parseInternalU64(object.get("topology_epoch") orelse return error.InvalidBatchRequest),
         } };
@@ -1040,6 +1072,7 @@ fn parseBatchRequestWithOptions(
         return error.InvalidBatchRequest;
     }
     if (predicates.len != 0 and transaction == null) return error.InvalidBatchRequest;
+    if (range_guards != null and (transaction == null or transaction.? != .prepare)) return error.InvalidBatchRequest;
     if (integrity.len != 0 and (transaction == null or transaction.? != .prepare)) return error.InvalidBatchRequest;
     if (integrity_commands != null and (transaction == null or transaction.? != .prepare or integrity.len != 0)) return error.InvalidBatchRequest;
     if (relational_activation != null and (transaction == null or transaction.? != .prepare)) return error.InvalidBatchRequest;
@@ -1094,6 +1127,7 @@ fn parseBatchRequestWithOptions(
         .predicates = predicates,
         .integrity = integrity,
         .integrity_commands = integrity_commands,
+        .range_guards = range_guards,
         .relational_activation = relational_activation,
         .relational_retirement = relational_retirement,
         .relational_index_maintenance = relational_index_maintenance,
@@ -1114,6 +1148,7 @@ fn parseBatchRequestWithOptions(
         .req = .{
             .integrity = integrity,
             .integrity_commands = if (integrity_commands) |commands| commands.value else &.{},
+            .range_guards = if (range_guards) |guards| guards.value else &.{},
             .relational_activation = if (relational_activation) |activation| activation.value else null,
             .relational_retirement = if (relational_retirement) |retirement| retirement.value else null,
             .relational_index_maintenance = if (relational_index_maintenance) |maintenance| maintenance.value else null,
@@ -1121,10 +1156,12 @@ fn parseBatchRequestWithOptions(
             .restore_staging = if (restore_staging) |control| control.value else null,
             .online_source = if (online_source) |control| control.value else null,
             .relational_schema_version = relational_schema_version,
+            .schema_version = schema_version,
             .relational_integrity_generation_set = relational_integrity_generation_set,
             .restore_staging_scope = restore_staging_scope,
             .restore_staging_plan_id = restore_staging_plan_id,
             .relational_repair = relational_repair,
+            .activate_range_tracking = activate_range_tracking,
             .writes = writes,
             .deletes = deletes,
             .transforms = transforms,
@@ -1145,6 +1182,7 @@ fn parseBatchRequestWithOptions(
             .transaction = transaction,
         },
     };
+    try @import("../storage/range_protection.zig").validateRequest(result_value.req);
     try merge_pages.validateRequest(result_value.req);
     try @import("../storage/db/online_source_contract.zig").validateRequest(result_value.req);
     return result_value;
@@ -1155,6 +1193,16 @@ pub fn encodeBatchResponse(alloc: std.mem.Allocator, result: BatchResult) ![]u8 
 }
 
 pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchRequest) ![]u8 {
+    return encodeBatchRequestOwned(alloc, req) catch |err| switch (err) {
+        // This memory writer can fail only when allocation fails.
+        error.WriteFailed => error.OutOfMemory,
+        else => err,
+    };
+}
+
+fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequest) ![]u8 {
+    if (req.range_guards.len != 0 and (req.range_guards.len > 257 or req.transaction == null or req.transaction.? != .prepare)) return error.InvalidBatchRequest;
+    try @import("../storage/range_protection.zig").validateRequest(req);
     try @import("../storage/db/online_source_contract.zig").validateRequest(req);
     try merge_pages.validateRequest(req);
     if (req.merge_checkpoint) |checkpoint| {
@@ -1277,7 +1325,10 @@ pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReque
         try writer.writeAll("]");
     }
     if (req.relational_schema_version) |version| try writer.print(",\"_relational_schema_version\":{d}", .{version});
+    if (req.schema_version) |version| try writer.print(",\"_schema_version\":{d}", .{version});
     if (req.relational_repair) try writer.writeAll(",\"_relational_repair\":true");
+    if (req.activate_range_tracking) try writer.writeAll(",\"_activate_range_tracking\":true");
+    if (req.range_guards.len != 0) try writer.print(",\"_range_guards\":{f}", .{std.json.fmt(req.range_guards, .{})});
     if (req.restore_staging_scope) |scope| {
         try writer.writeAll(",\"_restore_staging_scope\":");
         const encoded = try @import("relational_integrity_wire.zig").encodeGenerationSet(alloc, scope);
@@ -1512,7 +1563,7 @@ pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReque
             },
             .prepare => |prepare| {
                 const txn_hex = std.fmt.bytesToHex(prepare.txn_id, .lower);
-                try writer.print("\"phase\":\"prepare\",\"txn_id\":\"{s}\",\"topology_epoch\":\"{d}\"", .{ &txn_hex, prepare.topology_epoch });
+                try writer.print("\"phase\":\"{s}\",\"txn_id\":\"{s}\",\"topology_epoch\":\"{d}\"", .{ if (req.range_guards.len != 0) "prepare_ranges_v1" else "prepare", &txn_hex, prepare.topology_epoch });
             },
             .resolve => |resolve| {
                 const txn_hex = std.fmt.bytesToHex(resolve.txn_id, .lower);
@@ -1586,8 +1637,10 @@ fn parseInserts(
         // preserve replay and movement of durable data written by older nodes.
         if (require_document_objects and entry.value_ptr.* != .object)
             return error.InvalidBatchRequest;
+        const key = try alloc.dupe(u8, entry.key_ptr.*);
+        errdefer alloc.free(key);
         writes[initialized] = .{
-            .key = try alloc.dupe(u8, entry.key_ptr.*),
+            .key = key,
             .value = try std.json.Stringify.valueAlloc(alloc, entry.value_ptr.*, .{}),
         };
         initialized += 1;
@@ -1892,6 +1945,13 @@ fn consumerTests() type {
         }
 
         test "internal batch topology control preserves binary fences and refuses public injection" {
+            try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(std.testing.allocator, "{\"_activate_range_tracking\":true}"));
+            const activation = try encodeBatchRequest(std.testing.allocator, .{ .activate_range_tracking = true });
+            defer std.testing.allocator.free(activation);
+            var parsed_activation = try parseInternalBatchRequest(std.testing.allocator, activation);
+            defer parsed_activation.deinit(std.testing.allocator);
+            try std.testing.expect(parsed_activation.req.activate_range_tracking);
+            try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(std.testing.allocator, .{ .activate_range_tracking = true, .writes = &.{.{ .key = "a", .value = "{}" }} }));
             const alloc = std.testing.allocator;
             const topology = @import("../storage/db/relational_integrity_topology_contract.zig");
             const fence: topology.Fence = .{

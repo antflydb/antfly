@@ -1971,6 +1971,10 @@ const RaftTableApplyStateMachine = struct {
         read_states: []const raft_engine.core.ReadState,
     ) !void {
         const self: *RaftTableApplyStateMachine = @ptrCast(@alignCast(ptr));
+        // Publish only the quorum observation before apply. Ordinary strong
+        // readers still require noteApplied; frozen readers can now reject a
+        // target beyond their snapshot without waiting on their own apply lock.
+        self.read_barriers.observeReadStates(group_id, read_states);
         // ReadIndex can produce a Ready containing only ReadStates. Those are
         // request completions, not empty apply work: dropping them strands the
         // registered strong-read waiter until its timeout. Keep this fast path
@@ -9272,8 +9276,60 @@ pub const DataServer = struct {
     fn dataReadSafetyBarrier(self: *DataServer) antfly.raft.ReadSafetyBarrier {
         return .{
             .ptr = self,
-            .vtable = &.{ .wait_read_safe = waitDataReadSafe },
+            .vtable = &.{ .wait_read_safe = waitDataReadSafe, .capture_frozen = captureFrozenReadProof, .validate_frozen = validateFrozenReadProof },
         };
+    }
+
+    fn captureFrozenReadProof(ptr: *anyopaque, group_id: u64) !antfly.raft.ReadSafetyBarrier.FrozenProof {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        // Never wait for a Raft owner which may itself be waiting for the
+        // caller's frozen apply lock. Failure releases the capture immediately.
+        if (!self.data_raft_mutex.tryLock()) return error.ReadUnavailable;
+        defer self.data_raft_mutex.unlock();
+        const raft = self.data_raft orelse return error.NotLeader;
+        const apply_sm = self.data_raft_apply orelse return error.NotLeader;
+        if (!raft.host.http_host.host.isLocalLeader(group_id)) return error.NotLeader;
+        const status = raft.host.http_host.host.raftStatus(group_id) orelse return error.UnknownGroup;
+        try self.seedCompletedDataReadIndexLocked(group_id);
+        const applied = apply_sm.read_barriers.appliedIndex(group_id);
+        if (applied < status.hard.commit_index) return error.ReadUnavailable;
+        return .{ .incarnation = apply_sm.read_barriers.incarnation, .term = status.hard.current_term, .applied_index = applied };
+    }
+
+    fn validateFrozenReadProof(ptr: *anyopaque, group_id: u64, proof: antfly.raft.ReadSafetyBarrier.FrozenProof, requested_deadline: ?u64, cancellation: antfly.db.types.CancellationToken) !void {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        const raft = self.data_raft orelse return error.NotLeader;
+        const apply_sm = self.data_raft_apply orelse return error.NotLeader;
+        const io = self.dataRaftIo() orelse return error.BackendRuntimeUnavailable;
+        if (proof.incarnation != apply_sm.read_barriers.incarnation) return error.NotLeader;
+        // Bound the mutation freeze independently of the outer statement.
+        // A busy quorum/apply owner is retried after releasing all captures.
+        const remaining_ns = if (requested_deadline) |deadline| deadline -| platform_time.monotonicNs() else std.math.maxInt(u64);
+        const deadline = self.dataRaftMonotonicNs() +| @min(remaining_ns, 250 * std.time.ns_per_ms);
+        var context_buffer: [160]u8 = undefined;
+        const registration = try apply_sm.read_barriers.register(group_id, &context_buffer);
+        defer apply_sm.read_barriers.cancel(registration.token);
+        if (!self.data_raft_mutex.tryLock()) return error.ReadUnavailable;
+        {
+            defer self.data_raft_mutex.unlock();
+            if (cancellation.isCancelled()) return error.Cancelled;
+            const status = raft.host.http_host.host.raftStatus(group_id) orelse return error.UnknownGroup;
+            try proof.validate(apply_sm.read_barriers.incarnation, status.hard.current_term, raft.host.http_host.host.isLocalLeader(group_id), status.hard.commit_index);
+            try raft.requestReadIndex(group_id, registration.request_ctx);
+        }
+        while (self.dataRaftMonotonicNs() < deadline) {
+            if (cancellation.isCancelled()) return error.Cancelled;
+            if (apply_sm.read_barriers.takeObservedIndex(registration.token)) |index| {
+                if (index > proof.applied_index) return error.ReadUnavailable;
+                if (!self.data_raft_mutex.tryLock()) return error.ReadUnavailable;
+                defer self.data_raft_mutex.unlock();
+                const status = raft.host.http_host.host.raftStatus(group_id) orelse return error.UnknownGroup;
+                try proof.validate(apply_sm.read_barriers.incarnation, status.hard.current_term, raft.host.http_host.host.isLocalLeader(group_id), index);
+                return;
+            }
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        return error.ReadUnavailable;
     }
 
     fn dataGraphReadBarrier(self: *DataServer) antfly.public_api.table_reads.GraphReadBarrier {
@@ -32939,6 +32995,18 @@ fn consumerTests() type {
             );
             try std.testing.expect(canceled_deadline.token().isCancelled());
             try std.testing.expectEqual(error.Cancelled, canceled_deadline.classify(error.EnrichmentWaitCanceled));
+        }
+
+        test "data raft read safety barrier frozen proof never waits for apply owner" {
+            var server: DataServer = undefined;
+            server.data_raft_mutex = .unlocked;
+            server.data_raft = null;
+            server.data_raft_apply = null;
+            try std.testing.expectError(error.NotLeader, DataServer.captureFrozenReadProof(&server, 7));
+            try std.testing.expect(server.data_raft_mutex.tryLock());
+            try std.testing.expectError(error.ReadUnavailable, DataServer.captureFrozenReadProof(&server, 7));
+            server.data_raft_mutex.unlock();
+            try std.testing.expectError(error.NotLeader, DataServer.validateFrozenReadProof(&server, 7, .{ .incarnation = 1, .term = 1, .applied_index = 1 }, null, .none));
         }
 
         test "data raft read safety barrier rejects pre-restart responses for both read paths" {

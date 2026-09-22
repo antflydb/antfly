@@ -18,12 +18,15 @@ feature inventory. Current additions include:
   grouped/global aggregates, HAVING, joins, derived tables and nonrecursive CTEs.
 - Expression INSERT/UPDATE with whole-batch validation, exact integer values,
   and explicit SQL-null versus JSON-null provenance through native storage.
-- Coordinated capture across local owners and tables, with all capture fences
-  released before paging. Alias cursors share capture but not cursor position.
-  Remote-owner transport and durable range/phantom protection remain unfinished.
+- Coordinated capture across local and remote owners and tables, with all capture
+  fences released before paging. Alias cursors share capture but not position.
+  Remote capture uses authenticated internal RPC, bounded owner leases and fresh
+  quorum proofs. Durable owner-routed range protection is implemented below;
+  deployment capabilities and TTL restrictions are explicit admission boundaries.
 - Durable READ COMMITTED sessions, savepoints, read-your-writes overlays and
-  native constraint/default/generated-row normalization. Stronger isolation
-  remains rejected rather than silently weakened.
+  native constraint/default/generated-row normalization. Repeatable-read and
+  serializable sessions require explicitly capable providers, replicated range
+  tracking and owner-fenced atomic prepare; unsupported providers reject BEGIN.
 - Native catalog/schema/index/constraint DDL and durable pending/invalid
   receipts; pending activation/rewrite is not reported as synchronous success.
 - Generated HTTP clients, authenticated pgwire, a Lite C ABI, interactive CLI,
@@ -39,21 +42,78 @@ values rather than reading rows back after the write.
 
 Document reads now have declaration-derived shapes and retained native
 transactions with bounded pages, TTL, authorization and typed projections.
-Document mutations remain explicitly unsupported: undeclared-field preservation
-and native mutation/version integration must land before they are enabled.
+Document INSERT/UPDATE/DELETE now use native validation and schema fences.
+Updates preserve undeclared fields from the full raw preimage; exact-byte row
+digests prevent stale writes even when custom TTL timestamps are unchanged.
+RETURNING is prepared before commit, including SQL-null provenance.
 
 Remote retained-read ownership now has bounded admission, incarnation/generation
 tokens, sequence-fenced page borrowing, owned cancellation and periodic expiry.
-This is internal infrastructure, NOT enabled remote SQL: authenticated RPC
-mounting, client transport and distributed capture coordination are unfinished.
+Authenticated RPC mounting, client transport and distributed capture coordination
+are implemented. Lost capture responses have scoped cleanup, rather than relying
+only on lease expiry. Remote typed pages preserve exact integers, null provenance
+and mutation preimages; native normalization remains the owner authority.
 
-Remaining major items include document-table mutations, remote coordinated readers, durable
-transactional range protection, conflict actions,
-native SQL row identity, windows/correlated subqueries, streaming portals and
-the complete parity, fault-injection and workload benchmark gates. Passing
-focused component tests is not completion of S2.
+Nonblocking pgwire queries now pull bounded pages, including nested derived
+queries and CTEs, with network backpressure and immediate snapshot release on
+completion/error. Portal admission and plan leases live with the cursor, not a
+request stack. Blocking sorts/aggregates/windows retain bounded materialization.
+Prepared identity manifests cover all physical tables in a relation plan.
+
+Window execution shares partition/order sorts, tracks peer boundaries, and uses
+segment trees for moving aggregate frames. Ranking, offsets, value functions,
+aggregates and ROWS/numeric RANGE frames preserve typed null/numeric semantics.
+Internal aggregate nodes use wider numeric state; only requested SQL results are
+range-checked. Omitted INSERT identities use the shared native secure row-ID
+generator. Primary-identity ON CONFLICT actions use exact observed row fences.
+Ordinary composite-unique targets now use the native tuple codec, activation
+coverage, generation identity and durable compare-claim observations; those
+observations survive session merging and savepoints. Lite uses native durable
+transaction prepare/commit for single-handle constraint expansion, including
+self-referencing foreign-key actions. It rejects out-of-handle dependencies.
+
+Equality-correlated EXISTS/NOT EXISTS and scalar subqueries lower to grouped
+hash joins under the same coordinated capture as their outer query. Scalar
+cardinality, NULL equality and hidden-column projection are checked explicitly.
+Broader correlation forms remain unsupported; there is no per-row remote-query
+fallback.
+
+Remaining major items include broader isolation deployment and fault validation,
+unique-arbiter inference and correlated subquery shapes,
+SQL-language prepared/cursor session ownership, and the complete parity,
+fault-injection and workload benchmark gates. Passing focused component tests is
+not completion of S2. Partial/expression/deferrable unique arbiters and targetless
+conflict inference are not yet supported.
 
 ### Latest local validation
+
+- Expanded SQL runtime/compiler/binder: 156 tests in ReleaseSafe; pgwire:
+  25 tests; native SQL pgwire adapter and mounted route: seven tests. Final
+  combined SQL-filtered API run: 30 tests; distributed transactions: 96 tests.
+- API guarded-session integration covers activation, guard-only commit,
+  savepoint observation retention, changed-proof rejection before row fetch,
+  and DELETE RETURNING with row digest and range proof in one commit plan.
+- DocStore/native transactions: 89 tests, including recovery and range-guard
+  races. A 100,000-touch bookkeeping fixture performs one activation probe and
+  zero counter writes when inactive, versus two probes and one coalesced counter
+  write for an active single bucket. This is not a storage-throughput benchmark.
+- Native Lite SQL: nine tests, including document mutation/preimage preservation,
+  schema fences, same-TTL stale-write rejection, normalized RETURNING, composite
+  arbiters, self-FK cascades and stale claim rejection.
+- The synthetic 10,000-row pull fixture retains about 98 KiB; one ReleaseSafe
+  run produced its first 73-row page in 0.42 ms and completed in 63 ms. This is
+  an in-process executor/allocation measurement, not distributed throughput.
+- Window tests cover peer-aware frames, grouping/HAVING phase ordering,
+  cancellation, exhaustive allocation failures, all boundaries of filtered
+  nullable moving frames, and intermediate-versus-result numeric overflow.
+- The ReleaseSafe 10,000-row, 8,193-wide moving SUM fixture uses 2.73 MiB of
+  indexed aggregate state and completes in about 2 ms. This measures the
+  aggregate operator, excluding scan, binding and network work.
+- `make generate` succeeded using `/private/tmp/antfly-sql-generate-cache` after
+  the default cache again referenced a missing generator executable. `make fmt`
+  succeeded across Zig, Go, Python, TypeScript and Rust.
+
+### Prior checkpoint validation
 
 - SQL runtime/compiler/binder: 122 tests; pgwire: 23 tests.
 - Native RETURNING/Lite integration: four tests, including document reads.
@@ -288,3 +348,74 @@ antfly sql --database default --namespace public \
 Results remain ordinal arrays, so duplicate column names are not lost. The
 `--limit` option is an admission ceiling; put `LIMIT` in SQL when intentionally
 requesting a prefix. Transaction/session commands still fail explicitly.
+
+## Durable range protection implementation boundary
+
+The implementation now includes replicated activation, native bucket counters,
+pending-writer reservations, retained-read/RPC proof export, durable session
+observations and owner-fenced distributed prepare. Savepoint rollback keeps read
+observations while discarding staged writes. Versioned private prepare envelopes
+make older receivers reject guarded requests instead of ignoring their proofs.
+The transaction suite passes 96 cases, including allocation-failure coverage for
+guard ownership and durable savepoint round trips.
+
+Tracking is inactive by default: inactive native batches perform one activation
+probe and no counter writes. Active batches update each touched bucket once.
+The initial 257-bucket layout is conservative: common-prefix keys share a bucket,
+so it is not an adaptive low-contention interval index. TTL-enabled reads reject
+guarded snapshots because clock-driven visibility needs an explicit transaction
+time contract. Hosted activation and guarded Lite sessions remain unsupported.
+The acceptance checklist below remains the release gate for the broader shape,
+not a claim that every deployment or fault workload has been completed.
+
+Remote retained reads now mount a service-authenticated owner protocol, with
+catalog-scoped capabilities, bounded owner leases, sequenced pages, cancellation,
+and exact typed-row metadata. Distributed statement capture admits each selected
+leader before freezing any participant, then validates fresh quorum observations
+against the frozen applied index and leader term. Quorum validation never waits
+for Raft apply while holding an apply freeze; contention, a newer committed index,
+or a leader/incarnation change aborts the statement. These are statement snapshot
+guarantees, not durable serializable transaction protection.
+
+Repeatable-read/serializable admission requires capable read and write providers;
+the full deployment contract requires all of the following together:
+
+1. Activate tracking through an explicit replicated catalog capability transition
+   under the native apply mutex, after draining/rejecting existing prepared
+   writers. A guarded read must reject an inactive database; it must never enable
+   tracking through an unreplicated read-side write. This avoids unconditional
+   write amplification for document/vector workloads that do not use SQL isolation.
+   Persist bounded logical-primary-key bucket generations in the same native
+   transaction as primary changes. Instrument `DocStore.Txn` and `BatchTxn`
+   put/delete/append paths, covering document and relational rows, FK actions,
+   TTL deletion, transaction resolution, and bulk restore. Increment each changed
+   bucket once per transaction; never derive predicates from physical LSM runs.
+2. Capture bucket-generation tokens from the exact native read transaction and
+   export them through retained cursor/RPC pages. Bind tokens to table identity,
+   schema, and a durable data incarnation. An empty range must produce tokens too.
+3. Extend existing durable exact-value predicates and shared read guards to these
+   bucket keys. Pending writers must reserve affected buckets before a concurrent
+   reader prepares a shared guard; checking only committed generations permits a
+   prepare/commit race. Use a separate shared writer-reservation namespace, so
+   unrelated concurrent writers in one conservative bucket do not acquire an
+   exclusive bucket intent and serialize unnecessarily. Every ordinary writer
+   must check reader guards. Acquire bounded, sorted bucket sets rather than a
+   global table mutex.
+4. Retain and deduplicate tokens in the transaction session, including savepoint
+   rollback, and route their validation/read-guard acquisition through the same
+   atomic participant prepare as writes. Preserve original snapshot identity
+   across subsequent statements, rather than silently opening a fresh snapshot.
+5. Fence restore publication, split/merge, ownership movement, and database reopen
+   with durable incarnation rules so counters cannot reset or transfer ambiguously.
+   Distributed restore already allocates target table/range identities and carries
+   the metadata incarnation; reuse those fences rather than generating divergent
+   random epochs on individual replicas. In-place CAPI restoration needs explicit
+   native session invalidation before enabling guarded CAPI transactions.
+   Recovery must resolve shared guards and pending writer reservations together.
+
+Required acceptance coverage includes empty-range phantoms, pending writer versus
+reader-prepare races, FK/TTL mutations, restart/recovery, restore and topology
+changes, cancellation and lost prepare responses. Fixed logical buckets trade
+bounded metadata/locking cost for conservative conflicts; benchmark write
+amplification and false-conflict rate before selecting the bucket granularity.
+Adding counters alone would add write cost without providing the missing guarantee.

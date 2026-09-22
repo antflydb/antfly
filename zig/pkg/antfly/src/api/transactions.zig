@@ -64,6 +64,18 @@ pub const TransactionReadItem = struct {
 };
 
 pub const TableCommitRequest = struct {
+    pub const ConflictGuards = struct {
+        generation_set: [32]u8,
+        commands: []const @import("../storage/db/relational_integrity_contract.zig").Command,
+        pub fn jsonStringify(self: @This(), stream: anytype) @TypeOf(stream.*).Error!void {
+            return @import("../storage/db/relational_integrity_json.zig").write(self, stream);
+        }
+    };
+    /// Server-authored arbiter observations survive statement merging,
+    /// savepoints, restart and final native dependency expansion.
+    conflict_guards: ?std.json.Parsed(ConflictGuards) = null,
+    range_guards: ?@import("range_read_guards.zig").Owned = null,
+    schema_version: ?u32 = null,
     table_name: []u8,
     relational_schema_version: ?u32 = null,
     batch: batch_api.OwnedBatchRequest = .{},
@@ -71,6 +83,8 @@ pub const TableCommitRequest = struct {
     txn_writes: []db_mod.types.TransactionWrite = &.{},
 
     pub fn deinit(self: *TableCommitRequest, alloc: std.mem.Allocator) void {
+        if (self.conflict_guards) |*guards| guards.deinit();
+        if (self.range_guards) |*guards| guards.deinit();
         alloc.free(self.table_name);
         if (self.txn_writes.len > 0) alloc.free(self.txn_writes);
         for (self.predicates.items) |predicate| alloc.free(@constCast(predicate.key));
@@ -82,15 +96,22 @@ pub const TableCommitRequest = struct {
     pub fn clone(self: TableCommitRequest, alloc: std.mem.Allocator) !TableCommitRequest {
         var out: TableCommitRequest = .{
             .table_name = try alloc.dupe(u8, self.table_name),
+            .schema_version = self.schema_version,
             .relational_schema_version = self.relational_schema_version,
         };
         errdefer out.deinit(alloc);
         out.batch = try cloneBatchRequest(alloc, self.batch);
+        if (self.conflict_guards) |guards| try out.mergeConflictGuards(alloc, guards.value);
+        if (self.range_guards) |guards| try out.mergeRangeGuards(alloc, guards.value);
         try clonePredicatesInto(alloc, &out.predicates, self.predicates.items);
         return out;
     }
 
     pub fn mergeFrom(self: *TableCommitRequest, alloc: std.mem.Allocator, other: TableCommitRequest) !void {
+        if (other.range_guards) |guards| try self.mergeRangeGuards(alloc, guards.value);
+        if (other.conflict_guards) |guards| try self.mergeConflictGuards(alloc, guards.value);
+        if (self.schema_version != null and other.schema_version != null and self.schema_version != other.schema_version) return error.CatalogGenerationChanged;
+        if (self.schema_version == null) self.schema_version = other.schema_version;
         if (self.relational_schema_version != null and other.relational_schema_version != null and self.relational_schema_version != other.relational_schema_version) return error.CatalogGenerationChanged;
         if (self.relational_schema_version == null) self.relational_schema_version = other.relational_schema_version;
         try appendBatchWrites(alloc, &self.batch, other.batch.writes);
@@ -98,6 +119,43 @@ pub const TableCommitRequest = struct {
         try appendBatchTransforms(alloc, &self.batch, other.batch.transforms);
         try appendPredicates(alloc, &self.predicates, other.predicates.items);
         syncAndClear(self, alloc);
+    }
+
+    pub fn mergeConflictGuards(self: *TableCommitRequest, alloc: std.mem.Allocator, incoming: ConflictGuards) !void {
+        const native = @import("../storage/db/relational_integrity_contract.zig");
+        if (std.mem.allEqual(u8, &incoming.generation_set, 0)) return error.InvalidTransactionSessionRecord;
+        for (incoming.commands) |command| if (command.operation != .compare_claim) return error.InvalidTransactionSessionRecord;
+        const previous: []const native.Command = if (self.conflict_guards) |guards| blk: {
+            if (!std.mem.eql(u8, &guards.value.generation_set, &incoming.generation_set)) return error.CatalogGenerationChanged;
+            break :blk guards.value.commands;
+        } else &.{};
+        if (incoming.commands.len > native.max_commands or previous.len > native.max_commands) return error.TransactionTooLarge;
+        const combined = try alloc.alloc(native.Command, previous.len + incoming.commands.len);
+        defer alloc.free(combined);
+        var seen: std.AutoHashMapUnmanaged(native.Address, void) = .empty;
+        defer seen.deinit(alloc);
+        var count: usize = 0;
+        // Retain the first physical observation across statements. Later
+        // statements can observe this transaction's own staged claim changes;
+        // their statement validation must not replace the initial commit fence.
+        for ([_][]const native.Command{ previous, incoming.commands }) |commands| for (commands) |command| {
+            if ((try seen.getOrPut(alloc, command.address)).found_existing) continue;
+            if (count >= native.max_commands) return error.TransactionTooLarge;
+            combined[count] = command;
+            count += 1;
+        };
+        _ = try native.validateCommandAdmission(combined[0..count]);
+        const bytes = try std.json.Stringify.valueAlloc(alloc, ConflictGuards{ .generation_set = incoming.generation_set, .commands = combined[0..count] }, .{});
+        defer alloc.free(bytes);
+        const owned = try std.json.parseFromSlice(ConflictGuards, alloc, bytes, .{ .allocate = .alloc_always });
+        if (self.conflict_guards) |*guards| guards.deinit();
+        self.conflict_guards = owned;
+    }
+
+    pub fn mergeRangeGuards(self: *TableCommitRequest, alloc: std.mem.Allocator, incoming: []const @import("range_read_guards.zig").OwnerRangeProof) !void {
+        const merged = try @import("range_read_guards.zig").merge(alloc, if (self.range_guards) |guards| guards.value else &.{}, incoming);
+        if (self.range_guards) |*guards| guards.deinit();
+        self.range_guards = merged;
     }
 
     pub fn prepareWrites(self: *TableCommitRequest, alloc: std.mem.Allocator) !void {
@@ -142,6 +200,18 @@ pub const OwnedTransactionCommitRequest = struct {
     pub fn physicalName(self: OwnedTransactionCommitRequest, logical: []const u8) []const u8 {
         for (self.catalog_bindings.items) |binding| if (std.mem.eql(u8, binding.logical, logical)) return binding.physical;
         return logical;
+    }
+    pub fn observeRanges(self: *OwnedTransactionCommitRequest, alloc: std.mem.Allocator, logical: []const u8, physical: []const u8, schema_version: u32, observations: []const @import("range_read_guards.zig").OwnerRangeProof) !void {
+        try self.bind(alloc, logical, physical);
+        for (self.tables) |*table| if (std.mem.eql(u8, self.physicalName(table.table_name), physical)) {
+            if (table.schema_version != null and table.schema_version != schema_version) return error.CatalogGenerationChanged;
+            try table.mergeRangeGuards(alloc, observations);
+            table.schema_version = schema_version;
+            return;
+        };
+        var guards = try @import("range_read_guards.zig").merge(alloc, &.{}, observations);
+        defer guards.deinit();
+        try appendTable(alloc, self, .{ .table_name = @constCast(logical), .schema_version = schema_version, .range_guards = guards });
     }
     pub fn logicalName(self: OwnedTransactionCommitRequest, physical: []const u8) []const u8 {
         for (self.catalog_bindings.items) |binding| if (std.mem.eql(u8, binding.physical, physical)) return binding.logical;
@@ -218,7 +288,11 @@ pub const OwnedTransactionCommitRequest = struct {
         for (self.tables, 0..) |*table, i| {
             out[i] = .{
                 .table_name = self.physicalName(table.table_name),
+                .schema_version = table.schema_version,
                 .relational_schema_version = table.relational_schema_version,
+                .relational_integrity_generation_set = if (table.conflict_guards) |guards| guards.value.generation_set else null,
+                .integrity_commands = if (table.conflict_guards) |guards| guards.value.commands else &.{},
+                .range_guards = if (table.range_guards) |guards| guards.value else &.{},
                 .writes = table.txn_writes,
                 .deletes = table.batch.deletes,
                 .transforms = table.batch.transforms,
@@ -226,6 +300,24 @@ pub const OwnedTransactionCommitRequest = struct {
             };
         }
         return out;
+    }
+
+    /// Rollback undoes staged mutations, not observations already exposed to
+    /// the client. Retain range dependencies across savepoint rollback so a
+    /// later write cannot evade serializable validation using an undone read.
+    pub fn retainRangeGuards(self: *OwnedTransactionCommitRequest, alloc: std.mem.Allocator, other: *const OwnedTransactionCommitRequest) !void {
+        for (other.tables) |table| if (table.range_guards) |guards| {
+            const physical = other.physicalName(table.table_name);
+            try self.bind(alloc, table.table_name, physical);
+            const existing = for (self.tables) |*entry| {
+                if (std.mem.eql(u8, self.physicalName(entry.table_name), physical)) break entry;
+            } else null;
+            if (existing) |entry| {
+                if (entry.schema_version != null and table.schema_version != null and entry.schema_version != table.schema_version) return error.CatalogGenerationChanged;
+                try entry.mergeRangeGuards(alloc, guards.value);
+                if (entry.schema_version == null) entry.schema_version = table.schema_version;
+            } else try appendTable(alloc, self, .{ .table_name = table.table_name, .schema_version = table.schema_version, .relational_schema_version = table.relational_schema_version, .range_guards = guards });
+        };
     }
 };
 
@@ -2329,9 +2421,13 @@ pub const SessionRegistry = struct {
         }
         const savepoint = candidate.savepoints.getPtr(savepoint_id).?;
         if (!release) {
-            const staged = try savepoint.snapshot.clone(alloc);
+            var staged = try savepoint.snapshot.clone(alloc);
+            errdefer staged.deinit(alloc);
+            if (candidate.staged) |*old| try staged.retainRangeGuards(alloc, old);
             if (candidate.staged) |*old| old.deinit(alloc);
             candidate.staged = staged;
+            // Ownership moved into candidate, whose error path releases it.
+            staged = .{};
             const read_snapshots = try cloneReadSnapshotMap(alloc, savepoint.read_snapshots);
             deinitReadSnapshotMap(alloc, &candidate.read_snapshots);
             candidate.read_snapshots = read_snapshots;
@@ -3322,6 +3418,15 @@ fn encodeCommitRequestMode(alloc: std.mem.Allocator, req: OwnedTransactionCommit
             if (!first_null_write) try out.append(alloc, '}');
         }
         try out.append(alloc, '}');
+        try out.appendSlice(alloc, ",\"schema_versions\":{");
+        var first_epoch = true;
+        for (req.tables) |table| if (table.schema_version) |version| {
+            if (!first_epoch) try out.append(alloc, ',');
+            first_epoch = false;
+            try appendJsonString(alloc, &out, table.table_name);
+            try out.print(alloc, ":{d}", .{version});
+        };
+        try out.append(alloc, '}');
         try out.appendSlice(alloc, ",\"relational_schema_versions\":{");
         var first_schema = true;
         for (req.tables) |table| if (table.relational_schema_version) |version| {
@@ -3334,6 +3439,30 @@ fn encodeCommitRequestMode(alloc: std.mem.Allocator, req: OwnedTransactionCommit
         // Private durable dependencies are distinct from the public read set.
         // Savepoints and recovery use this same encoding; public bodies cannot
         // supply these observations or receive their physical content digests.
+        try out.appendSlice(alloc, ",\"conflict_guards\":{");
+        var first_guard = true;
+        for (req.tables) |table| if (table.conflict_guards) |guards| {
+            if (!first_guard) try out.append(alloc, ',');
+            first_guard = false;
+            try appendJsonString(alloc, &out, table.table_name);
+            try out.append(alloc, ':');
+            const bytes = try std.json.Stringify.valueAlloc(alloc, guards.value, .{});
+            defer alloc.free(bytes);
+            try out.appendSlice(alloc, bytes);
+        };
+        try out.append(alloc, '}');
+        try out.appendSlice(alloc, ",\"range_guards\":{");
+        var first_range_guard = true;
+        for (req.tables) |table| if (table.range_guards) |guards| {
+            if (!first_range_guard) try out.append(alloc, ',');
+            first_range_guard = false;
+            try appendJsonString(alloc, &out, table.table_name);
+            try out.append(alloc, ':');
+            const bytes = try std.json.Stringify.valueAlloc(alloc, guards.value, .{});
+            defer alloc.free(bytes);
+            try out.appendSlice(alloc, bytes);
+        };
+        try out.append(alloc, '}');
         try out.appendSlice(alloc, ",\"observed_predicates\":{");
         for (req.tables, 0..) |table, i| {
             if (i != 0) try out.append(alloc, ',');
@@ -3549,6 +3678,21 @@ fn parseStoredCommitValue(alloc: std.mem.Allocator, value: std.json.Value) !Owne
             try request.bind(alloc, logical, physical);
         }
     }
+    if (value.object.get("schema_versions")) |versions| {
+        if (versions != .object) return error.InvalidTransactionSessionRecord;
+        var entries = versions.object.iterator();
+        while (entries.next()) |entry| {
+            const table = for (request.tables) |*table| {
+                if (std.mem.eql(u8, table.table_name, entry.key_ptr.*)) break table;
+            } else return error.InvalidTransactionSessionRecord;
+            const version: u64 = switch (entry.value_ptr.*) {
+                .integer => |number| try nonNegativeRecordInteger(number),
+                .number_string => |number| try recordNumber(number),
+                else => return error.InvalidTransactionSessionRecord,
+            };
+            table.schema_version = std.math.cast(u32, version) orelse return error.InvalidTransactionSessionRecord;
+        }
+    }
     if (value.object.get("relational_schema_versions")) |versions| {
         if (versions != .object) return error.InvalidTransactionSessionRecord;
         var entries = versions.object.iterator();
@@ -3562,6 +3706,30 @@ fn parseStoredCommitValue(alloc: std.mem.Allocator, value: std.json.Value) !Owne
                 else => return error.InvalidTransactionSessionRecord,
             };
             table.relational_schema_version = std.math.cast(u32, version) orelse return error.InvalidTransactionSessionRecord;
+        }
+    }
+    if (value.object.get("conflict_guards")) |guards| {
+        if (guards != .object) return error.InvalidTransactionSessionRecord;
+        var entries = guards.object.iterator();
+        while (entries.next()) |entry| {
+            const table = for (request.tables) |*table| {
+                if (std.mem.eql(u8, table.table_name, entry.key_ptr.*)) break table;
+            } else return error.InvalidTransactionSessionRecord;
+            var parsed = try std.json.parseFromValue(TableCommitRequest.ConflictGuards, alloc, entry.value_ptr.*, .{ .allocate = .alloc_always });
+            defer parsed.deinit();
+            try table.mergeConflictGuards(alloc, parsed.value);
+        }
+    }
+    if (value.object.get("range_guards")) |guards| {
+        if (guards != .object) return error.InvalidTransactionSessionRecord;
+        var entries = guards.object.iterator();
+        while (entries.next()) |entry| {
+            const table = for (request.tables) |*table| {
+                if (std.mem.eql(u8, table.table_name, entry.key_ptr.*)) break table;
+            } else return error.InvalidTransactionSessionRecord;
+            var parsed = try std.json.parseFromValue([]const @import("range_read_guards.zig").OwnerRangeProof, alloc, entry.value_ptr.*, .{ .allocate = .alloc_always });
+            defer parsed.deinit();
+            try table.mergeRangeGuards(alloc, parsed.value);
         }
     }
     if (value.object.get("observed_predicates")) |observations| {
@@ -5853,7 +6021,7 @@ test "SQL session metadata and schema fences survive durable records" {
     var request: OwnedTransactionCommitRequest = .{};
     defer request.deinit(alloc);
     request.tables = try alloc.alloc(TableCommitRequest, 1);
-    request.tables[0] = .{ .table_name = try alloc.dupe(u8, "table"), .relational_schema_version = 7 };
+    request.tables[0] = .{ .table_name = try alloc.dupe(u8, "table"), .relational_schema_version = 7, .schema_version = 7 };
     const stored = try encodeCommitRequestMode(alloc, request, true);
     defer alloc.free(stored);
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, stored, .{ .parse_numbers = false });
@@ -5861,9 +6029,96 @@ test "SQL session metadata and schema fences survive durable records" {
     var restored = try parseStoredCommitValue(alloc, parsed.value);
     defer restored.deinit(alloc);
     try std.testing.expectEqual(@as(?u32, 7), restored.tables[0].relational_schema_version);
+    try std.testing.expectEqual(@as(?u32, 7), restored.tables[0].schema_version);
     const tables = try restored.distributedTables(alloc);
     defer alloc.free(tables);
     try std.testing.expectEqual(@as(?u32, 7), tables[0].relational_schema_version);
+    try std.testing.expectEqual(@as(?u32, 7), tables[0].schema_version);
+}
+
+test "distributed txn SQL range guards survive durability and savepoint rollback without restoring writes" {
+    const Case = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            const ranges = @import("range_read_guards.zig");
+            const observation = ranges.OwnerRangeProof{ .fence = .{ .metadata_group_id = 1, .metadata_incarnation = @splat('1'), .catalog_revision = 2, .table_id = 3, .topology_epoch = 4, .route = .{ .group_id = 5, .range_id = 6, .identity_namespace = .{ .table_id = 3, .shard_id = 5, .range_id = 6 } } }, .proofs = &.{.{ .bucket = 98, .generation = std.math.maxInt(u64) }} };
+            var registry = SessionRegistry.init(null);
+            defer registry.deinit(alloc);
+            const session = try registry.begin(alloc, .{ .sql = .{ .database = "default", .namespace = "public", .isolation = .serializable, .mode = .read_write } }, 1);
+            _ = try registry.createNamedSavepoint(alloc, session.txn_id, "before");
+            var request = try parseCommitRequest(alloc, "{\"read_set\":[],\"tables\":{\"docs\":{\"inserts\":{\"a\":{\"v\":1}}}}}");
+            defer request.deinit(alloc);
+            try request.bind(alloc, "docs", "physical:3");
+            request.tables[0].schema_version = 7;
+            try request.tables[0].mergeRangeGuards(alloc, &.{observation});
+            _ = try registry.stage(alloc, session.txn_id, &request);
+            _ = try registry.rollbackToNamedSavepoint(alloc, session.txn_id, "before");
+            var restored = try registry.cloneSqlStaged(alloc, session.txn_id);
+            defer restored.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 1), restored.tables.len);
+            try std.testing.expectEqual(@as(usize, 0), restored.tables[0].batch.writes.len);
+            try std.testing.expectEqualStrings("physical:3", restored.physicalName("docs"));
+            try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), restored.tables[0].range_guards.?.value[0].proofs[0].generation);
+            const encoded = try encodeCommitRequestMode(alloc, restored, true);
+            defer alloc.free(encoded);
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded, .{ .parse_numbers = false });
+            defer parsed.deinit();
+            var durable = try parseStoredCommitValue(alloc, parsed.value);
+            defer durable.deinit(alloc);
+            const routed = try durable.distributedTables(alloc);
+            defer alloc.free(routed);
+            try std.testing.expectEqual(@as(u64, 5), routed[0].range_guards[0].fence.route.group_id);
+            try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), routed[0].range_guards[0].proofs[0].generation);
+            const public = try encodeCommitRequestMode(alloc, durable, false);
+            defer alloc.free(public);
+            try std.testing.expect(std.mem.indexOf(u8, public, "range_guards") == null);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "distributed txn SQL conflict guards retain first native observation through clone and durable round trip" {
+    const Harness = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            const native = @import("../storage/db/relational_integrity_contract.zig");
+            const address = try native.Address.init(@splat(3), "\x00\xfftuple");
+            const first = [_]native.Command{.{ .address = address, .operation = .{ .compare_claim = null } }};
+            const later = [_]native.Command{.{ .address = address, .operation = .{ .compare_claim = .{ .tuple = "\x00\xfftuple", .parent_table = "table", .parent_key = "staged", .schema_version = 7 } } }};
+            var original: TableCommitRequest = .{ .table_name = try alloc.dupe(u8, "table"), .relational_schema_version = 7 };
+            defer original.deinit(alloc);
+            try original.mergeConflictGuards(alloc, .{ .generation_set = @splat(255), .commands = &first });
+            var request: OwnedTransactionCommitRequest = .{};
+            defer request.deinit(alloc);
+            const table = try original.clone(alloc);
+            request.tables = alloc.alloc(TableCommitRequest, 1) catch |err| {
+                var owned = table;
+                owned.deinit(alloc);
+                return err;
+            };
+            request.tables[0] = table;
+            try request.tables[0].mergeConflictGuards(alloc, .{ .generation_set = @splat(255), .commands = &later });
+            try std.testing.expectEqual(@as(usize, 1), request.tables[0].conflict_guards.?.value.commands.len);
+            try std.testing.expect(request.tables[0].conflict_guards.?.value.commands[0].operation.compare_claim == null);
+            const encoded = try encodeCommitRequestMode(alloc, request, true);
+            defer alloc.free(encoded);
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded, .{ .parse_numbers = false });
+            defer parsed.deinit();
+            var restored = try parseStoredCommitValue(alloc, parsed.value);
+            defer restored.deinit(alloc);
+            const tables = try restored.distributedTables(alloc);
+            defer alloc.free(tables);
+            try std.testing.expectEqualSlices(u8, &(@as([32]u8, @splat(255))), &tables[0].relational_integrity_generation_set.?);
+            try std.testing.expectEqualDeep(address, tables[0].integrity_commands[0].address);
+            try std.testing.expect(tables[0].integrity_commands[0].operation.compare_claim == null);
+            var occupied: TableCommitRequest = .{ .table_name = try alloc.dupe(u8, "table") };
+            defer occupied.deinit(alloc);
+            try occupied.mergeConflictGuards(alloc, .{ .generation_set = @splat(255), .commands = &later });
+            var occupied_copy = try occupied.clone(alloc);
+            defer occupied_copy.deinit(alloc);
+            try std.testing.expectEqualStrings("\x00\xfftuple", occupied_copy.conflict_guards.?.value.commands[0].operation.compare_claim.?.tuple);
+            try std.testing.expectError(error.CatalogGenerationChanged, occupied.mergeConflictGuards(alloc, .{ .generation_set = @splat(1), .commands = &first }));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
 }
 
 test "SQL staged statements coalesce writes deletes and retain first version" {

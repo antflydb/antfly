@@ -126,6 +126,56 @@ pub const Plan = struct {
         self.* = undefined;
     }
 
+    /// Bind the SQL conflict shape against durable native unique generations,
+    /// once per statement. Column order does not change arbiter inference;
+    /// encoding always follows the constraint's canonical native tuple order.
+    pub fn bindConflictTarget(self: *const Plan, alloc: Allocator, columns: []const []const u8) ![]const usize {
+        if (columns.len == 0 or columns.len > 32) return error.InvalidIntegrityDefinition;
+        for (columns, 0..) |column, i| for (columns[0..i]) |previous| {
+            if (std.mem.eql(u8, column, previous)) return error.InvalidIntegrityDefinition;
+        };
+        var selected: std.ArrayList(usize) = .empty;
+        errdefer selected.deinit(alloc);
+        for (self.uniques, 0..) |unique, index| {
+            if (unique.definition.columns.len != columns.len) continue;
+            const matches = for (columns) |column| {
+                const present = for (unique.definition.columns) |candidate| {
+                    if (std.mem.eql(u8, column, candidate)) break true;
+                } else false;
+                if (!present) break false;
+            } else true;
+            if (matches) try selected.append(alloc, index);
+        }
+        if (selected.items.len == 0) return error.ConflictArbiterNotFound;
+        return selected.toOwnedSlice(alloc);
+    }
+
+    pub const ConflictAddress = struct { address: storage.Address, tuple: []const u8 };
+
+    /// Uses exactly the ordinary uniqueness claim codec. NULL-distinct tuples
+    /// have no conflict address (their native witness is row-specific), while
+    /// NULLS NOT DISTINCT remains a real arbiter. Output is request-owned.
+    pub fn conflictAddresses(self: *const Plan, alloc: Allocator, selected: []const usize, row: codec.OrdinalRowView) ![]const ConflictAddress {
+        if (row.layout != self.view.physicalLayout() or row.table_schema.relational_columns.ptr != self.view.tableSchema().relational_columns.ptr) return error.PreparedGenerationChanged;
+        var output: std.ArrayList(ConflictAddress) = .empty;
+        errdefer {
+            for (output.items) |item| alloc.free(item.tuple);
+            output.deinit(alloc);
+        }
+        for (selected) |index| {
+            if (index >= self.uniques.len) return error.InvalidIntegrityDefinition;
+            const unique = self.uniques[index];
+            var tuple = try unique.tuple.encodeAlloc(alloc, row);
+            if (tuple.has_null and !unique.definition.nulls_not_distinct) {
+                tuple.deinit(alloc);
+                continue;
+            }
+            errdefer tuple.deinit(alloc);
+            try output.append(alloc, .{ .address = try storage.Address.init(unique.generation, tuple.bytes), .tuple = tuple.bytes });
+        }
+        return output.toOwnedSlice(alloc);
+    }
+
     pub fn expand(self: *const Plan, alloc: Allocator, mutations: []const Mutation) !Expansion {
         if (mutations.len > 4096) return error.TransactionTooLarge;
         var arena = std.heap.ArenaAllocator.init(alloc);
@@ -268,11 +318,20 @@ test "distributed txn typed integrity expansion matches composite parent claim w
     }, @splat(0));
     defer alloc.free(encoded);
     const row = try codec.ordinalRowView(encoded, view.tableSchema().*, view.physicalLayout());
+    const target = try parent.bindConflictTarget(alloc, &.{ "id", "tenant" });
+    defer alloc.free(target);
+    const arbiters = try parent.conflictAddresses(alloc, target, row);
+    defer {
+        for (arbiters) |arbiter| alloc.free(arbiter.tuple);
+        alloc.free(arbiters);
+    }
     var parent_insert = try parent.expand(alloc, &.{.{ .key = "p1", .after = row }});
     defer parent_insert.deinit();
     var child_insert = try child.expand(alloc, &.{.{ .key = "c1", .after = row }});
     defer child_insert.deinit();
     try std.testing.expectEqual(@as(usize, 1), parent_insert.commands.len);
+    try std.testing.expectEqual(@as(usize, 1), arbiters.len);
+    try std.testing.expectEqualDeep(parent_insert.commands[0].command.address, arbiters[0].address);
     try std.testing.expectEqual(@as(usize, 1), child_insert.commands.len);
     try std.testing.expectEqualDeep(parent_insert.commands[0].command.address, child_insert.commands[0].command.address);
     try std.testing.expectEqualStrings("parents", child_insert.commands[0].table_name);
@@ -290,5 +349,8 @@ test "distributed txn typed integrity expansion matches composite parent claim w
     }, @splat(0));
     defer alloc.free(partial);
     const partial_row = try codec.ordinalRowView(partial, view.tableSchema().*, view.physicalLayout());
+    const null_arbiters = try parent.conflictAddresses(alloc, target, partial_row);
+    defer alloc.free(null_arbiters);
+    try std.testing.expectEqual(@as(usize, 0), null_arbiters.len);
     try std.testing.expectError(error.ForeignKeyMatchFullViolation, child.expand(alloc, &.{.{ .key = "c2", .after = partial_row }}));
 }

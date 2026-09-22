@@ -153,6 +153,7 @@ fn Engine(comptime Context: type) type {
             engine: *Self,
             node: *const binding.Node,
             arena: std.heap.ArenaAllocator,
+            scratch: std.heap.ArenaAllocator,
             left: ?*Iterator = null,
             right: ?*Iterator = null,
             page: ?catalog.Page = null,
@@ -167,6 +168,9 @@ fn Engine(comptime Context: type) type {
             unmatched_index: usize = 0,
             output: ?@import("runtime.zig").Output = null,
             output_index: usize = 0,
+            query_fields: ?[]const []const u8 = null,
+            query_skip: usize = 0,
+            query_remaining: usize = 0,
             set_entries: std.ArrayList(SetEntry) = .empty,
             set_heads: std.AutoHashMapUnmanaged(u64, usize) = .empty,
             set_ready: bool = false,
@@ -176,7 +180,7 @@ fn Engine(comptime Context: type) type {
             fn create(engine: *Self, node: *const binding.Node) anyerror!*Iterator {
                 const alloc = engine.context.alloc;
                 const self = try alloc.create(Iterator);
-                self.* = .{ .engine = engine, .node = node, .arena = .init(alloc) };
+                self.* = .{ .engine = engine, .node = node, .arena = .init(alloc), .scratch = .init(alloc) };
                 errdefer self.deinit();
                 switch (node.operation) {
                     .join => |join| {
@@ -198,6 +202,7 @@ fn Engine(comptime Context: type) type {
                 if (self.right) |right| right.deinit();
                 if (self.hash_join) |join| join.deinit();
                 self.arena.deinit();
+                self.scratch.deinit();
                 self.engine.context.alloc.destroy(self);
             }
             fn next(self: *Iterator, alloc: Allocator) anyerror!?[]const Datum {
@@ -235,6 +240,11 @@ fn Engine(comptime Context: type) type {
                     .join => |join| self.nextJoin(alloc, join),
                     .set => |set| self.nextSet(alloc, set),
                     .query => |query| blk: {
+                        // Nonblocking nested queries are pipelines, not hidden
+                        // materialization boundaries. Blocking sort/aggregate
+                        // nodes retain their bounded operator-specific state.
+                        if (query.binding.aggregate == null and query.binding.window == null and !query.statement.count_all and query.binding.order_keys.len == 0)
+                            break :blk try self.nextQuery(alloc, query);
                         if (self.output == null) {
                             var adapter: Adapter = .{ .engine = self.engine, .iterator = self.left.?, .table = query.binding.table.? };
                             var context = self.engine.context;
@@ -255,6 +265,45 @@ fn Engine(comptime Context: type) type {
                         break :blk values;
                     },
                 };
+            }
+
+            fn nextQuery(self: *Iterator, alloc: Allocator, query: @FieldType(@FieldType(binding.Node, "operation"), "query")) anyerror!?[]const Datum {
+                var context = self.engine.context;
+                context.binding = query.binding;
+                context.binding.relation = null;
+                context.typed_output = true;
+                if (self.query_fields == null) {
+                    const fields = try self.arena.allocator().alloc([]const u8, query.statement.columns.len);
+                    for (query.statement.columns, fields) |column, *field| field.* = if (column.expression != null) "" else column.field;
+                    self.query_fields = fields;
+                    self.query_skip = try context.count(query.statement.offset, 0);
+                    self.query_remaining = try context.count(query.statement.limit, std.math.maxInt(usize));
+                }
+                if (self.query_remaining == 0) return null;
+                const scratch = &self.scratch;
+                _ = scratch.reset(.retain_capacity);
+                while (try self.left.?.next(scratch.allocator())) |input| {
+                    try self.engine.checkpoint();
+                    var object: std.json.ObjectMap = .empty;
+                    const nulls = try scratch.allocator().alloc(bool, input.len);
+                    for (input, query.source.columns, nulls) |cell, column, *is_null| {
+                        try object.put(scratch.allocator(), column.internal, cell.value);
+                        is_null.* = cell.sql_null;
+                    }
+                    const row: catalog.Row = .{ .id = "", .version = 0, .value = .{ .object = object }, .sql_nulls = nulls };
+                    const cells = try context.binding.scalars.cells(scratch.allocator(), row);
+                    if (try context.binding.scalars.matches(scratch.allocator(), cells, context.parameters)) {
+                        if (self.query_skip != 0) self.query_skip -= 1 else {
+                            const values = try context.projectValues(scratch.allocator(), row, self.query_fields.?, cells);
+                            const owned = try alloc.alloc(Datum, values.len);
+                            for (values, owned) |value, *out| out.* = try operators.cloneDatum(alloc, value);
+                            self.query_remaining -= 1;
+                            return owned;
+                        }
+                    }
+                    _ = scratch.reset(.retain_capacity);
+                }
+                return null;
             }
 
             fn setValues(self: *Iterator, alloc: Allocator, values: []const Datum) ![]const Datum {
@@ -467,32 +516,65 @@ fn Engine(comptime Context: type) type {
     };
 }
 
+fn Source(comptime Context: type) type {
+    return struct {
+        const Self = @This();
+        alloc: Allocator,
+        read: ?catalog.StatementRead = null,
+        single: ?catalog.Cursor = null,
+        single_list: [1]catalog.Cursor = undefined,
+        engine: Engine(Context),
+        iterator: ?*Engine(Context).Iterator = null,
+        adapter: Engine(Context).Adapter = undefined,
+
+        fn create(context: Context) !*Self {
+            const relation = context.binding.relation orelse return error.InvalidSqlBackendResponse;
+            const self = try context.alloc.create(Self);
+            self.* = .{ .alloc = context.alloc, .engine = .{ .context = context, .cursors = &.{} } };
+            errdefer self.close();
+            if (relation.scans.len != 0) {
+                if (context.backend.vtable.open_statement) |open| {
+                    self.read = try open(context.backend.ptr, context.alloc, relation.scans);
+                    self.engine.cursors = self.read.?.cursors;
+                    if (self.engine.cursors.len != relation.scans.len) return error.InvalidSqlBackendResponse;
+                } else if (relation.scans.len == 1) {
+                    const open = context.backend.vtable.open_scan orelse return error.SqlStatementSnapshotRequired;
+                    self.single = (try open(context.backend.ptr, context.alloc, relation.scans[0].table, relation.scans[0].request)) orelse return error.SqlStatementSnapshotRequired;
+                    self.single_list[0] = self.single.?;
+                    self.engine.cursors = &self.single_list;
+                } else return error.SqlStatementSnapshotRequired;
+            }
+            self.iterator = try Engine(Context).Iterator.create(&self.engine, relation.root);
+            self.adapter = .{ .engine = &self.engine, .iterator = self.iterator.?, .table = relation.table };
+            return self;
+        }
+        fn close(self: *Self) void {
+            if (self.iterator) |iterator| iterator.deinit();
+            if (self.read) |read| read.close(read.ptr);
+            if (self.single) |cursor| cursor.close(cursor.ptr);
+            self.alloc.destroy(self);
+        }
+        fn next(raw: *anyopaque, alloc: Allocator, limit: u32) !catalog.Page {
+            const self: *Self = @ptrCast(@alignCast(raw));
+            return Engine(Context).Adapter.next(&self.adapter, alloc, limit);
+        }
+        fn closeCursor(raw: *anyopaque) void {
+            const self: *Self = @ptrCast(@alignCast(raw));
+            self.close();
+        }
+    };
+}
+
+pub fn openCursor(context: anytype) !catalog.Cursor {
+    const owner = try Source(@TypeOf(context)).create(context);
+    return .{ .ptr = owner, .next = @TypeOf(owner.*).next, .close = @TypeOf(owner.*).closeCursor };
+}
+
 pub fn execute(context: anytype) anyerror!@import("runtime.zig").Output {
-    const relation = context.binding.relation orelse return error.InvalidSqlBackendResponse;
-    var statement_read: ?catalog.StatementRead = null;
-    defer if (statement_read) |read| read.close(read.ptr);
-    var single: ?catalog.Cursor = null;
-    defer if (single) |cursor| cursor.close(cursor.ptr);
-    var single_list: [1]catalog.Cursor = undefined;
-    var cursors: []const catalog.Cursor = &.{};
-    if (relation.scans.len != 0) {
-        if (context.backend.vtable.open_statement) |open| {
-            statement_read = try open(context.backend.ptr, context.alloc, relation.scans);
-            cursors = statement_read.?.cursors;
-            if (cursors.len != relation.scans.len) return error.InvalidSqlBackendResponse;
-        } else if (relation.scans.len == 1) {
-            const open = context.backend.vtable.open_scan orelse return error.SqlStatementSnapshotRequired;
-            single = (try open(context.backend.ptr, context.alloc, relation.scans[0].table, relation.scans[0].request)) orelse return error.SqlStatementSnapshotRequired;
-            single_list[0] = single.?;
-            cursors = &single_list;
-        } else return error.SqlStatementSnapshotRequired;
-    }
-    var engine: Engine(@TypeOf(context)) = .{ .context = context, .cursors = cursors };
-    const iterator = try @TypeOf(engine).Iterator.create(&engine, relation.root);
-    defer iterator.deinit();
-    var adapter: @TypeOf(engine).Adapter = .{ .engine = &engine, .iterator = iterator, .table = relation.table };
+    const owner = try Source(@TypeOf(context)).create(context);
+    defer owner.close();
     var lowered = context;
-    lowered.backend = adapter.iface();
+    lowered.backend = owner.adapter.iface();
     lowered.binding.relation = null;
-    return lowered.select(relation.statement);
+    return lowered.select(context.binding.relation.?.statement);
 }

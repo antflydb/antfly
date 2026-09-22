@@ -29,12 +29,15 @@ process's port separately when running multiple nodes on one host.
   Describe does not execute. The backend validates syntax and parameter count.
 - Text and typed binary parameters, including exact signed 64-bit integers;
   values are never interpolated into SQL. Unsupported binary OIDs fail closed.
-- Bounded materialized portals. Execute with a row count suspends/resumes the
-  same result without replaying the statement or mutation. A statement can be
-  closed independently of its bound portals. Backend continuation tokens are
-  rejected rather than silently truncating results or re-executing queries.
-- Prepared native statements retain a catalog revision, physical table ID/name,
-  and schema-version fence through Bind. Execute rejects changed bindings before
+- Pull-based read portals for eligible scan/filter/projection and relational
+  plans, including nonblocking nested queries. Each bounded page is released
+  before the next pull; network flush supplies backpressure to storage reads.
+  Blocking final sorts/aggregations and transaction-session reads retain the
+  bounded materialized path. Execute suspends/resumes the same snapshot/result
+  without replaying a statement or mutation. A statement can be closed
+  independently of its portals. Opaque backend continuation tokens are rejected.
+- Prepared native statements retain a catalog revision and every physical table
+  ID/name and schema-version fence through Bind. Execute rejects changed bindings before
   reading or mutating, including a same-shaped dropped/recreated table.
 - Extended-query errors drain queued messages until Sync. Backend transaction
   state is reflected by ReadyForQuery, and disconnect abandons session state.
@@ -61,6 +64,12 @@ freeing their state; there are no detached threads or shutdown-time state leaks.
 Each connection has a total allocation cap shared by packets, prepared state,
 bound parameters, and backend result arenas, in addition to frame/count/row
 limits. Closed/replaced statements and portals reclaim their own arenas.
+Native streaming cursors retain their original statement deadline as a hard
+snapshot lifetime; subsequent Execute messages do not extend it. Pages recheck
+credentials, current read grants and row-filter policy. Errors and disconnects
+close snapshots before releasing credentials. Explicit SQL LIMIT is distinct
+from page size; scan/work/memory exhaustion returns an error, never a truncated
+successful SELECT.
 Authentication, idle, and statement deadlines use the owner's monotonic clock;
 an event wakes the watchdog when a shorter deadline replaces an idle deadline.
 Timeout while a mutation is in flight closes the connection rather than

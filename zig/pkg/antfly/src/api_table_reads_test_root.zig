@@ -7,6 +7,8 @@ const storage_db = @import("antfly_source_root").antfly_sources.selected_db;
 
 test {
     _ = @import("api/retained_read_owner.zig");
+    _ = @import("api/retained_read_rpc.zig");
+    _ = @import("api/retained_read_client.zig");
     _ = table_reads;
     _ = table_router;
     _ = internal_query_operations;

@@ -50,6 +50,43 @@ test "relational index system statement fence never waits on partial prepared tr
     defer after_resolution.release();
 }
 
+test "relational index system range activation rejects pending writers and captures empty snapshot guards" {
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("sql-range-activation");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    const options: db_mod.types.ScanOptions = .{ .include_range_proofs = true, .relational_query = .{ .fields = &.{"_id"} } };
+    try std.testing.expectError(error.SqlRangeTrackingRequired, db.openDocumentReadSession(alloc, "a", "az", options));
+    const pending = try db.beginTransaction(1);
+    try db.writeIntents(pending, &.{.{ .key = "alpha", .value = "{}" }}, &.{});
+    try std.testing.expectError(error.IntentConflict, db.batch(.{ .activate_range_tracking = true }));
+    try db.abortTransaction(pending, 2);
+    try db.batch(.{ .activate_range_tracking = true });
+    const before = try db.openDocumentReadSession(alloc, "a", "az", options);
+    defer before.deinit();
+    const empty_proofs = try before.rangeProofs(alloc);
+    defer alloc.free(empty_proofs);
+    try std.testing.expectEqual(@as(usize, 1), empty_proofs.len);
+    try std.testing.expectEqual(null, empty_proofs[0].generation);
+    try db.batch(.{ .writes = &.{.{ .key = "alpha", .value = "{}" }} });
+    const after = try db.openDocumentReadSession(alloc, "a", "az", options);
+    defer after.deinit();
+    const changed = try after.rangeProofs(alloc);
+    defer alloc.free(changed);
+    try std.testing.expectEqual(@as(?u64, 1), changed[0].generation);
+    const pinned = try before.rangeProofs(alloc);
+    defer alloc.free(pinned);
+    try std.testing.expectEqual(null, pinned[0].generation);
+    const guarded = try db.beginTransaction(3);
+    try std.testing.expectError(error.VersionConflict, db.writeTransaction(guarded, .{ .range_guards = empty_proofs }));
+    try db.writeTransaction(guarded, .{ .range_guards = changed });
+    try std.testing.expectError(error.IntentConflict, db.batch(.{ .writes = &.{.{ .key = "another", .value = "{}" }} }));
+    try std.testing.expectError(error.InvalidBatchRequest, db.batch(.{ .range_guards = changed }));
+    try db.abortTransaction(guarded, 4);
+    try db.batch(.{ .writes = &.{.{ .key = "another", .value = "{}" }} });
+    try db.batch(.{ .activate_range_tracking = true });
+}
+
 test "relational index system document SQL retains snapshot and projected null semantics" {
     var directory = try @import("../../common/test_directory.zig").TestDirectory.init("document-sql-snapshot");
     defer directory.cleanup();

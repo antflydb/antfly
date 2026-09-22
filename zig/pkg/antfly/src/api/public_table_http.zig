@@ -1673,6 +1673,14 @@ fn executeRelationalLifecycle(alloc: std.mem.Allocator, table_name: []const u8, 
     return .{ .status = 202, .json = true, .body = try alloc.dupe(u8, "{\"status\":\"accepted\"}") };
 }
 
+/// Internal typed callers retain their request buffers for this synchronous
+/// call. In particular SQL predicate-only fences must not become deletes.
+pub fn handleNativeTableBatch(alloc: std.mem.Allocator, table_name: []const u8, req: db_mod.types.BatchRequest, api: TableApi) !OwnedResponse {
+    resetLastBatchFailureName();
+    last_ambiguous_batch_txn_id = null;
+    return executeOwnedTableBatch(alloc, table_name, .{ .req = req, .writes = @constCast(req.writes), .deletes = @constCast(req.deletes) }, api);
+}
+
 fn executeOwnedTableBatch(alloc: std.mem.Allocator, table_name: []const u8, batch_req: batch_api.OwnedBatchRequest, api: TableApi) !OwnedResponse {
     api.executeTableBatch(alloc, table_name, batch_req.req) catch |err| switch (err) {
         error.RelationalIndexKeyTooLarge => return .{ .status = 413, .json = true, .body = try alloc.dupe(u8, "{\"error\":\"RelationalIndexKeyTooLarge\",\"message\":\"encoded relational index keys, including the document ID, must not exceed 1048576 bytes\"}") },

@@ -56,7 +56,7 @@ fn isUriUnreserved(ch: u8) bool {
         ch == '-' or ch == '.' or ch == '_' or ch == '~';
 }
 
-fn percentEncodePathComponent(alloc: std.mem.Allocator, value: []const u8) ![]u8 {
+pub fn percentEncodePathComponent(alloc: std.mem.Allocator, value: []const u8) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
     for (value) |ch| {

@@ -500,6 +500,8 @@ pub const ProvisionedKernelOwnerSource = struct {
         return .{
             .ptr = self,
             .strict_read_index_absence = true,
+            .remote_statement_fences_safe = self.read_safety_barrier.vtable.capture_frozen != null and self.read_safety_barrier.vtable.validate_frozen != null,
+            .supports_sql_range_guards = true,
             .vtable = &.{
                 .lookup = unsupportedTopLevelLookup,
                 .scan = unsupportedTopLevelScan,
@@ -3310,6 +3312,10 @@ pub const ProvisionedKernelOwnerSource = struct {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.view.normalize(alloc, writes);
         }
+        fn rangeProofs(ptr: *anyopaque, alloc: std.mem.Allocator) ![]@import("../storage/range_protection.zig").Proof {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.view.rangeProofs(alloc);
+        }
         fn close(ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.view.deinit();
@@ -3327,8 +3333,18 @@ pub const ProvisionedKernelOwnerSource = struct {
         group: u64,
         table: []const u8,
 
+        frozen_proof: ?read_gate.ReadSafetyBarrier.FrozenProof = null,
+
         fn validate(ptr: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            try validateLocal(self);
+            if (self.frozen_proof) |proof| {
+                const barrier = self.source.read_safety_barrier;
+                const validate_proof = barrier.vtable.validate_frozen orelse return error.SqlStatementSnapshotRequired;
+                try validate_proof(barrier.ptr, self.group, proof, self.route.admission_deadline_ns, self.route.admission_cancellation);
+            }
+        }
+        fn validateLocal(self: *@This()) !void {
             try self.native.validate();
             try self.source.validateRoutedRead(self.alloc, self.route, self.group, self.table);
         }
@@ -3341,15 +3357,15 @@ pub const ProvisionedKernelOwnerSource = struct {
         }
         fn open(ptr: *anyopaque, alloc: std.mem.Allocator, from: []const u8, to: []const u8, opts: db_types.ScanOptions) !table_read_source.RelationalReadView {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            try validate(ptr);
+            try validateLocal(self);
             var owner = self.owner.cloneRead();
             errdefer owner.deinit();
             const view = try self.native.open(alloc, from, to, opts);
             errdefer view.deinit();
-            try validate(ptr);
+            try validateLocal(self);
             const retained = try alloc.create(RetainedRelationalRead);
             retained.* = .{ .alloc = alloc, .lease = owner, .view = view };
-            return .{ .ptr = retained, .vtable = &.{ .next = RetainedRelationalRead.next, .close = RetainedRelationalRead.close, .normalize = RetainedRelationalRead.normalize } };
+            return .{ .ptr = retained, .vtable = &.{ .next = RetainedRelationalRead.next, .close = RetainedRelationalRead.close, .normalize = RetainedRelationalRead.normalize, .range_proofs = RetainedRelationalRead.rangeProofs } };
         }
     };
 
@@ -3369,7 +3385,9 @@ pub const ProvisionedKernelOwnerSource = struct {
         errdefer alloc.destroy(retained);
         retained.* = .{ .alloc = alloc, .source = self, .owner = owner, .native = native, .route = route, .group = group, .table = try alloc.dupe(u8, table) };
         errdefer alloc.free(retained.table);
-        try RetainedStatementFence.validate(retained);
+        if (self.read_safety_barrier.vtable.capture_frozen) |capture_proof|
+            retained.frozen_proof = try capture_proof(self.read_safety_barrier.ptr, group);
+        try RetainedStatementFence.validateLocal(retained);
         return .{ .ptr = retained, .vtable = &.{ .validate = RetainedStatementFence.validate, .open = RetainedStatementFence.open, .release = RetainedStatementFence.release } };
     }
 
@@ -3393,7 +3411,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         try self.validateRoutedRead(alloc, fence, group, table);
         const retained = try alloc.create(RetainedRelationalRead);
         retained.* = .{ .alloc = alloc, .lease = lease, .view = view };
-        return .{ .ptr = retained, .vtable = &.{ .next = RetainedRelationalRead.next, .close = RetainedRelationalRead.close, .normalize = RetainedRelationalRead.normalize } };
+        return .{ .ptr = retained, .vtable = &.{ .next = RetainedRelationalRead.next, .close = RetainedRelationalRead.close, .normalize = RetainedRelationalRead.normalize, .range_proofs = RetainedRelationalRead.rangeProofs } };
     }
 
     fn scanGroupLocalRoutedStream(
@@ -4478,6 +4496,8 @@ pub const ProvisionedKernelOwnerSource = struct {
             .predicates = req.predicates,
             .integrity = req.integrity,
             .integrity_commands = req.integrity_commands,
+            .range_guards = req.range_guards,
+            .schema_version = req.schema_version,
             .relational_schema_version = req.relational_schema_version,
             .relational_integrity_generation_set = req.relational_integrity_generation_set,
             .relational_repair = req.relational_repair,

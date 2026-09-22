@@ -53,6 +53,9 @@ const Portal = struct {
     formats: []const u16,
     description: backend.Description,
     result: ?backend.Result = null,
+    stream: ?backend.ReadStream = null,
+    stream_opened: bool = false,
+    stream_complete: bool = false,
     offset: usize = 0,
     failed: bool = false,
 };
@@ -85,11 +88,13 @@ pub const Session = struct {
 
     pub fn deinit(self: *Session) void {
         if (self.hooks) |hooks| hooks.unregister(hooks.context, self);
+        // Retained readers may still reference the authenticated credential.
+        // Close them before disconnecting/releasing that credential.
+        self.clearPortals();
         if (self.identity) |identity| {
             self.source.vtable.disconnect(self.source.context, identity, self.session_id);
             identity.release(identity.context, self.alloc);
         }
-        self.clearPortals();
         self.portals.deinit(self.alloc);
         var it = self.prepared.iterator();
         while (it.next()) |entry| {
@@ -309,6 +314,11 @@ pub const Session = struct {
                 } else {
                     var arena = std.heap.ArenaAllocator.init(self.alloc);
                     defer arena.deinit();
+                    if (try self.simpleStream(statement)) {
+                        if (self.status == .idle) self.clearPortals();
+                        try self.ready();
+                        return;
+                    }
                     var result = try self.execute(arena.allocator(), statement, &.{}, &.{}, null);
                     defer result.deinit();
                     if (result.columns.len > 0) try self.rowDescription(result.columns, &.{});
@@ -433,6 +443,26 @@ pub const Session = struct {
                 const portal = self.portals.getPtr(name) orelse return error.InvalidPortalName;
                 if (portal.failed) return error.PortalExecutionFailed;
                 portal.failed = true;
+                errdefer if (portal.stream) |stream| {
+                    stream.close(stream.context);
+                    portal.stream = null;
+                };
+                if (!portal.stream_opened) {
+                    portal.stream_opened = true;
+                    if (self.source.vtable.open_stream) |open| {
+                        self.cancel_requested.store(false, .release);
+                        self.executing.store(true, .release);
+                        defer self.executing.store(false, .release);
+                        var req = self.request(portal.statement, portal.parameters, portal.types);
+                        req.binding_guard = portal.description.binding_guard;
+                        portal.stream = try open(self.source.context, self.alloc, self.identity orelse return error.AuthenticationFailed, req);
+                    }
+                }
+                if (portal.stream != null or portal.stream_complete) {
+                    try self.executeStream(portal, requested);
+                    portal.failed = false;
+                    return;
+                }
                 if (portal.result == null) {
                     portal.result = try self.execute(portal.arena.allocator(), portal.statement, portal.parameters, portal.types, portal.description.binding_guard);
                     const result = portal.result.?;
@@ -487,6 +517,7 @@ pub const Session = struct {
         if (self.portals.fetchRemove(name)) |entry| {
             self.alloc.free(entry.key);
             var value = entry.value;
+            if (value.stream) |stream| stream.close(stream.context);
             if (value.result) |*result| result.deinit();
             value.arena.deinit();
         }
@@ -496,10 +527,73 @@ pub const Session = struct {
         var it = self.portals.iterator();
         while (it.next()) |entry| {
             self.alloc.free(entry.key_ptr.*);
+            if (entry.value_ptr.stream) |stream| stream.close(stream.context);
             if (entry.value_ptr.result) |*result| result.deinit();
             entry.value_ptr.arena.deinit();
         }
         self.portals.clearRetainingCapacity();
+    }
+
+    fn executeStream(self: *Session, portal: *Portal, requested: i32) !void {
+        self.cancel_requested.store(false, .release);
+        self.executing.store(true, .release);
+        defer self.executing.store(false, .release);
+        var req = self.request(portal.statement, portal.parameters, portal.types);
+        req.binding_guard = portal.description.binding_guard;
+        var remaining: usize = if (requested == 0) std.math.maxInt(usize) else @intCast(requested);
+        while (!portal.stream_complete and remaining != 0) {
+            try req.check();
+            var arena = std.heap.ArenaAllocator.init(self.alloc);
+            defer arena.deinit();
+            const stream = portal.stream orelse return error.InvalidResult;
+            const wanted: u32 = @intCast(@min(remaining, @min(self.limits.result_rows, 256)));
+            var page = try stream.next(stream.context, arena.allocator(), req, wanted);
+            defer page.result.deinit();
+            const result = page.result;
+            if (result.rows.len > wanted or !columnsEqual(portal.description.columns, result.columns) or
+                result.mutation_outcome != null or result.continuation != null or result.session_id != null)
+                return error.InvalidResult;
+            if (!page.exhausted and result.rows.len == 0) return error.InvalidResult;
+            if (result.sql_nulls) |flags| if (flags.len != result.rows.len) return error.InvalidResult;
+            for (result.rows, 0..) |row, index| try self.dataRow(result.columns, portal.formats, row, if (result.sql_nulls) |flags| flags[index] else null);
+            remaining -= result.rows.len;
+            portal.offset += result.rows.len;
+            portal.stream_complete = page.exhausted;
+            // Flush every bounded page. Slow clients exert backpressure before
+            // another storage page is read, rather than buffering the result.
+            try self.writer.flush();
+        }
+        if (portal.stream_complete) {
+            if (portal.stream) |stream| stream.close(stream.context);
+            portal.stream = null;
+            var tag: [64]u8 = undefined;
+            try self.command(try std.fmt.bufPrint(&tag, "SELECT {d}", .{portal.offset}));
+        } else try self.message('s', "");
+    }
+
+    fn simpleStream(self: *Session, statement: []const u8) !bool {
+        const open = self.source.vtable.open_stream orelse return false;
+        self.cancel_requested.store(false, .release);
+        self.executing.store(true, .release);
+        defer self.executing.store(false, .release);
+        const req = self.request(statement, &.{}, &.{});
+        const stream = (try open(self.source.context, self.alloc, self.identity orelse return error.AuthenticationFailed, req)) orelse return false;
+        var portal = Portal{
+            .arena = std.heap.ArenaAllocator.init(self.alloc),
+            .statement = statement,
+            .parameters = &.{},
+            .types = &.{},
+            .formats = &.{},
+            .description = .{ .columns = stream.columns },
+            .stream = stream,
+            .stream_opened = true,
+        };
+        defer portal.arena.deinit();
+        defer if (portal.stream) |remaining| remaining.close(remaining.context);
+        if (stream.columns.len > self.limits.columns) return error.ProgramLimitExceeded;
+        try self.rowDescription(stream.columns, &.{});
+        try self.executeStream(&portal, 0);
+        return true;
     }
 
     fn message(self: *Session, tag: u8, payload: []const u8) !void {

@@ -16,6 +16,8 @@ pub const View = struct {
         version: u64,
         schema_version: u32,
         value: std.json.Value,
+        expected_content_digest: ?[32]u8 = null,
+        document: ?std.json.Value = null,
         /// SQL NULL flags aligned with value.object insertion order. A JSON
         /// payload containing null has a false flag.
         sql_nulls: ?[]const bool = null,
@@ -31,6 +33,7 @@ pub const View = struct {
         }
     };
     pub const VTable = struct {
+        range_proofs: ?*const fn (*anyopaque, std.mem.Allocator) anyerror![]@import("range_protection.zig").Proof = null,
         next: *const fn (*anyopaque, std.mem.Allocator, u32) anyerror!Page,
         normalize: ?*const fn (*anyopaque, std.mem.Allocator, []const types.BatchWrite) anyerror![]types.BatchWrite = null,
         close: *const fn (*anyopaque) void,
@@ -39,6 +42,10 @@ pub const View = struct {
 
     pub fn next(self: View, alloc: std.mem.Allocator, limit: u32) !Page {
         return Abi.call("next", self.boundary_dispatch, self.vtable.next, .{ self.ptr, alloc, limit });
+    }
+    pub fn rangeProofs(self: View, alloc: std.mem.Allocator) ![]@import("range_protection.zig").Proof {
+        const callback = self.vtable.range_proofs orelse return error.SqlRangeTrackingRequired;
+        return Abi.call("range_proofs", self.boundary_dispatch, callback, .{ self.ptr, alloc });
     }
     pub fn normalize(self: View, alloc: std.mem.Allocator, writes: []const types.BatchWrite) ![]types.BatchWrite {
         const callback = self.vtable.normalize orelse return error.UnsupportedSqlExecution;

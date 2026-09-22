@@ -13,6 +13,8 @@
 // limitations.
 
 test {
+    _ = @import("window_test.zig");
+    _ = @import("subquery_test.zig");
     _ = @import("aggregate_binding.zig");
     _ = @import("compiler.zig");
     _ = @import("scalar.zig");
@@ -20,8 +22,10 @@ test {
     _ = @import("runtime.zig");
     _ = @import("insert_test.zig");
     _ = @import("returning_test.zig");
+    _ = @import("conflict_test.zig");
     _ = @import("catalog.zig");
     _ = @import("document_row.zig");
+    _ = @import("read_stream.zig");
     _ = @import("operators.zig");
     _ = @import("plan_cache.zig");
     _ = @import("session.zig");

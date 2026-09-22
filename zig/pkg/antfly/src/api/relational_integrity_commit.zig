@@ -67,7 +67,7 @@ pub fn requiresActivation(alloc: Allocator, schema_json: []const u8) !bool {
 /// and let the storage receiver mistake it for internal coordination proof.
 pub fn metadataRequiresCoordination(alloc: Allocator, metadata: ?[]const TableRecord, requests: []const contract.TableCommitRequest) !bool {
     const tables = metadata orelse {
-        for (requests) |request| if (request.relational_schema_version != null) return error.IntegrityCatalogUnavailable;
+        for (requests) |request| if (request.relational_schema_version != null or request.schema_version != null) return error.IntegrityCatalogUnavailable;
         return false;
     };
     var coordinated = false;
@@ -75,6 +75,12 @@ pub fn metadataRequiresCoordination(alloc: Allocator, metadata: ?[]const TableRe
         const record = for (tables) |table| {
             if (std.mem.eql(u8, table.name, request.table_name)) break table;
         } else return error.TableNotFound;
+        if (request.schema_version) |version| {
+            if (record.schema_json.len == 0) return error.PreparedGenerationChanged;
+            var parsed = try schema_api.parseValidatedTableSchema(alloc, record.schema_json);
+            defer parsed.deinit(alloc);
+            if (parsed.version != version) return error.PreparedGenerationChanged;
+        }
         if (request.relational_schema_version) |version| {
             if (record.schema_json.len == 0) return error.PreparedGenerationChanged;
             var parsed = try schema_api.parseValidatedTableSchema(alloc, record.schema_json);
@@ -620,7 +626,7 @@ const Builder = struct {
             if (!std.meta.eql(address, command.address)) continue;
             const command_phase: usize = switch (command.operation) {
                 .detach, .repair_detach => 0,
-                .check_owner => 1,
+                .compare_claim, .check_owner => 1,
                 .release, .repair_release => 2,
                 .establish => 3,
                 .attach => 4,
@@ -638,6 +644,10 @@ const Builder = struct {
                     const claim = state.claim orelse return error.ForeignKeyParentMissing;
                     if (!std.mem.eql(u8, claim.parent_table, owner.parent_table) or !std.mem.eql(u8, claim.parent_key, owner.parent_key)) return error.UniqueConstraintViolation;
                 },
+                // This predicate fences physical pre-transaction state. The
+                // statement overlay may already contain this transaction's
+                // writes; native preparation validates it before any writes.
+                .compare_claim => {},
                 .release, .repair_release => {
                     if (validate and state.references.items.len != 0) return error.ForeignKeyReferenced;
                     state.claim = null;
@@ -906,7 +916,12 @@ fn prepareModeInternal(alloc: Allocator, source: reads.TableReadSource, metadata
     defer builder.deinit();
     try builder.output.appendSlice(builder.alloc, requests);
     for (requests) |request| {
-        try builder.command_lists.append(builder.alloc, .empty);
+        var commands: std.ArrayList(planner.storage.Command) = .empty;
+        for (request.integrity_commands) |command| {
+            if (command.operation != .compare_claim) return error.InvalidIntegrityCommand;
+            try commands.append(builder.alloc, command);
+        }
+        try builder.command_lists.append(builder.alloc, commands);
         var predicates = std.ArrayList(types.TransactionVersionPredicate).empty;
         try predicates.appendSlice(builder.alloc, request.predicates);
         try builder.predicate_lists.append(builder.alloc, predicates);
@@ -914,7 +929,8 @@ fn prepareModeInternal(alloc: Allocator, source: reads.TableReadSource, metadata
     var requested_tables = std.StringHashMapUnmanaged(void).empty;
     for (requests) |request| {
         if ((try requested_tables.getOrPut(builder.alloc, request.table_name)).found_existing) return error.InvalidBatchRequest;
-        if (request.integrity.len != 0 or request.integrity_commands.len != 0 or request.relational_activation != null or request.relational_integrity_generation_set != null or request.relational_repair) return error.InvalidBatchRequest;
+        if (request.integrity.len != 0 or request.relational_activation != null or request.relational_repair) return error.InvalidBatchRequest;
+        if (request.integrity_commands.len != 0 and request.relational_integrity_generation_set == null) return error.InvalidBatchRequest;
         const record = try builder.metadataTable(request.table_name);
         if (record.schema_json.len == 0) continue;
         var declaration = try schema_api.parseValidatedTableSchema(builder.alloc, record.schema_json);
@@ -922,6 +938,10 @@ fn prepareModeInternal(alloc: Allocator, source: reads.TableReadSource, metadata
         if (declaration.unique_constraints == null and declaration.foreign_keys == null and (repair_table == null or declaration.checks == null)) continue;
         if (request.transforms.len != 0) return error.UnsupportedOperation;
         const table = try builder.load(request.table_name);
+        if (request.relational_integrity_generation_set) |expected| {
+            const current = @import("../storage/db/relational_integrity_activation_contract.zig").generationSet(table.catalog);
+            if (!std.mem.eql(u8, &expected, &current)) return error.CatalogGenerationChanged;
+        }
         _ = try builder.outputIndex(table.name, table.view.version());
         var writes = std.StringHashMapUnmanaged(?[]const u8).empty;
         for (request.writes) |write| try writes.put(builder.alloc, write.key, write.value);
@@ -1047,6 +1067,65 @@ pub fn prepareSessionStatement(alloc: Allocator, source: reads.TableReadSource, 
 }
 
 pub const BackfillRow = struct { key: []const u8, json: []const u8, version: u64, expected_content_digest: ?[32]u8 = null };
+
+/// Request-owned arbiter proof. SQL carries this opaque envelope to its native
+/// commit adapter; only this existing integrity authority understands claims.
+pub const ConflictOwner = struct {
+    key: ?[]const u8,
+    identity: ?[]const u8,
+    generation_set: [32]u8,
+    guards: []const planner.storage.Command,
+};
+
+pub fn resolveConflictOwners(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, ranges: []const RangeRecord, name: []const u8, version: u32, columns: []const []const u8, writes: []const types.BatchWrite, previous: []const contract.TableCommitRequest, control: RequestContext) ![]const ConflictOwner {
+    if (writes.len > 4096) return error.TransactionTooLarge;
+    // Absence is useful only after EVERY current owner proves unique coverage.
+    try ensureUniqueCoverageControlled(alloc, source, metadata, ranges, &.{name}, control);
+    var before: ?Prepared = if (previous.len != 0) try prepareModeInternal(alloc, source, metadata, previous, control, null, true, &.{}, false) else null;
+    defer if (before) |*prepared| prepared.deinit();
+    var builder: Builder = .{ .alloc = alloc, .source = source, .metadata = metadata, .control = try boundedControl(control), .previous = if (before) |prepared| prepared.tables else &.{} };
+    defer builder.deinit();
+    const table = try builder.load(name);
+    if (table.view.version() != version) return error.PreparedGenerationChanged;
+    var plan = try builder.bindingPlanSelected(table, true, false);
+    defer plan.deinit();
+    const selected = try plan.bindConflictTarget(alloc, columns);
+    defer alloc.free(selected);
+    const owners = try alloc.alloc(ConflictOwner, writes.len);
+    const generation_set = @import("../storage/db/relational_integrity_activation_contract.zig").generationSet(table.catalog);
+    for (writes, owners) |write, *owner| {
+        try builder.control.ensureActive();
+        try builder.charge(write.key.len + write.value.len);
+        var row = try mapper.PreparedRelationalWrite.initTyped(alloc, alloc, alloc, false, write.key, write.value, null, table.view.tableSchema().*, table.view.physicalLayout(), write.json_null_fields, false);
+        defer row.deinit(alloc);
+        const addresses = try plan.conflictAddresses(alloc, selected, try row.typedView(table.view.tableSchema().*, table.view.physicalLayout()));
+        const guards = try alloc.alloc(planner.storage.Command, addresses.len);
+        owner.* = .{ .key = null, .identity = null, .generation_set = generation_set, .guards = guards };
+        for (addresses, guards) |item, *guard| {
+            const query = try std.json.Stringify.valueAlloc(alloc, .{ .kind = "references", .address = item.address, .limit = @as(u32, 1) }, .{});
+            var observation = try builder.lookup(name, &item.address.routing, .{ .relational_integrity_jobs_json = query });
+            defer if (observation) |*value| value.deinit(alloc);
+            var actual: ?planner.storage.Claim = null;
+            if (observation) |value| {
+                try builder.charge(value.json.len);
+                const result = try std.json.parseFromSliceLeaky(struct { address: planner.storage.Address, claim: planner.storage.Claim }, alloc, value.json, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
+                if (!std.meta.eql(result.address, item.address) or !std.mem.eql(u8, result.claim.tuple, item.tuple) or !std.mem.eql(u8, result.claim.parent_table, name)) return error.InvalidIntegrityRecord;
+                actual = result.claim;
+            }
+            guard.* = .{ .address = item.address, .operation = .{ .compare_claim = actual } };
+            var logical: Builder.StatementState = .{ .claim = actual };
+            for (builder.previous) |request| if (std.mem.eql(u8, request.table_name, name)) try builder.applyStatementCommands(&logical, item.address, request.integrity_commands, false);
+            if (logical.claim) |claim| {
+                if (claim.state != .live) return error.ForeignKeyActionInProgress;
+                if (!std.mem.eql(u8, claim.parent_table, name) or !std.mem.eql(u8, claim.tuple, item.tuple)) return error.InvalidIntegrityRecord;
+                if (owner.key) |key| if (!std.mem.eql(u8, key, claim.parent_key)) return error.InvalidIntegrityRecord;
+                owner.key = try alloc.dupe(u8, claim.parent_key);
+            }
+            if (owner.identity == null) owner.identity = try alloc.dupe(u8, &item.address.claimKey());
+        }
+    }
+    return owners;
+}
 pub const BackfillPhase = enum { unique, foreign_key, check };
 
 /// A positive local proof does not imply global uniqueness: another owner's
@@ -1635,11 +1714,18 @@ test "distributed txn global unique coverage checks every owner and rejects stal
         calls: usize = 0,
         ready: bool = false,
         stale: bool = false,
+        conflict_claim: ?planner.storage.Claim = null,
         fn lookup(ptr: *anyopaque, allocator: Allocator, _: []const u8, key: []const u8, opts: types.LookupOptions, consistency: @import("../raft/read_gate.zig").ReadConsistency) !?reads.LookupResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqual(@import("../raft/read_gate.zig").ReadConsistency.read_index, consistency);
             try std.testing.expect(opts.execution_deadline_ns != null);
             if (opts.relational_integrity_catalog) return .{ .json = try allocator.dupe(u8, self.envelope), .version = 0 };
+            if (opts.relational_integrity_jobs_json.len != 0) {
+                const claim = self.conflict_claim orelse return null;
+                var requested = try std.json.parseFromSlice(struct { address: planner.storage.Address }, allocator, opts.relational_integrity_jobs_json, .{ .ignore_unknown_fields = true });
+                defer requested.deinit();
+                return .{ .json = try std.json.Stringify.valueAlloc(allocator, .{ .address = requested.value.address, .claim = claim }, .{}), .version = 0 };
+            }
             try std.testing.expectEqualStrings("{\"mode\":\"status\"}", opts.relational_activation_json);
             const first = key.len == 0;
             self.calls += 1;
@@ -1675,6 +1761,31 @@ test "distributed txn global unique coverage checks every owner and rejects stal
     fake.ready = true;
     try ensureUniqueCoverage(alloc, source, &tables, &ranges, &.{ "rows", "rows" });
     try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const owners = try resolveConflictOwners(arena.allocator(), source, &tables, &ranges, "rows", 1, &.{"id"}, &.{.{ .key = "new", .value = "{\"id\":9007199254740993}" }}, &.{}, .{});
+        try std.testing.expectEqual(@as(usize, 1), owners.len);
+        try std.testing.expect(owners[0].key == null);
+        try std.testing.expect(owners[0].identity != null);
+        try std.testing.expectEqual(@as(usize, 1), owners[0].guards.len);
+        try std.testing.expect(owners[0].guards[0].operation.compare_claim == null);
+        try std.testing.expectEqualSlices(u8, &fake.generation_set, &owners[0].generation_set);
+        var builder: Builder = .{ .alloc = arena.allocator(), .source = source, .metadata = &tables, .control = try boundedControl(.{}) };
+        defer builder.deinit();
+        const loaded = try builder.load("rows");
+        var plan = try builder.bindingPlanSelected(loaded, true, false);
+        defer plan.deinit();
+        var row = try mapper.PreparedRelationalWrite.initTyped(arena.allocator(), arena.allocator(), arena.allocator(), false, "new", "{\"id\":9007199254740993}", null, loaded.view.tableSchema().*, loaded.view.physicalLayout(), &.{}, false);
+        defer row.deinit(arena.allocator());
+        const addresses = try plan.conflictAddresses(arena.allocator(), &.{0}, try row.typedView(loaded.view.tableSchema().*, loaded.view.physicalLayout()));
+        fake.conflict_claim = .{ .tuple = addresses[0].tuple, .parent_table = "rows", .parent_key = "old", .schema_version = 1 };
+        defer fake.conflict_claim = null;
+        const occupied = try resolveConflictOwners(arena.allocator(), source, &tables, &ranges, "rows", 1, &.{"id"}, &.{.{ .key = "new", .value = "{\"id\":9007199254740993}" }}, &.{}, .{});
+        try std.testing.expectEqualStrings("old", occupied[0].key.?);
+        try std.testing.expectEqualDeep(addresses[0].address, occupied[0].guards[0].address);
+        try std.testing.expectEqualStrings("old", occupied[0].guards[0].operation.compare_claim.?.parent_key);
+    }
     fake.stale = true;
     try std.testing.expectError(error.PreparedGenerationChanged, ensureUniqueCoverage(alloc, source, &tables, &ranges, &.{"rows"}));
     var gap = ranges;

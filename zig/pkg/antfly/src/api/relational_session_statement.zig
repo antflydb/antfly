@@ -56,6 +56,7 @@ pub fn apply(alloc: std.mem.Allocator, candidate: *sessions.OwnedTransactionComm
         var entry = [_]sessions.TableCommitRequest{.{
             .table_name = @constCast(label),
             .relational_schema_version = update.relational_schema_version,
+            .schema_version = update.schema_version,
             .batch = .{ .writes = writes, .deletes = @constCast(update.deletes) },
             .predicates = .{ .items = @constCast(update.predicates), .capacity = update.predicates.len },
         }};

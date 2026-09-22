@@ -10025,6 +10025,7 @@ pub const DB = struct {
     /// the global serialization fence. The bound prevents catalog churn from
     /// turning one request into unbounded CPU/provider work.
     fn batchInternal(self: *DB, req: types.BatchRequest, profile: ?*BatchProfile, opts: BatchExecutionOptions) anyerror!void {
+        try @import("../range_protection.zig").validateRequest(req);
         try @import("merge_page_contract.zig").validateRequest(req);
         try @import("online_source_contract.zig").validateRequest(req);
         if (req.online_source != null) return self.applyOnlineSourceBatch(req, opts);
@@ -10295,11 +10296,14 @@ pub const DB = struct {
         };
 
         const effective_req: types.BatchRequest = .{
+            .range_guards = req.range_guards,
             .restore_staging_scope = req.restore_staging_scope,
             .restore_staging_plan_id = req.restore_staging_plan_id,
+            .schema_version = req.schema_version,
             .relational_schema_version = req.relational_schema_version,
             .relational_integrity_generation_set = req.relational_integrity_generation_set,
             .relational_repair = req.relational_repair,
+            .activate_range_tracking = req.activate_range_tracking,
             .integrity = req.integrity,
             .integrity_commands = req.integrity_commands,
             .relational_activation = req.relational_activation,
@@ -10333,6 +10337,10 @@ pub const DB = struct {
         const transaction_schema_binding = if (opts.transaction_resolution) |resolution| resolution.schema_binding else null;
         var request_schema_view = try self.acquireTransactionSchemaView(preparation_alloc, transaction_schema_binding);
         defer if (request_schema_view) |*view| view.release();
+        if (req.schema_version) |version| {
+            const view = request_schema_view orelse return error.PreparedGenerationChanged;
+            if (view.version() != version) return error.PreparedGenerationChanged;
+        }
         // Only authenticated HA replay may supply final scoped metadata effects
         // without local participant intents. Scope, key kinds, owner range and
         // generation are revalidated below under the apply fence.
@@ -10625,6 +10633,9 @@ pub const DB = struct {
         // A durable epoch survives active-schema publication, not replacement
         // of the entire database namespace with reused version/transaction IDs.
         if (schema_namespace != self.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
+        // A document batch has no AROW preparation to perform this fence on
+        // its behalf. Check the pinned epoch again under exclusive admission.
+        if (req.schema_version != null) try self.validatePreparedSchemaViewLocked(request_schema_view);
         if (!self.core.relational_indexes.isCurrent(relational_index_snapshot)) return error.PreparedGenerationChanged;
         if (live_ha_apply) {
             var integrity_read = try self.core.store.beginProbeTxn();
@@ -10955,6 +10966,16 @@ pub const DB = struct {
         };
         var store_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
         defer store_writes.deinit(self.alloc);
+        if (req.activate_range_tracking) {
+            const ranges = @import("../range_protection.zig");
+            try ranges.validateRequest(req);
+            var probe = try self.core.store.beginReadTxn();
+            defer probe.abort();
+            if (!try ranges.isActive(&probe)) {
+                if (try self.core.hasTopologySensitiveTransactions()) return error.IntentConflict;
+                try store_writes.append(self.alloc, .{ .key = ranges.activation_key, .value = ranges.activation_value });
+            }
+        }
         var owned_store_keys = std.ArrayListUnmanaged([]u8).empty;
         defer {
             for (owned_store_keys.items) |key| self.alloc.free(key);
@@ -26960,6 +26981,28 @@ pub const DB = struct {
             });
         }
 
+        // These internal observations address this exact owner's metadata,
+        // never document keyspace. The coordinator routes them by owner fence.
+        const tracking = @import("../range_protection.zig");
+        if (req.range_guards.len > tracking.bucket_count) return error.TransactionTooLarge;
+        const range_keys = try preparation_alloc.alloc([tracking.counter_prefix.len + 2]u8, req.range_guards.len);
+        defer preparation_alloc.free(range_keys);
+        const range_values = try preparation_alloc.alloc([8]u8, req.range_guards.len);
+        defer preparation_alloc.free(range_values);
+        var observed_buckets = std.StaticBitSet(tracking.bucket_count).initEmpty();
+        for (req.range_guards, 0..) |guard, i| {
+            if (guard.bucket >= tracking.bucket_count or observed_buckets.isSet(guard.bucket)) return error.InvalidBatchRequest;
+            observed_buckets.set(guard.bucket);
+            range_keys[i] = tracking.counterKey(guard.bucket);
+            if (guard.generation) |generation| std.mem.writeInt(u64, &range_values[i], generation, .little);
+            try predicates.append(preparation_alloc, .{
+                .key = &range_keys[i],
+                .expected_version = 0,
+                .comparison = .exact_value,
+                .expected_value = if (guard.generation != null) &range_values[i] else null,
+            });
+        }
+
         var identity_upsert_keys = std.ArrayListUnmanaged([]const u8).empty;
         defer identity_upsert_keys.deinit(preparation_alloc);
         for (intents.items) |intent| {
@@ -26970,6 +27013,10 @@ pub const DB = struct {
         const binding = try self.core.transactionSchemaBinding(preparation_alloc, txn_id);
         var prepared_schema_view = try self.acquireTransactionSchemaView(preparation_alloc, binding);
         defer if (prepared_schema_view) |*view| view.release();
+        if (req.schema_version) |version| {
+            const view = prepared_schema_view orelse return error.PreparedGenerationChanged;
+            if (view.version() != version) return error.PreparedGenerationChanged;
+        }
         if ((hasCoordinatedConstraints(prepared_schema_view) or req.relational_repair) and
             (req.relational_schema_version == null or req.relational_integrity_generation_set == null) and
             (effective_ops.writes.len != 0 or effective_ops.deletes.len != 0)) return error.ForeignKeyCoordinationRequired;
@@ -39158,6 +39205,7 @@ pub const DB = struct {
     /// The DB owner and request cancellation source must outlive this session;
     /// no query, projection, bound or filter bytes are borrowed from the caller.
     pub const RelationalReadSession = struct {
+        range_proofs: ?[]@import("../range_protection.zig").Proof = null,
         alloc: Allocator,
         reader: RelationalRows.Reader = undefined,
         filter_context: ?*anyopaque = null,
@@ -39166,6 +39214,7 @@ pub const DB = struct {
         deadline_ns: ?u64,
 
         pub fn deinit(session: *RelationalReadSession) void {
+            if (session.range_proofs) |proofs| session.alloc.free(proofs);
             session.reader.deinit();
             if (session.filter_context) |filter| session.destroy_filter.?(session.alloc, filter);
             const owner = session.alloc;
@@ -39175,6 +39224,10 @@ pub const DB = struct {
         pub fn checkpoint(session: *const RelationalReadSession) !void {
             if (session.cancellation) |cancellation| try cancellation.check();
             if (session.deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.DeadlineExceeded;
+        }
+        pub fn rangeProofs(session: *RelationalReadSession, alloc: Allocator) ![]@import("../range_protection.zig").Proof {
+            try session.checkpoint();
+            return alloc.dupe(@import("../range_protection.zig").Proof, session.range_proofs orelse return error.SqlRangeTrackingRequired);
         }
 
         pub fn nextTypedPage(session: *RelationalReadSession, alloc: Allocator, io: ?std.Io, budget: RelationalRows.Budget) !RelationalRows.Page {
@@ -39272,6 +39325,7 @@ pub const DB = struct {
         var view = self.core.acquireSchemaView() orelse return error.RelationalTableRequired;
         defer view.release();
         if (view.storageMode() != .relational) return error.RelationalTableRequired;
+        if (opts.include_range_proofs and view.tableSchema().ttl_duration_ns != 0) return error.UnsupportedSqlExecution;
         if (parsed.value.schema_version) |version| if (version != view.version()) return error.PreparedGenerationChanged;
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
@@ -39367,6 +39421,8 @@ pub const DB = struct {
         });
         session.filter_context = filter;
         session.destroy_filter = Filter.destroy;
+        errdefer session.reader.deinit();
+        if (opts.include_range_proofs) session.range_proofs = try @import("../range_protection.zig").capture(alloc, &session.reader.read, from_key, to_key);
         return session;
     }
 

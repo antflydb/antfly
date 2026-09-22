@@ -132,7 +132,9 @@ pub const Owner = struct {
         opts.execution_deadline_ns = deadline_ns;
         owned.view = try capture_value.fence.open(alloc, from, to, opts);
         errdefer owned.view.deinit();
-        try capture_value.fence.validate();
+        // open() validates local ownership while pinning; the coordinator does
+        // one final quorum validation per capture after ALL aliases are open.
+        // Repeating quorum rounds per alias would inflate the apply-lock hold.
         try borrow.validate(time.monotonicNs());
         return try self.registry.insert(scope, connection, time.monotonicNs(), deadline_ns, .{ .ptr = owned, .kind = .cursor, .close = Cursor.close, .cancellation = &owned.cancelled });
     }
@@ -156,68 +158,108 @@ pub const Owner = struct {
         cursor.next_sequence = std.math.add(u64, cursor.next_sequence, 1) catch return error.RetainedReadSequenceExhausted;
         return page;
     }
+
+    pub fn rangeProofs(self: Owner, alloc: std.mem.Allocator, scope: registry_mod.Scope, token: registry_mod.Token) ![]@import("../storage/range_protection.zig").Proof {
+        var borrow = try self.registry.borrow(token, scope, .cursor, time.monotonicNs());
+        defer borrow.deinit();
+        const cursor: *Cursor = @ptrCast(@alignCast(borrow.resource.ptr));
+        const result = try cursor.view.rangeProofs(alloc);
+        errdefer alloc.free(result);
+        try borrow.validate(time.monotonicNs());
+        return result;
+    }
+
+    pub fn normalize(self: Owner, alloc: std.mem.Allocator, scope: registry_mod.Scope, token: registry_mod.Token, writes: []const types.BatchWrite) ![]types.BatchWrite {
+        if (writes.len > 4096) return error.InvalidRetainedReadQuery;
+        var borrow = try self.registry.borrow(token, scope, .cursor, time.monotonicNs());
+        defer borrow.deinit();
+        const cursor: *Cursor = @ptrCast(@alignCast(borrow.resource.ptr));
+        const result = try cursor.view.normalize(alloc, writes);
+        errdefer {
+            for (result) |row| {
+                alloc.free(row.key);
+                alloc.free(row.value);
+                for (row.json_null_fields) |field| alloc.free(field);
+                if (row.json_null_fields.len != 0) alloc.free(row.json_null_fields);
+            }
+            alloc.free(result);
+        }
+        try borrow.validate(time.monotonicNs());
+        return result;
+    }
 };
 
-test "retained read owner owns controls across capture release and cursor expiry" {
-    const Fixture = struct {
-        capture_token: CancellationToken = .none,
-        cursor_token: CancellationToken = .none,
-        captures_closed: usize = 0,
-        cursors_closed: usize = 0,
+pub const consumer_tests = consumerTests();
+comptime {
+    if (@import("builtin").is_test) _ = consumer_tests;
+}
+fn consumerTests() type {
+    if (!@import("builtin").is_test) return struct {};
+    const root = @import("antfly_source_root");
+    if (@hasDecl(root, "implementation_tests_only") and root.implementation_tests_only) return struct {};
+    return struct {
+        test "retained read owner owns controls across capture release and cursor expiry" {
+            const Fixture = struct {
+                capture_token: CancellationToken = .none,
+                cursor_token: CancellationToken = .none,
+                captures_closed: usize = 0,
+                cursors_closed: usize = 0,
 
-        fn capture(ptr: *anyopaque, _: std.mem.Allocator, route: metadata.CatalogRouteFence, _: u64, _: []const u8, opts: types.ScanOptions, _: @import("../raft/read_gate.zig").ReadConsistency) !?reads.StatementReadFence {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.capture_token = opts.cancellation.?;
-            try std.testing.expectEqual(self.capture_token.ptr, route.admission_cancellation.ptr);
-            return .{ .ptr = self, .vtable = &.{ .validate = validate, .open = open, .release = release } };
+                fn capture(ptr: *anyopaque, _: std.mem.Allocator, route: metadata.CatalogRouteFence, _: u64, _: []const u8, opts: types.ScanOptions, _: @import("../raft/read_gate.zig").ReadConsistency) !?reads.StatementReadFence {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.capture_token = opts.cancellation.?;
+                    try std.testing.expectEqual(self.capture_token.ptr, route.admission_cancellation.ptr);
+                    return .{ .ptr = self, .vtable = &.{ .validate = validate, .open = open, .release = release } };
+                }
+                fn validate(ptr: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try self.capture_token.check();
+                }
+                fn release(ptr: *anyopaque) void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.captures_closed += 1;
+                }
+                fn open(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, opts: types.ScanOptions) !reads.RelationalReadView {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.cursor_token = opts.cancellation.?;
+                    try std.testing.expectEqual(@as(?u32, 5), opts.relational_query.?.schema_version);
+                    try std.testing.expect(self.cursor_token.ptr != self.capture_token.ptr);
+                    return .{ .ptr = self, .vtable = &.{ .next = next, .close = close } };
+                }
+                fn next(ptr: *anyopaque, alloc: std.mem.Allocator, _: u32) !reads.RelationalReadView.Page {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try self.cursor_token.check();
+                    return .{ .arena = std.heap.ArenaAllocator.init(alloc), .rows = &.{}, .after = null };
+                }
+                fn close(ptr: *anyopaque) void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.cursors_closed += 1;
+                }
+            };
+            var registry = try registry_mod.Registry.init(std.testing.allocator, std.testing.io, 1, 8, 8, 10 * std.time.ns_per_s);
+            defer registry.deinit();
+            var fixture: Fixture = .{};
+            const owner = Owner{ .registry = &registry, .source = .{ .ptr = &fixture, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined, .try_statement_read_fence_group_local_routed = Fixture.capture } } };
+            const scope = registry_mod.Scope{ .principal = @splat(1), .authorization_revision = 1, .table_id = 2, .group_id = 3, .topology_revision = 4, .schema_version = 5 };
+            const route = metadata.CatalogRouteFence{ .metadata_group_id = 1, .catalog_revision = 1, .table_id = 2, .topology_epoch = 4, .route = .{ .group_id = 3, .range_id = 3, .identity_namespace = .{ .table_id = 2, .shard_id = 3, .range_id = 3 } } };
+            const deadline = time.monotonicNs() + 5 * std.time.ns_per_s;
+            const capture = (try owner.capture(scope, 1, route, "rows", deadline)).?;
+            try owner.validateCapture(scope, capture);
+            const cursor = try owner.open(scope, capture, 1, "", "", .{ .relational_query = .{ .fields = &.{} } }, deadline);
+            try registry.close(capture, scope);
+            try std.testing.expectEqual(1, fixture.captures_closed);
+            var page = try owner.next(std.testing.allocator, scope, cursor, 0, 10);
+            page.deinit();
+            try std.testing.expectError(error.RetainedReadSequenceMismatch, owner.next(std.testing.allocator, scope, cursor, 0, 10));
+            try std.testing.expectEqual(0, fixture.cursors_closed);
+            registry.expire(deadline, 8);
+            try std.testing.expectEqual(1, fixture.cursors_closed);
+            try std.testing.expectError(error.RetainedReadNotFound, owner.next(std.testing.allocator, scope, cursor, 1, 10));
         }
-        fn validate(ptr: *anyopaque) !void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            try self.capture_token.check();
-        }
-        fn release(ptr: *anyopaque) void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.captures_closed += 1;
-        }
-        fn open(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, opts: types.ScanOptions) !reads.RelationalReadView {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.cursor_token = opts.cancellation.?;
-            try std.testing.expectEqual(@as(?u32, 5), opts.relational_query.?.schema_version);
-            try std.testing.expect(self.cursor_token.ptr != self.capture_token.ptr);
-            return .{ .ptr = self, .vtable = &.{ .next = next, .close = close } };
-        }
-        fn next(ptr: *anyopaque, alloc: std.mem.Allocator, _: u32) !reads.RelationalReadView.Page {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            try self.cursor_token.check();
-            return .{ .arena = std.heap.ArenaAllocator.init(alloc), .rows = &.{}, .after = null };
-        }
-        fn close(ptr: *anyopaque) void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.cursors_closed += 1;
+
+        test "retained read owner expiry runtime joins maintenance before freeing registry" {
+            const runtime = try Runtime.create(std.testing.allocator, std.testing.io, 1, 8, 4, std.time.ns_per_s);
+            runtime.deinit();
         }
     };
-    var registry = try registry_mod.Registry.init(std.testing.allocator, std.testing.io, 1, 8, 8, 10 * std.time.ns_per_s);
-    defer registry.deinit();
-    var fixture: Fixture = .{};
-    const owner = Owner{ .registry = &registry, .source = .{ .ptr = &fixture, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined, .try_statement_read_fence_group_local_routed = Fixture.capture } } };
-    const scope = registry_mod.Scope{ .principal = @splat(1), .authorization_revision = 1, .table_id = 2, .group_id = 3, .topology_revision = 4, .schema_version = 5 };
-    const route = metadata.CatalogRouteFence{ .metadata_group_id = 1, .catalog_revision = 1, .table_id = 2, .topology_epoch = 4, .route = .{ .group_id = 3, .range_id = 3, .identity_namespace = .{ .table_id = 2, .shard_id = 3, .range_id = 3 } } };
-    const deadline = time.monotonicNs() + 5 * std.time.ns_per_s;
-    const capture = (try owner.capture(scope, 1, route, "rows", deadline)).?;
-    try owner.validateCapture(scope, capture);
-    const cursor = try owner.open(scope, capture, 1, "", "", .{ .relational_query = .{ .fields = &.{} } }, deadline);
-    try registry.close(capture, scope);
-    try std.testing.expectEqual(1, fixture.captures_closed);
-    var page = try owner.next(std.testing.allocator, scope, cursor, 0, 10);
-    page.deinit();
-    try std.testing.expectError(error.RetainedReadSequenceMismatch, owner.next(std.testing.allocator, scope, cursor, 0, 10));
-    try std.testing.expectEqual(0, fixture.cursors_closed);
-    registry.expire(deadline, 8);
-    try std.testing.expectEqual(1, fixture.cursors_closed);
-    try std.testing.expectError(error.RetainedReadNotFound, owner.next(std.testing.allocator, scope, cursor, 1, 10));
-}
-
-test "retained read owner expiry runtime joins maintenance before freeing registry" {
-    const runtime = try Runtime.create(std.testing.allocator, std.testing.io, 1, 8, 4, std.time.ns_per_s);
-    runtime.deinit();
 }

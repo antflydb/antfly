@@ -35,10 +35,37 @@ const Mock = struct {
     saw_statement_unchanged: bool = false,
     entered: ?*std.Io.Event = null,
     blocked: bool = false,
+    stream_rows: usize = 0,
+    stream_offset: usize = 0,
+    stream_closes: usize = 0,
+    stream_pulls: usize = 0,
+    stream_fail_at: ?usize = null,
     canceled: std.atomic.Value(bool) = .init(false),
 
     fn source(self: *Mock) backend.Backend {
-        return .{ .context = self, .vtable = &.{ .authenticate = authenticate, .describe = describe, .execute = Mock.execute, .disconnect = disconnect } };
+        return .{ .context = self, .vtable = &.{ .authenticate = authenticate, .describe = describe, .execute = Mock.execute, .open_stream = openStream, .disconnect = disconnect } };
+    }
+    fn openStream(raw: *anyopaque, _: std.mem.Allocator, _: backend.Identity, request: backend.Request) !?backend.ReadStream {
+        const self: *Mock = @ptrCast(@alignCast(raw));
+        if (self.stream_rows == 0) return null;
+        try request.check();
+        return .{ .context = self, .columns = &.{.{ .name = "n", .type = .integer }}, .next = nextPage, .close = closeStream };
+    }
+    fn nextPage(raw: *anyopaque, alloc: std.mem.Allocator, request: backend.Request, wanted: u32) !backend.StreamPage {
+        const self: *Mock = @ptrCast(@alignCast(raw));
+        try request.check();
+        self.stream_pulls += 1;
+        if (self.stream_fail_at) |at| if (self.stream_offset >= at) return error.QueryCanceled;
+        const count = @min(wanted, self.stream_rows - self.stream_offset);
+        const rows = try alloc.alloc([]const std.json.Value, count);
+        for (rows, 0..) |*row, i| row.* = try alloc.dupe(std.json.Value, &.{.{ .integer = @intCast(self.stream_offset + i) }});
+        self.stream_offset += count;
+        return .{ .exhausted = self.stream_offset == self.stream_rows, .result = .{ .columns = &.{.{ .name = "n", .type = .integer }}, .rows = rows, .command_tag = "SELECT" } };
+    }
+    fn closeStream(raw: *anyopaque) void {
+        const self: *Mock = @ptrCast(@alignCast(raw));
+        std.debug.assert(self.releases == 0);
+        self.stream_closes += 1;
     }
     fn authenticate(raw: *anyopaque, _: std.mem.Allocator, user: []const u8, password: []const u8) !backend.Identity {
         const self: *Mock = @ptrCast(@alignCast(raw));
@@ -180,6 +207,55 @@ fn tags(alloc: std.mem.Allocator, bytes: []const u8) ![]u8 {
         _ = try cursor.take(len - 4);
     }
     return out.toOwnedSlice(alloc);
+}
+
+test "pgwire pull portals stream beyond result cap without replay and release on exhaustion" {
+    for ([_]bool{ false, true }) |simple| {
+        var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+        defer input.deinit();
+        try startup(&input.writer);
+        if (simple) {
+            try frame(&input.writer, 'Q', "SELECT n FROM t\x00");
+        } else {
+            try parse(&input.writer, "q", "SELECT n FROM t", false);
+            try bind(&input.writer, "p", "q", null);
+            try execute(&input.writer, "p", 3);
+            try execute(&input.writer, "p", 0);
+            try frame(&input.writer, 'S', "");
+        }
+        try frame(&input.writer, 'X', "");
+        var mock: Mock = .{ .stream_rows = 600 };
+        var output = try run(&mock, input.written(), .{ .result_rows = 7 });
+        defer output.deinit();
+        const messages = try tags(std.testing.allocator, output.written());
+        defer std.testing.allocator.free(messages);
+        try std.testing.expectEqual(@as(usize, 600), std.mem.count(u8, messages, "D"));
+        try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, messages, "E"));
+        try std.testing.expectEqual(@as(usize, if (simple) 0 else 1), std.mem.count(u8, messages, "s"));
+        try std.testing.expectEqual(@as(usize, 0), mock.executions);
+        try std.testing.expectEqual(@as(usize, 1), mock.stream_closes);
+        try std.testing.expect(mock.stream_pulls > 1);
+        try std.testing.expect(std.mem.indexOf(u8, output.written(), "SELECT 600") != null);
+    }
+}
+
+test "pgwire pull failure and disconnect close snapshots before releasing identity" {
+    for ([_]bool{ false, true }) |fail| {
+        var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+        defer input.deinit();
+        try startup(&input.writer);
+        try parse(&input.writer, "q", "SELECT n FROM t", false);
+        try bind(&input.writer, "p", "q", null);
+        try execute(&input.writer, "p", 2);
+        if (fail) try execute(&input.writer, "p", 0);
+        try frame(&input.writer, 'X', "");
+        var mock: Mock = .{ .stream_rows = 100, .stream_fail_at = if (fail) 2 else null };
+        var output = try run(&mock, input.written(), .{});
+        defer output.deinit();
+        try std.testing.expectEqual(@as(usize, 1), mock.stream_closes);
+        try std.testing.expectEqual(@as(usize, 0), mock.executions);
+        try std.testing.expectEqual(@as(usize, 1), mock.releases);
+    }
 }
 
 test "pgwire distinguishes JSON null from SQL NULL in text and binary suspended portals" {

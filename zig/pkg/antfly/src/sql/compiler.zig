@@ -258,8 +258,26 @@ const Parser = struct {
         var left: *const ast.Scalar = undefined;
         if (self.keyword(.not)) {
             left = try self.scalarNode(.{ .unary = .{ .op = .not, .operand = try self.scalar(depth + 1, 3) } });
+        } else if (self.keyword(.exists)) {
+            self.relation_depth += 1;
+            defer self.relation_depth -= 1;
+            if (self.relation_depth >= self.limits.max_depth) return self.fail(error.SqlLimitExceeded, "SQL subquery nesting limit exceeded");
+            try self.expect(.lparen);
+            try self.expectKeyword(.select);
+            const query = try self.alloc.create(ast.Select);
+            query.* = try self.select();
+            try self.expect(.rparen);
+            left = try self.scalarNode(.{ .call = .{ .name = "$exists", .args = &.{}, .subquery = query } });
         } else if (self.take(.lparen)) {
-            left = try self.scalar(depth + 1, 0);
+            if (self.pos < self.tokens.len and self.tokens[self.pos].isKeyword(.select)) {
+                self.relation_depth += 1;
+                defer self.relation_depth -= 1;
+                if (self.relation_depth >= self.limits.max_depth) return self.fail(error.SqlLimitExceeded, "SQL subquery nesting limit exceeded");
+                self.pos += 1;
+                const query = try self.alloc.create(ast.Select);
+                query.* = try self.select();
+                left = try self.scalarNode(.{ .call = .{ .name = "$scalar", .args = &.{}, .subquery = query } });
+            } else left = try self.scalar(depth + 1, 0);
             try self.expect(.rparen);
         } else if (self.keyword(.cast)) {
             try self.expect(.lparen);
@@ -310,7 +328,8 @@ const Parser = struct {
                 filter = try self.scalar(depth + 1, 0);
                 try self.expect(.rparen);
             }
-            left = try self.scalarNode(.{ .call = .{ .name = name_value, .args = try args.toOwnedSlice(self.alloc), .star = star, .distinct = distinct, .filter = filter } });
+            const window_spec = if (self.keyword(.over)) try self.window(depth + 1) else null;
+            left = try self.scalarNode(.{ .call = .{ .name = name_value, .args = try args.toOwnedSlice(self.alloc), .star = star, .distinct = distinct, .filter = filter, .window = window_spec } });
         } else if (self.peek(.identifier) and !self.tokens[self.pos].isKeyword(.null) and !self.tokens[self.pos].isKeyword(.true) and !self.tokens[self.pos].isKeyword(.false)) {
             left = try self.scalarNode(.{ .column = try self.field() });
         } else left = try self.scalarNode(.{ .literal = try self.value() });
@@ -408,6 +427,10 @@ const Parser = struct {
             .call => |part| {
                 for (part.args) |arg| try self.checkScalarDepth(arg, depth + 1);
                 if (part.filter) |filter| try self.checkScalarDepth(filter, depth + 1);
+                if (part.window) |spec| {
+                    for (spec.partition) |item| try self.checkScalarDepth(item, depth + 1);
+                    for (spec.order) |item| if (item.expression) |expression_| try self.checkScalarDepth(expression_, depth + 1);
+                }
             },
             .case_when => |part| {
                 for (part.branches) |branch| {
@@ -533,7 +556,7 @@ const Parser = struct {
         result.limit = if (self.keyword(.limit)) try self.rowBound() else null;
         result.offset = if (self.keyword(.offset)) try self.rowBound() else null;
         if (result.columns.len == 1 and result.group_by.len == 0 and result.having == null and result.order_by.len == 0) {
-            if (result.columns[0].expression) |expression| if (expression.* == .call and expression.call.star and !expression.call.distinct and expression.call.filter == null and std.mem.eql(u8, expression.call.name, "count")) {
+            if (result.columns[0].expression) |expression| if (expression.* == .call and expression.call.window == null and expression.call.star and !expression.call.distinct and expression.call.filter == null and std.mem.eql(u8, expression.call.name, "count")) {
                 result.count_all = true;
                 result.count_alias = result.columns[0].alias;
                 result.columns = &.{};
@@ -607,7 +630,56 @@ const Parser = struct {
         return .{ .table = table, .source = if (simple) null else source, .columns = try columns.toOwnedSlice(self.alloc), .predicate = filter, .group_by = try group_by.toOwnedSlice(self.alloc), .having = having };
     }
 
+    fn window(self: *Parser, depth: usize) Error!ast.Window {
+        try self.expect(.lparen);
+        var partitions: std.ArrayList(*const ast.Scalar) = .empty;
+        if (self.keyword(.partition)) {
+            try self.expectKeyword(.by);
+            while (true) {
+                try partitions.append(self.alloc, try self.scalar(depth, 0));
+                if (!self.take(.comma)) break;
+            }
+        }
+        const orders = try self.orderExpressions(false);
+        var frame: ?ast.Window.Frame = null;
+        const mode: ?@FieldType(ast.Window.Frame, "mode") = if (self.keyword(.rows)) .rows else if (self.keyword(.range)) .range else null;
+        if (mode) |kind| {
+            const between = self.keyword(.between);
+            const first = try self.windowBound();
+            const last = if (between) blk: {
+                try self.expectKeyword(.@"and");
+                break :blk try self.windowBound();
+            } else ast.Window.Bound.current;
+            if (first == .unbounded_following or last == .unbounded_preceding) return self.fail(error.InvalidSqlSyntax, "invalid window frame boundary");
+            if ((first == .following and (last == .current or last == .preceding)) or (first == .current and last == .preceding)) return self.fail(error.InvalidSqlSyntax, "window frame end cannot precede its start category");
+            frame = .{ .mode = kind, .start = first, .end = last };
+        }
+        try self.expect(.rparen);
+        return .{ .partition = try partitions.toOwnedSlice(self.alloc), .order = orders, .frame = frame };
+    }
+
+    fn windowBound(self: *Parser) Error!ast.Window.Bound {
+        if (self.keyword(.unbounded)) {
+            if (self.keyword(.preceding)) return .unbounded_preceding;
+            try self.expectKeyword(.following);
+            return .unbounded_following;
+        }
+        if (self.keyword(.current)) {
+            try self.expectKeyword(.row);
+            return .current;
+        }
+        const offset = try self.value();
+        if (offset != .parameter and (offset != .integer or offset.integer < 0)) return self.fail(error.InvalidSqlSyntax, "window frame offset must be a nonnegative integer or parameter");
+        if (self.keyword(.preceding)) return .{ .preceding = offset };
+        try self.expectKeyword(.following);
+        return .{ .following = offset };
+    }
+
     fn selectOrder(self: *Parser) Error![]const ast.Order {
+        return self.orderExpressions(true);
+    }
+
+    fn orderExpressions(self: *Parser, positions: bool) Error![]const ast.Order {
         var order_by = std.ArrayList(ast.Order).empty;
         if (self.keyword(.order)) {
             try self.expectKeyword(.by);
@@ -618,7 +690,7 @@ const Parser = struct {
                 const descending = self.keyword(.desc);
                 if (!descending) _ = self.keyword(.asc);
                 var order: ast.Order = .{ .descending = descending };
-                if (expression.* == .column) order.field = expression.column else if (expression.* == .literal and expression.literal == .integer) {
+                if (expression.* == .column) order.field = expression.column else if (positions and expression.* == .literal and expression.literal == .integer) {
                     order.position = std.math.cast(u32, expression.literal.integer) orelse return self.fail(error.InvalidSqlSyntax, "ORDER BY position must be a positive integer");
                     if (order.position.? == 0) return self.fail(error.InvalidSqlSyntax, "ORDER BY position must be a positive integer");
                 } else order.expression = expression;
@@ -717,7 +789,7 @@ const Parser = struct {
             const statement_ = try self.statement();
             if (statement_ != .select) return self.fail(error.InvalidSqlSyntax, "INSERT source must be SELECT");
             source.* = statement_.select;
-            return .{ .table = table, .columns = try columns.toOwnedSlice(self.alloc), .source = source, .returning = try self.returning() };
+            return .{ .table = table, .columns = try columns.toOwnedSlice(self.alloc), .source = source, .conflict = try self.conflict(), .returning = try self.returning() };
         }
         try self.expectKeyword(.values);
         var rows = std.ArrayList([]const ast.Value).empty;
@@ -740,7 +812,40 @@ const Parser = struct {
             try expressions.append(self.alloc, try row_expressions.toOwnedSlice(self.alloc));
             if (!self.take(.comma)) break;
         }
-        return .{ .table = table, .columns = try columns.toOwnedSlice(self.alloc), .rows = try rows.toOwnedSlice(self.alloc), .expressions = try expressions.toOwnedSlice(self.alloc), .returning = try self.returning() };
+        return .{ .table = table, .columns = try columns.toOwnedSlice(self.alloc), .rows = try rows.toOwnedSlice(self.alloc), .expressions = try expressions.toOwnedSlice(self.alloc), .conflict = try self.conflict(), .returning = try self.returning() };
+    }
+
+    fn conflict(self: *Parser) Error!?ast.Conflict {
+        if (!self.keyword(.on)) return null;
+        try self.expectKeyword(.conflict);
+        // Only explicit arbiters are accepted: omitting the target means ALL
+        // unique constraints, which cannot be emulated with a primary lookup.
+        if (!self.take(.lparen)) return self.fail(error.UnsupportedSqlShape, "ON CONFLICT requires an explicit conflict target");
+        var columns: std.ArrayList([]const u8) = .empty;
+        while (true) {
+            try self.node();
+            try columns.append(self.alloc, try self.identifier());
+            if (!self.take(.comma)) break;
+        }
+        try self.expect(.rparen);
+        try self.expectKeyword(.do);
+        if (self.keyword(.nothing)) return .{ .columns = try columns.toOwnedSlice(self.alloc) };
+        try self.expectKeyword(.update);
+        try self.expectKeyword(.set);
+        var assignments: std.ArrayList(ast.Assignment) = .empty;
+        while (true) {
+            try self.node();
+            const column_name = try self.identifier();
+            for (assignments.items) |prior| if (std.mem.eql(u8, prior.field, column_name)) return self.fail(error.DuplicateSqlColumn, "duplicate conflict assignment");
+            try self.expect(.eq);
+            const expression = try self.scalar(0, 0);
+            try self.checkScalarDepth(expression, 0);
+            try assignments.append(self.alloc, .{ .field = column_name, .expression = expression });
+            if (!self.take(.comma)) break;
+        }
+        const filter = if (self.keyword(.where)) try self.scalar(0, 0) else null;
+        if (filter) |expression| try self.checkScalarDepth(expression, 0);
+        return .{ .columns = try columns.toOwnedSlice(self.alloc), .assignments = try assignments.toOwnedSlice(self.alloc), .predicate = filter };
     }
 
     fn update(self: *Parser) Error!ast.Update {

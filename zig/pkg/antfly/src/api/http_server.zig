@@ -2898,6 +2898,20 @@ const MetadataMutationRetryPolicy = struct {
 };
 
 pub const ApiHttpServer = struct {
+    /// Lazily started only at the stable server address. HTTP ingress must be
+    /// drained before server destruction, as for the other request owners.
+    pub fn retainedReadRuntime(self: *ApiHttpServer) !*@import("retained_read_owner.zig").Runtime {
+        const io = self.sharedApiIo() orelse return error.ReadUnavailable;
+        self.retained_read_runtime_mutex.lockUncancelable(io);
+        defer self.retained_read_runtime_mutex.unlock(io);
+        if (self.retained_read_runtime) |runtime| return runtime;
+        var nonce: [16]u8 = undefined;
+        try io.randomSecure(&nonce);
+        const incarnation = std.mem.readInt(u128, &nonce, .little);
+        const runtime = try @import("retained_read_owner.zig").Runtime.create(self.owner_alloc, io, if (incarnation == 0) 1 else incarnation, 1024, 256, 30 * std.time.ns_per_s);
+        self.retained_read_runtime = runtime;
+        return runtime;
+    }
     const SupportedJoinRequest = distributed_join.SupportedJoinRequest;
     const SupportedJoinFilters = distributed_join.SupportedJoinFilters;
     const JoinShuffleJobPhase = distributed_join.JoinShuffleJobPhase;
@@ -3239,6 +3253,8 @@ pub const ApiHttpServer = struct {
         return distributed_join.partitionForJoinValue(value, partition_count);
     }
 
+    retained_read_runtime: ?*@import("retained_read_owner.zig").Runtime = null,
+    retained_read_runtime_mutex: std.Io.Mutex = .init,
     table_definition_cache: tables_api.DefinitionCache = .{},
     alloc: std.mem.Allocator,
     owner_alloc: std.mem.Allocator,
@@ -3946,6 +3962,10 @@ pub const ApiHttpServer = struct {
         if (self.pgwire_listener) |listener| {
             listener.deinit();
             self.pgwire_listener = null;
+        }
+        if (self.retained_read_runtime) |runtime| {
+            runtime.deinit();
+            self.retained_read_runtime = null;
         }
         self.restore_jobs_closing.store(true, .release);
         self.signalRestoreRetryWakeup();
@@ -11647,6 +11667,7 @@ pub const ApiHttpServer = struct {
         for (request.tables) |table| {
             const resource = resources.get(table.table_name) orelse table.table_name;
             if (resource.len == 0) return false;
+            if (table.range_guards != null and !admittedTablePermissionAllowed(authenticated_identity, resource, .read)) return false;
             if ((table.batch.writes.len != 0 or table.batch.deletes.len != 0 or table.batch.transforms.len != 0) and
                 !admittedTablePermissionAllowed(authenticated_identity, resource, .write)) return false;
         }
@@ -11972,7 +11993,10 @@ pub const ApiHttpServer = struct {
             .deletes = req.deletes,
             .transforms = req.transforms,
             .predicates = req.predicates,
+            .schema_version = req.schema_version,
             .relational_schema_version = req.relational_schema_version,
+            .integrity_commands = req.integrity_commands,
+            .relational_integrity_generation_set = req.relational_integrity_generation_set,
         }};
         // Cancellation is safe before commit begins. Once commitBatch enters
         // the transaction protocol, preserve its typed outcome instead of
@@ -12024,6 +12048,8 @@ pub const ApiHttpServer = struct {
             error.PreparedGenerationChanged,
             error.PreparedSchemaChanged,
             error.SchemaVersionChanged,
+            error.CatalogGenerationChanged,
+            error.PreparedReadSetChanged,
             => {
                 if (batch_conflict_diagnostic_gate.admit(platform_time.monotonicNs()))
                     std.log.warn("public batch rejected phase=preparation table={s} class={s}", .{ table_name, @errorName(err) });

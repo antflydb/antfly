@@ -434,6 +434,7 @@ pub const DocStore = struct {
     });
 
     pub const Txn = struct {
+        range_mutation: @import("range_protection.zig").Mutation = .{},
         retained: retained_effects.Capture = .{},
         mutation_capture: ?*@import("txn_mutation_capture.zig").Capture = null,
         payload_session: ?*artifact_payload.Session = null,
@@ -669,6 +670,7 @@ pub const DocStore = struct {
         }
 
         pub fn put(self: *Txn, key: []const u8, value: []const u8) !void {
+            try self.range_mutation.touch(self, key);
             try self.retained.touch(self.alloc, self, key, internal_keys.isStoredDocumentRowKey(key), if (self.columnar_owner) |owner| &owner.retained_effects_cache else null);
             if (self.mutation_capture) |capture| try capture.touch(key);
             try self.markColumnarDirty(key, value);
@@ -685,6 +687,7 @@ pub const DocStore = struct {
         }
 
         pub fn delete(self: *Txn, key: []const u8) !void {
+            try self.range_mutation.touch(self, key);
             try self.retained.touch(self.alloc, self, key, internal_keys.isStoredDocumentRowKey(key), if (self.columnar_owner) |owner| &owner.retained_effects_cache else null);
             if (self.mutation_capture) |capture| try capture.touch(key);
             try self.markColumnarDirty(key, null);
@@ -761,6 +764,7 @@ pub const DocStore = struct {
     };
 
     pub const Batch = struct {
+        range_mutation: @import("range_protection.zig").Mutation = .{},
         retained: retained_effects.Capture = .{},
         columnar_owner: ?*DocStore = null,
         payload_session: ?*artifact_payload.Session = null,
@@ -773,6 +777,7 @@ pub const DocStore = struct {
         runtime: ?backend_erased.Batch = null,
 
         pub const BatchTxn = struct {
+            range_mutation: *@import("range_protection.zig").Mutation,
             retained: *retained_effects.Capture,
             retained_cache: ?*std.atomic.Value(u8) = null,
             payload_session: ?*artifact_payload.Session = null,
@@ -833,6 +838,7 @@ pub const DocStore = struct {
             }
 
             pub fn put(self: @This(), key: []const u8, value: []const u8) !void {
+                try self.range_mutation.touch(self, key);
                 try self.retained.touch(self.alloc, self, key, internal_keys.isStoredDocumentRowKey(key), self.retained_cache);
                 try self.markColumnarDirty(key, value);
                 try self.invalidateColumns(key);
@@ -848,6 +854,10 @@ pub const DocStore = struct {
             }
 
             pub fn appendPut(self: @This(), key: []const u8, value: []const u8) !void {
+                // Active tracking requires point updates for bucket counters.
+                // Restore bulk writers publish into a fresh identity; they may
+                // defer activation until their unordered import is complete.
+                try self.range_mutation.touch(self, key);
                 try self.retained.touch(self.alloc, self, key, internal_keys.isStoredDocumentRowKey(key), self.retained_cache);
                 if (self.unordered_bulk_append_puts and internal_keys.isRelationalRowKey(key)) {
                     // Keep auxiliary records in the bulk arena too. A regular
@@ -870,6 +880,7 @@ pub const DocStore = struct {
             }
 
             pub fn delete(self: @This(), key: []const u8) !void {
+                try self.range_mutation.touch(self, key);
                 try self.retained.touch(self.alloc, self, key, internal_keys.isStoredDocumentRowKey(key), self.retained_cache);
                 try self.markColumnarDirty(key, null);
                 try self.invalidateColumns(key);
@@ -982,6 +993,7 @@ pub const DocStore = struct {
 
         pub fn asTxn(self: *Batch) BatchTxn {
             return .{
+                .range_mutation = &self.range_mutation,
                 .retained = &self.retained,
                 .retained_cache = if (self.columnar_owner) |owner| &owner.retained_effects_cache else null,
                 .payload_session = self.payload_session,

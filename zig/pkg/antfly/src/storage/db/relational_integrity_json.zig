@@ -12,6 +12,7 @@ pub fn write(value: anytype, stream: anytype) @TypeOf(stream.*).Error!void {
     const T = @TypeOf(value);
     switch (@typeInfo(T)) {
         .@"struct" => |info| {
+            if (@hasDecl(T, "nativeJsonProjection")) return write(value.nativeJsonProjection(), stream);
             try stream.beginObject();
             inline for (info.fields) |field| {
                 try stream.objectField(field.name);

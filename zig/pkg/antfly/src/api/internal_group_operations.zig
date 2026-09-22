@@ -638,6 +638,10 @@ pub const Operations = struct {
 
     pub fn txnPrepare(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: distributed_txn.TxnPrepareRequest) Error!void {
         try ensurePreDecisionRequestActive(request);
+        if (input.req.range_guards.len != 0 and input.route_fence == null) return error.InvalidArgument;
+        if (input.route_fence) |fence| {
+            if (fence.route.group_id != group_id or fence.topology_epoch != input.topology_epoch) return error.TopologyChanged;
+        }
         const writes = self.writes orelse return error.NotFound;
         const supports_pre_decision_context =
             writes.vtable.txn_prepare_group_local_with_pre_decision_context != null;
@@ -660,6 +664,7 @@ pub const Operations = struct {
         }
         try ensurePreDecisionRequestActive(request);
         _ = (writes.txnPrepareGroupLocalWithPreDecisionContext(alloc, group_id, table_name, input.txn_id, input.topology_epoch, input.req, .{
+            .route_fence = input.route_fence,
             .deadline_ns = request.deadline_ns,
             .deadline_io = request.deadline_io,
             .cancellation = request.cancellation,

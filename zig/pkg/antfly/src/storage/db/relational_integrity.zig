@@ -205,7 +205,7 @@ pub fn prepare(alloc: Allocator, txn: anytype, commands: []const Command) !Effec
         for (commands) |command| {
             const command_phase: usize = switch (command.operation) {
                 .detach, .repair_detach => continue,
-                .check_owner => 0,
+                .compare_claim, .check_owner => 0,
                 .release, .repair_release => 1,
                 .establish => 2,
                 .attach => 3,
@@ -216,6 +216,12 @@ pub fn prepare(alloc: Allocator, txn: anytype, commands: []const Command) !Effec
             const claim_key = address.claimKey();
             switch (command.operation) {
                 .detach, .repair_detach => {},
+                .compare_claim => |expected| {
+                    const observed = try builder.current(txn, &claim_key);
+                    const encoded = if (expected) |claim| try claim.encode(owned, address) else null;
+                    if (!optionalEqual(observed, encoded)) return error.PreparedReadSetChanged;
+                    try builder.add(txn, address, &claim_key, .guard, null);
+                },
                 .check_owner => |owner| {
                     const claim = try Claim.decode(&claim_key, try builder.current(txn, &claim_key) orelse return error.ForeignKeyParentMissing);
                     try requireOwner(claim, owner.parent_table, owner.parent_key);
@@ -621,6 +627,52 @@ fn testPrepareEffects(store: *@import("../docstore.zig").DocStore, manager: *tra
         if (op.kind != .guard) try intents.append(alloc, .{ .key = op.key, .value = op.value });
     }
     try manager.writeIntents(id, intents.items, predicates.items);
+}
+
+test "relational index system integrity compare claim fences absence and exact owner before combined writes" {
+    const Fake = struct {
+        value: ?[]const u8 = null,
+        pub fn get(self: *@This(), _: []const u8) ![]const u8 {
+            return self.value orelse error.NotFound;
+        }
+        const Cursor = struct {
+            const Entry = struct { key: []const u8, value: []const u8 };
+            pub fn close(_: *@This()) void {}
+            pub fn seekAtOrAfter(_: *@This(), _: []const u8) !?Entry {
+                return null;
+            }
+            pub fn next(_: *@This()) !?Entry {
+                return null;
+            }
+        };
+        pub fn openCursor(_: *@This()) !Cursor {
+            return .{};
+        }
+    };
+    const alloc = std.testing.allocator;
+    const address = try Address.init(@splat(7), "tuple");
+    const claim: Claim = .{ .tuple = "tuple", .parent_table = "items", .parent_key = "first", .schema_version = 1 };
+    const encoded = try claim.encode(alloc, address);
+    defer alloc.free(encoded);
+    var empty: Fake = .{};
+    var insertion = try prepare(alloc, &empty, &.{
+        .{ .address = address, .operation = .{ .establish = claim } },
+        .{ .address = address, .operation = .{ .compare_claim = null } },
+    });
+    defer insertion.deinit();
+    try std.testing.expectEqual(@as(usize, 1), insertion.operations.len);
+    try std.testing.expect(insertion.operations[0].kind == .put);
+    try std.testing.expect(insertion.operations[0].expected_value == null);
+    var occupied: Fake = .{ .value = encoded };
+    try std.testing.expectError(error.PreparedReadSetChanged, prepare(alloc, &occupied, &.{.{ .address = address, .operation = .{ .compare_claim = null } }}));
+    var guard = try prepare(alloc, &occupied, &.{.{ .address = address, .operation = .{ .compare_claim = claim } }});
+    defer guard.deinit();
+    try std.testing.expectEqual(@as(usize, 1), guard.operations.len);
+    try std.testing.expectEqualStrings(encoded, guard.operations[0].expected_value.?);
+    var changed = claim;
+    changed.schema_version += 1;
+    try std.testing.expectError(error.PreparedReadSetChanged, prepare(alloc, &occupied, &.{.{ .address = address, .operation = .{ .compare_claim = changed } }}));
+    try std.testing.expectError(error.VersionConflict, validatePreparedEffects(alloc, &empty, guard.operations));
 }
 
 fn testCommands(store: *@import("../docstore.zig").DocStore, manager: *transactions.TxnManager, id: transactions.TxnId, commands: []const Command, commit: bool) !void {

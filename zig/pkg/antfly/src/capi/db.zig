@@ -6327,10 +6327,20 @@ const StorageRelationalRead = struct {
         defer if (schema) |*epoch| epoch.release();
         if (schema == null or schema.?.storageMode() == .document) {
             const session = try db.openDocumentReadSession(alloc, from, to, opts);
-            return .{ .ptr = session, .vtable = &.{ .next = nextDocument, .close = closeDocument } };
+            return .{ .ptr = session, .vtable = &.{ .next = nextDocument, .close = closeDocument, .normalize = normalizeDocument, .range_proofs = documentRangeProofs } };
         }
         const session = try db.openRelationalReadSession(alloc, from, to, opts);
-        return .{ .ptr = session, .vtable = &.{ .next = next, .close = close, .normalize = normalize } };
+        return .{ .ptr = session, .vtable = &.{ .next = next, .close = close, .normalize = normalize, .range_proofs = rangeProofs } };
+    }
+
+    fn documentRangeProofs(ptr: *anyopaque, alloc: std.mem.Allocator) ![]antfly.capi_dependencies.storage_range_protection.Proof {
+        const session: *db_mod.DB.DocumentReadSession = @ptrCast(@alignCast(ptr));
+        return session.rangeProofs(alloc);
+    }
+
+    fn rangeProofs(ptr: *anyopaque, alloc: std.mem.Allocator) ![]antfly.capi_dependencies.storage_range_protection.Proof {
+        const session: *db_mod.DB.RelationalReadSession = @ptrCast(@alignCast(ptr));
+        return session.rangeProofs(alloc);
     }
 
     fn nextDocument(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !View.Page {
@@ -6341,6 +6351,11 @@ const StorageRelationalRead = struct {
     fn closeDocument(ptr: *anyopaque) void {
         const session: *db_mod.DB.DocumentReadSession = @ptrCast(@alignCast(ptr));
         session.deinit();
+    }
+
+    fn normalizeDocument(ptr: *anyopaque, alloc: std.mem.Allocator, writes: []const db_mod.types.BatchWrite) ![]db_mod.types.BatchWrite {
+        const session: *db_mod.DB.DocumentReadSession = @ptrCast(@alignCast(ptr));
+        return session.normalizeRows(alloc, writes);
     }
 
     fn next(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !View.Page {
@@ -6355,6 +6370,7 @@ const StorageRelationalRead = struct {
             .schema_version = session.reader.active.version(),
             .value = row.typed orelse return error.InvalidResponse,
             .sql_nulls = row.sql_nulls,
+            .expected_content_digest = row.expected_content_digest,
         };
         const after = if (page.more) try owned.dupe(u8, session.reader.after.items) else null;
         return .{ .arena = page.arena, .rows = rows, .after = after };
@@ -9941,7 +9957,8 @@ pub export fn antfly_db_sql_json(handle_ptr: ?*anyopaque, table_name: capi.Slice
     if (handle.storage_owner_context != null or handle.storage_owner_path != null or handle.storage_owner_group_id != 0 or handle.readable_lease_hook != null) return .unsupported;
     executeEmbeddedSql(handle, table_name.bytes(), request_json.bytes(), out_buf) catch |err| {
         const diagnostic = antfly.capi_dependencies.sql_errors.describe(err);
-        out_buf.* = stringifyJson(.{ .@"error" = diagnostic }) catch return .internal;
+        if (out_buf.ptr == null) out_buf.* = stringifyJson(.{ .@"error" = diagnostic }) catch return .internal;
+        if (std.mem.eql(u8, diagnostic.code, "40003")) return .outcome_unknown;
         if (std.mem.eql(u8, diagnostic.code, "0A000")) return .unsupported;
         if (std.mem.eql(u8, diagnostic.code, "40001")) return .version_conflict;
         if (std.mem.eql(u8, diagnostic.code, "XX000") or std.mem.eql(u8, diagnostic.code, "53200")) return .internal;
@@ -9984,7 +10001,12 @@ fn executeEmbeddedSql(handle: *Handle, table_name: []const u8, request_json: []c
     };
     defer if (commit_receipt) |buffer| std.heap.c_allocator.free(buffer);
     var adapter = sql.Adapter(antfly){ .db = &handle.db, .table_name = table_name, .read_only = handle.open_mode != .writer };
-    var result = try sql.runtime.execute(handle.alloc, adapter.backend(), &compiled, parsed.value.parameters, .{ .result_rows = parsed.value.limit });
+    var result = sql.runtime.execute(handle.alloc, adapter.backend(), &compiled, parsed.value.parameters, .{ .result_rows = parsed.value.limit }) catch |err| {
+        if (err == error.SqlMutationOutcomeUnknown) if (adapter.outcome_transaction_id) |txn_id| {
+            out_buf.* = embeddedSqlUnknownReceipt(&commit_receipt, txn_id);
+        };
+        return err;
+    };
     defer result.deinit();
     var encoding_budget = Budget{ .backing = handle.alloc, .limit = 16 * 1024 * 1024 };
     const bytes = std.json.Stringify.valueAlloc(encoding_budget.allocator(), result.output, .{}) catch |err| {
@@ -10005,6 +10027,18 @@ fn executeEmbeddedSql(handle: *Handle, table_name: []const u8, request_json: []c
         }
         return err;
     };
+}
+
+fn embeddedSqlUnknownReceipt(reserved: *?[]u8, txn_id: db_mod.types.TxnId) capi.Buffer {
+    const buffer = reserved.*.?;
+    @memset(buffer, ' ');
+    const txn_hex = std.fmt.bytesToHex(txn_id, .lower);
+    _ = std.fmt.bufPrint(buffer, "{f}", .{std.json.fmt(.{
+        .transaction_id = @as([]const u8, &txn_hex),
+        .@"error" = .{ .code = "40003", .message = "The mutation outcome is unknown. Reconcile the native transaction receipt; do not replay the statement.", .retryable = false },
+    }, .{})}) catch unreachable;
+    reserved.* = null;
+    return .{ .ptr = buffer.ptr, .len = buffer.len };
 }
 
 fn embeddedSqlCommitReceipt(reserved: *?[]u8, output: antfly.capi_dependencies.sql_runtime.Output) capi.Buffer {
@@ -10035,6 +10069,19 @@ test "capi SQL reserved receipt preserves every known mutation outcome without a
         try std.testing.expectEqualStrings("18446744073709551615", decoded.value.object.get("rows_affected").?.number_string);
         try std.testing.expect(!decoded.value.object.get("error").?.object.get("retryable").?.bool);
     }
+}
+
+test "capi SQL unknown commit receipt retains native transaction identity without allocation" {
+    var reserved: ?[]u8 = try std.heap.c_allocator.alloc(u8, 512);
+    defer if (reserved) |buffer| std.heap.c_allocator.free(buffer);
+    const receipt = embeddedSqlUnknownReceipt(&reserved, @splat(0xab));
+    defer antfly_db_buffer_free(receipt.ptr, receipt.len);
+    try std.testing.expect(reserved == null);
+    const decoded = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, receipt.ptr.?[0..receipt.len], .{});
+    defer decoded.deinit();
+    try std.testing.expectEqualStrings("abababababababababababababababab", decoded.value.object.get("transaction_id").?.string);
+    try std.testing.expectEqualStrings("40003", decoded.value.object.get("error").?.object.get("code").?.string);
+    try std.testing.expect(!decoded.value.object.get("error").?.object.get("retryable").?.bool);
 }
 
 pub export fn antfly_db_search_json(
@@ -12790,7 +12837,7 @@ test "capi transaction lifecycle" {
     try std.testing.expectEqual(@as(u64, 2_000), commit_version);
 }
 
-test "capi SQL document reads use schema shape and reject unsupported document mutation" {
+test "capi SQL document mutations preserve undeclared fields and typed null semantics" {
     var directory = try TestDirectory.init("capi-sql-document");
     defer directory.cleanup();
     const alloc = std.testing.allocator;
@@ -12800,7 +12847,7 @@ test "capi SQL document reads use schema shape and reject unsupported document m
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open(path, &handle));
     defer antfly_db_close(handle);
     const schema =
-        \\{"version":1,"default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer"}},"additionalProperties":true}}}}
+        \\{"version":1,"default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer"},"j":{"default":{"annotated":true}}},"additionalProperties":true}}}}
     ;
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_set_schema_json(handle, .fromSlice(schema)));
     var inserted: capi.Buffer = .{};
@@ -12814,9 +12861,177 @@ test "capi SQL document reads use schema shape and reject unsupported document m
     const rows = parsed.value.object.get("rows").?.array.items;
     try std.testing.expectEqual(@as(usize, 1), rows.len);
     try std.testing.expectEqualStrings("9007199254740993", rows[0].array.items[0].string);
-    var rejected: capi.Buffer = .{};
-    try std.testing.expectEqual(capi.ErrorCode.unsupported, antfly_db_sql_json(handle, .fromSlice("items"), .fromSlice("{\"statement\":\"UPDATE items SET n=1\"}"), &rejected));
-    defer antfly_db_buffer_free(rejected.ptr, rejected.len);
+    for ([_][]const u8{
+        "UPDATE items SET n=n+1, j='null' WHERE _id='a' RETURNING n,j",
+        "INSERT INTO items (_id,n,j) VALUES ('b',2,NULL) RETURNING n,j",
+        "INSERT INTO items (_id,n) VALUES ('c',2) RETURNING j",
+        "UPDATE items SET j=NULL WHERE _id='a' RETURNING j",
+    }) |statement| {
+        const body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = statement }, .{});
+        defer alloc.free(body);
+        var updated: capi.Buffer = .{};
+        const status = antfly_db_sql_json(handle, .fromSlice("items"), .fromSlice(body), &updated);
+        defer antfly_db_buffer_free(updated.ptr, updated.len);
+        if (status != .ok) std.debug.print("document mutation error: {s}\n", .{updated.ptr.?[0..updated.len]});
+        try std.testing.expectEqual(capi.ErrorCode.ok, status);
+    }
+    var stored: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_lookup_json(handle, .fromSlice("a"), &stored));
+    defer antfly_db_buffer_free(stored.ptr, stored.len);
+    const document = try std.json.parseFromSlice(std.json.Value, alloc, stored.ptr.?[0..stored.len], .{});
+    defer document.deinit();
+    try std.testing.expectEqual(@as(i64, 9007199254740994), document.value.object.get("n").?.integer);
+    try std.testing.expect(document.value.object.get("extra").?.bool);
+    try std.testing.expect(!document.value.object.contains("j"));
+    // JSON Schema defaults are annotations, not SQL column defaults. Both
+    // omitted JSON and explicit SQL NULL stay absent under native semantics.
+    for ([_][]const u8{ "b", "c" }) |key| {
+        var row: capi.Buffer = .{};
+        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_lookup_json(handle, .fromSlice(key), &row));
+        defer antfly_db_buffer_free(row.ptr, row.len);
+        const value = try std.json.parseFromSlice(std.json.Value, alloc, row.ptr.?[0..row.len], .{});
+        defer value.deinit();
+        try std.testing.expect(!value.value.object.contains("j"));
+    }
+    var deleted: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_sql_json(handle, .fromSlice("items"), .fromSlice("{\"statement\":\"DELETE FROM items WHERE _id='a' RETURNING n\"}"), &deleted));
+    defer antfly_db_buffer_free(deleted.ptr, deleted.len);
+}
+
+test "capi SQL document validation rejects an entire mutation before publication" {
+    var directory = try TestDirectory.init("capi-sql-document-validation");
+    defer directory.cleanup();
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, directory.path(), "document");
+    defer alloc.free(path);
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open(path, &handle));
+    defer antfly_db_close(handle);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_set_schema_json(handle, .fromSlice(
+        \\{"version":1,"enforce_types":true,"default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer","minimum":0}},"required":["n"],"additionalProperties":true}}}}
+    )));
+    var response: capi.Buffer = .{};
+    const status = antfly_db_sql_json(handle, .fromSlice("items"), .fromSlice("{\"statement\":\"INSERT INTO items (_id,n) VALUES ('valid',1),('invalid',-1) RETURNING n\"}"), &response);
+    defer antfly_db_buffer_free(response.ptr, response.len);
+    try std.testing.expect(status != .ok);
+    var count: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_sql_json(handle, .fromSlice("items"), .fromSlice("{\"statement\":\"SELECT COUNT(*) FROM items\"}"), &count));
+    defer antfly_db_buffer_free(count.ptr, count.len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, count.ptr.?[0..count.len], .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("0", parsed.value.object.get("rows").?.array.items[0].array.items[0].string);
+}
+
+test "capi SQL mutations fence exact primary bytes with unchanged TTL and schema epochs" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "document", "relational" }) |mode| {
+        var directory = try TestDirectory.init("capi-sql-digest-fence");
+        defer directory.cleanup();
+        var database = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+        defer database.close();
+        const schema = try std.fmt.allocPrint(alloc,
+            \\{{"version":1,"storage_mode":"{s}","default_type":"row","ttl":{{"duration":"1s","field":"expires"}},"document_schemas":{{"row":{{"schema":{{"type":"object","properties":{{"n":{{"type":"integer"}},"expires":{{"type":"datetime"}}}},"additionalProperties":false}}}}}}}}
+        , .{mode});
+        defer alloc.free(schema);
+        try database.setSchemaJson(alloc, schema);
+        try database.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"n\":1,\"expires\":\"2090-01-01T00:00:00Z\"}" }} });
+        var adapter = @import("sql.zig").Adapter(antfly){ .db = &database, .table_name = "items" };
+        const backend = adapter.backend();
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const table = try backend.vtable.resolve(backend.ptr, arena.allocator(), .{ .table = "items" }, .read_write);
+        const cursor = (try backend.vtable.open_scan.?(backend.ptr, alloc, table, .{ .fields = &.{"n"}, .include_primary_digest = true, .primary_key = "a", .limit = 1 })).?;
+        defer cursor.close(cursor.ptr);
+        const page = try cursor.next(cursor.ptr, alloc, 1);
+        defer page.deinit();
+        try std.testing.expectEqual(@as(usize, 1), page.rows.len);
+        const before = page.rows[0];
+        try std.testing.expect(before.expected_content_digest != null);
+        try database.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"n\":2,\"expires\":\"2090-01-01T00:00:00Z\"}" }} });
+        try std.testing.expectEqual(before.version, try database.getTimestamp(alloc, "a"));
+        try std.testing.expectError(error.SqlWriteConflict, backend.vtable.mutate(backend.ptr, arena.allocator(), table, &.{.{ .key = "a", .expected_version = before.version, .expected_content_digest = before.expected_content_digest, .row = null }}));
+        try std.testing.expectError(error.PreparedGenerationChanged, database.batch(.{ .schema_version = 2, .deletes = &.{"a"} }));
+        const txn = try database.beginTransactionWithId(@splat(97), 1);
+        try std.testing.expectError(error.PreparedGenerationChanged, database.writeTransaction(txn, .{ .schema_version = 2, .deletes = &.{"a"} }));
+        try database.abortTransaction(txn, 2);
+        var retained = (try database.lookup(alloc, "a", .{})).?;
+        defer retained.deinit(alloc);
+        try std.testing.expect(std.mem.indexOf(u8, retained.json, "\"n\":2") != null);
+    }
+}
+
+test "capi SQL local integrity coordinator enforces unique arbitration and self FK actions" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("capi-sql-integrity");
+    defer directory.cleanup();
+    var database = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .identity_namespace = .{ .table_id = 501, .shard_id = 502 } });
+    defer database.close();
+    const schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"foreign_keys":[{"name":"parent_fk","child_columns":["parent"],"parent_table":"rows","parent_columns":["id"],"on_delete":"cascade","on_update":"cascade"}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent":{"type":"integer","nullable":true}},"additionalProperties":false}}}}
+    ;
+    try database.setSchemaJson(alloc, schema);
+    var adapter = @import("sql.zig").Adapter(antfly){ .db = &database, .table_name = "rows" };
+    const sql = @import("sql.zig");
+    for ([_]struct { statement: []const u8, count: u64 }{
+        .{ .statement = "INSERT INTO rows (_id,id,parent) VALUES ('p',1,NULL),('c',2,1)", .count = 2 },
+        .{ .statement = "INSERT INTO rows (_id,id,parent) VALUES ('skipped',1,NULL) ON CONFLICT (id) DO NOTHING RETURNING id", .count = 0 },
+        .{ .statement = "INSERT INTO rows (_id,id,parent) VALUES ('new',1,NULL) ON CONFLICT (id) DO UPDATE SET id=3 RETURNING id", .count = 1 },
+    }) |case| {
+        var compiled = try sql.compiler.compile(alloc, case.statement, .{});
+        defer compiled.deinit();
+        var result = try sql.runtime.execute(alloc, adapter.backend(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(case.count, result.output.rows_affected);
+    }
+    var child = (try database.lookup(alloc, "c", .{})).?;
+    defer child.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, child.json, "\"parent\":3") != null);
+    var removed = try sql.compiler.compile(alloc, "DELETE FROM rows WHERE _id='p'", .{});
+    defer removed.deinit();
+    var outcome = try sql.runtime.execute(alloc, adapter.backend(), &removed, &.{}, .{});
+    defer outcome.deinit();
+    try std.testing.expect(try database.lookup(alloc, "c", .{}) == null);
+    try std.testing.expect(try database.lookup(alloc, "p", .{}) == null);
+    try std.testing.expect(try database.lookup(alloc, "new", .{}) == null);
+    var orphan = try sql.compiler.compile(alloc, "INSERT INTO rows (_id,id,parent) VALUES ('orphan',4,999)", .{});
+    defer orphan.deinit();
+    try std.testing.expectError(error.ForeignKeyParentMissing, sql.runtime.execute(alloc, adapter.backend(), &orphan, &.{}, .{}));
+    try std.testing.expect(try database.lookup(alloc, "orphan", .{}) == null);
+    // An absent secondary claim is a commit predicate, not permission to
+    // overwrite whichever owner appears after conflict resolution.
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const backend = adapter.backend();
+    const table = try backend.vtable.resolve(backend.ptr, arena.allocator(), .{ .table = "rows" }, .read_write);
+    const row = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), "{\"id\":4,\"parent\":null}", .{});
+    var mutation: antfly.capi_dependencies.sql_catalog.Mutation = .{ .key = "racer", .row = row, .expected_version = 0 };
+    const owners = try backend.vtable.resolve_conflict_owners.?(backend.ptr, arena.allocator(), table, &.{"id"}, &.{mutation});
+    try std.testing.expect(owners[0].key == null);
+    mutation.conflict_guard = owners[0].guard;
+    var winner = try sql.compiler.compile(alloc, "INSERT INTO rows (_id,id,parent) VALUES ('winner',4,NULL)", .{});
+    defer winner.deinit();
+    var won = try sql.runtime.execute(alloc, backend, &winner, &.{}, .{});
+    defer won.deinit();
+    try std.testing.expectError(error.PreparedReadSetChanged, backend.vtable.mutate(backend.ptr, arena.allocator(), table, &.{mutation}));
+    try std.testing.expect(try database.lookup(alloc, "racer", .{}) == null);
+}
+
+test "capi SQL local integrity refuses partial ownership instead of inventing coverage" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("capi-sql-partial-integrity");
+    defer directory.cleanup();
+    var database = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .identity_namespace = .{ .table_id = 503, .shard_id = 504 } });
+    defer database.close();
+    try database.updateRange(.{ .start = "a", .end = "z" });
+    try database.setSchemaJson(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    );
+    var adapter = @import("sql.zig").Adapter(antfly){ .db = &database, .table_name = "rows" };
+    const sql = @import("sql.zig");
+    var compiled = try sql.compiler.compile(alloc, "INSERT INTO rows (_id,id) VALUES ('k',1)", .{});
+    defer compiled.deinit();
+    try std.testing.expectError(error.UnsupportedSqlExecution, sql.runtime.execute(alloc, adapter.backend(), &compiled, &.{}, .{}));
+    try std.testing.expect(try database.lookup(alloc, "k", .{}) == null);
 }
 
 test "capi SQL RETURNING uses native defaults generated values and versioned preimages" {
@@ -12834,6 +13049,8 @@ test "capi SQL RETURNING uses native defaults generated values and versioned pre
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_set_schema_json(handle, .fromSlice(schema)));
     for ([_]struct { statement: []const u8, expected: []const u8 }{
         .{ .statement = "INSERT INTO items (_id,a) VALUES ('a',3) RETURNING total", .expected = "5" },
+        .{ .statement = "INSERT INTO items (_id,a) VALUES ('a',1) ON CONFLICT (_id) DO UPDATE SET a=excluded.a+items.a RETURNING total", .expected = "6" },
+        .{ .statement = "INSERT INTO items (_id,a) VALUES ('a',99) ON CONFLICT (_id) DO NOTHING RETURNING total", .expected = "empty" },
         .{ .statement = "UPDATE items SET a=4 WHERE _id='a' RETURNING items.total", .expected = "6" },
         .{ .statement = "DELETE FROM items WHERE _id='a' RETURNING total", .expected = "6" },
     }) |case| {
@@ -12847,9 +13064,27 @@ test "capi SQL RETURNING uses native defaults generated values and versioned pre
         const parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.ptr.?[0..response.len], .{});
         defer parsed.deinit();
         const rows = parsed.value.object.get("rows").?.array.items;
+        if (std.mem.eql(u8, case.expected, "empty")) {
+            try std.testing.expectEqual(@as(usize, 0), rows.len);
+            try std.testing.expectEqual(@as(i64, 0), parsed.value.object.get("rows_affected").?.integer);
+            continue;
+        }
         try std.testing.expectEqual(@as(usize, 1), rows.len);
         try std.testing.expectEqualStrings(case.expected, rows[0].array.items[0].string);
     }
+    var generated: capi.Buffer = .{};
+    const status = antfly_db_sql_json(handle, .fromSlice("items"), .fromSlice("{\"statement\":\"INSERT INTO items (a) VALUES (3),(3) RETURNING _id,total\"}"), &generated);
+    defer antfly_db_buffer_free(generated.ptr, generated.len);
+    try std.testing.expectEqual(capi.ErrorCode.ok, status);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, generated.ptr.?[0..generated.len], .{});
+    defer parsed.deinit();
+    const generated_rows = parsed.value.object.get("rows").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), generated_rows.len);
+    const first = generated_rows[0].array.items[0].string;
+    const second = generated_rows[1].array.items[0].string;
+    try std.testing.expectEqual(@as(usize, 32), first.len);
+    try std.testing.expect(!std.mem.eql(u8, first, second));
+    try std.testing.expectEqualStrings("5", generated_rows[0].array.items[1].string);
 }
 
 test "capi SQL uses native typed snapshots and atomic mutations" {

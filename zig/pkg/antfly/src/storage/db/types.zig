@@ -321,6 +321,12 @@ pub const TransactionMutation = union(enum) {
 };
 
 pub const BatchRequest = struct {
+    range_guards: []const @import("../range_protection.zig").Proof = &.{},
+    /// Internal replicated capability activation. Never accepted by public JSON.
+    activate_range_tracking: bool = false,
+    /// Internal schema epoch fence shared by document and relational writes.
+    /// Never accepted from public batch JSON.
+    schema_version: ?u32 = null,
     /// Private, replicated source-retention lifecycle. Never accepted by public JSON.
     online_source: ?@import("online_source_contract.zig").Command = null,
     /// Private replicated hidden-owner lifecycle; public JSON cannot set it.
@@ -1389,6 +1395,10 @@ pub const RelationalRowQuery = struct {
 };
 
 pub const ScanOptions = struct {
+    /// Retain the full document only for a version-fenced SQL mutation.
+    sql_document_preimage: bool = false,
+    /// Collect durable logical range guards only for explicitly guarded SQL.
+    include_range_proofs: bool = false,
     relational_query: ?RelationalRowQuery = null,
     /// Schema-bound typed row query carried by the routed scan transport. It
     /// is never interpreted as a search DSL or permitted to replace RLS filters.
@@ -1573,6 +1583,8 @@ pub const TransactionVersionPredicate = struct {
 pub const TransactionIntegrityOperation = @import("relational_integrity_contract.zig").Operation;
 
 pub const TransactionIntentRequest = struct {
+    range_guards: []const @import("../range_protection.zig").Proof = &.{},
+    schema_version: ?u32 = null,
     relational_index_maintenance: ?@import("relational_index_maintenance_contract.zig").Command = null,
     restore_staging_scope: ?[32]u8 = null,
     restore_staging_plan_id: ?[16]u8 = null,

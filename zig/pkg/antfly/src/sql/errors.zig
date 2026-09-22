@@ -35,6 +35,8 @@ pub const Diagnostic = struct {
 
 pub fn describe(err: anyerror) Diagnostic {
     return switch (err) {
+        error.ConflictArbiterNotFound => .{ .code = "42P10", .message = "No native unique constraint matches the conflict target.", .hint = "Use the complete column set of an active unique constraint.", .retryable = false },
+        error.RetainedReadRestartRequired, error.RetainedReadExpired, error.RetainedReadNotFound, error.RetainedReadScopeChanged, error.RetainedReadSequenceMismatch => .{ .code = "40001", .message = "The retained statement snapshot is no longer available.", .hint = "Restart the complete read statement; do not replay an individual page.", .retryable = true },
         error.SqlIndexAlreadyExists => .{ .code = "42P07", .message = "The index already exists.", .retryable = false },
         error.SqlIndexNotFound => .{ .code = "42704", .message = "The index does not exist.", .retryable = false },
         error.SqlConstraintAlreadyExists => .{ .code = "42710", .message = "The constraint already exists.", .retryable = false },
@@ -59,6 +61,7 @@ pub fn describe(err: anyerror) Diagnostic {
         error.UnsupportedSqlExecution, error.UnsupportedSqlShape => .{ .code = "0A000", .message = "This SQL statement or expression is not supported.", .hint = "Use a supported relational SELECT, INSERT, UPDATE, or DELETE statement." },
         error.SqlRowIdentityRequired => .{ .code = "0A000", .message = "This mutation requires an explicit row identity.", .hint = "Provide a non-null _id for each inserted row." },
         error.SqlStatementSnapshotRequired => .{ .code = "0A000", .message = "This query requires a consistent statement snapshot that is not available.", .hint = "Narrow the query to one bounded page or use a runtime with statement snapshots." },
+        error.SqlRangeTrackingRequired => .{ .code = "0A000", .message = "This transaction requires activated, owner-fenced range protection.", .hint = "Use a runtime that supports the requested isolation level; isolation was not downgraded.", .retryable = false },
         error.InvalidSqlSyntax => .{ .code = "42601", .message = "The SQL statement has invalid syntax.", .hint = "Check the reported position and submit one supported statement." },
         error.TableNotFound, error.NotFound, error.CatalogNotFound => .{ .code = "42P01", .message = "The requested catalog object does not exist.", .hint = "Check the database, namespace, and object name." },
         error.CatalogAlreadyExists, error.TableAlreadyExists => .{ .code = "42P07", .message = "The requested catalog object already exists.", .retryable = false },
@@ -77,6 +80,7 @@ pub fn describe(err: anyerror) Diagnostic {
         error.DuplicateSqlRow, error.UniqueConstraintViolation => .{ .code = "23505", .message = "The mutation violates a unique constraint.", .hint = "Use distinct row identities and unique column values.", .retryable = false },
         error.ForeignKeyViolation, error.ForeignKeyParentMissing, error.ForeignKeyReferenced, error.ForeignKeyMatchFullViolation => .{ .code = "23503", .message = "The mutation violates a foreign key constraint.", .hint = "Ensure referenced rows exist and dependent rows satisfy the configured foreign key action.", .retryable = false },
         error.SqlNotNullViolation => .{ .code = "23502", .message = "A required column cannot be null.", .hint = "Provide a non-null value for every required column.", .retryable = false },
+        error.SqlCardinalityViolation => .{ .code = "21000", .message = "A scalar subquery returned more than one row.", .hint = "Use a unique predicate or an aggregate to produce at most one value.", .retryable = false },
         error.RelationalCheckViolation => .{ .code = "23514", .message = "The mutation violates a check constraint.", .hint = "Change the row values to satisfy the table's check constraints.", .retryable = false },
         error.Forbidden, error.Unauthorized, error.AccessDenied => .{ .code = "42501", .message = "Permission denied for this SQL operation.", .hint = "Check the current credential and permissions for every affected table.", .retryable = false },
         error.SqlTypeMismatch, error.InvalidSqlParameters, error.InvalidBatchRequest, error.InvalidRelationalExpressionInput, error.InvalidRelationalGeneratedValue => .{ .code = "22023", .message = "A parameter or row value does not match the required type.", .hint = "Check parameter count, nullability, and the current column types." },

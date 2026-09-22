@@ -17,6 +17,7 @@ const scalar = @import("../../sql/scalar.zig");
 const View = @import("../relational_read_view.zig").View;
 
 pub const Session = struct {
+    range_proofs: ?[]const @import("../range_protection.zig").Proof = null,
     alloc: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
     store: *store_mod.DocStore,
@@ -24,6 +25,8 @@ pub const Session = struct {
     schema: ?registry.SchemaView,
     table: catalog.Table,
     projection: document.Projection,
+    include_document: bool,
+    include_primary_digest: bool,
     condition_projection: document.Projection,
     conditions: []const types.RelationalRowQuery.Condition,
     filter: ?graph.PreparedPatternFilter,
@@ -47,6 +50,7 @@ pub const Session = struct {
         var read = txn;
         errdefer read.abort();
         if (schema) |view| if (view.storageMode() != .document) return error.UnsupportedSqlExecution;
+        if (opts.include_range_proofs) if (schema) |view| if (view.tableSchema().ttl_duration_ns != 0) return error.UnsupportedSqlExecution;
         if (opts.relational_query_json.len > 1024 * 1024 or opts.limit > 4096) return error.InvalidRelationalRowsRequest;
         var arena = std.heap.ArenaAllocator.init(alloc);
         errdefer arena.deinit();
@@ -83,13 +87,16 @@ pub const Session = struct {
         const session = try alloc.create(Session);
         errdefer alloc.destroy(session);
         session.* = .{
+            .range_proofs = if (opts.include_range_proofs) try @import("../range_protection.zig").capture(owned, &read, lower_raw, upper_raw) else null,
             .alloc = alloc,
-            .arena = arena,
+            .arena = undefined,
             .store = store,
             .txn = read,
             .schema = null,
             .table = table,
             .projection = projection,
+            .include_document = opts.sql_document_preimage,
+            .include_primary_digest = opts.include_content_hashes or opts.sql_document_preimage,
             .condition_projection = condition_projection,
             .conditions = conditions,
             .filter = filter,
@@ -106,6 +113,9 @@ pub const Session = struct {
         };
         // Epoch retain is the last fallible initialization boundary.
         session.schema = if (schema) |view| view.clone() else null;
+        // Move arena state only after all initializer allocations. Copying it
+        // before bounds/proofs allocate a new chunk loses that chunk on close.
+        session.arena = arena;
         return session;
     }
 
@@ -118,10 +128,55 @@ pub const Session = struct {
         self.alloc.destroy(self);
     }
 
+    pub fn rangeProofs(self: *Session, alloc: std.mem.Allocator) ![]@import("../range_protection.zig").Proof {
+        return alloc.dupe(@import("../range_protection.zig").Proof, self.range_proofs orelse return error.SqlRangeTrackingRequired);
+    }
+
     fn checkpoint(self: *const Session) !void {
         if (self.failed) return error.InvalidSqlBackendResponse;
         if (self.cancellation) |token| try token.check();
         if (self.deadline_ns) |deadline| if (time.monotonicNs() >= deadline) return error.DeadlineExceeded;
+    }
+
+    /// Uses the same pinned public validator as native schema admission. SQL
+    /// does not implement a second defaults/coercion/generated-value engine.
+    /// All output belongs to the bounded caller arena.
+    pub fn normalizeRows(self: *Session, alloc: std.mem.Allocator, writes: []const types.BatchWrite) ![]types.BatchWrite {
+        if (writes.len > 4096) return error.InvalidArgument;
+        const result = try alloc.alloc(types.BatchWrite, writes.len);
+        // Parse/validator scratch is row-local, not retained for the batch.
+        // Only canonical bytes and null provenance cross the commit boundary.
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        var total: usize = 0;
+        for (writes, result) |write, *out| {
+            try self.checkpoint();
+            _ = scratch.reset(.retain_capacity);
+            const temporary = scratch.allocator();
+            var value = try std.json.parseFromSliceLeaky(std.json.Value, temporary, write.value, .{ .parse_numbers = false });
+            if (value != .object) return error.InvalidBatchRequest;
+            // A JSON column's SQL NULL is represented by absence, whereas a
+            // JSON null datum is an explicit null member in document storage.
+            for (self.table.columns) |column| if (column.type == .json) {
+                if (value.object.get(column.path)) |cell| if (cell == .null) {
+                    const explicit = for (write.json_null_fields) |name| {
+                        if (std.mem.eql(u8, name, column.path)) break true;
+                    } else false;
+                    if (!explicit) _ = value.object.orderedRemove(column.path);
+                };
+            };
+            if (self.schema) |view| if (view.validator()) |validator| try validator.prepareValue(temporary, temporary, &value);
+            var json_nulls: std.ArrayList([]const u8) = .empty;
+            for (self.table.columns) |column| if (column.type == .json) {
+                if (value.object.get(column.path)) |cell| if (cell == .null) try json_nulls.append(alloc, try alloc.dupe(u8, column.path));
+            };
+            const bytes = try std.json.Stringify.valueAlloc(alloc, value, .{});
+            total = std.math.add(usize, total, bytes.len +| write.key.len) catch return error.RelationalRowResultTooLarge;
+            if (total > 16 * 1024 * 1024) return error.RelationalRowResultTooLarge;
+            out.* = .{ .key = try alloc.dupe(u8, write.key), .value = bytes, .json_null_fields = try json_nulls.toOwnedSlice(alloc) };
+        }
+        try self.checkpoint();
+        return result;
     }
 
     pub fn next(self: *Session, alloc: std.mem.Allocator, limit: u32) !View.Page {
@@ -231,8 +286,13 @@ pub const Session = struct {
                     return .stop;
                 }
                 const projected = try session.projection.projectValue(ctx.owned, key, version, root);
+                const digest: ?[32]u8 = if (session.include_primary_digest) blk: {
+                    var result: [32]u8 = undefined;
+                    std.crypto.hash.sha2.Sha256.hash(bytes, &result, .{});
+                    break :blk result;
+                } else null;
                 ctx.bytes += charge;
-                try ctx.rows.append(ctx.owned, .{ .id = projected.id, .version = projected.version, .schema_version = session.table.schema_version, .value = projected.value, .sql_nulls = projected.sql_nulls });
+                try ctx.rows.append(ctx.owned, .{ .id = projected.id, .version = projected.version, .schema_version = session.table.schema_version, .value = projected.value, .sql_nulls = projected.sql_nulls, .expected_content_digest = digest, .document = if (session.include_document) try @import("../typed_json.zig").clone(ctx.owned, root) else null });
                 return .@"continue";
             }
         };

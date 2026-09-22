@@ -178,6 +178,21 @@ pub const Registry = struct {
         }
     }
 
+    /// RPC cleanup after a response was lost before the caller learned its
+    /// token. Unlike local transport shutdown this must match current scope;
+    /// a caller-chosen connection identifier is never cross-principal authority.
+    pub fn disconnectScoped(self: *Registry, scope: Scope, connection: u128) void {
+        for (0..self.slots.len) |index| {
+            self.mutex.lockUncancelable(self.io);
+            const resource = if (self.slots[index].entry) |entry|
+                if (entry.connection == connection and std.meta.eql(entry.scope, scope)) self.revoke(index) else null
+            else
+                null;
+            self.mutex.unlock(self.io);
+            if (resource) |value| value.close(value.ptr);
+        }
+    }
+
     fn find(self: *Registry, token: Token) ?usize {
         if (token.incarnation != self.incarnation or token.slot >= self.slots.len) return null;
         if (self.slots[token.slot].entry) |entry| {
@@ -232,6 +247,30 @@ test "retained read registry fences identity, bounds admission and defers close 
     registry.expire(100, 2);
     try std.testing.expectEqual(2, counter.closed);
     try std.testing.expectError(error.RetainedReadNotFound, registry.borrow(second, scope, .cursor, 100));
+}
+
+test "retained read registry lost-response cleanup cannot revoke another principal" {
+    const Fixture = struct {
+        closed: usize = 0,
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.closed += 1;
+        }
+    };
+    var registry = try Registry.init(std.testing.allocator, std.testing.io, 1, 4, 4, 100);
+    defer registry.deinit();
+    var first: Fixture = .{};
+    var other: Fixture = .{};
+    const scope = Scope{ .principal = @splat(1), .authorization_revision = 1, .table_id = 2, .group_id = 3, .topology_revision = 4, .schema_version = 5 };
+    var other_scope = scope;
+    other_scope.principal = @splat(2);
+    _ = try registry.insert(scope, 99, 1, 100, .{ .ptr = &first, .kind = .capture, .close = Fixture.close });
+    const foreign = try registry.insert(other_scope, 99, 1, 100, .{ .ptr = &other, .kind = .capture, .close = Fixture.close });
+    registry.disconnectScoped(scope, 99);
+    try std.testing.expectEqual(@as(usize, 1), first.closed);
+    try std.testing.expectEqual(@as(usize, 0), other.closed);
+    var borrow = try registry.borrow(foreign, other_scope, .capture, 2);
+    borrow.deinit();
 }
 
 test "retained read registry expires in bounded slices without destroying active callbacks" {

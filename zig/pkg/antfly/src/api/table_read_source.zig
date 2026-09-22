@@ -133,11 +133,19 @@ pub const RelationalStatementRead = struct {
     views: []const RelationalReadView,
     vtable: *const VTable,
     boundary_dispatch: Abi.Dispatch = Abi.local_dispatch,
-    pub const VTable = struct { close: *const fn (*anyopaque) void };
+    pub const OwnerRangeProof = @import("range_read_guards.zig").OwnerRangeProof;
+    pub const VTable = struct {
+        close: *const fn (*anyopaque) void,
+        range_proofs: ?*const fn (*anyopaque, std.mem.Allocator, usize) anyerror![]OwnerRangeProof = null,
+    };
     const Abi = @import("../runtime_callback_abi.zig").Boundary(VTable);
 
     pub fn deinit(self: @This()) void {
         Abi.call("close", self.boundary_dispatch, self.vtable.close, .{self.ptr}) catch unreachable;
+    }
+    pub fn rangeProofs(self: @This(), alloc: std.mem.Allocator, scan_index: usize) ![]OwnerRangeProof {
+        const callback = self.vtable.range_proofs orelse return error.SqlRangeTrackingRequired;
+        return Abi.call("range_proofs", self.boundary_dispatch, callback, .{ self.ptr, alloc, scan_index });
     }
 };
 
@@ -174,6 +182,11 @@ pub const TableReadSource = struct {
     /// Provider guarantees read_index never downgrades to a stale read. Only
     /// such a successful lookup may certify absence to another replica.
     strict_read_index_absence: bool = false,
+    /// Requires a retained Raft ownership proof, not only a local apply lock.
+    remote_statement_fences_safe: bool = false,
+    /// Retained statement snapshots carry durable native range observations.
+    /// Callback availability alone does not certify serializable reads.
+    supports_sql_range_guards: bool = false,
     /// Set only by authenticated group-local ingress. When present, dispatch
     /// must use a routed callback; silently falling back would reintroduce an
     /// admin-snapshot identity race.

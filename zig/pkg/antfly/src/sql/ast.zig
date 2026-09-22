@@ -18,7 +18,7 @@ pub const Scalar = union(enum) {
     column: []const u8,
     unary: struct { op: Unary, operand: *const Scalar },
     binary: struct { op: Binary, left: *const Scalar, right: *const Scalar },
-    call: struct { name: []const u8, args: []const *const Scalar, star: bool = false, distinct: bool = false, filter: ?*const Scalar = null },
+    call: struct { name: []const u8, args: []const *const Scalar, star: bool = false, distinct: bool = false, filter: ?*const Scalar = null, window: ?Window = null, subquery: ?*const Select = null },
     cast: struct { operand: *const Scalar, type: ColumnType },
     case_when: struct { branches: []const Branch, otherwise: ?*const Scalar = null },
     in_list: struct { operand: *const Scalar, values: []const *const Scalar, negated: bool = false },
@@ -63,6 +63,13 @@ pub const Order = struct {
     descending: bool = false,
     nulls_first: ?bool = null,
 };
+pub const Window = struct {
+    partition: []const *const Scalar = &.{},
+    order: []const Order = &.{},
+    frame: ?Frame = null,
+    pub const Bound = union(enum) { unbounded_preceding, preceding: Value, current, following: Value, unbounded_following };
+    pub const Frame = struct { mode: enum { rows, range }, start: Bound, end: Bound = .current };
+};
 pub const Select = struct {
     set_operation: ?struct { kind: SetKind, all: bool, left: *const Select, right: *const Select } = null,
     table: ?Name = null,
@@ -83,11 +90,12 @@ pub const SetKind = enum { @"union", intersect, except };
 pub const Cte = struct { name: []const u8, columns: []const []const u8 = &.{}, query: *const Select };
 pub const Relation = union(enum) {
     table: struct { name: Name, alias: ?[]const u8 = null },
-    derived: struct { query: *const Select, alias: []const u8 },
+    derived: struct { query: *const Select, alias: []const u8, hidden: bool = false },
     join: struct { kind: JoinKind, left: *const Relation, right: *const Relation, condition: ?*const Scalar = null },
 };
 pub const JoinKind = enum { inner, left, right, full, cross };
 pub const Insert = struct {
+    conflict: ?Conflict = null,
     returning: ?[]const Projection = null,
     table: Name,
     columns: []const []const u8,
@@ -95,6 +103,11 @@ pub const Insert = struct {
     source: ?*const Select = null,
     /// Aligned with rows/cells. Literal cells keep the direct binding path.
     expressions: []const []const ?*const Scalar = &.{},
+};
+pub const Conflict = struct {
+    columns: []const []const u8,
+    assignments: []const Assignment = &.{},
+    predicate: ?*const Scalar = null,
 };
 pub const Assignment = struct { field: []const u8, value: Value = .null, expression: ?*const Scalar = null };
 pub const Update = struct { table: Name, assignments: []const Assignment, predicate: ?*const Predicate = null, returning: ?[]const Projection = null };

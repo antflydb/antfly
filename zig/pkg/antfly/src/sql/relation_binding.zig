@@ -42,6 +42,13 @@ fn qualified(node: *const ast.Scalar) bool {
         .binary => |part| qualified(part.left) or qualified(part.right),
         .cast => |part| qualified(part.operand),
         .call => |part| blk: {
+            if (part.window) |spec| {
+                for (spec.partition) |item| if (qualified(item)) break :blk true;
+                for (spec.order) |item| {
+                    if (std.mem.indexOfScalar(u8, item.field, 0) != null) break :blk true;
+                    if (item.expression) |expression_| if (qualified(expression_)) break :blk true;
+                }
+            }
             for (part.args) |arg| if (qualified(arg)) break :blk true;
             break :blk if (part.filter) |filter| qualified(filter) else false;
         },
@@ -132,6 +139,38 @@ const Builder = struct {
                 break :blk expression_.*;
             },
             .call => |call| blk: {
+                if (call.window) |spec| {
+                    if (self.shape_only) {
+                        for (spec.partition) |item| try self.constraints.append(self.alloc, .{ .expression = try self.inferenceExpression(item, columns) });
+                        for (spec.order) |item| try self.constraints.append(self.alloc, .{ .expression = try self.inferenceExpression(item.expression orelse try self.scalarNode(.{ .column = item.field }), columns) });
+                        if (spec.frame) |frame| for ([_]ast.Window.Bound{ frame.start, frame.end }) |bound| switch (bound) {
+                            .preceding, .following => |value| try self.constraints.append(self.alloc, .{ .expression = try self.scalarNode(.{ .literal = value }), .expected = .integer }),
+                            else => {},
+                        };
+                    }
+                    const kind = std.meta.stringToEnum(@import("window_binding.zig").Kind, call.name) orelse return error.UndefinedSqlFunction;
+                    switch (kind) {
+                        .row_number, .rank, .dense_rank => break :blk .{ .literal = .{ .integer = 0 } },
+                        .ntile => {
+                            if (call.args.len != 1) return error.InvalidSqlParameters;
+                            if (self.shape_only) try self.constraints.append(self.alloc, .{ .expression = try self.inferenceExpression(call.args[0], columns), .expected = .integer });
+                            break :blk .{ .literal = .{ .integer = 0 } };
+                        },
+                        .percent_rank, .cume_dist => break :blk .{ .literal = .{ .number = 0 } },
+                        .lag, .lead, .first_value, .last_value, .nth_value => {
+                            if (call.args.len == 0) return error.InvalidSqlParameters;
+                            if (self.shape_only and call.args.len > 1) try self.constraints.append(self.alloc, .{ .expression = try self.inferenceExpression(call.args[1], columns), .expected = .integer });
+                            if (call.args.len == 3) {
+                                const args = try self.alloc.alloc(*const ast.Scalar, 2);
+                                args[0] = try self.inferenceExpression(call.args[0], columns);
+                                args[1] = try self.inferenceExpression(call.args[2], columns);
+                                break :blk .{ .call = .{ .name = "coalesce", .args = args } };
+                            }
+                            break :blk (try self.inferenceExpression(call.args[0], columns)).*;
+                        },
+                        else => {},
+                    }
+                }
                 if (@import("aggregate_binding.zig").aggregateKind(call.name)) |kind| {
                     if (self.shape_only) if (call.filter) |filter| try self.constraints.append(self.alloc, .{ .expression = try self.inferenceExpression(filter, columns), .expected = .boolean });
                     if (kind == .count) break :blk .{ .literal = .{ .integer = 0 } };
@@ -344,7 +383,18 @@ const Builder = struct {
             .call => |part| blk: {
                 const args = try self.alloc.alloc(*const ast.Scalar, part.args.len);
                 for (part.args, args) |arg, *out| out.* = try self.expression(columns, arg, aliases);
-                break :blk .{ .call = .{ .name = part.name, .args = args, .star = part.star, .distinct = part.distinct, .filter = if (part.filter) |filter| try self.expression(columns, filter, aliases) else null } };
+                var window = part.window;
+                if (window) |*spec| {
+                    const partitions = try self.alloc.alloc(*const ast.Scalar, spec.partition.len);
+                    for (spec.partition, partitions) |item, *out| out.* = try self.expression(columns, item, &.{});
+                    spec.partition = partitions;
+                    const order = try self.alloc.dupe(ast.Order, spec.order);
+                    for (order) |*item| {
+                        if (item.expression) |expression_| item.expression = try self.expression(columns, expression_, &.{}) else item.field = (try field(columns, item.field)).internal;
+                    }
+                    spec.order = order;
+                }
+                break :blk .{ .call = .{ .name = part.name, .args = args, .star = part.star, .distinct = part.distinct, .filter = if (part.filter) |filter| try self.expression(columns, filter, aliases) else null, .window = window } };
             },
             .case_when => |part| blk: {
                 const branches = try self.alloc.alloc(ast.Scalar.Branch, part.branches.len);
@@ -448,6 +498,11 @@ const Builder = struct {
         return self.node(&.{}, .singleton);
     }
     fn derived(self: *Builder, query: *const ast.Select, alias: []const u8, names: []const []const u8, scope: []const ast.Cte, depth: usize) anyerror!*const Node {
+        if (@import("subquery_lowering.zig").accepts(query.*)) {
+            const rewritten = try self.alloc.create(ast.Select);
+            rewritten.* = try @import("subquery_lowering.zig").lower(self.alloc, query.*);
+            return self.derived(rewritten, alias, names, scope, depth + 1);
+        }
         const prepared: ?Prepared = if (self.prepared.fetchRemove(query)) |entry| entry.value else null;
         const child = if (prepared) |entry| entry.source else try self.querySource(query.*, scope, depth + 1);
         var lowered = if (prepared) |entry| entry.lowered else try self.lower(child, query.*);
@@ -530,7 +585,13 @@ const Builder = struct {
                 try self.scans.append(self.alloc, .{ .table = table, .request = .{ .fields = fields, .limit = 256 } });
                 break :blk try self.node(columns, .{ .scan = .{ .index = index, .source_columns = source_columns } });
             },
-            .derived => |query| self.derived(query.query, query.alias, &.{}, scope, depth + 1),
+            .derived => |query| blk: {
+                const result = try self.derived(query.query, query.alias, &.{}, scope, depth + 1);
+                if (query.hidden) for (@constCast(result.columns)) |*column| {
+                    column.visible = false;
+                };
+                break :blk result;
+            },
             .join => |join| blk: {
                 const left = try self.relation(join.left, scope, depth + 1);
                 const right = try self.relation(join.right, scope, depth + 1);
@@ -607,6 +668,10 @@ fn markExpression(alloc: Allocator, needed: *std.StringHashMapUnmanaged(void), i
         .call => |part| {
             for (part.args) |arg| try markExpression(alloc, needed, arg);
             if (part.filter) |filter| try markExpression(alloc, needed, filter);
+            if (part.window) |spec| {
+                for (spec.partition) |item| try markExpression(alloc, needed, item);
+                for (spec.order) |item| if (item.expression) |expression_| try markExpression(alloc, needed, expression_) else try needed.put(alloc, item.field, {});
+            }
         },
         .case_when => |part| {
             for (part.branches) |branch| {

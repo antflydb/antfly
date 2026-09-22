@@ -113,7 +113,7 @@ fn runBound(alloc: std.mem.Allocator, arena: std.mem.Allocator, backend: catalog
     return context.run(compiled.statement);
 }
 
-const Context = struct {
+pub const Context = struct {
     alloc: std.mem.Allocator,
     arena: std.mem.Allocator,
     backend: catalog.Backend,
@@ -255,6 +255,7 @@ const Context = struct {
 
     pub fn select(self: Context, statement: ast.Select) anyerror!Output {
         if (self.binding.relation != null) return @import("relation_runtime.zig").execute(self);
+        if (self.binding.window != null) return @import("window_runtime.zig").execute(self, statement);
         if (self.binding.aggregate != null) return @import("aggregate_runtime.zig").execute(self, statement);
         const table_def = self.binding.table orelse return self.constantSelect(statement);
         const predicates = try self.conditions(table_def, statement.predicate);
@@ -419,7 +420,7 @@ const Context = struct {
         return .{ .columns = columns, .rows = rows.items, .sql_nulls = null_rows.items, .command_tag = "SELECT" };
     }
 
-    fn projectValues(self: Context, alloc: std.mem.Allocator, row: catalog.Row, fields: []const []const u8, expression_cells: []const Datum) ![]const Datum {
+    pub fn projectValues(self: Context, alloc: std.mem.Allocator, row: catalog.Row, fields: []const []const u8, expression_cells: []const Datum) ![]const Datum {
         const values = try alloc.alloc(Datum, fields.len);
         for (fields, self.binding.columns, values, 0..) |field, column, *out, index| {
             const program = if (index < self.binding.scalars.projections.len) self.binding.scalars.projections[index] else null;
@@ -470,24 +471,21 @@ const Context = struct {
             if (std.mem.eql(u8, name, "_id")) key_index = i;
             for (statement.columns[0..i]) |previous| if (std.mem.eql(u8, previous, name)) return error.DuplicateColumn;
         }
-        // Generated physical identities must have a native primary-key policy.
-        // Until bound, explicit _id is required; never invent unstable hashes.
-        const key_at = key_index orelse return error.SqlRowIdentityRequired;
         const mutations = try self.arena.alloc(catalog.Mutation, statement.rows.len);
         var keys: std.StringHashMapUnmanaged(void) = .empty;
         var retained: usize = 0;
         for (statement.rows, mutations, 0..) |row, *mutation, row_index| {
             try self.checkpoint();
             if (row.len != columns.len) return error.InvalidSqlParameters;
-            const key_datum = try self.insertValue(row[key_at], columns[key_at], row_index, key_at);
+            const key_datum: @import("scalar.zig").Datum = if (key_index) |key_at| try self.insertValue(row[key_at], columns[key_at], row_index, key_at) else .{ .value = .{ .string = try (self.backend.vtable.generate_row_id orelse return error.SqlRowIdentityRequired)(self.backend.ptr, self.arena) }, .sql_null = false };
             const key = key_datum.value;
             if (key_datum.sql_null or key != .string or key.string.len == 0) return error.SqlRowIdentityRequired;
             if (!std.unicode.utf8ValidateSlice(key.string)) return error.SqlTypeMismatch;
-            if ((try keys.getOrPut(self.arena, key.string)).found_existing) return error.DuplicateSqlRow;
+            if ((try keys.getOrPut(self.arena, key.string)).found_existing and (statement.conflict == null or !@import("conflict.zig").primary(statement.conflict.?) or statement.conflict.?.assignments.len != 0)) return error.DuplicateSqlRow;
             var object: std.json.ObjectMap = .empty;
             var json_null_fields: std.ArrayList([]const u8) = .empty;
             for (columns, row, 0..) |column, item, i| {
-                if (i == key_at) continue;
+                if (key_index != null and i == key_index.?) continue;
                 const datum = try self.insertValue(item, column, row_index, i);
                 const typed = datum.value;
                 const json_null = typed == .null and !datum.sql_null;
@@ -501,7 +499,8 @@ const Context = struct {
             mutation.* = .{ .key = key.string, .expected_version = 0, .row = document, .json_null_fields = json_null_fields.items };
         }
         try self.checkpoint();
-        return self.commitMutations(table_def, mutations, "INSERT", statement.returning);
+        const resolved = if (statement.conflict) |clause| try @import("conflict.zig").resolve(self, table_def, clause, self.binding.conflict orelse return error.InvalidSqlBackendResponse, mutations) else mutations;
+        return self.commitMutations(table_def, resolved, "INSERT", statement.returning);
     }
 
     fn insertSelect(self: Context, statement: ast.Insert, source: ast.Select) !Output {
@@ -545,12 +544,14 @@ const Context = struct {
                     try putField(self.arena, &object, target.path, typed);
                 }
             }
-            const identity = key orelse return error.SqlRowIdentityRequired;
-            if ((try keys.getOrPut(self.arena, identity)).found_existing) return error.DuplicateSqlRow;
+            const identity = key orelse try (self.backend.vtable.generate_row_id orelse return error.SqlRowIdentityRequired)(self.backend.ptr, self.arena);
+            if (identity.len == 0 or !std.unicode.utf8ValidateSlice(identity)) return error.InvalidSqlBackendResponse;
+            if ((try keys.getOrPut(self.arena, identity)).found_existing and (statement.conflict == null or !@import("conflict.zig").primary(statement.conflict.?) or statement.conflict.?.assignments.len != 0)) return error.DuplicateSqlRow;
             mutation.* = .{ .key = identity, .expected_version = 0, .row = .{ .object = object }, .json_null_fields = json_null_fields.items };
         }
         try self.checkpoint();
-        return self.commitMutations(table, mutations, "INSERT", statement.returning);
+        const resolved = if (statement.conflict) |clause| try @import("conflict.zig").resolve(self, table, clause, self.binding.conflict orelse return error.InvalidSqlBackendResponse, mutations) else mutations;
+        return self.commitMutations(table, resolved, "INSERT", statement.returning);
     }
 
     fn insertValue(self: Context, literal: ast.Value, column: catalog.Column, row: usize, cell: usize) !@import("scalar.zig").Datum {
@@ -629,9 +630,12 @@ const Context = struct {
             if (page_count > self.limits.scan_pages) return error.SqlProgramLimitExceeded;
             var page_arena = std.heap.ArenaAllocator.init(self.alloc);
             defer page_arena.deinit();
-            const page = try scan_state.page(self, page_arena.allocator(), table_def, .{ .fields = fields.items, .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .after = after, .limit = self.limits.page_rows });
+            const page = try scan_state.page(self, page_arena.allocator(), table_def, .{ .fields = fields.items, .include_primary_digest = true, .include_document = table_def.storage_mode == .document and assignments != null, .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .after = after, .limit = self.limits.page_rows });
             defer page.deinit();
             if (page.rows.len > self.limits.page_rows) return error.InvalidSqlBackendResponse;
+            // Grow once per bounded native page. Arena-backed geometric growth
+            // otherwise retains every superseded per-row staging buffer.
+            try mutations.ensureUnusedCapacity(self.arena, @min(page.rows.len, self.limits.mutation_rows - mutations.items.len));
             for (page.rows) |row| {
                 try self.checkpoint();
                 visited += 1;
@@ -644,7 +648,20 @@ const Context = struct {
                 if (assignments != null) {
                     if (row.value != .object) return error.InvalidSqlBackendResponse;
                     var copy: Json = .{ .object = .empty };
+                    if (table_def.storage_mode == .document) {
+                        const original = row.document orelse return error.InvalidSqlBackendResponse;
+                        if (original != .object or (row.expected_content_digest == null and row.version != 0)) return error.InvalidSqlBackendResponse;
+                        var members = original.object.iterator();
+                        while (members.next()) |member| {
+                            if (replaced.contains(member.key_ptr.*)) continue;
+                            const declared = table_def.column(member.key_ptr.*) catch null;
+                            if (declared) |column| if (column.generated) continue;
+                            try copy.object.put(self.arena, try self.arena.dupe(u8, member.key_ptr.*), try clone(self.arena, member.value_ptr.*));
+                            if (declared) |column| if (column.type == .json and member.value_ptr.* == .null) try json_null_fields.append(self.arena, column.path);
+                        }
+                    }
                     for (table_def.columns) |column| {
+                        if (table_def.storage_mode == .document) continue;
                         if (column.generated or replaced.contains(column.path)) continue;
                         if (row.value.object.get(column.path)) |old| {
                             const cell = try row.cell(column.path);
@@ -669,7 +686,13 @@ const Context = struct {
                 retained = std.math.add(usize, retained, row.id.len + if (document) |doc| jsonSize(doc) else 0) catch return error.SqlProgramLimitExceeded;
                 if (retained > self.limits.retained_bytes) return error.SqlProgramLimitExceeded;
                 const key = try self.arena.dupe(u8, row.id);
-                try mutations.append(self.arena, .{ .key = key, .expected_version = row.version, .row = document, .json_null_fields = json_null_fields.items, .previous = if (assignments == null and returning != null) .{ .id = key, .version = row.version, .value = try clone(self.arena, row.value), .sql_nulls = if (row.sql_nulls) |flags| try self.arena.dupe(bool, flags) else null } else null });
+                if (table_def.storage_mode == .document and row.expected_content_digest == null and row.version != 0) return error.InvalidSqlBackendResponse;
+                const previous = if (assignments == null and returning != null) blk: {
+                    const owned = try self.arena.create(catalog.Row);
+                    owned.* = .{ .id = key, .version = row.version, .value = try clone(self.arena, row.value), .sql_nulls = if (row.sql_nulls) |flags| try self.arena.dupe(bool, flags) else null };
+                    break :blk owned;
+                } else null;
+                try mutations.append(self.arena, .{ .key = key, .expected_version = row.version, .expected_content_digest = row.expected_content_digest, .row = document, .json_null_fields = json_null_fields.items, .previous = previous });
             }
             const next = page.after orelse break;
             if (!scan_state.retained(self)) return error.SqlStatementSnapshotRequired;
@@ -685,14 +708,32 @@ const Context = struct {
         return self.commitMutations(table_def, mutations.items, if (assignments != null) "UPDATE" else "DELETE", returning);
     }
 
-    fn commitMutations(self: Context, table: catalog.Table, input: []const catalog.Mutation, tag: []const u8, returning: ?[]const ast.Projection) !Output {
+    fn commitMutations(self: Context, table: catalog.Table, all: []const catalog.Mutation, tag: []const u8, returning: ?[]const ast.Projection) !Output {
+        var fences: std.ArrayList(catalog.Mutation) = .empty;
+        for (all) |mutation| if (mutation.predicate_only) {
+            try fences.append(self.arena, mutation);
+        };
+        const input: []const catalog.Mutation = if (fences.items.len == 0) all else blk: {
+            const effective = try self.arena.alloc(catalog.Mutation, all.len - fences.items.len);
+            var index: usize = 0;
+            for (all) |mutation| if (!mutation.predicate_only) {
+                effective[index] = mutation;
+                index += 1;
+            };
+            break :blk effective;
+        };
         var output: Output = .{ .command_tag = tag, .rows_affected = input.len };
         var prepared = input;
+        if (table.storage_mode == .document and input.len != 0) {
+            const prepare = self.backend.vtable.prepare_mutations orelse return error.UnsupportedSqlExecution;
+            prepared = try prepare(self.backend.ptr, self.arena, table, input);
+            if (prepared.len != input.len) return error.InvalidSqlBackendResponse;
+        }
         if (returning != null) {
             const projections = self.binding.returning_projections orelse return error.InvalidSqlBackendResponse;
             if (input.len > self.limits.result_rows) return error.SqlResultTooLarge;
             const binding = self.binding.returning orelse return error.InvalidSqlBackendResponse;
-            if (input.len != 0 and !std.mem.eql(u8, tag, "DELETE")) {
+            if (input.len != 0 and table.storage_mode != .document and !std.mem.eql(u8, tag, "DELETE")) {
                 const prepare = self.backend.vtable.prepare_mutations orelse return error.UnsupportedSqlExecution;
                 prepared = try prepare(self.backend.ptr, self.arena, table, input);
                 if (prepared.len != input.len) return error.InvalidSqlBackendResponse;
@@ -718,7 +759,7 @@ const Context = struct {
                         typed_nulls[index] = false;
                     }
                     break :blk catalog.Row{ .id = mutation.key, .version = mutation.expected_version, .value = value_, .sql_nulls = typed_nulls };
-                } else original.previous orelse return error.InvalidSqlBackendResponse;
+                } else (original.previous orelse return error.InvalidSqlBackendResponse).*;
                 const expressions = try binding.scalars.cells(self.arena, row);
                 const projected = try context.projectValues(self.arena, row, fields.items, expressions);
                 const values = try self.arena.alloc(Json, projected.len);
@@ -736,8 +777,18 @@ const Context = struct {
         }
         // Projection, quotas and normalization can fail only BEFORE commit.
         // No post-commit lookup or allocation can replace the known outcome.
+        for (input, prepared) |original, mutation| {
+            if (!std.mem.eql(u8, mutation.key, original.key) or mutation.expected_version != original.expected_version or
+                !std.meta.eql(mutation.expected_content_digest, original.expected_content_digest) or
+                mutation.predicate_only != original.predicate_only or (mutation.row == null) != (original.row == null)) return error.InvalidSqlBackendResponse;
+            if (mutation.conflict_guard != original.conflict_guard) return error.InvalidSqlBackendResponse;
+        }
         try self.checkpoint();
-        output.mutation_outcome = if (prepared.len == 0) .committed else try self.backend.vtable.mutate(self.backend.ptr, self.arena, table, prepared);
+        const committed = if (fences.items.len == 0) prepared else blk: {
+            try fences.appendSlice(self.arena, prepared);
+            break :blk fences.items;
+        };
+        output.mutation_outcome = if (committed.len == 0) .committed else try self.backend.vtable.mutate(self.backend.ptr, self.arena, table, committed);
         return output;
     }
 };
@@ -762,7 +813,7 @@ fn putField(arena: std.mem.Allocator, object: *std.json.ObjectMap, path: []const
     try object.put(arena, path, value);
 }
 
-fn clone(arena: std.mem.Allocator, value: Json) error{ OutOfMemory, SqlProgramLimitExceeded }!Json {
+pub fn clone(arena: std.mem.Allocator, value: Json) error{ OutOfMemory, SqlProgramLimitExceeded }!Json {
     return cloneDepth(arena, value, 0);
 }
 
@@ -1570,6 +1621,7 @@ test "SQL update reads only preserved columns and shares immutable assignments" 
     try std.testing.expectEqual(@as(u64, 64), result.output.rows_affected);
     try std.testing.expectEqual(@as(usize, 1), fixture.reads);
     try std.testing.expectEqual(@as(usize, 1), fixture.writes);
+    std.debug.print("SQL shared UPDATE: peak_bytes={d} mutation_bytes={d} row_bytes={d}\n", .{ result.peakMemoryBytes(), @sizeOf(catalog.Mutation), @sizeOf(catalog.Row) });
     try std.testing.expect(result.peakMemoryBytes() < 128 * 1024);
 }
 

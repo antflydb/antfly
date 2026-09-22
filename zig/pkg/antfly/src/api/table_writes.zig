@@ -6807,6 +6807,7 @@ pub const BoundTableWriteSource = struct {
 
         if (table.relational_index_maintenance) |command| if (command.owner_group_id != (self.owner_group_id orelse return error.UnsupportedOperation)) return error.PreparedGenerationChanged;
         const db = try self.activeDb();
+        if (table.range_guards.len != 0) return error.SqlStatementSnapshotRequired;
         try validateTransactionAgainstLocalSchema(alloc, db, txn_id, table.writes, table.deletes, table.transforms);
         const commit_version = begin_timestamp + 1;
         const local_participant = try distributed_txn.participantIdForGroup(alloc, table.table_name, 0);
@@ -6878,6 +6879,7 @@ pub const BoundTableWriteSource = struct {
             .relational_activation = table.relational_activation,
             .relational_retirement = table.relational_retirement,
             .relational_index_maintenance = table.relational_index_maintenance,
+            .schema_version = table.schema_version,
             .relational_schema_version = table.relational_schema_version,
             .relational_integrity_generation_set = table.relational_integrity_generation_set,
             .restore_staging_scope = table.restore_staging_scope,
@@ -7127,6 +7129,7 @@ pub const BoundTableWriteSource = struct {
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
         try ensurePreDecisionContextActive(context);
         const db = try self.activeDb();
+        if (context.route_fence != null) return error.CatalogRouteFenceUnsupported;
         try validateTransactionAgainstLocalSchema(alloc, db, txn_id, req.writes, req.deletes, req.transforms);
         if (req.relational_index_maintenance) |command| if (command.owner_group_id != (self.owner_group_id orelse return error.UnsupportedOperation)) return error.PreparedGenerationChanged;
         try ensurePreDecisionContextActive(context);
@@ -20937,7 +20940,9 @@ pub const ProvisionedTableWriteSource = struct {
     pub fn source(self: *ProvisionedTableWriteSource) TableWriteSource {
         return .{
             .ptr = self,
+            .supports_sql_range_guards = self.raft_batcher != null,
             .vtable = &.{
+                .activate_range_tracking = activateRangeTracking,
                 .create_table = createTable,
                 .update_schema = updateSchema,
                 .create_index = createIndex,
@@ -22331,6 +22336,25 @@ pub const ProvisionedTableWriteSource = struct {
         return try self.batchWithVisibilityCancellation(alloc, table_name, req, .none);
     }
 
+    fn activateRangeTracking(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, context: @import("operation.zig").RequestContext) !void {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try context.ensureActive();
+        const batcher = self.raft_batcher orelse return error.SqlRangeTrackingRequired;
+        try enforceHAWriteGateOptional(self.ha_write_gate);
+        var routing = (try table_catalog.tableRoutingSnapshotForWrite(alloc, self.catalog, table, self.catalog.deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io }))) orelse return error.TableNotFound;
+        defer routing.deinit(alloc);
+        if (!routing.coversKeyspace() or routing.ranges.len > 256) return error.CatalogGenerationChanged;
+        for (routing.ranges) |range| {
+            try context.ensureActive();
+            const route = routing.resolveRouteForKey(range.start_key) orelse return error.CatalogGenerationChanged;
+            var fence = routing.fenceForRoute(route);
+            fence.admission_deadline_ns = context.deadline_ns;
+            fence.admission_deadline_io = context.deadline_io;
+            fence.admission_cancellation = context.cancellation;
+            try batcher.batchGroupRoutedWithCancellation(alloc, fence, table, .{ .activate_range_tracking = true }, context.cancellation);
+        }
+    }
+
     fn batchWithVisibilityCancellation(
         self: *ProvisionedTableWriteSource,
         alloc: std.mem.Allocator,
@@ -22338,6 +22362,9 @@ pub const ProvisionedTableWriteSource = struct {
         req: db_mod.types.BatchRequest,
         cancellation: db_mod.types.CancellationToken,
     ) !?void {
+        // Capability activation is an explicit owner-routed command, never an
+        // empty ordinary batch whose grouping could silently discard it.
+        if (req.activate_range_tracking) return error.SqlRangeTrackingRequired;
         try @import("../storage/db/online_source_contract.zig").validateRequest(req);
         const control_group: ?u64 = if (req.online_source) |command| command.scope().fence.owner_group_id else if (req.relational_topology) |command| command.fence.owner_group_id else null;
         if (control_group) |group_id| {
@@ -23072,7 +23099,8 @@ pub const ProvisionedTableWriteSource = struct {
         if (tables.len != 1) return null;
 
         const table_req = tables[0];
-        if (table_req.integrity.len != 0 or table_req.integrity_commands.len != 0 or table_req.relational_activation != null or table_req.relational_retirement != null or table_req.relational_index_maintenance != null or table_req.relational_schema_version != null) return null;
+        if (table_req.range_guards.len != 0) return null;
+        if (table_req.integrity.len != 0 or table_req.integrity_commands.len != 0 or table_req.relational_activation != null or table_req.relational_retirement != null or table_req.relational_index_maintenance != null or table_req.relational_schema_version != null or table_req.schema_version != null) return null;
         const has_mutations = table_req.writes.len != 0 or
             table_req.deletes.len != 0 or
             table_req.transforms.len != 0;
@@ -23155,7 +23183,8 @@ pub const ProvisionedTableWriteSource = struct {
         if (tables.len == 0) return .{ .committed = .{ .participant_count = 0 } };
         if (tables.len != 1) return null;
         const table_req = tables[0];
-        if (table_req.predicates.len != 0 or table_req.integrity.len != 0 or table_req.integrity_commands.len != 0 or table_req.relational_activation != null or table_req.relational_retirement != null or table_req.relational_index_maintenance != null or table_req.relational_schema_version != null) return null;
+        if (table_req.range_guards.len != 0) return null;
+        if (table_req.predicates.len != 0 or table_req.integrity.len != 0 or table_req.integrity_commands.len != 0 or table_req.relational_activation != null or table_req.relational_retirement != null or table_req.relational_index_maintenance != null or table_req.relational_schema_version != null or table_req.schema_version != null) return null;
         if (try tableCommitHasGraphProjectionTransform(table_req)) return null;
 
         var routing = (try table_catalog.tableRoutingSnapshotForWrite(
@@ -24078,6 +24107,14 @@ pub const ProvisionedTableWriteSource = struct {
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         try ensurePreDecisionContextActive(context);
+        if (req.range_guards.len != 0 and context.route_fence == null) return error.CatalogRouteFenceRequired;
+        var guarded_admission: ?RoutedWriteAdmission = null;
+        defer if (guarded_admission) |*admission| admission.deinit();
+        if (context.route_fence) |fence| {
+            if (req.restore_staging_scope != null or fence.route.group_id != group_id or fence.topology_epoch != topology_epoch) return error.TopologyChanged;
+            const deadline = self.catalog.deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io }) orelse self.catalog.budget(null).nowNs() +| std.time.ns_per_s * 5;
+            guarded_admission = try self.acquireRoutedWriteAdmission(alloc, table_name, fence, deadline, context.cancellation);
+        }
         try enforceHAWriteGateOptional(self.ha_write_gate);
         self.beginGroupOperation(table_name, group_id);
         defer self.endGroupOperation(table_name, group_id);
@@ -24092,9 +24129,11 @@ pub const ProvisionedTableWriteSource = struct {
                 .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = topology_epoch } },
                 .integrity = req.integrity,
                 .integrity_commands = req.integrity_commands,
+                .range_guards = req.range_guards,
                 .relational_activation = req.relational_activation,
                 .relational_retirement = req.relational_retirement,
                 .relational_index_maintenance = req.relational_index_maintenance,
+                .schema_version = req.schema_version,
                 .relational_schema_version = req.relational_schema_version,
                 .relational_integrity_generation_set = req.relational_integrity_generation_set,
                 .restore_staging_scope = req.restore_staging_scope,
@@ -24114,8 +24153,10 @@ pub const ProvisionedTableWriteSource = struct {
                 .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = topology_epoch } },
                 .integrity = req.integrity,
                 .integrity_commands = req.integrity_commands,
+                .range_guards = req.range_guards,
                 .relational_activation = req.relational_activation,
                 .relational_retirement = req.relational_retirement,
+                .schema_version = req.schema_version,
                 .relational_schema_version = req.relational_schema_version,
                 .relational_index_maintenance = req.relational_index_maintenance,
                 .relational_integrity_generation_set = req.relational_integrity_generation_set,
@@ -26686,6 +26727,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         req: db_mod.types.BatchRequest,
     ) !?void {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (req.activate_range_tracking) return error.SqlRangeTrackingRequired;
         try @import("../storage/db/online_source_contract.zig").validateRequest(req);
         const control_group: ?u64 = if (req.online_source) |command| command.scope().fence.owner_group_id else if (req.relational_topology) |command| command.fence.owner_group_id else null;
         if (control_group) |group_id| {
@@ -27306,6 +27348,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         try ensurePreDecisionContextActive(context);
         if (comptime control_only_storage_sources) {
+            if (context.route_fence != null or req.range_guards.len != 0) return error.CatalogRouteFenceUnsupported;
             if (topology_epoch != 0)
                 try table_catalog.validateTransactionTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
             const local_source = self.groupLocalWriteSource() orelse
@@ -27321,6 +27364,11 @@ pub const HostedProvisionedTableWriteSource = struct {
         // Keep the catalog fence and transaction mutation inside one root
         // writer lease. Split/merge cannot snapshot this root between the
         // epoch check and making the transaction durable.
+        if (req.range_guards.len != 0 and context.route_fence == null) return error.CatalogRouteFenceRequired;
+        if (context.route_fence) |fence| {
+            if (fence.route.group_id != group_id or fence.topology_epoch != topology_epoch) return error.TopologyChanged;
+            try table_catalog.validateCatalogRouteFenceUntil(alloc, self.catalog, table_name, fence, self.catalog.deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io }));
+        }
         if (topology_epoch != 0)
             try table_catalog.validateTransactionTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
         if (!try batchUsesDurableTransactionContract(alloc, cached.db, req))
@@ -27405,9 +27453,11 @@ pub const HostedProvisionedTableWriteSource = struct {
             .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = topology_epoch } },
             .integrity = req.integrity,
             .integrity_commands = req.integrity_commands,
+            .range_guards = req.range_guards,
             .relational_activation = req.relational_activation,
             .relational_retirement = req.relational_retirement,
             .relational_index_maintenance = req.relational_index_maintenance,
+            .schema_version = req.schema_version,
             .relational_schema_version = req.relational_schema_version,
             .relational_integrity_generation_set = req.relational_integrity_generation_set,
             .restore_staging_scope = req.restore_staging_scope,
@@ -28489,6 +28539,7 @@ fn sleepStatelessBatchRetry(source: anytype, attempt: u8) !void {
 
 fn statelessBatchMayRetry(tables: []const distributed_txn.TableCommitRequest) bool {
     for (tables) |table| {
+        if (table.range_guards.len != 0) return false;
         if (table.predicates.len != 0 or table.integrity.len != 0 or table.integrity_commands.len != 0 or table.relational_activation != null or table.relational_retirement != null or table.relational_index_maintenance != null) return false;
     }
     return true;

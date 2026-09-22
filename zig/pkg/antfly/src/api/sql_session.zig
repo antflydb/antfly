@@ -86,6 +86,7 @@ pub const Adapter = struct {
     node_id: u64,
     commit_context: *anyopaque,
     commit_fn: *const fn (*anyopaque, sql.Scope, sql.Id) anyerror!sql.CommitResult,
+    supports_range_guards: bool = false,
 
     pub fn owner(self: *Adapter) sql.Owner {
         return .{ .ptr = self, .vtable = &vtable };
@@ -110,7 +111,7 @@ pub const Adapter = struct {
         const self = cast(ptr);
         // Stronger isolation requires native retained snapshots + range
         // validation, not a label on an ordinary staged transaction.
-        if (options.isolation != .read_committed) return error.UnsupportedSqlExecution;
+        if (options.isolation != .read_committed and !self.supports_range_guards) return error.UnsupportedSqlExecution;
         const info = try self.registry.beginForPrincipal(self.alloc, .{ .sql = .{
             .database = scope.database,
             .namespace = scope.namespace,

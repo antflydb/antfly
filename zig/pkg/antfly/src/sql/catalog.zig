@@ -60,6 +60,9 @@ pub const Condition = struct {
 };
 pub const Scan = struct {
     fields: []const []const u8,
+    /// Mutation-only full document preimage; ordinary reads remain projected.
+    include_document: bool = false,
+    include_primary_digest: bool = false,
     /// Ordered SQL must not be satisfied by an unrelated secondary-key order.
     primary_order: bool = false,
     /// Exact physical identity, not a schema predicate. Point pages exhaust
@@ -73,6 +76,10 @@ pub const Row = struct {
     id: []const u8,
     version: u64,
     value: std.json.Value,
+    /// Digest of the exact primary bytes in this snapshot. Timestamps alone
+    /// are not a version fence when a custom TTL field is unchanged.
+    expected_content_digest: ?[32]u8 = null,
+    document: ?std.json.Value = null,
     /// Authoritative native null flags aligned with value.object insertion
     /// order. Null means a legacy JSON-only backend without that distinction.
     sql_nulls: ?[]const bool = null,
@@ -125,14 +132,21 @@ pub const StatementRead = struct {
     close: *const fn (*anyopaque) void,
 };
 pub const Mutation = struct {
+    /// Owned native authority envelope. The SQL engine carries but never
+    /// interprets native claim keys, generation fences or commands.
+    conflict_guard: ?*const anyopaque = null,
+    /// Read-set fence only; never a delete, write or affected result row.
+    predicate_only: bool = false,
     key: []const u8,
     expected_version: u64,
+    expected_content_digest: ?[32]u8 = null,
     row: ?std.json.Value,
     json_null_fields: []const []const u8 = &.{},
     /// Owned preimage retained only for DELETE RETURNING. The observed version
     /// predicate makes it authoritative only after a successful commit.
-    previous: ?Row = null,
+    previous: ?*const Row = null,
 };
+pub const ConflictOwner = struct { key: ?[]const u8, identity: ?[]const u8, guard: ?*const anyopaque };
 pub const MutationOutcome = enum {
     committed,
     committed_pending,
@@ -163,8 +177,14 @@ pub const Backend = struct {
     /// Only set when every page belongs to the same retained statement read
     /// view. Catalog revisions and per-page read_index are not such a view.
     pinned_statement_snapshot: bool = false,
+    /// mutate retains predicate-only entries in the same atomic commit.
+    predicate_only_mutations: bool = false,
 
     pub const VTable = struct {
+        /// Native opaque identity, generated once before mutation admission.
+        /// Providers without this capability require an explicit _id.
+        generate_row_id: ?*const fn (*anyopaque, std.mem.Allocator) anyerror![]const u8 = null,
+        resolve_conflict_owners: ?*const fn (*anyopaque, std.mem.Allocator, Table, []const []const u8, []const Mutation) anyerror![]const ConflictOwner = null,
         // All returned data belongs to the supplied allocator. Scans receive
         // a short-lived page arena, not the retained statement result arena.
         resolve: *const fn (*anyopaque, std.mem.Allocator, ast.Name, Action) anyerror!Table,

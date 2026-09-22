@@ -45,7 +45,44 @@ pub const TxnBeginRequest = struct {
     restore_staging_plan_id: ?[16]u8 = null,
 };
 
+test "distributed txn range guard wire preserves absent and exact counters" {
+    const Harness = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            const proofs = [_]@import("../storage/range_protection.zig").Proof{ .{ .bucket = 0, .generation = null }, .{ .bucket = 256, .generation = 9007199254740993 } };
+            const request: TxnPrepareRequest = .{ .txn_id = @splat(1), .topology_epoch = 3, .route_fence = .{ .metadata_group_id = 1, .metadata_incarnation = @splat('1'), .catalog_revision = 2, .table_id = 7, .topology_epoch = 3, .route = .{ .group_id = 9, .range_id = 10, .identity_namespace = .{ .table_id = 7, .shard_id = 9, .range_id = 10 } } }, .req = .{ .range_guards = &proofs } };
+            const bytes = try encodeTxnPrepareRequest(alloc, request);
+            defer alloc.free(bytes);
+            var parsed = try parseTxnPrepareRequest(alloc, bytes);
+            defer freeTxnPrepareRequest(alloc, &parsed);
+            try std.testing.expectEqualDeep(&proofs, parsed.req.range_guards);
+            try std.testing.expectEqualDeep(request.route_fence, parsed.route_fence);
+            const prefix = "[\"range-prepare-v1\",";
+            try std.testing.expect(std.mem.startsWith(u8, bytes, prefix));
+            // Legacy readers reject the outer array; upgraded readers also
+            // reject stripping its version marker while retaining guards.
+            if (parseTxnPrepareRequest(alloc, bytes[prefix.len .. bytes.len - 1])) |value| {
+                var unexpected = value;
+                freeTxnPrepareRequest(alloc, &unexpected);
+                return error.TestExpectedError;
+            } else |err| if (err != error.InvalidTxnRequest) return err;
+            const batch_bytes = try @import("batch.zig").encodeBatchRequest(alloc, .{ .transaction = .{ .prepare = .{ .txn_id = @splat(1), .topology_epoch = 3 } }, .range_guards = &proofs });
+            defer alloc.free(batch_bytes);
+            var batch = try @import("batch.zig").parseInternalBatchRequest(alloc, batch_bytes);
+            defer batch.deinit(alloc);
+            try std.testing.expectEqualDeep(&proofs, batch.req.range_guards);
+            if (@import("batch.zig").parseBatchRequest(alloc, batch_bytes)) |value| {
+                var unexpected = value;
+                unexpected.deinit(alloc);
+                return error.TestExpectedError;
+            } else |err| if (err != error.InvalidBatchRequest) return err;
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}
+
 pub const TxnPrepareRequest = struct {
+    route_fence: ?@import("../metadata/api.zig").CatalogRouteFence = null,
+    range_guards_owner: ?std.json.Parsed([]const @import("../storage/range_protection.zig").Proof) = null,
     txn_id: db_mod.types.TxnId,
     topology_epoch: u64 = 0,
     req: db_mod.types.TransactionIntentRequest,
@@ -430,7 +467,9 @@ pub const HostedParticipantWorker = struct {
         };
         switch (route) {
             .local => {
-                const result = self.writes.txnPrepareGroupLocalWithPreDecisionContext(alloc, group_id, table_name, req.txn_id, req.topology_epoch, req.req, try self.localPreDecisionContext(deadline_ns)) catch |err| {
+                var context = try self.localPreDecisionContext(deadline_ns);
+                context.route_fence = req.route_fence;
+                const result = self.writes.txnPrepareGroupLocalWithPreDecisionContext(alloc, group_id, table_name, req.txn_id, req.topology_epoch, req.req, context) catch |err| {
                     if (!isLocalPreDecisionCandidateMiss(err, self.writes.vtable.txn_prepare_group_local_with_pre_decision_context != null)) return err;
                     return try self.prepareGroupFromCandidates(alloc, group_id, table_name, req, attempted_node_id, null, deadline_ns);
                 };
@@ -614,7 +653,9 @@ pub const HostedParticipantWorker = struct {
         try ensurePreDecisionDeadline(deadline_ns, self.executor.monotonicNs());
         if (node_id == self.router.localNodeId()) {
             if (self.router.localStatus(group_id) != .active) return false;
-            const result = self.writes.txnPrepareGroupLocalWithPreDecisionContext(alloc, group_id, table_name, req.txn_id, req.topology_epoch, req.req, try self.localPreDecisionContext(deadline_ns)) catch |err| {
+            var context = try self.localPreDecisionContext(deadline_ns);
+            context.route_fence = req.route_fence;
+            const result = self.writes.txnPrepareGroupLocalWithPreDecisionContext(alloc, group_id, table_name, req.txn_id, req.topology_epoch, req.req, context) catch |err| {
                 if (isLocalPreDecisionCandidateMiss(err, self.writes.vtable.txn_prepare_group_local_with_pre_decision_context != null)) return false;
                 return err;
             };
@@ -1059,6 +1100,7 @@ pub fn executeCrossGroup(
     req: db_mod.types.TransactionIntentRequest,
     trace_writer: ?tracing.AntflyTraceWriter,
 ) !ExecuteResult {
+    if (req.range_guards.len != 0) return error.InvalidTxnRequest;
     const tables = [_]TableCommitRequest{.{
         .table_name = table_name,
         .writes = req.writes,
@@ -1070,6 +1112,7 @@ pub fn executeCrossGroup(
         .relational_activation = req.relational_activation,
         .relational_retirement = req.relational_retirement,
         .relational_index_maintenance = req.relational_index_maintenance,
+        .schema_version = req.schema_version,
         .relational_schema_version = req.relational_schema_version,
         .relational_integrity_generation_set = req.relational_integrity_generation_set,
         .restore_staging_scope = req.restore_staging_scope,
@@ -1156,6 +1199,26 @@ fn executeMultiTableCommitOnce(
         defer routing.deinit(alloc);
         const topology_epoch = routing.topology_epoch;
 
+        try @import("range_read_guards.zig").validate(table.range_guards);
+        for (table.range_guards) |owner| {
+            const fence = owner.fence;
+            if (routing.snapshot.status.metadata_group_id != fence.metadata_group_id or
+                !std.meta.eql(routing.snapshot.status.metadata_incarnation, fence.metadata_incarnation) or topology_epoch != fence.topology_epoch)
+                return error.TopologyChanged;
+            const range = for (routing.ranges) |candidate| {
+                if (candidate.group_id == fence.route.group_id) break candidate;
+            } else return error.TopologyChanged;
+            const manager = @import("../metadata/table_manager.zig");
+            if (range.table_id != fence.table_id or
+                manager.rangeDocIdentityRangeId(range.*) != fence.route.range_id or
+                fence.route.identity_namespace.table_id != range.table_id or
+                fence.route.identity_namespace.shard_id != manager.rangeDocIdentityShardId(range.*) or
+                fence.route.identity_namespace.range_id != manager.rangeDocIdentityRangeId(range.*)) return error.TopologyChanged;
+            const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, fence.route.group_id, topology_epoch);
+            participant.route_fence = fence;
+            for (owner.proofs) |proof| try participant.range_guards.append(alloc, .{ .bucket = proof.bucket, .generation = proof.generation });
+        }
+
         for (table.writes) |write| {
             const group_id = routing.resolveGroupForKey(write.key) orelse return error.UnknownGroup;
             const participant = try ensureParticipantTxn(alloc, &participants, table.table_name, group_id, topology_epoch);
@@ -1212,6 +1275,9 @@ fn executeMultiTableCommitOnce(
                     if (existing != requested) return error.InvalidTxnRequest;
                 }
             } else participant.relational_schema_version = table.relational_schema_version;
+            if (participant.schema_version) |existing| {
+                if (table.schema_version) |requested| if (existing != requested) return error.CatalogGenerationChanged;
+            } else participant.schema_version = table.schema_version;
             if (participant.relational_integrity_generation_set) |existing| {
                 const requested = table.relational_integrity_generation_set orelse return error.PreparedGenerationChanged;
                 if (!std.mem.eql(u8, &existing, &requested)) return error.PreparedGenerationChanged;
@@ -1746,6 +1812,9 @@ fn resolveCoordinatorDecisionAfterFailureUntil(
 }
 
 const ParticipantTxn = struct {
+    route_fence: ?@import("../metadata/api.zig").CatalogRouteFence = null,
+    range_guards: std.ArrayListUnmanaged(@import("../storage/range_protection.zig").Proof) = .empty,
+    schema_version: ?u32 = null,
     table_name: []const u8,
     group_id: u64,
     topology_epoch: u64,
@@ -1769,6 +1838,7 @@ const ParticipantTxn = struct {
     }
 
     fn deinit(self: *ParticipantTxn, alloc: std.mem.Allocator) void {
+        self.range_guards.deinit(alloc);
         self.writes.deinit(alloc);
         self.deletes.deinit(alloc);
         self.transforms.deinit(alloc);
@@ -1871,6 +1941,7 @@ const PrepareFanoutTask = struct {
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
         worker.prepareGroup(arena.allocator(), participant.group_id, participant.table_name, .{
+            .route_fence = participant.route_fence,
             .txn_id = txn_id,
             .topology_epoch = participant.topology_epoch,
             .req = .{
@@ -1880,10 +1951,12 @@ const PrepareFanoutTask = struct {
                 .predicates = participant.predicates.items,
                 .integrity = participant.integrity.items,
                 .integrity_commands = participant.integrity_commands.items,
+                .range_guards = participant.range_guards.items,
                 .relational_activation = participant.relational_activation,
                 .relational_retirement = participant.relational_retirement,
                 .relational_index_maintenance = participant.relational_index_maintenance,
                 .relational_schema_version = participant.relational_schema_version,
+                .schema_version = participant.schema_version,
                 .relational_integrity_generation_set = participant.relational_integrity_generation_set,
                 .restore_staging_scope = participant.restore_staging_scope,
                 .restore_staging_plan_id = participant.restore_staging_plan_id,
@@ -2208,12 +2281,20 @@ pub fn encodeTxnPrepareRequest(alloc: std.mem.Allocator, req: TxnPrepareRequest)
     const txn_hex = encodeTxnIdHex(req.txn_id);
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
+    const guarded = req.req.range_guards.len != 0;
+    if (guarded) try out.appendSlice(alloc, "[\"range-prepare-v1\",");
     try out.appendSlice(alloc, "{\"txn_id\":\"");
     try out.appendSlice(alloc, &txn_hex);
     try out.appendSlice(alloc, "\",\"topology_epoch\":");
     const epoch = try std.fmt.allocPrint(alloc, "{d}", .{req.topology_epoch});
     defer alloc.free(epoch);
     try out.appendSlice(alloc, epoch);
+    if (req.route_fence) |fence| {
+        const bytes = try std.json.Stringify.valueAlloc(alloc, fence, .{});
+        defer alloc.free(bytes);
+        try out.appendSlice(alloc, ",\"route_fence\":");
+        try out.appendSlice(alloc, bytes);
+    }
     try out.appendSlice(alloc, ",\"writes\":[");
     for (req.req.writes, 0..) |write, i| {
         if (i > 0) try out.append(alloc, ',');
@@ -2276,6 +2357,10 @@ pub fn encodeTxnPrepareRequest(alloc: std.mem.Allocator, req: TxnPrepareRequest)
     try integrity_wire.append(alloc, &out, req.req.integrity);
     try out.appendSlice(alloc, ",\"integrity_commands\":");
     try integrity_wire.appendCommands(alloc, &out, req.req.integrity_commands);
+    try out.appendSlice(alloc, ",\"range_guards\":");
+    const range_json = try std.json.Stringify.valueAlloc(alloc, req.req.range_guards, .{});
+    defer alloc.free(range_json);
+    try out.appendSlice(alloc, range_json);
     if (req.req.relational_activation) |activation| {
         const encoded = try std.json.Stringify.valueAlloc(alloc, activation, .{});
         defer alloc.free(encoded);
@@ -2299,6 +2384,7 @@ pub fn encodeTxnPrepareRequest(alloc: std.mem.Allocator, req: TxnPrepareRequest)
         defer alloc.free(field);
         try out.appendSlice(alloc, field);
     }
+    if (req.req.schema_version) |version| try out.print(alloc, ",\"schema_version\":{d}", .{version});
     if (req.req.relational_repair) try out.appendSlice(alloc, ",\"relational_repair\":true");
     try appendRestorePlan(alloc, &out, req.req.restore_staging_plan_id);
     if (req.req.restore_staging_scope) |scope| {
@@ -2314,6 +2400,7 @@ pub fn encodeTxnPrepareRequest(alloc: std.mem.Allocator, req: TxnPrepareRequest)
         try out.appendSlice(alloc, encoded);
     }
     try out.append(alloc, '}');
+    if (guarded) try out.append(alloc, ']');
     return try out.toOwnedSlice(alloc);
 }
 
@@ -2470,7 +2557,13 @@ pub fn freeTxnBeginRequest(alloc: std.mem.Allocator, req: *TxnBeginRequest) void
 pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPrepareRequest {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{ .parse_numbers = false });
     defer parsed.deinit();
-    const obj = switch (parsed.value) {
+    const guarded = parsed.value == .array;
+    const root = if (guarded) blk: {
+        const entries = parsed.value.array.items;
+        if (entries.len != 2 or entries[0] != .string or !std.mem.eql(u8, entries[0].string, "range-prepare-v1")) return error.InvalidTxnRequest;
+        break :blk entries[1];
+    } else parsed.value;
+    const obj = switch (root) {
         .object => |obj| obj,
         else => return error.InvalidTxnRequest,
     };
@@ -2487,6 +2580,9 @@ pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPr
     errdefer integrity_wire.free(alloc, integrity);
     var integrity_commands_owner = if (obj.get("integrity_commands")) |value| try integrity_wire.parseCommands(alloc, value) else null;
     errdefer if (integrity_commands_owner) |*owner| owner.deinit();
+    var range_guards_owner = if (obj.get("range_guards")) |value| try std.json.parseFromValue([]const @import("../storage/range_protection.zig").Proof, alloc, value, .{ .allocate = .alloc_always }) else null;
+    errdefer if (range_guards_owner) |*owner| owner.deinit();
+    if (range_guards_owner) |owner| if (owner.value.len > 257) return error.InvalidTxnRequest;
     var relational_activation_owner = if (obj.get("relational_activation")) |value| try std.json.parseFromValue(integrity_activation.Command, alloc, value, .{ .allocate = .alloc_always }) else null;
     errdefer if (relational_activation_owner) |*owner| owner.deinit();
     var relational_retirement_owner = if (obj.get("relational_retirement")) |value| try std.json.parseFromValue(integrity_retirement.Command, alloc, value, .{ .allocate = .alloc_always }) else null;
@@ -2498,13 +2594,22 @@ pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPr
         if (version > std.math.maxInt(u32)) return error.InvalidTxnRequest;
         break :blk @intCast(version);
     } else null;
+    const schema_version: ?u32 = if (obj.get("schema_version")) |_| blk: {
+        const version = try optionalU64(obj, "schema_version");
+        break :blk std.math.cast(u32, version) orelse return error.InvalidTxnRequest;
+    } else null;
     const generation_set: ?[32]u8 = if (obj.get("relational_integrity_generation_set")) |value| try integrity_wire.parseGenerationSet(value) else null;
     const restore_staging_scope: ?[32]u8 = if (obj.get("restore_staging_scope")) |value| try integrity_wire.parseGenerationSet(value) else null;
     const relational_repair = if (obj.get("relational_repair")) |value| switch (value) {
         .bool => |flag| flag,
         else => return error.InvalidTxnRequest,
     } else false;
+    var route_fence = if (obj.get("route_fence")) |value| try std.json.parseFromValue(@import("../metadata/api.zig").CatalogRouteFence, alloc, value, .{}) else null;
+    defer if (route_fence) |*fence| fence.deinit();
+    if (range_guards_owner != null and range_guards_owner.?.value.len != 0 and route_fence == null) return error.InvalidTxnRequest;
+    if (guarded != (range_guards_owner != null and range_guards_owner.?.value.len != 0)) return error.InvalidTxnRequest;
     return .{
+        .route_fence = if (route_fence) |fence| fence.value else null,
         .txn_id = txn_id,
         .topology_epoch = try optionalU64(obj, "topology_epoch"),
         .req = .{
@@ -2514,16 +2619,19 @@ pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPr
             .predicates = predicates,
             .integrity = integrity,
             .integrity_commands = if (integrity_commands_owner) |owner| owner.value else &.{},
+            .range_guards = if (range_guards_owner) |owner| owner.value else &.{},
             .relational_activation = if (relational_activation_owner) |owner| owner.value else null,
             .relational_retirement = if (relational_retirement_owner) |owner| owner.value else null,
             .relational_index_maintenance = if (relational_index_maintenance_owner) |owner| owner.value else null,
             .relational_schema_version = relational_schema_version,
+            .schema_version = schema_version,
             .relational_integrity_generation_set = generation_set,
             .restore_staging_scope = restore_staging_scope,
             .restore_staging_plan_id = try parseRestorePlan(obj, restore_staging_scope),
             .relational_repair = relational_repair,
         },
         .integrity_commands_owner = integrity_commands_owner,
+        .range_guards_owner = range_guards_owner,
         .relational_activation_owner = relational_activation_owner,
         .relational_retirement_owner = relational_retirement_owner,
         .relational_index_maintenance_owner = relational_index_maintenance_owner,
@@ -2531,6 +2639,7 @@ pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPr
 }
 
 pub fn freeTxnPrepareRequest(alloc: std.mem.Allocator, req: *TxnPrepareRequest) void {
+    if (req.range_guards_owner) |*owner| owner.deinit();
     freeTxnWrites(alloc, req.req.writes);
     freeTxnDeletes(alloc, req.req.deletes);
     freeTxnTransforms(alloc, req.req.transforms);
@@ -2559,6 +2668,18 @@ test "distributed txn prepare preserves exact numeric row and transform payloads
     try std.testing.expectEqualStrings("9007199254740993.0", parsed.req.transforms[0].operations[0].value_json.?);
     try std.testing.expectEqual(request.topology_epoch, parsed.topology_epoch);
     try std.testing.expectEqual(request.req.relational_integrity_generation_set, parsed.req.relational_integrity_generation_set);
+}
+
+test "SQL document schema epoch survives distributed prepare transport" {
+    const alloc = std.testing.allocator;
+    for ([_]u32{ 0, 9, std.math.maxInt(u32) }) |version| {
+        const encoded = try encodeTxnPrepareRequest(alloc, .{ .txn_id = @splat(1), .req = .{ .schema_version = version, .deletes = &.{"row"} } });
+        defer alloc.free(encoded);
+        var parsed = try parseTxnPrepareRequest(alloc, encoded);
+        defer freeTxnPrepareRequest(alloc, &parsed);
+        try std.testing.expectEqual(@as(?u32, version), parsed.req.schema_version);
+        try std.testing.expect(parsed.req.relational_schema_version == null);
+    }
 }
 
 test "distributed txn index maintenance prepare roundtrips owned exact observation" {
@@ -4916,7 +5037,7 @@ fn consumerTests() type {
                     const raft_reconciler = @import("../raft/reconciler.zig");
                     const metadata_transition_state = @import("../metadata/transition_state.zig");
                     return .{
-                        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                        .status = .{ .metadata_group_id = 1, .metadata_incarnation = @splat('1'), .metrics = .{} },
                         .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{ .table_id = 7, .name = "docs", .placement_role = "data" }})[0..]),
                         .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
                             .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = "doc:m" },
@@ -4939,6 +5060,7 @@ fn consumerTests() type {
                 integrity_prepares: usize = 0,
                 semantic_prepares: usize = 0,
                 activation_prepares: usize = 0,
+                range_prepares: usize = 0,
                 coordinator_group: u64 = 7001,
                 resolves: std.ArrayListUnmanaged(struct {
                     group_id: u64,
@@ -4975,7 +5097,12 @@ fn consumerTests() type {
 
                 fn prepare(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, _: []const u8, req: TxnPrepareRequest) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
-                    try std.testing.expect(req.req.writes.len + req.req.deletes.len + req.req.predicates.len + req.req.integrity.len > 0);
+                    try std.testing.expect(req.req.writes.len + req.req.deletes.len + req.req.predicates.len + req.req.integrity.len + req.req.range_guards.len > 0);
+                    if (req.req.range_guards.len != 0) {
+                        try std.testing.expectEqual(@as(u64, 7002), group_id);
+                        try std.testing.expectEqual(@as(?u64, 9007199254740993), req.req.range_guards[0].generation);
+                        self.range_prepares += 1;
+                    }
                     if (req.req.integrity.len != 0) {
                         // Physical metadata keys sort on the first range, but their
                         // explicit claim routing key must choose the second owner.
@@ -5138,6 +5265,23 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(usize, 1), recorder.integrity_prepares);
             try std.testing.expectEqual(@as(usize, 1), recorder.semantic_prepares);
             try std.testing.expectEqual(@as(usize, 1), recorder.activation_prepares);
+            var routing = (try table_catalog.transactionRoutingSnapshot(std.testing.allocator, FakeCatalog.iface(), "docs")).?;
+            defer routing.deinit(std.testing.allocator);
+            const manager = @import("../metadata/table_manager.zig");
+            const owner = routing.ranges[1].*;
+            var observation: @import("range_read_guards.zig").OwnerRangeProof = .{
+                .fence = .{ .metadata_group_id = 1, .metadata_incarnation = @splat('1'), .catalog_revision = 9, .table_id = 7, .topology_epoch = routing.topology_epoch, .route = .{ .group_id = 7002, .range_id = manager.rangeDocIdentityRangeId(owner), .identity_namespace = .{ .table_id = 7, .shard_id = manager.rangeDocIdentityShardId(owner), .range_id = manager.rangeDocIdentityRangeId(owner) } } },
+                .proofs = &.{.{ .bucket = 100, .generation = 9007199254740993 }},
+            };
+            recorder.coordinator_group = 7002;
+            const guarded = try executeMultiTableCommit(std.testing.allocator, FakeCatalog.iface(), recorder.worker(), try parseTxnIdHex("40112233445566778899aabbccddeeff"), 50_000, 50_001, &.{.{ .table_name = "docs", .writes = &.{.{ .key = "doc:a", .value = "{}" }}, .range_guards = (&observation)[0..1] }}, .write, null);
+            try std.testing.expect(guarded == .committed);
+            try std.testing.expectEqual(@as(usize, 2), guarded.committed.participant_count);
+            try std.testing.expectEqual(@as(usize, 1), recorder.range_prepares);
+            const prior_begins = recorder.begins.items.len;
+            observation.fence.metadata_incarnation = @splat('2');
+            try std.testing.expectError(error.TopologyChanged, executeMultiTableCommit(std.testing.allocator, FakeCatalog.iface(), recorder.worker(), try parseTxnIdHex("50112233445566778899aabbccddeeff"), 60_000, 60_001, &.{.{ .table_name = "docs", .range_guards = (&observation)[0..1] }}, .write, null));
+            try std.testing.expectEqual(prior_begins, recorder.begins.items.len);
         }
 
         test "stable distributed transaction retry resumes a durable commit decision" {

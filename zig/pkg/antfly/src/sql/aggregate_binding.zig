@@ -28,7 +28,7 @@ pub fn aggregateKind(name: []const u8) ?operators.Aggregate.Kind {
     inline for (std.meta.fields(operators.Aggregate.Kind)) |field| if (std.mem.eql(u8, name, field.name)) return @enumFromInt(field.value);
     return null;
 }
-fn contains(node: *const ast.Scalar) bool {
+pub fn contains(node: *const ast.Scalar) bool {
     return switch (node.*) {
         .call => |call| blk: {
             if (aggregateKind(call.name) != null) break :blk true;
@@ -58,7 +58,7 @@ pub fn accepts(statement: ast.Select) bool {
     return false;
 }
 
-fn same(a: *const ast.Scalar, b: *const ast.Scalar) bool {
+pub fn same(a: *const ast.Scalar, b: *const ast.Scalar) bool {
     if (std.meta.activeTag(a.*) != std.meta.activeTag(b.*)) return false;
     return switch (a.*) {
         .column => |name| std.mem.eql(u8, name, b.column),
@@ -71,6 +71,9 @@ fn same(a: *const ast.Scalar, b: *const ast.Scalar) bool {
         .cast => |cast| cast.type == b.cast.type and same(cast.operand, b.cast.operand),
         .call => |call| blk: {
             if (!std.mem.eql(u8, call.name, b.call.name) or call.star != b.call.star or call.distinct != b.call.distinct or (call.filter == null) != (b.call.filter == null) or call.args.len != b.call.args.len) break :blk false;
+            // Query and window domains cannot lose their metadata through
+            // ordinary aggregate-expression deduplication.
+            if (call.subquery != null or b.call.subquery != null or call.window != null or b.call.window != null) break :blk a == b;
             if (call.filter) |filter| if (!same(filter, b.call.filter.?)) break :blk false;
             for (call.args, b.call.args) |left, right| if (!same(left, right)) break :blk false;
             break :blk true;
