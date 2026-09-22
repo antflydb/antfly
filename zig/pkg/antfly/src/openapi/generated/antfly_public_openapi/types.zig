@@ -9961,6 +9961,7 @@ pub const RestoreJob = struct {
     total_table_count: ?i64 = null,
     /// Bounded terminal result. A committed result with durability pending means publication is visible but parent-directory durability was not confirmed. Cluster restores report aggregate triggered, committed, durability-pending, skipped, and failed table counts plus a bounded sample of failure details. `failure_details_truncated` indicates that additional failures or part of a long failure detail were omitted. Any failed or durability-pending table makes the job phase `failed`; inspect this result for partial progress and use a new idempotency key when retrying a changed request.
     result: ?std.json.Value = null,
+    /// Most recent retry or terminal failure reason. Retained while queued or running, including across progress checkpoints and recovery; omitted after successful completion.
     @"error": ?[]const u8 = null,
     created_at_ms: i64,
     updated_at_ms: i64,

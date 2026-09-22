@@ -133,6 +133,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         lmdb_engine_wasm_mod,
         json_mod,
         api.public,
+        api.schema,
         api.query,
         api.indexes,
         api.sort,

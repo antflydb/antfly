@@ -14,8 +14,8 @@
 
 from __future__ import annotations
 
-import os
 import json
+import os
 import signal
 import subprocess
 import tempfile
@@ -25,7 +25,6 @@ from typing import Any
 
 import pytest
 import requests
-
 from conftest import (
     DEFAULT_ANTFLY_BIN,
     REPO_ROOT,
@@ -209,7 +208,16 @@ class _ExtensionProcess:
             f"[data]\n{_read_log_tail(self.data_log_path)}"
         )
 
-    def stop(self) -> None:
+    def stop(self, *, test_failed: bool = False) -> None:
+        if test_failed:
+            for name, proc in (
+                ("standalone", self.standalone_proc),
+                ("metadata", self.metadata_proc),
+                ("data", self.data_proc),
+            ):
+                if proc is not None:
+                    print(f"extension {name} process exit={proc.poll()}")
+            print(self.debug_logs())
         self.port_reservations.close()
         for proc in (self.data_proc, self.metadata_proc, self.standalone_proc):
             if proc is not None and proc.poll() is None:
@@ -229,7 +237,7 @@ class _ExtensionProcess:
         ):
             if not handle.closed:
                 handle.close()
-        if not maybe_preserve_tempdir(self.tempdir):
+        if not maybe_preserve_tempdir(self.tempdir, failed=test_failed):
             self.tempdir.cleanup()
 
 
@@ -249,7 +257,8 @@ def extension_server(request) -> _ExtensionProcess:
     try:
         yield server
     finally:
-        server.stop()
+        report = getattr(request.node, "rep_call", None)
+        server.stop(test_failed=report is not None and report.failed)
 
 
 def _check_response(response: requests.Response) -> Any:
@@ -528,7 +537,7 @@ def _assert_extension_package_routes(extension_server: _ExtensionProcess) -> Non
             timeout=10,
         )
     )
-    assert store["result"]["isError"] is False
+    assert store["result"]["isError"] is False, store
     assert store["result"]["structuredContent"]["ok"] is True
     assert store["result"]["structuredContent"]["tool"] == "store_memory"
     assert store["result"]["structuredContent"]["status"] == "stored"
