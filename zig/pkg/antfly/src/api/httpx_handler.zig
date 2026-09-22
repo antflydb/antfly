@@ -20,6 +20,12 @@
 /// a typed operation, and adapts its owned result to an httpx.Response.
 const std = @import("std");
 const ant_json = @import("antfly-json");
+const sql_execution = @import("sql_execution.zig");
+const sql_compiler = @import("../sql/compiler.zig");
+const sql_runtime = @import("../sql/runtime.zig");
+const sql_plan_cache = @import("../sql/plan_cache.zig");
+const SQLMemoryBudget = @import("../sql/memory_budget.zig");
+const sql_wire = @import("antfly_metadata_openapi").types;
 const httpx = @import("httpx");
 const system_catalog = @import("../system_catalog/domain.zig");
 const system_catalog_routes = @import("../system_catalog/routes.zig");
@@ -4944,6 +4950,221 @@ pub const AntflyApiHandler = struct {
         return respondOwnedApiResponse(ctx, &resp);
     }
 
+    const SQLJob = struct {
+        adapter: sql_execution.Adapter,
+        statement: []const u8,
+        principal: []const u8,
+        database: []const u8,
+        namespace: []const u8,
+        parameters: []const std.json.Value,
+        limit: usize,
+        completion_io: std.Io,
+        cache_io: std.Io,
+        cache: *sql_plan_cache.Cache,
+        done: std.Io.Event = .unset,
+        result: ?sql_runtime.Result = null,
+        failure: ?anyerror = null,
+        diagnostic: sql_compiler.Diagnostic = .{},
+        diagnostic_message_buffer: [256]u8 = undefined,
+        compile_diagnostic_valid: bool = false,
+        execution_entered: bool = false,
+        is_write: bool = false,
+        preparation: *RequestAdmission.Lease,
+
+        fn run(self: *@This()) void {
+            // Wake on the executor that owns the request waiter, not the
+            // backend executor running this worker.
+            defer self.done.set(self.completion_io);
+            defer self.preparation.release();
+            var lease = self.cache.acquire(self.cache_io, .{
+                .statement = self.statement,
+                .principal = self.principal,
+                .database = self.database,
+                .namespace = self.namespace,
+            }, &self.diagnostic) catch |err| {
+                self.compile_diagnostic_valid = err != error.SqlPlanCacheBusy and err != error.InvalidSqlPlanCacheConfig;
+                self.failure = err;
+                return;
+            };
+            defer lease.release(self.cache_io);
+            const compiled = lease.compiled();
+            self.is_write = switch (compiled.statement) {
+                .select => false,
+                .insert, .update, .delete, .create_table, .drop_table, .catalog_ddl, .begin, .commit, .rollback, .savepoint, .rollback_to_savepoint, .release_savepoint => true,
+            };
+            var execution = self.adapter.server.acquireSqlExecution(self.is_write) catch |err| {
+                self.failure = err;
+                return;
+            };
+            defer execution.release();
+            self.preparation.release();
+            self.execution_entered = true;
+            self.result = self.adapter.execute(std.heap.page_allocator, compiled, self.parameters, .{ .result_rows = self.limit, .page_rows = 4096 }, null) catch |err| {
+                self.failure = err;
+                return;
+            };
+        }
+    };
+
+    fn sqlOverloadedResponse(ctx: *httpx.Context) !httpx.Response {
+        try ctx.setHeader("Retry-After", "1");
+        if (ctx.h1_sock != null) try ctx.setHeader("Connection", "close");
+        return ctx.status(503).json(sql_wire.SQLDiagnostic{
+            .code = "53300",
+            .message = "SQL preparation capacity is temporarily exhausted; retry after a bounded delay.",
+            .retryable = true,
+        });
+    }
+
+    pub fn executeSQL(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*value| value.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &identity)) |response| return response;
+        const body = body: {
+            const streaming = ctx.hasStreamingRequestBody();
+            if (streaming and !self.query_body_admission.tryAcquire()) return sqlOverloadedResponse(ctx);
+            defer if (streaming) self.query_body_admission.release();
+            break :body (try ctx.body()) orelse return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "missing SQL request body" });
+        };
+        if (body.len > @import("http_routes.zig").sql_max_request_body_bytes) return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "54000", .message = "SQL request body exceeds 4 MiB" });
+        var preparation = self.api_server.sql_preparation_admission.tryAcquireLease() orelse return sqlOverloadedResponse(ctx);
+        defer preparation.release();
+        var preparation_budget: SQLMemoryBudget = .{ .backing = ctx.allocator, .limit = 8 << 20 };
+        const preparation_alloc = preparation_budget.allocator();
+        var parsed = std.json.parseFromSlice(sql_wire.SQLRequest, preparation_alloc, body, .{ .parse_numbers = false }) catch |err| {
+            if (preparation_budget.exhausted) return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "54000", .message = "SQL preparation memory budget exceeded" });
+            if (err == error.OutOfMemory) return ctx.status(500).json(sql_wire.SQLDiagnostic{ .code = "XX000", .message = "SQL preparation memory unavailable" });
+            return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "invalid SQL request" });
+        };
+        defer parsed.deinit();
+        const request = parsed.value;
+        if (request.parameters) |parameters| if (parameters.len > 1024) return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "54000", .message = "SQL parameter count exceeds 1024" });
+        if (request.session_id) |encoded| {
+            const id = distributed_txn.parseTxnIdHex(encoded) catch return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "SQL session_id must be a 32-character transaction id" });
+            if (try self.forwardTransactionSession(ctx, id, body)) |response| return response;
+        }
+        const limit = request.limit orelse 128;
+        if (limit < 1 or limit > 4096) return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "SQL result limit must be between 1 and 4096" });
+        // Preparation has an independent bounded lane. The worker transfers
+        // admission to exactly one execution class after classification.
+        try self.api_server.reachRequestLifecycle(.admission_acquired, "executeSQL");
+
+        // Never run a blocking catalog/row operation on the network executor,
+        // including when the backend executor is absent or saturated.
+        const runtime = self.api_server.cfg.backend_runtime orelse {
+            // A missing execution lane is a capacity failure for supported
+            // statements, but preserve the useful 501 syntax/shape contract
+            // for callers and tests without scheduling a worker.
+            var diagnostic: sql_compiler.Diagnostic = .{};
+            var compiled = sql_compiler.compileDiagnostic(preparation_alloc, request.statement, .{}, &diagnostic) catch |err| {
+                return ctx.status(sql_execution.httpStatus(err)).json(sql_wire.SQLDiagnostic{
+                    .code = sql_execution.sqlState(err),
+                    .message = diagnostic.message,
+                    .position = sql_execution.characterPosition(request.statement, diagnostic.start),
+                });
+            };
+            defer compiled.deinit();
+            return switch (compiled.statement) {
+                .select, .insert, .update, .delete, .create_table, .drop_table, .catalog_ddl => ctx.status(503).json(sql_wire.SQLDiagnostic{ .code = "53300", .message = "SQL execution capacity unavailable" }),
+                else => ctx.status(501).json(sql_wire.SQLDiagnostic{ .code = "0A000", .message = "SQL statement is not supported by this endpoint" }),
+            };
+        };
+        var runtime_io = runtime.io() orelse return ctx.status(503).json(sql_wire.SQLDiagnostic{ .code = "53300", .message = "SQL execution capacity unavailable" });
+        var job = SQLJob{
+            .adapter = .{ .server = self.api_server, .identity = &identity, .context = tableMutationContext(ctx, &identity), .database = request.database orelse "default", .namespace = request.namespace orelse "public", .session_id = request.session_id, .inherit_session_database = request.database == null, .inherit_session_namespace = request.namespace == null },
+            .statement = request.statement,
+            .principal = if (identity) |value| value.credential_principal else "anonymous",
+            .database = request.database orelse "default",
+            .namespace = request.namespace orelse "public",
+            .parameters = request.parameters orelse &.{},
+            .limit = @intCast(limit),
+            .completion_io = ctx.io,
+            .cache_io = self.api_server.sqlPlanCacheIo(),
+            .cache = self.api_server.sqlPlanCache(),
+            .preparation = &preparation,
+        };
+        var future = runtime_io.concurrent(SQLJob.run, .{&job}) catch
+            return ctx.status(503).json(sql_wire.SQLDiagnostic{ .code = "53300", .message = "SQL execution capacity unavailable" });
+        // Borrowed request/identity storage remains alive until the worker has
+        // completely finished. Cancellation is observed by native checkpoints;
+        // never cancel a durable mutation future after proposal admission.
+        // A canceled request must still join durable work, without repeatedly
+        // hitting an already-canceled sleep and spinning until commit ends.
+        job.done.waitUncancelable(ctx.io);
+        _ = future.await(runtime_io);
+        if (job.failure) |err| {
+            const diagnostic = sql_execution.diagnostic(err);
+            if (std.mem.eql(u8, diagnostic.code, "53300")) try ctx.setHeader("Retry-After", "1");
+            return ctx.status(sql_execution.httpStatus(err)).json(sql_wire.SQLDiagnostic{
+                .code = sql_execution.sqlState(err),
+                .message = if (job.compile_diagnostic_valid) job.diagnostic.message else sql_execution.diagnosticMessage(err, &job.diagnostic_message_buffer),
+                .transaction_id = if (job.adapter.outcome_transaction_id) |*id| id else null,
+                .retryable = diagnostic.retryable,
+                .position = if (job.compile_diagnostic_valid) sql_execution.characterPosition(request.statement, job.diagnostic.start) else null,
+                .transaction_status = if (!job.execution_entered) null else switch (job.adapter.transaction_status) {
+                    .idle => .idle,
+                    .in_transaction => .in_transaction,
+                    .failed => .failed,
+                },
+            });
+        }
+        var result = job.result.?;
+        defer result.deinit();
+        const columns = ctx.allocator.alloc(sql_wire.SQLColumn, result.output.columns.len) catch |err| {
+            if (job.is_write) return ctx.status(409).json(sql_wire.SQLDiagnostic{ .code = "40003", .message = "mutation completed but its acknowledgement could not be encoded; do not replay the statement", .retryable = false, .transaction_id = if (job.adapter.outcome_transaction_id) |*id| id else null });
+            return err;
+        };
+        defer ctx.allocator.free(columns);
+        for (result.output.columns, columns) |column, *output| output.* = .{ .name = column.name, .type = switch (column.type) {
+            inline else => |kind| @field(sql_wire.SQLColumnType, @tagName(kind)),
+        } };
+        const output: sql_wire.SQLResponse = .{
+            .columns = columns,
+            .rows = result.output.rows,
+            .sql_nulls = result.output.sql_nulls,
+            .session_id = if (job.adapter.result_session_id) |*id| id else null,
+            .transaction_status = switch (job.adapter.transaction_status) {
+                .idle => .idle,
+                .in_transaction => .in_transaction,
+                .failed => .failed,
+            },
+            .rows_affected = @intCast(result.output.rows_affected),
+            .command_tag = result.output.command_tag,
+            .ddl_receipt = if (result.output.ddl_receipt) |receipt| .{
+                .database = receipt.database,
+                .namespace = receipt.namespace,
+                .table = receipt.table,
+                .table_id = receipt.table_id,
+                .schema_version = receipt.schema_version,
+                .state = switch (receipt.state) {
+                    inline else => |state| @field(sql_wire.SQLDDLReceiptState, @tagName(state)),
+                },
+                .diagnostic = receipt.diagnostic,
+                .restore_job_id = receipt.restore_job_id,
+            } else null,
+            .transaction_id = if (job.adapter.outcome_transaction_id) |*id| id else null,
+            .mutation_outcome = if (result.output.mutation_outcome) |outcome| switch (outcome) {
+                inline else => |kind| @field(sql_wire.SQLMutationOutcome, @tagName(kind)),
+            } else null,
+        };
+        var encoding_budget: SQLMemoryBudget = .{ .backing = ctx.allocator, .limit = 16 << 20 };
+        const encoded = std.json.Stringify.valueAlloc(encoding_budget.allocator(), output, .{ .emit_null_optional_fields = false }) catch |err| {
+            if (job.is_write) return ctx.status(409).json(sql_wire.SQLDiagnostic{ .code = "40003", .message = "mutation completed but its acknowledgement could not be encoded; do not replay the statement", .retryable = false, .transaction_id = if (job.adapter.outcome_transaction_id) |*id| id else null });
+            if (encoding_budget.exhausted) return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "54000", .message = "SQL encoded result exceeds its 16 MiB memory budget" });
+            return err;
+        };
+        defer encoding_budget.allocator().free(encoded);
+        const response_status: u16 = if (result.output.ddl_receipt) |receipt| switch (receipt.state) {
+            .ready => 200,
+            .pending => 202,
+            .invalid => 409,
+        } else 200;
+        return jsonResponse(ctx, response_status, encoded) catch |err| {
+            if (job.is_write) return ctx.status(409).json(sql_wire.SQLDiagnostic{ .code = "40003", .message = "mutation completed but its acknowledgement could not be encoded; do not replay the statement", .retryable = false, .transaction_id = if (job.adapter.outcome_transaction_id) |*id| id else null });
+            return err;
+        };
+    }
+
     pub fn globalQuery(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
@@ -7910,6 +8131,7 @@ fn PrefixedServer(comptime prefix: []const u8, comptime Inner: type) type {
         inner: *Inner,
 
         pub fn post(self: *const @This(), comptime path: []const u8, handler_fn: httpx.Handler) !void {
+            if (@import("http_routes.zig").publicPostBodyLimit(prefix ++ path)) |limit| return self.inner.postWithBodyLimit(prefix ++ path, limit, handler_fn);
             try self.inner.post(prefix ++ path, handler_fn);
         }
 
@@ -10700,6 +10922,176 @@ test "httpx antfly routes require auth and enforce admin middleware" {
     var me_body = try std.json.parseFromSlice(struct { username: []const u8 }, alloc, me_resp.body.?, .{ .ignore_unknown_fields = true });
     defer me_body.deinit();
     try std.testing.expectEqualStrings("admin", me_body.value.username);
+}
+
+test "httpx SQL rejects unsupported shapes and releases dynamic admission" {
+    const alloc = std.testing.allocator;
+    var source = AuthStatusSource{};
+    var server = ApiHttpServer.init(alloc, .{ .query_max_concurrent_requests = 1, .write_max_concurrent_requests = 1 }, source.iface(), null, null);
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    {
+        // Read saturation must not block SQL writes, and the owned write
+        // permit must stay charged throughout the caller's execution scope.
+        var read = try server.acquireSqlExecution(false);
+        defer read.release();
+        var write = try server.acquireSqlExecution(true);
+        defer write.release();
+        try std.testing.expectError(error.SqlWriteCapacityUnavailable, server.acquireSqlExecution(true));
+        try std.testing.expectError(error.SqlWriteCapacityUnavailable, server.acquireSqlExecution(false));
+        var preparation = server.sql_preparation_admission.tryAcquireLease().?;
+        preparation.release();
+    }
+    var transport = httpx.Server.init(alloc, std.testing.io);
+    defer transport.deinit();
+    var prefixed = PrefixedServer("/db/v1", httpx.Server){ .inner = &transport };
+    try prefixed.post("/sql", httpx.Handler.bind(&handler, AntflyApiHandler.executeSQL));
+    try std.testing.expectEqual(@as(?usize, 4 << 20), transport.router.bodySizeLimit(.POST, "/db/v1/sql"));
+    try std.testing.expectEqual(@as(?usize, null), transport.router.bodySizeLimit(.POST, "/db/v1/query"));
+    const cases = [_]struct { body: []const u8, status: u16, state: []const u8 }{
+        .{ .body = "{}", .status = 400, .state = "22023" },
+        .{ .body = "{\"statement\":\"SELECT id FROM docs\",\"limit\":0}", .status = 400, .state = "22023" },
+        .{ .body = "{\"statement\":\"SELECT id FROM docs\",\"session_id\":\"opaque\"}", .status = 400, .state = "22023" },
+        .{ .body = "{\"statement\":\"BEGIN\"}", .status = 501, .state = "0A000" },
+        .{ .body = "{\"statement\":\"SELECT id FROM docs\"}", .status = 503, .state = "53300" },
+        .{ .body = "{\"statement\":\"DELETE FROM docs\"}", .status = 503, .state = "53300" },
+    };
+    for (cases) |case| {
+        var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+        defer request.deinit();
+        request.body = case.body;
+        var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try handler.executeSQL(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(case.status, response.status.code);
+        var diagnostic = try std.json.parseFromSlice(sql_wire.SQLDiagnostic, alloc, response.body.?, .{});
+        defer diagnostic.deinit();
+        try std.testing.expectEqualStrings(case.state, diagnostic.value.code);
+        try std.testing.expect(server.tryAcquireQuery());
+        server.releaseQuery();
+        try std.testing.expect(server.tryAcquireWrite());
+        server.releaseWrite();
+    }
+    server.sql_preparation_admission.capacity = 1;
+    var held = server.sql_preparation_admission.tryAcquireLease().?;
+    defer held.release();
+    var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+    defer request.deinit();
+    request.body = "{\"statement\":\"SELECT id FROM docs\"}";
+    var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try handler.executeSQL(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 503), response.status.code);
+    var diagnostic = try std.json.parseFromSlice(sql_wire.SQLDiagnostic, alloc, response.body.?, .{});
+    defer diagnostic.deinit();
+    try std.testing.expectEqualStrings("53300", diagnostic.value.code);
+    try std.testing.expectEqual(@as(?bool, true), diagnostic.value.retryable);
+}
+
+test "httpx SQL executes one relational page with exact integer parameters" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"name":{"type":"keyword"}},"additionalProperties":false}}}}
+    ;
+    const Source = struct {
+        calls: usize = 0,
+        replace_after_open: bool = false,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn catalog(ptr: *anyopaque, a: std.mem.Allocator, context: operation_contract.RequestContext, input: system_catalog.Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.replace_after_open and self.calls == 3) return error.CatalogGenerationChanged;
+            try context.ensureActive();
+            if (input != .resolve_many) return error.UnexpectedCatalogCall;
+            if (input.resolve_many.expected_revision) |revision| if (revision != 7) return error.CatalogGenerationChanged;
+            const tables = [_]?system_catalog.ResolvedTable{.{ .table_id = 7, .name = "docs", .query_definition = if (input.resolve_many.include_query_definitions) .{ .table_id = 7, .schema_json = schema_json, .read_schema_json = "", .indexes_json = "{}" } else null }};
+            return std.json.Stringify.valueAlloc(a, system_catalog.ResolvedMany{ .revision = 7, .tables = &tables }, .{});
+        }
+    };
+    var directory = try @import("../common/test_directory.zig").TestDirectory.init("antfly-httpx-sql");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(alloc, directory.path(), .{});
+    defer db.close();
+    try db.setSchemaJson(alloc, schema_json);
+    try db.batch(.{ .writes = &.{
+        .{ .key = "a", .value = "{\"id\":9007199254740993,\"name\":\"exact\"}" },
+        .{ .key = "b", .value = "{\"id\":2,\"name\":\"other\"}" },
+    }, .timestamp_ns = 42 });
+    var reads = table_reads.BoundTableReadSource.init("docs", 7, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer backend_runtime.deinit();
+    var source: Source = .{};
+    var server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr() }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog, .supports_query_definitions = true } }, reads.source(), null);
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    for ([_][]const u8{
+        "{\"statement\":\"SELECT id, name FROM docs WHERE id = $1 LIMIT 1\",\"parameters\":[9007199254740993]}",
+        "{\"statement\":\"SELECT id, name FROM docs WHERE _id = $1\",\"parameters\":[\"a\"]}",
+    }) |body| {
+        var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+        defer request.deinit();
+        request.body = body;
+        var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try handler.executeSQL(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        var result = try std.json.parseFromSlice(sql_wire.SQLResponse, alloc, response.body.?, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.value.rows.len);
+        try std.testing.expectEqualStrings("9007199254740993", result.value.rows[0][0].string);
+        try std.testing.expectEqualStrings("exact", result.value.rows[0][1].string);
+        try std.testing.expectEqual(sql_wire.SQLColumnType.integer, result.value.columns[0].type);
+    }
+    // Force several physical pages through the real native adapter, not a
+    // synthetic Backend claiming snapshot support. The cursor owns the view
+    // until exhaustion and no catalog access occurs per page.
+    var identity: ?http_server_mod.AuthenticatedIdentity = null;
+    var adapter: sql_execution.Adapter = .{ .server = &server, .identity = &identity, .context = .{} };
+    var count = try sql_compiler.compile(alloc, "SELECT count(*) FROM docs", .{});
+    defer count.deinit();
+    source.calls = 0;
+    var counted = try sql_runtime.execute(alloc, adapter.backend(), &count, &.{}, .{ .page_rows = 1 });
+    defer counted.deinit();
+    try std.testing.expectEqualStrings("2", counted.output.rows[0][0].string);
+    try std.testing.expectEqual(@as(usize, 3), source.calls);
+    // The SQL owner is the native transaction registry, not connection-local
+    // buffered state. A new request adapter can attach and recover a failed
+    // statement through a durable named savepoint.
+    var begin_sql = try sql_compiler.compile(alloc, "BEGIN ISOLATION LEVEL READ COMMITTED READ ONLY", .{});
+    defer begin_sql.deinit();
+    adapter.database = "app";
+    adapter.namespace = "tenant";
+    var begun = try adapter.execute(alloc, &begin_sql, &.{}, .{}, null);
+    defer begun.deinit();
+    const sql_session_id = adapter.result_session_id.?;
+    var wrong_scope: sql_execution.Adapter = .{ .server = &server, .identity = &identity, .context = .{}, .session_id = &sql_session_id, .database = "other", .inherit_session_namespace = true };
+    try std.testing.expectError(error.SqlTransactionNotActive, wrong_scope.execute(alloc, &count, &.{}, .{}, null));
+    for ([_][]const u8{ "SAVEPOINT one", "SELECT count(*) FROM docs", "ROLLBACK TO one", "RELEASE one", "ROLLBACK" }) |statement| {
+        var control = try sql_compiler.compile(alloc, statement, .{});
+        defer control.deinit();
+        var attached: sql_execution.Adapter = .{ .server = &server, .identity = &identity, .context = .{}, .session_id = &sql_session_id, .inherit_session_database = true, .inherit_session_namespace = true };
+        var outcome = try attached.execute(alloc, &control, &.{}, .{}, null);
+        defer outcome.deinit();
+        if (std.mem.startsWith(u8, statement, "SELECT")) {
+            try std.testing.expectEqualStrings("2", outcome.output.rows[0][0].string);
+            var invalid = try sql_compiler.compile(alloc, "SELECT missing FROM docs", .{});
+            defer invalid.deinit();
+            try std.testing.expectError(error.UndefinedColumn, attached.execute(alloc, &invalid, &.{}, .{}, null));
+        }
+        try std.testing.expect(outcome.output.mutation_outcome == null);
+    }
+    // Simulate replacement after the physical view opens. Admission must
+    // release that view and reject the old binding before exposing any row.
+    source.calls = 0;
+    source.replace_after_open = true;
+    var replaced: sql_execution.Adapter = .{ .server = &server, .identity = &identity, .context = .{} };
+    try std.testing.expectError(error.CatalogGenerationChanged, sql_runtime.execute(alloc, replaced.backend(), &count, &.{}, .{ .page_rows = 1 }));
+    try std.testing.expectEqual(@as(usize, 3), source.calls);
 }
 
 test "httpx relational row query mutation endpoints enforce exact versions and schema epochs" {

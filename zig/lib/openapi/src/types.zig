@@ -93,6 +93,16 @@ pub const Operation = struct {
     responses: std.StringArrayHashMapUnmanaged(ResponseOrRef) = .{},
     security: []const SecurityRequirement = &.{},
     deprecated: bool = false,
+    /// Explicit per-operation ceilings, independent of a borrowed client's
+    /// ambient policy. Populated from x-antfly-client-request-policy.
+    client_request_policy: ?ClientRequestPolicy = null,
+};
+
+pub const ClientRequestPolicy = struct {
+    max_retries: ?u32 = null,
+    follow_redirects: ?bool = null,
+    cookies_enabled: ?bool = null,
+    max_response_size: ?u32 = null,
 };
 
 /// Schema type: in 3.0 a single string, in 3.1+ can be an array of strings.

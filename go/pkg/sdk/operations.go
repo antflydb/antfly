@@ -621,6 +621,60 @@ func (c *AntflyClient) LookupKeyWithFields(ctx context.Context, tableName, key, 
 	return document, nil
 }
 
+// SQLExecutionError preserves SQLSTATE and an optional native reconciliation receipt.
+type SQLExecutionError struct {
+	StatusCode int
+	Diagnostic SQLDiagnostic
+}
+
+func (e *SQLExecutionError) Error() string {
+	return fmt.Sprintf("SQL execution failed (%s): %s", e.Diagnostic.Code, e.Diagnostic.Message)
+}
+
+// ExecuteSQL executes one statement without retrying ambiguous mutations.
+// Result cells remain json.RawMessage so arbitrary JSON numbers retain precision.
+func (c *AntflyClient) ExecuteSQL(ctx context.Context, request SQLRequest) (*SQLResponse, error) {
+	resp, err := c.client.ExecuteSQL(ctx, request)
+	if err != nil {
+		return nil, fmt.Errorf("executing SQL: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		body, truncated, err := readLimitedBody(resp.Body, maxErrorResponseBytes)
+		if err != nil {
+			return nil, fmt.Errorf("reading SQL diagnostic: %w", err)
+		}
+		var diagnostic SQLDiagnostic
+		if !truncated && json.Unmarshal(body, &diagnostic) == nil && len(diagnostic.Code) == 5 && diagnostic.Message != "" {
+			return nil, &SQLExecutionError{StatusCode: resp.StatusCode, Diagnostic: diagnostic}
+		}
+		return nil, fmt.Errorf("executing SQL: HTTP %d: %s", resp.StatusCode, body)
+	}
+	body, truncated, err := readLimitedBody(resp.Body, 16<<20)
+	if err != nil {
+		return nil, fmt.Errorf("reading SQL response: %w", err)
+	}
+	if truncated {
+		return nil, fmt.Errorf("SQL response exceeds 16 MiB")
+	}
+	var result SQLResponse
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("decoding SQL response: %w", err)
+	}
+	if result.Columns == nil || result.Rows == nil {
+		return nil, fmt.Errorf("SQL response is missing columns or rows")
+	}
+	if len(result.Rows) > 4096 {
+		return nil, fmt.Errorf("SQL response exceeds 4096 rows")
+	}
+	for _, row := range result.Rows {
+		if len(row) != len(result.Columns) {
+			return nil, fmt.Errorf("SQL row width differs from column metadata")
+		}
+	}
+	return &result, nil
+}
+
 // QueryRelationalRows reads one bounded primary-key-ordered page. Integer row
 // values decode as json.Number, preserving int64 precision. Resume using the
 // final row's Id as From; pagination opens a new snapshot on each request.

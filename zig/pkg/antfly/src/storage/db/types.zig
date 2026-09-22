@@ -90,7 +90,23 @@ test "public sync level text accepts full_index and rejects removed aknn alias" 
 pub const BatchWrite = struct {
     key: []const u8,
     value: []const u8,
+    /// Top-level JSON-typed fields whose null datum is JSON null, not SQL NULL.
+    /// Validated against the pinned relational schema before preparation.
+    json_null_fields: []const []const u8 = &.{},
 };
+
+pub fn cloneJsonNullFields(alloc: std.mem.Allocator, fields: []const []const u8) ![]const []const u8 {
+    if (fields.len == 0) return &.{};
+    const copy = try alloc.alloc([]const u8, fields.len);
+    errdefer alloc.free(copy);
+    var initialized: usize = 0;
+    errdefer for (copy[0..initialized]) |name| alloc.free(name);
+    for (fields, copy) |name, *out| {
+        out.* = try alloc.dupe(u8, name);
+        initialized += 1;
+    }
+    return copy;
+}
 
 pub const TransformOpType = enum {
     set,
@@ -1349,7 +1365,31 @@ pub const ColumnarScanStats = struct {
     primary_rows_read: u64 = 0,
 };
 
+/// Borrowed typed request for native callers. Encoded only at an archive or
+/// network boundary; fields and JSON operands must outlive the synchronous scan.
+pub const RelationalRowQuery = struct {
+    pub const Bound = struct { values: []const std.json.Value, inclusive: bool = true };
+    pub const Condition = struct {
+        column: []const u8,
+        op: @import("../relational_index.zig").RelationalCheckOp,
+        value: ?std.json.Value = null,
+        collation: ?[]const u8 = null,
+    };
+    fields: []const []const u8,
+    index: ?[]const u8 = null,
+    /// Let the storage reader choose a READY covering/key index from the
+    /// pinned catalog snapshot. This is deliberately a hint: no usable index
+    /// is a correct primary-key fallback.
+    auto_index: bool = false,
+    after: ?[]const u8 = null,
+    lower: ?Bound = null,
+    upper: ?Bound = null,
+    conditions: []const Condition = &.{},
+    schema_version: ?u32 = null,
+};
+
 pub const ScanOptions = struct {
+    relational_query: ?RelationalRowQuery = null,
     /// Schema-bound typed row query carried by the routed scan transport. It
     /// is never interpreted as a search DSL or permitted to replace RLS filters.
     relational_query_json: []const u8 = "",
@@ -1377,6 +1417,10 @@ pub const ScanOptions = struct {
     /// scan lifetime.
     execution_deadline_ns: ?u64 = null,
     cancellation: ?CancellationToken = null,
+
+    pub fn isRelational(self: ScanOptions) bool {
+        return self.relational_query != null or self.relational_query_json.len != 0;
+    }
 };
 
 pub const ScanDocument = struct {
@@ -1396,10 +1440,13 @@ pub const ScanHash = struct {
     content_hash: ?DocumentContentHash = null,
     relational_schema_version: ?u32 = null,
     relational_cursor: ?[]u8 = null,
+    json_null_fields: []const []const u8 = &.{},
 
     pub fn deinit(self: *ScanHash, alloc: Allocator) void {
         alloc.free(self.id);
         if (self.relational_cursor) |cursor| alloc.free(cursor);
+        for (self.json_null_fields) |field| alloc.free(field);
+        alloc.free(self.json_null_fields);
         self.* = undefined;
     }
 };
@@ -1412,6 +1459,7 @@ pub const ScanVisitEntry = struct {
     content_hash: ?DocumentContentHash = null,
     relational_schema_version: ?u32 = null,
     relational_cursor: ?[]const u8 = null,
+    json_null_fields: []const []const u8 = &.{},
     document_json: ?[]const u8 = null,
 };
 
@@ -1507,6 +1555,7 @@ pub const GraphPath = paths_mod.Path;
 pub const TransactionWrite = struct {
     key: []const u8,
     value: []const u8,
+    json_null_fields: []const []const u8 = &.{},
 };
 
 pub const TransactionVersionPredicate = struct {

@@ -688,9 +688,13 @@ pub const UserManager = struct {
     pub fn getUser(self: *const UserManager, username: []const u8) !User {
         const password_hash = self.users.get(username) orelse return error.UserNotFound;
         const metadata_json = self.user_metadata.get(username) orelse "{}";
+        const owned_username = try self.alloc.dupe(u8, username);
+        errdefer self.alloc.free(owned_username);
+        const owned_hash = try self.alloc.dupe(u8, password_hash);
+        errdefer self.alloc.free(owned_hash);
         return .{
-            .username = try self.alloc.dupe(u8, username),
-            .password_hash = try self.alloc.dupe(u8, password_hash),
+            .username = owned_username,
+            .password_hash = owned_hash,
             .metadata_json = try self.alloc.dupe(u8, metadata_json),
         };
     }
@@ -1418,7 +1422,10 @@ fn hashPassword(alloc: Allocator, io: std.Io, password: []const u8) ![]u8 {
     return try alloc.dupe(u8, hashed);
 }
 
-fn verifyPassword(password_hash: []const u8, password: []const u8) !void {
+/// Verify an owned credential snapshot outside the user-manager mutation lock.
+/// Callers retaining authenticated sessions must revalidate the live verifier
+/// before publishing authority; password verification alone is not a lease.
+pub fn verifyPassword(password_hash: []const u8, password: []const u8) !void {
     bcrypt.strVerify(password_hash, password, .{ .silently_truncate_password = false }) catch {
         return error.InvalidPassword;
     };

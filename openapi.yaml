@@ -3414,6 +3414,101 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
+  /db/v1/sql:
+    post:
+      summary: Execute a SQL statement
+      tags:
+        - data_operations
+      description: >
+        Executes the bounded relational SELECT, INSERT, UPDATE, and DELETE
+
+        subset through the current catalog and native row execution contracts.
+
+        Parameters are bound separately from statement text. Document, graph,
+
+        and lake SQL sources, DDL, and SQL sessions are not yet supported.
+
+        Reads inherit native owner-local consistency, not a global SQL
+
+        transaction snapshot. Statements requiring a retained multi-page
+
+        statement snapshot fail when that capability is unavailable.
+
+        Unsupported statement shapes fail explicitly; the server never
+
+        silently substitutes a different query or truncates the result.
+      operationId: executeSQL
+      x-antfly-client-request-policy:
+        max_retries: 0
+        follow_redirects: false
+        cookies_enabled: false
+        max_response_size: 16777216
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SQLRequest'
+      responses:
+        '200':
+          description: SQL statement result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SQLResponse'
+        '202':
+          description: DDL declaration committed; constraint validation is pending. Do not replay.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SQLResponse'
+        '400':
+          description: Invalid statement, parameter, or result admission limit
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SQLDiagnostic'
+        '401':
+          description: Authentication required
+        '403':
+          description: Insufficient permission for the statement's catalog resources
+        '409':
+          description: Transaction or catalog conflict, or committed DDL whose validation failed
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/SQLDiagnostic'
+                  - $ref: '#/components/schemas/SQLResponse'
+        '429':
+          description: Foreground query, write, or request-body admission is exhausted
+          headers:
+            Retry-After:
+              schema:
+                type: integer
+                minimum: 1
+        '501':
+          description: SQL statement shape is not supported
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SQLDiagnostic'
+        '503':
+          description: SQL backend execution capacity is unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SQLDiagnostic'
+        '500':
+          description: Internal SQL execution failure
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SQLDiagnostic'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
   /db/v1/query:
     post:
       summary: Perform a global query
@@ -11434,6 +11529,238 @@ components:
         type: string
         example: role:tenant_reader
   schemas:
+    SQLColumnType:
+      type: string
+      description: Logical SQL result type. Integer values are decimal strings to preserve exact precision
+        in every client.
+      enum:
+        - string
+        - integer
+        - number
+        - boolean
+        - datetime
+        - json
+        - unknown
+    SQLColumn:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+        - type
+      properties:
+        name:
+          type: string
+          description: Display label. Labels need not be unique; rows use matching ordinal positions.
+        type:
+          $ref: '#/components/schemas/SQLColumnType'
+    SQLRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - statement
+      description: >
+        Execute one SQL statement. Parameters are positional (`$1`, `$2`, ...),
+
+        never interpolated into SQL text. To preserve integer precision in
+
+        JavaScript clients, supply integers outside the exact JSON number range
+
+        as decimal strings; binding coerces parameters to the expected type.
+
+        The result limit is an admission bound, not an implicit SQL LIMIT:
+
+        statements whose results exceed it fail instead of silently truncating.
+
+        Request bodies are limited to 4 MiB, preparation to 8 MiB of allocated
+
+        memory, and encoded results to a 16 MiB allocation budget.
+      properties:
+        statement:
+          type: string
+          minLength: 1
+          description: A single SQL statement.
+        parameters:
+          type: array
+          maxItems: 1024
+          description: Positional JSON parameter values, including null.
+          items:
+            x-go-type: json.RawMessage
+        database:
+          type: string
+          minLength: 1
+          description: Database used to resolve unqualified catalog names.
+        namespace:
+          type: string
+          minLength: 1
+          description: Namespace used to resolve unqualified table names.
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 4096
+          default: 128
+          description: Maximum admitted result rows; does not change statement semantics.
+        session_id:
+          type: string
+          pattern: ^[0-9a-fA-F]{32}$
+          description: Opaque SQL session identifier returned by a previous response.
+    SQLTransactionStatus:
+      type: string
+      enum:
+        - idle
+        - in_transaction
+        - failed
+      description: Authoritative native SQL session state after the statement. Failed sessions require
+        ROLLBACK or ROLLBACK TO SAVEPOINT; uncertain commit outcomes must be reconciled by transaction_id,
+        never replayed.
+    SQLMutationOutcome:
+      type: string
+      description: >
+        Durable mutation outcome. Every value confirms a commit and must not
+
+        cause the statement to be replayed. Pending or repair outcomes require
+
+        visibility convergence or operator action rather than another write.
+      enum:
+        - committed
+        - committed_pending
+        - committed_repair_required
+        - committed_graph_metric_materialization_rejected
+    SQLResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - columns
+        - rows
+        - rows_affected
+        - command_tag
+      description: >
+        Ordinal result rows with corresponding logical column metadata. SQL NULL
+
+        is JSON null; sql_nulls distinguishes it from a JSON column containing
+
+        the JSON literal null. Integer-typed values are exact decimal strings; datetime
+
+        values are strings. Objects and arrays in JSON columns remain JSON.
+      properties:
+        columns:
+          type: array
+          items:
+            $ref: '#/components/schemas/SQLColumn'
+        rows:
+          type: array
+          maxItems: 4096
+          items:
+            type: array
+            items:
+              x-go-type: json.RawMessage
+        rows_affected:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Number of rows affected by a mutation, or zero for a read-only statement.
+        sql_nulls:
+          type: array
+          maxItems: 4096
+          description: >
+            Null flags aligned exactly with rows and their columns. True denotes
+
+            SQL NULL; false denotes a value, including the JSON literal null.
+
+            When omitted, null cells have the legacy SQL NULL interpretation.
+          items:
+            type: array
+            items:
+              type: boolean
+        command_tag:
+          type: string
+          description: SQL command completion tag.
+        mutation_outcome:
+          $ref: '#/components/schemas/SQLMutationOutcome'
+        ddl_receipt:
+          $ref: '#/components/schemas/SQLDDLReceipt'
+        transaction_id:
+          type: string
+          pattern: ^[0-9a-fA-F]{32}$
+          description: Native transaction receipt for visibility or repair reconciliation; never replay
+            a committed statement.
+        session_id:
+          type: string
+          description: Opaque SQL session identifier for subsequent requests.
+        transaction_status:
+          $ref: '#/components/schemas/SQLTransactionStatus'
+    SQLDDLReceiptState:
+      type: string
+      enum:
+        - ready
+        - pending
+        - invalid
+    SQLDDLReceipt:
+      type: object
+      additionalProperties: false
+      required:
+        - database
+        - namespace
+        - table
+        - table_id
+        - schema_version
+        - state
+      description: >
+        Durable DDL declaration receipt. Pending or invalid means the declaration
+
+        committed but validation has not established an active constraint. Do not
+
+        replay it. Inspect table constraint status using this immutable table
+
+        identity and schema generation; a later generation supersedes this receipt.
+      properties:
+        database:
+          type: string
+        namespace:
+          type: string
+        table:
+          type: string
+        table_id:
+          type: string
+        schema_version:
+          type: integer
+          format: int64
+          minimum: 0
+        state:
+          $ref: '#/components/schemas/SQLDDLReceiptState'
+        diagnostic:
+          type: string
+        restore_job_id:
+          type: string
+          description: Native restore job for an atomic schema rewrite. Until publication table_id identifies
+            the source generation. Poll the restore job; do not replay this DDL.
+    SQLDiagnostic:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+          minLength: 5
+          maxLength: 5
+          description: Five-character SQLSTATE error code.
+        message:
+          type: string
+          description: Human-readable diagnostic with no sensitive parameter values.
+        position:
+          type: integer
+          minimum: 1
+          description: Optional one-based character position in the submitted SQL statement.
+        transaction_id:
+          type: string
+          pattern: ^[0-9a-fA-F]{32}$
+          description: Native transaction receipt for reconciliation when a mutation outcome is unknown.
+        retryable:
+          type: boolean
+          description: False for SQLSTATE 40003; never replay a mutation whose outcome is unknown.
+        transaction_status:
+          $ref: '#/components/schemas/SQLTransactionStatus'
     DatabaseCatalogRecord:
       type: object
       required:
@@ -16512,6 +16839,12 @@ components:
         row:
           type: object
           additionalProperties: true
+        json_null_fields:
+          type: array
+          items:
+            type: string
+          description: Projected JSON columns containing the JSON literal null rather than SQL NULL. Other
+            null-valued fields are SQL NULL.
         version:
           type: string
           pattern: ^[0-9]+$
@@ -16539,6 +16872,14 @@ components:
         row:
           type: object
           additionalProperties: true
+        json_null_fields:
+          type: array
+          uniqueItems: true
+          items:
+            type: string
+          description: Names of JSON-typed columns whose row value is the JSON literal null rather than
+            SQL NULL. Each name must identify a present null-valued JSON column; duplicates, unknown names,
+            non-null values, and use with deletion are rejected.
     RelationalRowMutationRequest:
       type: object
       additionalProperties: false

@@ -83,6 +83,26 @@ test "distributed txn native lookup read-index rejects leader loss before storag
     try std.testing.expectEqual(@as(usize, 1), barrier.calls);
 }
 
+test "SQL retained native scan rejects leader loss without stale retry" {
+    const Barrier = struct {
+        calls: usize = 0,
+        fn wait(ptr: *anyopaque, _: u64, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return error.NotLeader;
+        }
+    };
+    var barrier: Barrier = .{};
+    var source: ProvisionedKernelOwnerSource = undefined;
+    source.read_safety_barrier = .{ .ptr = &barrier, .vtable = &.{ .wait_read_safe = Barrier.wait } };
+    try std.testing.expectError(error.NotLeader, source.prepareRetainedScanRead(7, "", "", .{}, .read_index));
+    try std.testing.expectEqual(@as(usize, 1), barrier.calls);
+    // Already-prepared local routing explicitly requests stale; only that
+    // caller-provided consistency may omit an additional read-index barrier.
+    try source.prepareRetainedScanRead(7, "", "", .{}, .stale);
+    try std.testing.expectEqual(@as(usize, 1), barrier.calls);
+}
+
 test "source owner deadlines normalize executor clock epochs without extending budgets" {
     const FakeClock = struct {
         fn now(raw: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
@@ -272,6 +292,16 @@ pub const ProvisionedKernelOwnerSource = struct {
 
         fn owner(self: *Lease) *client.Owner {
             return &self.entry.owner;
+        }
+
+        /// Extend an already-admitted read capability without entering the
+        /// owner admission queue again while its statement fence is held.
+        fn cloneRead(self: *Lease) Lease {
+            lock(&self.source.mutex);
+            defer self.source.mutex.unlock();
+            std.debug.assert(self.active and !self.exclusive);
+            self.entry.active_users += 1;
+            return .{ .source = self.source, .entry = self.entry };
         }
 
         fn downgrade(self: *Lease) void {
@@ -473,6 +503,8 @@ pub const ProvisionedKernelOwnerSource = struct {
             .vtable = &.{
                 .lookup = unsupportedTopLevelLookup,
                 .scan = unsupportedTopLevelScan,
+                .open_relational_read_group_local_routed = openRelationalReadRouted,
+                .try_statement_read_fence_group_local_routed = tryStatementReadFenceRouted,
                 .query = unsupportedTopLevelQuery,
                 .preflight_query_group_local = preflightQueryGroupLocal,
                 .preflight_query_group_local_routed = preflightQueryGroupLocalRouted,
@@ -3263,6 +3295,105 @@ pub const ProvisionedKernelOwnerSource = struct {
         if (opts.restore_staging_scope != null) return self.lookupRestoreStaging(alloc, group_id, table_name, key, opts, fence);
         try self.validateRoutedRead(alloc, fence, group_id, table_name);
         return try lookupGroupLocal(ptr, alloc, group_id, table_name, key, opts, consistency);
+    }
+
+    const RetainedRelationalRead = struct {
+        alloc: std.mem.Allocator,
+        lease: Lease,
+        view: table_read_source.RelationalReadView,
+
+        fn next(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !table_read_source.RelationalReadView.Page {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.view.next(alloc, limit);
+        }
+        fn normalize(ptr: *anyopaque, alloc: std.mem.Allocator, writes: []const db_types.BatchWrite) ![]db_types.BatchWrite {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.view.normalize(alloc, writes);
+        }
+        fn close(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.view.deinit();
+            self.lease.deinit();
+            self.alloc.destroy(self);
+        }
+    };
+
+    const RetainedStatementFence = struct {
+        alloc: std.mem.Allocator,
+        source: *ProvisionedKernelOwnerSource,
+        owner: Lease,
+        native: table_read_source.StatementReadFence,
+        route: metadata_api.CatalogRouteFence,
+        group: u64,
+        table: []const u8,
+
+        fn validate(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try self.native.validate();
+            try self.source.validateRoutedRead(self.alloc, self.route, self.group, self.table);
+        }
+        fn release(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.native.deinit();
+            self.owner.deinit();
+            self.alloc.free(self.table);
+            self.alloc.destroy(self);
+        }
+        fn open(ptr: *anyopaque, alloc: std.mem.Allocator, from: []const u8, to: []const u8, opts: db_types.ScanOptions) !table_read_source.RelationalReadView {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try validate(ptr);
+            var owner = self.owner.cloneRead();
+            errdefer owner.deinit();
+            const view = try self.native.open(alloc, from, to, opts);
+            errdefer view.deinit();
+            try validate(ptr);
+            const retained = try alloc.create(RetainedRelationalRead);
+            retained.* = .{ .alloc = alloc, .lease = owner, .view = view };
+            return .{ .ptr = retained, .vtable = &.{ .next = RetainedRelationalRead.next, .close = RetainedRelationalRead.close, .normalize = RetainedRelationalRead.normalize } };
+        }
+    };
+
+    fn tryStatementReadFenceRouted(ptr: *anyopaque, alloc: std.mem.Allocator, route: metadata_api.CatalogRouteFence, group: u64, table: []const u8, opts: db_types.ScanOptions, consistency: read_gate.ReadConsistency) !?table_read_source.StatementReadFence {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        try self.validateRoutedRead(alloc, route, group, table);
+        try self.prepareRetainedScanRead(group, "", "", opts, consistency);
+        var owner = try self.acquireWithControls(group, table, .from(opts));
+        errdefer owner.deinit();
+        const provider = try @import("../storage/relational_read_provider.zig").acquire(owner.owner().handle);
+        const native = (try provider.tryFence(alloc, table, opts)) orelse {
+            owner.deinit();
+            return null;
+        };
+        errdefer native.deinit();
+        const retained = try alloc.create(RetainedStatementFence);
+        errdefer alloc.destroy(retained);
+        retained.* = .{ .alloc = alloc, .source = self, .owner = owner, .native = native, .route = route, .group = group, .table = try alloc.dupe(u8, table) };
+        errdefer alloc.free(retained.table);
+        try RetainedStatementFence.validate(retained);
+        return .{ .ptr = retained, .vtable = &.{ .validate = RetainedStatementFence.validate, .open = RetainedStatementFence.open, .release = RetainedStatementFence.release } };
+    }
+
+    fn prepareRetainedScanRead(self: *ProvisionedKernelOwnerSource, group: u64, from: []const u8, to: []const u8, opts: db_types.ScanOptions, consistency: read_gate.ReadConsistency) !void {
+        // Retained SQL reads promise the requested statement snapshot. Leader
+        // loss must be retried by routing, never weakened to a stale snapshot.
+        try feature_reads.FeatureReads.init(self.read_safety_barrier).prepareScanWithConsistency(group, from, to, opts, consistency);
+    }
+
+    fn openRelationalReadRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group: u64, table: []const u8, from: []const u8, to: []const u8, opts: db_types.ScanOptions, consistency: read_gate.ReadConsistency) !?table_read_source.RelationalReadView {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        try self.validateRoutedRead(alloc, fence, group, table);
+        try self.prepareRetainedScanRead(group, from, to, opts, consistency);
+        var lease = try self.acquireWithControls(group, table, .from(opts));
+        errdefer lease.deinit();
+        const provider = try @import("../storage/relational_read_provider.zig").acquire(lease.owner().handle);
+        const view = try provider.open(alloc, table, from, to, opts);
+        errdefer view.deinit();
+        // Close the admission race before publishing the retained snapshot.
+        // The physical owner lease then fences retirement for its lifetime.
+        try self.validateRoutedRead(alloc, fence, group, table);
+        const retained = try alloc.create(RetainedRelationalRead);
+        retained.* = .{ .alloc = alloc, .lease = lease, .view = view };
+        return .{ .ptr = retained, .vtable = &.{ .next = RetainedRelationalRead.next, .close = RetainedRelationalRead.close, .normalize = RetainedRelationalRead.normalize } };
     }
 
     fn scanGroupLocalRoutedStream(

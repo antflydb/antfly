@@ -12,6 +12,7 @@ from .client import (
     GraphQueryInput,
     IndexEmbedderConfig,
     IndexOperations,
+    SQLExecutionError,
     antfly_embedder,
 )
 from .client_generated.models import (
@@ -62,6 +63,12 @@ from .client_generated.models import (
     RelationalRowQueryRequest,
     RelationalScalarExpression,
     RelationalUniqueConstraint,
+    SQLColumn,
+    SQLColumnType,
+    SQLDiagnostic,
+    SQLMutationOutcome,
+    SQLRequest,
+    SQLResponse,
 )
 from .client_generated.models.embedding_type_1 import EmbeddingType1 as SparseEmbedding
 from .client_generated.models.embedding_type_3 import EmbeddingType3 as PackedSparseEmbedding
@@ -104,6 +111,13 @@ from .index_config import (
 __version__ = "0.2.0"
 
 __all__ = [
+    "SQLExecutionError",
+    "SQLColumn",
+    "SQLColumnType",
+    "SQLDiagnostic",
+    "SQLMutationOutcome",
+    "SQLRequest",
+    "SQLResponse",
     "IndexMaintenanceRequest",
     "IndexMaintenanceResponse",
     "IndexMaintenanceOwnerProof",

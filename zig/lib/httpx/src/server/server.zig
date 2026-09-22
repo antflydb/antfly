@@ -1728,6 +1728,11 @@ pub const Server = struct {
         try self.router.addWithData(method, path, handler, data);
     }
 
+    /// Register bounded request bodies without losing route-owned context.
+    pub fn routeWithDataAndBodyLimit(self: *Self, method: types.Method, path: []const u8, handler: anytype, data: *anyopaque, max_body_size: usize) !void {
+        try self.router.addWithDataAndBodyLimit(method, path, handler, data, max_body_size);
+    }
+
     /// Registers a GET route.
     pub fn get(self: *Self, path: []const u8, handler: anytype) !void {
         try self.route(.GET, path, handler);

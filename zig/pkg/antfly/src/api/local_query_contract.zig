@@ -3602,6 +3602,7 @@ pub const StorageKernelScanWireRequest = struct {
     filter_query_json: []const u8 = "",
     include_content_hashes: bool = false,
     relational_query_json: []const u8 = "",
+    relational_query: ?db_mod.types.RelationalRowQuery = null,
 
     pub fn options(self: StorageKernelScanWireRequest) db_mod.types.ScanOptions {
         return .{
@@ -3614,6 +3615,7 @@ pub const StorageKernelScanWireRequest = struct {
             .filter_query_json = self.filter_query_json,
             .include_content_hashes = self.include_content_hashes,
             .relational_query_json = self.relational_query_json,
+            .relational_query = self.relational_query,
         };
     }
 
@@ -3647,6 +3649,7 @@ pub fn encodeStorageKernelScanRequest(
         .filter_query_json = opts.filter_query_json,
         .include_content_hashes = opts.include_content_hashes,
         .relational_query_json = opts.relational_query_json,
+        .relational_query = opts.relational_query,
     }, .{});
 }
 
@@ -3660,7 +3663,7 @@ pub fn encodeStorageKernelScanNdjson(
     for (result.hashes, 0..) |entry, i| {
         const json = if (include_documents) result.documents[i].json else null;
         if (entry.relational_schema_version) |version| {
-            try appendRelationalScanLine(alloc, &out, .{ .id = entry.id, .hash = entry.hash, .document_json = json, .content_hash = entry.content_hash, .relational_schema_version = version, .relational_cursor = entry.relational_cursor }, version);
+            try appendRelationalScanLine(alloc, &out, .{ .id = entry.id, .hash = entry.hash, .document_json = json, .content_hash = entry.content_hash, .relational_schema_version = version, .relational_cursor = entry.relational_cursor, .json_null_fields = entry.json_null_fields }, version);
         } else try appendScanLine(alloc, &out, entry.id, json, entry.content_hash);
     }
     return try out.toOwnedSlice(alloc);
@@ -5698,9 +5701,16 @@ pub fn appendRelationalScanLine(alloc: std.mem.Allocator, out: *std.ArrayListUnm
     const header = try std.fmt.allocPrint(alloc, "{{\"_id\":{f},\"version\":\"{d}\",\"schema_version\":{d},\"row\":", .{ std.json.fmt(entry.id, .{}), entry.hash, schema_version });
     defer alloc.free(header);
     const cursor_bytes = if (entry.relational_cursor) |cursor| cursor.len +| 12 else @as(usize, 0);
-    if (header.len +| projected.len +| cursor_bytes +| 2 > (16 * 1024 * 1024) -| out.items.len) return error.RelationalRowsOutputBudgetExceeded;
+    const null_fields = if (entry.json_null_fields.len != 0) try std.json.Stringify.valueAlloc(alloc, entry.json_null_fields, .{}) else null;
+    defer if (null_fields) |bytes| alloc.free(bytes);
+    const null_bytes = if (null_fields) |bytes| bytes.len +| 20 else @as(usize, 0);
+    if (header.len +| projected.len +| cursor_bytes +| null_bytes +| 2 > (16 * 1024 * 1024) -| out.items.len) return error.RelationalRowsOutputBudgetExceeded;
     try out.appendSlice(alloc, header);
     try out.appendSlice(alloc, projected);
+    if (null_fields) |bytes| {
+        try out.appendSlice(alloc, ",\"json_null_fields\":");
+        try out.appendSlice(alloc, bytes);
+    }
     if (entry.relational_cursor) |cursor| {
         try out.appendSlice(alloc, ",\"cursor\":");
         try appendJsonString(alloc, out, cursor);

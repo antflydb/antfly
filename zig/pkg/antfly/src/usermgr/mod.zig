@@ -16,6 +16,7 @@ const user_manager = @import("user_manager.zig");
 const storage_adapter = @import("storage_adapter.zig");
 
 pub const MemoryStore = user_manager.MemoryStore;
+pub const verifyPassword = user_manager.verifyPassword;
 pub const AuthSubjectEntry = user_manager.AuthSubjectEntry;
 pub const AuthSubjectKind = user_manager.AuthSubjectKind;
 pub const ApiKey = user_manager.ApiKey;

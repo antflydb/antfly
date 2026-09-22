@@ -447,7 +447,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     test_imports.configure(b, relational_index_system_mod, true, true);
     const relational_index_system_tests = b.addTest(.{
         .root_module = relational_index_system_mod,
-        .filters = &.{ "relational index system", "relational index records" },
+        .filters = &.{ "relational index system", "relational index records", "relational rows snapshot", "ordinal typed projection" },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-relational-index-system-test", "Run LSM index lifecycle, standby replay, and work-count benchmarks").dependOn(&addCuratedTestRunArtifact(b, relational_index_system_tests, relational_index_system_tests.filters).step);
@@ -863,6 +863,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "antfly client pkg compiles",
             "get index response timeout bounds the complete HTTP request",
             "list indexes response timeout bounds readiness preflight",
+            "SQL client preserves typed parameters receipts and forbids replay",
         },
     });
     const run_antfly_client_pkg_tests = addFilteredTestRunArtifact(b, antfly_client_pkg_tests);
@@ -1480,6 +1481,17 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "httpx restore owner accepts bounded rewrite source chunks above legacy control limit",
         "httpx schema patch merges at the authority and accepts version zero ETag",
         "httpx relational row query mutation endpoints enforce exact versions and schema epochs",
+        "httpx SQL",
+        "api.sql_execution",
+        "api.sql_pgwire",
+        "SQL schema cache",
+        "SQL catalog",
+        "SQL native session",
+        "SQL session metadata",
+        "SQL session overlay",
+        "SQL JSON null",
+        "SQL staged",
+        "SQL retained native scan",
         "system catalog",
         "backup heartbeat ",
         "table storage creation intent survives",

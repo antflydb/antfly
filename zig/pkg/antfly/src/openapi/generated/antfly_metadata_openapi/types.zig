@@ -8526,6 +8526,8 @@ pub const RelationalRow = struct {
     cursor: ?[]const u8 = null,
     _id: []const u8,
     row: std.json.ArrayHashMap(std.json.Value),
+    /// Projected JSON columns containing the JSON literal null rather than SQL NULL. Other null-valued fields are SQL NULL.
+    json_null_fields: ?[]const []const u8 = null,
     /// Exact row version for mutation preconditions, encoded as decimal text.
     version: []const u8,
     /// Active pinned schema epoch, not the historical physical row layout.
@@ -8536,6 +8538,7 @@ pub const RelationalRow = struct {
         .{ "cursor", "cursor", true },
         .{ "_id", "_id", false },
         .{ "row", "row", false },
+        .{ "json_null_fields", "json_null_fields", true },
         .{ "version", "version", false },
         .{ "schema_version", "schema_version", false },
     };
@@ -8558,6 +8561,10 @@ pub const RelationalRow = struct {
         try jw.write(self._id);
         try jw.objectField("row");
         try jw.write(self.row);
+        if (self.json_null_fields) |value| {
+            try jw.objectField("json_null_fields");
+            try jw.write(value);
+        }
         try jw.objectField("version");
         try jw.write(self.version);
         try jw.objectField("schema_version");
@@ -8644,12 +8651,15 @@ pub const RelationalRowMutation = struct {
     /// Exact observed version. Zero requires that the row does not exist.
     expected_version: []const u8,
     row: ?std.json.ArrayHashMap(std.json.Value) = null,
+    /// Names of JSON-typed columns whose row value is the JSON literal null rather than SQL NULL. Each name must identify a present null-valued JSON column; duplicates, unknown names, non-null values, and use with deletion are rejected.
+    json_null_fields: ?[]const []const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "key", "key", false },
         .{ "expected_version", "expected_version", false },
         .{ "row", "row", true },
+        .{ "json_null_fields", "json_null_fields", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -8668,6 +8678,10 @@ pub const RelationalRowMutation = struct {
         try jw.write(self.expected_version);
         if (self.row) |value| {
             try jw.objectField("row");
+            try jw.write(value);
+        }
+        if (self.json_null_fields) |value| {
+            try jw.objectField("json_null_fields");
             try jw.write(value);
         }
         try jw.endObject();
@@ -10352,6 +10366,396 @@ pub const RuntimeConfigStatus = struct {
             try jw.write(value);
         }
         try jw.endObject();
+    }
+};
+
+pub const SQLColumn = struct {
+    /// Display label. Labels need not be unique; rows use matching ordinal positions.
+    name: []const u8,
+    type: SQLColumnType,
+};
+
+/// Logical SQL result type. Integer values are decimal strings to preserve exact precision in every client.
+pub const SQLColumnType = enum {
+    string,
+    integer,
+    number,
+    boolean,
+    datetime,
+    json,
+    unknown,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .string => "string",
+            .integer => "integer",
+            .number => "number",
+            .boolean => "boolean",
+            .datetime => "datetime",
+            .json => "json",
+            .unknown => "unknown",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "string", .string },
+            .{ "integer", .integer },
+            .{ "number", .number },
+            .{ "boolean", .boolean },
+            .{ "datetime", .datetime },
+            .{ "json", .json },
+            .{ "unknown", .unknown },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Durable DDL declaration receipt. Pending or invalid means the declaration committed but validation has not established an active constraint. Do not replay it. Inspect table constraint status using this immutable table identity and schema generation; a later generation supersedes this receipt.
+pub const SQLDDLReceipt = struct {
+    database: []const u8,
+    namespace: []const u8,
+    table: []const u8,
+    table_id: []const u8,
+    schema_version: i64,
+    state: SQLDDLReceiptState,
+    diagnostic: ?[]const u8 = null,
+    /// Native restore job for an atomic schema rewrite. Until publication table_id identifies the source generation. Poll the restore job; do not replay this DDL.
+    restore_job_id: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "database", "database", false },
+        .{ "namespace", "namespace", false },
+        .{ "table", "table", false },
+        .{ "table_id", "table_id", false },
+        .{ "schema_version", "schema_version", false },
+        .{ "state", "state", false },
+        .{ "diagnostic", "diagnostic", true },
+        .{ "restore_job_id", "restore_job_id", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("database");
+        try jw.write(self.database);
+        try jw.objectField("namespace");
+        try jw.write(self.namespace);
+        try jw.objectField("table");
+        try jw.write(self.table);
+        try jw.objectField("table_id");
+        try jw.write(self.table_id);
+        try jw.objectField("schema_version");
+        try jw.write(self.schema_version);
+        try jw.objectField("state");
+        try jw.write(self.state);
+        if (self.diagnostic) |value| {
+            try jw.objectField("diagnostic");
+            try jw.write(value);
+        }
+        if (self.restore_job_id) |value| {
+            try jw.objectField("restore_job_id");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const SQLDDLReceiptState = enum {
+    ready,
+    pending,
+    invalid,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .ready => "ready",
+            .pending => "pending",
+            .invalid => "invalid",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "ready", .ready },
+            .{ "pending", .pending },
+            .{ "invalid", .invalid },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const SQLDiagnostic = struct {
+    /// Five-character SQLSTATE error code.
+    code: []const u8,
+    /// Human-readable diagnostic with no sensitive parameter values.
+    message: []const u8,
+    /// Optional one-based character position in the submitted SQL statement.
+    position: ?i64 = null,
+    /// Native transaction receipt for reconciliation when a mutation outcome is unknown.
+    transaction_id: ?[]const u8 = null,
+    /// False for SQLSTATE 40003; never replay a mutation whose outcome is unknown.
+    retryable: ?bool = null,
+    transaction_status: ?SQLTransactionStatus = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "code", "code", false },
+        .{ "message", "message", false },
+        .{ "position", "position", true },
+        .{ "transaction_id", "transaction_id", true },
+        .{ "retryable", "retryable", true },
+        .{ "transaction_status", "transaction_status", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("code");
+        try jw.write(self.code);
+        try jw.objectField("message");
+        try jw.write(self.message);
+        if (self.position) |value| {
+            try jw.objectField("position");
+            try jw.write(value);
+        }
+        if (self.transaction_id) |value| {
+            try jw.objectField("transaction_id");
+            try jw.write(value);
+        }
+        if (self.retryable) |value| {
+            try jw.objectField("retryable");
+            try jw.write(value);
+        }
+        if (self.transaction_status) |value| {
+            try jw.objectField("transaction_status");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Durable mutation outcome. Every value confirms a commit and must not cause the statement to be replayed. Pending or repair outcomes require visibility convergence or operator action rather than another write.
+pub const SQLMutationOutcome = enum {
+    committed,
+    committed_pending,
+    committed_repair_required,
+    committed_graph_metric_materialization_rejected,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .committed => "committed",
+            .committed_pending => "committed_pending",
+            .committed_repair_required => "committed_repair_required",
+            .committed_graph_metric_materialization_rejected => "committed_graph_metric_materialization_rejected",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "committed", .committed },
+            .{ "committed_pending", .committed_pending },
+            .{ "committed_repair_required", .committed_repair_required },
+            .{ "committed_graph_metric_materialization_rejected", .committed_graph_metric_materialization_rejected },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Execute one SQL statement. Parameters are positional (`$1`, `$2`, ...), never interpolated into SQL text. To preserve integer precision in JavaScript clients, supply integers outside the exact JSON number range as decimal strings; binding coerces parameters to the expected type. The result limit is an admission bound, not an implicit SQL LIMIT: statements whose results exceed it fail instead of silently truncating. Request bodies are limited to 4 MiB, preparation to 8 MiB of allocated memory, and encoded results to a 16 MiB allocation budget.
+pub const SQLRequest = struct {
+    /// A single SQL statement.
+    statement: []const u8,
+    /// Positional JSON parameter values, including null.
+    parameters: ?[]const std.json.Value = null,
+    /// Database used to resolve unqualified catalog names.
+    database: ?[]const u8 = null,
+    /// Namespace used to resolve unqualified table names.
+    namespace: ?[]const u8 = null,
+    /// Maximum admitted result rows; does not change statement semantics.
+    limit: ?i64 = null,
+    /// Opaque SQL session identifier returned by a previous response.
+    session_id: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "statement", "statement", false },
+        .{ "parameters", "parameters", true },
+        .{ "database", "database", true },
+        .{ "namespace", "namespace", true },
+        .{ "limit", "limit", true },
+        .{ "session_id", "session_id", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("statement");
+        try jw.write(self.statement);
+        if (self.parameters) |value| {
+            try jw.objectField("parameters");
+            try jw.write(value);
+        }
+        if (self.database) |value| {
+            try jw.objectField("database");
+            try jw.write(value);
+        }
+        if (self.namespace) |value| {
+            try jw.objectField("namespace");
+            try jw.write(value);
+        }
+        if (self.limit) |value| {
+            try jw.objectField("limit");
+            try jw.write(value);
+        }
+        if (self.session_id) |value| {
+            try jw.objectField("session_id");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Ordinal result rows with corresponding logical column metadata. SQL NULL is JSON null; sql_nulls distinguishes it from a JSON column containing the JSON literal null. Integer-typed values are exact decimal strings; datetime values are strings. Objects and arrays in JSON columns remain JSON.
+pub const SQLResponse = struct {
+    columns: []const SQLColumn,
+    rows: []const []const std.json.Value,
+    /// Number of rows affected by a mutation, or zero for a read-only statement.
+    rows_affected: i64,
+    /// Null flags aligned exactly with rows and their columns. True denotes SQL NULL; false denotes a value, including the JSON literal null. When omitted, null cells have the legacy SQL NULL interpretation.
+    sql_nulls: ?[]const []const bool = null,
+    /// SQL command completion tag.
+    command_tag: []const u8,
+    mutation_outcome: ?SQLMutationOutcome = null,
+    ddl_receipt: ?SQLDDLReceipt = null,
+    /// Native transaction receipt for visibility or repair reconciliation; never replay a committed statement.
+    transaction_id: ?[]const u8 = null,
+    /// Opaque SQL session identifier for subsequent requests.
+    session_id: ?[]const u8 = null,
+    transaction_status: ?SQLTransactionStatus = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "columns", "columns", false },
+        .{ "rows", "rows", false },
+        .{ "rows_affected", "rows_affected", false },
+        .{ "sql_nulls", "sql_nulls", true },
+        .{ "command_tag", "command_tag", false },
+        .{ "mutation_outcome", "mutation_outcome", true },
+        .{ "ddl_receipt", "ddl_receipt", true },
+        .{ "transaction_id", "transaction_id", true },
+        .{ "session_id", "session_id", true },
+        .{ "transaction_status", "transaction_status", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("columns");
+        try jw.write(self.columns);
+        try jw.objectField("rows");
+        try jw.write(self.rows);
+        try jw.objectField("rows_affected");
+        try jw.write(self.rows_affected);
+        if (self.sql_nulls) |value| {
+            try jw.objectField("sql_nulls");
+            try jw.write(value);
+        }
+        try jw.objectField("command_tag");
+        try jw.write(self.command_tag);
+        if (self.mutation_outcome) |value| {
+            try jw.objectField("mutation_outcome");
+            try jw.write(value);
+        }
+        if (self.ddl_receipt) |value| {
+            try jw.objectField("ddl_receipt");
+            try jw.write(value);
+        }
+        if (self.transaction_id) |value| {
+            try jw.objectField("transaction_id");
+            try jw.write(value);
+        }
+        if (self.session_id) |value| {
+            try jw.objectField("session_id");
+            try jw.write(value);
+        }
+        if (self.transaction_status) |value| {
+            try jw.objectField("transaction_status");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Authoritative native SQL session state after the statement. Failed sessions require ROLLBACK or ROLLBACK TO SAVEPOINT; uncertain commit outcomes must be reconciled by transaction_id, never replayed.
+pub const SQLTransactionStatus = enum {
+    idle,
+    in_transaction,
+    failed,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .idle => "idle",
+            .in_transaction => "in_transaction",
+            .failed => "failed",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "idle", .idle },
+            .{ "in_transaction", .in_transaction },
+            .{ "failed", .failed },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
     }
 };
 

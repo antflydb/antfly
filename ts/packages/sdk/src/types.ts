@@ -153,6 +153,14 @@ export interface WriteOptions {
   signal?: AbortSignal;
 }
 
+// SQL types. Integer result values are exact decimal strings.
+export type SQLRequest = components["schemas"]["SQLRequest"];
+export type SQLResponse = components["schemas"]["SQLResponse"];
+export type SQLColumn = components["schemas"]["SQLColumn"];
+export type SQLColumnType = components["schemas"]["SQLColumnType"];
+export type SQLDiagnostic = components["schemas"]["SQLDiagnostic"];
+export type SQLMutationOutcome = components["schemas"]["SQLMutationOutcome"];
+
 // Table types
 export type Table = components["schemas"]["Table"];
 export type CommittedMutationOutcome = components["schemas"]["CommittedMutationOutcome"];

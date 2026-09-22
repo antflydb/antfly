@@ -566,6 +566,11 @@ pub const DeleteSecretPathParams = struct {
     key: []const u8,
 };
 
+/// Parse the JSON request body for executeSQL.
+pub fn parseExecuteSQLBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.SQLRequest) {
+    return std.json.parseFromSlice(types.SQLRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 pub const ListTablesParams = struct {
     /// Filter tables by name prefix (e.g., "prod_")
     prefix: ?[]const u8 = null,
@@ -1246,6 +1251,7 @@ pub const routes = [_]Route{
     .{ .method = "GET", .path = "/secrets", .operation_id = "listSecrets", .request_body = .none, .streaming_response = false },
     .{ .method = "PUT", .path = "/secrets/{key}", .operation_id = "putSecret", .request_body = .buffered, .streaming_response = false },
     .{ .method = "DELETE", .path = "/secrets/{key}", .operation_id = "deleteSecret", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/sql", .operation_id = "executeSQL", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/status", .operation_id = "getStatus", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/tables", .operation_id = "listTables", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}", .operation_id = "getTable", .request_body = .none, .streaming_response = false },
@@ -1383,6 +1389,7 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "listSecrets")) @compileError("ServerRouter: Impl missing required method 'listSecrets'");
         if (!@hasDecl(Impl, "putSecret")) @compileError("ServerRouter: Impl missing required method 'putSecret'");
         if (!@hasDecl(Impl, "deleteSecret")) @compileError("ServerRouter: Impl missing required method 'deleteSecret'");
+        if (!@hasDecl(Impl, "executeSQL")) @compileError("ServerRouter: Impl missing required method 'executeSQL'");
         if (!@hasDecl(Impl, "getStatus")) @compileError("ServerRouter: Impl missing required method 'getStatus'");
         if (!@hasDecl(Impl, "listTables")) @compileError("ServerRouter: Impl missing required method 'listTables'");
         if (!@hasDecl(Impl, "getTable")) @compileError("ServerRouter: Impl missing required method 'getTable'");
@@ -1518,6 +1525,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.get("/secrets", httpx.Handler.bind(self.impl, listSecrets));
             try server.put("/secrets/:key", httpx.Handler.bind(self.impl, putSecret));
             try server.delete("/secrets/:key", httpx.Handler.bind(self.impl, deleteSecret));
+            try server.post("/sql", httpx.Handler.bind(self.impl, executeSQL));
             try server.get("/status", httpx.Handler.bind(self.impl, getStatus));
             try server.get("/tables", httpx.Handler.bind(self.impl, listTables));
             try server.get("/tables/:tableName", httpx.Handler.bind(self.impl, getTable));
@@ -2065,6 +2073,12 @@ pub fn ServerRouter(comptime Impl: type) type {
         fn deleteSecret(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const key = ctx.param("key") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: key" });
             return impl.deleteSecret(ctx, key);
+        }
+
+        /// Execute a SQL statement
+        /// POST /sql
+        fn executeSQL(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.executeSQL(ctx);
         }
 
         /// Get cluster status
@@ -2645,6 +2659,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn listSecrets(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn putSecret(self: *Impl, ctx: *httpx.Context, key: []const u8) !httpx.Response
 //   fn deleteSecret(self: *Impl, ctx: *httpx.Context, key: []const u8) !httpx.Response
+//   fn executeSQL(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn getStatus(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn listTables(self: *Impl, ctx: *httpx.Context, params: ListTablesParams) !httpx.Response
 //   fn getTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response

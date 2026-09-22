@@ -24,6 +24,7 @@ pub const table = @import("table.zig");
 pub const index = @import("index.zig");
 pub const artifact = @import("artifact.zig");
 pub const query = @import("query.zig");
+pub const sql = @import("sql.zig");
 pub const data = @import("data.zig");
 pub const backup = @import("backup.zig");
 pub const agents = @import("agents.zig");
@@ -72,6 +73,16 @@ pub fn isHelpArg(arg: []const u8) bool {
 }
 
 pub fn commandUsage(command: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, command, "sql")) return
+    \\usage: antfly sql --statement '<SQL>' [--parameters '<JSON array>']
+    \\                  [--database <name>] [--namespace <name>] [--limit <1..4096>]
+    \\       antfly sql --interactive [--database <name>] [--namespace <name>]
+    \\  Interactive mode accepts one statement per line; \q rolls back and exits.
+    \\  Parameters bind as typed values; quote SQL to prevent shell expansion of $1.
+    \\  Limit is a result admission cap, not an implicit SQL LIMIT. No automatic retries.
+    \\  Scope defaults use ANTFLY_DATABASE / ANTFLY_NAMESPACE or default/public.
+    \\
+    ;
     if (std.mem.eql(u8, command, "query")) return
     \\usage: antfly query --table <table> [search options]
     \\
@@ -276,6 +287,7 @@ test "cli mod compiles" {
     _ = index;
     _ = artifact;
     _ = query;
+    _ = sql;
     _ = data;
     _ = backup;
     _ = agents;

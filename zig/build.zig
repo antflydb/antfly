@@ -248,6 +248,37 @@ pub fn create(b: *std.Build) ?Artifacts {
     sql_generated_check.dependOn(&yacc_steps.run_generated.step);
     b.step("lib-sql-parser-test", "Run the storage-independent SQL lexer and parser tests").dependOn(&yacc_steps.run_parser_tests.step);
     b.step("lib-sql-parser-bench", "Build and install lib-sql-parser-bench").dependOn(&b.addInstallArtifact(yacc_steps.benchmark, .{}).step);
+    const sql_parser_mod = b.createModule(.{
+        .root_source_file = b.path("lib/sql/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const sql_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/sql_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    sql_test_mod.addImport("sql_parser", sql_parser_mod);
+    const sql_tests = b.addTest(.{ .root_module = sql_test_mod, .filters = b.args orelse &.{} });
+    const run_sql_tests = b.addRunArtifact(sql_tests);
+    // These storage-independent owners must not inherit the multi-GiB claims
+    // reserved for the full database compilation and integration test roots.
+    sql_tests.step.max_rss = 1024 * 1024 * 1024;
+    run_sql_tests.step.max_rss = 64 * 1024 * 1024;
+    b.step("sql-test", "Run SQL compilation, catalog binding, and native execution contract tests").dependOn(&run_sql_tests.step);
+    const pgwire_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly/src/pgwire/mod.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = link_libc,
+        }),
+        .filters = b.args orelse &.{},
+    });
+    const run_pgwire_tests = b.addRunArtifact(pgwire_tests);
+    pgwire_tests.step.max_rss = 1024 * 1024 * 1024;
+    run_pgwire_tests.step.max_rss = 64 * 1024 * 1024;
+    b.step("pgwire-test", "Run PostgreSQL wire framing, session, and lifecycle tests").dependOn(&run_pgwire_tests.step);
     const openapi_root_check = addOpenApiRootCheckStep(b);
     openapi_check_step.dependOn(&openapi_root_check.step);
     const openapi_modules = pkg_antfly_build_codegen.createCommittedModules(b, .{
@@ -682,6 +713,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const inference_steps = @import("pkg/inference/build/integration.zig").add(inference_workflow, inference_wasm_jinja, inference_wasm_platform);
 
     const antfly_imports = AntflyRootImports{
+        .sql_parser = sql_parser_mod,
         .storage_boundary = @import("pkg/antfly/build/storage_boundary.zig").create(b, b.path("pkg/antfly/src"), target, optimize),
         .build_info = build_info,
         .build_options = build_options,
@@ -1216,6 +1248,8 @@ pub fn create(b: *std.Build) ?Artifacts {
     const run_lib_ha_compat_tests = owner_tests.run_lib_ha_compat_tests;
     const antfly_test_step = owner_tests.antfly_test_step;
     const unit_test_step = owner_tests.unit_test_step;
+    unit_test_step.dependOn(&run_sql_tests.step);
+    unit_test_step.dependOn(&run_pgwire_tests.step);
     unit_test_step.dependOn(&pdf_integration.run.step);
     // HTTP client lifecycle tests belong to lib-test; keep their focused target.
     const vopr_test_step = owner_tests.vopr_test_step;

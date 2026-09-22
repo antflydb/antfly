@@ -49,6 +49,7 @@ export {
   QueryTemporarilyUnavailableError,
   type RestoreOptions,
   type SchemaMutationOptions,
+  SQLExecutionError,
   StorageReadTemporarilyUnavailableError,
   StorageResourceExhaustedError,
 } from "./client.js";
@@ -418,6 +419,12 @@ export type {
   SignificanceAlgorithm,
   SortProfile,
   SparseEmbedding,
+  SQLColumn,
+  SQLColumnType,
+  SQLDiagnostic,
+  SQLMutationOutcome,
+  SQLRequest,
+  SQLResponse,
   SSEStepStarted,
   SSEToolMode,
   // Table types

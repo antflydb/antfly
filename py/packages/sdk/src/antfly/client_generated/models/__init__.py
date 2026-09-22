@@ -1133,6 +1133,15 @@ from .sort_field import SortField
 from .sort_profile import SortProfile
 from .sort_profile_candidate_source import SortProfileCandidateSource
 from .sort_profile_sort_lifecycle_state import SortProfileSortLifecycleState
+from .sql_column import SQLColumn
+from .sql_column_type import SQLColumnType
+from .sql_diagnostic import SQLDiagnostic
+from .sql_mutation_outcome import SQLMutationOutcome
+from .sql_request import SQLRequest
+from .sql_response import SQLResponse
+from .sql_transaction_status import SQLTransactionStatus
+from .sqlddl_receipt import SQLDDLReceipt
+from .sqlddl_receipt_state import SQLDDLReceiptState
 from .sse_error import SSEError
 from .sse_error_reason import SSEErrorReason
 from .sse_event import SSEEvent
@@ -2406,6 +2415,15 @@ __all__ = (
     "SortProfile",
     "SortProfileCandidateSource",
     "SortProfileSortLifecycleState",
+    "SQLColumn",
+    "SQLColumnType",
+    "SQLDDLReceipt",
+    "SQLDDLReceiptState",
+    "SQLDiagnostic",
+    "SQLMutationOutcome",
+    "SQLRequest",
+    "SQLResponse",
+    "SQLTransactionStatus",
     "SSEError",
     "SSEErrorReason",
     "SSEEvent",

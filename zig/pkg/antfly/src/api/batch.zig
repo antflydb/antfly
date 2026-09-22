@@ -338,6 +338,8 @@ pub const OwnedBatchRequest = struct {
             for (self.writes) |write| {
                 alloc.free(@constCast(write.key));
                 alloc.free(@constCast(write.value));
+                for (write.json_null_fields) |name| alloc.free(name);
+                if (write.json_null_fields.len != 0) alloc.free(write.json_null_fields);
             }
             if (self.writes.len > 0) alloc.free(self.writes);
             for (self.deletes) |key| alloc.free(key);
@@ -1798,6 +1800,8 @@ fn freeWrites(alloc: std.mem.Allocator, writes: []db_mod.types.BatchWrite) void 
     for (writes) |write| {
         alloc.free(@constCast(write.key));
         alloc.free(@constCast(write.value));
+        for (write.json_null_fields) |name| alloc.free(name);
+        if (write.json_null_fields.len != 0) alloc.free(write.json_null_fields);
     }
     if (writes.len > 0) alloc.free(writes);
 }

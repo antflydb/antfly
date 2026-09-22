@@ -15,6 +15,10 @@
 const std = @import("std");
 
 pub const Slice = extern struct {
+    pub fn fromSlice(value: []const u8) Slice {
+        return .{ .ptr = value.ptr, .len = value.len };
+    }
+
     ptr: ?[*]const u8 = null,
     len: usize = 0,
 

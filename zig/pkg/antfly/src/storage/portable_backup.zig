@@ -3635,7 +3635,8 @@ fn validatePortableDocumentEntryAgainstArchive(
             else => return error.InvalidBackupRequest,
         };
         defer logical.deinit(alloc);
-        validator.validateValue(alloc, &logical.root) catch |err| switch (err) {
+        const typed_row = try relational_row_codec.ordinalRowViewTrusted(entry.value, layout.schema.*, layout.physical);
+        validator.validateTypedStoredRoot(alloc, &logical.root, typed_row) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return error.InvalidBackupRequest,
         };

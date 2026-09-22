@@ -2540,6 +2540,31 @@ pub const DocStore = struct {
         checkpoint: *const fn (?*anyopaque, []const u8) anyerror!ScanAction,
         callback: ScanWithContextCallback,
     ) !void {
+        return self.scanRowKindReadTxnWithContext(txn, lower, upper, internal_keys.relational_row_kind, ctx, checkpoint, callback);
+    }
+
+    pub fn scanDocumentRowsReadTxnWithContext(
+        self: *DocStore,
+        txn: *Txn,
+        lower: []const u8,
+        upper: []const u8,
+        ctx: ?*anyopaque,
+        checkpoint: *const fn (?*anyopaque, []const u8) anyerror!ScanAction,
+        callback: ScanWithContextCallback,
+    ) !void {
+        return self.scanRowKindReadTxnWithContext(txn, lower, upper, internal_keys.primary_kind, ctx, checkpoint, callback);
+    }
+
+    fn scanRowKindReadTxnWithContext(
+        self: *DocStore,
+        txn: *Txn,
+        lower: []const u8,
+        upper: []const u8,
+        row_kind: u8,
+        ctx: ?*anyopaque,
+        checkpoint: *const fn (?*anyopaque, []const u8) anyerror!ScanAction,
+        callback: ScanWithContextCallback,
+    ) !void {
         var cursor = try txn.openCursor();
         defer cursor.close();
         const end = if (upper.len != 0) upper else &[_]u8{internal_keys.user_namespace + 1};
@@ -2555,7 +2580,7 @@ pub const DocStore = struct {
             const term = internal_keys.findComponentTerminator(item.key, 1) orelse return error.InvalidInternalUserKey;
             candidate.clearRetainingCapacity();
             try candidate.appendSlice(self.alloc, item.key[0 .. term + 2]);
-            try candidate.append(self.alloc, internal_keys.relational_row_kind);
+            try candidate.append(self.alloc, row_kind);
             if (try checkpoint(ctx, candidate.items) == .stop) return;
             var current = item;
             if (std.mem.order(u8, current.key, candidate.items) == .lt) {

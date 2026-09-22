@@ -17,6 +17,9 @@ const document_mapper = @import("../storage/db/document_mapper.zig");
 
 pub const cluster = @import("cluster.zig");
 pub const operation = @import("operation.zig");
+const sql_execution = @import("sql_execution.zig");
+const sql_pgwire = @import("sql_pgwire.zig");
+const sql_session = @import("sql_session.zig");
 pub const probe_operations = @import("probe_operations.zig");
 pub const storage_maintenance_operations = @import("storage_maintenance_operations.zig");
 pub const batch = @import("batch.zig");
@@ -227,6 +230,10 @@ test "join inequality: incomparable types return 0" {
 }
 
 test "api module compiles" {
+    _ = sql_execution;
+    _ = @import("sql_schema_cache.zig");
+    _ = sql_pgwire;
+    _ = sql_session;
     _ = cluster;
     _ = batch;
     _ = backups;

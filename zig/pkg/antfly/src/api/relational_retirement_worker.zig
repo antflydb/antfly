@@ -30,12 +30,45 @@ const schema = @import("../storage/schema.zig");
 const Allocator = std.mem.Allocator;
 const Control = @import("operation.zig").RequestContext;
 
+test "SQL catalog retirement permits only deletion of ordered indexes" {
+    const alloc = std.testing.allocator;
+    const before = "{\"version\":1,\"storage_mode\":\"relational\",\"relational_indexes\":[{\"name\":\"drop\",\"keys\":[{\"column\":\"id\"}]},{\"name\":\"retain\",\"keys\":[{\"column\":\"label\"}]}],\"unique_constraints\":[{\"name\":\"drop\",\"columns\":[\"id\"]}]}";
+    try std.testing.expect(try retainedSchemaEqual(alloc, before, "{\"version\":2,\"storage_mode\":\"relational\",\"relational_indexes\":[{\"keys\":[{\"column\":\"label\"}],\"name\":\"retain\"}],\"unique_constraints\":[]}"));
+    try std.testing.expect(!try retainedSchemaEqual(alloc, before, "{\"version\":2,\"storage_mode\":\"relational\",\"relational_indexes\":[{\"name\":\"retain\",\"keys\":[{\"column\":\"id\"}]}],\"unique_constraints\":[]}"));
+    try std.testing.expect(!try retainedSchemaEqual(alloc, before, "{\"version\":2,\"storage_mode\":\"relational\",\"relational_indexes\":[{\"name\":\"new\",\"keys\":[{\"column\":\"label\"}]}],\"unique_constraints\":[]}"));
+    try std.testing.expect(!try retainedSchemaEqual(alloc, before, "{\"version\":2,\"storage_mode\":\"document\",\"relational_indexes\":[],\"unique_constraints\":[]}"));
+}
+
 fn retainedSchemaEqual(alloc: Allocator, source: []const u8, target: []const u8) !bool {
     var before = try std.json.parseFromSlice(std.json.Value, alloc, source, .{ .parse_numbers = false });
     defer before.deinit();
     var after = try std.json.parseFromSlice(std.json.Value, alloc, target, .{ .parse_numbers = false });
     defer after.deinit();
     if (before.value != .object or after.value != .object) return false;
+    // Dropping a SQL-owned UNIQUE index retires its claims and removes the
+    // corresponding ordered index in the same publication. Permit deletion
+    // only: additions or changed retained indexes need their normal lifecycle.
+    var prior_indexes: std.StringHashMapUnmanaged(std.json.Value) = .empty;
+    defer prior_indexes.deinit(alloc);
+    if (before.value.object.get("relational_indexes")) |indexes| if (indexes == .array) {
+        for (indexes.array.items) |index| {
+            const name = index.object.get("name") orelse return false;
+            try prior_indexes.put(alloc, name.string, index);
+        }
+    };
+    if (after.value.object.get("relational_indexes")) |indexes| if (indexes == .array) {
+        for (indexes.array.items) |index| {
+            const name = index.object.get("name") orelse return false;
+            const prior = prior_indexes.get(name.string) orelse return false;
+            const prior_json = try @import("../storage/db/document_content_hash.zig").canonicalJsonValueAlloc(alloc, prior);
+            defer alloc.free(prior_json);
+            const current_json = try @import("../storage/db/document_content_hash.zig").canonicalJsonValueAlloc(alloc, index);
+            defer alloc.free(current_json);
+            if (!std.mem.eql(u8, prior_json, current_json)) return false;
+        }
+    };
+    _ = before.value.object.swapRemove("relational_indexes");
+    _ = after.value.object.swapRemove("relational_indexes");
     for ([_][]const u8{ "version", "unique_constraints", "foreign_keys" }) |field| {
         _ = before.value.object.swapRemove(field);
         _ = after.value.object.swapRemove(field);
@@ -72,6 +105,11 @@ pub const Replacement = struct {
 /// intent. The returned private record is admitted with the ordinary metadata
 /// exact-definition CAS, never accepted through public TableSchema fields.
 pub fn begin(alloc: Allocator, reader: reads.TableReadSource, tables: []const records.TableRecord, ranges: []const records.RangeRecord, table_name: []const u8, target_input: []const u8, drop: bool) !Replacement {
+    return beginControlled(alloc, reader, tables, ranges, table_name, target_input, drop, .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() +| 5 * std.time.ns_per_s });
+}
+
+pub fn beginControlled(alloc: Allocator, reader: reads.TableReadSource, tables: []const records.TableRecord, ranges: []const records.RangeRecord, table_name: []const u8, target_input: []const u8, drop: bool, control: Control) !Replacement {
+    try control.ensureActive();
     var arena = std.heap.ArenaAllocator.init(alloc);
     errdefer arena.deinit();
     const owned = arena.allocator();
@@ -99,7 +137,7 @@ pub fn begin(alloc: Allocator, reader: reads.TableReadSource, tables: []const re
         }
     }.less);
     if (owners.items.len == 0 or owners.items.len > 4096) return error.TopologyChanged;
-    const first = try readStatus(owned, reader, table.name, owners.items[0].start, .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() +| 5 * std.time.ns_per_s }, true);
+    const first = try readStatus(owned, reader, table.name, owners.items[0].start, control, true);
     const catalog = try catalog_mod.decode(owned, first.value.catalog);
     if (!std.mem.eql(u8, &catalog.incarnation, &(try catalog_mod.incarnationFromTableId(table.table_id))) or target_runtime.version != std.math.add(u32, catalog.schema_version, 1) catch return error.PreparedGenerationChanged) return error.PreparedGenerationChanged;
     for (definitions) |definition| {
@@ -120,6 +158,7 @@ pub fn begin(alloc: Allocator, reader: reads.TableReadSource, tables: []const re
     // A retained FK owns references under one concrete UNIQUE generation;
     // an equivalent second UNIQUE does not transfer those references.
     for (tables) |candidate| {
+        try control.ensureActive();
         if (candidate.schema_json.len == 0) continue;
         const child = if (candidate.table_id == table.table_id) target else try schema_api.parseValidatedTableSchema(owned, candidate.schema_json);
         if (child.foreign_keys) |foreign| for (foreign.value) |fk| {
@@ -492,10 +531,10 @@ fn testRetirementDrain(pressure: RetirementPressure) !void {
     var db_open = true;
     defer if (db_open) db.close();
     const declaration =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"foreign_keys":[{"name":"parent_fk","child_columns":["parent"],"parent_table":"rows","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent":{"type":"integer"}},"additionalProperties":false}}}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","relational_indexes":[{"name":"pk","keys":[{"column":"id"}],"description":"SQL UNIQUE INDEX"},{"name":"retained","keys":[{"column":"parent"}]}],"unique_constraints":[{"name":"pk","columns":["id"]}],"foreign_keys":[{"name":"parent_fk","child_columns":["parent"],"parent_table":"rows","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent":{"type":"integer"}},"additionalProperties":false}}}}
     ;
     const target =
-        \\{"version":2,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent":{"type":"integer"}},"additionalProperties":false}}}}
+        \\{"version":2,"storage_mode":"relational","default_type":"row","relational_indexes":[{"name":"retained","keys":[{"column":"parent"}]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent":{"type":"integer"}},"additionalProperties":false}}}}
     ;
     try db.setSchemaJson(alloc, declaration);
     const Fixture = struct {

@@ -14,6 +14,14 @@
 
 const std = @import("std");
 
+pub const sql_max_request_body_bytes: usize = 4 << 20;
+
+/// Transport admission shared by native and linked-kernel registrars. Resolve
+/// before buffering so a SQL request cannot consume the much larger batch cap.
+pub fn publicPostBodyLimit(path: []const u8) ?usize {
+    return if (std.mem.eql(u8, path, "/db/v1/sql")) sql_max_request_body_bytes else null;
+}
+
 pub const Routes = struct {
     pub const healthz = "/healthz";
     pub const readyz = "/readyz";

@@ -52,6 +52,8 @@ pub const Request = struct {
     /// Optional caller-specific response ceiling. Client execution clamps
     /// this to the configured client-wide maximum.
     max_response_size: ?usize = null,
+    /// Per-request retry ceiling; can only lower the client-wide policy.
+    max_retries: ?u32 = null,
     attempt_observer: ?@import("attempt_observer.zig").AttemptObserver = null,
     /// Borrowed through synchronous execution, including retries and redirects.
     /// Called before request bytes can reach the peer, never during setup.

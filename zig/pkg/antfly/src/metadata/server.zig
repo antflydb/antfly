@@ -331,15 +331,18 @@ pub const MetadataServer = struct {
             };
 
             const public_http_server = try alloc.create(public_api_kernel.ApiHttpServer);
-            public_http_server.* = public_api_kernel.ApiHttpServer.initWithProcessRequestAllocator(
+            public_http_server.* = public_api_kernel.ApiHttpServer.initWithProcessRequestAllocatorFallible(
                 alloc,
                 api_server_cfg,
                 public_api_http_server.StatusSource.fromMetadataHttpService(svc),
                 public_read_source.source(),
                 public_write_source.source(),
-            );
-            try public_http_server.attachReplicatedRestoreJobStore(metadataRestoreJobPersistence(svc));
+            ) catch |err| {
+                alloc.destroy(public_http_server);
+                return err;
+            };
             owned_public_http_server = public_http_server;
+            try public_http_server.attachReplicatedRestoreJobStore(metadataRestoreJobPersistence(svc));
             public_http_server.bindIncomingGraphRoutes(public_read_source.source());
 
             const mux = try alloc.create(MetadataAdminMux);

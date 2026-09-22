@@ -263,6 +263,37 @@ pub const AntflyClient = struct {
 
     // --- Query operations ---
 
+    /// SQL may mutate data. Preserve structured errors/commit receipts and
+    /// forbid automatic replay or redirect, regardless of the borrowed HTTP
+    /// client's global policy. Callers reconcile ambiguous outcomes explicitly.
+    pub fn executeSQL(self: *AntflyClient, body: openapi.types.SQLRequest) !openapi.ApiResponse(openapi.types.SQLResponse) {
+        var request = body;
+        if (self.catalog_scope) |scope| {
+            request.database = request.database orelse scope.database;
+            request.namespace = request.namespace orelse scope.namespace;
+        }
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/sql", .{self.inner.base_url});
+        defer self.allocator.free(url);
+        const encoded = try httpx.json.Json.stringifyRequest(self.allocator, request);
+        defer self.allocator.free(encoded);
+        if (encoded.len > 4 << 20) return error.SqlRequestTooLarge;
+        const headers: ?[]const [2][]const u8 = if (self.inner.auth_header) |*header| @as(*const [1][2][]const u8, header) else null;
+        var response = try self.inner.http.post(url, .{
+            .json = encoded,
+            .headers = headers,
+            .max_response_size = 16 << 20,
+            .max_retries = 0,
+            .follow_redirects = false,
+            .cookies_enabled = false,
+        });
+        var result = try openapi.ApiResponse(openapi.types.SQLResponse).fromResponse(self.allocator, &response);
+        errdefer result.deinit();
+        if (result.data) |data| {
+            for (data.value.rows) |row| if (row.len != data.value.columns.len) return error.InvalidApiResponse;
+        }
+        return result;
+    }
+
     pub fn query(self: *AntflyClient, body: openapi.types.QueryRequest) !openapi.ApiResponse(openapi.types.QueryResponses) {
         var resp = try self.queryCanonicalPath("/db/v1/query", body);
         if (resp.status_code >= 300) {

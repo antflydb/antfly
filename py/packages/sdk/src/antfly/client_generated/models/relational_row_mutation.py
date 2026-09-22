@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 
@@ -22,11 +22,15 @@ class RelationalRowMutation:
         key (str):
         expected_version (str): Exact observed version. Zero requires that the row does not exist.
         row (RelationalRowMutationRow | Unset):
+        json_null_fields (list[str] | Unset): Names of JSON-typed columns whose row value is the JSON literal null
+            rather than SQL NULL. Each name must identify a present null-valued JSON column; duplicates, unknown names, non-
+            null values, and use with deletion are rejected.
     """
 
     key: str
     expected_version: str
     row: RelationalRowMutationRow | Unset = UNSET
+    json_null_fields: list[str] | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         key = self.key
@@ -36,6 +40,10 @@ class RelationalRowMutation:
         row: dict[str, Any] | Unset = UNSET
         if not isinstance(self.row, Unset):
             row = self.row.to_dict()
+
+        json_null_fields: list[str] | Unset = UNSET
+        if not isinstance(self.json_null_fields, Unset):
+            json_null_fields = self.json_null_fields
 
         field_dict: dict[str, Any] = {}
 
@@ -47,6 +55,8 @@ class RelationalRowMutation:
         )
         if row is not UNSET:
             field_dict["row"] = row
+        if json_null_fields is not UNSET:
+            field_dict["json_null_fields"] = json_null_fields
 
         return field_dict
 
@@ -66,10 +76,13 @@ class RelationalRowMutation:
         else:
             row = RelationalRowMutationRow.from_dict(_row)
 
+        json_null_fields = cast(list[str], d.pop("json_null_fields", UNSET))
+
         relational_row_mutation = cls(
             key=key,
             expected_version=expected_version,
             row=row,
+            json_null_fields=json_null_fields,
         )
 
         return relational_row_mutation

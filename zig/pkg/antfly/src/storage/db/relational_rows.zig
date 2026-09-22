@@ -53,6 +53,9 @@ pub const Request = struct {
     /// Null selects primary-key order. Named indexes must have a durable
     /// ready proof for this exact generation and owned range.
     index: ?[]const u8 = null,
+    /// Bounded planner hint for equality prefixes, range suffixes and proven partial indexes.
+    /// Callers requiring primary-key order must leave this disabled.
+    auto_index: bool = false,
     after: ?[]const u8 = null,
     lower: ?Bound = null,
     upper: ?Bound = null,
@@ -82,6 +85,9 @@ pub const Budget = struct {
 pub const Row = struct {
     key: []const u8,
     json: []const u8,
+    typed: ?std.json.Value = null,
+    sql_nulls: ?[]const bool = null,
+    json_null_fields: []const []const u8 = &.{},
     version: u64,
     schema_version: u32,
     semantic_hash: [32]u8,
@@ -111,6 +117,9 @@ pub const Reader = struct {
     read: docstore.DocStore.Txn,
     active: registry.SchemaView,
     index_plan: ?plans.View,
+    /// Snapshot-local planner work, distinct from execution-page work.
+    planner_candidates: usize = 0,
+    planner_records: usize = 0,
     index: ?plans.BoundIndex,
     lower: []const u8,
     upper: []const u8,
@@ -169,6 +178,15 @@ pub const Reader = struct {
     /// Owns request data except row_filter.context, which the caller retains
     /// through reader.deinit. The reader must close before its DB closes.
     pub fn open(alloc: Allocator, store: *docstore.DocStore, active_view: registry.SchemaView, indexes: ?catalog.WriteSnapshot, request: Request, now_ns: u64) !Reader {
+        return openSnapshot(alloc, try store.beginReadTxn(), store.valuesAreAuthenticated(), active_view, indexes, request, now_ns);
+    }
+
+    /// Consumes the transaction on both success and error. Schema/index pins
+    /// and this transaction must have been captured under one publication
+    /// fence; predicate compilation and bounded planning need no apply lock.
+    pub fn openSnapshot(alloc: Allocator, snapshot: docstore.DocStore.Txn, authenticated: bool, active_view: registry.SchemaView, indexes: ?catalog.WriteSnapshot, request: Request, now_ns: u64) !Reader {
+        var read = snapshot;
+        errdefer read.abort();
         if (active_view.storageMode() != .relational) return error.RelationalTableRequired;
         if (request.expected_schema_version) |version| if (version != active_view.version()) return error.PreparedGenerationChanged;
         if (request.fields.len > 256 or request.conditions.len > 256 or (request.index == null and (request.lower != null or request.upper != null)))
@@ -185,8 +203,6 @@ pub const Reader = struct {
             for (fields[0..i]) |prior| if (std.mem.eql(u8, field, prior)) return error.InvalidRelationalRowsRequest;
             copy.* = try owned.dupe(u8, field);
         }
-        var read = try store.beginReadTxn();
-        errdefer read.abort();
         const range_raw = read.get(range_state.range_key) catch |err| switch (err) {
             error.NotFound => &([_]u8{0} ** 8),
             else => return err,
@@ -243,6 +259,131 @@ pub const Reader = struct {
             plan.* = try predicates.Plan.init(alloc, active_view.tableSchema().*, active_view.physicalLayout(), condition);
             initialized += 1;
         }
+
+        // Candidate metadata belongs to the immutable pinned index plan. Bound
+        // at most sixteen promising paths, then compare actual snapshot-local
+        // cardinality probes. This never extrapolates a sample into invented
+        // table statistics; saturated samples remain lower bounds. All query
+        // predicates remain residual checks against the selected snapshot.
+        var planner_candidates: usize = 0;
+        var planner_records: usize = 0;
+        if (selected_index == null and request.auto_index and request.primary_lower == null and request.primary_upper == null) {
+            if (indexes) |pinned| {
+                if (pinned.plan.schemaView().epoch != active_view.epoch) return error.PreparedGenerationChanged;
+                const raw_head = try read.get(catalog.head_key);
+                if (!(try catalog.Head.decode(raw_head)).eql(pinned.head)) return error.PreparedGenerationChanged;
+                var candidates: [16]Candidate = undefined;
+                var candidate_count: usize = 0;
+                const implication = try owned.alloc(bool, conditions.len);
+                const KeyConditions = struct { equality: ?Value = null, has_range: bool = false };
+                var keyed: std.AutoHashMapUnmanaged(u64, KeyConditions) = .empty;
+                try keyed.ensureTotalCapacity(owned, @intCast(conditions.len));
+                for (request.conditions, conditions) |condition, compiled| {
+                    const identity = @as(u64, compiled.tuple.keys[0].ordinal) * 2 + @intFromBool(compiled.tuple.keys[0].fold_ascii);
+                    const entry = keyed.getOrPutAssumeCapacity(identity);
+                    if (!entry.found_existing) entry.value_ptr.* = .{};
+                    switch (condition.op) {
+                        .eq, .is_not_distinct => if (entry.value_ptr.equality == null) {
+                            entry.value_ptr.equality = condition.value;
+                        },
+                        .gt, .gte, .lt, .lte => if (condition.value != .null) {
+                            entry.value_ptr.has_range = true;
+                        },
+                        else => {},
+                    }
+                }
+                for (pinned.plan.boundIndexes()) |candidate| {
+                    if (candidate.tuple.keys.len == 0) continue;
+                    var equality_count: usize = 0;
+                    var candidate_values: [32]Value = @splat(.null);
+                    for (candidate.tuple.keys) |key| {
+                        if (equality_count == candidate_values.len or key.expression != null) break;
+                        const operand = keyed.get(@as(u64, key.ordinal) * 2 + @intFromBool(key.fold_ascii)) orelse break;
+                        candidate_values[equality_count] = operand.equality orelse break;
+                        equality_count += 1;
+                    }
+                    var has_range = false;
+                    if (equality_count < @min(candidate.tuple.keys.len, candidate_values.len)) {
+                        const key = candidate.tuple.keys[equality_count];
+                        if (key.expression == null) if (keyed.get(@as(u64, key.ordinal) * 2 + @intFromBool(key.fold_ascii))) |operand| {
+                            has_range = operand.has_range;
+                        };
+                    }
+                    if (equality_count == 0 and !has_range) continue;
+                    // Reject unusable access paths without touching durable
+                    // readiness records or evaluating partial-index proofs.
+                    @memset(implication, false);
+                    if (candidate.predicate) |predicate| {
+                        if (!predicate.impliedByAndMark(conditions, implication)) continue;
+                    }
+                    var covering = false;
+                    if (candidate.cover) |cover| {
+                        covering = request.row_filter == null and !request.include_primary_digest;
+                        for (fields) |field| {
+                            if (!cover.contains(field)) covering = false;
+                        }
+                        for (request.conditions, implication) |condition, implied| {
+                            if (!implied and !cover.contains(condition.column)) covering = false;
+                        }
+                    }
+                    const score = equality_count * 4 + @as(usize, @intFromBool(has_range)) * 2 + @as(usize, @intFromBool(covering));
+                    var position: usize = 0;
+                    while (position < candidate_count and (candidates[position].score > score or
+                        (candidates[position].score == score and std.mem.lessThan(u8, candidates[position].index.name, candidate.name)))) : (position += 1)
+                    {}
+                    if (position == candidates.len) continue;
+                    const end = @min(candidate_count, candidates.len - 1);
+                    std.mem.copyBackwards(Candidate, candidates[position + 1 .. end + 1], candidates[position..end]);
+                    candidates[position] = .{ .index = candidate, .score = score, .covering = covering, .equality_count = equality_count, .has_range = has_range, .values = candidate_values };
+                    candidate_count = @min(candidate_count + 1, candidates.len);
+                }
+                if (candidate_count != 0) {
+                    const owner = try jobs.ownership(&read);
+                    var best_cost: usize = std.math.maxInt(usize);
+                    var best_complete = false;
+                    var best_candidate: ?*Candidate = null;
+                    for (candidates[0..candidate_count]) |*candidate| {
+                        planner_candidates += 1;
+                        if ((try jobs.statusWithOwnership(&read, candidate.index, owner)).state != .ready) continue;
+                        if (candidate_count == 1) {
+                            selected_index = candidate.index;
+                            best_candidate = candidate;
+                            break;
+                        }
+                        var scratch = std.heap.ArenaAllocator.init(alloc);
+                        defer scratch.deinit();
+                        const bounds = try candidate.bounds(scratch.allocator(), request.conditions, conditions);
+                        var count: usize = 0;
+                        var complete = std.mem.order(u8, bounds.lower, bounds.upper) != .lt;
+                        if (std.mem.order(u8, bounds.lower, bounds.upper) == .lt) {
+                            var cursor = try read.openCursor();
+                            defer cursor.close();
+                            cursor.setUpperBound(bounds.upper);
+                            var entry = try cursor.seekAtOrAfter(bounds.lower);
+                            while (entry != null) {
+                                count += 1;
+                                if (count == 8) break;
+                                entry = try cursor.next();
+                            }
+                            complete = entry == null;
+                            planner_records += count;
+                        }
+                        const cost = count * (1 + @as(usize, @intFromBool(!candidate.covering)));
+                        if (selected_index == null or (complete and !best_complete) or (complete == best_complete and cost < best_cost)) {
+                            selected_index = candidate.index;
+                            best_candidate = candidate;
+                            best_cost = cost;
+                            best_complete = complete;
+                        }
+                    }
+                    if (best_candidate) |candidate| {
+                        const bounds = try candidate.bounds(owned, request.conditions, conditions);
+                        lower = bounds.lower;
+                        upper = bounds.upper;
+                    }
+                }
+            }
+        }
         const implied_conditions = try owned.alloc(bool, conditions.len);
         @memset(implied_conditions, false);
         if (selected_index) |index| if (index.predicate) |condition| {
@@ -265,6 +406,8 @@ pub const Reader = struct {
             .read = read,
             .active = active_view.clone(),
             .index_plan = if (selected_index != null) indexes.?.plan.clone() else null,
+            .planner_candidates = planner_candidates,
+            .planner_records = planner_records,
             .index = selected_index,
             .lower = lower,
             .upper = upper,
@@ -272,7 +415,7 @@ pub const Reader = struct {
             .owned_upper = owned_upper,
             .fields = fields,
             .now_ns = now_ns,
-            .authenticated = store.valuesAreAuthenticated(),
+            .authenticated = authenticated,
             .include_primary_digest = request.include_primary_digest,
             .include_cursor = request.include_cursor,
             .cursor_identity = cursor_identity,
@@ -283,6 +426,51 @@ pub const Reader = struct {
             .done = std.mem.order(u8, lower, upper) != .lt,
         };
     }
+
+    const Candidate = struct {
+        index: plans.BoundIndex,
+        score: usize,
+        covering: bool,
+        equality_count: usize,
+        has_range: bool,
+        values: [32]Value,
+
+        fn bounds(self: *Candidate, alloc: Allocator, requested: []const Condition, compiled: []const predicates.Plan) !struct { lower: []const u8, upper: []const u8 } {
+            var lower = try boundKey(alloc, self.index, .{ .values = self.values[0..self.equality_count] }, false);
+            var upper = try boundKey(alloc, self.index, .{ .values = self.values[0..self.equality_count] }, true);
+            if (self.has_range) {
+                const key = self.index.tuple.keys[self.equality_count];
+                var endpoints: [2]?usize = .{ null, null };
+                for (requested, compiled, 0..) |condition, plan, i| {
+                    if (plan.tuple.keys[0].ordinal != key.ordinal or plan.tuple.keys[0].fold_ascii != key.fold_ascii or condition.value == .null) continue;
+                    const logical_upper = switch (condition.op) {
+                        .gt, .gte => false,
+                        .lt, .lte => true,
+                        else => continue,
+                    };
+                    const slot = @intFromBool(logical_upper);
+                    if (endpoints[slot]) |prior| {
+                        const order = std.mem.order(u8, plan.operand, compiled[prior].operand);
+                        if ((logical_upper and order == .gt) or (!logical_upper and order == .lt)) continue;
+                        if (order == .eq and (condition.op == .gte or condition.op == .lte)) continue;
+                    }
+                    endpoints[slot] = i;
+                }
+                // Compare precompiled scalar operands before encoding tuples:
+                // repeated constraints must not multiply wide-prefix memory.
+                for (endpoints, 0..) |endpoint, slot| {
+                    const condition = requested[endpoint orelse continue];
+                    const is_upper = (slot == 1) != key.descending;
+                    self.values[self.equality_count] = condition.value;
+                    const bound = try boundKey(alloc, self.index, .{ .values = self.values[0 .. self.equality_count + 1], .inclusive = condition.op == .gte or condition.op == .lte }, is_upper);
+                    if (is_upper) {
+                        if (std.mem.order(u8, bound, upper) == .lt) upper = bound;
+                    } else if (std.mem.order(u8, bound, lower) == .gt) lower = bound;
+                }
+            }
+            return .{ .lower = lower, .upper = upper };
+        }
+    };
 
     fn boundKey(alloc: Allocator, index: plans.BoundIndex, bound: Bound, upper: bool) ![]const u8 {
         var key = std.ArrayList(u8).empty;
@@ -432,6 +620,14 @@ pub const Reader = struct {
     /// Page continuation advances only after successful preparation. An OOM,
     /// cancellation, or corrupt row cannot silently consume part of the result.
     pub fn nextPage(self: *Reader, alloc: Allocator, io: ?std.Io, budget: Budget) !Page {
+        return self.nextPageFormat(alloc, io, budget, false);
+    }
+
+    pub fn nextTypedPage(self: *Reader, alloc: Allocator, io: ?std.Io, budget: Budget) !Page {
+        return self.nextPageFormat(alloc, io, budget, true);
+    }
+
+    fn nextPageFormat(self: *Reader, alloc: Allocator, io: ?std.Io, budget: Budget, typed_output: bool) !Page {
         try budget.validate();
         var arena = std.heap.ArenaAllocator.init(alloc);
         errdefer arena.deinit();
@@ -519,13 +715,19 @@ pub const Reader = struct {
                     break :check true;
                 };
                 if (matches) {
-                    const json = try row.projectAlloc(temporary, if (self.index_only) self.covering_projection.? else self.selected.?);
+                    const projection = if (self.index_only) self.covering_projection.? else self.selected.?;
+                    const typed_projection = if (typed_output) try row.projectSqlTypedAlloc(page, projection) else null;
+                    const typed = if (typed_projection) |projected| projected.value else null;
+                    const json = if (typed_output) "" else try row.projectAlloc(temporary, projection);
+                    const json_null_fields = if (typed_output) &.{} else try row.projectJsonNullFieldsAlloc(page, projection);
+                    var null_metadata_bytes: usize = json_null_fields.len * @sizeOf([]const u8);
+                    for (json_null_fields) |name| null_metadata_bytes +|= name.len;
                     const document = decoded_key orelse (try internal.decodeStoredDocumentRowKeyAlloc(temporary, key)).?;
                     const row_cursor = if (self.include_cursor) blk: {
                         const identity = self.cursor_identity orelse break :blk null;
                         break :blk try row_cursor_codec.encode(temporary, identity, kv.key[records.forward_prefix_len..]);
                     } else null;
-                    const size = json.len + document.len + if (row_cursor) |encoded| encoded.len else @as(usize, 0);
+                    const size = (if (typed) |value| try typedSize(value, 0) else json.len) +| (if (typed_projection) |projected| projected.sql_nulls.len else @as(usize, 0)) +| document.len +| (if (row_cursor) |encoded| encoded.len else @as(usize, 0)) +| null_metadata_bytes;
                     if (size > budget.output_bytes) {
                         if (!self.index_only) try self.observeFailedRow(key, raw);
                         return error.RelationalRowResultTooLarge;
@@ -537,6 +739,9 @@ pub const Reader = struct {
                     try output.append(page, .{
                         .key = try page.dupe(u8, document),
                         .json = try page.dupe(u8, json),
+                        .typed = typed,
+                        .sql_nulls = if (typed_projection) |projected| projected.sql_nulls else null,
+                        .json_null_fields = json_null_fields,
                         .version = row.writeTimestampNs(),
                         .schema_version = if (self.index_only) try @import("relational_index_cover.zig").Plan.sourceVersion(try records.forwardPayload(kv.key, raw)) else row.table_schema.version,
                         .semantic_hash = row.semanticHash(),
@@ -566,5 +771,21 @@ pub const Reader = struct {
         result.rows = output.items;
         result.more = !exhausted;
         return result;
+    }
+
+    fn typedSize(value: std.json.Value, depth: usize) error{RelationalRowResultTooLarge}!usize {
+        if (depth > 64) return error.RelationalRowResultTooLarge;
+        var size: usize = @sizeOf(std.json.Value);
+        switch (value) {
+            .string, .number_string => |text| size +|= text.len,
+            .array => |items| for (items.items) |item| {
+                size +|= try typedSize(item, depth + 1);
+            },
+            .object => |object| for (object.keys(), object.values()) |key, item| {
+                size +|= key.len +| try typedSize(item, depth + 1);
+            },
+            else => {},
+        }
+        return size;
     }
 };

@@ -67,6 +67,9 @@ import type {
   RetrievalAgentResult,
   RetrievalAgentStreamCallbacks,
   ScanKeysRequest,
+  SQLDiagnostic,
+  SQLRequest,
+  SQLResponse,
   Table,
   TableArtifactEnrichmentList,
   TableQueryRequest,
@@ -79,6 +82,16 @@ import type {
 export interface RestoreOptions {
   /** Stable key used to safely retry creation of the same restore job. */
   idempotencyKey?: string;
+}
+
+export class SQLExecutionError extends Error {
+  constructor(
+    public readonly status: number,
+    public readonly diagnostic: SQLDiagnostic
+  ) {
+    super(`SQL execution failed (${diagnostic.code}): ${diagnostic.message}`);
+    this.name = "SQLExecutionError";
+  }
 }
 
 export interface SchemaMutationOptions {
@@ -569,7 +582,9 @@ export class AntflyClient {
     options: WriteOptions | undefined,
     errorPrefix: string,
     marshalErrorPrefix: string,
-    relational = false
+    relational = false,
+    errorFactory?: (status: number, body: unknown) => Error | undefined,
+    redirect?: RequestRedirect
   ): Promise<{ data?: T; text: string; status: number }> {
     const opts = normalizedWriteOptions(options);
     let encodedBody: string;
@@ -584,18 +599,25 @@ export class AntflyClient {
       headers: this.requestHeaders(),
       body: encodedBody,
       signal: opts.signal,
+      ...(redirect ? { redirect } : {}),
     });
 
     if (!response.ok) {
       const { text, truncated } = await readLimitedResponseText(response, MAX_ERROR_RESPONSE_BYTES);
       let message = apiErrorMessage(text);
+      let errorBody: unknown;
       try {
-        message = apiErrorMessage(parseJSON<unknown>(text), message);
+        errorBody = parseJSON<unknown>(text);
+        message = apiErrorMessage(errorBody, message);
       } catch {
         // Non-JSON error bodies are reported as-is below.
       }
       if (truncated) {
         message = `${message} (response body exceeded ${MAX_ERROR_RESPONSE_BYTES} bytes)`;
+      }
+      if (!truncated && errorFactory) {
+        const structured = errorFactory(response.status, errorBody);
+        if (structured) throw structured;
       }
       throw new Error(`${errorPrefix}: ${response.status} ${message}`);
     }
@@ -744,6 +766,49 @@ export class AntflyClient {
       validateGraphQueryResponses(data as QueryResponses, requests);
       return data as QueryResponses;
     }
+  }
+
+  /** Execute one statement with bounded transport and no automatic mutation retries. */
+  async executeSQL(request: SQLRequest, options?: WriteOptions): Promise<SQLResponse> {
+    const { data } = await this.postBoundedJSON<SQLResponse>(
+      "/db/v1/sql",
+      request,
+      {
+        ...options,
+        maxRequestBytes: Math.min(normalizedWriteOptions(options).maxRequestBytes, 4 << 20),
+        maxResponseBytes: Math.min(
+          options?.maxResponseBytes && options.maxResponseBytes > 0
+            ? options.maxResponseBytes
+            : 16 << 20,
+          16 << 20
+        ),
+      },
+      "SQL execution failed",
+      "Invalid SQL request",
+      true,
+      (status, body) => {
+        if (typeof body !== "object" || body === null) return undefined;
+        const diagnostic = body as SQLDiagnostic;
+        if (
+          typeof diagnostic.code !== "string" ||
+          diagnostic.code.length !== 5 ||
+          typeof diagnostic.message !== "string"
+        )
+          return undefined;
+        return new SQLExecutionError(status, diagnostic);
+      },
+      "error"
+    );
+    if (!data || !Array.isArray(data.columns) || !Array.isArray(data.rows)) {
+      throw new Error("Invalid SQL response");
+    }
+    if (data.rows.length > 4096) throw new Error("SQL response exceeds 4096 rows");
+    for (const row of data.rows) {
+      if (!Array.isArray(row) || row.length !== data.columns.length) {
+        throw new Error("SQL row width differs from column metadata");
+      }
+    }
+    return data;
   }
 
   /**

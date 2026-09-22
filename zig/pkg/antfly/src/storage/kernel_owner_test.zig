@@ -21,6 +21,71 @@ const wal_client = @import("kernel_wal_client.zig");
 const data_apply_client = @import("data_raft_apply_client.zig");
 const metadata_apply_client = @import("metadata_raft_apply_client.zig");
 
+test "opaque owner retained relational read crosses checked archive boundary" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(path);
+    var context: client.Context = .{};
+    try context.ensure();
+    defer context.deinit();
+    var owner = try client.Owner.open(.{
+        .context = context.handle,
+        .path = .fromSlice(path),
+        .table_name = .fromSlice("rows"),
+        .group_id = 72,
+        .has_identity_namespace = 1,
+        .identity_table_id = 7,
+        .identity_shard_id = 172,
+        .identity_range_id = 272,
+        .schema_json = .fromSlice(
+            \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+        ),
+    });
+    defer owner.deinit();
+    var inserted = try owner.batchJson("rows",
+        \\{"inserts":{"a":{"id":9007199254740993},"b":{"id":42}},"sync_level":"write"}
+    );
+    inserted.deinit();
+    const provider = try @import("relational_read_provider.zig").acquire(owner.handle);
+    const view = try provider.open(alloc, "rows", "", "", .{ .relational_query = .{ .schema_version = 1, .fields = &.{"id"} }, .limit = 1 });
+    defer view.deinit();
+    const normalized = try view.normalize(alloc, &.{.{ .key = "c", .value = "{\"id\":9007199254740993}" }});
+    defer {
+        for (normalized) |row| {
+            alloc.free(row.key);
+            alloc.free(row.value);
+            for (row.json_null_fields) |field| alloc.free(field);
+            if (row.json_null_fields.len != 0) alloc.free(row.json_null_fields);
+        }
+        alloc.free(normalized);
+    }
+    try std.testing.expectEqual(@as(usize, 1), normalized.len);
+    try std.testing.expectEqualStrings("c", normalized[0].key);
+    try std.testing.expect(std.mem.indexOf(u8, normalized[0].value, "9007199254740993") != null);
+    var first = try view.next(alloc, 1);
+    defer first.deinit();
+    try std.testing.expectEqual(@as(usize, 1), first.rows.len);
+    try std.testing.expectEqualStrings("a", first.rows[0].id);
+    try std.testing.expectEqual(@as(i64, 9007199254740993), first.rows[0].value.object.get("id").?.integer);
+    try std.testing.expect(first.after != null);
+    var updated = try owner.batchJson("rows",
+        \\{"inserts":{"b":{"id":99}},"sync_level":"write"}
+    );
+    updated.deinit();
+    var second = try view.next(alloc, 1);
+    defer second.deinit();
+    try std.testing.expectEqual(@as(usize, 1), second.rows.len);
+    try std.testing.expectEqualStrings("b", second.rows[0].id);
+    try std.testing.expectEqual(@as(i64, 42), second.rows[0].value.object.get("id").?.integer);
+    var end = try view.next(alloc, 1);
+    defer end.deinit();
+    try std.testing.expectEqual(@as(usize, 0), end.rows.len);
+    try std.testing.expect(end.after == null);
+    try std.testing.expectError(error.PreparedGenerationChanged, provider.open(alloc, "rows", "", "", .{ .relational_query = .{ .schema_version = 2, .fields = &.{} }, .limit = 1 }));
+}
+
 test "opaque owner standalone rewrite authority is durable and cannot be selected by a request" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

@@ -112,6 +112,10 @@ pub const Router = struct {
         return self.addWithOptions(method, pattern, handler, null, max_body_size, .none);
     }
 
+    pub fn addWithDataAndBodyLimit(self: *Self, method: types.Method, pattern: []const u8, handler: anytype, data: *anyopaque, max_body_size: usize) !void {
+        return self.addWithOptions(method, pattern, handler, data, max_body_size, .none);
+    }
+
     /// Opt a route into dispatch after fixed-length request headers. The
     /// application may then consume the body incrementally through Context.
     pub fn addStreaming(self: *Self, method: types.Method, pattern: []const u8, handler: anytype) !void {
@@ -471,6 +475,12 @@ test "Router exposes route-specific body limits" {
     }.h;
 
     try router.addWithBodyLimit(.POST, "/bounded/:id", handler, 64 * 1024);
+    var route_state: u8 = 0;
+    try router.addWithDataAndBodyLimit(.POST, "/bounded-data", handler, &route_state, 1024);
+    try std.testing.expectEqual(@as(?usize, 1024), router.bodySizeLimit(.POST, "/bounded-data"));
+    var pbuf: [16]RouteParam = undefined;
+    const matched = router.find(.POST, "/bounded-data", &pbuf).?;
+    try std.testing.expectEqual(@as(?*anyopaque, &route_state), matched.data);
     try router.add(.POST, "/unbounded", handler);
     try router.add(.PUT, "/overlap/:id", handler);
     try router.addWithBodyLimit(.PUT, "/overlap/*", handler, 1024);

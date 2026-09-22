@@ -2864,7 +2864,9 @@ fn prepareRelationalRows(
             while (!ctx.failed.load(.acquire)) {
                 const index = ctx.next.fetchAdd(1, .monotonic);
                 if (index >= ctx.writes.len) return;
-                var prepared = (if (ctx.preserve_logical_values)
+                var prepared = (if (ctx.writes[index].json_null_fields.len != 0)
+                    mapper.PreparedRelationalWrite.initTypedInSharedRegion(region, scratch_arena.allocator(), ctx.retain_text_roots, ctx.writes[index].key, ctx.writes[index].value, ctx.validator, ctx.table_schema, ctx.physical_layout, ctx.writes[index].json_null_fields, ctx.preserve_logical_values)
+                else if (ctx.preserve_logical_values)
                     mapper.PreparedRelationalWrite.initInSharedRegionPreserved(region, scratch_arena.allocator(), ctx.retain_text_roots, ctx.writes[index].key, ctx.writes[index].value, ctx.validator, ctx.table_schema, ctx.physical_layout)
                 else
                     mapper.PreparedRelationalWrite.initInSharedRegionFromIntent(
@@ -5677,12 +5679,21 @@ pub const DB = struct {
 
     pub fn beginRelationalRows(self: *DB, alloc: Allocator, request: RelationalRows.Request) !RelationalRows.Reader {
         try self.lockApplySharedForPortableRuntime();
-        defer self.core.unlockApplyShared();
+        var locked = true;
+        defer if (locked) self.core.unlockApplyShared();
         var view = self.core.acquireSchemaView() orelse return error.RelationalTableRequired;
         defer view.release();
         var indexes = self.core.relational_indexes.acquire();
         defer if (indexes) |*pinned| pinned.deinit();
-        return try RelationalRows.Reader.open(alloc, self.core.store, view, indexes, request, currentTimeNs());
+        const read_snapshot = try self.core.store.beginReadTxn();
+        const authenticated = self.core.store.valuesAreAuthenticated();
+        const now = currentTimeNs();
+        self.core.unlockApplyShared();
+        locked = false;
+        // Immutable pins and the read transaction were captured together.
+        // Allocation, predicate compilation, readiness I/O and cardinality
+        // probes must not hold the global apply publication fence.
+        return try RelationalRows.Reader.openSnapshot(alloc, read_snapshot, authenticated, view, indexes, request, now);
     }
 
     pub fn relationalIndexBuildStatus(self: *DB, name: []const u8) !RelationalIndexBuildStatus {
@@ -10870,6 +10881,7 @@ pub const DB = struct {
         else
             null;
         defer if (apply_schema_view) |*view| view.release();
+        if (relationalColumns(self) == null) for (effective_req.writes) |write| if (write.json_null_fields.len != 0) return error.InvalidBatchRequest;
         if (!use_preprepared_rows and relationalColumns(self) != null and apply_schema_view == null)
             return error.InvalidSchemaUpdateRequest;
         const batch_timestamp_ns = if (use_preprepared_rows)
@@ -11051,7 +11063,9 @@ pub const DB = struct {
                 preprepared_rows.?[i] = null;
                 break :blk prepared;
             } else if (apply_schema_view) |view|
-                if (opts.restore_staging != null or opts.preserve_logical_values)
+                if (write.json_null_fields.len != 0)
+                    try mapper.PreparedRelationalWrite.initTyped(self.alloc, self.alloc, self.alloc, false, write.key, write.value, view.validator(), view.tableSchema().*, view.physicalLayout(), write.json_null_fields, opts.restore_staging != null or opts.preserve_logical_values)
+                else if (opts.restore_staging != null or opts.preserve_logical_values)
                     try mapper.PreparedRelationalWrite.initPreserved(self.alloc, write.key, write.value, view.validator(), view.tableSchema().*, view.physicalLayout())
                 else
                     try mapper.PreparedRelationalWrite.initFromIntent(
@@ -13442,6 +13456,7 @@ pub const DB = struct {
     fn CoalescedKeyValueRequest(comptime T: type) type {
         return struct {
             const Entry = struct {
+                json_null_fields: []const []const u8 = &.{},
                 key: []const u8,
                 value: ?[]const u8 = null,
                 kind: enum { write, delete },
@@ -13996,6 +14011,7 @@ pub const DB = struct {
     fn setCoalescedEntryToBorrowedWrite(comptime T: type, entry: *CoalescedKeyValueRequest(T).Entry, write: T) void {
         entry.key = write.key;
         entry.value = write.value;
+        entry.json_null_fields = write.json_null_fields;
         entry.kind = .write;
         entry.owned_key = false;
         entry.owned_value = false;
@@ -14027,6 +14043,9 @@ pub const DB = struct {
         transforms: []const types.DocumentTransform,
         transform_snapshot: ?*const TransformReadSnapshot,
     ) !CoalescedKeyValueRequest(T) {
+        // SQL mutations lower to complete replacements. A document transform
+        // cannot retain the provenance of JSON null after reconstructing JSON.
+        if (transforms.len != 0) for (writes) |write| if (write.json_null_fields.len != 0) return error.UnsupportedTransformOperation;
         var result = CoalescedKeyValueRequest(T){};
         var order = std.ArrayListUnmanaged(CoalescedKeyValueRequest(T).Entry).empty;
         defer order.deinit(alloc);
@@ -14051,6 +14070,7 @@ pub const DB = struct {
                 try order.append(alloc, .{
                     .key = write.key,
                     .value = write.value,
+                    .json_null_fields = write.json_null_fields,
                     .kind = .write,
                 });
                 continue;
@@ -14217,6 +14237,7 @@ pub const DB = struct {
                     result.writes[write_index] = .{
                         .key = entry.key,
                         .value = entry.value.?,
+                        .json_null_fields = entry.json_null_fields,
                     };
                     write_index += 1;
                 },
@@ -26920,6 +26941,7 @@ pub const DB = struct {
             try intents.append(preparation_alloc, .{
                 .key = write.key,
                 .value = write.value,
+                .json_null_fields = write.json_null_fields,
             });
         }
         for (effective_ops.deletes) |key| {
@@ -27170,8 +27192,14 @@ pub const DB = struct {
         intents: []transactions_mod.WriteIntent,
         schema_view: ?schema_registry_mod.SchemaView,
     ) !void {
-        const view = schema_view orelse return;
-        if (view.storageMode() != .relational) return;
+        const view = schema_view orelse {
+            for (intents) |intent| if (intent.json_null_fields.len != 0) return error.InvalidBatchRequest;
+            return;
+        };
+        if (view.storageMode() != .relational) {
+            for (intents) |intent| if (intent.json_null_fields.len != 0) return error.InvalidBatchRequest;
+            return;
+        }
         const Context = struct {
             alloc: Allocator,
             intents: []transactions_mod.WriteIntent,
@@ -27185,7 +27213,7 @@ pub const DB = struct {
             fn prepare(ctx: *@This(), scratch: Allocator, intent: *transactions_mod.WriteIntent) !void {
                 if (isMetadataKey(intent.key)) return;
                 const value = intent.value orelse return;
-                var row = try mapper.PreparedRelationalWrite.initWithTransientParse(ctx.alloc, scratch, intent.key, value, ctx.view.validator(), ctx.view.tableSchema().*, ctx.view.physicalLayout());
+                var row = try mapper.PreparedRelationalWrite.initTyped(ctx.alloc, scratch, scratch, false, intent.key, value, ctx.view.validator(), ctx.view.tableSchema().*, ctx.view.physicalLayout(), intent.json_null_fields, false);
                 defer row.deinit(ctx.alloc);
                 try row.finalizeMetadata(0);
                 var specials = std.json.ObjectMap.empty;
@@ -27196,6 +27224,7 @@ pub const DB = struct {
                 const sidecar = try std.json.Stringify.valueAlloc(ctx.alloc, std.json.Value{ .object = specials }, .{});
                 intent.prepared_row = row.takePackedRow();
                 intent.value = sidecar;
+                intent.json_null_fields = &.{};
             }
 
             fn run(ctx: *@This()) void {
@@ -39054,6 +39083,11 @@ pub const DB = struct {
                 errdefer collector.alloc.free(hash_id);
                 const row_cursor = if (entry.relational_cursor) |value| try collector.alloc.dupe(u8, value) else null;
                 errdefer if (row_cursor) |value| collector.alloc.free(value);
+                const json_null_fields = try types.cloneJsonNullFields(collector.alloc, entry.json_null_fields);
+                errdefer {
+                    for (json_null_fields) |field| collector.alloc.free(field);
+                    collector.alloc.free(json_null_fields);
+                }
                 if (collector.include_documents) {
                     const document_id = try collector.alloc.dupe(u8, entry.id);
                     errdefer collector.alloc.free(document_id);
@@ -39067,6 +39101,7 @@ pub const DB = struct {
                     .content_hash = entry.content_hash,
                     .relational_schema_version = entry.relational_schema_version,
                     .relational_cursor = row_cursor,
+                    .json_null_fields = json_null_fields,
                 });
             }
         };
@@ -39086,27 +39121,153 @@ pub const DB = struct {
         return .{ .hashes = hashes, .documents = documents };
     }
 
-    fn scanRelationalRowsVisit(self: *DB, alloc: Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions, visitor: types.ScanVisitor) !void {
-        if (opts.relational_query_json.len > 1024 * 1024 or opts.limit > 4096) return error.InvalidRelationalRowsRequest;
-        const Input = struct {
-            fields: []const []const u8,
-            index: ?[]const u8 = null,
-            after: ?[]const u8 = null,
-            lower: ?struct { values: []const std.json.Value, inclusive: bool = true } = null,
-            upper: ?struct { values: []const std.json.Value, inclusive: bool = true } = null,
-            conditions: []const struct {
-                column: []const u8,
-                op: @import("../relational_index.zig").RelationalCheckOp,
-                value: ?std.json.Value = null,
-                collation: ?[]const u8 = null,
-            } = &.{},
-            schema_version: ?u32 = null,
+    pub const StatementReadFence = struct {
+        primary: snapshot_admission_mod.SnapshotAdmission.CaptureLease,
+        replay: snapshot_admission_mod.SnapshotAdmission.CaptureLease,
+
+        pub fn release(fence: *StatementReadFence) void {
+            fence.replay.release();
+            fence.primary.release();
+        }
+    };
+
+    /// A short capture fence, not a transaction-long writer lock. The caller
+    /// captures every participating owner, pins their read views, then releases
+    /// every fence before reading rows. A busy participant requires releasing
+    /// ALL earlier fences before retrying: a prepared transaction may need one
+    /// of those owners to finish resolution. Never drain it under this fence.
+    pub fn tryStatementReadFence(self: *DB) !?StatementReadFence {
+        var primary = self.core.snapshot_admission.tryAcquireCapture() orelse return null;
+        errdefer primary.release();
+        var replay = self.core.snapshot_replay_admission.tryAcquireCapture() orelse {
+            primary.release();
+            return null;
         };
-        var parsed = std.json.parseFromSlice(Input, alloc, opts.relational_query_json, .{ .allocate = .alloc_always, .parse_numbers = false, .ignore_unknown_fields = true }) catch |err| switch (err) {
+        errdefer replay.release();
+        try self.ensurePrimaryOnlySnapshot();
+        var manager = try self.core.initTxnManager();
+        if (try manager.hasUnresolvedWriteIntents()) {
+            replay.release();
+            primary.release();
+            return null;
+        }
+        return .{ .primary = primary, .replay = replay };
+    }
+
+    /// Owns a retained schema/store snapshot and its authorization predicate.
+    /// The DB owner and request cancellation source must outlive this session;
+    /// no query, projection, bound or filter bytes are borrowed from the caller.
+    pub const RelationalReadSession = struct {
+        alloc: Allocator,
+        reader: RelationalRows.Reader = undefined,
+        filter_context: ?*anyopaque = null,
+        destroy_filter: ?*const fn (Allocator, *anyopaque) void = null,
+        cancellation: @FieldType(types.ScanOptions, "cancellation"),
+        deadline_ns: ?u64,
+
+        pub fn deinit(session: *RelationalReadSession) void {
+            session.reader.deinit();
+            if (session.filter_context) |filter| session.destroy_filter.?(session.alloc, filter);
+            const owner = session.alloc;
+            owner.destroy(session);
+        }
+
+        pub fn checkpoint(session: *const RelationalReadSession) !void {
+            if (session.cancellation) |cancellation| try cancellation.check();
+            if (session.deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.DeadlineExceeded;
+        }
+
+        pub fn nextTypedPage(session: *RelationalReadSession, alloc: Allocator, io: ?std.Io, budget: RelationalRows.Budget) !RelationalRows.Page {
+            try session.checkpoint();
+            var page = try session.reader.nextTypedPage(alloc, io, budget);
+            errdefer page.deinit();
+            try session.checkpoint();
+            return page;
+        }
+
+        /// Prepare logical rows under this reader's immutable schema epoch,
+        /// without publishing primary rows, index effects or transaction state.
+        /// SQL staging uses the same defaults/generated/CHECK pipeline as commit.
+        /// Each returned key/value and the outer slice belong to alloc.
+        pub fn normalizeRows(session: *RelationalReadSession, alloc: Allocator, writes: []const types.BatchWrite) ![]types.BatchWrite {
+            if (writes.len > 4096) return error.InvalidArgument;
+            try session.checkpoint();
+            const view = session.reader.active;
+            const normalized = try alloc.alloc(types.BatchWrite, writes.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (normalized[0..initialized]) |write| {
+                    alloc.free(write.key);
+                    alloc.free(write.value);
+                    for (write.json_null_fields) |name| alloc.free(name);
+                    if (write.json_null_fields.len != 0) alloc.free(write.json_null_fields);
+                }
+                alloc.free(normalized);
+            }
+            var output_bytes: usize = 0;
+            for (writes, normalized) |write, *out| {
+                try session.checkpoint();
+                var prepared = try mapper.PreparedRelationalWrite.initTyped(alloc, alloc, alloc, false, write.key, write.value, view.validator(), view.tableSchema().*, view.physicalLayout(), write.json_null_fields, false);
+                defer prepared.deinit(alloc);
+                try prepared.requireLogicalRoot();
+                const value = try std.json.Stringify.valueAlloc(alloc, prepared.parsedValue(), .{});
+                errdefer alloc.free(value);
+                output_bytes = std.math.add(usize, output_bytes, value.len +| write.key.len) catch return error.RelationalRowResultTooLarge;
+                if (output_bytes > 16 * 1024 * 1024) return error.RelationalRowResultTooLarge;
+                const key = try alloc.dupe(u8, write.key);
+                errdefer alloc.free(key);
+                // Generated values can replace a submitted literal JSON null
+                // with SQL NULL. Return provenance from the prepared authority.
+                const typed = try prepared.typedView(view.tableSchema().*, view.physicalLayout());
+                var null_names = std.ArrayListUnmanaged([]const u8).empty;
+                defer null_names.deinit(alloc);
+                for (write.json_null_fields) |name| {
+                    const ordinal = typed.ordinalForName(name) orelse return error.InvalidBatchRequest;
+                    const cell = (try typed.findCell(ordinal)) orelse continue;
+                    if (!cell.is_null) try null_names.append(alloc, name);
+                }
+                const nulls = try types.cloneJsonNullFields(alloc, null_names.items);
+                out.* = .{ .key = key, .value = value, .json_null_fields = nulls };
+                initialized += 1;
+            }
+            try session.checkpoint();
+            return normalized;
+        }
+    };
+
+    pub const DocumentReadSession = @import("document_rows.zig").Session;
+
+    pub fn openDocumentReadSession(self: *DB, alloc: Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions) !*DocumentReadSession {
+        try self.lockApplySharedForPortableRuntime();
+        var locked = true;
+        defer if (locked) self.core.unlockApplyShared();
+        var schema = self.core.acquireSchemaView();
+        defer if (schema) |*view| view.release();
+        const borrowed = self.core.byteRange();
+        const start = try alloc.dupe(u8, borrowed.start);
+        defer alloc.free(start);
+        const end = try alloc.dupe(u8, borrowed.end);
+        defer alloc.free(end);
+        const txn = try self.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
+        const now = currentTimeNs();
+        self.core.unlockApplyShared();
+        locked = false;
+        return DocumentReadSession.openSnapshot(alloc, self.core.store, txn, schema, .{ .start = start, .end = end }, from_key, to_key, opts, now);
+    }
+
+    pub fn openRelationalReadSession(self: *DB, alloc: Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions) !*RelationalReadSession {
+        if (opts.relational_query_json.len > 1024 * 1024 or opts.limit > 4096) return error.InvalidRelationalRowsRequest;
+        const session = try alloc.create(RelationalReadSession);
+        errdefer alloc.destroy(session);
+        session.* = .{ .alloc = alloc, .cancellation = opts.cancellation, .deadline_ns = opts.execution_deadline_ns };
+        try session.checkpoint();
+        const Input = types.RelationalRowQuery;
+        var parsed_json: ?std.json.Parsed(Input) = if (opts.relational_query == null) std.json.parseFromSlice(Input, alloc, opts.relational_query_json, .{ .allocate = .alloc_always, .parse_numbers = false, .ignore_unknown_fields = true }) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return error.InvalidRelationalRowsRequest,
-        };
-        defer parsed.deinit();
+        } else null;
+        defer if (parsed_json) |*owned| owned.deinit();
+        const parsed = .{ .value = opts.relational_query orelse parsed_json.?.value };
         if (parsed.value.conditions.len > 256 or parsed.value.fields.len > 256) return error.InvalidRelationalRowsRequest;
         var view = self.core.acquireSchemaView() orelse return error.RelationalTableRequired;
         defer view.release();
@@ -39158,6 +39319,12 @@ pub const DB = struct {
                 filter.source.deinit();
             }
 
+            fn destroy(owner: Allocator, raw: *anyopaque) void {
+                const filter: *@This() = @ptrCast(@alignCast(raw));
+                filter.deinit();
+                owner.destroy(filter);
+            }
+
             fn matches(raw: *anyopaque, temporary: Allocator, key: []const u8, row: relational_row_codec.OrdinalRowView) !bool {
                 const filter: *@This() = @ptrCast(@alignCast(raw));
                 if (filter.version == null or filter.version.? != row.table_schema.version) {
@@ -39176,10 +39343,17 @@ pub const DB = struct {
                 return try filter.source.matchesStored(temporary, key, json);
             }
         };
-        var filter = if (opts.filter_query_json.len != 0) Filter{ .alloc = alloc, .source = try db_query_graph.PreparedPatternFilter.init(alloc, opts.filter_query_json) } else null;
-        defer if (filter) |*active| active.deinit();
-        var reader = try self.beginRelationalRows(alloc, .{
+        const filter: ?*Filter = if (opts.filter_query_json.len != 0) blk: {
+            const active = try alloc.create(Filter);
+            errdefer alloc.destroy(active);
+            active.* = .{ .alloc = alloc, .source = try db_query_graph.PreparedPatternFilter.init(alloc, opts.filter_query_json) };
+            break :blk active;
+        } else null;
+        errdefer if (filter) |active| Filter.destroy(alloc, active);
+        session.reader = try self.beginRelationalRows(alloc, .{
             .index = parsed.value.index,
+            .auto_index = parsed.value.auto_index,
+            .include_primary_digest = opts.include_content_hashes,
             .include_cursor = parsed.value.index != null,
             .after = parsed.value.after,
             .lower = lower,
@@ -39189,9 +39363,17 @@ pub const DB = struct {
             .primary_lower = if (from_key.len != 0) .{ .key = from_key, .inclusive = opts.inclusive_from } else null,
             .primary_upper = if (to_key.len != 0) .{ .key = to_key, .inclusive = !opts.exclusive_to } else null,
             .expected_schema_version = parsed.value.schema_version orelse view.version(),
-            .row_filter = if (filter) |*active| .{ .context = active, .matches = Filter.matches } else null,
+            .row_filter = if (filter) |active| .{ .context = active, .matches = Filter.matches } else null,
         });
-        defer reader.deinit();
+        session.filter_context = filter;
+        session.destroy_filter = Filter.destroy;
+        return session;
+    }
+
+    fn scanRelationalRowsVisit(self: *DB, alloc: Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions, visitor: types.ScanVisitor) !void {
+        const session = try self.openRelationalReadSession(alloc, from_key, to_key, opts);
+        defer session.deinit();
+        const reader = &session.reader;
         const limit = if (opts.limit == 0) @as(u32, 128) else opts.limit;
         var delivered: usize = 0;
         var remaining_bytes: usize = 16 * 1024 * 1024;
@@ -39209,6 +39391,7 @@ pub const DB = struct {
                     .content_hash = if (opts.include_content_hashes) row.semantic_hash else null,
                     .relational_schema_version = reader.active.version(),
                     .relational_cursor = row.cursor,
+                    .json_null_fields = row.json_null_fields,
                     .document_json = if (opts.include_documents) row.json else null,
                 });
                 delivered += 1;
@@ -39230,7 +39413,7 @@ pub const DB = struct {
         opts: types.ScanOptions,
         visitor: types.ScanVisitor,
     ) !void {
-        if (opts.relational_query_json.len != 0) return self.scanRelationalRowsVisit(alloc, from_key, to_key, opts, visitor);
+        if (opts.isRelational()) return self.scanRelationalRowsVisit(alloc, from_key, to_key, opts, visitor);
         const projection_plan = db_query_projection.buildLookupFieldSelectionPlan(.{
             .fields = opts.fields,
             .include_all_fields = opts.include_all_fields,
@@ -72807,6 +72990,54 @@ test "relational rows snapshot projects exact composite ranges through writes DD
         if ((try db.relationalIndexBuildStatus("tenant_id")).state == .ready) break;
         _ = try db.buildRelationalIndexStep("tenant_id", .{});
     }
+    {
+        // Native SQL scans hand the storage reader typed conjunctions and let
+        // it choose a READY index. The two equality predicates must bind the
+        // compound key, including its descending suffix, without widening the
+        // read to a primary-table scan or exposing an index name to callers.
+        const PlanningAllocator = struct {
+            db: *DB,
+            blocked: bool = false,
+            allocations: usize = 0,
+
+            fn allocate(ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, ret: usize) ?[*]u8 {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.allocations += 1;
+                if (self.db.core.tryLockApplyExclusive()) self.db.core.unlockApplyExclusive() else self.blocked = true;
+                return std.testing.allocator.rawAlloc(len, alignment, ret);
+            }
+            fn resize(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
+                return false;
+            }
+            fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+                return null;
+            }
+            fn free(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret: usize) void {
+                std.testing.allocator.rawFree(memory, alignment, ret);
+            }
+            fn allocator(self: *@This()) Allocator {
+                return .{ .ptr = self, .vtable = &.{ .alloc = allocate, .resize = resize, .remap = remap, .free = free } };
+            }
+        };
+        var planning: PlanningAllocator = .{ .db = &db };
+        var automatic = try db.beginRelationalRows(planning.allocator(), .{
+            .auto_index = true,
+            .fields = &.{"id"},
+            .conditions = &.{
+                .{ .column = "tenant", .op = .eq, .value = .{ .integer = 1 } },
+                .{ .column = "id", .op = .eq, .value = .{ .integer = 9007199254740993 } },
+            },
+        });
+        defer automatic.deinit();
+        try std.testing.expect(planning.allocations != 0);
+        try std.testing.expect(!planning.blocked);
+        try std.testing.expectEqualStrings("tenant_id", automatic.index.?.name);
+        var page = try automatic.nextPage(alloc, null, .{});
+        defer page.deinit();
+        try std.testing.expectEqual(@as(usize, 1), page.rows.len);
+        try std.testing.expectEqualStrings("b", page.rows[0].key);
+        try std.testing.expectEqualStrings("{\"id\":9007199254740993}", page.rows[0].json);
+    }
     var wrong = request;
     wrong.lower = .{ .values = &.{.{ .number = 1 }} };
     try std.testing.expectError(error.InvalidRelationalIndexBound, db.beginRelationalRows(alloc, wrong));
@@ -72896,6 +73127,34 @@ test "relational rows snapshot projects exact composite ranges through writes DD
         });
         defer excluded.deinit(alloc);
         try std.testing.expectEqual(@as(usize, 0), excluded.hashes.len);
+        // Session owns compiled query/filter bytes and keeps the original
+        // snapshot even after caller buffers and live row values change.
+        const query_copy = try alloc.dupe(u8, query);
+        defer alloc.free(query_copy);
+        const filter_copy = try alloc.dupe(u8, "{\"doc_id\":[\"b\"]}");
+        defer alloc.free(filter_copy);
+        var cancel = std.atomic.Value(bool).init(false);
+        const session = try db.openRelationalReadSession(alloc, "", "", .{
+            .relational_query_json = query_copy,
+            .filter_query_json = filter_copy,
+            .limit = 16,
+            .cancellation = types.CancellationToken.fromAtomic(&cancel),
+        });
+        defer session.deinit();
+        @memset(query_copy, 'x');
+        @memset(filter_copy, 'x');
+        try db.batch(.{ .timestamp_ns = 300, .writes = &.{.{ .key = "b", .value = "{\"tenant\":1,\"id\":2}" }} });
+        var typed = try session.nextTypedPage(alloc, null, .{});
+        defer typed.deinit();
+        try std.testing.expectEqual(@as(usize, 1), typed.rows.len);
+        try std.testing.expectEqualStrings("b", typed.rows[0].key);
+        try std.testing.expectEqual(@as(i64, 1), typed.rows[0].typed.?.object.get("id").?.integer);
+        cancel.store(true, .release);
+        try std.testing.expectError(error.Canceled, session.nextTypedPage(alloc, null, .{}));
+        try std.testing.expectError(error.DeadlineExceeded, db.openRelationalReadSession(alloc, "", "", .{
+            .relational_query_json = query,
+            .execution_deadline_ns = 0,
+        }));
     }
 }
 

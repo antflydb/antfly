@@ -2281,6 +2281,17 @@ pub const Client = struct {
         return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
     }
 
+    /// Execute a SQL statement
+    /// POST /db/v1/sql
+    pub fn executeSQL(self: *@This(), body: types.SQLRequest) !ApiResponse(types.SQLResponse) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/sql", .{self.base_url});
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders(), .max_retries = 0, .follow_redirects = false, .cookies_enabled = false, .max_response_size = 16777216 });
+        return ApiResponse(types.SQLResponse).fromResponse(self.allocator, &resp);
+    }
+
     /// Get cluster status
     /// GET /db/v1/status
     pub fn getStatus(self: *@This()) !ApiResponse(types.ClusterStatus) {

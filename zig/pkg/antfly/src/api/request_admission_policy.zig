@@ -87,6 +87,9 @@ pub const public_operation_policies = [_]PublicOperationPolicy{
     .{ .operation_id = "invokeInferenceConnection", .class = .inference },
     .{ .operation_id = "evaluate", .class = .none },
     .{ .operation_id = "globalQuery", .class = .query },
+    // SQL selects query/write admission only after bounded compilation. It
+    // owns that reservation until its offloaded native operation completes.
+    .{ .operation_id = "executeSQL", .class = .none },
     .{ .operation_id = "restore", .class = .none },
     .{ .operation_id = "listRestoreJobs", .class = .none },
     .{ .operation_id = "getRestoreJob", .class = .none },

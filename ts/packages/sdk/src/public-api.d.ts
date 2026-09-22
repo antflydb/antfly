@@ -646,6 +646,34 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/sql": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Execute a SQL statement
+         * @description Executes the bounded relational SELECT, INSERT, UPDATE, and DELETE
+         *     subset through the current catalog and native row execution contracts.
+         *     Parameters are bound separately from statement text. Document, graph,
+         *     and lake SQL sources, DDL, and SQL sessions are not yet supported.
+         *     Reads inherit native owner-local consistency, not a global SQL
+         *     transaction snapshot. Statements requiring a retained multi-page
+         *     statement snapshot fail when that capability is unavailable.
+         *     Unsupported statement shapes fail explicitly; the server never
+         *     silently substitutes a different query or truncates the result.
+         */
+        post: operations["executeSQL"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/query": {
         parameters: {
             query?: never;
@@ -4065,6 +4093,118 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /**
+         * @description Logical SQL result type. Integer values are decimal strings to preserve exact precision in every client.
+         * @enum {string}
+         */
+        SQLColumnType: "string" | "integer" | "number" | "boolean" | "datetime" | "json" | "unknown";
+        SQLColumn: {
+            /** @description Display label. Labels need not be unique; rows use matching ordinal positions. */
+            name: string;
+            type: components["schemas"]["SQLColumnType"];
+        };
+        /**
+         * @description Execute one SQL statement. Parameters are positional (`$1`, `$2`, ...),
+         *     never interpolated into SQL text. To preserve integer precision in
+         *     JavaScript clients, supply integers outside the exact JSON number range
+         *     as decimal strings; binding coerces parameters to the expected type.
+         *     The result limit is an admission bound, not an implicit SQL LIMIT:
+         *     statements whose results exceed it fail instead of silently truncating.
+         *     Request bodies are limited to 4 MiB, preparation to 8 MiB of allocated
+         *     memory, and encoded results to a 16 MiB allocation budget.
+         */
+        SQLRequest: {
+            /** @description A single SQL statement. */
+            statement: string;
+            /** @description Positional JSON parameter values, including null. */
+            parameters?: unknown[];
+            /** @description Database used to resolve unqualified catalog names. */
+            database?: string;
+            /** @description Namespace used to resolve unqualified table names. */
+            namespace?: string;
+            /**
+             * @description Maximum admitted result rows; does not change statement semantics.
+             * @default 128
+             */
+            limit?: number;
+            /** @description Opaque SQL session identifier returned by a previous response. */
+            session_id?: string;
+        };
+        /**
+         * @description Authoritative native SQL session state after the statement. Failed sessions require ROLLBACK or ROLLBACK TO SAVEPOINT; uncertain commit outcomes must be reconciled by transaction_id, never replayed.
+         * @enum {string}
+         */
+        SQLTransactionStatus: "idle" | "in_transaction" | "failed";
+        /**
+         * @description Durable mutation outcome. Every value confirms a commit and must not
+         *     cause the statement to be replayed. Pending or repair outcomes require
+         *     visibility convergence or operator action rather than another write.
+         * @enum {string}
+         */
+        SQLMutationOutcome: "committed" | "committed_pending" | "committed_repair_required" | "committed_graph_metric_materialization_rejected";
+        /**
+         * @description Ordinal result rows with corresponding logical column metadata. SQL NULL
+         *     is JSON null; sql_nulls distinguishes it from a JSON column containing
+         *     the JSON literal null. Integer-typed values are exact decimal strings; datetime
+         *     values are strings. Objects and arrays in JSON columns remain JSON.
+         */
+        SQLResponse: {
+            columns: components["schemas"]["SQLColumn"][];
+            rows: unknown[][];
+            /**
+             * Format: int64
+             * @description Number of rows affected by a mutation, or zero for a read-only statement.
+             */
+            rows_affected: number;
+            /**
+             * @description Null flags aligned exactly with rows and their columns. True denotes
+             *     SQL NULL; false denotes a value, including the JSON literal null.
+             *     When omitted, null cells have the legacy SQL NULL interpretation.
+             */
+            sql_nulls?: boolean[][];
+            /** @description SQL command completion tag. */
+            command_tag: string;
+            mutation_outcome?: components["schemas"]["SQLMutationOutcome"];
+            ddl_receipt?: components["schemas"]["SQLDDLReceipt"];
+            /** @description Native transaction receipt for visibility or repair reconciliation; never replay a committed statement. */
+            transaction_id?: string;
+            /** @description Opaque SQL session identifier for subsequent requests. */
+            session_id?: string;
+            transaction_status?: components["schemas"]["SQLTransactionStatus"];
+        };
+        /** @enum {string} */
+        SQLDDLReceiptState: "ready" | "pending" | "invalid";
+        /**
+         * @description Durable DDL declaration receipt. Pending or invalid means the declaration
+         *     committed but validation has not established an active constraint. Do not
+         *     replay it. Inspect table constraint status using this immutable table
+         *     identity and schema generation; a later generation supersedes this receipt.
+         */
+        SQLDDLReceipt: {
+            database: string;
+            namespace: string;
+            table: string;
+            table_id: string;
+            /** Format: int64 */
+            schema_version: number;
+            state: components["schemas"]["SQLDDLReceiptState"];
+            diagnostic?: string;
+            /** @description Native restore job for an atomic schema rewrite. Until publication table_id identifies the source generation. Poll the restore job; do not replay this DDL. */
+            restore_job_id?: string;
+        };
+        SQLDiagnostic: {
+            /** @description Five-character SQLSTATE error code. */
+            code: string;
+            /** @description Human-readable diagnostic with no sensitive parameter values. */
+            message: string;
+            /** @description Optional one-based character position in the submitted SQL statement. */
+            position?: number;
+            /** @description Native transaction receipt for reconciliation when a mutation outcome is unknown. */
+            transaction_id?: string;
+            /** @description False for SQLSTATE 40003; never replay a mutation whose outcome is unknown. */
+            retryable?: boolean;
+            transaction_status?: components["schemas"]["SQLTransactionStatus"];
+        };
         /** @description Database catalog object. Tables and namespaces resolve under a database before authorization and routing. */
         DatabaseCatalogRecord: {
             /**
@@ -7281,6 +7421,8 @@ export interface components {
             row: {
                 [key: string]: unknown;
             };
+            /** @description Projected JSON columns containing the JSON literal null rather than SQL NULL. Other null-valued fields are SQL NULL. */
+            json_null_fields?: string[];
             /** @description Exact row version for mutation preconditions, encoded as decimal text. */
             version: string;
             /**
@@ -7297,6 +7439,8 @@ export interface components {
             row?: {
                 [key: string]: unknown;
             };
+            /** @description Names of JSON-typed columns whose row value is the JSON literal null rather than SQL NULL. Each name must identify a present null-valued JSON column; duplicates, unknown names, non-null values, and use with deletion are rejected. */
+            json_null_fields?: string[];
         };
         /** @description Atomic version-conditional typed-row replacements and deletions using the durable distributed transaction coordinator. */
         RelationalRowMutationRequest: {
@@ -20456,6 +20600,106 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             500: components["responses"]["InternalServerError"];
+        };
+    };
+    executeSQL: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SQLRequest"];
+            };
+        };
+        responses: {
+            /** @description SQL statement result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLResponse"];
+                };
+            };
+            /** @description DDL declaration committed; constraint validation is pending. Do not replay. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLResponse"];
+                };
+            };
+            /** @description Invalid statement, parameter, or result admission limit */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLDiagnostic"];
+                };
+            };
+            /** @description Authentication required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Insufficient permission for the statement's catalog resources */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Transaction or catalog conflict, or committed DDL whose validation failed */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLDiagnostic"] | components["schemas"]["SQLResponse"];
+                };
+            };
+            /** @description Foreground query, write, or request-body admission is exhausted */
+            429: {
+                headers: {
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Internal SQL execution failure */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLDiagnostic"];
+                };
+            };
+            /** @description SQL statement shape is not supported */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLDiagnostic"];
+                };
+            };
+            /** @description SQL backend execution capacity is unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLDiagnostic"];
+                };
+            };
         };
     };
     globalQuery: {

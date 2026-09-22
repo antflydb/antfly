@@ -75,6 +75,7 @@ pub const Config = struct {
     admission: AdmissionConfig = .{},
     graph_execution: graph_work_budget.Limits = .{},
     mcp: McpConfig = .{},
+    pgwire: ?PgwireConfig = null,
     backup: BackupConfig = .{},
     metadata: MetadataConfig = .{},
     storage: StorageConfig = .{},
@@ -100,6 +101,14 @@ pub const Config = struct {
     pub const McpConfig = struct {
         /// Zero disables the serialized MCP tool-result compatibility guard.
         max_tool_result_bytes: u32 = default_mcp_max_tool_result_bytes,
+    };
+
+    pub const PgwireConfig = struct {
+        enabled: bool = false,
+        bind_host: ?[]const u8 = null,
+        bind_port: u16 = 5432,
+        max_connections: u16 = 32,
+        externally_protected_transport: bool = false,
     };
 
     pub const BackupConfig = struct {
@@ -819,7 +828,32 @@ pub const Config = struct {
         else
             Config.InferenceConfig.KernelJitConfig{};
         errdefer kernel_jit.deinit(alloc);
+        var pgwire: ?PgwireConfig = null;
+        if (root.get("pgwire")) |value| {
+            try validateObjectMemberFields(root, "pgwire", &.{ "enabled", "bind_host", "bind_port", "max_connections", "externally_protected_transport" });
+            const object = switch (value) {
+                .object => |object| object,
+                else => return error.InvalidConfig,
+            };
+            const port = try optionalU32Field(object, "bind_port") orelse 5432;
+            const connections_count = try optionalU32Field(object, "max_connections") orelse 32;
+            if (port == 0 or port > 65535 or connections_count == 0 or connections_count > 65535) return error.InvalidConfig;
+            const host = if (object.get("bind_host")) |host| switch (host) {
+                .string => |string| string,
+                else => return error.InvalidConfig,
+            } else null;
+            if (host) |name| if (name.len == 0 or name.len > 253) return error.InvalidConfig;
+            pgwire = .{
+                .enabled = try optionalBoolField(object, "enabled") orelse false,
+                .bind_port = @intCast(port),
+                .max_connections = @intCast(connections_count),
+                .externally_protected_transport = try optionalBoolField(object, "externally_protected_transport") orelse false,
+                .bind_host = if (host) |name| try alloc.dupe(u8, name) else null,
+            };
+        }
+        errdefer if (pgwire) |wire| if (wire.bind_host) |host| alloc.free(host);
         return .{
+            .pgwire = pgwire,
             .registry = registry,
             .transcribers = transcribers,
             .readers = reader_registry,
@@ -1101,6 +1135,7 @@ pub const Config = struct {
     }
 
     pub fn deinit(self: *Config) void {
+        if (self.pgwire) |wire| if (wire.bind_host) |host| self.registry.allocator.free(host);
         if (self.tls) |*tls| tls.deinit(self.registry.allocator);
         if (self.cors) |*cors| cors.deinit(self.registry.allocator);
         self.metadata.deinit(self.registry.allocator);
@@ -3623,6 +3658,24 @@ test "common config parses the hot_standby section and the deprecated ha alias" 
     );
     defer both.deinit();
     try std.testing.expectEqual(@as(u64, 2), both.ha.?.cluster_id.?);
+}
+
+test "common config parses bounded pgwire listener policy" {
+    var config = try Config.parseFromSlice(std.testing.allocator,
+        \\{"pgwire":{"enabled":true,"bind_host":"127.0.0.1","bind_port":15432,"max_connections":8}}
+    );
+    defer config.deinit();
+    try std.testing.expect(config.pgwire.?.enabled);
+    try std.testing.expectEqualStrings("127.0.0.1", config.pgwire.?.bind_host.?);
+    try std.testing.expectEqual(@as(u16, 15432), config.pgwire.?.bind_port);
+    try std.testing.expect(!config.pgwire.?.externally_protected_transport);
+    for ([_][]const u8{
+        \\{"pgwire":{"max_connections":0}}
+        ,
+        \\{"pgwire":{"bind_port":65536}}
+        ,
+        \\{"pgwire":{"allow_insecure":true}}
+    }) |raw| try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(std.testing.allocator, raw));
 }
 
 test "common config parses bounded transaction session policy" {

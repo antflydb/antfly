@@ -17,6 +17,7 @@ const platform_build = @import("../../../lib/platform/build_support.zig");
 const addSnowballModule = @import("snowball.zig").addSnowballModule;
 
 pub const AntflyRootImports = struct {
+    sql_parser: *std.Build.Module,
     storage_boundary: @import("storage_boundary.zig").Modules,
     boundary_profile: @import("storage_boundary.zig").Profile = .all,
     build_info: @import("../../../lib/build_info/build_support.zig").BuildInfo,
@@ -299,6 +300,7 @@ pub const AntflyRootImports = struct {
     }
 
     fn configureBase(self: @This(), mod: *std.Build.Module, link_libc: bool) void {
+        mod.addImport("sql_parser", self.sql_parser);
         self.storage_boundary.configureProfile(mod, false, false, self.boundary_profile);
         mod.addOptions("build_options", self.build_options);
         mod.addImport("antfly_platform", self.platform);

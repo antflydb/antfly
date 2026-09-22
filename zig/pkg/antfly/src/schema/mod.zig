@@ -121,6 +121,21 @@ pub const CompiledTableValidator = struct {
         try impl.prepareDocumentValueWithPlan(owned_alloc, scratch, self.schema, value, self.physical_fields, &self.execution);
     }
 
+    pub fn prepareTypedValue(self: CompiledTableValidator, owned_alloc: std.mem.Allocator, scratch: std.mem.Allocator, value: *std.json.Value, json_null_fields: []const []const u8, preserve: bool) !void {
+        try impl.prepareTypedDocumentValueWithPlan(owned_alloc, scratch, self.schema, value, self.physical_fields, &self.execution, json_null_fields, preserve);
+    }
+
+    pub fn validateTypedStoredRoot(self: CompiledTableValidator, alloc: std.mem.Allocator, value: *std.json.Value, row: anytype) !void {
+        var names: std.ArrayList([]const u8) = .empty;
+        defer names.deinit(alloc);
+        for (row.table_schema.relational_columns, 0..) |column, ordinal| {
+            if (!column.is_json or column.json_kind != .any) continue;
+            const cell = (try row.findCell(@intCast(ordinal))) orelse continue;
+            if (!cell.is_null and std.mem.eql(u8, cell.value.bytes_val, "null")) try names.append(alloc, column.name);
+        }
+        try self.prepareTypedValue(alloc, alloc, value, names.items, true);
+    }
+
     /// The caller must first validate canonical bytes/hash against the runtime
     /// layout. Its binding to this public schema must be verified before any
     /// validated rows are published (archive finish checks staged restores).
@@ -135,7 +150,7 @@ pub const CompiledTableValidator = struct {
             var arena = std.heap.ArenaAllocator.init(alloc);
             defer arena.deinit();
             const value = try row.materializeCellAlloc(arena.allocator(), cell);
-            try impl.validateRelationalRestoreProperty(alloc, self.schema, index, &value, &self.execution);
+            try impl.validateRelationalRestoreProperty(alloc, self.schema, index, &value, &self.execution, !cell.is_null and cell.is_json and value == .null);
         }
     }
 };

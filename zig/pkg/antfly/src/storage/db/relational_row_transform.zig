@@ -251,7 +251,7 @@ fn validateStored(alloc: Allocator, bytes: []const u8, view: registry.SchemaView
     if (validator.restore.full_root) {
         var logical = try codec.validateCanonicalAndMaterializeOrdinalRootWithLayoutAlloc(alloc, bytes, view.tableSchema().*, view.physicalLayout());
         defer logical.deinit(alloc);
-        try validator.validateValue(alloc, &logical.root);
+        try validator.validateTypedStoredRoot(alloc, &logical.root, try codec.ordinalRowViewTrusted(bytes, view.tableSchema().*, view.physicalLayout()));
     } else {
         try store.validateCanonicalValueForSchemaAndLayout(alloc, bytes, view.tableSchema().*, view.physicalLayout());
         const row = try codec.ordinalRowViewTrusted(bytes, view.tableSchema().*, view.physicalLayout());

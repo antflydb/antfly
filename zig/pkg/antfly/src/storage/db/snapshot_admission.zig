@@ -80,6 +80,14 @@ pub const SnapshotAdmission = struct {
         return .{ .admission = self };
     }
 
+    /// Distributed capture never waits for another owner while retaining a
+    /// partial set of fences. The coordinator releases all acquired leases
+    /// before parking/retrying when any owner cannot admit capture immediately.
+    pub fn tryAcquireCapture(self: *@This()) ?CaptureLease {
+        if (!self.lock.tryLockExclusive()) return null;
+        return .{ .admission = self };
+    }
+
     pub fn acquireCaptureIo(self: *@This(), io: std.Io, cancellation: anytype) !CaptureLease {
         try self.lock.lockExclusiveIo(io, cancellation);
         return .{ .admission = self };

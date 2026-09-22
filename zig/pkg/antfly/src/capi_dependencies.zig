@@ -16,6 +16,18 @@
 //! Both the focused kernel root and broad benchmark root share this surface.
 
 pub const relational_expression_errors = @import("schema/relational_expression_errors.zig");
+pub const runtime_native_abi = @import("runtime_native_abi.zig");
+pub const runtime_error_abi = @import("runtime_error_abi.zig");
+pub const relational_read_provider = @import("storage/relational_read_provider.zig");
+pub const statement_read_fence = @import("storage/statement_read_fence.zig");
+pub const sql_catalog = @import("sql/catalog.zig");
+pub const sql_ast = @import("sql/ast.zig");
+pub const sql_compiler = @import("sql/compiler.zig");
+pub const sql_runtime = @import("sql/runtime.zig");
+pub const sql_errors = @import("sql/errors.zig");
+pub const sql_memory_budget = @import("sql/memory_budget.zig");
+pub const sql_mutation_images = @import("sql/mutation_images.zig");
+pub const sql_document_row = @import("sql/document_row.zig");
 pub const storage_coordinated_ttl = @import("storage/coordinated_ttl.zig");
 pub const storage_metadata_ha_port = @import("storage/metadata_ha_port.zig");
 pub const storage_hot_standby_replication_record = @import("storage/hot_standby/replication_record.zig");

@@ -102,6 +102,9 @@ pub const TxnStatus = enum(u8) {
 pub const WriteIntent = struct {
     key: []const u8,
     value: ?[]const u8, // null for deletes
+    /// Borrowed logical typing metadata; must be consumed by canonical AROW
+    /// preparation before the journal boundary, never silently discarded.
+    json_null_fields: []const []const u8 = &.{},
     /// Schema-bound canonical AROW produced before voting prepared. The API
     /// sidecar retains only API-only special fields needed by commit effects.
     prepared_row: ?[]const u8 = null,
@@ -131,8 +134,9 @@ pub const IntentValue = struct {
 /// exact-number DOM, and per-row commit metadata. Limits apply to the entire
 /// transaction, including repeated prepares; replacing a key releases credits.
 pub fn intentAdmissionBytes(intent: WriteIntent) !u64 {
-    const payload: u64 = (if (intent.value) |value| value.len else 0) +
+    var payload: u64 = (if (intent.value) |value| value.len else 0) +
         (if (intent.prepared_row) |row| row.len else 0);
+    for (intent.json_null_fields) |field| payload = std.math.add(u64, payload, field.len + @sizeOf([]const u8)) catch return error.TransactionTooLarge;
     const bytes = std.math.mul(u64, payload, 64) catch return error.TransactionTooLarge;
     const keys = std.math.mul(u64, intent.key.len, 16) catch return error.TransactionTooLarge;
     return std.math.add(u64, bytes, std.math.add(u64, keys, 4096) catch return error.TransactionTooLarge) catch error.TransactionTooLarge;
@@ -639,6 +643,7 @@ pub const TxnManager = struct {
         predicates: []const VersionPredicate,
         extra_batch: MutationExtraBatch,
     ) !void {
+        for (intents) |intent| if (intent.json_null_fields.len != 0 and intent.prepared_row == null) return error.PreparedIntentRequiresMaterialization;
         var record = try self.loadTransactionRecord(txn_id);
         if (record.status != .pending) return TxnError.DecisionConflict;
 
@@ -1379,6 +1384,16 @@ pub const TxnManager = struct {
             entry = try cursor.next();
         }
         return false;
+    }
+
+    /// Constant-work uncertainty check for coordinated statement snapshots.
+    /// The caller must hold primary AND replay mutation admission while using
+    /// this result. A prepared participant may otherwise resolve immediately
+    /// after the check, yielding different sides of one distributed commit.
+    pub fn hasUnresolvedWriteIntents(self: *TxnManager) !bool {
+        var read = try self.store.beginRead();
+        defer read.abort();
+        return readHasPrefix(&read, intents_prefix);
     }
 
     pub fn listTransactionsPage(
@@ -3022,6 +3037,21 @@ test "transaction intent admission releases failed allocations before voting" {
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
+test "transaction journal refuses to lose unprepared JSON null typing" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(alloc, .{});
+    defer runtime.deinit();
+    var mgr = try TxnManager.init(alloc, &runtime);
+    defer mgr.deinit();
+    const txn: TxnId = .{32} ** 16;
+    try mgr.initTransaction(txn, 100);
+    try std.testing.expectError(error.PreparedIntentRequiresMaterialization, mgr.writeIntents(txn, &.{.{ .key = "row", .value = "{\"j\":null}", .json_null_fields = &.{"j"} }}, &.{}));
+    // Once the native AROW exists, its bitmap is the durable authority.
+    try mgr.writeIntents(txn, &.{.{ .key = "row", .value = "{}", .json_null_fields = &.{"j"}, .prepared_row = "physical" }}, &.{});
 }
 
 test "transaction abort retires large intents without loading their payloads" {

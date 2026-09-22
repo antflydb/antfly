@@ -1604,7 +1604,20 @@ pub fn handleTableBatch(
 pub fn handleRelationalRowsMutation(alloc: std.mem.Allocator, table_name: []const u8, body: []const u8, api: TableApi) !OwnedResponse {
     resetLastBatchFailureName();
     last_ambiguous_batch_txn_id = null;
-    var req = @import("relational_rows.zig").parseMutation(alloc, body) catch |err| switch (err) {
+    var parsed = std.json.parseFromSlice(@import("antfly_metadata_openapi").types.RelationalRowMutationRequest, alloc, body, .{ .parse_numbers = false }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return .{ .status = 400, .body = try alloc.dupe(u8, "{\"error\":\"invalid relational mutation request\"}"), .json = true },
+    };
+    defer parsed.deinit();
+    return handleTypedRelationalRowsMutation(alloc, table_name, parsed.value, api);
+}
+
+/// Native callers share the exact public ownership/coordinator/outcome path
+/// without serializing and reparsing a request envelope.
+pub fn handleTypedRelationalRowsMutation(alloc: std.mem.Allocator, table_name: []const u8, request: @import("antfly_metadata_openapi").types.RelationalRowMutationRequest, api: TableApi) !OwnedResponse {
+    resetLastBatchFailureName();
+    last_ambiguous_batch_txn_id = null;
+    var req = @import("relational_rows.zig").prepareMutation(alloc, request) catch |err| switch (err) {
         error.InvalidBatchRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "{\"error\":\"invalid relational mutation request\"}"), .json = true },
         else => return err,
     };
@@ -2999,7 +3012,7 @@ fn unsupportedRestore(
     return error.InternalFailure;
 }
 
-test "relational mutation HTTP preserves conditional coordinator inputs" {
+test "SQL relational mutation HTTP and typed paths preserve conditional coordinator inputs" {
     const Backend = struct {
         called: bool = false,
         missing: bool = false,
@@ -3029,6 +3042,22 @@ test "relational mutation HTTP preserves conditional coordinator inputs" {
     defer response.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 201), response.status);
     try std.testing.expect(backend.called);
+    backend.called = false;
+    var typed = try handleTypedRelationalRowsMutation(std.testing.allocator, "rows", .{
+        .schema_version = 8,
+        .mutations = &.{.{ .key = "a", .expected_version = "9007199254740993", .row = .{ .map = .empty } }},
+    }, api);
+    defer typed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 201), typed.status);
+    try std.testing.expect(backend.called);
+    backend.called = false;
+    var invalid_typed = try handleTypedRelationalRowsMutation(std.testing.allocator, "rows", .{
+        .schema_version = 8,
+        .mutations = &.{ .{ .key = "a", .expected_version = "0" }, .{ .key = "a", .expected_version = "0" } },
+    }, api);
+    defer invalid_typed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 400), invalid_typed.status);
+    try std.testing.expect(!backend.called);
     var invalid = try handleRelationalRowsMutation(std.testing.allocator, "rows", "{}", api);
     defer invalid.deinit(std.testing.allocator);
     try std.testing.expect(invalid.json);

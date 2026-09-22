@@ -136,6 +136,8 @@ const raft_mutation_forwarding = @import("raft_mutation_forwarding.zig");
 const metadata_server = @import("../metadata/server.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const query_embedding_cache = @import("../inference/query_embedding_cache.zig");
+const sql_plan_cache = @import("../sql/plan_cache.zig");
+const sql_schema_cache = @import("sql_schema_cache.zig");
 const cache_budget = @import("../common/cache_budget.zig");
 const resource_manager_mod = @import("../storage/resource_manager.zig");
 const connections_api = @import("connections.zig");
@@ -1154,6 +1156,7 @@ test "imported runtime I/O views override raw runtime including unavailable view
 }
 
 pub const ApiHttpServerConfig = struct {
+    pgwire: ?common_config.Config.PgwireConfig = null,
     restore_validation: ?@import("restore_catalog.zig").ValidationPort = null,
     auth_enabled: bool = false,
     experimental: bool = false,
@@ -1163,6 +1166,8 @@ pub const ApiHttpServerConfig = struct {
     mcp_max_tool_result_bytes: usize = common_config.default_mcp_max_tool_result_bytes,
     /// Node-local public database-query admission capacity. Zero is unlimited.
     query_max_concurrent_requests: u32 = common_config.default_query_max_concurrent_requests,
+    /// SQL decoding/compilation admission shared by HTTP and pgwire.
+    sql_max_concurrent_preparations: u32 = 16,
     /// Node-local foreground data-mutation admission capacity. Zero is unlimited.
     write_max_concurrent_requests: u32 = common_config.default_write_max_concurrent_requests,
     /// Node-local inference request admission capacity. Zero is unlimited.
@@ -3239,6 +3244,7 @@ pub const ApiHttpServer = struct {
     owner_alloc: std.mem.Allocator,
     cfg: ApiHttpServerConfig,
     query_admission: RequestAdmission,
+    sql_preparation_admission: RequestAdmission,
     write_admission: RequestAdmission,
     inference_admission: RequestAdmission,
     source: StatusSource,
@@ -3301,6 +3307,11 @@ pub const ApiHttpServer = struct {
     local_resource_manager: resource_manager_mod.ResourceManager,
     shared_resource_manager: ?*resource_manager_mod.ResourceManager,
     query_embedding_cache: query_embedding_cache.QueryEmbeddingCache,
+    /// Shared immutable SQL plan cache. Plans contain no catalog, auth, or
+    /// parameter state; every execution still binds against its own snapshot.
+    sql_plan_cache: sql_plan_cache.Cache,
+    sql_schema_cache: sql_schema_cache.Cache,
+    pgwire_listener: ?*@import("sql_pgwire.zig").Listener = null,
     embedding_provider_runtime: managed_embedder.ProviderRuntime,
     incoming_graph_routes: distributed_graph.IncomingSourceGroupCache,
 
@@ -3451,6 +3462,7 @@ pub const ApiHttpServer = struct {
             .owner_alloc = owner_alloc,
             .cfg = cfg,
             .query_admission = RequestAdmission.init(cfg.query_max_concurrent_requests),
+            .sql_preparation_admission = RequestAdmission.init(@max(1, cfg.sql_max_concurrent_preparations)),
             .write_admission = RequestAdmission.init(cfg.write_max_concurrent_requests),
             .inference_admission = RequestAdmission.init(cfg.inference_max_concurrent_requests),
             .source = source,
@@ -3501,6 +3513,8 @@ pub const ApiHttpServer = struct {
             .local_resource_manager = resource_manager_mod.ResourceManager.init(.{}),
             .shared_resource_manager = cfg.resource_manager,
             .query_embedding_cache = query_embedding_cache.QueryEmbeddingCache.init(owner_alloc, api_io, effective_query_embedding_cache),
+            .sql_plan_cache = sql_plan_cache.Cache.init(owner_alloc, .{}),
+            .sql_schema_cache = sql_schema_cache.Cache.init(owner_alloc),
             .embedding_provider_runtime = managed_embedder.ProviderRuntime.init(owner_alloc, api_io),
             .mcp_sessions = mcp.InMemorySessionStore.initWithOptions(owner_alloc, api_io, .{
                 .now_ns_fn = protocolStoreNowNs,
@@ -3605,6 +3619,11 @@ pub const ApiHttpServer = struct {
 
     pub fn tryAcquireQuery(self: *ApiHttpServer) bool {
         return self.query_admission.tryAcquire();
+    }
+
+    pub fn acquireSqlExecution(self: *ApiHttpServer, write: bool) !RequestAdmission.Lease {
+        const admission = if (write) &self.write_admission else &self.query_admission;
+        return admission.tryAcquireLease() orelse error.SqlWriteCapacityUnavailable;
     }
 
     pub fn releaseQuery(self: *ApiHttpServer) void {
@@ -3784,6 +3803,16 @@ pub const ApiHttpServer = struct {
         return try cluster.topologyFromStatus(alloc, status);
     }
 
+    pub fn initWithProcessRequestAllocatorFallible(
+        alloc: std.mem.Allocator,
+        cfg: ApiHttpServerConfig,
+        source: StatusSource,
+        table_read_source: ?table_reads.TableReadSource,
+        table_write_source: ?table_writes.TableWriteSource,
+    ) !ApiHttpServer {
+        return initWithProcessRequestAllocator(alloc, cfg, source, table_read_source, table_write_source);
+    }
+
     pub fn initWithConfig(
         alloc: std.mem.Allocator,
         cfg: ApiHttpServerConfig,
@@ -3914,6 +3943,10 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn deinit(self: *ApiHttpServer) void {
+        if (self.pgwire_listener) |listener| {
+            listener.deinit();
+            self.pgwire_listener = null;
+        }
         self.restore_jobs_closing.store(true, .release);
         self.signalRestoreRetryWakeup();
         self.signalRestoreBackoffWaiters();
@@ -3952,6 +3985,8 @@ pub const ApiHttpServer = struct {
         }
         self.connections_cache.deinit();
         self.query_embedding_cache.deinit(self.inferenceCacheBudget());
+        self.sql_plan_cache.deinit(queryEmbeddingCacheIo(self.cfg));
+        self.sql_schema_cache.deinit();
         self.embedding_provider_runtime.deinit();
         self.incoming_graph_routes.deinit();
         self.local_resource_manager.deinit(self.owner_alloc);
@@ -4178,8 +4213,26 @@ pub const ApiHttpServer = struct {
         return configuredApiIo(self.cfg);
     }
 
+    /// Called only after this server reaches its stable owner address.
+    pub fn startPgwire(self: *ApiHttpServer) !void {
+        if (self.pgwire_listener != null) return;
+        const config = self.cfg.pgwire orelse return;
+        if (!config.enabled) return;
+        self.pgwire_listener = try @import("sql_pgwire.zig").Listener.start(self, config);
+    }
+
     pub fn sharedApiNetworkIo(self: *ApiHttpServer) ?std.Io {
         return configuredApiNetworkIo(self.cfg);
+    }
+
+    /// Executor used by the process-wide SQL plan cache. It remains valid for
+    /// the complete server lifetime and is independent of request cancellation.
+    pub fn sqlPlanCacheIo(self: *ApiHttpServer) std.Io {
+        return queryEmbeddingCacheIo(self.cfg);
+    }
+
+    pub fn sqlPlanCache(self: *ApiHttpServer) *sql_plan_cache.Cache {
+        return &self.sql_plan_cache;
     }
 
     /// Local backup repositories need the API lane's native filesystem
