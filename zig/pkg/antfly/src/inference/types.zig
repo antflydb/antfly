@@ -454,6 +454,16 @@ fn jsonContentPayload(raw: []const u8) []const u8 {
     return text;
 }
 
+/// Shared HTTP failure taxonomy for reranking provider adapters.
+pub fn rerankStatusError(status: u16) anyerror {
+    return switch (status) {
+        408, 504 => error.Timeout,
+        429 => error.RerankRateLimited,
+        500...503, 505...599 => error.RerankTransientFailure,
+        else => error.RerankRequestFailed,
+    };
+}
+
 pub const RerankResult = struct {
     scores: []const f32,
     allocator: std.mem.Allocator,
