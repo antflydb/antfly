@@ -247,6 +247,12 @@ tags:
       applies to the whole subtree. This is the way to keep a large field that
       exists only as the source of an embeddings index out of the text index.
 
+      Adding `x-antfly-index: false` to an existing table is a schema
+      migration, not an in-place edit: the current full-text index keeps
+      serving the field's existing postings until the replacement index has
+      been rebuilt under the new schema, and only then are they gone. The
+      table does not shrink on the schema update itself.
+
       ### `x-antfly-include-in-all`
       Schema-level array of field names to include in the special `_all` field for cross-field search:
       ```json
