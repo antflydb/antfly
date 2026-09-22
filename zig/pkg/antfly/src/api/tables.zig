@@ -3466,6 +3466,16 @@ fn appendRuntimeSchemaObject(
             if (infer_idx > 0) try out.append(alloc, ',');
             try appendJsonString(alloc, out, path);
         }
+        try out.appendSlice(alloc, "],\"declared_paths\":[");
+        for (doc.declared_paths, 0..) |path, declared_idx| {
+            if (declared_idx > 0) try out.append(alloc, ',');
+            try appendJsonString(alloc, out, path);
+        }
+        try out.appendSlice(alloc, "],\"unindexed_paths\":[");
+        for (doc.unindexed_paths, 0..) |path, unindexed_idx| {
+            if (unindexed_idx > 0) try out.append(alloc, ',');
+            try appendJsonString(alloc, out, path);
+        }
         try out.appendSlice(alloc, "]}");
     }
     try out.appendSlice(alloc, "]}");
@@ -3731,7 +3741,9 @@ fn schemaArrayIsUnordered(kind: CanonicalSchemaKind, field_name: ?[]const u8) bo
             std.mem.eql(u8, name, "fields") or
             std.mem.eql(u8, name, "variants") or
             std.mem.eql(u8, name, "open_dynamic_paths") or
-            std.mem.eql(u8, name, "infer_type_dynamic_paths"),
+            std.mem.eql(u8, name, "infer_type_dynamic_paths") or
+            std.mem.eql(u8, name, "declared_paths") or
+            std.mem.eql(u8, name, "unindexed_paths"),
     };
 }
 

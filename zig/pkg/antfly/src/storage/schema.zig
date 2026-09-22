@@ -166,7 +166,38 @@ pub const FullTextDocument = struct {
     dynamic_rules: []const FullTextDynamicRule = &.{},
     open_dynamic_paths: []const []const u8 = &.{},
     infer_type_dynamic_paths: []const []const u8 = &.{},
+    /// Every dotted path declared under `properties`, whether or not the
+    /// declaration emits a text field. An explicit declaration owns its path:
+    /// the dynamic mapper must never treat a declared path as an undeclared
+    /// field, even when the enclosing object opts into dynamic indexing.
+    declared_paths: []const []const u8 = &.{},
+    /// Subtrees declared with `x-antfly-index: false`. Nothing at or below
+    /// these paths is indexed by any dynamic rule, open path, or type
+    /// inference.
+    unindexed_paths: []const []const u8 = &.{},
 };
+
+/// Whether `path` is `prefix` itself or a dotted descendant of it. An empty
+/// prefix covers every path.
+pub fn pathFallsUnderPrefix(prefix: []const u8, path: []const u8) bool {
+    if (prefix.len == 0) return true;
+    if (!std.mem.startsWith(u8, path, prefix)) return false;
+    return path.len == prefix.len or path[prefix.len] == '.';
+}
+
+pub fn pathFallsUnderAnyPrefix(prefixes: []const []const u8, path: []const u8) bool {
+    for (prefixes) |prefix| {
+        if (pathFallsUnderPrefix(prefix, path)) return true;
+    }
+    return false;
+}
+
+pub fn containsPath(paths: []const []const u8, path: []const u8) bool {
+    for (paths) |candidate| {
+        if (std.mem.eql(u8, candidate, path)) return true;
+    }
+    return false;
+}
 
 /// Storage profile for a table. Relational mode stores a self-describing packed
 /// row as the authoritative document value instead of retaining a JSON blob.
@@ -248,7 +279,7 @@ const schema_version_prefix = "\x00\x00__metadata__:schema_v";
 /// Current durable runtime-schema format. Catalog compatibility checks use the
 /// same exported constant so a writer can never silently drift from the format
 /// it advertises in transactional table metadata.
-pub const storage_format_version: u32 = 13;
+pub const storage_format_version: u32 = 14;
 
 /// Serialize a TableSchema to bytes. Caller owns the returned slice.
 pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
@@ -289,18 +320,29 @@ fn encodedSchemasEqual(alloc: Allocator, existing: []const u8, incoming: []const
 /// current schema storage format: schemas without executable exact mappings
 /// retain the deployed v11 byte representation, while exact mappings use the
 /// v12 extension. Capability-only declarations are excluded because changing
-/// query diagnostics must not make existing postings unavailable.
+/// query diagnostics must not make existing postings unavailable. The v14
+/// declared/unindexed path lists are excluded for the same reason: they are
+/// derived from the same public schema whose logical version already
+/// participates in projection provenance, so encoding them here would only
+/// re-fingerprint every existing generation on upgrade.
 pub fn serializeTextProjectionSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
     var projection_schema = schema;
     projection_schema.declared_fields = &.{};
     projection_schema.storage_mode = .document;
     projection_schema.relational_columns = &.{};
+    const projection_documents = try alloc.dupe(FullTextDocument, schema.full_text_documents);
+    defer alloc.free(projection_documents);
+    for (projection_documents) |*doc| {
+        doc.declared_paths = &.{};
+        doc.unindexed_paths = &.{};
+    }
+    projection_schema.full_text_documents = projection_documents;
     const projection_format_version: u32 = if (projection_schema.exact_fields.len == 0) 11 else 12;
     return serializeSchemaFormat(alloc, projection_schema, projection_format_version);
 }
 
 fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: u32) ![]u8 {
-    std.debug.assert(format_version == 11 or format_version == 12 or format_version == 13);
+    std.debug.assert(format_version >= 11 and format_version <= storage_format_version);
     if (!exactFieldsValid(schema.exact_fields)) return error.InvalidSchema;
     try validateRelationalSchema(alloc, schema);
     if (format_version < 12 and (schema.declared_fields.len != 0 or schema.exact_fields.len != 0)) {
@@ -310,6 +352,11 @@ fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: 
         (schema.storage_mode != .document or schema.relational_columns.len != 0))
     {
         return error.InvalidSchema;
+    }
+    if (format_version < 14) {
+        for (schema.full_text_documents) |doc| {
+            if (doc.declared_paths.len != 0 or doc.unindexed_paths.len != 0) return error.InvalidSchema;
+        }
     }
 
     var buf = std.ArrayListUnmanaged(u8).empty;
@@ -403,6 +450,12 @@ fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: 
         for (doc.open_dynamic_paths) |path| try appendStr(&buf, alloc, path);
         try appendU32(&buf, alloc, @intCast(doc.infer_type_dynamic_paths.len));
         for (doc.infer_type_dynamic_paths) |path| try appendStr(&buf, alloc, path);
+        if (format_version >= 14) {
+            try appendU32(&buf, alloc, @intCast(doc.declared_paths.len));
+            for (doc.declared_paths) |path| try appendStr(&buf, alloc, path);
+            try appendU32(&buf, alloc, @intCast(doc.unindexed_paths.len));
+            for (doc.unindexed_paths) |path| try appendStr(&buf, alloc, path);
+        }
     }
 
     try appendU32(&buf, alloc, @intCast(schema.index_sort.len));
@@ -452,7 +505,7 @@ fn deserializeSchemaOwned(alloc: Allocator, data: []const u8) !TableSchema {
 
     var pos: usize = 4;
     const fmt_version = readU32(data, &pos);
-    if (fmt_version < 1 or fmt_version > 13) return error.UnsupportedVersion;
+    if (fmt_version < 1 or fmt_version > storage_format_version) return error.UnsupportedVersion;
 
     const version = readU32(data, &pos);
     const default_type = try alloc.dupe(u8, readStr(data, &pos));
@@ -700,6 +753,8 @@ fn deserializeSchemaOwned(alloc: Allocator, data: []const u8) !TableSchema {
                 if (doc.open_dynamic_paths.len > 0) alloc.free(doc.open_dynamic_paths);
                 for (doc.infer_type_dynamic_paths) |infer_path| alloc.free(infer_path);
                 if (doc.infer_type_dynamic_paths.len > 0) alloc.free(doc.infer_type_dynamic_paths);
+                freeOwnedPaths(alloc, doc.declared_paths);
+                freeOwnedPaths(alloc, doc.unindexed_paths);
             }
             alloc.free(docs);
         }
@@ -827,6 +882,12 @@ fn deserializeSchemaOwned(alloc: Allocator, data: []const u8) !TableSchema {
                     infer_type_dynamic_paths_initialized += 1;
                 }
                 doc.infer_type_dynamic_paths = infer_type_dynamic_paths;
+            }
+            if (fmt_version >= 14) {
+                const declared_paths = try readOwnedPaths(alloc, data, &pos);
+                errdefer freeOwnedPaths(alloc, declared_paths);
+                doc.unindexed_paths = try readOwnedPaths(alloc, data, &pos);
+                doc.declared_paths = declared_paths;
             }
             docs_initialized += 1;
         }
@@ -1016,7 +1077,7 @@ fn validateSerializedSchema(data: []const u8) !void {
     cursor.pos = 4;
 
     const format_version = try cursor.readU32();
-    if (format_version < 1 or format_version > 13) return error.UnsupportedVersion;
+    if (format_version < 1 or format_version > storage_format_version) return error.UnsupportedVersion;
     _ = try cursor.readU32(); // logical schema version
     try cursor.readStr(); // default type
     try cursor.readU64(); // TTL duration
@@ -1078,6 +1139,7 @@ fn validateSerializedSchema(data: []const u8) !void {
         if (format_version >= 3) minimum_document_size += 4;
         if (format_version >= 6) minimum_document_size += 4;
         if (format_version >= 8) minimum_document_size += 4;
+        if (format_version >= 14) minimum_document_size += 8;
         try cursor.ensureCount(document_count, minimum_document_size);
         for (0..document_count) |_| {
             try cursor.readStr();
@@ -1117,6 +1179,14 @@ fn validateSerializedSchema(data: []const u8) !void {
                 const infer_path_count = try cursor.readU32();
                 try cursor.ensureCount(infer_path_count, 4);
                 for (0..infer_path_count) |_| try cursor.readStr();
+            }
+            if (format_version >= 14) {
+                const declared_path_count = try cursor.readU32();
+                try cursor.ensureCount(declared_path_count, 4);
+                for (0..declared_path_count) |_| try cursor.readStr();
+                const unindexed_path_count = try cursor.readU32();
+                try cursor.ensureCount(unindexed_path_count, 4);
+                for (0..unindexed_path_count) |_| try cursor.readStr();
             }
         }
     }
@@ -1235,8 +1305,31 @@ fn freeFullTextDocuments(alloc: Allocator, documents: []const FullTextDocument) 
         if (doc.open_dynamic_paths.len > 0) alloc.free(doc.open_dynamic_paths);
         for (doc.infer_type_dynamic_paths) |infer_path| alloc.free(infer_path);
         if (doc.infer_type_dynamic_paths.len > 0) alloc.free(doc.infer_type_dynamic_paths);
+        freeOwnedPaths(alloc, doc.declared_paths);
+        freeOwnedPaths(alloc, doc.unindexed_paths);
     }
     if (documents.len > 0) alloc.free(documents);
+}
+
+fn readOwnedPaths(alloc: Allocator, data: []const u8, pos: *usize) ![]const []const u8 {
+    const count = readU32(data, pos);
+    if (count == 0) return &.{};
+    const paths = try alloc.alloc([]const u8, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (paths[0..initialized]) |path| alloc.free(path);
+        alloc.free(paths);
+    }
+    for (paths) |*path| {
+        path.* = try alloc.dupe(u8, readStr(data, pos));
+        initialized += 1;
+    }
+    return paths;
+}
+
+pub fn freeOwnedPaths(alloc: Allocator, paths: []const []const u8) void {
+    for (paths) |path| alloc.free(path);
+    if (paths.len > 0) alloc.free(paths);
 }
 
 /// Save a schema to DocStore. Returns whether durable state changed.
@@ -2596,6 +2689,8 @@ test "schema serialize/deserialize round-trip" {
                 },
                 .open_dynamic_paths = &.{ "", "meta" },
                 .infer_type_dynamic_paths = &.{"typed"},
+                .declared_paths = &.{ "title", "stored_only", "meta" },
+                .unindexed_paths = &.{"stored_only"},
             },
         },
         .index_sort = &.{
@@ -2608,7 +2703,7 @@ test "schema serialize/deserialize round-trip" {
     defer alloc.free(data);
 
     var format_pos: usize = 4;
-    try std.testing.expectEqual(@as(u32, 13), readU32(data, &format_pos));
+    try std.testing.expectEqual(@as(u32, 14), readU32(data, &format_pos));
 
     const loaded = try deserializeSchema(alloc, data);
     defer freeSchema(alloc, loaded);
@@ -2658,6 +2753,12 @@ test "schema serialize/deserialize round-trip" {
     try std.testing.expectEqualStrings("meta", loaded.full_text_documents[0].open_dynamic_paths[1]);
     try std.testing.expectEqual(@as(usize, 1), loaded.full_text_documents[0].infer_type_dynamic_paths.len);
     try std.testing.expectEqualStrings("typed", loaded.full_text_documents[0].infer_type_dynamic_paths[0]);
+    try std.testing.expectEqual(@as(usize, 3), loaded.full_text_documents[0].declared_paths.len);
+    try std.testing.expectEqualStrings("title", loaded.full_text_documents[0].declared_paths[0]);
+    try std.testing.expectEqualStrings("stored_only", loaded.full_text_documents[0].declared_paths[1]);
+    try std.testing.expectEqualStrings("meta", loaded.full_text_documents[0].declared_paths[2]);
+    try std.testing.expectEqual(@as(usize, 1), loaded.full_text_documents[0].unindexed_paths.len);
+    try std.testing.expectEqualStrings("stored_only", loaded.full_text_documents[0].unindexed_paths[0]);
     try std.testing.expectEqual(@as(usize, 2), loaded.index_sort.len);
     try std.testing.expectEqualStrings("created_at", loaded.index_sort[0].field);
     try std.testing.expect(loaded.index_sort[0].desc);
@@ -2837,6 +2938,21 @@ test "text projection serialization preserves v11 witnesses and excludes declara
     const projection_without_declaration = try serializeTextProjectionSchema(alloc, without_declaration);
     defer alloc.free(projection_without_declaration);
     try std.testing.expectEqualSlices(u8, projection, projection_without_declaration);
+
+    // Declared/unindexed path lists are v14 storage state. They must neither
+    // leak into the v11 witness nor be representable in a pre-v14 encoding.
+    const documents_with_paths = [_]FullTextDocument{.{
+        .name = "doc",
+        .fields = &fields,
+        .declared_paths = &.{ "created_at", "stored_only" },
+        .unindexed_paths = &.{"stored_only"},
+    }};
+    var with_paths = schema;
+    with_paths.full_text_documents = &documents_with_paths;
+    const projection_with_paths = try serializeTextProjectionSchema(alloc, with_paths);
+    defer alloc.free(projection_with_paths);
+    try std.testing.expectEqualSlices(u8, projection, projection_with_paths);
+    try std.testing.expectError(error.InvalidSchema, serializeSchemaFormat(alloc, with_paths, 13));
 
     const exact_fields = [_]ExactField{.{
         .source_field = "created_at",

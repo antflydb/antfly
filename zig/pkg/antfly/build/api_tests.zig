@@ -1544,6 +1544,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-api-transactions-test", "Run transaction coordinator and participant contracts").dependOn(&addFilteredTestRunArtifact(b, api_transaction_contract_tests).step);
     const run_api_public_table_http_docid_tests = addFilteredTestRunArtifact(b, api_public_table_http_docid_tests);
+    b.step("antfly-api-public-table-http-test", "Run public table HTTP response contracts").dependOn(&run_api_public_table_http_docid_tests.step);
     const api_relational_row_contract_tests = b.addTest(.{
         .root_module = api_public_table_http_docid_test_mod,
         .filters = &.{ "relational mutation", "relational row query", "relational declarations" },
