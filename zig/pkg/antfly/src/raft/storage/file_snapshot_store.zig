@@ -1786,7 +1786,9 @@ test "active chunked fetch lease fences committed artifact expiry" {
         .root_dir = root_dir,
         .artifact_policy = .{
             .committed_ttl_ns = std.time.ns_per_ms,
-            .active_fetch_lease_ns = 20 * std.time.ns_per_ms,
+            // Control lease expiry explicitly below. A 20 ms lease can expire
+            // while the CI runner is descheduled waiting for maintenance.
+            .active_fetch_lease_ns = std.math.maxInt(u64),
         },
     });
     defer store.deinit();
@@ -1833,8 +1835,15 @@ test "active chunked fetch lease fences committed artifact expiry" {
     defer std.testing.allocator.free(chunk);
     try std.testing.expectEqualStrings(body, chunk);
 
-    // An abandoned fetch eventually becomes reclaimable again.
-    try store.io().sleep(.fromMilliseconds(25), .awake);
+    // An abandoned fetch becomes reclaimable once its recorded deadline has
+    // passed. Drive that transition without depending on scheduler timing.
+    {
+        platform_sync.lockYielding(&store.fetch_lease_mutex);
+        defer store.fetch_lease_mutex.unlock();
+        const lease = store.fetch_leases.getPtr("leased") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(std.math.maxInt(u64), lease.deadline_ns);
+        lease.deadline_ns = 0;
+    }
     maintenance_runs = store.artifactUsageSnapshot().maintenance_runs;
     store.requestArtifactMaintenance();
     try waitForArtifactMaintenance(&store, maintenance_runs);

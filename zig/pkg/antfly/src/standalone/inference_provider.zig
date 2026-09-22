@@ -6,7 +6,9 @@
 //! numeric results, and invocation lifetime; the inference node stays opaque.
 const std = @import("std");
 const builtin = @import("builtin");
-const platform_time = @import("antfly_platform").time;
+const platform = @import("antfly_platform");
+const platform_time = platform.time;
+const process_memory_budget = @import("../common/process_memory_budget.zig");
 const inference_bridge = @import("inference_bridge.zig");
 const inference_connection_abi = @import("../inference_connection_abi.zig");
 const runtime_http_abi = @import("../runtime_http_abi.zig");
@@ -42,6 +44,11 @@ pub const EmbeddedInferenceProviderLifetime = struct {
     const count_mask: usize = closed_bit - 1;
 
     handle: *anyopaque,
+    // Owns the resource-budget capability `createEmbeddedInferenceNode`
+    // configures on `handle`; released by `destroyEmbeddedInferenceNode`
+    // after the node itself is torn down. Null only if configuration failed
+    // (`create()` still succeeded and the node is otherwise usable).
+    resource_owner: ?*LiteInferenceResourceOwner = null,
     // Admission and borrower count share one modification order. A separate
     // accepting flag and counter would leave a check/increment window where
     // shutdown could observe zero and destroy the node before that borrower
@@ -98,6 +105,380 @@ pub const EmbeddedInferenceProviderLifetime = struct {
         return self.state.load(.acquire) & count_mask;
     }
 };
+
+/// Creates a minimal, self-contained embedded inference node and returns its
+/// opaque handle. This is the smallest equivalent of standalone/runtime.zig's
+/// production `CreateContext` construction, scoped for an in-process,
+/// caller-owned inference runtime such as an Antfly Lite handle: no CLI
+/// configuration, warm preload, kernel JIT, or prompt cache tuning -- just
+/// model auto-discovery under the default `~/.antfly/inference/models`
+/// layout (when `models_dir`/`ml_dir` are null) and automatic memory budgets.
+///
+/// Callers must only invoke this when they know the real inference runtime
+/// archive is linked into the final binary (see
+/// `pkg/antfly/build/runtime.zig`'s `addCapiInferenceVariantUnits` and
+/// `capi/link_anchor_inference.zig`): the default libantfly and antfly
+/// executable's storage_kernel archive traps this entry point, and calling
+/// through the trap aborts the process.
+///
+/// `io` must outlive the returned node; destroy it with
+/// `destroyEmbeddedInferenceNode` before releasing `io`.
+/// Result of `createEmbeddedInferenceNode`: the opaque node handle plus the
+/// resource-budget owner `configureLiteInferenceResourceBudget` installed on
+/// it (null only if that configuration step itself failed; the node is still
+/// usable, but every provider call will fail with the same
+/// `ResourceOwnerNotConfigured`-class error a caller reached before this
+/// existed).
+/// Explicit resource-budget overrides for `createEmbeddedInferenceNode`, 0
+/// meaning automatic/host-detected sizing. These mirror the CLI's
+/// `--inference-host-budget-mb`/`--inference-backend-budget-mb`/
+/// `--process-memory-budget-mb` flags (see standalone/runtime.zig's
+/// `CliConfig` and inference_runtime/runtime.zig's `runServer`), letting a
+/// Lite handle opt into the same knobs rather than being stuck with whatever
+/// the default automatic policy resolves to.
+pub const EmbeddedInferenceNodeOptions = struct {
+    host_budget_mb: u32 = 0,
+    backend_budget_mb: u32 = 0,
+    combined_budget_mb: u32 = 0,
+    kv_budget_mb: u32 = 0,
+    scratch_budget_mb: u32 = 0,
+    process_memory_budget_mb: u32 = 0,
+};
+
+// Default embedded per-lane generation budgets (MiB), used whenever the
+// caller leaves the corresponding `EmbeddedInferenceNodeOptions` field at 0.
+// `antfly inference run`'s CLI flags for these same five lanes
+// (`--host-budget-mb`/`--backend-budget-mb`/`--combined-budget-mb`/
+// `--kv-budget-mb`/`--scratch-budget-mb`) also default to 0 (automatic), but
+// that default relies on an operator supplying real values on the command
+// line -- confirmed in production qualification work
+// (pkg/inference/models/gliner2/GLINER25.md's "Memory budget" section) that
+// a boundary-architecture model's admission estimate (encoder + boundary
+// head at worst-case single-window capacity, independent of actual request
+// size) exceeds what the automatic/zero-value policy admits, and that these
+// exact values are known-good: with them, `antfly inference run` extracts
+// real long documents against fastino/gliner2.5-base-v1 without
+// MemoryBudgetExceeded. An embedded Lite handle has no operator to supply
+// overrides, so it defaults to these directly instead of reproducing the
+// CLI's own insufficient zero-value default. `effectiveEmbeddedBudgetMb`
+// still clamps each to the host-detected envelope so a genuinely small box
+// does not get an admission ceiling larger than its own memory.
+const default_host_budget_mb: u32 = 16384;
+const default_backend_budget_mb: u32 = 16384;
+const default_combined_budget_mb: u32 = 32768;
+const default_kv_budget_mb: u32 = 4096;
+const default_scratch_budget_mb: u32 = 16384;
+
+pub const EmbeddedInferenceNode = struct {
+    handle: *anyopaque,
+    resource_owner: ?*LiteInferenceResourceOwner,
+    // The process-memory envelope this node actually resolved -- either the
+    // caller's explicit `process_memory_budget_mb` override or, when that is
+    // 0 (the default), the same host/cgroup-detected policy
+    // `antfly inference run` and standalone report at startup (see
+    // `resolveEmbeddedProcessMemoryBudget` below).
+    process_memory_limit_bytes: usize,
+    process_memory_limit_source: process_memory_budget.EffectiveSource,
+    // Effective per-lane generation budgets actually installed (MiB): either
+    // the caller's explicit override, or the host-clamped default above.
+    host_budget_mb: u32,
+    backend_budget_mb: u32,
+    combined_budget_mb: u32,
+    kv_budget_mb: u32,
+    scratch_budget_mb: u32,
+};
+
+fn resolveEmbeddedProcessMemoryBudget(process_memory_budget_mb: u32) !process_memory_budget.EffectiveResolution {
+    return process_memory_budget.resolveSystemDetailed(
+        if (process_memory_budget_mb == 0) null else @as(usize, process_memory_budget_mb),
+        platform.env.getenv(process_memory_budget.canonical_env),
+        platform.env.getenv(process_memory_budget.inference_compat_env),
+    );
+}
+
+// Resolves one generation-budget lane: an explicit override always wins;
+// otherwise fall back to `default_mb`, clamped down to the host-detected
+// envelope (`detected_limit_bytes`, 0 meaning detection was unavailable, in
+// which case the generous default is kept as-is rather than clamped to
+// zero).
+fn effectiveEmbeddedBudgetMb(override_mb: u32, default_mb: u32, detected_limit_bytes: usize) u32 {
+    if (override_mb != 0) return override_mb;
+    if (detected_limit_bytes == 0) return default_mb;
+    const detected_mb = detected_limit_bytes / (1024 * 1024);
+    if (detected_mb == 0) return default_mb;
+    return @intCast(@min(@as(usize, default_mb), detected_mb));
+}
+
+fn embeddedInferenceMemoryLimitProvenance(
+    source: process_memory_budget.EffectiveSource,
+) inference_bridge.ProcessMemoryLimitProvenance {
+    return switch (source) {
+        .explicit => .explicit,
+        .cgroup_v2 => .cgroup_v2,
+        .cgroup_v1 => .cgroup_v1,
+        .host => .host,
+        .unavailable => .unavailable,
+    };
+}
+
+pub fn createEmbeddedInferenceNode(
+    data_dir: []const u8,
+    io: std.Io,
+    options: EmbeddedInferenceNodeOptions,
+) !EmbeddedInferenceNode {
+    var borrowed_io = io;
+    var out_handle: ?*anyopaque = null;
+    // Resolve the same host/cgroup-detected process-memory policy the CLI
+    // ("antfly inference run" and "antfly standalone") reports at startup
+    // instead of hardcoding zero bytes with `.automatic` provenance: an
+    // unresolved envelope here previously left every embedded-node sizing
+    // decision (including per-request extraction scratch/KV budgets) unable
+    // to distinguish "no host information available" from "this box has N
+    // GiB", which is what let large in-process extraction requests trip
+    // `error.MemoryBudgetExceeded` that an out-of-process `antfly inference
+    // run` serving the same input did not.
+    const process_memory_resolution = try resolveEmbeddedProcessMemoryBudget(options.process_memory_budget_mb);
+    // Per-lane generation budgets: an explicit override always wins; absent
+    // one, default to the CLI's own known-good values (see
+    // `default_host_budget_mb` and friends above), clamped to the
+    // host-detected envelope. Passing 0/automatic here -- this function's
+    // previous behavior -- left every embedded node unable to admit a
+    // boundary-architecture model's worst-case single-window estimate
+    // regardless of request size (see GLINER25.md's "Memory budget"
+    // section); `antfly inference run` only worked because an operator
+    // supplied generous flags by hand.
+    const effective_host_budget_mb = effectiveEmbeddedBudgetMb(options.host_budget_mb, default_host_budget_mb, process_memory_resolution.limit_bytes);
+    const effective_backend_budget_mb = effectiveEmbeddedBudgetMb(options.backend_budget_mb, default_backend_budget_mb, process_memory_resolution.limit_bytes);
+    const effective_combined_budget_mb = effectiveEmbeddedBudgetMb(options.combined_budget_mb, default_combined_budget_mb, process_memory_resolution.limit_bytes);
+    const effective_kv_budget_mb = effectiveEmbeddedBudgetMb(options.kv_budget_mb, default_kv_budget_mb, process_memory_resolution.limit_bytes);
+    const effective_scratch_budget_mb = effectiveEmbeddedBudgetMb(options.scratch_budget_mb, default_scratch_budget_mb, process_memory_resolution.limit_bytes);
+    std.log.info(
+        "lite embedded inference resource policy input_source={s} effective_source={s} configured_limit_bytes={d} effective_limit_bytes={d} host_budget_mb={d} backend_budget_mb={d} combined_budget_mb={d} kv_budget_mb={d} scratch_budget_mb={d}",
+        .{
+            @tagName(process_memory_resolution.source),
+            @tagName(process_memory_resolution.effective_source),
+            process_memory_resolution.configured_limit_bytes,
+            process_memory_resolution.limit_bytes,
+            effective_host_budget_mb,
+            effective_backend_budget_mb,
+            effective_combined_budget_mb,
+            effective_kv_budget_mb,
+            effective_scratch_budget_mb,
+        },
+    );
+    const create_context = inference_bridge.CreateContext{
+        .abi_version = inference_bridge.abi_version,
+        .data_dir_ptr = data_dir.ptr,
+        .data_dir_len = data_dir.len,
+        .models_dir = .{},
+        .ml_dir = .{},
+        .host_limit_bytes = try process_memory_budget.mibToBytes(@as(usize, effective_host_budget_mb)),
+        .backend_limit_bytes = try process_memory_budget.mibToBytes(@as(usize, effective_backend_budget_mb)),
+        .combined_limit_bytes = try process_memory_budget.mibToBytes(@as(usize, effective_combined_budget_mb)),
+        .kv_limit_bytes = try process_memory_budget.mibToBytes(@as(usize, effective_kv_budget_mb)),
+        .scratch_limit_bytes = try process_memory_budget.mibToBytes(@as(usize, effective_scratch_budget_mb)),
+        .process_memory_limit_bytes = process_memory_resolution.limit_bytes,
+        .process_memory_limit_provenance = embeddedInferenceMemoryLimitProvenance(
+            process_memory_resolution.effective_source,
+        ),
+        .preload_ptr = null,
+        .preload_len = 0,
+        .keep_alive = .{},
+        // Explicitly unlimited (model_manager.zig: 0 means unbounded), not
+        // merely unset. A Lite handle typically enrichs with a small,
+        // fixed set of models (an embedder and an extractor, say); the
+        // unset default of 10 would technically cover that too, but an
+        // interleaved embed/extract workload that evicts and reloads either
+        // model between documents is exactly the kind of self-inflicted
+        // thrash this embedded node must not reproduce.
+        .max_loaded_models = 0,
+        .has_max_loaded_models = 1,
+        .content_security_json = .{},
+        .s3_credentials_json = .{},
+        .runtime_config_json = inference_bridge.String.init("{}"),
+        .executor = .init(&borrowed_io),
+        .out_handle = &out_handle,
+    };
+    // Unit tests compile the inference call graph directly into the same
+    // binary (no archive/trap boundary), so `linkedInferenceApi` would try
+    // to resolve the real cross-archive symbol and fail to link. Route
+    // through the same inline codegen path `invokeInferenceProvider` uses
+    // for tests.
+    const handle = if (comptime inline_inference_codegen)
+        try inference_host.linkedInferenceCreate(&create_context)
+    else handle: {
+        const table = try linkedInferenceApi(
+            inference_bridge.Capability.provider |
+                inference_bridge.Capability.route_manifest |
+                inference_bridge.Capability.resource_budget |
+                inference_bridge.Capability.request_admission,
+        );
+        const status = table.create(&create_context);
+        if (!status.isOk()) return inference_bridge.errorFromStatus(status);
+        break :handle out_handle orelse return error.InferenceRuntimeStartupFailed;
+    };
+    // `Capability.resource_budget` was requested above, which the standalone
+    // runtime treats as a promise that a follow-up `configure()` call will
+    // install a resource-budget owner (see runtime.zig's
+    // `InferenceResourceBudgetOwner`, wired to the DataServer's storage
+    // ResourceManager). A Lite handle has no such storage-tied resource
+    // manager to reuse, so every provider call previously failed with
+    // `error.ResourceOwnerNotConfigured` the moment it tried to reserve
+    // admission. Install a minimal, permissive, host-detected-by-default
+    // owner instead: Lite is a single-process embedding of the runtime, not
+    // a multi-tenant server, so unconditional admission is the correct
+    // policy, matching "antfly inference run"'s own local/host-owned default
+    // when no external resource policy is configured.
+    const resource_owner = configureLiteInferenceResourceBudget(handle) catch |err| blk: {
+        std.log.warn(
+            "lite embedded inference resource budget configuration failed, provider calls will fail: {s}",
+            .{@errorName(err)},
+        );
+        break :blk null;
+    };
+    return .{
+        .handle = handle,
+        .resource_owner = resource_owner,
+        .process_memory_limit_bytes = process_memory_resolution.limit_bytes,
+        .process_memory_limit_source = process_memory_resolution.effective_source,
+        .host_budget_mb = effective_host_budget_mb,
+        .backend_budget_mb = effective_backend_budget_mb,
+        .combined_budget_mb = effective_combined_budget_mb,
+        .kv_budget_mb = effective_kv_budget_mb,
+        .scratch_budget_mb = effective_scratch_budget_mb,
+    };
+}
+
+/// Counterpart to `createEmbeddedInferenceNode`. Callers must quiesce any
+/// `EmbeddedInferenceProviderLifetime` wrapping `handle` before calling this.
+pub fn destroyEmbeddedInferenceNode(handle: *anyopaque, resource_owner: ?*LiteInferenceResourceOwner) void {
+    if (comptime inline_inference_codegen) {
+        inference_host.linkedInferenceDestroy(handle);
+    } else {
+        linkedInferenceApiInfallible().destroy(handle);
+    }
+    if (resource_owner) |owner| owner.releaseBaseReference();
+}
+
+/// Minimal resource-budget owner for a Lite-embedded inference node. Unlike
+/// `standalone/runtime.zig`'s `InferenceResourceBudgetOwner`, this does not
+/// track real memory accounting against a shared storage `ResourceManager`:
+/// Lite has no such manager, and a single embedded node with no concurrent
+/// tenants does not need arbitrated admission. It exists solely to satisfy
+/// the resource-budget capability contract every provider call requires.
+pub const LiteInferenceResourceOwner = struct {
+    references: std.atomic.Value(usize) = .init(1),
+    next_lease_token: std.atomic.Value(usize) = .init(1),
+
+    fn releaseBaseReference(self: *LiteInferenceResourceOwner) void {
+        const previous = self.references.fetchSub(1, .acq_rel);
+        std.debug.assert(previous >= 1);
+        if (previous == 1) std.heap.c_allocator.destroy(self);
+    }
+};
+
+fn retainLiteInferenceResourceOwner(context: *anyopaque) callconv(.c) u8 {
+    const owner: *LiteInferenceResourceOwner = @ptrCast(@alignCast(context));
+    var observed = owner.references.load(.acquire);
+    while (true) {
+        if (observed == 0) return 0;
+        if (owner.references.cmpxchgWeak(observed, observed + 1, .acq_rel, .acquire)) |actual| {
+            observed = actual;
+            continue;
+        }
+        return 1;
+    }
+}
+
+fn releaseLiteInferenceResourceOwner(context: *anyopaque) callconv(.c) void {
+    const owner: *LiteInferenceResourceOwner = @ptrCast(@alignCast(context));
+    owner.releaseBaseReference();
+}
+
+fn reserveLiteInferenceResources(
+    context: *anyopaque,
+    amounts: *const inference_bridge.AdmissionAmounts,
+    out_lease: *usize,
+) callconv(.c) inference_bridge.Status {
+    _ = amounts;
+    const owner: *LiteInferenceResourceOwner = @ptrCast(@alignCast(context));
+    out_lease.* = owner.next_lease_token.fetchAdd(1, .acq_rel);
+    return .{};
+}
+
+fn retainLiteInferenceResources(
+    context: *anyopaque,
+    lease_token: usize,
+    retained: *const inference_bridge.AdmissionAmounts,
+) callconv(.c) inference_bridge.Status {
+    _ = context;
+    _ = lease_token;
+    _ = retained;
+    return .{};
+}
+
+fn releaseLiteInferenceResources(context: *anyopaque, lease_token: usize) callconv(.c) void {
+    _ = context;
+    _ = lease_token;
+}
+
+fn observeLiteInferencePromptCache(context: *anyopaque, observer_id: usize, previous: u64, next: u64) callconv(.c) u8 {
+    _ = context;
+    _ = observer_id;
+    _ = previous;
+    _ = next;
+    return 1;
+}
+
+fn observeLiteInferenceTokenizerCache(context: *anyopaque, observer_id: usize, previous: u64, next: u64) callconv(.c) u8 {
+    _ = context;
+    _ = observer_id;
+    _ = previous;
+    _ = next;
+    return 1;
+}
+
+fn configureLiteInferenceResourceBudget(handle: *anyopaque) !*LiteInferenceResourceOwner {
+    const owner = try std.heap.c_allocator.create(LiteInferenceResourceOwner);
+    owner.* = .{};
+    // `Client.configure` (standalone/inference_worker.zig) calls
+    // `retain_context` -- and sets its own `self.budget` field to point at
+    // `owner` -- *before* it can fail (for example the `ensureWorker`
+    // failure this catches at the call site below): a failure after that
+    // point still leaves the client holding a retained reference it will
+    // release exactly once, whenever it deinits. Unconditionally destroying
+    // `owner` here on any error would be a use-after-free/double-free the
+    // instant that later release runs. `releaseBaseReference` is the
+    // correct unwind either way: it only frees `owner` once every retained
+    // reference -- ours here, and the client's if it got far enough to take
+    // one -- has been released.
+    errdefer owner.releaseBaseReference();
+    var budget = inference_bridge.ResourceBudget{
+        .abi_version = inference_bridge.abi_version,
+        .context = owner,
+        .retain_context = retainLiteInferenceResourceOwner,
+        .release_context = releaseLiteInferenceResourceOwner,
+        .reserve_admission = reserveLiteInferenceResources,
+        .retain_admission = retainLiteInferenceResources,
+        .release_admission = releaseLiteInferenceResources,
+        .observe_prompt_cache = observeLiteInferencePromptCache,
+        .observe_tokenizer_cache = observeLiteInferenceTokenizerCache,
+    };
+    const configure_context = inference_bridge.ConfigureContext{
+        .abi_version = inference_bridge.abi_version,
+        .handle = handle,
+        .resource_budget = &budget,
+    };
+    if (comptime inline_inference_codegen) {
+        try inference_host.linkedInferenceConfigure(&configure_context);
+    } else {
+        const status = (try linkedInferenceApi(
+            inference_bridge.Capability.resource_budget,
+        )).configure(&configure_context);
+        if (!status.isOk()) return inference_bridge.errorFromStatus(status);
+    }
+    return owner;
+}
 
 pub fn inferenceBoundaryProvider(lifetime: *EmbeddedInferenceProviderLifetime) inference.managed_embedder.AntflyProvider {
     return .{

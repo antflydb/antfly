@@ -20,6 +20,7 @@ const platform_clock = platform.clock;
 const Allocator = std.mem.Allocator;
 const fs_paths = @import("../../../common/fs_paths.zig");
 const CancellationToken = @import("../../../common/cancellation.zig").CancellationToken;
+const full_text_index_defaults = @import("../../../common/full_text_index_defaults.zig");
 const native_artifact_sink = @import("../../native_artifact_sink.zig");
 const native_backup = @import("../native_backup.zig");
 const process_memory = @import("antfly_platform").process_memory;
@@ -13926,18 +13927,29 @@ pub const IndexManager = struct {
         }
 
         if (self.text_indexes.items.len == 1) return &self.text_indexes.items[0].persistent;
+        // Every table (and, since Antfly Lite creation provisions it too,
+        // every Lite database) carries the default full-text index
+        // alongside any additional named indexes. When the caller does not
+        // disambiguate and there is more than one candidate, prefer the
+        // default rather than failing closed the way an HTTP request path
+        // that never resolved a primary index would.
+        if (self.textIndexEntryByName(full_text_index_defaults.default_full_text_index_name)) |entry| return &entry.persistent;
         return null;
     }
 
     pub fn textIndexEntry(self: *IndexManager, name: ?[]const u8) ?*TextIndex {
         if (name) |index_name| {
-            for (self.text_indexes.items) |*entry| {
-                if (std.mem.eql(u8, entry.config.name, index_name)) return entry;
-            }
-            return null;
+            return self.textIndexEntryByName(index_name);
         }
 
         if (self.text_indexes.items.len == 1) return &self.text_indexes.items[0];
+        return self.textIndexEntryByName(full_text_index_defaults.default_full_text_index_name);
+    }
+
+    fn textIndexEntryByName(self: *IndexManager, index_name: []const u8) ?*TextIndex {
+        for (self.text_indexes.items) |*entry| {
+            if (std.mem.eql(u8, entry.config.name, index_name)) return entry;
+        }
         return null;
     }
 

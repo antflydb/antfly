@@ -29,6 +29,19 @@ go build ./...
 On macOS use `DYLD_LIBRARY_PATH` instead of `LD_LIBRARY_PATH` when the library
 is not already on the loader search path.
 
+### Embedded inference
+
+`libantfly` always links the standalone inference runtime in-process, the
+same as the `antfly` executable (see `zig/COMPILATION.md`'s "C API
+composition" section and `zig/LITE.md`'s "Local Embedded Inference"
+section). Setting `LocalRuntimeConfigured` (below) yields `local_embedded`
+behavior -- an embedded model runtime that runs chunker, embedder, and
+extractor producers configured with `"provider": "antfly"` and no `api_url`
+locally instead of failing or requiring a remote URL -- with the standard
+library and no extra link flags. This makes `libantfly` a much larger shared
+library than before inference was embedded by default; there is no smaller
+inference-free variant to link against instead.
+
 Normal `go test ./...` does not run the C ABI smoke test. The
 `antflylite_capi` tag is intentional so package consumers do not need a freshly
 built `libantfly` unless they are testing the local binding against the
@@ -57,6 +70,9 @@ corrupted `.aflite` file without opening a database handle.
 Use `Create` for a new native `.aflite` writer database and `Open` for an
 existing native `.aflite` writer database. `Open` does not create missing files
 or upgrade pre-release Lite layouts; unknown or invalid files fail explicitly.
+Every `Create*` variant provisions the default `full_text_index_v0` full-text
+index, matching the server's table-create behavior, so `AddIndexJSON` is only
+needed for indexes beyond that default.
 Use `OpenReadonly` for read-only query handles and `OpenStatusOnly` for
 inspection. Use `CreateHosted` for a new hosted/manual-maintenance database and
 `OpenHosted` for an existing hosted/manual-maintenance database when the
@@ -68,7 +84,26 @@ size, native-profile TTL cleanup, and explicit inference status reporting. Set
 remote provider so `Status().Inference` reports `remote_provider` instead of the
 default caller-supplied/deferred mode. Set `LocalRuntimeConfigured` when the
 application requests a local inference runtime; Lite reports `local_embedded`
-only when the loaded build advertises `LocalInferenceRuntime`.
+whenever the loaded build advertises `LocalInferenceRuntime`, which is true
+by default for the standard `libantfly` (see "Embedded inference" above).
+
+**Worker executable resolution.** GPU-hosted and driver-backed backends
+(Metal, CUDA, ONNX, PJRT) construct and, for Metal/CUDA/PJRT, execute models
+in a separate, replaceable worker process rather than inside the Go process
+-- crash containment for an unabortable driver call or GPU state corruption
+means the process that made the call must be the one that gets killed and
+respawned, and that must never be the Go host. Unlike the `antfly` CLI (which
+re-execs `argv[0]`, itself), a Go binary linking `libantfly` has no
+`antfly`-shaped `argv[0]` to re-exec, so the runtime resolves the worker
+executable itself, in order: the `ANTFLY_INFERENCE_WORKER` environment
+variable (a path to the worker executable, typically an `antfly` binary);
+otherwise an `antfly` binary next to the loaded `libantfly`; otherwise
+`antfly` on `PATH`. If none of these resolve, calls into a process-isolated
+backend fail with a clear error naming `ANTFLY_INFERENCE_WORKER` -- set it
+(or place an `antfly` binary next to `libantfly` or on `PATH`) before opening
+a `LocalRuntimeConfigured` handle that needs Metal/CUDA/ONNX/PJRT models. See
+`zig/LITE.md`'s "Local Embedded Inference" section for the full resolution
+order and rationale.
 
 Use `BeginTransaction`, `WriteTransaction`, `ResolveTransaction`,
 `TransactionStatus`, and `CommitVersion` when an embedded application needs the

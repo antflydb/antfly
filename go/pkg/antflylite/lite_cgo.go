@@ -64,6 +64,17 @@ const (
 )
 
 // OpenOptions configures OpenWithOptions and CreateWithOptions.
+//
+// HostBudgetMB, BackendBudgetMB, CombinedBudgetMB, KVBudgetMB,
+// ScratchBudgetMB, and ProcessMemoryBudgetMB are explicit resource-budget
+// overrides for the local embedded inference runtime (0 means the embedded
+// node's own host-clamped default, not the previous automatic/zero-bytes
+// policy -- see antfly's inference_provider.zig default_*_budget_mb
+// constants). They are only consulted when LocalRuntimeConfigured is set,
+// and mirror the antfly CLI's --inference-host-budget-mb/
+// --inference-backend-budget-mb/--inference-combined-budget-mb/
+// --inference-kv-budget-mb/--inference-scratch-budget-mb/
+// --process-memory-budget-mb flags.
 type OpenOptions struct {
 	Mode                      OpenMode
 	Profile                   Profile
@@ -73,6 +84,12 @@ type OpenOptions struct {
 	GeneratedEnrichmentReplay bool
 	MapSize                   uint64
 	TTLCleanup                *TTLCleanupOptions
+	HostBudgetMB              uint32
+	BackendBudgetMB           uint32
+	CombinedBudgetMB          uint32
+	KVBudgetMB                uint32
+	ScratchBudgetMB           uint32
+	ProcessMemoryBudgetMB     uint32
 }
 
 // TTLCleanupOptions configures the optional Lite TTL cleanup runtime.
@@ -233,6 +250,12 @@ func openWithOptions(path string, opts OpenOptions, create bool) (*DB, error) {
 	if opts.LocalRuntimeConfigured {
 		cOpts.flags |= C.ANTFLY_LITE_OPEN_FLAG_LOCAL_RUNTIME_CONFIGURED
 	}
+	cOpts.inference_host_budget_mb = C.uint32_t(opts.HostBudgetMB)
+	cOpts.inference_backend_budget_mb = C.uint32_t(opts.BackendBudgetMB)
+	cOpts.inference_combined_budget_mb = C.uint32_t(opts.CombinedBudgetMB)
+	cOpts.inference_kv_budget_mb = C.uint32_t(opts.KVBudgetMB)
+	cOpts.inference_scratch_budget_mb = C.uint32_t(opts.ScratchBudgetMB)
+	cOpts.inference_process_memory_budget_mb = C.uint32_t(opts.ProcessMemoryBudgetMB)
 	if opts.GeneratedEnrichmentReplay {
 		cOpts.flags |= C.ANTFLY_LITE_OPEN_FLAG_GENERATED_ENRICHMENT_REPLAY
 	}

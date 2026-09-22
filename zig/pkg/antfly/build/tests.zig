@@ -832,10 +832,39 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "embedded api round-trips batch lookup scan and search over memory-backed durable lsm",
             "embedded api hosted profile drains derived indexing without native runtimes",
             "embedded api hosted profile persists text index across reopen over storage",
+            "embedded api createLite provisions default full text index",
+            "embedded api openLite round-trips batch lookup over aflite file",
+            "embedded api openLite manages index and enrichment definitions over aflite file",
+            "embedded api openLite persists schema json over aflite file",
+            "embedded api openLite resumes generated enrichment after hosted maintenance pause",
         },
     });
     const run_embedded_api_tests = addFilteredTestRunArtifact(b, embedded_api_tests);
     embedded_test_step.dependOn(&run_embedded_api_tests.step);
+    // db.zig is also its own module (embedded_db_mod) rather than a file
+    // reachable from embedded_mod's root, so its tests need the same
+    // explicit treatment as the API fixtures above.
+    const embedded_db_tests = b.addTest(.{
+        .root_module = embedded_db_mod,
+        .filters = &.{
+            "embedded db openLite persists documents in aflite file",
+            "embedded db openLite close syncs unsynced batch before readonly reopen",
+            "embedded db openLite propagates no_sync to aflite backend",
+            "embedded db openLite does not fall back to internal bridge files",
+            "embedded db liteStatus exposes storage stats work and capabilities",
+            "embedded db liteStatus reflects explicitly configured remote inference",
+            "embedded db liteStatus reports local inference request according to build support",
+            "embedded db openLite can run ttl cleanup over aflite file",
+            "embedded db openLiteHosted exposes manual maintenance capabilities",
+            "embedded db openLite query_readonly rejects writes",
+            "embedded db openLite persists schema json in aflite file",
+            "embedded db portable relational restore is immediately readable and validated",
+            "embedded db openLite persists index and enrichment catalogs in aflite file",
+            "embedded db createLite files are openable through the CLI's lite Connection and vice versa",
+        },
+    });
+    const run_embedded_db_tests = addFilteredTestRunArtifact(b, embedded_db_tests);
+    embedded_test_step.dependOn(&run_embedded_db_tests.step);
 
     const antfly_embedded_pkg_tests = b.addTest(.{
         .root_module = antfly_embedded_pkg_mod,
@@ -1021,6 +1050,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "public index config encoders redact coverage incarnation",
         "created nested response allowlists cover generated schemas",
         "public index config encoders redact nested credentials",
+        "public index config encoders preserve enrichment objects on read",
         "public index config encoders retain credential-free provider urls",
         "public index config encoders omit root write-only producer documents",
         "created graph index response projects closed nested schemas",
