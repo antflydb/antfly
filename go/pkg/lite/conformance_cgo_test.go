@@ -96,6 +96,9 @@ type conformanceStep struct {
 	Schema        json.RawMessage    `json:"schema"`
 	Name          string             `json:"name"`
 	Kind          string             `json:"kind"`
+	Index         string             `json:"index"`
+	EdgeType      string             `json:"edge_type"`
+	Direction     string             `json:"direction"`
 	TxnID         string             `json:"txn_id"`
 	Status        string             `json:"status"`
 	CommitVersion uint64             `json:"commit_version"`
@@ -336,6 +339,13 @@ func (r *conformanceRunner) execute(step conformanceStep) (any, error) {
 		return nil, db.AddIndexJSON(step.Config)
 	case "delete_index":
 		return db.DeleteIndex(step.Name)
+	case "get_edges":
+		directions := map[string]uint8{"": 0, "out": 0, "in": 1, "both": 2}
+		direction, ok := directions[step.Direction]
+		if !ok {
+			return nil, fmt.Errorf("unknown direction %q", step.Direction)
+		}
+		return db.EdgesJSON(step.Index, step.Key, step.EdgeType, direction)
 	case "list_enrichments":
 		return db.EnrichmentsJSON()
 	case "add_enrichment":

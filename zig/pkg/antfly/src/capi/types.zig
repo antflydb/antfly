@@ -283,7 +283,7 @@ pub fn mapError(err: anyerror) ErrorCode {
         error.VersionConflict => .version_conflict,
         error.IntentConflict, error.DecisionConflict, error.SchemaInUse => .intent_conflict,
         error.TxnNotFound => .txn_not_found,
-        error.NotFound => .not_found,
+        error.NotFound, error.IndexNotFound, error.TableNotFound => .not_found,
         error.InvalidArgument,
         error.RelationalExpressionOverflow,
         error.RelationalExpressionDivisionByZero,

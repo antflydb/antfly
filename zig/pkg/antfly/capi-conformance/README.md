@@ -87,6 +87,7 @@ Values written as JSON objects in a case (`value`, `request`, `config`,
 | `list_indexes` | | `antfly_db_list_indexes_json` | JSON |
 | `add_index` | `config` | `antfly_db_add_index_json` | none |
 | `delete_index` | `name` | `antfly_db_delete_index` | boolean: whether it existed |
+| `get_edges` | `index`, `key`, `edge_type` (`""` for all), `direction` (`"out"`/`"in"`/`"both"`, default `"out"`) | `antfly_db_get_edges_json` with `ANTFLY_GRAPH_DIRECTION_*` | JSON |
 | `list_enrichments` | | `antfly_db_list_enrichments_json` | JSON |
 | `add_enrichment` | `config` | `antfly_db_add_enrichment_json` | none |
 | `delete_enrichment` | `kind`, `name` | `antfly_db_delete_enrichment` | boolean: whether it existed |

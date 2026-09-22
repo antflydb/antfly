@@ -523,6 +523,11 @@ antfly_error_code antfly_db_decode_artifact_id_json(antfly_slice artifact_id_b64
 antfly_error_code antfly_db_extract_enrichments_json(void *handle, antfly_slice request_json, antfly_buffer *out);
 antfly_error_code antfly_db_compute_enrichments_json(void *handle, antfly_slice request_json, antfly_buffer *out);
 
+/* `direction` values for antfly_db_get_edges_json and
+ * antfly_db_get_neighbors_json. */
+#define ANTFLY_GRAPH_DIRECTION_OUT 0u
+#define ANTFLY_GRAPH_DIRECTION_IN 1u
+#define ANTFLY_GRAPH_DIRECTION_BOTH 2u
 antfly_error_code antfly_db_get_edges_json(
     void *handle,
     antfly_slice index_name,

@@ -1,0 +1,21 @@
+{
+  "name": "graph_edges",
+  "description": "Graph edges declared inline on documents, read back by direction; a missing graph index is ANTFLY_NOT_FOUND, not an internal error.",
+  "open": {"create": true, "no_sync": true},
+  "steps": [
+    {"op": "add_index", "config": {"name": "gr_links_v1", "kind": "graph", "config_json": "{}"}},
+    {"op": "batch", "timestamp": 1, "writes": [
+      {"key": "doc:source", "value": {"title": "source", "_edges": {"gr_links_v1": {"links": [{"target": "doc:target", "weight": 1.0}]}}}},
+      {"key": "doc:target", "value": {"title": "target"}}
+    ]},
+    {"op": "run_until_idle"},
+    {"op": "get_edges", "index": "gr_links_v1", "key": "doc:source", "edge_type": "links", "direction": "out",
+      "expect": {"contains": ["links"]}},
+    {"op": "get_edges", "index": "gr_links_v1", "key": "doc:target", "edge_type": "links", "direction": "in",
+      "expect": {"contains": ["links"]}},
+    {"op": "get_edges", "index": "gr_links_v1", "key": "doc:target", "edge_type": "links", "direction": "out",
+      "expect": {"not_contains": ["links"]}},
+    {"op": "get_edges", "index": "gr_missing", "key": "doc:source", "edge_type": "", "direction": "both",
+      "expect": {"error": "ANTFLY_NOT_FOUND"}}
+  ]
+}

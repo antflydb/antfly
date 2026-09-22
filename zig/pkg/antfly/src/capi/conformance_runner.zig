@@ -184,6 +184,28 @@ const Runner = struct {
             const code = c.antfly_db_delete_index(h, slice(str(step, "name") orelse ""), &deleted);
             return .{ .code = code, .text = if (deleted) "true" else "false" };
         }
+        if (eql(op, "get_edges")) {
+            const direction_name = str(step, "direction") orelse "out";
+            const direction: u8 = if (eql(direction_name, "out"))
+                c.ANTFLY_GRAPH_DIRECTION_OUT
+            else if (eql(direction_name, "in"))
+                c.ANTFLY_GRAPH_DIRECTION_IN
+            else if (eql(direction_name, "both"))
+                c.ANTFLY_GRAPH_DIRECTION_BOTH
+            else
+                return self.fail("unknown direction {s}", .{direction_name});
+            var buf: c.antfly_buffer = .{ .ptr = null, .len = 0 };
+            const code = c.antfly_db_get_edges_json(
+                h,
+                slice(str(step, "index") orelse ""),
+                slice(str(step, "key") orelse ""),
+                slice(str(step, "edge_type") orelse ""),
+                direction,
+                &buf,
+            );
+            if (code != c.ANTFLY_OK) return .{ .code = code };
+            return .{ .text = try self.take(buf) };
+        }
         if (eql(op, "list_enrichments")) return self.output(c.antfly_db_list_enrichments_json);
         if (eql(op, "add_enrichment")) return .{ .code = c.antfly_db_add_enrichment_json(h, slice(try self.encoded(step, "config"))) };
         if (eql(op, "delete_enrichment")) {
