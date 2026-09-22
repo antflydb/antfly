@@ -1,0 +1,5023 @@
+{
+ "schemaVersion": 1,
+ "routes": [
+  {
+   "id": "q4_0/rows_2_8/none",
+   "format": "q4_0",
+   "rowBucket": "rows_2_8",
+   "epilogue": "none",
+   "schedule": {
+    "threadsPerThreadgroup": 32,
+    "colsPerThreadgroup": 1,
+    "reduction": "simd_sum"
+   },
+   "generated": true,
+   "generatedFile": "zig/pkg/inference/src/ops/metal/generated/quant_kernel_q4_0_small_batch.metal",
+   "source": {
+    "path": "zig/pkg/inference/src/graph/quant_kernel_compiler.zig",
+    "line": 697,
+    "anchor": ".format = .q4_0, .row_bucket = .rows_2_8, .epilogue = .none"
+   }
+  },
+  {
+   "id": "q4_1/rows_2_8/none",
+   "format": "q4_1",
+   "rowBucket": "rows_2_8",
+   "epilogue": "none",
+   "schedule": {
+    "threadsPerThreadgroup": 32,
+    "colsPerThreadgroup": 2,
+    "reduction": "simd_sum"
+   },
+   "generated": true,
+   "generatedFile": "zig/pkg/inference/src/ops/metal/generated/quant_kernel_q4_1_small_batch.metal",
+   "source": {
+    "path": "zig/pkg/inference/src/graph/quant_kernel_compiler.zig",
+    "line": 698,
+    "anchor": ".format = .q4_1, .row_bucket = .rows_2_8, .epilogue = .none"
+   }
+  },
+  {
+   "id": "q5_0/rows_2_8/none",
+   "format": "q5_0",
+   "rowBucket": "rows_2_8",
+   "epilogue": "none",
+   "schedule": {
+    "threadsPerThreadgroup": 32,
+    "colsPerThreadgroup": 1,
+    "reduction": "simd_sum"
+   },
+   "generated": true,
+   "generatedFile": "zig/pkg/inference/src/ops/metal/generated/quant_kernel_q5_0_small_batch.metal",
+   "source": {
+    "path": "zig/pkg/inference/src/graph/quant_kernel_compiler.zig",
+    "line": 699,
+    "anchor": ".format = .q5_0, .row_bucket = .rows_2_8, .epilogue = .none"
+   }
+  },
+  {
+   "id": "q5_1/rows_2_8/none",
+   "format": "q5_1",
+   "rowBucket": "rows_2_8",
+   "epilogue": "none",
+   "schedule": {
+    "threadsPerThreadgroup": 32,
+    "colsPerThreadgroup": 2,
+    "reduction": "simd_sum"
+   },
+   "generated": true,
+   "generatedFile": "zig/pkg/inference/src/ops/metal/generated/quant_kernel_q5_1_small_batch.metal",
+   "source": {
+    "path": "zig/pkg/inference/src/graph/quant_kernel_compiler.zig",
+    "line": 700,
+    "anchor": ".format = .q5_1, .row_bucket = .rows_2_8, .epilogue = .none"
+   }
+  },
+  {
+   "id": "q8_0/rows_2_8/none",
+   "format": "q8_0",
+   "rowBucket": "rows_2_8",
+   "epilogue": "none",
+   "schedule": {
+    "threadsPerThreadgroup": 32,
+    "colsPerThreadgroup": 2,
+    "reduction": "simd_sum"
+   },
+   "generated": true,
+   "generatedFile": "zig/pkg/inference/src/ops/metal/generated/quant_kernel_q8_0_small_batch.metal",
+   "source": {
+    "path": "zig/pkg/inference/src/graph/quant_kernel_compiler.zig",
+    "line": 701,
+    "anchor": ".format = .q8_0, .row_bucket = .rows_2_8, .epilogue = .none"
+   }
+  },
+  {
+   "id": "q8_0/rows_2_8/bias",
+   "format": "q8_0",
+   "rowBucket": "rows_2_8",
+   "epilogue": "bias",
+   "schedule": {
+    "threadsPerThreadgroup": 32,
+    "colsPerThreadgroup": 1,
+    "reduction": "simd_sum"
+   },
+   "generated": true,
+   "generatedFile": "zig/pkg/inference/src/ops/metal/generated/quant_kernel_q8_0_small_batch_bias.metal",
+   "source": {
+    "path": "zig/pkg/inference/src/graph/quant_kernel_compiler.zig",
+    "line": 702,
+    "anchor": ".format = .q8_0, .row_bucket = .rows_2_8, .epilogue = .bias"
+   }
+  },
+  {
+   "id": "q8_0/rows_2_8/bias_gelu",
+   "format": "q8_0",
+   "rowBucket": "rows_2_8",
+   "epilogue": "bias_gelu",
+   "schedule": {
+    "threadsPerThreadgroup": 32,
+    "colsPerThreadgroup": 2,
+    "reduction": "simd_sum"
+   },
+   "generated": true,
+   "generatedFile": "zig/pkg/inference/src/ops/metal/generated/quant_kernel_q8_0_small_batch_bias_gelu.metal",
+   "source": {
+    "path": "zig/pkg/inference/src/graph/quant_kernel_compiler.zig",
+    "line": 703,
+    "anchor": ".format = .q8_0, .row_bucket = .rows_2_8, .epilogue = .bias_gelu"
+   }
+  },
+  {
+   "id": "q8_0/rows_2_8/relu",
+   "format": "q8_0",
+   "rowBucket": "rows_2_8",
+   "epilogue": "relu",
+   "schedule": {
+    "threadsPerThreadgroup": 32,
+    "colsPerThreadgroup": 1,
+    "reduction": "simd_sum"
+   },
+   "generated": true,
+   "generatedFile": "zig/pkg/inference/src/ops/metal/generated/quant_kernel_q8_0_small_batch_relu.metal",
+   "source": {
+    "path": "zig/pkg/inference/src/graph/quant_kernel_compiler.zig",
+    "line": 704,
+    "anchor": ".format = .q8_0, .row_bucket = .rows_2_8, .epilogue = .relu"
+   }
+  },
+  {
+   "id": "q8_1/rows_2_8/none",
+   "format": "q8_1",
+   "rowBucket": "rows_2_8",
+   "epilogue": "none",
+   "schedule": {
+    "threadsPerThreadgroup": 32,
+    "colsPerThreadgroup": 1,
+    "reduction": "simd_sum"
+   },
+   "generated": true,
+   "generatedFile": "zig/pkg/inference/src/ops/metal/generated/quant_kernel_q8_1_small_batch.metal",
+   "source": {
+    "path": "zig/pkg/inference/src/graph/quant_kernel_compiler.zig",
+    "line": 705,
+    "anchor": ".format = .q8_1, .row_bucket = .rows_2_8, .epilogue = .none"
+   }
+  },
+  {
+   "id": "q8_k/rows_2_8/none",
+   "format": "q8_k",
+   "rowBucket": "rows_2_8",
+   "epilogue": "none",
+   "schedule": {
+    "threadsPerThreadgroup": 64,
+    "colsPerThreadgroup": 1,
+    "reduction": "hybrid_simd"
+   },
+   "generated": true,
+   "generatedFile": "zig/pkg/inference/src/ops/metal/generated/quant_kernel_q8_k_small_batch.metal",
+   "source": {
+    "path": "zig/pkg/inference/src/graph/quant_kernel_compiler.zig",
+    "line": 707,
+    "anchor": ".format = .q8_k, .row_bucket = .rows_2_8, .epilogue = .none"
+   }
+  },
+  {
+   "id": "q2_k/rows_2_8/none",
+   "format": "q2_k",
+   "rowBucket": "rows_2_8",
+   "epilogue": "none",
+   "schedule": {
+    "threadsPerThreadgroup": 128,
+    "colsPerThreadgroup": 1,
+    "reduction": "hybrid_simd"
+   },
+   "generated": true,
+   "generatedFile": "zig/pkg/inference/src/ops/metal/generated/quant_kernel_q2_k_small_batch.metal",
+   "source": {
+    "path": "zig/pkg/inference/src/graph/quant_kernel_compiler.zig",
+    "line": 708,
+    "anchor": ".format = .q2_k, .row_bucket = .rows_2_8, .epilogue = .none"
+   }
+  },
+  {
+   "id": "q2_k/rows_2_8/bias",
+   "format": "q2_k",
+   "rowBucket": "rows_2_8",
+   "epilogue": "bias",
+   "schedule": {
+    "threadsPerThreadgroup": 32,
+    "colsPerThreadgroup": 1,
+    "reduction": "simd_sum"
+   },
+   "generated": true,
+   "generatedFile": "zig/pkg/inference/src/ops/metal/generated/quant_kernel_q2_k_small_batch_bias.metal",
+   "source": {
+    "path": "zig/pkg/inference/src/graph/quant_kernel_compiler.zig",
+    "line": 709,
+    "anchor": ".format = .q2_k, .row_bucket = .rows_2_8, .epilogue = .bias"
+   }
+  },
+  {
+   "id": "q2_k/rows_2_8/bias_gelu",
+   "format": "q2_k",
+   "rowBucket": "rows_2_8",
+   "epilogue": "bias_gelu",
+   "schedule": {
+    "threadsPerThreadgroup": 32,
+    "colsPerThreadgroup": 1,
+    "reduction": "simd_sum"
+   },
+   "generated": true,
+   "generatedFile": "zig/pkg/inference/src/ops/metal/generated/quant_kernel_q2_k_small_batch_bias_gelu.metal",
+   "source": {
+    "path": "zig/pkg/inference/src/graph/quant_kernel_compiler.zig",
+    "line": 710,
+    "anchor": ".format = .q2_k, .row_bucket = .rows_2_8, .epilogue = .bias_gelu"
+   }
+  },
+  {
+   "id": "q3_k/rows_2_8/none",
+   "format": "q3_k",
+   "rowBucket": "rows_2_8",
+   "epilogue": "none",
+   "schedule": {
+    "threadsPerThreadgroup": 32,
+    "colsPerThreadgroup": 1,
+    "reduction": "simd_sum"
+   },
+   "generated": true,
+   "generatedFile": "zig/pkg/inference/src/ops/metal/generated/quant_kernel_q3_k_small_batch.metal",
+   "source": {
+    "path": "zig/pkg/inference/src/graph/quant_kernel_compiler.zig",
+    "line": 711,
+    "anchor": ".format = .q3_k, .row_bucket = .rows_2_8, .epilogue = .none"
+   }
+  },
+  {
+   "id": "q3_k/rows_2_8/bias",
+   "format": "q3_k",
+   "rowBucket": "rows_2_8",
+   "epilogue": "bias",
+   "schedule": {
+    "threadsPerThreadgroup": 32,
+    "colsPerThreadgroup": 1,
+    "reduction": "simd_sum"
+   },
+   "generated": true,
+   "generatedFile": "zig/pkg/inference/src/ops/metal/generated/quant_kernel_q3_k_small_batch_bias.metal",
+   "source": {
+    "path": "zig/pkg/inference/src/graph/quant_kernel_compiler.zig",
+    "line": 712,
+    "anchor": ".format = .q3_k, .row_bucket = .rows_2_8, .epilogue = .bias"
+   }
+  },
+  {
+   "id": "q3_k/rows_2_8/bias_gelu",
+   "format": "q3_k",
+   "rowBucket": "rows_2_8",
+   "epilogue": "bias_gelu",
+   "schedule": {
+    "threadsPerThreadgroup": 32,
+    "colsPerThreadgroup": 1,
+    "reduction": "simd_sum"
+   },
+   "generated": true,
+   "generatedFile": "zig/pkg/inference/src/ops/metal/generated/quant_kernel_q3_k_small_batch_bias_gelu.metal",
+   "source": {
+    "path": "zig/pkg/inference/src/graph/quant_kernel_compiler.zig",
+    "line": 713,
+    "anchor": ".format = .q3_k, .row_bucket = .rows_2_8, .epilogue = .bias_gelu"
+   }
+  },
+  {
+   "id": "q4_k/rows_2_8/none",
+   "format": "q4_k",
+   "rowBucket": "rows_2_8",
+   "epilogue": "none",
+   "schedule": {
+    "threadsPerThreadgroup": 128,
+    "colsPerThreadgroup": 16,
+    "rowsPerThreadgroup": 2,
+    "reduction": "simdgroup_tiled"
+   },
+   "generated": true,
+   "generatedFile": "zig/pkg/inference/src/ops/metal/generated/quant_kernel_q4_k_small_batch.metal",
+   "source": {
+    "path": "zig/pkg/inference/src/graph/quant_kernel_compiler.zig",
+    "line": 715,
+    "anchor": ".format = .q4_k, .row_bucket = .rows_2_8, .epilogue = .none"
+   }
+  },
+  {
+   "id": "q4_k/rows_2_8/bias",
+   "format": "q4_k",
+   "rowBucket": "rows_2_8",
+   "epilogue": "bias",
+   "schedule": {
+    "threadsPerThreadgroup": 128,
+    "colsPerThreadgroup": 16,
+    "rowsPerThreadgroup": 2,
+    "reduction": "simdgroup_tiled"
+   },
+   "generated": true,
+   "generatedFile": "zig/pkg/inference/src/ops/metal/generated/quant_kernel_q4_k_small_batch_bias.metal",
+   "source": {
+    "path": "zig/pkg/inference/src/graph/quant_kernel_compiler.zig",
+    "line": 716,
+    "anchor": ".format = .q4_k, .row_bucket = .rows_2_8, .epilogue = .bias"
+   }
+  },
+  {
+   "id": "q4_k/rows_2_8/bias_gelu",
+   "format": "q4_k",
+   "rowBucket": "rows_2_8",
+   "epilogue": "bias_gelu",
+   "schedule": {
+    "threadsPerThreadgroup": 128,
+    "colsPerThreadgroup": 16,
+    "rowsPerThreadgroup": 2,
+    "reduction": "simdgroup_tiled"
+   },
+   "generated": true,
+   "generatedFile": "zig/pkg/inference/src/ops/metal/generated/quant_kernel_q4_k_small_batch_bias_gelu.metal",
+   "source": {
+    "path": "zig/pkg/inference/src/graph/quant_kernel_compiler.zig",
+    "line": 717,
+    "anchor": ".format = .q4_k, .row_bucket = .rows_2_8, .epilogue = .bias_gelu"
+   }
+  },
+  {
+   "id": "q5_k/rows_2_8/none",
+   "format": "q5_k",
+   "rowBucket": "rows_2_8",
+   "epilogue": "none",
+   "schedule": {
+    "threadsPerThreadgroup": 256,
+    "colsPerThreadgroup": 1,
+    "reduction": "hybrid_simd"
+   },
+   "generated": true,
+   "generatedFile": "zig/pkg/inference/src/ops/metal/generated/quant_kernel_q5_k_small_batch.metal",
+   "source": {
+    "path": "zig/pkg/inference/src/graph/quant_kernel_compiler.zig",
+    "line": 718,
+    "anchor": ".format = .q5_k, .row_bucket = .rows_2_8, .epilogue = .none"
+   }
+  },
+  {
+   "id": "q5_k/rows_2_8/bias",
+   "format": "q5_k",
+   "rowBucket": "rows_2_8",
+   "epilogue": "bias",
+   "schedule": {
+    "threadsPerThreadgroup": 128,
+    "colsPerThreadgroup": 1,
+    "reduction": "hybrid_simd"
+   },
+   "generated": true,
+   "generatedFile": "zig/pkg/inference/src/ops/metal/generated/quant_kernel_q5_k_small_batch_bias.metal",
+   "source": {
+    "path": "zig/pkg/inference/src/graph/quant_kernel_compiler.zig",
+    "line": 719,
+    "anchor": ".format = .q5_k, .row_bucket = .rows_2_8, .epilogue = .bias"
+   }
+  },
+  {
+   "id": "q5_k/rows_2_8/bias_gelu",
+   "format": "q5_k",
+   "rowBucket": "rows_2_8",
+   "epilogue": "bias_gelu",
+   "schedule": {
+    "threadsPerThreadgroup": 128,
+    "colsPerThreadgroup": 1,
+    "reduction": "hybrid_simd"
+   },
+   "generated": true,
+   "generatedFile": "zig/pkg/inference/src/ops/metal/generated/quant_kernel_q5_k_small_batch_bias_gelu.metal",
+   "source": {
+    "path": "zig/pkg/inference/src/graph/quant_kernel_compiler.zig",
+    "line": 720,
+    "anchor": ".format = .q5_k, .row_bucket = .rows_2_8, .epilogue = .bias_gelu"
+   }
+  },
+  {
+   "id": "q6_k/rows_2_8/none",
+   "format": "q6_k",
+   "rowBucket": "rows_2_8",
+   "epilogue": "none",
+   "schedule": {
+    "threadsPerThreadgroup": 128,
+    "colsPerThreadgroup": 16,
+    "rowsPerThreadgroup": 2,
+    "reduction": "simdgroup_tiled"
+   },
+   "generated": true,
+   "generatedFile": "zig/pkg/inference/src/ops/metal/generated/quant_kernel_q6_k_small_batch.metal",
+   "source": {
+    "path": "zig/pkg/inference/src/graph/quant_kernel_compiler.zig",
+    "line": 722,
+    "anchor": ".format = .q6_k, .row_bucket = .rows_2_8, .epilogue = .none"
+   }
+  },
+  {
+   "id": "q6_k/rows_2_8/bias",
+   "format": "q6_k",
+   "rowBucket": "rows_2_8",
+   "epilogue": "bias",
+   "schedule": {
+    "threadsPerThreadgroup": 128,
+    "colsPerThreadgroup": 16,
+    "rowsPerThreadgroup": 2,
+    "reduction": "simdgroup_tiled"
+   },
+   "generated": true,
+   "generatedFile": "zig/pkg/inference/src/ops/metal/generated/quant_kernel_q6_k_small_batch_bias.metal",
+   "source": {
+    "path": "zig/pkg/inference/src/graph/quant_kernel_compiler.zig",
+    "line": 723,
+    "anchor": ".format = .q6_k, .row_bucket = .rows_2_8, .epilogue = .bias"
+   }
+  },
+  {
+   "id": "q6_k/rows_2_8/bias_gelu",
+   "format": "q6_k",
+   "rowBucket": "rows_2_8",
+   "epilogue": "bias_gelu",
+   "schedule": {
+    "threadsPerThreadgroup": 128,
+    "colsPerThreadgroup": 16,
+    "rowsPerThreadgroup": 2,
+    "reduction": "simdgroup_tiled"
+   },
+   "generated": true,
+   "generatedFile": "zig/pkg/inference/src/ops/metal/generated/quant_kernel_q6_k_small_batch_bias_gelu.metal",
+   "source": {
+    "path": "zig/pkg/inference/src/graph/quant_kernel_compiler.zig",
+    "line": 724,
+    "anchor": ".format = .q6_k, .row_bucket = .rows_2_8, .epilogue = .bias_gelu"
+   }
+  }
+ ],
+ "inventory": [
+  {
+   "name": "antfly_paged_attention_1x_generated_msl_v1",
+   "family": "attention",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/ops/metal/generated/attention_decode_1x.metal",
+    "line": 29,
+    "anchor": "kernel void antfly_paged_attention_1x_generated_msl_v1"
+   }
+  },
+  {
+   "name": "antfly_paged_attention_prefill_flash_generated_msl_v1",
+   "family": "attention",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/ops/metal/generated/attention_prefill_flash.metal",
+    "line": 31,
+    "anchor": "kernel void antfly_paged_attention_prefill_flash_generated_msl_v1"
+   }
+  },
+  {
+   "name": "antfly_paged_attention_prefill_flash_hd512_generated_msl_v1",
+   "family": "attention",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/ops/metal/generated/attention_prefill_flash_hd512.metal",
+    "line": 28,
+    "anchor": "kernel void antfly_paged_attention_prefill_flash_hd512_generated_msl_v1"
+   }
+  },
+  {
+   "name": "antfly_q2_k_small_batch_bias_gelu_msl_v1",
+   "family": "other",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/ops/metal/generated/quant_kernel_q2_k_small_batch_bias_gelu.metal",
+    "line": 34,
+    "anchor": "kernel void antfly_q2_k_small_batch_bias_gelu_msl_v1"
+   }
+  },
+  {
+   "name": "antfly_q2_k_small_batch_bias_msl_v1",
+   "family": "other",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/ops/metal/generated/quant_kernel_q2_k_small_batch_bias.metal",
+    "line": 33,
+    "anchor": "kernel void antfly_q2_k_small_batch_bias_msl_v1"
+   }
+  },
+  {
+   "name": "antfly_q2_k_small_batch_msl_v1",
+   "family": "other",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/ops/metal/generated/quant_kernel_q2_k_small_batch.metal",
+    "line": 32,
+    "anchor": "kernel void antfly_q2_k_small_batch_msl_v1"
+   }
+  },
+  {
+   "name": "antfly_q3_k_small_batch_bias_gelu_msl_v1",
+   "family": "other",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/ops/metal/generated/quant_kernel_q3_k_small_batch_bias_gelu.metal",
+    "line": 42,
+    "anchor": "kernel void antfly_q3_k_small_batch_bias_gelu_msl_v1"
+   }
+  },
+  {
+   "name": "antfly_q3_k_small_batch_bias_msl_v1",
+   "family": "other",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/ops/metal/generated/quant_kernel_q3_k_small_batch_bias.metal",
+    "line": 41,
+    "anchor": "kernel void antfly_q3_k_small_batch_bias_msl_v1"
+   }
+  },
+  {
+   "name": "antfly_q3_k_small_batch_msl_v1",
+   "family": "other",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/ops/metal/generated/quant_kernel_q3_k_small_batch.metal",
+    "line": 40,
+    "anchor": "kernel void antfly_q3_k_small_batch_msl_v1"
+   }
+  },
+  {
+   "name": "antfly_q4_0_small_batch_msl_v1",
+   "family": "other",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/ops/metal/generated/quant_kernel_q4_0_small_batch.metal",
+    "line": 29,
+    "anchor": "kernel void antfly_q4_0_small_batch_msl_v1"
+   }
+  },
+  {
+   "name": "antfly_q4_1_small_batch_msl_v1",
+   "family": "other",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/ops/metal/generated/quant_kernel_q4_1_small_batch.metal",
+    "line": 29,
+    "anchor": "kernel void antfly_q4_1_small_batch_msl_v1"
+   }
+  },
+  {
+   "name": "antfly_q4_k_small_batch_bias_gelu_msl_v1",
+   "family": "other",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/ops/metal/generated/quant_kernel_q4_k_small_batch_bias_gelu.metal",
+    "line": 39,
+    "anchor": "kernel void antfly_q4_k_small_batch_bias_gelu_msl_v1"
+   }
+  },
+  {
+   "name": "antfly_q4_k_small_batch_bias_msl_v1",
+   "family": "other",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/ops/metal/generated/quant_kernel_q4_k_small_batch_bias.metal",
+    "line": 37,
+    "anchor": "kernel void antfly_q4_k_small_batch_bias_msl_v1"
+   }
+  },
+  {
+   "name": "antfly_q4_k_small_batch_msl_v1",
+   "family": "other",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/ops/metal/generated/quant_kernel_q4_k_small_batch.metal",
+    "line": 37,
+    "anchor": "kernel void antfly_q4_k_small_batch_msl_v1"
+   }
+  },
+  {
+   "name": "antfly_q5_0_small_batch_msl_v1",
+   "family": "other",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/ops/metal/generated/quant_kernel_q5_0_small_batch.metal",
+    "line": 30,
+    "anchor": "kernel void antfly_q5_0_small_batch_msl_v1"
+   }
+  },
+  {
+   "name": "antfly_q5_1_small_batch_msl_v1",
+   "family": "other",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/ops/metal/generated/quant_kernel_q5_1_small_batch.metal",
+    "line": 30,
+    "anchor": "kernel void antfly_q5_1_small_batch_msl_v1"
+   }
+  },
+  {
+   "name": "antfly_q5_k_small_batch_bias_gelu_msl_v1",
+   "family": "other",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/ops/metal/generated/quant_kernel_q5_k_small_batch_bias_gelu.metal",
+    "line": 39,
+    "anchor": "kernel void antfly_q5_k_small_batch_bias_gelu_msl_v1"
+   }
+  },
+  {
+   "name": "antfly_q5_k_small_batch_bias_msl_v1",
+   "family": "other",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/ops/metal/generated/quant_kernel_q5_k_small_batch_bias.metal",
+    "line": 37,
+    "anchor": "kernel void antfly_q5_k_small_batch_bias_msl_v1"
+   }
+  },
+  {
+   "name": "antfly_q5_k_small_batch_msl_v1",
+   "family": "other",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/ops/metal/generated/quant_kernel_q5_k_small_batch.metal",
+    "line": 37,
+    "anchor": "kernel void antfly_q5_k_small_batch_msl_v1"
+   }
+  },
+  {
+   "name": "antfly_q6_k_small_batch_bias_gelu_msl_v1",
+   "family": "other",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/ops/metal/generated/quant_kernel_q6_k_small_batch_bias_gelu.metal",
+    "line": 34,
+    "anchor": "kernel void antfly_q6_k_small_batch_bias_gelu_msl_v1"
+   }
+  },
+  {
+   "name": "antfly_q6_k_small_batch_bias_msl_v1",
+   "family": "other",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/ops/metal/generated/quant_kernel_q6_k_small_batch_bias.metal",
+    "line": 32,
+    "anchor": "kernel void antfly_q6_k_small_batch_bias_msl_v1"
+   }
+  },
+  {
+   "name": "antfly_q6_k_small_batch_msl_v1",
+   "family": "other",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/ops/metal/generated/quant_kernel_q6_k_small_batch.metal",
+    "line": 32,
+    "anchor": "kernel void antfly_q6_k_small_batch_msl_v1"
+   }
+  },
+  {
+   "name": "antfly_q8_0_small_batch_bias_gelu_msl_v1",
+   "family": "other",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/ops/metal/generated/quant_kernel_q8_0_small_batch_bias_gelu.metal",
+    "line": 30,
+    "anchor": "kernel void antfly_q8_0_small_batch_bias_gelu_msl_v1"
+   }
+  },
+  {
+   "name": "antfly_q8_0_small_batch_bias_msl_v1",
+   "family": "other",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/ops/metal/generated/quant_kernel_q8_0_small_batch_bias.metal",
+    "line": 28,
+    "anchor": "kernel void antfly_q8_0_small_batch_bias_msl_v1"
+   }
+  },
+  {
+   "name": "antfly_q8_0_small_batch_msl_v1",
+   "family": "other",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/ops/metal/generated/quant_kernel_q8_0_small_batch.metal",
+    "line": 28,
+    "anchor": "kernel void antfly_q8_0_small_batch_msl_v1"
+   }
+  },
+  {
+   "name": "antfly_q8_0_small_batch_relu_msl_v1",
+   "family": "other",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/ops/metal/generated/quant_kernel_q8_0_small_batch_relu.metal",
+    "line": 29,
+    "anchor": "kernel void antfly_q8_0_small_batch_relu_msl_v1"
+   }
+  },
+  {
+   "name": "antfly_q8_1_small_batch_msl_v1",
+   "family": "other",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/ops/metal/generated/quant_kernel_q8_1_small_batch.metal",
+    "line": 29,
+    "anchor": "kernel void antfly_q8_1_small_batch_msl_v1"
+   }
+  },
+  {
+   "name": "antfly_q8_k_small_batch_msl_v1",
+   "family": "other",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/ops/metal/generated/quant_kernel_q8_k_small_batch.metal",
+    "line": 28,
+    "anchor": "kernel void antfly_q8_k_small_batch_msl_v1"
+   }
+  },
+  {
+   "name": "antfly_rms_norm_generated_msl_v1",
+   "family": "norm_rope",
+   "generated": true,
+   "source": {
+    "path": "zig/pkg/inference/src/ops/metal/generated/microkernel_rms_norm.metal",
+    "line": 27,
+    "anchor": "kernel void antfly_rms_norm_generated_msl_v1"
+   }
+  },
+  {
+   "name": "dt_dkdv",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 46167,
+    "anchor": "kernel void dt_dkdv"
+   }
+  },
+  {
+   "name": "dt_dq",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 46134,
+    "anchor": "kernel void dt_dq"
+   }
+  },
+  {
+   "name": "dt_forward",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 46042,
+    "anchor": "kernel void dt_forward"
+   }
+  },
+  {
+   "name": "dt_relative",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 46205,
+    "anchor": "kernel void dt_relative"
+   }
+  },
+  {
+   "name": "dt_rows",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 46091,
+    "anchor": "kernel void dt_rows"
+   }
+  },
+  {
+   "name": "dt_validate_control",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 46026,
+    "anchor": "kernel void dt_validate_control"
+   }
+  },
+  {
+   "name": "dt_validate_f32",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 46021,
+    "anchor": "kernel void dt_validate_f32"
+   }
+  },
+  {
+   "name": "dt_zero",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 46037,
+    "anchor": "kernel void dt_zero"
+   }
+  },
+  {
+   "name": "termite_apply_activation_1x",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9016,
+    "anchor": "kernel void termite_apply_activation_1x"
+   }
+  },
+  {
+   "name": "termite_apply_activation_multiply_1x",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9145,
+    "anchor": "kernel void termite_apply_activation_multiply_1x"
+   }
+  },
+  {
+   "name": "termite_apply_activation_multiply_f16_output",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9150,
+    "anchor": "kernel void termite_apply_activation_multiply_f16_output"
+   }
+  },
+  {
+   "name": "termite_apply_add_1x",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9499,
+    "anchor": "kernel void termite_apply_add_1x"
+   }
+  },
+  {
+   "name": "termite_apply_add_layer_norm_1x",
+   "family": "norm_rope",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7530,
+    "anchor": "kernel void termite_apply_add_layer_norm_1x"
+   }
+  },
+  {
+   "name": "termite_apply_add_layer_norm_rows",
+   "family": "norm_rope",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7554,
+    "anchor": "kernel void termite_apply_add_layer_norm_rows"
+   }
+  },
+  {
+   "name": "termite_apply_add_layer_norm_sum_1x",
+   "family": "norm_rope",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7542,
+    "anchor": "kernel void termite_apply_add_layer_norm_sum_1x"
+   }
+  },
+  {
+   "name": "termite_apply_add_layer_norm_sum_rows",
+   "family": "norm_rope",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7562,
+    "anchor": "kernel void termite_apply_add_layer_norm_sum_rows"
+   }
+  },
+  {
+   "name": "termite_apply_add_scale_1x",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9505,
+    "anchor": "kernel void termite_apply_add_scale_1x"
+   }
+  },
+  {
+   "name": "termite_apply_bf16_gate_up_mm_m64_n32",
+   "family": "mm_sg",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 8298,
+    "anchor": "kernel void termite_apply_bf16_gate_up_mm_m64_n32"
+   }
+  },
+  {
+   "name": "termite_apply_bf16_gate_up_mm_m64_n32_vec4",
+   "family": "mm_sg",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 8228,
+    "anchor": "kernel void termite_apply_bf16_gate_up_mm_m64_n32_vec4"
+   }
+  },
+  {
+   "name": "termite_apply_bias_activation_2d",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9140,
+    "anchor": "kernel void termite_apply_bias_activation_2d"
+   }
+  },
+  {
+   "name": "termite_apply_bias_add_layer_norm_1x",
+   "family": "norm_rope",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7570,
+    "anchor": "kernel void termite_apply_bias_add_layer_norm_1x"
+   }
+  },
+  {
+   "name": "termite_apply_bias_add_layer_norm_rows",
+   "family": "norm_rope",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7582,
+    "anchor": "kernel void termite_apply_bias_add_layer_norm_rows"
+   }
+  },
+  {
+   "name": "termite_apply_divide_1x",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9553,
+    "anchor": "kernel void termite_apply_divide_1x"
+   }
+  },
+  {
+   "name": "termite_apply_gelu_backward_1x",
+   "family": "training",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9020,
+    "anchor": "kernel void termite_apply_gelu_backward_1x"
+   }
+  },
+  {
+   "name": "termite_apply_head_rms_rope",
+   "family": "fusion",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7754,
+    "anchor": "kernel void termite_apply_head_rms_rope"
+   }
+  },
+  {
+   "name": "termite_apply_layer_norm_1x",
+   "family": "norm_rope",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7492,
+    "anchor": "kernel void termite_apply_layer_norm_1x"
+   }
+  },
+  {
+   "name": "termite_apply_layer_norm_rows",
+   "family": "norm_rope",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7504,
+    "anchor": "kernel void termite_apply_layer_norm_rows"
+   }
+  },
+  {
+   "name": "termite_apply_less_than_1x",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9571,
+    "anchor": "kernel void termite_apply_less_than_1x"
+   }
+  },
+  {
+   "name": "termite_apply_linear_1x",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7884,
+    "anchor": "kernel void termite_apply_linear_1x"
+   }
+  },
+  {
+   "name": "termite_apply_linear_1x_reduce",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7891,
+    "anchor": "kernel void termite_apply_linear_1x_reduce"
+   }
+  },
+  {
+   "name": "termite_apply_linear_1x_reduce_simd",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7909,
+    "anchor": "kernel void termite_apply_linear_1x_reduce_simd"
+   }
+  },
+  {
+   "name": "termite_apply_linear_argmax_1x",
+   "family": "sampling",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 8533,
+    "anchor": "kernel void termite_apply_linear_argmax_1x"
+   }
+  },
+  {
+   "name": "termite_apply_linear_bf16_1x",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7940,
+    "anchor": "kernel void termite_apply_linear_bf16_1x"
+   }
+  },
+  {
+   "name": "termite_apply_linear_bf16_1x_reduce",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7947,
+    "anchor": "kernel void termite_apply_linear_bf16_1x_reduce"
+   }
+  },
+  {
+   "name": "termite_apply_linear_bf16_mm_m64_n32",
+   "family": "mm_sg",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 8415,
+    "anchor": "kernel void termite_apply_linear_bf16_mm_m64_n32"
+   }
+  },
+  {
+   "name": "termite_apply_linear_bf16_mm_m64_n32_vec4",
+   "family": "mm_sg",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 8350,
+    "anchor": "kernel void termite_apply_linear_bf16_mm_m64_n32_vec4"
+   }
+  },
+  {
+   "name": "termite_apply_linear_bf16_multi_row",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 8486,
+    "anchor": "kernel void termite_apply_linear_bf16_multi_row"
+   }
+  },
+  {
+   "name": "termite_apply_linear_bf16_multi_row_reduce",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 8497,
+    "anchor": "kernel void termite_apply_linear_bf16_multi_row_reduce"
+   }
+  },
+  {
+   "name": "termite_apply_linear_bf16_multi_row_shared_reduce",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 8513,
+    "anchor": "kernel void termite_apply_linear_bf16_multi_row_shared_reduce"
+   }
+  },
+  {
+   "name": "termite_apply_linear_bf16_multi_row_tiled32_m16",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 8457,
+    "anchor": "kernel void termite_apply_linear_bf16_multi_row_tiled32_m16"
+   }
+  },
+  {
+   "name": "termite_apply_linear_bias_2d",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6541,
+    "anchor": "kernel void termite_apply_linear_bias_2d"
+   }
+  },
+  {
+   "name": "termite_apply_linear_f16_1x",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7918,
+    "anchor": "kernel void termite_apply_linear_f16_1x"
+   }
+  },
+  {
+   "name": "termite_apply_linear_f16_1x_reduce",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7925,
+    "anchor": "kernel void termite_apply_linear_f16_1x_reduce"
+   }
+  },
+  {
+   "name": "termite_apply_linear_f16_multi_row",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 8204,
+    "anchor": "kernel void termite_apply_linear_f16_multi_row"
+   }
+  },
+  {
+   "name": "termite_apply_linear_f16_multi_row_reduce",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 8215,
+    "anchor": "kernel void termite_apply_linear_f16_multi_row_reduce"
+   }
+  },
+  {
+   "name": "termite_apply_linear_multi_row",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7985,
+    "anchor": "kernel void termite_apply_linear_multi_row"
+   }
+  },
+  {
+   "name": "termite_apply_linear_multi_row_reduce",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7996,
+    "anchor": "kernel void termite_apply_linear_multi_row_reduce"
+   }
+  },
+  {
+   "name": "termite_apply_linear_multi_row_tiled32_activation_f32",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 8117,
+    "anchor": "kernel void termite_apply_linear_multi_row_tiled32_activation_f32"
+   }
+  },
+  {
+   "name": "termite_apply_linear_multi_row_tiled32_f32",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 8082,
+    "anchor": "kernel void termite_apply_linear_multi_row_tiled32_f32"
+   }
+  },
+  {
+   "name": "termite_apply_linear_multi_row_tiled32_m16_activation_f32",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 8175,
+    "anchor": "kernel void termite_apply_linear_multi_row_tiled32_m16_activation_f32"
+   }
+  },
+  {
+   "name": "termite_apply_linear_multi_row_tiled32_m16_f32",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 8146,
+    "anchor": "kernel void termite_apply_linear_multi_row_tiled32_m16_f32"
+   }
+  },
+  {
+   "name": "termite_apply_linear_multi_row_tiled_activation_f32",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 8047,
+    "anchor": "kernel void termite_apply_linear_multi_row_tiled_activation_f32"
+   }
+  },
+  {
+   "name": "termite_apply_linear_multi_row_tiled_f32",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 8012,
+    "anchor": "kernel void termite_apply_linear_multi_row_tiled_f32"
+   }
+  },
+  {
+   "name": "termite_apply_linear_pair_1x_reduce",
+   "family": "fusion",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7961,
+    "anchor": "kernel void termite_apply_linear_pair_1x_reduce"
+   }
+  },
+  {
+   "name": "termite_apply_mrope",
+   "family": "norm_rope",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11309,
+    "anchor": "kernel void termite_apply_mrope"
+   }
+  },
+  {
+   "name": "termite_apply_multiply_1x",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9582,
+    "anchor": "kernel void termite_apply_multiply_1x"
+   }
+  },
+  {
+   "name": "termite_apply_multiply_add2_1x",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9517,
+    "anchor": "kernel void termite_apply_multiply_add2_1x"
+   }
+  },
+  {
+   "name": "termite_apply_multiply_add_1x",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9513,
+    "anchor": "kernel void termite_apply_multiply_add_1x"
+   }
+  },
+  {
+   "name": "termite_apply_parallel_ffn_post_residual_simd4",
+   "family": "fusion",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7695,
+    "anchor": "kernel void termite_apply_parallel_ffn_post_residual_simd4"
+   }
+  },
+  {
+   "name": "termite_apply_rms_norm_1x",
+   "family": "norm_rope",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7590,
+    "anchor": "kernel void termite_apply_rms_norm_1x"
+   }
+  },
+  {
+   "name": "termite_apply_rms_norm_1x_reduce",
+   "family": "norm_rope",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7599,
+    "anchor": "kernel void termite_apply_rms_norm_1x_reduce"
+   }
+  },
+  {
+   "name": "termite_apply_rms_norm_add_1x",
+   "family": "fusion",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7784,
+    "anchor": "kernel void termite_apply_rms_norm_add_1x"
+   }
+  },
+  {
+   "name": "termite_apply_rms_norm_add_1x_f16_input",
+   "family": "fusion",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7815,
+    "anchor": "kernel void termite_apply_rms_norm_add_1x_f16_input"
+   }
+  },
+  {
+   "name": "termite_apply_rms_norm_add_1x_sumsq",
+   "family": "fusion",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7795,
+    "anchor": "kernel void termite_apply_rms_norm_add_1x_sumsq"
+   }
+  },
+  {
+   "name": "termite_apply_rms_norm_add_scale_1x",
+   "family": "fusion",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7826,
+    "anchor": "kernel void termite_apply_rms_norm_add_scale_1x"
+   }
+  },
+  {
+   "name": "termite_apply_rms_norm_add_scale_1x_sumsq",
+   "family": "fusion",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7805,
+    "anchor": "kernel void termite_apply_rms_norm_add_scale_1x_sumsq"
+   }
+  },
+  {
+   "name": "termite_apply_rms_norm_add_scale_rows",
+   "family": "fusion",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7837,
+    "anchor": "kernel void termite_apply_rms_norm_add_scale_rows"
+   }
+  },
+  {
+   "name": "termite_apply_rms_norm_add_scale_simd4",
+   "family": "fusion",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7849,
+    "anchor": "kernel void termite_apply_rms_norm_add_scale_simd4"
+   }
+  },
+  {
+   "name": "termite_apply_rms_norm_rows",
+   "family": "norm_rope",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7618,
+    "anchor": "kernel void termite_apply_rms_norm_rows"
+   }
+  },
+  {
+   "name": "termite_apply_rms_norm_rows_reduce",
+   "family": "norm_rope",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7628,
+    "anchor": "kernel void termite_apply_rms_norm_rows_reduce"
+   }
+  },
+  {
+   "name": "termite_apply_rms_norm_rows_simd4_reduce",
+   "family": "norm_rope",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7640,
+    "anchor": "kernel void termite_apply_rms_norm_rows_simd4_reduce"
+   }
+  },
+  {
+   "name": "termite_apply_rms_norm_rows_triple_simd4_reduce",
+   "family": "norm_rope",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7666,
+    "anchor": "kernel void termite_apply_rms_norm_rows_triple_simd4_reduce"
+   }
+  },
+  {
+   "name": "termite_apply_rope",
+   "family": "norm_rope",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11276,
+    "anchor": "kernel void termite_apply_rope"
+   }
+  },
+  {
+   "name": "termite_apply_rope_pair",
+   "family": "norm_rope",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11339,
+    "anchor": "kernel void termite_apply_rope_pair"
+   }
+  },
+  {
+   "name": "termite_apply_scale_1x",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9588,
+    "anchor": "kernel void termite_apply_scale_1x"
+   }
+  },
+  {
+   "name": "termite_apply_scaled_add_scale_1x",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9509,
+    "anchor": "kernel void termite_apply_scaled_add_scale_1x"
+   }
+  },
+  {
+   "name": "termite_apply_softmax_rows",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9155,
+    "anchor": "kernel void termite_apply_softmax_rows"
+   }
+  },
+  {
+   "name": "termite_apply_subtract_1x",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9548,
+    "anchor": "kernel void termite_apply_subtract_1x"
+   }
+  },
+  {
+   "name": "termite_apply_where_select_1x",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9759,
+    "anchor": "kernel void termite_apply_where_select_1x"
+   }
+  },
+  {
+   "name": "termite_argmax_axis_f32",
+   "family": "sampling",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10406,
+    "anchor": "kernel void termite_argmax_axis_f32"
+   }
+  },
+  {
+   "name": "termite_argmax_logits_1x",
+   "family": "sampling",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 8545,
+    "anchor": "kernel void termite_argmax_logits_1x"
+   }
+  },
+  {
+   "name": "termite_argmax_logits_partials",
+   "family": "sampling",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 8556,
+    "anchor": "kernel void termite_argmax_logits_partials"
+   }
+  },
+  {
+   "name": "termite_argmax_logits_reduce",
+   "family": "sampling",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 8611,
+    "anchor": "kernel void termite_argmax_logits_reduce"
+   }
+  },
+  {
+   "name": "termite_argmax_logits_reduce_tg",
+   "family": "sampling",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 8777,
+    "anchor": "kernel void termite_argmax_logits_reduce_tg"
+   }
+  },
+  {
+   "name": "termite_argmax_logits_suppress_partials",
+   "family": "sampling",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 8586,
+    "anchor": "kernel void termite_argmax_logits_suppress_partials"
+   }
+  },
+  {
+   "name": "termite_attention_f32",
+   "family": "attention",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11351,
+    "anchor": "kernel void termite_attention_f32"
+   }
+  },
+  {
+   "name": "termite_attention_f32_decode_1x_hd64",
+   "family": "attention",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11415,
+    "anchor": "kernel void termite_attention_f32_decode_1x_hd64"
+   }
+  },
+  {
+   "name": "termite_attention_f32_decode_1x_hd64_split_reduce",
+   "family": "attention",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11482,
+    "anchor": "kernel void termite_attention_f32_decode_1x_hd64_split_reduce"
+   }
+  },
+  {
+   "name": "termite_attention_f32_decode_1x_hd64_split_stage",
+   "family": "attention",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11443,
+    "anchor": "kernel void termite_attention_f32_decode_1x_hd64_split_stage"
+   }
+  },
+  {
+   "name": "termite_attention_f32_dense_causal_sg",
+   "family": "attention",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11612,
+    "anchor": "kernel void termite_attention_f32_dense_causal_sg"
+   }
+  },
+  {
+   "name": "termite_attention_f32_dense_causal_sg_q16",
+   "family": "attention",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11675,
+    "anchor": "kernel void termite_attention_f32_dense_causal_sg_q16"
+   }
+  },
+  {
+   "name": "termite_attention_f32_dense_causal_sg_q16_f16kv",
+   "family": "attention",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11799,
+    "anchor": "kernel void termite_attention_f32_dense_causal_sg_q16_f16kv"
+   }
+  },
+  {
+   "name": "termite_attention_f32_dense_causal_sg_q16_f16kv_gqa2",
+   "family": "attention",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11810,
+    "anchor": "kernel void termite_attention_f32_dense_causal_sg_q16_f16kv_gqa2"
+   }
+  },
+  {
+   "name": "termite_attention_f32_dense_causal_sg_q16_f16kv_hd128",
+   "family": "attention",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11802,
+    "anchor": "kernel void termite_attention_f32_dense_causal_sg_q16_f16kv_hd128"
+   }
+  },
+  {
+   "name": "termite_attention_f32_prefill_tiled",
+   "family": "attention",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11600,
+    "anchor": "kernel void termite_attention_f32_prefill_tiled"
+   }
+  },
+  {
+   "name": "termite_broadcast_f32",
+   "family": "data_movement",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9473,
+    "anchor": "kernel void termite_broadcast_f32"
+   }
+  },
+  {
+   "name": "termite_broadcast_last_dim_f32_2d",
+   "family": "data_movement",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9465,
+    "anchor": "kernel void termite_broadcast_last_dim_f32_2d"
+   }
+  },
+  {
+   "name": "termite_cast_typed",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10616,
+    "anchor": "kernel void termite_cast_typed"
+   }
+  },
+  {
+   "name": "termite_compressed_attention_hybrid_attention",
+   "family": "attention",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11578,
+    "anchor": "kernel void termite_compressed_attention_hybrid_attention"
+   }
+  },
+  {
+   "name": "termite_compressed_attention_select_compressed",
+   "family": "attention",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11555,
+    "anchor": "kernel void termite_compressed_attention_select_compressed"
+   }
+  },
+  {
+   "name": "termite_compressed_attention_store_component",
+   "family": "attention",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11502,
+    "anchor": "kernel void termite_compressed_attention_store_component"
+   }
+  },
+  {
+   "name": "termite_compressed_attention_store_local",
+   "family": "attention",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11495,
+    "anchor": "kernel void termite_compressed_attention_store_local"
+   }
+  },
+  {
+   "name": "termite_compressed_attention_update_component",
+   "family": "attention",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11508,
+    "anchor": "kernel void termite_compressed_attention_update_component"
+   }
+  },
+  {
+   "name": "termite_compute_rms_inv_scale_1x",
+   "family": "norm_rope",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7609,
+    "anchor": "kernel void termite_compute_rms_inv_scale_1x"
+   }
+  },
+  {
+   "name": "termite_concat_lastdim_f32_2d",
+   "family": "data_movement",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10082,
+    "anchor": "kernel void termite_concat_lastdim_f32_2d"
+   }
+  },
+  {
+   "name": "termite_conv1d_f32",
+   "family": "vision",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11218,
+    "anchor": "kernel void termite_conv1d_f32"
+   }
+  },
+  {
+   "name": "termite_conv1d_im2col_f32",
+   "family": "vision",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11223,
+    "anchor": "kernel void termite_conv1d_im2col_f32"
+   }
+  },
+  {
+   "name": "termite_conv2d_f32",
+   "family": "vision",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11230,
+    "anchor": "kernel void termite_conv2d_f32"
+   }
+  },
+  {
+   "name": "termite_convert_dtype_f32",
+   "family": "data_movement",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10637,
+    "anchor": "kernel void termite_convert_dtype_f32"
+   }
+  },
+  {
+   "name": "termite_copy_bytes",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10067,
+    "anchor": "kernel void termite_copy_bytes"
+   }
+  },
+  {
+   "name": "termite_cumulative_sum_f32",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10415,
+    "anchor": "kernel void termite_cumulative_sum_f32"
+   }
+  },
+  {
+   "name": "termite_cumulative_sum_i16",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10503,
+    "anchor": "kernel void termite_cumulative_sum_i16"
+   }
+  },
+  {
+   "name": "termite_cumulative_sum_i32",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10437,
+    "anchor": "kernel void termite_cumulative_sum_i32"
+   }
+  },
+  {
+   "name": "termite_cumulative_sum_i64",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10459,
+    "anchor": "kernel void termite_cumulative_sum_i64"
+   }
+  },
+  {
+   "name": "termite_cumulative_sum_i8",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10481,
+    "anchor": "kernel void termite_cumulative_sum_i8"
+   }
+  },
+  {
+   "name": "termite_cumulative_sum_u8",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10525,
+    "anchor": "kernel void termite_cumulative_sum_u8"
+   }
+  },
+  {
+   "name": "termite_deberta_attention_pack_f32",
+   "family": "gliner",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10907,
+    "anchor": "kernel void termite_deberta_attention_pack_f32"
+   }
+  },
+  {
+   "name": "termite_deberta_embeddings_f32",
+   "family": "gliner",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10126,
+    "anchor": "kernel void termite_deberta_embeddings_f32"
+   }
+  },
+  {
+   "name": "termite_deberta_relative_score_accumulate_f32",
+   "family": "gliner",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10912,
+    "anchor": "kernel void termite_deberta_relative_score_accumulate_f32"
+   }
+  },
+  {
+   "name": "termite_deberta_relative_score_gemm_f32",
+   "family": "gliner",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11061,
+    "anchor": "kernel void termite_deberta_relative_score_gemm_f32"
+   }
+  },
+  {
+   "name": "termite_deberta_relative_score_softmax_pv_f32",
+   "family": "gliner",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11067,
+    "anchor": "kernel void termite_deberta_relative_score_softmax_pv_f32"
+   }
+  },
+  {
+   "name": "termite_dense_pair_direct_f32_2d",
+   "family": "fusion",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10118,
+    "anchor": "kernel void termite_dense_pair_direct_f32_2d"
+   }
+  },
+  {
+   "name": "termite_dense_pair_split_bias_f32_2d",
+   "family": "fusion",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10104,
+    "anchor": "kernel void termite_dense_pair_split_bias_f32_2d"
+   }
+  },
+  {
+   "name": "termite_dense_pair_split_f32_2d",
+   "family": "fusion",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10099,
+    "anchor": "kernel void termite_dense_pair_split_f32_2d"
+   }
+  },
+  {
+   "name": "termite_dense_qkv_direct_f32_2d",
+   "family": "kv",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10109,
+    "anchor": "kernel void termite_dense_qkv_direct_f32_2d"
+   }
+  },
+  {
+   "name": "termite_dense_qkv_split_bias_f32_2d",
+   "family": "kv",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10093,
+    "anchor": "kernel void termite_dense_qkv_split_bias_f32_2d"
+   }
+  },
+  {
+   "name": "termite_dense_qkv_split_f32_2d",
+   "family": "kv",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10087,
+    "anchor": "kernel void termite_dense_qkv_split_f32_2d"
+   }
+  },
+  {
+   "name": "termite_disentangled_relative_attention_bwd_dq_dk_f32",
+   "family": "training",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11042,
+    "anchor": "kernel void termite_disentangled_relative_attention_bwd_dq_dk_f32"
+   }
+  },
+  {
+   "name": "termite_disentangled_relative_attention_bwd_dqr_dkr_f32",
+   "family": "training",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11052,
+    "anchor": "kernel void termite_disentangled_relative_attention_bwd_dqr_dkr_f32"
+   }
+  },
+  {
+   "name": "termite_disentangled_relative_attention_bwd_dv_f32",
+   "family": "training",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11035,
+    "anchor": "kernel void termite_disentangled_relative_attention_bwd_dv_f32"
+   }
+  },
+  {
+   "name": "termite_disentangled_relative_attention_bwd_scores_f32",
+   "family": "training",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11003,
+    "anchor": "kernel void termite_disentangled_relative_attention_bwd_scores_f32"
+   }
+  },
+  {
+   "name": "termite_disentangled_relative_attention_f32",
+   "family": "gliner",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10915,
+    "anchor": "kernel void termite_disentangled_relative_attention_f32"
+   }
+  },
+  {
+   "name": "termite_disentangled_relative_attention_f32_flash4",
+   "family": "gliner",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10959,
+    "anchor": "kernel void termite_disentangled_relative_attention_f32_flash4"
+   }
+  },
+  {
+   "name": "termite_disentangled_relative_attention_f32_tg",
+   "family": "gliner",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10934,
+    "anchor": "kernel void termite_disentangled_relative_attention_f32_tg"
+   }
+  },
+  {
+   "name": "termite_dot_general_2d_f32",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11093,
+    "anchor": "kernel void termite_dot_general_2d_f32"
+   }
+  },
+  {
+   "name": "termite_dot_general_2d_f32_reduce",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11098,
+    "anchor": "kernel void termite_dot_general_2d_f32_reduce"
+   }
+  },
+  {
+   "name": "termite_dot_general_2d_f32_small_m_rows4_cols16",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11133,
+    "anchor": "kernel void termite_dot_general_2d_f32_small_m_rows4_cols16"
+   }
+  },
+  {
+   "name": "termite_dot_general_2d_f32_small_m_rows4_cols4",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11114,
+    "anchor": "kernel void termite_dot_general_2d_f32_small_m_rows4_cols4"
+   }
+  },
+  {
+   "name": "termite_dot_general_2d_f32_small_m_rows4_cols8",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11124,
+    "anchor": "kernel void termite_dot_general_2d_f32_small_m_rows4_cols8"
+   }
+  },
+  {
+   "name": "termite_dot_general_2d_f32_small_m_tile",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11105,
+    "anchor": "kernel void termite_dot_general_2d_f32_small_m_tile"
+   }
+  },
+  {
+   "name": "termite_dot_general_batched_f32",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11203,
+    "anchor": "kernel void termite_dot_general_batched_f32"
+   }
+  },
+  {
+   "name": "termite_dot_general_rank1_outer_f32",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11143,
+    "anchor": "kernel void termite_dot_general_rank1_outer_f32"
+   }
+  },
+  {
+   "name": "termite_dot_general_rank1_reduce_f32",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11146,
+    "anchor": "kernel void termite_dot_general_rank1_reduce_f32"
+   }
+  },
+  {
+   "name": "termite_embed_absolute_position",
+   "family": "data_movement",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11245,
+    "anchor": "kernel void termite_embed_absolute_position"
+   }
+  },
+  {
+   "name": "termite_embedding_lookup",
+   "family": "data_movement",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11251,
+    "anchor": "kernel void termite_embedding_lookup"
+   }
+  },
+  {
+   "name": "termite_embedding_lookup_bf16",
+   "family": "data_movement",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11260,
+    "anchor": "kernel void termite_embedding_lookup_bf16"
+   }
+  },
+  {
+   "name": "termite_embedding_lookup_f16",
+   "family": "data_movement",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11268,
+    "anchor": "kernel void termite_embedding_lookup_f16"
+   }
+  },
+  {
+   "name": "termite_encode_f16_convert",
+   "family": "data_movement",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10040,
+    "anchor": "kernel void termite_encode_f16_convert"
+   }
+  },
+  {
+   "name": "termite_encode_int8_per_head",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11235,
+    "anchor": "kernel void termite_encode_int8_per_head"
+   }
+  },
+  {
+   "name": "termite_encode_polar4_key",
+   "family": "kv",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10032,
+    "anchor": "kernel void termite_encode_polar4_key"
+   }
+  },
+  {
+   "name": "termite_encode_turbo3_key",
+   "family": "kv",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10035,
+    "anchor": "kernel void termite_encode_turbo3_key"
+   }
+  },
+  {
+   "name": "termite_ffn_gelu_backward_rank1_branches",
+   "family": "training",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9040,
+    "anchor": "kernel void termite_ffn_gelu_backward_rank1_branches"
+   }
+  },
+  {
+   "name": "termite_ffn_gelu_backward_rank1_first_branch",
+   "family": "training",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9115,
+    "anchor": "kernel void termite_ffn_gelu_backward_rank1_first_branch"
+   }
+  },
+  {
+   "name": "termite_ffn_gelu_backward_rank1_first_output",
+   "family": "training",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9091,
+    "anchor": "kernel void termite_ffn_gelu_backward_rank1_first_output"
+   }
+  },
+  {
+   "name": "termite_ffn_gelu_backward_rank1_output",
+   "family": "training",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9067,
+    "anchor": "kernel void termite_ffn_gelu_backward_rank1_output"
+   }
+  },
+  {
+   "name": "termite_florence_channel_apply_f32",
+   "family": "vision",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10895,
+    "anchor": "kernel void termite_florence_channel_apply_f32"
+   }
+  },
+  {
+   "name": "termite_florence_channel_scores_f32",
+   "family": "vision",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10883,
+    "anchor": "kernel void termite_florence_channel_scores_f32"
+   }
+  },
+  {
+   "name": "termite_florence_channel_softmax_f32",
+   "family": "vision",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10889,
+    "anchor": "kernel void termite_florence_channel_softmax_f32"
+   }
+  },
+  {
+   "name": "termite_florence_q4_k_mm_matrix_m64_n64",
+   "family": "vision",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6913,
+    "anchor": "kernel void termite_florence_q4_k_mm_matrix_m64_n64"
+   }
+  },
+  {
+   "name": "termite_florence_q4_k_mm_matrix_m64_n64_in_f16",
+   "family": "vision",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6952,
+    "anchor": "kernel void termite_florence_q4_k_mm_matrix_m64_n64_in_f16"
+   }
+  },
+  {
+   "name": "termite_florence_q4_k_mm_nr4",
+   "family": "vision",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6906,
+    "anchor": "kernel void termite_florence_q4_k_mm_nr4"
+   }
+  },
+  {
+   "name": "termite_florence_window_pack_f32",
+   "family": "vision",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10868,
+    "anchor": "kernel void termite_florence_window_pack_f32"
+   }
+  },
+  {
+   "name": "termite_florence_window_unpack_f32",
+   "family": "vision",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10876,
+    "anchor": "kernel void termite_florence_window_unpack_f32"
+   }
+  },
+  {
+   "name": "termite_gather_axis0_add_bias_f32_2d",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10076,
+    "anchor": "kernel void termite_gather_axis0_add_bias_f32_2d"
+   }
+  },
+  {
+   "name": "termite_gather_axis0_f32_2d",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10070,
+    "anchor": "kernel void termite_gather_axis0_f32_2d"
+   }
+  },
+  {
+   "name": "termite_gather_typed",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10556,
+    "anchor": "kernel void termite_gather_typed"
+   }
+  },
+  {
+   "name": "termite_gemma4_audio_channel_norm_relu",
+   "family": "norm_rope",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9628,
+    "anchor": "kernel void termite_gemma4_audio_channel_norm_relu"
+   }
+  },
+  {
+   "name": "termite_gemma4_audio_clamp",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9595,
+    "anchor": "kernel void termite_gemma4_audio_clamp"
+   }
+  },
+  {
+   "name": "termite_gemma4_audio_dwconv_causal",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9609,
+    "anchor": "kernel void termite_gemma4_audio_dwconv_causal"
+   }
+  },
+  {
+   "name": "termite_gemma4_audio_flatten_ctf",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9621,
+    "anchor": "kernel void termite_gemma4_audio_flatten_ctf"
+   }
+  },
+  {
+   "name": "termite_gemma4_audio_glu_rows",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9602,
+    "anchor": "kernel void termite_gemma4_audio_glu_rows"
+   }
+  },
+  {
+   "name": "termite_gemma4_audio_local_attention",
+   "family": "attention",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9642,
+    "anchor": "kernel void termite_gemma4_audio_local_attention"
+   }
+  },
+  {
+   "name": "termite_gemma4_audio_local_attention_tg",
+   "family": "attention",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9697,
+    "anchor": "kernel void termite_gemma4_audio_local_attention_tg"
+   }
+  },
+  {
+   "name": "termite_gliner_boundary_f32",
+   "family": "gliner",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10137,
+    "anchor": "kernel void termite_gliner_boundary_f32"
+   }
+  },
+  {
+   "name": "termite_gliner_gru_combine_f32",
+   "family": "gliner",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10398,
+    "anchor": "kernel void termite_gliner_gru_combine_f32"
+   }
+  },
+  {
+   "name": "termite_gliner_word_embeddings_f32",
+   "family": "gliner",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10391,
+    "anchor": "kernel void termite_gliner_word_embeddings_f32"
+   }
+  },
+  {
+   "name": "termite_i2_s_linear",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7475,
+    "anchor": "kernel void termite_i2_s_linear"
+   }
+  },
+  {
+   "name": "termite_i2_s_linear_i8",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7486,
+    "anchor": "kernel void termite_i2_s_linear_i8"
+   }
+  },
+  {
+   "name": "termite_i2_s_pair_linear",
+   "family": "fusion",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7479,
+    "anchor": "kernel void termite_i2_s_pair_linear"
+   }
+  },
+  {
+   "name": "termite_i2_s_pair_linear_i8",
+   "family": "fusion",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7489,
+    "anchor": "kernel void termite_i2_s_pair_linear_i8"
+   }
+  },
+  {
+   "name": "termite_i8_s_linear",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6241,
+    "anchor": "kernel void termite_i8_s_linear"
+   }
+  },
+  {
+   "name": "termite_integer_binary",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10591,
+    "anchor": "kernel void termite_integer_binary"
+   }
+  },
+  {
+   "name": "termite_iq2_xs_linear",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9988,
+    "anchor": "kernel void termite_iq2_xs_linear"
+   }
+  },
+  {
+   "name": "termite_iq4_nl_linear",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9939,
+    "anchor": "kernel void termite_iq4_nl_linear"
+   }
+  },
+  {
+   "name": "termite_iq4_nl_linear_1x_reduce",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9944,
+    "anchor": "kernel void termite_iq4_nl_linear_1x_reduce"
+   }
+  },
+  {
+   "name": "termite_iq4_xs_linear",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9952,
+    "anchor": "kernel void termite_iq4_xs_linear"
+   }
+  },
+  {
+   "name": "termite_iq4_xs_linear_1x_reduce",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9958,
+    "anchor": "kernel void termite_iq4_xs_linear_1x_reduce"
+   }
+  },
+  {
+   "name": "termite_layer_norm_bwd_dgdb",
+   "family": "training",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7525,
+    "anchor": "kernel void termite_layer_norm_bwd_dgdb"
+   }
+  },
+  {
+   "name": "termite_layer_norm_bwd_dx",
+   "family": "training",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7512,
+    "anchor": "kernel void termite_layer_norm_bwd_dx"
+   }
+  },
+  {
+   "name": "termite_lm_head_q6_k_rescore_top8",
+   "family": "sampling",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 8770,
+    "anchor": "kernel void termite_lm_head_q6_k_rescore_top8"
+   }
+  },
+  {
+   "name": "termite_lm_head_top8_reduce",
+   "family": "sampling",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 8764,
+    "anchor": "kernel void termite_lm_head_top8_reduce"
+   }
+  },
+  {
+   "name": "termite_lm_head_top8_suppress_partials",
+   "family": "sampling",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 8742,
+    "anchor": "kernel void termite_lm_head_top8_suppress_partials"
+   }
+  },
+  {
+   "name": "termite_lora_after_a_f32",
+   "family": "training",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11153,
+    "anchor": "kernel void termite_lora_after_a_f32"
+   }
+  },
+  {
+   "name": "termite_lora_finish_f32",
+   "family": "training",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11159,
+    "anchor": "kernel void termite_lora_finish_f32"
+   }
+  },
+  {
+   "name": "termite_lora_grad_a_f32",
+   "family": "training",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11190,
+    "anchor": "kernel void termite_lora_grad_a_f32"
+   }
+  },
+  {
+   "name": "termite_lora_grad_after_a_f32",
+   "family": "training",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11183,
+    "anchor": "kernel void termite_lora_grad_after_a_f32"
+   }
+  },
+  {
+   "name": "termite_lora_grad_b_f32",
+   "family": "training",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11173,
+    "anchor": "kernel void termite_lora_grad_b_f32"
+   }
+  },
+  {
+   "name": "termite_lora_grad_b_transposed_f32",
+   "family": "training",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11178,
+    "anchor": "kernel void termite_lora_grad_b_transposed_f32"
+   }
+  },
+  {
+   "name": "termite_lora_rank1_grad_b_after_a_f32",
+   "family": "training",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11195,
+    "anchor": "kernel void termite_lora_rank1_grad_b_after_a_f32"
+   }
+  },
+  {
+   "name": "termite_lora_rank1_linear_f32",
+   "family": "training",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11165,
+    "anchor": "kernel void termite_lora_rank1_linear_f32"
+   }
+  },
+  {
+   "name": "termite_mapped_page_touch",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9351,
+    "anchor": "kernel void termite_mapped_page_touch"
+   }
+  },
+  {
+   "name": "termite_mapped_selected_expert_page_touch",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9358,
+    "anchor": "kernel void termite_mapped_selected_expert_page_touch"
+   }
+  },
+  {
+   "name": "termite_masked_bce_with_logits_backward",
+   "family": "training",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9422,
+    "anchor": "kernel void termite_masked_bce_with_logits_backward"
+   }
+  },
+  {
+   "name": "termite_masked_bce_with_logits_loss",
+   "family": "training",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9396,
+    "anchor": "kernel void termite_masked_bce_with_logits_loss"
+   }
+  },
+  {
+   "name": "termite_moe_merged_gate_up_activation",
+   "family": "moe",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6323,
+    "anchor": "kernel void termite_moe_merged_gate_up_activation"
+   }
+  },
+  {
+   "name": "termite_moe_route_map_slots",
+   "family": "moe",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9305,
+    "anchor": "kernel void termite_moe_route_map_slots"
+   }
+  },
+  {
+   "name": "termite_moe_route_select",
+   "family": "moe",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9183,
+    "anchor": "kernel void termite_moe_route_select"
+   }
+  },
+  {
+   "name": "termite_moe_route_select_tg",
+   "family": "moe",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9264,
+    "anchor": "kernel void termite_moe_route_select_tg"
+   }
+  },
+  {
+   "name": "termite_moe_route_select_tg_map",
+   "family": "moe",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9265,
+    "anchor": "kernel void termite_moe_route_select_tg_map"
+   }
+  },
+  {
+   "name": "termite_moe_route_select_tg_register",
+   "family": "moe",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9270,
+    "anchor": "kernel void termite_moe_route_select_tg_register"
+   }
+  },
+  {
+   "name": "termite_moe_route_select_tg_register_v2",
+   "family": "moe",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9295,
+    "anchor": "kernel void termite_moe_route_select_tg_register_v2"
+   }
+  },
+  {
+   "name": "termite_moe_scatter_add",
+   "family": "moe",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6326,
+    "anchor": "kernel void termite_moe_scatter_add"
+   }
+  },
+  {
+   "name": "termite_moe_slot_q4_0_down",
+   "family": "moe",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9337,
+    "anchor": "kernel void termite_moe_slot_q4_0_down"
+   }
+  },
+  {
+   "name": "termite_moe_slot_q4_0_gate_up",
+   "family": "moe",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9326,
+    "anchor": "kernel void termite_moe_slot_q4_0_gate_up"
+   }
+  },
+  {
+   "name": "termite_moe_slot_reduce",
+   "family": "moe",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9344,
+    "anchor": "kernel void termite_moe_slot_reduce"
+   }
+  },
+  {
+   "name": "termite_multiply_reduce_last_dim_rows",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9451,
+    "anchor": "kernel void termite_multiply_reduce_last_dim_rows"
+   }
+  },
+  {
+   "name": "termite_mxfp4_linear",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9966,
+    "anchor": "kernel void termite_mxfp4_linear"
+   }
+  },
+  {
+   "name": "termite_mxfp4_linear_1x_reduce",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9972,
+    "anchor": "kernel void termite_mxfp4_linear_1x_reduce"
+   }
+  },
+  {
+   "name": "termite_nomic_pool_normalize",
+   "family": "norm_rope",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9384,
+    "anchor": "kernel void termite_nomic_pool_normalize"
+   }
+  },
+  {
+   "name": "termite_nvfp4_linear",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9981,
+    "anchor": "kernel void termite_nvfp4_linear"
+   }
+  },
+  {
+   "name": "termite_paged_attention_kv",
+   "family": "attention",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11900,
+    "anchor": "kernel void termite_paged_attention_kv"
+   }
+  },
+  {
+   "name": "termite_paged_attention_kv_1x",
+   "family": "attention",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11913,
+    "anchor": "kernel void termite_paged_attention_kv_1x"
+   }
+  },
+  {
+   "name": "termite_paged_attention_kv_decode_gqa_split_reduce",
+   "family": "attention",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 12020,
+    "anchor": "kernel void termite_paged_attention_kv_decode_gqa_split_reduce"
+   }
+  },
+  {
+   "name": "termite_paged_attention_kv_decode_gqa_split_stage",
+   "family": "attention",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11993,
+    "anchor": "kernel void termite_paged_attention_kv_decode_gqa_split_stage"
+   }
+  },
+  {
+   "name": "termite_paged_attention_kv_prefill_sg",
+   "family": "attention",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11926,
+    "anchor": "kernel void termite_paged_attention_kv_prefill_sg"
+   }
+  },
+  {
+   "name": "termite_paged_f16_kv_seed",
+   "family": "attention",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10049,
+    "anchor": "kernel void termite_paged_f16_kv_seed"
+   }
+  },
+  {
+   "name": "termite_paged_f32_kv_seed",
+   "family": "attention",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10043,
+    "anchor": "kernel void termite_paged_f32_kv_seed"
+   }
+  },
+  {
+   "name": "termite_paged_f32_v_seed",
+   "family": "attention",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10055,
+    "anchor": "kernel void termite_paged_f32_v_seed"
+   }
+  },
+  {
+   "name": "termite_polar4_attention_span",
+   "family": "attention",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 12026,
+    "anchor": "kernel void termite_polar4_attention_span"
+   }
+  },
+  {
+   "name": "termite_polar4_key_scores",
+   "family": "kv",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10016,
+    "anchor": "kernel void termite_polar4_key_scores"
+   }
+  },
+  {
+   "name": "termite_q1_0_linear",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6236,
+    "anchor": "kernel void termite_q1_0_linear"
+   }
+  },
+  {
+   "name": "termite_q2_k_linear",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9764,
+    "anchor": "kernel void termite_q2_k_linear"
+   }
+  },
+  {
+   "name": "termite_q3_k_linear",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9769,
+    "anchor": "kernel void termite_q3_k_linear"
+   }
+  },
+  {
+   "name": "termite_q4_0_activation_rhs_1x_reduce",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6390,
+    "anchor": "kernel void termite_q4_0_activation_rhs_1x_reduce"
+   }
+  },
+  {
+   "name": "termite_q4_0_activation_rhs_1x_reduce_out_f16",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6396,
+    "anchor": "kernel void termite_q4_0_activation_rhs_1x_reduce_out_f16"
+   }
+  },
+  {
+   "name": "termite_q4_0_cpy_f32_to_q",
+   "family": "data_movement",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7363,
+    "anchor": "kernel void termite_q4_0_cpy_f32_to_q"
+   }
+  },
+  {
+   "name": "termite_q4_0_cpy_q_to_f32",
+   "family": "data_movement",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7360,
+    "anchor": "kernel void termite_q4_0_cpy_q_to_f32"
+   }
+  },
+  {
+   "name": "termite_q4_0_get_rows",
+   "family": "data_movement",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7354,
+    "anchor": "kernel void termite_q4_0_get_rows"
+   }
+  },
+  {
+   "name": "termite_q4_0_linear",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6246,
+    "anchor": "kernel void termite_q4_0_linear"
+   }
+  },
+  {
+   "name": "termite_q4_0_linear_1x_packed_t4_nsg4",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6427,
+    "anchor": "kernel void termite_q4_0_linear_1x_packed_t4_nsg4"
+   }
+  },
+  {
+   "name": "termite_q4_0_linear_1x_reduce",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6402,
+    "anchor": "kernel void termite_q4_0_linear_1x_reduce"
+   }
+  },
+  {
+   "name": "termite_q4_0_linear_1x_reduce_in_f16",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6453,
+    "anchor": "kernel void termite_q4_0_linear_1x_reduce_in_f16"
+   }
+  },
+  {
+   "name": "termite_q4_0_linear_1x_reduce_in_f16_out_f16",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6473,
+    "anchor": "kernel void termite_q4_0_linear_1x_reduce_in_f16_out_f16"
+   }
+  },
+  {
+   "name": "termite_q4_0_linear_1x_reduce_in_f16_small",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6459,
+    "anchor": "kernel void termite_q4_0_linear_1x_reduce_in_f16_small"
+   }
+  },
+  {
+   "name": "termite_q4_0_linear_1x_reduce_in_f16_sumsq",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6465,
+    "anchor": "kernel void termite_q4_0_linear_1x_reduce_in_f16_sumsq"
+   }
+  },
+  {
+   "name": "termite_q4_0_linear_1x_reduce_nr4_nsg4",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6414,
+    "anchor": "kernel void termite_q4_0_linear_1x_reduce_nr4_nsg4"
+   }
+  },
+  {
+   "name": "termite_q4_0_linear_1x_reduce_nr4_nsg4_nq8",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6421,
+    "anchor": "kernel void termite_q4_0_linear_1x_reduce_nr4_nsg4_nq8"
+   }
+  },
+  {
+   "name": "termite_q4_0_linear_1x_reduce_nr8_nsg4",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6433,
+    "anchor": "kernel void termite_q4_0_linear_1x_reduce_nr8_nsg4"
+   }
+  },
+  {
+   "name": "termite_q4_0_linear_1x_reduce_out_f16",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6447,
+    "anchor": "kernel void termite_q4_0_linear_1x_reduce_out_f16"
+   }
+  },
+  {
+   "name": "termite_q4_0_linear_1x_reduce_small",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6408,
+    "anchor": "kernel void termite_q4_0_linear_1x_reduce_small"
+   }
+  },
+  {
+   "name": "termite_q4_0_linear_1x_reduce_sumsq",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6439,
+    "anchor": "kernel void termite_q4_0_linear_1x_reduce_sumsq"
+   }
+  },
+  {
+   "name": "termite_q4_0_linear_id",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6251,
+    "anchor": "kernel void termite_q4_0_linear_id"
+   }
+  },
+  {
+   "name": "termite_q4_0_linear_id_a4b_down",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6271,
+    "anchor": "kernel void termite_q4_0_linear_id_a4b_down"
+   }
+  },
+  {
+   "name": "termite_q4_0_linear_id_a4b_down_nq8",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6283,
+    "anchor": "kernel void termite_q4_0_linear_id_a4b_down_nq8"
+   }
+  },
+  {
+   "name": "termite_q4_0_linear_id_a4b_down_reduce",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6295,
+    "anchor": "kernel void termite_q4_0_linear_id_a4b_down_reduce"
+   }
+  },
+  {
+   "name": "termite_q4_0_linear_id_a4b_gate_up",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6264,
+    "anchor": "kernel void termite_q4_0_linear_id_a4b_gate_up"
+   }
+  },
+  {
+   "name": "termite_q4_0_linear_mm_sg",
+   "family": "mm_sg",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6999,
+    "anchor": "kernel void termite_q4_0_linear_mm_sg"
+   }
+  },
+  {
+   "name": "termite_q4_0_linear_mm_sg_aligned",
+   "family": "mm_sg",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7041,
+    "anchor": "kernel void termite_q4_0_linear_mm_sg_aligned"
+   }
+  },
+  {
+   "name": "termite_q4_0_linear_mm_sg_aligned_tail",
+   "family": "mm_sg",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7062,
+    "anchor": "kernel void termite_q4_0_linear_mm_sg_aligned_tail"
+   }
+  },
+  {
+   "name": "termite_q4_0_linear_mm_sg_unrolled",
+   "family": "mm_sg",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7020,
+    "anchor": "kernel void termite_q4_0_linear_mm_sg_unrolled"
+   }
+  },
+  {
+   "name": "termite_q4_0_linear_r2_ext",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6976,
+    "anchor": "kernel void termite_q4_0_linear_r2_ext"
+   }
+  },
+  {
+   "name": "termite_q4_0_linear_r2_ext4",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6986,
+    "anchor": "kernel void termite_q4_0_linear_r2_ext4"
+   }
+  },
+  {
+   "name": "termite_q4_0_linear_r4_ext",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6977,
+    "anchor": "kernel void termite_q4_0_linear_r4_ext"
+   }
+  },
+  {
+   "name": "termite_q4_0_linear_r4_ext4",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6987,
+    "anchor": "kernel void termite_q4_0_linear_r4_ext4"
+   }
+  },
+  {
+   "name": "termite_q4_0_linear_r8_ext",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6978,
+    "anchor": "kernel void termite_q4_0_linear_r8_ext"
+   }
+  },
+  {
+   "name": "termite_q4_0_linear_r8_ext4",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6988,
+    "anchor": "kernel void termite_q4_0_linear_r8_ext4"
+   }
+  },
+  {
+   "name": "termite_q4_0_pair_activation_1x_packed_t4_nsg2",
+   "family": "fusion",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6364,
+    "anchor": "kernel void termite_q4_0_pair_activation_1x_packed_t4_nsg2"
+   }
+  },
+  {
+   "name": "termite_q4_0_pair_activation_1x_reduce",
+   "family": "fusion",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6370,
+    "anchor": "kernel void termite_q4_0_pair_activation_1x_reduce"
+   }
+  },
+  {
+   "name": "termite_q4_0_pair_activation_1x_reduce_nr4_nsg2",
+   "family": "fusion",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6349,
+    "anchor": "kernel void termite_q4_0_pair_activation_1x_reduce_nr4_nsg2"
+   }
+  },
+  {
+   "name": "termite_q4_0_pair_activation_1x_reduce_nr4_nsg2_nq8",
+   "family": "fusion",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6355,
+    "anchor": "kernel void termite_q4_0_pair_activation_1x_reduce_nr4_nsg2_nq8"
+   }
+  },
+  {
+   "name": "termite_q4_0_pair_activation_1x_reduce_nr4_nsg4",
+   "family": "fusion",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6351,
+    "anchor": "kernel void termite_q4_0_pair_activation_1x_reduce_nr4_nsg4"
+   }
+  },
+  {
+   "name": "termite_q4_0_pair_activation_1x_reduce_nr8_nsg2",
+   "family": "fusion",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6350,
+    "anchor": "kernel void termite_q4_0_pair_activation_1x_reduce_nr8_nsg2"
+   }
+  },
+  {
+   "name": "termite_q4_0_pair_activation_1x_reduce_nr8_nsg4",
+   "family": "fusion",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6352,
+    "anchor": "kernel void termite_q4_0_pair_activation_1x_reduce_nr8_nsg4"
+   }
+  },
+  {
+   "name": "termite_q4_0_pair_activation_1x_reduce_out_f16",
+   "family": "fusion",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6376,
+    "anchor": "kernel void termite_q4_0_pair_activation_1x_reduce_out_f16"
+   }
+  },
+  {
+   "name": "termite_q4_0_pair_activation_id",
+   "family": "fusion",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6316,
+    "anchor": "kernel void termite_q4_0_pair_activation_id"
+   }
+  },
+  {
+   "name": "termite_q4_0_pair_activation_mm_m32_n32_aligned",
+   "family": "mm_sg",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7099,
+    "anchor": "kernel void termite_q4_0_pair_activation_mm_m32_n32_aligned"
+   }
+  },
+  {
+   "name": "termite_q4_0_pair_activation_mm_m32_n32_tail",
+   "family": "mm_sg",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7100,
+    "anchor": "kernel void termite_q4_0_pair_activation_mm_m32_n32_tail"
+   }
+  },
+  {
+   "name": "termite_q4_0_pair_activation_mm_m32_n64_aligned",
+   "family": "mm_sg",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7092,
+    "anchor": "kernel void termite_q4_0_pair_activation_mm_m32_n64_aligned"
+   }
+  },
+  {
+   "name": "termite_q4_0_pair_activation_mm_m32_n64_tail",
+   "family": "mm_sg",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7093,
+    "anchor": "kernel void termite_q4_0_pair_activation_mm_m32_n64_tail"
+   }
+  },
+  {
+   "name": "termite_q4_0_pair_activation_multiply_r2_ext",
+   "family": "fusion",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7335,
+    "anchor": "kernel void termite_q4_0_pair_activation_multiply_r2_ext"
+   }
+  },
+  {
+   "name": "termite_q4_0_pair_activation_multiply_r3_ext",
+   "family": "fusion",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7336,
+    "anchor": "kernel void termite_q4_0_pair_activation_multiply_r3_ext"
+   }
+  },
+  {
+   "name": "termite_q4_0_pair_activation_multiply_r4_ext",
+   "family": "fusion",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7337,
+    "anchor": "kernel void termite_q4_0_pair_activation_multiply_r4_ext"
+   }
+  },
+  {
+   "name": "termite_q4_0_pair_activation_multiply_r5_ext",
+   "family": "fusion",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7338,
+    "anchor": "kernel void termite_q4_0_pair_activation_multiply_r5_ext"
+   }
+  },
+  {
+   "name": "termite_q4_0_pair_activation_rms_scale_1x_reduce_out_f16",
+   "family": "fusion",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6382,
+    "anchor": "kernel void termite_q4_0_pair_activation_rms_scale_1x_reduce_out_f16"
+   }
+  },
+  {
+   "name": "termite_q4_0_pair_linear",
+   "family": "fusion",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6329,
+    "anchor": "kernel void termite_q4_0_pair_linear"
+   }
+  },
+  {
+   "name": "termite_q4_0_pair_linear_1x_reduce",
+   "family": "fusion",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6335,
+    "anchor": "kernel void termite_q4_0_pair_linear_1x_reduce"
+   }
+  },
+  {
+   "name": "termite_q4_0_pair_linear_id",
+   "family": "fusion",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6305,
+    "anchor": "kernel void termite_q4_0_pair_linear_id"
+   }
+  },
+  {
+   "name": "termite_q4_0_set_rows",
+   "family": "data_movement",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7357,
+    "anchor": "kernel void termite_q4_0_set_rows"
+   }
+  },
+  {
+   "name": "termite_q4_1_cpy_f32_to_q",
+   "family": "data_movement",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7375,
+    "anchor": "kernel void termite_q4_1_cpy_f32_to_q"
+   }
+  },
+  {
+   "name": "termite_q4_1_cpy_q_to_f32",
+   "family": "data_movement",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7372,
+    "anchor": "kernel void termite_q4_1_cpy_q_to_f32"
+   }
+  },
+  {
+   "name": "termite_q4_1_get_rows",
+   "family": "data_movement",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7366,
+    "anchor": "kernel void termite_q4_1_get_rows"
+   }
+  },
+  {
+   "name": "termite_q4_1_linear",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6479,
+    "anchor": "kernel void termite_q4_1_linear"
+   }
+  },
+  {
+   "name": "termite_q4_1_linear_1x_reduce",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6484,
+    "anchor": "kernel void termite_q4_1_linear_1x_reduce"
+   }
+  },
+  {
+   "name": "termite_q4_1_set_rows",
+   "family": "data_movement",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7369,
+    "anchor": "kernel void termite_q4_1_set_rows"
+   }
+  },
+  {
+   "name": "termite_q4_k_activation_rhs_1x_reduce",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9844,
+    "anchor": "kernel void termite_q4_k_activation_rhs_1x_reduce"
+   }
+  },
+  {
+   "name": "termite_q4_k_cpy_f32_to_q",
+   "family": "data_movement",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7411,
+    "anchor": "kernel void termite_q4_k_cpy_f32_to_q"
+   }
+  },
+  {
+   "name": "termite_q4_k_cpy_q_to_f32",
+   "family": "data_movement",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7408,
+    "anchor": "kernel void termite_q4_k_cpy_q_to_f32"
+   }
+  },
+  {
+   "name": "termite_q4_k_get_rows",
+   "family": "data_movement",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7402,
+    "anchor": "kernel void termite_q4_k_get_rows"
+   }
+  },
+  {
+   "name": "termite_q4_k_linear",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9774,
+    "anchor": "kernel void termite_q4_k_linear"
+   }
+  },
+  {
+   "name": "termite_q4_k_linear_1x_reduce",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9779,
+    "anchor": "kernel void termite_q4_k_linear_1x_reduce"
+   }
+  },
+  {
+   "name": "termite_q4_k_linear_1x_reduce_v2",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9791,
+    "anchor": "kernel void termite_q4_k_linear_1x_reduce_v2"
+   }
+  },
+  {
+   "name": "termite_q4_k_pair_activation_1x_reduce",
+   "family": "fusion",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9828,
+    "anchor": "kernel void termite_q4_k_pair_activation_1x_reduce"
+   }
+  },
+  {
+   "name": "termite_q4_k_pair_activation_1x_reduce_out_f16",
+   "family": "fusion",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9836,
+    "anchor": "kernel void termite_q4_k_pair_activation_1x_reduce_out_f16"
+   }
+  },
+  {
+   "name": "termite_q4_k_pair_linear",
+   "family": "fusion",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9814,
+    "anchor": "kernel void termite_q4_k_pair_linear"
+   }
+  },
+  {
+   "name": "termite_q4_k_pair_linear_1x_reduce",
+   "family": "fusion",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9820,
+    "anchor": "kernel void termite_q4_k_pair_linear_1x_reduce"
+   }
+  },
+  {
+   "name": "termite_q4_k_set_rows",
+   "family": "data_movement",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7405,
+    "anchor": "kernel void termite_q4_k_set_rows"
+   }
+  },
+  {
+   "name": "termite_q5_0_cpy_f32_to_q",
+   "family": "data_movement",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7387,
+    "anchor": "kernel void termite_q5_0_cpy_f32_to_q"
+   }
+  },
+  {
+   "name": "termite_q5_0_cpy_q_to_f32",
+   "family": "data_movement",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7384,
+    "anchor": "kernel void termite_q5_0_cpy_q_to_f32"
+   }
+  },
+  {
+   "name": "termite_q5_0_get_rows",
+   "family": "data_movement",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7378,
+    "anchor": "kernel void termite_q5_0_get_rows"
+   }
+  },
+  {
+   "name": "termite_q5_0_linear",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6492,
+    "anchor": "kernel void termite_q5_0_linear"
+   }
+  },
+  {
+   "name": "termite_q5_0_linear_1x_reduce",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6497,
+    "anchor": "kernel void termite_q5_0_linear_1x_reduce"
+   }
+  },
+  {
+   "name": "termite_q5_0_set_rows",
+   "family": "data_movement",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7381,
+    "anchor": "kernel void termite_q5_0_set_rows"
+   }
+  },
+  {
+   "name": "termite_q5_1_cpy_f32_to_q",
+   "family": "data_movement",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7399,
+    "anchor": "kernel void termite_q5_1_cpy_f32_to_q"
+   }
+  },
+  {
+   "name": "termite_q5_1_cpy_q_to_f32",
+   "family": "data_movement",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7396,
+    "anchor": "kernel void termite_q5_1_cpy_q_to_f32"
+   }
+  },
+  {
+   "name": "termite_q5_1_get_rows",
+   "family": "data_movement",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7390,
+    "anchor": "kernel void termite_q5_1_get_rows"
+   }
+  },
+  {
+   "name": "termite_q5_1_linear",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6505,
+    "anchor": "kernel void termite_q5_1_linear"
+   }
+  },
+  {
+   "name": "termite_q5_1_linear_1x_reduce",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6510,
+    "anchor": "kernel void termite_q5_1_linear_1x_reduce"
+   }
+  },
+  {
+   "name": "termite_q5_1_set_rows",
+   "family": "data_movement",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7393,
+    "anchor": "kernel void termite_q5_1_set_rows"
+   }
+  },
+  {
+   "name": "termite_q5_k_cpy_f32_to_q",
+   "family": "data_movement",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7423,
+    "anchor": "kernel void termite_q5_k_cpy_f32_to_q"
+   }
+  },
+  {
+   "name": "termite_q5_k_cpy_q_to_f32",
+   "family": "data_movement",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7420,
+    "anchor": "kernel void termite_q5_k_cpy_q_to_f32"
+   }
+  },
+  {
+   "name": "termite_q5_k_get_rows",
+   "family": "data_movement",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7414,
+    "anchor": "kernel void termite_q5_k_get_rows"
+   }
+  },
+  {
+   "name": "termite_q5_k_linear",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9852,
+    "anchor": "kernel void termite_q5_k_linear"
+   }
+  },
+  {
+   "name": "termite_q5_k_linear_1x_reduce",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9857,
+    "anchor": "kernel void termite_q5_k_linear_1x_reduce"
+   }
+  },
+  {
+   "name": "termite_q5_k_set_rows",
+   "family": "data_movement",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7417,
+    "anchor": "kernel void termite_q5_k_set_rows"
+   }
+  },
+  {
+   "name": "termite_q6_k_cpy_f32_to_q",
+   "family": "data_movement",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7435,
+    "anchor": "kernel void termite_q6_k_cpy_f32_to_q"
+   }
+  },
+  {
+   "name": "termite_q6_k_cpy_q_to_f32",
+   "family": "data_movement",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7432,
+    "anchor": "kernel void termite_q6_k_cpy_q_to_f32"
+   }
+  },
+  {
+   "name": "termite_q6_k_get_rows",
+   "family": "data_movement",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7426,
+    "anchor": "kernel void termite_q6_k_get_rows"
+   }
+  },
+  {
+   "name": "termite_q6_k_high_row_mm_matrix_m64_n64",
+   "family": "mm_sg",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6935,
+    "anchor": "kernel void termite_q6_k_high_row_mm_matrix_m64_n64"
+   }
+  },
+  {
+   "name": "termite_q6_k_linear",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9865,
+    "anchor": "kernel void termite_q6_k_linear"
+   }
+  },
+  {
+   "name": "termite_q6_k_linear_1x_reduce",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9870,
+    "anchor": "kernel void termite_q6_k_linear_1x_reduce"
+   }
+  },
+  {
+   "name": "termite_q6_k_linear_1x_reduce_in_f16",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9925,
+    "anchor": "kernel void termite_q6_k_linear_1x_reduce_in_f16"
+   }
+  },
+  {
+   "name": "termite_q6_k_linear_1x_reduce_nbodd",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9906,
+    "anchor": "kernel void termite_q6_k_linear_1x_reduce_nbodd"
+   }
+  },
+  {
+   "name": "termite_q6_k_linear_1x_reduce_nbodd_nr1",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9907,
+    "anchor": "kernel void termite_q6_k_linear_1x_reduce_nbodd_nr1"
+   }
+  },
+  {
+   "name": "termite_q6_k_linear_1x_reduce_nbodd_nr4_nsg1",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9908,
+    "anchor": "kernel void termite_q6_k_linear_1x_reduce_nbodd_nr4_nsg1"
+   }
+  },
+  {
+   "name": "termite_q6_k_linear_1x_reduce_nbodd_nr4_nsg2",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9909,
+    "anchor": "kernel void termite_q6_k_linear_1x_reduce_nbodd_nr4_nsg2"
+   }
+  },
+  {
+   "name": "termite_q6_k_linear_1x_reduce_nbodd_nr6_nsg1",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9910,
+    "anchor": "kernel void termite_q6_k_linear_1x_reduce_nbodd_nr6_nsg1"
+   }
+  },
+  {
+   "name": "termite_q6_k_linear_1x_reduce_nbodd_nr8_nsg1",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9911,
+    "anchor": "kernel void termite_q6_k_linear_1x_reduce_nbodd_nr8_nsg1"
+   }
+  },
+  {
+   "name": "termite_q6_k_linear_1x_reduce_nsg4",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9880,
+    "anchor": "kernel void termite_q6_k_linear_1x_reduce_nsg4"
+   }
+  },
+  {
+   "name": "termite_q6_k_linear_1x_reduce_nsg8",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9887,
+    "anchor": "kernel void termite_q6_k_linear_1x_reduce_nsg8"
+   }
+  },
+  {
+   "name": "termite_q6_k_linear_r2_reduce",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9918,
+    "anchor": "kernel void termite_q6_k_linear_r2_reduce"
+   }
+  },
+  {
+   "name": "termite_q6_k_pair_linear",
+   "family": "fusion",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9933,
+    "anchor": "kernel void termite_q6_k_pair_linear"
+   }
+  },
+  {
+   "name": "termite_q6_k_set_rows",
+   "family": "data_movement",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7429,
+    "anchor": "kernel void termite_q6_k_set_rows"
+   }
+  },
+  {
+   "name": "termite_q8_0_activation_multiply_1r_ext",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7339,
+    "anchor": "kernel void termite_q8_0_activation_multiply_1r_ext"
+   }
+  },
+  {
+   "name": "termite_q8_0_activation_multiply_1x_reduce4",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7345,
+    "anchor": "kernel void termite_q8_0_activation_multiply_1x_reduce4"
+   }
+  },
+  {
+   "name": "termite_q8_0_cpy_f32_to_q",
+   "family": "data_movement",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7447,
+    "anchor": "kernel void termite_q8_0_cpy_f32_to_q"
+   }
+  },
+  {
+   "name": "termite_q8_0_cpy_q_to_f32",
+   "family": "data_movement",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7444,
+    "anchor": "kernel void termite_q8_0_cpy_q_to_f32"
+   }
+  },
+  {
+   "name": "termite_q8_0_get_rows",
+   "family": "data_movement",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7438,
+    "anchor": "kernel void termite_q8_0_get_rows"
+   }
+  },
+  {
+   "name": "termite_q8_0_kv_pair_mm_sg",
+   "family": "mm_sg",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7196,
+    "anchor": "kernel void termite_q8_0_kv_pair_mm_sg"
+   }
+  },
+  {
+   "name": "termite_q8_0_kv_pair_mm_sg_tail",
+   "family": "mm_sg",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7197,
+    "anchor": "kernel void termite_q8_0_kv_pair_mm_sg_tail"
+   }
+  },
+  {
+   "name": "termite_q8_0_linear",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6535,
+    "anchor": "kernel void termite_q8_0_linear"
+   }
+  },
+  {
+   "name": "termite_q8_0_linear_mm",
+   "family": "mm_sg",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7208,
+    "anchor": "kernel void termite_q8_0_linear_mm"
+   }
+  },
+  {
+   "name": "termite_q8_0_linear_mm_in_f16",
+   "family": "mm_sg",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7217,
+    "anchor": "kernel void termite_q8_0_linear_mm_in_f16"
+   }
+  },
+  {
+   "name": "termite_q8_0_linear_mm_sg",
+   "family": "mm_sg",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7108,
+    "anchor": "kernel void termite_q8_0_linear_mm_sg"
+   }
+  },
+  {
+   "name": "termite_q8_0_linear_mm_sg_m64",
+   "family": "mm_sg",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7172,
+    "anchor": "kernel void termite_q8_0_linear_mm_sg_m64"
+   }
+  },
+  {
+   "name": "termite_q8_0_linear_mm_sg_m64_in_f16",
+   "family": "mm_sg",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7183,
+    "anchor": "kernel void termite_q8_0_linear_mm_sg_m64_in_f16"
+   }
+  },
+  {
+   "name": "termite_q8_0_linear_mm_sg_m64_in_f16_tail",
+   "family": "mm_sg",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7184,
+    "anchor": "kernel void termite_q8_0_linear_mm_sg_m64_in_f16_tail"
+   }
+  },
+  {
+   "name": "termite_q8_0_linear_mm_sg_m64_tail",
+   "family": "mm_sg",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7173,
+    "anchor": "kernel void termite_q8_0_linear_mm_sg_m64_tail"
+   }
+  },
+  {
+   "name": "termite_q8_0_linear_mm_sg_v2",
+   "family": "mm_sg",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7154,
+    "anchor": "kernel void termite_q8_0_linear_mm_sg_v2"
+   }
+  },
+  {
+   "name": "termite_q8_0_linear_mm_sg_v2_in_f16",
+   "family": "mm_sg",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7156,
+    "anchor": "kernel void termite_q8_0_linear_mm_sg_v2_in_f16"
+   }
+  },
+  {
+   "name": "termite_q8_0_linear_mm_sg_v2_in_f16_tail",
+   "family": "mm_sg",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7157,
+    "anchor": "kernel void termite_q8_0_linear_mm_sg_v2_in_f16_tail"
+   }
+  },
+  {
+   "name": "termite_q8_0_linear_mm_sg_v2_tail",
+   "family": "mm_sg",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7155,
+    "anchor": "kernel void termite_q8_0_linear_mm_sg_v2_tail"
+   }
+  },
+  {
+   "name": "termite_q8_0_linear_mmv",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6565,
+    "anchor": "kernel void termite_q8_0_linear_mmv"
+   }
+  },
+  {
+   "name": "termite_q8_0_linear_mmv_in_f16",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6574,
+    "anchor": "kernel void termite_q8_0_linear_mmv_in_f16"
+   }
+  },
+  {
+   "name": "termite_q8_0_linear_r2_ext",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6598,
+    "anchor": "kernel void termite_q8_0_linear_r2_ext"
+   }
+  },
+  {
+   "name": "termite_q8_0_linear_r3_ext",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6599,
+    "anchor": "kernel void termite_q8_0_linear_r3_ext"
+   }
+  },
+  {
+   "name": "termite_q8_0_linear_r4_ext",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6600,
+    "anchor": "kernel void termite_q8_0_linear_r4_ext"
+   }
+  },
+  {
+   "name": "termite_q8_0_linear_r5_ext",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6601,
+    "anchor": "kernel void termite_q8_0_linear_r5_ext"
+   }
+  },
+  {
+   "name": "termite_q8_0_linear_rms_scale_mmv",
+   "family": "norm_rope",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6583,
+    "anchor": "kernel void termite_q8_0_linear_rms_scale_mmv"
+   }
+  },
+  {
+   "name": "termite_q8_0_pair_activation_mm_sg_v2",
+   "family": "mm_sg",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7206,
+    "anchor": "kernel void termite_q8_0_pair_activation_mm_sg_v2"
+   }
+  },
+  {
+   "name": "termite_q8_0_pair_activation_mm_sg_v2_out_f16",
+   "family": "mm_sg",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7207,
+    "anchor": "kernel void termite_q8_0_pair_activation_mm_sg_v2_out_f16"
+   }
+  },
+  {
+   "name": "termite_q8_0_pair_activation_multiply_1r_ext",
+   "family": "fusion",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7290,
+    "anchor": "kernel void termite_q8_0_pair_activation_multiply_1r_ext"
+   }
+  },
+  {
+   "name": "termite_q8_0_pair_activation_multiply_1x_reduce4",
+   "family": "fusion",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7281,
+    "anchor": "kernel void termite_q8_0_pair_activation_multiply_1x_reduce4"
+   }
+  },
+  {
+   "name": "termite_q8_0_pair_activation_multiply_mm",
+   "family": "mm_sg",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7226,
+    "anchor": "kernel void termite_q8_0_pair_activation_multiply_mm"
+   }
+  },
+  {
+   "name": "termite_q8_0_pair_activation_multiply_mm_out_f16",
+   "family": "mm_sg",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7235,
+    "anchor": "kernel void termite_q8_0_pair_activation_multiply_mm_out_f16"
+   }
+  },
+  {
+   "name": "termite_q8_0_pair_activation_multiply_r2_ext",
+   "family": "fusion",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7314,
+    "anchor": "kernel void termite_q8_0_pair_activation_multiply_r2_ext"
+   }
+  },
+  {
+   "name": "termite_q8_0_pair_activation_multiply_r3_ext",
+   "family": "fusion",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7315,
+    "anchor": "kernel void termite_q8_0_pair_activation_multiply_r3_ext"
+   }
+  },
+  {
+   "name": "termite_q8_0_pair_activation_multiply_r4_ext",
+   "family": "fusion",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7316,
+    "anchor": "kernel void termite_q8_0_pair_activation_multiply_r4_ext"
+   }
+  },
+  {
+   "name": "termite_q8_0_pair_activation_multiply_r5_ext",
+   "family": "fusion",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7317,
+    "anchor": "kernel void termite_q8_0_pair_activation_multiply_r5_ext"
+   }
+  },
+  {
+   "name": "termite_q8_0_pair_activation_multiply_rms_scale_1r_ext",
+   "family": "fusion",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7296,
+    "anchor": "kernel void termite_q8_0_pair_activation_multiply_rms_scale_1r_ext"
+   }
+  },
+  {
+   "name": "termite_q8_0_pair_activation_multiply_rms_scale_1r_ext_out_f16",
+   "family": "fusion",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7302,
+    "anchor": "kernel void termite_q8_0_pair_activation_multiply_rms_scale_1r_ext_out_f16"
+   }
+  },
+  {
+   "name": "termite_q8_0_pair_linear",
+   "family": "fusion",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6546,
+    "anchor": "kernel void termite_q8_0_pair_linear"
+   }
+  },
+  {
+   "name": "termite_q8_0_pair_linear_mmv",
+   "family": "fusion",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7244,
+    "anchor": "kernel void termite_q8_0_pair_linear_mmv"
+   }
+  },
+  {
+   "name": "termite_q8_0_pair_linear_r2_ext",
+   "family": "fusion",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7259,
+    "anchor": "kernel void termite_q8_0_pair_linear_r2_ext"
+   }
+  },
+  {
+   "name": "termite_q8_0_pair_linear_r3_ext",
+   "family": "fusion",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7260,
+    "anchor": "kernel void termite_q8_0_pair_linear_r3_ext"
+   }
+  },
+  {
+   "name": "termite_q8_0_pair_linear_r4_ext",
+   "family": "fusion",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7261,
+    "anchor": "kernel void termite_q8_0_pair_linear_r4_ext"
+   }
+  },
+  {
+   "name": "termite_q8_0_pair_linear_r5_ext",
+   "family": "fusion",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7262,
+    "anchor": "kernel void termite_q8_0_pair_linear_r5_ext"
+   }
+  },
+  {
+   "name": "termite_q8_0_qkv_linear_mmv",
+   "family": "kv",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7263,
+    "anchor": "kernel void termite_q8_0_qkv_linear_mmv"
+   }
+  },
+  {
+   "name": "termite_q8_0_set_rows",
+   "family": "data_movement",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7441,
+    "anchor": "kernel void termite_q8_0_set_rows"
+   }
+  },
+  {
+   "name": "termite_q8_1_cpy_f32_to_q",
+   "family": "data_movement",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7459,
+    "anchor": "kernel void termite_q8_1_cpy_f32_to_q"
+   }
+  },
+  {
+   "name": "termite_q8_1_cpy_q_to_f32",
+   "family": "data_movement",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7456,
+    "anchor": "kernel void termite_q8_1_cpy_q_to_f32"
+   }
+  },
+  {
+   "name": "termite_q8_1_get_rows",
+   "family": "data_movement",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7450,
+    "anchor": "kernel void termite_q8_1_get_rows"
+   }
+  },
+  {
+   "name": "termite_q8_1_linear",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6552,
+    "anchor": "kernel void termite_q8_1_linear"
+   }
+  },
+  {
+   "name": "termite_q8_1_linear_1x_reduce",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 6557,
+    "anchor": "kernel void termite_q8_1_linear_1x_reduce"
+   }
+  },
+  {
+   "name": "termite_q8_1_set_rows",
+   "family": "data_movement",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7453,
+    "anchor": "kernel void termite_q8_1_set_rows"
+   }
+  },
+  {
+   "name": "termite_q8_k_linear",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7462,
+    "anchor": "kernel void termite_q8_k_linear"
+   }
+  },
+  {
+   "name": "termite_q8_k_linear_1x_reduce",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7467,
+    "anchor": "kernel void termite_q8_k_linear_1x_reduce"
+   }
+  },
+  {
+   "name": "termite_quantize_rows_i8",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 7483,
+    "anchor": "kernel void termite_quantize_rows_i8"
+   }
+  },
+  {
+   "name": "termite_reduce_axis_f32",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9485,
+    "anchor": "kernel void termite_reduce_axis_f32"
+   }
+  },
+  {
+   "name": "termite_reduce_last_dim_rows",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9363,
+    "anchor": "kernel void termite_reduce_last_dim_rows"
+   }
+  },
+  {
+   "name": "termite_sample_gumbel_partials",
+   "family": "sampling",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 8800,
+    "anchor": "kernel void termite_sample_gumbel_partials"
+   }
+  },
+  {
+   "name": "termite_sample_logits_1x",
+   "family": "sampling",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 8829,
+    "anchor": "kernel void termite_sample_logits_1x"
+   }
+  },
+  {
+   "name": "termite_sample_topk_partials",
+   "family": "sampling",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 8923,
+    "anchor": "kernel void termite_sample_topk_partials"
+   }
+  },
+  {
+   "name": "termite_sample_topk_reduce",
+   "family": "sampling",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 8952,
+    "anchor": "kernel void termite_sample_topk_reduce"
+   }
+  },
+  {
+   "name": "termite_scatter_add_axis0_f32",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11208,
+    "anchor": "kernel void termite_scatter_add_axis0_f32"
+   }
+  },
+  {
+   "name": "termite_sdpa_f32",
+   "family": "attention",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10642,
+    "anchor": "kernel void termite_sdpa_f32"
+   }
+  },
+  {
+   "name": "termite_sdpa_f32_bert_prefill_s256_hd64_q8",
+   "family": "attention",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10819,
+    "anchor": "kernel void termite_sdpa_f32_bert_prefill_s256_hd64_q8"
+   }
+  },
+  {
+   "name": "termite_sdpa_f32_florence_window_hd32",
+   "family": "vision",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10810,
+    "anchor": "kernel void termite_sdpa_f32_florence_window_hd32"
+   }
+  },
+  {
+   "name": "termite_sdpa_f32_nomic_q8",
+   "family": "attention",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10845,
+    "anchor": "kernel void termite_sdpa_f32_nomic_q8"
+   }
+  },
+  {
+   "name": "termite_sdpa_f32_tg",
+   "family": "attention",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10674,
+    "anchor": "kernel void termite_sdpa_f32_tg"
+   }
+  },
+  {
+   "name": "termite_sdpa_f32_vision_hd64_flash_q16",
+   "family": "vision",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10754,
+    "anchor": "kernel void termite_sdpa_f32_vision_hd64_flash_q16"
+   }
+  },
+  {
+   "name": "termite_sdpa_f32_vision_hd64_flash_q32",
+   "family": "vision",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10784,
+    "anchor": "kernel void termite_sdpa_f32_vision_hd64_flash_q32"
+   }
+  },
+  {
+   "name": "termite_sdpa_f32_vision_hd64_q32",
+   "family": "vision",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10731,
+    "anchor": "kernel void termite_sdpa_f32_vision_hd64_q32"
+   }
+  },
+  {
+   "name": "termite_sdpa_f32_vision_hd64_q8",
+   "family": "vision",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10708,
+    "anchor": "kernel void termite_sdpa_f32_vision_hd64_q8"
+   }
+  },
+  {
+   "name": "termite_select_typed",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10584,
+    "anchor": "kernel void termite_select_typed"
+   }
+  },
+  {
+   "name": "termite_slice_last_dim_f32_2d",
+   "family": "data_movement",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10060,
+    "anchor": "kernel void termite_slice_last_dim_f32_2d"
+   }
+  },
+  {
+   "name": "termite_slice_typed",
+   "family": "data_movement",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10579,
+    "anchor": "kernel void termite_slice_typed"
+   }
+  },
+  {
+   "name": "termite_tl1_linear",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9993,
+    "anchor": "kernel void termite_tl1_linear"
+   }
+  },
+  {
+   "name": "termite_tl2_linear",
+   "family": "matvec",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10004,
+    "anchor": "kernel void termite_tl2_linear"
+   }
+  },
+  {
+   "name": "termite_training_accumulate_f32",
+   "family": "training",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9521,
+    "anchor": "kernel void termite_training_accumulate_f32"
+   }
+  },
+  {
+   "name": "termite_training_adamw_f32",
+   "family": "training",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9526,
+    "anchor": "kernel void termite_training_adamw_f32"
+   }
+  },
+  {
+   "name": "termite_training_sumsq_f32",
+   "family": "training",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 9539,
+    "anchor": "kernel void termite_training_sumsq_f32"
+   }
+  },
+  {
+   "name": "termite_transpose_f32",
+   "family": "data_movement",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11075,
+    "anchor": "kernel void termite_transpose_f32"
+   }
+  },
+  {
+   "name": "termite_transpose_last2_tiled_f32",
+   "family": "data_movement",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 11081,
+    "anchor": "kernel void termite_transpose_last2_tiled_f32"
+   }
+  },
+  {
+   "name": "termite_turbo3_attention_span",
+   "family": "attention",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 12091,
+    "anchor": "kernel void termite_turbo3_attention_span"
+   }
+  },
+  {
+   "name": "termite_turbo3_key_scores",
+   "family": "kv",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 10021,
+    "anchor": "kernel void termite_turbo3_key_scores"
+   }
+  },
+  {
+   "name": "termite_whisper_logits_partials",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 8634,
+    "anchor": "kernel void termite_whisper_logits_partials"
+   }
+  },
+  {
+   "name": "termite_whisper_logits_reduce",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m",
+    "line": 8688,
+    "anchor": "kernel void termite_whisper_logits_reduce"
+   }
+  }
+ ]
+}
