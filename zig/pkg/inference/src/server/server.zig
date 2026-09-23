@@ -10839,6 +10839,22 @@ pub const Node = struct {
             envelope.attachments
         else
             &.{};
+        return self.rerankDocumentValues(ctx, execution_control, body.model, body.query, documents, attachments);
+    }
+
+    /// Scores parsed rerank documents, each a string or an array of content
+    /// parts whose `attachment:N` references index `attachments`. The HTTP
+    /// handler and the in-process provider operation both call this, so they
+    /// share admission, validation, and pipeline selection.
+    pub fn rerankDocumentValues(
+        self: *Node,
+        ctx: *httpx.Context,
+        execution_control: InferenceExecutionControl,
+        requested_model: []const u8,
+        query: []const u8,
+        documents: []const std.json.Value,
+        attachments: []const httpx.attachment_envelope.Attachment,
+    ) !httpx.Response {
         validateRerankAttachmentReferences(ctx.allocator, documents, attachments.len) catch |err|
             return ctx.status(400).json(.{
                 .@"error" = "INVALID_REQUEST",
@@ -10852,7 +10868,7 @@ pub const Node = struct {
         self.metrics.incRequest("rerank");
         defer self.metrics.decActive();
 
-        const model_name: ?[]const u8 = if (body.model.len > 0) body.model else null;
+        const model_name: ?[]const u8 = if (requested_model.len > 0) requested_model else null;
         const model_path = self.resolveRequestModelPath(ctx.allocator, ctx.io, model_name, "rerankers") catch |err|
             return requestModelResolutionError(ctx, err);
         defer ctx.allocator.free(model_path);
@@ -10923,7 +10939,7 @@ pub const Node = struct {
             try parsed_docs.append(ctx.allocator, parsed);
         }
 
-        const rerank_text_bytes = std.math.add(usize, body.query.len, max_doc_text_bytes) catch
+        const rerank_text_bytes = std.math.add(usize, query.len, max_doc_text_bytes) catch
             return inferenceExecutorContractFailureResponse(ctx, error.InferenceTextBytesExceeded);
         if (image_count > 0) {
             var decoded_budget = ReadDecodedImageBudget.init(media_admission, effectiveRequestContentSecurity(self).max_image_dimension);
@@ -10956,7 +10972,7 @@ pub const Node = struct {
 
             var pipeline = self.createRerankingPipeline(ctx.allocator, model);
             pipeline.execution_control = execution_control;
-            var prepared = pipeline.prepareInputs(body.query, flat_texts) catch |err|
+            var prepared = pipeline.prepareInputs(query, flat_texts) catch |err|
                 return inferenceFailureResponse(ctx, err);
             defer prepared.deinit();
             validateInferenceExecutorInvocation(executor_contract, .{
@@ -10969,7 +10985,7 @@ pub const Node = struct {
             const scores = pipeline.rerankPrepared(&prepared) catch |err|
                 return inferenceFailureResponse(ctx, err);
             defer ctx.allocator.free(scores);
-            return writeRerankScoresResponse(ctx, body.model, scores, prepared.prompt_tokens);
+            return writeRerankScoresResponse(ctx, requested_model, scores, prepared.prompt_tokens);
         }
 
         if (model.manifest.isQwen3VlReranker()) {
@@ -11056,12 +11072,12 @@ pub const Node = struct {
                     var text_pipeline = model.rerankingPipeline(ctx.allocator);
                     text_pipeline.execution_lock = null;
                     text_pipeline.execution_control = execution_control;
-                    const text_scores = text_pipeline.rerank(body.query, &.{doc.text}) catch |err|
+                    const text_scores = text_pipeline.rerank(query, &.{doc.text}) catch |err|
                         return inferenceFailureResponse(ctx, err);
                     defer ctx.allocator.free(text_scores);
                     scores[idx] = text_scores[0];
                     const text_tokens =
-                        (countTokenizerTokens(ctx.allocator, self.session_manager.io, model.getTokenizer(), body.query) catch estimateTextTokens(body.query)) +
+                        (countTokenizerTokens(ctx.allocator, self.session_manager.io, model.getTokenizer(), query) catch estimateTextTokens(query)) +
                         (countTokenizerTokens(ctx.allocator, self.session_manager.io, model.getTokenizer(), doc.text) catch estimateTextTokens(doc.text));
                     prompt_tokens = std.math.add(usize, prompt_tokens, text_tokens) catch
                         return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "rerank token accounting overflow" });
@@ -11069,7 +11085,7 @@ pub const Node = struct {
                 }
 
                 const result = qwen_pipeline.scoreDocument(
-                    body.query,
+                    query,
                     doc.qwen_content,
                     doc.images,
                 ) catch |err| switch (err) {
@@ -11099,7 +11115,7 @@ pub const Node = struct {
                 prompt_tokens = std.math.add(usize, prompt_tokens, result.prompt_tokens) catch
                     return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "rerank token accounting overflow" });
             }
-            return writeRerankScoresResponse(ctx, body.model, scores, prompt_tokens);
+            return writeRerankScoresResponse(ctx, requested_model, scores, prompt_tokens);
         }
 
         if (!(model.manifest.hasCapability("colqwen") or model.manifest.hasCapability("multimodal_late_interaction"))) {
@@ -11150,9 +11166,9 @@ pub const Node = struct {
         for (parsed_docs.items) |doc| {
             const item_tokens = if (doc.images.len == 0) tokens: {
                 var text_pipeline = model.rerankingPipeline(ctx.allocator);
-                break :tokens text_pipeline.maxInputTokensPerItem(body.query, &.{doc.text}) catch |err|
+                break :tokens text_pipeline.maxInputTokensPerItem(query, &.{doc.text}) catch |err|
                     return inferenceFailureResponse(ctx, err);
-            } else mm_pipeline.maxInputTokensPerItem(body.query, doc.text, doc.images) catch |err|
+            } else mm_pipeline.maxInputTokensPerItem(query, doc.text, doc.images) catch |err|
                 return inferenceFailureResponse(ctx, err);
             input_tokens_for_limit = @max(input_tokens_for_limit, item_tokens);
         }
@@ -11168,7 +11184,7 @@ pub const Node = struct {
             .has_image = true,
         }) catch |err| return inferenceExecutorContractFailureResponse(ctx, err);
 
-        var query_encoded = mm_pipeline.encodeQueryText(body.query) catch |err|
+        var query_encoded = mm_pipeline.encodeQueryText(query) catch |err|
             return inferenceFailureResponse(ctx, err);
         defer query_encoded.deinit();
 
@@ -11181,7 +11197,7 @@ pub const Node = struct {
                 // This request already owns the non-reentrant model lane.
                 text_pipeline.execution_lock = null;
                 text_pipeline.execution_control = execution_control;
-                const text_scores = text_pipeline.rerank(body.query, &.{doc.text}) catch |err|
+                const text_scores = text_pipeline.rerank(query, &.{doc.text}) catch |err|
                     return inferenceFailureResponse(ctx, err);
                 defer ctx.allocator.free(text_scores);
                 scores[idx] = text_scores[0];
@@ -11203,9 +11219,9 @@ pub const Node = struct {
         defer ctx.allocator.free(doc_texts);
         for (parsed_docs.items, 0..) |doc, idx| doc_texts[idx] = doc.text;
         const prompt_tokens =
-            (countTokenizerTokens(ctx.allocator, self.session_manager.io, model.getTokenizer(), body.query) catch estimateTextTokens(body.query)) * doc_texts.len +
+            (countTokenizerTokens(ctx.allocator, self.session_manager.io, model.getTokenizer(), query) catch estimateTextTokens(query)) * doc_texts.len +
             (countTokenizerTexts(ctx.allocator, self.session_manager.io, model.getTokenizer(), doc_texts) catch estimateTextsTokens(doc_texts));
-        return writeRerankScoresResponse(ctx, body.model, scores, prompt_tokens);
+        return writeRerankScoresResponse(ctx, requested_model, scores, prompt_tokens);
     }
 
     pub fn generateContent(self: *Node, ctx: *httpx.Context) !httpx.Response {
@@ -21943,6 +21959,35 @@ test "executor capability resolution never advertises raw documents" {
     try std.testing.expect(chunk.text and chunk.image and chunk.audio and !chunk.document);
 }
 
+test "reranker catalog advertises rerank documents" {
+    var body = std.ArrayListUnmanaged(u8).empty;
+    defer body.deinit(std.testing.allocator);
+    try appendModelInfo(
+        &body,
+        std.testing.allocator,
+        "reranker",
+        "",
+        &.{},
+        &.{ "text", "image" },
+        false,
+        true,
+        false,
+        .compatibility,
+        null,
+        "rerankers",
+        16 * 1024 * 1024,
+        32 * 1024 * 1024,
+        false,
+        "compatible",
+    );
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body.items, .{});
+    defer parsed.deinit();
+    const capabilities = parsed.value.object.get("inference_capabilities").?.object;
+    try std.testing.expectEqualStrings("rerank", capabilities.get("task").?.string);
+    try std.testing.expect(capabilities.get("rerank_documents_v1").?.bool);
+    try std.testing.expect(capabilities.get("framed_attachments").?.bool);
+}
+
 test "fixed chunk catalog advertises its multimodal transport truth" {
     var body = std.ArrayListUnmanaged(u8).empty;
     defer body.deinit(std.testing.allocator);
@@ -21969,6 +22014,7 @@ test "fixed chunk catalog advertises its multimodal transport truth" {
     const capabilities = parsed.value.object.get("inference_capabilities").?.object;
     try std.testing.expect(capabilities.get("framed_attachments").?.bool);
     try std.testing.expect(!capabilities.get("numeric_responses_v1").?.bool);
+    try std.testing.expect(!capabilities.get("rerank_documents_v1").?.bool);
     const modalities = capabilities.get("input_modalities").?.array.items;
     try std.testing.expectEqual(@as(usize, 3), modalities.len);
     const mime_types = capabilities.get("accepted_mime_types").?.array.items;
@@ -22100,6 +22146,10 @@ fn appendResolvedInferenceCapabilities(
         std.mem.eql(u8, resolved_task, "rerank")) "true" else "false");
     try buf.appendSlice(allocator, ",\"numeric_responses_v1\":");
     try buf.appendSlice(allocator, if (std.mem.eql(u8, resolved_task, "embed") or std.mem.eql(u8, resolved_task, "rerank")) "true" else "false");
+    // `/rerank` accepts `documents` (strings or content parts). Older servers
+    // only accept `prompts`, so clients send `documents` only when this is set.
+    try buf.appendSlice(allocator, ",\"rerank_documents_v1\":");
+    try buf.appendSlice(allocator, if (std.mem.eql(u8, resolved_task, "rerank")) "true" else "false");
     try buf.appendSlice(allocator, ",\"image_transform\":");
     if (if (accepts_image) image_transform else null) |transform| {
         const encoded = try std.fmt.allocPrint(

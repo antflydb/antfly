@@ -173,6 +173,16 @@ pub const AntflyProvider = struct {
         documents: []const []const u8,
         context: RequestContext,
     ) anyerror![]f32 = null,
+    /// Reranks documents given as ordered content parts, which may include
+    /// images. Binary media stays borrowed for the synchronous call.
+    rerank_documents_with_context: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        query: []const u8,
+        documents: []const []const template_mod.ContentPart,
+        context: RequestContext,
+    ) anyerror![]f32 = null,
     generate_text: ?*const fn (
         ptr: *anyopaque,
         alloc: std.mem.Allocator,

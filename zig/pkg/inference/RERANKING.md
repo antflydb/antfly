@@ -147,6 +147,10 @@ Each document uses the same content format as generation and embedding:
 
 The deprecated `prompts` field (an array of strings) is still accepted in place of `documents`; a request may not send both.
 
+The model catalog advertises `rerank_documents_v1: true` on reranker capabilities. Antfly sends `documents` only to servers that advertise it and falls back to `prompts` (text only) otherwise, so a cluster and an inference pool can be upgraded in either order.
+
+Query-time rerankers reach this path through their `template`: the `media` and `remoteMedia` helpers render each candidate into text and image parts. The embedded runtime receives them through the linked `rerank_documents` provider operation, which runs the same handler core (`Node.rerankDocumentValues`) as the HTTP route.
+
 ### Current Behavior
 
 - Requests without images are reranked through the native text reranker path, whatever the model.

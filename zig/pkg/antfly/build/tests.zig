@@ -1301,6 +1301,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "reranker admission precedes candidate rendering",
         "reranker component paging includes the post-rerank offset",
         "reranker paging preserves the underlying retrieval total",
+        "reranker templates render media into image documents",
         "query dependency errors expose a stable JSON retry contract",
         "wildcard matching distinguishes operators from escaped literals",
         "wildcard literal escaping round trips metacharacters",
@@ -4294,6 +4295,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "Lease executor accepts optional CertificateRequest with projected CA and verified hostname",
             "Lease executor accepts TLS 1.2 optional CertificateRequest",
             "Lease executor rejects optional CertificateRequest hostname mismatch",
+            "linked rerank documents become server content parts with attachment references",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),

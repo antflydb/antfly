@@ -15484,7 +15484,7 @@ export interface components {
             provider: components["schemas"]["RerankerProvider"];
             /** @description Field name to extract from documents for reranking. */
             field?: string;
-            /** @description Handlebars template to render document text for reranking. */
+            /** @description Handlebars template that renders each candidate for reranking. The `media` and `remoteMedia` helpers add images, which are sent to the reranker alongside the rendered text; only an Antfly reranker whose model accepts images can score them, and any other reranker rejects the query with `400`. */
             template?: string;
             /** @description Optional provider model name. When omitted, the selected provider's documented default is used. */
             model?: string;

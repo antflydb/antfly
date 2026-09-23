@@ -28,7 +28,15 @@ All notable changes to Antfly will be documented in this file.
   adds `InferenceClient.RerankMultimodal`, and the TypeScript `rerank()` accepts
   content-part documents. Inference proxy route rules that matched the
   `rerank_multimodal` operation should match `rerank` and select the model by
-  name instead.
+  name instead. Inference servers advertise `rerank_documents_v1` in the model
+  catalog; Antfly sends `documents` only to servers that do and keeps sending
+  `prompts` to older ones, so clusters and inference pools can upgrade in
+  either order. `prompts` can be removed once every client sends `documents`.
+- **Query rerankers score images** — a reranker `template` can use the `media`
+  and `remoteMedia` helpers, and each candidate's images are sent with its
+  text to an Antfly reranker whose model accepts images, whether it runs in
+  process or on a remote inference server. Other rerankers reject such queries
+  with `400`.
 - **TOON document rendering in retrieval agents** — the generation prompt now
   encodes each retrieved document's fields as TOON instead of raw JSON, and
   `document_renderer` on a retrieval agent request is accepted again: a

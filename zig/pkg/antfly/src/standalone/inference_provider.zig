@@ -494,6 +494,7 @@ pub fn inferenceBoundaryProvider(lifetime: *EmbeddedInferenceProviderLifetime) i
         .embed_dense_rasters = inferenceProviderEmbedDenseRasters,
         .rerank_texts = inferenceProviderRerankTexts,
         .rerank_texts_with_context = inferenceProviderRerankTextsWithContext,
+        .rerank_documents_with_context = inferenceProviderRerankDocumentsWithContext,
         .generate_text = inferenceProviderGenerateText,
         .generate_text_with_context = inferenceProviderGenerateTextWithContext,
         .generate_messages = inferenceProviderGenerateMessages,
@@ -988,6 +989,73 @@ pub fn inferenceProviderRerankTexts(
         .query = query,
         .documents = documents,
     }, null);
+}
+
+/// Request metadata for `rerank_documents`. Binary parts carry only their MIME
+/// type; their bytes are payloads referenced by the part's flattened index.
+pub const RerankDocumentsWireRequest = struct {
+    model: []const u8,
+    query: []const u8,
+    documents: []const []const template.ContentPart,
+    attachment_count: usize,
+};
+
+pub fn inferenceProviderRerankDocumentsWithContext(
+    handle: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    query: []const u8,
+    documents: []const []const template.ContentPart,
+    context: inference.RequestContext,
+) anyerror![]f32 {
+    try context.check();
+    const embedding_wire = @import("../inference/embedding_wire.zig");
+    var part_count: usize = 0;
+    for (documents) |document| part_count += document.len;
+    const wire_documents = try alloc.alloc([]template.ContentPart, documents.len);
+    defer alloc.free(wire_documents);
+    const wire_storage = try alloc.alloc(template.ContentPart, part_count);
+    defer alloc.free(wire_storage);
+    const payload_storage = try alloc.alloc(inference_bridge.ProviderBinaryPayload, part_count);
+    defer alloc.free(payload_storage);
+    const ref_storage = try alloc.alloc(inference_bridge.ProviderAttachmentRef, part_count);
+    defer alloc.free(ref_storage);
+    var payload_count: usize = 0;
+    var item_index: usize = 0;
+    for (documents, wire_documents) |document, *wire_document| {
+        wire_document.* = wire_storage[item_index .. item_index + document.len];
+        for (document, wire_document.*) |part, *wire_part| {
+            if (part == .binary) {
+                payload_storage[payload_count] = .{
+                    .bytes = inference_bridge.String.init(part.binary.data),
+                    .content_type = inference_bridge.String.init(part.binary.mime_type),
+                };
+                ref_storage[payload_count] = .{ .attachment_index = payload_count, .item_index = item_index };
+                payload_count += 1;
+            }
+            wire_part.* = embedding_wire.metadataPart(part);
+            item_index += 1;
+        }
+    }
+    const result = try invokeInferenceProviderWithBinaryControlled(
+        []f32,
+        alloc,
+        handle,
+        .rerank_documents,
+        RerankDocumentsWireRequest{
+            .model = model,
+            .query = query,
+            .documents = wire_documents,
+            .attachment_count = payload_count,
+        },
+        context.deadline_ns,
+        payload_storage[0..payload_count],
+        ref_storage[0..payload_count],
+        context.cancellation orelse .none,
+    );
+    errdefer alloc.free(result);
+    try context.check();
+    return result;
 }
 
 pub fn inferenceProviderRerankTextsWithContext(

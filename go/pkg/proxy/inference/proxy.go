@@ -3792,6 +3792,14 @@ func conservativeInferenceCapabilities(left, right any) (map[string]any, bool) {
 				return nil, false
 			}
 			result["numeric_responses_v1"] = aNumeric && bNumeric
+			aDocuments, aok := optionalInferenceCapabilityBool(a, "rerank_documents_v1")
+			bDocuments, bok := optionalInferenceCapabilityBool(b, "rerank_documents_v1")
+			if !aok || !bok {
+				return nil, false
+			}
+			// A pooled reranker accepts `documents` only when every upstream
+			// does; absence means an older server that only takes `prompts`.
+			result["rerank_documents_v1"] = aDocuments && bDocuments
 			aLimits, aok := a["task_limits"].(map[string]any)
 			bLimits, bok := b["task_limits"].(map[string]any)
 			if !aok || !bok {
@@ -3988,6 +3996,9 @@ func validExactInferenceCapabilities(capabilities map[string]any, version int) b
 		return false
 	}
 	if _, ok := optionalInferenceCapabilityBool(capabilities, "numeric_responses_v1"); !ok {
+		return false
+	}
+	if _, ok := optionalInferenceCapabilityBool(capabilities, "rerank_documents_v1"); !ok {
 		return false
 	}
 	if version >= 4 {

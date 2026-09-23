@@ -149,6 +149,37 @@ curl -X POST http://127.0.0.1:8080/db/v1/query \
 For an inline data URI, use `{{media url=this}}` instead. Avoid logging or
 persisting large data URIs in query histories.
 
+### Rerank with Images
+
+A reranker `template` accepts the same `media` and `remoteMedia` helpers as an
+embedding template. Each candidate is then sent to the reranker as its text
+plus its images, so a multimodal reranker can score page scans and product
+photos directly:
+
+```bash
+curl -X POST http://127.0.0.1:8080/db/v1/query \
+  -H "Content-Type: application/json" \
+  -d '{
+    "table": "product_catalog",
+    "semantic_search": "brown leather jacket with zipper",
+    "indexes": ["visual_search"],
+    "reranker": {
+      "provider": "antfly",
+      "model": "vidore/colqwen2-v1.0",
+      "template": "{{name}}{{#if image_url}}{{remoteMedia url=image_url}}{{/if}}",
+      "candidate_count": 50
+    },
+    "limit": 10
+  }'
+```
+
+The model must accept images: a ColQwen-style late-interaction reranker or
+the qualified Qwen3-VL reranker bundle. A text-only reranker, a Cohere or
+Vertex reranker, or a remote inference server older than this feature rejects
+the query with a `400` instead of silently dropping the images. Candidates
+whose template renders no image are scored on their text. Image fetches follow
+the same content security policy as embedding templates.
+
 ## Precomputed Descriptions for Text Retrieval
 
 If users search for detailed attributes that a joint embedding model does not

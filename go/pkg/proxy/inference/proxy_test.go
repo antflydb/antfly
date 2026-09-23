@@ -5728,6 +5728,22 @@ func TestConservativeCapabilitiesV4RequiresEveryEndpointToSupportFramedAttachmen
 	if _, ok := conservativeInferenceCapabilities(left, right); ok {
 		t.Fatal("malformed numeric response capability was accepted")
 	}
+	left, right = base(&trueValue), base(&trueValue)
+	left["rerank_documents_v1"] = true
+	right["rerank_documents_v1"] = true
+	merged, ok = conservativeInferenceCapabilities(left, right)
+	if !ok || merged["rerank_documents_v1"] != true {
+		t.Fatalf("uniform rerank documents support was not preserved: %#v", merged)
+	}
+	delete(right, "rerank_documents_v1")
+	merged, ok = conservativeInferenceCapabilities(left, right)
+	if !ok || merged["rerank_documents_v1"] != false {
+		t.Fatalf("mixed-version rerank documents support was not weakened: %#v", merged)
+	}
+	right["rerank_documents_v1"] = "yes"
+	if _, ok := conservativeInferenceCapabilities(left, right); ok {
+		t.Fatal("malformed rerank documents capability was accepted")
+	}
 }
 
 func TestConservativeCapabilitiesV4PreservesOnlyIdenticalImageTransforms(t *testing.T) {

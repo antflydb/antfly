@@ -22,7 +22,7 @@ const http_abi = @import("../runtime_http_abi.zig");
 const native_abi = @import("../runtime_native_abi.zig");
 const antfly_image = @import("antfly_image");
 
-pub const abi_version: u32 = 26;
+pub const abi_version: u32 = 27;
 pub const ai_api_prefix = "/ai/v1";
 pub const public_api_prefix = "/ml/v1";
 pub const Status = error_abi.Status;
@@ -169,6 +169,9 @@ pub const ProviderOperation = enum(c_int) {
     classify_texts = 19,
     read_raster_images_reported = 20,
     embed_dense_rasters = 21,
+    /// Documents as ordered content parts; binary parts travel as payloads
+    /// whose refs index the parts flattened in document order.
+    rerank_documents = 22,
 };
 
 pub const ProviderBinaryPayload = extern struct {
