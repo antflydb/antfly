@@ -1461,6 +1461,10 @@ pub fn create(b: *std.Build) ?Artifacts {
     });
     b.getInstallStep().dependOn(&install_antfly.step);
     b.getInstallStep().dependOn(&install_antfarm_assets.step);
+    // The C smoke test runs the inference runtime, which spawns this build's
+    // `antfly` as its sandboxed worker on backends that need one.
+    run_capi_smoke.setEnvironmentVariable("ANTFLY_INFERENCE_WORKER", b.getInstallPath(.bin, antfly_bin_name));
+    run_capi_smoke.step.dependOn(&install_antfly.step);
     const antfly_step = b.step("antfly", "Build and install the top-level Antfly CLI");
     antfly_step.dependOn(&install_antfly.step);
     antfly_step.dependOn(&install_antfarm_assets.step);

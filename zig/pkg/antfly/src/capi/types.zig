@@ -93,6 +93,28 @@ pub const OpenOptions = extern struct {
     reserved: [8]u64 = .{0} ** 8,
 };
 
+/// Options for `antfly_inference_open`. Same prefix-compatible contract as
+/// `OpenOptions`: initialize with `antfly_inference_options_init`.
+pub const InferenceOptions = extern struct {
+    abi_size: u32 = @sizeOf(InferenceOptions),
+    /// No flags are defined yet; must be zero.
+    flags: u32 = 0,
+    /// Models directory; empty uses `$ANTFLY_INFERENCE_MODELS_DIR`, else
+    /// `~/.antfly/inference/models`.
+    models_dir: Slice = .{},
+    // Resource budgets in MiB, 0 meaning automatic. Same meaning as the
+    // `inference_*_budget_mb` fields of `OpenOptions`.
+    host_budget_mb: u32 = 0,
+    backend_budget_mb: u32 = 0,
+    process_memory_budget_mb: u32 = 0,
+    combined_budget_mb: u32 = 0,
+    kv_budget_mb: u32 = 0,
+    scratch_budget_mb: u32 = 0,
+    /// Per-call deadline in milliseconds; 0 means none.
+    call_timeout_ms: u64 = 0,
+    reserved: [8]u64 = .{0} ** 8,
+};
+
 pub const DenseSearchHit = extern struct {
     id_ptr: ?[*]u8 = null,
     id_len: usize = 0,
@@ -345,6 +367,14 @@ pub fn mapError(err: anyerror) ErrorCode {
         error.GenerationTransitionActive,
         => .busy,
         error.FileLocksUnsupported, error.GenerationFileLocksUnsupported => .unsupported,
+        // The inference runtime needs a sandboxed worker process on this
+        // backend and no `antfly` executable was found to run it.
+        error.InferenceWorkerExecutableNotConfigured,
+        // The runtime, or the worker process it runs models in, could not
+        // start; the process log has the cause.
+        error.InferenceRuntimeStartupFailed,
+        => .unsupported,
+        error.InferenceProviderCallCapacityExhausted => .busy,
         error.DurabilityOutcomeUnknown => .outcome_unknown,
         error.RunUntilIdleNoProgress => .stalled,
         // A dimension probe against a live embedder hit an operational

@@ -73,7 +73,8 @@ typedef enum antfly_error_code {
  * Naming: antfly_* functions are library-level and take no database handle;
  * antfly_db_* functions take an antfly_db handle of any storage kind;
  * antfly_lite_* functions operate on the .aflite single-file format itself,
- * plus shortcuts for opening one.
+ * plus shortcuts for opening one; antfly_inference_* functions take an
+ * antfly_inference handle and run inference without a database.
  */
 
 /* An open database. Opaque; see antfly_db_open_with_options. */
@@ -525,6 +526,80 @@ antfly_error_code antfly_db_get_neighbors_json(
 antfly_error_code antfly_db_find_shortest_path_json(antfly_db *db, antfly_slice request_json, antfly_buffer *out);
 antfly_error_code antfly_db_find_k_shortest_paths_json(antfly_db *db, antfly_slice request_json, antfly_buffer *out);
 antfly_error_code antfly_db_match_pattern_json(antfly_db *db, antfly_slice request_json, antfly_buffer *out);
+
+/*
+ * Embedded inference without a database.
+ *
+ * An antfly_inference handle owns an inference runtime: models load on first
+ * use and stay cached until the handle closes. Each call takes the request
+ * JSON and returns the response JSON of the matching /ai/v1 route of the
+ * Antfly inference HTTP API (see specs/openapi/inference/api.yaml): embed,
+ * rerank, chunk, generate, rewrite, extract, read (OCR), transcribe, and
+ * models. Binary inputs such as images and audio are passed inline, as base64
+ * or data: URIs. Responses are always complete: a generate request with
+ * "stream": true fails with ANTFLY_INVALID_ARGUMENT.
+ *
+ * Every call resets *out, then fills it with the response body whether or
+ * not the call succeeds, so a failure carries the runtime's JSON error
+ * ({"error": ..., "message": ...}); release it with antfly_buffer_free
+ * either way. An HTTP 4xx maps to ANTFLY_INVALID_ARGUMENT, 404 (such as a
+ * model that is not installed) to ANTFLY_NOT_FOUND, 429/503/504 and an
+ * elapsed call_timeout_ms to ANTFLY_BUSY, and 501 or 507 (the model does not
+ * fit the memory budgets) to ANTFLY_UNSUPPORTED.
+ *
+ * Models are not downloaded automatically; install them with
+ * `antfly inference pull <owner/name>`. antfly_inference_open returns
+ * ANTFLY_UNSUPPORTED when this build does not link the inference runtime or
+ * the runtime cannot start. On backends that run models in a sandboxed worker
+ * process (Metal, CUDA, ONNX), the worker is the `antfly` executable named by
+ * $ANTFLY_INFERENCE_WORKER, else the one next to libantfly, else the first on
+ * PATH, and it must come from the same release as libantfly.
+ *
+ * Handles have the same safety as antfly_db handles: any thread may call
+ * concurrently, close waits for in-flight calls, and a closed or foreign
+ * handle is rejected with ANTFLY_INVALID_ARGUMENT.
+ */
+typedef struct antfly_inference antfly_inference;
+
+typedef struct antfly_inference_options {
+    uint32_t abi_size;
+    /* No flags are defined yet; must be zero. */
+    uint32_t flags;
+    /* Models directory. Empty uses $ANTFLY_INFERENCE_MODELS_DIR, else
+     * ~/.antfly/inference/models. */
+    antfly_slice models_dir;
+    /* Resource budgets in MiB, 0 meaning automatic; the same knobs as the
+     * inference_*_budget_mb fields of antfly_open_options. */
+    uint32_t host_budget_mb;
+    uint32_t backend_budget_mb;
+    uint32_t process_memory_budget_mb;
+    uint32_t combined_budget_mb;
+    uint32_t kv_budget_mb;
+    uint32_t scratch_budget_mb;
+    /* Deadline for each call in milliseconds; 0 means none. */
+    uint64_t call_timeout_ms;
+    uint64_t reserved[8];
+} antfly_inference_options;
+
+uint32_t antfly_inference_options_size(void);
+antfly_error_code antfly_inference_options_init(antfly_inference_options *options);
+/* options may be NULL for defaults. */
+antfly_error_code antfly_inference_open(
+    const antfly_inference_options *options,
+    antfly_inference **out_inference
+);
+void antfly_inference_close(antfly_inference *inference);
+
+antfly_error_code antfly_inference_embed_json(antfly_inference *inference, antfly_slice request_json, antfly_buffer *out);
+antfly_error_code antfly_inference_rerank_json(antfly_inference *inference, antfly_slice request_json, antfly_buffer *out);
+antfly_error_code antfly_inference_chunk_json(antfly_inference *inference, antfly_slice request_json, antfly_buffer *out);
+antfly_error_code antfly_inference_generate_json(antfly_inference *inference, antfly_slice request_json, antfly_buffer *out);
+antfly_error_code antfly_inference_rewrite_json(antfly_inference *inference, antfly_slice request_json, antfly_buffer *out);
+antfly_error_code antfly_inference_extract_json(antfly_inference *inference, antfly_slice request_json, antfly_buffer *out);
+antfly_error_code antfly_inference_read_json(antfly_inference *inference, antfly_slice request_json, antfly_buffer *out);
+antfly_error_code antfly_inference_transcribe_json(antfly_inference *inference, antfly_slice request_json, antfly_buffer *out);
+/* The installed models, as returned by GET /ai/v1/models. */
+antfly_error_code antfly_inference_list_models_json(antfly_inference *inference, antfly_buffer *out);
 
 #ifdef __cplusplus
 }

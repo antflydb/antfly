@@ -58,7 +58,67 @@ static int fail_with_buffer(const char *message, antfly_buffer *buffer) {
     return 1;
 }
 
+/* Runs the inference runtime without a database. Skipped when this build or
+ * host cannot start it (ANTFLY_UNSUPPORTED). */
+static int run_inference_smoke(void) {
+    antfly_inference_options options;
+    if (expect_ok(antfly_inference_options_init(&options), "inference options init") != 0) {
+        return 1;
+    }
+    if (options.abi_size != antfly_inference_options_size()) {
+        fprintf(stderr, "inference options abi_size does not match the library\n");
+        return 1;
+    }
+    antfly_inference *inference = NULL;
+    antfly_error_code code = antfly_inference_open(&options, &inference);
+    if (code == ANTFLY_UNSUPPORTED) {
+        fprintf(stderr, "inference smoke skipped: %s\n", antfly_error_code_name(code));
+        return 0;
+    }
+    if (expect_ok(code, "inference open") != 0) {
+        return 1;
+    }
+
+    antfly_buffer chunks = {0};
+    if (expect_ok(antfly_inference_chunk_json(
+            inference,
+            slice_from_cstr("{\"input\":\"Ants live in colonies. Workers gather food.\"}"),
+            &chunks
+        ), "inference chunk") != 0) {
+        fprintf(stderr, "%.*s\n", (int)chunks.len, chunks.ptr ? (const char *)chunks.ptr : "");
+        antfly_buffer_free(&chunks);
+        antfly_inference_close(inference);
+        return 1;
+    }
+    if (!buffer_contains(chunks, "\"data\"")) {
+        antfly_inference_close(inference);
+        return fail_with_buffer("inference chunk json did not include data", &chunks);
+    }
+    antfly_buffer_free(&chunks);
+
+    antfly_buffer models = {0};
+    if (expect_ok(antfly_inference_list_models_json(inference, &models), "inference list models") != 0) {
+        antfly_buffer_free(&models);
+        antfly_inference_close(inference);
+        return 1;
+    }
+    antfly_buffer_free(&models);
+
+    antfly_inference_close(inference);
+    antfly_inference_close(inference);
+    antfly_buffer after_close = {0};
+    if (antfly_inference_list_models_json(inference, &after_close) != ANTFLY_INVALID_ARGUMENT) {
+        antfly_buffer_free(&after_close);
+        fprintf(stderr, "a closed inference handle was not rejected\n");
+        return 1;
+    }
+    return 0;
+}
+
 int main(void) {
+    if (run_inference_smoke() != 0) {
+        return 1;
+    }
     const char *path = "/tmp/antfly-c-smoke.aflite";
     const char *restored_path = "/tmp/antfly-c-smoke-restored.aflite";
     const char *snapshot_path = "/tmp/antfly-c-smoke-snapshot.aflite";

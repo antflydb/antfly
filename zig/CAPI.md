@@ -17,6 +17,8 @@ or transcribe it; the Lite bindings built on it are Apache-2.0 too. The
 - `antfly_lite_*`: operations on the `.aflite` single-file format itself
   (integrity checks, compaction, vacuum, stable snapshots), plus shortcuts
   that open one with default options.
+- `antfly_inference_*`: calls on an `antfly_inference *` handle, which runs
+  inference (embed, rerank, chunk, generate, and so on) without a database.
 
 Each operation has one name. ABI version 2 removed the earlier `antfly_lite_*`
 duplicates of storage-neutral calls and the separate Lite options struct.
@@ -85,6 +87,56 @@ Portable `.afb` backups are storage-neutral:
 A backup of either kind restores or imports into either kind.
 `antfly_db_status_json` and `antfly_db_capabilities_json` likewise report on
 any handle; the status `storage.format` is `"aflite"` or `"directory"`.
+
+## Inference
+
+`antfly_inference_open` starts the embedded inference runtime on its own,
+with no database, and returns an `antfly_inference *` handle; close it with
+`antfly_inference_close`. `antfly_inference_options` sets the models
+directory, the same resource budgets as the `inference_*_budget_mb` open
+options, and an optional per-call timeout. NULL options use the defaults.
+
+Each call takes the request JSON and returns the response JSON of the
+matching `/ai/v1` route of the inference HTTP API
+(`specs/openapi/inference/api.yaml`), dispatched in memory to the same
+handlers:
+
+| Call | Route |
+|---|---|
+| `antfly_inference_embed_json` | `POST /embed` |
+| `antfly_inference_rerank_json` | `POST /rerank` |
+| `antfly_inference_chunk_json` | `POST /chunk` |
+| `antfly_inference_generate_json` | `POST /generate` |
+| `antfly_inference_rewrite_json` | `POST /rewrite` |
+| `antfly_inference_extract_json` | `POST /extract` |
+| `antfly_inference_read_json` | `POST /read` (OCR) |
+| `antfly_inference_transcribe_json` | `POST /transcribe` |
+| `antfly_inference_list_models_json` | `GET /models` |
+
+- Images and audio go inline in the JSON, as base64 or `data:` URIs.
+- Responses are complete; a generate request with `"stream": true` fails
+  with `ANTFLY_INVALID_ARGUMENT`.
+- The output buffer holds the response body even when a call fails, so a
+  failure carries the runtime's JSON error. Free it either way. HTTP 404
+  (for example a model that is not installed) maps to `ANTFLY_NOT_FOUND`,
+  other 4xx to `ANTFLY_INVALID_ARGUMENT`, 429/503/504 and an elapsed timeout
+  to `ANTFLY_BUSY`, and 501 or 507 (the model does not fit the budgets) to
+  `ANTFLY_UNSUPPORTED`.
+- Models are not downloaded on demand. Install them with
+  `antfly inference pull <owner/name>`.
+- On backends that isolate model execution in a worker process (Metal, CUDA,
+  ONNX), the runtime runs the `antfly` executable named by
+  `ANTFLY_INFERENCE_WORKER`, else the one next to libantfly, else the first
+  on `PATH`; it must come from the same release. If the runtime cannot
+  start, open returns `ANTFLY_UNSUPPORTED`.
+
+Inference handles have the same guarantees as database handles (see Thread
+Safety): any thread may call concurrently, close waits for in-flight calls,
+and a closed handle, or a database handle passed by mistake, is rejected with
+`ANTFLY_INVALID_ARGUMENT`. They live in a separate registry with its own
+reserved address range on 64-bit POSIX targets, so there the two kinds can
+never alias. Each handle owns its own runtime and loaded models; share one
+handle rather than opening several.
 
 ## Read-Only Modes
 
