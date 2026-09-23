@@ -1003,6 +1003,7 @@ pub const BackendRuntime = struct {
     control_lane_acquisitions_total: std.atomic.Value(u64) = .init(0),
     control_lane_rejections_total: std.atomic.Value(u64) = .init(0),
     threaded_jobs: ?*ThreadedDurableJobLane = null,
+    protected_jobs_io_impl: ?*IoImpl = null,
     durable_jobs: DurableJobLane,
     db_open_configurator: ?DbOpenConfigurator = null,
 
@@ -1047,15 +1048,18 @@ pub const BackendRuntime = struct {
             } else {
                 const io_impl = try initIoLane(alloc, config.lane_limits.durable_background);
                 errdefer deinitIoLane(alloc, io_impl);
+                const protected_io_impl = try initIoLane(alloc, config.lane_limits.durable_protected);
+                errdefer deinitIoLane(alloc, protected_io_impl);
                 const threaded_network_io_vtable = try threaded_connect_io.createVTable(alloc, io_impl);
                 errdefer alloc.destroy(threaded_network_io_vtable);
                 const threaded_jobs = try alloc.create(ThreadedDurableJobLane);
                 errdefer alloc.destroy(threaded_jobs);
-                threaded_jobs.* = ThreadedDurableJobLane.init(alloc, io_impl, owner_registry);
+                threaded_jobs.* = ThreadedDurableJobLane.init(alloc, io_impl, protected_io_impl, owner_registry);
                 try threaded_jobs.start();
                 errdefer threaded_jobs.deinit();
 
                 runtime.io_impl = io_impl;
+                runtime.protected_jobs_io_impl = protected_io_impl;
                 runtime.threaded_network_io_vtable = threaded_network_io_vtable;
                 runtime.threaded_jobs = threaded_jobs;
                 runtime.durable_jobs = threaded_jobs.lane();
@@ -1114,6 +1118,10 @@ pub const BackendRuntime = struct {
             jobs.deinit();
             self.alloc.destroy(jobs);
             self.threaded_jobs = null;
+        }
+        if (self.protected_jobs_io_impl) |io_impl| {
+            deinitIoLane(self.alloc, io_impl);
+            self.protected_jobs_io_impl = null;
         }
         if (self.api_io_impl.swap(null, .acq_rel)) |io_impl| {
             deinitIoLane(self.alloc, io_impl);
@@ -1932,7 +1940,7 @@ const inline_vtable = DurableJobLane.VTable{
 };
 
 const ThreadedDurableJobLane = if (builtin.os.tag == .freestanding) struct {
-    fn init(_: Allocator, _: *IoImpl, _: *OwnerRegistry) ThreadedDurableJobLane {
+    fn init(_: Allocator, _: *IoImpl, _: *IoImpl, _: *OwnerRegistry) ThreadedDurableJobLane {
         return .{};
     }
 
@@ -1994,6 +2002,7 @@ const ThreadedDurableJobLane = if (builtin.os.tag == .freestanding) struct {
 
     alloc: Allocator,
     io_impl: *IoImpl,
+    protected_io_impl: *IoImpl,
     owners: *OwnerRegistry,
     mutex: std.atomic.Mutex = .unlocked,
     reap_mutex: std.atomic.Mutex = .unlocked,
@@ -2003,10 +2012,11 @@ const ThreadedDurableJobLane = if (builtin.os.tag == .freestanding) struct {
     reaper_future: ?Io.Future(void) = null,
     entries: std.ArrayListUnmanaged(*Entry) = .empty,
 
-    fn init(alloc: Allocator, io_impl: *IoImpl, owners: *OwnerRegistry) ThreadedDurableJobLane {
+    fn init(alloc: Allocator, io_impl: *IoImpl, protected_io_impl: *IoImpl, owners: *OwnerRegistry) ThreadedDurableJobLane {
         return .{
             .alloc = alloc,
             .io_impl = io_impl,
+            .protected_io_impl = protected_io_impl,
             .owners = owners,
         };
     }
@@ -2051,7 +2061,8 @@ const ThreadedDurableJobLane = if (builtin.os.tag == .freestanding) struct {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         try self.entries.ensureUnusedCapacity(self.alloc, 1);
-        entry.future = try self.io_impl.io().concurrent(runEntry, .{entry});
+        const job_io = if (job.class == .maintenance) self.io_impl.io() else self.protected_io_impl.io();
+        entry.future = try job_io.concurrent(runEntry, .{entry});
         self.entries.appendAssumeCapacity(entry);
     }
 
@@ -2219,7 +2230,8 @@ const ThreadedDurableJobLane = if (builtin.os.tag == .freestanding) struct {
     }
 
     fn awaitAndDestroy(self: *ThreadedDurableJobLane, entry: *Entry) void {
-        _ = entry.future.await(self.io_impl.io());
+        const job_io = if (entry.job.class == .maintenance) self.io_impl.io() else self.protected_io_impl.io();
+        _ = entry.future.await(job_io);
         if (entry.completed.swap(false, .acq_rel)) {
             _ = self.completed_count.fetchSub(1, .monotonic);
         }
@@ -3463,6 +3475,7 @@ test "backend runtime honors reduced per-lane limits under the aggregate ceiling
 
     try std.testing.expectEqual(limits, runtime.laneStats().limits);
     try std.testing.expectEqual(std.Io.Limit.limited(limits.durable_background), runtime.io_impl.?.concurrent_limit);
+    try std.testing.expectEqual(std.Io.Limit.limited(limits.durable_protected), runtime.protected_jobs_io_impl.?.concurrent_limit);
     try std.testing.expectEqual(std.Io.Limit.limited(limits.raft_inbound), runtime.raftInboundIoImpl().?.concurrent_limit);
     try std.testing.expectEqual(std.Io.Limit.limited(limits.raft_outbound), runtime.raftOutboundIoImpl().?.concurrent_limit);
     var forward_lease = try runtime.acquireRequestForwardLane();
@@ -3959,7 +3972,7 @@ test "backend runtime idle reaper waits on shutdown instead of an unconditional 
     defer io_impl.deinit();
     var owners = OwnerRegistry.init(std.testing.allocator);
     defer owners.deinit();
-    var lane = ThreadedDurableJobLane.init(std.testing.allocator, &io_impl, &owners);
+    var lane = ThreadedDurableJobLane.init(std.testing.allocator, &io_impl, &io_impl, &owners);
     defer lane.deinit();
     var probe: Probe = .{ .lane = &lane };
     var vtable = std.testing.io.vtable.*;
@@ -4035,6 +4048,82 @@ test "backend runtime durable lane deinits threaded job payload after completion
 
     try std.testing.expectEqual(@as(u32, 1), ctx.ran.load(.acquire));
     try std.testing.expectEqual(@as(u32, 1), ctx.deinits.load(.acquire));
+}
+
+test "backend runtime protected durable jobs progress under saturated maintenance workers" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const Context = struct {
+        maintenance_started: std.atomic.Value(bool) = .init(false),
+        protected_finished: std.atomic.Value(u32) = .init(0),
+        release_maintenance: Io.Event = .unset,
+
+        fn maintenance(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.maintenance_started.store(true, .release);
+            self.release_maintenance.waitUncancelable(std.testing.io);
+        }
+
+        fn protected(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.protected_finished.fetchAdd(1, .acq_rel);
+        }
+
+        fn deinit(_: *anyopaque) void {}
+    };
+
+    var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{
+        .backend = .io_threaded,
+        .lane_limits = .{ .durable_background = 2, .durable_protected = 2 },
+    });
+    defer handle.deinit();
+    var context = Context{};
+    defer context.release_maintenance.set(std.testing.io);
+    const runtime = handle.ptr();
+    try std.testing.expect(runtime.protected_jobs_io_impl.? != runtime.io_impl.?);
+    try std.testing.expectEqual(std.Io.Limit.limited(2), runtime.protected_jobs_io_impl.?.concurrent_limit);
+    const owner = try runtime.allocOwnerId();
+    try runtime.durable_jobs.submit(.{
+        .owner_id = owner,
+        .class = .maintenance,
+        .ptr = &context,
+        .run = Context.maintenance,
+        .deinit = Context.deinit,
+    });
+    const deadline = Io.Clock.Timestamp.fromNow(std.testing.io, .{ .raw = .fromSeconds(5), .clock = .awake });
+    while (!context.maintenance_started.load(.acquire)) {
+        if (Io.Clock.Timestamp.now(std.testing.io, .awake).compare(.gte, deadline)) return error.TestUnexpectedResult;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectError(error.ConcurrencyUnavailable, runtime.durable_jobs.submit(.{
+        .owner_id = owner,
+        .class = .maintenance,
+        .ptr = &context,
+        .run = Context.maintenance,
+        .deinit = Context.deinit,
+    }));
+    try runtime.durable_jobs.submit(.{
+        .owner_id = owner,
+        .class = .commit_durable,
+        .ptr = &context,
+        .run = Context.protected,
+        .deinit = Context.deinit,
+    });
+    while (context.protected_finished.load(.acquire) < 1) {
+        if (Io.Clock.Timestamp.now(std.testing.io, .awake).compare(.gte, deadline)) return error.TestUnexpectedResult;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try runtime.durable_jobs.submit(.{
+        .owner_id = owner,
+        .class = .cleanup,
+        .ptr = &context,
+        .run = Context.protected,
+        .deinit = Context.deinit,
+    });
+    while (context.protected_finished.load(.acquire) < 2) {
+        if (Io.Clock.Timestamp.now(std.testing.io, .awake).compare(.gte, deadline)) return error.TestUnexpectedResult;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(context.maintenance_started.load(.acquire));
 }
 
 test "backend runtime threaded worker releases payload before reaper joins" {

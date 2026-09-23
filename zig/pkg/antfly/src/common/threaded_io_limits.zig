@@ -34,7 +34,9 @@ pub const service: u32 = 256;
 /// redistribute capacity while keeping fixed lanes nonzero and the total
 /// bounded; dedicated workers may be disabled with a zero capacity.
 pub const backend_runtime_aggregate: u32 = service;
-pub const backend_runtime_durable_background: u32 = 48;
+pub const backend_runtime_durable_background: u32 = 40;
+/// Commit completion and required cleanup cannot queue behind maintenance.
+pub const backend_runtime_durable_protected: u32 = 8;
 pub const backend_runtime_api: u32 = 16;
 pub const backend_runtime_request_forward: u32 = 32;
 /// Request/deadline, nested connect/deadline, and socket operation/deadline.
@@ -61,6 +63,7 @@ pub const pdf_render_max_scratch_bytes: usize = pdf_render_window_scratch_bytes 
 
 pub const BackendRuntimeLaneLimits = struct {
     durable_background: u32 = backend_runtime_durable_background,
+    durable_protected: u32 = backend_runtime_durable_protected,
     api: u32 = backend_runtime_api,
     request_forward: u32 = backend_runtime_request_forward,
     raft_inbound: u32 = backend_runtime_raft_inbound,
@@ -76,6 +79,7 @@ pub const BackendRuntimeLaneLimits = struct {
 
     pub fn total(self: @This()) u64 {
         return @as(u64, self.durable_background) +
+            @as(u64, self.durable_protected) +
             @as(u64, self.api) +
             @as(u64, self.request_forward) +
             @as(u64, self.raft_inbound) +
@@ -88,6 +92,7 @@ pub const BackendRuntimeLaneLimits = struct {
 
     pub fn validate(self: @This()) !void {
         if (self.durable_background == 0 or self.durable_background > backend_runtime_aggregate or
+            self.durable_protected == 0 or self.durable_protected > backend_runtime_aggregate or
             self.api == 0 or self.api > backend_runtime_aggregate or
             self.request_forward < request_forward_workers_per_request or self.request_forward > backend_runtime_aggregate or
             self.raft_inbound == 0 or self.raft_inbound > backend_runtime_aggregate or
@@ -152,6 +157,7 @@ test "threaded io production limits are finite" {
     const runtime_limits = BackendRuntimeLaneLimits{};
     try runtime_limits.validate();
     const expected_runtime_total = @as(u64, backend_runtime_durable_background) +
+        backend_runtime_durable_protected +
         backend_runtime_api + backend_runtime_request_forward + backend_runtime_raft_inbound +
         backend_runtime_raft_outbound + backend_runtime_inference +
         backend_runtime_control + pdf_render + backend_runtime_workers;
@@ -161,7 +167,7 @@ test "threaded io production limits are finite" {
     try std.testing.expect(backend_runtime_control < backend_runtime_api);
     try std.testing.expect(backend_runtime_control < backend_runtime_durable_background);
     try (BackendRuntimeLaneLimits{
-        .durable_background = 16,
+        .durable_background = 8,
         .api = 96,
         .raft_inbound = 16,
         .raft_outbound = 16,

@@ -6,6 +6,8 @@
 //! identity and durable Raft reconciliation remain separate required proofs.
 const std = @import("std");
 const record_codec = @import("completion_control_record.zig");
+const entry_codec = @import("completion_entry.zig");
+const begin = @import("completion_control_begin.zig");
 const protocol = @import("../../common/completion_entry_protocol.zig");
 
 pub const max_owners = record_codec.max_owners;
@@ -53,6 +55,28 @@ pub const Guard = struct {
         try self.validate();
         return self;
     }
+
+    /// A checksum only binds opaque bytes. Before restoring an obligation,
+    /// prove that those bytes are the canonical fresh BEGIN described by the
+    /// immutable owner, and that its installation identity still matches.
+    pub fn validateBegin(self: Guard, alloc: std.mem.Allocator) !void {
+        try self.record.verifyOwner(self.record.authority, self.record.txn_id);
+        try self.validate();
+        var decoded = try entry_codec.decode(alloc, self.envelope);
+        defer decoded.deinit();
+        const entry = decoded.entry;
+        if (entry.kind != .mutation or entry.group_id != self.record.authority.group_id or
+            !std.mem.eql(u8, &entry.group_incarnation, &self.record.authority.incarnation) or
+            !std.mem.eql(u8, &entry.policy_digest, &self.record.authority.policy_digest) or
+            !std.mem.eql(u8, &entry.schema_catalog_digest, &self.record.authority.schema_catalog_digest))
+            return error.InvalidCompletionSlot;
+        // The envelope's txn_id is a derived physical mutation ID. The
+        // logical transaction ID is carried by the BEGIN record operation.
+        const declaration = try begin.inspect(entry.prepare_operations);
+        if (!std.mem.eql(u8, &declaration.txn_id, &self.record.txn_id) or
+            !std.meta.eql(declaration.participants, self.record.participants))
+            return error.InvalidCompletionSlot;
+    }
 };
 
 pub const Owned = struct {
@@ -84,6 +108,7 @@ pub fn load(alloc: std.mem.Allocator, storage: anytype, root: []const u8, index:
     const guard = try Guard.decode(bytes);
     if (guard.record.slot_index != index) return error.InvalidCompletionSlot;
     try guard.record.verifyOwner(authority, guard.record.txn_id);
+    try guard.validateBegin(alloc);
     return .{ .alloc = alloc, .bytes = bytes, .guard = guard };
 }
 

@@ -20,6 +20,12 @@ this requested implementation/correctness scope.
 
 ## Current work
 
+- Item 6: durable maintenance and mandatory commit/cleanup jobs now use
+  separate `BackendRuntime` executors. The fixed default budget allocates
+  40 maintenance workers and 8 protected workers within the existing 252-worker
+  aggregate. This reserves their initial dispatch/execution threads while the
+  maintenance executor is saturated. Nested I/O paths and process-wide memory,
+  storage, connection, and combined-pressure qualification remain open.
 - Item 1: retain separate durable control ownership from begin through the final
   acknowledgement, then connect its preowned compiler and DATA proposal path.
   Ordinary writes and initial begin application already have canonical plans.

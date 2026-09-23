@@ -3634,6 +3634,19 @@ test "workload admission completion compiler derives native control ownership fr
             defer alloc.free(retained);
             const restored = try guard.Guard.decode(retained);
             try std.testing.expectEqualDeep(owned_record, restored.record);
+            try restored.validateBegin(alloc);
+            var wrong_participants = owned_record;
+            wrong_participants.participants.digest[0] ^= 1;
+            try std.testing.expectError(error.InvalidCompletionSlot, (guard.Guard{
+                .record = wrong_participants,
+                .envelope = wire,
+            }).validateBegin(alloc));
+            var wrong_authority = owned_record;
+            wrong_authority.authority.schema_catalog_digest[0] ^= 1;
+            try std.testing.expectError(error.InvalidCompletionSlot, (guard.Guard{
+                .record = wrong_authority,
+                .envelope = wire,
+            }).validateBegin(alloc));
             var restored_entry = try entry.decode(alloc, restored.envelope);
             defer restored_entry.deinit();
             try std.testing.expectEqualDeep(declaration, try begin.inspect(restored_entry.entry.prepare_operations));

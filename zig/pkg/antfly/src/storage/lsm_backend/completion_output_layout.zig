@@ -13,8 +13,9 @@ pub const Held = struct {
     mask: u8 = 0,
 };
 
-/// Guard framing/installation is checked here, not consensus authority or BEGIN
-/// semantics. Actual owner restoration remains required before qualification.
+/// Guard framing, installation identity and canonical BEGIN semantics are
+/// checked here. Durable-log reconciliation and owner restoration still must
+/// establish consensus authority before these IDs can be used.
 pub fn loadHeld(alloc: std.mem.Allocator, storage: anytype, root: []const u8, authority: control_record.Authority) !Held {
     var result: Held = .{};
     for (0..capacity.control_outputs) |i| {
