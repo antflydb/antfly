@@ -103,6 +103,13 @@ pub const RequestDiagnostics = struct {
 };
 
 pub const RequestContext = struct {
+    /// A request-scoped authorization callback for logical table writes.
+    /// FK expansion can discover additional physical participants after the
+    /// primary route is authenticated, so those names must be checked here.
+    table_write_authorization: ?struct {
+        ptr: *const anyopaque,
+        allows: *const fn (*const anyopaque, []const u8) bool,
+    } = null,
     /// Set only by the administrator-authorized relational recovery routes.
     relational_recovery: enum { none, repair, retry, retire } = .none,
     relational_retirement_target: ?[]const u8 = null,

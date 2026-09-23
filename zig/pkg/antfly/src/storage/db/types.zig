@@ -1319,6 +1319,18 @@ pub const Query = union(enum) {
 };
 
 pub const LookupOptions = struct {
+    /// Private optimistic observation: captures version and SHA256 of the
+    /// exact primary bytes from one snapshot, regardless of JSON projection.
+    include_primary_digest: bool = false,
+    restore_staging_scope: ?[32]u8 = null,
+    restore_staging_plan_id: ?[16]u8 = null,
+    /// Authenticated group-local control read; never accepted by public lookup parsing.
+    relational_integrity_catalog: bool = false,
+    relational_integrity_action: bool = false,
+    relational_integrity_jobs_json: []const u8 = "",
+    relational_activation_json: []const u8 = "",
+    relational_index_status_json: []const u8 = "",
+    relational_topology_json: []const u8 = "",
     /// Borrowed synchronous read driver; never part of the transport contract.
     read_execution: ?*resource_manager_mod.DenseExecution.Runtime.Lease = null,
     fields: []const []const u8 = &.{},
@@ -1390,6 +1402,9 @@ pub const ColumnarScanStats = struct {
 };
 
 pub const ScanOptions = struct {
+    /// Schema-bound typed row query carried by the routed scan transport. It
+    /// is never interpreted as a search DSL or permitted to replace RLS filters.
+    relational_query_json: []const u8 = "",
     /// Borrowed synchronous driver. The outer streamed scan owns its parked
     /// state until every cursor/snapshot has unwound; never serialized.
     read_execution: ?*@import("../dense_execution.zig").Runtime.Lease = null,

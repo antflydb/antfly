@@ -1515,7 +1515,7 @@ fn executeMultiTableCommitOnce(
                 // Resume commit-only propagation instead of treating that
                 // terminal record as a failed fresh begin.
                 worker = worker.startRecovery();
-                const status = worker.statusGroup(
+                const status = worker.statusGroupWithRequest(
                     alloc,
                     participant.group_id,
                     participant.table_name,

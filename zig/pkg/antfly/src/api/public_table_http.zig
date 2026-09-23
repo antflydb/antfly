@@ -106,6 +106,7 @@ pub const TableApi = struct {
     pub const ExecuteBatchError = error{
         OutOfMemory,
         InvalidBatchRequest,
+        RelationalIndexKeyTooLarge,
         Forbidden,
         UnsupportedSyncLevel,
         GraphMetricFeatureNotEnabled,

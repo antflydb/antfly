@@ -7757,6 +7757,7 @@ pub const MetadataService = struct {
 };
 
 pub const MetadataHttpService = struct {
+    online_merge_runtime: ?@import("online_merge_driver.zig").Runtime = null,
     completion_activation_mutex: std.Io.Mutex = .init,
     // Protected by runtime_mutex; only the authenticated collector sets it.
     completion_activation_verified: ?[32]u8 = null,

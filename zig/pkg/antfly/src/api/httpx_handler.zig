@@ -1679,8 +1679,8 @@ pub const AntflyApiHandler = struct {
         handler: *const fn (std.mem.Allocator, []const u8, []const u8, public_table_http.TableApi) anyerror!public_table_http.OwnedResponse,
     ) !httpx.Response {
         const request_alloc = ctx.response.bodyAllocator();
-        const runtime = backend_runtime orelse return handleTableBatchInline(ctx, request_alloc, table_name, body_data, api);
-        var runtime_io = runtime.io() orelse return handleTableBatchInline(ctx, request_alloc, table_name, body_data, api);
+        const runtime = backend_runtime orelse return handleTableBatchInline(ctx, request_alloc, table_name, body_data, api, handler);
+        var runtime_io = runtime.io() orelse return handleTableBatchInline(ctx, request_alloc, table_name, body_data, api, handler);
         const Owner = @import("../common/workload_allocator.zig").Owner;
         const request_owner: ?*Owner = if (ctx.getData("antfly.workload-body-memory")) |raw| @ptrCast(@alignCast(raw)) else null;
         const job_owner = if (request_owner) |owner| owner.fork(std.heap.page_allocator) catch |err| switch (err) {
@@ -1720,7 +1720,7 @@ pub const AntflyApiHandler = struct {
             // executing synchronously is a safe bounded degradation path.
             if (err != error.ConcurrencyUnavailable)
                 std.log.warn("batch offload scheduling failed; executing inline err={s}", .{@errorName(err)});
-            return handleTableBatchInline(ctx, job_alloc, table_name, body_data, api);
+            return handleTableBatchInline(ctx, job_alloc, table_name, body_data, api, handler);
         };
         while (!job.done.load(.acquire)) {
             // The borrowed request token is consumed only by post-commit
@@ -7057,8 +7057,9 @@ pub const AntflyApiHandler = struct {
             .retry => "retryRelationalConstraints",
             .retire => "retireRelationalConstraints",
         };
-        if (try self.acquirePublicOperation(ctx, operation_id)) |response| return response;
-        defer self.releasePublicOperation(operation_id);
+        var admission_lease: ?RequestAdmission.Lease = null;
+        if (try self.acquirePublicOperation(ctx, operation_id, &admission_lease)) |response| return response;
+        defer self.releasePublicOperation(operation_id, &admission_lease);
         var request = tableMutationContext(ctx, &authenticated_identity);
         request.relational_recovery = recovery;
         const handler = switch (recovery) {
@@ -7395,8 +7396,9 @@ pub const AntflyApiHandler = struct {
         const alloc = ctx.allocator;
         const name = (try self.resolvePublicTableName(ctx, table_name, &identity)) orelse return ctx.response.build();
         defer alloc.free(name);
-        if (try self.acquirePublicOperation(ctx, "getRelationalConstraintStatus")) |response| return response;
-        defer self.releasePublicOperation("getRelationalConstraintStatus");
+        var admission_lease: ?RequestAdmission.Lease = null;
+        if (try self.acquirePublicOperation(ctx, "getRelationalConstraintStatus", &admission_lease)) |response| return response;
+        defer self.releasePublicOperation("getRelationalConstraintStatus", &admission_lease);
         const reads = self.api_server.table_reads orelse return jsonErrorResponse(ctx, 503, "constraint owners unavailable");
         const body = @import("relational_constraint_status.zig").collect(alloc, self.api_server.source, reads, name, operationContext(ctx, identity)) catch |err| switch (err) {
             error.TableNotFound => return jsonErrorResponse(ctx, 404, "not found"),

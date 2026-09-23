@@ -2357,6 +2357,7 @@ pub const ProvisionedTableWriteCache = struct {
         defer if (transition) |*guard| guard.deinit();
         try db.setResolutionCandidateSource(self.resolution_candidate_source);
         try db.setEntitySink(self.entity_sink);
+        db.setCoordinatedTtl(self.coordinated_ttl, group_id);
         if (owner_state) |state| {
             state.* = .{
                 .group_id = group_id,
@@ -2518,10 +2519,15 @@ pub const ProvisionedTableWriteCache = struct {
         candidate_source: ?db_mod.CandidateSource,
         entity_sink_value: ?db_mod.EntitySink,
         leadership_source: ?PromotionLeadershipSourceContract,
+        coordinated_ttl: ?db_mod.coordinated_ttl.Port,
     ) bool {
         return candidateSourcesEqual(self.resolution_candidate_source, candidate_source) and
             entitySinksEqual(self.entity_sink, entity_sink_value) and
-            promotionLeadershipSourcesEqual(self.promotion_leadership_source, leadership_source);
+            promotionLeadershipSourcesEqual(self.promotion_leadership_source, leadership_source) and
+            (if (self.coordinated_ttl) |left|
+                if (coordinated_ttl) |right| left.ptr == right.ptr and left.expire_fn == right.expire_fn else false
+            else
+                coordinated_ttl == null);
     }
 
     fn setRuntimeHooksLocked(
@@ -2529,8 +2535,9 @@ pub const ProvisionedTableWriteCache = struct {
         candidate_source: ?db_mod.CandidateSource,
         entity_sink_value: ?db_mod.EntitySink,
         leadership_source: ?PromotionLeadershipSourceContract,
+        coordinated_ttl: ?db_mod.coordinated_ttl.Port,
     ) !void {
-        if (self.runtimeHooksEqual(candidate_source, entity_sink_value, leadership_source)) return;
+        if (self.runtimeHooksEqual(candidate_source, entity_sink_value, leadership_source, coordinated_ttl)) return;
         const previous_resolution_candidate_source = self.resolution_candidate_source;
         errdefer self.resolution_candidate_source = previous_resolution_candidate_source;
         self.resolution_candidate_source = candidate_source;
@@ -2540,6 +2547,9 @@ pub const ProvisionedTableWriteCache = struct {
         const previous_promotion_leadership_source = self.promotion_leadership_source;
         errdefer self.promotion_leadership_source = previous_promotion_leadership_source;
         self.promotion_leadership_source = leadership_source;
+        const previous_coordinated_ttl = self.coordinated_ttl;
+        errdefer self.coordinated_ttl = previous_coordinated_ttl;
+        self.coordinated_ttl = coordinated_ttl;
         try self.refreshRuntimeHooksLocked();
     }
 
@@ -8919,6 +8929,7 @@ pub const ProvisionedTableWriteSource = struct {
         defer if (transition) |*guard| guard.deinit();
         try db.setResolutionCandidateSource(self.resolution_candidate_source);
         try db.setEntitySink(self.entity_sink);
+        db.setCoordinatedTtl(self.coordinated_ttl, group_id);
         owner_state.* = .{
             .group_id = group_id,
             .leadership_source = self.promotion_leadership_source,

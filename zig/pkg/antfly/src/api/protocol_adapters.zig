@@ -1236,6 +1236,7 @@ fn callExtensionMcpTool(alloc: std.mem.Allocator, server: anytype, authenticated
             .installed = installed,
             .parent_owner = parent_owner,
             .request_context = request_context,
+            .expected_storage_name = if (tool.member.scope.kind == .table and !std.mem.eql(u8, tool.member.table_name, tool.member.scope.table_name)) tool.member.table_name else null,
         };
         try request_context.ensureActive();
         if (wasmtime_runtime.invokeExtensionWithOptions(alloc, binding.runtime(), tool_name, request_json, .{
@@ -1283,6 +1284,8 @@ fn ExtensionHostContext(comptime Server: type, comptime Identity: type) type {
         installed: *const extension_domain.InstalledExtension,
         parent_owner: ?*@import("../common/workload_allocator.zig").Owner,
         request_context: @import("operation.zig").RequestContext,
+        expected_storage_name: ?[]const u8,
+        binding_failed: bool = false,
 
         fn dbQuery(ptr: ?*anyopaque, alloc: std.mem.Allocator, table: []const u8, query_json: []const u8) anyerror![]u8 {
             const ctx = hostContext(ptr);
@@ -1291,7 +1294,10 @@ fn ExtensionHostContext(comptime Server: type, comptime Identity: type) type {
             const table_name = try ctx.resolveTableName(table);
             const body = try extensionQueryBodyAlloc(alloc, query_json);
             defer alloc.free(body);
-            return try ctx.server.executeExtensionHostQueryWithOwner(alloc, table_name, body, ctx.authenticated_identity, ctx.parent_owner, ctx.request_context);
+            return ctx.server.executeExtensionHostQueryBoundWithOwner(alloc, table_name, body, ctx.authenticated_identity, ctx.expected_storage_name, ctx.parent_owner, ctx.request_context) catch |err| {
+                if (err == error.ExtensionTableBindingChanged) ctx.binding_failed = true;
+                return err;
+            };
         }
 
         fn dbWrite(ptr: ?*anyopaque, alloc: std.mem.Allocator, table: []const u8, writes_json: []const u8) anyerror![]u8 {
@@ -1301,7 +1307,10 @@ fn ExtensionHostContext(comptime Server: type, comptime Identity: type) type {
             const table_name = try ctx.resolveTableName(table);
             const body = try extensionBatchBodyAlloc(alloc, writes_json);
             defer alloc.free(body);
-            return try ctx.server.executeExtensionHostBatchWithOwner(alloc, table_name, body, ctx.parent_owner, ctx.request_context);
+            return ctx.server.executeExtensionHostBatchBoundWithOwner(alloc, table_name, body, ctx.authenticated_identity, ctx.expected_storage_name, ctx.parent_owner, ctx.request_context) catch |err| {
+                if (err == error.ExtensionTableBindingChanged) ctx.binding_failed = true;
+                return err;
+            };
         }
 
         fn aiEmbed(ptr: ?*anyopaque, alloc: std.mem.Allocator, _: []const u8, text: []const u8) anyerror![]f32 {

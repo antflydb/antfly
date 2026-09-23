@@ -1437,8 +1437,36 @@ pub const DBCore = struct {
         metadata_deletes: []const []const u8,
         reconciled_row_count: ?u64,
     ) !bool {
-        var completion_transition = try self.completion_eligibility.beginTransition();
-        defer completion_transition.deinit();
+        return self.commitPreparedSchemaMetadataMode(prepared, metadata_writes, metadata_deletes, reconciled_row_count, false);
+    }
+
+    /// Reinstall an exact durable schema without inventing a mutation. A
+    /// changed descriptor must use the authorized schema-update path.
+    pub fn rehydratePreparedSchemaMetadata(
+        self: *DBCore,
+        prepared: *PreparedSchemaMetadata,
+        metadata_writes: []const docstore_mod.KVPair,
+    ) !bool {
+        _ = self.commitPreparedSchemaMetadataMode(prepared, metadata_writes, &.{}, null, true) catch |err| switch (err) {
+            error.SchemaMetadataChanged => return false,
+            else => return err,
+        };
+        return true;
+    }
+
+    fn commitPreparedSchemaMetadataMode(
+        self: *DBCore,
+        prepared: *PreparedSchemaMetadata,
+        metadata_writes: []const docstore_mod.KVPair,
+        metadata_deletes: []const []const u8,
+        reconciled_row_count: ?u64,
+        rehydrate_only: bool,
+    ) !bool {
+        // An exact rehydration writes nothing. Mutable schema publication
+        // retains the transition guard through every preflight and save.
+        var completion_transition: ?@import("completion_eligibility.zig").Fence.Transition =
+            if (rehydrate_only) null else try self.completion_eligibility.beginTransition();
+        defer if (completion_transition) |*guard| guard.deinit();
         if (prepared.combined_writes.len != metadata_writes.len + 1)
             return error.InvalidSchemaUpdateRequest;
         try relational_index_catalog_mod.Controller.validateExtraMetadata(metadata_writes, metadata_deletes);
@@ -1548,6 +1576,17 @@ pub const DBCore = struct {
             }
         };
         const participants = Participants{ .prepared = prepared, .row_count = next_catalog.row_count, .namespace = self.identity_namespace };
+        const unchanged = same_active_epoch and try schema_mod.encodedSchemaMetadataUnchanged(
+            self.store,
+            self.alloc,
+            table_schema.version,
+            prepared.encoded,
+            prepared.combined_writes,
+            metadata_deletes,
+            participants,
+        );
+        if (rehydrate_only and !unchanged) return error.SchemaMetadataChanged;
+        if (unchanged) return false;
         // The current resident epoch and index snapshot were fenced above and
         // already describe these exact bytes. Keep their identities stable so
         // reopening/configuring an owner does not invalidate prepared writes.

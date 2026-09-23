@@ -109,6 +109,9 @@ pub const WalReplicaState = struct {
     store: raft_engine.core.MemoryStorage,
     applied_index: raft_engine.core.types.Index = 0,
     durable_applied_index: raft_engine.core.types.Index = 0,
+    /// State-machine completion is separate from native accepted progress.
+    completed_applied_index: raft_engine.core.types.Index = 0,
+    durable_completed_applied_index: raft_engine.core.types.Index = 0,
     /// MemoryStorage changes before WAL persistence; after a failed persistence
     /// it cannot authenticate native progress until reopened from durable WAL.
     native_progress_blocked: bool = false,

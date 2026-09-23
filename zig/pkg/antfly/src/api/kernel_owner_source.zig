@@ -167,6 +167,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     restore_descriptor_recovery: ?RestoreDescriptorRecovery = null,
     document_child_range_dispatch_source: ?table_write_source.TableWriteSource = null,
     resolution_candidate_source: ?runtime_callbacks.CandidateSource = null,
+    coordinated_ttl: ?@import("../storage/coordinated_ttl.zig").Port = null,
     deferred_runtime_hooks: bool = false,
     runtime_hooks_ready: std.atomic.Value(bool) = .init(false),
     entity_sink: ?runtime_callbacks.EntitySink = null,
@@ -2474,6 +2475,40 @@ pub const ProvisionedKernelOwnerSource = struct {
         return self.acquireDescriptorWithMode(group_id, table_name, descriptor.path, descriptor.view(), false, .resident, controls);
     }
 
+    fn acquireTransactionOwner(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_types.BatchRequest,
+        context: request_operation.RequestContext,
+    ) !Lease {
+        const controls: ReadControls = .{ .execution_deadline_ns = context.deadline_ns, .execution_io = context.deadline_io, .cancellation = context.cancellation };
+        if (req.restore_staging_scope) |scope| {
+            var descriptor = try self.resolveRestoreDescriptor(alloc, group_id, table_name, scope, req.restore_staging_plan_id, restoreDescriptorUseForBatch(req), context);
+            defer descriptor.deinit(alloc);
+            const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
+            defer alloc.free(path);
+            return self.acquireDescriptorWithMode(group_id, table_name, path, descriptor.view(), false, .resident, controls);
+        }
+        if (req.restore_staging_plan_id != null) return error.RestoreStagingScopeChanged;
+        return self.acquireWithControls(group_id, table_name, controls);
+    }
+
+    fn acquireHiddenTransactionOwner(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8) !?Lease {
+        const generation = self.visibleRootGeneration(group_id);
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        var found: ?*Entry = null;
+        for (self.entries.items) |entry| {
+            if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name) or
+                entry.retired or entry.closing or entry.generation != generation or entry.restore_bootstrap_json.len == 0) continue;
+            if (found != null) return error.CommitDecisionUnknown;
+            found = entry;
+        }
+        return if (found) |entry| try self.borrowEntryLocked(entry) else null;
+    }
+
     fn transactionRecoveryStatus(err: anyerror) abi.Status {
         return kernel_error_identity.statusFromError(err);
     }
@@ -3340,7 +3375,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 try std.Io.Dir.cwd().realPathFileAlloc(io, path, self.alloc);
         } else null;
         defer if (canonical_path) |owned| self.alloc.free(owned);
-        var cancellation = controls.cancellation orelse .none;
+        var cancellation = controls.cancellation orelse db_types.CancellationToken.none;
         const native_context = try platformDeadlineContext(.{
             .deadline_ns = controls.execution_deadline_ns,
             .deadline_io = controls.execution_io,
@@ -4752,7 +4787,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         lock(&self.mutex);
         self.completion_filesystem_io = io;
         self.mutex.unlock();
-        var lease = try self.acquireDescriptorOnce(group_id, table_name, descriptor.path, descriptor.view(), .completion_install, .resident);
+        var lease = try self.acquireDescriptorOnce(group_id, table_name, descriptor.path, descriptor.view(), .completion_install, .resident, .{});
         defer lease.deinit();
         try lease.owner().installCompletion(.{ .binding = record.binding, .schema_json = .fromSlice(schema_json), .read_schema_json = .fromSlice(record.read_schema_json), .indexes_json = .fromSlice(indexes_json), .settings_json = .fromSlice(record.settings_json) });
         // Native install is still hidden behind state.installing. Persist the
@@ -6562,7 +6597,7 @@ test "workload admission completion installation pins owner through ordinary ret
     try std.testing.expectEqual(@as(usize, 0), source.retireTable("docs"));
     try std.testing.expect(!entry.retired);
     try std.testing.expectError(error.PreparedCompletionActive, source.registerPublication(7, "docs"));
-    try std.testing.expectError(error.PreparedCompletionActive, source.acquireDescriptorOnce(7, "docs", "/unused", .{ .lsm_root_generation = 2, .identity = entry.identity }, .shared, .resident));
+    try std.testing.expectError(error.PreparedCompletionActive, source.acquireDescriptorOnce(7, "docs", "/unused", .{ .lsm_root_generation = 2, .identity = entry.identity }, .shared, .resident, .{}));
     try std.testing.expectEqual(@as(usize, 1), source.entries.items.len);
     source.quiescing = true;
     try std.testing.expect(!source.installationPinsOwnerLocked(7));

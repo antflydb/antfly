@@ -353,7 +353,7 @@ pub const TransitionCommand = union(enum) {
         switch (self.*) {
             .apply_restore_staging => |bytes| alloc.free(bytes),
             .upsert_schema_progress_batch => |records| alloc.free(records),
-            .activate_topology_protocol, .apply_completion_activation, .apply_system_catalog, .apply_store_report_update, .apply_store_report_baseline => |bytes| alloc.free(bytes),
+            .publish_secret_collection, .activate_topology_protocol, .apply_completion_activation, .apply_system_catalog, .apply_store_report_update, .apply_store_report_baseline => |bytes| alloc.free(bytes),
             .upsert_node, .register_node => |*record| {
                 metadata_table_manager.freeNode(alloc, record.*);
             },
@@ -9406,6 +9406,21 @@ pub const RaftApplyStore = struct {
     fn applyTransitionCommandTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, command: TransitionCommand) !void {
         try validateTransitionCommandDataGroupIds(command);
         switch (command) {
+            .apply_restore_staging => |bytes| try self.applyRestoreStagingTxn(txn, group_id, bytes),
+            .publish_secret_collection => |bytes| {
+                const publication = try secret_store.decodePublication(self.alloc, bytes);
+                var key_buf: [256]u8 = undefined;
+                const key = try secret_store.keyForScope(&key_buf, group_id, publication.scope);
+                const old = txn.get(key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                var view = try secret_collection.decode(self.alloc, publication.scope, old);
+                defer view.deinit(self.alloc);
+                if (view.revision != publication.expected_revision) return;
+                try txn.put(key, publication.bytes);
+                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+            },
             .apply_completion_activation => |bytes| try self.applyCompletionActivationTxn(txn, group_id, bytes),
             .activate_topology_protocol => |bytes| {
                 var parsed = try std.json.parseFromSlice(topology_protocol.Activation, self.alloc, bytes, .{});
@@ -13231,14 +13246,14 @@ fn storeRuntimeStatusRecordVersion(record: metadata.StoreRecord) ?u16 {
 }
 
 const TransitionTag = enum(u8) {
-    apply_completion_activation = 60,
+    apply_completion_activation = 66,
     upsert_schema_progress_batch = 59,
     activate_topology_protocol = 57,
     apply_system_catalog = 54,
     upsert_store_heartbeat = 55,
     apply_store_report_update = 56,
     apply_store_report_baseline = 58,
-    // Tag 60 is published on main for secrets; restore staging is new in this PR.
+    publish_secret_collection = 60,
     apply_restore_staging = 65,
     initialize_metadata_incarnation = 45,
     upsert_node = 1,
@@ -13304,6 +13319,16 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
 
     try out.appendSlice(alloc, transition_magic);
     switch (command) {
+        .apply_restore_staging => |bytes| {
+            if (bytes.len == 0 or bytes.len > restore_staging.max_encoded_bytes) return error.InvalidRestoreStaging;
+            try out.append(alloc, @intFromEnum(TransitionTag.apply_restore_staging));
+            try appendRequiredString(alloc, &out, bytes);
+        },
+        .publish_secret_collection => |bytes| {
+            _ = try secret_store.decodePublication(alloc, bytes);
+            try out.append(alloc, @intFromEnum(TransitionTag.publish_secret_collection));
+            try appendRequiredString(alloc, &out, bytes);
+        },
         .apply_completion_activation => |bytes| {
             if (bytes.len > completion_activation.max_encoded_bytes) return error.InvalidCompletionActivation;
             try out.append(alloc, @intFromEnum(TransitionTag.apply_completion_activation));
@@ -13662,6 +13687,20 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
     pos += 1;
 
     return switch (tag) {
+        .apply_restore_staging => blk: {
+            const bytes = try readRequiredString(alloc, encoded, &pos);
+            errdefer alloc.free(bytes);
+            if (pos != encoded.len or bytes.len > restore_staging.max_encoded_bytes) return error.InvalidMetadataTransitionEncoding;
+            break :blk .{ .apply_restore_staging = bytes };
+        },
+        .publish_secret_collection => blk: {
+            if (encoded.len > secret_store.max_command_bytes + 16) return error.CorruptInput;
+            const bytes = try readRequiredString(alloc, encoded, &pos);
+            errdefer alloc.free(bytes);
+            if (pos != encoded.len) return error.CorruptInput;
+            _ = try secret_store.decodePublication(alloc, bytes);
+            break :blk .{ .publish_secret_collection = bytes };
+        },
         .apply_completion_activation => blk: {
             if (encoded.len > completion_activation.max_encoded_bytes + 16) return error.InvalidCompletionActivation;
             const bytes = try readRequiredString(alloc, encoded, &pos);
@@ -22244,7 +22283,7 @@ test "metadata raft apply store fences exact cutover authority and retirement" {
     );
 }
 
-test "metadata raft apply store transition codec keeps published secrets distinct from restore staging" {
+test "metadata raft apply store transition codec keeps secrets restore and completion tags distinct" {
     const alloc = std.testing.allocator;
     const collection = try secret_collection.replace(alloc, std.testing.io, "default", .{ .revision = 0, .entries = &.{} }, "removed", null);
     defer alloc.free(collection);
@@ -22263,6 +22302,13 @@ test "metadata raft apply store transition codec keeps published secrets distinc
     var restore_command = (try decodeTransitionCommand(alloc, restore_wire)).?;
     defer restore_command.deinit(alloc);
     try std.testing.expectEqualStrings("{}", restore_command.apply_restore_staging);
+
+    const completion_wire = try encodeTransitionCommand(alloc, .{ .apply_completion_activation = "completion" });
+    defer alloc.free(completion_wire);
+    try std.testing.expectEqual(@as(u8, 66), completion_wire[transition_magic.len]);
+    var completion_command = (try decodeTransitionCommand(alloc, completion_wire)).?;
+    defer completion_command.deinit(alloc);
+    try std.testing.expectEqualStrings("completion", completion_command.apply_completion_activation);
 }
 
 test "metadata raft apply store transition codec preserves exact raft voter identity" {

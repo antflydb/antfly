@@ -4485,6 +4485,117 @@ pub fn metadataApplyStoreProjection(
     const handle = asMetadataApplyStore(store_ptr) orelse return .invalid_argument;
     const alloc = handle.alloc;
     return switch (request.kind) {
+        .flush_ha_outbox => blk: {
+            handle.store.flushHAOutbox() catch |err| break :blk storageOwnerStatusFromError(err);
+            break :blk metadataProjectionJson(alloc, out_json, true);
+        },
+        .apply_ha_record => blk: {
+            if (request.key.len > 2 * 1024 * 1024) break :blk .invalid_argument;
+            const record = antfly.capi_dependencies.storage_hot_standby_replication_record.decode(request.key.slice()) catch |err| break :blk storageOwnerStatusFromError(err);
+            handle.store.applyHARecord(record) catch |err| break :blk storageOwnerStatusFromError(err);
+            break :blk metadataProjectionJson(alloc, out_json, true);
+        },
+        .export_ha_checkpoint, .import_ha_checkpoint => blk: {
+            const path = request.key.slice();
+            if (path.len == 0 or path.len > 4096 or std.mem.indexOfScalar(u8, path, 0) != null) break :blk .invalid_argument;
+            const io = handle.store.io_impl.io();
+            if (request.kind == .export_ha_checkpoint) {
+                const value = handle.store.exportHACheckpoint(io, path) catch |err| break :blk storageOwnerStatusFromError(err);
+                break :blk metadataProjectionJson(alloc, out_json, value);
+            }
+            handle.store.importHACheckpoint(io, path, request.arg0) catch |err| break :blk storageOwnerStatusFromError(err);
+            break :blk metadataProjectionJson(alloc, out_json, true);
+        },
+        .migrate_standalone_restore_jobs => blk: {
+            if (request.key.len > 64 * 1024 * 1024) break :blk .invalid_argument;
+            var rows = std.json.parseFromSlice([]const metadata_raft_apply.RaftApplyStore.RestoreJobRow, alloc, request.key.slice(), .{}) catch |err| break :blk storageOwnerStatusFromError(err);
+            defer rows.deinit();
+            handle.store.migrateStandaloneRestoreJobs(rows.value) catch |err| break :blk storageOwnerStatusFromError(err);
+            break :blk metadataProjectionJson(alloc, out_json, true);
+        },
+        .backup_cohort => blk: {
+            const value = handle.store.getBackupCohort(alloc, request.group_id, request.arg0) catch |err| break :blk storageOwnerStatusFromError(err);
+            defer if (value) |bytes| alloc.free(bytes);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .backup_cohort_progress => blk: {
+            const value = handle.store.getBackupCohortProgress(alloc, request.group_id, request.arg0) catch |err| break :blk storageOwnerStatusFromError(err);
+            defer if (value) |bytes| alloc.free(bytes);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .backup_cohorts => blk: {
+            if (request.arg1 > 1) break :blk .invalid_argument;
+            const value = handle.store.listBackupCohorts(alloc, request.group_id, if (request.arg1 == 0) null else request.key.slice(), std.math.cast(usize, request.arg0) orelse break :blk .invalid_argument) catch |err| break :blk storageOwnerStatusFromError(err);
+            defer antfly.capi_dependencies.storage_docstore.DocStore.freeResults(alloc, value);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .provisioning_catalog => blk: {
+            var value = handle.store.captureProvisioningCatalog(alloc, request.group_id) catch |err| break :blk storageOwnerStatusFromError(err);
+            defer value.deinit(alloc);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .relational_topology_protocol_activation_version => blk: {
+            const value = handle.store.getRelationalTopologyProtocolActivationVersion(request.group_id) catch |err| break :blk storageOwnerStatusFromError(err);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .resolve_table_create_identity => blk: {
+            const value = handle.store.resolveTableCreateIdentity(request.group_id, request.arg0) catch |err| break :blk storageOwnerStatusFromError(err);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .standalone_catalog => blk: {
+            const value = (if (request.arg0 == 1) handle.store.loadStandaloneCatalogSnapshot(alloc) else handle.store.loadStandaloneCatalog(alloc)) catch |err| break :blk storageOwnerStatusFromError(err);
+            defer if (value) |bytes| alloc.free(bytes);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .standalone_revision => blk: {
+            const value = handle.store.standaloneRevision() catch |err| break :blk storageOwnerStatusFromError(err);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .restore_staging_job => blk: {
+            if (request.key.len != 16) break :blk .invalid_argument;
+            var value = (handle.store.loadRestoreStaging(alloc, request.group_id, request.key.slice()[0..16].*) catch |err| break :blk storageOwnerStatusFromError(err)) orelse break :blk metadataProjectionJson(alloc, out_json, @as(?u8, null));
+            defer value.deinit();
+            break :blk metadataProjectionJson(alloc, out_json, value.value);
+        },
+        .restore_staging_owner_job => blk: {
+            var value = (handle.store.loadRestoreStagingForOwner(alloc, request.group_id, request.arg0) catch |err| break :blk storageOwnerStatusFromError(err)) orelse break :blk metadataProjectionJson(alloc, out_json, @as(?u8, null));
+            defer value.deinit();
+            break :blk metadataProjectionJson(alloc, out_json, value.value);
+        },
+        .restore_staging_authority_allowed => blk: {
+            if (request.key.len != 16) break :blk .invalid_argument;
+            const owner_group: ?u64 = if (request.arg1 == 0) null else request.arg1;
+            const value = handle.store.restoreStagingAuthorityAllowed(alloc, request.group_id, request.key.slice()[0..16].*, request.arg0, owner_group) catch |err| break :blk storageOwnerStatusFromError(err);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .restore_staging_progress, .restore_staging_receipt => blk: {
+            if (request.key.len != 16) break :blk .invalid_argument;
+            const id = request.key.slice()[0..16].*;
+            if (request.kind == .restore_staging_progress) {
+                const value = handle.store.loadRestoreStagingProgress(alloc, request.group_id, id) catch |err| break :blk storageOwnerStatusFromError(err);
+                break :blk metadataProjectionJson(alloc, out_json, value);
+            }
+            const state = std.enums.fromInt(antfly.capi_dependencies.metadata_restore_staging.State, request.arg0) orelse break :blk .invalid_argument;
+            const value = handle.store.loadRestoreStagingReceipt(alloc, request.group_id, id, state, request.arg1) catch |err| break :blk storageOwnerStatusFromError(err);
+            defer if (value) |bytes| alloc.free(bytes);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .standalone_command => blk: {
+            const physical = antfly.capi_dependencies.metadata_storage_raft_apply_store;
+            if (request.key.len > 32 * 1024 * 1024) break :blk .invalid_argument;
+            var command = (physical.decodeTransitionCommand(alloc, request.key.slice()) catch |err| break :blk storageOwnerStatusFromError(err)) orelse break :blk .invalid_argument;
+            defer command.deinit(alloc);
+            handle.store.applyStandaloneCommand(request.group_id, command) catch |err| break :blk storageOwnerStatusFromError(err);
+            break :blk metadataProjectionJson(alloc, out_json, true);
+        },
+        .replace_standalone_catalog => blk: {
+            if (request.key.len > 64 * 1024 * 1024) break :blk .invalid_argument;
+            const Input = antfly.capi_dependencies.metadata_storage_raft_apply_contract.StandaloneCatalogUpdate;
+            var input = std.json.parseFromSlice(Input, alloc, request.key.slice(), .{}) catch |err| break :blk storageOwnerStatusFromError(err);
+            defer input.deinit();
+            handle.store.updateStandaloneCatalog(request.group_id, request.arg0, input.value) catch |err| break :blk storageOwnerStatusFromError(err);
+            break :blk metadataProjectionJson(alloc, out_json, true);
+        },
         .capture_completion_activation, .completion_activation, .completion_installation_response => blk: {
             // These are coherent metadata observations, never backing proof.
             // Decode and collect in finite owner scratch across the C boundary.

@@ -693,9 +693,8 @@ fn executeInternal(
         return error.InvalidRetrievalAgentRequest;
     };
     defer parsed.deinit();
-    const request = try retrieval_plan.fromPublic(alloc, parsed.value);
+    const request = parsed.value;
     const normalized_queries = @constCast(request.queries);
-    defer alloc.free(normalized_queries);
 
     var parsed_raw = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| {
         if (err == error.OutOfMemory) return err;

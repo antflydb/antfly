@@ -59,6 +59,14 @@ pub fn ensurePreDecisionContextActive(context: PreDecisionContext) !void {
     }
 }
 
+/// Authenticated private recovery observation. A locator is never authority by
+/// itself: hidden owner handlers validate the exact plan and scope together.
+pub const TxnStatusRequest = struct {
+    txn_id: db_types.TxnId,
+    restore_staging_scope: ?[32]u8 = null,
+    restore_staging_plan_id: ?[16]u8 = null,
+};
+
 pub const TableCommitRequest = struct {
     table_name: []const u8,
     relational_schema_version: ?u32 = null,

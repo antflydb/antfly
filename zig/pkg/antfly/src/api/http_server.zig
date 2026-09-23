@@ -8306,6 +8306,7 @@ pub const ApiHttpServer = struct {
             snapshot = legacy.?;
         }
         if (tables_api.findTableByName(&snapshot, table_name) == null) return null;
+        try self.projectSnapshotForeignKeyNames(arena.allocator(), context, &snapshot);
         var storage_status_buf: [1]tables_api.TableStorageStatus = undefined;
         const storage_statuses = if (include_runtime) try self.bestEffortSingleTableStorageStatuses(table_name, &snapshot, &storage_status_buf) else null;
         const observed: []table_reads.ObservedDynamicFieldCapabilitySet = if (storage_statuses != null) observations: {
@@ -12423,9 +12424,6 @@ pub const ApiHttpServer = struct {
                 return error.WriteUnavailable;
             },
             error.CommitDecisionUnknown => return error.OutcomeUnknown,
-            // Only the read-only planner emits this pre-decision marker.
-            // A timeout from commit itself does not prove that nothing wrote.
-            error.PreDecisionDeadlineExceeded => return error.DeadlineExceeded,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
             error.ResourceBudgetExceeded,
@@ -15053,6 +15051,57 @@ pub const ApiHttpServer = struct {
         return std.json.Stringify.valueAlloc(alloc, document, .{});
     }
 
+    /// Project immutable FK storage identities back to namespace-relative
+    /// names at the public boundary. Missing bindings fail closed: returning
+    /// a physical name would expose an implementation detail and invite a
+    /// client to submit a schema that cannot be bound again.
+    pub fn projectForeignKeyNames(self: *ApiHttpServer, alloc: std.mem.Allocator, context: api_operation.RequestContext, schema_json: []const u8) ![]u8 {
+        if (self.source.vtable.system_catalog == null) return alloc.dupe(u8, schema_json);
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var document = try std.json.parseFromSliceLeaky(std.json.Value, a, schema_json, .{ .allocate = .alloc_always, .parse_numbers = false });
+        if (document != .object) return error.InvalidCatalogRecord;
+        const foreign = document.object.getPtr("foreign_keys") orelse return alloc.dupe(u8, schema_json);
+        if (foreign.* == .null) return alloc.dupe(u8, schema_json);
+        if (foreign.* != .array or foreign.array.items.len > 256) return error.InvalidCatalogRecord;
+        const names = try a.alloc([]const u8, foreign.array.items.len);
+        for (foreign.array.items, names) |fk, *name| {
+            if (fk != .object) return error.InvalidCatalogRecord;
+            const parent = fk.object.get("parent_table") orelse return error.InvalidCatalogRecord;
+            if (parent != .string) return error.InvalidCatalogRecord;
+            name.* = parent.string;
+        }
+        const logical = try self.logicalTableNamesInArena(a, context, names);
+        for (foreign.array.items, logical) |*fk, name| {
+            const parent = fk.object.getPtr("parent_table").?;
+            parent.* = .{ .string = (try system_catalog.Target.parse(name)).table };
+        }
+        return std.json.Stringify.valueAlloc(alloc, document, .{});
+    }
+
+    fn projectSnapshotForeignKeyNames(self: *ApiHttpServer, alloc: std.mem.Allocator, context: api_operation.RequestContext, snapshot: *metadata_api.AdminSnapshot) !void {
+        if (self.source.vtable.system_catalog == null) return;
+        var needs_projection = false;
+        for (snapshot.tables) |table| {
+            if (std.mem.indexOf(u8, table.schema_json, "\"foreign_keys\"") != null or
+                std.mem.indexOf(u8, table.read_schema_json, "\"foreign_keys\"") != null)
+            {
+                needs_projection = true;
+                break;
+            }
+        }
+        if (!needs_projection) return;
+        const projected = try alloc.dupe(metadata_table_manager.TableRecord, snapshot.tables);
+        for (projected) |*table| {
+            if (std.mem.indexOf(u8, table.schema_json, "\"foreign_keys\"") != null)
+                table.schema_json = try self.projectForeignKeyNames(alloc, context, table.schema_json);
+            if (std.mem.indexOf(u8, table.read_schema_json, "\"foreign_keys\"") != null)
+                table.read_schema_json = try self.projectForeignKeyNames(alloc, context, table.read_schema_json);
+        }
+        snapshot.tables = projected;
+    }
+
     /// Called only after the request's complete FK parent-admin check. Every
     /// parent mutation uses the same exact definition CAS as /indexes; failed
     /// child admission leaves discoverable owned definitions for maintenance.
@@ -17573,6 +17622,24 @@ pub const ApiHttpServer = struct {
         return try result_alloc.dupe(u8, response.body);
     }
 
+    pub fn executeExtensionHostBatchBoundWithOwner(
+        self: *ApiHttpServer,
+        result_alloc: std.mem.Allocator,
+        public_name: []const u8,
+        body: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+        expected_storage_name: ?[]const u8,
+        parent: ?*@import("../common/workload_allocator.zig").Owner,
+        request_context: api_operation.RequestContext,
+    ) ![]u8 {
+        if (authenticated_identity) |identity| if (!permissionsAllow(identity.permissions, .table, public_name, .write)) return error.Forbidden;
+        var catalog_identity = try cloneCatalogIdentity(self.alloc, authenticated_identity);
+        defer if (catalog_identity) |*owned| owned.deinit(self.alloc);
+        const physical = try self.resolveExtensionHostTableAlloc(public_name, expected_storage_name, &catalog_identity);
+        defer self.alloc.free(physical);
+        return self.executeExtensionHostBatchWithOwner(result_alloc, physical, body, parent, request_context);
+    }
+
     pub fn executeExtensionHostQuery(
         self: *ApiHttpServer,
         result_alloc: std.mem.Allocator,
@@ -17636,6 +17703,24 @@ pub const ApiHttpServer = struct {
         );
         defer query_response.deinit(alloc);
         return try result_alloc.dupe(u8, query_response.json);
+    }
+
+    pub fn executeExtensionHostQueryBoundWithOwner(
+        self: *ApiHttpServer,
+        result_alloc: std.mem.Allocator,
+        public_name: []const u8,
+        body: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+        expected_storage_name: ?[]const u8,
+        parent: ?*@import("../common/workload_allocator.zig").Owner,
+        request_context: api_operation.RequestContext,
+    ) ![]u8 {
+        if (authenticated_identity) |identity| if (!permissionsAllow(identity.permissions, .table, public_name, .read)) return error.Forbidden;
+        var catalog_identity = try cloneCatalogIdentity(self.alloc, authenticated_identity);
+        defer if (catalog_identity) |*owned| owned.deinit(self.alloc);
+        const physical = try self.resolveExtensionHostTableAlloc(public_name, expected_storage_name, &catalog_identity);
+        defer self.alloc.free(physical);
+        return self.executeExtensionHostQueryWithOwner(result_alloc, physical, body, catalog_identity, parent, request_context);
     }
 
     fn resolveExtensionHostTableAlloc(
@@ -17839,6 +17924,7 @@ pub const ApiHttpServer = struct {
             snapshot = selected.snapshot;
             labels = selected.labels;
         }
+        try self.projectSnapshotForeignKeyNames(arena, context, &snapshot);
         const storage_statuses = try self.collectTableStorageStatuses(alloc, &snapshot, null);
         defer if (storage_statuses) |items| tables_api.freeTableStorageStatuses(alloc, items);
         var definitions: tables_api.DefinitionCache.Leases = .{ .cache = &self.table_definition_cache, .alloc = alloc, .cache_alloc = self.owner_alloc };

@@ -1416,6 +1416,18 @@ const RaftTableApplyStateMachine = struct {
         transaction_recovery_capacity_exhausted,
         invalid_batch_request,
         invalid_participant,
+        integrity_topology_busy,
+        integrity_topology_changed,
+        integrity_topology_completed,
+        integrity_handoff_incomplete,
+        integrity_handoff_sequence_changed,
+        integrity_handoff_destination_reset_required,
+        RelationalExpressionOverflow,
+        RelationalExpressionDivisionByZero,
+        RelationalExpressionBudgetExceeded,
+        InvalidRelationalExpressionInput,
+        InvalidRelationalGeneratedValue,
+        GeneratedColumnRewriteRequired,
 
         fn fromError(err: anyerror) ?ExpectedApplyFailure {
             inline for (@typeInfo(@import("../storage/db/online_source_contract.zig").Rejection).error_set.?) |field| {
@@ -1448,6 +1460,21 @@ const RaftTableApplyStateMachine = struct {
                 // An ACK naming an unenlisted participant is invalid input.
                 // Replaying the same committed command cannot make it valid.
                 error.InvalidParticipant => .invalid_participant,
+                error.IntegrityTopologyBusy, error.TransactionTopologyBusy => .integrity_topology_busy,
+                error.IntegrityTopologyChanged, error.IntegrityTopologyFenceMissing => .integrity_topology_changed,
+                error.IntegrityTopologyCompleted => .integrity_topology_completed,
+                error.IntegrityHandoffMissing, error.IntegrityHandoffIncomplete, error.SplitBootstrapIncomplete, error.MergeTransitionNotReady => .integrity_handoff_incomplete,
+                error.IntegrityHandoffSequenceChanged => .integrity_handoff_sequence_changed,
+                error.IntegrityHandoffDestinationResetRequired => .integrity_handoff_destination_reset_required,
+                error.InvalidIntegrityTopologyFence,
+                error.IntegrityTopologyCutoverRequired,
+                error.IntegrityHandoffCollision,
+                error.IntegrityHandoffTooLarge,
+                error.IntegrityRecordTooLarge,
+                error.InvalidIntegrityKey,
+                error.InvalidRange,
+                error.IdentityNamespaceMismatch,
+                => .invalid_batch_request,
                 else => null,
             };
         }
@@ -1475,6 +1502,13 @@ const RaftTableApplyStateMachine = struct {
                 .transaction_recovery_capacity_exhausted => error.TransactionRecoveryCapacityExhausted,
                 .invalid_batch_request => error.InvalidBatchRequest,
                 .invalid_participant => error.InvalidParticipant,
+                .integrity_topology_busy => error.IntegrityTopologyBusy,
+                .integrity_topology_changed => error.IntegrityTopologyChanged,
+                .integrity_topology_completed => error.IntegrityTopologyCompleted,
+                .integrity_handoff_incomplete => error.IntegrityHandoffIncomplete,
+                .integrity_handoff_sequence_changed => error.IntegrityHandoffSequenceChanged,
+                .integrity_handoff_destination_reset_required => error.IntegrityHandoffDestinationResetRequired,
+                else => unreachable, // Stable semantic cases handled above.
             };
         }
 
@@ -1518,6 +1552,9 @@ const RaftTableApplyStateMachine = struct {
     /// paths cannot open competing physical DB owners.
     kernel_owner_source: ?*antfly.public_api.ProvisionedKernelOwnerSource = null,
     completion_host: ?*antfly.raft.Host = null,
+    /// Borrowed from the managed host, which applies the raw projection first.
+    /// Its exact-index arbitration receipt also survives a delegate retry.
+    topology_apply_store: ?*DataRaftApplyStore = null,
     applied_mutex: std.atomic.Mutex = .unlocked,
     applied_indexes: std.AutoHashMapUnmanaged(u64, u64) = .empty,
     retry_apply_checkpoints: std.AutoHashMapUnmanaged(u64, RetryApplyCheckpoint) = .empty,

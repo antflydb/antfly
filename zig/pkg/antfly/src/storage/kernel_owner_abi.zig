@@ -563,11 +563,34 @@ pub const MetadataProjectionKind = enum(u32) {
     table_restore_admission = 38,
     verify_table_create_projection = 39,
     system_catalog = 41,
+    /// Opaque binary AFSC bytes (empty = absent), unlike JSON projections.
+    secret_collection = 42,
+    backup_cohort_progress = 43,
+    backup_cohorts = 44,
+    restore_staging_job = 45,
+    restore_staging_owner_job = 46,
+    restore_staging_progress = 47,
+    restore_staging_receipt = 48,
+    provisioning_catalog = 49,
+    relational_topology_protocol_activation_version = 50,
+    resolve_table_create_identity = 51,
+    standalone_command = 52,
+    standalone_catalog = 53,
+    standalone_revision = 54,
+    replace_standalone_catalog = 55,
+    flush_ha_outbox = 56,
+    apply_ha_record = 57,
+    export_ha_checkpoint = 58,
+    import_ha_checkpoint = 59,
+    migrate_standalone_restore_jobs = 60,
+    restore_staging_authority_allowed = 61,
+    merge_transition = 62,
+    backup_cohort = 63,
     /// Completion projections return bounded raw owned bytes, without an
     /// additional JSON-string envelope around the already encoded record.
-    capture_completion_activation = 42,
-    completion_activation = 43,
-    completion_installation_response = 44,
+    capture_completion_activation = 64,
+    completion_activation = 65,
+    completion_installation_response = 66,
 };
 
 pub const MetadataHABindRequest = extern struct {
