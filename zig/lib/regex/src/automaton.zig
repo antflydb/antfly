@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! NFA-based regex engine implementing the vellum Automaton interface.
+//! NFA-based regex engine implementing the `fst.Automaton` interface.
 //!
 //! Uses Thompson's NFA construction for regex → NFA, then on-the-fly
 //! DFA construction (powerset/subset construction) for efficient FST
@@ -34,7 +34,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const vellum = @import("antfly_vellum");
+const fst = @import("antfly_fst");
 
 const dead_state = std.math.maxInt(usize);
 const transition_unknown = dead_state - 1;
@@ -126,8 +126,8 @@ pub const RegexAutomaton = struct {
         self.dfa_cache_transitions.deinit(self.alloc);
     }
 
-    /// Get a vellum.Automaton interface for FST traversal.
-    pub fn automaton(self: *RegexAutomaton) vellum.Automaton {
+    /// Get an fst.Automaton interface for FST traversal.
+    pub fn automaton(self: *RegexAutomaton) fst.Automaton {
         return .{
             .ptr = @ptrCast(self),
             .vtable = &.{

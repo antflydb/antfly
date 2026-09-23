@@ -15,7 +15,7 @@
 //! Persistent full-text index catalog with WAL for crash safety.
 //!
 //! Wraps IndexWriter (in-memory) with durable metadata. Full-text segment bytes
-//! are immutable AFSM/zapx-style files when a host file store is available; the
+//! are immutable AFSM segment files when a host file store is available; the
 //! metadata backend tracks active segment ids, ranges, deletions, and committed
 //! WAL state. The WAL ensures that in-flight batches survive crashes. On
 //! recovery, the WAL is replayed to reconstruct any batches that were written

@@ -12,10 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Vellum-compatible FST (Finite State Transducer) implementation.
+//! FST (Finite State Transducer) implementation.
 //!
-//! Wire-compatible with github.com/blevesearch/vellum v1 format.
-//! Supports building FSTs from sorted key/value pairs, exact lookup,
+//! Originally ported from Bleve's vellum, which was itself inspired by Andrew
+//! Gallant's "Index 1,600,000,000 Keys with Automata and Rust"
+//! (https://burntsushi.net/transducers/). The on-disk format is still vellum's
+//! v1 format. Supports building FSTs from sorted key/value pairs, exact lookup,
 //! range iteration, and automaton-based search.
 //!
 //! File layout:
@@ -46,7 +48,7 @@ const none_addr: usize = 1;
 const empty_addr: usize = 0;
 
 // ============================================================================
-// Common input encoding (Vellum-compatible byte frequency table)
+// Common input encoding (byte frequency table)
 // ============================================================================
 
 /// Maps byte value → common code. 0 means uncommon.
@@ -400,7 +402,7 @@ const Registry = struct {
     }
 };
 
-/// Builds a Vellum-compatible FST. Keys must be inserted in lexicographic order.
+/// Builds an FST. Keys must be inserted in lexicographic order.
 pub const Builder = struct {
     alloc: Allocator,
     stack: std.ArrayListUnmanaged(BuilderNodeUnfinished),

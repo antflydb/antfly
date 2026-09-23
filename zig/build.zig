@@ -402,8 +402,8 @@ pub fn create(b: *std.Build) ?Artifacts {
     usermgr_test_storage_mod.addImport("antfly_root", usermgr_mod);
     usermgr_test_storage_mod.addImport("antfly_platform", platform_mod);
     usermgr_mod.addImport("usermgr_storage", usermgr_test_storage_mod);
-    const vellum_mod = b.createModule(.{
-        .root_source_file = b.path("lib/vellum/src/mod.zig"),
+    const fst_mod = b.createModule(.{
+        .root_source_file = b.path("lib/fst/src/mod.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -412,7 +412,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .target = target,
         .optimize = optimize,
     });
-    regex_mod.addImport("antfly_vellum", vellum_mod);
+    regex_mod.addImport("antfly_fst", fst_mod);
     const jsonschema_mod = b.createModule(.{
         .root_source_file = b.path("lib/jsonschema/src/mod.zig"),
         .target = target,
@@ -590,7 +590,7 @@ pub fn create(b: *std.Build) ?Artifacts {
             .json = json_mod,
             .httpx = httpx_mod,
             .platform = platform_mod,
-            .vellum = vellum_mod,
+            .fst = fst_mod,
             .scraping = scraping_mod,
             .google = google_mod,
             .objectstore = objectstore_mod,
@@ -750,7 +750,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .matcher = matcher_mod,
         .resolver = resolver_mod,
         .casbin = casbin_mod,
-        .vellum = vellum_mod,
+        .fst = fst_mod,
         .regex = regex_mod,
         .json = json_mod,
         .jsonschema = jsonschema_mod,
@@ -1303,7 +1303,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .optimize = optimize,
     });
     regex_bench_mod.addImport("antfly_regex", regex_mod);
-    regex_bench_mod.addImport("antfly_vellum", vellum_mod);
+    regex_bench_mod.addImport("antfly_fst", fst_mod);
     const regex_bench = b.addExecutable(.{
         .name = "regex_bench",
         .root_module = regex_bench_mod,
