@@ -21,8 +21,8 @@
 // - `language_model.model.decoder.*`
 //
 // The vision tower is hybrid: conv/window/channel pieces run in Zig over f32
-// buffers, while dense linear, attention, GELU, and LayerNorm use the active
-// ComputeBackend so the same code works for native .
+// buffers, while dense linear, attention, exact-erf GELU, and LayerNorm use
+// the active ComputeBackend so the same code works for native and devices.
 
 const std = @import("std");
 const platform = @import("antfly_platform");
@@ -30,6 +30,7 @@ const ops = @import("../ops/ops.zig");
 const CT = ops.CT;
 const ComputeBackend = ops.ComputeBackend;
 const florence_config = @import("../models/florence.zig");
+const activations = @import("../backends/activations.zig");
 
 pub const Config = florence_config.Config;
 const ImageFeatureSource = florence_config.ImageFeatureSource;
@@ -1934,7 +1935,7 @@ fn residualMlpData(
     const fc2_b_name = try fmtAlloc(allocator, "vision_tower.blocks.{d}.{d}.{s}.fn.net.fc2.bias", .{ stage, layer, block_prefix });
     defer allocator.free(fc2_b_name);
 
-    const updates = try backendNormedGeluMlpData(
+    const updates = try backendNormedExactGeluMlpData(
         cb,
         allocator,
         input,
@@ -2485,13 +2486,9 @@ fn residualMlp(
 
     const fc1_w = try cb.getWeight(fc1_w_name);
     const fc1_b = try cb.getWeight(fc1_b_name);
-    const activated_ct = if (try cb.linearGelu(normed_ct, fc1_w, fc1_b, rows, dim, hidden_dim)) |fused|
-        fused
-    else blk: {
-        const fc1_ct = try cb.linear(normed_ct, fc1_w, fc1_b, rows, dim, hidden_dim);
-        defer cb.free(fc1_ct);
-        break :blk try cb.gelu(fc1_ct);
-    };
+    const fc1_ct = try cb.linear(normed_ct, fc1_w, fc1_b, rows, dim, hidden_dim);
+    defer cb.free(fc1_ct);
+    const activated_ct = try florenceExactGelu(cb, fc1_ct);
     defer cb.free(activated_ct);
 
     const fc2_w = try cb.getWeight(fc2_w_name);
@@ -2874,13 +2871,9 @@ fn encoderBlock(
 
     const fc1_start = nowNs();
     const fc1_weights = try encoderLinearWeights(cb, layer, "fc1", buf);
-    const activated = if (try cb.linearGelu(attn_normed, fc1_weights.weight, fc1_weights.bias, total, d_model, ffn_dim)) |fused|
-        fused
-    else blk: {
-        const fc1 = try cb.linear(attn_normed, fc1_weights.weight, fc1_weights.bias, total, d_model, ffn_dim);
-        defer cb.free(fc1);
-        break :blk try cb.gelu(fc1);
-    };
+    const fc1 = try cb.linear(attn_normed, fc1_weights.weight, fc1_weights.bias, total, d_model, ffn_dim);
+    defer cb.free(fc1);
+    const activated = try florenceExactGelu(cb, fc1);
     defer cb.free(activated);
     if (profile) logFlorenceProfileStep("enc_fc1_gelu", layer, fc1_start);
 
@@ -2937,13 +2930,9 @@ fn decoderBlockSelfOnly(
     cb.free(attn_res);
 
     const fc1_weights = try decoderLinearWeights(cb, layer, "fc1", buf);
-    const activated = if (try cb.linearGelu(attn_normed, fc1_weights.weight, fc1_weights.bias, total, d_model, ffn_dim)) |fused|
-        fused
-    else blk: {
-        const fc1 = try cb.linear(attn_normed, fc1_weights.weight, fc1_weights.bias, total, d_model, ffn_dim);
-        defer cb.free(fc1);
-        break :blk try cb.gelu(fc1);
-    };
+    const fc1 = try cb.linear(attn_normed, fc1_weights.weight, fc1_weights.bias, total, d_model, ffn_dim);
+    defer cb.free(fc1);
+    const activated = try florenceExactGelu(cb, fc1);
     defer cb.free(activated);
 
     const fc2_weights = try decoderLinearWeights(cb, layer, "fc2", buf);
@@ -3061,13 +3050,9 @@ fn decoderBlockWithOptionalCrossCache(
     cb.free(cross_res);
 
     const fc1_weights = try decoderLinearWeights(cb, layer, "fc1", buf);
-    const activated = if (try cb.linearGelu(cross_normed, fc1_weights.weight, fc1_weights.bias, dec_total, d_model, ffn_dim)) |fused|
-        fused
-    else blk: {
-        const fc1 = try cb.linear(cross_normed, fc1_weights.weight, fc1_weights.bias, dec_total, d_model, ffn_dim);
-        defer cb.free(fc1);
-        break :blk try cb.gelu(fc1);
-    };
+    const fc1 = try cb.linear(cross_normed, fc1_weights.weight, fc1_weights.bias, dec_total, d_model, ffn_dim);
+    defer cb.free(fc1);
+    const activated = try florenceExactGelu(cb, fc1);
     defer cb.free(activated);
 
     const fc2_weights = try decoderLinearWeights(cb, layer, "fc2", buf);
@@ -3148,13 +3133,9 @@ fn decoderBlockIncrementalCached(
     profile_stage_start = try profileFlorenceDecoderStageFrameBoundary(cb, "decoder_cross", layer, profile_stage_start);
 
     const fc1_weights = try decoderLinearWeights(cb, layer, "fc1", buf);
-    const activated = if (try cb.linearGelu(cross_normed, fc1_weights.weight, fc1_weights.bias, batch, d_model, ffn_dim)) |fused|
-        fused
-    else blk: {
-        const fc1 = try cb.linear(cross_normed, fc1_weights.weight, fc1_weights.bias, batch, d_model, ffn_dim);
-        defer cb.free(fc1);
-        break :blk try cb.gelu(fc1);
-    };
+    const fc1 = try cb.linear(cross_normed, fc1_weights.weight, fc1_weights.bias, batch, d_model, ffn_dim);
+    defer cb.free(fc1);
+    const activated = try florenceExactGelu(cb, fc1);
     defer cb.free(activated);
 
     const fc2_weights = try decoderLinearWeights(cb, layer, "fc2", buf);
@@ -3549,22 +3530,59 @@ fn backendLayerNormData(
     return cb.toFloat32(out_ct, allocator);
 }
 
-fn backendGeluData(
-    cb: *const ComputeBackend,
-    allocator: std.mem.Allocator,
-    input: []const f32,
-    rows: usize,
-    dim: usize,
-) ![]f32 {
-    const shape = [_]i32{ @intCast(rows), @intCast(dim) };
-    const input_ct = try cb.fromFloat32Shape(input, &shape);
-    defer cb.free(input_ct);
-    const out_ct = try cb.gelu(input_ct);
-    defer cb.free(out_ct);
-    return cb.toFloat32(out_ct, allocator);
+/// Florence checkpoints use Hugging Face's exact-erf `gelu`, not the
+/// `gelu_pytorch_tanh` approximation exposed by `ComputeBackend.gelu`.
+/// Every built-in backend supplies this hook. An external backend that does
+/// not must fail explicitly rather than silently changing model semantics.
+fn florenceExactGelu(cb: *const ComputeBackend, input: CT) !CT {
+    return (try cb.geluExact(input)) orelse error.UnsupportedFlorenceExactGelu;
 }
 
-fn backendNormedGeluMlpData(
+test "Florence GELU preserves exact-erf values without approximate fallback" {
+    const Probe = struct {
+        exact_calls: usize = 0,
+        approximate_calls: usize = 0,
+
+        fn exact(raw: *anyopaque, input: CT) !CT {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const values: *[4]f32 = @ptrCast(@alignCast(input));
+            self.exact_calls += 1;
+            activations.geluExact(values[0..]);
+            return input;
+        }
+
+        fn approximate(raw: *anyopaque, input: CT) !CT {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const values: *[4]f32 = @ptrCast(@alignCast(input));
+            self.approximate_calls += 1;
+            activations.gelu(values[0..]);
+            return input;
+        }
+    };
+
+    var probe = Probe{};
+    var vtable: ComputeBackend.VTable = undefined;
+    vtable.gelu = Probe.approximate;
+    vtable.geluExact = Probe.exact;
+    const cb = ComputeBackend{ .ptr = &probe, .vtable = &vtable };
+    var values = [_]f32{ 0.0, 1.0, -1.0, 2.0 };
+    const input: CT = @ptrCast(&values);
+    try std.testing.expectEqual(input, try florenceExactGelu(&cb, input));
+
+    const expected = [_]f32{ 0.0, 0.8413447, -0.15865526, 1.9544997 };
+    const tolerance = 4 * std.math.floatEps(f32);
+    for (expected, values) |want, actual| {
+        try std.testing.expectApproxEqAbs(want, actual, tolerance);
+    }
+    try std.testing.expectEqual(@as(usize, 1), probe.exact_calls);
+    try std.testing.expectEqual(@as(usize, 0), probe.approximate_calls);
+
+    vtable.geluExact = null;
+    try std.testing.expectError(error.UnsupportedFlorenceExactGelu, florenceExactGelu(&cb, input));
+    try std.testing.expectEqual(@as(usize, 0), probe.approximate_calls);
+}
+
+fn backendNormedExactGeluMlpData(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
     input: []const f32,
@@ -3586,7 +3604,7 @@ fn backendNormedGeluMlpData(
     defer cb.free(normed_ct);
     const fc1_ct = try cb.linear(normed_ct, fc1_weight, fc1_bias, rows, in_dim, hidden_dim);
     defer cb.free(fc1_ct);
-    const activated_ct = try cb.gelu(fc1_ct);
+    const activated_ct = try florenceExactGelu(cb, fc1_ct);
     defer cb.free(activated_ct);
     const fc2_ct = try cb.linear(activated_ct, fc2_weight, fc2_bias, rows, hidden_dim, in_dim);
     defer cb.free(fc2_ct);

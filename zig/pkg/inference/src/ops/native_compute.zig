@@ -687,6 +687,14 @@ fn shouldUseQuantizedDequantSgemm(
     };
     if (!dequantSgemmSupportedQuant(known)) return false;
     if (quantizedDequantSgemmEnabled()) return true;
+    // Florence's CPU encoder and incremental decoder benefit from BLAS over
+    // cached dense weights. Promotion remains bounded by the dense-cache budget.
+    if (std.mem.startsWith(u8, name, "language_model.model.encoder.") or
+        std.mem.startsWith(u8, name, "language_model.model.decoder.") or
+        std.mem.eql(u8, name, "language_model.model.shared.weight") or
+        std.mem.eql(u8, name, "language_model.lm_head.weight") or
+        std.mem.startsWith(u8, name, "vision_tower.blocks.") or
+        std.mem.eql(u8, name, "image_projection")) return true;
     if (shouldUseGlinerRecognizerDequantSgemm(name, storage.tensor_type)) return true;
     if (shouldUseGlinerEncoderDequantSgemm(name, rows, out_dim, storage.tensor_type)) return true;
     return shouldUseClipClapDequantSgemm(name, rows, out_dim, storage.tensor_type);
@@ -4657,7 +4665,7 @@ pub const vtable_impl = ComputeBackend.VTable{
     .prefetchWeightHint = &prefetchWeightHint,
     .drainPrefetchBudget = &drainPrefetchBudget,
     .embeddingLookup = &embeddingLookup,
-    .takeRows = null,
+    .takeRows = &takeRowsOp,
     .linear = &linearOp,
     .linearPlanned = &linearPlannedOp,
     .linearNoBias = &linearNoBiasOp,
@@ -4739,6 +4747,8 @@ pub const vtable_impl = ComputeBackend.VTable{
     .tensorShapeMatches = &tensorShapeMatchesOp,
     .evalTensor = &evalTensorOp,
     .argmaxLastRow = &argmaxLastRowOp,
+    .argmaxRows = &argmaxRowsOp,
+    .argmaxRowsSuppress = &argmaxRowsSuppressOp,
     .sliceLastDim = &sliceLastDimOp,
     // Primitive ops for training
     .subtract = &subtractOp,
@@ -40672,6 +40682,58 @@ fn splitLastDim3Op(ctx: *anyopaque, input: CT, rows: usize, dim: usize) anyerror
     };
 }
 
+fn takeRowsOp(ctx: *anyopaque, request: *const ops.TakeRowsRequest) anyerror!?CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    if (request.dim == 0 or request.rows != request.row_ids.len) return error.InvalidTensorShape;
+    const input = toBuf(request.input);
+    if (input.quantized_storage != null or (input.source_tensor != null and input.data.len == 0)) return null;
+    if (input.view_strides != null) try materializeViewData(input);
+    const data = input.data;
+    if (data.len % request.dim != 0) return error.InvalidTensorShape;
+    const total_rows = data.len / request.dim;
+    for (request.row_ids) |row| {
+        if (row >= total_rows) return error.InvalidTensorShape;
+    }
+    const count = std.math.mul(usize, request.rows, request.dim) catch return error.InvalidTensorShape;
+    const shape = [_]i64{
+        std.math.cast(i64, request.rows) orelse return error.InvalidTensorShape,
+        std.math.cast(i64, request.dim) orelse return error.InvalidTensorShape,
+    };
+    const output = try self.allocator.alloc(f32, count);
+    const tensor = try self.makeOwnedBuf(output);
+    errdefer freeTensor(ctx, tensor);
+    for (request.row_ids, 0..) |row, index| {
+        @memcpy(output[index * request.dim ..][0..request.dim], data[@as(usize, row) * request.dim ..][0..request.dim]);
+    }
+    return try self.withLogicalShape(tensor, &shape);
+}
+
+test "Florence native row gather preserves row identity and independent storage" {
+    const allocator = std.testing.allocator;
+    var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
+    var data = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const input = try compute.makeBuf(&data, false);
+    defer freeTensor(&compute, input);
+    const output = (try takeRowsOp(&compute, &.{
+        .input = input,
+        .row_ids = &.{ 2, 0, 2 },
+        .rows = 3,
+        .dim = 2,
+    })).?;
+    defer freeTensor(&compute, output);
+    try std.testing.expectEqualSlices(f32, &.{ 5, 6, 1, 2, 5, 6 }, getData(output));
+    getData(output)[0] = 99;
+    try std.testing.expectEqual(@as(f32, 5), data[4]);
+    try std.testing.expectError(error.InvalidTensorShape, takeRowsOp(&compute, &.{
+        .input = input,
+        .row_ids = &.{3},
+        .rows = 1,
+        .dim = 2,
+    }));
+}
+
 fn concatRows2DOp(ctx: *anyopaque, a: CT, b: CT, rows_a: usize, rows_b: usize, cols: usize) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     const a_data = getData(a);
@@ -40890,6 +40952,58 @@ fn argmaxLastRowOp(_: *anyopaque, tensor: CT, rows: usize, dim: usize) anyerror!
     if (data.len != rows * dim) return error.InvalidTensorShape;
     const last_row = data[(rows - 1) * dim ..][0..dim];
     return @intCast(activations_mod.argmax(last_row));
+}
+
+fn argmaxRowsOp(
+    ctx: *anyopaque,
+    tensor: CT,
+    row_start: usize,
+    row_count: usize,
+    dim: usize,
+    allocator: std.mem.Allocator,
+) anyerror!?[]u32 {
+    return argmaxRowsSuppressOp(ctx, tensor, row_start, row_count, dim, &.{}, allocator);
+}
+
+fn argmaxRowsSuppressOp(
+    _: *anyopaque,
+    tensor: CT,
+    row_start: usize,
+    row_count: usize,
+    dim: usize,
+    suppress_token_ids: []const i32,
+    allocator: std.mem.Allocator,
+) anyerror!?[]u32 {
+    if (row_count == 0 or dim == 0) return error.InvalidTensorShape;
+    const row_end = std.math.add(usize, row_start, row_count) catch return error.InvalidTensorShape;
+    const elem_count = std.math.mul(usize, row_end, dim) catch return error.InvalidTensorShape;
+    const data = getData(tensor);
+    if (data.len < elem_count) return error.InvalidTensorShape;
+
+    const tokens = try allocator.alloc(u32, row_count);
+    errdefer allocator.free(tokens);
+    for (tokens, 0..) |*token, row_idx| {
+        const row = data[(row_start + row_idx) * dim ..][0..dim];
+        var best_idx: u32 = 0;
+        var best_val: f32 = -std.math.inf(f32);
+        var found = false;
+        for (row, 0..) |value, idx| {
+            if (found and !(value > best_val)) continue;
+            var suppressed = false;
+            for (suppress_token_ids) |raw| {
+                if (raw >= 0 and @as(usize, @intCast(raw)) == idx) {
+                    suppressed = true;
+                    break;
+                }
+            }
+            if (suppressed) continue;
+            found = true;
+            best_val = value;
+            best_idx = @intCast(idx);
+        }
+        token.* = best_idx;
+    }
+    return tokens;
 }
 
 test "linear q8_0 kernel computes direct matmul" {
