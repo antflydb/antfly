@@ -73,8 +73,14 @@ Portable `.afb` backups are storage-neutral:
 - `antfly_restore_backup_json` and `antfly_restore_backup_file_json` create a
   new database at a path, of the storage kind in the passed
   `antfly_open_options` (NULL means directory storage). The database is built
-  beside the destination and published by rename, so a failed restore never
-  leaves a partial destination; `replace` swaps out an existing one.
+  and indexed beside the destination, then published atomically; `replace`
+  swaps out an existing one. A failed or interrupted restore leaves the
+  destination holding either the complete old or the complete new database,
+  never a partial or missing one. Replacing a directory database that any
+  process has open (through libantfly or otherwise), or a Lite file that has
+  an open writer, fails with `ANTFLY_BUSY`; so does opening a directory
+  database while a restore publishes it. `ANTFLY_OUTCOME_UNKNOWN` means the
+  new database was published but its crash durability could not be confirmed.
 
 A backup of either kind restores or imports into either kind.
 `antfly_db_status_json` and `antfly_db_capabilities_json` likewise report on

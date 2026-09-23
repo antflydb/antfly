@@ -9297,11 +9297,20 @@ fn restorePortableBackupToLiteFile(
     try restorePortableSourceToLiteFile(alloc, io, backend_runtime, dest_path, replace, backup, Populate.run, cancel);
 }
 
-var directory_restore_nonce = std.atomic.Value(u64).init(0);
-
-/// Restores a portable backup into a new directory database: build it in a
-/// sibling staging directory, then publish with a rename so a failed restore
-/// never leaves a partial database at `dest_path`.
+/// Restores a portable backup into a directory database at `dest_path`.
+///
+/// Uses the engine's generation lifecycle, the same publication path as
+/// server-side table restores:
+/// - The exclusive generation transition fails with BUSY while any database
+///   (libantfly handle, server, or CLI, in this process or another) holds a
+///   read lease on the destination, and new opens wait or fail until
+///   publication finishes.
+/// - The database is built and indexed in an unpublished sibling generation,
+///   sealed, then published with a durable marker and an atomic exchange (or
+///   rename when nothing exists yet), and the parent directory is synced.
+/// - A crash at any point leaves `dest_path` holding the complete old or the
+///   complete new database; the next open reconciles the marker and
+///   reclaims the other generation.
 fn restorePortableBackupToDirectory(
     alloc: Allocator,
     io: std.Io,
@@ -9310,33 +9319,35 @@ fn restorePortableBackupToDirectory(
     replace: bool,
 ) !void {
     if (backup.len == 0) return error.InvalidArgument;
-    const dest_exists = capiPathExists(io, dest_path);
-    if (dest_exists and !replace) return error.PathAlreadyExists;
+    const live_path = std.mem.trimEnd(u8, dest_path, "/");
+    if (live_path.len == 0) return error.InvalidArgument;
+    var transition = try db_mod.generation_lifecycle.beginProcessExclusiveWithIo(live_path, io);
+    defer transition.deinit();
+    // Reconcile an interrupted earlier publication before deciding whether
+    // the destination exists.
+    try transition.reconcilePublished();
+    if (capiPathExists(io, live_path) and !replace) return error.PathAlreadyExists;
 
-    const nonce = directory_restore_nonce.fetchAdd(1, .monotonic);
-    const staging = try std.fmt.allocPrint(alloc, "{s}.restore-{x}-{x}", .{ dest_path, monotonicNowNs(), nonce });
-    defer alloc.free(staging);
-    std.Io.Dir.cwd().deleteTree(io, staging) catch {};
-    errdefer std.Io.Dir.cwd().deleteTree(io, staging) catch {};
+    var staged = try transition.beginStaging();
+    defer staged.deinit();
     {
-        var db = try db_mod.DB.open(alloc, staging, .{});
+        var db = try db_mod.DB.open(alloc, staged.path(), .{ .staged_generation = &staged });
         defer db.close();
-        try db.importPortableIntoEmpty(alloc, backup, db.core.identity_namespace);
-        // Make the imported generation durable before it is published. Index
-        // activation is the import's own concern, as for embedded imports.
+        try db.importPortableIntoUnpublishedEmpty(alloc, backup, db.core.identity_namespace);
+        _ = try db.rebuildDenseIndexesForTargetCoverage(alloc);
+        _ = try db.rebuildSparseIndexesForTargetCoverage(alloc);
+        try db.rebuildGraphIndexesForTargetCoverage(alloc);
+        _ = try db.replayGeneratedEnrichmentsFromStoredDocs(alloc);
         try db.sync(true);
         try db.syncIndexes(true);
     }
-
-    if (!dest_exists) return capiRenameFilePath(io, staging, dest_path);
-    const replaced = try std.fmt.allocPrint(alloc, "{s}.replaced-{x}-{x}", .{ dest_path, monotonicNowNs(), nonce });
-    defer alloc.free(replaced);
-    try capiRenameFilePath(io, dest_path, replaced);
-    capiRenameFilePath(io, staging, dest_path) catch |err| {
-        capiRenameFilePath(io, replaced, dest_path) catch {};
-        return err;
-    };
-    std.Io.Dir.cwd().deleteTree(io, replaced) catch {};
+    switch (try staged.publish()) {
+        .durable => {},
+        .durability_uncertain => {
+            std.log.err("directory restore published but crash durability could not be confirmed path={s}", .{live_path});
+            return error.DurabilityOutcomeUnknown;
+        },
+    }
 }
 
 fn restorePortableBackupPathToDirectory(
@@ -15244,6 +15255,93 @@ test "capi lite exposes hosted and status-only profiles" {
     defer freeRawBuffer(stats.ptr, stats.len);
     try std.testing.expect(std.mem.indexOf(u8, stats.ptr.?[0..stats.len], "\"doc_count\":") != null);
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_batch(status_handle, &writes, writes.len, null, 0, 2_000, 0));
+}
+
+test "capi directory restore coordinates with open handles and publishes atomically" {
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
+    const alloc = std.testing.allocator;
+    const io = handleLockIo();
+    const src_path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-dir-restore-src");
+    defer alloc.free(src_path);
+    const dest_path = try tempTestPath(alloc, test_tmp.path(), "capi-dir-restore-dest");
+    defer alloc.free(dest_path);
+    cleanupTestFile(src_path);
+    defer cleanupTestFile(src_path);
+    cleanupTestDir(dest_path);
+    defer cleanupTestDir(dest_path);
+
+    // Two backups with different contents.
+    var src: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(src_path, &src));
+    const first_writes = [_]capi.WriteIntent{.{ .key = .{ .ptr = "doc:v1", .len = 6 }, .value = .{ .ptr = "{\"v\":1}", .len = 7 } }};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch(src, &first_writes, 1, null, 0, 1, 0));
+    var first_backup: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_backup(src, &first_backup));
+    defer antfly_buffer_free(&first_backup);
+    const second_writes = [_]capi.WriteIntent{.{ .key = .{ .ptr = "doc:v2", .len = 6 }, .value = .{ .ptr = "{\"v\":2}", .len = 7 } }};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch(src, &second_writes, 1, null, 0, 2, 0));
+    var second_backup: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_backup(src, &second_backup));
+    defer antfly_buffer_free(&second_backup);
+    antfly_db_close(src);
+
+    const directory = capi.OpenOptions{ .storage_kind = capi.storage_kind_directory };
+    var readonly = directory;
+    readonly.open_mode = capi.open_mode_readonly;
+    const first: capi.Slice = .{ .ptr = first_backup.ptr, .len = first_backup.len };
+    const second: capi.Slice = .{ .ptr = second_backup.ptr, .len = second_backup.len };
+    var report: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_restore_backup_json(dest_path, &directory, first, false, &report));
+    antfly_buffer_free(&report);
+
+    // An open read-only handle blocks replacement, and keeps working.
+    var reader: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open_with_options(dest_path, &readonly, &reader));
+    try std.testing.expectEqual(capi.ErrorCode.busy, antfly_restore_backup_json(dest_path, &directory, second, true, &report));
+    var lookup: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_lookup_json(reader, .{ .ptr = "doc:v1", .len = 6 }, &lookup));
+    antfly_buffer_free(&lookup);
+    antfly_db_close(reader);
+
+    // A database opened outside libantfly holds the same generation lease.
+    {
+        var direct = try db_mod.DB.open(alloc, dest_path, .{});
+        defer direct.close();
+        try std.testing.expectEqual(capi.ErrorCode.busy, antfly_restore_backup_json(dest_path, &directory, second, true, &report));
+    }
+
+    // While a restore holds the generation transition, opens are refused.
+    {
+        var transition = try db_mod.generation_lifecycle.beginProcessExclusiveWithIo(dest_path, io);
+        defer transition.deinit();
+        var blocked: ?*anyopaque = null;
+        try std.testing.expectEqual(capi.ErrorCode.busy, antfly_db_open_with_options(dest_path, &directory, &blocked));
+        try std.testing.expect(blocked == null);
+    }
+
+    // With no handles open, replacement publishes the new database.
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_restore_backup_json(dest_path, &directory, second, true, &report));
+    antfly_buffer_free(&report);
+    var restored: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open_with_options(dest_path, &readonly, &restored));
+    defer antfly_db_close(restored);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_lookup_json(restored, .{ .ptr = "doc:v2", .len = 6 }, &lookup));
+    antfly_buffer_free(&lookup);
+
+    // No staging or displaced directory is left beside the destination.
+    const parent = std.fs.path.dirname(dest_path).?;
+    const prefix = try std.fmt.allocPrint(alloc, "{s}.restore-", .{std.fs.path.basename(dest_path)});
+    defer alloc.free(prefix);
+    var dir = try std.Io.Dir.cwd().openDir(io, parent, .{ .iterate = true });
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (std.mem.startsWith(u8, entry.name, prefix)) {
+            std.debug.print("unexpected restore sibling left behind: {s}\n", .{entry.name});
+            return error.TestUnexpectedResult;
+        }
+    }
 }
 
 test "capi handle ids are safe to use after close and across slot reuse" {

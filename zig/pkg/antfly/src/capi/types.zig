@@ -342,6 +342,7 @@ pub fn mapError(err: anyerror) ErrorCode {
         error.SourceFileChanged,
         error.PortableImportPublicationInProgress,
         error.PortableRuntimeActivationPending,
+        error.GenerationTransitionActive,
         => .busy,
         error.FileLocksUnsupported => .unsupported,
         error.DurabilityOutcomeUnknown => .outcome_unknown,
