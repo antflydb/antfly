@@ -22367,6 +22367,7 @@ fn processChunkedDenseWindow(
             }
 
             var request_complete = true;
+            var request_batch_items_pending = false;
             source_loop: for (source_set.sources) |*source| {
                 if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
                 const source_hash = enrichment_artifact_codec.hashEmbeddingSource(source.text, request.producer_json);
@@ -22382,7 +22383,10 @@ fn processChunkedDenseWindow(
                 if (chunk_items.items.len > 0 and
                     (chunk_items.items.len >= max_batch_items or batch_source_bytes + source.text.len > max_batch_bytes))
                 {
-                    _ = flushChunkedDenseItems(runtime, dense_embedder, embedding_artifact_name, seed.expected_dims, consumer_indexes, &chunk_texts, &chunk_items, window, true, scope) catch |err| {
+                    // A shared batch may contain only an earlier request. A
+                    // terminal failure there must not park this request.
+                    const failed_batch_includes_request = request_batch_items_pending;
+                    const complete = flushChunkedDenseItems(runtime, dense_embedder, embedding_artifact_name, seed.expected_dims, consumer_indexes, &chunk_texts, &chunk_items, window, true, scope) catch |err| {
                         if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request)
                             return err;
                         if (deferred_retry_error == null) {
@@ -22397,6 +22401,11 @@ fn processChunkedDenseWindow(
                     };
                     try flushGeneratedReplayWindowIfNeededWithIdentity(runtime, window, max_window_items, scope.completedFingerprint());
                     batch_source_bytes = 0;
+                    request_batch_items_pending = false;
+                    if (!complete and failed_batch_includes_request) {
+                        request_complete = false;
+                        break :source_loop;
+                    }
                 }
                 const source_text_len = source.text.len;
                 try chunk_texts.append(runtime.alloc, source.text);
@@ -22414,6 +22423,7 @@ fn processChunkedDenseWindow(
                     .source_record_digest = source.source_record_digest,
                     .source_record_is_parent = source.source_record_is_parent,
                 });
+                request_batch_items_pending = true;
                 batch_source_bytes += source_text_len;
                 if (chunk_items.items.len >= max_batch_items or batch_source_bytes >= max_batch_bytes) {
                     const complete = flushChunkedDenseItems(runtime, dense_embedder, embedding_artifact_name, seed.expected_dims, consumer_indexes, &chunk_texts, &chunk_items, window, true, scope) catch |err| {
@@ -22431,6 +22441,7 @@ fn processChunkedDenseWindow(
                     };
                     try flushGeneratedReplayWindowIfNeededWithIdentity(runtime, window, max_window_items, scope.completedFingerprint());
                     batch_source_bytes = 0;
+                    request_batch_items_pending = false;
                     // The failed batch already parked this logical request.
                     // Avoid paying for every remaining chunk after a terminal
                     // provider outcome; later requests retain independent work.
