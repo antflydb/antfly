@@ -16,11 +16,17 @@ All notable changes to Antfly will be documented in this file.
 
 ### [Unreleased]
 
-- **Complete hybrid-search aggregations** — internal aggregation collection now
-  exhausts vector candidates instead of only increasing the result limit,
-  preserving the original ranked page. Exhausted vector traversal with a
-  truncated top-k window remains inexact; candidate-budget failures still
-  reject incomplete counts. Exact aggregation may require a full vector scan.
+- **Aggregations on hybrid and semantic queries** — queries that combine
+  `aggregations` with `semantic_search` or `embeddings` no longer fail with
+  `query_candidate_budget_exceeded`. Aggregations now count every full-text
+  match plus each embedding index's top results at the requested limit and
+  `search_effort`, merged across shards. Previously the internal collection
+  widened each vector search to the full-result budget, which approximate
+  search could never prove complete. The ranked page is unchanged, the
+  full-result budget still bounds full-text matches, and a filter with no
+  full-text query contributes no extra rows. Separately, a vector search that
+  exhausts its traversal with a truncated top-k window now reports its total as
+  a lower bound instead of exact.
 - **`antfly standby` replaces `antfly ha`** — the hot-standby command is
   renamed; `antfly ha` remains a hidden alias for one minor release. It gains
   `--data-dir` (opens the node's standby state under `<dir>/ha/` and reads the
