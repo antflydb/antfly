@@ -107,6 +107,7 @@ handlers:
 | `antfly_inference_rerank_json` | `POST /rerank` |
 | `antfly_inference_chunk_json` | `POST /chunk` |
 | `antfly_inference_generate_json` | `POST /generate` |
+| `antfly_inference_generate_batch_json` | `POST /generate/batch` |
 | `antfly_inference_rewrite_json` | `POST /rewrite` |
 | `antfly_inference_extract_json` | `POST /extract` |
 | `antfly_inference_read_json` | `POST /read` (OCR) |
@@ -122,13 +123,13 @@ handlers:
   other 4xx to `ANTFLY_INVALID_ARGUMENT`, 429/503/504 and an elapsed timeout
   to `ANTFLY_BUSY`, and 501 or 507 (the model does not fit the budgets) to
   `ANTFLY_UNSUPPORTED`.
-- Models are not downloaded on demand. Install them with
-  `antfly inference pull <owner/name>`.
-- On backends that isolate model execution in a worker process (Metal, CUDA,
-  ONNX), the runtime runs the `antfly` executable named by
-  `ANTFLY_INFERENCE_WORKER`, else the one next to libantfly, else the first
-  on `PATH`; it must come from the same release. If the runtime cannot
-  start, open returns `ANTFLY_UNSUPPORTED`.
+- Models are not downloaded on demand. `antfly_inference_pull_json`
+  downloads one into the handle's models directory, like
+  `antfly inference pull`, with an optional progress callback called on the
+  calling thread. It cannot be cancelled, and close waits for it.
+- Models run in the calling process on every backend; see Inference In
+  Process below. If the runtime cannot start, open returns
+  `ANTFLY_UNSUPPORTED`.
 
 Inference handles have the same guarantees as database handles (see Thread
 Safety): any thread may call concurrently, close waits for in-flight calls,
@@ -137,6 +138,24 @@ and a closed handle, or a database handle passed by mistake, is rejected with
 reserved address range on 64-bit POSIX targets, so there the two kinds can
 never alias. Each handle owns its own runtime and loaded models; share one
 handle rather than opening several.
+
+## Inference In Process
+
+libantfly runs every inference backend, including Metal, CUDA, and ONNX, in
+the calling process. This applies to `antfly_inference` handles and to Lite
+handles opened with local inference.
+
+The `antfly` server runs those backends in a worker process instead, because
+a GPU driver call or an ONNX model load has no per-call abort: the server
+stops a stuck call by killing the worker and starting a new one. A library
+cannot do that to its host program, so libantfly accepts the trade SQLite
+makes and runs them in-process:
+
+- Once a call reaches the device or driver it runs to completion.
+  `call_timeout_ms`, and closing a handle, take effect when it returns.
+  Calls on CPU backends still stop cooperatively.
+- A GPU driver fault terminates the process.
+- A session wedged in the driver blocks close instead of being abandoned.
 
 ## Read-Only Modes
 

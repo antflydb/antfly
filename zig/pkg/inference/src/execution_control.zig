@@ -73,6 +73,23 @@ pub const MonitorControl = struct {
     }
 };
 
+/// Set once by a host that runs process-required backends (Metal, CUDA,
+/// ONNX loads) inside its own process instead of a supervised worker, as
+/// libantfly does: the host process is the caller's program, which cannot be
+/// killed and restarted. Such calls then run without a hard-cancellation
+/// boundary. Once one enters the backend it cannot be interrupted; its
+/// deadline and cancellation take effect when it returns, and a driver fault
+/// takes down the host.
+var uninterruptible_in_process = std.atomic.Value(bool).init(false);
+
+pub fn allowUninterruptibleInProcess() void {
+    uninterruptible_in_process.store(true, .release);
+}
+
+pub fn uninterruptibleInProcessAllowed() bool {
+    return uninterruptible_in_process.load(.acquire);
+}
+
 pub const HardCancellationBoundary = struct {
     ptr: *anyopaque,
     arm_fn: *const fn (*anyopaque, MonitorControl) anyerror!u64,
@@ -185,8 +202,10 @@ pub const InferenceExecutionControl = struct {
         interruption: Interruption,
     ) !UninterruptibleGuard {
         if (interruption != .process_required) return .{};
-        const boundary = self.hard_cancellation orelse
+        const boundary = self.hard_cancellation orelse {
+            if (uninterruptibleInProcessAllowed()) return .{};
             return error.ProcessIsolationRequired;
+        };
         return .{
             .boundary = boundary,
             .token = try boundary.arm(.{

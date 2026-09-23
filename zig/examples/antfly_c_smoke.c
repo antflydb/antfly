@@ -104,6 +104,14 @@ static int run_inference_smoke(void) {
     }
     antfly_buffer_free(&models);
 
+    antfly_buffer pull = {0};
+    if (antfly_inference_pull_json(inference, slice_from_cstr("{}"), NULL, NULL, &pull) != ANTFLY_INVALID_ARGUMENT ||
+        !buffer_contains(pull, "\"error\"")) {
+        antfly_inference_close(inference);
+        return fail_with_buffer("an invalid pull request was not rejected with a JSON error", &pull);
+    }
+    antfly_buffer_free(&pull);
+
     antfly_inference_close(inference);
     antfly_inference_close(inference);
     antfly_buffer after_close = {0};

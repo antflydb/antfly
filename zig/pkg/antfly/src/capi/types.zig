@@ -115,6 +115,21 @@ pub const InferenceOptions = extern struct {
     reserved: [8]u64 = .{0} ** 8,
 };
 
+/// One progress report passed to an `antfly_inference_pull_json` callback.
+pub const InferencePullProgress = extern struct {
+    abi_size: u32 = @sizeOf(InferencePullProgress),
+    reserved0: u32 = 0,
+    model: Slice = .{},
+    file: Slice = .{},
+    bytes_downloaded: u64 = 0,
+    total_bytes: u64 = 0,
+    files_done: u64 = 0,
+    files_total: u64 = 0,
+    cached: bool = false,
+};
+
+pub const InferencePullProgressFn = *const fn (?*anyopaque, *const InferencePullProgress) callconv(.c) void;
+
 pub const DenseSearchHit = extern struct {
     id_ptr: ?[*]u8 = null,
     id_len: usize = 0,

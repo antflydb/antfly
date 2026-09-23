@@ -494,7 +494,7 @@ pub const ModelRegistry = struct {
         }
     }
 
-    /// Pull a model from HuggingFace Hub.
+    /// Pull a model from HuggingFace Hub, printing progress to stderr.
     pub fn pull(
         self: *ModelRegistry,
         io: std.Io,
@@ -503,6 +503,25 @@ pub const ModelRegistry = struct {
         tasks_csv: ?[]const u8,
         capabilities_csv: ?[]const u8,
         projector_selection: download.ProjectorSelection,
+    ) !void {
+        var progress = ProgressPrinter{};
+        return self.pullWithProgress(io, ref_str, hub_config, tasks_csv, capabilities_csv, projector_selection, .{
+            .callback = ProgressPrinter.onProgress,
+            .context = &progress,
+        });
+    }
+
+    /// Pull a model from HuggingFace Hub, reporting progress to `progress_sink`
+    /// on the calling thread.
+    pub fn pullWithProgress(
+        self: *ModelRegistry,
+        io: std.Io,
+        ref_str: []const u8,
+        hub_config: download.HubConfig,
+        tasks_csv: ?[]const u8,
+        capabilities_csv: ?[]const u8,
+        projector_selection: download.ProjectorSelection,
+        progress_sink: download.ProgressSink,
     ) !void {
         const ref = try parsePullModelRef(ref_str);
         const resolved_models_dir = try resolveModelsDirForWriteAlloc(self.allocator, io, self.models_dir);
@@ -526,11 +545,6 @@ pub const ModelRegistry = struct {
         var transaction = try download.ManagedModelTransaction.begin(self.allocator, io, dest);
         defer transaction.deinit(io);
 
-        var progress = ProgressPrinter{};
-        const progress_sink: download.ProgressSink = .{
-            .callback = ProgressPrinter.onProgress,
-            .context = &progress,
-        };
         if (qwen3vl_catalog.findGenerationBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle| {
             try download.downloadPinnedQwen3VlGenerationBundle(
                 self.allocator,
@@ -623,7 +637,7 @@ pub const ModelRegistry = struct {
                 break :blk isModelDir(io, companion_dest);
             };
             if (!companion_installed) {
-                self.pull(io, companion_ref, hub_config, null, null, projector_selection) catch |err| {
+                self.pullWithProgress(io, companion_ref, hub_config, null, null, projector_selection, progress_sink) catch |err| {
                     std.log.warn(
                         "optional Gemma4 MTP assistant pull failed for {s}: {s}",
                         .{ companion_ref, @errorName(err) },

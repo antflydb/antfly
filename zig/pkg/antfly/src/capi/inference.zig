@@ -213,6 +213,12 @@ fn requestsStreaming(request: []const u8) bool {
     return stream == .bool and stream.bool;
 }
 
+/// Runs up to 128 non-streaming generate requests as one batch. Item failures
+/// are reported per item in the response; the call itself succeeds.
+pub export fn antfly_inference_generate_batch_json(h: ?*anyopaque, request_json: capi.Slice, out: ?*capi.Buffer) capi.ErrorCode {
+    return invoke(h, .post, "generate/batch", request_json.bytes(), out);
+}
+
 pub export fn antfly_inference_rewrite_json(h: ?*anyopaque, request_json: capi.Slice, out: ?*capi.Buffer) capi.ErrorCode {
     return invoke(h, .post, "rewrite", request_json.bytes(), out);
 }
@@ -231,6 +237,100 @@ pub export fn antfly_inference_transcribe_json(h: ?*anyopaque, request_json: cap
 
 pub export fn antfly_inference_list_models_json(h: ?*anyopaque, out: ?*capi.Buffer) capi.ErrorCode {
     return invoke(h, .get, "models", "", out);
+}
+
+const PullCall = struct {
+    progress: ?capi.InferencePullProgressFn,
+    progress_context: ?*anyopaque,
+    result: ?[]u8 = null,
+
+    fn onProgress(raw: ?*anyopaque, progress: *const inference_provider.inference_bridge.PullProgress) callconv(.c) void {
+        const self: *PullCall = @ptrCast(@alignCast(raw.?));
+        const callback = self.progress orelse return;
+        const view = capi.InferencePullProgress{
+            .model = sliceOf(progress.model.slice()),
+            .file = sliceOf(progress.file.slice()),
+            .bytes_downloaded = progress.bytes_downloaded,
+            .total_bytes = progress.total_bytes,
+            .files_done = progress.files_done,
+            .files_total = progress.files_total,
+            .cached = progress.cached != 0,
+        };
+        callback(self.progress_context, &view);
+    }
+
+    fn onResult(raw: ?*anyopaque, result: inference_provider.inference_bridge.String) callconv(.c) void {
+        const self: *PullCall = @ptrCast(@alignCast(raw.?));
+        self.result = alloc.dupe(u8, result.slice()) catch null;
+    }
+};
+
+fn sliceOf(bytes: []const u8) capi.Slice {
+    return .{ .ptr = if (bytes.len == 0) null else bytes.ptr, .len = bytes.len };
+}
+
+/// Maps a failed pull, by the error name in its result JSON.
+fn pullErrorCode(name: []const u8) capi.ErrorCode {
+    const table = [_]struct { []const u8, capi.ErrorCode }{
+        .{ "HubModelNotFound", .not_found },
+        .{ "NoModelFilesFound", .not_found },
+        .{ "HubAccessDenied", .invalid_argument },
+        .{ "InvalidModelRef", .invalid_argument },
+        .{ "InvalidModelVariant", .invalid_argument },
+        .{ "InvalidHubRevision", .invalid_argument },
+        .{ "InvalidArgument", .invalid_argument },
+        .{ "UnknownField", .invalid_argument },
+        .{ "MissingField", .invalid_argument },
+        .{ "SyntaxError", .invalid_argument },
+        .{ "UnexpectedToken", .invalid_argument },
+        .{ "UnexpectedEndOfInput", .invalid_argument },
+        .{ "DownloadSizeLimitExceeded", .invalid_argument },
+        .{ "ModelSizeLimitExceeded", .invalid_argument },
+        // Transient network and hub failures; retrying may succeed.
+        .{ "HubApiError", .busy },
+        .{ "DownloadFailed", .busy },
+        .{ "Timeout", .busy },
+        .{ "UnknownHostName", .busy },
+        .{ "NameServerFailure", .busy },
+        .{ "ConnectionRefused", .busy },
+        .{ "ConnectionResetByPeer", .busy },
+        .{ "ConnectionTimedOut", .busy },
+        .{ "NetworkUnreachable", .busy },
+    };
+    for (table) |entry| if (std.mem.eql(u8, entry[0], name)) return entry[1];
+    return .internal;
+}
+
+/// Downloads models into this handle's models directory, calling `progress`
+/// (if set) on the calling thread as files download.
+pub export fn antfly_inference_pull_json(
+    handle_ptr: ?*anyopaque,
+    request_json: capi.Slice,
+    progress: ?capi.InferencePullProgressFn,
+    progress_context: ?*anyopaque,
+    out_buf: ?*capi.Buffer,
+) capi.ErrorCode {
+    const out = db.resetOutBuffer(out_buf) orelse return .invalid_argument;
+    const handle, const slot = registry.enter(handle_ptr) orelse return .invalid_argument;
+    defer @TypeOf(registry).leave(slot);
+    var call = PullCall{ .progress = progress, .progress_context = progress_context };
+    const pulled = inference_provider.pullEmbeddedInferenceModels(
+        handle.io.io(),
+        handle.models_dir,
+        request_json.bytes(),
+        &call,
+        PullCall.onProgress,
+        &call,
+        PullCall.onResult,
+    );
+    const result = call.result orelse return if (pulled) |_| .internal else |err| capi.mapError(err);
+    out.* = .{ .ptr = result.ptr, .len = result.len };
+    _ = pulled catch {
+        const parsed = std.json.parseFromSlice(struct { @"error": []const u8 }, alloc, result, .{ .ignore_unknown_fields = true }) catch return .internal;
+        defer parsed.deinit();
+        return pullErrorCode(parsed.value.@"error");
+    };
+    return .ok;
 }
 
 fn testSlice(bytes: []const u8) capi.Slice {
@@ -435,4 +535,77 @@ test "capi inference generates text with a local model and rejects streaming" {
     if (code != .ok) std.debug.print("generate failed: {s}\n", .{testBuffer(out)});
     try std.testing.expectEqual(capi.ErrorCode.ok, code);
     try std.testing.expect(std.mem.indexOf(u8, testBuffer(out), "choices") != null);
+
+    var batch: capi.Buffer = .{};
+    const batch_request =
+        \\{"requests":[
+        \\ {"custom_id":"a","body":{"model":"ggml-org/gemma-4-e2b-it-gguf:gguf:Q4_0","messages":[{"role":"user","content":"Say one"}],"max_tokens":4}},
+        \\ {"custom_id":"b","body":{"model":"ggml-org/gemma-4-e2b-it-gguf:gguf:Q4_0","messages":[{"role":"user","content":"Say two"}],"max_tokens":4}}]}
+    ;
+    const batch_code = antfly_inference_generate_batch_json(handle, testSlice(batch_request), &batch);
+    defer db.antfly_buffer_free(&batch);
+    if (batch_code != .ok) std.debug.print("generate batch failed: {s}\n", .{testBuffer(batch)});
+    try std.testing.expectEqual(capi.ErrorCode.ok, batch_code);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, testBuffer(batch), .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.object.get("data").?.array.items.len);
+}
+
+test "capi inference pull rejects invalid requests with a JSON error" {
+    if (!db.localInferenceRuntimeAvailable()) return error.SkipZigTest;
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_inference_open(null, &handle));
+    defer antfly_inference_close(handle);
+
+    for ([_][]const u8{ "{}", "{\"model\":\"\"}", "{\"model\":\"a/b\",\"unknown\":1}", "{\"model\":\"not a ref\"}" }) |request| {
+        var out: capi.Buffer = .{};
+        const code = antfly_inference_pull_json(handle, testSlice(request), null, null, &out);
+        defer db.antfly_buffer_free(&out);
+        try std.testing.expectEqual(capi.ErrorCode.invalid_argument, code);
+        try std.testing.expect(std.mem.indexOf(u8, testBuffer(out), "\"error\"") != null);
+    }
+}
+
+// Downloads from the model hub, so it runs only when
+// ANTFLY_INFERENCE_PULL_TEST_MODEL names a (small) model to pull, e.g.
+// sparse-encoder-testing/splade-bert-tiny-nq-onnx.
+test "capi inference pulls a model with progress into the handle's models directory" {
+    if (!db.localInferenceRuntimeAvailable()) return error.SkipZigTest;
+    const model = std.mem.span(std.c.getenv("ANTFLY_INFERENCE_PULL_TEST_MODEL") orelse return error.SkipZigTest);
+    var test_tmp = try db.TestDirectoryType.init("capi-inference-pull");
+    defer test_tmp.cleanup();
+    const models_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}-models", .{test_tmp.path()});
+    defer std.testing.allocator.free(models_dir);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, models_dir);
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, models_dir) catch {};
+
+    var options: capi.InferenceOptions = .{ .models_dir = testSlice(models_dir) };
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_inference_open(&options, &handle));
+    defer antfly_inference_close(handle);
+
+    const Progress = struct {
+        reports: usize = 0,
+        saw_model: bool = false,
+        fn report(raw: ?*anyopaque, progress: *const capi.InferencePullProgress) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.reports += 1;
+            if (progress.model.len > 0 and progress.file.len > 0) self.saw_model = true;
+        }
+    };
+    var progress = Progress{};
+    const request = try std.fmt.allocPrint(std.testing.allocator, "{{\"model\":\"{s}\"}}", .{model});
+    defer std.testing.allocator.free(request);
+    var out: capi.Buffer = .{};
+    const code = antfly_inference_pull_json(handle, testSlice(request), Progress.report, &progress, &out);
+    defer db.antfly_buffer_free(&out);
+    if (code != .ok) std.debug.print("pull failed: {s}\n", .{testBuffer(out)});
+    try std.testing.expectEqual(capi.ErrorCode.ok, code);
+    try std.testing.expect(progress.reports > 0 and progress.saw_model);
+
+    // The same handle sees the pulled model.
+    var models: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_inference_list_models_json(handle, &models));
+    defer db.antfly_buffer_free(&models);
+    try std.testing.expect(std.mem.indexOf(u8, testBuffer(models), model) != null);
 }

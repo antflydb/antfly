@@ -2333,7 +2333,11 @@ pub fn resolveModelSnapshot(
                 if (snippet_len < body.len) "..." else "",
             },
         );
-        return error.HubApiError;
+        return switch (resp.status.code) {
+            404 => error.HubModelNotFound,
+            401, 403 => error.HubAccessDenied,
+            else => error.HubApiError,
+        };
     }
 
     const body = resp.body orelse return error.EmptyResponse;

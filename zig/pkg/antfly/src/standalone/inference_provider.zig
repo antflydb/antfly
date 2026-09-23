@@ -9,7 +9,7 @@ const builtin = @import("builtin");
 const platform = @import("antfly_platform");
 const platform_time = platform.time;
 const process_memory_budget = @import("../common/process_memory_budget.zig");
-const inference_bridge = @import("inference_bridge.zig");
+pub const inference_bridge = @import("inference_bridge.zig");
 const inference_connection_abi = @import("../inference_connection_abi.zig");
 const runtime_http_abi = @import("../runtime_http_abi.zig");
 const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
@@ -302,7 +302,10 @@ pub fn createEmbeddedInferenceNode(
         .has_max_loaded_models = 1,
         .content_security_json = .{},
         .s3_credentials_json = .{},
-        .runtime_config_json = inference_bridge.String.init("{}"),
+        // libantfly runs inside the caller's program, which it cannot kill
+        // and restart like a worker, so every backend runs in-process; see
+        // execution_control.allowUninterruptibleInProcess.
+        .runtime_config_json = inference_bridge.String.init("{\"process_isolation\":false}"),
         .executor = .init(&borrowed_io),
         .out_handle = &out_handle,
     };
@@ -357,6 +360,34 @@ pub fn createEmbeddedInferenceNode(
         .kv_budget_mb = effective_kv_budget_mb,
         .scratch_budget_mb = effective_scratch_budget_mb,
     };
+}
+
+/// Downloads models into `models_dir` (null for the default); see
+/// `inference_bridge.PullModelContext` for the callbacks. Needs no node.
+pub fn pullEmbeddedInferenceModels(
+    io: std.Io,
+    models_dir: ?[]const u8,
+    request_json: []const u8,
+    progress_context: ?*anyopaque,
+    on_progress: ?*const fn (?*anyopaque, *const inference_bridge.PullProgress) callconv(.c) void,
+    result_context: ?*anyopaque,
+    on_result: *const fn (?*anyopaque, inference_bridge.String) callconv(.c) void,
+) !void {
+    var borrowed_io = io;
+    const context = inference_bridge.PullModelContext{
+        .abi_version = inference_bridge.abi_version,
+        .executor = .init(&borrowed_io),
+        .models_dir = .init(models_dir),
+        .request_json = .init(request_json),
+        .progress_context = progress_context,
+        .on_progress = on_progress,
+        .result_context = result_context,
+        .on_result = on_result,
+    };
+    if (comptime inline_inference_codegen) return inference_host.linkedInferencePullModel(&context);
+    const table = try linkedInferenceApi(inference_bridge.Capability.model_pull);
+    const status = table.pull_model(&context);
+    if (!status.isOk()) return inference_bridge.errorFromStatus(status);
 }
 
 /// Counterpart to `createEmbeddedInferenceNode`. Callers must quiesce any

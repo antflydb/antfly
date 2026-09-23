@@ -534,8 +534,8 @@ antfly_error_code antfly_db_match_pattern_json(antfly_db *db, antfly_slice reque
  * use and stay cached until the handle closes. Each call takes the request
  * JSON and returns the response JSON of the matching /ai/v1 route of the
  * Antfly inference HTTP API (see specs/openapi/inference/api.yaml): embed,
- * rerank, chunk, generate, rewrite, extract, read (OCR), transcribe, and
- * models. Binary inputs such as images and audio are passed inline, as base64
+ * rerank, chunk, generate, generate/batch, rewrite, extract, read (OCR),
+ * transcribe, and models. Binary inputs such as images and audio are passed inline, as base64
  * or data: URIs. Responses are always complete: a generate request with
  * "stream": true fails with ANTFLY_INVALID_ARGUMENT.
  *
@@ -548,12 +548,15 @@ antfly_error_code antfly_db_match_pattern_json(antfly_db *db, antfly_slice reque
  * fit the memory budgets) to ANTFLY_UNSUPPORTED.
  *
  * Models are not downloaded automatically; install them with
- * `antfly inference pull <owner/name>`. antfly_inference_open returns
- * ANTFLY_UNSUPPORTED when this build does not link the inference runtime or
- * the runtime cannot start. On backends that run models in a sandboxed worker
- * process (Metal, CUDA, ONNX), the worker is the `antfly` executable named by
- * $ANTFLY_INFERENCE_WORKER, else the one next to libantfly, else the first on
- * PATH, and it must come from the same release as libantfly.
+ * `antfly inference pull <owner/name>` or antfly_inference_pull_json.
+ * antfly_inference_open returns ANTFLY_UNSUPPORTED when this build does not
+ * link the inference runtime or the runtime cannot start.
+ *
+ * Models run in the calling process on every backend, including Metal, CUDA,
+ * and ONNX. Those backends cannot interrupt a call once it reaches the device
+ * or driver: call_timeout_ms and closing the handle take effect only when the
+ * call returns, and a driver fault terminates the process. (The antfly server
+ * instead runs them in a worker process it can kill and restart.)
  *
  * Handles have the same safety as antfly_db handles: any thread may call
  * concurrently, close waits for in-flight calls, and a closed or foreign
@@ -594,12 +597,64 @@ antfly_error_code antfly_inference_embed_json(antfly_inference *inference, antfl
 antfly_error_code antfly_inference_rerank_json(antfly_inference *inference, antfly_slice request_json, antfly_buffer *out);
 antfly_error_code antfly_inference_chunk_json(antfly_inference *inference, antfly_slice request_json, antfly_buffer *out);
 antfly_error_code antfly_inference_generate_json(antfly_inference *inference, antfly_slice request_json, antfly_buffer *out);
+/* Up to 128 non-streaming generate requests in one call; per-item failures
+ * are reported in the response. */
+antfly_error_code antfly_inference_generate_batch_json(antfly_inference *inference, antfly_slice request_json, antfly_buffer *out);
 antfly_error_code antfly_inference_rewrite_json(antfly_inference *inference, antfly_slice request_json, antfly_buffer *out);
 antfly_error_code antfly_inference_extract_json(antfly_inference *inference, antfly_slice request_json, antfly_buffer *out);
 antfly_error_code antfly_inference_read_json(antfly_inference *inference, antfly_slice request_json, antfly_buffer *out);
 antfly_error_code antfly_inference_transcribe_json(antfly_inference *inference, antfly_slice request_json, antfly_buffer *out);
 /* The installed models, as returned by GET /ai/v1/models. */
 antfly_error_code antfly_inference_list_models_json(antfly_inference *inference, antfly_buffer *out);
+
+/* One report to an antfly_inference_pull_json progress callback. The slices
+ * are valid only during the callback. Check abi_size before reading fields
+ * added in later versions. */
+typedef struct antfly_inference_pull_progress {
+    uint32_t abi_size;
+    uint32_t reserved0;
+    /* The model reference being pulled (one per requested variant). */
+    antfly_slice model;
+    antfly_slice file;
+    uint64_t bytes_downloaded;
+    /* 0 when unknown. */
+    uint64_t total_bytes;
+    uint64_t files_done;
+    uint64_t files_total;
+    /* The file was already present and verified; nothing was downloaded. */
+    bool cached;
+} antfly_inference_pull_progress;
+
+typedef void (*antfly_inference_pull_progress_fn)(
+    void *context,
+    const antfly_inference_pull_progress *progress
+);
+
+/*
+ * Downloads a model from the Hugging Face Hub into the handle's models
+ * directory, like `antfly inference pull`. request_json:
+ *
+ *   {"model": "owner/name[:variant]",      required
+ *    "variants": ["q8_0", ...],             pull model:variant for each
+ *    "token": "...",                        private or gated models; default $HF_TOKEN
+ *    "tasks": [...], "capabilities": [...], override the model manifest
+ *    "projector": "auto" | "none" | "match",
+ *    "max_artifact_bytes": N, "max_model_bytes": N}
+ *
+ * progress (may be NULL) is called on the calling thread as files download.
+ * On success *out is {"models": [...], "models_dir": "..."}; on failure it is
+ * {"error": ..., "message": ...}. A model missing from the hub returns
+ * ANTFLY_NOT_FOUND, a bad request or a model over the size limits
+ * ANTFLY_INVALID_ARGUMENT, and a network or hub failure ANTFLY_BUSY. The call
+ * cannot be cancelled, and antfly_inference_close waits for it.
+ */
+antfly_error_code antfly_inference_pull_json(
+    antfly_inference *inference,
+    antfly_slice request_json,
+    antfly_inference_pull_progress_fn progress,
+    void *progress_context,
+    antfly_buffer *out
+);
 
 #ifdef __cplusplus
 }
