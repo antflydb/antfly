@@ -66,7 +66,7 @@ Set `document_renderer` on the retrieval agent request to render each document w
 
 Values in `{{...}}` are HTML-escaped; use triple braces (`{{{...}}}`) for raw text. Queries (`/db/v1/tables/{table}/query`) do not generate text and reject `document_renderer`.
 
-A template that fails to parse, or passes invalid `encodeToon` options, is rejected with a `400` before retrieval runs.
+A template that fails to parse, or passes invalid `encodeToon` options anywhere in it (including inside `{{#if}}` or `{{#each}}` branches), is rejected with a `400` before retrieval runs. `encodeToon` options must be literal values, and unknown options are rejected.
 
 ### Template Helpers
 

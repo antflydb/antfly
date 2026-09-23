@@ -31,6 +31,7 @@ const Allocator = std.mem.Allocator;
 const hbs = @import("handlebars");
 const toon = @import("antfly_toon");
 const template = @import("../template.zig");
+const Expression = @FieldType(hbs.Node, "expression");
 
 /// Source keys that carry retrieval metadata the prompt already states
 /// elsewhere, so the default rendering omits them.
@@ -91,13 +92,85 @@ const HelperState = struct {
 };
 
 /// Reject a template that cannot parse or whose helper arguments are invalid
-/// before any retrieval work runs.
+/// before any retrieval work runs. `encodeToon` options are checked on every
+/// call site in the syntax tree, including branches that sample data would
+/// skip, and must be literals so a valid template cannot fail per hit.
 pub fn validateTemplate(alloc: Allocator, template_source: []const u8) !void {
+    {
+        var arena_state = std.heap.ArenaAllocator.init(alloc);
+        defer arena_state.deinit();
+        const program = hbs.Parser.parse(template_source, arena_state.allocator()) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidDocumentRenderer,
+        };
+        try validateNode(program);
+    }
     const rendered = renderTemplate(alloc, template_source, "", 0, null) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return error.InvalidDocumentRenderer,
     };
     alloc.free(rendered);
+}
+
+fn validateNode(node: *const hbs.Node) error{InvalidDocumentRenderer}!void {
+    switch (node.*) {
+        .program => |program| for (program.body) |child| try validateNode(child),
+        .mustache => |mustache| try validateNode(mustache.expression),
+        .block => |block| {
+            try validateNode(block.expression);
+            try validateNode(block.program);
+            if (block.inverse) |inverse| try validateNode(inverse);
+        },
+        .partial => |partial| {
+            try validateNode(partial.name);
+            for (partial.params) |param| try validateNode(param);
+            if (partial.hash) |hash| try validateNode(hash);
+        },
+        .partial_block => |partial| {
+            try validateNode(partial.name);
+            for (partial.params) |param| try validateNode(param);
+            if (partial.hash) |hash| try validateNode(hash);
+            try validateNode(partial.program);
+        },
+        .inline_partial => |partial| try validateNode(partial.program),
+        .expression => |expression| {
+            if (isEncodeToonCall(expression)) try validateEncodeToonOptions(expression);
+            try validateNode(expression.path);
+            for (expression.params) |param| try validateNode(param);
+            if (expression.hash) |hash| try validateNode(hash);
+        },
+        .sub_expression => |sub| try validateNode(sub.expression),
+        .hash => |hash| for (hash.pairs) |pair| try validateNode(pair),
+        .hash_pair => |pair| try validateNode(pair.value),
+        .content, .comment, .path, .string_literal, .boolean_literal, .number_literal => {},
+    }
+}
+
+fn isEncodeToonCall(expression: Expression) bool {
+    return switch (expression.path.*) {
+        .path => |path| !path.data and path.parts.len == 1 and std.mem.eql(u8, path.parts[0], "encodeToon"),
+        else => false,
+    };
+}
+
+fn validateEncodeToonOptions(expression: Expression) error{InvalidDocumentRenderer}!void {
+    const hash = expression.hash orelse return;
+    for (hash.hash.pairs) |pair_node| {
+        const pair = pair_node.hash_pair;
+        if (std.mem.eql(u8, pair.key, "indent")) {
+            const literal = switch (pair.value.*) {
+                .number_literal => |number| number,
+                else => return error.InvalidDocumentRenderer,
+            };
+            if (!literal.is_int or literal.value < 1) return error.InvalidDocumentRenderer;
+        } else if (std.mem.eql(u8, pair.key, "delimiter")) {
+            const literal = switch (pair.value.*) {
+                .string_literal => |string| string,
+                else => return error.InvalidDocumentRenderer,
+            };
+            _ = parseDelimiter(literal.value) catch return error.InvalidDocumentRenderer;
+        } else return error.InvalidDocumentRenderer;
+    }
 }
 
 fn encodeToonHelper(ctx: hbs.HelperContext) anyerror!hbs.Value {
@@ -121,6 +194,9 @@ fn encodeToon(ctx: hbs.HelperContext) anyerror!hbs.Value {
         .string, .safe_string => |name| try parseDelimiter(name),
         else => return error.InvalidToonDelimiter,
     };
+    for (ctx.hash.keys()) |key| {
+        if (!std.mem.eql(u8, key, "indent") and !std.mem.eql(u8, key, "delimiter")) return error.InvalidToonOption;
+    }
     const encoded = try toon.encodeValueAlloc(ctx.arena, try toJson(ctx.arena, ctx.params[0]), options);
     // TOON is plain text for the prompt; HTML-escaping it would corrupt quotes.
     return .{ .safe_string = encoded };
@@ -212,4 +288,12 @@ test "validateTemplate rejects invalid templates and helper options" {
     try std.testing.expectError(error.InvalidDocumentRenderer, validateTemplate(std.testing.allocator, "{{#if}}"));
     try std.testing.expectError(error.InvalidDocumentRenderer, validateTemplate(std.testing.allocator, "{{encodeToon this.fields indent=0}}"));
     try std.testing.expectError(error.InvalidDocumentRenderer, validateTemplate(std.testing.allocator, "{{encodeToon this.fields delimiter=\"semicolon\"}}"));
+    // Options are checked where sample data would skip the branch.
+    try std.testing.expectError(error.InvalidDocumentRenderer, validateTemplate(std.testing.allocator, "{{#if this.fields.title}}{{encodeToon this.fields indent=0}}{{/if}}"));
+    try std.testing.expectError(error.InvalidDocumentRenderer, validateTemplate(std.testing.allocator, "{{#each this.fields.items}}{{else}}{{encodeToon this indent=2.5}}{{/each}}"));
+    try std.testing.expectError(error.InvalidDocumentRenderer, validateTemplate(std.testing.allocator, "{{#if this.fields.title}}{{eq (encodeToon this.fields delimiter=\"semicolon\") \"x\"}}{{/if}}"));
+    // Options must be literals, and unknown options are rejected.
+    try std.testing.expectError(error.InvalidDocumentRenderer, validateTemplate(std.testing.allocator, "{{encodeToon this.fields indent=this.fields.indent}}"));
+    try std.testing.expectError(error.InvalidDocumentRenderer, validateTemplate(std.testing.allocator, "{{encodeToon this.fields lengthMarker=false}}"));
+    try validateTemplate(std.testing.allocator, "{{#if this.fields.title}}{{encodeToon this.fields indent=4 delimiter=\"tab\"}}{{/if}}");
 }
