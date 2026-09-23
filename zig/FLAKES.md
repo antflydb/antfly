@@ -1,5 +1,45 @@
 # Zig runtime flakes
 
+## 2026-09-22: schema rewrite cutover readiness after coordinator crash
+
+[CI run 35813900420, job 107039234761](https://github.com/antflydb/antfly/actions/runs/35813900420/job/107039234761)
+failed `test_schema_rewrite_recovers_dependency_cohort[publication-coordinator]`:
+the restore was still running with `RestoreValidationPending` after its
+180-second terminal wait. The retained server logs show import and validation
+progress, and the test's old-owner observations reached the fenced/drained
+state. The generic job error does not identify which cutover owner was pending;
+the stripped CI stacks do not establish a deadlock.
+
+Cutover polls each old owner's topology fence before recording its durable
+receipt. An absent write/status response or a not-yet-drained fence is expected
+readiness, but previously used `RestoreValidationPending`, which requeued a new
+replicated job attempt with exponential repository-failure backoff. Across six
+old owners, this can consume the test's recovery window without advancing the
+cutover cursor. These readiness checks now park a bounded 250-ms in-memory
+continuation of the same durable attempt. The owner receipt and cursor still
+advance only after the fence is observed drained; process loss reconstructs
+the running job from its durable checkpoint. A read-index status check first
+recognizes an already-applied begin, including one whose response was lost, so
+short polling does not resend a Raft write on each turn. Actual repository and
+validation errors retain their existing retry/fencing behavior.
+
+The unchanged `origin/main` binary passed six focused macOS Debug repetitions
+with two concurrent regression-loop workers (roughly 144–162 seconds each),
+so the exact CI failure was not reproduced locally. The store's continuation
+regression now exercises both yield and readiness-wait paths, including
+checkpoint preservation, zero scheduling writes, same-attempt resume, and
+leader-recovery fencing. The initial fixed binary passed four concurrent E2E
+repetitions; the final revision with read-before-resend passed two more. The
+focused restore-job suite passed 42/42. These runs validate integrated recovery
+but do not establish a latency speedup or prove the CI failure's exact cause.
+
+```sh
+SKIP_BUILD=1 ANTFLY_E2E_ENV_LOADED=1 \
+  ANTFLY_E2E_REGRESSION_WORKERS=2 ANTFLY_E2E_REGRESSION_REPEATS=3 \
+  scripts/ci/zig-e2e-regression-loop.sh \
+  'e2e/antfly/test_relational_integrity_recovery.py::test_schema_rewrite_recovers_dependency_cohort[publication-coordinator]'
+```
+
 See also the [E2E flake history](e2e/FLAKES.md). Record the original evidence,
 reproduction conditions, deterministic regression, and before/after results;
 a passing soak alone does not establish a failure's cause.

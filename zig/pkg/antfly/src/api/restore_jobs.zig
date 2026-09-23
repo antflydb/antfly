@@ -1912,10 +1912,11 @@ pub const Store = struct {
             });
         }
 
-        if (std.mem.eql(u8, err_name, "RestoreStagingYield")) {
-            // Yielding must not write running -> queued -> running for each
-            // bounded page. Those extra consensus/fsync barriers dominate small
-            // restores on high-latency disks and inflate failure backoff attempts.
+        if (std.mem.eql(u8, err_name, "RestoreStagingYield") or std.mem.eql(u8, err_name, "RestoreStagingWait")) {
+            // Cooperative pages and readiness waits must not write running ->
+            // queued -> running on every turn. Those extra consensus/fsync
+            // barriers dominate small restores on high-latency disks and
+            // inflate failure backoff attempts.
             // The actual progress has already been durably checkpointed.
             const encoded = try alloc.dupe(u8, current);
             errdefer alloc.free(encoded);
@@ -3817,8 +3818,8 @@ test "restore cooperative continuations preserve checkpoints without replicated 
     const writes = persistence.put_calls;
     // The caller may hold an older view than the latest checkpoint. Yield must
     // keep that checkpoint, and neither yield nor resume requires persistence.
-    for (0..100) |_| {
-        const yielded = try store.retryRunning(alloc, worker.value, "RestoreStagingYield", 0);
+    for (0..100) |iteration| {
+        const yielded = try store.retryRunning(alloc, worker.value, if (iteration % 2 == 0) "RestoreStagingYield" else "RestoreStagingWait", 0);
         defer alloc.free(yielded);
         try std.testing.expectEqualStrings(checkpoint, yielded);
         // A retiring worker that could not schedule the timer no longer owns

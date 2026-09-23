@@ -559,6 +559,22 @@ const max_pending_table_reclaims_per_target: usize = 128;
 const backup_maintenance_target_retention_ns: u64 = 7 * std.time.ns_per_day;
 const restore_repository_retry_min_ms: u64 = 100;
 const restore_repository_retry_max_ms: u64 = 5_000;
+const restore_staging_wait_ns: u64 = 250 * std.time.ns_per_ms;
+
+fn restoreRetryDelayNs(err: anyerror, job_id: u64, attempt_id: u64) u64 {
+    return switch (err) {
+        error.RestoreStagingYield => 10 * std.time.ns_per_ms,
+        error.RestoreStagingWait => restore_staging_wait_ns,
+        else => restoreRepositoryRetryDelayNs(job_id, attempt_id),
+    };
+}
+
+test "restore cutover readiness waits without exponential retry" {
+    try std.testing.expectEqual(10 * std.time.ns_per_ms, restoreRetryDelayNs(error.RestoreStagingYield, 42, 8));
+    try std.testing.expectEqual(restore_staging_wait_ns, restoreRetryDelayNs(error.RestoreStagingWait, 42, 8));
+    try std.testing.expect(restoreRetryDelayNs(error.RestoreValidationPending, 42, 8) > restore_staging_wait_ns);
+    try std.testing.expect(restoreJobErrorIsRetryable(error.RestoreStagingWait));
+}
 
 fn restoreRepositoryRetryDelayNs(job_id: u64, attempt_id: u64) u64 {
     const exponent: u6 = @intCast(@min(attempt_id -| 1, 6));
@@ -16184,14 +16200,29 @@ pub const ApiHttpServer = struct {
                             owner_cursor += 1;
                             continue;
                         }
-                        _ = (try (self.table_writes orelse return error.UnsupportedOperation).batch(self.alloc, old.table.name, .{ .relational_topology = .{ .fence = old.fence, .action = if (phase == .cutover) .begin else .cancel } })) orelse return error.RestoreValidationPending;
                         if (phase == .cutover) {
-                            var response = (try (self.table_reads orelse return error.UnsupportedOperation).topologyStatus(self.alloc, old.table.name, old.range.start_key, "{\"mode\":\"status\"}")) orelse return error.RestoreValidationPending;
-                            defer response.deinit(self.alloc);
-                            const status = try std.json.parseFromSlice(@import("../metadata/backup_cohort.zig").Observation, self.alloc, response.json, .{});
-                            defer status.deinit();
-                            if (status.value.fence == null or !status.value.fence.?.eql(old.fence)) return error.RestoreStagingScopeChanged;
-                            if (!status.value.drained) return error.RestoreValidationPending;
+                            // A read-index status can prove that an earlier
+                            // begin reached the owner even if its response was
+                            // lost. Reissuing begin on every readiness poll
+                            // would amplify Raft writes across the cohort.
+                            var began_in_this_slice = false;
+                            while (true) {
+                                var response = (try (self.table_reads orelse return error.UnsupportedOperation).topologyStatus(self.alloc, old.table.name, old.range.start_key, "{\"mode\":\"status\"}")) orelse return error.RestoreStagingWait;
+                                defer response.deinit(self.alloc);
+                                const status = try std.json.parseFromSlice(@import("../metadata/backup_cohort.zig").Observation, self.alloc, response.json, .{});
+                                defer status.deinit();
+                                if (status.value.fence) |fence| {
+                                    if (fence.eql(old.fence)) {
+                                        if (!status.value.drained) return error.RestoreStagingWait;
+                                        break;
+                                    }
+                                }
+                                if (began_in_this_slice) return error.RestoreStagingScopeChanged;
+                                _ = (try (self.table_writes orelse return error.UnsupportedOperation).batch(self.alloc, old.table.name, .{ .relational_topology = .{ .fence = old.fence, .action = .begin } })) orelse return error.RestoreStagingWait;
+                                began_in_this_slice = true;
+                            }
+                        } else {
+                            _ = (try (self.table_writes orelse return error.UnsupportedOperation).batch(self.alloc, old.table.name, .{ .relational_topology = .{ .fence = old.fence, .action = .cancel } })) orelse return error.RestoreValidationPending;
                         }
                         if (old.rewrite_source) |source_scope| {
                             // Targets already applied final cuts before global
@@ -19793,7 +19824,7 @@ pub const ApiHttpServer = struct {
                     return;
                 }
                 if (restoreJobErrorIsFenced(err)) return error.RestoreJobFenced;
-                const retry = try self.restore_job_store.retryRunning(self.alloc, state, @errorName(err), if (err == error.RestoreStagingYield) 10 * std.time.ns_per_ms else restoreRepositoryRetryDelayNs(state.job_id, state.attempt_id));
+                const retry = try self.restore_job_store.retryRunning(self.alloc, state, @errorName(err), restoreRetryDelayNs(err, state.job_id, state.attempt_id));
                 self.alloc.free(retry);
                 self.wakeRequeuedRestoreJobs();
                 return;
@@ -19834,7 +19865,7 @@ pub const ApiHttpServer = struct {
                     }, &location, state.restore_mode, state.destination_authorization_principal, .{ .job_id = state.job_id, .attempt_id = state.attempt_id }, state.active_table_index, state.durability_pending_table_ranges orelse &.{}, state.published_table_ranges orelse &.{}) catch |err| {
                         if (restoreJobErrorIsFenced(err)) return error.RestoreJobFenced;
                         if (restoreJobErrorIsRetryable(err)) {
-                            const encoded = try self.restore_job_store.retryRunning(self.alloc, state, @errorName(err), if (err == error.RestoreStagingYield) 10 * std.time.ns_per_ms else restoreRepositoryRetryDelayNs(state.job_id, state.attempt_id));
+                            const encoded = try self.restore_job_store.retryRunning(self.alloc, state, @errorName(err), restoreRetryDelayNs(err, state.job_id, state.attempt_id));
                             self.alloc.free(encoded);
                             self.wakeRequeuedRestoreJobs();
                             return;
@@ -19900,10 +19931,7 @@ pub const ApiHttpServer = struct {
                         else => {
                             if (restoreJobErrorIsFenced(err)) return error.RestoreJobFenced;
                             if (restoreJobErrorIsRetryable(err)) {
-                                const retry_delay_ns = restoreRepositoryRetryDelayNs(
-                                    state.job_id,
-                                    state.attempt_id,
-                                );
+                                const retry_delay_ns = restoreRetryDelayNs(err, state.job_id, state.attempt_id);
                                 const retried = try self.restore_job_store.retryRunning(
                                     self.alloc,
                                     state,
@@ -19964,10 +19992,7 @@ pub const ApiHttpServer = struct {
                 .restore_mode = state.restore_mode,
             }, &location, state.restore_mode, state.destination_authorization_principal, .{ .job_id = state.job_id, .attempt_id = state.attempt_id }, state.active_table_index, state.durability_pending_table_ranges orelse &.{}, state.published_table_ranges orelse &.{}) catch |err| {
                 if (restoreJobErrorIsRetryable(err)) {
-                    const retry_delay_ns = if (err == error.RestoreStagingYield) 10 * std.time.ns_per_ms else restoreRepositoryRetryDelayNs(
-                        state.job_id,
-                        state.attempt_id,
-                    );
+                    const retry_delay_ns = restoreRetryDelayNs(err, state.job_id, state.attempt_id);
                     const retried = try self.restore_job_store.retryRunning(
                         self.alloc,
                         state,
@@ -20569,6 +20594,7 @@ fn restoreJobErrorIsFenced(err: anyerror) bool {
 fn restoreJobErrorIsRetryable(err: anyerror) bool {
     return err == error.BackupRepositoryBusy or
         err == error.RestoreStagingYield or
+        err == error.RestoreStagingWait or
         err == error.RestoreValidationPending;
 }
 
