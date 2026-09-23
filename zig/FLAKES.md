@@ -13,7 +13,8 @@ signature: the generic error mapping treated transient owner contention as
 `RestoreValidationPending`, requeued a fresh durable attempt, and applied
 repository-failure backoff. `StorageBusy` now takes the existing bounded
 same-attempt staging wait; ordinary repository errors still use their durable
-retry policy. The mapping regression checks both classifications.
+retry policy. The translator also preserves readiness waits raised directly
+by cutover fencing. The mapping regression checks all three classifications.
 
 In `test_progressive_publication_remains_queryable_across_process_restart`,
 the same index incarnation had 160 searchable vectors before restart and 32

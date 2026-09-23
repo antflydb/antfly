@@ -16539,6 +16539,7 @@ pub const ApiHttpServer = struct {
     fn stagedRestoreError(err: anyerror) cluster_api_http.ClusterApi.ExecuteRestoreError {
         return switch (err) {
             error.RestoreStagingYield => error.RestoreStagingYield,
+            error.RestoreStagingWait => error.RestoreStagingWait,
             // Owner transitions and publication drains can report StorageBusy
             // while the pinned staging plan is still making ordinary progress.
             // Preserve the durable attempt and its cursors rather than treating
@@ -20951,6 +20952,10 @@ test "native restore validation uncertainty remains an asynchronous retry" {
 }
 
 test "busy staged restore owner retains its pinned attempt" {
+    try std.testing.expectEqual(
+        @as(cluster_api_http.ClusterApi.ExecuteRestoreError, error.RestoreStagingWait),
+        ApiHttpServer.stagedRestoreError(error.RestoreStagingWait),
+    );
     try std.testing.expectEqual(
         @as(cluster_api_http.ClusterApi.ExecuteRestoreError, error.RestoreStagingWait),
         ApiHttpServer.stagedRestoreError(error.StorageBusy),
