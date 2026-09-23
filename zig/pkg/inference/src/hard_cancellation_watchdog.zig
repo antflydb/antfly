@@ -31,7 +31,7 @@ pub const HardCancellationWatchdog = struct {
 
         fn shouldRestart(self: *Entry, now_ns: u64) bool {
             self.control.check() catch |err| {
-                if (err == error.Cancelled) {
+                if (err == error.Cancelled or err == error.Canceled) {
                     if (self.control.cancellation_grace_ns) |grace_ns| {
                         const observed = self.cancellation_observed_ns orelse now_ns;
                         self.cancellation_observed_ns = observed;
@@ -144,11 +144,12 @@ pub const HardCancellationWatchdog = struct {
 test "native call cancellation gets a bounded grace but deadlines stay hard" {
     const State = struct {
         cancelled: bool = true,
+        alternate_spelling: bool = false,
         timed_out: bool = false,
         fn check(raw: ?*anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             if (self.timed_out) return error.Timeout;
-            if (self.cancelled) return error.Cancelled;
+            if (self.cancelled) return if (self.alternate_spelling) error.Canceled else error.Cancelled;
         }
     };
     var state = State{};
@@ -164,4 +165,12 @@ test "native call cancellation gets a bounded grace but deadlines stay hard" {
     try std.testing.expect(entry.cancellation_observed_ns == null);
     state.timed_out = true;
     try std.testing.expect(entry.shouldRestart(141));
+
+    state.timed_out = false;
+    state.cancelled = true;
+    state.alternate_spelling = true;
+    entry.cancellation_observed_ns = null;
+    try std.testing.expect(!entry.shouldRestart(200));
+    try std.testing.expect(!entry.shouldRestart(229));
+    try std.testing.expect(entry.shouldRestart(230));
 }

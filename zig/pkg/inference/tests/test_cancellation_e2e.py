@@ -229,17 +229,14 @@ class CancellationE2E(unittest.TestCase):
         body = json.dumps(
             {"model": self.model, "query": "ab", "prompts": ["ab"] * 30}
             if path == "/ai/v1/rerank"
-            else {"model": self.model, "input": ["ab"]}
-            if path == "/ai/v1/embed"
-            else {}
+            else (
+                {"model": self.model, "input": ["ab"]} if path == "/ai/v1/embed" else {}
+            )
         ).encode()
         client.sendall(
             f"POST {path} HTTP/1.1\r\nHost: localhost\r\n".encode()
             + b"Content-Type: application/json\r\n"
-            b"Content-Length: "
-            + str(len(body)).encode()
-            + b"\r\n\r\n"
-            + body
+            b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
         )
         running = self.wait_state(lambda s: s["active"] == 1)
         self.assertEqual(running["pid"], initial["pid"])
