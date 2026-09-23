@@ -569,11 +569,98 @@ fn restoreRetryDelayNs(err: anyerror, job_id: u64, attempt_id: u64) u64 {
     };
 }
 
+fn waitForRestoreCutoverFence(
+    alloc: std.mem.Allocator,
+    reads: table_reads.TableReadSource,
+    writes: table_writes.TableWriteSource,
+    table_name: []const u8,
+    range_key: []const u8,
+    expected: @import("../storage/db/relational_integrity_topology.zig").Fence,
+) !void {
+    // A read-index status can prove that an earlier begin reached the owner
+    // even if its response was lost. Reissuing begin on every readiness poll
+    // would amplify Raft writes across the cohort.
+    var began_in_this_slice = false;
+    while (true) {
+        var response = (try reads.topologyStatus(alloc, table_name, range_key, "{\"mode\":\"status\"}")) orelse return error.RestoreStagingWait;
+        defer response.deinit(alloc);
+        const status = try std.json.parseFromSlice(@import("../metadata/backup_cohort.zig").Observation, alloc, response.json, .{});
+        defer status.deinit();
+        if (status.value.fence) |fence| {
+            if (fence.eql(expected)) {
+                if (!status.value.drained) return error.RestoreStagingWait;
+                return;
+            }
+        }
+        if (began_in_this_slice) return error.RestoreStagingScopeChanged;
+        _ = (try writes.batch(alloc, table_name, .{ .relational_topology = .{ .fence = expected, .action = .begin } })) orelse return error.RestoreStagingWait;
+        began_in_this_slice = true;
+    }
+}
+
 test "restore cutover readiness waits without exponential retry" {
     try std.testing.expectEqual(10 * std.time.ns_per_ms, restoreRetryDelayNs(error.RestoreStagingYield, 42, 8));
     try std.testing.expectEqual(restore_staging_wait_ns, restoreRetryDelayNs(error.RestoreStagingWait, 42, 8));
     try std.testing.expect(restoreRetryDelayNs(error.RestoreValidationPending, 42, 8) > restore_staging_wait_ns);
     try std.testing.expect(restoreJobErrorIsRetryable(error.RestoreStagingWait));
+}
+
+test "restore cutover lost begin reply waits for the same fence to drain" {
+    const alloc = std.testing.allocator;
+    const Fence = @import("../storage/db/relational_integrity_topology.zig").Fence;
+    const expected: Fence = .{
+        .transition_id = 7,
+        .attempt = 1,
+        .peer_group_id = 401,
+        .owner_group_id = 301,
+        .role = .rewrite_source,
+        .namespace = .{ .table_id = 9, .shard_id = 301, .range_id = 301 },
+        .catalog_digest = @splat(4),
+    };
+    const Fake = struct {
+        fence: ?Fence = null,
+        drained: bool = false,
+        begin_count: usize = 0,
+        read_count: usize = 0,
+
+        fn lookup(ptr: *anyopaque, a: std.mem.Allocator, table_name: []const u8, key: []const u8, opts: db_mod.types.LookupOptions, consistency: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqualStrings("range", key);
+            try std.testing.expectEqualStrings("{\"mode\":\"status\"}", opts.relational_topology_json);
+            try std.testing.expectEqual(raft_mod.ReadConsistency.read_index, consistency);
+            self.read_count += 1;
+            return .{ .json = try std.json.Stringify.valueAlloc(a, @import("../metadata/backup_cohort.zig").Observation{ .fence = self.fence, .drained = self.drained }, .{}), .version = 0 };
+        }
+
+        fn batch(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, req: db_mod.types.BatchRequest) !?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            const command = req.relational_topology orelse return error.TestUnexpectedResult;
+            try std.testing.expect(command.action == .begin);
+            try std.testing.expect(command.fence.eql(expected));
+            self.begin_count += 1;
+            self.fence = command.fence;
+            // The owner applied begin, but the caller lost its response.
+            return null;
+        }
+    };
+    var fake: Fake = .{};
+    const reads: table_reads.TableReadSource = .{ .ptr = &fake, .vtable = &.{ .lookup = Fake.lookup, .scan = undefined, .query = undefined } };
+    const writes: table_writes.TableWriteSource = .{ .ptr = &fake, .vtable = &.{ .batch = Fake.batch } };
+
+    try std.testing.expectError(error.RestoreStagingWait, waitForRestoreCutoverFence(alloc, reads, writes, "docs", "range", expected));
+    try std.testing.expectEqual(@as(usize, 1), fake.begin_count);
+    // Each resumed slice sees the applied fence but must keep waiting while
+    // the source has not drained, without replaying the Raft mutation.
+    for (0..3) |_| {
+        try std.testing.expectError(error.RestoreStagingWait, waitForRestoreCutoverFence(alloc, reads, writes, "docs", "range", expected));
+        try std.testing.expectEqual(@as(usize, 1), fake.begin_count);
+    }
+    fake.drained = true;
+    try waitForRestoreCutoverFence(alloc, reads, writes, "docs", "range", expected);
+    try std.testing.expectEqual(@as(usize, 1), fake.begin_count);
+    try std.testing.expectEqual(@as(usize, 5), fake.read_count);
 }
 
 fn restoreRepositoryRetryDelayNs(job_id: u64, attempt_id: u64) u64 {
@@ -16201,26 +16288,7 @@ pub const ApiHttpServer = struct {
                             continue;
                         }
                         if (phase == .cutover) {
-                            // A read-index status can prove that an earlier
-                            // begin reached the owner even if its response was
-                            // lost. Reissuing begin on every readiness poll
-                            // would amplify Raft writes across the cohort.
-                            var began_in_this_slice = false;
-                            while (true) {
-                                var response = (try (self.table_reads orelse return error.UnsupportedOperation).topologyStatus(self.alloc, old.table.name, old.range.start_key, "{\"mode\":\"status\"}")) orelse return error.RestoreStagingWait;
-                                defer response.deinit(self.alloc);
-                                const status = try std.json.parseFromSlice(@import("../metadata/backup_cohort.zig").Observation, self.alloc, response.json, .{});
-                                defer status.deinit();
-                                if (status.value.fence) |fence| {
-                                    if (fence.eql(old.fence)) {
-                                        if (!status.value.drained) return error.RestoreStagingWait;
-                                        break;
-                                    }
-                                }
-                                if (began_in_this_slice) return error.RestoreStagingScopeChanged;
-                                _ = (try (self.table_writes orelse return error.UnsupportedOperation).batch(self.alloc, old.table.name, .{ .relational_topology = .{ .fence = old.fence, .action = .begin } })) orelse return error.RestoreStagingWait;
-                                began_in_this_slice = true;
-                            }
+                            try waitForRestoreCutoverFence(self.alloc, self.table_reads orelse return error.UnsupportedOperation, self.table_writes orelse return error.UnsupportedOperation, old.table.name, old.range.start_key, old.fence);
                         } else {
                             _ = (try (self.table_writes orelse return error.UnsupportedOperation).batch(self.alloc, old.table.name, .{ .relational_topology = .{ .fence = old.fence, .action = .cancel } })) orelse return error.RestoreValidationPending;
                         }
