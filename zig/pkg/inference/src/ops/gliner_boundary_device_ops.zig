@@ -288,6 +288,15 @@ pub const Kind = enum(u32) {
     scatter_grouped_i32 = 39,
     norm_chunks = 40,
     norm_merge = 41,
+    // Laya uses this strict device dispatcher; no host fallback is permitted.
+    laya_qkv = 42,
+    laya_geglu = 43,
+    laya_window = 44,
+    laya_type_add = 45,
+    laya_action_features = 46,
+    laya_decisions = 47,
+    laya_exact_gelu = 48,
+    laya_logits = 49,
 };
 
 pub const Params = extern struct {
@@ -343,6 +352,51 @@ pub fn layoutFor(kind: Kind, d: [8]u32, scalars: [4]f32) !Layout {
     var r = Layout{};
     for (scalars) |v| if (!std.math.isFinite(v)) return error.InvalidBoundaryDeviceShape;
     switch (kind) {
+        .laya_qkv => { // rows,hidden,heads,sequence,part,rotate
+            if (d[2] == 0 or d[1] % d[2] != 0 or (d[1] / d[2]) % 2 != 0 or d[3] == 0 or d[4] > 2 or d[5] > 1 or (d[5] == 1 and scalars[0] <= 0)) return error.InvalidBoundaryDeviceShape;
+            r.output_elements = try mul(d[0..2]);
+            r.input_elements[0] = try shape(&.{ r.output_elements, 3 });
+        },
+        .laya_geglu => {
+            r.output_elements = try mul(d[0..2]);
+            r.input_elements[0] = try shape(&.{ r.output_elements, 2 });
+        },
+        .laya_window => { // heads,sequence,half-window
+            r.output_elements = try shape(&.{ d[0], d[1], d[1] });
+        },
+        .laya_type_add => { // batch,sequence,hidden
+            r.output_elements = try mul(d[0..3]);
+            r.input_elements[0] = r.output_elements;
+            r.input_elements[1] = try shape(&.{ 3, d[2] });
+            r.input_elements[2] = d[0];
+            r.integer_inputs = 1 << 2;
+        },
+        .laya_action_features => { // batch,sequence,hidden,options
+            if (d[3] < 2 or d[3] > 20) return error.InvalidBoundaryDeviceShape;
+            r.input_elements[0] = try mul(d[0..3]);
+            r.input_elements[1] = try shape(&.{ d[0], d[3] });
+            r.input_elements[2] = r.input_elements[1];
+            r.integer_inputs = 1 << 2;
+            r.output_elements = try shape(&.{ d[0], @as(usize, d[2]) + 4 });
+        },
+        .laya_decisions, .laya_logits => { // batch,options,actions
+            if (d[1] < 2 or d[1] > 20 or d[2] < 1 or d[2] > 33) return error.InvalidBoundaryDeviceShape;
+            r.input_elements[0] = try mul(d[0..2]);
+            r.input_elements[1] = try shape(&.{ d[0], d[2] });
+            r.input_elements[2] = r.input_elements[0];
+            r.integer_inputs = 1 << 2;
+            if (kind == .laya_decisions) {
+                r.input_elements[3] = d[0];
+                r.integer_inputs |= 1 << 3;
+                r.input_elements[4] = 12;
+                r.output_elements = try shape(&.{ d[0], @as(usize, d[1]) + 6 });
+                r.work_items = d[0];
+            } else r.output_elements = try shape(&.{ d[0], @as(usize, d[1]) + d[2] });
+        },
+        .laya_exact_gelu => {
+            r.output_elements = try mul(d[0..1]);
+            r.input_elements[0] = r.output_elements;
+        },
         .bias, .norm => {
             r.output_elements = try mul(d[0..2]);
             r.input_elements[0] = r.output_elements;
