@@ -282,7 +282,11 @@ def _create_domain_table(api, name, num_shards):
         for i in range(start, min(start + 500, _DOMAIN_DOCS)):
             va, vb = _domain_vectors(i)
             inserts[_domain_key(i)] = {
-                "body": ("needle " if i in _TEXT_IDS else "") + "filler words here",
+                "body": (
+                    ("needle " if i in _TEXT_IDS else "")
+                    + ("boundary " if i < 100 else "")
+                    + "filler words here"
+                ),
                 "key": _domain_key(i),
                 "status": "active" if i % 2 == 0 else "inactive",
                 "_embeddings": {"va": va, "vb": vb},
@@ -437,6 +441,16 @@ def test_vector_aggregation_budget_counts_windows_not_index(monkeypatch, request
     assert {
         bucket["key"] for bucket in keyword["aggregations"]["keys"]["buckets"]
     } == text_keys
+    # A complete Block-Max window that exactly fills the budget is still exact.
+    boundary = _domain_query(
+        api,
+        name,
+        {"full_text_search": {"match": "boundary", "field": "body"}},
+        _DOMAIN_TERMS,
+    )
+    assert {
+        bucket["key"] for bucket in boundary["aggregations"]["keys"]["buckets"]
+    } == {_domain_key(i) for i in range(100)}
     hybrid = _domain_query(
         api,
         name,

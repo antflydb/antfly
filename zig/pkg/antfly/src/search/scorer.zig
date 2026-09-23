@@ -350,7 +350,6 @@ pub const WANDScorer = struct {
         }
 
         if (has_block_max) {
-            if (collector.topKLimit() > 0) collector.markLowerBound();
             if (self.terms.items.len == 1) {
                 try self.executeSingleTermWAND(collector);
             } else {
@@ -417,6 +416,9 @@ pub const WANDScorer = struct {
                 term.exhausted = true;
             }
         }
+        // The posting list's cardinality proves whether an advance actually
+        // skipped a match. An advance after its final posting is still exact.
+        if (self.pivots_scored < term.iter.doc_freq) collector.markLowerBound();
     }
 
     /// Brute-force: score every document that appears in any term's postings.
@@ -489,7 +491,10 @@ pub const WANDScorer = struct {
                 sorted[insert_pos] = moving;
             }
 
-            if (try self.skipNonCompetitiveFrontBlock(collector, sorted)) continue;
+            if (try self.skipNonCompetitiveFrontBlock(collector, sorted)) {
+                collector.markLowerBound();
+                continue;
+            }
 
             // Find pivot: smallest position where sum of max-impacts reaches
             // the collector's current competitive score.
@@ -506,7 +511,10 @@ pub const WANDScorer = struct {
                 }
             }
 
-            if (pivot_pos == null) break;
+            if (pivot_pos == null) {
+                collector.markLowerBound();
+                break;
+            }
 
             const pivot_doc = self.terms.items[sorted[pivot_pos.?]].current.?.doc_id;
 
@@ -555,6 +563,7 @@ pub const WANDScorer = struct {
                 // to the start of the next chunk and try again. This is the
                 // core Block-Max WAND skip on top of WAND's pivot-level pruning.
                 self.pivots_advanced += 1;
+                collector.markLowerBound();
                 for (sorted[0 .. pivot_pos.? + 1]) |idx| {
                     const t = &self.terms.items[idx];
                     if (!t.exhausted and t.current.?.doc_id < pivot_doc) {
@@ -1204,4 +1213,25 @@ test "block-max scorer proves sparse matches complete below top-k" {
     defer alloc.free(results.hits);
     try std.testing.expectEqual(@as(usize, 4), results.hits.len);
     try std.testing.expectEqual(TotalHitsRelation.exact, results.total_relation);
+
+    // Exactly filling the window is also complete when every posting was
+    // scored. A smaller window must keep its lower-bound relation.
+    inline for (.{ 4, 3 }) |k| {
+        var boundary_scorer = WANDScorer.init(alloc, k, reader.doc_count, reader.avgDocLen(), .{});
+        defer boundary_scorer.deinit();
+        try boundary_scorer.addTerm(
+            try lookup.iterator(alloc),
+            lookup.docFreq(),
+            switch (lookup) {
+                .postings => |postings| postings.block_max,
+                .one_hit => null,
+            },
+            8,
+            0,
+        );
+        const boundary = try boundary_scorer.execute();
+        defer alloc.free(boundary.hits);
+        try std.testing.expectEqual(@as(usize, k), boundary.hits.len);
+        try std.testing.expectEqual(if (k == 4) TotalHitsRelation.exact else .gte, boundary.total_relation);
+    }
 }
