@@ -6446,6 +6446,8 @@ test "malformed chunked dense batch is isolated without failing the worker" {
     var window = GeneratedReplayWindow{ .alloc = alloc };
     defer window.deinit();
     var malformed = MalformedBatchEmbedder{};
+    var rejected = std.AutoHashMapUnmanaged(u64, void).empty;
+    defer rejected.deinit(alloc);
 
     var scope = FailureScope{};
     const complete = try flushChunkedDenseItems(
@@ -6459,6 +6461,7 @@ test "malformed chunked dense batch is isolated without failing the worker" {
         &window,
         false,
         &scope,
+        &rejected,
     );
 
     try std.testing.expect(!complete);
@@ -6468,6 +6471,77 @@ test "malformed chunked dense batch is isolated without failing the worker" {
     try std.testing.expectEqual(@as(u64, 1), runtime.fatal_error_count);
     try std.testing.expectEqual(@as(u64, 0), runtime.embed_batches_completed);
     try std.testing.expect(!runtime.worker_failed);
+}
+
+test "rejected chunk embedding publication records its request for stale cleanup" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer store.deinit();
+    var erased_store = try backend_erased.storeFrom(alloc, store);
+    defer erased_store.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const index_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/rejected-chunk-indexes", .{tmp.sub_path});
+    var index_manager = try index_manager_mod.IndexManager.init(alloc, index_path);
+    defer index_manager.deinit();
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .io_impl = null,
+        .store = erased_store,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = &index_manager,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .failure_ctx = undefined,
+        .failure_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{},
+        .ownership = undefined,
+    };
+    defer clearIndexEmbeddingActivity(&runtime);
+    const request = enrichment_types.GeneratedEnrichmentRequest{
+        .kind = .dense_embedding,
+        .index_name = "semantic",
+        .embedding_name = "dense_v1",
+        .artifact_name = "chunks_v1",
+        .doc_key = "doc:1",
+        .source_field = "body",
+        .expected_dims = 3,
+    };
+    const chunk_key = try internal_keys.chunkArtifactKeyAlloc(alloc, request.doc_key, "chunks_v1", 0);
+    defer alloc.free(chunk_key);
+    var texts = std.ArrayListUnmanaged([]const u8).empty;
+    defer texts.deinit(alloc);
+    try texts.append(alloc, "obsolete source");
+    var items = std.ArrayListUnmanaged(ChunkedDenseWindowItem).empty;
+    defer {
+        freeChunkedDenseWindowItems(alloc, items.items);
+        items.deinit(alloc);
+    }
+    try items.append(alloc, .{
+        .request = request,
+        .parent_doc_key = request.doc_key,
+        .source_field = request.source_field,
+        .artifact_name = "dense_v1",
+        .chunk_key = try alloc.dupe(u8, chunk_key),
+        .source_hash = 1,
+        .source_record_digest = [_]u8{0} ** 32,
+    });
+    var window = GeneratedReplayWindow{ .alloc = alloc };
+    defer window.deinit();
+    var rejected = std.AutoHashMapUnmanaged(u64, void).empty;
+    defer rejected.deinit(alloc);
+    var dense = embedder_mod.DeterministicDenseEmbedder{};
+    var scope = FailureScope{};
+    try std.testing.expect(try flushChunkedDenseItems(&runtime, dense.interface(), "dense_v1", 3, &.{"semantic"}, &texts, &items, &window, false, &scope, &rejected));
+    try std.testing.expect(rejected.contains(requestFailureFingerprint(request)));
+    try std.testing.expectEqual(@as(usize, 0), window.dense_embeddings.items.len);
 }
 
 fn workerStep(runtime: *EnrichmentRuntime) ?u64 {
@@ -21453,6 +21527,7 @@ fn flushChunkedDenseItems(
     window: *GeneratedReplayWindow,
     owns_texts: bool,
     scope: *FailureScope,
+    rejected_requests: *std.AutoHashMapUnmanaged(u64, void),
 ) !bool {
     if (chunk_items.items.len == 0) return true;
 
@@ -21521,7 +21596,12 @@ fn flushChunkedDenseItems(
         start = end;
     }
     for (batch_items, accepted) |item, committed| {
-        if (!committed) continue;
+        if (!committed) {
+            // A source changed while the provider ran. Its obsolete vectors
+            // must survive until a later request publishes replacements.
+            try rejected_requests.put(runtime.alloc, requestFailureFingerprint(item.request), {});
+            continue;
+        }
         try queueDerivedCoverageProduced(runtime, window, item.request, consumer_indexes);
         const artifact_key = try embeddingArtifactKey(runtime, item.chunk_key, item.artifact_name);
         var artifact_key_owned = true;
@@ -21616,6 +21696,8 @@ fn processMaterializedChunkDenseRequest(
     defer freeOwnedKeySet(runtime.alloc, &desired_chunk_keys);
     var existing_embedding_keys = std.ArrayListUnmanaged([]u8).empty;
     defer deinitOwnedKeyList(runtime.alloc, &existing_embedding_keys);
+    var rejected_requests = std.AutoHashMapUnmanaged(u64, void).empty;
+    defer rejected_requests.deinit(runtime.alloc);
 
     const prefix = try internal_keys.artifactNamedPrefixAlloc(runtime.alloc, request.doc_key, "chunk", chunk_artifact_name);
     defer runtime.alloc.free(prefix);
@@ -21736,8 +21818,9 @@ fn processMaterializedChunkDenseRequest(
         try backend_scan.scanWithContext(&runtime.store, lower, upper_bound, .{}, &collect, Collect.scan);
 
         try processCachedChunkDenseItems(runtime, request, consumer_indexes, window, &cached_items, max_window_items, scope);
-        const complete = try flushChunkedDenseItems(runtime, dense_embedder, embedding_artifact_name, request.expected_dims, consumer_indexes, &chunk_texts, &chunk_items, window, true, scope);
+        const complete = try flushChunkedDenseItems(runtime, dense_embedder, embedding_artifact_name, request.expected_dims, consumer_indexes, &chunk_texts, &chunk_items, window, true, scope, &rejected_requests);
         if (!complete) return;
+        if (rejected_requests.contains(requestFailureFingerprint(request))) return;
         try flushGeneratedReplayWindowIfNeededWithIdentity(runtime, window, max_window_items, scope.completedFingerprint());
         batch_source_bytes = 0;
 
@@ -21748,6 +21831,7 @@ fn processMaterializedChunkDenseRequest(
         lower = next_lower;
     }
 
+    if (rejected_requests.contains(requestFailureFingerprint(request))) return;
     for (existing_embedding_keys.items) |embedding_key| {
         if (try derivedEmbeddingBelongsToDesiredChunkSet(runtime.alloc, embedding_key, &desired_chunk_keys)) continue;
         try appendUniqueDupeKey(runtime.alloc, &window.artifact_delete_keys, embedding_key);
@@ -22325,6 +22409,8 @@ fn processChunkedDenseWindow(
         const max_batch_items = effectiveRequestEmbedBatchItems(runtime, seed);
         const max_batch_bytes = requestEmbedBatchBytes(runtime.alloc, seed);
         var batch_source_bytes: usize = 0;
+        var rejected_requests = std.AutoHashMapUnmanaged(u64, void).empty;
+        defer rejected_requests.deinit(runtime.alloc);
 
         var j: usize = i;
         while (j < requests.len) : (j += 1) {
@@ -22386,7 +22472,7 @@ fn processChunkedDenseWindow(
                     // A shared batch may contain only an earlier request. A
                     // terminal failure there must not park this request.
                     const failed_batch_includes_request = request_batch_items_pending;
-                    const complete = flushChunkedDenseItems(runtime, dense_embedder, embedding_artifact_name, seed.expected_dims, consumer_indexes, &chunk_texts, &chunk_items, window, true, scope) catch |err| {
+                    const complete = flushChunkedDenseItems(runtime, dense_embedder, embedding_artifact_name, seed.expected_dims, consumer_indexes, &chunk_texts, &chunk_items, window, true, scope, &rejected_requests) catch |err| {
                         if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request)
                             return err;
                         if (deferred_retry_error == null) {
@@ -22426,7 +22512,7 @@ fn processChunkedDenseWindow(
                 request_batch_items_pending = true;
                 batch_source_bytes += source_text_len;
                 if (chunk_items.items.len >= max_batch_items or batch_source_bytes >= max_batch_bytes) {
-                    const complete = flushChunkedDenseItems(runtime, dense_embedder, embedding_artifact_name, seed.expected_dims, consumer_indexes, &chunk_texts, &chunk_items, window, true, scope) catch |err| {
+                    const complete = flushChunkedDenseItems(runtime, dense_embedder, embedding_artifact_name, seed.expected_dims, consumer_indexes, &chunk_texts, &chunk_items, window, true, scope, &rejected_requests) catch |err| {
                         if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request)
                             return err;
                         if (deferred_retry_error == null) {
@@ -22458,7 +22544,7 @@ fn processChunkedDenseWindow(
                 // committing its obsolete artifact keys. Most requests have
                 // no stale keys and retain cross-request batching.
                 const failed_batch_includes_request = request_batch_items_pending;
-                const complete = flushChunkedDenseItems(runtime, dense_embedder, embedding_artifact_name, seed.expected_dims, consumer_indexes, &chunk_texts, &chunk_items, window, true, scope) catch |err| {
+                const complete = flushChunkedDenseItems(runtime, dense_embedder, embedding_artifact_name, seed.expected_dims, consumer_indexes, &chunk_texts, &chunk_items, window, true, scope, &rejected_requests) catch |err| {
                     if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request)
                         return err;
                     if (deferred_retry_error == null) {
@@ -22476,13 +22562,14 @@ fn processChunkedDenseWindow(
                 // An earlier request may own the whole failed shared batch;
                 // cached replacements for this request still permit cleanup.
                 if (!complete and failed_batch_includes_request) continue;
+                if (rejected_requests.contains(requestFailureFingerprint(request))) continue;
                 try mergeOwnedStaleEmbeddingDeletesIntoWindow(runtime, window, &stale_deletes);
                 try flushGeneratedReplayWindowIfNeededWithIdentity(runtime, window, max_window_items, scope.completedFingerprint());
             }
         }
 
         if (chunk_items.items.len == 0) continue;
-        _ = flushChunkedDenseItems(runtime, dense_embedder, embedding_artifact_name, seed.expected_dims, consumer_indexes, &chunk_texts, &chunk_items, window, true, scope) catch |err| {
+        _ = flushChunkedDenseItems(runtime, dense_embedder, embedding_artifact_name, seed.expected_dims, consumer_indexes, &chunk_texts, &chunk_items, window, true, scope, &rejected_requests) catch |err| {
             if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request)
                 return err;
             if (deferred_retry_error == null) {

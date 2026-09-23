@@ -220,6 +220,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "storage.db.db.test.db synchronous chunk replacement retires stale embeddings in the same commit",
         "storage.db.db.test.db asynchronous empty inline chunks retire old embeddings",
         "storage.db.db.test.pending chunk deletes index only new keys by document",
+        "storage.db.db.test.pending artifact writes index only new writes by document",
+        "storage.db.enrichment.enrichment_runtime.test.rejected chunk embedding publication records its request for stale cleanup",
         "storage.db.db.test.db cached chunk cleanup survives another failed shared batch request",
         "storage.db.db.test.db managed dense enrichment retries temporary model capacity without terminal coverage",
         "storage.db.db.test.db managed sparse enrichment retries temporary model capacity without terminal coverage",
