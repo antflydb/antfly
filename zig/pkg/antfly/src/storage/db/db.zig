@@ -46392,14 +46392,13 @@ fn appendStalePrecomputedChunkEmbeddingDeletes(
     db: *DB,
     doc_value: []const u8,
     request: enrichment_types.GeneratedEnrichmentRequest,
-    artifact_writes: []const types.BatchWrite,
     cache: *std.ArrayListUnmanaged(ChunkCacheEntry),
     artifact_delete_keys: *std.ArrayListUnmanaged([]const u8),
 ) !void {
     if (!requestUsesChunkSource(request) or requestUsesPinnedMaterializedChunkArtifact(request)) return;
 
     var chunks_created: usize = 0;
-    const sources = try chunkEmbeddingSourcesForRequest(alloc, db, doc_value, request, artifact_writes, cache, &chunks_created);
+    const sources = try chunkEmbeddingSourcesForRequest(alloc, db, doc_value, request, cache, &chunks_created);
     defer freeChunkEmbeddingSources(alloc, sources);
     var desired = std.StringHashMapUnmanaged(void).empty;
     defer desired.deinit(alloc);
@@ -50880,10 +50879,10 @@ fn chunkEmbeddingSourcesForRequest(
     db: *DB,
     doc_value: []const u8,
     request: enrichment_types.GeneratedEnrichmentRequest,
-    artifact_writes: []const types.BatchWrite,
     cache: *std.ArrayListUnmanaged(ChunkCacheEntry),
     chunks_created: *usize,
 ) ![]ChunkEmbeddingSource {
+    std.debug.assert(request.input_kind == .inline_chunks);
     chunks_created.* = 0;
     const artifact_name = requestArtifactName(request);
     var sources = std.ArrayListUnmanaged(ChunkEmbeddingSource).empty;
@@ -50905,10 +50904,9 @@ fn chunkEmbeddingSourcesForRequest(
         });
         chunks_created.* += 1;
     }
-    if (sources.items.len > 0) return try sources.toOwnedSlice(alloc);
-
-    try collectChunkEmbeddingSourcesFromWrites(alloc, &sources, artifact_writes, request.doc_key, artifact_name, request.source_field);
-    try collectChunkEmbeddingSourcesFromStore(alloc, db, &sources, request.doc_key, artifact_name, request.source_field);
+    // Inline chunks are derived from this document revision. An empty set is
+    // intentional; falling back to stored rows would resurrect the previous
+    // revision's chunks while this commit is deleting them.
     return try sources.toOwnedSlice(alloc);
 }
 
@@ -51299,7 +51297,7 @@ fn preparePreservedEmbeddingSources(
             try collectChunkEmbeddingSourcesFromStore(alloc, db, &sources, request.doc_key, requestArtifactName(request), request.source_field);
         } else {
             var chunks_created: usize = 0;
-            sources = .fromOwnedSlice(try chunkEmbeddingSourcesForRequest(alloc, db, doc_value, request, artifact_writes, cache, &chunks_created));
+            sources = .fromOwnedSlice(try chunkEmbeddingSourcesForRequest(alloc, db, doc_value, request, cache, &chunks_created));
         }
     } else {
         const text = if (request.source_template.len != 0)
@@ -51369,7 +51367,7 @@ fn computeDenseRequestImpl(
             return;
         }
         var chunks_created: usize = 0;
-        const sources = try chunkEmbeddingSourcesForRequest(alloc, db, doc_value, request, artifact_writes.items, cache, &chunks_created);
+        const sources = try chunkEmbeddingSourcesForRequest(alloc, db, doc_value, request, cache, &chunks_created);
         defer freeChunkEmbeddingSources(alloc, sources);
         if (sources.len == 0) return;
         enrichment_runtime_mod.noteIndexChunksCreated(runtime, consumer_indexes, chunks_created);
@@ -51608,7 +51606,7 @@ fn computeSparseRequestDerived(
             return;
         }
         var chunks_created: usize = 0;
-        const sources = try chunkEmbeddingSourcesForRequest(alloc, db, doc_value, request, artifact_writes.items, cache, &chunks_created);
+        const sources = try chunkEmbeddingSourcesForRequest(alloc, db, doc_value, request, cache, &chunks_created);
         defer freeChunkEmbeddingSources(alloc, sources);
         if (sources.len == 0) return;
         enrichment_runtime_mod.noteIndexChunksCreated(runtime, consumer_indexes, chunks_created);
@@ -52528,7 +52526,7 @@ fn prepareGeneratedEnrichments(
                         },
                         else => return err,
                     };
-                    try appendStalePrecomputedChunkEmbeddingDeletes(alloc, self, cleaned, request, artifact_writes.items, &chunk_cache, &artifact_delete_keys);
+                    try appendStalePrecomputedChunkEmbeddingDeletes(alloc, self, cleaned, request, &chunk_cache, &artifact_delete_keys);
                     try appendPrecomputedCoverageCandidate(
                         alloc,
                         &coverage_candidates,
@@ -52545,7 +52543,7 @@ fn prepareGeneratedEnrichments(
                         },
                         else => return err,
                     };
-                    try appendStalePrecomputedChunkEmbeddingDeletes(alloc, self, cleaned, request, artifact_writes.items, &chunk_cache, &artifact_delete_keys);
+                    try appendStalePrecomputedChunkEmbeddingDeletes(alloc, self, cleaned, request, &chunk_cache, &artifact_delete_keys);
                     try appendPrecomputedCoverageCandidate(
                         alloc,
                         &coverage_candidates,
@@ -98806,6 +98804,70 @@ test "db synchronous chunk replacement retires stale embeddings in the same comm
     try std.testing.expectEqual(@as(u64, 1), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
 
     const prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "chunk", "body_chunks_v1");
+    defer alloc.free(prefix);
+    const artifacts = try db.core.store.scanPrefix(alloc, prefix);
+    defer docstore_mod.DocStore.freeResults(alloc, artifacts);
+    var embeddings: usize = 0;
+    for (artifacts) |entry| {
+        if (internal_keys.isDerivedEmbeddingArtifactKey(entry.key)) embeddings += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), embeddings);
+
+    // An empty inline result must not reuse the old stored chunk row while
+    // preparing the same commit's embedding and stale-artifact deletions.
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"\"}" }},
+        .sync_level = .full_index,
+    });
+    try std.testing.expectEqual(@as(u64, 0), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
+    const empty_artifacts = try db.core.store.scanPrefix(alloc, prefix);
+    defer docstore_mod.DocStore.freeResults(alloc, empty_artifacts);
+    try std.testing.expectEqual(@as(usize, 0), empty_artifacts.len);
+}
+
+test "db cached chunk cleanup survives another failed shared batch request" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var gated = GateDenseEmbedder{
+        .allowed_successes = .init(3),
+        .blocked_error = error.UnsupportedEmbeddingProvider,
+    };
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = gated.interface(),
+        },
+    });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"chunk_dense_v1\"}}",
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:b", .value = "{\"body\":\"abcdefghijklmno\"}" }},
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(usize, 3), gated.snapshot().successful_requests);
+
+    // A's new chunk stays in the shared batch. B's retained first chunk is
+    // cached, but its two obsolete chunks still need deletion when A fails.
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"qrstuvwx\"}" },
+            .{ .key = "doc:b", .value = "{\"body\":\"abcdefgh\"}" },
+        },
+        .sync_level = .write,
+    });
+    try std.testing.expectError(error.EnrichmentWorkerFailed, db.runUntilIdle());
+    try std.testing.expect(gated.snapshot().blocked_requests > 0);
+
+    const prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:b", "chunk", "body_chunks_v1");
     defer alloc.free(prefix);
     const artifacts = try db.core.store.scanPrefix(alloc, prefix);
     defer docstore_mod.DocStore.freeResults(alloc, artifacts);

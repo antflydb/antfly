@@ -22457,6 +22457,7 @@ fn processChunkedDenseWindow(
                 // intact. Finish this request's replacement embeddings before
                 // committing its obsolete artifact keys. Most requests have
                 // no stale keys and retain cross-request batching.
+                const failed_batch_includes_request = request_batch_items_pending;
                 const complete = flushChunkedDenseItems(runtime, dense_embedder, embedding_artifact_name, seed.expected_dims, consumer_indexes, &chunk_texts, &chunk_items, window, true, scope) catch |err| {
                     if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request)
                         return err;
@@ -22470,8 +22471,11 @@ fn processChunkedDenseWindow(
                     }
                     continue :request_key;
                 };
-                if (!complete) continue;
                 batch_source_bytes = 0;
+                request_batch_items_pending = false;
+                // An earlier request may own the whole failed shared batch;
+                // cached replacements for this request still permit cleanup.
+                if (!complete and failed_batch_includes_request) continue;
                 try mergeOwnedStaleEmbeddingDeletesIntoWindow(runtime, window, &stale_deletes);
                 try flushGeneratedReplayWindowIfNeededWithIdentity(runtime, window, max_window_items, scope.completedFingerprint());
             }
