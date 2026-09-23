@@ -245,6 +245,10 @@ pub const ProvisionedKernelOwnerSource = struct {
         table_storage: ?@import("../common/table_storage.zig").Settings = null,
         restore: ?@import("../storage/restore_identity.zig").Identity = null,
         owner: client.Owner,
+        /// A Raft entry's pinned descriptor did not authorize current-catalog
+        /// reconciliation. The next ordinary acquisition must reopen against
+        /// the catalog, even when the descriptor bytes happen to match.
+        opened_for_historical_apply: bool = false,
         // Exact descriptor/target proof, owned by this physical generation.
         // Shared repair steps may reuse it until a structural follow-up is due.
         repair_target: ?[]u8 = null,
@@ -3051,7 +3055,8 @@ pub const ProvisionedKernelOwnerSource = struct {
                 }
                 return error.StorageKernelOwnerTransitionRequired;
             }
-            if (!std.mem.eql(u8, entry.schema_json, descriptor.schema_json) or
+            if ((!controls.historical_raft_apply and entry.opened_for_historical_apply) or
+                !std.mem.eql(u8, entry.schema_json, descriptor.schema_json) or
                 !std.mem.eql(u8, entry.indexes_json, descriptor.indexes_json) or
                 !std.mem.eql(u8, entry.restore_bootstrap_json, descriptor.restore_bootstrap_json) or
                 !descriptor_contract.initialRangesEqual(entry.initial_range, descriptor.initial_range) or
@@ -3169,6 +3174,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .table_storage = descriptor.table_storage,
             .restore = owned_restore,
             .owner = owner,
+            .opened_for_historical_apply = controls.historical_raft_apply,
             .active_users = 1,
             .resident = residency == .resident,
             .exclusive_pending = false,
@@ -5301,7 +5307,7 @@ test "committed catch-up does not reconcile an older index-only descriptor" {
         };
         break;
     } else return error.TestOwnerAdmissionDidNotRecover;
-    var lease = try source.acquireDescriptor(1, "docs", path, old);
+    var lease = try source.acquireDescriptorOnce(1, "docs", path, old, .shared, .resident, .{ .historical_raft_apply = true });
     defer lease.deinit();
     // Reconciliation would have to add this index again if historical open
     // retired it. Querying the existing owner avoids an intervening reopen.
@@ -5309,6 +5315,65 @@ test "committed catch-up does not reconcile an older index-only descriptor" {
     try std.testing.expectEqual(@as(u64, 0), reconciled.indexes_added);
     try std.testing.expectEqual(@as(u64, 0), reconciled.indexes_removed);
     var second = try lease.owner().lookupJson("docs", "{\"key\":\"doc:second\"}");
+    defer second.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, second.bytes(), "second") != null);
+}
+
+test "current catalog acquisition replaces a replay-only owner with the same descriptor" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer alloc.free(root);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-1/table-db", .{root});
+    defer alloc.free(path);
+    const descriptor: descriptor_contract.Descriptor = .{
+        .lsm_root_generation = table_reads.backend_current_root_generation,
+        .identity = .{ .table_id = 1, .shard_id = 1, .range_id = 1 },
+        .schema_json = "{\"version\":0}",
+        .indexes_json =
+        \\{"search":{"type":"full_text","artifact_name":"chunks","enrichments":[{"name":"assets","kind":"asset","field":"url","content_type":"application/json","producer_json":"{\"type\":\"document_extraction\",\"config\":{}}"},{"name":"chunks","kind":"chunk","source_artifact_name":"assets","field":"text","chunk_size":128}]}}
+        ,
+    };
+    {
+        var initial = ProvisionedKernelOwnerSource.init(alloc, root, table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
+        defer initial.deinit();
+        try initial.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", descriptor, .{
+            .writes = &.{.{ .key = "doc:first", .value = "{\"title\":\"first\"}" }},
+        }, 1, 1);
+    }
+    var source = ProvisionedKernelOwnerSource.init(alloc, root, table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
+    defer source.deinit();
+    try source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", descriptor, .{
+        .writes = &.{.{ .key = "doc:second", .value = "{\"title\":\"second\"}" }},
+    }, 1, 2);
+    try std.testing.expectEqual(@as(u64, 1), source.cacheStats().miss_count);
+    {
+        var replay = try source.acquireDescriptorOnce(1, "docs", path, descriptor, .shared, .resident, .{ .historical_raft_apply = true });
+        defer replay.deinit();
+        const deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+        while (true) {
+            var status = replay.owner().runtimeStatusJson("docs") catch |err| switch (err) {
+                error.StorageBusy => {
+                    if (platform_time.monotonicNs() >= deadline) return error.TestEnrichmentRuntimeNotObservable;
+                    try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+                    continue;
+                },
+                else => return err,
+            };
+            defer status.deinit();
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, status.bytes(), .{});
+            defer parsed.deinit();
+            const enrichment = parsed.value.object.get("stats").?.object.get("enrichment").?.object;
+            if (enrichment.get("enabled").?.bool and enrichment.get("worker_started").?.bool) break;
+            if (platform_time.monotonicNs() >= deadline) return error.TestEnrichmentRuntimeNotStarted;
+            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        }
+    }
+    var current = try source.acquireDescriptor(1, "docs", path, descriptor);
+    defer current.deinit();
+    try std.testing.expectEqual(@as(u64, 2), source.cacheStats().miss_count);
+    var second = try current.owner().lookupJson("docs", "{\"key\":\"doc:second\"}");
     defer second.deinit();
     try std.testing.expect(std.mem.indexOf(u8, second.bytes(), "second") != null);
 }
