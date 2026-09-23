@@ -200,7 +200,67 @@ Flags:
   --artifact-labels Entity labels for the artifact extractor
   --artifact-relation-labels
                     Relation labels for the artifact extractor
+  --autoschema      Provision the AutoSchemaKG pipeline: LLM extraction
+                    passes, entities/events resolution, and a concept taxonomy
+                    (requires --create-table; see "AutoSchemaKG mode" below)
+  --autoschema-model
+                    Antfly generative model shared by the AutoSchemaKG
+                    extractors and conceptualizer
+                    (default: ggml-org/gemma-4-E4B-it-GGUF)
+  --autoschema-gliner-model
+                    GLiNER2.5 extraction model for the fast closed-schema
+                    autoschema lane; "" disables the lane
+                    (default: fastino/gliner2.5-base-v1)
 ```
+
+### AutoSchemaKG mode
+
+`--autoschema` provisions the schema-free knowledge graph pipeline described
+in `zig/AUTOSCHEMA.md`, following *AutoSchemaKG: Autonomous Knowledge Graph
+Construction through Dynamic Schema Induction from Web-Scale Corpora*
+(arXiv:2505.23628). It coexists with `--enable-artifact-graph` and creates:
+
+- Two generator asset enrichments on the documents table, one per
+  extraction pass (`kg_ee_v1` entity-entity; `kg_events_v1` events with
+  their participating entities and the temporal/causal relations between
+  them), each a forced tool call emitting the `extraction_graph` artifact
+  shape.
+- A `knowledge_graph` graph index merging the artifact streams, with
+  label-routed resolvers that promote `event`-labelled mentions into an
+  `events` table (compositional `event/{{ hash _entity.event_identity }}`
+  keys: sorted participant slugs + predicate lemma, composed from the
+  participants' canonical entity keys once their resolution lands) and
+  every other mention into an `entities` table
+  (label-free `entity/{{ slug _entity.text }}` keys; the extractor's label
+  rides the promoted document as `entity_type`, never the key, so mentions
+  labeled differently by different passes still converge on one node).
+- A third, GLiNER2.5-powered extraction lane (`kg_gliner_v1`, disable with
+  `--autoschema-gliner-model ""`): a fast `extractor` asset producer with a
+  closed entity/relation schema (person, organization, location, date;
+  `employed_by`, `located_in`, `traveled_with`, `met_with`,
+  `associated_with`) feeding the same `knowledge_graph` index as an
+  `extraction_relation` source. GLiNER relations reference entities
+  positionally (`entity_index`); the lane's own catch-all resolver mints the
+  SAME label-free `entity/{{ slug _entity.text }}` canonical keys as the
+  LLM lanes, so both extractors' edges converge on shared entity nodes
+  regardless of how each extractor labeled the mention, and a
+  `min_confidence` floor drops low-score junk before it mints nodes.
+  The LLM stages keep the paper's open-vocabulary verb-phrase relations,
+  which a closed-schema extractor cannot express.
+- A recursive conceptualization autograph on the `entities` table: the
+  `conceptualize_v1` enrichment abstracts each promoted entity into three or
+  more concept phrases (grounded by `neighbor_context` sampling of the
+  taxonomy graph), and the `taxonomy` graph index promotes them into a
+  `concepts` table with `is_a` edges.
+
+```bash
+./epstein load --create-table --autoschema \
+  --autoschema-model ggml-org/gemma-4-E4B-it-GGUF \
+  --input epstein-docs-small.json
+```
+
+The `entities`, `events`, and `concepts` tables are created automatically
+before the documents table so cross-table promotion targets exist up front.
 
 ### `sync`
 

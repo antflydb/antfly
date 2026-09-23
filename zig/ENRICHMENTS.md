@@ -155,6 +155,148 @@ worker resumes after the exact last published document instead of replaying the
 beginning of a large ingestion batch; a missing, stale, or corrupt cursor is
 discarded and safely repeats work from the authoritative applied sequence.
 
+### Two-Stream Execution Model
+
+Within one preparation quantum, the asset-producer (extraction, for example
+GLiNER2) and dense-embedding (for example Qwen3) producer classes run as two
+independent execution lanes instead of one strictly sequential
+extract-then-embed pipeline. Each lane:
+
+- keeps its own model resident and issues consecutive provider batches
+  without waiting on the other lane's round trip,
+- owns a private `GeneratedReplayWindow` so its writes never interleave with
+  the sibling lane's writes,
+- publishes that window as its own durable batch as soon as its own work is
+  ready, and
+- checkpoints its own replay cursor scope (`generated.assets` for the asset
+  lane, `generated.dense` for the dense lane) immediately after its own
+  publish succeeds, independent of the sibling lane's progress.
+
+Both lanes are handed the same document group's classified work and are
+dispatched with `Io.concurrent` so their provider round trips overlap. If the
+`Io` backend does not support concurrency (for example a deterministic
+single-flow VOPR/simulation harness), a lane runs inline instead --
+concurrency is a scheduling optimization, not a correctness requirement.
+
+Overlap is not limited to the two lanes within one preparation quantum: each
+lane also pipelines *across* quanta. `LanePipeline` dispatches a quantum's
+lane work without awaiting it, so the foreground scan can immediately move on
+to classifying the next quantum's documents instead of idling until the
+slower sibling lane's current quantum finishes. In-flight work is bounded to
+exactly one preparation quantum *per lane* (not per pass): dispatching lane
+L's next quantum first awaits and frees lane L's previous quantum, but never
+waits on the sibling lane, so wall time for a pass approaches
+`max(extract_ns, embed_ns)` instead of their sum once both lanes have steady
+work. Memory therefore stays bounded to at most two in-flight quanta (one per
+lane) at any time, not the whole backlog.
+
+Making a quantum's lane work independent of the calling scan's own state
+requires every value the dispatched lane reads to be owned by that lane, not
+borrowed from a cache the scan will keep mutating for the next quantum.
+`LanePipeline` clones the queued `GeneratedEnrichmentRequest` values (deep
+copy, since `request_plan_cache` -- which owns their backing strings -- is
+cleared as soon as *both* lanes for a quantum have been dispatched, not once
+they finish) and moves the chunk cache wholesale into the dense lane (a move
+suffices there since chunk_cache has exactly one reader). A prior attempt at
+this pipelining moved the deferred request *lists* out per quantum but left
+`request_plan_cache` itself cleared unconditionally underneath them, which
+freed the borrowed strings while a dispatched lane could still be reading
+them; cloning decouples a dispatched quantum's lifetime from the scan's
+caches entirely and closes that gap.
+
+A guard timeout, cancellation, or scan-time error still leaves an
+already-dispatched quantum's lane running in the background; the caller of
+the foreground scan always drains `LanePipeline` (awaiting and freeing every
+in-flight quantum) before returning, so an in-flight future is never
+abandoned and a terminal error in one lane still surfaces even if the sibling
+lane's quantum is still running. The final `applied_sequence` watermark
+still only advances after that drain completes for every quantum in the
+pass, preserving the durability contract below.
+
+A stream's cursor is a claim that every request of that stream up to the
+checkpointed group is durably published, so only the party that made the
+work durable may write it. The lanes checkpoint their own scope after their
+own publish. The scanner also publishes a synchronous window mid-scan
+(chunk text, sparse embeddings, copy/document-extraction assets) when it
+fills, and at that point it checkpoints a stream only if that stream has
+nothing outstanding: no requests queued for the lane's next dispatch and no
+quantum still in flight in `LanePipeline` (`saveReplayCursorForIdleStreams`).
+The historical mid-scan checkpoint advanced both streams unconditionally,
+which let a restart skip documents whose extraction was still queued or
+still running in a parked asset lane.
+
+Failure identity is per operation, never global, once lanes run
+concurrently. The runtime's `active_failure_fingerprint` (which
+`shouldYieldRequestError`, `requestAttemptNumber` and the supervisor
+boundary consult) belongs to the scanner thread alone. Each lane quantum
+carries a `FailureScope` -- the request or provider batch it is attempting
+and the first retryable error it deferred with that error's identity -- and
+every lane-side helper takes the identity from the scope
+(`shouldYieldRequestErrorFor`, `requestAttemptNumberFor`,
+`recordIsolatedRequestErrorFor`, `flushGeneratedReplayWindowWithIdentity`,
+`noteEmbedBatchStartedFor`). A successful publish credits durable retry
+progress to the scope's request, unless that request is the one that
+deferred a retry, so a sibling's success cannot clear another request's
+debt. When a lane's quantum ends with its deferred retryable error, the
+error and the identity travel together in a `LaneOutcome`. Every place that
+finishes lane work -- a dispatch draining a lane's previous quantum or
+running one inline, and the end-of-pass drain -- first selects which of the
+two lanes' outcomes the supervisor will see (`selectLaneOutcome`, asset
+before dense) and only then installs that outcome's identity as the runtime's
+active retry identity on the scanner thread. Installing identities as lanes
+are drained would let the dense lane's identity overwrite the asset lane's
+while the asset error is the one returned; a scan-time error keeps the
+scanner's own identity untouched.
+
+Shared runtime sets touched from both lanes and the scanner
+(`published_generated_artifacts`, `isolated_failed_indexes`,
+`isolated_failed_sources`) are accessed only through helpers that hold
+`shared_sets_mutex`; the rest of the retry-episode state
+(`retry_failure_fingerprint`, attempt counts, embedding activity) was
+already behind the runtime mutex.
+
+Replay skip-ahead on the next pass still requires *both* per-stream cursors
+to cover a document group before that group is skipped
+(`replayCursorsCoverGroup`); a group covered by only one lane's cursor is
+re-derived (cheaply, since chunk/document parsing is not the bottleneck) so
+the lagging lane's work is retried. The final `applied_sequence` watermark --
+the actual crash-recovery/visibility boundary -- still only advances after
+*every* group in the pass has been fully handled by both lanes; per-stream
+cursors are a resume optimization layered on top of that unchanged
+durability contract, not a new source of truth. As already documented above,
+a cursor (of either stream) is purely an optimization: the underlying
+artifact-level source-hash skip checks make re-deriving a group's work safe
+and idempotent even when a stale or missing cursor forces a redo.
+
+One behavior changed deliberately from the historical strictly-sequential
+implementation: a fatal (non-retryable) error in one lane no longer aborts
+the sibling lane's attempt within the same quantum. Previously, a fatal
+asset-producer error skipped the dense-embedding stage entirely for that
+quantum; now both lanes still run to completion (each independently safe
+and crash-idempotent) before the fatal error propagates to the replay pass.
+Retryable-failure handling is unchanged: each producer class remains an
+independent availability domain, and a retryable failure in one lane never
+discards the sibling lane's successful, durably published output.
+
+Model residency across the two lanes relies on the embedded inference node
+being configured with an unbounded model cache (`max_loaded_models = 0` for
+Lite's `createEmbeddedInferenceNode`, see `standalone/inference_provider.zig`)
+specifically so an interleaved/concurrent extract+embed workload does not
+evict and reload either model between batches. The worker-subprocess RPC
+transport (`standalone/inference_worker.zig`, `inference_worker_rpc.zig`)
+already multiplexes concurrent in-flight requests by request ID over one
+pipe pair, so the two lanes' provider calls can be genuinely in flight at
+the same time without any transport-level change.
+
+Follow-up (out of this slice's ownership): per-batch measurements on the
+dogfood corpus showed embed/extract batches taking roughly 1.6-2x their
+direct-call-baseline time at the same batch size, pointing at fixed
+per-call overhead inside the linked inference runtime invocation path
+(`zig/pkg/inference/**`) rather than in the enrichment runtime or the RPC
+transport. Closing that gap on top of this concurrency change is likely
+necessary to fully reach the direct-call baseline wall time on large
+corpora; see the handoff note left for that ownership area.
+
 Lazy HBC posting centroid and quantized-payload freshness is a separate,
 bounded maintenance concern. Dirty posting caches remain exactly searchable by
 falling back to member scoring/recomputation and drain through the background

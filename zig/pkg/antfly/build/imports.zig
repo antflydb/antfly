@@ -87,6 +87,7 @@ pub const AntflyRootImports = struct {
     pdf: *std.Build.Module,
     openai_api: *std.Build.Module,
     exa_api: *std.Build.Module,
+    tavily_api: *std.Build.Module,
     handlebars: *std.Build.Module,
     inference_server: *std.Build.Module,
     prometheus: *std.Build.Module,
@@ -160,6 +161,7 @@ pub const AntflyRootImports = struct {
         .{ .name = "antfly_pdf", .field = "pdf" },
         .{ .name = "openai_api", .field = "openai_api" },
         .{ .name = "exa_api", .field = "exa_api" },
+        .{ .name = "tavily_api", .field = "tavily_api" },
         .{ .name = "handlebars", .field = "handlebars" },
         .{ .name = "inference_server", .field = "inference_server" },
         .{ .name = "prometheus", .field = "prometheus" },
@@ -244,6 +246,7 @@ pub const AntflyRootImports = struct {
     };
     const api_imports = .{
         "exa_api",
+        "tavily_api",
         "websearch_openapi",
         "a2a",
         "casbin",

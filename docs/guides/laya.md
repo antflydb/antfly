@@ -20,6 +20,12 @@ existing directory. Native support requires a ModernBERT-backed checkpoint with
 the Laya decision heads. The runtime validates tensor shapes before execution.
 Unprepared upstream checkpoints are not automatically converted by `inference pull`.
 
+CUDA execution is available for Laya checkpoints with sequence lengths up to 512
+and encoder head dimensions up to 128. It uses FP32 resident weights and bounded
+internal batches. The English checkpoint was validated on NVIDIA L4 using fatbin
+artifacts. Portable PTX requires a driver compatible with the CUDA toolkit used
+to generate it.
+
 Submit a text request to the server's AI endpoint:
 
 ```json
@@ -115,7 +121,10 @@ compares token IDs and probabilities against upstream PyTorch on labeled data,
 checks accuracy, and measures warm batches through 128 rows. See
 [qualification results and reproduction](../design/laya-qualification.md).
 
-These checks qualify native CPU and Metal. CUDA remains unqualified.
+These checks cover native CPU and Metal. CUDA has a separate
+[qualification script](../../scripts/laya_cuda_qualify.py) and
+[matched PyTorch performance gate](../../scripts/laya_cuda_performance.py), run
+by the [L4 CI workflow](../../.github/workflows/zig-inference-l4-spot.yml).
 
 ## Resident Metal inference
 

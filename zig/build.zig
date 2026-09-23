@@ -172,7 +172,19 @@ pub fn create(b: *std.Build) ?Artifacts {
         .optimize = optimize,
         .version = antfly_version,
     });
-    const lite_local_inference_runtime = b.option(bool, "lite-local-inference-runtime", "Advertise an embedded local inference runtime in Antfly Lite status") orelse false;
+    // Antfly Lite always links and advertises the embedded local inference
+    // runtime, matching the `antfly` executable (see COMPILATION.md's "C API
+    // composition" section and LITE.md's "Local Embedded Inference" section).
+    // This remains a build option so a caller can still opt out of
+    // advertising the capability; freestanding/wasm builds always disable it
+    // regardless of this flag (see storage/lite/capabilities.zig).
+    // Antfly Lite always links and advertises the embedded local inference
+    // runtime, matching the `antfly` executable (see COMPILATION.md's "C API
+    // composition" section and LITE.md's "Local Embedded Inference" section).
+    // This remains a build option so a caller can still opt out of
+    // advertising the capability; freestanding/wasm builds always disable it
+    // regardless of this flag (see storage/lite/capabilities.zig).
+    const lite_local_inference_runtime = b.option(bool, "lite-local-inference-runtime", "Advertise an embedded local inference runtime in Antfly Lite status") orelse true;
     const platform_tests = platform_build.addTests(b, .{
         .root = b.path("lib/platform"),
         .target = target,
@@ -285,6 +297,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const extraction_openapi_mod = openapi_modules.extraction;
     const openai_api_mod = openapi_modules.openai_api;
     const exa_api_mod = openapi_modules.exa_api;
+    const tavily_api_mod = openapi_modules.tavily_api;
 
     // Handlebars template engine
     const handlebars_dep = b.dependency("handlebars", .{ .target = target, .optimize = optimize });
@@ -754,6 +767,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .pdf = pdf_mod,
         .openai_api = openai_api_mod,
         .exa_api = exa_api_mod,
+        .tavily_api = tavily_api_mod,
         .handlebars = handlebars_mod,
         .inference_server = inference_server_mod,
         .prometheus = prometheus_mod,
@@ -804,7 +818,11 @@ pub fn create(b: *std.Build) ?Artifacts {
     const install_libantfly = embedded.install_libantfly;
     const install_capi_header = embedded.install_capi_header;
     const run_capi_smoke = embedded.run_capi_smoke;
+    const run_capi_conformance = embedded.run_capi_conformance;
     const run_lite_go_tests = embedded.run_lite_go_tests;
+    const run_lite_py_tests = embedded.run_lite_py_tests;
+    const run_lite_rs_tests = embedded.run_lite_rs_tests;
+    const run_lite_ts_tests = embedded.run_lite_ts_tests;
     const run_lite_go_example = embedded.run_lite_go_example;
     const run_lite_go_retrieval_template = embedded.run_lite_go_retrieval_template;
     const run_cabi_packaging_tests = embedded.run_cabi_packaging_tests;
@@ -1502,7 +1520,11 @@ pub fn create(b: *std.Build) ?Artifacts {
     lite_test_step.dependOn(&run_lite_cmd_tests.step);
     lite_test_step.dependOn(&run_lite_native_tests.step);
     lite_test_step.dependOn(&run_capi_smoke.step);
+    lite_test_step.dependOn(&run_capi_conformance.step);
     lite_test_step.dependOn(&run_lite_go_tests.step);
+    lite_test_step.dependOn(&run_lite_py_tests.step);
+    lite_test_step.dependOn(&run_lite_rs_tests.step);
+    lite_test_step.dependOn(&run_lite_ts_tests.step);
     lite_test_step.dependOn(&run_lite_go_example.step);
     lite_test_step.dependOn(&run_lite_go_retrieval_template.step);
     lite_test_step.dependOn(&run_lite_cli_smoke.step);

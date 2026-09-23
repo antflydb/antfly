@@ -1,0 +1,15 @@
+{
+  "name": "batch_json",
+  "description": "The JSON batch request shape shared with the server API: inserts and deletes in one call.",
+  "open": {"create": true, "no_sync": true},
+  "steps": [
+    {"op": "batch_json", "request": {"inserts": {
+      "doc:json:1": {"title": "from json batch", "body": "one"},
+      "doc:json:2": {"title": "also from json batch", "body": "two"}
+    }, "sync_level": "full_index"}},
+    {"op": "lookup", "key": "doc:json:1", "expect": {"json_subset": {"title": "from json batch"}}},
+    {"op": "batch_json", "request": {"deletes": ["doc:json:2"]}},
+    {"op": "lookup", "key": "doc:json:2", "expect": {"error": "ANTFLY_NOT_FOUND"}},
+    {"op": "batch_json", "request": {"inserts": "not an object"}, "expect": {"error": "ANTFLY_INVALID_ARGUMENT"}}
+  ]
+}

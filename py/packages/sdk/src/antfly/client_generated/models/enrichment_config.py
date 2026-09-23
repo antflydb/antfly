@@ -10,6 +10,7 @@ from ..models.enrichment_kind import EnrichmentKind
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.enrichment_neighbor_context_config import EnrichmentNeighborContextConfig
     from ..models.execution_policy import ExecutionPolicy
     from ..models.transcriber_enrichment_config import TranscriberEnrichmentConfig
 
@@ -28,7 +29,9 @@ class EnrichmentConfig:
             field (str | Unset): Source field to read from the source document or source artifact payload.
             template (str | Unset): Optional template for generated text input.
             source_artifact_name (str | Unset): Existing artifact stream this enrichment consumes. Chunk enrichments may
-                consume asset artifacts; embedding enrichments may consume chunk artifacts.
+                consume asset artifacts; embedding enrichments may consume chunk artifacts; asset enrichments may consume other
+                asset artifacts (the upstream asset's produced bytes become this producer's source, so field and template must
+                be omitted and the producer must consume text: copy, generator, or extractor).
             expected_dims (int | Unset): Expected embedding dimension for embedding enrichments.
             vector_space (str | Unset): Optional stable model/token-space identifier for embedding artifacts. When omitted
                 on every source, Antfly requires the effective producers to be semantically equivalent. To combine intentionally
@@ -42,6 +45,12 @@ class EnrichmentConfig:
             content_type (str | Unset): Produced asset content type for asset enrichments.
             producer_json (str | Unset): Write-only serialized producer configuration. For managed embedding enrichments
                 Antfly stores a canonical semantic producer identity here; credentials and execution policy are excluded.
+            neighbor_context (EnrichmentNeighborContextConfig | Unset): Bounded sample of the document's same-shard graph
+                neighbors appended to an asset producer's rendered input as a compact JSON block
+                ({"neighbors":[{"edge_type":...,"direction":...,"target":...,"weight":...}]}), ordered by edge type then target
+                key. A conceptualizer enrichment on an entities table can thereby ground its abstractions in adjacent facts
+                ("started_by -> John Andrew Rice"). The sampled block participates in the producer's skip state, so a changed
+                adjacency re-runs the producer.
             execution (ExecutionPolicy | Unset): Non-semantic execution policy for one producer or index maintenance
                 operation. These fields tune how work is batched and do not change generated artifact identity.
             transcriber (TranscriberEnrichmentConfig | Unset): Speech-to-text provider for the `transcriber` enrichment
@@ -78,6 +87,7 @@ class EnrichmentConfig:
     full_text_index: bool | Unset = False
     content_type: str | Unset = UNSET
     producer_json: str | Unset = UNSET
+    neighbor_context: EnrichmentNeighborContextConfig | Unset = UNSET
     execution: ExecutionPolicy | Unset = UNSET
     transcriber: TranscriberEnrichmentConfig | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
@@ -108,6 +118,10 @@ class EnrichmentConfig:
         content_type = self.content_type
 
         producer_json = self.producer_json
+
+        neighbor_context: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.neighbor_context, Unset):
+            neighbor_context = self.neighbor_context.to_dict()
 
         execution: dict[str, Any] | Unset = UNSET
         if not isinstance(self.execution, Unset):
@@ -147,6 +161,8 @@ class EnrichmentConfig:
             field_dict["content_type"] = content_type
         if producer_json is not UNSET:
             field_dict["producer_json"] = producer_json
+        if neighbor_context is not UNSET:
+            field_dict["neighbor_context"] = neighbor_context
         if execution is not UNSET:
             field_dict["execution"] = execution
         if transcriber is not UNSET:
@@ -156,6 +172,7 @@ class EnrichmentConfig:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.enrichment_neighbor_context_config import EnrichmentNeighborContextConfig
         from ..models.execution_policy import ExecutionPolicy
         from ..models.transcriber_enrichment_config import TranscriberEnrichmentConfig
 
@@ -186,6 +203,13 @@ class EnrichmentConfig:
 
         producer_json = d.pop("producer_json", UNSET)
 
+        _neighbor_context = d.pop("neighbor_context", UNSET)
+        neighbor_context: EnrichmentNeighborContextConfig | Unset
+        if isinstance(_neighbor_context, Unset):
+            neighbor_context = UNSET
+        else:
+            neighbor_context = EnrichmentNeighborContextConfig.from_dict(_neighbor_context)
+
         _execution = d.pop("execution", UNSET)
         execution: ExecutionPolicy | Unset
         if isinstance(_execution, Unset):
@@ -214,6 +238,7 @@ class EnrichmentConfig:
             full_text_index=full_text_index,
             content_type=content_type,
             producer_json=producer_json,
+            neighbor_context=neighbor_context,
             execution=execution,
             transcriber=transcriber,
         )

@@ -143,6 +143,9 @@ class HAStandaloneNode:
 
     def capture_catalog(self) -> dict[str, Any]:
         generation = f"catalog-{time.time_ns()}"
+        # The server allows 30 seconds just for seed snapshot preflight.
+        # Capture can commit before its reply, so a short transport timeout
+        # cannot be recovered by issuing the POST again.
         captured = self.admin_post(
             "/base-backups/capture",
             {
@@ -154,6 +157,8 @@ class HAStandaloneNode:
                 "target_pvc_name": "e2e-data",
                 "target_pvc_uid": "e2e-data-uid",
             },
+            timeout_s=60.0,
+            request_timeout_s=60.0,
         )
         topology = json.loads(
             (Path(captured["content_root"]) / "TOPOLOGY.json").read_text()
@@ -364,13 +369,22 @@ class HAStandaloneNode:
             # transient response without weakening any other failure signal.
             time.sleep(HA_TRANSITION_RETRY_INTERVAL_S)
 
-    def admin_post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
-        deadline = time.monotonic() + HA_TRANSITION_RETRY_TIMEOUT_S
+    def admin_post(
+        self,
+        path: str,
+        payload: dict[str, Any],
+        *,
+        timeout_s: float = HA_TRANSITION_RETRY_TIMEOUT_S,
+        request_timeout_s: float = 10.0,
+    ) -> dict[str, Any]:
+        deadline = time.monotonic() + timeout_s
         while True:
             response = self.admin_post_response(
                 path,
                 payload,
-                request_timeout_s=max(0.001, min(10.0, deadline - time.monotonic())),
+                request_timeout_s=max(
+                    0.001, min(request_timeout_s, deadline - time.monotonic())
+                ),
             )
             if not _is_ha_post_not_admitted(path, response):
                 return self._check(response)
@@ -571,6 +585,30 @@ def test_admin_capture_admission_budget_includes_request_and_sleep(
         node.admin_post("/base-backups/capture", {})
     assert timeouts == pytest.approx([10.0, 9.9])
     assert now[0] == pytest.approx(HA_TRANSITION_RETRY_TIMEOUT_S)
+
+
+def test_admin_capture_can_outlive_server_preflight_without_replay(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    node = object.__new__(HAStandaloneNode)
+    now = [0.0]
+    timeouts = []
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+
+    def captured(_path, _payload, *, request_timeout_s):
+        timeouts.append(request_timeout_s)
+        now[0] += 31.0
+        return _test_response(200, b"{}")
+
+    node.admin_post_response = captured
+    node._check = lambda response: response.json()
+    assert (
+        node.admin_post(
+            "/base-backups/capture", {}, timeout_s=60.0, request_timeout_s=60.0
+        )
+        == {}
+    )
+    assert timeouts == [60.0]
 
 
 class HACluster:
@@ -945,6 +983,32 @@ def _wait_for_primary_slot_applied(
     )
 
 
+def _write_and_wait_for_standby_durability(cluster, table_name, inserts):
+    """Send once, then require both replay and the primary's durable ACK."""
+    response = cluster.primary.batch_write_response(table_name, inserts)
+    pending = response.status_code == 503 and response.text == (
+        "write committed locally; standby durability acknowledgment pending"
+    )
+    if not pending:
+        cluster.primary._check(response)
+    # A prior successful replication round cannot guarantee that the next
+    # write's ACK arrives inside its two-second response budget. Replaying
+    # this post-commit outcome would issue another mutation. Reconcile the
+    # original write through actual progress; all document assertions follow.
+    deadline = time.monotonic() + 20.0
+    lsn = _primary_lsn(cluster)
+    snapshot = _wait_for_standby_applied(
+        cluster, lsn, timeout_s=max(0.0, deadline - time.monotonic())
+    )
+    _wait_for_primary_slot_applied(
+        cluster,
+        "standby-a",
+        lsn,
+        timeout_s=max(0.0, deadline - time.monotonic()),
+    )
+    return lsn, snapshot
+
+
 def _table_identity_from_catalog(
     node: HAStandaloneNode, table_name: str
 ) -> tuple[int, int]:
@@ -1311,10 +1375,10 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(
         ha_cluster, seed["backup_lsn"], require_live_replication=True
     )
 
-    ha_cluster.primary.batch_write(table_name, {"doc:first": {"title": "first"}})
-    first_lsn = _primary_lsn(ha_cluster)
+    first_lsn, first_snapshot = _write_and_wait_for_standby_durability(
+        ha_cluster, table_name, {"doc:first": {"title": "first"}}
+    )
     assert first_lsn >= 1
-    first_snapshot = _wait_for_standby_applied(ha_cluster, first_lsn)
     assert first_snapshot["role"] == "standby"
     assert first_snapshot["received_lsn"] >= first_lsn
     assert first_snapshot["applied_lsn"] >= first_lsn
@@ -1359,10 +1423,10 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(
     restarted_doc = _wait_for_standby_lookup(ha_cluster, table_name, "doc:first")
     assert restarted_doc["title"] == "first"
 
-    ha_cluster.primary.batch_write(table_name, {"doc:second": {"title": "second"}})
-    second_lsn = _primary_lsn(ha_cluster)
+    second_lsn, second_snapshot = _write_and_wait_for_standby_durability(
+        ha_cluster, table_name, {"doc:second": {"title": "second"}}
+    )
     assert second_lsn > first_lsn
-    second_snapshot = _wait_for_standby_applied(ha_cluster, second_lsn)
     assert second_snapshot["received_lsn"] >= second_lsn
     assert second_snapshot["applied_lsn"] >= second_lsn
     second_read_check = ha_cluster.standby.admin_post(

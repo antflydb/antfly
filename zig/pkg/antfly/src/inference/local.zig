@@ -781,7 +781,7 @@ pub const Provider = struct {
         if (!resp.ok()) return if (isCapabilityStaleResponse(resp))
             error.InferenceCapabilitiesStale
         else
-            error.RerankRequestFailed;
+            inference.rerankStatusError(resp.status.code);
         const body = resp.body orelse return error.EmptyResponse;
         if (resp.contentType()) |ct| if (std.ascii.eqlIgnoreCase(ct, httpx.numeric_response.content_type)) {
             const view = try httpx.numeric_response.parse(body, .scores, documents.len, 1);

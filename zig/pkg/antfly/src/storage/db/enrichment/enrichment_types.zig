@@ -176,6 +176,10 @@ pub const GeneratedEnrichmentRequest = struct {
     persist_artifact: bool = false,
     content_type: []const u8 = "",
     producer_json: []const u8 = "",
+    /// Serialized neighbor-context configuration for asset producers. When
+    /// non-empty, the runtime samples the document's same-shard graph
+    /// adjacency into the rendered producer input before dispatch.
+    neighbor_context_json: []const u8 = "",
     execution_json: []const u8 = "",
     /// Upstream materialized asset for a chunk-backed request, pinned with the
     /// same catalog generation as the rest of the plan.
@@ -214,6 +218,7 @@ pub fn freeGeneratedRequest(alloc: Allocator, request: GeneratedEnrichmentReques
     if (request.chunker_json.len > 0) alloc.free(request.chunker_json);
     if (request.content_type.len > 0) alloc.free(request.content_type);
     if (request.producer_json.len > 0) alloc.free(request.producer_json);
+    if (request.neighbor_context_json.len > 0) alloc.free(request.neighbor_context_json);
     if (request.execution_json.len > 0) alloc.free(request.execution_json);
     if (request.upstream_artifact_name.len > 0) alloc.free(request.upstream_artifact_name);
     for (request.consumer_indexes) |name| alloc.free(name);
@@ -239,6 +244,8 @@ pub fn cloneGeneratedRequest(alloc: Allocator, request: GeneratedEnrichmentReque
     errdefer if (content_type.len > 0) alloc.free(content_type);
     const producer_json = if (request.producer_json.len > 0) try alloc.dupe(u8, request.producer_json) else "";
     errdefer if (producer_json.len > 0) alloc.free(producer_json);
+    const neighbor_context_json = if (request.neighbor_context_json.len > 0) try alloc.dupe(u8, request.neighbor_context_json) else "";
+    errdefer if (neighbor_context_json.len > 0) alloc.free(neighbor_context_json);
     const execution_json = if (request.execution_json.len > 0) try alloc.dupe(u8, request.execution_json) else "";
     errdefer if (execution_json.len > 0) alloc.free(execution_json);
     const upstream_artifact_name = if (request.upstream_artifact_name.len > 0) try alloc.dupe(u8, request.upstream_artifact_name) else "";
@@ -271,6 +278,7 @@ pub fn cloneGeneratedRequest(alloc: Allocator, request: GeneratedEnrichmentReque
         .persist_artifact = request.persist_artifact,
         .content_type = content_type,
         .producer_json = producer_json,
+        .neighbor_context_json = neighbor_context_json,
         .execution_json = execution_json,
         .upstream_artifact_name = upstream_artifact_name,
         .consumer_indexes = consumer_indexes,

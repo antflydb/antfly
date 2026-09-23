@@ -1,12 +1,11 @@
 # Copyright 2026 Antfly, Inc.
 # SPDX-License-Identifier: Apache-2.0
-import tempfile
+import importlib.util
 import shutil
 import subprocess
-from pathlib import Path
+import tempfile
 import unittest
-
-import importlib.util
+from pathlib import Path
 
 _SPEC = importlib.util.spec_from_file_location(
     "prune_completed_test_cache",
@@ -16,6 +15,7 @@ assert _SPEC and _SPEC.loader
 _module = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_module)
 prune = _module.prune
+release_completed_phase = _module.release_completed_phase
 
 
 class PruneTests(unittest.TestCase):
@@ -100,7 +100,7 @@ class PruneTests(unittest.TestCase):
     )
     def test_zig_cache_hit_and_source_rebuild_after_pruning(self):
         with tempfile.TemporaryDirectory() as root:
-            project = Path(root)
+            project = Path(root).resolve()
             # The self-hosted Linux Debug backend emits no disposable object.
             # Select LLVM so this integration test actually exercises pruning.
             (project / "build.zig").write_text(
@@ -117,7 +117,7 @@ class PruneTests(unittest.TestCase):
             source.write_text(
                 'test "cache prune" { try @import("std").testing.expect(true); }\n'
             )
-            cache = project / "cache"
+            cache = project / "zig-local"
             command = [
                 "zig",
                 "build",
@@ -130,7 +130,7 @@ class PruneTests(unittest.TestCase):
 
             def build():
                 result = subprocess.run(
-                    command, cwd=project, capture_output=True, text=True
+                    command, cwd=project, capture_output=True, text=True, check=False
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
@@ -141,6 +141,41 @@ class PruneTests(unittest.TestCase):
                 'test "cache prune rebuilt" { try @import("std").testing.expectEqual(2, 1 + 1); }\n'
             )
             build()  # Recompilation must regenerate the removed link input.
+            release_completed_phase(cache)
+            build()  # No surviving manifest may claim a missing executable.
+
+    def test_phase_release_removes_manifests_and_outputs_but_preserves_siblings(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root).resolve()
+            cache = root / "zig-local"
+            for name in (
+                "zig-local/o/test",
+                "zig-local/h/manifest",
+                "global/dependency",
+                "zig-out/antfly",
+            ):
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("keep outside phase")
+            release_completed_phase(cache)
+            self.assertEqual(list(cache.iterdir()), [])
+            self.assertTrue((root / "global/dependency").exists())
+            self.assertTrue((root / "zig-out/antfly").exists())
+            release_completed_phase(cache)
+            self.assertEqual(list(cache.iterdir()), [])
+
+    def test_phase_release_rejects_non_private_paths_and_symlinks(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root).resolve()
+            target = root / "shared"
+            target.mkdir()
+            (target / "keep").write_text("keep")
+            link = root / "zig-local"
+            link.symlink_to(target, target_is_directory=True)
+            for path in (target, link, link / "zig-local"):
+                with self.assertRaises(ValueError):
+                    release_completed_phase(path)
+            self.assertEqual((target / "keep").read_text(), "keep")
 
     def test_missing_cache_is_harmless(self):
         with tempfile.TemporaryDirectory() as root:

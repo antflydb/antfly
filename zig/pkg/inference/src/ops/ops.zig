@@ -1394,6 +1394,17 @@ pub const WorkloadRegime = enum(u8) {
     speculative_verify = 5,
 };
 
+/// Borrowed tensors and host marker metadata. The returned feature tensor is owned.
+pub const LayaActionFeaturesRequest = struct {
+    hidden: CT,
+    logits: CT,
+    markers: []const i64,
+    batch: usize,
+    sequence: usize,
+    options: usize,
+    hidden_size: usize,
+};
+
 /// Abstract compute backend for tensor operations.
 pub const ComputeBackend = struct {
     ptr: *anyopaque,
@@ -1524,6 +1535,11 @@ pub const ComputeBackend = struct {
         return op(self.ptr);
     }
 
+    pub fn tryCumulativeSum(self: *const ComputeBackend, tensor: CT, axis: u8, exclusive: bool, reverse: bool) !?CT {
+        const op = self.vtable.cumulativeSum orelse return null;
+        return op(self.ptr, tensor, axis, exclusive, reverse);
+    }
+
     pub fn tryConvertDType(self: *const ComputeBackend, tensor: CT, target: GraphDType) !?CT {
         const op = self.vtable.convertDType orelse return null;
         return op(self.ptr, tensor, target);
@@ -1628,6 +1644,7 @@ pub const ComputeBackend = struct {
         decoderRuntimePushPlannedComputeBarrierSuppression: ?*const fn (ctx: *anyopaque) anyerror!bool = null,
         decoderRuntimePopPlannedComputeBarrierSuppression: ?*const fn (ctx: *anyopaque) anyerror!void = null,
 
+        cumulativeSum: ?*const fn (ctx: *anyopaque, tensor: CT, axis: u8, exclusive: bool, reverse: bool) anyerror!?CT = null,
         convertDType: ?*const fn (ctx: *anyopaque, tensor: CT, target: GraphDType) anyerror!?CT = null,
         glinerBoundaryDevice: ?*const fn (ctx: *anyopaque, request: *const gliner_boundary_device.Request) anyerror!CT = null,
         glinerBoundaryScope: ?*const fn (ctx: *anyopaque, request: *const gliner_boundary_device.ScopeRequest) anyerror!gliner_boundary_device.ScopeStats = null,
@@ -2159,6 +2176,12 @@ pub const ComputeBackend = struct {
         /// Returns: [batch*seq_len, num_heads*head_dim].
         scaledDotProductAttention: *const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, mask: []const i64, attn_bias: ?CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT,
 
+        /// Inclusive symmetric window; padding masks keys, never introduces causality.
+        /// Token-major Q/K/V and output: [batch*seq_len, num_heads*head_dim].
+        encoderLocalAttention: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, mask: []const i64, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize, radius: usize) anyerror!CT = null,
+        layaActionFeatures: ?*const fn (ctx: *anyopaque, request: *const LayaActionFeaturesRequest) anyerror!CT = null,
+        packedGegluExact: ?*const fn (ctx: *anyopaque, input: CT, rows: usize, width: usize) anyerror!?CT = null,
+
         /// Optional Qwen3-VL vision-attention route. It has the same unmasked,
         /// unbiased semantics as scaledDotProductAttention with an empty mask,
         /// but lets a backend select a model-scoped kernel without changing
@@ -2351,6 +2374,10 @@ pub const ComputeBackend = struct {
         /// Create a tensor from raw i32 data with an explicit logical shape.
         /// Backends may leave this null when they do not support integer tensors.
         fromInt32Shape: ?*const fn (ctx: *anyopaque, data: []const i32, shape: []const i32) anyerror!?CT = null,
+
+        /// Optional exact graph-constant import. Copies bytes and shape; return
+        /// null to retain the backend's legacy numeric-constant path.
+        fromConstantBytes: ?*const fn (ctx: *anyopaque, data: []const u8, dtype: GraphDType, shape: []const i64) anyerror!?CT = null,
 
         /// Copy tensor data to a caller-owned f32 slice.
         toFloat32: *const fn (ctx: *anyopaque, tensor: CT, allocator: std.mem.Allocator) anyerror![]f32,
@@ -3914,6 +3941,22 @@ pub const ComputeBackend = struct {
         return null;
     }
 
+    pub fn encoderLocalAttention(self: *const ComputeBackend, Q: CT, K: CT, V: CT, mask: []const i64, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize, radius: usize) !?CT {
+        if (self.vtable.encoderLocalAttention) |f| return try f(self.ptr, Q, K, V, mask, batch, seq_len, num_heads, head_dim, radius);
+        return null;
+    }
+
+    /// Optional exact GELU(gate) * value from [rows, 2*width], without slices.
+    pub fn packedGegluExact(self: *const ComputeBackend, input: CT, rows: usize, width: usize) !?CT {
+        const op = self.vtable.packedGegluExact orelse return null;
+        return op(self.ptr, input, rows, width);
+    }
+
+    pub fn layaActionFeatures(self: *const ComputeBackend, request: *const LayaActionFeaturesRequest) !?CT {
+        if (self.vtable.layaActionFeatures) |f| return try f(self.ptr, request);
+        return null;
+    }
+
     pub fn scaledDotProductAttention(self: *const ComputeBackend, Q: CT, K: CT, V: CT, mask: []const i64, attn_bias: ?CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) !CT {
         return self.vtable.scaledDotProductAttention(self.ptr, Q, K, V, mask, attn_bias, batch, seq_len, num_heads, head_dim);
     }
@@ -4266,6 +4309,11 @@ pub const ComputeBackend = struct {
         if (self.vtable.fromInt32Shape) |op| {
             return op(self.ptr, data, shape);
         }
+        return null;
+    }
+
+    pub fn fromConstantBytes(self: *const ComputeBackend, data: []const u8, dtype: GraphDType, shape: []const i64) !?CT {
+        if (self.vtable.fromConstantBytes) |op| return op(self.ptr, data, dtype, shape);
         return null;
     }
 

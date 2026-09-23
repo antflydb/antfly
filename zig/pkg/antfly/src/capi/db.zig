@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const local_write = antfly.local_write;
 const raft_engine = @import("raft_engine");
 const storage_root = @import("antfly_storage_root");
@@ -79,9 +80,12 @@ const scraping = antfly.scraping;
 const inference_provider = antfly.inference_provider;
 const managed_embedder = antfly.managed_embedder;
 const raft_catalog = antfly.raft_catalog;
+const indexes_api = antfly.public_api.indexes;
 const Allocator = std.mem.Allocator;
 
 const lite_abi_version: u32 = 1;
+/// ANTFLY_MIN_THREAD_STACK_SIZE in antfly.h.
+const capi_min_thread_stack_size = 8 * 1024 * 1024;
 
 const kernel_runtime_services = antfly.kernel_runtime_services;
 
@@ -681,6 +685,34 @@ const Handle = struct {
     storage_owner_context: ?*StorageOwnerContext = null,
     storage_owner_transaction_recovery: ?*StorageOwnerTransactionRecovery = null,
     storage_owner_runtime_hooks: ?*StorageOwnerRuntimeHooks = null,
+    // Present only for a Lite handle opened with the local-runtime-configured
+    // flag on a build that both advertises and actually links the local
+    // inference runtime (see capi_build_options.inference_enabled and
+    // pkg/antfly/build/runtime.zig's addCapiInferenceVariantUnits). Default
+    // libantfly and Lite handles opened without the flag leave these null,
+    // which keeps today's behavior unchanged.
+    lite_inference_lifetime: ?inference_provider.EmbeddedInferenceProviderLifetime = null,
+    lite_inference_io: ?*std.Io.Threaded = null,
+    // Mirrors `LiteResolvedOpenOptions.generated_enrichment_replay` from this
+    // handle's open call. `refreshLiteManagedEmbeddingRuntime` must not lose
+    // this caller intent across its own reconfigure passes -- see its doc
+    // comment.
+    lite_generated_enrichment_replay: bool = false,
+    // Serialized threading mode (see CAPI.md "Thread Safety"): every export
+    // enters through `enterHandle`, which takes `api_lock` shared for reads
+    // and data writes and exclusively for schema/admin changes. Data writes
+    // and maintenance additionally serialize on their own mutexes so they
+    // queue instead of failing with ANTFLY_BUSY, while reads keep running
+    // against pinned snapshots. Callers hold a HandleRegistry id rather than
+    // this pointer, so close can drain and free safely (see HandleRegistry).
+    api_lock: std.Io.RwLock = .init,
+    write_mutex: std.Io.Mutex = .init,
+    maintenance_mutex: std.Io.Mutex = .init,
+
+    fn liteAntflyProvider(self: *Handle) ?managed_embedder.AntflyProvider {
+        const lifetime = if (self.lite_inference_lifetime) |*value| value else return null;
+        return inference_provider.inferenceBoundaryProvider(lifetime);
+    }
 
     fn prepareSearchRequest(self: *Handle, req: db_mod.types.SearchRequest) !void {
         const hook = self.readable_lease_hook orelse return;
@@ -744,6 +776,843 @@ const StorageSnapshot = struct {
     }
 };
 
+/// Starts the embedded inference provider owned by a Lite handle. Callers
+/// must only invoke this when `capi_build_options.inference_enabled` is true
+/// (only true for the isolated `-Dcapi-inference=true` storage_kernel unit
+/// and for unit tests): that is the only context where the real inference
+/// runtime archive is linked in this binary instead of the
+/// capi/link_anchor(_inference).zig trap.
+fn startLiteEmbeddedInference(
+    handle: *Handle,
+    alloc: Allocator,
+    path: []const u8,
+    budget_options: inference_provider.EmbeddedInferenceNodeOptions,
+) !void {
+    const io_impl = try alloc.create(std.Io.Threaded);
+    errdefer alloc.destroy(io_impl);
+    io_impl.* = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    errdefer io_impl.deinit();
+    const data_dir = std.fs.path.dirname(path) orelse ".";
+    const created = try inference_provider.createEmbeddedInferenceNode(data_dir, io_impl.io(), budget_options);
+    handle.lite_inference_io = io_impl;
+    handle.lite_inference_lifetime = .{ .handle = created.handle, .resource_owner = created.resource_owner };
+    // Report the policy the node actually resolved (host-detected by
+    // default, or the caller's explicit override) rather than leaving
+    // `lite_inference_status` at the pre-open placeholder values.
+    if (handle.lite_inference_status) |*status| {
+        status.process_memory_limit_bytes = @intCast(created.process_memory_limit_bytes);
+        status.process_memory_limit_source = @tagName(created.process_memory_limit_source);
+        status.host_budget_mb = created.host_budget_mb;
+        status.backend_budget_mb = created.backend_budget_mb;
+        status.combined_budget_mb = created.combined_budget_mb;
+        status.kv_budget_mb = created.kv_budget_mb;
+        status.scratch_budget_mb = created.scratch_budget_mb;
+    }
+}
+
+fn stopLiteEmbeddedInference(handle: *Handle) void {
+    if (handle.lite_inference_lifetime) |*lifetime| {
+        lifetime.quiesce();
+        inference_provider.destroyEmbeddedInferenceNode(lifetime.handle, lifetime.resource_owner);
+        handle.lite_inference_lifetime = null;
+    }
+    if (handle.lite_inference_io) |io_impl| {
+        io_impl.deinit();
+        handle.alloc.destroy(io_impl);
+        handle.lite_inference_io = null;
+    }
+}
+
+/// `managed_embedder.zig`'s index scanner only recognizes an entry as a
+/// managed embeddings producer when it carries the public
+/// `"type":"embeddings"` marker, matching the shape a server table stores
+/// (see the `EmbeddingsIndexConfig` OpenAPI schema). Lite's own raw
+/// `config_json` for a dense_vector/sparse_vector index uses lower-level,
+/// pre-existing field names instead ("dims"/"metric" rather than
+/// "dimension"/"distance_metric", and no "type" at all -- confirmed against
+/// examples/dogfood's index_config.go), so without this the entry is
+/// silently skipped by `parseManagedEmbeddingEntry` rather than erroring.
+/// Bridges the gap by injecting the marker (and a "dimension" alias of
+/// "dims" so a known vector width skips the capability-discovery probe)
+/// without touching any field the caller supplied. Falls back to passing
+/// `config_json` through unchanged for any other index kind, or if it fails
+/// to parse as a JSON object.
+fn liteManagedEmbeddingIndexConfigJson(
+    alloc: Allocator,
+    kind: db_mod.types.IndexKind,
+    config_json: []const u8,
+) ![]u8 {
+    if (kind != .dense_vector and kind != .sparse_vector) return try alloc.dupe(u8, config_json);
+
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    var parsed = std.json.parseFromSlice(std.json.Value, arena, config_json, .{}) catch
+        return try alloc.dupe(u8, config_json);
+    if (parsed.value != .object) return try alloc.dupe(u8, config_json);
+
+    if (parsed.value.object.get("type") == null) {
+        try parsed.value.object.put(arena, "type", .{ .string = "embeddings" });
+    }
+    if (kind == .sparse_vector and parsed.value.object.get("sparse") == null) {
+        try parsed.value.object.put(arena, "sparse", .{ .bool = true });
+    }
+    if (parsed.value.object.get("dimension") == null) {
+        if (parsed.value.object.get("dims")) |dims_value| {
+            try parsed.value.object.put(arena, "dimension", dims_value);
+        }
+    }
+    return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(parsed.value, .{})});
+}
+
+/// Server table provisioning accepts the artifact-stream chunk pattern
+/// (`go/pkg/docsaf`'s `chunk` enrichment producing a `doc_chunks_v1` artifact,
+/// consumed by an embeddings index via `"sources":[{"artifact":...}]`) by
+/// nesting an `"enrichments"` array inside whichever index config
+/// authoritatively owns each producer, then harvesting every nested
+/// declaration across the whole table (`api/indexes.zig`'s
+/// `collectArtifactEnrichmentsFromTableIndexesJsonWithOptions`, dependency
+/// sorted via `sortArtifactEnrichmentsByDependency`) and registering each one
+/// with `db.upsertEnrichment` *before* admitting the physical indexes
+/// (`metadata_table_provisioner.reconcileDbIndexesWithOptions` calls
+/// `ensureEnrichments` ahead of `ensureIndexes`). A native Lite handle only
+/// ever admits one index at a time through `antfly_db_add_index_json`, so
+/// there is no single merged table definition to harvest from; this instead
+/// harvests the `"enrichments"` nested in *this* index's own raw config
+/// before it is translated/admitted, mirroring the same per-index shape
+/// docsaf and the dogfood example already send. Two caveats callers must
+/// respect that the server's atomic table-create request does not have: (1)
+/// a producer index (e.g. the `chunk` enrichment's owning `full_text` index)
+/// must be added before any index whose `sources`/`embedding_name` names an
+/// artifact that producer's enrichment declares, since enrichment admission
+/// validates upstream references immediately; (2) re-adding the same index
+/// name replays its enrichment declarations too, which is harmless because
+/// `db.upsertEnrichment` is idempotent for an unchanged config. Scoped to the
+/// native profile: a hosted Lite handle's owning process reconciles its own
+/// enrichments the same way the server does.
+fn registerLiteIndexEnrichments(handle: *Handle, config_json: []const u8, rollback: *LiteCatalogRollback) !void {
+    var arena_impl = std.heap.ArenaAllocator.init(handle.alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    var parsed = std.json.parseFromSlice(std.json.Value, arena, config_json, .{}) catch return;
+    if (parsed.value != .object or parsed.value.object.get("enrichments") == null) return;
+
+    const alloc = handle.alloc;
+    var collected: std.ArrayListUnmanaged(db_mod.types.EnrichmentConfig) = .empty;
+    defer {
+        for (collected.items) |*cfg| cfg.deinit(alloc);
+        collected.deinit(alloc);
+    }
+    try indexes_api.collectArtifactEnrichmentsFromValueWithOptions(
+        alloc,
+        parsed.value,
+        .{ .antfly_provider = handle.liteAntflyProvider() },
+        &collected,
+    );
+    if (collected.items.len == 0) return;
+    indexes_api.sortArtifactEnrichmentsByDependency(collected.items);
+    for (collected.items) |cfg| {
+        // Record the touch before mutating, so a mid-loop failure still rolls
+        // back every enrichment this call may have changed.
+        try rollback.willTouchEnrichment(cfg.kind, cfg.name);
+        _ = try handle.db.upsertEnrichment(cfg);
+    }
+}
+
+/// Undo buffer for the catalog mutations a native Lite AddIndex performs
+/// before (nested enrichments) and after (nested resolvers) `db.addIndex`.
+/// The C ABI admits one index per call with no transaction around the
+/// enrichment/resolver catalogs, so a rejected or partially failed AddIndex
+/// must restore the pre-call configuration itself: durably upserting an
+/// existing enrichment's changed geometry and then failing index admission
+/// (for example with IndexAlreadyExists) must not leave the changed
+/// enrichment active.
+const LiteCatalogRollback = struct {
+    const TouchedEnrichment = struct {
+        kind: db_mod.types.EnrichmentKind,
+        name: []u8,
+    };
+
+    handle: *Handle,
+    /// Full pre-call enrichment catalog (owned).
+    prior: []db_mod.types.EnrichmentConfig,
+    /// Full pre-call resolver catalog (owned).
+    prior_resolvers: []db_mod.ResolverConfig,
+    touched: std.ArrayListUnmanaged(TouchedEnrichment) = .empty,
+    touched_resolvers: std.ArrayListUnmanaged([]u8) = .empty,
+
+    fn init(handle: *Handle) !LiteCatalogRollback {
+        const prior = try handle.db.listEnrichments(handle.alloc);
+        errdefer db_mod.types.freeEnrichmentConfigs(handle.alloc, prior);
+        return .{
+            .handle = handle,
+            .prior = prior,
+            .prior_resolvers = try handle.db.listResolvers(handle.alloc),
+        };
+    }
+
+    fn deinit(self: *LiteCatalogRollback) void {
+        const alloc = self.handle.alloc;
+        db_mod.types.freeEnrichmentConfigs(alloc, self.prior);
+        for (self.prior_resolvers) |*cfg| cfg.deinit(alloc);
+        alloc.free(self.prior_resolvers);
+        for (self.touched.items) |touch| alloc.free(touch.name);
+        self.touched.deinit(alloc);
+        for (self.touched_resolvers.items) |name| alloc.free(name);
+        self.touched_resolvers.deinit(alloc);
+    }
+
+    fn willTouchEnrichment(self: *LiteCatalogRollback, kind: db_mod.types.EnrichmentKind, name: []const u8) !void {
+        const alloc = self.handle.alloc;
+        for (self.touched.items) |touch| {
+            if (touch.kind == kind and std.mem.eql(u8, touch.name, name)) return;
+        }
+        try self.touched.append(alloc, .{ .kind = kind, .name = try alloc.dupe(u8, name) });
+    }
+
+    fn willTouchResolver(self: *LiteCatalogRollback, name: []const u8) !void {
+        const alloc = self.handle.alloc;
+        for (self.touched_resolvers.items) |touched| {
+            if (std.mem.eql(u8, touched, name)) return;
+        }
+        try self.touched_resolvers.append(alloc, try alloc.dupe(u8, name));
+    }
+
+    /// Best-effort restore of every touched enrichment to its pre-call
+    /// configuration: re-upsert the prior config, or delete an enrichment
+    /// this call introduced. Restore failures are logged, never masked over
+    /// the admission error the caller is already returning.
+    fn restore(self: *LiteCatalogRollback) void {
+        for (self.touched_resolvers.items) |name| {
+            const prior = blk: {
+                for (self.prior_resolvers) |cfg| {
+                    if (std.mem.eql(u8, cfg.name, name)) break :blk cfg;
+                }
+                break :blk null;
+            };
+            if (prior) |cfg| {
+                _ = self.handle.db.upsertResolverWithResultOptions(cfg, .{ .drain_backfill = false }) catch |err| {
+                    std.log.warn("lite AddIndex rollback failed to restore resolver {s}: {s}", .{ name, @errorName(err) });
+                };
+            } else {
+                _ = self.handle.db.removeResolverWithoutDrain(name) catch |err| {
+                    std.log.warn("lite AddIndex rollback failed to remove resolver {s}: {s}", .{ name, @errorName(err) });
+                };
+            }
+        }
+        for (self.touched.items) |touch| {
+            const prior = blk: {
+                for (self.prior) |cfg| {
+                    if (cfg.kind == touch.kind and std.mem.eql(u8, cfg.name, touch.name)) break :blk cfg;
+                }
+                break :blk null;
+            };
+            if (prior) |cfg| {
+                _ = self.handle.db.upsertEnrichment(cfg) catch |err| {
+                    std.log.warn("lite AddIndex rollback failed to restore enrichment {s}: {s}", .{ touch.name, @errorName(err) });
+                };
+            } else {
+                _ = self.handle.db.deleteEnrichment(touch.kind, touch.name) catch |err| {
+                    std.log.warn("lite AddIndex rollback failed to remove enrichment {s}: {s}", .{ touch.name, @errorName(err) });
+                };
+            }
+        }
+    }
+};
+
+/// Register the entity resolvers nested in this index's own raw config, the
+/// way `registerLiteIndexEnrichments` harvests nested `"enrichments"`. The
+/// server registers resolvers from the whole table's indexes JSON
+/// (`metadata_table_provisioner.ensureResolversWithOptions`) after index
+/// provisioning; a native Lite handle admits one index at a time, so this
+/// harvests the graph config's `"resolvers"` array after the index itself is
+/// admitted. Add/update only — a single index's config never proves another
+/// index's resolvers are gone, so nothing is removed here. `upsertResolver`
+/// is idempotent for an unchanged config; backfill is deferred to the
+/// resolver workers (or the next `antfly_lite_run_until_idle`).
+fn registerLiteIndexResolvers(handle: *Handle, config_json: []const u8, rollback: *LiteCatalogRollback) !void {
+    var arena_impl = std.heap.ArenaAllocator.init(handle.alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    var parsed = std.json.parseFromSlice(std.json.Value, arena, config_json, .{}) catch return;
+    if (parsed.value != .object) return;
+    const resolvers = parsed.value.object.get("resolvers") orelse return;
+    if (resolvers != .array) return;
+    for (resolvers.array.items) |item| {
+        if (item != .object) continue;
+        const cfg = try std.json.parseFromValue(db_mod.ResolverConfig, arena, item, .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = true,
+        });
+        // Record the touch before mutating, so a mid-loop failure (an
+        // invalid later resolver, a label conflict) still restores every
+        // earlier insertion or replacement this call made.
+        try rollback.willTouchResolver(cfg.value.name);
+        _ = try handle.db.upsertResolverWithResultOptions(cfg.value, .{ .drain_backfill = false });
+    }
+}
+
+test "capi lite AddIndexJSON registers the server's nested artifact-sourced enrichment shape" {
+    // Reproduces the docsaf/dogfood chunk-artifact pattern -- a `chunk`
+    // enrichment producing `document_chunks_v1`, then an embeddings index
+    // consuming it via `"sources":[{"artifact":"document_chunk_dense_v1"}]`
+    // with the producing `embedding` enrichment nested in the index's own
+    // config -- driven entirely through `antfly_db_add_index_json`, the way
+    // `go/pkg/docsaf/cmd/docsaf/main.go`'s `createHierarchyIndexes` and
+    // `antfly.NewArtifactEmbeddingIndexConfig` build it. Before
+    // `registerLiteIndexEnrichments` this silently dropped both nested
+    // enrichment declarations (they are not valid `db.addIndex` fields), so
+    // the physical dense_vector index referenced a `document_chunk_dense_v1`
+    // artifact with no enrichment ever registered to produce it.
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
+    const alloc = std.testing.allocator;
+    const path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-nested-enrichments");
+    defer alloc.free(path);
+    cleanupTestFile(path);
+    defer cleanupTestFile(path);
+
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(path, &handle));
+    defer antfly_db_close(handle);
+
+    // Producer index: a full_text index over the chunk artifact (docsaf's
+    // `document_text`), with the `chunk` enrichment nested in its config.
+    const chunk_index_json =
+        \\{"name":"document_text_chunks","kind":"full_text","config_json":"{\"chunk_name\":\"document_chunks_v1\",\"enrichments\":[{\"name\":\"document_chunks_v1\",\"kind\":\"chunk\",\"field\":\"body\",\"chunk_size\":64}]}"}
+    ;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(handle, .{
+        .ptr = chunk_index_json,
+        .len = chunk_index_json.len,
+    }));
+
+    var enrichments_after_chunk: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_list_enrichments_json(handle, &enrichments_after_chunk));
+    defer antfly_db_buffer_free(enrichments_after_chunk.ptr, enrichments_after_chunk.len);
+    try std.testing.expect(std.mem.indexOf(u8, enrichments_after_chunk.ptr.?[0..enrichments_after_chunk.len], "\"document_chunks_v1\"") != null);
+
+    // Consumer index: the exact two-stage `sources` form docsaf's
+    // `NewArtifactEmbeddingIndexConfig` builds, with the `embedding`
+    // enrichment nested in this index's own config and its
+    // `source_artifact_name` pointing at the chunk artifact above.
+    const vector_index_json =
+        \\{"name":"document_vectors","kind":"dense_vector","config_json":"{\"type\":\"embeddings\",\"sources\":[{\"artifact\":\"document_chunk_dense_v1\"}],\"dimension\":3,\"embedder\":{\"provider\":\"antfly\",\"model\":\"test-embed\",\"api_url\":\"http://127.0.0.1:1\"},\"distance_metric\":\"cosine\",\"enrichments\":[{\"name\":\"document_chunk_dense_v1\",\"kind\":\"embedding\",\"field\":\"text\",\"source_artifact_name\":\"document_chunks_v1\",\"expected_dims\":3}]}"}
+    ;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(handle, .{
+        .ptr = vector_index_json,
+        .len = vector_index_json.len,
+    }));
+
+    var enrichments_after_vectors: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_list_enrichments_json(handle, &enrichments_after_vectors));
+    defer antfly_db_buffer_free(enrichments_after_vectors.ptr, enrichments_after_vectors.len);
+    try std.testing.expect(std.mem.indexOf(u8, enrichments_after_vectors.ptr.?[0..enrichments_after_vectors.len], "\"document_chunk_dense_v1\"") != null);
+
+    var indexes: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_list_indexes_json(handle, &indexes));
+    defer antfly_db_buffer_free(indexes.ptr, indexes.len);
+    const indexes_json = indexes.ptr.?[0..indexes.len];
+    try std.testing.expect(std.mem.indexOf(u8, indexes_json, "\"document_vectors\"") != null);
+    // The physical config carries the translated artifact source reference
+    // (config_json is itself JSON-encoded as a string, so its embedded quotes
+    // are backslash-escaped here rather than literal).
+    try std.testing.expect(std.mem.indexOf(u8, indexes_json, "\\\"sources\\\":[{\\\"artifact\\\":\\\"document_chunk_dense_v1\\\"") != null);
+}
+
+test "capi lite AddIndexJSON restores the enrichment catalog when admission rejects the index" {
+    // Reviewer-reported P2: registerLiteIndexEnrichments durably upserted
+    // every nested enrichment BEFORE db.addIndex validated the index, so
+    // re-adding an existing index with a changed chunk_size updated the
+    // active enrichment and then failed with IndexAlreadyExists — the caller
+    // saw an error while the configuration had silently changed. AddIndex is
+    // now all-or-nothing: the pre-call enrichment catalog is restored on any
+    // admission failure.
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
+    const alloc = std.testing.allocator;
+    const path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-addindex-rollback");
+    defer alloc.free(path);
+    cleanupTestFile(path);
+    defer cleanupTestFile(path);
+
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(path, &handle));
+    defer antfly_db_close(handle);
+
+    const original_index_json =
+        \\{"name":"document_text_chunks","kind":"full_text","config_json":"{\"chunk_name\":\"document_chunks_v1\",\"enrichments\":[{\"name\":\"document_chunks_v1\",\"kind\":\"chunk\",\"field\":\"body\",\"chunk_size\":64}]}"}
+    ;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(handle, .{
+        .ptr = original_index_json,
+        .len = original_index_json.len,
+    }));
+
+    // Same index name, changed chunk geometry: admission must reject it AND
+    // the active chunk enrichment must keep chunk_size 64.
+    const changed_index_json =
+        \\{"name":"document_text_chunks","kind":"full_text","config_json":"{\"chunk_name\":\"document_chunks_v1\",\"enrichments\":[{\"name\":\"document_chunks_v1\",\"kind\":\"chunk\",\"field\":\"body\",\"chunk_size\":128}]}"}
+    ;
+    try std.testing.expect(antfly_db_add_index_json(handle, .{
+        .ptr = changed_index_json,
+        .len = changed_index_json.len,
+    }) != .ok);
+
+    {
+        const enrichments = try asHandle(handle).?.db.listEnrichments(alloc);
+        defer db_mod.types.freeEnrichmentConfigs(alloc, enrichments);
+        try std.testing.expectEqual(@as(usize, 1), enrichments.len);
+        try std.testing.expectEqualStrings("document_chunks_v1", enrichments[0].name);
+        try std.testing.expectEqual(@as(u32, 64), enrichments[0].chunk_size);
+    }
+}
+
+test "capi lite AddIndexJSON registers a graph config's nested resolvers" {
+    // The server registers entity resolvers from the whole table's indexes
+    // JSON (metadata_table_provisioner.ensureResolvers); a native Lite
+    // handle admits one index at a time, so registerLiteIndexResolvers
+    // harvests the graph config's own "resolvers" array — the shape
+    // examples/dogfood's knowledgeGraphIndexJSON declares. Re-adding the
+    // same index must be idempotent (upsertResolver observes an unchanged
+    // config), matching the enrichment path's contract.
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
+    const alloc = std.testing.allocator;
+    const path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-graph-resolvers");
+    defer alloc.free(path);
+    cleanupTestFile(path);
+    defer cleanupTestFile(path);
+
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(path, &handle));
+    defer antfly_db_close(handle);
+
+    const graph_index_json =
+        \\{"name":"knowledge","kind":"graph","config_json":"{\"source\":{\"artifact\":\"relations_v1\",\"path\":\"$.relations[*]\",\"format\":\"extraction_relation\",\"mention_edge_type\":\"mentions\"},\"artifact\":{\"name\":\"relations_v1\",\"kind\":\"asset\",\"source\":{\"type\":\"field\",\"value\":\"body\"},\"content_type\":\"application/json\"},\"resolvers\":[{\"name\":\"entities\",\"table\":\"entities\",\"source_artifact\":\"relations_v1\",\"resolution_artifact\":\"entities_resolution_v1\",\"key_template\":\"{{ lower _entity.label }}/{{ slug _entity.text }}\",\"config_generation\":1}]}"}
+    ;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(handle, .{
+        .ptr = graph_index_json,
+        .len = graph_index_json.len,
+    }));
+
+    {
+        const resolvers = try asHandle(handle).?.db.listResolvers(alloc);
+        defer {
+            for (resolvers) |*cfg| cfg.deinit(alloc);
+            alloc.free(resolvers);
+        }
+        try std.testing.expectEqual(@as(usize, 1), resolvers.len);
+        try std.testing.expectEqualStrings("entities", resolvers[0].name);
+        try std.testing.expectEqualStrings("relations_v1", resolvers[0].source_artifact);
+        try std.testing.expectEqualStrings("entities_resolution_v1", resolvers[0].resolution_artifact);
+        try std.testing.expectEqual(@as(u64, 1), resolvers[0].config_generation);
+    }
+
+    // Re-adding the identical index (whatever its own admission outcome)
+    // must not duplicate or corrupt the resolver catalog: an unchanged
+    // config upserts as a no-op.
+    _ = antfly_db_add_index_json(handle, .{
+        .ptr = graph_index_json,
+        .len = graph_index_json.len,
+    });
+    {
+        const resolvers = try asHandle(handle).?.db.listResolvers(alloc);
+        defer {
+            for (resolvers) |*cfg| cfg.deinit(alloc);
+            alloc.free(resolvers);
+        }
+        try std.testing.expectEqual(@as(usize, 1), resolvers.len);
+    }
+}
+
+test "capi lite AddIndexJSON surfaces an unresolvable source_artifact_name as invalid_argument, not internal" {
+    // Regression test for the ANTFLY_INTERNAL reported against every
+    // `sources`-based dense_vector config: the enrichment catalog's own
+    // upstream-reference validation (an `embedding` enrichment naming a
+    // `source_artifact_name` with no matching `chunk` enrichment) is a
+    // caller config mistake, not a server fault, and must map to
+    // ANTFLY_INVALID_ARGUMENT (see `capi/types.zig`'s `mapError`).
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
+    const alloc = std.testing.allocator;
+    const path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-unresolved-artifact-source");
+    defer alloc.free(path);
+    cleanupTestFile(path);
+    defer cleanupTestFile(path);
+
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(path, &handle));
+    defer antfly_db_close(handle);
+
+    const vector_index_json =
+        \\{"name":"document_vectors","kind":"dense_vector","config_json":"{\"type\":\"embeddings\",\"sources\":[{\"artifact\":\"document_chunk_dense_v1\"}],\"dimension\":3,\"embedder\":{\"provider\":\"antfly\",\"model\":\"test-embed\",\"api_url\":\"http://127.0.0.1:1\"},\"enrichments\":[{\"name\":\"document_chunk_dense_v1\",\"kind\":\"embedding\",\"field\":\"text\",\"source_artifact_name\":\"missing_chunks_v1\",\"expected_dims\":3}]}"}
+    ;
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_add_index_json(handle, .{
+        .ptr = vector_index_json,
+        .len = vector_index_json.len,
+    }));
+}
+
+/// Server table provisioning never calls `db.addIndex` with a caller's raw
+/// dense/sparse config: `metadata_table_provisioner.extractIndexConfigJsonForKind`
+/// first runs it through `managed_embedder.translateEmbeddingsIndexConfigJson`,
+/// which is what attaches the internal `"generator"` section that
+/// `index_manager`'s `hasGeneratedEnrichmentTargets`/`appendGeneratedEnrichments`
+/// need to ever schedule a document's field for embedding. A native Lite
+/// handle calling `db.addIndex` directly skipped that step entirely, so even
+/// after `refreshLiteManagedEmbeddingRuntime` wires up a working embedder,
+/// the physical index never asks it for anything: `parseDenseConfig` only
+/// looks at `field`/`dims`/`metric`/`embedding_name`/`external`, and nothing
+/// else marks the index as awaiting generated content. Runs the same
+/// translation here so what gets stored via `db.addIndex` matches what the
+/// server would have stored. Falls back to the untranslated config on any
+/// translation error (for example a managed, non-external index with
+/// neither `embedder` nor `chunker` configured) so a Lite caller that never
+/// relied on this feature keeps today's permissive, pass-through behavior;
+/// `refreshLiteManagedEmbeddingRuntime` is likewise a no-op for such an
+/// index.
+/// True for a plain embedder-only embeddings config -- no `field`/`template`
+/// of its own, and none of the other shapes that mean something different
+/// (an artifact-backed consumer, an external/caller-supplied index, or one
+/// still carrying its own chunker) -- where defaulting `field` to
+/// `"embedding"` is unambiguous. Keeps `litePhysicalIndexConfigJson` from
+/// defaulting a config whose author meant something other than "index the
+/// stored `embedding` field".
+fn needsDefaultEmbeddingField(object: std.json.ObjectMap) bool {
+    if (object.get("field") != null) return false;
+    if (object.get("template") != null) return false;
+    if (object.get("sources") != null) return false;
+    if (object.get("embedding_name") != null) return false;
+    if (object.get("source_artifact_name") != null) return false;
+    if (object.get("chunker") != null) return false;
+    if (object.get("external")) |external| {
+        if (external == .bool and external.bool) return false;
+    }
+    return true;
+}
+
+fn litePhysicalIndexConfigJson(
+    alloc: Allocator,
+    kind: db_mod.types.IndexKind,
+    name: []const u8,
+    config_json: []const u8,
+    provider: ?managed_embedder.AntflyProvider,
+) ![]u8 {
+    if (kind != .dense_vector and kind != .sparse_vector) return try alloc.dupe(u8, config_json);
+    const bridged = try liteManagedEmbeddingIndexConfigJson(alloc, kind, config_json);
+    defer alloc.free(bridged);
+
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    var parsed = std.json.parseFromSlice(std.json.Value, arena, bridged, .{}) catch
+        return try alloc.dupe(u8, config_json);
+    // The translator requires `field` (or `template`/an artifact source) on
+    // a non-external embeddings config and otherwise bails out before ever
+    // resolving dimensions -- before this, a caller relying on the same
+    // "embedding" default `field` this function's own post-failure fallback
+    // below injects would always take that fallback, which has no way to
+    // learn the real vector width and stores an index `db.addIndex` then
+    // rejects for a missing `dims`. Inject the default proactively so
+    // translation actually runs and probes the configured embedder (local or
+    // remote) for its output width instead of falling back before trying.
+    if (parsed.value == .object and needsDefaultEmbeddingField(parsed.value.object)) {
+        parsed.value.object.put(arena, "field", .{ .string = "embedding" }) catch
+            return try alloc.dupe(u8, config_json);
+    }
+    // `provider` must be threaded through here too: an embedder with no
+    // `api_url` translates to a durable `"antfly:embedded"` semantic
+    // producer identity, and the translator rejects that identity outright
+    // when no embedded provider is attached to validate it against.
+    return managed_embedder.translateEmbeddingsIndexConfigJsonWithOptions(alloc, name, parsed.value, .{ .antfly_provider = provider }) catch {
+        // A translation failure (for example dimension auto-detection
+        // requiring a live round trip this call cannot make) must not turn
+        // into a hard AddIndex error. Fall back to the bridged config, but
+        // `index_manager.parseDenseConfig` hard-requires `field` on every
+        // dense/sparse entry -- callers who omit it entirely (relying on
+        // translation to supply the artifact-storage default) would
+        // otherwise fail `db.addIndex` outright instead of landing in the
+        // same "no managed producer configured" no-op state as any other
+        // untranslatable config.
+        if (parsed.value == .object and parsed.value.object.get("field") == null) {
+            parsed.value.object.put(arena, "field", .{ .string = "embedding" }) catch
+                return try alloc.dupe(u8, config_json);
+            return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(parsed.value, .{})});
+        }
+        return try alloc.dupe(u8, config_json);
+    };
+}
+
+/// Rebuilds the DB's managed embedding/chunking/extraction runtime from the
+/// currently declared indexes and enrichments. Provider "antfly" producers
+/// with no `api_url` route through the Lite handle's embedded inference
+/// provider when one exists (see `startLiteEmbeddedInference`); producers
+/// that carry their own `api_url` call that remote Antfly inference service
+/// directly and work fine with a null local provider. Scoped to the native
+/// profile: hosted Lite handles are reconciled by their owning process and
+/// non-Lite (storage-owner) handles are reconciled through
+/// `configureStorageKernelOwnerDb` instead. Includes every declared index
+/// kind (not just dense/sparse vector) plus standalone enrichments so a
+/// graph index's asset-producer extractor and any chunk enrichments are
+/// discovered the same way `indexesJsonNeedsAssetProducer` /
+/// `indexesJsonHasGeneratedEnrichment` discover them for the server. A
+/// database with neither a local provider nor any producer `api_url`
+/// resolves an empty producer set, which is a safe no-op: pending work stays
+/// visible and neither open nor AddIndex/AddEnrichment errors.
+/// Builds the merged `{"<index_name>":<bridged_config_json>, ...}` blob both
+/// `refreshLiteManagedEmbeddingRuntime` (write-time enrichment wiring) and
+/// `LiteSemanticResolver` (query-time `semantic_search` embedding) feed to
+/// `managed_embedder.zig`. Every index kind is included, not just
+/// dense_vector/sparse_vector: `indexesJsonNeedsAssetProducer`/
+/// `indexesJsonHasGeneratedEnrichment` recursively scan the whole merged
+/// object for a nested `"kind":"asset","producer_json":...}` object (see
+/// examples/dogfood's knowledgeGraphIndexJSON, which declares the graph
+/// index's extractor exactly that way, under an "artifact" key inside the
+/// graph index's own config), so a graph/full_text/algebraic index must not
+/// be filtered out here even though `managed_embedder.zig`'s embedder
+/// scanner only ever recognizes a dense_vector/sparse_vector entry.
+/// `liteManagedEmbeddingIndexConfigJson` passes every other kind through
+/// unchanged.
+///
+/// Also appends every *standalone* catalog enrichment from `db.listEnrichments`
+/// -- one registered directly through `antfly_db_add_enrichment_json` with no
+/// index nesting the same declaration in its own config (see
+/// `registerLiteIndexEnrichments`). Without this, a `kind:"asset"` extractor
+/// or a `kind:"chunk"` enrichment added standalone is accepted into the
+/// catalog (`db.addEnrichment` validates and stores it) but never gets an
+/// asset producer or chunk provider wired up: `indexesJsonNeedsAssetProducer`/
+/// `indexesJsonHasGeneratedEnrichment` only ever saw the index catalog, so a
+/// document's pending generated-enrichment work for that name stays "accepted"
+/// forever with nothing servicing it (a stall, surfaced as
+/// `error.RunUntilIdleNoProgress` from `antfly_db_run_until_idle`). Each
+/// standalone entry is appended under a `"$enrichment:<kind>:<name>"` key --
+/// reserved so it cannot collide with a real index name -- as an object shaped
+/// `{"kind":<kind>,"producer_json":<...>}` (only when non-empty), which is
+/// exactly the shape the two scanners above already recognize wherever it
+/// appears in the merged tree. `managed_embedder.zig`'s own scanners
+/// (`parseManagedEmbeddingEntry`, `addArtifactBackedManagedEmbeddingEntries`)
+/// only ever look at top-level entries carrying `"type":"embeddings"`, and
+/// this shape carries no `"type"` or `"enrichments"` key, so it is inert to
+/// them and to `LiteSemanticResolver`'s query-time resolution. Caller owns the
+/// returned slice.
+fn liteMergedIndexesJsonAlloc(handle: *Handle) ![]u8 {
+    const alloc = handle.alloc;
+    const configs = try handle.db.listIndexes(alloc);
+    defer db_mod.types.freeIndexConfigs(alloc, configs);
+    const enrichments = try handle.db.listEnrichments(alloc);
+    defer db_mod.types.freeEnrichmentConfigs(alloc, enrichments);
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(alloc);
+    try buf.append(alloc, '{');
+    var wrote_any = false;
+    for (configs) |cfg| {
+        if (wrote_any) try buf.append(alloc, ',');
+        wrote_any = true;
+        const escaped_name = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(cfg.name, .{})});
+        defer alloc.free(escaped_name);
+        try buf.appendSlice(alloc, escaped_name);
+        try buf.append(alloc, ':');
+        const entry_config_json = try liteManagedEmbeddingIndexConfigJson(alloc, cfg.kind, cfg.config_json);
+        defer alloc.free(entry_config_json);
+        try buf.appendSlice(alloc, entry_config_json);
+    }
+    for (enrichments) |cfg| {
+        if (wrote_any) try buf.append(alloc, ',');
+        wrote_any = true;
+        const merged_key = try std.fmt.allocPrint(alloc, "$enrichment:{s}:{s}", .{ @tagName(cfg.kind), cfg.name });
+        defer alloc.free(merged_key);
+        const escaped_key = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(merged_key, .{})});
+        defer alloc.free(escaped_key);
+        try buf.appendSlice(alloc, escaped_key);
+        try buf.append(alloc, ':');
+        const entry_json = try liteEnrichmentCatalogEntryJsonAlloc(alloc, cfg);
+        defer alloc.free(entry_json);
+        try buf.appendSlice(alloc, entry_json);
+    }
+    try buf.append(alloc, '}');
+    return try buf.toOwnedSlice(alloc);
+}
+
+/// Builds the `{"kind":<kind>,"producer_json":<...>}`-shaped object
+/// `liteMergedIndexesJsonAlloc` nests under each standalone catalog
+/// enrichment's reserved `"$enrichment:<kind>:<name>"` key. `producer_json`
+/// is included only for an `asset` enrichment that carries one (the field
+/// `objectIsModelBackedAssetEnrichment` inspects); `kind:"chunk"` needs no
+/// further fields since `jsonValueHasGeneratedEnrichment` treats any
+/// `"kind":"chunk"` object as a generated-enrichment marker regardless of
+/// its other fields. A standalone `embedding` enrichment (always paired with
+/// an owning dense/sparse index's own `"type":"embeddings"` config, already
+/// merged in above) carries neither marker and is included only for listing
+/// symmetry; it is inert to every scanner.
+fn liteEnrichmentCatalogEntryJsonAlloc(alloc: Allocator, cfg: db_mod.types.EnrichmentConfig) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(alloc);
+    const kind_json = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(@tagName(cfg.kind), .{})});
+    defer alloc.free(kind_json);
+    try buf.appendSlice(alloc, "{\"kind\":");
+    try buf.appendSlice(alloc, kind_json);
+    if (cfg.producer_json.len > 0) {
+        const producer_json_json = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(cfg.producer_json, .{})});
+        defer alloc.free(producer_json_json);
+        try buf.appendSlice(alloc, ",\"producer_json\":");
+        try buf.appendSlice(alloc, producer_json_json);
+    }
+    try buf.append(alloc, '}');
+    return try buf.toOwnedSlice(alloc);
+}
+
+test "capi lite merged indexes JSON discovers a standalone asset extractor and chunk enrichment with no owning index" {
+    // Regression test for db.zig:1091 (pre-fix): `liteMergedIndexesJsonAlloc`
+    // only read `handle.db.listIndexes`, so a `kind:"asset"` extractor or a
+    // `kind:"chunk"` enrichment registered directly through
+    // `antfly_db_add_enrichment_json` -- with no index nesting the same
+    // declaration in its own config (see `registerLiteIndexEnrichments`) --
+    // was accepted into the catalog but invisible to
+    // `local_write.indexesJsonNeedsAssetProducer`/`indexesJsonHasGeneratedEnrichment`.
+    // `refreshLiteManagedEmbeddingRuntime` always resolved an empty producer
+    // set for it, so `ManagedDbEnrichmentSet.enabled()` stayed false and the
+    // enrichment runtime never serviced that name's pending work at all.
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
+    const alloc = std.testing.allocator;
+    const path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-standalone-enrichment-discovery");
+    defer alloc.free(path);
+    cleanupTestFile(path);
+    defer cleanupTestFile(path);
+
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(path, &handle));
+    defer antfly_db_close(handle);
+
+    // Standalone `chunk` enrichment: no index anywhere nests this declaration.
+    const chunk_enrichment_json =
+        \\{"name":"standalone_chunks_v1","kind":"chunk","field":"body","chunk_size":64,"chunk_overlap":8}
+    ;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_enrichment_json(handle, .{
+        .ptr = chunk_enrichment_json,
+        .len = chunk_enrichment_json.len,
+    }));
+
+    // Standalone `asset` enrichment with a model-backed (non-"copy") extractor
+    // producer: also nested nowhere.
+    const asset_enrichment_json =
+        \\{"name":"standalone_extract_v1","kind":"asset","field":"body","producer_json":"{\"type\":\"extractor\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-extract\"}}"}
+    ;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_enrichment_json(handle, .{
+        .ptr = asset_enrichment_json,
+        .len = asset_enrichment_json.len,
+    }));
+
+    const owned_handle = asHandle(handle).?;
+    const merged_json = try liteMergedIndexesJsonAlloc(owned_handle);
+    defer std.heap.c_allocator.free(merged_json);
+
+    try std.testing.expect(std.mem.indexOf(u8, merged_json, "$enrichment:chunk:standalone_chunks_v1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, merged_json, "$enrichment:asset:standalone_extract_v1") != null);
+
+    // Before the fix these both returned false: neither scanner ever saw a
+    // "kind":"asset"/"chunk" object anywhere in the merged JSON.
+    try std.testing.expect(try local_write.indexesJsonHasGeneratedEnrichment(alloc, merged_json));
+    try std.testing.expect(try local_write.indexesJsonNeedsAssetProducer(alloc, merged_json));
+}
+
+test "capi lite run until idle drains a standalone chunk enrichment with no owning index" {
+    // End-to-end reproduction of the same gap: before the fix, a standalone
+    // `kind:"chunk"` catalog enrichment left `generated=false` in
+    // `local_write.createManagedDbEnrichments`'s scan of the merged JSON, so
+    // `ManagedDbEnrichmentSet.enabled()` (dense/sparse/asset_runtime all null,
+    // `generated` false) stayed false and `refreshLiteManagedEmbeddingRuntime`
+    // never created an enrichment runtime at all. A document's pending chunk
+    // work for that name was accepted (the catalog entry validates and
+    // stores) but nothing ever serviced it, so `antfly_db_run_until_idle`
+    // would return `.stalled` (`error.RunUntilIdleNoProgress`) instead of
+    // draining. A fixed-size, non-semantic chunker (`chunk_size`/
+    // `chunk_overlap`, no `chunker_json`) needs no embedder or extractor
+    // provider at all (`chunker_mod.chunkText` in enrichment_runtime.zig), so
+    // this reproduces and proves the fix end to end without any local model.
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
+    const alloc = std.testing.allocator;
+    const path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-standalone-chunk-drain");
+    defer alloc.free(path);
+    cleanupTestFile(path);
+    defer cleanupTestFile(path);
+
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(path, &handle));
+    defer antfly_db_close(handle);
+
+    const enrichment_json =
+        \\{"name":"standalone_chunks_v1","kind":"chunk","field":"body","chunk_size":16,"chunk_overlap":4}
+    ;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_enrichment_json(handle, .{
+        .ptr = enrichment_json,
+        .len = enrichment_json.len,
+    }));
+
+    const batch_json = "{\"inserts\":{\"doc:capi-standalone-chunk\":{\"body\":\"antfly lite chunks this document body text into overlapping windows for later retrieval\"}},\"sync_level\":\"write\"}";
+    var batch_out: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch_json(handle, .{
+        .ptr = batch_json.ptr,
+        .len = batch_json.len,
+    }, &batch_out));
+    defer antfly_db_buffer_free(batch_out.ptr, batch_out.len);
+
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_run_until_idle(handle));
+
+    const owned_handle = asHandle(handle).?;
+    const drained = owned_handle.db.pendingWorkStats();
+    try std.testing.expectEqual(@as(u64, 0), drained.enrichment.error_count);
+    try std.testing.expectEqual(@as(u64, 0), drained.enrichment.fatal_error_count);
+    try std.testing.expect(!drained.enrichment.stalled);
+    try std.testing.expectEqual(drained.enrichment.target_sequence, drained.enrichment.applied_sequence);
+    try std.testing.expect(drained.enrichment.target_sequence > 0);
+}
+
+fn refreshLiteManagedEmbeddingRuntime(handle: *Handle) !void {
+    if (handle.lite_profile != .native) return;
+    // A read-only/status-only handle has nothing to reconcile toward, and
+    // `db.reconfigureEnrichmentRuntime` unconditionally fails with
+    // `error.ReadOnly` on one -- before it even looks at whether there is
+    // anything to configure. Every open of an already-written native Lite
+    // database (query_readonly, status_only) would otherwise fail outright.
+    if (!liteOpenModeCanWrite(handle.open_mode)) return;
+    const provider = handle.liteAntflyProvider();
+    const alloc = handle.alloc;
+    const merged_json = try liteMergedIndexesJsonAlloc(handle);
+    defer alloc.free(merged_json);
+
+    // Not `local_write.reconfigureManagedDbEnrichmentRuntime` directly: that
+    // helper derives `enable_without_producers` purely from
+    // `indexesJsonHasGeneratedEnrichment`'s scan of the *index* catalog's own
+    // config shape (an inline `"kind":"chunk"`/`"asset"` object, or an
+    // `"embeddings"` config). A full-text index that references a chunk
+    // enrichment by name -- `{"chunk_name":"..."}`, the shape
+    // `antfly_db_add_index_json` stores -- carries no such literal marker, so
+    // the scan misses it even though a caller that opened this handle with
+    // `generated_enrichment_replay` explicitly asked to resume exactly that
+    // pending work. This function runs unconditionally after every open,
+    // addIndex, and addEnrichment, so without preserving that intent here it
+    // silently tears down and never rebuilds the runtime
+    // `replayGeneratedEnrichmentsFromStoredDocs` depends on the very first
+    // time this handle reconciles anything.
+    var enrichments = try local_write.createManagedDbEnrichments(
+        alloc,
+        merged_json,
+        handle.db.backend_runtime,
+        provider,
+        null,
+        null,
+        "",
+        null,
+        null,
+    );
+    defer enrichments.deinit(alloc);
+    var cfg = enrichments.takeConfig();
+    cfg.enable_without_producers = cfg.enable_without_producers or handle.lite_generated_enrichment_replay;
+    try handle.db.reconfigureEnrichmentRuntime(cfg);
+}
+
 fn closeHandle(handle: *Handle) void {
     const storage_owner_context = handle.storage_owner_context;
     const storage_owner_transaction_recovery = handle.storage_owner_transaction_recovery;
@@ -753,6 +1622,7 @@ fn closeHandle(handle: *Handle) void {
         handle.db.syncIndexes(true) catch {};
     }
     handle.db.close();
+    stopLiteEmbeddedInference(handle);
     if (storage_owner_transaction_recovery) |recovery| {
         recovery.deinit();
         handle.alloc.destroy(recovery);
@@ -781,6 +1651,63 @@ fn currentIdentityReadGenerationForHandle(handle: *Handle, requested: ?u64) !u64
 fn stampSearchRequestIdentityGeneration(handle: *Handle, req: *db_mod.types.SearchRequest) !void {
     req.identity_read_generation = try currentIdentityReadGenerationForHandle(handle, req.identity_read_generation);
 }
+
+/// Optimistic attempts before `runAtStampedGeneration` blocks writers.
+const stamped_generation_optimistic_attempts = 4;
+
+/// Stamps `req` with the current identity generation and runs `query.run`
+/// against it. Reads run concurrently with writes, so a batch can commit
+/// between the stamp and the executor's re-check, which then rejects the
+/// stale stamp with IdentityReadGenerationChanged. When the caller did not pin
+/// a generation, restamp and retry, as the server's public query path does.
+/// The last attempt holds the handle's write mutex so no write can intervene,
+/// which bounds retries under sustained writes. A caller-pinned generation
+/// that has gone stale is returned as an error without retrying.
+fn runAtStampedGeneration(
+    handle: *Handle,
+    req: *db_mod.types.SearchRequest,
+    query: anytype,
+) !@TypeOf(query).Result {
+    return runAtStampedGenerationWithOptions(handle, req, query, .{});
+}
+
+const StampedGenerationOptions = struct {
+    /// Run the readable-lease hook for the stamped request. Paths whose export
+    /// already ran a request-specific hook (dense search) turn this off.
+    prepare: bool = true,
+};
+
+fn runAtStampedGenerationWithOptions(
+    handle: *Handle,
+    req: *db_mod.types.SearchRequest,
+    query: anytype,
+    comptime options: StampedGenerationOptions,
+) !@TypeOf(query).Result {
+    const pinned = req.identity_read_generation;
+    var attempt: u32 = 0;
+    while (true) : (attempt += 1) {
+        const block_writers = pinned == null and attempt == stamped_generation_optimistic_attempts;
+        const last = pinned != null or block_writers;
+        // Same order as write exports (api_lock shared, then write_mutex), so
+        // this cannot deadlock against them.
+        if (block_writers) handle.write_mutex.lockUncancelable(handleLockIo());
+        defer if (block_writers) handle.write_mutex.unlock(handleLockIo());
+        req.identity_read_generation = pinned;
+        try stampSearchRequestIdentityGeneration(handle, req);
+        if (options.prepare) try handle.prepareSearchRequest(req.*);
+        return query.run(handle, req.*) catch |err| {
+            if (err == error.IdentityReadGenerationChanged and !last) continue;
+            return err;
+        };
+    }
+}
+
+const LocalSearchQuery = struct {
+    const Result = db_mod.types.SearchResult;
+    fn run(_: LocalSearchQuery, handle: *Handle, req: db_mod.types.SearchRequest) !Result {
+        return executeLocalSearch(handle, req);
+    }
+};
 
 fn executeLocalSearch(handle: *Handle, req: db_mod.types.SearchRequest) !db_mod.types.SearchResult {
     if (comptime capi_build_options.linked_storage) {
@@ -859,14 +1786,310 @@ const ReadableLeaseHook = struct {
             .busy => return error.WouldBlock,
             .outcome_unknown => return error.DurabilityOutcomeUnknown,
             .unsupported => return error.UnsupportedOperation,
+            .stalled => return error.Stalled,
             .internal => return error.Internal,
         }
     }
 };
 
+/// Resolves a caller's handle id without entering it. Exports go through
+/// `enterHandle` instead; this is for close and for internal callers (the
+/// storage-owner ABI, tests) that do not race close.
 fn asHandle(ptr: ?*anyopaque) ?*Handle {
-    const raw = ptr orelse return null;
-    return @ptrCast(@alignCast(raw));
+    const id = HandleRegistry.decode(ptr) orelse return null;
+    const slot = handle_registry.slotFor(id.index) orelse return null;
+    if (slot.state.load(.acquire) >> 1 != id.generation) return null;
+    return slot.handle.load(.acquire);
+}
+
+/// Handles given to callers are ids naming a registry slot plus a
+/// generation, not `*Handle` pointers. Slots live in chunks that are never
+/// freed, so any handle value a caller passes, including one for a handle
+/// closed on another thread a moment ago, dereferences valid memory:
+/// entering a stale or closing generation fails with
+/// ANTFLY_INVALID_ARGUMENT instead of touching a freed Handle, closing one
+/// is a no-op, and a reused slot never matches an old id.
+///
+/// Handle values must also be safe for bindings to hold in pointer-typed
+/// fields: Go's garbage collector throws on an `unsafe.Pointer` that lands
+/// in its heap arenas without naming a live object, and on values below
+/// 4096. So on 64-bit POSIX targets each id is encoded as an address inside
+/// a PROT_NONE reservation this process owns and never touches: a real,
+/// unique address that no allocator can ever return.
+const HandleRegistry = struct {
+    const chunk_len = 256;
+    const index_bits = 20;
+    const max_slots = 1 << index_bits;
+    const max_chunks = max_slots / chunk_len;
+    /// Handle values are 8-byte aligned offsets into the reservation.
+    const stride_shift = 3;
+    const reserve_address_space = @bitSizeOf(usize) == 64 and switch (builtin.os.tag) {
+        .linux, .macos, .freebsd, .netbsd, .openbsd, .dragonfly, .ios => true,
+        else => false,
+    };
+
+    const Slot = struct {
+        /// `generation << 1 | closing`. The slot is open for `generation`
+        /// exactly when the closing bit is clear.
+        state: std.atomic.Value(u64) = .init(0),
+        /// Calls that have entered, or are trying to, for any generation.
+        active: std.atomic.Value(u32) = .init(0),
+        handle: std.atomic.Value(?*Handle) = .init(null),
+        next_free: u32 = 0,
+    };
+
+    const Id = struct {
+        index: u32,
+        generation: u64,
+    };
+
+    chunks: [max_chunks]std.atomic.Value(?*[chunk_len]Slot) = @splat(.init(null)),
+    mutex: std.atomic.Mutex = .unlocked,
+    slot_count: u32 = 0,
+    free_head: ?u32 = null,
+    /// Start of the id reservation (0 until the first registration, or on
+    /// targets that use plain integer ids) and the generation width it fits.
+    base: std.atomic.Value(usize) = .init(0),
+    generation_bits: u6 = 0,
+
+    fn generationMask(self: *const HandleRegistry) u64 {
+        return (@as(u64, 1) << self.generation_bits) - 1;
+    }
+
+    /// Reserves the id address space on first use. Called with `mutex` held.
+    fn ensureIdSpace(self: *HandleRegistry) !void {
+        if (self.generation_bits != 0) return;
+        if (comptime !reserve_address_space) {
+            self.generation_bits = @bitSizeOf(usize) - index_bits - 1;
+            return;
+        }
+        // Prefer 17 generation bits (1 TiB of address space, no memory);
+        // step down if the platform limits reservations.
+        for ([_]u6{ 17, 13, 9 }) |bits| {
+            const len = @as(usize, 1) << (index_bits + bits + stride_shift);
+            const region = std.posix.mmap(null, len, .{}, .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .NORESERVE = true }, -1, 0) catch continue;
+            self.generation_bits = bits;
+            self.base.store(@intFromPtr(region.ptr), .release);
+            return;
+        }
+        return error.OutOfMemory;
+    }
+
+    fn encode(self: *const HandleRegistry, id: Id) *anyopaque {
+        const offset = (id.generation << index_bits | id.index);
+        if (comptime !reserve_address_space) {
+            // Plain ids; index + 1 keeps the value non-null.
+            return @ptrFromInt(@as(usize, @intCast(offset + 1)));
+        }
+        return @ptrFromInt(self.base.load(.acquire) + (@as(usize, @intCast(offset)) << stride_shift));
+    }
+
+    fn decode(ptr: ?*anyopaque) ?Id {
+        const raw = @intFromPtr(ptr orelse return null);
+        const offset: u64 = if (comptime !reserve_address_space) blk: {
+            break :blk @as(u64, raw) - 1;
+        } else blk: {
+            const base = handle_registry.base.load(.acquire);
+            if (base == 0 or raw < base) return null;
+            const delta = raw - base;
+            if (delta & ((1 << stride_shift) - 1) != 0) return null;
+            const offset = delta >> stride_shift;
+            if (offset >> index_bits > handle_registry.generationMask()) return null;
+            break :blk offset;
+        };
+        return .{
+            .index = @intCast(offset & (max_slots - 1)),
+            .generation = offset >> index_bits,
+        };
+    }
+
+    fn slotFor(self: *HandleRegistry, index: u32) ?*Slot {
+        const chunk_index = index / chunk_len;
+        if (chunk_index >= max_chunks) return null;
+        const chunk = self.chunks[chunk_index].load(.acquire) orelse return null;
+        return &chunk[index % chunk_len];
+    }
+
+    /// Publishes `handle` and returns the id callers hold.
+    fn register(self: *HandleRegistry, handle: *Handle) !*anyopaque {
+        antfly.platform_sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        try self.ensureIdSpace();
+        const index = if (self.free_head) |free| blk: {
+            self.free_head = if (self.slotFor(free).?.next_free == 0) null else self.slotFor(free).?.next_free - 1;
+            break :blk free;
+        } else blk: {
+            const index = self.slot_count;
+            const chunk_index = index / chunk_len;
+            if (chunk_index >= max_chunks) return error.OutOfMemory;
+            if (self.chunks[chunk_index].load(.acquire) == null) {
+                const chunk = try std.heap.page_allocator.create([chunk_len]Slot);
+                chunk.* = @splat(.{});
+                self.chunks[chunk_index].store(chunk, .release);
+            }
+            self.slot_count += 1;
+            break :blk index;
+        };
+        const slot = self.slotFor(index).?;
+        slot.handle.store(handle, .release);
+        const generation = slot.state.load(.acquire) >> 1;
+        return self.encode(.{ .index = index, .generation = generation });
+    }
+
+    /// Claims the slot for close. Returns the handle to free, or null when
+    /// the id is stale or another close already claimed it. Waits for every
+    /// call that entered (or is backing out) to leave first.
+    fn beginClose(self: *HandleRegistry, ptr: ?*anyopaque) ?struct { *Handle, Id } {
+        const id = decode(ptr) orelse return null;
+        const slot = self.slotFor(id.index) orelse return null;
+        if (slot.state.cmpxchgStrong(id.generation << 1, id.generation << 1 | 1, .seq_cst, .seq_cst) != null) return null;
+        // A call that counted itself before the closing bit was set may still
+        // be queued behind a handle lock, so poll rather than taking the lock:
+        // yield first, then back off so a long search does not spin a core.
+        var spins: u32 = 0;
+        while (slot.active.load(.seq_cst) != 0) : (spins +|= 1) {
+            if (spins < 64) {
+                std.Thread.yield() catch {};
+            } else {
+                handleLockIo().sleep(.fromMicroseconds(500), .awake) catch {};
+            }
+        }
+        const handle = slot.handle.swap(null, .acq_rel) orelse return null;
+        return .{ handle, id };
+    }
+
+    /// Releases a slot claimed by `beginClose` after its handle is freed.
+    fn finishClose(self: *HandleRegistry, id: Id) void {
+        const slot = self.slotFor(id.index).?;
+        antfly.platform_sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        if (id.generation >= self.generationMask()) {
+            // The slot has used every generation an id can encode. Wrapping
+            // would let an old id match a future handle, so retire it: the
+            // state stays claimed (closing bit set), which no id can enter or
+            // close, and the slot never returns to the free list.
+            return;
+        }
+        slot.state.store((id.generation + 1) << 1, .release);
+        slot.next_free = if (self.free_head) |free| free + 1 else 0;
+        self.free_head = id.index;
+    }
+};
+
+var handle_registry: HandleRegistry = .{};
+
+/// Registers a newly opened handle, closing it if registration fails. Only for
+/// callers that own `handle` outright and have no cleanup of their own left;
+/// storageOwnerOpen registers directly so its defers stay the only cleanup.
+fn publishHandle(handle: *Handle) !*anyopaque {
+    return handle_registry.register(handle) catch |err| {
+        closeHandle(handle);
+        return err;
+    };
+}
+
+/// Closes a handle id: rejects new calls, drains entered ones, frees it.
+/// Safe for stale ids and concurrent or repeated closes.
+fn closeHandleId(ptr: ?*anyopaque) void {
+    const handle, const id = handle_registry.beginClose(ptr) orelse return;
+    closeHandle(handle);
+    handle_registry.finishClose(id);
+}
+
+/// Tests that build a Handle on the stack register it to get a caller id,
+/// then retire the id without freeing the Handle.
+fn registerTestHandle(handle: *Handle) !*anyopaque {
+    return handle_registry.register(handle);
+}
+
+fn unregisterTestHandle(ptr: *anyopaque) void {
+    _, const id = handle_registry.beginClose(ptr) orelse return;
+    handle_registry.finishClose(id);
+}
+
+/// How an export may overlap with other calls on the same handle.
+const HandleAccess = enum {
+    /// Pure queries. Any number run in parallel with each other and with a
+    /// write; the storage layer serves them from pinned snapshots.
+    read,
+    /// Document writes, transactions, and storage rewrites (compact, vacuum).
+    /// One at a time per handle, concurrent with reads.
+    write,
+    /// Enrichment drains, replay, and snapshot copies. One at a time per
+    /// handle, concurrent with reads and writes, mirroring the background
+    /// maintenance workers that already run alongside them.
+    maintain,
+    /// Schema, index, enrichment, range, and restore changes. Waits for
+    /// in-flight calls and blocks new ones until done.
+    exclusive,
+};
+
+/// Held for the duration of one export call; see `enterHandle`.
+const HandleGuard = struct {
+    handle: *Handle,
+    slot: *HandleRegistry.Slot,
+    access: HandleAccess,
+
+    fn leave(self: HandleGuard) void {
+        const io = handleLockIo();
+        switch (self.access) {
+            .read => self.handle.api_lock.unlockShared(io),
+            .write => {
+                self.handle.write_mutex.unlock(io);
+                self.handle.api_lock.unlockShared(io);
+            },
+            .maintain => {
+                self.handle.maintenance_mutex.unlock(io);
+                self.handle.api_lock.unlockShared(io);
+            },
+            .exclusive => self.handle.api_lock.unlock(io),
+        }
+        _ = self.slot.active.fetchSub(1, .release);
+    }
+};
+
+/// The handle locks are called from arbitrary foreign threads, so they use
+/// the process-wide threaded Io, whose waits block the calling OS thread.
+fn handleLockIo() std.Io {
+    return std.Options.debug_io;
+}
+
+/// Entry point for every export that takes a DB handle. Returns null for a
+/// null handle or one that is being closed. Must be taken exactly once per
+/// export, at entry: the lock is not reentrant, so internal helpers must not
+/// call it again.
+fn enterHandle(ptr: ?*anyopaque, access: HandleAccess) ?HandleGuard {
+    const id = HandleRegistry.decode(ptr) orelse return null;
+    const slot = handle_registry.slotFor(id.index) orelse return null;
+    // Count the call before checking the slot state so close either sees this
+    // call and waits for it, or this call sees closing (or a newer
+    // generation) and backs out. Each side stores then loads the other's
+    // variable, so both need seq_cst: weaker orderings let both loads miss
+    // both stores. The slot itself is never freed, so this is safe even if
+    // the handle was closed before we got here.
+    _ = slot.active.fetchAdd(1, .seq_cst);
+    if (slot.state.load(.seq_cst) != id.generation << 1) {
+        _ = slot.active.fetchSub(1, .release);
+        return null;
+    }
+    const handle = slot.handle.load(.acquire) orelse {
+        _ = slot.active.fetchSub(1, .release);
+        return null;
+    };
+    const io = handleLockIo();
+    switch (access) {
+        .read => handle.api_lock.lockSharedUncancelable(io),
+        .write => {
+            handle.api_lock.lockSharedUncancelable(io);
+            handle.write_mutex.lockUncancelable(io);
+        },
+        .maintain => {
+            handle.api_lock.lockSharedUncancelable(io);
+            handle.maintenance_mutex.lockUncancelable(io);
+        },
+        .exclusive => handle.api_lock.lockUncancelable(io),
+    }
+    return .{ .handle = handle, .slot = slot, .access = access };
 }
 
 fn cleanupTestDir(path: []const u8) void {
@@ -1226,6 +2449,14 @@ const JsonDBIndexStats = struct {
     repair_issue_count: u64,
     repair_summary_ready: bool,
     repair_issue_count_estimated: bool,
+    // Durable per-document generation-outcome coverage (produced / skipped /
+    // terminal_failed markers), so an embedded consumer can report honest
+    // coverage: documents that failed non-retryably are settled failures,
+    // not pending work. Mirrors the server's index-status coverage block.
+    coverage_produced_count: u64,
+    coverage_skipped_count: u64,
+    coverage_terminal_failed_count: u64,
+    coverage_summary_ready: bool,
 };
 
 const JsonEnrichmentStats = struct {
@@ -1241,10 +2472,15 @@ const JsonEnrichmentStats = struct {
     processed_requests: u64,
     error_count: u64,
     retryable_error_count: u64,
+    // Durable count of requests parked non-retryably (terminal disposition);
+    // per-document terminal state lives in the index coverage counters.
     fatal_error_count: u64,
     retrying: bool,
     worker_failed: bool,
+    stalled: bool,
+    stall_reason: []const u8,
     skip_by_hash_count: u64,
+    skipped_source_count: u64,
     codec_decode_failures: u64,
     dense_artifact_bytes_written: u64,
     sparse_artifact_bytes_written: u64,
@@ -2289,7 +3525,7 @@ pub export fn antfly_db_open(path: ?[*:0]const u8, out_handle: ?*?*anyopaque) ca
     out.* = null;
     const path_slice = cStringSpan(path) orelse return .invalid_argument;
     const handle = openDefaultDirectoryHandle(path_slice) catch |err| return capi.mapError(err);
-    out.* = handle;
+    out.* = publishHandle(handle) catch |err| return capi.mapError(err);
     return .ok;
 }
 
@@ -4793,8 +6029,13 @@ pub fn storageOwnerOpen(
         handle.db.activateResolverReplayRuntimes() catch |err| return storageOwnerStatusFromError(err);
         handle.db.startResidentBackgroundWorkersIfNeeded();
     }
+    // Register as the last fallible step: on failure the defers above close
+    // the DB and release the borrowed context exactly once, as for every
+    // earlier failure. (publishHandle's close-on-failure would release the
+    // context a second time.)
+    const owner_id = handle_registry.register(handle) catch |err| return storageOwnerStatusFromError(err);
     success = true;
-    out_owner.* = handle;
+    out_owner.* = owner_id;
     context_borrowed = false;
     return .ok;
 }
@@ -6891,7 +8132,7 @@ pub fn storageOwnerRuntimeStatusJson(
 
     var status = runtime_status.LocalTableRuntimeStatus{
         .group_id = handle.storage_owner_group_id,
-        .source_vectors = handle.db.sourceVectorStats(),
+        .source_vectors = handle.db.sourceVectorStats() catch |err| return storageOwnerStatusFromError(err),
         .created_at_millis = (handle.db.getGroupCreatedAtMillis(
             handle.alloc,
             handle.storage_owner_group_id,
@@ -6944,6 +8185,8 @@ test "storage owner runtime status does not wait behind apply writer" {
         .storage_owner_group_id = 7,
     };
     defer handle.db.close();
+    const handle_id = try registerTestHandle(&handle);
+    defer unregisterTestHandle(handle_id);
 
     handle.db.core.lockApplyExclusive();
     defer handle.db.core.unlockApplyExclusive();
@@ -6951,12 +8194,62 @@ test "storage owner runtime status does not wait behind apply writer" {
     try std.testing.expectEqual(
         kernel_owner_abi.Status.busy,
         storageOwnerRuntimeStatusJson(
-            &handle,
+            handle_id,
             &.{ .table_name = .fromSlice("docs") },
             &response,
         ),
     );
     try std.testing.expectEqual(@as(u64, 0), response.len);
+}
+
+test "storage owner runtime status distinguishes absent and busy source vectors" {
+    const alloc = std.testing.allocator;
+    var test_tmp = try TestDirectory.init("storage-owner-source-status-busy");
+    defer test_tmp.cleanup();
+    for ([_]bool{ false, true }) |with_source| {
+        const path = try tempTestPath(alloc, test_tmp.path(), if (with_source) "with-source" else "without-source");
+        defer alloc.free(path);
+        defer cleanupTestDir(path);
+        var handle = Handle{
+            .alloc = alloc,
+            .db = try db_mod.DB.open(alloc, path, .{
+                .table_storage = .{ .dense_embeddings = if (with_source) .vector_store else .primary_lsm },
+                .start_index_workers = false,
+                .start_optional_runtimes = false,
+                .ttl_cleanup = .{ .enabled = false },
+            }),
+            .storage_owner_table_name = @constCast("docs"),
+            .storage_owner_group_id = 7,
+        };
+        defer handle.db.close();
+        const handle_id = try registerTestHandle(&handle);
+        defer unregisterTestHandle(handle_id);
+        handle.db.backend_runtime.durable_jobs.drainOwner(handle.db.repair_cleanup_owner_id);
+        var response: kernel_owner_abi.OwnedBytes = .{};
+        if (handle.db.source_vectors.load(.acquire)) |source| {
+            // Holding the mutex on this thread makes both the missing-field
+            // bug and any blocking-lock replacement deterministic.
+            while (!source.mutex.tryLock()) antfly.platform_time.yieldBriefly();
+            defer source.mutex.unlock();
+            try std.testing.expectEqual(kernel_owner_abi.Status.busy, storageOwnerRuntimeStatusJson(
+                handle_id,
+                &.{ .table_name = .fromSlice("docs") },
+                &response,
+            ));
+            try std.testing.expectEqual(@as(u64, 0), response.len);
+            try std.testing.expect(response.ptr == null);
+        } else try std.testing.expect(!with_source);
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, storageOwnerRuntimeStatusJson(
+            handle_id,
+            &.{ .table_name = .fromSlice("docs") },
+            &response,
+        ));
+        defer alloc.free(response.ptr.?[0..@intCast(response.len)]);
+        const Status = struct { source_vectors: ?struct { retained_payloads: u64 } = null };
+        var parsed = try std.json.parseFromSlice(Status, alloc, response.ptr.?[0..@intCast(response.len)], .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        try std.testing.expectEqual(with_source, parsed.value.source_vectors != null);
+    }
 }
 
 const StorageOwnerObservationCancellation = struct {
@@ -7183,8 +8476,15 @@ fn openDefaultDirectoryHandle(path: []const u8) !*Handle {
 }
 
 pub export fn antfly_db_close(handle_ptr: ?*anyopaque) void {
-    const handle = asHandle(handle_ptr) orelse return;
-    closeHandle(handle);
+    // Stale ids and concurrent or repeated closes are no-ops.
+    closeHandleId(handle_ptr);
+}
+
+/// Threading contract of this library, like sqlite3_threadsafe(). Always
+/// ANTFLY_THREADING_SERIALIZED: every handle may be used from any thread,
+/// concurrently. See zig/CAPI.md "Thread Safety".
+pub export fn antfly_threading_mode() u32 {
+    return capi.threading_serialized;
 }
 
 pub export fn antfly_abi_version() u32 {
@@ -7249,6 +8549,7 @@ const LiteResolvedOpenOptions = struct {
     ttl_cleanup: ?db_mod.ttl_runtime.Config = null,
     inference: lite_backend.InferenceOpenOptions = .{},
     generated_enrichment_replay: bool = false,
+    busy_timeout_ms: u64 = 0,
 };
 
 fn optionFieldType(comptime Options: type, comptime field_name: []const u8) type {
@@ -7353,8 +8654,15 @@ fn resolveLiteOpenOptions(options_ptr: ?*const capi.LiteOpenOptions) !LiteResolv
         .inference = .{
             .remote_provider_configured = (flags & capi.lite_open_flag_remote_provider_configured) != 0,
             .local_runtime_configured = (flags & capi.lite_open_flag_local_runtime_configured) != 0,
+            .host_budget_mb = readOptionField(capi.LiteOpenOptions, options, abi_size, "inference_host_budget_mb") orelse 0,
+            .backend_budget_mb = readOptionField(capi.LiteOpenOptions, options, abi_size, "inference_backend_budget_mb") orelse 0,
+            .combined_budget_mb = readOptionField(capi.LiteOpenOptions, options, abi_size, "inference_combined_budget_mb") orelse 0,
+            .kv_budget_mb = readOptionField(capi.LiteOpenOptions, options, abi_size, "inference_kv_budget_mb") orelse 0,
+            .scratch_budget_mb = readOptionField(capi.LiteOpenOptions, options, abi_size, "inference_scratch_budget_mb") orelse 0,
+            .process_memory_budget_mb = readOptionField(capi.LiteOpenOptions, options, abi_size, "inference_process_memory_budget_mb") orelse 0,
         },
         .generated_enrichment_replay = (flags & capi.lite_open_flag_generated_enrichment_replay) != 0,
+        .busy_timeout_ms = readOptionField(capi.LiteOpenOptions, options, abi_size, "busy_timeout_ms") orelse 0,
     };
     if ((flags & capi.lite_open_flag_ttl_cleanup) != 0) {
         const owner_id = readOptionField(capi.LiteOpenOptions, options, abi_size, "ttl_cleanup_owner_id") orelse capi.Slice{};
@@ -7411,6 +8719,7 @@ fn resolveOpenOptions(options_ptr: ?*const capi.OpenOptions) !LiteResolvedOpenOp
             .local_runtime_configured = (flags & capi.open_flag_local_runtime_configured) != 0,
         },
         .generated_enrichment_replay = (flags & capi.open_flag_generated_enrichment_replay) != 0,
+        .busy_timeout_ms = readOptionField(capi.OpenOptions, options, abi_size, "busy_timeout_ms") orelse 0,
     };
     if ((flags & capi.open_flag_ttl_cleanup) != 0) {
         const owner_id = readOptionField(capi.OpenOptions, options, abi_size, "ttl_cleanup_owner_id") orelse capi.Slice{};
@@ -7447,7 +8756,7 @@ fn openLiteHandle(
     const out = out_handle orelse return .invalid_argument;
     out.* = null;
     const handle = openLiteHandleAlloc(path, resolved, create) catch |err| return capi.mapError(err);
-    out.* = handle;
+    out.* = publishHandle(handle) catch |err| return capi.mapError(err);
     return .ok;
 }
 
@@ -7477,16 +8786,15 @@ pub fn openLiteHandleWithRuntime(
     backend_runtime: *db_mod.background_runtime.BackendRuntime,
     options: HostLiteOpenOptions,
 ) !*anyopaque {
-    return try openLiteHandleAllocWithRuntime(alloc, path, .{
+    return publishHandle(try openLiteHandleAllocWithRuntime(alloc, path, .{
         .open_mode = if (options.read_only) .query_readonly else .writer,
         .profile = if (options.hosted) .hosted else .native,
         .no_sync = options.no_sync,
-    }, options.create, io, backend_runtime);
+    }, options.create, io, backend_runtime));
 }
 
 pub fn closeLiteRuntimeHandle(handle_ptr: ?*anyopaque) void {
-    const handle = asHandle(handle_ptr) orelse return;
-    closeHandle(handle);
+    closeHandleId(handle_ptr);
 }
 
 fn openLiteHandleAllocWithRuntime(
@@ -7532,8 +8840,22 @@ fn openLiteHandleAllocWithRuntime(
     }
     try backend.configureDbOpenOptions(&opts);
 
+    // One identity policy for every Lite surface (C ABI, embedded package,
+    // CLI): pin a new file to the embedded root identity and adopt whatever
+    // identity an existing file already carries, so a database created
+    // through one surface opens through any other.
+    const identity = antfly.lite.connection.identityOpenOptions(create);
+    opts.identity_namespace = identity.identity_namespace;
+    opts.prefer_existing_identity_namespace = identity.prefer_existing_identity_namespace;
     var db = try db_mod.DB.open(alloc, path, opts);
     errdefer db.close();
+
+    if (create) {
+        // Antfly Lite databases provision the same default full-text index
+        // the server provisions on every table create, through the routine
+        // shared with the CLI and the embedded package.
+        try antfly.lite.connection.provisionDefaultFullTextIndex(&db);
+    }
 
     const handle = alloc.create(Handle) catch return error.OutOfMemory;
     errdefer alloc.destroy(handle);
@@ -7544,6 +8866,40 @@ fn openLiteHandleAllocWithRuntime(
         .owned_lite_backend = backend,
         .lite_profile = resolved.profile,
         .lite_inference_status = lite_backend.inferenceStatusForProfileWithOptions(resolved.profile, resolved.inference),
+        .lite_generated_enrichment_replay = resolved.generated_enrichment_replay,
+    };
+    // Only the native profile runs background enrichment automatically;
+    // only builds that both advertise (lite-local-inference-runtime) and
+    // actually link (capi_build_options.inference_enabled) the local
+    // inference runtime may construct one. Every other combination -- flag
+    // unset, default build, hosted profile -- leaves the handle exactly as
+    // it was before this feature existed.
+    if (resolved.profile == .native and
+        resolved.inference.local_runtime_configured and
+        capi_build_options.inference_enabled and
+        lite_backend.capabilitiesForProfile(.native).local_inference_runtime)
+    {
+        // `backend.deinit()`, `db.close()`, and `alloc.destroy(handle)` are
+        // already registered as `errdefer`s above (in that unwind order);
+        // adding any of that cleanup here too would run it twice on this
+        // error path. Only unwind the state this function itself owns.
+        try startLiteEmbeddedInference(handle, alloc, path, .{
+            .host_budget_mb = resolved.inference.host_budget_mb,
+            .backend_budget_mb = resolved.inference.backend_budget_mb,
+            .combined_budget_mb = resolved.inference.combined_budget_mb,
+            .kv_budget_mb = resolved.inference.kv_budget_mb,
+            .scratch_budget_mb = resolved.inference.scratch_budget_mb,
+            .process_memory_budget_mb = resolved.inference.process_memory_budget_mb,
+        });
+    }
+    // Restores the managed enrichment runtime for indexes/enrichments that
+    // were already declared in a prior session (`create` only ever adds the
+    // default full-text index, so this is a no-op there). Must run after
+    // `startLiteEmbeddedInference` so an embedded local provider is already
+    // attached to the handle when this reads it.
+    refreshLiteManagedEmbeddingRuntime(handle) catch |err| {
+        stopLiteEmbeddedInference(handle);
+        return err;
     };
     handle.db.startQuarantineRetryWorkerIfNeeded();
     return handle;
@@ -7580,7 +8936,7 @@ fn openDirectoryHandle(
     out.* = null;
     if (create) return .invalid_argument;
     const handle = openDirectoryHandleAlloc(path, resolved) catch |err| return capi.mapError(err);
-    out.* = handle;
+    out.* = publishHandle(handle) catch |err| return capi.mapError(err);
     return .ok;
 }
 
@@ -7600,6 +8956,32 @@ fn openDirectoryHandleAlloc(path: []const u8, resolved: LiteResolvedOpenOptions)
 }
 
 fn openGenericHandle(
+    path: []const u8,
+    resolved: LiteResolvedOpenOptions,
+    create: bool,
+    out_handle: ?*?*anyopaque,
+) capi.ErrorCode {
+    const first = openGenericHandleOnce(path, resolved, create, out_handle);
+    if (first != .busy or resolved.busy_timeout_ms == 0) return first;
+    // Another writer holds the writer lock. A failed open releases everything
+    // it acquired, so retry the whole open with capped exponential backoff
+    // until `busy_timeout_ms` elapses, like sqlite3_busy_timeout.
+    const io = handleLockIo();
+    const deadline_ns = std.Io.Timestamp.now(io, .awake).toNanoseconds() +
+        @as(i96, resolved.busy_timeout_ms) * std.time.ns_per_ms;
+    var backoff_ms: i64 = 1;
+    while (true) {
+        const remaining_ns = deadline_ns - std.Io.Timestamp.now(io, .awake).toNanoseconds();
+        if (remaining_ns <= 0) return .busy;
+        const sleep_ns = @min(@as(i96, backoff_ms) * std.time.ns_per_ms, remaining_ns);
+        io.sleep(.fromNanoseconds(sleep_ns), .awake) catch return .busy;
+        const code = openGenericHandleOnce(path, resolved, create, out_handle);
+        if (code != .busy) return code;
+        backoff_ms = @min(backoff_ms * 2, 50);
+    }
+}
+
+fn openGenericHandleOnce(
     path: []const u8,
     resolved: LiteResolvedOpenOptions,
     create: bool,
@@ -7653,7 +9035,7 @@ pub export fn antfly_lite_open_with_options(path: ?[*:0]const u8, options: ?*con
     out.* = null;
     const path_slice = cStringSpan(path) orelse return .invalid_argument;
     const resolved = resolveLiteOpenOptions(options) catch |err| return capi.mapError(err);
-    return openLiteHandle(path_slice, resolved, false, out);
+    return openGenericHandle(path_slice, resolved, false, out);
 }
 
 pub export fn antfly_lite_create_with_options(path: ?[*:0]const u8, options: ?*const capi.LiteOpenOptions, out_handle: ?*?*anyopaque) capi.ErrorCode {
@@ -7661,7 +9043,7 @@ pub export fn antfly_lite_create_with_options(path: ?[*:0]const u8, options: ?*c
     out.* = null;
     const path_slice = cStringSpan(path) orelse return .invalid_argument;
     const resolved = resolveLiteOpenOptions(options) catch |err| return capi.mapError(err);
-    return openLiteHandle(path_slice, resolved, true, out);
+    return openGenericHandle(path_slice, resolved, true, out);
 }
 
 pub export fn antfly_lite_open_hosted(path: ?[*:0]const u8, out_handle: ?*?*anyopaque) capi.ErrorCode {
@@ -7704,7 +9086,9 @@ fn resetOutBuffer(out_buf: ?*capi.Buffer) ?*capi.Buffer {
 
 pub export fn antfly_lite_capabilities_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
     const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     if (handle.owned_lite_backend == null) return .invalid_argument;
     const profile = handle.lite_profile orelse .native;
     const inference = handle.lite_inference_status orelse lite_backend.inferenceStatusForProfile(profile);
@@ -7714,7 +9098,9 @@ pub export fn antfly_lite_capabilities_json(handle_ptr: ?*anyopaque, out_buf: ?*
 
 pub export fn antfly_lite_status_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
     const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     const backend = if (handle.owned_lite_backend) |*backend| backend else return .invalid_argument;
 
     const stats = handle.db.stats(handle.alloc) catch |err| return capi.mapError(err);
@@ -7739,8 +9125,10 @@ pub export fn antfly_lite_status_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.B
 }
 
 pub export fn antfly_lite_backup(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
+    const guard = enterHandle(handle_ptr, .maintain) orelse return .invalid_argument;
+    defer guard.leave();
     const out_buf_ptr = resetOutBuffer(out_buf) orelse return .invalid_argument;
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const handle = guard.handle;
     if (handle.owned_lite_backend == null) return .invalid_argument;
 
     var out = std.ArrayList(u8).empty;
@@ -7754,11 +9142,14 @@ pub export fn antfly_lite_backup(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer
 }
 
 pub export fn antfly_lite_export(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
+    // Alias: the target export takes the handle guard.
     return antfly_lite_backup(handle_ptr, out_buf);
 }
 
 pub export fn antfly_lite_import_backup(handle_ptr: ?*anyopaque, backup: capi.Slice) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     if (handle.owned_lite_backend == null) return .invalid_argument;
     if (backup.len == 0) return .invalid_argument;
     if (backup.ptr == null and backup.len != 0) return .invalid_argument;
@@ -7768,6 +9159,7 @@ pub export fn antfly_lite_import_backup(handle_ptr: ?*anyopaque, backup: capi.Sl
 }
 
 pub export fn antfly_lite_import(handle_ptr: ?*anyopaque, backup: capi.Slice) capi.ErrorCode {
+    // Alias: the target export takes the handle guard.
     return antfly_lite_import_backup(handle_ptr, backup);
 }
 
@@ -7834,7 +9226,9 @@ pub export fn antfly_lite_restore_backup_file_json(
 
 pub export fn antfly_lite_check_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
     const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     if (handle.owned_lite_backend) |*backend| {
         out.* = stringifyJson(backend.check() catch |err| return capi.mapError(err)) catch return .internal;
         return .ok;
@@ -7858,7 +9252,9 @@ pub export fn antfly_lite_copy_stable_snapshot_json(
     out_buf: ?*capi.Buffer,
 ) capi.ErrorCode {
     const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .maintain) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     if (handle.owned_lite_backend) |*backend| {
         const dest = cStringSpan(dest_path) orelse return .invalid_argument;
         out.* = stringifyJson(backend.copyStableSnapshot(dest, replace) catch |err| return capi.mapError(err)) catch return .internal;
@@ -7896,7 +9292,9 @@ fn prepareLiteCompact(handle: *Handle) !void {
 
 pub export fn antfly_lite_compact_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
     const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .write) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     if (handle.owned_lite_backend) |*backend| {
         prepareLiteCompact(handle) catch |err| return capi.mapError(err);
         const report = LiteCompactReport{
@@ -7911,7 +9309,9 @@ pub export fn antfly_lite_compact_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.
 
 pub export fn antfly_lite_vacuum_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
     const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .write) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     if (handle.owned_lite_backend) |*backend| {
         out.* = stringifyJson(backend.vacuum() catch |err| return capi.mapError(err)) catch return .internal;
         return .ok;
@@ -7920,7 +9320,9 @@ pub export fn antfly_lite_vacuum_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.B
 }
 
 pub export fn antfly_lite_run_until_idle(handle_ptr: ?*anyopaque) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .maintain) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     if (handle.owned_lite_backend == null) return .invalid_argument;
     handle.db.runUntilIdle() catch |err| return capi.mapError(err);
     return .ok;
@@ -7928,9 +9330,14 @@ pub export fn antfly_lite_run_until_idle(handle_ptr: ?*anyopaque) capi.ErrorCode
 
 pub export fn antfly_lite_run_until_idle_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
     const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .maintain) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     if (handle.owned_lite_backend == null) return .invalid_argument;
-    handle.db.runUntilIdle() catch |err| return capi.mapError(err);
+    handle.db.runUntilIdle() catch |err| {
+        writeRunUntilIdleNoProgressDiagnosticIfAny(&handle.db, out, err);
+        return capi.mapError(err);
+    };
     out.* = stringifyJson(handle.db.pendingWorkStats()) catch return .internal;
     return .ok;
 }
@@ -7941,7 +9348,9 @@ const LiteReplayGeneratedEnrichmentsReport = struct {
 
 pub export fn antfly_lite_replay_generated_enrichments_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
     const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .maintain) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     if (handle.owned_lite_backend == null) return .invalid_argument;
     const replayed = handle.db.replayGeneratedEnrichmentsFromStoredDocs(handle.alloc) catch |err| return capi.mapError(err);
     out.* = stringifyJson(LiteReplayGeneratedEnrichmentsReport{ .replayed = replayed }) catch return .internal;
@@ -7950,7 +9359,9 @@ pub export fn antfly_lite_replay_generated_enrichments_json(handle_ptr: ?*anyopa
 
 pub export fn antfly_lite_pending_work_stats_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
     const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     if (handle.owned_lite_backend == null) return .invalid_argument;
     out.* = stringifyJson(handle.db.pendingWorkStats()) catch return .internal;
     return .ok;
@@ -8134,7 +9545,9 @@ pub export fn antfly_db_set_readable_lease_hook(
     callback_ctx: ?*anyopaque,
     callback: ?ReadableLeaseHookFn,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     if (callback) |hook| {
         handle.readable_lease_hook = .{
             .group_id = group_id,
@@ -8728,7 +10141,7 @@ fn searchDenseOwnedProfiled(
     }
     const lookup_end = monotonicNowNs();
 
-    const req: db_mod.types.SearchRequest = .{
+    var req: db_mod.types.SearchRequest = .{
         .index_name = index_name,
         .query = .{ .dense_knn = .{
             .vector = vector,
@@ -8737,13 +10150,15 @@ fn searchDenseOwnedProfiled(
         .limit = limit,
         .offset = offset,
         .include_stored = false,
-        .identity_read_generation = identity_read_generation,
     };
 
+    // The export already ran prepareDenseSearchRequest, so skip the generic
+    // lease hook; restamp and retry like the other search paths.
     const fallback_start = monotonicNowNs();
-    var result = try executeLocalSearch(handle, req);
+    var result = try runAtStampedGenerationWithOptions(handle, &req, LocalSearchQuery{}, .{ .prepare = false });
     defer result.deinit();
     const fallback_end = monotonicNowNs();
+    const fallback_generation = req.identity_read_generation.?;
 
     const ids = try handle.alloc.alloc([]const u8, result.hits.len);
     errdefer handle.alloc.free(ids);
@@ -8766,7 +10181,7 @@ fn searchDenseOwnedProfiled(
             .total_hits = result.total_hits,
             .ids = ids,
             .scores = scores,
-            .identity_read_generation = identity_read_generation,
+            .identity_read_generation = fallback_generation,
         },
         .total_ns = @intCast(total_end - total_start),
         .index_lookup_ns = @intCast(lookup_end - lookup_start),
@@ -8869,21 +10284,22 @@ fn searchTextOwned(
     limit: u32,
     offset: u32,
 ) !DenseOwnedResult {
-    if (index_name.len == 0) return error.InvalidArgument;
-    const identity_read_generation = try currentIdentityReadGenerationForHandle(handle, null);
+    // An empty index name aliases the default full-text index, matching the
+    // server's public-query resolution (see api/tables.zig). A name that
+    // does not resolve to an existing index still fails inside
+    // executeLocalSearch below.
+    const resolved_index_name = if (index_name.len == 0) tables_api.default_full_text_index_name else index_name;
 
-    const req: db_mod.types.SearchRequest = .{
-        .index_name = index_name,
+    var req: db_mod.types.SearchRequest = .{
+        .index_name = resolved_index_name,
         .query = query,
         .limit = limit,
         .offset = offset,
         .include_stored = false,
-        .identity_read_generation = identity_read_generation,
     };
-
-    try handle.prepareSearchRequest(req);
-    var result = try executeLocalSearch(handle, req);
+    var result = try runAtStampedGeneration(handle, &req, LocalSearchQuery{});
     defer result.deinit();
+    const identity_read_generation = req.identity_read_generation.?;
 
     const ids = try handle.alloc.alloc([]const u8, result.hits.len);
     errdefer handle.alloc.free(ids);
@@ -8929,7 +10345,9 @@ pub export fn antfly_db_begin_transaction_with_id(
     participants_ptr: ?[*]const capi.Slice,
     participant_count: usize,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .write) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     const txn_id = txn_id_ptr orelse return .invalid_argument;
     beginWithIdAndParticipants(handle, txn_id.*, timestamp_ns, participants_ptr, participant_count) catch |err| return capi.mapError(err);
     return .ok;
@@ -8943,7 +10361,9 @@ pub export fn antfly_db_write_transaction(
     predicates_ptr: ?[*]const capi.VersionPredicate,
     predicate_count: usize,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .write) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     const txn_id = txn_id_ptr orelse return .invalid_argument;
     if ((write_count > 0 and writes_ptr == null) or (predicate_count > 0 and predicates_ptr == null)) return .invalid_argument;
     writeIntentsInternal(handle, txn_id.*, writes_ptr, write_count, predicates_ptr, predicate_count) catch |err| return capi.mapError(err);
@@ -8959,7 +10379,9 @@ pub export fn antfly_db_batch(
     timestamp_ns: u64,
     sync_level: u8,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .write) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     if ((write_count > 0 and writes_ptr == null) or (predicate_count > 0 and predicates_ptr == null)) return .invalid_argument;
     batchInternal(handle, writes_ptr, write_count, predicates_ptr, predicate_count, timestamp_ns, sync_level) catch |err| return capi.mapError(err);
     return .ok;
@@ -8970,7 +10392,9 @@ pub export fn antfly_db_batch_json(
     request_json: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .write) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     var owned = batch_api.parseBatchRequest(handle.alloc, request_json.bytes()) catch |err| return capi.mapError(err);
     defer owned.deinit(handle.alloc);
 
@@ -8989,7 +10413,9 @@ pub export fn antfly_db_resolve_intents(
     status: u8,
     commit_version: u64,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .write) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     const txn_id = txn_id_ptr orelse return .invalid_argument;
     const txn_status: transactions_mod.TxnStatus = switch (status) {
         0 => .pending,
@@ -9006,9 +10432,11 @@ pub export fn antfly_db_get_transaction_status(
     txn_id_ptr: ?*const [16]u8,
     out_status: ?*u8,
 ) capi.ErrorCode {
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
     const out = out_status orelse return .invalid_argument;
     out.* = 0;
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const handle = guard.handle;
     const txn_id = txn_id_ptr orelse return .invalid_argument;
     const status = handle.db.getTransactionStatus(txn_id.*) catch |err| return capi.mapError(err);
     out.* = @intFromEnum(status);
@@ -9020,9 +10448,11 @@ pub export fn antfly_db_get_commit_version(
     txn_id_ptr: ?*const [16]u8,
     out_commit_version: ?*u64,
 ) capi.ErrorCode {
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
     const out = out_commit_version orelse return .invalid_argument;
     out.* = 0;
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const handle = guard.handle;
     const txn_id = txn_id_ptr orelse return .invalid_argument;
     out.* = handle.db.getCommitVersion(txn_id.*) catch |err| return capi.mapError(err);
     return .ok;
@@ -9033,7 +10463,9 @@ pub export fn antfly_db_get_timestamp(
     key: capi.Slice,
     out_timestamp: *u64,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     out_timestamp.* = handle.db.getTimestamp(handle.alloc, key.bytes()) catch |err| return capi.mapError(err);
     return .ok;
 }
@@ -9043,7 +10475,9 @@ pub export fn antfly_db_lookup_json(
     key: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     handle.prepareLookupRequest(key.bytes(), .{}) catch |err| return capi.mapError(err);
     const result = handle.db.getDocument(handle.alloc, key.bytes(), .{}) catch |err| return capi.mapError(err);
     if (result == null) return .not_found;
@@ -9059,7 +10493,9 @@ pub export fn antfly_db_get_raw(
     key: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     const result = handle.db.get(handle.alloc, key.bytes()) catch |err| return capi.mapError(err);
     if (result == null) return .not_found;
     out_buf.* = .{
@@ -9074,7 +10510,9 @@ pub export fn antfly_db_lookup_artifact_json(
     artifact_id_b64: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     handle.prepareLookupRequest(artifact_id_b64.bytes(), .{}) catch |err| return capi.mapError(err);
     const artifact_id = decodeBase64Alloc(handle.alloc, artifact_id_b64.bytes()) catch return .invalid_argument;
     defer handle.alloc.free(artifact_id);
@@ -9112,7 +10550,9 @@ pub export fn antfly_db_get_schema_json(
     handle_ptr: ?*anyopaque,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     if (handle.db.getSchemaJson(handle.alloc) catch |err| return capi.mapError(err)) |schema_json| {
         out_buf.* = .{ .ptr = schema_json.ptr, .len = schema_json.len };
     } else {
@@ -9125,13 +10565,17 @@ pub export fn antfly_db_set_schema_json(
     handle_ptr: ?*anyopaque,
     schema_json: capi.Slice,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     handle.db.setSchemaJson(handle.alloc, schema_json.bytes()) catch |err| return capi.mapError(err);
     return .ok;
 }
 
 pub export fn antfly_db_run_until_idle(handle_ptr: ?*anyopaque) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .maintain) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     handle.db.runUntilIdle() catch |err| return capi.mapError(err);
     return .ok;
 }
@@ -9140,17 +10584,40 @@ pub export fn antfly_db_run_until_idle_json(
     handle_ptr: ?*anyopaque,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
-    handle.db.runUntilIdle() catch |err| return capi.mapError(err);
+    const guard = enterHandle(handle_ptr, .maintain) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
+    handle.db.runUntilIdle() catch |err| {
+        writeRunUntilIdleNoProgressDiagnosticIfAny(&handle.db, out_buf, err);
+        return capi.mapError(err);
+    };
     out_buf.* = stringifyJson(handle.db.pendingWorkStats()) catch return .internal;
     return .ok;
+}
+
+/// On `error.RunUntilIdleNoProgress` (mapped to `capi.ErrorCode.stalled`),
+/// best-effort populate `out_buf` with the exact stuck index name and its
+/// indexed/expected counters (see `DB.NoProgressDiagnostic`) instead of
+/// leaving callers with only the non-descriptive status code. Any other
+/// error leaves `out_buf` untouched, matching every other failure path here.
+fn writeRunUntilIdleNoProgressDiagnosticIfAny(db: anytype, out_buf: *capi.Buffer, err: anyerror) void {
+    if (err != error.RunUntilIdleNoProgress) return;
+    const diagnostic = db.lastRunUntilIdleNoProgressDiagnostic() orelse return;
+    out_buf.* = stringifyJson(.{
+        .index_name = diagnostic.index_name,
+        .indexed = diagnostic.indexed,
+        .expected = diagnostic.expected,
+        .stuck_ms = diagnostic.stuck_ns / std.time.ns_per_ms,
+    }) catch return;
 }
 
 pub export fn antfly_db_pending_work_stats_json(
     handle_ptr: ?*anyopaque,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     out_buf.* = stringifyJson(handle.db.pendingWorkStats()) catch return .internal;
     return .ok;
 }
@@ -9160,7 +10627,9 @@ fn antflyDbExtractEnrichmentsJson(
     request_json: capi.Slice,
     out_buf: *capi.Buffer,
 ) callconv(.c) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     const writes = decodeBatchWritesRequest(handle.alloc, request_json.bytes()) catch return .invalid_argument;
     defer freeOwnedBatchWrites(handle.alloc, writes);
 
@@ -9179,7 +10648,9 @@ fn antflyDbComputeEnrichmentsJson(
     request_json: capi.Slice,
     out_buf: *capi.Buffer,
 ) callconv(.c) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     const writes = decodeBatchWritesRequest(handle.alloc, request_json.bytes()) catch return .invalid_argument;
     defer freeOwnedBatchWrites(handle.alloc, writes);
 
@@ -9209,7 +10680,9 @@ pub export fn antfly_db_update_range(
     start: capi.Slice,
     end: capi.Slice,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     handle.db.updateRange(.{
         .start = start.bytes(),
         .end = end.bytes(),
@@ -9221,7 +10694,9 @@ pub export fn antfly_db_get_range_json(
     handle_ptr: ?*anyopaque,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     var payload = JsonRange.init(handle.alloc, handle.db.getRange()) catch return .internal;
     defer payload.deinit(handle.alloc);
     out_buf.* = stringifyJson(payload) catch return .internal;
@@ -9232,7 +10707,9 @@ pub export fn antfly_db_get_split_state_json(
     handle_ptr: ?*anyopaque,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     const state = handle.db.getSplitState(handle.alloc) catch |err| return capi.mapError(err);
     if (state == null) return .not_found;
     var payload = JsonSplitState.init(handle.alloc, state.?) catch return .internal;
@@ -9246,7 +10723,9 @@ pub export fn antfly_db_set_split_state_json(
     handle_ptr: ?*anyopaque,
     state_json: capi.Slice,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     const ParsedState = struct {
         phase: u8,
         split_key_b64: []const u8,
@@ -9279,7 +10758,9 @@ pub export fn antfly_db_set_split_state_json(
 }
 
 pub export fn antfly_db_clear_split_state(handle_ptr: ?*anyopaque) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     handle.db.clearSplitState() catch |err| return capi.mapError(err);
     return .ok;
 }
@@ -9288,7 +10769,9 @@ pub export fn antfly_db_get_split_delta_seq(
     handle_ptr: ?*anyopaque,
     out_seq: *u64,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     out_seq.* = handle.db.getSplitDeltaSeq();
     return .ok;
 }
@@ -9297,7 +10780,9 @@ pub export fn antfly_db_get_split_delta_final_seq(
     handle_ptr: ?*anyopaque,
     out_seq: *u64,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     out_seq.* = handle.db.getSplitDeltaFinalSeq(handle.alloc) catch |err| return capi.mapError(err);
     return .ok;
 }
@@ -9306,13 +10791,17 @@ pub export fn antfly_db_set_split_delta_final_seq(
     handle_ptr: ?*anyopaque,
     seq: u64,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     handle.db.setSplitDeltaFinalSeq(seq) catch |err| return capi.mapError(err);
     return .ok;
 }
 
 pub export fn antfly_db_clear_split_delta_final_seq(handle_ptr: ?*anyopaque) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     handle.db.clearSplitDeltaFinalSeq() catch |err| return capi.mapError(err);
     return .ok;
 }
@@ -9322,7 +10811,9 @@ pub export fn antfly_db_list_split_delta_entries_after_json(
     after_seq: u64,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     const entries = handle.db.listSplitDeltaEntriesAfter(handle.alloc, after_seq) catch |err| return capi.mapError(err);
     defer db_mod.types.freeSplitDeltaEntries(handle.alloc, entries);
 
@@ -9342,7 +10833,9 @@ pub export fn antfly_db_list_split_delta_entries_after_json(
 }
 
 pub export fn antfly_db_clear_split_delta_entries(handle_ptr: ?*anyopaque) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     handle.db.clearSplitDeltaEntries() catch |err| return capi.mapError(err);
     return .ok;
 }
@@ -9351,7 +10844,9 @@ pub export fn antfly_db_list_indexes_json(
     handle_ptr: ?*anyopaque,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     const configs = handle.db.listIndexes(handle.alloc) catch |err| return capi.mapError(err);
     defer db_mod.types.freeIndexConfigs(handle.alloc, configs);
 
@@ -9373,7 +10868,9 @@ pub export fn antfly_db_list_enrichments_json(
     handle_ptr: ?*anyopaque,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     const configs = handle.db.listEnrichments(handle.alloc) catch |err| return capi.mapError(err);
     defer db_mod.types.freeEnrichmentConfigs(handle.alloc, configs);
     out_buf.* = stringifyJson(configs) catch return .internal;
@@ -9385,7 +10882,9 @@ pub export fn antfly_db_scan_json(
     request_json: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     const Request = struct {
         from_key_b64: []const u8 = "",
         to_key_b64: []const u8 = "",
@@ -9450,7 +10949,9 @@ pub export fn antfly_db_scan_hashes(
     request_json: capi.Slice,
     out_result: *capi.ScanHashResult,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     const Request = struct {
         from_key_b64: []const u8 = "",
         to_key_b64: []const u8 = "",
@@ -9510,7 +11011,9 @@ pub export fn antfly_db_stats_json(
     handle_ptr: ?*anyopaque,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     const bytes = dbStatsJsonAlloc(handle) catch |err| return capi.mapError(err);
     out_buf.* = .{ .ptr = bytes.ptr, .len = bytes.len };
     return .ok;
@@ -9541,6 +11044,10 @@ fn dbIndexStatsProjectionAlloc(alloc: Allocator, stats: db_mod.types.DBStats) ![
             .repair_issue_count = item.repair_issue_count,
             .repair_summary_ready = item.repair_summary_ready,
             .repair_issue_count_estimated = item.repair_issue_count_estimated,
+            .coverage_produced_count = item.coverage_produced_count,
+            .coverage_skipped_count = item.coverage_skipped_count,
+            .coverage_terminal_failed_count = item.coverage_terminal_failed_count,
+            .coverage_summary_ready = item.coverage_summary_ready,
         };
     }
     return indexes;
@@ -9571,7 +11078,10 @@ fn jsonDBStatsProjection(stats: db_mod.types.DBStats, indexes: []JsonDBIndexStat
             .fatal_error_count = stats.enrichment.fatal_error_count,
             .retrying = stats.enrichment.retrying,
             .worker_failed = stats.enrichment.worker_failed,
+            .stalled = stats.enrichment.stalled,
+            .stall_reason = stats.enrichment.stall_reason,
             .skip_by_hash_count = stats.enrichment.skip_by_hash_count,
+            .skipped_source_count = stats.enrichment.skipped_source_count,
             .codec_decode_failures = stats.enrichment.codec_decode_failures,
             .dense_artifact_bytes_written = stats.enrichment.dense_artifact_bytes_written,
             .sparse_artifact_bytes_written = stats.enrichment.sparse_artifact_bytes_written,
@@ -9764,43 +11274,108 @@ fn storageOwnerQueryFailure(
     return out_failure.status;
 }
 
+/// Resolves a public query's `semantic_search` text into a dense query
+/// vector for a native Lite handle, the same way the server does for a
+/// managed table: embed the text through the index's own configured
+/// embedder, using the retrieval-query task/instruction (Qwen3's built-in
+/// query instruction, for example) rather than the document-indexing task.
+/// Mirrors `http_server.zig`'s `SemanticStatusResolver`, but against Lite's
+/// index list instead of a table's admin snapshot, and constructs a
+/// throwaway `ManagedEmbedder` per call instead of reusing one cached on the
+/// enrichment runtime: Lite queries are not expected at a rate where that
+/// matters, and every other Lite embedder call site (`refreshLite...`,
+/// `litePhysicalIndexConfigJson`) already does the same thing.
+const LiteSemanticResolver = struct {
+    handle: *Handle,
+
+    fn resolveDenseQuery(
+        ptr: *anyopaque,
+        alloc: Allocator,
+        table_name: []const u8,
+        index_name: []const u8,
+        semantic_search: []const u8,
+        embedding_template: ?[]const u8,
+        limit: u32,
+    ) anyerror!db_mod.types.DenseKnnQuery {
+        _ = table_name;
+        if (embedding_template != null) return error.UnsupportedQueryRequest;
+        const self: *LiteSemanticResolver = @ptrCast(@alignCast(ptr));
+        const handle = self.handle;
+        const merged_json = try liteMergedIndexesJsonAlloc(handle);
+        defer handle.alloc.free(merged_json);
+        var managed = try managed_embedder.ManagedEmbedder.initFromIndexesJsonWithOptions(
+            handle.alloc,
+            merged_json,
+            .{ .antfly_provider = handle.liteAntflyProvider() },
+        );
+        defer managed.deinit();
+        const vector = try managed.embedQuery(alloc, index_name, semantic_search);
+        return .{ .vector = vector, .k = limit };
+    }
+
+    fn resolver(self: *LiteSemanticResolver) query_api.SemanticResolver {
+        return .{
+            .ptr = self,
+            .vtable = &.{ .resolve_dense_query = resolveDenseQuery },
+        };
+    }
+};
+
 fn searchPublicQueryJson(
     handle: *Handle,
     table_name: []const u8,
     request_json: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
+    // `linked_storage` says this compiled library links the full storage
+    // internals -- true unconditionally for the default `libantfly` since
+    // it is shared with the `antfly` executable -- not that `handle` is a
+    // genuine storage-owner/distributed-table handle. A Lite handle
+    // (`owned_lite_backend != null`) has no metadata/table catalog for
+    // `local_query_client`'s internal semantic-search resolution to look an
+    // index's embedder up in, so it always takes the simpler path below,
+    // which resolves `semantic_search` itself via `LiteSemanticResolver`.
     if (comptime capi_build_options.linked_storage) {
-        handle.prepareSearchRequest(.{}) catch |err| return capi.mapError(err);
-        var failure: kernel_owner_abi.FailureIdentity = .{};
-        const response = local_query_client.executeJsonAlloc(
-            std.heap.c_allocator,
-            @ptrCast(&handle.db),
-            table_name,
-            request_json.bytes(),
-            .public,
-            .{},
-            null,
-            null,
-            null,
-            &failure,
-        ) catch |err| return capi.mapError(err);
-        out_buf.* = .{ .ptr = response.json.ptr, .len = response.json.len };
-        return .ok;
+        if (handle.owned_lite_backend == null) {
+            handle.prepareSearchRequest(.{}) catch |err| return capi.mapError(err);
+            var failure: kernel_owner_abi.FailureIdentity = .{};
+            const response = local_query_client.executeJsonAlloc(
+                std.heap.c_allocator,
+                @ptrCast(&handle.db),
+                table_name,
+                request_json.bytes(),
+                .public,
+                .{},
+                null,
+                null,
+                null,
+                &failure,
+            ) catch |err| return capi.mapError(err);
+            out_buf.* = .{ .ptr = response.json.ptr, .len = response.json.len };
+            return .ok;
+        }
     }
 
+    var lite_semantic_resolver = LiteSemanticResolver{ .handle = handle };
+    const semantic_resolver: ?query_api.SemanticResolver = if (handle.lite_profile == .native)
+        lite_semantic_resolver.resolver()
+    else
+        null;
     var owned = query_api.parsePublicQueryRequest(
         handle.alloc,
-        null,
+        semantic_resolver,
         table_name,
         request_json.bytes(),
     ) catch |err| return capi.mapError(err);
     defer owned.deinit(handle.alloc);
 
-    stampSearchRequestIdentityGeneration(handle, &owned.req) catch |err| return capi.mapError(err);
-    handle.prepareSearchRequest(owned.req) catch |err| return capi.mapError(err);
-
-    var result = handle.db.search(handle.alloc, owned.req) catch |err| return capi.mapError(err);
+    const DbSearchQuery = struct {
+        const Result = db_mod.types.SearchResult;
+        fn run(_: @This(), h: *Handle, req: db_mod.types.SearchRequest) !Result {
+            return h.db.search(h.alloc, req);
+        }
+    };
+    var result = runAtStampedGeneration(handle, &owned.req, DbSearchQuery{}) catch |err| return capi.mapError(err);
     defer result.deinit();
 
     var response = query_api.encodeQueryResponses(
@@ -9821,7 +11396,9 @@ pub export fn antfly_db_search_json(
     request_json: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     if (requestLooksLikePublicQueryJson(request_json.bytes())) {
         return searchPublicQueryJson(handle, "docs", request_json, out_buf);
     }
@@ -9911,9 +11488,7 @@ pub export fn antfly_db_search_json(
         return .invalid_argument;
     }
 
-    stampSearchRequestIdentityGeneration(handle, &req) catch |err| return capi.mapError(err);
-    handle.prepareSearchRequest(req) catch |err| return capi.mapError(err);
-    var result = executeLocalSearch(handle, req) catch |err| return capi.mapError(err);
+    var result = runAtStampedGeneration(handle, &req, LocalSearchQuery{}) catch |err| return capi.mapError(err);
     defer result.deinit();
 
     var aggregation_results: []JsonSearchAggregationResult = &.{};
@@ -9989,7 +11564,9 @@ pub export fn antfly_db_search_dense(
     offset: u32,
     out_result: *capi.PackedDenseSearchResult,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     if (vector_ptr == null or vector_len == 0) return .invalid_argument;
     handle.prepareDenseSearchRequest(index_name.bytes(), vector_ptr.?[0..vector_len], k, limit, offset) catch |err| return capi.mapError(err);
     const identity_read_generation = currentIdentityReadGenerationForHandle(handle, null) catch |err| return capi.mapError(err);
@@ -10014,7 +11591,9 @@ pub export fn antfly_db_search_dense_profile(
     offset: u32,
     out_profile: *capi.DenseSearchProfile,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     if (vector_ptr == null or vector_len == 0) return .invalid_argument;
     handle.prepareDenseSearchRequest(index_name.bytes(), vector_ptr.?[0..vector_len], k, limit, offset) catch |err| return capi.mapError(err);
 
@@ -10050,7 +11629,9 @@ pub export fn antfly_db_search_dense_profile(
 }
 
 pub export fn antfly_db_dense_noop(handle_ptr: ?*anyopaque) capi.ErrorCode {
-    _ = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    _ = guard.handle;
     return .ok;
 }
 
@@ -10058,7 +11639,9 @@ pub export fn antfly_db_dense_fixed_packed_result(
     handle_ptr: ?*anyopaque,
     out_result: *capi.PackedDenseSearchResult,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
 
     const ids = [_][]const u8{ "doc-fixed-1", "doc-fixed-2", "doc-fixed-3" };
     const scores = [_]f32{ 0.125, 0.25, 0.5 };
@@ -10071,7 +11654,9 @@ pub export fn antfly_db_search_dense_wire(
     request_buf: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
 
     var req = search_wire.decodeDenseRequest(handle.alloc, request_buf.bytes()) catch |err| return capi.mapError(err);
     defer search_wire.freeDenseRequest(handle.alloc, &req);
@@ -10097,7 +11682,9 @@ pub export fn antfly_db_search_dense_wire_profile(
     out_buf: *capi.Buffer,
     out_profile: *capi.DenseWireSearchProfile,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
 
     var req = search_wire.decodeDenseRequest(handle.alloc, request_buf.bytes()) catch |err| return capi.mapError(err);
     defer search_wire.freeDenseRequest(handle.alloc, &req);
@@ -10143,7 +11730,9 @@ pub export fn antfly_db_search_text_match(
     offset: u32,
     out_result: *capi.DenseSearchResult,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     var owned = searchTextMatchOwned(handle, index_name.bytes(), field.bytes(), text.bytes(), "", 1.0, limit, offset) catch |err| return capi.mapError(err);
     defer owned.deinit();
 
@@ -10179,7 +11768,9 @@ pub export fn antfly_db_search_text_match_wire(
     request_buf: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
 
     var req = search_wire.decodeTextMatchRequest(handle.alloc, request_buf.bytes()) catch |err| return capi.mapError(err);
     defer search_wire.freeTextMatchRequest(handle.alloc, &req);
@@ -10196,7 +11787,9 @@ pub export fn antfly_db_search_text_term_wire(
     request_buf: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
 
     var req = search_wire.decodeTextTermRequest(handle.alloc, request_buf.bytes()) catch |err| return capi.mapError(err);
     defer search_wire.freeTextTermRequest(handle.alloc, &req);
@@ -10213,7 +11806,9 @@ pub export fn antfly_db_search_text_match_phrase_wire(
     request_buf: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
 
     var req = search_wire.decodeTextMatchPhraseRequest(handle.alloc, request_buf.bytes()) catch |err| return capi.mapError(err);
     defer search_wire.freeTextMatchPhraseRequest(handle.alloc, &req);
@@ -10230,7 +11825,9 @@ pub export fn antfly_db_search_hits_json(
     request_json: capi.Slice,
     out_result: *capi.DenseSearchResult,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     const Request = struct {
         mode: []const u8,
         index_name: []const u8 = "",
@@ -10293,9 +11890,7 @@ pub export fn antfly_db_search_hits_json(
         return .invalid_argument;
     }
 
-    stampSearchRequestIdentityGeneration(handle, &req) catch |err| return capi.mapError(err);
-    handle.prepareSearchRequest(req) catch |err| return capi.mapError(err);
-    var result = executeLocalSearch(handle, req) catch |err| return capi.mapError(err);
+    var result = runAtStampedGeneration(handle, &req, LocalSearchQuery{}) catch |err| return capi.mapError(err);
     defer result.deinit();
     if (result.graph_results.len > 0) return .invalid_argument;
 
@@ -10833,7 +12428,9 @@ pub export fn antfly_db_execute_graph_queries_json(
     request_json: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     const Request = struct {
         graph_queries: []const JsonGraphQueryRequest,
         named_sets: []const JsonNamedGraphInputSetRequest,
@@ -10866,9 +12463,18 @@ pub export fn antfly_db_execute_graph_queries_json(
         .identity_read_generation = parsed.value.identity_read_generation,
     };
 
-    stampSearchRequestIdentityGeneration(handle, &req) catch |err| return capi.mapError(err);
-    handle.prepareSearchRequest(req) catch |err| return capi.mapError(err);
-    const results = handle.db.executeNamedGraphQueries(handle.alloc, req, graph_queries, named_sets) catch |err| return capi.mapError(err);
+    const GraphQuery = struct {
+        graph_queries: []const db_mod.types.NamedGraphQuery,
+        named_sets: []const db_mod.types.NamedGraphInputSet,
+        const Result = []db_mod.types.GraphSearchResult;
+        fn run(self: @This(), h: *Handle, r: db_mod.types.SearchRequest) !Result {
+            return h.db.executeNamedGraphQueries(h.alloc, r, self.graph_queries, self.named_sets);
+        }
+    };
+    const results = runAtStampedGeneration(handle, &req, GraphQuery{
+        .graph_queries = graph_queries,
+        .named_sets = named_sets,
+    }) catch |err| return capi.mapError(err);
     defer {
         for (results) |*result| result.deinit(handle.alloc);
         if (results.len > 0) handle.alloc.free(results);
@@ -10893,7 +12499,9 @@ pub export fn antfly_db_aggregate_hits_json(
     request_json: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     var parsed = std.json.parseFromSlice(JsonAggregateHitsRequest, handle.alloc, request_json.bytes(), .{}) catch return .invalid_argument;
     defer parsed.deinit();
 
@@ -12012,7 +13620,9 @@ pub export fn antfly_db_add_index_json(
     handle_ptr: ?*anyopaque,
     config_json: capi.Slice,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     const Request = struct {
         name: []const u8,
         kind: []const u8,
@@ -12032,11 +13642,61 @@ pub export fn antfly_db_add_index_json(
         .algebraic
     else
         return .invalid_argument;
+    // A native Lite handle also accepts the server's nested "enrichments"
+    // shape on this index's own config (see `registerLiteIndexEnrichments`),
+    // registering every declared producer before the index below is admitted
+    // so an artifact-sourced `sources`/`embedding_name` reference already
+    // resolves. The server's atomic table-create request has no such
+    // pre-admission catalog mutation, so this call carries its own undo: a
+    // rejected admission (IndexAlreadyExists, invalid config) or a partial
+    // enrichment/resolver registration restores the pre-call enrichment
+    // catalog instead of leaving durably changed producers behind a caller
+    // who was told the AddIndex failed.
+    var rollback: ?LiteCatalogRollback = null;
+    defer if (rollback) |*undo| undo.deinit();
+    if (handle.lite_profile == .native) {
+        rollback = LiteCatalogRollback.init(handle) catch |err| return capi.mapError(err);
+        registerLiteIndexEnrichments(handle, parsed.value.config_json, &rollback.?) catch |err| {
+            rollback.?.restore();
+            return capi.mapError(err);
+        };
+    }
+    // Only a native Lite handle calls `db.addIndex` directly with a raw
+    // public-shaped dense/sparse config; the server always translates first
+    // (see `litePhysicalIndexConfigJson`). Every other handle keeps calling
+    // `db.addIndex` with exactly the config it was given, unchanged.
+    const stored_config_json = if (handle.lite_profile == .native)
+        litePhysicalIndexConfigJson(handle.alloc, kind, parsed.value.name, parsed.value.config_json, handle.liteAntflyProvider()) catch |err| {
+            if (rollback) |*undo| undo.restore();
+            return capi.mapError(err);
+        }
+    else
+        parsed.value.config_json;
+    defer if (handle.lite_profile == .native) handle.alloc.free(@constCast(stored_config_json));
     handle.db.addIndex(.{
         .name = parsed.value.name,
         .kind = kind,
-        .config_json = parsed.value.config_json,
-    }) catch |err| return capi.mapError(err);
+        .config_json = stored_config_json,
+    }) catch |err| {
+        if (rollback) |*undo| undo.restore();
+        return capi.mapError(err);
+    };
+    // A native handle also registers the entity resolvers a graph config
+    // declares inline, after the index (and its source artifact's enrichment)
+    // is admitted, the way the server's provisioner runs ensureResolvers
+    // after index reconciliation. A resolver registration failure unwinds
+    // the just-admitted index and the enrichment catalog so the call is
+    // all-or-nothing.
+    if (handle.lite_profile == .native and kind == .graph) {
+        registerLiteIndexResolvers(handle, parsed.value.config_json, &rollback.?) catch |err| {
+            _ = handle.db.deleteIndex(parsed.value.name) catch |delete_err| {
+                std.log.warn("lite AddIndex rollback failed to remove index {s}: {s}", .{ parsed.value.name, @errorName(delete_err) });
+            };
+            if (rollback) |*undo| undo.restore();
+            return capi.mapError(err);
+        };
+    }
+    refreshLiteManagedEmbeddingRuntime(handle) catch |err| return capi.mapError(err);
     return .ok;
 }
 
@@ -12045,9 +13705,11 @@ pub export fn antfly_db_delete_index(
     name: capi.Slice,
     out_deleted: ?*bool,
 ) capi.ErrorCode {
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    defer guard.leave();
     const out = out_deleted orelse return .invalid_argument;
     out.* = false;
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const handle = guard.handle;
     out.* = handle.db.deleteIndex(name.bytes()) catch |err| return capi.mapError(err);
     return .ok;
 }
@@ -12056,12 +13718,15 @@ pub export fn antfly_db_add_enrichment_json(
     handle_ptr: ?*anyopaque,
     config_json: capi.Slice,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     var parsed = std.json.parseFromSlice(db_mod.types.EnrichmentConfig, handle.alloc, config_json.bytes(), .{
         .ignore_unknown_fields = true,
     }) catch return .invalid_argument;
     defer parsed.deinit();
     handle.db.addEnrichment(parsed.value) catch |err| return capi.mapError(err);
+    refreshLiteManagedEmbeddingRuntime(handle) catch |err| return capi.mapError(err);
     return .ok;
 }
 
@@ -12071,9 +13736,11 @@ pub export fn antfly_db_delete_enrichment(
     name: capi.Slice,
     out_deleted: ?*bool,
 ) capi.ErrorCode {
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    defer guard.leave();
     const out = out_deleted orelse return .invalid_argument;
     out.* = false;
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const handle = guard.handle;
     const kind = parseEnrichmentKind(kind_slice.bytes()) orelse return .invalid_argument;
     out.* = handle.db.deleteEnrichment(kind, name.bytes()) catch |err| return capi.mapError(err);
     return .ok;
@@ -12087,7 +13754,9 @@ pub export fn antfly_db_get_edges_json(
     direction: u8,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     const dir: db_mod.types.GraphEdgeDirection = switch (direction) {
         0 => .out,
         1 => .in,
@@ -12111,6 +13780,14 @@ pub export fn antfly_db_get_edges_json(
 }
 
 test "capi get edges json does not double free a non-empty edge slice" {
+    // Regression test for graphFreeEdges double-freeing the edges slice
+    // GraphIndex.freeEdges already frees (antfly_db_get_edges_json's only
+    // caller). std.testing.allocator (a GeneralPurposeAllocator) detects a
+    // double free immediately, so this test would have failed loudly before
+    // the fix -- the bug otherwise only corrupted the libc heap used by
+    // production builds, manifesting later as an unrelated SIGABRT with no
+    // panic message. An empty-result query (before any edges exist) freed a
+    // zero-length slice, which many allocators no-op, so it never caught this.
     // Exercise the edge cleanup helper with the testing allocator as well as
     // the public C ABI, which uses the C allocator for its handle and results.
     var test_tmp = try TestDirectory.init("capi");
@@ -12151,6 +13828,8 @@ test "capi get edges json does not double free a non-empty edge slice" {
     defer antfly_db_buffer_free(batch_out.ptr, batch_out.len);
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_run_until_idle(handle_ptr));
 
+    // Now getEdges returns one real edge. Freeing that non-empty slice twice
+    // is a real heap corruption that std.testing.allocator catches.
     {
         const edges = try asHandle(handle_ptr).?.db.getEdges(alloc, "gr_edges_v1", "doc:edge-source", "", .both);
         defer graphFreeEdges(alloc, edges);
@@ -12173,7 +13852,9 @@ pub export fn antfly_db_traverse_edges_json(
     request_json: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     const Request = struct {
         index_name: []const u8,
         start_key_b64: []const u8,
@@ -12229,7 +13910,9 @@ pub export fn antfly_db_get_neighbors_json(
     direction: u8,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     const dir: db_mod.types.GraphEdgeDirection = switch (direction) {
         0 => .out,
         1 => .in,
@@ -12257,7 +13940,9 @@ pub export fn antfly_db_find_shortest_path_json(
     request_json: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     const Request = struct {
         index_name: []const u8,
         source_b64: []const u8,
@@ -12301,7 +13986,9 @@ pub export fn antfly_db_find_k_shortest_paths_json(
     request_json: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     const Request = struct {
         index_name: []const u8,
         source_b64: []const u8,
@@ -12353,7 +14040,9 @@ pub export fn antfly_db_match_pattern_json(
     request_json: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     const JsonPatternNodeFilter = struct {
         filter_prefix: []const u8 = "",
         query_json: []const u8 = "",
@@ -12444,13 +14133,17 @@ pub export fn antfly_db_create_shadow_index_manager(
     split_key: capi.Slice,
     original_range_end: capi.Slice,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     handle.db.createShadowIndexManager(split_key.bytes(), original_range_end.bytes()) catch |err| return capi.mapError(err);
     return .ok;
 }
 
 pub export fn antfly_db_close_shadow_index_manager(handle_ptr: ?*anyopaque) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     handle.db.closeShadowIndexManager() catch |err| return capi.mapError(err);
     return .ok;
 }
@@ -12459,7 +14152,9 @@ pub export fn antfly_db_get_shadow_index_dir(
     handle_ptr: ?*anyopaque,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     const dir = handle.db.getShadowIndexDir();
     if (dir.len == 0) return .not_found;
     out_buf.* = dupBytes(dir) catch return .internal;
@@ -12470,7 +14165,9 @@ pub export fn antfly_db_find_median_key(
     handle_ptr: ?*anyopaque,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     const key = handle.db.findMedianKey(handle.alloc) catch |err| return capi.mapError(err);
     defer handle.alloc.free(key);
     out_buf.* = dupBytes(key) catch return .internal;
@@ -12486,7 +14183,9 @@ pub export fn antfly_db_split(
     dest_dir2: capi.Slice,
     prepare_only: bool,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     handle.db.split(
         .{
             .start = curr_start.bytes(),
@@ -12505,7 +14204,9 @@ pub export fn antfly_db_finalize_split(
     new_start: capi.Slice,
     new_end: capi.Slice,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     handle.db.finalizeSplit(.{
         .start = new_start.bytes(),
         .end = new_end.bytes(),
@@ -12518,7 +14219,9 @@ pub export fn antfly_db_snapshot(
     id: capi.Slice,
     out_size: *u64,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .write) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     out_size.* = handle.db.snapshot(id.bytes()) catch |err| return capi.mapError(err);
     return .ok;
 }
@@ -13167,6 +14870,13 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_stats_json(concurrent_status_handle, &concurrent_status));
     defer antfly_db_buffer_free(concurrent_status.ptr, concurrent_status.len);
     try std.testing.expect(std.mem.indexOf(u8, concurrent_status.ptr.?[0..concurrent_status.len], "\"doc_count\":") != null);
+    // Every fresh Lite database now carries the default full-text index,
+    // whose maintenance for the writes above runs in the background. Bring
+    // that work to idle before the vacuum and the physical-tail probes that
+    // follow: the online vacuum waits its turn for the writer slot, but the
+    // junk bytes appended below are only a stable tail if no later
+    // checkpoint extends the file past them.
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_run_until_idle(src_handle));
     var online_vacuum: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_vacuum_json(src_handle, &online_vacuum));
     defer antfly_db_buffer_free(online_vacuum.ptr, online_vacuum.len);
@@ -13234,6 +14944,8 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     var snapshot_file_report: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_copy_stable_snapshot_file_json(src_path, snapshot_file_path, false, &snapshot_file_report));
     defer antfly_db_buffer_free(snapshot_file_report.ptr, snapshot_file_report.len);
+    if (std.mem.indexOf(u8, snapshot_file_report.ptr.?[0..snapshot_file_report.len], "\"tail_bytes\":4") == null)
+        std.debug.print("stable snapshot file report: {s}\n", .{snapshot_file_report.ptr.?[0..snapshot_file_report.len]});
     try std.testing.expect(std.mem.indexOf(u8, snapshot_file_report.ptr.?[0..snapshot_file_report.len], "\"tail_bytes\":4") != null);
     var snapshot_file_existing_report: capi.Buffer = .{ .ptr = scratch[0..].ptr, .len = scratch.len };
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_copy_stable_snapshot_file_json(src_path, snapshot_file_path, false, &snapshot_file_existing_report));
@@ -13509,10 +15221,17 @@ test "capi lite exposes hosted and status-only profiles" {
     try std.testing.expect(std.mem.indexOf(u8, hosted_caps_json, "\"ttl_cleanup_runtime\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, hosted_caps_json, "\"transaction_recovery_runtime\":false") != null);
 
+    // Creating a Lite database already provisions the default full-text
+    // index, matching the server's behavior on table create.
+    var initial_indexes: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_list_indexes_json(hosted_handle, &initial_indexes));
+    defer antfly_db_buffer_free(initial_indexes.ptr, initial_indexes.len);
+    try std.testing.expect(std.mem.indexOf(u8, initial_indexes.ptr.?[0..initial_indexes.len], "\"full_text_index_v0\"") != null);
+
     const index_json =
         \\{"name":"full_text_index_v0","kind":"full_text","config_json":"{}"}
     ;
-    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(hosted_handle, .{
+    try std.testing.expectEqual(capi.ErrorCode.internal, antfly_db_add_index_json(hosted_handle, .{
         .ptr = index_json,
         .len = index_json.len,
     }));
@@ -13569,6 +15288,204 @@ test "capi lite exposes hosted and status-only profiles" {
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_batch(status_handle, &writes, writes.len, null, 0, 2_000, 0));
 }
 
+test "capi handle ids are safe to use after close and across slot reuse" {
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
+    const alloc = std.testing.allocator;
+    const path_a = try tempTestAflitePath(alloc, test_tmp.path(), "capi-handle-id-a");
+    defer alloc.free(path_a);
+    const path_b = try tempTestAflitePath(alloc, test_tmp.path(), "capi-handle-id-b");
+    defer alloc.free(path_b);
+    cleanupTestFile(path_a);
+    defer cleanupTestFile(path_a);
+    cleanupTestFile(path_b);
+    defer cleanupTestFile(path_b);
+
+    var a: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(path_a, &a));
+    var out: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_status_json(a, &out));
+    antfly_buffer_free(&out);
+
+    antfly_db_close(a);
+    // Use after close and repeated close are defined: no access to freed memory.
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_status_json(a, &out));
+    antfly_db_close(a);
+
+    // The next handle reuses the freed slot under a new generation, so the
+    // stale id neither matches it nor closes it.
+    var b: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(path_b, &b));
+    defer antfly_db_close(b);
+    try std.testing.expect(a != b);
+    try std.testing.expectEqual(HandleRegistry.decode(a).?.index, HandleRegistry.decode(b).?.index);
+    if (HandleRegistry.reserve_address_space) {
+        // Ids are addresses in the reservation, so bindings can keep them in
+        // pointer-typed fields that a garbage collector inspects.
+        const base = handle_registry.base.load(.acquire);
+        try std.testing.expect(base >= 4096);
+        try std.testing.expect(@intFromPtr(b) >= base);
+        try std.testing.expectEqual(@as(usize, 0), @intFromPtr(b) % 8);
+    }
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_status_json(a, &out));
+    antfly_db_close(a);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_status_json(b, &out));
+    antfly_buffer_free(&out);
+
+    // Values that were never issued fail cleanly too.
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_status_json(null, &out));
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_status_json(@ptrFromInt(0x7fff_0000), &out));
+}
+
+test "capi handle registry retires a slot instead of wrapping its generation" {
+    var first = Handle{ .alloc = std.testing.allocator, .db = undefined };
+    var second = Handle{ .alloc = std.testing.allocator, .db = undefined };
+    var third = Handle{ .alloc = std.testing.allocator, .db = undefined };
+
+    // Put a slot at the front of the free list, then move it to the last
+    // generation an id can encode.
+    const first_id = try registerTestHandle(&first);
+    const index = HandleRegistry.decode(first_id).?.index;
+    unregisterTestHandle(first_id);
+    const slot = handle_registry.slotFor(index).?;
+    const last_generation = handle_registry.generationMask();
+    slot.state.store(last_generation << 1, .release);
+
+    const second_id = try registerTestHandle(&second);
+    try std.testing.expectEqual(index, HandleRegistry.decode(second_id).?.index);
+    try std.testing.expectEqual(last_generation, HandleRegistry.decode(second_id).?.generation);
+    unregisterTestHandle(second_id);
+
+    // Retired: still claimed, unusable by any id, and never handed out again.
+    try std.testing.expectEqual(last_generation << 1 | 1, slot.state.load(.acquire));
+    try std.testing.expect(asHandle(second_id) == null);
+    try std.testing.expect(enterHandle(second_id, .read) == null);
+    unregisterTestHandle(second_id);
+    const third_id = try registerTestHandle(&third);
+    defer unregisterTestHandle(third_id);
+    try std.testing.expect(HandleRegistry.decode(third_id).?.index != index);
+    const wrapped = handle_registry.encode(.{ .index = index, .generation = 0 });
+    try std.testing.expect(enterHandle(wrapped, .read) == null);
+}
+
+test "capi concurrent calls and closes on one handle never touch freed memory" {
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
+    const alloc = std.testing.allocator;
+    const path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-handle-close-race");
+    defer alloc.free(path);
+    cleanupTestFile(path);
+    defer cleanupTestFile(path);
+
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(path, &handle));
+
+    const Worker = struct {
+        fn call(id: ?*anyopaque, unexpected: *std.atomic.Value(u32)) void {
+            while (true) {
+                var out: capi.Buffer = .{};
+                switch (antfly_lite_status_json(id, &out)) {
+                    .ok => antfly_buffer_free(&out),
+                    .invalid_argument => return,
+                    else => {
+                        _ = unexpected.fetchAdd(1, .monotonic);
+                        return;
+                    },
+                }
+            }
+        }
+        fn close(id: ?*anyopaque) void {
+            antfly_db_close(id);
+        }
+    };
+
+    var unexpected = std.atomic.Value(u32).init(0);
+    const spawn_config: std.Thread.SpawnConfig = .{ .stack_size = capi_min_thread_stack_size };
+    var callers: [6]std.Thread = undefined;
+    for (&callers) |*t| t.* = try std.Thread.spawn(spawn_config, Worker.call, .{ handle, &unexpected });
+    std.Io.sleep(std.testing.io, .fromMilliseconds(20), .awake) catch {};
+    const closer_a = try std.Thread.spawn(spawn_config, Worker.close, .{handle});
+    const closer_b = try std.Thread.spawn(spawn_config, Worker.close, .{handle});
+    closer_a.join();
+    closer_b.join();
+    for (callers) |t| t.join();
+    try std.testing.expectEqual(@as(u32, 0), unexpected.load(.monotonic));
+}
+
+test "capi text and dense searches succeed while writes commit" {
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
+    const alloc = std.testing.allocator;
+    const path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-search-during-writes");
+    defer alloc.free(path);
+    cleanupTestFile(path);
+    defer cleanupTestFile(path);
+
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(path, &handle));
+    defer antfly_db_close(handle);
+    const dense_index =
+        \\{"name":"dv_v1","kind":"dense_vector","config_json":"{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}"}
+    ;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(handle, .{ .ptr = dense_index, .len = dense_index.len }));
+
+    const Writer = struct {
+        fn run(id: ?*anyopaque, stop: *std.atomic.Value(bool), failures: *std.atomic.Value(u32)) void {
+            var ts: u64 = 1;
+            var key_buf: [32]u8 = undefined;
+            while (!stop.load(.acquire)) : (ts += 1) {
+                const key = std.fmt.bufPrint(&key_buf, "doc:{d}", .{ts}) catch unreachable;
+                const value =
+                    \\{"body":"searchable writes","_embeddings":{"dv_v1":[1.0,0.0]}}
+                ;
+                const writes = [_]capi.WriteIntent{.{
+                    .key = .{ .ptr = key.ptr, .len = key.len },
+                    .value = .{ .ptr = value, .len = value.len },
+                    .is_delete = false,
+                }};
+                if (antfly_db_batch(id, &writes, writes.len, null, 0, ts, 0) != .ok) _ = failures.fetchAdd(1, .monotonic);
+            }
+        }
+    };
+
+    var stop = std.atomic.Value(bool).init(false);
+    var write_failures = std.atomic.Value(u32).init(0);
+    const writer = try std.Thread.spawn(.{ .stack_size = capi_min_thread_stack_size }, Writer.run, .{ handle, &stop, &write_failures });
+    defer writer.join();
+    defer stop.store(true, .release);
+
+    // Every search stamps an identity generation that a concurrent commit
+    // can invalidate; unpinned reads must restamp rather than fail.
+    const vector = [_]f32{ 1.0, 0.0 };
+    for (0..200) |_| {
+        var text_result: capi.DenseSearchResult = .{};
+        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_search_text_match(
+            handle,
+            .{},
+            .{ .ptr = "body", .len = 4 },
+            .{ .ptr = "searchable", .len = 10 },
+            5,
+            0,
+            &text_result,
+        ));
+        antfly_db_dense_search_result_free(&text_result);
+        var dense_result: capi.PackedDenseSearchResult = .{};
+        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_search_dense(
+            handle,
+            .{ .ptr = "dv_v1", .len = 5 },
+            &vector,
+            vector.len,
+            1,
+            1,
+            0,
+            &dense_result,
+        ));
+        antfly_db_packed_dense_search_result_free(&dense_result);
+    }
+    stop.store(true, .release);
+    try std.testing.expectEqual(@as(u32, 0), write_failures.load(.monotonic));
+}
+
 test "capi lite open options validate and configure ttl cleanup" {
     var test_tmp = try TestDirectory.init("capi");
     defer test_tmp.cleanup();
@@ -13590,7 +15507,8 @@ test "capi lite open options validate and configure ttl cleanup" {
         .profile = 99,
         .flags = std.math.maxInt(u32),
         .reserved0 = 1,
-        .reserved = .{1} ** 8,
+        .busy_timeout_ms = 1,
+        .reserved = .{1} ** 7,
     };
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&generic_defaults));
     try std.testing.expectEqual(@as(u32, @sizeOf(capi.OpenOptions)), generic_defaults.abi_size);
@@ -13599,6 +15517,7 @@ test "capi lite open options validate and configure ttl cleanup" {
     try std.testing.expectEqual(capi.profile_native, generic_defaults.profile);
     try std.testing.expectEqual(@as(u32, 0), generic_defaults.flags);
     try std.testing.expectEqual(@as(u32, 0), generic_defaults.reserved0);
+    try std.testing.expectEqual(@as(u64, 0), generic_defaults.busy_timeout_ms);
     for (generic_defaults.reserved) |word| try std.testing.expectEqual(@as(u64, 0), word);
 
     var defaults = capi.LiteOpenOptions{
@@ -13608,7 +15527,8 @@ test "capi lite open options validate and configure ttl cleanup" {
         .flags = std.math.maxInt(u32),
         .map_size = std.math.maxInt(u64),
         .ttl_cleanup_enabled = true,
-        .reserved = .{1} ** 8,
+        .busy_timeout_ms = 1,
+        .reserved = .{1} ** 7,
     };
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open_options_init(&defaults));
     try std.testing.expectEqual(@as(u32, @sizeOf(capi.LiteOpenOptions)), defaults.abi_size);
@@ -13617,6 +15537,7 @@ test "capi lite open options validate and configure ttl cleanup" {
     try std.testing.expectEqual(@as(u32, 0), defaults.flags);
     try std.testing.expectEqual(@as(u64, 0), defaults.map_size);
     try std.testing.expect(!defaults.ttl_cleanup_enabled);
+    try std.testing.expectEqual(@as(u64, 0), defaults.busy_timeout_ms);
     for (defaults.reserved) |word| try std.testing.expectEqual(@as(u64, 0), word);
 
     var default_handle: ?*anyopaque = null;
@@ -13634,7 +15555,7 @@ test "capi lite open options validate and configure ttl cleanup" {
         .open_mode = capi.lite_open_mode_readonly,
         .profile = capi.lite_profile_native,
         .flags = std.math.maxInt(u32),
-        .reserved = .{1} ** 8,
+        .reserved = .{1} ** 7,
     };
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create_with_options(path, &defaults, &default_handle));
     antfly_db_close(default_handle);
@@ -13856,6 +15777,8 @@ test "capi search rejects stale identity generation before readable lease hook" 
         .alloc = alloc,
         .db = try db_mod.DB.open(alloc, path, .{}),
     };
+    const handle_id = try registerTestHandle(&handle);
+    defer unregisterTestHandle(handle_id);
     defer {
         handle.db.close();
         cleanupTestDir(path);
@@ -13875,7 +15798,7 @@ test "capi search rejects stale identity generation before readable lease hook" 
 
     var recorder = Recorder{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_set_readable_lease_hook(
-        @ptrCast(&handle),
+        handle_id,
         42,
         &recorder,
         &Recorder.callback,
@@ -13889,13 +15812,13 @@ test "capi search rejects stale identity generation before readable lease hook" 
 
     var out: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_search_json(
-        @ptrCast(&handle),
+        handle_id,
         .{ .ptr = request.ptr, .len = request.len },
         &out,
     ));
     try std.testing.expectEqual(@as(usize, 0), recorder.count);
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_set_readable_lease_hook(
-        @ptrCast(&handle),
+        handle_id,
         0,
         null,
         null,
@@ -13915,6 +15838,8 @@ test "capi search json returns stamped identity generation" {
         .alloc = alloc,
         .db = try db_mod.DB.open(alloc, path, .{}),
     };
+    const handle_id = try registerTestHandle(&handle);
+    defer unregisterTestHandle(handle_id);
     defer {
         handle.db.close();
         cleanupTestDir(path);
@@ -13942,7 +15867,7 @@ test "capi search json returns stamped identity generation" {
         "{\"mode\":\"dense\",\"index_name\":\"dv_v1\",\"vector\":[1,0],\"k\":1,\"limit\":1,\"offset\":0,\"include_stored\":false}";
     var out: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_search_json(
-        @ptrCast(&handle),
+        handle_id,
         .{ .ptr = search_req.ptr, .len = search_req.len },
         &out,
     ));
@@ -13956,7 +15881,7 @@ test "capi search json returns stamped identity generation" {
 
     var packed_result: capi.PackedDenseSearchResult = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_search_dense(
-        @ptrCast(&handle),
+        handle_id,
         .{ .ptr = "dv_v1".ptr, .len = "dv_v1".len },
         (&[_]f32{ 1.0, 0.0 }).ptr,
         2,
@@ -13970,7 +15895,7 @@ test "capi search json returns stamped identity generation" {
 
     var text_result: capi.DenseSearchResult = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_search_text_match(
-        @ptrCast(&handle),
+        handle_id,
         .{ .ptr = "ft_v1".ptr, .len = "ft_v1".len },
         .{ .ptr = "title".ptr, .len = "title".len },
         .{ .ptr = "alpha".ptr, .len = "alpha".len },
@@ -13985,7 +15910,7 @@ test "capi search json returns stamped identity generation" {
         "{\"mode\":\"full_text\",\"index_name\":\"ft_v1\",\"text_query_type\":\"match\",\"field\":\"title\",\"text\":\"alpha\",\"limit\":1}";
     var hits_result: capi.DenseSearchResult = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_search_hits_json(
-        @ptrCast(&handle),
+        handle_id,
         .{ .ptr = hits_request.ptr, .len = hits_request.len },
         &hits_result,
     ));
@@ -14006,6 +15931,8 @@ test "capi aggregate hits rejects stale identity generation before aggregation m
         .alloc = alloc,
         .db = try db_mod.DB.open(alloc, path, .{}),
     };
+    const handle_id = try registerTestHandle(&handle);
+    defer unregisterTestHandle(handle_id);
     defer {
         handle.db.close();
         cleanupTestDir(path);
@@ -14029,7 +15956,7 @@ test "capi aggregate hits rejects stale identity generation before aggregation m
     defer alloc.free(current_request);
     var current_out: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.internal, antfly_db_aggregate_hits_json(
-        @ptrCast(&handle),
+        handle_id,
         .{ .ptr = current_request.ptr, .len = current_request.len },
         &current_out,
     ));
@@ -14039,7 +15966,7 @@ test "capi aggregate hits rejects stale identity generation before aggregation m
     ;
     var missing_generation_out: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_aggregate_hits_json(
-        @ptrCast(&handle),
+        handle_id,
         .{ .ptr = missing_generation_request.ptr, .len = missing_generation_request.len },
         &missing_generation_out,
     ));
@@ -14048,7 +15975,7 @@ test "capi aggregate hits rejects stale identity generation before aggregation m
     defer alloc.free(stale_request);
     var stale_out: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_aggregate_hits_json(
-        @ptrCast(&handle),
+        handle_id,
         .{ .ptr = stale_request.ptr, .len = stale_request.len },
         &stale_out,
     ));
@@ -14091,6 +16018,8 @@ test "capi request paths trigger readable lease hook" {
         .alloc = alloc,
         .db = try db_mod.DB.open(alloc, path, .{}),
     };
+    const handle_id = try registerTestHandle(&handle);
+    defer unregisterTestHandle(handle_id);
     defer {
         handle.db.close();
         cleanupTestDir(path);
@@ -14113,7 +16042,7 @@ test "capi request paths trigger readable lease hook" {
 
     var recorder = Recorder{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_set_readable_lease_hook(
-        @ptrCast(&handle),
+        handle_id,
         42,
         &recorder,
         &Recorder.callback,
@@ -14121,7 +16050,7 @@ test "capi request paths trigger readable lease hook" {
 
     var lookup_out: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_lookup_json(
-        @ptrCast(&handle),
+        handle_id,
         .{ .ptr = "doc:a".ptr, .len = "doc:a".len },
         &lookup_out,
     ));
@@ -14130,7 +16059,7 @@ test "capi request paths trigger readable lease hook" {
     const scan_req = "{\"from_key_b64\":\"\",\"to_key_b64\":\"\",\"include_documents\":false,\"limit\":10}";
     var scan_out: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_scan_json(
-        @ptrCast(&handle),
+        handle_id,
         .{ .ptr = scan_req.ptr, .len = scan_req.len },
         &scan_out,
     ));
@@ -14140,7 +16069,7 @@ test "capi request paths trigger readable lease hook" {
         "{\"mode\":\"dense\",\"index_name\":\"dv_v1\",\"vector\":[1,0],\"k\":1,\"limit\":1,\"offset\":0,\"include_stored\":false}";
     var search_out: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_search_json(
-        @ptrCast(&handle),
+        handle_id,
         .{ .ptr = search_req.ptr, .len = search_req.len },
         &search_out,
     ));
@@ -14148,7 +16077,7 @@ test "capi request paths trigger readable lease hook" {
 
     var packed_result: capi.PackedDenseSearchResult = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_search_dense(
-        @ptrCast(&handle),
+        handle_id,
         .{ .ptr = "dv_v1".ptr, .len = "dv_v1".len },
         (&[_]f32{ 1.0, 0.0 }).ptr,
         2,
@@ -14161,7 +16090,7 @@ test "capi request paths trigger readable lease hook" {
 
     var dense_profile: capi.DenseSearchProfile = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_search_dense_profile(
-        @ptrCast(&handle),
+        handle_id,
         .{ .ptr = "dv_v1".ptr, .len = "dv_v1".len },
         (&[_]f32{ 1.0, 0.0 }).ptr,
         2,
@@ -14185,7 +16114,7 @@ test "capi request paths trigger readable lease hook" {
     };
     var dense_wire_out: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_search_dense_wire(
-        @ptrCast(&handle),
+        handle_id,
         .{ .ptr = &dense_wire_req, .len = dense_wire_req.len },
         &dense_wire_out,
     ));
@@ -14195,7 +16124,7 @@ test "capi request paths trigger readable lease hook" {
     var dense_wire_profile_out: capi.Buffer = .{};
     var dense_wire_profile: capi.DenseWireSearchProfile = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_search_dense_wire_profile(
-        @ptrCast(&handle),
+        handle_id,
         .{ .ptr = &dense_wire_req, .len = dense_wire_req.len },
         &dense_wire_profile_out,
         &dense_wire_profile,
@@ -14205,7 +16134,7 @@ test "capi request paths trigger readable lease hook" {
 
     var text_result: capi.DenseSearchResult = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_search_text_match(
-        @ptrCast(&handle),
+        handle_id,
         .{ .ptr = "dv_v1".ptr, .len = "dv_v1".len },
         .{ .ptr = "title".ptr, .len = "title".len },
         .{ .ptr = "alpha".ptr, .len = "alpha".len },
@@ -14219,7 +16148,7 @@ test "capi request paths trigger readable lease hook" {
         "{\"mode\":\"full_text\",\"index_name\":\"dv_v1\",\"text_query_type\":\"match\",\"field\":\"title\",\"text\":\"alpha\",\"limit\":1,\"offset\":0,\"include_stored\":false}";
     var hits_result: capi.DenseSearchResult = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_search_hits_json(
-        @ptrCast(&handle),
+        handle_id,
         .{ .ptr = hits_req.ptr, .len = hits_req.len },
         &hits_result,
     ));
@@ -14338,6 +16267,8 @@ test "capi dense search profile breakdown" {
         .alloc = alloc,
         .db = try db_mod.DB.open(alloc, path, .{}),
     };
+    const handle_id = try registerTestHandle(&handle);
+    defer unregisterTestHandle(handle_id);
     defer {
         handle.db.close();
         cleanupTestDir(path);
@@ -14403,7 +16334,7 @@ test "capi dense search profile breakdown" {
         var out: capi.Buffer = .{};
         const start = monotonicNowNs();
         try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_search_json(
-            @ptrCast(&handle),
+            handle_id,
             .{ .ptr = request_json.ptr, .len = request_json.len },
             &out,
         ));
@@ -14424,6 +16355,242 @@ test "capi dense search profile breakdown" {
     var final_result = try handle.db.search(alloc, req);
     defer final_result.deinit();
     try std.testing.expectEqual(@as(u32, 10), final_result.total_hits);
+}
+
+// This always runs (on every build, including the default) and only asserts
+// on the build-capability signal, never on whether construction succeeded:
+// `local_inference_runtime` and `inference_mode: "local_embedded"` must
+// report true/present only when the loaded build both advertises and links
+// the local inference runtime.
+test "capi lite local-runtime-configured flag reports local_embedded only when the build links inference" {
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
+    const alloc = std.testing.allocator;
+    const path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-inference-variant-caps");
+    defer alloc.free(path);
+    cleanupTestFile(path);
+    defer cleanupTestFile(path);
+
+    var options = capi.LiteOpenOptions{
+        .abi_size = @sizeOf(capi.LiteOpenOptions),
+        .flags = capi.lite_open_flag_local_runtime_configured,
+    };
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create_with_options(path, &options, &handle));
+    defer antfly_db_close(handle);
+
+    var status: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_status_json(handle, &status));
+    defer antfly_db_buffer_free(status.ptr, status.len);
+    const status_json = status.ptr.?[0..status.len];
+
+    // capi_build_options.inference_enabled is only true for the isolated
+    // `-Dcapi-inference=true` storage_kernel unit and for unit tests
+    // themselves; it is never true for the default build.
+    if (capi_build_options.inference_enabled and lite_backend.capabilitiesForProfile(.native).local_inference_runtime) {
+        try std.testing.expect(std.mem.indexOf(u8, status_json, "\"inference_mode\":\"local_embedded\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, status_json, "\"local_inference_runtime\":true") != null);
+        const owned_handle = asHandle(handle).?;
+        try std.testing.expect(owned_handle.lite_inference_lifetime != null);
+    } else {
+        try std.testing.expect(std.mem.indexOf(u8, status_json, "\"inference_mode\":\"caller_supplied_or_disabled\"") != null);
+        const owned_handle = asHandle(handle).?;
+        try std.testing.expect(owned_handle.lite_inference_lifetime == null);
+    }
+}
+
+// Confirms `EmbeddedInferenceNodeOptions` plumbing end to end: an explicit
+// process-memory budget override passed through `antfly_lite_open_options`
+// is what the embedded node actually resolves and reports back in
+// `antfly_lite_status_json`'s "inference" object, rather than the previous
+// hardcoded zero-bytes/"automatic" policy that gave every Lite handle no way
+// to distinguish "host-detected" from "unset" (see
+// `inference_provider.createEmbeddedInferenceNode` and
+// `LiteResolvedOpenOptions.inference`). Runs on every build (including the
+// default, where the local runtime never actually starts) and only asserts
+// the reported budgets on the build-capability signal, matching the sibling
+// local-runtime test above.
+test "capi lite explicit resource budget overrides are reported in status" {
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
+    const alloc = std.testing.allocator;
+    const path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-inference-budget-status");
+    defer alloc.free(path);
+    cleanupTestFile(path);
+    defer cleanupTestFile(path);
+
+    var options = capi.LiteOpenOptions{
+        .abi_size = @sizeOf(capi.LiteOpenOptions),
+        .flags = capi.lite_open_flag_local_runtime_configured,
+        .inference_host_budget_mb = 256,
+        .inference_backend_budget_mb = 128,
+        .inference_process_memory_budget_mb = 512,
+        .inference_combined_budget_mb = 384,
+        .inference_kv_budget_mb = 64,
+        .inference_scratch_budget_mb = 32,
+    };
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create_with_options(path, &options, &handle));
+    defer antfly_db_close(handle);
+
+    var status: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_status_json(handle, &status));
+    defer antfly_db_buffer_free(status.ptr, status.len);
+    const status_json = status.ptr.?[0..status.len];
+
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"host_budget_mb\":256") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"backend_budget_mb\":128") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"process_memory_budget_mb\":512") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"combined_budget_mb\":384") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"kv_budget_mb\":64") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"scratch_budget_mb\":32") != null);
+
+    if (capi_build_options.inference_enabled and lite_backend.capabilitiesForProfile(.native).local_inference_runtime) {
+        // The node actually started against the explicit override: the
+        // resolved envelope is exactly the requested 512 MiB (clamped by
+        // `resolveEffectiveDetailed` only when the detected host is
+        // smaller, which a 512 MiB request never exceeds on any test
+        // runner), and its provenance is "explicit", not "automatic".
+        try std.testing.expect(std.mem.indexOf(u8, status_json, "\"process_memory_limit_bytes\":536870912") != null);
+        try std.testing.expect(std.mem.indexOf(u8, status_json, "\"process_memory_limit_source\":\"explicit\"") != null);
+        const owned_handle = asHandle(handle).?;
+        try std.testing.expect(owned_handle.lite_inference_lifetime != null);
+    } else {
+        // No local runtime started, so the resolution never ran; status
+        // still echoes the caller's requested override values (asserted
+        // above) but the resolved fields stay at their zero-value/automatic
+        // defaults.
+        try std.testing.expect(std.mem.indexOf(u8, status_json, "\"process_memory_limit_bytes\":0") != null);
+        try std.testing.expect(std.mem.indexOf(u8, status_json, "\"process_memory_limit_source\":\"automatic\"") != null);
+    }
+}
+
+// A Lite handle opened with the local-runtime flag but no explicit budget
+// overrides must not fall back to the previous zero-bytes/automatic
+// generation-budget policy: that policy could not admit even one
+// boundary-architecture extraction window (fastino/gliner2.5-base-v1's
+// admission estimate exceeds it regardless of request size -- see
+// GLINER25.md's "Memory budget" section and this task's
+// gliner25-longdoc-handoff.md), so every such call failed with
+// error.MemoryBudgetExceeded through the embedded/in-process worker path
+// even though `antfly inference run` succeeded (only because an operator
+// supplied `--host-budget-mb`/`--backend-budget-mb`/`--combined-budget-mb`/
+// `--kv-budget-mb`/`--scratch-budget-mb` by hand). Confirms the embedded
+// node instead defaults each lane to
+// `inference_provider.default_{host,backend,combined,kv,scratch}_budget_mb`
+// (clamped to the host-detected envelope), and logs the resolved values for
+// the machine running this test.
+test "capi lite defaults embedded generation budgets when no override is given" {
+    if (!capi_build_options.inference_enabled) return error.SkipZigTest;
+    if (!lite_backend.capabilitiesForProfile(.native).local_inference_runtime) return error.SkipZigTest;
+
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
+    const alloc = std.testing.allocator;
+    const path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-inference-budget-defaults");
+    defer alloc.free(path);
+    cleanupTestFile(path);
+    defer cleanupTestFile(path);
+
+    var options = capi.LiteOpenOptions{
+        .abi_size = @sizeOf(capi.LiteOpenOptions),
+        .flags = capi.lite_open_flag_local_runtime_configured,
+    };
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create_with_options(path, &options, &handle));
+    defer antfly_db_close(handle);
+
+    var status: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_status_json(handle, &status));
+    defer antfly_db_buffer_free(status.ptr, status.len);
+    const status_json = status.ptr.?[0..status.len];
+    std.debug.print("capi lite default embedded generation budgets on this machine: {s}\n", .{status_json});
+
+    // None of these lanes may resolve to 0 (the previous automatic/unbounded
+    // policy that admitted no boundary-model window). host/backend/scratch
+    // default to 16384 MiB, combined to 32768, kv to 4096, each clamped to
+    // the host-detected envelope; a real dev/CI machine has well over 4 GiB,
+    // so all five stay at their un-clamped defaults on any realistic runner.
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"host_budget_mb\":0") == null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"backend_budget_mb\":0") == null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"combined_budget_mb\":0") == null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"kv_budget_mb\":0") == null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"scratch_budget_mb\":0") == null);
+}
+
+fn liteLocalEmbeddingModelAvailable(alloc: Allocator) bool {
+    const home_c = std.c.getenv("HOME") orelse return false;
+    const home = std.mem.span(home_c);
+    const owner_dir = std.fs.path.join(alloc, &.{ home, ".antfly", "inference", "models", "Qwen" }) catch return false;
+    defer alloc.free(owner_dir);
+    var dir = std.Io.Dir.cwd().openDir(std.testing.io, owner_dir, .{ .iterate = true }) catch return false;
+    defer dir.close(std.testing.io);
+    var it = dir.iterateAssumeFirstIteration();
+    while (it.next(std.testing.io) catch return false) |entry| {
+        if (std.mem.startsWith(u8, entry.name, "Qwen3-Embedding-0.6B-GGUF")) return true;
+    }
+    return false;
+}
+
+// Conditional on the `-Dcapi-inference=true` variant (skips on the default
+// build, where capi_build_options.inference_enabled is false) and on the
+// small local embedding model being present under
+// ~/.antfly/inference/models, so this never requires a network call and
+// never fails a machine that has not pulled the model.
+test "capi lite drains an antfly embedder with no api_url through the embedded inference provider" {
+    if (!capi_build_options.inference_enabled) return error.SkipZigTest;
+    if (!lite_backend.capabilitiesForProfile(.native).local_inference_runtime) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    if (!liteLocalEmbeddingModelAvailable(alloc)) return error.SkipZigTest;
+
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
+    const path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-lite-local-embedding-drain");
+    defer alloc.free(path);
+    cleanupTestFile(path);
+    defer cleanupTestFile(path);
+
+    var options = capi.LiteOpenOptions{
+        .abi_size = @sizeOf(capi.LiteOpenOptions),
+        .flags = capi.lite_open_flag_local_runtime_configured,
+    };
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create_with_options(path, &options, &handle));
+    defer antfly_db_close(handle);
+    const owned_handle = asHandle(handle).?;
+    try std.testing.expect(owned_handle.lite_inference_lifetime != null);
+
+    const index_json =
+        \\{"name":"body_embedding","kind":"dense_vector","config_json":"{\"type\":\"embeddings\",\"embedder\":{\"provider\":\"antfly\",\"model\":\"Qwen/Qwen3-Embedding-0.6B-GGUF\"}}"}
+    ;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(handle, .{
+        .ptr = index_json.ptr,
+        .len = index_json.len,
+    }));
+
+    const enrichment_json =
+        \\{"name":"body_embedder","kind":"embedding","field":"body","vector_space":"body_embedding","producer_json":"{\"type\":\"embedder\",\"config\":{\"provider\":\"antfly\",\"model\":\"Qwen/Qwen3-Embedding-0.6B-GGUF\"}}"}
+    ;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_enrichment_json(handle, .{
+        .ptr = enrichment_json.ptr,
+        .len = enrichment_json.len,
+    }));
+
+    const batch_json = "{\"inserts\":{\"doc:capi-local-embedding\":{\"body\":\"antfly lite embeds documents locally\"}},\"sync_level\":\"write\"}";
+    var batch_out: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch_json(handle, .{
+        .ptr = batch_json.ptr,
+        .len = batch_json.len,
+    }, &batch_out));
+    defer antfly_db_buffer_free(batch_out.ptr, batch_out.len);
+
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_run_until_idle(handle));
+
+    const drained = owned_handle.db.pendingWorkStats();
+    try std.testing.expectEqual(@as(u64, 0), drained.enrichment.error_count);
+    try std.testing.expectEqual(@as(u64, 0), drained.enrichment.fatal_error_count);
+    try std.testing.expect(!drained.enrichment.stalled);
+    try std.testing.expectEqual(drained.enrichment.target_sequence, drained.enrichment.applied_sequence);
 }
 
 pub fn storageOwnerRestoreControlJson(owner_ptr: ?*anyopaque, request: *const kernel_owner_abi.RestoreOwnerControlRequest, out_result: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {

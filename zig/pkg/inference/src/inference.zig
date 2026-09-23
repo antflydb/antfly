@@ -121,6 +121,7 @@ test {
     _ = @import("finetune/laya/job.zig");
     _ = @import("pipelines/laya.zig");
     _ = @import("pipelines/laya_parity_test.zig");
+    _ = @import("pipelines/laya_cuda_test.zig");
     _ = @import("extractors/laya.zig");
     _ = backends;
     _ = execution_control;

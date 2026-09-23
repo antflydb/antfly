@@ -431,8 +431,11 @@ pub const FileReader = struct {
 pub fn decompressZstd(alloc: Allocator, compressed: []const u8) ![]u8 {
     const Reader = std.Io.Reader;
     var input = Reader.fixed(compressed);
-    var window_buf: [std.compress.zstd.default_window_len + std.compress.zstd.block_size_max]u8 = undefined;
-    var decomp = std.compress.zstd.Decompress.init(&input, &window_buf, .{});
+    // The window is about 8 MiB, so keep it off the stack: embedded callers
+    // run libantfly on threads whose stacks are only a few MiB.
+    const window_buf = try alloc.alloc(u8, std.compress.zstd.default_window_len + std.compress.zstd.block_size_max);
+    defer alloc.free(window_buf);
+    var decomp = std.compress.zstd.Decompress.init(&input, window_buf, .{});
     return decomp.reader.allocRemaining(alloc, .limited(max_block_payload_bytes));
 }
 

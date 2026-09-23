@@ -1393,15 +1393,17 @@ pub const HfTokenizer = struct {
         }
     }
 
-    fn parseNormalizer(self: *HfTokenizer, obj: std.json.ObjectMap, strict_unigram: bool) error{ InvalidTokenizerNormalizer, UnsupportedTokenizerNormalizer }!void {
+    fn parseNormalizer(self: *HfTokenizer, obj: std.json.ObjectMap, strict_unigram: bool) anyerror!void {
         if (self.model_type == .unigram) {
             // Parse transactionally. A legacy Sequence may have supported
             // steps before Precompiled/Lowercase; retaining just that prefix
             // would change its old tokenization while discarding later steps.
             var profile = unicode_normalizer.Profile{};
-            profile.parse(.{ .object = obj }) catch |err| switch (err) {
+            errdefer profile.deinit(self.allocator);
+            profile.parse(self.allocator, .{ .object = obj }) catch |err| switch (err) {
                 error.UnsupportedTokenizerNormalizer => {
                     if (strict_unigram) return err;
+                    profile.deinit(self.allocator);
                     self.parseLegacyNormalizer(obj);
                     self.unigram_encoding = .legacy_unsupported_normalizer;
                     return;
@@ -7597,6 +7599,7 @@ pub const HfTokenizer = struct {
 
     pub fn deinitSelf(self: *HfTokenizer) void {
         const allocator = self.allocator;
+        self.unigram_normalizer.deinit(allocator);
         for (self.arena_strings.items) |s| {
             allocator.free(s);
         }

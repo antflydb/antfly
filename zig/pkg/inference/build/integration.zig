@@ -59,7 +59,20 @@ pub fn add(ctx: Context, wasm_jinja: *std.Build.Module, wasm_platform: *std.Buil
     }
 
     const suite = tests.create(ctx);
-    const bge_tests = benches.createBge(ctx).tests;
+    const registry_module = ctx.b.createModule(.{
+        .root_source_file = ctx.path("src/registry_test_root.zig"),
+        .target = ctx.target,
+        .optimize = ctx.optimize,
+        .link_libc = ctx.backend.link_libc,
+    });
+    registry_module.addImport("httpx", ctx.graph.httpx_mod);
+    registry_module.addImport("protobuf", ctx.graph.protobuf_mod);
+    const registry_tests = ctx.b.addTest(.{ .root_module = registry_module });
+    ctx.step("registry-test", "Run Hub snapshot, artifact dependency and download tests").dependOn(&ctx.addRunArtifact(registry_tests).step);
+    const bge = benches.createBge(ctx);
+    const bge_tests = bge.tests;
+    const bge_install = ctx.b.addInstallArtifact(bge.bge_m3_e2e_bench_exe, .{});
+    ctx.step("build-bge-m3-benchmark", "Build the managed BGE-M3 format qualification probe").dependOn(&bge_install.step);
     const test_step = tests.addDefault(ctx, suite, .{
         .codegen = checks.createCodegen(ctx).quant_kernel_codegen_test_check,
         .cuda_source = checks.createCudaSourceCheck(ctx).cuda_artifact_source_policy_check,
