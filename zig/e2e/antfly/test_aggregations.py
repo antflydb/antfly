@@ -3,6 +3,7 @@
 
 """Exact aggregation results while unrelated documents are inserted (issue #788)."""
 
+import math
 import os
 import threading
 import time
@@ -10,6 +11,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 import requests
+from conftest import finish_create_table
+from helpers import wait_until
 
 
 def _check_age_aggregation(payload, kind):
@@ -198,3 +201,212 @@ def test_aggregation_full_result_budget(monkeypatch, request):
         assert response.json()["error"] == "query_candidate_budget_exceeded", (
             response.text
         )
+
+
+# Hybrid aggregation domain.
+#
+# A full-text query has a matching set; a vector query only has the ranked
+# window the caller asked for. Aggregations over a hybrid query therefore count
+# every text match plus each vector index's global top window. The corpus below
+# makes that domain differ from every wrong answer: the whole index, the page,
+# the text matches alone, and a per-shard union of vector windows.
+
+_DOMAIN_DOCS = 3000
+_DOMAIN_LIMIT = 10
+_DOMAIN_NEAR = 24
+_QUERY_A = [1.0, 0.0, 0.0]
+_QUERY_B = [0.0, 1.0, 0.0]
+_NEAR_A = [i * (_DOMAIN_DOCS // _DOMAIN_NEAR) + 7 for i in range(_DOMAIN_NEAR)]
+_NEAR_B = [i * (_DOMAIN_DOCS // _DOMAIN_NEAR) + 131 for i in range(_DOMAIN_NEAR)]
+_TEXT_IDS = set(range(1000, 1037)) | {_NEAR_A[0], _NEAR_A[1], _NEAR_B[3]}
+
+
+def _unit(vector):
+    norm = math.sqrt(sum(x * x for x in vector))
+    return [x / norm for x in vector]
+
+
+def _domain_key(i):
+    return f"doc:{i:05d}"
+
+
+def _domain_vectors(i):
+    # Far vectors sit in the negative octant: similarity <= 0 to both queries.
+    va = _unit([-0.3 - (i % 17) * 0.01, -0.3 - (i % 13) * 0.01, 1.0])
+    vb = _unit([-0.3 - ((i + 5) % 17) * 0.01, -0.3 - ((i + 5) % 13) * 0.01, 1.0])
+    if i in _NEAR_A:
+        angle = 0.02 * (_NEAR_A.index(i) + 1)  # strictly graded ranks
+        va = [math.cos(angle), 0.0, math.sin(angle)]
+    if i in _NEAR_B:
+        angle = 0.02 * (_NEAR_B.index(i) + 1)
+        vb = [0.0, math.cos(angle), math.sin(angle)]
+    return va, vb
+
+
+def _domain_top(pick, query, n):
+    scored = sorted(
+        (-sum(x * y for x, y in zip(_domain_vectors(i)[pick], query)), _domain_key(i))
+        for i in range(_DOMAIN_DOCS)
+    )
+    return [key for _, key in scored[:n]]
+
+
+def _create_domain_table(api, name, num_shards):
+    schema = {
+        "default_type": "doc",
+        "document_schemas": {
+            "doc": {
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "body": {"type": "string", "x-antfly-types": ["text"]},
+                        "key": {"type": "string", "x-antfly-types": ["keyword"]},
+                    },
+                }
+            }
+        },
+    }
+    response = api._request(
+        "POST", f"/tables/{name}", {"num_shards": num_shards, "schema": schema}
+    )
+    finish_create_table(api, name, response)
+    for index in ("va", "vb"):
+        api.post(
+            f"/tables/{name}/indexes/{index}",
+            {"name": index, "type": "embeddings", "external": True, "dimension": 3},
+        )
+    for start in range(0, _DOMAIN_DOCS, 500):
+        inserts = {}
+        for i in range(start, min(start + 500, _DOMAIN_DOCS)):
+            va, vb = _domain_vectors(i)
+            inserts[_domain_key(i)] = {
+                "body": ("needle " if i in _TEXT_IDS else "") + "filler words here",
+                "key": _domain_key(i),
+                "_embeddings": {"va": va, "vb": vb},
+            }
+        result = api.batch_write(name, inserts=inserts, sync_level="full_index")
+        assert result["inserted"] == len(inserts), result
+
+    def indexes_ready():
+        statuses = {
+            index["config"]["name"]: index.get("status", {})
+            for index in api.get(f"/tables/{name}/indexes")
+        }
+        return all(
+            statuses.get(index, {}).get("total_indexed", 0) >= _DOMAIN_DOCS
+            for index in ("va", "vb")
+        )
+
+    assert wait_until(indexes_ready, timeout_s=120.0, interval_s=0.5)
+
+
+def _domain_query(api, name, shape, aggregations=None):
+    payload = dict(shape, limit=_DOMAIN_LIMIT, fields=["key"])
+    if aggregations is not None:
+        payload["aggregations"] = aggregations
+    response = api.query_table(name, payload)["responses"][0]
+    assert response.get("status", 200) == 200, response
+    return response
+
+
+_DOMAIN_TERMS = {"keys": {"type": "terms", "field": "key", "size": 5000}}
+_DOMAIN_MERGE = {"strategy": "rrf", "rank_constant": 60}
+
+
+@pytest.mark.e2e_resource("antfly_process")
+@pytest.mark.parametrize("num_shards", [1, 3])
+def test_hybrid_aggregation_domain(stateful_api, num_shards):
+    name = f"aggregation_domain_{num_shards}_{time.time_ns()}"
+    _create_domain_table(stateful_api, name, num_shards)
+    top_a = _domain_top(0, _QUERY_A, _DOMAIN_LIMIT)
+    top_b = _domain_top(1, _QUERY_B, _DOMAIN_LIMIT)
+    text_keys = {_domain_key(i) for i in _TEXT_IDS}
+
+    # The fixture itself: single-index retrieval matches brute force.
+    for index, query, want in (("va", _QUERY_A, top_a), ("vb", _QUERY_B, top_b)):
+        single = _domain_query(
+            stateful_api, name, {"embeddings": {index: query}, "indexes": [index]}
+        )
+        assert [hit["_id"] for hit in single["hits"]["hits"]] == want, single
+
+    shapes = {
+        "hybrid": (
+            {
+                "full_text_search": {"match": "needle", "field": "body"},
+                "embeddings": {"va": _QUERY_A, "vb": _QUERY_B},
+                "indexes": ["va", "vb"],
+                "merge_config": _DOMAIN_MERGE,
+            },
+            text_keys | set(top_a) | set(top_b),
+        ),
+        "semantic": (
+            {"embeddings": {"va": _QUERY_A}, "indexes": ["va"]},
+            set(top_a),
+        ),
+        "keyword": (
+            {"full_text_search": {"match": "needle", "field": "body"}},
+            text_keys,
+        ),
+    }
+    beyond_window = {
+        _domain_key(i) for i in _NEAR_A[_DOMAIN_LIMIT:] + _NEAR_B[_DOMAIN_LIMIT:]
+    }
+    for label, (shape, expected) in shapes.items():
+        page = _domain_query(stateful_api, name, shape)
+        counted = _domain_query(stateful_api, name, shape, _DOMAIN_TERMS)
+        keys = {bucket["key"] for bucket in counted["aggregations"]["keys"]["buckets"]}
+        assert keys == expected, (label, sorted(keys ^ expected)[:20])
+        assert all(
+            bucket["doc_count"] == 1
+            for bucket in counted["aggregations"]["keys"]["buckets"]
+        ), label
+        assert not (keys & beyond_window - text_keys), label
+        # Aggregations never change the ranked page.
+        assert [hit["_id"] for hit in counted["hits"]["hits"]] == [
+            hit["_id"] for hit in page["hits"]["hits"]
+        ], label
+
+
+@pytest.mark.e2e_resource("antfly_process")
+def test_vector_aggregation_budget_counts_windows_not_index(monkeypatch, request):
+    if os.environ.get("ANTFLY_STATEFUL_URL"):
+        pytest.skip("Changing the server budget requires a locally started process")
+    monkeypatch.setenv("ANTFLY_AGGREGATION_FULL_RESULT_BUDGET", "100")
+    api = request.getfixturevalue("stateful_api")
+    name = f"aggregation_vector_budget_{time.time_ns()}"
+    _create_domain_table(api, name, 1)
+
+    # Vector windows are the matching set, so a budget far below the index size
+    # still admits them.
+    semantic = _domain_query(
+        api,
+        name,
+        {
+            "embeddings": {"va": _QUERY_A, "vb": _QUERY_B},
+            "indexes": ["va", "vb"],
+            "merge_config": _DOMAIN_MERGE,
+        },
+        _DOMAIN_TERMS,
+    )
+    keys = {bucket["key"] for bucket in semantic["aggregations"]["keys"]["buckets"]}
+    assert keys == set(_domain_top(0, _QUERY_A, _DOMAIN_LIMIT)) | set(
+        _domain_top(1, _QUERY_B, _DOMAIN_LIMIT)
+    )
+
+    # Text matches still count against the budget.
+    with pytest.raises(requests.HTTPError) as failure:
+        api.query_table(
+            name,
+            {
+                "full_text_search": {"match": "filler", "field": "body"},
+                "embeddings": {"va": _QUERY_A, "vb": _QUERY_B},
+                "indexes": ["va", "vb"],
+                "merge_config": _DOMAIN_MERGE,
+                "limit": _DOMAIN_LIMIT,
+                "aggregations": _DOMAIN_TERMS,
+            },
+        )
+    assert failure.value.response.status_code == 422, failure.value.response.text
+    assert (
+        failure.value.response.json()["error"] == "query_candidate_budget_exceeded"
+    ), failure.value.response.text
