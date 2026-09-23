@@ -6433,6 +6433,11 @@ pub const DB = struct {
                 try db.core.loadIndexes();
                 profile.load_indexes_ns = elapsedSince(load_indexes_started_ns);
             }
+            // Validate the physical snapshot while the opened generation is
+            // still untouched by replay and background workers. Status can
+            // then retain this proof as live writes advance past the durable
+            // checkpoint's cardinality.
+            if (opts.open_mode != .status_only) db.validateOpenedDenseServingCertificates();
             if (!openModeRequiresReadOnlyBackends(opts.open_mode)) {
                 // Catalog admission and its outbox are one primary-store
                 // commit. Materialize any crash-surviving outbox before replay
@@ -35152,6 +35157,14 @@ pub const DB = struct {
         return .admitted;
     }
 
+    /// Seed certificate validation before replay can advance live cardinality.
+    fn validateOpenedDenseServingCertificates(self: *DB) void {
+        for (self.core.index_manager.dense_indexes.items) |*entry| {
+            const checkpoint = self.core.loadProjectionCheckpoint(self.alloc, entry.config.name) catch continue;
+            _ = entry.servingCertificateReady(checkpoint);
+        }
+    }
+
     /// Project exact resident query admission. Presence alone is insufficient
     /// because managed admission installs a gated empty generation before its
     /// first safe snapshot; cardinality is insufficient because a published
@@ -35159,30 +35172,32 @@ pub const DB = struct {
     fn vectorServingSnapshotReady(
         self: *DB,
         alloc: Allocator,
-        kind: types.IndexKind,
-        index_name: []const u8,
+        item: *const types.DBIndexStats,
         preloaded_repair_state: ?*const index_repair_state.State,
-        published_count: ?u64,
-        produced_count: u64,
     ) bool {
-        const installed = switch (kind) {
-            .dense_vector => self.core.denseIndex(index_name) != null,
-            .sparse_vector => self.core.sparseIndex(index_name) != null,
+        const installed = switch (item.kind) {
+            .dense_vector => self.core.denseIndex(item.name) != null,
+            .sparse_vector => self.core.sparseIndex(item.name) != null,
             else => false,
         };
-        if (!installed or self.observeResidentIndexAdmission(alloc, index_name, preloaded_repair_state) != .admitted) return false;
-        if (kind == .dense_vector) {
-            if (published_count) |certified| {
-                const entry = self.core.denseIndex(index_name) orelse return false;
-                if (entry.index.stats().active_count != certified) return false;
-            } else if (produced_count != 0) {
-                if (self.core.index_manager.get(index_name)) |cfg| {
+        if (!installed or self.observeResidentIndexAdmission(alloc, item.name, preloaded_repair_state) != .admitted) return false;
+        if (item.kind == .dense_vector) {
+            if (item.projection_checkpoint_published_count) |certified| {
+                const entry = self.core.denseIndex(item.name) orelse return false;
+                if (!entry.servingCertificateReady(.{
+                    .applied_sequence = item.projection_checkpoint_applied_sequence,
+                    .generation = item.projection_checkpoint_generation,
+                    .config_hash = item.projection_checkpoint_config_hash,
+                    .published_count = certified,
+                })) return false;
+            } else if (item.coverage_produced_count != 0) {
+                if (self.core.index_manager.get(item.name)) |cfg| {
                     // Older checkpoints have no count certificate. For managed
                     // progressive indexes use the existing durable coverage
                     // proof instead of treating an empty HBC as ready.
                     const proof = self.observeProgressiveManagedGenerationQueryabilityAtLeast(
                         alloc,
-                        index_name,
+                        item.name,
                         types.indexConfigHash(cfg.*),
                         0,
                     ) catch return false;
@@ -36363,7 +36378,7 @@ pub const DB = struct {
                     self.async_context.index_repair_state_corrupt.load(.acquire),
                     item,
                 );
-                item.serving_snapshot_ready = self.vectorServingSnapshotReady(stats_alloc, item.kind, item.name, if (repairs) |*state| state else null, item.projection_checkpoint_published_count, item.coverage_produced_count);
+                item.serving_snapshot_ready = self.vectorServingSnapshotReady(stats_alloc, item, if (repairs) |*state| state else null);
             }
             for (item.source_replay) |*source| {
                 source.target_sequence = try self.artifactSourceTargetSequence(
@@ -38177,11 +38192,8 @@ pub const DB = struct {
             if (cfg.kind == .dense_vector or cfg.kind == .sparse_vector) {
                 item.serving_snapshot_ready = self.vectorServingSnapshotReady(
                     alloc,
-                    cfg.kind,
-                    cfg.name,
+                    &item,
                     if (durable_index_repairs) |*state| state else null,
-                    item.projection_checkpoint_published_count,
-                    item.coverage_produced_count,
                 );
             }
             // Coverage and rebuild accounting above describes serviceable
@@ -38434,11 +38446,8 @@ pub const DB = struct {
             if (cfg.kind == .dense_vector or cfg.kind == .sparse_vector) {
                 item.serving_snapshot_ready = self.vectorServingSnapshotReady(
                     alloc,
-                    cfg.kind,
-                    cfg.name,
+                    &item,
                     if (durable_index_repairs) |*state| state else null,
-                    item.projection_checkpoint_published_count,
-                    item.coverage_produced_count,
                 );
             }
             if (item.load_error != null) applyTerminalLoadFailureStatus(&item);
@@ -112954,6 +112963,21 @@ test "db progressive managed admission serves a checkpointed partial generation"
         try std.testing.expect(index_stats.index_repair_active_generation_serviceable);
     }
     try db.failIfIndexQuarantined(cfg.name);
+
+    // Model a newer live count before its next checkpoint. Native generations
+    // reject direct HBC writes, so change only the published stats observation.
+    {
+        const entry = db.core.denseIndex(cfg.name) orelse return error.IndexNotFound;
+        entry.index.published_active_count.store(target_before + 1, .release);
+        defer entry.index.published_active_count.store(target_before, .release);
+        try std.testing.expectEqual(target_before + 1, entry.index.stats().active_count);
+        const ahead_stats = try db.stats(alloc);
+        defer types.freeDBStats(alloc, ahead_stats);
+        for (ahead_stats.indexes) |index_stats| {
+            if (!std.mem.eql(u8, index_stats.name, cfg.name)) continue;
+            try std.testing.expect(index_stats.serving_snapshot_ready);
+        }
+    }
 
     // The certificate is not a blanket cardinality bypass: if the loaded
     // physical snapshot no longer matches the exact published count, fail

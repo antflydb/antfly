@@ -2092,6 +2092,17 @@ pub const IndexManager = struct {
     pub const DenseIndex = struct {
         apply_mutex: *std.atomic.Mutex,
         capture_incarnation: u64 = 0,
+        /// A certificate is checked against the resident HBC generation once.
+        /// Later live writes may change active_count before the next checkpoint;
+        /// they must not revoke an already validated serving snapshot.
+        serving_certificate_mutex: std.atomic.Mutex = .unlocked,
+        verified_serving_certificate: ?struct {
+            capture_incarnation: u64,
+            applied_sequence: u64,
+            generation: u64,
+            config_hash: u64,
+            published_count: u64,
+        } = null,
         config: types.IndexConfig,
         field_name: []u8,
         dims: u32,
@@ -2123,6 +2134,28 @@ pub const IndexManager = struct {
         vector_loader_context: ?*DenseVectorLoadContext = null,
         ordinal_vector_ids: std.AutoHashMapUnmanaged(doc_identity.DocOrdinal, u64) = .empty,
         vector_ordinals: std.AutoHashMapUnmanaged(u64, doc_identity.DocOrdinal) = .empty,
+
+        pub fn servingCertificateReady(self: *DenseIndex, checkpoint: apply_state.ProjectionCheckpoint) bool {
+            const certified_count = checkpoint.published_count orelse return false;
+            while (!self.serving_certificate_mutex.tryLock()) std.atomic.spinLoopHint();
+            defer self.serving_certificate_mutex.unlock();
+            if (self.verified_serving_certificate) |verified| {
+                if (verified.capture_incarnation == self.capture_incarnation and
+                    verified.applied_sequence == checkpoint.applied_sequence and
+                    verified.generation == checkpoint.generation and
+                    verified.config_hash == checkpoint.config_hash and
+                    verified.published_count == certified_count) return true;
+            }
+            if (self.index.stats().active_count != certified_count) return false;
+            self.verified_serving_certificate = .{
+                .capture_incarnation = self.capture_incarnation,
+                .applied_sequence = checkpoint.applied_sequence,
+                .generation = checkpoint.generation,
+                .config_hash = checkpoint.config_hash,
+                .published_count = certified_count,
+            };
+            return true;
+        }
     };
 
     const DenseVectorLoadContext = struct {
@@ -8806,6 +8839,9 @@ pub const IndexManager = struct {
             .generation = checkpoint.generation,
             .config_hash = checkpoint.config_hash,
         });
+        // Verify at publication time. A status request may arrive only after
+        // the next live mutation has already advanced the resident count.
+        _ = entry.servingCertificateReady(checkpoint);
     }
 
     pub fn denseProjectionCheckpointMetadata(
