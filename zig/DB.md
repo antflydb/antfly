@@ -2003,7 +2003,7 @@ the hot data plane, port the local control plane, port remaining local
 features). Neither `ZigCoreDB` nor `StoreDB` appears anywhere in the current
 Go tree — only in this document and a historical TLA+ spec — so this section
 cannot be confirmed as either shipped or still the live target architecture.
-The closest living analog is `go/pkg/antflylite`, which has a typed `Batch`
+The closest living analog is `go/pkg/lite`, which has a typed `Batch`
 and binary `DenseSearchWire`/`TextMatchWire`/etc. wire types consuming the
 `antfly_db_search_*_wire` C API (see [Hot-Path Search
 Wire](#hot-path-search-wire) above), but it is a single-node embedded DB with

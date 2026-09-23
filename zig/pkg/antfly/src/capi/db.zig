@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const local_write = antfly.local_write;
 const raft_engine = @import("raft_engine");
 const storage_root = @import("antfly_storage_root");
@@ -83,6 +84,8 @@ const indexes_api = antfly.public_api.indexes;
 const Allocator = std.mem.Allocator;
 
 const lite_abi_version: u32 = 1;
+/// ANTFLY_MIN_THREAD_STACK_SIZE in antfly.h.
+const capi_min_thread_stack_size = 8 * 1024 * 1024;
 
 const kernel_runtime_services = antfly.kernel_runtime_services;
 
@@ -695,6 +698,16 @@ const Handle = struct {
     // this caller intent across its own reconfigure passes -- see its doc
     // comment.
     lite_generated_enrichment_replay: bool = false,
+    // Serialized threading mode (see CAPI.md "Thread Safety"): every export
+    // enters through `enterHandle`, which takes `api_lock` shared for reads
+    // and data writes and exclusively for schema/admin changes. Data writes
+    // and maintenance additionally serialize on their own mutexes so they
+    // queue instead of failing with ANTFLY_BUSY, while reads keep running
+    // against pinned snapshots. Callers hold a HandleRegistry id rather than
+    // this pointer, so close can drain and free safely (see HandleRegistry).
+    api_lock: std.Io.RwLock = .init,
+    write_mutex: std.Io.Mutex = .init,
+    maintenance_mutex: std.Io.Mutex = .init,
 
     fn liteAntflyProvider(self: *Handle) ?managed_embedder.AntflyProvider {
         const lifetime = if (self.lite_inference_lifetime) |*value| value else return null;
@@ -1639,6 +1652,63 @@ fn stampSearchRequestIdentityGeneration(handle: *Handle, req: *db_mod.types.Sear
     req.identity_read_generation = try currentIdentityReadGenerationForHandle(handle, req.identity_read_generation);
 }
 
+/// Optimistic attempts before `runAtStampedGeneration` blocks writers.
+const stamped_generation_optimistic_attempts = 4;
+
+/// Stamps `req` with the current identity generation and runs `query.run`
+/// against it. Reads run concurrently with writes, so a batch can commit
+/// between the stamp and the executor's re-check, which then rejects the
+/// stale stamp with IdentityReadGenerationChanged. When the caller did not pin
+/// a generation, restamp and retry, as the server's public query path does.
+/// The last attempt holds the handle's write mutex so no write can intervene,
+/// which bounds retries under sustained writes. A caller-pinned generation
+/// that has gone stale is returned as an error without retrying.
+fn runAtStampedGeneration(
+    handle: *Handle,
+    req: *db_mod.types.SearchRequest,
+    query: anytype,
+) !@TypeOf(query).Result {
+    return runAtStampedGenerationWithOptions(handle, req, query, .{});
+}
+
+const StampedGenerationOptions = struct {
+    /// Run the readable-lease hook for the stamped request. Paths whose export
+    /// already ran a request-specific hook (dense search) turn this off.
+    prepare: bool = true,
+};
+
+fn runAtStampedGenerationWithOptions(
+    handle: *Handle,
+    req: *db_mod.types.SearchRequest,
+    query: anytype,
+    comptime options: StampedGenerationOptions,
+) !@TypeOf(query).Result {
+    const pinned = req.identity_read_generation;
+    var attempt: u32 = 0;
+    while (true) : (attempt += 1) {
+        const block_writers = pinned == null and attempt == stamped_generation_optimistic_attempts;
+        const last = pinned != null or block_writers;
+        // Same order as write exports (api_lock shared, then write_mutex), so
+        // this cannot deadlock against them.
+        if (block_writers) handle.write_mutex.lockUncancelable(handleLockIo());
+        defer if (block_writers) handle.write_mutex.unlock(handleLockIo());
+        req.identity_read_generation = pinned;
+        try stampSearchRequestIdentityGeneration(handle, req);
+        if (options.prepare) try handle.prepareSearchRequest(req.*);
+        return query.run(handle, req.*) catch |err| {
+            if (err == error.IdentityReadGenerationChanged and !last) continue;
+            return err;
+        };
+    }
+}
+
+const LocalSearchQuery = struct {
+    const Result = db_mod.types.SearchResult;
+    fn run(_: LocalSearchQuery, handle: *Handle, req: db_mod.types.SearchRequest) !Result {
+        return executeLocalSearch(handle, req);
+    }
+};
+
 fn executeLocalSearch(handle: *Handle, req: db_mod.types.SearchRequest) !db_mod.types.SearchResult {
     if (comptime capi_build_options.linked_storage) {
         const request_json = try table_reads_api.encodeStorageKernelQueryRequest(handle.alloc, req);
@@ -1722,9 +1792,304 @@ const ReadableLeaseHook = struct {
     }
 };
 
+/// Resolves a caller's handle id without entering it. Exports go through
+/// `enterHandle` instead; this is for close and for internal callers (the
+/// storage-owner ABI, tests) that do not race close.
 fn asHandle(ptr: ?*anyopaque) ?*Handle {
-    const raw = ptr orelse return null;
-    return @ptrCast(@alignCast(raw));
+    const id = HandleRegistry.decode(ptr) orelse return null;
+    const slot = handle_registry.slotFor(id.index) orelse return null;
+    if (slot.state.load(.acquire) >> 1 != id.generation) return null;
+    return slot.handle.load(.acquire);
+}
+
+/// Handles given to callers are ids naming a registry slot plus a
+/// generation, not `*Handle` pointers. Slots live in chunks that are never
+/// freed, so any handle value a caller passes, including one for a handle
+/// closed on another thread a moment ago, dereferences valid memory:
+/// entering a stale or closing generation fails with
+/// ANTFLY_INVALID_ARGUMENT instead of touching a freed Handle, closing one
+/// is a no-op, and a reused slot never matches an old id.
+///
+/// Handle values must also be safe for bindings to hold in pointer-typed
+/// fields: Go's garbage collector throws on an `unsafe.Pointer` that lands
+/// in its heap arenas without naming a live object, and on values below
+/// 4096. So on 64-bit POSIX targets each id is encoded as an address inside
+/// a PROT_NONE reservation this process owns and never touches: a real,
+/// unique address that no allocator can ever return.
+const HandleRegistry = struct {
+    const chunk_len = 256;
+    const index_bits = 20;
+    const max_slots = 1 << index_bits;
+    const max_chunks = max_slots / chunk_len;
+    /// Handle values are 8-byte aligned offsets into the reservation.
+    const stride_shift = 3;
+    const reserve_address_space = @bitSizeOf(usize) == 64 and switch (builtin.os.tag) {
+        .linux, .macos, .freebsd, .netbsd, .openbsd, .dragonfly, .ios => true,
+        else => false,
+    };
+
+    const Slot = struct {
+        /// `generation << 1 | closing`. The slot is open for `generation`
+        /// exactly when the closing bit is clear.
+        state: std.atomic.Value(u64) = .init(0),
+        /// Calls that have entered, or are trying to, for any generation.
+        active: std.atomic.Value(u32) = .init(0),
+        handle: std.atomic.Value(?*Handle) = .init(null),
+        next_free: u32 = 0,
+    };
+
+    const Id = struct {
+        index: u32,
+        generation: u64,
+    };
+
+    chunks: [max_chunks]std.atomic.Value(?*[chunk_len]Slot) = @splat(.init(null)),
+    mutex: std.atomic.Mutex = .unlocked,
+    slot_count: u32 = 0,
+    free_head: ?u32 = null,
+    /// Start of the id reservation (0 until the first registration, or on
+    /// targets that use plain integer ids) and the generation width it fits.
+    base: std.atomic.Value(usize) = .init(0),
+    generation_bits: u6 = 0,
+
+    fn generationMask(self: *const HandleRegistry) u64 {
+        return (@as(u64, 1) << self.generation_bits) - 1;
+    }
+
+    /// Reserves the id address space on first use. Called with `mutex` held.
+    fn ensureIdSpace(self: *HandleRegistry) !void {
+        if (self.generation_bits != 0) return;
+        if (comptime !reserve_address_space) {
+            self.generation_bits = @bitSizeOf(usize) - index_bits - 1;
+            return;
+        }
+        // Prefer 17 generation bits (1 TiB of address space, no memory);
+        // step down if the platform limits reservations.
+        for ([_]u6{ 17, 13, 9 }) |bits| {
+            const len = @as(usize, 1) << (index_bits + bits + stride_shift);
+            const region = std.posix.mmap(null, len, .{}, .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .NORESERVE = true }, -1, 0) catch continue;
+            self.generation_bits = bits;
+            self.base.store(@intFromPtr(region.ptr), .release);
+            return;
+        }
+        return error.OutOfMemory;
+    }
+
+    fn encode(self: *const HandleRegistry, id: Id) *anyopaque {
+        const offset = (id.generation << index_bits | id.index);
+        if (comptime !reserve_address_space) {
+            // Plain ids; index + 1 keeps the value non-null.
+            return @ptrFromInt(@as(usize, @intCast(offset + 1)));
+        }
+        return @ptrFromInt(self.base.load(.acquire) + (@as(usize, @intCast(offset)) << stride_shift));
+    }
+
+    fn decode(ptr: ?*anyopaque) ?Id {
+        const raw = @intFromPtr(ptr orelse return null);
+        const offset: u64 = if (comptime !reserve_address_space) blk: {
+            break :blk @as(u64, raw) - 1;
+        } else blk: {
+            const base = handle_registry.base.load(.acquire);
+            if (base == 0 or raw < base) return null;
+            const delta = raw - base;
+            if (delta & ((1 << stride_shift) - 1) != 0) return null;
+            const offset = delta >> stride_shift;
+            if (offset >> index_bits > handle_registry.generationMask()) return null;
+            break :blk offset;
+        };
+        return .{
+            .index = @intCast(offset & (max_slots - 1)),
+            .generation = offset >> index_bits,
+        };
+    }
+
+    fn slotFor(self: *HandleRegistry, index: u32) ?*Slot {
+        const chunk_index = index / chunk_len;
+        if (chunk_index >= max_chunks) return null;
+        const chunk = self.chunks[chunk_index].load(.acquire) orelse return null;
+        return &chunk[index % chunk_len];
+    }
+
+    /// Publishes `handle` and returns the id callers hold.
+    fn register(self: *HandleRegistry, handle: *Handle) !*anyopaque {
+        antfly.platform_sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        try self.ensureIdSpace();
+        const index = if (self.free_head) |free| blk: {
+            self.free_head = if (self.slotFor(free).?.next_free == 0) null else self.slotFor(free).?.next_free - 1;
+            break :blk free;
+        } else blk: {
+            const index = self.slot_count;
+            const chunk_index = index / chunk_len;
+            if (chunk_index >= max_chunks) return error.OutOfMemory;
+            if (self.chunks[chunk_index].load(.acquire) == null) {
+                const chunk = try std.heap.page_allocator.create([chunk_len]Slot);
+                chunk.* = @splat(.{});
+                self.chunks[chunk_index].store(chunk, .release);
+            }
+            self.slot_count += 1;
+            break :blk index;
+        };
+        const slot = self.slotFor(index).?;
+        slot.handle.store(handle, .release);
+        const generation = slot.state.load(.acquire) >> 1;
+        return self.encode(.{ .index = index, .generation = generation });
+    }
+
+    /// Claims the slot for close. Returns the handle to free, or null when
+    /// the id is stale or another close already claimed it. Waits for every
+    /// call that entered (or is backing out) to leave first.
+    fn beginClose(self: *HandleRegistry, ptr: ?*anyopaque) ?struct { *Handle, Id } {
+        const id = decode(ptr) orelse return null;
+        const slot = self.slotFor(id.index) orelse return null;
+        if (slot.state.cmpxchgStrong(id.generation << 1, id.generation << 1 | 1, .seq_cst, .seq_cst) != null) return null;
+        // A call that counted itself before the closing bit was set may still
+        // be queued behind a handle lock, so poll rather than taking the lock:
+        // yield first, then back off so a long search does not spin a core.
+        var spins: u32 = 0;
+        while (slot.active.load(.seq_cst) != 0) : (spins +|= 1) {
+            if (spins < 64) {
+                std.Thread.yield() catch {};
+            } else {
+                handleLockIo().sleep(.fromMicroseconds(500), .awake) catch {};
+            }
+        }
+        const handle = slot.handle.swap(null, .acq_rel) orelse return null;
+        return .{ handle, id };
+    }
+
+    /// Releases a slot claimed by `beginClose` after its handle is freed.
+    fn finishClose(self: *HandleRegistry, id: Id) void {
+        const slot = self.slotFor(id.index).?;
+        antfly.platform_sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        if (id.generation >= self.generationMask()) {
+            // The slot has used every generation an id can encode. Wrapping
+            // would let an old id match a future handle, so retire it: the
+            // state stays claimed (closing bit set), which no id can enter or
+            // close, and the slot never returns to the free list.
+            return;
+        }
+        slot.state.store((id.generation + 1) << 1, .release);
+        slot.next_free = if (self.free_head) |free| free + 1 else 0;
+        self.free_head = id.index;
+    }
+};
+
+var handle_registry: HandleRegistry = .{};
+
+/// Registers a newly opened handle, closing it if registration fails. Only for
+/// callers that own `handle` outright and have no cleanup of their own left;
+/// storageOwnerOpen registers directly so its defers stay the only cleanup.
+fn publishHandle(handle: *Handle) !*anyopaque {
+    return handle_registry.register(handle) catch |err| {
+        closeHandle(handle);
+        return err;
+    };
+}
+
+/// Closes a handle id: rejects new calls, drains entered ones, frees it.
+/// Safe for stale ids and concurrent or repeated closes.
+fn closeHandleId(ptr: ?*anyopaque) void {
+    const handle, const id = handle_registry.beginClose(ptr) orelse return;
+    closeHandle(handle);
+    handle_registry.finishClose(id);
+}
+
+/// Tests that build a Handle on the stack register it to get a caller id,
+/// then retire the id without freeing the Handle.
+fn registerTestHandle(handle: *Handle) !*anyopaque {
+    return handle_registry.register(handle);
+}
+
+fn unregisterTestHandle(ptr: *anyopaque) void {
+    _, const id = handle_registry.beginClose(ptr) orelse return;
+    handle_registry.finishClose(id);
+}
+
+/// How an export may overlap with other calls on the same handle.
+const HandleAccess = enum {
+    /// Pure queries. Any number run in parallel with each other and with a
+    /// write; the storage layer serves them from pinned snapshots.
+    read,
+    /// Document writes, transactions, and storage rewrites (compact, vacuum).
+    /// One at a time per handle, concurrent with reads.
+    write,
+    /// Enrichment drains, replay, and snapshot copies. One at a time per
+    /// handle, concurrent with reads and writes, mirroring the background
+    /// maintenance workers that already run alongside them.
+    maintain,
+    /// Schema, index, enrichment, range, and restore changes. Waits for
+    /// in-flight calls and blocks new ones until done.
+    exclusive,
+};
+
+/// Held for the duration of one export call; see `enterHandle`.
+const HandleGuard = struct {
+    handle: *Handle,
+    slot: *HandleRegistry.Slot,
+    access: HandleAccess,
+
+    fn leave(self: HandleGuard) void {
+        const io = handleLockIo();
+        switch (self.access) {
+            .read => self.handle.api_lock.unlockShared(io),
+            .write => {
+                self.handle.write_mutex.unlock(io);
+                self.handle.api_lock.unlockShared(io);
+            },
+            .maintain => {
+                self.handle.maintenance_mutex.unlock(io);
+                self.handle.api_lock.unlockShared(io);
+            },
+            .exclusive => self.handle.api_lock.unlock(io),
+        }
+        _ = self.slot.active.fetchSub(1, .release);
+    }
+};
+
+/// The handle locks are called from arbitrary foreign threads, so they use
+/// the process-wide threaded Io, whose waits block the calling OS thread.
+fn handleLockIo() std.Io {
+    return std.Options.debug_io;
+}
+
+/// Entry point for every export that takes a DB handle. Returns null for a
+/// null handle or one that is being closed. Must be taken exactly once per
+/// export, at entry: the lock is not reentrant, so internal helpers must not
+/// call it again.
+fn enterHandle(ptr: ?*anyopaque, access: HandleAccess) ?HandleGuard {
+    const id = HandleRegistry.decode(ptr) orelse return null;
+    const slot = handle_registry.slotFor(id.index) orelse return null;
+    // Count the call before checking the slot state so close either sees this
+    // call and waits for it, or this call sees closing (or a newer
+    // generation) and backs out. Each side stores then loads the other's
+    // variable, so both need seq_cst: weaker orderings let both loads miss
+    // both stores. The slot itself is never freed, so this is safe even if
+    // the handle was closed before we got here.
+    _ = slot.active.fetchAdd(1, .seq_cst);
+    if (slot.state.load(.seq_cst) != id.generation << 1) {
+        _ = slot.active.fetchSub(1, .release);
+        return null;
+    }
+    const handle = slot.handle.load(.acquire) orelse {
+        _ = slot.active.fetchSub(1, .release);
+        return null;
+    };
+    const io = handleLockIo();
+    switch (access) {
+        .read => handle.api_lock.lockSharedUncancelable(io),
+        .write => {
+            handle.api_lock.lockSharedUncancelable(io);
+            handle.write_mutex.lockUncancelable(io);
+        },
+        .maintain => {
+            handle.api_lock.lockSharedUncancelable(io);
+            handle.maintenance_mutex.lockUncancelable(io);
+        },
+        .exclusive => handle.api_lock.lockUncancelable(io),
+    }
+    return .{ .handle = handle, .slot = slot, .access = access };
 }
 
 fn cleanupTestDir(path: []const u8) void {
@@ -3160,7 +3525,7 @@ pub export fn antfly_db_open(path: ?[*:0]const u8, out_handle: ?*?*anyopaque) ca
     out.* = null;
     const path_slice = cStringSpan(path) orelse return .invalid_argument;
     const handle = openDefaultDirectoryHandle(path_slice) catch |err| return capi.mapError(err);
-    out.* = handle;
+    out.* = publishHandle(handle) catch |err| return capi.mapError(err);
     return .ok;
 }
 
@@ -5664,8 +6029,13 @@ pub fn storageOwnerOpen(
         handle.db.activateResolverReplayRuntimes() catch |err| return storageOwnerStatusFromError(err);
         handle.db.startResidentBackgroundWorkersIfNeeded();
     }
+    // Register as the last fallible step: on failure the defers above close
+    // the DB and release the borrowed context exactly once, as for every
+    // earlier failure. (publishHandle's close-on-failure would release the
+    // context a second time.)
+    const owner_id = handle_registry.register(handle) catch |err| return storageOwnerStatusFromError(err);
     success = true;
-    out_owner.* = handle;
+    out_owner.* = owner_id;
     context_borrowed = false;
     return .ok;
 }
@@ -7815,6 +8185,8 @@ test "storage owner runtime status does not wait behind apply writer" {
         .storage_owner_group_id = 7,
     };
     defer handle.db.close();
+    const handle_id = try registerTestHandle(&handle);
+    defer unregisterTestHandle(handle_id);
 
     handle.db.core.lockApplyExclusive();
     defer handle.db.core.unlockApplyExclusive();
@@ -7822,7 +8194,7 @@ test "storage owner runtime status does not wait behind apply writer" {
     try std.testing.expectEqual(
         kernel_owner_abi.Status.busy,
         storageOwnerRuntimeStatusJson(
-            &handle,
+            handle_id,
             &.{ .table_name = .fromSlice("docs") },
             &response,
         ),
@@ -7850,6 +8222,8 @@ test "storage owner runtime status distinguishes absent and busy source vectors"
             .storage_owner_group_id = 7,
         };
         defer handle.db.close();
+        const handle_id = try registerTestHandle(&handle);
+        defer unregisterTestHandle(handle_id);
         handle.db.backend_runtime.durable_jobs.drainOwner(handle.db.repair_cleanup_owner_id);
         var response: kernel_owner_abi.OwnedBytes = .{};
         if (handle.db.source_vectors.load(.acquire)) |source| {
@@ -7858,7 +8232,7 @@ test "storage owner runtime status distinguishes absent and busy source vectors"
             while (!source.mutex.tryLock()) antfly.platform_time.yieldBriefly();
             defer source.mutex.unlock();
             try std.testing.expectEqual(kernel_owner_abi.Status.busy, storageOwnerRuntimeStatusJson(
-                &handle,
+                handle_id,
                 &.{ .table_name = .fromSlice("docs") },
                 &response,
             ));
@@ -7866,7 +8240,7 @@ test "storage owner runtime status distinguishes absent and busy source vectors"
             try std.testing.expect(response.ptr == null);
         } else try std.testing.expect(!with_source);
         try std.testing.expectEqual(kernel_owner_abi.Status.ok, storageOwnerRuntimeStatusJson(
-            &handle,
+            handle_id,
             &.{ .table_name = .fromSlice("docs") },
             &response,
         ));
@@ -8102,8 +8476,15 @@ fn openDefaultDirectoryHandle(path: []const u8) !*Handle {
 }
 
 pub export fn antfly_db_close(handle_ptr: ?*anyopaque) void {
-    const handle = asHandle(handle_ptr) orelse return;
-    closeHandle(handle);
+    // Stale ids and concurrent or repeated closes are no-ops.
+    closeHandleId(handle_ptr);
+}
+
+/// Threading contract of this library, like sqlite3_threadsafe(). Always
+/// ANTFLY_THREADING_SERIALIZED: every handle may be used from any thread,
+/// concurrently. See zig/CAPI.md "Thread Safety".
+pub export fn antfly_threading_mode() u32 {
+    return capi.threading_serialized;
 }
 
 pub export fn antfly_abi_version() u32 {
@@ -8168,6 +8549,7 @@ const LiteResolvedOpenOptions = struct {
     ttl_cleanup: ?db_mod.ttl_runtime.Config = null,
     inference: lite_backend.InferenceOpenOptions = .{},
     generated_enrichment_replay: bool = false,
+    busy_timeout_ms: u64 = 0,
 };
 
 fn optionFieldType(comptime Options: type, comptime field_name: []const u8) type {
@@ -8280,6 +8662,7 @@ fn resolveLiteOpenOptions(options_ptr: ?*const capi.LiteOpenOptions) !LiteResolv
             .process_memory_budget_mb = readOptionField(capi.LiteOpenOptions, options, abi_size, "inference_process_memory_budget_mb") orelse 0,
         },
         .generated_enrichment_replay = (flags & capi.lite_open_flag_generated_enrichment_replay) != 0,
+        .busy_timeout_ms = readOptionField(capi.LiteOpenOptions, options, abi_size, "busy_timeout_ms") orelse 0,
     };
     if ((flags & capi.lite_open_flag_ttl_cleanup) != 0) {
         const owner_id = readOptionField(capi.LiteOpenOptions, options, abi_size, "ttl_cleanup_owner_id") orelse capi.Slice{};
@@ -8336,6 +8719,7 @@ fn resolveOpenOptions(options_ptr: ?*const capi.OpenOptions) !LiteResolvedOpenOp
             .local_runtime_configured = (flags & capi.open_flag_local_runtime_configured) != 0,
         },
         .generated_enrichment_replay = (flags & capi.open_flag_generated_enrichment_replay) != 0,
+        .busy_timeout_ms = readOptionField(capi.OpenOptions, options, abi_size, "busy_timeout_ms") orelse 0,
     };
     if ((flags & capi.open_flag_ttl_cleanup) != 0) {
         const owner_id = readOptionField(capi.OpenOptions, options, abi_size, "ttl_cleanup_owner_id") orelse capi.Slice{};
@@ -8372,7 +8756,7 @@ fn openLiteHandle(
     const out = out_handle orelse return .invalid_argument;
     out.* = null;
     const handle = openLiteHandleAlloc(path, resolved, create) catch |err| return capi.mapError(err);
-    out.* = handle;
+    out.* = publishHandle(handle) catch |err| return capi.mapError(err);
     return .ok;
 }
 
@@ -8402,16 +8786,15 @@ pub fn openLiteHandleWithRuntime(
     backend_runtime: *db_mod.background_runtime.BackendRuntime,
     options: HostLiteOpenOptions,
 ) !*anyopaque {
-    return try openLiteHandleAllocWithRuntime(alloc, path, .{
+    return publishHandle(try openLiteHandleAllocWithRuntime(alloc, path, .{
         .open_mode = if (options.read_only) .query_readonly else .writer,
         .profile = if (options.hosted) .hosted else .native,
         .no_sync = options.no_sync,
-    }, options.create, io, backend_runtime);
+    }, options.create, io, backend_runtime));
 }
 
 pub fn closeLiteRuntimeHandle(handle_ptr: ?*anyopaque) void {
-    const handle = asHandle(handle_ptr) orelse return;
-    closeHandle(handle);
+    closeHandleId(handle_ptr);
 }
 
 fn openLiteHandleAllocWithRuntime(
@@ -8553,7 +8936,7 @@ fn openDirectoryHandle(
     out.* = null;
     if (create) return .invalid_argument;
     const handle = openDirectoryHandleAlloc(path, resolved) catch |err| return capi.mapError(err);
-    out.* = handle;
+    out.* = publishHandle(handle) catch |err| return capi.mapError(err);
     return .ok;
 }
 
@@ -8573,6 +8956,32 @@ fn openDirectoryHandleAlloc(path: []const u8, resolved: LiteResolvedOpenOptions)
 }
 
 fn openGenericHandle(
+    path: []const u8,
+    resolved: LiteResolvedOpenOptions,
+    create: bool,
+    out_handle: ?*?*anyopaque,
+) capi.ErrorCode {
+    const first = openGenericHandleOnce(path, resolved, create, out_handle);
+    if (first != .busy or resolved.busy_timeout_ms == 0) return first;
+    // Another writer holds the writer lock. A failed open releases everything
+    // it acquired, so retry the whole open with capped exponential backoff
+    // until `busy_timeout_ms` elapses, like sqlite3_busy_timeout.
+    const io = handleLockIo();
+    const deadline_ns = std.Io.Timestamp.now(io, .awake).toNanoseconds() +
+        @as(i96, resolved.busy_timeout_ms) * std.time.ns_per_ms;
+    var backoff_ms: i64 = 1;
+    while (true) {
+        const remaining_ns = deadline_ns - std.Io.Timestamp.now(io, .awake).toNanoseconds();
+        if (remaining_ns <= 0) return .busy;
+        const sleep_ns = @min(@as(i96, backoff_ms) * std.time.ns_per_ms, remaining_ns);
+        io.sleep(.fromNanoseconds(sleep_ns), .awake) catch return .busy;
+        const code = openGenericHandleOnce(path, resolved, create, out_handle);
+        if (code != .busy) return code;
+        backoff_ms = @min(backoff_ms * 2, 50);
+    }
+}
+
+fn openGenericHandleOnce(
     path: []const u8,
     resolved: LiteResolvedOpenOptions,
     create: bool,
@@ -8626,7 +9035,7 @@ pub export fn antfly_lite_open_with_options(path: ?[*:0]const u8, options: ?*con
     out.* = null;
     const path_slice = cStringSpan(path) orelse return .invalid_argument;
     const resolved = resolveLiteOpenOptions(options) catch |err| return capi.mapError(err);
-    return openLiteHandle(path_slice, resolved, false, out);
+    return openGenericHandle(path_slice, resolved, false, out);
 }
 
 pub export fn antfly_lite_create_with_options(path: ?[*:0]const u8, options: ?*const capi.LiteOpenOptions, out_handle: ?*?*anyopaque) capi.ErrorCode {
@@ -8634,7 +9043,7 @@ pub export fn antfly_lite_create_with_options(path: ?[*:0]const u8, options: ?*c
     out.* = null;
     const path_slice = cStringSpan(path) orelse return .invalid_argument;
     const resolved = resolveLiteOpenOptions(options) catch |err| return capi.mapError(err);
-    return openLiteHandle(path_slice, resolved, true, out);
+    return openGenericHandle(path_slice, resolved, true, out);
 }
 
 pub export fn antfly_lite_open_hosted(path: ?[*:0]const u8, out_handle: ?*?*anyopaque) capi.ErrorCode {
@@ -8677,7 +9086,9 @@ fn resetOutBuffer(out_buf: ?*capi.Buffer) ?*capi.Buffer {
 
 pub export fn antfly_lite_capabilities_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
     const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     if (handle.owned_lite_backend == null) return .invalid_argument;
     const profile = handle.lite_profile orelse .native;
     const inference = handle.lite_inference_status orelse lite_backend.inferenceStatusForProfile(profile);
@@ -8687,7 +9098,9 @@ pub export fn antfly_lite_capabilities_json(handle_ptr: ?*anyopaque, out_buf: ?*
 
 pub export fn antfly_lite_status_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
     const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     const backend = if (handle.owned_lite_backend) |*backend| backend else return .invalid_argument;
 
     const stats = handle.db.stats(handle.alloc) catch |err| return capi.mapError(err);
@@ -8712,8 +9125,10 @@ pub export fn antfly_lite_status_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.B
 }
 
 pub export fn antfly_lite_backup(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
+    const guard = enterHandle(handle_ptr, .maintain) orelse return .invalid_argument;
+    defer guard.leave();
     const out_buf_ptr = resetOutBuffer(out_buf) orelse return .invalid_argument;
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const handle = guard.handle;
     if (handle.owned_lite_backend == null) return .invalid_argument;
 
     var out = std.ArrayList(u8).empty;
@@ -8727,11 +9142,14 @@ pub export fn antfly_lite_backup(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer
 }
 
 pub export fn antfly_lite_export(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
+    // Alias: the target export takes the handle guard.
     return antfly_lite_backup(handle_ptr, out_buf);
 }
 
 pub export fn antfly_lite_import_backup(handle_ptr: ?*anyopaque, backup: capi.Slice) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     if (handle.owned_lite_backend == null) return .invalid_argument;
     if (backup.len == 0) return .invalid_argument;
     if (backup.ptr == null and backup.len != 0) return .invalid_argument;
@@ -8741,6 +9159,7 @@ pub export fn antfly_lite_import_backup(handle_ptr: ?*anyopaque, backup: capi.Sl
 }
 
 pub export fn antfly_lite_import(handle_ptr: ?*anyopaque, backup: capi.Slice) capi.ErrorCode {
+    // Alias: the target export takes the handle guard.
     return antfly_lite_import_backup(handle_ptr, backup);
 }
 
@@ -8807,7 +9226,9 @@ pub export fn antfly_lite_restore_backup_file_json(
 
 pub export fn antfly_lite_check_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
     const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     if (handle.owned_lite_backend) |*backend| {
         out.* = stringifyJson(backend.check() catch |err| return capi.mapError(err)) catch return .internal;
         return .ok;
@@ -8831,7 +9252,9 @@ pub export fn antfly_lite_copy_stable_snapshot_json(
     out_buf: ?*capi.Buffer,
 ) capi.ErrorCode {
     const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .maintain) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     if (handle.owned_lite_backend) |*backend| {
         const dest = cStringSpan(dest_path) orelse return .invalid_argument;
         out.* = stringifyJson(backend.copyStableSnapshot(dest, replace) catch |err| return capi.mapError(err)) catch return .internal;
@@ -8869,7 +9292,9 @@ fn prepareLiteCompact(handle: *Handle) !void {
 
 pub export fn antfly_lite_compact_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
     const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .write) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     if (handle.owned_lite_backend) |*backend| {
         prepareLiteCompact(handle) catch |err| return capi.mapError(err);
         const report = LiteCompactReport{
@@ -8884,7 +9309,9 @@ pub export fn antfly_lite_compact_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.
 
 pub export fn antfly_lite_vacuum_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
     const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .write) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     if (handle.owned_lite_backend) |*backend| {
         out.* = stringifyJson(backend.vacuum() catch |err| return capi.mapError(err)) catch return .internal;
         return .ok;
@@ -8893,7 +9320,9 @@ pub export fn antfly_lite_vacuum_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.B
 }
 
 pub export fn antfly_lite_run_until_idle(handle_ptr: ?*anyopaque) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .maintain) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     if (handle.owned_lite_backend == null) return .invalid_argument;
     handle.db.runUntilIdle() catch |err| return capi.mapError(err);
     return .ok;
@@ -8901,7 +9330,9 @@ pub export fn antfly_lite_run_until_idle(handle_ptr: ?*anyopaque) capi.ErrorCode
 
 pub export fn antfly_lite_run_until_idle_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
     const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .maintain) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     if (handle.owned_lite_backend == null) return .invalid_argument;
     handle.db.runUntilIdle() catch |err| {
         writeRunUntilIdleNoProgressDiagnosticIfAny(&handle.db, out, err);
@@ -8917,7 +9348,9 @@ const LiteReplayGeneratedEnrichmentsReport = struct {
 
 pub export fn antfly_lite_replay_generated_enrichments_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
     const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .maintain) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     if (handle.owned_lite_backend == null) return .invalid_argument;
     const replayed = handle.db.replayGeneratedEnrichmentsFromStoredDocs(handle.alloc) catch |err| return capi.mapError(err);
     out.* = stringifyJson(LiteReplayGeneratedEnrichmentsReport{ .replayed = replayed }) catch return .internal;
@@ -8926,7 +9359,9 @@ pub export fn antfly_lite_replay_generated_enrichments_json(handle_ptr: ?*anyopa
 
 pub export fn antfly_lite_pending_work_stats_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
     const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     if (handle.owned_lite_backend == null) return .invalid_argument;
     out.* = stringifyJson(handle.db.pendingWorkStats()) catch return .internal;
     return .ok;
@@ -9110,7 +9545,9 @@ pub export fn antfly_db_set_readable_lease_hook(
     callback_ctx: ?*anyopaque,
     callback: ?ReadableLeaseHookFn,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     if (callback) |hook| {
         handle.readable_lease_hook = .{
             .group_id = group_id,
@@ -9704,7 +10141,7 @@ fn searchDenseOwnedProfiled(
     }
     const lookup_end = monotonicNowNs();
 
-    const req: db_mod.types.SearchRequest = .{
+    var req: db_mod.types.SearchRequest = .{
         .index_name = index_name,
         .query = .{ .dense_knn = .{
             .vector = vector,
@@ -9713,13 +10150,15 @@ fn searchDenseOwnedProfiled(
         .limit = limit,
         .offset = offset,
         .include_stored = false,
-        .identity_read_generation = identity_read_generation,
     };
 
+    // The export already ran prepareDenseSearchRequest, so skip the generic
+    // lease hook; restamp and retry like the other search paths.
     const fallback_start = monotonicNowNs();
-    var result = try executeLocalSearch(handle, req);
+    var result = try runAtStampedGenerationWithOptions(handle, &req, LocalSearchQuery{}, .{ .prepare = false });
     defer result.deinit();
     const fallback_end = monotonicNowNs();
+    const fallback_generation = req.identity_read_generation.?;
 
     const ids = try handle.alloc.alloc([]const u8, result.hits.len);
     errdefer handle.alloc.free(ids);
@@ -9742,7 +10181,7 @@ fn searchDenseOwnedProfiled(
             .total_hits = result.total_hits,
             .ids = ids,
             .scores = scores,
-            .identity_read_generation = identity_read_generation,
+            .identity_read_generation = fallback_generation,
         },
         .total_ns = @intCast(total_end - total_start),
         .index_lookup_ns = @intCast(lookup_end - lookup_start),
@@ -9850,20 +10289,17 @@ fn searchTextOwned(
     // does not resolve to an existing index still fails inside
     // executeLocalSearch below.
     const resolved_index_name = if (index_name.len == 0) tables_api.default_full_text_index_name else index_name;
-    const identity_read_generation = try currentIdentityReadGenerationForHandle(handle, null);
 
-    const req: db_mod.types.SearchRequest = .{
+    var req: db_mod.types.SearchRequest = .{
         .index_name = resolved_index_name,
         .query = query,
         .limit = limit,
         .offset = offset,
         .include_stored = false,
-        .identity_read_generation = identity_read_generation,
     };
-
-    try handle.prepareSearchRequest(req);
-    var result = try executeLocalSearch(handle, req);
+    var result = try runAtStampedGeneration(handle, &req, LocalSearchQuery{});
     defer result.deinit();
+    const identity_read_generation = req.identity_read_generation.?;
 
     const ids = try handle.alloc.alloc([]const u8, result.hits.len);
     errdefer handle.alloc.free(ids);
@@ -9909,7 +10345,9 @@ pub export fn antfly_db_begin_transaction_with_id(
     participants_ptr: ?[*]const capi.Slice,
     participant_count: usize,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .write) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     const txn_id = txn_id_ptr orelse return .invalid_argument;
     beginWithIdAndParticipants(handle, txn_id.*, timestamp_ns, participants_ptr, participant_count) catch |err| return capi.mapError(err);
     return .ok;
@@ -9923,7 +10361,9 @@ pub export fn antfly_db_write_transaction(
     predicates_ptr: ?[*]const capi.VersionPredicate,
     predicate_count: usize,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .write) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     const txn_id = txn_id_ptr orelse return .invalid_argument;
     if ((write_count > 0 and writes_ptr == null) or (predicate_count > 0 and predicates_ptr == null)) return .invalid_argument;
     writeIntentsInternal(handle, txn_id.*, writes_ptr, write_count, predicates_ptr, predicate_count) catch |err| return capi.mapError(err);
@@ -9939,7 +10379,9 @@ pub export fn antfly_db_batch(
     timestamp_ns: u64,
     sync_level: u8,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .write) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     if ((write_count > 0 and writes_ptr == null) or (predicate_count > 0 and predicates_ptr == null)) return .invalid_argument;
     batchInternal(handle, writes_ptr, write_count, predicates_ptr, predicate_count, timestamp_ns, sync_level) catch |err| return capi.mapError(err);
     return .ok;
@@ -9950,7 +10392,9 @@ pub export fn antfly_db_batch_json(
     request_json: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .write) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     var owned = batch_api.parseBatchRequest(handle.alloc, request_json.bytes()) catch |err| return capi.mapError(err);
     defer owned.deinit(handle.alloc);
 
@@ -9969,7 +10413,9 @@ pub export fn antfly_db_resolve_intents(
     status: u8,
     commit_version: u64,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .write) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     const txn_id = txn_id_ptr orelse return .invalid_argument;
     const txn_status: transactions_mod.TxnStatus = switch (status) {
         0 => .pending,
@@ -9986,9 +10432,11 @@ pub export fn antfly_db_get_transaction_status(
     txn_id_ptr: ?*const [16]u8,
     out_status: ?*u8,
 ) capi.ErrorCode {
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
     const out = out_status orelse return .invalid_argument;
     out.* = 0;
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const handle = guard.handle;
     const txn_id = txn_id_ptr orelse return .invalid_argument;
     const status = handle.db.getTransactionStatus(txn_id.*) catch |err| return capi.mapError(err);
     out.* = @intFromEnum(status);
@@ -10000,9 +10448,11 @@ pub export fn antfly_db_get_commit_version(
     txn_id_ptr: ?*const [16]u8,
     out_commit_version: ?*u64,
 ) capi.ErrorCode {
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
     const out = out_commit_version orelse return .invalid_argument;
     out.* = 0;
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const handle = guard.handle;
     const txn_id = txn_id_ptr orelse return .invalid_argument;
     out.* = handle.db.getCommitVersion(txn_id.*) catch |err| return capi.mapError(err);
     return .ok;
@@ -10013,7 +10463,9 @@ pub export fn antfly_db_get_timestamp(
     key: capi.Slice,
     out_timestamp: *u64,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     out_timestamp.* = handle.db.getTimestamp(handle.alloc, key.bytes()) catch |err| return capi.mapError(err);
     return .ok;
 }
@@ -10023,7 +10475,9 @@ pub export fn antfly_db_lookup_json(
     key: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     handle.prepareLookupRequest(key.bytes(), .{}) catch |err| return capi.mapError(err);
     const result = handle.db.getDocument(handle.alloc, key.bytes(), .{}) catch |err| return capi.mapError(err);
     if (result == null) return .not_found;
@@ -10039,7 +10493,9 @@ pub export fn antfly_db_get_raw(
     key: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     const result = handle.db.get(handle.alloc, key.bytes()) catch |err| return capi.mapError(err);
     if (result == null) return .not_found;
     out_buf.* = .{
@@ -10054,7 +10510,9 @@ pub export fn antfly_db_lookup_artifact_json(
     artifact_id_b64: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     handle.prepareLookupRequest(artifact_id_b64.bytes(), .{}) catch |err| return capi.mapError(err);
     const artifact_id = decodeBase64Alloc(handle.alloc, artifact_id_b64.bytes()) catch return .invalid_argument;
     defer handle.alloc.free(artifact_id);
@@ -10092,7 +10550,9 @@ pub export fn antfly_db_get_schema_json(
     handle_ptr: ?*anyopaque,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     if (handle.db.getSchemaJson(handle.alloc) catch |err| return capi.mapError(err)) |schema_json| {
         out_buf.* = .{ .ptr = schema_json.ptr, .len = schema_json.len };
     } else {
@@ -10105,13 +10565,17 @@ pub export fn antfly_db_set_schema_json(
     handle_ptr: ?*anyopaque,
     schema_json: capi.Slice,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     handle.db.setSchemaJson(handle.alloc, schema_json.bytes()) catch |err| return capi.mapError(err);
     return .ok;
 }
 
 pub export fn antfly_db_run_until_idle(handle_ptr: ?*anyopaque) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .maintain) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     handle.db.runUntilIdle() catch |err| return capi.mapError(err);
     return .ok;
 }
@@ -10120,7 +10584,9 @@ pub export fn antfly_db_run_until_idle_json(
     handle_ptr: ?*anyopaque,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .maintain) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     handle.db.runUntilIdle() catch |err| {
         writeRunUntilIdleNoProgressDiagnosticIfAny(&handle.db, out_buf, err);
         return capi.mapError(err);
@@ -10149,7 +10615,9 @@ pub export fn antfly_db_pending_work_stats_json(
     handle_ptr: ?*anyopaque,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     out_buf.* = stringifyJson(handle.db.pendingWorkStats()) catch return .internal;
     return .ok;
 }
@@ -10159,7 +10627,9 @@ fn antflyDbExtractEnrichmentsJson(
     request_json: capi.Slice,
     out_buf: *capi.Buffer,
 ) callconv(.c) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     const writes = decodeBatchWritesRequest(handle.alloc, request_json.bytes()) catch return .invalid_argument;
     defer freeOwnedBatchWrites(handle.alloc, writes);
 
@@ -10178,7 +10648,9 @@ fn antflyDbComputeEnrichmentsJson(
     request_json: capi.Slice,
     out_buf: *capi.Buffer,
 ) callconv(.c) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     const writes = decodeBatchWritesRequest(handle.alloc, request_json.bytes()) catch return .invalid_argument;
     defer freeOwnedBatchWrites(handle.alloc, writes);
 
@@ -10208,7 +10680,9 @@ pub export fn antfly_db_update_range(
     start: capi.Slice,
     end: capi.Slice,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     handle.db.updateRange(.{
         .start = start.bytes(),
         .end = end.bytes(),
@@ -10220,7 +10694,9 @@ pub export fn antfly_db_get_range_json(
     handle_ptr: ?*anyopaque,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     var payload = JsonRange.init(handle.alloc, handle.db.getRange()) catch return .internal;
     defer payload.deinit(handle.alloc);
     out_buf.* = stringifyJson(payload) catch return .internal;
@@ -10231,7 +10707,9 @@ pub export fn antfly_db_get_split_state_json(
     handle_ptr: ?*anyopaque,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     const state = handle.db.getSplitState(handle.alloc) catch |err| return capi.mapError(err);
     if (state == null) return .not_found;
     var payload = JsonSplitState.init(handle.alloc, state.?) catch return .internal;
@@ -10245,7 +10723,9 @@ pub export fn antfly_db_set_split_state_json(
     handle_ptr: ?*anyopaque,
     state_json: capi.Slice,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     const ParsedState = struct {
         phase: u8,
         split_key_b64: []const u8,
@@ -10278,7 +10758,9 @@ pub export fn antfly_db_set_split_state_json(
 }
 
 pub export fn antfly_db_clear_split_state(handle_ptr: ?*anyopaque) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     handle.db.clearSplitState() catch |err| return capi.mapError(err);
     return .ok;
 }
@@ -10287,7 +10769,9 @@ pub export fn antfly_db_get_split_delta_seq(
     handle_ptr: ?*anyopaque,
     out_seq: *u64,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     out_seq.* = handle.db.getSplitDeltaSeq();
     return .ok;
 }
@@ -10296,7 +10780,9 @@ pub export fn antfly_db_get_split_delta_final_seq(
     handle_ptr: ?*anyopaque,
     out_seq: *u64,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     out_seq.* = handle.db.getSplitDeltaFinalSeq(handle.alloc) catch |err| return capi.mapError(err);
     return .ok;
 }
@@ -10305,13 +10791,17 @@ pub export fn antfly_db_set_split_delta_final_seq(
     handle_ptr: ?*anyopaque,
     seq: u64,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     handle.db.setSplitDeltaFinalSeq(seq) catch |err| return capi.mapError(err);
     return .ok;
 }
 
 pub export fn antfly_db_clear_split_delta_final_seq(handle_ptr: ?*anyopaque) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     handle.db.clearSplitDeltaFinalSeq() catch |err| return capi.mapError(err);
     return .ok;
 }
@@ -10321,7 +10811,9 @@ pub export fn antfly_db_list_split_delta_entries_after_json(
     after_seq: u64,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     const entries = handle.db.listSplitDeltaEntriesAfter(handle.alloc, after_seq) catch |err| return capi.mapError(err);
     defer db_mod.types.freeSplitDeltaEntries(handle.alloc, entries);
 
@@ -10341,7 +10833,9 @@ pub export fn antfly_db_list_split_delta_entries_after_json(
 }
 
 pub export fn antfly_db_clear_split_delta_entries(handle_ptr: ?*anyopaque) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     handle.db.clearSplitDeltaEntries() catch |err| return capi.mapError(err);
     return .ok;
 }
@@ -10350,7 +10844,9 @@ pub export fn antfly_db_list_indexes_json(
     handle_ptr: ?*anyopaque,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     const configs = handle.db.listIndexes(handle.alloc) catch |err| return capi.mapError(err);
     defer db_mod.types.freeIndexConfigs(handle.alloc, configs);
 
@@ -10372,7 +10868,9 @@ pub export fn antfly_db_list_enrichments_json(
     handle_ptr: ?*anyopaque,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     const configs = handle.db.listEnrichments(handle.alloc) catch |err| return capi.mapError(err);
     defer db_mod.types.freeEnrichmentConfigs(handle.alloc, configs);
     out_buf.* = stringifyJson(configs) catch return .internal;
@@ -10384,7 +10882,9 @@ pub export fn antfly_db_scan_json(
     request_json: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     const Request = struct {
         from_key_b64: []const u8 = "",
         to_key_b64: []const u8 = "",
@@ -10449,7 +10949,9 @@ pub export fn antfly_db_scan_hashes(
     request_json: capi.Slice,
     out_result: *capi.ScanHashResult,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     const Request = struct {
         from_key_b64: []const u8 = "",
         to_key_b64: []const u8 = "",
@@ -10509,7 +11011,9 @@ pub export fn antfly_db_stats_json(
     handle_ptr: ?*anyopaque,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     const bytes = dbStatsJsonAlloc(handle) catch |err| return capi.mapError(err);
     out_buf.* = .{ .ptr = bytes.ptr, .len = bytes.len };
     return .ok;
@@ -10865,10 +11369,13 @@ fn searchPublicQueryJson(
     ) catch |err| return capi.mapError(err);
     defer owned.deinit(handle.alloc);
 
-    stampSearchRequestIdentityGeneration(handle, &owned.req) catch |err| return capi.mapError(err);
-    handle.prepareSearchRequest(owned.req) catch |err| return capi.mapError(err);
-
-    var result = handle.db.search(handle.alloc, owned.req) catch |err| return capi.mapError(err);
+    const DbSearchQuery = struct {
+        const Result = db_mod.types.SearchResult;
+        fn run(_: @This(), h: *Handle, req: db_mod.types.SearchRequest) !Result {
+            return h.db.search(h.alloc, req);
+        }
+    };
+    var result = runAtStampedGeneration(handle, &owned.req, DbSearchQuery{}) catch |err| return capi.mapError(err);
     defer result.deinit();
 
     var response = query_api.encodeQueryResponses(
@@ -10889,7 +11396,9 @@ pub export fn antfly_db_search_json(
     request_json: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     if (requestLooksLikePublicQueryJson(request_json.bytes())) {
         return searchPublicQueryJson(handle, "docs", request_json, out_buf);
     }
@@ -10979,9 +11488,7 @@ pub export fn antfly_db_search_json(
         return .invalid_argument;
     }
 
-    stampSearchRequestIdentityGeneration(handle, &req) catch |err| return capi.mapError(err);
-    handle.prepareSearchRequest(req) catch |err| return capi.mapError(err);
-    var result = executeLocalSearch(handle, req) catch |err| return capi.mapError(err);
+    var result = runAtStampedGeneration(handle, &req, LocalSearchQuery{}) catch |err| return capi.mapError(err);
     defer result.deinit();
 
     var aggregation_results: []JsonSearchAggregationResult = &.{};
@@ -11057,7 +11564,9 @@ pub export fn antfly_db_search_dense(
     offset: u32,
     out_result: *capi.PackedDenseSearchResult,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     if (vector_ptr == null or vector_len == 0) return .invalid_argument;
     handle.prepareDenseSearchRequest(index_name.bytes(), vector_ptr.?[0..vector_len], k, limit, offset) catch |err| return capi.mapError(err);
     const identity_read_generation = currentIdentityReadGenerationForHandle(handle, null) catch |err| return capi.mapError(err);
@@ -11082,7 +11591,9 @@ pub export fn antfly_db_search_dense_profile(
     offset: u32,
     out_profile: *capi.DenseSearchProfile,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     if (vector_ptr == null or vector_len == 0) return .invalid_argument;
     handle.prepareDenseSearchRequest(index_name.bytes(), vector_ptr.?[0..vector_len], k, limit, offset) catch |err| return capi.mapError(err);
 
@@ -11118,7 +11629,9 @@ pub export fn antfly_db_search_dense_profile(
 }
 
 pub export fn antfly_db_dense_noop(handle_ptr: ?*anyopaque) capi.ErrorCode {
-    _ = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    _ = guard.handle;
     return .ok;
 }
 
@@ -11126,7 +11639,9 @@ pub export fn antfly_db_dense_fixed_packed_result(
     handle_ptr: ?*anyopaque,
     out_result: *capi.PackedDenseSearchResult,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
 
     const ids = [_][]const u8{ "doc-fixed-1", "doc-fixed-2", "doc-fixed-3" };
     const scores = [_]f32{ 0.125, 0.25, 0.5 };
@@ -11139,7 +11654,9 @@ pub export fn antfly_db_search_dense_wire(
     request_buf: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
 
     var req = search_wire.decodeDenseRequest(handle.alloc, request_buf.bytes()) catch |err| return capi.mapError(err);
     defer search_wire.freeDenseRequest(handle.alloc, &req);
@@ -11165,7 +11682,9 @@ pub export fn antfly_db_search_dense_wire_profile(
     out_buf: *capi.Buffer,
     out_profile: *capi.DenseWireSearchProfile,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
 
     var req = search_wire.decodeDenseRequest(handle.alloc, request_buf.bytes()) catch |err| return capi.mapError(err);
     defer search_wire.freeDenseRequest(handle.alloc, &req);
@@ -11211,7 +11730,9 @@ pub export fn antfly_db_search_text_match(
     offset: u32,
     out_result: *capi.DenseSearchResult,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     var owned = searchTextMatchOwned(handle, index_name.bytes(), field.bytes(), text.bytes(), "", 1.0, limit, offset) catch |err| return capi.mapError(err);
     defer owned.deinit();
 
@@ -11247,7 +11768,9 @@ pub export fn antfly_db_search_text_match_wire(
     request_buf: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
 
     var req = search_wire.decodeTextMatchRequest(handle.alloc, request_buf.bytes()) catch |err| return capi.mapError(err);
     defer search_wire.freeTextMatchRequest(handle.alloc, &req);
@@ -11264,7 +11787,9 @@ pub export fn antfly_db_search_text_term_wire(
     request_buf: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
 
     var req = search_wire.decodeTextTermRequest(handle.alloc, request_buf.bytes()) catch |err| return capi.mapError(err);
     defer search_wire.freeTextTermRequest(handle.alloc, &req);
@@ -11281,7 +11806,9 @@ pub export fn antfly_db_search_text_match_phrase_wire(
     request_buf: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
 
     var req = search_wire.decodeTextMatchPhraseRequest(handle.alloc, request_buf.bytes()) catch |err| return capi.mapError(err);
     defer search_wire.freeTextMatchPhraseRequest(handle.alloc, &req);
@@ -11298,7 +11825,9 @@ pub export fn antfly_db_search_hits_json(
     request_json: capi.Slice,
     out_result: *capi.DenseSearchResult,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     const Request = struct {
         mode: []const u8,
         index_name: []const u8 = "",
@@ -11361,9 +11890,7 @@ pub export fn antfly_db_search_hits_json(
         return .invalid_argument;
     }
 
-    stampSearchRequestIdentityGeneration(handle, &req) catch |err| return capi.mapError(err);
-    handle.prepareSearchRequest(req) catch |err| return capi.mapError(err);
-    var result = executeLocalSearch(handle, req) catch |err| return capi.mapError(err);
+    var result = runAtStampedGeneration(handle, &req, LocalSearchQuery{}) catch |err| return capi.mapError(err);
     defer result.deinit();
     if (result.graph_results.len > 0) return .invalid_argument;
 
@@ -11901,7 +12428,9 @@ pub export fn antfly_db_execute_graph_queries_json(
     request_json: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     const Request = struct {
         graph_queries: []const JsonGraphQueryRequest,
         named_sets: []const JsonNamedGraphInputSetRequest,
@@ -11934,9 +12463,18 @@ pub export fn antfly_db_execute_graph_queries_json(
         .identity_read_generation = parsed.value.identity_read_generation,
     };
 
-    stampSearchRequestIdentityGeneration(handle, &req) catch |err| return capi.mapError(err);
-    handle.prepareSearchRequest(req) catch |err| return capi.mapError(err);
-    const results = handle.db.executeNamedGraphQueries(handle.alloc, req, graph_queries, named_sets) catch |err| return capi.mapError(err);
+    const GraphQuery = struct {
+        graph_queries: []const db_mod.types.NamedGraphQuery,
+        named_sets: []const db_mod.types.NamedGraphInputSet,
+        const Result = []db_mod.types.GraphSearchResult;
+        fn run(self: @This(), h: *Handle, r: db_mod.types.SearchRequest) !Result {
+            return h.db.executeNamedGraphQueries(h.alloc, r, self.graph_queries, self.named_sets);
+        }
+    };
+    const results = runAtStampedGeneration(handle, &req, GraphQuery{
+        .graph_queries = graph_queries,
+        .named_sets = named_sets,
+    }) catch |err| return capi.mapError(err);
     defer {
         for (results) |*result| result.deinit(handle.alloc);
         if (results.len > 0) handle.alloc.free(results);
@@ -11961,7 +12499,9 @@ pub export fn antfly_db_aggregate_hits_json(
     request_json: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     var parsed = std.json.parseFromSlice(JsonAggregateHitsRequest, handle.alloc, request_json.bytes(), .{}) catch return .invalid_argument;
     defer parsed.deinit();
 
@@ -13080,7 +13620,9 @@ pub export fn antfly_db_add_index_json(
     handle_ptr: ?*anyopaque,
     config_json: capi.Slice,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     const Request = struct {
         name: []const u8,
         kind: []const u8,
@@ -13163,9 +13705,11 @@ pub export fn antfly_db_delete_index(
     name: capi.Slice,
     out_deleted: ?*bool,
 ) capi.ErrorCode {
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    defer guard.leave();
     const out = out_deleted orelse return .invalid_argument;
     out.* = false;
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const handle = guard.handle;
     out.* = handle.db.deleteIndex(name.bytes()) catch |err| return capi.mapError(err);
     return .ok;
 }
@@ -13174,7 +13718,9 @@ pub export fn antfly_db_add_enrichment_json(
     handle_ptr: ?*anyopaque,
     config_json: capi.Slice,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     var parsed = std.json.parseFromSlice(db_mod.types.EnrichmentConfig, handle.alloc, config_json.bytes(), .{
         .ignore_unknown_fields = true,
     }) catch return .invalid_argument;
@@ -13190,9 +13736,11 @@ pub export fn antfly_db_delete_enrichment(
     name: capi.Slice,
     out_deleted: ?*bool,
 ) capi.ErrorCode {
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    defer guard.leave();
     const out = out_deleted orelse return .invalid_argument;
     out.* = false;
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const handle = guard.handle;
     const kind = parseEnrichmentKind(kind_slice.bytes()) orelse return .invalid_argument;
     out.* = handle.db.deleteEnrichment(kind, name.bytes()) catch |err| return capi.mapError(err);
     return .ok;
@@ -13206,7 +13754,9 @@ pub export fn antfly_db_get_edges_json(
     direction: u8,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     const dir: db_mod.types.GraphEdgeDirection = switch (direction) {
         0 => .out,
         1 => .in,
@@ -13302,7 +13852,9 @@ pub export fn antfly_db_traverse_edges_json(
     request_json: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     const Request = struct {
         index_name: []const u8,
         start_key_b64: []const u8,
@@ -13358,7 +13910,9 @@ pub export fn antfly_db_get_neighbors_json(
     direction: u8,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     const dir: db_mod.types.GraphEdgeDirection = switch (direction) {
         0 => .out,
         1 => .in,
@@ -13386,7 +13940,9 @@ pub export fn antfly_db_find_shortest_path_json(
     request_json: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     const Request = struct {
         index_name: []const u8,
         source_b64: []const u8,
@@ -13430,7 +13986,9 @@ pub export fn antfly_db_find_k_shortest_paths_json(
     request_json: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     const Request = struct {
         index_name: []const u8,
         source_b64: []const u8,
@@ -13482,7 +14040,9 @@ pub export fn antfly_db_match_pattern_json(
     request_json: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     const JsonPatternNodeFilter = struct {
         filter_prefix: []const u8 = "",
         query_json: []const u8 = "",
@@ -13573,13 +14133,17 @@ pub export fn antfly_db_create_shadow_index_manager(
     split_key: capi.Slice,
     original_range_end: capi.Slice,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     handle.db.createShadowIndexManager(split_key.bytes(), original_range_end.bytes()) catch |err| return capi.mapError(err);
     return .ok;
 }
 
 pub export fn antfly_db_close_shadow_index_manager(handle_ptr: ?*anyopaque) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     handle.db.closeShadowIndexManager() catch |err| return capi.mapError(err);
     return .ok;
 }
@@ -13588,7 +14152,9 @@ pub export fn antfly_db_get_shadow_index_dir(
     handle_ptr: ?*anyopaque,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     const dir = handle.db.getShadowIndexDir();
     if (dir.len == 0) return .not_found;
     out_buf.* = dupBytes(dir) catch return .internal;
@@ -13599,7 +14165,9 @@ pub export fn antfly_db_find_median_key(
     handle_ptr: ?*anyopaque,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     const key = handle.db.findMedianKey(handle.alloc) catch |err| return capi.mapError(err);
     defer handle.alloc.free(key);
     out_buf.* = dupBytes(key) catch return .internal;
@@ -13615,7 +14183,9 @@ pub export fn antfly_db_split(
     dest_dir2: capi.Slice,
     prepare_only: bool,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     handle.db.split(
         .{
             .start = curr_start.bytes(),
@@ -13634,7 +14204,9 @@ pub export fn antfly_db_finalize_split(
     new_start: capi.Slice,
     new_end: capi.Slice,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     handle.db.finalizeSplit(.{
         .start = new_start.bytes(),
         .end = new_end.bytes(),
@@ -13647,7 +14219,9 @@ pub export fn antfly_db_snapshot(
     id: capi.Slice,
     out_size: *u64,
 ) capi.ErrorCode {
-    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const guard = enterHandle(handle_ptr, .write) orelse return .invalid_argument;
+    defer guard.leave();
+    const handle = guard.handle;
     out_size.* = handle.db.snapshot(id.bytes()) catch |err| return capi.mapError(err);
     return .ok;
 }
@@ -14714,6 +15288,204 @@ test "capi lite exposes hosted and status-only profiles" {
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_batch(status_handle, &writes, writes.len, null, 0, 2_000, 0));
 }
 
+test "capi handle ids are safe to use after close and across slot reuse" {
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
+    const alloc = std.testing.allocator;
+    const path_a = try tempTestAflitePath(alloc, test_tmp.path(), "capi-handle-id-a");
+    defer alloc.free(path_a);
+    const path_b = try tempTestAflitePath(alloc, test_tmp.path(), "capi-handle-id-b");
+    defer alloc.free(path_b);
+    cleanupTestFile(path_a);
+    defer cleanupTestFile(path_a);
+    cleanupTestFile(path_b);
+    defer cleanupTestFile(path_b);
+
+    var a: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(path_a, &a));
+    var out: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_status_json(a, &out));
+    antfly_buffer_free(&out);
+
+    antfly_db_close(a);
+    // Use after close and repeated close are defined: no access to freed memory.
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_status_json(a, &out));
+    antfly_db_close(a);
+
+    // The next handle reuses the freed slot under a new generation, so the
+    // stale id neither matches it nor closes it.
+    var b: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(path_b, &b));
+    defer antfly_db_close(b);
+    try std.testing.expect(a != b);
+    try std.testing.expectEqual(HandleRegistry.decode(a).?.index, HandleRegistry.decode(b).?.index);
+    if (HandleRegistry.reserve_address_space) {
+        // Ids are addresses in the reservation, so bindings can keep them in
+        // pointer-typed fields that a garbage collector inspects.
+        const base = handle_registry.base.load(.acquire);
+        try std.testing.expect(base >= 4096);
+        try std.testing.expect(@intFromPtr(b) >= base);
+        try std.testing.expectEqual(@as(usize, 0), @intFromPtr(b) % 8);
+    }
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_status_json(a, &out));
+    antfly_db_close(a);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_status_json(b, &out));
+    antfly_buffer_free(&out);
+
+    // Values that were never issued fail cleanly too.
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_status_json(null, &out));
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_status_json(@ptrFromInt(0x7fff_0000), &out));
+}
+
+test "capi handle registry retires a slot instead of wrapping its generation" {
+    var first = Handle{ .alloc = std.testing.allocator, .db = undefined };
+    var second = Handle{ .alloc = std.testing.allocator, .db = undefined };
+    var third = Handle{ .alloc = std.testing.allocator, .db = undefined };
+
+    // Put a slot at the front of the free list, then move it to the last
+    // generation an id can encode.
+    const first_id = try registerTestHandle(&first);
+    const index = HandleRegistry.decode(first_id).?.index;
+    unregisterTestHandle(first_id);
+    const slot = handle_registry.slotFor(index).?;
+    const last_generation = handle_registry.generationMask();
+    slot.state.store(last_generation << 1, .release);
+
+    const second_id = try registerTestHandle(&second);
+    try std.testing.expectEqual(index, HandleRegistry.decode(second_id).?.index);
+    try std.testing.expectEqual(last_generation, HandleRegistry.decode(second_id).?.generation);
+    unregisterTestHandle(second_id);
+
+    // Retired: still claimed, unusable by any id, and never handed out again.
+    try std.testing.expectEqual(last_generation << 1 | 1, slot.state.load(.acquire));
+    try std.testing.expect(asHandle(second_id) == null);
+    try std.testing.expect(enterHandle(second_id, .read) == null);
+    unregisterTestHandle(second_id);
+    const third_id = try registerTestHandle(&third);
+    defer unregisterTestHandle(third_id);
+    try std.testing.expect(HandleRegistry.decode(third_id).?.index != index);
+    const wrapped = handle_registry.encode(.{ .index = index, .generation = 0 });
+    try std.testing.expect(enterHandle(wrapped, .read) == null);
+}
+
+test "capi concurrent calls and closes on one handle never touch freed memory" {
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
+    const alloc = std.testing.allocator;
+    const path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-handle-close-race");
+    defer alloc.free(path);
+    cleanupTestFile(path);
+    defer cleanupTestFile(path);
+
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(path, &handle));
+
+    const Worker = struct {
+        fn call(id: ?*anyopaque, unexpected: *std.atomic.Value(u32)) void {
+            while (true) {
+                var out: capi.Buffer = .{};
+                switch (antfly_lite_status_json(id, &out)) {
+                    .ok => antfly_buffer_free(&out),
+                    .invalid_argument => return,
+                    else => {
+                        _ = unexpected.fetchAdd(1, .monotonic);
+                        return;
+                    },
+                }
+            }
+        }
+        fn close(id: ?*anyopaque) void {
+            antfly_db_close(id);
+        }
+    };
+
+    var unexpected = std.atomic.Value(u32).init(0);
+    const spawn_config: std.Thread.SpawnConfig = .{ .stack_size = capi_min_thread_stack_size };
+    var callers: [6]std.Thread = undefined;
+    for (&callers) |*t| t.* = try std.Thread.spawn(spawn_config, Worker.call, .{ handle, &unexpected });
+    std.Io.sleep(std.testing.io, .fromMilliseconds(20), .awake) catch {};
+    const closer_a = try std.Thread.spawn(spawn_config, Worker.close, .{handle});
+    const closer_b = try std.Thread.spawn(spawn_config, Worker.close, .{handle});
+    closer_a.join();
+    closer_b.join();
+    for (callers) |t| t.join();
+    try std.testing.expectEqual(@as(u32, 0), unexpected.load(.monotonic));
+}
+
+test "capi text and dense searches succeed while writes commit" {
+    var test_tmp = try TestDirectory.init("capi");
+    defer test_tmp.cleanup();
+    const alloc = std.testing.allocator;
+    const path = try tempTestAflitePath(alloc, test_tmp.path(), "capi-search-during-writes");
+    defer alloc.free(path);
+    cleanupTestFile(path);
+    defer cleanupTestFile(path);
+
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(path, &handle));
+    defer antfly_db_close(handle);
+    const dense_index =
+        \\{"name":"dv_v1","kind":"dense_vector","config_json":"{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}"}
+    ;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(handle, .{ .ptr = dense_index, .len = dense_index.len }));
+
+    const Writer = struct {
+        fn run(id: ?*anyopaque, stop: *std.atomic.Value(bool), failures: *std.atomic.Value(u32)) void {
+            var ts: u64 = 1;
+            var key_buf: [32]u8 = undefined;
+            while (!stop.load(.acquire)) : (ts += 1) {
+                const key = std.fmt.bufPrint(&key_buf, "doc:{d}", .{ts}) catch unreachable;
+                const value =
+                    \\{"body":"searchable writes","_embeddings":{"dv_v1":[1.0,0.0]}}
+                ;
+                const writes = [_]capi.WriteIntent{.{
+                    .key = .{ .ptr = key.ptr, .len = key.len },
+                    .value = .{ .ptr = value, .len = value.len },
+                    .is_delete = false,
+                }};
+                if (antfly_db_batch(id, &writes, writes.len, null, 0, ts, 0) != .ok) _ = failures.fetchAdd(1, .monotonic);
+            }
+        }
+    };
+
+    var stop = std.atomic.Value(bool).init(false);
+    var write_failures = std.atomic.Value(u32).init(0);
+    const writer = try std.Thread.spawn(.{ .stack_size = capi_min_thread_stack_size }, Writer.run, .{ handle, &stop, &write_failures });
+    defer writer.join();
+    defer stop.store(true, .release);
+
+    // Every search stamps an identity generation that a concurrent commit
+    // can invalidate; unpinned reads must restamp rather than fail.
+    const vector = [_]f32{ 1.0, 0.0 };
+    for (0..200) |_| {
+        var text_result: capi.DenseSearchResult = .{};
+        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_search_text_match(
+            handle,
+            .{},
+            .{ .ptr = "body", .len = 4 },
+            .{ .ptr = "searchable", .len = 10 },
+            5,
+            0,
+            &text_result,
+        ));
+        antfly_db_dense_search_result_free(&text_result);
+        var dense_result: capi.PackedDenseSearchResult = .{};
+        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_search_dense(
+            handle,
+            .{ .ptr = "dv_v1", .len = 5 },
+            &vector,
+            vector.len,
+            1,
+            1,
+            0,
+            &dense_result,
+        ));
+        antfly_db_packed_dense_search_result_free(&dense_result);
+    }
+    stop.store(true, .release);
+    try std.testing.expectEqual(@as(u32, 0), write_failures.load(.monotonic));
+}
+
 test "capi lite open options validate and configure ttl cleanup" {
     var test_tmp = try TestDirectory.init("capi");
     defer test_tmp.cleanup();
@@ -14735,7 +15507,8 @@ test "capi lite open options validate and configure ttl cleanup" {
         .profile = 99,
         .flags = std.math.maxInt(u32),
         .reserved0 = 1,
-        .reserved = .{1} ** 8,
+        .busy_timeout_ms = 1,
+        .reserved = .{1} ** 7,
     };
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&generic_defaults));
     try std.testing.expectEqual(@as(u32, @sizeOf(capi.OpenOptions)), generic_defaults.abi_size);
@@ -14744,6 +15517,7 @@ test "capi lite open options validate and configure ttl cleanup" {
     try std.testing.expectEqual(capi.profile_native, generic_defaults.profile);
     try std.testing.expectEqual(@as(u32, 0), generic_defaults.flags);
     try std.testing.expectEqual(@as(u32, 0), generic_defaults.reserved0);
+    try std.testing.expectEqual(@as(u64, 0), generic_defaults.busy_timeout_ms);
     for (generic_defaults.reserved) |word| try std.testing.expectEqual(@as(u64, 0), word);
 
     var defaults = capi.LiteOpenOptions{
@@ -14753,7 +15527,8 @@ test "capi lite open options validate and configure ttl cleanup" {
         .flags = std.math.maxInt(u32),
         .map_size = std.math.maxInt(u64),
         .ttl_cleanup_enabled = true,
-        .reserved = .{1} ** 8,
+        .busy_timeout_ms = 1,
+        .reserved = .{1} ** 7,
     };
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open_options_init(&defaults));
     try std.testing.expectEqual(@as(u32, @sizeOf(capi.LiteOpenOptions)), defaults.abi_size);
@@ -14762,6 +15537,7 @@ test "capi lite open options validate and configure ttl cleanup" {
     try std.testing.expectEqual(@as(u32, 0), defaults.flags);
     try std.testing.expectEqual(@as(u64, 0), defaults.map_size);
     try std.testing.expect(!defaults.ttl_cleanup_enabled);
+    try std.testing.expectEqual(@as(u64, 0), defaults.busy_timeout_ms);
     for (defaults.reserved) |word| try std.testing.expectEqual(@as(u64, 0), word);
 
     var default_handle: ?*anyopaque = null;
@@ -14779,7 +15555,7 @@ test "capi lite open options validate and configure ttl cleanup" {
         .open_mode = capi.lite_open_mode_readonly,
         .profile = capi.lite_profile_native,
         .flags = std.math.maxInt(u32),
-        .reserved = .{1} ** 8,
+        .reserved = .{1} ** 7,
     };
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create_with_options(path, &defaults, &default_handle));
     antfly_db_close(default_handle);
@@ -15001,6 +15777,8 @@ test "capi search rejects stale identity generation before readable lease hook" 
         .alloc = alloc,
         .db = try db_mod.DB.open(alloc, path, .{}),
     };
+    const handle_id = try registerTestHandle(&handle);
+    defer unregisterTestHandle(handle_id);
     defer {
         handle.db.close();
         cleanupTestDir(path);
@@ -15020,7 +15798,7 @@ test "capi search rejects stale identity generation before readable lease hook" 
 
     var recorder = Recorder{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_set_readable_lease_hook(
-        @ptrCast(&handle),
+        handle_id,
         42,
         &recorder,
         &Recorder.callback,
@@ -15034,13 +15812,13 @@ test "capi search rejects stale identity generation before readable lease hook" 
 
     var out: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_search_json(
-        @ptrCast(&handle),
+        handle_id,
         .{ .ptr = request.ptr, .len = request.len },
         &out,
     ));
     try std.testing.expectEqual(@as(usize, 0), recorder.count);
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_set_readable_lease_hook(
-        @ptrCast(&handle),
+        handle_id,
         0,
         null,
         null,
@@ -15060,6 +15838,8 @@ test "capi search json returns stamped identity generation" {
         .alloc = alloc,
         .db = try db_mod.DB.open(alloc, path, .{}),
     };
+    const handle_id = try registerTestHandle(&handle);
+    defer unregisterTestHandle(handle_id);
     defer {
         handle.db.close();
         cleanupTestDir(path);
@@ -15087,7 +15867,7 @@ test "capi search json returns stamped identity generation" {
         "{\"mode\":\"dense\",\"index_name\":\"dv_v1\",\"vector\":[1,0],\"k\":1,\"limit\":1,\"offset\":0,\"include_stored\":false}";
     var out: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_search_json(
-        @ptrCast(&handle),
+        handle_id,
         .{ .ptr = search_req.ptr, .len = search_req.len },
         &out,
     ));
@@ -15101,7 +15881,7 @@ test "capi search json returns stamped identity generation" {
 
     var packed_result: capi.PackedDenseSearchResult = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_search_dense(
-        @ptrCast(&handle),
+        handle_id,
         .{ .ptr = "dv_v1".ptr, .len = "dv_v1".len },
         (&[_]f32{ 1.0, 0.0 }).ptr,
         2,
@@ -15115,7 +15895,7 @@ test "capi search json returns stamped identity generation" {
 
     var text_result: capi.DenseSearchResult = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_search_text_match(
-        @ptrCast(&handle),
+        handle_id,
         .{ .ptr = "ft_v1".ptr, .len = "ft_v1".len },
         .{ .ptr = "title".ptr, .len = "title".len },
         .{ .ptr = "alpha".ptr, .len = "alpha".len },
@@ -15130,7 +15910,7 @@ test "capi search json returns stamped identity generation" {
         "{\"mode\":\"full_text\",\"index_name\":\"ft_v1\",\"text_query_type\":\"match\",\"field\":\"title\",\"text\":\"alpha\",\"limit\":1}";
     var hits_result: capi.DenseSearchResult = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_search_hits_json(
-        @ptrCast(&handle),
+        handle_id,
         .{ .ptr = hits_request.ptr, .len = hits_request.len },
         &hits_result,
     ));
@@ -15151,6 +15931,8 @@ test "capi aggregate hits rejects stale identity generation before aggregation m
         .alloc = alloc,
         .db = try db_mod.DB.open(alloc, path, .{}),
     };
+    const handle_id = try registerTestHandle(&handle);
+    defer unregisterTestHandle(handle_id);
     defer {
         handle.db.close();
         cleanupTestDir(path);
@@ -15174,7 +15956,7 @@ test "capi aggregate hits rejects stale identity generation before aggregation m
     defer alloc.free(current_request);
     var current_out: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.internal, antfly_db_aggregate_hits_json(
-        @ptrCast(&handle),
+        handle_id,
         .{ .ptr = current_request.ptr, .len = current_request.len },
         &current_out,
     ));
@@ -15184,7 +15966,7 @@ test "capi aggregate hits rejects stale identity generation before aggregation m
     ;
     var missing_generation_out: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_aggregate_hits_json(
-        @ptrCast(&handle),
+        handle_id,
         .{ .ptr = missing_generation_request.ptr, .len = missing_generation_request.len },
         &missing_generation_out,
     ));
@@ -15193,7 +15975,7 @@ test "capi aggregate hits rejects stale identity generation before aggregation m
     defer alloc.free(stale_request);
     var stale_out: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_aggregate_hits_json(
-        @ptrCast(&handle),
+        handle_id,
         .{ .ptr = stale_request.ptr, .len = stale_request.len },
         &stale_out,
     ));
@@ -15236,6 +16018,8 @@ test "capi request paths trigger readable lease hook" {
         .alloc = alloc,
         .db = try db_mod.DB.open(alloc, path, .{}),
     };
+    const handle_id = try registerTestHandle(&handle);
+    defer unregisterTestHandle(handle_id);
     defer {
         handle.db.close();
         cleanupTestDir(path);
@@ -15258,7 +16042,7 @@ test "capi request paths trigger readable lease hook" {
 
     var recorder = Recorder{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_set_readable_lease_hook(
-        @ptrCast(&handle),
+        handle_id,
         42,
         &recorder,
         &Recorder.callback,
@@ -15266,7 +16050,7 @@ test "capi request paths trigger readable lease hook" {
 
     var lookup_out: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_lookup_json(
-        @ptrCast(&handle),
+        handle_id,
         .{ .ptr = "doc:a".ptr, .len = "doc:a".len },
         &lookup_out,
     ));
@@ -15275,7 +16059,7 @@ test "capi request paths trigger readable lease hook" {
     const scan_req = "{\"from_key_b64\":\"\",\"to_key_b64\":\"\",\"include_documents\":false,\"limit\":10}";
     var scan_out: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_scan_json(
-        @ptrCast(&handle),
+        handle_id,
         .{ .ptr = scan_req.ptr, .len = scan_req.len },
         &scan_out,
     ));
@@ -15285,7 +16069,7 @@ test "capi request paths trigger readable lease hook" {
         "{\"mode\":\"dense\",\"index_name\":\"dv_v1\",\"vector\":[1,0],\"k\":1,\"limit\":1,\"offset\":0,\"include_stored\":false}";
     var search_out: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_search_json(
-        @ptrCast(&handle),
+        handle_id,
         .{ .ptr = search_req.ptr, .len = search_req.len },
         &search_out,
     ));
@@ -15293,7 +16077,7 @@ test "capi request paths trigger readable lease hook" {
 
     var packed_result: capi.PackedDenseSearchResult = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_search_dense(
-        @ptrCast(&handle),
+        handle_id,
         .{ .ptr = "dv_v1".ptr, .len = "dv_v1".len },
         (&[_]f32{ 1.0, 0.0 }).ptr,
         2,
@@ -15306,7 +16090,7 @@ test "capi request paths trigger readable lease hook" {
 
     var dense_profile: capi.DenseSearchProfile = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_search_dense_profile(
-        @ptrCast(&handle),
+        handle_id,
         .{ .ptr = "dv_v1".ptr, .len = "dv_v1".len },
         (&[_]f32{ 1.0, 0.0 }).ptr,
         2,
@@ -15330,7 +16114,7 @@ test "capi request paths trigger readable lease hook" {
     };
     var dense_wire_out: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_search_dense_wire(
-        @ptrCast(&handle),
+        handle_id,
         .{ .ptr = &dense_wire_req, .len = dense_wire_req.len },
         &dense_wire_out,
     ));
@@ -15340,7 +16124,7 @@ test "capi request paths trigger readable lease hook" {
     var dense_wire_profile_out: capi.Buffer = .{};
     var dense_wire_profile: capi.DenseWireSearchProfile = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_search_dense_wire_profile(
-        @ptrCast(&handle),
+        handle_id,
         .{ .ptr = &dense_wire_req, .len = dense_wire_req.len },
         &dense_wire_profile_out,
         &dense_wire_profile,
@@ -15350,7 +16134,7 @@ test "capi request paths trigger readable lease hook" {
 
     var text_result: capi.DenseSearchResult = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_search_text_match(
-        @ptrCast(&handle),
+        handle_id,
         .{ .ptr = "dv_v1".ptr, .len = "dv_v1".len },
         .{ .ptr = "title".ptr, .len = "title".len },
         .{ .ptr = "alpha".ptr, .len = "alpha".len },
@@ -15364,7 +16148,7 @@ test "capi request paths trigger readable lease hook" {
         "{\"mode\":\"full_text\",\"index_name\":\"dv_v1\",\"text_query_type\":\"match\",\"field\":\"title\",\"text\":\"alpha\",\"limit\":1,\"offset\":0,\"include_stored\":false}";
     var hits_result: capi.DenseSearchResult = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_search_hits_json(
-        @ptrCast(&handle),
+        handle_id,
         .{ .ptr = hits_req.ptr, .len = hits_req.len },
         &hits_result,
     ));
@@ -15483,6 +16267,8 @@ test "capi dense search profile breakdown" {
         .alloc = alloc,
         .db = try db_mod.DB.open(alloc, path, .{}),
     };
+    const handle_id = try registerTestHandle(&handle);
+    defer unregisterTestHandle(handle_id);
     defer {
         handle.db.close();
         cleanupTestDir(path);
@@ -15548,7 +16334,7 @@ test "capi dense search profile breakdown" {
         var out: capi.Buffer = .{};
         const start = monotonicNowNs();
         try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_search_json(
-            @ptrCast(&handle),
+            handle_id,
             .{ .ptr = request_json.ptr, .len = request_json.len },
             &out,
         ));

@@ -317,7 +317,7 @@ path does not currently expose an equivalent of `antfly inference run`'s
 change the outcome in testing), so operators embedding this checkpoint
 in-process cannot currently raise these specific generation budgets the way
 `antfly inference run`'s CLI flags allow. That gap is in the embedded
-worker/`antflylite` configuration surface, outside this file's ownership.
+worker/`lite` configuration surface, outside this file's ownership.
 
 ### 9. Follow-up: long-document windowing qualified for the real dogfood schema
 
@@ -501,7 +501,7 @@ elements) even while remaining within this row's reviewed geometry bounds
 to, the qualification table. Both are documented in detail, with the exact
 fix needed, in
 `gliner25-longdoc-handoff.md` (scratchpad; not committed, since the fix
-lives in `zig/pkg/antfly/**`/`go/pkg/antflylite`, outside this file's
+lives in `zig/pkg/antfly/**`/`go/pkg/lite`, outside this file's
 ownership).
 
 ### 10. Follow-up: long-document throughput (window size, batching, precision)

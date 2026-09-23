@@ -1,0 +1,43 @@
+[package]
+name = "antfly-lite"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Safe Rust binding for Antfly Lite, the embedded libantfly C ABI"
+
+[dependencies]
+antfly-lite-sys = { path = "../lite-sys", version = "0.1.0" }
+serde = { version = "1.0", features = ["derive"], optional = true }
+serde_json = { version = "1.0", optional = true }
+
+[dev-dependencies]
+serde_json = "1.0"
+
+[features]
+default = ["serde"]
+# Typed convenience wrappers (Status, Capabilities, CheckReport, ...) on top
+# of the raw *_json methods.
+serde = ["dep:serde", "dep:serde_json"]
+# Actually link against libantfly. Off by default so `cargo build`/plain
+# `cargo test` never require the dylib to be present; enable for tests under
+# tests/ that call into the real library (see their `required-features`).
+libantfly = ["antfly-lite-sys/libantfly"]
+
+[[test]]
+name = "conformance"
+path = "tests/conformance.rs"
+required-features = ["libantfly", "serde"]
+
+[[test]]
+name = "concurrency"
+path = "tests/concurrency.rs"
+required-features = ["libantfly", "serde"]
+
+[[test]]
+name = "errors"
+path = "tests/errors.rs"
+required-features = ["libantfly"]
+
+[[test]]
+name = "pure"
+path = "tests/pure.rs"

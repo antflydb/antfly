@@ -40,7 +40,7 @@ work-log entries reads sensibly end to end.
    ```
 
    This also produces `libantfly` for the Go cgo bindings (the minimal
-   equivalent is `zig build capi`; see `go/pkg/antflylite/README.md`).
+   equivalent is `zig build capi`; see `go/pkg/lite/README.md`).
 
 2. Inference runs in-process by default. `libantfly` links the standalone
    inference runtime (the same one the `antfly` executable embeds), so a Lite
@@ -83,7 +83,7 @@ work-log entries reads sensibly end to end.
 
    In-process inference budgets (host, backend, combined, KV, scratch) are
    derived from the host memory policy the way `antfly inference run` derives
-   its defaults, and can be overridden on `antflylite.OpenOptions`.
+   its defaults, and can be overridden on `lite.OpenOptions`.
 
 4. `dogfood ingest` fails fast before doing any work: in-process mode it
    checks that the linked `libantfly` advertises `local_inference_runtime`;

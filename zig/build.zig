@@ -818,7 +818,11 @@ pub fn create(b: *std.Build) ?Artifacts {
     const install_libantfly = embedded.install_libantfly;
     const install_capi_header = embedded.install_capi_header;
     const run_capi_smoke = embedded.run_capi_smoke;
+    const run_capi_conformance = embedded.run_capi_conformance;
     const run_lite_go_tests = embedded.run_lite_go_tests;
+    const run_lite_py_tests = embedded.run_lite_py_tests;
+    const run_lite_rs_tests = embedded.run_lite_rs_tests;
+    const run_lite_ts_tests = embedded.run_lite_ts_tests;
     const run_lite_go_example = embedded.run_lite_go_example;
     const run_lite_go_retrieval_template = embedded.run_lite_go_retrieval_template;
     const run_cabi_packaging_tests = embedded.run_cabi_packaging_tests;
@@ -1516,7 +1520,11 @@ pub fn create(b: *std.Build) ?Artifacts {
     lite_test_step.dependOn(&run_lite_cmd_tests.step);
     lite_test_step.dependOn(&run_lite_native_tests.step);
     lite_test_step.dependOn(&run_capi_smoke.step);
+    lite_test_step.dependOn(&run_capi_conformance.step);
     lite_test_step.dependOn(&run_lite_go_tests.step);
+    lite_test_step.dependOn(&run_lite_py_tests.step);
+    lite_test_step.dependOn(&run_lite_rs_tests.step);
+    lite_test_step.dependOn(&run_lite_ts_tests.step);
     lite_test_step.dependOn(&run_lite_go_example.step);
     lite_test_step.dependOn(&run_lite_go_retrieval_template.step);
     lite_test_step.dependOn(&run_lite_cli_smoke.step);
