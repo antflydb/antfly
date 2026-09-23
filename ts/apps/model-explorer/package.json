@@ -1,0 +1,45 @@
+{
+  "name": "@antfly/model-explorer",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "next dev --turbopack",
+    "build": "node --experimental-strip-types generator/index.ts --check && node --experimental-strip-types --test generator/*.test.ts scripts/*.test.ts && next build && rm -rf out/dev",
+    "start": "node --experimental-strip-types scripts/preview.ts",
+    "preview": "node --experimental-strip-types scripts/preview.ts",
+    "test": "node --experimental-strip-types --test generator/*.test.ts scripts/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "generate": "node --experimental-strip-types generator/index.ts",
+    "gen:check": "node --experimental-strip-types generator/index.ts --check",
+    "lint": "biome lint app components content lib generator scripts && node --experimental-strip-types generator/index.ts --check",
+    "clean": "rm -rf .next out"
+  },
+  "dependencies": {
+    "@antfly/design-system": "workspace:*",
+    "@dagrejs/dagre": "^1.1.4",
+    "@fontsource-variable/roboto-mono": "^5.3.0",
+    "@xyflow/react": "^12.11.0",
+    "d3-sankey": "^0.12.3",
+    "lucide-react": "^1.18.0",
+    "next": "^16.2.9",
+    "next-themes": "^0.4.6",
+    "nuqs": "^2.8.8",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
+    "recharts": "^3.8.1",
+    "server-only": "^0.0.1",
+    "shiki": "^3.23.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.3.1",
+    "@types/d3-sankey": "^0.12.4",
+    "@types/node": "^25.9.3",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "postcss": "^8.5.15",
+    "tailwindcss": "^4.3.1",
+    "typescript": "5.9.3"
+  }
+}

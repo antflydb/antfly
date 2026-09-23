@@ -47,8 +47,11 @@ def main():
     parser.add_argument("--sst5", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--samples-per-task", type=int, default=64)
+    parser.add_argument("--threads", type=int, default=8)
     args = parser.parse_args()
-    torch.set_num_threads(8)
+    if args.threads < 1:
+        parser.error("--threads must be positive")
+    torch.set_num_threads(args.threads)
     torch.manual_seed(714)
     spec = importlib.util.spec_from_file_location("laya_common", args.common)
     common = importlib.util.module_from_spec(spec)
@@ -218,7 +221,7 @@ def main():
         "excluded_overlength": excluded,
         "torch_version": torch.__version__,
         "transformers_attention": "eager",
-        "threads": 8,
+        "threads": torch.get_num_threads(),
         "forward_seconds": elapsed,
         "metrics": metrics,
         "rows": rows,

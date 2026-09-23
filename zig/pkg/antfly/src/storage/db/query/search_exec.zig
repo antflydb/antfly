@@ -8849,6 +8849,7 @@ fn searchQueryCanUseMappedDocValues(
 
 fn schemaInfersDynamicFieldType(schema: runtime_schema_mod.TableSchema, field: []const u8) bool {
     for (schema.full_text_documents) |document| {
+        if (runtime_schema_mod.pathFallsUnderAnyPrefix(document.unindexed_paths, field)) continue;
         for (document.infer_type_dynamic_paths) |path| {
             if (path.len == 0) return true;
             if (!std.mem.startsWith(u8, field, path)) continue;
@@ -18059,6 +18060,7 @@ fn resolveDynamicTemplateFieldAnalyzer(schema: runtime_schema_mod.TableSchema, f
 
 fn fallsUnderDynamicTextPath(schema: runtime_schema_mod.TableSchema, field: []const u8) bool {
     for (schema.full_text_documents) |document_schema| {
+        if (runtime_schema_mod.pathFallsUnderAnyPrefix(document_schema.unindexed_paths, field)) continue;
         for (document_schema.open_dynamic_paths) |open_path| {
             if (open_path.len == 0) return true;
             if (!std.mem.startsWith(u8, field, open_path)) continue;

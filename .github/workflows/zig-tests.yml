@@ -575,6 +575,7 @@ jobs:
         run: |
           python3 -m unittest discover -s scripts -p test_run_db_query_matrix.py
           python3 -m unittest discover -s scripts -p test_conformance_fixtures.py
+          python3 -m unittest discover -s scripts -p 'test_laya_cuda*.py'
           python3 -m unittest discover -s scripts/bench/pdf -p 'test_*.py'
 
       - name: Check inference kernels through the root build graph
@@ -869,6 +870,15 @@ jobs:
           ANTFLY_TLA_TRACE_VALIDATE: ${{ needs.changes.outputs.trace_validate }}
         run: scripts/ci/zig-tla-verify.sh
 
+      - name: Retain TLA trace evidence
+        if: always() && !cancelled()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tla-traces-${{ github.job }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/antfly-tla-traces/
+          if-no-files-found: ignore
+          retention-days: 14
+
   zig-full-tests:
     if: >-
       ${{ !cancelled() &&
@@ -964,6 +974,7 @@ jobs:
         run: |
           python3 -m unittest discover -s scripts -p test_run_db_query_matrix.py
           python3 -m unittest discover -s scripts -p test_conformance_fixtures.py
+          python3 -m unittest discover -s scripts -p 'test_laya_cuda*.py'
           python3 -m unittest discover -s scripts/bench/pdf -p 'test_*.py'
 
       # Keep normal build-step parallelism while bounding aggregate compiler
@@ -1015,11 +1026,12 @@ jobs:
 
       - name: Release completed phase compiler cache
         run: |
-          # The preceding build has finished. Release its large test link inputs
-          # while retaining cached executables, dependencies, and generators.
+          # The completed phase owns this private cache. Self-hosted Debug
+          # emits no disposable link objects; retire outputs and manifests
+          # together before the next phase. Global dependencies and zig-out stay.
           cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
           du -sh "$cache"
-          python3 zig/tools/prune_completed_test_cache.py "$cache"
+          python3 zig/tools/prune_completed_test_cache.py --release-phase "$cache"
           df -h "$cache"
           df -i "$cache"
 
@@ -1045,15 +1057,25 @@ jobs:
           ANTFLY_TLA_TRACE_VALIDATE: "true"
         run: scripts/ci/zig-tla-verify.sh
 
+      - name: Retain TLA trace evidence
+        if: always() && !cancelled()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tla-traces-${{ github.job }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/antfly-tla-traces/
+          if-no-files-found: ignore
+          retention-days: 14
+
       # Includes index-maintenance and index-ownership replay campaigns. The
       # fixed maintenance seed is already part of the zig-base unit aggregate.
       - name: Release completed phase compiler cache
         run: |
-          # The preceding build has finished. Release its large test link inputs
-          # while retaining cached executables, dependencies, and generators.
+          # The completed phase owns this private cache. Self-hosted Debug
+          # emits no disposable link objects; retire outputs and manifests
+          # together before the next phase. Global dependencies and zig-out stay.
           cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
           du -sh "$cache"
-          python3 zig/tools/prune_completed_test_cache.py "$cache"
+          python3 zig/tools/prune_completed_test_cache.py --release-phase "$cache"
           df -h "$cache"
           df -i "$cache"
 
@@ -1091,11 +1113,12 @@ jobs:
       # no graph-specific CLI or promotion matrix is built here.
       - name: Release completed phase compiler cache
         run: |
-          # The preceding build has finished. Release its large test link inputs
-          # while retaining cached executables, dependencies, and generators.
+          # The completed phase owns this private cache. Self-hosted Debug
+          # emits no disposable link objects; retire outputs and manifests
+          # together before the next phase. Global dependencies and zig-out stay.
           cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
           du -sh "$cache"
-          python3 zig/tools/prune_completed_test_cache.py "$cache"
+          python3 zig/tools/prune_completed_test_cache.py --release-phase "$cache"
           df -h "$cache"
           df -i "$cache"
 
@@ -1784,9 +1807,27 @@ jobs:
         working-directory: zig
         env:
           ANTFLY_BIN: ./zig-out/bin/antfly
+          ANTFLY_E2E_PRESERVE_ROOT_ON_FAILURE: "1"
+          ANTFLY_E2E_NATIVE_STACKS: "1"
         run: |
           chmod +x ./zig-out/bin/antfly
           taskset -c ${{ steps.e2e_cpus.outputs.list }} ../scripts/ci/zig-antfly-e2e-pytest.sh e2e/antfly
+
+      - name: Retain failed full E2E server logs and cluster diagnostics
+        if: failure() && matrix.suite == 'antfly'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: antfly-e2e-full-server-logs-${{ matrix.suite }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.TMPDIR }}/antfly-zig-standalone-e2e-*/server.log
+            ${{ env.TMPDIR }}/antfly-zig-scaling-e2e-*/*.log
+            ${{ env.TMPDIR }}/antfly-zig-scaling-e2e-*/failure-diagnostics.json
+            ${{ env.TMPDIR }}/antfly-zig-scaling-e2e-*/native-stacks.txt
+            ${{ env.TMPDIR }}/antfly-zig-metadata-backup-e2e-*/*.log
+            ${{ env.TMPDIR }}/antfly-zig-metadata-backup-e2e-*/failure-diagnostics.json
+            ${{ env.TMPDIR }}/antfly-zig-metadata-backup-e2e-*/native-stacks.txt
+          if-no-files-found: ignore
+          retention-days: 7
 
   e2e-full:
     if: >-

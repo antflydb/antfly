@@ -1604,7 +1604,7 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
                     indent=2,
                 )
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - preserve the original test failure
             print(f"progressive_completion_query_error: {exc}")
         raise
     assert complete["readiness"]["state"] == "ready"
@@ -1886,11 +1886,23 @@ def test_progressive_publication_remains_queryable_across_process_restart(
         assert written["inserted"] == len(documents)
 
         def queryable_partial() -> dict | None:
-            status = stateful_api.get_index(table_name, index_name)["status"]
+            observation = stateful_api.get_index(table_name, index_name)
+            status = observation["status"]
             milestones = status.get("milestones") or {}
             queryable = milestones.get("queryable") or {}
             complete = milestones.get("complete") or {}
             if not queryable.get("reached") or complete.get("reached"):
+                return None
+            shards = observation.get("shard_status") or {}
+            if (
+                not status.get("runtime_fresh")
+                or not shards
+                or any(
+                    int(shard.get("projection_checkpoint_applied_sequence", 0)) <= 0
+                    or not shard.get("runtime_fresh")
+                    for shard in shards.values()
+                )
+            ):
                 return None
             if int(status.get("searchable_vectors", 0)) <= 0:
                 return None
@@ -1908,7 +1920,14 @@ def test_progressive_publication_remains_queryable_across_process_restart(
             timeout_s=30.0,
             interval_s=0.05,
         )
-        assert before is not None
+        assert before is not None, json.dumps(
+            {
+                "index": stateful_api.get_index(table_name, index_name),
+                "logs": stateful_api.debug_logs(),
+            },
+            indent=2,
+            sort_keys=True,
+        )
         incarnation = before["incarnation"]
         searchable_vectors = before["searchable_vectors"]
         covered_sources = before["source_coverage"]["covered"]
@@ -1935,6 +1954,7 @@ def test_progressive_publication_remains_queryable_across_process_restart(
                     f"{current_searchable} < {restart_last_searchable}\n"
                     + json.dumps(
                         {
+                            "before_restart": before,
                             "index": stateful_api.get_index(table_name, index_name),
                             "logs": stateful_api.debug_logs(),
                             "status": status,

@@ -1421,6 +1421,43 @@ class ThreeByThreeBackupCluster:
             ready_when=lambda value: value is not None,
         )
 
+    def wait_for_group_leader(self, group_id: int, *, timeout_s: float = 30.0) -> dict:
+        """Wait for the data group's asynchronous report within one deadline."""
+        deadline = time.monotonic() + timeout_s
+        last = None
+        while time.monotonic() < deadline:
+            self.assert_processes_alive()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            leader = self.metadata_leader_id_once(request_timeout_s=min(1.0, remaining))
+            remaining = deadline - time.monotonic()
+            if leader is not None and remaining > 0:
+                try:
+                    snapshot = self.metadata_snapshot(
+                        leader - 1, request_timeout_s=min(3.0, remaining)
+                    )
+                except (requests.RequestException, AssertionError) as exc:
+                    last = repr(exc)
+                else:
+                    last = next(
+                        (
+                            row
+                            for row in snapshot["merged_group_statuses"]
+                            if int(row["group_id"]) == group_id
+                        ),
+                        None,
+                    )
+                    if last is not None and last["leader_known"]:
+                        assert int(last["leader_store_id"]) > 0, last
+                        return last
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(0.1, remaining))
+        raise AssertionError(
+            f"group {group_id} has no reported leader within {timeout_s}s; last={last!r}"
+        )
+
     def metadata_stable_leader_id(
         self,
         *,
@@ -2683,7 +2720,9 @@ def test_three_by_three_mixed_relational_restore_survives_coordinator_and_owner_
             job_id = response.json()["job_id"]
             cluster.metadata_procs[coordinator].kill()
             cluster.metadata_procs[coordinator].wait(timeout=10)
-            successor_id = cluster.metadata_stable_leader_id(timeout_s=30)
+            # A self-confirmed same-term quorum is sufficient after the crash;
+            # three consecutive transport samples add no Raft safety proof.
+            successor_id = cluster.metadata_leader_id(timeout_s=30)
             assert successor_id is not None and successor_id != leader_id, (
                 cluster.debug_logs()
             )
@@ -2877,7 +2916,7 @@ def _concurrent_restore_observers(backup_api, expected_titles):
                     response = session.get(
                         f"{backup_api.url}/tables/{table}{suffix}", timeout=10
                     )
-                    if response.status_code == 503:
+                    if response.status_code in (409, 503):
                         assert publication_retry_delay(response, 0.01) is not None, (
                             response.url,
                             response.status_code,

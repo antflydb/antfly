@@ -119,6 +119,35 @@ fn resolverConsumesArtifact(resolvers: []const ResolverConfig, source_artifact_k
     return resolverForArtifactKind(resolvers, source_artifact_kind, artifact_name) != null;
 }
 
+/// Labels claimed by sibling resolvers on the same source artifact. A
+/// catch-all resolver (empty `labels`) must skip these so each mention is
+/// resolved exactly once while extraction labels stay open-vocabulary. Only
+/// the returned outer slice is allocated (label strings are borrowed from the
+/// sibling configs); free it with `gpa`. Labeled resolvers need no exclusions
+/// (admission keeps sibling label sets disjoint), so this returns empty for
+/// them without allocating.
+fn siblingClaimedLabelsAlloc(
+    gpa: std.mem.Allocator,
+    resolvers: []const ResolverConfig,
+    cfg: *const ResolverConfig,
+) ![]const []const u8 {
+    if (cfg.labels.len > 0) return &.{};
+    var claimed = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer claimed.deinit(gpa);
+    for (resolvers) |*sibling| {
+        if (sibling == cfg) continue;
+        if (!std.mem.eql(u8, sibling.source_artifact, cfg.source_artifact)) continue;
+        if (!sibling.source_artifact_kind.matches(cfg.source_artifact_kind) and
+            !cfg.source_artifact_kind.matches(sibling.source_artifact_kind)) continue;
+        for (sibling.labels) |label| try claimed.append(gpa, label);
+    }
+    return try claimed.toOwnedSlice(gpa);
+}
+
+fn freeSiblingClaimedLabels(gpa: std.mem.Allocator, labels: []const []const u8) void {
+    if (labels.len > 0) gpa.free(labels);
+}
+
 const ParsedSourceArtifactKey = struct {
     doc_key: []u8,
     artifact_name: []u8,
@@ -182,11 +211,14 @@ pub fn resolveExtraction(
     candidates: []const []const resolver_lib.Candidate,
 ) !?ResolutionOutput {
     const cfg = resolverForArtifact(resolvers, artifact_name) orelse return null;
+    const sibling_excludes = try siblingClaimedLabelsAlloc(gpa, resolvers, cfg);
+    defer freeSiblingClaimedLabels(gpa, sibling_excludes);
 
     var resolver = try resolver_lib.Resolver.initFromParts(
         gpa,
         cfg.table,
         cfg.key_template,
+        .{ .labels = cfg.labels, .exclude_labels = sibling_excludes, .min_confidence = cfg.min_confidence },
         cfg.type_must_match,
         cfg.scorer_json,
     );
@@ -194,6 +226,7 @@ pub fn resolveExtraction(
 
     var parsed = try resolver_lib.parseExtractionEntities(gpa, extraction_bytes);
     defer parsed.deinit();
+    parsed.entities = resolver.filterEntitiesByLabel(parsed.entities);
 
     var resolution = try resolver.resolve(gpa, cfg.config_generation, parsed.entities, candidates);
     defer resolution.deinit();
@@ -233,11 +266,59 @@ pub fn processChangedExtraction(
     defer parsed.deinit(gpa);
 
     const cfg = resolverForArtifactKind(resolvers, parsed.source_artifact_kind, parsed.artifact_name) orelse return null;
-    return try processChangedExtractionWithConfig(gpa, cfg, store, provider, changed_key, candidate_source, embedder, .immediate);
+    return try processChangedExtractionWithConfig(gpa, resolvers, cfg, store, provider, changed_key, candidate_source, embedder, .immediate, &.{});
+}
+
+/// Serialized `_entities`-shaped map (local id -> {"key","table"}) built from
+/// the canonical decisions of every OTHER resolver's resolution artifact over
+/// the same source artifact. Compositional event identity composes these
+/// canonical keys, so the event resolver must see the sibling entity
+/// resolutions. `pending_overlay` exposes resolution artifacts computed
+/// earlier in the same replay batch but not yet committed, keeping a
+/// catalog-ordered entity->event pair convergent within one pass.
+fn siblingResolutionsJsonAlloc(
+    gpa: std.mem.Allocator,
+    resolvers: []const ResolverConfig,
+    cfg: *const ResolverConfig,
+    store: resolver_lib.ArtifactStore,
+    parsed: ParsedSourceArtifactKey,
+    pending_overlay: []const ArtifactWrite,
+) !?[]u8 {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var map: std.json.ObjectMap = .empty;
+    for (resolvers) |*sibling| {
+        if (sibling == cfg) continue;
+        if (!resolverMatchesArtifact(sibling, parsed.source_artifact_kind, parsed.artifact_name)) continue;
+        const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(a, parsed.resolution_scope_key, sibling.resolution_artifact);
+        const raw: ?[]const u8 = overlay: {
+            var i = pending_overlay.len;
+            while (i > 0) {
+                i -= 1;
+                if (std.mem.eql(u8, pending_overlay[i].key, resolution_key)) break :overlay pending_overlay[i].value;
+            }
+            break :overlay try store.get(a, resolution_key);
+        };
+        var resolution = resolver_lib.parseResolution(gpa, raw orelse continue) catch continue;
+        defer resolution.deinit();
+        for (resolution.entities) |entity| {
+            if (entity.decision == .review) continue;
+            if (entity.doc_ref.key.len == 0) continue;
+            var ref: std.json.ObjectMap = .empty;
+            try ref.put(a, "key", .{ .string = try a.dupe(u8, entity.doc_ref.key) });
+            try ref.put(a, "table", .{ .string = try a.dupe(u8, entity.doc_ref.table) });
+            try map.put(a, try a.dupe(u8, entity.local_id), .{ .object = ref });
+        }
+    }
+    if (map.count() == 0) return null;
+    return try std.json.Stringify.valueAlloc(gpa, std.json.Value{ .object = map }, .{});
 }
 
 fn processChangedExtractionWithConfig(
     gpa: std.mem.Allocator,
+    resolvers: []const ResolverConfig,
     cfg: *const ResolverConfig,
     store: resolver_lib.ArtifactStore,
     provider: ?resolver_lib.CandidateProvider,
@@ -245,6 +326,7 @@ fn processChangedExtractionWithConfig(
     candidate_source: ?CandidateSource,
     embedder: ?embedder_mod.DenseEmbedder,
     persistence: PersistenceMode,
+    pending_overlay: []const ArtifactWrite,
 ) !?ProcessOutcome {
     var parsed = (try parseSourceArtifactKeyAlloc(gpa, changed_key)) orelse return null;
     defer parsed.deinit(gpa);
@@ -254,10 +336,13 @@ fn processChangedExtractionWithConfig(
     defer if (candidate_batch) |batch| batch.deinit(gpa);
     const batch_source = if (candidate_batch) |batch| batch.source else null;
 
+    const sibling_excludes = try siblingClaimedLabelsAlloc(gpa, resolvers, cfg);
+    defer freeSiblingClaimedLabels(gpa, sibling_excludes);
     var resolver = try resolver_lib.Resolver.initFromParts(
         gpa,
         cfg.table,
         cfg.key_template,
+        .{ .labels = cfg.labels, .exclude_labels = sibling_excludes, .min_confidence = cfg.min_confidence },
         cfg.type_must_match,
         cfg.scorer_json,
     );
@@ -324,11 +409,15 @@ fn processChangedExtractionWithConfig(
     }
     defer if (stage_overrides != null) override_holder.deinit();
 
+    const sibling_resolutions = try siblingResolutionsJsonAlloc(gpa, resolvers, cfg, store, parsed, pending_overlay);
+    defer if (sibling_resolutions) |raw| gpa.free(raw);
+
     const stage = resolver_lib.ResolutionStage{
         .resolver = &resolver,
         .config_generation = cfg.config_generation,
         .embedder = stage_embedder,
         .overrides = stage_overrides,
+        .sibling_resolutions_json = sibling_resolutions,
         .doc_ref_binding = if (batch_source) |source| .{
             .ptr = source.ptr,
             .bind = source.vtable.bound_table orelse struct {
@@ -394,7 +483,7 @@ fn processChangedExtractionForAllResolvers(
     var processed: usize = 0;
     for (resolvers) |*cfg| {
         if (!resolverMatchesArtifact(cfg, parsed.source_artifact_kind, parsed.artifact_name)) continue;
-        const outcome = (try processChangedExtractionWithConfig(gpa, cfg, store, provider, changed_key, candidate_source, embedder, .deferred)) orelse continue;
+        const outcome = (try processChangedExtractionWithConfig(gpa, resolvers, cfg, store, provider, changed_key, candidate_source, embedder, .deferred, pending.artifact_writes.items)) orelse continue;
         processed += 1;
         switch (outcome.result) {
             .written => {
@@ -1054,6 +1143,56 @@ pub fn processRecordKeys(
         _ = try processChangedExtractionForAllResolvers(gpa, resolvers, store, provider, key, candidate_source, embedder, &pending);
     }
 
+    // A changed RESOLUTION artifact re-drives its source extraction for every
+    // consuming resolver: compositional event identity composes sibling
+    // canonical keys (see siblingResolutionsJsonAlloc), so the event resolver
+    // must recompute once the entity resolution lands or merges. The chain
+    // terminates because recomputing the writer itself yields identical bytes
+    // with a proven handoff (`.unchanged`), which emits no resolution-hinted
+    // record.
+    var redrive_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (redrive_keys.items) |key| gpa.free(key);
+        redrive_keys.deinit(gpa);
+    }
+    for (changed_artifact_keys) |key| {
+        const source_key = (try sourceExtractionKeyForResolutionKeyAlloc(gpa, resolvers, key)) orelse continue;
+        // Only a LIVE resolution artifact re-drives. A deleted one is
+        // resolver retirement: recomputing would resurrect the artifacts the
+        // retirement fence just deleted and spin the catalog-removal gate on
+        // WriterLocked forever.
+        const live = blk: {
+            const bytes = (try store.get(gpa, key)) orelse break :blk false;
+            gpa.free(bytes);
+            break :blk true;
+        };
+        if (!live) {
+            gpa.free(source_key);
+            continue;
+        }
+        var duplicate = false;
+        for (changed_artifact_keys) |other| {
+            if (std.mem.eql(u8, other, source_key)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate) for (redrive_keys.items) |other| {
+            if (std.mem.eql(u8, other, source_key)) {
+                duplicate = true;
+                break;
+            }
+        };
+        if (duplicate) {
+            gpa.free(source_key);
+            continue;
+        }
+        try redrive_keys.append(gpa, source_key);
+    }
+    for (redrive_keys.items) |key| {
+        _ = try processChangedExtractionForAllResolvers(gpa, resolvers, store, provider, key, candidate_source, embedder, &pending);
+    }
+
     if (pending.full_keys.items.len > 0) {
         _ = try write_fn(write_ctx, .{
             .batch = .{ .changed_artifact_keys = pending.full_keys.items },
@@ -1068,6 +1207,30 @@ pub fn processRecordKeys(
             .target_hints = &.{.graph},
         });
     }
+}
+
+/// Map a changed resolution-artifact key back to the source extraction
+/// artifact it was resolved from, or null when the key is not a resolution
+/// artifact of any configured resolver. A chunk- or unit-scoped resolution
+/// embeds the full source artifact key as its scope; a document-scoped one
+/// rebuilds the asset key from the owning resolver's source artifact name.
+fn sourceExtractionKeyForResolutionKeyAlloc(
+    gpa: std.mem.Allocator,
+    resolvers: []const ResolverConfig,
+    changed_key: []const u8,
+) !?[]u8 {
+    const parsed = (try internal_keys.parseResolutionArtifactKeyAlloc(gpa, changed_key)) orelse return null;
+    defer {
+        gpa.free(parsed.doc_key);
+        gpa.free(parsed.artifact_name);
+    }
+    const cfg = resolverForResolutionArtifact(resolvers, parsed.artifact_name) orelse return null;
+    if (try parseSourceArtifactKeyAlloc(gpa, parsed.doc_key)) |scoped| {
+        var owned = scoped;
+        owned.deinit(gpa);
+        return try gpa.dupe(u8, parsed.doc_key);
+    }
+    return try internal_keys.artifactNamedPrefixAlloc(gpa, parsed.doc_key, "asset", cfg.source_artifact);
 }
 
 pub const ReresolveEnqueueResult = struct {
@@ -2823,6 +2986,82 @@ test "processRecordKeys fans one source artifact out to all consuming resolvers"
     try testing.expectEqual(@as(u64, 1), writer.handoff_calls);
 }
 
+test "changed sibling resolution re-drives event identity onto canonical participant keys" {
+    const alloc = testing.allocator;
+    // Events resolver FIRST so the initial pass computes event identity
+    // before the entity resolution exists (raw mention slug), proving the
+    // re-drive — not catalog order — converges it onto the canonical key.
+    // The static entity key template stands in for a matcher-scorer merge:
+    // the canonical key's segment differs from the raw slug.
+    const resolvers = [_]ResolverConfig{
+        .{
+            .name = "events",
+            .table = "events",
+            .source_artifact = "relations_v1",
+            .resolution_artifact = "events_resolution_v1",
+            .key_template = "event/{{ hash _entity.event_identity }}",
+            .labels = &.{"event"},
+            .config_generation = 1,
+        },
+        .{
+            .name = "entities",
+            .table = "entities",
+            .source_artifact = "relations_v1",
+            .resolution_artifact = "entities_resolution_v1",
+            .key_template = "entity/merged_survivor",
+            .config_generation = 1,
+        },
+    };
+    const extraction =
+        \\{
+        \\  "entities": [
+        \\    {"id": "e0", "label": "person", "text": "A. Lovelace"},
+        \\    {"id": "v0", "label": "event", "text": "A. Lovelace spoke.", "predicate": "speak"}
+        \\  ],
+        \\  "relations": [{"type": "participates_in", "source": "e0", "target": "v0"}]
+        \\}
+    ;
+
+    var fake = FakeStore{ .alloc = alloc };
+    defer fake.deinit();
+    var das = DbArtifactStore(FakeStore){ .store = &fake };
+    const store = das.artifactStore();
+
+    const extraction_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:merge", "asset", "relations_v1");
+    defer alloc.free(extraction_key);
+    try store.put(extraction_key, extraction);
+
+    var writer = CaptureWriter{ .alloc = alloc, .store = store };
+    defer writer.deinit();
+
+    const changed = [_][]const u8{extraction_key};
+    try processRecordKeys(alloc, &resolvers, store, null, &changed, &writer, CaptureWriter.writeFn, null, null);
+    try testing.expectEqual(@as(u64, 1), writer.handoff_calls);
+
+    const events_resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:merge", "events_resolution_v1");
+    defer alloc.free(events_resolution_key);
+    const entities_resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:merge", "entities_resolution_v1");
+    defer alloc.free(entities_resolution_key);
+    const provisional = (try store.get(alloc, events_resolution_key)).?;
+    defer alloc.free(provisional);
+
+    // The committed entity resolution re-drives the source: the event
+    // resolution is rewritten with the canonical-key identity while the
+    // entity recompute is byte-stable (graph-only reconciliation).
+    const resolution_changed = [_][]const u8{entities_resolution_key};
+    try processRecordKeys(alloc, &resolvers, store, null, &resolution_changed, &writer, CaptureWriter.writeFn, null, null);
+    try testing.expectEqual(@as(u64, 2), writer.handoff_calls);
+    const canonical = (try store.get(alloc, events_resolution_key)).?;
+    defer alloc.free(canonical);
+    try testing.expect(!std.mem.eql(u8, provisional, canonical));
+
+    // The fan-back terminates: re-driving from the event resolution finds
+    // every recompute byte-stable and commits nothing new.
+    const settled = [_][]const u8{events_resolution_key};
+    try processRecordKeys(alloc, &resolvers, store, null, &settled, &writer, CaptureWriter.writeFn, null, null);
+    try testing.expectEqual(@as(u64, 2), writer.handoff_calls);
+}
+
 /// Minimal replay Source for tests: replays a fixed list of encoded records.
 const FakeSource = struct {
     const Rec = struct { sequence: u64, payload: []const u8 };
@@ -3735,7 +3974,7 @@ test "SourceCandidateProvider bulk exact keys retain duplicates missing candidat
         }
     };
     var fake: Bulk = .{};
-    var resolver = try resolver_lib.Resolver.initFromParts(alloc, "entities", "{{ lower _entity.label }}/{{ slug _entity.text }}", false, "");
+    var resolver = try resolver_lib.Resolver.initFromParts(alloc, "entities", "{{ lower _entity.label }}/{{ slug _entity.text }}", .{}, false, "");
     defer resolver.deinit();
     var provider = SourceCandidateProvider{
         .source = .{ .ptr = &fake, .vtable = &.{ .get = Bulk.get, .get_many = Bulk.getMany } },
@@ -3947,7 +4186,7 @@ test "SourceCandidateProvider shares prefix scans and negatively caches redirect
         }
     };
     var fake = Fake{};
-    var resolver = try resolver_lib.Resolver.initFromParts(alloc, "entities", "{{ lower _entity.label }}/{{ slug _entity.text }}", false, "");
+    var resolver = try resolver_lib.Resolver.initFromParts(alloc, "entities", "{{ lower _entity.label }}/{{ slug _entity.text }}", .{}, false, "");
     defer resolver.deinit();
     var provider = SourceCandidateProvider{ .source = .{ .ptr = &fake, .vtable = &.{ .get = Fake.get, .get_many = Fake.getMany, .scan_prefix = Fake.scan } }, .resolver = &resolver, .table = "entities", .mode = .prefix, .ann_index_name = "", .candidate_limit = 2 };
     const entities = [_]resolver_lib.ExtractedEntity{.{ .local_id = "one", .label = "person", .text = "Ada" }} ** 100;

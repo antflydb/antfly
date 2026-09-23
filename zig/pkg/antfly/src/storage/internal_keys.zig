@@ -89,6 +89,11 @@ pub const document_extraction_unit_spool_kind: u8 = 0x41;
 /// These attempts and their registry must stay outside document ranges: shard
 /// transfer must not copy temporary rows without their recovery metadata.
 pub const shared_pdf_consumer_kind: u8 = 0x42;
+/// Companion row of a resolution artifact recording the entity keys its
+/// canonical mentions last promoted (local id -> doc ref). The promoter
+/// diffs it on replay so a re-keyed mention tombstones the previously
+/// promoted document with a merged_into redirect instead of orphaning it.
+pub const promoted_keys_state_kind: u8 = 0x44;
 /// Store-wide index of outstanding shared-PDF attempts. Recovery is independent
 /// of document existence and the current enrichment configuration.
 pub const shared_pdf_consumer_attempt_prefix = [_]u8{ replay_namespace, 0xff, 0x43 };
@@ -1453,6 +1458,33 @@ pub fn graphEdgeArtifactKeyAlloc(
     return out;
 }
 
+/// Graph edge artifact key with an explicit topological source node distinct
+/// from the owning document. Ownership (routing, retirement, replacement
+/// manifests, split ranges) stays with `doc_key` — the leading component —
+/// while replay applies the edge from `source_node` (e.g. a resolver-minted
+/// canonical entity key for autoschema entity->entity relations, see
+/// zig/AUTOSCHEMA.md). A source equal to the owner encodes as the legacy
+/// five-component key so unchanged producers keep byte-identical rows.
+pub fn graphEdgeArtifactKeyWithSourceAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    index_name: []const u8,
+    edge_type: []const u8,
+    target_doc_key: []const u8,
+    source_node: []const u8,
+) ![]u8 {
+    if (std.mem.eql(u8, source_node, doc_key))
+        return graphEdgeArtifactKeyAlloc(alloc, doc_key, index_name, edge_type, target_doc_key);
+    const base = try graphEdgeArtifactKeyAlloc(alloc, doc_key, index_name, edge_type, target_doc_key);
+    defer alloc.free(base);
+    const out = try alloc.alloc(u8, base.len + encodedComponentLen(source_node));
+    errdefer alloc.free(out);
+    @memcpy(out[0..base.len], base);
+    const written = encodeComponent(out[base.len..], source_node);
+    std.debug.assert(base.len + written == out.len);
+    return out;
+}
+
 pub fn derivedEmbeddingBaseKeyAlloc(alloc: Allocator, key: []const u8) !?[]u8 {
     if (!isDerivedEmbeddingArtifactKey(key)) return null;
 
@@ -1744,7 +1776,12 @@ pub fn isGraphEdgeArtifactKey(key: []const u8) bool {
     pos = edge_type_term + 2;
 
     const target_term = findComponentTerminator(key, pos) orelse return false;
-    return target_term + 2 == key.len;
+    pos = target_term + 2;
+    if (pos == key.len) return true;
+    // Optional explicit source-node component (entity-sourced relations);
+    // ownership remains the leading doc component.
+    const source_term = findComponentTerminator(key, pos) orelse return false;
+    return source_term + 2 == key.len;
 }
 
 pub fn matchesGraphEdgeIndexName(key: []const u8, index_name: []const u8) bool {
@@ -2170,7 +2207,15 @@ pub fn artifactNameView(key: []const u8) !?[]const u8 {
 pub fn parseGraphEdgeArtifactKeyAlloc(
     alloc: Allocator,
     key: []const u8,
-) !?struct { doc_key: []u8, index_name: []u8, edge_type: []u8, target_doc_key: []u8 } {
+) !?struct {
+    doc_key: []u8,
+    index_name: []u8,
+    edge_type: []u8,
+    target_doc_key: []u8,
+    /// Explicit topological source node; null means the owning document is
+    /// the source (the legacy five-component shape).
+    source_node: ?[]u8 = null,
+} {
     if (!isGraphEdgeArtifactKey(key)) return null;
 
     const doc_term = findComponentTerminator(key, 1).?;
@@ -2196,12 +2241,21 @@ pub fn parseGraphEdgeArtifactKeyAlloc(
 
     const target_term = findComponentTerminator(key, pos).?;
     const target_doc_key = try decodeBodyAlloc(alloc, key[pos..target_term]);
+    errdefer alloc.free(target_doc_key);
+    pos = target_term + 2;
+
+    var source_node: ?[]u8 = null;
+    if (pos < key.len) {
+        const source_term = findComponentTerminator(key, pos).?;
+        source_node = try decodeBodyAlloc(alloc, key[pos..source_term]);
+    }
 
     return .{
         .doc_key = doc_key,
         .index_name = index_name,
         .edge_type = edge_type,
         .target_doc_key = target_doc_key,
+        .source_node = source_node,
     };
 }
 
@@ -2635,6 +2689,34 @@ test "graph edge artifact key round trip" {
     try std.testing.expectEqualStrings("gr_v1", parsed.index_name);
     try std.testing.expectEqualStrings("links", parsed.edge_type);
     try std.testing.expectEqualStrings("doc:b", parsed.target_doc_key);
+    try std.testing.expect(parsed.source_node == null);
+}
+
+test "graph edge artifact key carries an explicit source node" {
+    const alloc = std.testing.allocator;
+
+    // Source equal to the owner degrades to the legacy five-component key.
+    const legacy = try graphEdgeArtifactKeyWithSourceAlloc(alloc, "doc:a", "gr_v1", "works_at", "org/antfly", "doc:a");
+    defer alloc.free(legacy);
+    const plain = try graphEdgeArtifactKeyAlloc(alloc, "doc:a", "gr_v1", "works_at", "org/antfly");
+    defer alloc.free(plain);
+    try std.testing.expectEqualSlices(u8, plain, legacy);
+
+    const key = try graphEdgeArtifactKeyWithSourceAlloc(alloc, "doc:a", "gr_v1", "works_at", "org/antfly", "person/ada");
+    defer alloc.free(key);
+    try std.testing.expect(isGraphEdgeArtifactKey(key));
+    try std.testing.expect(matchesGraphEdgeIndexName(key, "gr_v1"));
+
+    const parsed = (try parseGraphEdgeArtifactKeyAlloc(alloc, key)).?;
+    defer alloc.free(parsed.doc_key);
+    defer alloc.free(parsed.index_name);
+    defer alloc.free(parsed.edge_type);
+    defer alloc.free(parsed.target_doc_key);
+    defer if (parsed.source_node) |source| alloc.free(source);
+    try std.testing.expectEqualStrings("doc:a", parsed.doc_key);
+    try std.testing.expectEqualStrings("works_at", parsed.edge_type);
+    try std.testing.expectEqualStrings("org/antfly", parsed.target_doc_key);
+    try std.testing.expectEqualStrings("person/ada", parsed.source_node.?);
 }
 
 test "graph asset state key matches exact index name" {

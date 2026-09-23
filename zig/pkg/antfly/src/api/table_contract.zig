@@ -884,6 +884,9 @@ fn validatePublicArtifactEnrichmentField(field: []const u8, value: std.json.Valu
     if (std.mem.eql(u8, field, "execution")) {
         validatePublicCreatedShape(value, .execution_policy) catch return error.InvalidArtifactEnrichmentRequest;
     }
+    if (std.mem.eql(u8, field, "neighbor_context")) {
+        validatePublicCreatedShape(value, .enrichment_neighbor_context) catch return error.InvalidArtifactEnrichmentRequest;
+    }
 }
 
 fn extractPublicIndexType(object: anytype) ?[]const u8 {

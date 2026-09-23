@@ -82,6 +82,40 @@ class OpenApiBuildPathsTest(unittest.TestCase):
             )
             self.assertEqual(spec.read_bytes(), original)
 
+    def test_vendored_tavily_inline_schemas_generate_named_types(self):
+        root = Path(__file__).resolve().parent.parent
+        spec = root / "zig/specs/tavily-openapi.json"
+        original = spec.read_bytes()
+        request_pointer = (
+            "/paths/~1search/post/requestBody/content/application~1json/schema"
+        )
+        result_pointer = "/paths/~1search/post/responses/200/content/application~1json/schema/properties/results/items"
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "tavily.json"
+            yaml_to_json.main(
+                [
+                    str(spec),
+                    str(output),
+                    "--schema-alias",
+                    "SearchRequest=" + request_pointer,
+                    "--schema-alias",
+                    "SearchResult=" + result_pointer,
+                ]
+            )
+            document = json.loads(output.read_text())
+            search = document["paths"]["/search"]["post"]
+            self.assertEqual(
+                document["components"]["schemas"]["SearchRequest"],
+                search["requestBody"]["content"]["application/json"]["schema"],
+            )
+            self.assertEqual(
+                document["components"]["schemas"]["SearchResult"],
+                search["responses"]["200"]["content"]["application/json"]["schema"][
+                    "properties"
+                ]["results"]["items"],
+            )
+            self.assertEqual(spec.read_bytes(), original)
+
     def test_schema_alias_rejects_missing_targets_and_component_collisions(self):
         root = Path(__file__).resolve().parent.parent
         with tempfile.TemporaryDirectory() as tmp:

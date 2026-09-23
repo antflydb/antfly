@@ -4138,7 +4138,7 @@ pub const ProvisionedTableReadSource = struct {
         if (group_ids.len == 1 and !distributed_graph.supportsCrossRange(req)) {
             if ((control_only_storage_sources or routed.local_read_source != null) and !queryRequiresCoordinatorFinalization(req)) {
                 const local_source = try routed.groupLocalSourceForGroup(alloc, group_ids[0], table_name, .{ .deadline_ns = req.execution_deadline_ns }, req.cancellation);
-                return local_source.queryGroupLocal(alloc, group_ids[0], table_name, req, .stale) catch |err| switch (err) {
+                return local_source.queryGroupLocal(alloc, group_ids[0], table_name, graphScopedSearchRequest(req, group_ids.len, table_name), .stale) catch |err| switch (err) {
                     error.ResidentDbRetryRequired => {
                         prepared.releaseActivity();
                         try routed.prepareResidentGroupsForReadRetry(alloc, table_name, group_ids);
@@ -4155,7 +4155,7 @@ pub const ProvisionedTableReadSource = struct {
                 // results below through the same routed physical provider.
             } else {
                 const local_collection_req = aggregationOnlyCollectionRequest(req);
-                const local_search_req = local_collection_req orelse req;
+                const local_search_req = graphScopedSearchRequest(local_collection_req orelse req, group_ids.len, table_name);
                 var execution = queryHostedLocalDetailed(routed.resident_db, routed.cache, routed.replica_root_dir, routed.catalog, routed.read_safety_barrier, alloc, group_ids[0], routed.visibleRootGeneration(group_ids[0]), routed.managedReadRuntimeConfig(), table_name, local_search_req, .stale, prepared.activity != null) catch |err| switch (err) {
                     error.ResidentDbRetryRequired => {
                         prepared.releaseActivity();
@@ -4274,7 +4274,7 @@ pub const ProvisionedTableReadSource = struct {
             return try query_api.encodeQueryResponses(alloc, table_name, graph_req, meta, merged);
         }
         const collection_req = aggregationOnlyCollectionRequest(req);
-        const search_req = collection_req orelse req;
+        const search_req = graphScopedSearchRequest(collection_req orelse req, group_ids.len, table_name);
         var merged = queryProvisionedAcrossGroups(routed, alloc, group_ids, search_req, table_name, .stale) catch |err| switch (err) {
             error.ResidentDbRetryRequired => {
                 prepared.releaseActivity();
@@ -6512,7 +6512,7 @@ pub const HostedProvisionedTableReadSource = struct {
             defer route.deinit(alloc);
 
             if (route == .local)
-                return try (try self.groupLocalSourceForGroup(alloc, group_ids[0], table_name, .{ .deadline_ns = req.execution_deadline_ns }, req.cancellation)).queryGroupLocal(alloc, group_ids[0], table_name, req, consistency);
+                return try (try self.groupLocalSourceForGroup(alloc, group_ids[0], table_name, .{ .deadline_ns = req.execution_deadline_ns }, req.cancellation)).queryGroupLocal(alloc, group_ids[0], table_name, graphScopedSearchRequest(req, group_ids.len, table_name), consistency);
         }
 
         if (requiresDistributedGraphCoordinator(group_ids.len, req)) {
@@ -6563,7 +6563,7 @@ pub const HostedProvisionedTableReadSource = struct {
             return try query_api.encodeQueryResponses(alloc, table_name, graph_req, meta, merged);
         }
         const collection_req = aggregationOnlyCollectionRequest(req);
-        const search_req = collection_req orelse req;
+        const search_req = graphScopedSearchRequest(collection_req orelse req, group_ids.len, table_name);
         var merged = try queryHostedAcrossGroups(self, alloc, group_ids, search_req, table_name, consistency);
         try checkQueryDeadline(req);
         defer merged.deinit();
@@ -8330,6 +8330,24 @@ const searchRequestHasResolvedDocFilter = local_query_contract.searchRequestHasR
 const searchRequestHasUnserializableResolvedDocFilter = local_query_contract.searchRequestHasUnserializableResolvedDocFilter;
 
 const graphHydrateRequestHasResolvedDocFilter = local_query_contract.graphHydrateRequestHasResolvedDocFilter;
+
+/// Single-group graph queries execute locally against a snapshot that holds
+/// the graph index's complete row set: mark the request so the storage graph
+/// executors may expand THROUGH cross-table tagged nodes (entity-sourced
+/// edges are document-owned rows in the same index) and canonicalize
+/// self-table target tags. Multi-group and non-graph requests pass through
+/// untouched; coordinator-routed requests never reach this helper.
+fn graphScopedSearchRequest(
+    req: db_mod.types.SearchRequest,
+    group_count: usize,
+    table_name: []const u8,
+) db_mod.types.SearchRequest {
+    if (group_count != 1 or req.graph_queries.len == 0) return req;
+    var scoped = req;
+    scoped.graph_owning_table = table_name;
+    scoped.graph_index_complete_snapshot = true;
+    return scoped;
+}
 
 fn requiresDistributedGraphCoordinator(
     group_count: usize,
@@ -24260,6 +24278,30 @@ fn consumerTests() type {
             req.graph_table_read_authorizer = null;
             try std.testing.expect(!requiresDistributedGraphCoordinator(1, req));
             try std.testing.expect(requiresDistributedGraphCoordinator(2, req));
+        }
+
+        test "single-group graph requests carry the complete-snapshot execution scope" {
+            const graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+                .name = "walk",
+                .query = .{
+                    .query_type = .traverse,
+                    .index_name = "graph_idx",
+                    .start_nodes = .{ .keys = &[_][]const u8{"doc:a"} },
+                },
+            }};
+            const req = db_mod.types.SearchRequest{ .graph_queries = &graph_queries };
+
+            const scoped = graphScopedSearchRequest(req, 1, "docs");
+            try std.testing.expect(scoped.graph_index_complete_snapshot);
+            try std.testing.expectEqualStrings("docs", scoped.graph_owning_table);
+
+            // A multi-group table cannot claim snapshot completeness, and a
+            // request without graph queries has no scope to carry.
+            const multi = graphScopedSearchRequest(req, 2, "docs");
+            try std.testing.expect(!multi.graph_index_complete_snapshot);
+            try std.testing.expectEqual(@as(usize, 0), multi.graph_owning_table.len);
+            const plain = graphScopedSearchRequest(.{}, 1, "docs");
+            try std.testing.expect(!plain.graph_index_complete_snapshot);
         }
 
         test "routing sessions reserve authoritative snapshots for cross-table plans" {

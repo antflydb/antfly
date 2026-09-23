@@ -1153,6 +1153,60 @@ test "imported runtime I/O views override raw runtime including unavailable view
     try std.testing.expect(ApiHttpServer.configuredDurableIo(cfg) == null);
 }
 
+test "session maintenance activation follows current range leadership without follower RPCs" {
+    const Fake = struct {
+        leader: u64 = 0,
+        reads: usize = 0,
+        fn owns(ptr: *anyopaque, group: u64) bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.leader == group;
+        }
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 3 };
+        }
+        fn snapshot(ptr: *anyopaque) !?metadata_api.AdminSnapshot {
+            return .{
+                .status = try status(ptr),
+                .tables = @constCast(&[_]metadata_table_manager.TableRecord{.{ .table_id = 1, .name = "rows", .schema_json =
+                    \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}}}}}}
+                }}),
+                .ranges = @constCast(&[_]metadata_table_manager.RangeRecord{
+                    .{ .table_id = 1, .group_id = 10, .range_id = 10, .start_key = "", .end_key = "m" },
+                    .{ .table_id = 1, .group_id = 20, .range_id = 20, .start_key = "m", .end_key = null },
+                }),
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+        fn lookup(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.reads += 1;
+            return null;
+        }
+    };
+    var fake: Fake = .{};
+    var server = ApiHttpServer.init(std.testing.allocator, .{
+        .relational_maintenance_leadership = .{ .ptr = &fake, .vtable = &.{ .is_local_leader = Fake.owns } },
+    }, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .cached_admin_snapshot = Fake.snapshot } }, .{
+        .ptr = &fake,
+        .vtable = &.{ .lookup = Fake.lookup, .scan = undefined, .query = undefined },
+    }, .{ .ptr = &fake, .vtable = &.{ .batch = undefined } });
+    defer server.deinit();
+    for (0..2) |_| try server.advanceRelationalActivationOnce();
+    try std.testing.expectEqual(@as(usize, 0), fake.reads);
+    fake.leader = 20;
+    for (0..2) |_| try server.advanceRelationalActivationOnce();
+    try std.testing.expectEqual(@as(usize, 1), fake.reads);
+    fake.leader = 10;
+    for (0..2) |_| try server.advanceRelationalActivationOnce();
+    try std.testing.expectEqual(@as(usize, 2), fake.reads);
+    server.cfg.relational_maintenance_leadership = null;
+    for (0..2) |_| try server.advanceRelationalActivationOnce();
+    try std.testing.expectEqual(@as(usize, 4), fake.reads);
+}
+
 pub const ApiHttpServerConfig = struct {
     restore_validation: ?@import("restore_catalog.zig").ValidationPort = null,
     auth_enabled: bool = false,
@@ -1232,6 +1286,9 @@ pub const ApiHttpServerConfig = struct {
     node_config: ?*const common_config.Config = null,
     user_manager: ?*usermgr.UserManager = null,
     session_router: ?table_router.HostedGroupRouter = null,
+    /// A scheduling hint only; durable activation/retirement still fences
+    /// every transaction. Null preserves standalone maintenance ownership.
+    relational_maintenance_leadership: ?@import("group_work_ownership.zig").Source = null,
     session_executor: ?http_common.RequestExecutor = null,
     session_store: ?*transactions_api.DurableSessionStore = null,
     session_store_path: ?[]const u8 = null,
@@ -4437,6 +4494,13 @@ pub const ApiHttpServer = struct {
         if (snapshot.ranges.len == 0) return;
         const next = self.relational_activation_range_cursor.fetchAdd(1, .monotonic) % snapshot.ranges.len;
         const owner = snapshot.ranges[next];
+        // All data nodes see the full catalog. Only the current range leader
+        // should spend RPC/transaction capacity on this restartable page.
+        // Recheck on every pass: an election transfers scheduling immediately,
+        // while the existing progress CAS rejects any old in-flight attempt.
+        if (self.cfg.relational_maintenance_leadership) |leadership| {
+            if (!leadership.isLocalLeader(owner.group_id)) return;
+        }
         for (snapshot.tables) |table| if (table.table_id == owner.table_id) {
             if (try @import("relational_witness_ddl.zig").cleanup(self.alloc, snapshot.tables, table)) |replacement| {
                 defer metadata_table_manager.freeTable(self.alloc, replacement);
@@ -12107,6 +12171,7 @@ pub const ApiHttpServer = struct {
         try ensureTableOperationActive(request);
         const response = self.executePublicTableQueryDispatchWithReadinessRetry(alloc, source, table_name, body, row_filter_json, null, request.cancellation, null, null, null) catch |err| switch (err) {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
+            error.GraphMetricPersonalizationRequiresFresh, error.UnsupportedGraphMetric => return error.InvalidQueryRequest,
             error.InvalidFilterQueryRequest => return error.InvalidFilterQueryRequest,
             error.InvalidExclusionQueryRequest => return error.InvalidExclusionQueryRequest,
             error.UnsupportedFilterQueryRequest => return error.UnsupportedFilterQueryRequest,
@@ -12390,6 +12455,10 @@ pub const ApiHttpServer = struct {
                 error.UnsupportedFilterQueryRequest,
                 error.UnsupportedExclusionQueryRequest,
                 => return err,
+                // Seeded personalization is a request-shape contract: seeds
+                // require fresh reads and a pagerank metric. Surface both as
+                // client errors rather than internal failures.
+                error.GraphMetricPersonalizationRequiresFresh, error.UnsupportedGraphMetric => return error.InvalidQueryRequest,
                 error.UnsupportedQueryRequest => return unsupportedPublicTableQueryDispatchError(alloc, body),
                 error.UnsupportedHierarchyGrouping => return error.UnsupportedHierarchyGrouping,
                 error.UnsupportedExactSort => return error.UnsupportedExactSort,
@@ -12462,6 +12531,7 @@ pub const ApiHttpServer = struct {
         var foreign_execution = CatalogJoinExecution{ .server = self, .resolver = resolver, .identity = authenticated_identity };
         if (self.executeForeignPublicTableQueryIfAny(alloc, source, table_name, body, row_filter_json, authenticated_identity, request_deadline_ns, cancellation, bound_join, foreign_execution.context()) catch |err| switch (err) {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
+            error.GraphMetricPersonalizationRequiresFresh, error.UnsupportedGraphMetric => return error.InvalidQueryRequest,
             // Foreign-source capability validation is part of the public
             // request contract. Keep its historical 400 classification;
             // exact-sort rejection is already carried by its distinct error.
@@ -12569,6 +12639,10 @@ pub const ApiHttpServer = struct {
             error.UnsupportedFilterQueryRequest,
             error.UnsupportedExclusionQueryRequest,
             => return err,
+            // Seeded personalization is a request-shape contract: seeds
+            // require fresh reads and a pagerank metric. Surface both as
+            // client errors rather than internal failures.
+            error.GraphMetricPersonalizationRequiresFresh, error.UnsupportedGraphMetric => return error.InvalidQueryRequest,
             error.UnsupportedQueryRequest => return unsupportedPublicTableQueryDispatchError(alloc, body),
             error.UnsupportedHierarchyGrouping => return error.UnsupportedHierarchyGrouping,
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
@@ -18014,6 +18088,11 @@ pub const ApiHttpServer = struct {
                 try contextualUnsupportedExactSortResponse(self.alloc)
             else
                 try contextual_operations.textAlloc(self.alloc, 400, "invalid query request"),
+            // Seeded personalization contract failures (seeds without fresh
+            // reads, or a non-pagerank metric) are client errors.
+            error.GraphMetricPersonalizationRequiresFresh,
+            error.UnsupportedGraphMetric,
+            => try contextual_operations.textAlloc(self.alloc, 400, "invalid query request"),
             error.InvalidFilterQueryRequest => try contextualPublicFilterQueryErrorResponseForBody(self.alloc, body, "filter_query", .invalid),
             error.InvalidExclusionQueryRequest => try contextualPublicFilterQueryErrorResponseForBody(self.alloc, body, "exclusion_query", .invalid),
             error.UnsupportedFilterQueryRequest => try contextualPublicFilterQueryErrorResponseForBody(self.alloc, body, "filter_query", .unsupported),
@@ -37948,7 +38027,6 @@ test "api http server retries stable terminal commits without replaying writes" 
 }
 
 test "api session maintenance recovers crash window after durable 2pc commit" {
-    @import("../test_error_logs.zig").expectErrorLogs(1);
     const alloc = std.testing.allocator;
     var session_path_tmp = try TestDirectory.init("antfly-api-http-session-post-commit-recovery");
     defer session_path_tmp.cleanup();
