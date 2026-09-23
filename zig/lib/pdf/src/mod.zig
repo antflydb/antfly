@@ -662,11 +662,16 @@ pub fn nativeRasterBboxToPagePoints(
         page_box.min_x + unrotated[2] / scale,
         page_box.min_y + (unrotated_height - unrotated[1]) / scale,
     };
-    if (!(mapped[0] < mapped[2]) or !(mapped[1] < mapped[3]) or
-        mapped[0] < page_box.min_x or mapped[1] < page_box.min_y or
-        mapped[2] > page_box.max_x or mapped[3] > page_box.max_y)
-        return null;
-    return mapped;
+    // The renderer rounds the trailing CropBox edges up to whole pixels. A
+    // region touching those pixels may extend past the original page bounds.
+    const clipped = [4]f64{
+        std.math.clamp(mapped[0], page_box.min_x, page_box.max_x),
+        std.math.clamp(mapped[1], page_box.min_y, page_box.max_y),
+        std.math.clamp(mapped[2], page_box.min_x, page_box.max_x),
+        std.math.clamp(mapped[3], page_box.min_y, page_box.max_y),
+    };
+    if (!(clipped[0] < clipped[2]) or !(clipped[1] < clipped[3])) return null;
+    return clipped;
 }
 
 test "native raster region inversion preserves fractional CropBox geometry through rotations" {
@@ -690,6 +695,16 @@ test "native raster region inversion preserves fractional CropBox geometry throu
         for (mapped, expected) |actual, wanted|
             try std.testing.expectApproxEqAbs(wanted, actual, 0.000_001);
     }
+}
+
+test "native raster region inversion clips rounded raster edges to the CropBox" {
+    const page_box = reader.PageBox{ .min_x = 0.25, .min_y = 1.5, .max_x = 72.45, .max_y = 37.9 };
+    const mapped = nativeRasterBboxToPagePoints(page_box, 144, 145, 73, 0, .{ 140, 0, 145, 5 }) orelse
+        return error.ExpectedMappedNativeRegion;
+    const expected = [4]f64{ 70.25, 35.5, 72.45, 37.9 };
+    for (mapped, expected) |actual, wanted|
+        try std.testing.expectApproxEqAbs(wanted, actual, 0.000_001);
+    try std.testing.expect(nativeRasterBboxToPagePoints(page_box, 144, 145, 73, 0, .{ 144.5, 0, 145, 0.1 }) == null);
 }
 
 test "native raster region inversion rejects invalid source bounds and rotations" {
