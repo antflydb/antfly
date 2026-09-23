@@ -107,6 +107,8 @@ const executor_microbatch = @import("executor_microbatch.zig");
 pub const ExecutorCancellation = executor_microbatch.Cancellation;
 const execution_control_mod = @import("../execution_control.zig");
 const InferenceExecutionControl = execution_control_mod.InferenceExecutionControl;
+const cancellable_rerank_batch_size: usize = 8;
+const rerank_driver_call_limit_ns: u64 = 120 * std.time.ns_per_s;
 
 fn httpInferenceExecutionControl(node: *Node, ctx: *httpx.Context) InferenceExecutionControl {
     const Check = struct {
@@ -4578,14 +4580,16 @@ pub const Node = struct {
         var deadline_control = DeadlineControl{ .deadline_ns = deadline_ns, .upstream = upstream_control };
         const execution_control = self.bindExecutionControl(request_io, .{
             .io = if (upstream_control) |control| control.io else null,
+            .deadline_ns = deadline_ns,
             .ptr = &deadline_control,
             .check_fn = DeadlineControl.check,
             .hard_cancellation = if (upstream_control) |control| control.hard_cancellation else null,
-        });
+        }).deferCancellationUntilSafeBoundary(rerank_driver_call_limit_ns);
         var model_handle = try self.model_manager.acquireFromDirWithControl(model_path, execution_control);
         defer model_handle.release();
         const model = model_handle.get();
         var pipeline = self.createRerankingPipeline(allocator, model);
+        pipeline.config.batch_size = @min(pipeline.config.batch_size, cancellable_rerank_batch_size);
         pipeline.execution_control = execution_control;
         var prepared = try pipeline.prepareInputs(query, documents);
         defer prepared.deinit();
@@ -10801,7 +10805,11 @@ pub const Node = struct {
     }
 
     pub fn rerankPrompts(self: *Node, ctx: *httpx.Context) !httpx.Response {
-        const execution_control = httpInferenceExecutionControl(self, ctx);
+        // A cancelled client must release the model between bounded batches.
+        // Metal/CUDA cannot stop a driver call in place; restarting the worker
+        // for every abandoned search would evict the model for the next one.
+        const execution_control = httpInferenceExecutionControl(self, ctx)
+            .deferCancellationUntilSafeBoundary(rerank_driver_call_limit_ns);
         var parsed = (try ctx.parseJson(api.RerankRequest)) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
@@ -10825,6 +10833,7 @@ pub const Node = struct {
         defer model_handle.release();
         const model = model_handle.get();
         var pipeline = self.createRerankingPipeline(ctx.allocator, model);
+        pipeline.config.batch_size = @min(pipeline.config.batch_size, cancellable_rerank_batch_size);
         pipeline.execution_control = execution_control;
         var prepared = pipeline.prepareInputs(body.query, body.prompts) catch |err|
             return inferenceFailureResponse(ctx, err);
@@ -10839,7 +10848,8 @@ pub const Node = struct {
     }
 
     pub fn rerankMultimodalPrompts(self: *Node, ctx: *httpx.Context) !httpx.Response {
-        const execution_control = httpInferenceExecutionControl(self, ctx);
+        const execution_control = httpInferenceExecutionControl(self, ctx)
+            .deferCancellationUntilSafeBoundary(300 * std.time.ns_per_s);
         const uses_attachment_envelope = requestUsesAttachmentEnvelope(ctx);
         var attachment_envelope: ?httpx.attachment_envelope.Envelope = null;
         defer if (attachment_envelope) |*envelope| envelope.deinit();
@@ -19526,6 +19536,7 @@ pub const Node = struct {
             .port = port,
             .max_connections = self.config.http_max_connections,
             .max_request_tasks = self.config.http_max_request_tasks,
+            .h1_cancel_on_half_close_header = "X-Antfly-Cancel-On-Disconnect",
             // Generation can legitimately take longer than the generic 30s HTTP
             // default during cold model startup or first-token GPU execution.
             .header_read_timeout_ms = 300_000,

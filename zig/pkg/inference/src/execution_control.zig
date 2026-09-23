@@ -116,6 +116,16 @@ pub const InferenceExecutionControl = struct {
     /// cannot notice that one particular request was cancelled while blocked
     /// in a driver.
     hard_cancellation: ?HardCancellationBoundary = null,
+    /// Optional watchdog policy for a non-interruptible native call. Callers
+    /// that can resume at a nearby safe boundary may defer ordinary request
+    /// cancellation during that call while retaining a hard driver deadline.
+    max_uninterruptible_run_ns: ?u64 = null,
+
+    pub fn deferCancellationUntilSafeBoundary(self: InferenceExecutionControl, max_run_ns: u64) InferenceExecutionControl {
+        var result = self;
+        result.max_uninterruptible_run_ns = max_run_ns;
+        return result;
+    }
 
     /// Borrow this control for structured image work. The caller must retain
     /// it until all preprocessing workers have joined.
@@ -189,7 +199,12 @@ pub const InferenceExecutionControl = struct {
             return error.ProcessIsolationRequired;
         return .{
             .boundary = boundary,
-            .token = try boundary.arm(.{
+            .token = try boundary.arm(if (self.max_uninterruptible_run_ns) |max_run_ns| blk: {
+                const hard_deadline = platform_time.monotonicNs() +| max_run_ns;
+                break :blk .{
+                    .deadline_ns = if (self.deadline_ns) |deadline| @min(deadline, hard_deadline) else hard_deadline,
+                };
+            } else .{
                 .deadline_ns = self.deadline_ns,
                 .cancellation = self.cancellation,
                 .ptr = self.ptr,
@@ -252,4 +267,32 @@ test "uninterruptible work fails closed without a process owner" {
     );
     var cooperative = try control.enterUninterruptible(.cooperative);
     cooperative.deinit();
+}
+
+test "deferred cancellation remains visible at safe boundaries without restarting a native call" {
+    const State = struct {
+        cancelled: bool = false,
+        monitor: ?MonitorControl = null,
+
+        fn isCancelled(raw: ?*anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            return self.cancelled;
+        }
+        fn arm(raw: *anyopaque, monitor: MonitorControl) !u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.monitor = monitor;
+            return 1;
+        }
+        fn disarm(_: *anyopaque, _: u64) void {}
+    };
+    var state = State{};
+    const control = (InferenceExecutionControl{
+        .cancellation = .{ .ptr = &state, .is_cancelled_fn = State.isCancelled },
+        .hard_cancellation = .{ .ptr = &state, .arm_fn = State.arm, .disarm_fn = State.disarm },
+    }).deferCancellationUntilSafeBoundary(std.time.ns_per_s);
+    var guard = try control.enterUninterruptible(.process_required);
+    state.cancelled = true;
+    try state.monitor.?.check();
+    try std.testing.expectError(error.Cancelled, control.check());
+    guard.deinit();
 }
