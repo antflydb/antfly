@@ -59,7 +59,7 @@ T = TypeVar("T", bound="GlobalStatefulQueryRequest")
 
 @_attrs_define
 class GlobalStatefulQueryRequest:
-    r"""A stateful global query. The target table is required on this route.
+    """A stateful global query. The target table is required on this route.
 
     Attributes:
         table (str): Name of the table to query. Example: wikipedia.
@@ -313,42 +313,9 @@ class GlobalStatefulQueryRequest:
         graph_queries (GraphQueries | Unset): Named canonical graph operations. When graph_queries is present it must
             contain at least one operation. A request may contain at most 64 operations, of which at most eight may be MATCH
             operations. Keys use the versioned GraphIdentifier policy.
-        document_renderer (str | Unset): Optional Handlebars template string for rendering document content in RAG
-            queries.
-            Template has access to document fields via `{{this.fields.fieldName}}`.
-
-            **Default**: Uses TOON (Token-Oriented Object Notation) format for 30-60% token reduction:
-            ```handlebars
-            {{encodeToon this.fields}}
-            ```
-
-            **Available Helpers**:
-            - `encodeToon` - Renders fields in compact TOON format with configurable options:
-              - `lengthMarker` (bool): Add # prefix to array counts (default: true)
-              - `indent` (int): Indentation spacing (default: 2)
-              - `delimiter` (string): Field separator for tabular arrays
-            - `scrubHtml` - Removes HTML tags and extracts text
-            - `media` - Wraps data URIs for GenKit multimodal support
-            - `eq` - Equality comparison for conditionals
-
-            **Examples**:
-            - Basic TOON: `{{encodeToon this.fields}}`
-            - Compact TOON: `{{encodeToon this.fields lengthMarker=false indent=0}}`
-            - Tabular data: `{{encodeToon this.fields delimiter="\t"}}`
-            - Custom template: `Title: {{this.fields.title}}\nBody: {{this.fields.body}}`
-            - Traditional format: `{{#each this.fields}}{{@key}}: {{this}}\n{{/each}}`
-
-            TOON format produces compact, LLM-optimized output like:
-            ```
-            title: Introduction to Vector Search
-            author: Jane Doe
-            tags[#3]: ai,search,ml
-            ```
-
-            **References**:
-            - TOON Specification: https://github.com/toon-format/toon
-            - Go Implementation: https://github.com/alpkeskin/gotoon
-             Example: {{encodeToon this.fields}}.
+        document_renderer (str | Unset): Not supported on queries, which do not generate text; requests that
+            set it are rejected. Set `document_renderer` on a retrieval agent
+            request to control how documents appear in the generation prompt.
         pruner (Pruner | Unset): Configuration for pruning search results based on score quality.
             Helps filter out low-relevance results in RAG pipelines by detecting
             score gaps or deviations from top results. Pruning runs once on the

@@ -185,7 +185,8 @@ type QueryRequest struct {
 	// SemanticSearch text to use for semantic similarity search
 	SemanticSearch string `json:"semantic_search,omitempty"`
 
-	// DocumentRenderer optional Go template string for rendering document content to the prompt
+	// DocumentRenderer is not supported on queries, which do not generate text;
+	// set document_renderer on a retrieval agent request instead.
 	DocumentRenderer string `json:"document_renderer,omitempty"`
 
 	// GraphQueries contains declarative graph matching, traversal, and path queries.

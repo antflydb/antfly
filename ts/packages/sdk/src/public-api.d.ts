@@ -8721,9 +8721,23 @@ export interface components {
             /** @description Step configuration */
             steps?: components["schemas"]["RetrievalAgentSteps"];
             /**
-             * @description Handlebars template for rendering documents in the generation prompt.
-             *     Default uses TOON format for token efficiency.
-             *     Requires steps.generation to be set.
+             * @description Handlebars template that renders each retrieved document in the
+             *     generation prompt. Requires steps.generation to be set.
+             *
+             *     The template is rendered once per hit against `{id, score, fields}`,
+             *     where `fields` is the hit's source. When omitted, each document's
+             *     fields are encoded as TOON (Token-Oriented Object Notation), which
+             *     carries the same structure as JSON in fewer tokens.
+             *
+             *     Helpers: `encodeToon` (options `indent`, at least 1, default 2; and
+             *     `delimiter`: `comma`, `tab`, or `pipe`), `scrubHtml`, `eq`, and
+             *     `media`. Values in `{{...}}` are HTML-escaped; use `{{{...}}}` for
+             *     raw text.
+             *
+             *     Examples:
+             *     - `{{encodeToon this.fields}}`
+             *     - `{{encodeToon this.fields delimiter="tab"}}`
+             *     - `Title: {{{this.fields.title}}}`
              * @example {{encodeToon this.fields}}
              */
             document_renderer?: string;
@@ -9446,41 +9460,9 @@ export interface components {
              */
             graph_queries?: components["schemas"]["GraphQueries"];
             /**
-             * @description Optional Handlebars template string for rendering document content in RAG queries.
-             *     Template has access to document fields via `{{this.fields.fieldName}}`.
-             *
-             *     **Default**: Uses TOON (Token-Oriented Object Notation) format for 30-60% token reduction:
-             *     ```handlebars
-             *     {{encodeToon this.fields}}
-             *     ```
-             *
-             *     **Available Helpers**:
-             *     - `encodeToon` - Renders fields in compact TOON format with configurable options:
-             *       - `lengthMarker` (bool): Add # prefix to array counts (default: true)
-             *       - `indent` (int): Indentation spacing (default: 2)
-             *       - `delimiter` (string): Field separator for tabular arrays
-             *     - `scrubHtml` - Removes HTML tags and extracts text
-             *     - `media` - Wraps data URIs for GenKit multimodal support
-             *     - `eq` - Equality comparison for conditionals
-             *
-             *     **Examples**:
-             *     - Basic TOON: `{{encodeToon this.fields}}`
-             *     - Compact TOON: `{{encodeToon this.fields lengthMarker=false indent=0}}`
-             *     - Tabular data: `{{encodeToon this.fields delimiter="\t"}}`
-             *     - Custom template: `Title: {{this.fields.title}}\nBody: {{this.fields.body}}`
-             *     - Traditional format: `{{#each this.fields}}{{@key}}: {{this}}\n{{/each}}`
-             *
-             *     TOON format produces compact, LLM-optimized output like:
-             *     ```
-             *     title: Introduction to Vector Search
-             *     author: Jane Doe
-             *     tags[#3]: ai,search,ml
-             *     ```
-             *
-             *     **References**:
-             *     - TOON Specification: https://github.com/toon-format/toon
-             *     - Go Implementation: https://github.com/alpkeskin/gotoon
-             * @example {{encodeToon this.fields}}
+             * @description Not supported on queries, which do not generate text; requests that
+             *     set it are rejected. Set `document_renderer` on a retrieval agent
+             *     request to control how documents appear in the generation prompt.
              */
             document_renderer?: string;
             /**

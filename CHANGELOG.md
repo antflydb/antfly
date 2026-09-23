@@ -16,6 +16,15 @@ All notable changes to Antfly will be documented in this file.
 
 ### [Unreleased]
 
+- **TOON document rendering in retrieval agents** — the generation prompt now
+  encodes each retrieved document's fields as TOON instead of raw JSON, and
+  `document_renderer` on a retrieval agent request is accepted again: a
+  Handlebars template rendered per hit against `{id, score, fields}` with an
+  `encodeToon` helper (`indent`, `delimiter`). Invalid templates are rejected
+  with `400`. Queries still reject `document_renderer`.
+- **Retrieval agent `auto_seed` stays agent-side** — the flag is cleared before
+  the internal query hop now that the generated rerank type carries it.
+
 - **`antfly standby` replaces `antfly ha`** — the hot-standby command is
   renamed; `antfly ha` remains a hidden alias for one minor release. It gains
   `--data-dir` (opens the node's standby state under `<dir>/ha/` and reads the
