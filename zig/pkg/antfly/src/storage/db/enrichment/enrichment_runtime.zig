@@ -221,11 +221,19 @@ pub const GeneratedWriteFence = struct {
     epoch: u64,
 };
 
+pub const GeneratedSourceGuard = struct {
+    key: []const u8,
+    expected_digest: ?[32]u8,
+    document_key: ?[]const u8 = null,
+    source_sequence: u64 = 0,
+};
+
 pub const GeneratedRecordWriter = *const fn (
     ptr: *anyopaque,
     batch: derived_types.DerivedBatch,
     artifact_promotions: []const GeneratedArtifactPromotion,
     artifact_delete_keys: []const []const u8,
+    source_guards: []const GeneratedSourceGuard,
     fence: ?GeneratedWriteFence,
 ) anyerror!GeneratedRecordCommit;
 pub const RequestFailure = struct {
@@ -417,6 +425,7 @@ const GeneratedReplayWindow = struct {
     documents: std.ArrayListUnmanaged(derived_types.DerivedDocument) = .empty,
     deleted_keys: std.ArrayListUnmanaged([]u8) = .empty,
     artifact_delete_keys: std.ArrayListUnmanaged([]u8) = .empty,
+    source_guards: std.ArrayListUnmanaged(GeneratedSourceGuard) = .empty,
     artifact_promotions: std.ArrayListUnmanaged(GeneratedArtifactPromotion) = .empty,
     changed_artifact_keys: std.ArrayListUnmanaged([]u8) = .empty,
     dense_embeddings: std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite) = .empty,
@@ -444,6 +453,7 @@ const GeneratedReplayWindow = struct {
         return self.documents.items.len +
             self.deleted_keys.items.len +
             self.artifact_delete_keys.items.len +
+            self.source_guards.items.len +
             self.artifact_promotions.items.len +
             self.changed_artifact_keys.items.len +
             self.dense_embeddings.items.len +
@@ -478,6 +488,9 @@ const GeneratedReplayWindow = struct {
 
         for (self.artifact_delete_keys.items) |key| self.alloc.free(key);
         self.artifact_delete_keys.deinit(self.alloc);
+        for (self.source_guards.items) |guard| self.alloc.free(@constCast(guard.key));
+        for (self.source_guards.items) |guard| if (guard.document_key) |key| self.alloc.free(@constCast(key));
+        self.source_guards.deinit(self.alloc);
 
         for (self.artifact_promotions.items) |promotion| {
             self.alloc.free(@constCast(promotion.staged_key));
@@ -3627,6 +3640,7 @@ fn clearChunkEmbeddingSourceList(alloc: Allocator, sources: *std.ArrayListUnmana
 const ChunkEmbeddingSourceSet = struct {
     sources: []ChunkEmbeddingSource = &.{},
     desired_chunk_keys: [][]u8 = &.{},
+    source_record_digest: ?[32]u8 = null,
 
     fn deinit(self: *@This(), alloc: Allocator) void {
         freeChunkEmbeddingSources(alloc, self.sources);
@@ -13324,7 +13338,7 @@ pub const PrecommitDocumentExecution = struct {
         setActiveFailureFingerprint(&self.runtime, requestFailureFingerprint(self.scheduler.requests[index]));
     }
 
-    fn rejectPublication(_: *anyopaque, _: derived_types.DerivedBatch, _: []const GeneratedArtifactPromotion, _: []const []const u8, _: ?GeneratedWriteFence) !GeneratedRecordCommit {
+    fn rejectPublication(_: *anyopaque, _: derived_types.DerivedBatch, _: []const GeneratedArtifactPromotion, _: []const []const u8, _: []const GeneratedSourceGuard, _: ?GeneratedWriteFence) !GeneratedRecordCommit {
         return error.PrecommitPublicationForbidden;
     }
 
@@ -19647,6 +19661,7 @@ fn runtimeDocumentExtractionWindowBytes(window: *const GeneratedReplayWindow) us
     var total: usize = window.documents.capacity *| @sizeOf(derived_types.DerivedDocument);
     total = addUsizeSaturating(total, window.deleted_keys.capacity *| @sizeOf([]const u8));
     total = addUsizeSaturating(total, window.artifact_delete_keys.capacity *| @sizeOf([]const u8));
+    total = addUsizeSaturating(total, window.source_guards.capacity *| @sizeOf(GeneratedSourceGuard));
     total = addUsizeSaturating(total, window.artifact_promotions.capacity *| @sizeOf(GeneratedArtifactPromotion));
     total = addUsizeSaturating(total, window.changed_artifact_keys.capacity *| @sizeOf([]const u8));
     total = addUsizeSaturating(total, window.dense_embeddings.capacity *| @sizeOf(derived_types.DerivedDenseEmbeddingWrite));
@@ -19660,6 +19675,10 @@ fn runtimeDocumentExtractionWindowBytes(window: *const GeneratedReplayWindow) us
     }
     for (window.deleted_keys.items) |key| total = addUsizeSaturating(total, key.len);
     for (window.artifact_delete_keys.items) |key| total = addUsizeSaturating(total, key.len);
+    for (window.source_guards.items) |guard| {
+        total = addUsizeSaturating(total, guard.key.len);
+        if (guard.document_key) |key| total = addUsizeSaturating(total, key.len);
+    }
     for (window.artifact_promotions.items) |promotion| {
         total = addUsizeSaturating(total, promotion.staged_key.len);
         total = addUsizeSaturating(total, promotion.final_key.len);
@@ -21673,6 +21692,9 @@ fn processMaterializedChunkDenseRequest(
     window: *GeneratedReplayWindow,
     scope: *FailureScope,
 ) !void {
+    const source_key = try documentSourceStoreKeyAlloc(runtime, request.doc_key);
+    defer runtime.alloc.free(source_key);
+    const source_digest = try currentRecordDigest(runtime, source_key);
     const max_window_items = generatedReplayWindowItems();
     const max_batch_items = effectiveRequestEmbedBatchItems(runtime, request);
     const max_batch_bytes = requestEmbedBatchBytes(runtime.alloc, request);
@@ -21834,6 +21856,9 @@ fn processMaterializedChunkDenseRequest(
     if (rejected_requests.contains(requestFailureFingerprint(request))) return;
     for (existing_embedding_keys.items) |embedding_key| {
         if (try derivedEmbeddingBelongsToDesiredChunkSet(runtime.alloc, embedding_key, &desired_chunk_keys)) continue;
+        if (window.source_guards.items.len == 0)
+            try flushGeneratedReplayWindowWithIdentity(runtime, window, scope.completedFingerprint());
+        try guardStaleEmbeddingDelete(runtime, window, source_key, source_digest, request, embedding_key);
         try appendUniqueDupeKey(runtime.alloc, &window.artifact_delete_keys, embedding_key);
         try flushGeneratedReplayWindowIfNeededWithIdentity(runtime, window, max_window_items, scope.completedFingerprint());
     }
@@ -22442,13 +22467,21 @@ fn processChunkedDenseWindow(
                 continue;
             }
 
+            const source_key = try documentSourceStoreKeyAlloc(runtime, request.doc_key);
+            defer runtime.alloc.free(source_key);
+            const fallback_source_digest = if (!requestHasChunking(request)) try currentRecordDigest(runtime, source_key) else null;
             var source_set = try chunkEmbeddingSourceSetForRequest(runtime, request, chunk_artifact_name, chunk_cache);
             defer source_set.deinit(runtime.alloc);
+            const source_digest = if (requestHasChunking(request)) source_set.source_record_digest else fallback_source_digest;
             var stale_deletes = try deleteStaleChunkEmbeddingArtifacts(runtime, request.doc_key, chunk_artifact_name, embedding_artifact_name, source_set.desired_chunk_keys);
             defer stale_deletes.deinit(runtime.alloc);
             if (source_set.sources.len == 0) {
-                try mergeOwnedStaleEmbeddingDeletesIntoWindow(runtime, window, &stale_deletes);
+                if (stale_deletes.artifact_delete_keys.len > 0)
+                    try flushGeneratedReplayWindowWithIdentity(runtime, window, scope.completedFingerprint());
+                try mergeGuardedStaleEmbeddingDeletesIntoWindow(runtime, window, &stale_deletes, source_key, source_digest, request);
                 try markDerivedCoverageSkipped(runtime, window, request, consumer_indexes);
+                if (window.source_guards.items.len > 0)
+                    try flushGeneratedReplayWindowWithIdentity(runtime, window, scope.completedFingerprint());
                 continue;
             }
 
@@ -22563,8 +22596,9 @@ fn processChunkedDenseWindow(
                 // cached replacements for this request still permit cleanup.
                 if (!complete and failed_batch_includes_request) continue;
                 if (rejected_requests.contains(requestFailureFingerprint(request))) continue;
-                try mergeOwnedStaleEmbeddingDeletesIntoWindow(runtime, window, &stale_deletes);
-                try flushGeneratedReplayWindowIfNeededWithIdentity(runtime, window, max_window_items, scope.completedFingerprint());
+                try flushGeneratedReplayWindowWithIdentity(runtime, window, scope.completedFingerprint());
+                try mergeGuardedStaleEmbeddingDeletesIntoWindow(runtime, window, &stale_deletes, source_key, source_digest, request);
+                try flushGeneratedReplayWindowWithIdentity(runtime, window, scope.completedFingerprint());
             }
         }
 
@@ -22691,16 +22725,16 @@ fn flushGeneratedReplayWindowWithIdentity(
     }
 
     const artifact_delete_keys = try window.artifact_delete_keys.toOwnedSlice(runtime.alloc);
-    errdefer freeKeyList(runtime.alloc, artifact_delete_keys);
+    defer freeKeyList(runtime.alloc, artifact_delete_keys);
+    const source_guards = try window.source_guards.toOwnedSlice(runtime.alloc);
+    defer freeGeneratedSourceGuards(runtime.alloc, source_guards);
     const artifact_promotions = try window.artifact_promotions.toOwnedSlice(runtime.alloc);
-    errdefer freeGeneratedArtifactPromotions(runtime.alloc, artifact_promotions);
+    defer freeGeneratedArtifactPromotions(runtime.alloc, artifact_promotions);
     var promotions_committed = false;
     defer if (!promotions_committed) cleanupGeneratedArtifactStages(runtime, artifact_promotions) catch {};
     var batch = try window.toOwnedBatch();
     defer derived_types.deinitDerivedBatch(runtime.alloc, &batch);
-    defer freeKeyList(runtime.alloc, artifact_delete_keys);
-    defer freeGeneratedArtifactPromotions(runtime.alloc, artifact_promotions);
-    const commit = try appendGeneratedBatchWithRetry(runtime, batch, artifact_promotions, artifact_delete_keys);
+    const commit = try appendGeneratedBatchWithRetry(runtime, batch, artifact_promotions, artifact_delete_keys, source_guards);
     promotions_committed = true;
     recordArtifactBytes(runtime, .dense_embedding, commit.promoted_artifact_bytes);
     try applyQueuedCoverageTransitionsAfterReplayAppend(runtime, window.coverage_transitions.items);
@@ -22924,6 +22958,79 @@ fn mergeOwnedStaleEmbeddingDeletesIntoWindow(
     errdefer stale.deinit(runtime.alloc);
     try mergeOwnedArtifactDeleteKeysIntoWindow(runtime, window, stale.artifact_delete_keys);
     stale.artifact_delete_keys = &.{};
+}
+
+fn freeGeneratedSourceGuards(alloc: Allocator, guards: []const GeneratedSourceGuard) void {
+    for (guards) |guard| {
+        alloc.free(@constCast(guard.key));
+        if (guard.document_key) |key| alloc.free(@constCast(key));
+    }
+    if (guards.len > 0) alloc.free(guards);
+}
+
+fn appendGeneratedSourceGuard(
+    runtime: *EnrichmentRuntime,
+    window: *GeneratedReplayWindow,
+    key: []const u8,
+    expected_digest: ?[32]u8,
+    document_key: ?[]const u8,
+    source_sequence: u64,
+) !void {
+    const owned_key = try runtime.alloc.dupe(u8, key);
+    errdefer runtime.alloc.free(owned_key);
+    const owned_doc_key = if (document_key) |doc_key| try runtime.alloc.dupe(u8, doc_key) else null;
+    errdefer if (owned_doc_key) |doc_key| runtime.alloc.free(doc_key);
+    try window.source_guards.append(runtime.alloc, .{ .key = owned_key, .expected_digest = expected_digest, .document_key = owned_doc_key, .source_sequence = source_sequence });
+}
+
+fn currentRecordDigest(runtime: *EnrichmentRuntime, key: []const u8) !?[32]u8 {
+    // Embedding payloads may be externalized behind a store reference. Match
+    // the writer transaction's logical read for those keys; ordinary source
+    // rows can use the lightweight runtime store directly.
+    const raw = if (runtime.artifact_store) |store| blk: {
+        if (internal_keys.isDerivedEmbeddingArtifactKey(key))
+            break :blk store.get(runtime.alloc, key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+        break :blk try storeGetOptionalAllocWithRetry(runtime, key);
+    } else try storeGetOptionalAllocWithRetry(runtime, key);
+    defer if (raw) |value| runtime.alloc.free(value);
+    return if (raw) |value| sourceRecordDigest(value) else null;
+}
+
+fn appendGuardForCurrentRecord(runtime: *EnrichmentRuntime, window: *GeneratedReplayWindow, key: []const u8) !void {
+    try appendGeneratedSourceGuard(runtime, window, key, try currentRecordDigest(runtime, key), null, 0);
+}
+
+fn guardStaleEmbeddingDelete(
+    runtime: *EnrichmentRuntime,
+    window: *GeneratedReplayWindow,
+    source_key: []const u8,
+    source_digest: ?[32]u8,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    embedding_key: []const u8,
+) !void {
+    if (window.source_guards.items.len == 0)
+        try appendGeneratedSourceGuard(runtime, window, source_key, source_digest, request.doc_key, request.sequence);
+    try appendGuardForCurrentRecord(runtime, window, embedding_key);
+    if (try internal_keys.derivedEmbeddingBaseKeyAlloc(runtime.alloc, embedding_key)) |base_key| {
+        defer runtime.alloc.free(base_key);
+        try appendGuardForCurrentRecord(runtime, window, base_key);
+    }
+}
+
+fn mergeGuardedStaleEmbeddingDeletesIntoWindow(
+    runtime: *EnrichmentRuntime,
+    window: *GeneratedReplayWindow,
+    stale: *StaleEmbeddingDeletes,
+    source_key: []const u8,
+    source_digest: ?[32]u8,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+) !void {
+    for (stale.artifact_delete_keys) |key|
+        try guardStaleEmbeddingDelete(runtime, window, source_key, source_digest, request, key);
+    try mergeOwnedStaleEmbeddingDeletesIntoWindow(runtime, window, stale);
 }
 
 const PdfEmbeddingPreparedWindow = struct {
@@ -25143,7 +25250,7 @@ fn publishDeletedKeys(runtime: *EnrichmentRuntime, deleted_keys: []const []const
     };
     var cloned = try derived_types.cloneBatch(runtime.alloc, batch);
     defer derived_types.deinitDerivedBatch(runtime.alloc, &cloned);
-    const commit = try appendGeneratedBatchWithRetry(runtime, cloned, &.{}, &.{});
+    const commit = try appendGeneratedBatchWithRetry(runtime, cloned, &.{}, &.{}, &.{});
     runtime.notify_fn(runtime.notify_ctx, commit.sequence);
 }
 
@@ -27092,13 +27199,14 @@ fn chunkEmbeddingSourceSetForRequest(
     }
 
     const chunks = try getOrCreateRequestChunks(runtime, request, chunk_cache);
+    const source_record_digest = blk: {
+        for (chunk_cache.items) |entry| {
+            if (entry.chunks.ptr == chunks.ptr) break :blk entry.source_record_digest;
+        }
+        if (requestHasChunking(request)) return error.MissingChunkSourceFence;
+        break :blk null;
+    };
     if (chunks.len > 0) {
-        const source_record_digest = blk: {
-            for (chunk_cache.items) |entry| {
-                if (entry.chunks.ptr == chunks.ptr) break :blk entry.source_record_digest;
-            }
-            return error.MissingChunkSourceFence;
-        };
         var sources = std.ArrayListUnmanaged(ChunkEmbeddingSource).empty;
         errdefer {
             for (sources.items) |source| {
@@ -27148,6 +27256,7 @@ fn chunkEmbeddingSourceSetForRequest(
         return .{
             .sources = owned_sources,
             .desired_chunk_keys = owned_keys,
+            .source_record_digest = source_record_digest,
         };
     }
 
@@ -27156,6 +27265,7 @@ fn chunkEmbeddingSourceSetForRequest(
     // describe the previous revision and must not become embedding inputs.
     if (requestHasChunking(request)) return .{
         .desired_chunk_keys = try runtime.alloc.alloc([]u8, 0),
+        .source_record_digest = source_record_digest,
     };
 
     const sources = try storedChunkEmbeddingSourcesForRequest(runtime, request, artifact_name);
@@ -28444,11 +28554,12 @@ fn appendGeneratedBatchWithRetry(
     batch: derived_types.DerivedBatch,
     artifact_promotions: []const GeneratedArtifactPromotion,
     artifact_delete_keys: []const []const u8,
+    source_guards: []const GeneratedSourceGuard,
 ) !GeneratedRecordCommit {
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
         try heartbeatEnrichmentLease(runtime);
-        const sequence = runtime.write_fn(runtime.write_ctx, batch, artifact_promotions, artifact_delete_keys, currentGeneratedWriteFence(runtime)) catch |err| switch (err) {
+        const sequence = runtime.write_fn(runtime.write_ctx, batch, artifact_promotions, artifact_delete_keys, source_guards, currentGeneratedWriteFence(runtime)) catch |err| switch (err) {
             error.WriterLocked => {
                 if (attempt >= writer_locked_retry_count) return err;
                 backoffWriterLockRetry();
@@ -29815,6 +29926,7 @@ test "asset preparation is lazy and byte bounded across retryable provider batch
             _: derived_types.DerivedBatch,
             _: []const GeneratedArtifactPromotion,
             _: []const []const u8,
+            _: []const GeneratedSourceGuard,
             _: ?GeneratedWriteFence,
         ) !GeneratedRecordCommit {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -29986,6 +30098,7 @@ test "asset producer neighbor context samples local graph adjacency into the inp
             _: derived_types.DerivedBatch,
             _: []const GeneratedArtifactPromotion,
             _: []const []const u8,
+            _: []const GeneratedSourceGuard,
             _: ?GeneratedWriteFence,
         ) !GeneratedRecordCommit {
             const self: *@This() = @ptrCast(@alignCast(ptr));

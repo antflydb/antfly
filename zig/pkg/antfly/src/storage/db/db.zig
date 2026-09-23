@@ -50957,13 +50957,6 @@ fn clearChunkEmbeddingSourceList(alloc: Allocator, sources: *std.ArrayListUnmana
     sources.clearRetainingCapacity();
 }
 
-fn containsChunkEmbeddingSource(sources: []const ChunkEmbeddingSource, key: []const u8) bool {
-    for (sources) |source| {
-        if (std.mem.eql(u8, source.key, key)) return true;
-    }
-    return false;
-}
-
 fn chunkPayloadTextAlloc(alloc: Allocator, payload: []const u8, source_field: []const u8) !?[]u8 {
     return try chunk_artifact_mod.artifactTextAlloc(alloc, payload, source_field);
 }
@@ -50978,6 +50971,7 @@ fn keyAfterAlloc(alloc: Allocator, key: []const u8) ![]u8 {
 fn collectChunkEmbeddingSourcesFromWrites(
     alloc: Allocator,
     out: *std.ArrayListUnmanaged(ChunkEmbeddingSource),
+    seen: *std.StringHashMapUnmanaged(void),
     writes: []const types.BatchWrite,
     doc_key: []const u8,
     artifact_name: []const u8,
@@ -50988,13 +50982,16 @@ fn collectChunkEmbeddingSourcesFromWrites(
     for (writes) |write| {
         if (!std.mem.startsWith(u8, write.key, prefix) or
             !internal_keys.matchesChunkArtifactName(write.key, artifact_name)) continue;
-        if (containsChunkEmbeddingSource(out.items, write.key)) continue;
+        if (seen.contains(write.key)) continue;
         const text = (try chunkPayloadTextAlloc(alloc, write.value, source_field)) orelse continue;
-        errdefer alloc.free(text);
+        var text_owned = true;
+        errdefer if (text_owned) alloc.free(text);
         try out.append(alloc, .{
             .key = try alloc.dupe(u8, write.key),
             .text = text,
         });
+        text_owned = false;
+        try seen.put(alloc, out.items[out.items.len - 1].key, {});
     }
 }
 
@@ -51002,6 +50999,7 @@ fn collectChunkEmbeddingSourcesFromStore(
     alloc: Allocator,
     db: *DB,
     out: *std.ArrayListUnmanaged(ChunkEmbeddingSource),
+    seen: *std.StringHashMapUnmanaged(void),
     doc_key: []const u8,
     artifact_name: []const u8,
     source_field: []const u8,
@@ -51015,16 +51013,49 @@ fn collectChunkEmbeddingSourcesFromStore(
 
     for (existing) |entry| {
         if (!internal_keys.isChunkArtifactRecordKey(entry.key)) continue;
-        if (containsChunkEmbeddingSource(out.items, entry.key)) continue;
+        if (seen.contains(entry.key)) continue;
         if (pending_writes.get(entry.key) != null) continue;
         if (pending_deletes.contains(entry.key)) continue;
         const text = (try chunkPayloadTextAlloc(alloc, entry.value, source_field)) orelse continue;
-        errdefer alloc.free(text);
+        var text_owned = true;
+        errdefer if (text_owned) alloc.free(text);
         try out.append(alloc, .{
             .key = try alloc.dupe(u8, entry.key),
             .text = text,
         });
+        text_owned = false;
+        try seen.put(alloc, out.items[out.items.len - 1].key, {});
     }
+}
+
+test "materialized preserved sources dedupe pending chunk keys" {
+    const alloc = std.testing.allocator;
+    var writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
+    defer {
+        for (writes.items) |write| alloc.free(@constCast(write.key));
+        writes.deinit(alloc);
+    }
+    for (0..128) |i| {
+        try writes.append(alloc, .{
+            .key = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc:a", "chunks", @intCast(i)),
+            .value = "{\"text\":\"first\"}",
+        });
+    }
+    try writes.append(alloc, .{
+        .key = try alloc.dupe(u8, writes.items[0].key),
+        .value = "{\"text\":\"later\"}",
+    });
+    var sources = std.ArrayListUnmanaged(ChunkEmbeddingSource).empty;
+    defer {
+        clearChunkEmbeddingSourceList(alloc, &sources);
+        sources.deinit(alloc);
+    }
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    defer seen.deinit(alloc);
+    try collectChunkEmbeddingSourcesFromWrites(alloc, &sources, &seen, writes.items, "doc:a", "chunks", "text");
+    try std.testing.expectEqual(@as(usize, 128), sources.items.len);
+    try std.testing.expectEqual(@as(usize, 128), seen.count());
+    try std.testing.expectEqualStrings("first", sources.items[0].text);
 }
 
 fn chunkEmbeddingSourcesForRequest(
@@ -51461,8 +51492,10 @@ fn preparePreservedEmbeddingSources(
                 PendingArtifactWriteIndex{};
             defer local_pending_writes.deinit(alloc);
             const pending_writes = shared_pending_writes orelse &local_pending_writes;
-            try collectChunkEmbeddingSourcesFromWrites(alloc, &sources, pending_writes.chunkWritesForDoc(request.doc_key), request.doc_key, requestArtifactName(request), request.source_field);
-            try collectChunkEmbeddingSourcesFromStore(alloc, db, &sources, request.doc_key, requestArtifactName(request), request.source_field, pending_writes, pending_deletes);
+            var seen = std.StringHashMapUnmanaged(void).empty;
+            defer seen.deinit(alloc);
+            try collectChunkEmbeddingSourcesFromWrites(alloc, &sources, &seen, pending_writes.chunkWritesForDoc(request.doc_key), request.doc_key, requestArtifactName(request), request.source_field);
+            try collectChunkEmbeddingSourcesFromStore(alloc, db, &sources, &seen, request.doc_key, requestArtifactName(request), request.source_field, pending_writes, pending_deletes);
         } else {
             var chunks_created: usize = 0;
             sources = .fromOwnedSlice(try chunkEmbeddingSourcesForRequest(alloc, db, doc_value, request, cache, &chunks_created));
@@ -58376,9 +58409,10 @@ fn appendGeneratedBatchFromEnrichment(
     batch: derived_types.DerivedBatch,
     artifact_promotions: []const enrichment_runtime_mod.GeneratedArtifactPromotion,
     artifact_delete_keys: []const []const u8,
+    source_guards: []const enrichment_runtime_mod.GeneratedSourceGuard,
     fence: ?enrichment_runtime_mod.GeneratedWriteFence,
 ) !enrichment_runtime_mod.GeneratedRecordCommit {
-    if (artifact_promotions.len == 0 and artifact_delete_keys.len == 0 and fence == null)
+    if (artifact_promotions.len == 0 and artifact_delete_keys.len == 0 and source_guards.len == 0 and fence == null)
         return .{ .sequence = try appendDerivedBatchFromEnrichment(ctx_ptr, batch) };
 
     const ctx: *EnrichmentAppendContext = @ptrCast(@alignCast(ctx_ptr));
@@ -58551,25 +58585,62 @@ fn appendGeneratedBatchFromEnrichment(
             };
         }
     };
-    const LeaseFenceGuard = struct {
-        fence: enrichment_runtime_mod.GeneratedWriteFence,
+    const PublicationGuard = struct {
+        fence: ?enrichment_runtime_mod.GeneratedWriteFence,
+        source_guards: []const enrichment_runtime_mod.GeneratedSourceGuard,
         clock: platform_clock.Clock,
+
+        fn validateLease(self: *@This(), alloc: Allocator, txn: *docstore_mod.DocStore.Batch.BatchTxn) !void {
+            if (self.fence) |active_fence| {
+                const raw = txn.get(active_fence.lease_key) catch |err| switch (err) {
+                    error.NotFound => return error.EnrichmentLeaseFenceLost,
+                    else => return err,
+                };
+                var parsed = std.json.parseFromSlice(lease_mod.LeaseRecord, alloc, raw, .{ .allocate = .alloc_always }) catch
+                    return error.EnrichmentLeaseFenceLost;
+                defer parsed.deinit();
+                if (!std.mem.eql(u8, parsed.value.owner_id, active_fence.owner_id) or
+                    parsed.value.epoch != active_fence.epoch or
+                    parsed.value.expires_at_ms <= self.clock.nowRealtimeMs())
+                {
+                    return error.EnrichmentLeaseFenceLost;
+                }
+            }
+        }
 
         fn validate(ptr: *anyopaque, alloc: Allocator, txn: *docstore_mod.DocStore.Batch.BatchTxn) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            const raw = txn.get(self.fence.lease_key) catch |err| switch (err) {
-                error.NotFound => return error.EnrichmentLeaseFenceLost,
-                else => return err,
-            };
-            var parsed = std.json.parseFromSlice(lease_mod.LeaseRecord, alloc, raw, .{ .allocate = .alloc_always }) catch
-                return error.EnrichmentLeaseFenceLost;
-            defer parsed.deinit();
-            if (!std.mem.eql(u8, parsed.value.owner_id, self.fence.owner_id) or
-                parsed.value.epoch != self.fence.epoch or
-                parsed.value.expires_at_ms <= self.clock.nowRealtimeMs())
-            {
-                return error.EnrichmentLeaseFenceLost;
+            try self.validateLease(alloc, txn);
+            for (self.source_guards) |guard| {
+                if (guard.document_key) |doc_key| {
+                    if (guard.source_sequence != 0) {
+                        if (try doc_identity.lookupOrdinalTxn(alloc, txn, doc_key)) |ordinal| {
+                            const state = (try doc_identity.lookupStateTxn(txn, ordinal)) orelse return error.InvalidDocIdentity;
+                            if (!state.isLive() or state.created_generation > guard.source_sequence)
+                                return error.EnrichmentSourceChanged;
+                        }
+                    }
+                }
+                const raw = txn.get(guard.key) catch |err| switch (err) {
+                    error.NotFound => {
+                        if (guard.expected_digest == null) continue;
+                        return error.EnrichmentSourceChanged;
+                    },
+                    else => return err,
+                };
+                const expected = guard.expected_digest orelse return error.EnrichmentSourceChanged;
+                var actual: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(raw, &actual, .{});
+                if (!std.mem.eql(u8, &expected, &actual)) return error.EnrichmentSourceChanged;
             }
+        }
+
+        fn validateAtCommit(ptr: *anyopaque, alloc: Allocator, txn: *docstore_mod.DocStore.Batch.BatchTxn) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            // Source records may be deleted by this transaction. The first
+            // validation holds under its writer lock; only the lease's clock
+            // expiry needs a second check immediately before commit.
+            try self.validateLease(alloc, txn);
         }
     };
     var split_delta_key_buf: [19]u8 = undefined;
@@ -58577,10 +58648,10 @@ fn appendGeneratedBatchFromEnrichment(
     var split_delta_reservation: ?resource_manager_mod.Reservation = null;
     defer if (split_delta_reservation) |*reservation| reservation.release();
     var split_delta_builder: SplitDeltaBuilder = undefined;
-    var lease_fence_guard: LeaseFenceGuard = undefined;
-    const transactional_guard: ?docstore_mod.DocStore.TransactionalGuard = if (fence) |active_fence| blk: {
-        lease_fence_guard = .{ .fence = active_fence, .clock = ctx.clock };
-        break :blk .{ .ptr = &lease_fence_guard, .validate = LeaseFenceGuard.validate };
+    var publication_guard: PublicationGuard = undefined;
+    const transactional_guard: ?docstore_mod.DocStore.TransactionalGuard = if (fence != null or source_guards.len > 0) blk: {
+        publication_guard = .{ .fence = fence, .source_guards = source_guards, .clock = ctx.clock };
+        break :blk .{ .ptr = &publication_guard, .validate = PublicationGuard.validate, .validate_at_commit = PublicationGuard.validateAtCommit };
     } else null;
     var transactional_split_delta: ?docstore_mod.DocStore.TransactionalWriteBuilder = null;
     if (append_split_delta) {
@@ -109952,6 +110023,7 @@ test "db generated replay atomically promotes staged artifacts and deletes stale
         .{},
         &.{.{ .staged_key = stage_key, .final_key = final_key }},
         &.{stale_key},
+        &.{},
         null,
     );
     try std.testing.expectEqual(
@@ -109987,6 +110059,7 @@ test "db generated replay atomically promotes staged artifacts and deletes stale
             .{},
             &.{.{ .staged_key = missing_stage, .final_key = final_key }},
             &.{stale_key},
+            &.{},
             null,
         ),
     );
@@ -110015,6 +110088,7 @@ test "db generated replay atomically promotes staged artifacts and deletes stale
             .{},
             &.{.{ .staged_key = stage_key, .final_key = final_key }},
             &.{stale_key},
+            &.{},
             .{ .lease_key = fence_key, .owner_id = "worker-a", .epoch = acquired.epoch - 1 },
         ),
     );
@@ -110033,6 +110107,7 @@ test "db generated replay atomically promotes staged artifacts and deletes stale
         .{},
         &.{.{ .staged_key = stage_key, .final_key = final_key }},
         &.{stale_key},
+        &.{},
         .{ .lease_key = fence_key, .owner_id = "worker-a", .epoch = acquired.epoch },
     );
     const fenced_promoted = try db.core.store.get(alloc, final_key);
@@ -110040,6 +110115,48 @@ test "db generated replay atomically promotes staged artifacts and deletes stale
     try std.testing.expectEqualStrings("fenced-vector", fenced_promoted);
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, stage_key));
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, stale_key));
+
+    const source_key = try internal_keys.documentKeyAlloc(alloc, "doc:guarded");
+    defer alloc.free(source_key);
+    try db.core.store.putBatch(&.{
+        .{ .key = source_key, .value = "old source" },
+        .{ .key = stale_key, .value = "old embedding" },
+    }, &.{});
+    var source_digest: [32]u8 = undefined;
+    var embedding_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("old source", &source_digest, .{});
+    std.crypto.hash.sha2.Sha256.hash("old embedding", &embedding_digest, .{});
+    try db.core.store.putBatch(&.{.{ .key = source_key, .value = "new source" }}, &.{});
+    try std.testing.expectError(error.EnrichmentSourceChanged, appendGeneratedBatchFromEnrichment(
+        append_ctx,
+        .{},
+        &.{},
+        &.{stale_key},
+        &.{.{ .key = source_key, .expected_digest = source_digest }},
+        null,
+    ));
+    const retained_old_embedding = try db.core.store.get(alloc, stale_key);
+    defer alloc.free(retained_old_embedding);
+    try std.testing.expectEqualStrings("old embedding", retained_old_embedding);
+
+    try db.core.store.putBatch(&.{
+        .{ .key = source_key, .value = "old source" },
+        .{ .key = stale_key, .value = "new embedding" },
+    }, &.{});
+    try std.testing.expectError(error.EnrichmentSourceChanged, appendGeneratedBatchFromEnrichment(
+        append_ctx,
+        .{},
+        &.{},
+        &.{stale_key},
+        &.{
+            .{ .key = source_key, .expected_digest = source_digest },
+            .{ .key = stale_key, .expected_digest = embedding_digest },
+        },
+        null,
+    ));
+    const retained_new_embedding = try db.core.store.get(alloc, stale_key);
+    defer alloc.free(retained_new_embedding);
+    try std.testing.expectEqualStrings("new embedding", retained_new_embedding);
 }
 
 test "db encodeThinReplayRecordPayload marks generated enrichment replay for async writes" {
